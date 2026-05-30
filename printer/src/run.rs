@@ -141,6 +141,14 @@ pub async fn run_with_sandbox(
 
     if let Ok(usage) = &inner {
         eprintln!("[printer] run token usage: {usage}");
+        crate::metrics::record(
+            &cwd,
+            &spec_abs.to_string_lossy(),
+            "run",
+            args.agent.to_string(),
+            args.model.clone(),
+            *usage,
+        );
     }
     inner
 }
@@ -243,14 +251,13 @@ async fn run_inner(
         // straight to the run loop instead of redoing this turn. No-op
         // for standalone `printer run` invocations: they have no
         // checkpoint to advance.
-        if let Some(cp_path) = args.checkpoint_path.as_deref() {
-            if let Err(e) = crate::exec::write_phase_planning_done(cp_path, spec_abs) {
+        if let Some(cp_path) = args.checkpoint_path.as_deref()
+            && let Err(e) = crate::exec::write_phase_planning_done(cp_path, spec_abs) {
                 eprintln!(
                     "[printer] warning: failed to advance checkpoint at {} to Running: {e}",
                     cp_path.display()
                 );
             }
-        }
     }
 
     // If the caller supplied review feedback, give the agent one turn to
@@ -283,7 +290,7 @@ async fn run_inner(
         // Compaction check.
         if session.cumulative_input_tokens >= args.compact_at {
             eprintln!(
-                "[printer] cumulative input tokens {} >= {}; rotating session",
+                "[printer] non-cached input tokens {} >= {}; rotating session",
                 session.cumulative_input_tokens, args.compact_at
             );
             session.rotate().await;

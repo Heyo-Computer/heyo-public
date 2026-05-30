@@ -590,7 +590,7 @@ fn resolve_spec(args: &AddPluginArgs) -> Result<ResolvedSpec> {
 
 fn git_url_basename(url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/');
-    let last = trimmed.rsplit(|c| c == '/' || c == ':').next()?;
+    let last = trimmed.rsplit(['/', ':']).next()?;
     let stripped = last.strip_suffix(".git").unwrap_or(last);
     if stripped.is_empty() {
         None

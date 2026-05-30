@@ -20,14 +20,12 @@ pub fn resolve(explicit: &[PathBuf], default_root: Option<&Path>) -> Result<Vec<
         collect_skill_files(p, &mut paths)
             .with_context(|| format!("resolving --skill {}", p.display()))?;
     }
-    if explicit.is_empty() {
-        if let Some(root) = default_root {
-            if root.is_dir() {
+    if explicit.is_empty()
+        && let Some(root) = default_root
+            && root.is_dir() {
                 collect_skill_files(root, &mut paths)
                     .with_context(|| format!("scanning default skills root {}", root.display()))?;
             }
-        }
-    }
 
     paths.sort();
     paths.dedup();

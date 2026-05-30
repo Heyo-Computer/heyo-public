@@ -1,5 +1,5 @@
 use crate::agent::acp::AcpClient;
-use crate::agent::{AgentInvocation, TokenUsage, TurnOutcome};
+use crate::agent::{AgentInvocation, TokenUsage, ToolUseEvent, TurnOutcome};
 use crate::cli::AgentKind;
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
@@ -14,8 +14,11 @@ use uuid::Uuid;
 pub struct Session<'a> {
     pub id: Uuid,
     pub turn_count: u32,
-    /// Largest single-turn input-side token total seen in the *current* (not
-    /// yet rotated) session. Used by the compaction trigger only.
+    /// Largest single-turn *non-cached* input-side token total seen in the
+    /// *current* (not yet rotated) session — freshly processed input plus
+    /// newly-written cache, excluding cache reads. Used by the compaction
+    /// trigger only; cache reads are intentionally ignored so a warm prompt
+    /// cache isn't thrown away by premature rotation.
     pub cumulative_input_tokens: u64,
     /// Sum of every turn's token usage for the lifetime of this Session,
     /// including across rotations. This is the operation-level total.
@@ -201,7 +204,7 @@ impl<'a> Session<'a> {
         let outcome = self.agent.parse_outcome(stdout_buf, &self.id)?;
         self.turn_count += 1;
         self.cumulative_input_tokens =
-            outcome.input_tokens().max(self.cumulative_input_tokens);
+            outcome.non_cached_input_tokens().max(self.cumulative_input_tokens);
         self.usage_total.add(&outcome.usage);
         eprintln!(
             "[printer] turn {} done in {:.1}s (turn: {}; op total: {})",
@@ -210,6 +213,25 @@ impl<'a> Session<'a> {
             outcome.usage,
             self.usage_total,
         );
+        // Surface per-tool activity when running verbose (claude stream-json
+        // populates `outcome.tools`; other backends leave it empty).
+        if self.verbose && !outcome.tools.is_empty() {
+            for t in &outcome.tools {
+                if t.input_summary.is_empty() {
+                    eprintln!("[agent] ⚙ {}", t.name);
+                } else {
+                    eprintln!("[agent] ⚙ {}({})", t.name, t.input_summary);
+                }
+            }
+            eprintln!("[printer] tools: {}", format_tool_summary(&outcome.tools));
+            let inefficient = count_inefficient_search_tools(&outcome.tools);
+            if inefficient > 0 {
+                eprintln!(
+                    "[printer] hint: {inefficient} raw grep/find/cat call(s) this turn — \
+                     prefer `codegraph` (search/definition/references) for token-efficient search."
+                );
+            }
+        }
         // Subsequent turns resume the same session id (claude requires a new
         // uuid for --session-id, so we keep using --resume from now on).
         self.fresh = false;
@@ -508,4 +530,92 @@ fn kill_subtree(child: &mut tokio::process::Child) {
     }
     // Fallback / non-unix: at minimum kill the immediate child.
     let _ = child.start_kill();
+}
+
+/// Aggregate tool-use events into a compact one-line summary like
+/// `Read x3, Bash x2, Edit x1`, ordered by descending count then name.
+fn format_tool_summary(tools: &[ToolUseEvent]) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for t in tools {
+        match counts.iter_mut().find(|(n, _)| *n == t.name) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((t.name.clone(), 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counts
+        .into_iter()
+        .map(|(name, c)| format!("{name} x{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Count tool calls that do raw text search / file dumps the codegraph CLI
+/// could answer more cheaply — the `Grep`/`Glob` built-ins and `Bash`
+/// invocations whose leading program is grep/rg/find/cat/ag/ack. Drives the
+/// verbose codegraph-first nudge (Spec 010, task 2). Advisory only.
+fn count_inefficient_search_tools(tools: &[ToolUseEvent]) -> usize {
+    tools
+        .iter()
+        .filter(|t| match t.name.as_str() {
+            "Grep" | "Glob" => true,
+            "Bash" => {
+                let first = t.input_summary.split_whitespace().next().unwrap_or("");
+                matches!(first, "grep" | "rg" | "find" | "cat" | "ag" | "ack")
+            }
+            _ => false,
+        })
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(name: &str) -> ToolUseEvent {
+        ToolUseEvent {
+            name: name.to_string(),
+            input_summary: String::new(),
+        }
+    }
+
+    #[test]
+    fn tool_summary_aggregates_and_orders_by_count_then_name() {
+        let tools = vec![
+            ev("Read"),
+            ev("Bash"),
+            ev("Read"),
+            ev("Edit"),
+            ev("Read"),
+            ev("Bash"),
+        ];
+        assert_eq!(format_tool_summary(&tools), "Read x3, Bash x2, Edit x1");
+    }
+
+    #[test]
+    fn tool_summary_empty_is_blank() {
+        assert_eq!(format_tool_summary(&[]), "");
+    }
+
+    fn ev_cmd(name: &str, cmd: &str) -> ToolUseEvent {
+        ToolUseEvent {
+            name: name.to_string(),
+            input_summary: cmd.to_string(),
+        }
+    }
+
+    #[test]
+    fn flags_raw_search_tools_and_ignores_codegraph() {
+        let tools = vec![
+            ev("Grep"),                         // built-in search
+            ev("Glob"),                         // built-in file find
+            ev_cmd("Bash", "grep -rn foo src"), // raw grep
+            ev_cmd("Bash", "find . -name '*.rs'"),
+            ev_cmd("Bash", "codegraph search foo"), // efficient — not flagged
+            ev_cmd("Bash", "cargo test"),           // unrelated — not flagged
+            ev("Read"),                              // reads aren't counted here
+        ];
+        assert_eq!(count_inefficient_search_tools(&tools), 4);
+        assert_eq!(count_inefficient_search_tools(&[]), 0);
+    }
 }

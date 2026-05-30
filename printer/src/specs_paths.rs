@@ -19,11 +19,10 @@ pub fn next_numbered_spec_path(root: &Path, slug: &str) -> Result<PathBuf> {
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(n) = parse_leading_number(&name) {
-                if n > max_n {
+            if let Some(n) = parse_leading_number(&name)
+                && n > max_n {
                     max_n = n;
                 }
-            }
         }
     }
     let next = max_n + 1;

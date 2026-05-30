@@ -111,7 +111,7 @@ fn latest_followups(cwd: &Path) -> Result<PathBuf> {
             continue;
         }
         let mtime = entry.metadata()?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
             best = Some((mtime, path));
         }
     }

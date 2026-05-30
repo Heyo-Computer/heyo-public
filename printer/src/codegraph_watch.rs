@@ -69,10 +69,7 @@ pub fn try_spawn(cwd: &Path) -> Result<Option<Guard>> {
         return Ok(None);
     }
 
-    let child = match spawn_one(&bin, cwd, &log_path) {
-        Ok(c) => c,
-        Err(e) => return Err(e),
-    };
+    let child = spawn_one(&bin, cwd, &log_path)?;
     let pid = child.id();
     eprintln!(
         "[printer] launched codegraph watch ({}); logs → {}",

@@ -11,6 +11,18 @@ pub const SENTINEL_QUESTIONS_OPEN: &str = "<<QUESTIONS>>";
 /// Sentinel that closes a block of questions opened with `<<QUESTIONS>>`.
 pub const SENTINEL_QUESTIONS_CLOSE: &str = "<<END_QUESTIONS>>";
 
+/// Shared token-efficiency guidance appended to the planning and execution
+/// prompts. States the codegraph-first / diffs-only preference unconditionally
+/// so it holds even when the codegraph plugin's agent hook isn't installed
+/// (Spec 010, tasks 2 & 3).
+const EFFICIENCY_GUIDANCE: &str = "\nToken efficiency:\n\
+- Navigate code with the `codegraph` CLI (search / definition / references / outline / snippet) \
+instead of raw `grep`/`find`/`cat` + full-file reads — it is tree-sitter-indexed and far cheaper \
+in tokens. Reach for `grep`/`find` only when codegraph genuinely can't answer.\n\
+- When changing code, apply a minimal unified diff (e.g. `codegraph patch`, or the codegraph-edit \
+skill) rather than rewriting whole files, and do not paste large file bodies back into the turn.\n\
+- Keep responses to the diff plus a one-line status; let the task log and the diff carry the rest.\n";
+
 /// Prompt for the empty-spec bootstrap turn: ask the agent to write a clean
 /// checklist into the spec file. The driver will then parse it and create
 /// tasks. The agent does NOT execute work here.
@@ -76,10 +88,12 @@ add fluff.\n\
 - When every open task has either a planning comment or is already detailed enough, output \
 the literal sentinel {plan_ready} on its own line and stop.\n\
 \n\
-Be terse. No preamble, no recap. Plan the work, then emit the sentinel.\n",
+Be terse. No preamble, no recap. Plan the work, then emit the sentinel.\n\
+{efficiency}",
         printer = printer_bin,
         spec = spec_path,
         plan_ready = SENTINEL_PLAN_READY,
+        efficiency = EFFICIENCY_GUIDANCE,
     )
 }
 
@@ -261,10 +275,12 @@ claim the next ready task and continue; otherwise stop and the driver will call 
 \n\
 Output style: be terse. Don't narrate, recap, or explain what you changed — the diff and task \
 log already say that. Status updates belong in `{printer} task comment`, not in chat. End the \
-turn with the sentinel or a short one-line status. No preamble, no closing summary.\n",
+turn with the sentinel or a short one-line status. No preamble, no closing summary.\n\
+{efficiency}",
         printer = printer_bin,
         done = SENTINEL_DONE,
         blocked = SENTINEL_BLOCKED,
+        efficiency = EFFICIENCY_GUIDANCE,
     )
 }
 
@@ -370,6 +386,57 @@ pub fn review_prompt_with(
     out
 }
 
+/// Prompt for `printer test`: a focused click-test turn. Unlike review, this
+/// is exclusively about exercising the running app through the `computer` tool
+/// — no static reading, no per-item spec audit. Reuses the same verification
+/// vocabulary as `render_review_body` step 4 so the two stay consistent.
+pub fn test_prompt(
+    spec_path: &str,
+    base_ref: &str,
+    url: Option<&str>,
+    skills: &[crate::skills::Skill],
+    extra_block: Option<&str>,
+) -> String {
+    let launch = match url {
+        Some(u) => format!(
+            "Start the app and open it with `computer browse {u}` (the change's local URL)."
+        ),
+        None => "Start the app under test (e.g. `computer browse <local URL>` for a web app, or \
+launch the desktop binary). Infer the start command from AGENTS.md / README / package.json scripts."
+            .to_string(),
+    };
+    let mut out = format!(
+        "You are click-testing a UI/web change end-to-end with the `computer` tool. A real display \
+is available — exercise the running app, do not stop at reading code or unit tests.\n\
+\n\
+1. Read `{spec}` to understand what behavior the change was supposed to deliver, and skim \
+`git diff {base}...HEAD` to see which UI surface changed.\n\
+2. {launch}\n\
+3. Use the `computer` skill to drive the affected flow: synthesize the clicks/keystrokes a user \
+would make, and capture before/after screenshots as evidence. Input synthesis is allowed — the \
+app, not the repo, is being mutated; do NOT edit project files, build artifacts excepted.\n\
+4. If no display is actually reachable (`$WAYLAND_DISPLAY`/`$XDG_SESSION_TYPE` unset, or \
+`/dev/uinput` missing), say so explicitly and set the verdict to FAIL rather than silently \
+skipping.\n\
+5. Produce a concise markdown report on stdout with these sections:\n\
+   - `## Verdict` — PASS if the flow worked as the spec intended, PARTIAL if it partly worked or \
+you could only verify some of it, FAIL if it broke or no display was available.\n\
+   - `## Verification` — bullet list of the exact click-test steps you performed and what you \
+observed (cite screenshots). \n\
+   - `## Suggested follow-ups` — short bulleted list, or 'none'.\n\
+\n\
+Be terse and concrete. No preamble, no closing summary.\n",
+        spec = spec_path,
+        base = base_ref,
+        launch = launch,
+    );
+    if let Some(extra) = extra_block {
+        out.push_str(extra);
+    }
+    append_skills(&mut out, skills);
+    out
+}
+
 fn append_skills(out: &mut String, skills: &[crate::skills::Skill]) {
     if skills.is_empty() {
         return;
@@ -422,7 +489,9 @@ do not exist or cannot run in this environment, say so explicitly in the report 
 silently skipping.\n\
 5. Produce a concise markdown review report on stdout with these sections:\n\
    - `## Verdict` — one of: PASS, PARTIAL, FAIL. A change that does not build or whose tests \
-fail is at most PARTIAL, and FAIL if the failure is in code the spec asked for.\n\
+fail is at most PARTIAL, and FAIL if the failure is in code the spec asked for. If the change \
+has a UI/web surface and no display was available to click-test it, the verdict is at most \
+PARTIAL.\n\
    - `## Verification` — bullet list of the build/test/lint commands you actually ran and their \
 result (pass/fail + the meaningful line of output). If the change has a UI/web surface, also list \
 the click-test steps you actually performed (or an explicit 'no UI surface' / 'no display \

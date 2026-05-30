@@ -12,7 +12,7 @@
 //!
 //! See https://agentclientprotocol.com for the wire spec.
 
-use crate::agent::TurnOutcome;
+use crate::agent::{TokenUsage, TurnOutcome};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -375,11 +375,12 @@ impl AcpClient {
     /// `tool_call_update`, `plan`) are always logged; per-chunk message and
     /// thought summaries plus a periodic heartbeat are gated on `verbose`.
     ///
-    /// Token usage is currently not surfaced (ACP doesn't standardize it; some
-    /// servers include it on the final `agent_message_chunk`'s metadata).
-    /// `TokenUsage::default()` is returned and the compaction trigger will
-    /// behave as if the session never crosses the threshold — that's fine for
-    /// T-017's blocking-turn scope; T-020 can wire usage in.
+    /// Token usage is best-effort: ACP doesn't standardize a usage field, so
+    /// `extract_acp_usage` scans the final `session/prompt` result for a
+    /// `usage`/`tokens` object (under a few common key conventions, including
+    /// `_meta`). When the server omits usage entirely we fall back to
+    /// `TokenUsage::default()` and warn once — the compaction trigger then
+    /// behaves as if the session never crosses the threshold for that backend.
     pub async fn prompt_blocking(
         &self,
         session_id: &str,
@@ -418,13 +419,15 @@ impl AcpClient {
         // turn — we only care about pacing within a single in-flight prompt.
         let mut chunk_state = ChunkLogState::default();
 
+        let mut prompt_result: Option<Value> = None;
         let mut notifications = self.notifications.lock().await;
         let result: Result<()> = loop {
             tokio::select! {
                 biased;
                 rpc = &mut result_fut => {
                     match rpc {
-                        Ok(_value) => {
+                        Ok(value) => {
+                            prompt_result = Some(value);
                             // Drain any remaining notifications already buffered.
                             while let Ok(update) = notifications.try_recv() {
                                 if update.session_id == session_id {
@@ -467,7 +470,19 @@ impl AcpClient {
         }
 
         result?;
-        Ok(TurnOutcome { result_text: text, ..Default::default() })
+        let usage = prompt_result
+            .as_ref()
+            .and_then(extract_acp_usage)
+            .unwrap_or_else(|| {
+                if !ACP_USAGE_MISSING_WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[printer] note: this ACP server did not report token usage; \
+                         metrics will show zero and session compaction won't trigger for it."
+                    );
+                }
+                TokenUsage::default()
+            });
+        Ok(TurnOutcome { result_text: text, usage, tools: Vec::new() })
     }
 
     /// Send a JSON-RPC 2.0 request and await its response.
@@ -745,6 +760,62 @@ fn pick_permission_outcome(params: &Value) -> Value {
 }
 
 /// Write one JSON-RPC frame to the server stdin pipe (line-delimited JSON).
+/// Warn at most once per process when an ACP server reports no token usage.
+static ACP_USAGE_MISSING_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Best-effort token-usage extraction from a `session/prompt` result. ACP has
+/// no standardized usage field, so we look in the conventional spots — the
+/// result root, then a `_meta`/`meta` envelope — for a `usage` or `tokens`
+/// object, and accept any of the common per-field key spellings. Returns
+/// `None` if nothing usage-shaped is present so the caller can fall back.
+fn extract_acp_usage(result: &Value) -> Option<TokenUsage> {
+    let obj = ["usage", "tokens"]
+        .into_iter()
+        .find_map(|k| result.get(k))
+        .or_else(|| {
+            ["_meta", "meta"]
+                .into_iter()
+                .filter_map(|env| result.get(env))
+                .find_map(|m| m.get("usage").or_else(|| m.get("tokens")))
+        })?;
+
+    // Accept snake_case, camelCase, and the opencode-style nested `cache`.
+    let pick = |keys: &[&str]| -> u64 {
+        keys.iter()
+            .find_map(|k| obj.get(*k).and_then(|v| v.as_u64()))
+            .unwrap_or(0)
+    };
+    let cache = obj.get("cache");
+    let cache_pick = |nested: &str, flat: &[&str]| -> u64 {
+        cache
+            .and_then(|c| c.get(nested))
+            .and_then(|v| v.as_u64())
+            .or_else(|| flat.iter().find_map(|k| obj.get(*k).and_then(|v| v.as_u64())))
+            .unwrap_or(0)
+    };
+
+    let usage = TokenUsage {
+        input_tokens: pick(&["input_tokens", "inputTokens", "input"]),
+        output_tokens: pick(&["output_tokens", "outputTokens", "output"]),
+        cache_creation_input_tokens: cache_pick(
+            "write",
+            &["cache_creation_input_tokens", "cacheCreationInputTokens", "cache_write"],
+        ),
+        cache_read_input_tokens: cache_pick(
+            "read",
+            &["cache_read_input_tokens", "cacheReadInputTokens", "cache_read"],
+        ),
+    };
+
+    // A usage object that parsed to all-zero is indistinguishable from absent;
+    // treat it as present only if at least one field is non-zero.
+    if usage.grand_total() == 0 {
+        None
+    } else {
+        Some(usage)
+    }
+}
+
 /// Used by `dispatch_message` to reply to server→client requests.
 async fn send_frame(writer: &Arc<Mutex<ChildStdin>>, frame: &Value) -> anyhow::Result<()> {
     let line = serde_json::to_string(frame)?;
@@ -1339,5 +1410,49 @@ mod tests {
         }
         assert_eq!(d.bad_stdout.len(), DiagnosticBuf::MAX);
         assert_eq!(d.bad_stdout.front().unwrap(), "line-5");
+    }
+
+    #[test]
+    fn acp_usage_extracted_from_snake_case_root() {
+        let result = json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 5,
+                "cache_read_input_tokens": 3
+            }
+        });
+        let u = extract_acp_usage(&result).unwrap();
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.output_tokens, 20);
+        assert_eq!(u.cache_creation_input_tokens, 5);
+        assert_eq!(u.cache_read_input_tokens, 3);
+    }
+
+    #[test]
+    fn acp_usage_extracted_from_meta_with_nested_cache() {
+        // camelCase under a `_meta` envelope, opencode-style nested cache.
+        let result = json!({
+            "_meta": {
+                "tokens": {
+                    "input": 200,
+                    "output": 40,
+                    "cache": { "write": 7, "read": 9 }
+                }
+            }
+        });
+        let u = extract_acp_usage(&result).unwrap();
+        assert_eq!(u.input_tokens, 200);
+        assert_eq!(u.output_tokens, 40);
+        assert_eq!(u.cache_creation_input_tokens, 7);
+        assert_eq!(u.cache_read_input_tokens, 9);
+    }
+
+    #[test]
+    fn acp_usage_absent_returns_none() {
+        assert!(extract_acp_usage(&json!({ "stopReason": "end_turn" })).is_none());
+        // An all-zero usage object is treated as absent.
+        assert!(extract_acp_usage(&json!({ "usage": { "input_tokens": 0 } })).is_none());
     }
 }
