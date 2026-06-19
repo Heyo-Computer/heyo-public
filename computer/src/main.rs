@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod mcp;
 mod platform;
 
 use platform::types::{KeyAction, MouseAction};
@@ -58,6 +59,13 @@ enum Cmd {
     },
     /// Sleep for milliseconds.
     Sleep { ms: u64 },
+    /// Serve the desktop tools over stdio as an MCP server.
+    ///
+    /// Speaks newline-delimited JSON-RPC 2.0 (the MCP stdio transport) and
+    /// exposes screenshot/outputs/windows/mouse/key/type/browse as tools.
+    /// `screenshot` returns an inline PNG image. Intended to be launched by an
+    /// agent host (e.g. `claude --mcp-config`), not run interactively.
+    Mcp,
 }
 
 fn main() -> Result<()> {
@@ -76,5 +84,6 @@ fn main() -> Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(ms));
             Ok(())
         }
+        Cmd::Mcp => mcp::serve(),
     }
 }

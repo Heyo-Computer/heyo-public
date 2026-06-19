@@ -115,6 +115,34 @@ computer mouse up   --button left
   deprecated in macOS 14. It still functions on current macOS; a future
   migration to ScreenCaptureKit is planned.
 
+### Serve as an MCP server
+
+```sh
+computer mcp
+```
+
+Speaks newline-delimited JSON-RPC 2.0 over stdin/stdout (the MCP stdio
+transport) and exposes the desktop commands as native tools: `screenshot`,
+`outputs`, `windows`, `mouse_move`, `mouse_click`, `mouse_scroll`,
+`mouse_drag`, `key`, `type`, `browse`. The headline difference from shelling
+out: **`screenshot` returns an inline PNG image content block**, so an agent
+host sees the pixels in the same turn it called the tool (no temp file + read).
+By default the screenshot's long edge is downscaled to 1568px to bound the
+payload; pass `max_width` to override.
+
+Intended to be wired into an agent host, not run by hand — e.g. for Claude:
+
+```sh
+claude --mcp-config '{"mcpServers":{"computer":{"type":"stdio","command":"computer","args":["mcp"]}}}' \
+       --strict-mcp-config \
+       --allowedTools mcp__computer__screenshot,mcp__computer__mouse_click,mcp__computer__type
+```
+
+The Printer CLI wires this automatically for the Claude backend when the
+`computer` binary is installed **and** a real display is present **and** the run
+is not sandboxed (the heyvm microVM is headless), using the absolute binary
+path. Input tools return a short text ack; `outputs`/`windows` return JSON text.
+
 ## Notes
 
 - On Linux this targets the active Wayland session. For X11 automation,

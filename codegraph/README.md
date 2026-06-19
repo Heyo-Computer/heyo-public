@@ -95,6 +95,30 @@ codegraph patch /etc/hosts --diff a.patch --allow-outside       # opt in to path
 
 Exit code is non-zero on failure; default output is JSON, pass `--text` for a one-line summary.
 
+### Serve as an MCP server
+
+```sh
+codegraph mcp
+```
+
+Speaks newline-delimited JSON-RPC 2.0 over stdin/stdout (the MCP stdio
+transport) and exposes the **read-only** query commands as native tools:
+`search`, `definition`, `outline`, `snippet`, `references`. Mutating commands
+(`patch`, `index`, `watch`) are deliberately not served. Each tool reads
+`.codegraph/index.json` relative to the working directory, so launch it with
+cwd set to the repo root. Intended to be wired into an agent host, not run by
+hand — e.g. for Claude:
+
+```sh
+claude --mcp-config '{"mcpServers":{"codegraph":{"type":"stdio","command":"codegraph","args":["mcp"]}}}' \
+       --strict-mcp-config \
+       --allowedTools mcp__codegraph__search,mcp__codegraph__definition,mcp__codegraph__outline,mcp__codegraph__snippet,mcp__codegraph__references
+```
+
+The Printer CLI wires this automatically for the Claude backend when the
+`codegraph` binary is on PATH (see `printer run`/`exec`), using the absolute
+binary path so it resolves inside sandbox VMs too.
+
 ## Output format
 
 Default is JSON for easy parsing. `--text` flips every command to a compact

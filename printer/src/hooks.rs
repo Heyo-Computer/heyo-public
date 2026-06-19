@@ -404,8 +404,8 @@ fn interpolate(template: &str, ctx: &HookContext) -> String {
     let bytes = template.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end) = template[i + 1..].find('}') {
+        if bytes[i] == b'{'
+            && let Some(end) = template[i + 1..].find('}') {
                 let name = &template[i + 1..i + 1 + end];
                 if let Some(val) = vars.get(name) {
                     out.push_str(val);
@@ -417,7 +417,6 @@ fn interpolate(template: &str, ctx: &HookContext) -> String {
                 i += end + 2;
                 continue;
             }
-        }
         // Not a `{var}` — push one char and advance.
         let ch_len = template[i..]
             .chars()

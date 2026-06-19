@@ -178,7 +178,7 @@ fn collect_answers(questions: &str) -> Result<String> {
 fn write_checkpoint(printer_dir: &Path, spec_abs: &Path, agent_tail: &str) -> Result<()> {
     let path = printer_dir.join("plan.checkpoint");
     let mut body = String::new();
-    body.push_str(&format!("# printer plan checkpoint\n"));
+    body.push_str("# printer plan checkpoint\n");
     body.push_str(&format!("spec: {}\n", spec_abs.display()));
     body.push_str(&format!("created_at: {}\n", Utc::now().to_rfc3339()));
     body.push_str("\n## Final agent output\n\n");

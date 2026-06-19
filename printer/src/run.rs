@@ -7,7 +7,7 @@ use crate::prompts::{
     bootstrap_prompt, fix_from_review_prompt, nudge_prompt_with, planning_prompt, rotation_prompt,
     unstall_prompt, SENTINEL_BLOCKED, SENTINEL_DONE,
 };
-use crate::session::Session;
+use crate::session::{MetricsCtx, Session};
 use crate::skills;
 use crate::tasks::model::{Status, Task};
 use crate::tasks::{spec, store};
@@ -141,6 +141,14 @@ pub async fn run_with_sandbox(
 
     if let Ok(usage) = &inner {
         eprintln!("[printer] run token usage: {usage}");
+        crate::metrics::record(
+            &cwd,
+            &spec_abs.to_string_lossy(),
+            "run",
+            args.agent.to_string(),
+            args.model.clone(),
+            *usage,
+        );
     }
     inner
 }
@@ -184,7 +192,14 @@ async fn run_inner(
         acp_args: acp.args.as_slice(),
         acp_env: &acp.env,
     };
-    let mut session = Session::new(agent).with_verbose(args.verbose);
+    let mut session = Session::new(agent)
+        .with_verbose(args.verbose)
+        .with_metrics_context(MetricsCtx {
+            cwd: cwd.to_path_buf(),
+            spec: spec_abs.to_string_lossy().into_owned(),
+            agent: args.agent.to_string(),
+            model: args.model.clone(),
+        });
 
     // Initial sync: parse spec and reconcile with the task store.
     let report = sync_spec(spec_abs, tasks_dir)?;
@@ -243,14 +258,13 @@ async fn run_inner(
         // straight to the run loop instead of redoing this turn. No-op
         // for standalone `printer run` invocations: they have no
         // checkpoint to advance.
-        if let Some(cp_path) = args.checkpoint_path.as_deref() {
-            if let Err(e) = crate::exec::write_phase_planning_done(cp_path, spec_abs) {
+        if let Some(cp_path) = args.checkpoint_path.as_deref()
+            && let Err(e) = crate::exec::write_phase_planning_done(cp_path, spec_abs) {
                 eprintln!(
                     "[printer] warning: failed to advance checkpoint at {} to Running: {e}",
                     cp_path.display()
                 );
             }
-        }
     }
 
     // If the caller supplied review feedback, give the agent one turn to
@@ -283,7 +297,7 @@ async fn run_inner(
         // Compaction check.
         if session.cumulative_input_tokens >= args.compact_at {
             eprintln!(
-                "[printer] cumulative input tokens {} >= {}; rotating session",
+                "[printer] non-cached input tokens {} >= {}; rotating session",
                 session.cumulative_input_tokens, args.compact_at
             );
             session.rotate().await;

@@ -11,11 +11,11 @@
 //!   1. `create`   — provision the sandbox; must print the handle on stdout.
 //!   2. `sync_in`  — (optional) push the host cwd into the sandbox.
 //!   3. `enter`    — wrap each child command (the agent CLI) so it executes
-//!                   inside the sandbox. `{child}` is the shell-quoted argv
-//!                   of the original command.
+//!      inside the sandbox. `{child}` is the shell-quoted argv of the
+//!      original command.
 //!   4. `sync_out` — (optional) pull artifacts back to the host.
 //!   5. `destroy`  — (optional) tear the sandbox down. Runs from `Drop` so
-//!                   it fires even on panic / early return.
+//!      it fires even on panic / early return.
 
 use crate::config::{SandboxCommands, SandboxDriverChoice};
 use crate::plugins::store;
@@ -290,8 +290,8 @@ pub fn interpolate(template: &str, vars: &BTreeMap<&'static str, String>) -> Str
     let bytes = template.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end) = template[i + 1..].find('}') {
+        if bytes[i] == b'{'
+            && let Some(end) = template[i + 1..].find('}') {
                 let name = &template[i + 1..i + 1 + end];
                 if let Some(val) = vars.get(name) {
                     out.push_str(val);
@@ -302,7 +302,6 @@ pub fn interpolate(template: &str, vars: &BTreeMap<&'static str, String>) -> Str
                 i += end + 2;
                 continue;
             }
-        }
         let ch_len = template[i..]
             .chars()
             .next()

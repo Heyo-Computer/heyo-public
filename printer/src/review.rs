@@ -2,8 +2,9 @@ use crate::agent::{AgentInvocation, TokenUsage};
 use crate::cli::ReviewArgs;
 use crate::drivers::{ActiveSandbox, DriverSet};
 use crate::hooks::{Event, HookContext, HookSet};
+use crate::host::{computer_on_path, host_display_available};
 use crate::prompts::review_prompt_with;
-use crate::session::Session;
+use crate::session::{MetricsCtx, Session};
 use crate::skills;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -53,12 +54,11 @@ pub fn extract_section(report: &str, heading: &str) -> Option<String> {
     let mut start: Option<usize> = None;
     for (i, line) in lines.by_ref() {
         let l = line.trim();
-        if let Some(rest) = l.strip_prefix("## ") {
-            if rest.trim().to_ascii_lowercase() == needle.strip_prefix("## ").unwrap_or(&needle) {
+        if let Some(rest) = l.strip_prefix("## ")
+            && rest.trim().to_ascii_lowercase() == needle.strip_prefix("## ").unwrap_or(&needle) {
                 start = Some(i + 1);
                 break;
             }
-        }
     }
     let start = start?;
     let collected: Vec<&str> = report
@@ -136,6 +136,17 @@ pub fn parse_verdict(report: &str) -> Verdict {
     best.map(|(_, v)| v).unwrap_or(Verdict::Unknown)
 }
 
+/// Cap a PASS verdict at PARTIAL when the diff has a UI/web surface but no
+/// display was available to click-test it — makes unverified UI non-silent.
+/// Only PASS is affected; PARTIAL/FAIL/UNKNOWN pass through unchanged.
+pub fn cap_verdict_for_unverified_ui(verdict: Verdict, ui_surface: bool, display: bool) -> Verdict {
+    if verdict == Verdict::Pass && ui_surface && !display {
+        Verdict::Partial
+    } else {
+        verdict
+    }
+}
+
 pub async fn review(args: ReviewArgs) -> Result<ReviewOutcome> {
     let sandbox = acquire_sandbox(&args)?;
     if let Some(sb) = sandbox.as_ref() {
@@ -173,6 +184,13 @@ pub async fn review_with_sandbox(
         None => detect_base(cwd_ref).unwrap_or_else(|| "HEAD~1".to_string()),
     };
     eprintln!("[printer] reviewing against base ref: {base}");
+
+    // Whether this review could actually click-test a UI/web surface. A heyvm
+    // sandbox is always headless, so a display is only possible when running on
+    // the host (sandbox is None). Captured here while `base` is still in scope;
+    // used after the verdict is parsed to cap an over-optimistic PASS.
+    let ui_surface = ui_surface_changed(cwd_ref, &base);
+    let display_available = sandbox.is_none() && host_display_available();
 
     hooks.run_cli(
         Event::BeforeReview,
@@ -220,7 +238,17 @@ pub async fn review_with_sandbox(
         acp_args: acp.args.as_slice(),
         acp_env: &acp.env,
     };
-    let mut session = Session::new(agent).with_verbose(args.verbose);
+    let metrics_cwd = cwd_ref
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let mut session = Session::new(agent)
+        .with_verbose(args.verbose)
+        .with_metrics_context(MetricsCtx {
+            cwd: metrics_cwd,
+            spec: spec_abs.to_string_lossy().into_owned(),
+            agent: args.agent.to_string(),
+            model: args.model.clone(),
+        });
 
     let spec_arg = spec_abs.to_string_lossy().into_owned();
     let result: Result<String> = async {
@@ -255,9 +283,21 @@ pub async fn review_with_sandbox(
 
     let usage = session.usage_total;
     let report = result?;
-    let verdict = parse_verdict(&report);
+    let parsed = parse_verdict(&report);
+    let verdict = cap_verdict_for_unverified_ui(parsed, ui_surface, display_available);
+    if verdict != parsed {
+        eprintln!(
+            "[printer] verdict capped {parsed}->{verdict}: UI/web surface changed but no display was available to click-test"
+        );
+    }
     eprintln!("[printer] review verdict: {verdict}");
     eprintln!("[printer] review token usage: {usage}");
+    // Verbose: surface the verification commands the reviewer claims to have
+    // run as a distinct stderr block (the full report already went to stdout).
+    if args.verbose
+        && let Some(verification) = extract_section(&report, "## Verification") {
+            eprintln!("[printer] review verification:\n{}", verification.trim());
+        }
 
     let followups_cwd = cwd
         .clone()
@@ -266,6 +306,14 @@ pub async fn review_with_sandbox(
         Ok(p) => eprintln!("[printer] follow-ups written to {}", p.display()),
         Err(e) => eprintln!("[printer] failed to persist follow-ups: {e}"),
     }
+    crate::metrics::record(
+        &followups_cwd,
+        &spec_abs.to_string_lossy(),
+        "review",
+        args.agent.to_string(),
+        args.model.clone(),
+        usage,
+    );
 
     Ok(ReviewOutcome {
         usage,
@@ -274,9 +322,95 @@ pub async fn review_with_sandbox(
     })
 }
 
+/// Does `path` (a repo-relative path) look like a UI/web surface? Pure matcher
+/// so it is unit-testable without a git tree. Unambiguous front-end / markup /
+/// style extensions always count; bare `.ts`/`.js` only count under a
+/// front-end-ish directory to avoid flagging backend TypeScript/Node code.
+fn is_ui_path(path: &str) -> bool {
+    let p = path.trim().to_ascii_lowercase();
+    const UI_EXTS: &[&str] = &[
+        ".tsx", ".jsx", ".vue", ".svelte", ".html", ".htm", ".css", ".scss", ".sass",
+    ];
+    if UI_EXTS.iter().any(|e| p.ends_with(e)) {
+        return true;
+    }
+    if [".ts", ".js", ".mjs", ".cjs"].iter().any(|e| p.ends_with(e)) {
+        const UI_DIRS: &[&str] = &[
+            "web/", "frontend/", "ui/", "client/", "src/components/", "app/",
+        ];
+        return UI_DIRS.iter().any(|d| p.contains(d));
+    }
+    false
+}
+
+/// Run `git <args>` in `cwd` and return stdout lines, or None on failure.
+fn git_lines(cwd: Option<&Path>, args: &[&str]) -> Option<Vec<String>> {
+    let mut cmd = Command::new("git");
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    cmd.args(args);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect(),
+    )
+}
+
+/// True if the review diff (committed `base...HEAD` plus uncommitted changes)
+/// touches any UI/web surface — i.e. a change a reviewer would want to
+/// click-test rather than just read.
+pub(crate) fn ui_surface_changed(cwd: Option<&Path>, base: &str) -> bool {
+    let mut paths: Vec<String> = Vec::new();
+    if let Some(lines) = git_lines(cwd, &["diff", "--name-only", &format!("{base}...HEAD")]) {
+        paths.extend(lines);
+    }
+    if let Some(lines) = git_lines(cwd, &["status", "--porcelain"]) {
+        for l in lines {
+            // porcelain format: two status chars + space + path.
+            let p = l.get(3..).unwrap_or("").trim();
+            if !p.is_empty() {
+                paths.push(p.to_string());
+            }
+        }
+    }
+    paths.iter().any(|p| is_ui_path(p))
+}
+
 fn acquire_sandbox(args: &ReviewArgs) -> Result<Option<ActiveSandbox>> {
     if args.no_sandbox {
         return Ok(None);
+    }
+    // UI/web review needs a real display to click-test, but a heyvm sandbox is a
+    // headless microVM with no Wayland/uinput. When the diff touches a UI
+    // surface AND the host has a usable display, run review on the host (no
+    // sandbox) so the `computer` tool can drive the app. `--no-ui-host` forces
+    // the sandbox even for UI diffs. (Note: `printer exec` shares one sandbox
+    // across run+review via review_with_sandbox and bypasses this — exec UI
+    // review needs `--no-sandbox`.)
+    if !args.no_ui_host {
+        let cwd = args.cwd.as_deref();
+        let base = match &args.base {
+            Some(b) => b.clone(),
+            None => detect_base(cwd).unwrap_or_else(|| "HEAD~1".to_string()),
+        };
+        if ui_surface_changed(cwd, &base) && host_display_available() {
+            eprintln!(
+                "[printer] UI/web surface detected + host display present; running review on host (no sandbox) for click-testing"
+            );
+            if !computer_on_path() {
+                eprintln!(
+                    "[printer] computer CLI not found on PATH; UI click-testing will be skipped. \
+                     Install it: re-run install.sh (or PRINTER_BINS=computer ./install.sh)."
+                );
+            }
+            return Ok(None);
+        }
     }
     let cfg = match crate::config::load() {
         Ok(c) => c,
@@ -315,9 +449,70 @@ fn acquire_sandbox(args: &ReviewArgs) -> Result<Option<ActiveSandbox>> {
     )?))
 }
 
+pub(crate) fn detect_base(cwd: Option<&Path>) -> Option<String> {
+    // Try `main`, then `master`, then HEAD~1.
+    for candidate in ["main", "master"] {
+        let mut cmd = Command::new("git");
+        cmd.args(["rev-parse", "--verify", "--quiet", candidate]);
+        if let Some(d) = cwd {
+            cmd.current_dir(d);
+        }
+        if let Ok(out) = cmd.output()
+            && out.status.success() {
+                return Some(candidate.to_string());
+            }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_path_matches_frontend_extensions() {
+        assert!(is_ui_path("src/App.tsx"));
+        assert!(is_ui_path("components/Button.jsx"));
+        assert!(is_ui_path("pages/Home.vue"));
+        assert!(is_ui_path("widget.svelte"));
+        assert!(is_ui_path("index.html"));
+        assert!(is_ui_path("styles/main.css"));
+        assert!(is_ui_path("theme.scss"));
+    }
+
+    #[test]
+    fn ui_path_rejects_backend_sources() {
+        assert!(!is_ui_path("src/lib.rs"));
+        assert!(!is_ui_path("printer/src/review.rs"));
+        assert!(!is_ui_path("README.md"));
+        // bare .ts/.js outside a front-end dir does not count
+        assert!(!is_ui_path("server/db.ts"));
+        assert!(!is_ui_path("scripts/build.js"));
+    }
+
+    #[test]
+    fn caps_pass_to_partial_when_ui_unverified() {
+        use Verdict::*;
+        // PASS + UI surface + no display -> capped to PARTIAL.
+        assert_eq!(cap_verdict_for_unverified_ui(Pass, true, false), Partial);
+        // PASS + UI surface + display present -> PASS stands.
+        assert_eq!(cap_verdict_for_unverified_ui(Pass, true, true), Pass);
+        // PASS + no UI surface -> PASS stands regardless of display.
+        assert_eq!(cap_verdict_for_unverified_ui(Pass, false, false), Pass);
+        // Non-PASS verdicts are never altered.
+        assert_eq!(cap_verdict_for_unverified_ui(Fail, true, false), Fail);
+        assert_eq!(cap_verdict_for_unverified_ui(Partial, true, false), Partial);
+        assert_eq!(cap_verdict_for_unverified_ui(Unknown, true, false), Unknown);
+    }
+
+
+    #[test]
+    fn ui_path_matches_ts_js_under_frontend_dirs() {
+        assert!(is_ui_path("web/app.js"));
+        assert!(is_ui_path("frontend/main.ts"));
+        assert!(is_ui_path("src/components/list.ts"));
+        assert!(is_ui_path("client/index.mjs"));
+    }
 
     #[test]
     fn parses_pass_verdict() {
@@ -408,21 +603,4 @@ mod tests {
         let report = "## Per-item findings\n- foo MET\n- bar MISSING (partial coverage)\n";
         assert_eq!(parse_verdict(report), Verdict::Partial);
     }
-}
-
-fn detect_base(cwd: Option<&Path>) -> Option<String> {
-    // Try `main`, then `master`, then HEAD~1.
-    for candidate in ["main", "master"] {
-        let mut cmd = Command::new("git");
-        cmd.args(["rev-parse", "--verify", "--quiet", candidate]);
-        if let Some(d) = cwd {
-            cmd.current_dir(d);
-        }
-        if let Ok(out) = cmd.output() {
-            if out.status.success() {
-                return Some(candidate.to_string());
-            }
-        }
-    }
-    None
 }

@@ -30,6 +30,18 @@ Install and configure via the bundled plugin — see
 and the per-exec lifecycle (sync in → run+review inside the worktree →
 sync out → destroy).
 
+**UI/web review on the host.** The heyvm sandbox is a headless microVM with no
+Wayland/X11 display, so the `computer` tool cannot click-test inside it. When a
+standalone `printer review` detects that the diff touches a UI/web surface
+(`.tsx/.jsx/.vue/.svelte/.html/.css/...`, or `.ts/.js` under `web/`,
+`frontend/`, `ui/`, `client/`, `src/components/`, `app/`) **and** the host has a
+real display (`$WAYLAND_DISPLAY`/`$XDG_SESSION_TYPE` set and `/dev/uinput`
+present), it automatically runs review on the host (no sandbox) so the UI can be
+exercised. Pass `--no-ui-host` to force the sandbox anyway. Because `printer
+exec` shares one sandbox across run + review, UI review under `exec` is not
+auto-routed — run `printer exec ... --no-sandbox` (or a separate `printer
+review`) when you need the `computer` tool to click-test.
+
 ### Agent Plugins
 the Printer CLI can install a plugin for Claude and OpenCode agents to utilize `codegraph` for searching and patching files. 
 
@@ -157,7 +169,14 @@ printer exec spec.md             # run + review in one command
 printer exec spec.md --verbose   # with live progress output
 printer exec spec.md --agent opencode            # use opencode one-shot backend
 printer exec spec.md --agent acp:opencode-acp    # use opencode ACP (persistent sessions)
+printer test spec.md             # click-test a UI/web change with the computer tool
 ```
+
+`printer test` drives one agent turn that exercises the running app end-to-end
+through the `computer` CLI (input synthesis + screenshots). It runs on the host
+because a real display is required, gates on a usable display **and** `computer`
+being on PATH, and exits non-zero unless the verdict is PASS — so it works as a
+CI/gate check. Pass `--url http://localhost:PORT` to point it at the app.
 
 
 ## Orchestration

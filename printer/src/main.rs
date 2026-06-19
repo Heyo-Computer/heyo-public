@@ -6,7 +6,9 @@ mod config;
 mod drivers;
 mod exec;
 mod hooks;
+mod host;
 mod init;
+mod metrics;
 mod plan;
 mod plugins;
 mod prompts;
@@ -17,6 +19,7 @@ mod skills;
 mod spec_from_followups;
 mod specs_paths;
 mod tasks;
+mod test;
 
 use clap::Parser;
 
@@ -29,8 +32,10 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::Run(args) => run::run(args).await.map(|_| ()),
         cli::Command::Plan(args) => plan::plan(args).await.map(|_| ()),
         cli::Command::Review(args) => review::review(args).await.map(|_| ()),
+        cli::Command::Test(args) => test::test(args).await,
         cli::Command::Exec(args) => exec::exec(args).await,
         cli::Command::History(args) => exec::print_history(args),
+        cli::Command::Spec(args) => dispatch_spec(args),
         cli::Command::SpecFromFollowups(args) => {
             spec_from_followups::spec_from_followups(args).await
         }
@@ -42,6 +47,14 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::Config(args) => dispatch_config(args),
         cli::Command::External(args) => plugins::exec_external(&args),
     }
+}
+
+fn dispatch_spec(args: cli::SpecArgs) -> anyhow::Result<()> {
+    let (target, phase) = match args.command {
+        cli::SpecCommand::Complete(t) => (t, exec::Phase::Done),
+        cli::SpecCommand::Cancel(t) => (t, exec::Phase::Cancelled),
+    };
+    exec::mark_spec_phase(target.cwd.as_deref(), &target.spec, phase)
 }
 
 fn dispatch_config(args: cli::ConfigArgs) -> anyhow::Result<()> {

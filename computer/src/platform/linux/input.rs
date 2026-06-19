@@ -162,6 +162,35 @@ pub fn mouse(action: MouseAction) -> Result<()> {
     Ok(())
 }
 
+/// Click-and-drag `button` from `from` to `to`, all on a SINGLE device so the
+/// press survives the move. Separate `mouse down`/`up` calls can't hold a
+/// button because `build_device` tears the device down on return; a drag must
+/// press, move, and release within one device's lifetime. Coordinates are
+/// pixels on the chosen output, same as `mouse move`.
+pub fn drag(from: (i32, i32), to: (i32, i32), button: Button, output: Option<&str>) -> Result<()> {
+    let mut dev = build_device()?;
+    let code = button_code(button);
+    let (fx, fy) = pixel_to_abs(from.0, from.1, output)?;
+    let (tx, ty) = pixel_to_abs(to.0, to.1, output)?;
+    dev.emit(&[
+        abs_event(AbsoluteAxisCode::ABS_X, fx),
+        abs_event(AbsoluteAxisCode::ABS_Y, fy),
+        syn(),
+    ])?;
+    sleep(Duration::from_millis(20));
+    dev.emit(&[key_event(code, 1), syn()])?;
+    sleep(Duration::from_millis(20));
+    dev.emit(&[
+        abs_event(AbsoluteAxisCode::ABS_X, tx),
+        abs_event(AbsoluteAxisCode::ABS_Y, ty),
+        syn(),
+    ])?;
+    sleep(Duration::from_millis(20));
+    dev.emit(&[key_event(code, 0), syn()])?;
+    sleep(Duration::from_millis(20));
+    Ok(())
+}
+
 pub fn key(action: KeyAction) -> Result<()> {
     let mut dev = build_device()?;
     match action {

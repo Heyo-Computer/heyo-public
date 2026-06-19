@@ -60,6 +60,27 @@ pub fn search(index: &Index, opts: SearchOpts<'_>) -> Vec<SearchHit> {
     hits
 }
 
+/// Look up a symbol's definition(s) by exact qualified or bare name. Shared by
+/// the `definition` CLI subcommand and the MCP server.
+pub fn definition(index: &Index, symbol: &str) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    for (path, entry) in &index.files {
+        for s in &entry.symbols {
+            if s.qualified == symbol || s.name == symbol {
+                hits.push(SearchHit {
+                    file: path.clone(),
+                    symbol: s.qualified.clone(),
+                    kind: s.kind,
+                    start_line: s.start_line,
+                    end_line: s.end_line,
+                    signature: s.signature.clone(),
+                });
+            }
+        }
+    }
+    hits
+}
+
 #[derive(Serialize, Debug)]
 pub struct ReferenceHit {
     pub file: String,

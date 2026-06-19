@@ -129,6 +129,29 @@ fn post_mouse(
     Ok(())
 }
 
+/// Click-and-drag `button` from `from` to `to`: press at the start, post a
+/// dragged event to the end, release. One logical gesture so the press is held
+/// across the move (mirrors the Linux single-device drag).
+pub fn drag(from: (i32, i32), to: (i32, i32), button: Button, output: Option<&str>) -> Result<()> {
+    perms::require_accessibility()?;
+    let p_from = resolve_target_point(from.0, from.1, output)?;
+    let p_to = resolve_target_point(to.0, to.1, output)?;
+    let (down, up, btn, btn_no) = cg_button(button);
+    let dragged = match button {
+        Button::Left => CGEventType::LeftMouseDragged,
+        Button::Right => CGEventType::RightMouseDragged,
+        _ => CGEventType::OtherMouseDragged,
+    };
+    move_to(p_from)?;
+    post_mouse(down, p_from, btn, btn_no, Some(1))?;
+    sleep(Duration::from_millis(20));
+    post_mouse(dragged, p_to, btn, btn_no, None)?;
+    sleep(Duration::from_millis(20));
+    post_mouse(up, p_to, btn, btn_no, Some(1))?;
+    sleep(Duration::from_millis(10));
+    Ok(())
+}
+
 pub fn key(action: KeyAction) -> Result<()> {
     perms::require_accessibility()?;
     match action {

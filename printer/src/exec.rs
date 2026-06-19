@@ -43,6 +43,11 @@ pub enum Phase {
     ReviewPending,
     /// Review report produced; nothing left to do.
     Done,
+    /// Spec was explicitly retired via `printer spec cancel` without
+    /// finishing review. Treated like `Done` for resume/already-finished
+    /// purposes (a bare re-`exec` archives + restarts), but kept distinct
+    /// so history and listings show it was cancelled, not completed.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,7 +277,7 @@ pub fn list_checkpoints(cwd: &Path) -> Result<Vec<(PathBuf, Checkpoint)>> {
             ),
         }
     }
-    out.sort_by(|a, b| a.1.started_at.cmp(&b.1.started_at));
+    out.sort_by_key(|a| a.1.started_at);
     Ok(out)
 }
 
@@ -354,7 +359,7 @@ fn decide(
             // checkpoint, error if zero or many.
             let in_flight: Vec<_> = all
                 .iter()
-                .filter(|(_, cp)| cp.phase != Phase::Done)
+                .filter(|(_, cp)| !matches!(cp.phase, Phase::Done | Phase::Cancelled))
                 .collect();
             match in_flight.len() {
                 0 => bail!(
@@ -383,8 +388,8 @@ fn decide(
             };
             match cp {
                 None => Ok((Action::Fresh { spec: spec.to_path_buf() }, path)),
-                Some(cp) if cp.phase == Phase::Done => {
-                    // Re-running a finished spec: archive + restart.
+                Some(cp) if matches!(cp.phase, Phase::Done | Phase::Cancelled) => {
+                    // Re-running a finished (or cancelled) spec: archive + restart.
                     Ok((
                         Action::FreshAfterDone {
                             spec: spec.to_path_buf(),
@@ -411,7 +416,7 @@ fn action_from_phase(cp: &Checkpoint) -> Action {
         Phase::Planning => Action::ResumeRun { spec: cp.spec.clone(), skip_planning: false },
         Phase::Running => Action::ResumeRun { spec: cp.spec.clone(), skip_planning: true },
         Phase::ReviewPending => Action::ResumeReview { spec: cp.spec.clone() },
-        Phase::Done => Action::AlreadyDone { spec: cp.spec.clone() },
+        Phase::Done | Phase::Cancelled => Action::AlreadyDone { spec: cp.spec.clone() },
     }
 }
 
@@ -678,7 +683,49 @@ async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<Token
     // Drop the codegraph guard to stop the watch daemon before committing
     drop(codegraph_guard);
 
-    // Clean up the worktree after the task (removes working tree, keeps branch)
+    // Post-task: commit changes to the task-specific branch. This MUST happen
+    // before the worktree is removed — the commit runs inside the worktree, so
+    // removing it first would leave nothing to commit (the previous ordering
+    // silently lost every task's work via the `|| true` fallback). Supports the
+    // stacked-PR pattern: each task lands on its own `task-<id>` branch which
+    // can later be merged/squashed.
+    if has_git && worktree_abs.exists() {
+        // Stage everything including new files (`commit --all` would miss
+        // untracked files the agent created), then commit.
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree_abs)
+            .args(["add", "-A"])
+            .output();
+        let commit_result = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree_abs)
+            .arg("commit")
+            .arg("-m")
+            .arg(format!("T-{}: {}", task.meta.id, task.meta.title))
+            .output();
+
+        match commit_result {
+            Ok(output) if output.status.success() => {
+                eprintln!("[printer] task {} committed to task branch", task.meta.id);
+            }
+            Ok(output) => {
+                // Non-zero is expected when there is nothing to commit; surface
+                // anything else so a real failure isn't hidden.
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("nothing to commit") {
+                    eprintln!(
+                        "[printer] task {} commit produced no commit: {}",
+                        task.meta.id,
+                        stderr.trim()
+                    );
+                }
+            }
+            Err(e) => eprintln!("[printer] task {} commit failed to run: {e}", task.meta.id),
+        }
+    }
+
+    // Clean up the worktree after committing (removes working tree, keeps branch).
     if has_git && worktree_path.exists() {
         let _ = std::process::Command::new("git")
             .arg("-C")
@@ -688,27 +735,6 @@ async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<Token
             .arg("-f")
             .arg(&worktree_path)
             .output();
-    }
-
-    // Post-task: commit changes to a task-specific branch
-    // This supports the stacked PR pattern: each task commits to its own branch
-    // which can later be merged/squashed to main
-    if has_git {
-        let commit_result = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "cd {} && git add -A && git commit -m 'T-{}: {}' 2>/dev/null || true",
-                worktree_abs.display(),
-                task.meta.id,
-                task.meta.title.replace("'", "'\\''")
-            ))
-            .output();
-        
-        if let Ok(output) = commit_result {
-            if output.status.success() {
-                eprintln!("[printer] task {} committed to task branch", task.meta.id);
-            }
-        }
     }
 
     eprintln!("[printer] task {} complete", task.meta.id);
@@ -763,10 +789,17 @@ async fn run_action(
     existing: Option<Checkpoint>,
     sandbox: Option<&ActiveSandbox>,
 ) -> Result<TokenUsage> {
+    let metrics_spec: PathBuf = match &action {
+        Action::Fresh { spec }
+        | Action::ResumeRun { spec, .. }
+        | Action::ResumeReview { spec }
+        | Action::AlreadyDone { spec }
+        | Action::FreshAfterDone { spec, .. } => spec.clone(),
+    };
     let total = match action {
         Action::AlreadyDone { spec } => {
             eprintln!(
-                "[printer] exec already complete for {} (checkpoint phase=done). \
+                "[printer] exec already finalized for {} (checkpoint is done/cancelled). \
                  Remove {} to start over.",
                 spec.display(),
                 checkpoint_path.display()
@@ -775,8 +808,8 @@ async fn run_action(
         }
         Action::Fresh { spec } => {
             let cp = Checkpoint::new(spec.clone(), Phase::Planning);
-            cp.save(&checkpoint_path)?;
-            do_run_then_review(&args, &spec, &checkpoint_path, false, sandbox).await?
+            cp.save(checkpoint_path)?;
+            do_run_then_review(args, &spec, checkpoint_path, false, sandbox).await?
         }
         Action::FreshAfterDone { spec, prior } => {
             let history_file = cwd.join(HISTORY_REL);
@@ -786,19 +819,20 @@ async fn run_action(
             };
             History::append(&history_file, entry)?;
             eprintln!(
-                "[printer] archived prior exec for {} to {} (phase=done); starting fresh",
+                "[printer] archived prior exec for {} to {} (phase={:?}); starting fresh",
                 prior.spec.display(),
                 history_file.display(),
+                prior.phase,
             );
             let cp = Checkpoint::new(spec.clone(), Phase::Planning);
-            cp.save(&checkpoint_path)?;
-            do_run_then_review(&args, &spec, &checkpoint_path, false, sandbox).await?
+            cp.save(checkpoint_path)?;
+            do_run_then_review(args, &spec, checkpoint_path, false, sandbox).await?
         }
         Action::ResumeRun { spec, skip_planning } => {
             // Bump updated_at so the file reflects this resume.
             let mut cp = existing.unwrap();
             cp.updated_at = Utc::now();
-            cp.save(&checkpoint_path)?;
+            cp.save(checkpoint_path)?;
             if skip_planning {
                 eprintln!(
                     "[printer] resuming run phase for {} (planning already complete)",
@@ -810,15 +844,23 @@ async fn run_action(
                     spec.display()
                 );
             }
-            do_run_then_review(&args, &spec, &checkpoint_path, skip_planning, sandbox).await?
+            do_run_then_review(args, &spec, checkpoint_path, skip_planning, sandbox).await?
         }
         Action::ResumeReview { spec } => {
             eprintln!("[printer] resuming at review phase for {}", spec.display());
-            do_review(&args, &spec, &checkpoint_path, sandbox).await?
+            do_review(args, &spec, checkpoint_path, sandbox).await?
         }
     };
 
     eprintln!("[printer] exec token usage (run + review): {total}");
+    crate::metrics::record(
+        cwd,
+        &metrics_spec.to_string_lossy(),
+        "exec-total",
+        args.agent.to_string(),
+        args.model.clone(),
+        total,
+    );
     Ok(total)
 }
 
@@ -847,6 +889,7 @@ async fn do_run_then_review(
 ///   2. if PASS, we're done
 ///   3. otherwise, feeds the report to the coding agent (which queues fix
 ///      tasks and works them) and loops back to (1)
+///
 /// Stops early if the verdict is PASS or the cap is hit.
 async fn do_review(
     args: &ExecArgs,
@@ -864,6 +907,23 @@ async fn do_review(
         eprintln!("[printer] review pass {pass}/{max_passes}");
         let outcome = review::review_with_sandbox(build_review_args(args, spec), sandbox).await?;
         total.add(&outcome.usage);
+
+        // In verbose mode echo the fed-back findings into the live log so the
+        // reviewer's verdict + suggested follow-ups are visible inline, not
+        // only in the written followups file.
+        if args.verbose {
+            match review::extract_section(&outcome.report, "## Suggested follow-ups") {
+                Some(followups) => eprintln!(
+                    "[printer] review pass {pass} verdict {} — suggested follow-ups:\n{}",
+                    outcome.verdict,
+                    followups.trim()
+                ),
+                None => eprintln!(
+                    "[printer] review pass {pass} verdict {} (no follow-ups section in report)",
+                    outcome.verdict
+                ),
+            }
+        }
 
         if outcome.verdict.is_pass() {
             eprintln!("[printer] review verdict PASS on pass {pass}; finishing");
@@ -934,6 +994,41 @@ pub fn write_phase_planning_done(cp_path: &Path, spec: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Force a spec's exec checkpoint to a terminal `phase` (`Done` for
+/// "completed" or `Cancelled` for "cancelled") without driving an agent.
+/// Backs `printer spec complete|cancel`. Creates the checkpoint if the
+/// spec has never been exec'd. The spec path is canonicalized so the
+/// checkpoint key matches what `printer exec` computes; if the file no
+/// longer exists on disk we fall back to the path as given. A later
+/// `printer exec <spec>` treats both terminal phases as "already
+/// finished" and archives + restarts on an explicit re-run.
+pub fn mark_spec_phase(cwd: Option<&Path>, spec: &Path, phase: Phase) -> Result<()> {
+    let cwd: PathBuf = match cwd {
+        Some(p) => p
+            .canonicalize()
+            .with_context(|| format!("--cwd not found: {}", p.display()))?,
+        None => std::env::current_dir()?,
+    };
+    let spec_abs = spec.canonicalize().unwrap_or_else(|_| spec.to_path_buf());
+    let path = checkpoint_path_for_spec(&cwd, &spec_abs);
+    let mut cp = if path.exists() {
+        Checkpoint::load(&path)?
+    } else {
+        Checkpoint::new(spec_abs.clone(), phase)
+    };
+    cp.phase = phase;
+    cp.spec = spec_abs;
+    cp.updated_at = Utc::now();
+    cp.save(&path)?;
+    println!(
+        "[printer] marked {} as {:?} ({})",
+        cp.spec.display(),
+        phase,
+        path.display()
+    );
+    Ok(())
+}
+
 fn build_run_args(
     args: &ExecArgs,
     spec: &Path,
@@ -982,6 +1077,7 @@ fn build_review_args(args: &ExecArgs, spec: &Path) -> ReviewArgs {
         skills: args.skills.clone(),
         verbose: args.verbose,
         no_sandbox: true,
+        no_ui_host: false,
         acp_bin: args.acp_bin.clone(),
         acp_args: args.acp_args.clone(),
     }
@@ -1121,6 +1217,55 @@ mod tests {
         let (action, _) =
             decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
         assert_eq!(action, Action::AlreadyDone { spec: PathBuf::from("/tmp/a.md") });
+    }
+
+    #[test]
+    fn continue_with_cancelled_yields_already_done() {
+        // A cancelled spec resumes the same as a done one: nothing to do.
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Cancelled);
+        let (action, _) =
+            decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
+        assert_eq!(action, Action::AlreadyDone { spec: PathBuf::from("/tmp/a.md") });
+    }
+
+    #[test]
+    fn continue_with_no_spec_and_cancelled_only_errors() {
+        // Cancelled is terminal, not in-flight — `--continue` (no spec)
+        // has nothing to pick up.
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Cancelled);
+        let err = decide(dir.path(), None, true).unwrap_err();
+        assert!(err.to_string().contains("no in-flight checkpoint"));
+    }
+
+    #[test]
+    fn fresh_with_cancelled_checkpoint_archives_and_restarts() {
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Cancelled);
+        let (action, _) =
+            decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
+        match action {
+            Action::FreshAfterDone { spec, prior } => {
+                assert_eq!(spec, PathBuf::from("/tmp/a.md"));
+                assert_eq!(prior.phase, Phase::Cancelled);
+            }
+            other => panic!("expected FreshAfterDone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mark_spec_phase_writes_terminal_phase() {
+        let dir = empty_cwd();
+        // No prior checkpoint: cancel creates one at Cancelled.
+        mark_spec_phase(Some(dir.path()), Path::new("/tmp/a.md"), Phase::Cancelled).unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let path = checkpoint_path_for_spec(&cwd, Path::new("/tmp/a.md"));
+        assert_eq!(Checkpoint::load(&path).unwrap().phase, Phase::Cancelled);
+
+        // Re-marking the same spec as complete overwrites the phase.
+        mark_spec_phase(Some(dir.path()), Path::new("/tmp/a.md"), Phase::Done).unwrap();
+        assert_eq!(Checkpoint::load(&path).unwrap().phase, Phase::Done);
     }
 
     #[test]

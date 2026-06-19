@@ -94,6 +94,14 @@ pub enum Command {
         #[arg(long)]
         allow_outside: bool,
     },
+    /// Serve the read-only query tools over stdio as an MCP server.
+    ///
+    /// Speaks newline-delimited JSON-RPC 2.0 (the MCP stdio transport) and
+    /// exposes `search`, `definition`, `outline`, `snippet`, and `references`
+    /// against the `.codegraph/index.json` at the current working directory.
+    /// Intended to be launched by an agent host (e.g. `claude --mcp-config`),
+    /// not run interactively.
+    Mcp,
 }
 
 pub fn run() -> Result<ExitCode> {
@@ -123,6 +131,7 @@ pub fn run() -> Result<ExitCode> {
             check,
             allow_outside,
         } => cmd_patch(file, diff, check, allow_outside, fmt),
+        Command::Mcp => crate::mcp::serve(),
     }
 }
 
@@ -295,21 +304,7 @@ fn cmd_definition(symbol: String, fmt: Format) -> Result<ExitCode> {
     let root = std::env::current_dir()?.canonicalize()?;
     let index = Index::load(&root)?
         .ok_or_else(|| anyhow!("no index at {}; run `codegraph index` first", Index::path_for(&root).display()))?;
-    let mut hits = Vec::new();
-    for (path, entry) in &index.files {
-        for s in &entry.symbols {
-            if s.qualified == symbol || s.name == symbol {
-                hits.push(search::SearchHit {
-                    file: path.clone(),
-                    symbol: s.qualified.clone(),
-                    kind: s.kind,
-                    start_line: s.start_line,
-                    end_line: s.end_line,
-                    signature: s.signature.clone(),
-                });
-            }
-        }
-    }
+    let hits = search::definition(&index, &symbol);
     if hits.is_empty() {
         match fmt {
             Format::Json => output::print_json(&hits)?,

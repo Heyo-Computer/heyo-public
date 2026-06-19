@@ -2,7 +2,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use core_graphics::display::{CGDirectDisplayID, CGDisplay};
 use std::io::{BufWriter, Write};
 
-pub fn run(target_output: Option<&str>, file: Option<&str>) -> Result<()> {
+/// Capture a display to a PNG byte buffer. When `max_width` is set and the
+/// capture's long edge exceeds it, the image is downscaled (aspect preserved)
+/// before encoding — bounds the base64 payload the MCP `screenshot` tool
+/// returns. The CLI passes `None` (full resolution).
+pub fn capture_png(target_output: Option<&str>, max_width: Option<u32>) -> Result<Vec<u8>> {
     super::perms::require_screen_recording().context("screen recording permission")?;
 
     let display_id = pick_display(target_output)?;
@@ -25,10 +29,20 @@ pub fn run(target_output: Option<&str>, file: Option<&str>) -> Result<()> {
 
     let img = image::RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| anyhow!("invalid image dimensions {width}x{height}"))?;
-    let mut png: Vec<u8> = Vec::with_capacity((width as usize) * (height as usize));
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    let dynimg = image::DynamicImage::ImageRgba8(img);
+    let dynimg = match max_width {
+        Some(max) if width.max(height) > max => {
+            dynimg.resize(max, max, image::imageops::FilterType::Triangle)
+        }
+        _ => dynimg,
+    };
+    let mut png: Vec<u8> = Vec::new();
+    dynimg.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    Ok(png)
+}
 
+pub fn run(target_output: Option<&str>, file: Option<&str>) -> Result<()> {
+    let png = capture_png(target_output, None)?;
     let mut out: Box<dyn Write> = match file {
         Some(path) => Box::new(BufWriter::new(
             std::fs::File::create(path).context("create output file")?,

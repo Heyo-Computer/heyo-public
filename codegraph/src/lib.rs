@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod index;
 pub mod languages;
+pub mod mcp;
 pub mod outline;
 pub mod output;
 pub mod parse;

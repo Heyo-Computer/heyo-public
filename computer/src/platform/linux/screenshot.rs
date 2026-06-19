@@ -149,7 +149,11 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for App {
     ) {}
 }
 
-pub fn run(target_output: Option<&str>, file: Option<&str>) -> Result<()> {
+/// Capture an output to a PNG byte buffer. When `max_width` is set and the
+/// capture's long edge exceeds it, the image is downscaled (aspect preserved)
+/// before encoding — this bounds the base64 payload the MCP `screenshot` tool
+/// returns into the model's context. The CLI passes `None` (full resolution).
+pub fn capture_png(target_output: Option<&str>, max_width: Option<u32>) -> Result<Vec<u8>> {
     let conn = Connection::connect_to_env().context("connect to wayland")?;
     let (globals, mut event_queue) = registry_queue_init::<App>(&conn).context("registry init")?;
     let qh = event_queue.handle();
@@ -234,15 +238,15 @@ pub fn run(target_output: Option<&str>, file: Option<&str>) -> Result<()> {
 
     let img = image::RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| anyhow!("invalid image dimensions"))?;
-    let mut png: Vec<u8> = Vec::with_capacity((width as usize) * (height as usize));
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
-    let mut out: Box<dyn Write> = match file {
-        Some(path) => Box::new(BufWriter::new(std::fs::File::create(path).context("create output file")?)),
-        None => Box::new(BufWriter::new(std::io::stdout().lock())),
+    let dynimg = image::DynamicImage::ImageRgba8(img);
+    let dynimg = match max_width {
+        Some(max) if width.max(height) > max => {
+            dynimg.resize(max, max, image::imageops::FilterType::Triangle)
+        }
+        _ => dynimg,
     };
-    out.write_all(&png)?;
-    out.flush()?;
+    let mut png: Vec<u8> = Vec::new();
+    dynimg.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
 
     // Cleanup.
     drop(buffer);
@@ -251,6 +255,19 @@ pub fn run(target_output: Option<&str>, file: Option<&str>) -> Result<()> {
     drop(source);
     drop(source_mgr);
     drop(copy_mgr);
+    Ok(png)
+}
+
+pub fn run(target_output: Option<&str>, file: Option<&str>) -> Result<()> {
+    let png = capture_png(target_output, None)?;
+    let mut out: Box<dyn Write> = match file {
+        Some(path) => Box::new(BufWriter::new(
+            std::fs::File::create(path).context("create output file")?,
+        )),
+        None => Box::new(BufWriter::new(std::io::stdout().lock())),
+    };
+    out.write_all(&png)?;
+    out.flush()?;
     Ok(())
 }
 

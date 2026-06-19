@@ -22,6 +22,10 @@ pub enum Command {
     Plan(PlanArgs),
     /// Review the working tree against the original spec.
     Review(ReviewArgs),
+    /// Click-test a UI/web change end-to-end with the `computer` tool. Runs on
+    /// the host (a display is required); exits non-PASS with guidance if no
+    /// display or the `computer` CLI is unavailable.
+    Test(TestArgs),
     /// Run-then-review in one shot, with crash-safe `--continue`.
     Exec(ExecArgs),
     /// Show the archive of completed execs (`.printer/history.json`).
@@ -30,6 +34,10 @@ pub enum Command {
     /// Spawns one agent turn that converts `.printer/followups/<spec>.md`
     /// (produced by `printer review`) into `specs/NNN-<slug>.md`.
     SpecFromFollowups(SpecFromFollowupsArgs),
+    /// Mark a spec's exec checkpoint as completed or cancelled without
+    /// driving an agent (`printer spec complete|cancel <spec>`).
+    #[command(subcommand_help_heading = "Spec subcommands")]
+    Spec(SpecArgs),
     /// File-based task tracking (create / list / start / done / ...).
     #[command(subcommand_help_heading = "Task subcommands")]
     Task(crate::tasks::TaskArgs),
@@ -247,6 +255,65 @@ pub struct ReviewArgs {
     #[arg(long, default_value_t = false)]
     pub no_sandbox: bool,
 
+    /// Force the sandbox even when the diff touches a UI/web surface. By default
+    /// such diffs run review on the host (when a display is present) so the
+    /// `computer` tool can click-test; this flag disables that auto-host routing.
+    #[arg(long, default_value_t = false)]
+    pub no_ui_host: bool,
+
+    /// Path/command to launch the ACP agent server when `--agent acp`.
+    #[arg(long)]
+    pub acp_bin: Option<String>,
+
+    /// Repeatable extra arg appended to the ACP agent binary's argv.
+    #[arg(long = "acp-arg", value_name = "ARG")]
+    pub acp_args: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct TestArgs {
+    /// Path to the markdown spec the change was driven from (context for the
+    /// click-test).
+    pub spec: PathBuf,
+
+    /// Which agent to drive.
+    #[arg(long, default_value_t = AgentKind::Claude, value_parser = parse_agent_kind)]
+    pub agent: AgentKind,
+
+    /// Override the model.
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Git ref to diff against when describing what changed. Defaults to the
+    /// detected base (main/master or HEAD~1).
+    #[arg(long)]
+    pub base: Option<String>,
+
+    /// Working directory for the child agent process.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+
+    /// Local URL to open for the click-test (e.g. http://localhost:3000). If
+    /// omitted, the agent infers how to start the app.
+    #[arg(long)]
+    pub url: Option<String>,
+
+    /// Permission mode passed to the child agent. The test agent drives the app
+    /// (input synthesis) but must not edit project files, so a permissive
+    /// default keeps the run non-interactive.
+    #[arg(long, default_value = "bypassPermissions")]
+    pub permission_mode: String,
+
+    /// Make a skill available to the test agent (path to a `SKILL.md`, a skill
+    /// dir, or a parent dir). Repeatable. Defaults to auto-discovering
+    /// `.claude/skills/` in the agent cwd.
+    #[arg(long = "skill", value_name = "PATH")]
+    pub skills: Vec<PathBuf>,
+
+    /// Show a live spinner and periodic heartbeats during the test turn.
+    #[arg(long, short, default_value_t = false)]
+    pub verbose: bool,
+
     /// Path/command to launch the ACP agent server when `--agent acp`.
     #[arg(long)]
     pub acp_bin: Option<String>,
@@ -349,6 +416,34 @@ pub struct ExecArgs {
     /// Repeatable extra arg appended to the ACP agent binary's argv.
     #[arg(long = "acp-arg", value_name = "ARG")]
     pub acp_args: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SpecArgs {
+    #[command(subcommand)]
+    pub command: SpecCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SpecCommand {
+    /// Force the spec's exec checkpoint to `done`. Use when work was
+    /// finished out-of-band and you want `printer exec <spec>` to treat
+    /// it as complete.
+    Complete(SpecTargetArgs),
+    /// Mark the spec's exec checkpoint `cancelled`. Like `complete`, a
+    /// bare re-`exec` of the spec archives the cancelled checkpoint and
+    /// starts fresh — but listings/history show it was cancelled.
+    Cancel(SpecTargetArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SpecTargetArgs {
+    /// Path to the markdown spec whose checkpoint should be marked.
+    pub spec: PathBuf,
+
+    /// Working directory containing `.printer/`. Defaults to the cwd.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
