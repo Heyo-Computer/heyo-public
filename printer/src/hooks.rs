@@ -141,10 +141,9 @@ impl HookSet {
             for spec in &manifest.hooks {
                 match resolve_hook(&manifest.name, &dir, spec.clone()) {
                     Ok(h) => hooks.push(h),
-                    Err(e) => eprintln!(
-                        "[printer] skipping hook in plugin `{}`: {e}",
-                        manifest.name
-                    ),
+                    Err(e) => {
+                        eprintln!("[printer] skipping hook in plugin `{}`: {e}", manifest.name)
+                    }
                 }
             }
         }
@@ -405,18 +404,19 @@ fn interpolate(template: &str, ctx: &HookContext) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{'
-            && let Some(end) = template[i + 1..].find('}') {
-                let name = &template[i + 1..i + 1 + end];
-                if let Some(val) = vars.get(name) {
-                    out.push_str(val);
-                    i += end + 2;
-                    continue;
-                }
-                // Unknown var — emit `{name}` literally and keep going.
-                out.push_str(&template[i..i + end + 2]);
+            && let Some(end) = template[i + 1..].find('}')
+        {
+            let name = &template[i + 1..i + 1 + end];
+            if let Some(val) = vars.get(name) {
+                out.push_str(val);
                 i += end + 2;
                 continue;
             }
+            // Unknown var — emit `{name}` literally and keep going.
+            out.push_str(&template[i..i + end + 2]);
+            i += end + 2;
+            continue;
+        }
         // Not a `{var}` — push one char and advance.
         let ch_len = template[i..]
             .chars()
@@ -553,8 +553,7 @@ mod tests {
     fn agent_contribution_renders_only_when_nonempty() {
         let mut a = AgentContribution::default();
         assert!(a.render_prompt_block().is_none());
-        a.prompt_chunks
-            .push(("p1".into(), "do the thing".into()));
+        a.prompt_chunks.push(("p1".into(), "do the thing".into()));
         let s = a.render_prompt_block().unwrap();
         assert!(s.contains("p1"));
         assert!(s.contains("do the thing"));

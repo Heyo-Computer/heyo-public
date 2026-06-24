@@ -34,10 +34,10 @@ impl SourceManifest {
         if !path.is_file() {
             return Ok(Self::default());
         }
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let parsed: SourceManifest = toml::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let parsed: SourceManifest =
+            toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         Ok(parsed)
     }
 
@@ -58,9 +58,10 @@ impl SourceManifest {
     /// Validate the optional `[driver]` block. Returns the spec ready to
     /// write into `Manifest::driver`. `None` if the source declares no driver.
     pub fn validate_driver(&self) -> Result<Option<DriverSpec>> {
-        let Some(spec) = &self.driver else { return Ok(None) };
-        validate_driver(spec)
-            .with_context(|| format!("{FILE_NAME} [driver] block"))?;
+        let Some(spec) = &self.driver else {
+            return Ok(None);
+        };
+        validate_driver(spec).with_context(|| format!("{FILE_NAME} [driver] block"))?;
         Ok(Some(spec.clone()))
     }
 
@@ -70,8 +71,7 @@ impl SourceManifest {
     pub fn validate_agents(&self) -> Result<Vec<AgentSpec>> {
         let mut out = Vec::with_capacity(self.agents.len());
         for (i, spec) in self.agents.iter().enumerate() {
-            validate_agent(spec)
-                .with_context(|| format!("{FILE_NAME} [[agent]] #{}", i + 1))?;
+            validate_agent(spec).with_context(|| format!("{FILE_NAME} [[agent]] #{}", i + 1))?;
             if out.iter().any(|s: &AgentSpec| s.name == spec.name) {
                 bail!(
                     "{FILE_NAME} declares two [[agent]] blocks with name `{}`",
@@ -106,8 +106,7 @@ pub fn copy_assets(source_dir: &Path, plugin_dir: &Path, assets: &[String]) -> R
             );
         }
         if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         if src.is_dir() {
             copy_dir(&src, &dst)
@@ -116,17 +115,17 @@ pub fn copy_assets(source_dir: &Path, plugin_dir: &Path, assets: &[String]) -> R
             fs::copy(&src, &dst)
                 .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
         }
-        eprintln!("[printer] installed asset {} ({})", asset, describe_kind(&dst));
+        eprintln!(
+            "[printer] installed asset {} ({})",
+            asset,
+            describe_kind(&dst)
+        );
     }
     Ok(())
 }
 
 fn describe_kind(p: &Path) -> &'static str {
-    if p.is_dir() {
-        "dir"
-    } else {
-        "file"
-    }
+    if p.is_dir() { "dir" } else { "file" }
 }
 
 fn validate_asset_path(asset: &str) -> Result<()> {

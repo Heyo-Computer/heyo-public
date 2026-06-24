@@ -452,8 +452,7 @@ fn append_skills(out: &mut String, skills: &[crate::skills::Skill]) {
     }
 }
 
-const SKILLS_HEADER: &str =
-    "\nYou also have skills available — bundled reference docs that explain how to use \
+const SKILLS_HEADER: &str = "\nYou also have skills available — bundled reference docs that explain how to use \
 specific tools for exercising or verifying the change you just made (e.g. driving the desktop or \
 a web app to click-test a UI change end-to-end). Read a skill's SKILL.md only when its description \
 matches what you actually need to do; do not load skills you will not use. Each skill is read-only \

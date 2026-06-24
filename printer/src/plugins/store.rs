@@ -40,15 +40,11 @@ pub enum Source {
         subdir: Option<String>,
     },
     /// Built from a local source directory with `cargo install --path …`.
-    Path {
-        path: String,
-    },
+    Path { path: String },
     /// Installed by running an arbitrary shell command (e.g. a vendor's
     /// `curl … | sh` installer). The binary lives wherever that command
     /// puts it; the resolved absolute path is stored in `Manifest::binary`.
-    Shell {
-        command: String,
-    },
+    Shell { command: String },
 }
 
 /// Resolve the per-user data directory `~/.printer/`. Created if missing.
@@ -56,15 +52,13 @@ pub fn data_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| anyhow!("$HOME is not set; cannot resolve ~/.printer"))?;
     let dir = PathBuf::from(home).join(".printer");
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("creating data dir {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("creating data dir {}", dir.display()))?;
     Ok(dir)
 }
 
 pub fn plugins_dir() -> Result<PathBuf> {
     let dir = data_dir()?.join("plugins");
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("creating plugins dir {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("creating plugins dir {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -167,9 +161,7 @@ pub fn prompt_if_no_plugins(skip: bool) -> Result<()> {
 pub fn installed_count() -> Result<usize> {
     let plugins = plugins_dir()?;
     let mut n = 0;
-    for entry in fs::read_dir(&plugins)
-        .with_context(|| format!("reading {}", plugins.display()))?
-    {
+    for entry in fs::read_dir(&plugins).with_context(|| format!("reading {}", plugins.display()))? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -185,9 +177,7 @@ pub fn installed_count() -> Result<usize> {
 pub fn list_installed() -> Result<()> {
     let plugins = plugins_dir()?;
     let mut found: Vec<Manifest> = Vec::new();
-    for entry in fs::read_dir(&plugins)
-        .with_context(|| format!("reading {}", plugins.display()))?
-    {
+    for entry in fs::read_dir(&plugins).with_context(|| format!("reading {}", plugins.display()))? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -212,7 +202,12 @@ pub fn list_installed() -> Result<()> {
     }
 
     let name_w = found.iter().map(|m| m.name.len()).max().unwrap_or(4).max(4);
-    let ver_w = found.iter().map(|m| m.version.len()).max().unwrap_or(7).max(7);
+    let ver_w = found
+        .iter()
+        .map(|m| m.version.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
     println!(
         "{:<name_w$}  {:<ver_w$}  ROLES        SOURCE",
         "NAME",

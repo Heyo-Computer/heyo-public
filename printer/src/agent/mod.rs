@@ -178,6 +178,10 @@ pub struct ToolUseEvent {
 pub struct TurnOutcome {
     pub result_text: String,
     pub usage: TokenUsage,
+    /// Backend-native session/thread id to use on subsequent turns. Most
+    /// backends either accept printer's UUID directly or manage this elsewhere;
+    /// Codex returns a `thread_id` that must be fed to `codex exec resume`.
+    pub backend_session_id: Option<String>,
     /// Tool calls the agent made this turn, in order. Empty unless a
     /// streaming output format was parsed (see `parse_claude_stream`).
     /// Consumed by the verbose reporting layer in `session.rs`.
@@ -244,7 +248,12 @@ impl<'a> AgentInvocation<'a> {
     pub fn bootstrap(&self, session_id: &Uuid, prompt: &str) -> Command {
         let argv = match &self.kind {
             AgentKind::Claude => self.claude_argv(Some(session_id), None, prompt),
-            AgentKind::Opencode => self.opencode_argv(Some(session_id), false, prompt),
+            AgentKind::Codex => self.codex_argv(None),
+            AgentKind::Amp => self.amp_argv(None),
+            AgentKind::Opencode => {
+                let session_id = session_id.to_string();
+                self.opencode_argv(Some(&session_id), false, prompt)
+            }
             AgentKind::Acp { .. } => panic!(
                 "AgentInvocation::bootstrap() must not be called for ACP agents; use the ACP path in Session::turn"
             ),
@@ -253,9 +262,11 @@ impl<'a> AgentInvocation<'a> {
     }
 
     /// Build a resume-session command.
-    pub fn resume(&self, session_id: &Uuid, prompt: &str) -> Command {
+    pub fn resume(&self, session_id: &str, prompt: &str) -> Command {
         let argv = match &self.kind {
             AgentKind::Claude => self.claude_argv(None, Some(session_id), prompt),
+            AgentKind::Codex => self.codex_argv(Some(session_id)),
+            AgentKind::Amp => self.amp_argv(Some(session_id)),
             AgentKind::Opencode => self.opencode_argv(Some(session_id), true, prompt),
             AgentKind::Acp { .. } => panic!(
                 "AgentInvocation::resume() must not be called for ACP agents; use the ACP path in Session::turn"
@@ -284,7 +295,19 @@ impl<'a> AgentInvocation<'a> {
         }
     }
 
-    fn claude_argv(&self, session_id: Option<&Uuid>, resume: Option<&Uuid>, prompt: &str) -> Vec<String> {
+    pub fn reads_prompt_from_stdin(&self) -> bool {
+        matches!(
+            self.kind,
+            AgentKind::Claude | AgentKind::Codex | AgentKind::Amp
+        )
+    }
+
+    fn claude_argv(
+        &self,
+        session_id: Option<&Uuid>,
+        resume: Option<&str>,
+        _prompt: &str,
+    ) -> Vec<String> {
         let mut v: Vec<String> = vec!["claude".into(), "--print".into(), "--output-format".into()];
         // `claude --output-format json` returns a single result object that
         // `parse_claude` reads. When the user passes `-v` we instead request
@@ -325,16 +348,67 @@ impl<'a> AgentInvocation<'a> {
         // `--strict-mcp-config` keeps the user's own MCP servers out of printer
         // runs.
         v.extend(mcp_args(self.command_wrapper.is_some()));
-        v.push(prompt.to_string());
         v
     }
 
-    fn opencode_argv(&self, session_id: Option<&Uuid>, resume: bool, prompt: &str) -> Vec<String> {
+    fn codex_argv(&self, resume: Option<&str>) -> Vec<String> {
+        let mut v: Vec<String> = vec!["codex".into(), "exec".into()];
+        if let Some(id) = resume {
+            v.push("resume".into());
+            v.push("--json".into());
+            if self.permission_mode == "bypassPermissions"
+                || self.permission_mode == "dangerously-bypass-approvals-and-sandbox"
+            {
+                v.push("--dangerously-bypass-approvals-and-sandbox".into());
+            }
+            if let Some(model) = self.model {
+                v.push("--model".into());
+                v.push(model.to_string());
+            }
+            v.push(id.to_string());
+            v.push("-".into());
+        } else {
+            v.push("--json".into());
+            if self.permission_mode == "bypassPermissions"
+                || self.permission_mode == "dangerously-bypass-approvals-and-sandbox"
+            {
+                v.push("--dangerously-bypass-approvals-and-sandbox".into());
+            }
+            if let Some(model) = self.model {
+                v.push("--model".into());
+                v.push(model.to_string());
+            }
+            v.push("-".into());
+        }
+        v
+    }
+
+    fn amp_argv(&self, resume: Option<&str>) -> Vec<String> {
         let mut v: Vec<String> = vec![
-            "opencode".into(),
-            "run".into(),
-            prompt.to_string(),
+            "amp".into(),
+            "--no-ide".into(),
+            "--no-notifications".into(),
+            "--no-color".into(),
+            "--execute".into(),
+            "--stream-json".into(),
+            "--no-archive-after-execute".into(),
         ];
+        if let Some(model) = self.model {
+            // Amp calls this a mode (`deep`, `rush`, `smart`). Printer keeps
+            // the shared flag name `--model`; pass it through as Amp's mode.
+            v.push("--mode".into());
+            v.push(model.to_string());
+        }
+        if let Some(id) = resume {
+            v.push("threads".into());
+            v.push("continue".into());
+            v.push(id.to_string());
+        }
+        v
+    }
+
+    fn opencode_argv(&self, session_id: Option<&str>, resume: bool, prompt: &str) -> Vec<String> {
+        let mut v: Vec<String> = vec!["opencode".into(), "run".into(), prompt.to_string()];
         // `--format json` switches stdout to a newline-delimited event stream
         // (step_start / text / step_finish …). `parse_opencode` reconstructs
         // the assistant text from `text` events and reads token usage from the
@@ -357,12 +431,18 @@ impl<'a> AgentInvocation<'a> {
     }
 
     /// Parse stdout from a completed agent process into a normalized outcome.
-    pub fn parse_outcome(&self, stdout: String, fallback_session: &Uuid) -> anyhow::Result<TurnOutcome> {
+    pub fn parse_outcome(
+        &self,
+        stdout: String,
+        fallback_session: &Uuid,
+    ) -> anyhow::Result<TurnOutcome> {
         match &self.kind {
             // Verbose Claude turns emit stream-json (see `claude_argv`); the
             // default single-object path stays for non-verbose runs.
             AgentKind::Claude if self.verbose => parse_claude_stream(stdout, fallback_session),
             AgentKind::Claude => parse_claude(stdout, fallback_session),
+            AgentKind::Codex => parse_codex(stdout, fallback_session),
+            AgentKind::Amp => parse_amp(stdout, fallback_session),
             AgentKind::Opencode => parse_opencode(stdout, fallback_session),
             AgentKind::Acp { .. } => parse_opencode(stdout, fallback_session),
         }
@@ -370,8 +450,9 @@ impl<'a> AgentInvocation<'a> {
 }
 
 fn parse_claude(stdout: String, _fallback_session: &Uuid) -> anyhow::Result<TurnOutcome> {
-    let parsed: ClaudeJsonResult = serde_json::from_str(stdout.trim())
-        .map_err(|e| anyhow::anyhow!("failed to parse claude JSON output: {e}\n--- stdout ---\n{stdout}"))?;
+    let parsed: ClaudeJsonResult = serde_json::from_str(stdout.trim()).map_err(|e| {
+        anyhow::anyhow!("failed to parse claude JSON output: {e}\n--- stdout ---\n{stdout}")
+    })?;
     let raw = parsed.usage.unwrap_or_default();
     let usage = TokenUsage {
         input_tokens: raw.input_tokens,
@@ -382,6 +463,94 @@ fn parse_claude(stdout: String, _fallback_session: &Uuid) -> anyhow::Result<Turn
     Ok(TurnOutcome {
         result_text: parsed.result,
         usage,
+        backend_session_id: None,
+        tools: Vec::new(),
+    })
+}
+
+/// Parse `codex exec --json` output: newline-delimited events. We care about:
+/// - `thread.started`: captures the Codex thread id for future resume turns.
+/// - `item.completed` with `item.type=agent_message`: assistant text.
+/// - `turn.completed`: token usage.
+///
+/// Unrecognized/non-JSON lines are skipped. If no JSON event is recognized,
+/// fall back to raw stdout as the reply, matching the opencode parser.
+fn parse_codex(stdout: String, _fallback_session: &Uuid) -> anyhow::Result<TurnOutcome> {
+    let mut result_text = String::new();
+    let mut usage = TokenUsage::default();
+    let mut backend_session_id: Option<String> = None;
+    let mut saw_event = false;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(event_type) = val.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        saw_event = true;
+        match event_type {
+            "thread.started" => {
+                if let Some(id) = val.get("thread_id").and_then(|v| v.as_str()) {
+                    backend_session_id = Some(id.to_string());
+                }
+            }
+            "item.completed" => {
+                if let Some(item) = val.get("item")
+                    && item.get("type").and_then(|v| v.as_str()) == Some("agent_message")
+                    && let Some(text) = item.get("text").and_then(|v| v.as_str())
+                {
+                    result_text.push_str(text);
+                }
+            }
+            "turn.completed" => {
+                if let Some(raw) = val.get("usage") {
+                    let input_total = raw
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cache_read = raw
+                        .get("cached_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let output = raw
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let reasoning = raw
+                        .get("reasoning_output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    usage = TokenUsage {
+                        input_tokens: input_total.saturating_sub(cache_read),
+                        output_tokens: output + reasoning,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: cache_read,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_event {
+        return Ok(TurnOutcome {
+            result_text: stdout,
+            usage: TokenUsage::default(),
+            backend_session_id: None,
+            tools: Vec::new(),
+        });
+    }
+
+    Ok(TurnOutcome {
+        result_text,
+        usage,
+        backend_session_id,
         tools: Vec::new(),
     })
 }
@@ -413,7 +582,9 @@ fn parse_opencode(stdout: String, _fallback_session: &Uuid) -> anyhow::Result<Tu
             Ok(v) => v,
             Err(_) => continue,
         };
-        let Some(part) = val.get("part") else { continue };
+        let Some(part) = val.get("part") else {
+            continue;
+        };
         match val.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
                 saw_event = true;
@@ -426,7 +597,10 @@ fn parse_opencode(stdout: String, _fallback_session: &Uuid) -> anyhow::Result<Tu
                 if let Some(tokens) = part.get("tokens") {
                     let input = tokens.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
                     let output = tokens.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let reasoning = tokens.get("reasoning").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let reasoning = tokens
+                        .get("reasoning")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     let cache = tokens.get("cache");
                     let cache_write = cache
                         .and_then(|c| c.get("write"))
@@ -455,6 +629,7 @@ fn parse_opencode(stdout: String, _fallback_session: &Uuid) -> anyhow::Result<Tu
         return Ok(TurnOutcome {
             result_text: stdout,
             usage: TokenUsage::default(),
+            backend_session_id: None,
             tools: Vec::new(),
         });
     }
@@ -462,8 +637,142 @@ fn parse_opencode(stdout: String, _fallback_session: &Uuid) -> anyhow::Result<Tu
     Ok(TurnOutcome {
         result_text,
         usage,
+        backend_session_id: None,
         tools: Vec::new(),
     })
+}
+
+/// Parse Amp `--execute --stream-json` output. Amp documents this as Claude
+/// Code-compatible stream JSON, so the shape is close to
+/// `claude --output-format stream-json --verbose`, but we accept assistant text
+/// chunks directly as a fallback and capture any thread/session id metadata for
+/// future `amp threads continue <id>` turns.
+fn parse_amp(stdout: String, _fallback_session: &Uuid) -> anyhow::Result<TurnOutcome> {
+    let mut assistant_text = String::new();
+    let mut result_text: Option<String> = None;
+    let mut usage = TokenUsage::default();
+    let mut tools: Vec<ToolUseEvent> = Vec::new();
+    let mut backend_session_id: Option<String> = None;
+    let mut saw_event = false;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(event_type) = val.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        saw_event = true;
+        if backend_session_id.is_none() {
+            backend_session_id = find_amp_thread_id(&val);
+        }
+        match event_type {
+            "assistant" => {
+                if let Some(content) = val
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        match block.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    assistant_text.push_str(text);
+                                }
+                            }
+                            Some("tool_use") => {
+                                let name = block
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let input_summary = summarize_tool_input(block.get("input"));
+                                tools.push(ToolUseEvent {
+                                    name,
+                                    input_summary,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(u) = val.get("message").and_then(|m| m.get("usage"))
+                    && let Ok(raw) = serde_json::from_value::<ClaudeUsage>(u.clone())
+                {
+                    usage = TokenUsage {
+                        input_tokens: raw.input_tokens,
+                        output_tokens: raw.output_tokens,
+                        cache_creation_input_tokens: raw.cache_creation_input_tokens,
+                        cache_read_input_tokens: raw.cache_read_input_tokens,
+                    };
+                }
+            }
+            "result" => {
+                if let Some(r) = val.get("result").and_then(|r| r.as_str()) {
+                    result_text = Some(r.to_string());
+                }
+                if let Some(u) = val.get("usage")
+                    && let Ok(raw) = serde_json::from_value::<ClaudeUsage>(u.clone())
+                {
+                    usage = TokenUsage {
+                        input_tokens: raw.input_tokens,
+                        output_tokens: raw.output_tokens,
+                        cache_creation_input_tokens: raw.cache_creation_input_tokens,
+                        cache_read_input_tokens: raw.cache_read_input_tokens,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_event {
+        return Ok(TurnOutcome {
+            result_text: stdout,
+            usage: TokenUsage::default(),
+            backend_session_id: None,
+            tools: Vec::new(),
+        });
+    }
+
+    Ok(TurnOutcome {
+        result_text: result_text.unwrap_or(assistant_text),
+        usage,
+        backend_session_id,
+        tools,
+    })
+}
+
+fn find_amp_thread_id(val: &serde_json::Value) -> Option<String> {
+    for key in [
+        "thread_id",
+        "threadId",
+        "threadID",
+        "session_id",
+        "sessionId",
+    ] {
+        if let Some(id) = val.get(key).and_then(|v| v.as_str())
+            && !id.is_empty()
+        {
+            return Some(id.to_string());
+        }
+    }
+    for key in ["thread", "session"] {
+        if let Some(id) = val
+            .get(key)
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            && !id.is_empty()
+        {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// Parse newline-delimited `claude --output-format stream-json --verbose`
@@ -503,7 +812,10 @@ fn parse_claude_stream(stdout: String, _fallback_session: &Uuid) -> anyhow::Resu
                                 .unwrap_or("unknown")
                                 .to_string();
                             let input_summary = summarize_tool_input(block.get("input"));
-                            tools.push(ToolUseEvent { name, input_summary });
+                            tools.push(ToolUseEvent {
+                                name,
+                                input_summary,
+                            });
                         }
                     }
                 }
@@ -514,14 +826,15 @@ fn parse_claude_stream(stdout: String, _fallback_session: &Uuid) -> anyhow::Resu
                     result_text = r.to_string();
                 }
                 if let Some(u) = val.get("usage")
-                    && let Ok(raw) = serde_json::from_value::<ClaudeUsage>(u.clone()) {
-                        usage = TokenUsage {
-                            input_tokens: raw.input_tokens,
-                            output_tokens: raw.output_tokens,
-                            cache_creation_input_tokens: raw.cache_creation_input_tokens,
-                            cache_read_input_tokens: raw.cache_read_input_tokens,
-                        };
-                    }
+                    && let Ok(raw) = serde_json::from_value::<ClaudeUsage>(u.clone())
+                {
+                    usage = TokenUsage {
+                        input_tokens: raw.input_tokens,
+                        output_tokens: raw.output_tokens,
+                        cache_creation_input_tokens: raw.cache_creation_input_tokens,
+                        cache_read_input_tokens: raw.cache_read_input_tokens,
+                    };
+                }
             }
             _ => {}
         }
@@ -536,6 +849,7 @@ fn parse_claude_stream(stdout: String, _fallback_session: &Uuid) -> anyhow::Resu
     Ok(TurnOutcome {
         result_text,
         usage,
+        backend_session_id: None,
         tools,
     })
 }
@@ -617,6 +931,30 @@ not json at all
     }
 
     #[test]
+    fn amp_stream_json_parses_text_usage_tools_and_thread_id() {
+        let amp = r#"{"type":"system","subtype":"init","thread_id":"T-123"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"hello "},{"type":"tool_use","name":"Bash","input":{"command":"pwd"}}],"usage":{"input_tokens":7,"output_tokens":9,"cache_creation_input_tokens":1,"cache_read_input_tokens":2}}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"world"}]}}"#;
+        let out = parse_amp(amp.to_string(), &sid()).unwrap();
+        assert_eq!(out.result_text, "hello world");
+        assert_eq!(out.backend_session_id.as_deref(), Some("T-123"));
+        assert_eq!(out.usage.input_tokens, 7);
+        assert_eq!(out.usage.output_tokens, 9);
+        assert_eq!(out.usage.cache_creation_input_tokens, 1);
+        assert_eq!(out.usage.cache_read_input_tokens, 2);
+        assert_eq!(out.tools.len(), 1);
+        assert_eq!(out.tools[0].name, "Bash");
+        assert_eq!(out.tools[0].input_summary, "pwd");
+    }
+
+    #[test]
+    fn amp_plain_text_falls_back_to_raw_stdout() {
+        let out = parse_amp("plain amp reply".to_string(), &sid()).unwrap();
+        assert_eq!(out.result_text, "plain amp reply");
+        assert_eq!(out.usage.grand_total(), 0);
+    }
+
+    #[test]
     fn non_verbose_single_object_path_still_works() {
         let single = r#"{"result":"hi","usage":{"input_tokens":1,"output_tokens":2}}"#;
         let out = parse_claude(single.to_string(), &sid()).unwrap();
@@ -643,13 +981,19 @@ not json at all
             serde_json::from_str(arg_after(&args, "--mcp-config")).unwrap();
         assert_eq!(cfg["mcpServers"]["codegraph"]["type"], "stdio");
         assert!(cfg["mcpServers"].get("computer").is_none());
-        assert_eq!(cfg["mcpServers"]["codegraph"]["command"], "/home/u/.local/bin/codegraph");
+        assert_eq!(
+            cfg["mcpServers"]["codegraph"]["command"],
+            "/home/u/.local/bin/codegraph"
+        );
         assert_eq!(cfg["mcpServers"]["codegraph"]["args"][0], "mcp");
         let allow = arg_after(&args, "--allowedTools");
         for tool in CODEGRAPH_MCP_TOOLS {
             assert!(allow.contains(tool), "{allow} missing {tool}");
         }
-        assert!(!allow.contains(' '), "allowedTools must be one arg: {allow}");
+        assert!(
+            !allow.contains(' '),
+            "allowedTools must be one arg: {allow}"
+        );
     }
 
     #[test]
@@ -671,7 +1015,10 @@ not json at all
         for tool in CODEGRAPH_MCP_TOOLS.iter().chain(COMPUTER_MCP_TOOLS) {
             assert!(allow.contains(tool), "{allow} missing {tool}");
         }
-        assert!(!allow.contains(' '), "allowedTools must be one arg: {allow}");
+        assert!(
+            !allow.contains(' '),
+            "allowedTools must be one arg: {allow}"
+        );
     }
 
     #[test]
@@ -745,6 +1092,85 @@ not json at all
         assert_eq!(out.usage.grand_total(), 0);
     }
 
+    const CODEX_JSON: &str = r#"
+{"type":"thread.started","thread_id":"019ef526-a8dd-7450-9738-6528393e0785"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"all done <<ALL_DONE>>"}}
+{"type":"turn.completed","usage":{"input_tokens":15116,"cached_input_tokens":2432,"output_tokens":5,"reasoning_output_tokens":7}}
+"#;
+
+    #[test]
+    fn codex_json_parses_text_usage_and_thread_id() {
+        let out = parse_codex(CODEX_JSON.to_string(), &sid()).unwrap();
+        assert_eq!(out.result_text, "all done <<ALL_DONE>>");
+        assert_eq!(
+            out.backend_session_id.as_deref(),
+            Some("019ef526-a8dd-7450-9738-6528393e0785")
+        );
+        assert_eq!(out.usage.input_tokens, 12684);
+        assert_eq!(out.usage.cache_read_input_tokens, 2432);
+        assert_eq!(out.usage.output_tokens, 12);
+    }
+
+    #[test]
+    fn codex_plain_text_falls_back_to_raw_stdout() {
+        let out = parse_codex("plain codex reply".to_string(), &sid()).unwrap();
+        assert_eq!(out.result_text, "plain codex reply");
+        assert_eq!(out.usage.grand_total(), 0);
+        assert!(out.backend_session_id.is_none());
+    }
+
+    #[test]
+    fn codex_argv_uses_stdin_json_and_resume_thread() {
+        let invocation = AgentInvocation {
+            kind: AgentKind::Codex,
+            model: Some("gpt-5-codex"),
+            cwd: None,
+            permission_mode: "bypassPermissions",
+            command_wrapper: None,
+            verbose: false,
+            acp_bin: None,
+            acp_args: &[],
+            acp_env: &std::collections::BTreeMap::new(),
+        };
+        let fresh = invocation.codex_argv(None);
+        assert_eq!(fresh[0..3], ["codex", "exec", "--json"]);
+        assert!(fresh.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert_eq!(fresh.last().map(String::as_str), Some("-"));
+
+        let resume = invocation.codex_argv(Some("thread-1"));
+        assert_eq!(resume[0..4], ["codex", "exec", "resume", "--json"]);
+        assert!(resume.contains(&"thread-1".to_string()));
+        assert_eq!(resume.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
+    fn amp_argv_uses_stdin_stream_json_and_resume_thread() {
+        let invocation = AgentInvocation {
+            kind: AgentKind::Amp,
+            model: Some("deep"),
+            cwd: None,
+            permission_mode: "bypassPermissions",
+            command_wrapper: None,
+            verbose: false,
+            acp_bin: None,
+            acp_args: &[],
+            acp_env: &std::collections::BTreeMap::new(),
+        };
+        let fresh = invocation.amp_argv(None);
+        assert_eq!(fresh[0], "amp");
+        assert!(fresh.contains(&"--execute".to_string()));
+        assert!(fresh.contains(&"--stream-json".to_string()));
+        assert!(fresh.contains(&"--no-archive-after-execute".to_string()));
+        assert_eq!(arg_after(&fresh, "--mode"), "deep");
+        assert!(!fresh.contains(&"threads".to_string()));
+
+        let resume = invocation.amp_argv(Some("thread-1"));
+        assert!(resume.contains(&"threads".to_string()));
+        assert!(resume.contains(&"continue".to_string()));
+        assert_eq!(resume.last().map(String::as_str), Some("thread-1"));
+    }
+
     #[test]
     fn non_cached_input_excludes_cache_reads() {
         let usage = TokenUsage {
@@ -771,6 +1197,7 @@ not json at all
                 cache_creation_input_tokens: 100,
                 cache_read_input_tokens: 500_000,
             },
+            backend_session_id: None,
             tools: Vec::new(),
         };
         assert_eq!(outcome.non_cached_input_tokens(), 300);

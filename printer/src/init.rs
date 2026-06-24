@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn init(args: InitArgs) -> Result<()> {
-    let project_root = std::env::current_dir()
-        .context("resolving current directory for project root")?;
+    let project_root =
+        std::env::current_dir().context("resolving current directory for project root")?;
     let printer_dir_exists = project_root.join(".printer").is_dir();
 
     let path = resolve_target(&project_root, args.path.as_deref(), printer_dir_exists)?;
@@ -39,8 +39,8 @@ pub fn init(args: InitArgs) -> Result<()> {
         Ok(())
     })();
 
-    let after_ctx = HookContext::new(Event::AfterInit, project_root.clone())
-        .with_exit_status(result.is_ok());
+    let after_ctx =
+        HookContext::new(Event::AfterInit, project_root.clone()).with_exit_status(result.is_ok());
     let _ = hooks.run_cli(Event::AfterInit, &after_ctx);
 
     result?;
@@ -66,14 +66,12 @@ fn resolve_target(
             .unwrap_or_else(|| PathBuf::from("spec.md")));
     }
     // Initialized repo: arg must be a slug.
-    let slug = arg
-        .and_then(|p| p.to_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "this repo already has a .printer/ directory; pass a slug like \
+    let slug = arg.and_then(|p| p.to_str()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "this repo already has a .printer/ directory; pass a slug like \
                  `printer init feat-deploy-assets` to write specs/NNN-<slug>.md"
-            )
-        })?;
+        )
+    })?;
     if slug.contains(std::path::MAIN_SEPARATOR) {
         bail!(
             "expected a slug (e.g. `feat-deploy-assets`) but got a path: {}",

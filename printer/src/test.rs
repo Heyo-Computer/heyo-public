@@ -6,9 +6,9 @@
 
 use crate::agent::AgentInvocation;
 use crate::cli::TestArgs;
-use crate::prompts::test_prompt;
 use crate::host::{computer_on_path, host_display_available};
-use crate::review::{detect_base, parse_verdict, Verdict};
+use crate::prompts::test_prompt;
+use crate::review::{Verdict, detect_base, parse_verdict};
 use crate::session::Session;
 use crate::skills;
 use anyhow::{Context, Result};
@@ -60,7 +60,8 @@ pub async fn test(args: TestArgs) -> Result<()> {
         eprintln!("[printer] skills available to tester: {}", names.join(", "));
     }
 
-    let acp = crate::agents::resolve_acp_launch(&args.agent, args.acp_bin.as_deref(), &args.acp_args)?;
+    let acp =
+        crate::agents::resolve_acp_launch(&args.agent, args.acp_bin.as_deref(), &args.acp_args)?;
     let agent = AgentInvocation {
         kind: args.agent.clone(),
         model: args.model.as_deref(),

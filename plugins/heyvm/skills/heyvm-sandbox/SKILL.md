@@ -25,6 +25,9 @@ extra `sh -c` layer).
   credentials and persist per-session state (conversation logs,
   `session-env/<uuid>` for Bash tool calls). Writes here also land on the
   host, so don't delete or rewrite anything you didn't create yourself.
+- **`~/.codex` and `~/.config/amp` are bind-mounted RW** so Codex and Amp
+  can read host auth/config and persist their own session state. Writes
+  here also land on the host.
 - **`~/.local/state`, `~/.local/share`, and `~/.cache` are bind-mounted
   RW** so agents that follow the standard XDG-state / XDG-data /
   XDG-cache convention (or hardcode `~/.local/state/<name>/` for logs
@@ -34,12 +37,12 @@ extra `sh -c` layer).
   as with `~/.claude`.
 - **`~/.local/bin` and `~/.cargo/bin` are on the session `PATH`** (set
   once in `post_create` and retained by the persistent `printer` heyvm
-  session). Host-installed CLIs that live there — claude, codex, cargo
+  session). Host-installed CLIs that live there — claude, codex, amp, cargo
   binaries, npm globals via `prefix` — resolve by bare name without you
   having to spell out the absolute path.
 - **The rest of `$HOME` is read-only** (heyvm's bubblewrap default).
-  Reads work; mkdir/touch outside `~/.claude`, `~/.local/state`,
-  `~/.cache`, and `/workspace` will fail with `EROFS`. If you need
+  Reads work; mkdir/touch outside `~/.claude`, `~/.codex`,
+  `~/.config/amp`, `~/.local/state`, `~/.cache`, and `/workspace` will fail with `EROFS`. If you need
   scratch space, use `/tmp` or a fresh dir under `/workspace`.
 - **Anything outside `/workspace` is ephemeral relative to the sandbox**
   but `~/.local/state` and `~/.cache` round-trip to the host, so

@@ -69,12 +69,12 @@ pub struct AgentSet {
 /// a plugin named "acp" would parse as the bare ACP form (which expects
 /// `--acp-bin`) and confuse the resolver.
 ///
-/// "claude" and "opencode" are reserved because they are the built-in
+/// "claude", "codex", "amp", and "opencode" are reserved because they are the built-in
 /// `--agent` names. While plugin agents only resolve under the `acp:<name>`
 /// prefix (so `--agent acp:opencode` is unambiguous from `--agent opencode`),
 /// reserving them prevents confusion and keeps the natural names available
 /// for the built-in one-shot backends.
-const RESERVED_AGENT_NAMES: &[&str] = &["acp", "claude", "opencode"];
+const RESERVED_AGENT_NAMES: &[&str] = &["acp", "claude", "codex", "amp", "opencode"];
 
 impl AgentSet {
     /// Load `[[agent]]` blocks from every installed plugin. Errors if two
@@ -175,7 +175,9 @@ pub fn resolve_acp_launch(
     explicit_args: &[String],
 ) -> Result<AcpLaunch> {
     match kind {
-        AgentKind::Claude | AgentKind::Opencode => Ok(AcpLaunch::default()),
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Amp | AgentKind::Opencode => {
+            Ok(AcpLaunch::default())
+        }
         AgentKind::Acp { name: None } => Ok(AcpLaunch {
             bin: explicit_bin.map(|s| s.to_string()),
             args: explicit_args.to_vec(),
@@ -247,7 +249,6 @@ mod tests {
 
     #[test]
     fn validate_rejects_reserved_name() {
-        // Only "acp" is reserved (it's the prefix word in `--agent acp:<name>`).
         let s = aspec("acp", "x");
         let err = validate_agent(&s).unwrap_err();
         assert!(err.to_string().contains("reserved"));
@@ -259,6 +260,8 @@ mod tests {
         // don't shadow the built-in one-shot backends. But the names are
         // still reserved to prevent confusion.
         assert!(validate_agent(&aspec("claude", "claude-code-acp")).is_err());
+        assert!(validate_agent(&aspec("codex", "codex")).is_err());
+        assert!(validate_agent(&aspec("amp", "amp")).is_err());
         assert!(validate_agent(&aspec("opencode", "opencode")).is_err());
     }
 
@@ -277,10 +280,7 @@ mod tests {
     #[test]
     fn resolve_picks_named() {
         let set = AgentSet {
-            agents: vec![
-                ra("p1", aspec("a", "x")),
-                ra("p2", aspec("b", "y")),
-            ],
+            agents: vec![ra("p1", aspec("a", "x")), ra("p2", aspec("b", "y"))],
         };
         let r = set.resolve("b").unwrap();
         assert_eq!(r.spec.name, "b");

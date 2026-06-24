@@ -49,11 +49,8 @@ pub async fn spec_from_followups(args: SpecFromFollowupsArgs) -> Result<()> {
         dest.display()
     );
 
-    let acp = crate::agents::resolve_acp_launch(
-        &args.agent,
-        args.acp_bin.as_deref(),
-        &args.acp_args,
-    )?;
+    let acp =
+        crate::agents::resolve_acp_launch(&args.agent, args.acp_bin.as_deref(), &args.acp_args)?;
     let agent = AgentInvocation {
         kind: args.agent.clone(),
         model: args.model.as_deref(),
@@ -75,9 +72,7 @@ pub async fn spec_from_followups(args: SpecFromFollowupsArgs) -> Result<()> {
         bail!("agent reported blocked: {line}");
     }
     if !text.contains(SENTINEL_PLAN_READY) {
-        bail!(
-            "agent ended turn without {SENTINEL_PLAN_READY}; the spec may not have been written"
-        );
+        bail!("agent ended turn without {SENTINEL_PLAN_READY}; the spec may not have been written");
     }
     if !dest.is_file() {
         bail!(
@@ -110,7 +105,10 @@ fn latest_followups(cwd: &Path) -> Result<PathBuf> {
         if path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
         }
-        let mtime = entry.metadata()?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let mtime = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
         if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
             best = Some((mtime, path));
         }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 pub struct Session<'a> {
@@ -30,6 +30,7 @@ pub struct Session<'a> {
     /// histogram. Left `None` for phases (test/exec-total) that don't track it.
     metrics_ctx: Option<MetricsCtx>,
     fresh: bool,
+    backend_session_id: Option<String>,
     acp: Option<AcpClient>,
     acp_session_id: Option<String>,
 }
@@ -53,6 +54,7 @@ impl<'a> Session<'a> {
             verbose: false,
             metrics_ctx: None,
             fresh: true,
+            backend_session_id: None,
             acp: None,
             acp_session_id: None,
         }
@@ -76,6 +78,7 @@ impl<'a> Session<'a> {
         self.id = Uuid::new_v4();
         self.fresh = true;
         self.cumulative_input_tokens = 0;
+        self.backend_session_id = None;
         // For ACP, shut down the existing client so the previous server's
         // process group is reaped before we drop it; otherwise the watcher
         // task would only fire when the parent process exits. Then re-null
@@ -96,11 +99,17 @@ impl<'a> Session<'a> {
         let mut cmd = if self.fresh {
             self.agent.bootstrap(&self.id, prompt)
         } else {
-            self.agent.resume(&self.id, prompt)
+            let fallback = self.id.to_string();
+            let session_id = self.backend_session_id.as_deref().unwrap_or(&fallback);
+            self.agent.resume(session_id, prompt)
         };
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        cmd.stdin(Stdio::null());
+        cmd.stdin(if self.agent.reads_prompt_from_stdin() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         // Put the child into its own process group so we can kill the whole
         // subtree on Ctrl-C — otherwise orphaned grandchildren can keep pipes
         // open and stall our cleanup readers indefinitely.
@@ -116,6 +125,17 @@ impl<'a> Session<'a> {
         );
 
         let mut child = cmd.spawn().context("failed to spawn agent process")?;
+        if self.agent.reads_prompt_from_stdin() {
+            let mut stdin = child.stdin.take().context("child has no stdin pipe")?;
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .context("failed to write prompt to agent stdin")?;
+            stdin
+                .shutdown()
+                .await
+                .context("failed to close agent stdin")?;
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         // Activity tracking for the heartbeat: last stderr line timestamp
@@ -164,10 +184,7 @@ impl<'a> Session<'a> {
         // child's exit. read_to_string would block until the child closes its
         // stdout pipe (i.e. exits), starving the ctrl_c branch — so we drive
         // the read inside the select loop instead.
-        let mut stdout = child
-            .stdout
-            .take()
-            .context("child has no stdout pipe")?;
+        let mut stdout = child.stdout.take().context("child has no stdout pipe")?;
         let mut stdout_bytes: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 8192];
         let mut read_done = false;
@@ -216,15 +233,17 @@ impl<'a> Session<'a> {
         let stdout_buf = String::from_utf8_lossy(&stdout_bytes).into_owned();
 
         if !status.success() {
-            anyhow::bail!(
-                "agent exited with status {status}\n--- stdout ---\n{stdout_buf}"
-            );
+            anyhow::bail!("agent exited with status {status}\n--- stdout ---\n{stdout_buf}");
         }
 
         let outcome = self.agent.parse_outcome(stdout_buf, &self.id)?;
+        if let Some(id) = outcome.backend_session_id.clone() {
+            self.backend_session_id = Some(id);
+        }
         self.turn_count += 1;
-        self.cumulative_input_tokens =
-            outcome.non_cached_input_tokens().max(self.cumulative_input_tokens);
+        self.cumulative_input_tokens = outcome
+            .non_cached_input_tokens()
+            .max(self.cumulative_input_tokens);
         self.usage_total.add(&outcome.usage);
         eprintln!(
             "[printer] turn {} done in {:.1}s (turn: {}; op total: {})",
@@ -673,7 +692,7 @@ mod tests {
             ev_cmd("Bash", "find . -name '*.rs'"),
             ev_cmd("Bash", "codegraph search foo"), // efficient — not flagged
             ev_cmd("Bash", "cargo test"),           // unrelated — not flagged
-            ev("Read"),                              // reads aren't counted here
+            ev("Read"),                             // reads aren't counted here
         ];
         assert_eq!(count_inefficient_search_tools(&tools), 4);
         assert_eq!(count_inefficient_search_tools(&[]), 0);
@@ -682,12 +701,12 @@ mod tests {
     #[test]
     fn counts_codegraph_tools_native_and_bash() {
         let tools = vec![
-            ev("mcp__codegraph__search"),           // native MCP tool
-            ev("mcp__codegraph__definition"),       // native MCP tool
+            ev("mcp__codegraph__search"),             // native MCP tool
+            ev("mcp__codegraph__definition"),         // native MCP tool
             ev_cmd("Bash", "codegraph outline x.rs"), // codegraph via Bash
-            ev_cmd("Bash", "grep -rn foo"),          // raw — not codegraph
-            ev("Grep"),                              // raw — not codegraph
-            ev("Read"),                              // unrelated
+            ev_cmd("Bash", "grep -rn foo"),           // raw — not codegraph
+            ev("Grep"),                               // raw — not codegraph
+            ev("Read"),                               // unrelated
         ];
         assert_eq!(count_codegraph_search_tools(&tools), 3);
         assert_eq!(count_codegraph_search_tools(&[]), 0);
@@ -704,8 +723,7 @@ mod tests {
         // Raw search alongside codegraph → only the soft hint, no escalation.
         let mixed = vec![ev("Grep"), ev("mcp__codegraph__search")];
         assert!(
-            count_inefficient_search_tools(&mixed) > 0
-                && count_codegraph_search_tools(&mixed) > 0
+            count_inefficient_search_tools(&mixed) > 0 && count_codegraph_search_tools(&mixed) > 0
         );
     }
 }

@@ -17,6 +17,7 @@
 //!   5. `destroy`  — (optional) tear the sandbox down. Runs from `Drop` so
 //!      it fires even on panic / early return.
 
+use crate::cli::AgentKind;
 use crate::config::{SandboxCommands, SandboxDriverChoice};
 use crate::plugins::store;
 use anyhow::{Context, Result, bail};
@@ -226,6 +227,7 @@ pub struct DriverContext {
     pub spec: Option<PathBuf>,
     pub handle: Option<String>,
     pub base_image: Option<String>,
+    pub agent_setup: String,
     pub spec_slug: Option<String>,
     pub task_id: Option<String>,
 }
@@ -243,6 +245,7 @@ impl DriverContext {
         if let Some(b) = &self.base_image {
             m.insert("base_image", b.clone());
         }
+        m.insert("agent_setup", self.agent_setup.clone());
         if let Some(s) = &self.spec_slug {
             m.insert("spec_slug", s.clone());
         }
@@ -253,14 +256,36 @@ impl DriverContext {
     }
 }
 
+/// Optional setup flag for sandbox drivers that know how to preinstall common
+/// agent CLIs. Empty for agents that either do their own setup or are not
+/// supported by the driver.
+pub fn agent_setup_arg(kind: &AgentKind) -> String {
+    match kind {
+        AgentKind::Claude => "--agent claude".into(),
+        // heyvm's built-in `--agent codex` setup hook currently assumes
+        // `sudo` exists in the base image. The bundled heyvm driver instead
+        // installs Codex from npm during `post_create` when Node is available.
+        AgentKind::Codex | AgentKind::Amp => String::new(),
+        AgentKind::Opencode | AgentKind::Acp { .. } => String::new(),
+    }
+}
+
+/// Choose a practical sandbox image for the selected built-in agent. Codex is
+/// distributed as an npm package in this driver path, so the default Ubuntu
+/// image is swapped for Node when the user has not explicitly chosen a
+/// different image.
+pub fn base_image_for_agent(kind: &AgentKind, configured: String) -> String {
+    match kind {
+        AgentKind::Codex | AgentKind::Amp if configured == "ubuntu:24.04" => "node:22".into(),
+        _ => configured,
+    }
+}
+
 /// Derive a sandbox-name-safe slug from a spec path. Keeps ASCII alphanumerics,
 /// `-` and `_`; everything else (including slashes and the file extension) is
 /// either stripped or replaced with `-`. Empty input → `"spec"`.
 pub fn make_spec_slug(spec_path: &Path) -> String {
-    let stem = spec_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let stem = spec_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let mut out = String::with_capacity(stem.len());
     let mut prev_dash = false;
     for ch in stem.chars() {
@@ -291,17 +316,18 @@ pub fn interpolate(template: &str, vars: &BTreeMap<&'static str, String>) -> Str
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{'
-            && let Some(end) = template[i + 1..].find('}') {
-                let name = &template[i + 1..i + 1 + end];
-                if let Some(val) = vars.get(name) {
-                    out.push_str(val);
-                    i += end + 2;
-                    continue;
-                }
-                out.push_str(&template[i..i + end + 2]);
+            && let Some(end) = template[i + 1..].find('}')
+        {
+            let name = &template[i + 1..i + 1 + end];
+            if let Some(val) = vars.get(name) {
+                out.push_str(val);
                 i += end + 2;
                 continue;
             }
+            out.push_str(&template[i..i + end + 2]);
+            i += end + 2;
+            continue;
+        }
         let ch_len = template[i..]
             .chars()
             .next()
@@ -359,6 +385,7 @@ impl ActiveSandbox {
         cwd: PathBuf,
         spec: Option<PathBuf>,
         base_image: Option<String>,
+        agent_setup: String,
         task_id: Option<String>,
     ) -> Result<Self> {
         let spec_slug = spec.as_deref().map(make_spec_slug);
@@ -367,14 +394,12 @@ impl ActiveSandbox {
             spec,
             handle: None,
             base_image,
+            agent_setup,
             spec_slug,
             task_id,
         };
         let create_cmd = interpolate(&driver.spec.create, &ctx.vars());
-        eprintln!(
-            "[printer] driver[{}] create: {}",
-            driver.plugin, create_cmd
-        );
+        eprintln!("[printer] driver[{}] create: {}", driver.plugin, create_cmd);
         let out = Command::new("sh")
             .arg("-c")
             .arg(&create_cmd)
@@ -398,10 +423,7 @@ impl ActiveSandbox {
             );
         }
         ctx.handle = Some(handle.clone());
-        eprintln!(
-            "[printer] driver[{}] handle: {}",
-            driver.plugin, handle
-        );
+        eprintln!("[printer] driver[{}] handle: {}", driver.plugin, handle);
         let sandbox = Self {
             driver,
             handle,
@@ -501,12 +523,7 @@ impl ActiveSandbox {
             .arg(&cmd_str)
             .current_dir(&self.ctx.cwd)
             .status()
-            .with_context(|| {
-                format!(
-                    "spawning driver `{}` {label}",
-                    self.driver.plugin
-                )
-            })?;
+            .with_context(|| format!("spawning driver `{}` {label}", self.driver.plugin))?;
         if !status.success() {
             bail!(
                 "driver `{}` {label} failed (exit {})",
@@ -766,13 +783,17 @@ mod tests {
             spec: None,
             handle: Some("vm-1".into()),
             base_image: Some("alpine:3.19".into()),
+            agent_setup: "--agent codex".into(),
             spec_slug: Some("foo".into()),
             task_id: None,
         };
         let s = interpolate(
-            "create --base {base_image} --name printer-{spec_slug} on {handle}",
+            "create --base {base_image} {agent_setup} --name printer-{spec_slug} on {handle}",
             &ctx.vars(),
         );
-        assert_eq!(s, "create --base alpine:3.19 --name printer-foo on vm-1");
+        assert_eq!(
+            s,
+            "create --base alpine:3.19 --agent codex --name printer-foo on vm-1"
+        );
     }
 }

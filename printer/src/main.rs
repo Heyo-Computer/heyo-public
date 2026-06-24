@@ -71,9 +71,9 @@ fn dispatch_reinstall_plugin(args: cli::ReinstallPluginArgs) -> anyhow::Result<(
         }
         (true, None) => plugins::reinstall_all(),
         (false, Some(name)) => plugins::reinstall_plugin(name),
-        (false, None) => anyhow::bail!(
-            "missing plugin name. Pass `printer reinstall-plugin <name>` or `--all`"
-        ),
+        (false, None) => {
+            anyhow::bail!("missing plugin name. Pass `printer reinstall-plugin <name>` or `--all`")
+        }
     }
 }
 

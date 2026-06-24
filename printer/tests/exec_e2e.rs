@@ -14,15 +14,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-/// The stub `claude`. `claude --print --output-format json ... <prompt>` passes
-/// the prompt as the final argv, so we branch on its content:
+/// The stub `claude`. `claude --print --output-format json` reads the prompt
+/// from stdin, so we branch on its content:
 /// - review prompt  → emit a one-line PASS verdict
 /// - nudge prompt   → mark every `.printer/tasks/T-*.md` done, emit <<ALL_DONE>>
 /// - anything else  → a no-op "planned" reply (planning / bootstrap turns)
 ///
 /// Single-line JSON keeps `parse_claude` happy without newline escaping.
 const STUB_CLAUDE: &str = r###"#!/bin/sh
-for prompt; do :; done
+prompt=$(cat)
 usage='"usage":{"input_tokens":5,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}'
 case "$prompt" in
   *"reviewing the result"*)
@@ -57,7 +57,8 @@ fn git(dir: &Path, args: &[&str]) {
 
 #[test]
 fn exec_drives_spec_to_done_with_metrics() {
-    let printer_bin = env!("CARGO_BIN_EXE_printer");
+    let printer_bin =
+        fs::canonicalize(env!("CARGO_BIN_EXE_printer")).expect("resolve printer binary");
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -86,7 +87,7 @@ fn exec_drives_spec_to_done_with_metrics() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let output = Command::new(printer_bin)
+    let output = Command::new(&printer_bin)
         .args([
             "exec",
             spec.to_str().unwrap(),
@@ -97,7 +98,7 @@ fn exec_drives_spec_to_done_with_metrics() {
             "--skip-plugin-check",
         ])
         .env("PATH", &path)
-        .env("PRINTER_BIN", printer_bin)
+        .env("PRINTER_BIN", &printer_bin)
         // Keep config/plugin lookups out of the developer's real ~/.printer.
         .env("HOME", root)
         .current_dir(root)
@@ -142,11 +143,17 @@ fn exec_drives_spec_to_done_with_metrics() {
     let metrics = fs::read_to_string(root.join(".printer/metrics.jsonl"))
         .expect(".printer/metrics.jsonl exists");
     assert!(metrics.contains("\"phase\":\"run\""), "no run metrics row");
-    assert!(metrics.contains("\"phase\":\"review\""), "no review metrics row");
+    assert!(
+        metrics.contains("\"phase\":\"review\""),
+        "no review metrics row"
+    );
     assert!(
         metrics.contains("\"phase\":\"exec-total\""),
         "no exec-total metrics row"
     );
     // Stub reported non-zero usage, so rows must carry token counts.
-    assert!(metrics.contains("\"input_tokens\":5"), "token usage not recorded");
+    assert!(
+        metrics.contains("\"input_tokens\":5"),
+        "token usage not recorded"
+    );
 }

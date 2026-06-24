@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]
-#[command(name = "printer", about = "Drive a Claude/opencode session against a markdown spec")]
+#[command(
+    name = "printer",
+    about = "Drive a Claude/Codex/Amp/opencode session against a markdown spec"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -551,6 +554,8 @@ pub enum ConfigCommand {
 ///
 /// CLI form (case-insensitive):
 /// - `claude` → built-in one-shot Claude CLI
+/// - `codex` → built-in one-shot Codex CLI
+/// - `amp` → built-in one-shot Amp CLI
 /// - `opencode` → built-in one-shot opencode CLI
 /// - `acp` → ACP server, launched from `--acp-bin` and `--acp-arg`
 /// - `acp:<name>` → ACP server contributed by an installed plugin's
@@ -558,6 +563,8 @@ pub enum ConfigCommand {
 #[derive(Clone, Debug)]
 pub enum AgentKind {
     Claude,
+    Codex,
+    Amp,
     Opencode,
     Acp { name: Option<String> },
 }
@@ -566,6 +573,8 @@ impl std::fmt::Display for AgentKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AgentKind::Claude => f.write_str("claude"),
+            AgentKind::Codex => f.write_str("codex"),
+            AgentKind::Amp => f.write_str("amp"),
             AgentKind::Opencode => f.write_str("opencode"),
             AgentKind::Acp { name: None } => f.write_str("acp"),
             AgentKind::Acp { name: Some(n) } => write!(f, "acp:{n}"),
@@ -574,7 +583,7 @@ impl std::fmt::Display for AgentKind {
 }
 
 /// Clap value parser. Wraps `AgentKind::from_str` so the `--agent` flag accepts
-/// the same forms (`claude`, `opencode`, `acp`, `acp:<name>`) without needing
+/// the same forms (`claude`, `codex`, `amp`, `opencode`, `acp`, `acp:<name>`) without needing
 /// a `ValueEnum` derive — `acp:<name>` carries a payload that ValueEnum can't
 /// model.
 fn parse_agent_kind(s: &str) -> Result<AgentKind, String> {
@@ -587,6 +596,8 @@ impl FromStr for AgentKind {
         let lower = s.to_ascii_lowercase();
         match lower.as_str() {
             "claude" => Ok(AgentKind::Claude),
+            "codex" => Ok(AgentKind::Codex),
+            "amp" => Ok(AgentKind::Amp),
             "opencode" => Ok(AgentKind::Opencode),
             "acp" => Ok(AgentKind::Acp { name: None }),
             other => {
@@ -602,7 +613,7 @@ impl FromStr for AgentKind {
                     })
                 } else {
                     Err(format!(
-                        "unknown agent `{s}` (expected one of: claude, opencode, acp, acp:<name>)"
+                        "unknown agent `{s}` (expected one of: claude, codex, amp, opencode, acp, acp:<name>)"
                     ))
                 }
             }
@@ -616,7 +627,12 @@ mod tests {
 
     #[test]
     fn parses_builtin_agents() {
-        assert!(matches!(AgentKind::from_str("claude"), Ok(AgentKind::Claude)));
+        assert!(matches!(
+            AgentKind::from_str("claude"),
+            Ok(AgentKind::Claude)
+        ));
+        assert!(matches!(AgentKind::from_str("codex"), Ok(AgentKind::Codex)));
+        assert!(matches!(AgentKind::from_str("amp"), Ok(AgentKind::Amp)));
         assert!(matches!(
             AgentKind::from_str("opencode"),
             Ok(AgentKind::Opencode)
@@ -625,6 +641,8 @@ mod tests {
             AgentKind::from_str("CLAUDE"),
             Ok(AgentKind::Claude)
         ));
+        assert!(matches!(AgentKind::from_str("CODEX"), Ok(AgentKind::Codex)));
+        assert!(matches!(AgentKind::from_str("AMP"), Ok(AgentKind::Amp)));
     }
 
     #[test]
@@ -656,7 +674,7 @@ mod tests {
 
     #[test]
     fn display_round_trips() {
-        for s in ["claude", "opencode", "acp", "acp:poolside"] {
+        for s in ["claude", "codex", "amp", "opencode", "acp", "acp:poolside"] {
             let parsed = AgentKind::from_str(s).unwrap();
             assert_eq!(parsed.to_string(), s);
         }

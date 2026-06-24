@@ -55,10 +55,11 @@ pub fn extract_section(report: &str, heading: &str) -> Option<String> {
     for (i, line) in lines.by_ref() {
         let l = line.trim();
         if let Some(rest) = l.strip_prefix("## ")
-            && rest.trim().to_ascii_lowercase() == needle.strip_prefix("## ").unwrap_or(&needle) {
-                start = Some(i + 1);
-                break;
-            }
+            && rest.trim().to_ascii_lowercase() == needle.strip_prefix("## ").unwrap_or(&needle)
+        {
+            start = Some(i + 1);
+            break;
+        }
     }
     let start = start?;
     let collected: Vec<&str> = report
@@ -88,8 +89,7 @@ pub fn write_followups(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "spec".to_string());
     let dir = cwd.join(".printer").join("followups");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let out = dir.join(format!("{stem}.md"));
     let body = extract_section(report, "## Suggested follow-ups").unwrap_or_else(|| "none".into());
     let now = chrono::Utc::now().to_rfc3339();
@@ -173,11 +173,16 @@ pub async fn review_with_sandbox(
         .canonicalize()
         .with_context(|| format!("spec file not found: {}", args.spec.display()))?;
     let cwd = match args.cwd.as_deref() {
-        Some(p) => Some(p.canonicalize().with_context(|| format!("--cwd not found: {}", p.display()))?),
+        Some(p) => Some(
+            p.canonicalize()
+                .with_context(|| format!("--cwd not found: {}", p.display()))?,
+        ),
         None => None,
     };
     let cwd_ref = cwd.as_deref();
-    let cwd_for_hook = cwd.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let cwd_for_hook = cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let base = match args.base {
         Some(b) => b,
@@ -211,7 +216,10 @@ pub async fn review_with_sandbox(
     let resolved_skills = skills::resolve(&all_skill_paths, Some(&default_skills_root))?;
     if !resolved_skills.is_empty() {
         let names: Vec<&str> = resolved_skills.iter().map(|s| s.name.as_str()).collect();
-        eprintln!("[printer] skills available to reviewer: {}", names.join(", "));
+        eprintln!(
+            "[printer] skills available to reviewer: {}",
+            names.join(", ")
+        );
     }
 
     if let Some(sb) = sandbox {
@@ -222,11 +230,8 @@ pub async fn review_with_sandbox(
         );
     }
     let wrapper = sandbox.map(|s| s.enter_template());
-    let acp = crate::agents::resolve_acp_launch(
-        &args.agent,
-        args.acp_bin.as_deref(),
-        &args.acp_args,
-    )?;
+    let acp =
+        crate::agents::resolve_acp_launch(&args.agent, args.acp_bin.as_deref(), &args.acp_args)?;
     let agent = AgentInvocation {
         kind: args.agent.clone(),
         model: args.model.as_deref(),
@@ -295,9 +300,10 @@ pub async fn review_with_sandbox(
     // Verbose: surface the verification commands the reviewer claims to have
     // run as a distinct stderr block (the full report already went to stdout).
     if args.verbose
-        && let Some(verification) = extract_section(&report, "## Verification") {
-            eprintln!("[printer] review verification:\n{}", verification.trim());
-        }
+        && let Some(verification) = extract_section(&report, "## Verification")
+    {
+        eprintln!("[printer] review verification:\n{}", verification.trim());
+    }
 
     let followups_cwd = cwd
         .clone()
@@ -334,9 +340,17 @@ fn is_ui_path(path: &str) -> bool {
     if UI_EXTS.iter().any(|e| p.ends_with(e)) {
         return true;
     }
-    if [".ts", ".js", ".mjs", ".cjs"].iter().any(|e| p.ends_with(e)) {
+    if [".ts", ".js", ".mjs", ".cjs"]
+        .iter()
+        .any(|e| p.ends_with(e))
+    {
         const UI_DIRS: &[&str] = &[
-            "web/", "frontend/", "ui/", "client/", "src/components/", "app/",
+            "web/",
+            "frontend/",
+            "ui/",
+            "client/",
+            "src/components/",
+            "app/",
         ];
         return UI_DIRS.iter().any(|d| p.contains(d));
     }
@@ -444,7 +458,11 @@ fn acquire_sandbox(args: &ReviewArgs) -> Result<Option<ActiveSandbox>> {
         merged,
         cwd,
         Some(spec),
-        Some(cfg.sandbox.base_image.clone()),
+        Some(crate::drivers::base_image_for_agent(
+            &args.agent,
+            cfg.sandbox.base_image.clone(),
+        )),
+        crate::drivers::agent_setup_arg(&args.agent),
         None,
     )?))
 }
@@ -458,9 +476,10 @@ pub(crate) fn detect_base(cwd: Option<&Path>) -> Option<String> {
             cmd.current_dir(d);
         }
         if let Ok(out) = cmd.output()
-            && out.status.success() {
-                return Some(candidate.to_string());
-            }
+            && out.status.success()
+        {
+            return Some(candidate.to_string());
+        }
     }
     None
 }
@@ -504,7 +523,6 @@ mod tests {
         assert_eq!(cap_verdict_for_unverified_ui(Partial, true, false), Partial);
         assert_eq!(cap_verdict_for_unverified_ui(Unknown, true, false), Unknown);
     }
-
 
     #[test]
     fn ui_path_matches_ts_js_under_frontend_dirs() {
@@ -573,10 +591,7 @@ mod tests {
         std::fs::write(&spec, "spec body").unwrap();
         let report = "## Verdict\nPARTIAL\n\n## Suggested follow-ups\n- thing one\n- thing two\n";
         let out = write_followups(dir.path(), &spec, Verdict::Partial, report).unwrap();
-        assert_eq!(
-            out,
-            dir.path().join(".printer/followups/003-followups.md")
-        );
+        assert_eq!(out, dir.path().join(".printer/followups/003-followups.md"));
         let body = std::fs::read_to_string(&out).unwrap();
         assert!(body.contains("Verdict: PARTIAL"));
         assert!(body.contains("- thing one"));
@@ -588,8 +603,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spec = dir.path().join("foo.md");
         std::fs::write(&spec, "x").unwrap();
-        let out =
-            write_followups(dir.path(), &spec, Verdict::Pass, "## Verdict\nPASS\n").unwrap();
+        let out = write_followups(dir.path(), &spec, Verdict::Pass, "## Verdict\nPASS\n").unwrap();
         let body = std::fs::read_to_string(&out).unwrap();
         assert!(body.contains("Verdict: PASS"));
         assert!(body.trim_end().ends_with("none"));

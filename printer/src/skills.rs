@@ -22,10 +22,11 @@ pub fn resolve(explicit: &[PathBuf], default_root: Option<&Path>) -> Result<Vec<
     }
     if explicit.is_empty()
         && let Some(root) = default_root
-            && root.is_dir() {
-                collect_skill_files(root, &mut paths)
-                    .with_context(|| format!("scanning default skills root {}", root.display()))?;
-            }
+        && root.is_dir()
+    {
+        collect_skill_files(root, &mut paths)
+            .with_context(|| format!("scanning default skills root {}", root.display()))?;
+    }
 
     paths.sort();
     paths.dedup();
@@ -68,8 +69,8 @@ fn collect_skill_files(p: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     }
 
     let mut found_any = false;
-    for entry in fs::read_dir(&canon)
-        .with_context(|| format!("reading directory {}", canon.display()))?
+    for entry in
+        fs::read_dir(&canon).with_context(|| format!("reading directory {}", canon.display()))?
     {
         let entry = entry?;
         let child = entry.path();
@@ -173,6 +174,9 @@ mod tests {
         }
         let skills = resolve(&[], Some(&root)).unwrap();
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"computer"), "expected computer skill, got {names:?}");
+        assert!(
+            names.contains(&"computer"),
+            "expected computer skill, got {names:?}"
+        );
     }
 }

@@ -57,6 +57,8 @@ npx skills add heyo-computer/printer
 
 - **Rust toolchain** — `rustc` and `cargo` (install via [rustup](https://rustup.rs))
 - **An agent CLI** — at least one of:
+  - [Codex CLI](https://developers.openai.com/codex/cli) — `codex` on `$PATH`
+  - [Amp CLI](https://ampcode.com/manual) — `amp` on `$PATH`
   - [OpenCode](https://opencode.ai) — `opencode` on `$PATH`
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) — `claude` on `$PATH`
 
@@ -167,6 +169,8 @@ This creates the `.printer/` task store and `.codegraph/` index directory.
 ```sh
 printer exec spec.md             # run + review in one command
 printer exec spec.md --verbose   # with live progress output
+printer exec spec.md --agent codex               # use Codex CLI backend
+printer exec spec.md --agent amp                 # use Amp CLI backend
 printer exec spec.md --agent opencode            # use opencode one-shot backend
 printer exec spec.md --agent acp:opencode-acp    # use opencode ACP (persistent sessions)
 printer test spec.md             # click-test a UI/web change with the computer tool

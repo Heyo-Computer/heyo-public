@@ -104,7 +104,14 @@ pub fn append(cwd: &Path, rec: &MetricsRecord) -> Result<()> {
 
 /// Best-effort wrapper: append and log on failure instead of propagating, for
 /// call sites that must never fail a run over a metrics write.
-pub fn record(cwd: &Path, spec: &str, phase: &str, agent: String, model: Option<String>, usage: TokenUsage) {
+pub fn record(
+    cwd: &Path,
+    spec: &str,
+    phase: &str,
+    agent: String,
+    model: Option<String>,
+    usage: TokenUsage,
+) {
     let rec = MetricsRecord::new(spec.to_string(), phase, agent, model, usage);
     if let Err(e) = append(cwd, &rec) {
         eprintln!("[printer] warning: failed to write metrics ({phase}): {e}");
