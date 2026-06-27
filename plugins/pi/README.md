@@ -27,8 +27,9 @@ Supported codegraph languages: Rust, Python, JavaScript, TypeScript.
 
 ## Prerequisites
 
-The `codegraph` (and optionally `computer`) binaries must be on `PATH`. From
-the [printer](https://github.com/sarocu/printer) repo root:
+The `codegraph` binary is required; `computer` is optional (only needed for the
+`computer_*` desktop tools). Both must be on `PATH`. From the
+[printer](https://github.com/sarocu/printer) repo root:
 
 ```sh
 make install-codegraph install-computer   # → ~/.local/bin
@@ -85,6 +86,8 @@ cd plugins/pi
 npm install            # dev-only typings (pi provides the runtime)
 npm run typecheck      # tsc --noEmit
 node scripts/smoke.mjs # exercises the tools against the repo's real index
+                       # needs Node >= 23.6 for .ts imports, or on 22.x:
+                       #   node --experimental-strip-types scripts/smoke.mjs
 ```
 
 ## Troubleshooting
