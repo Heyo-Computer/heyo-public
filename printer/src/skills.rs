@@ -10,7 +10,7 @@ pub struct Skill {
 }
 
 /// Resolve `--skill` arguments and an optional default skills root (e.g.
-/// `.claude/skills/`) into a flat list of skills. Each input may be a
+/// `skills/`) into a flat list of skills. Each input may be a
 /// `SKILL.md` file directly, a directory containing `SKILL.md`, or a
 /// directory of skill directories. Duplicate skill files are de-duplicated
 /// by canonical path.

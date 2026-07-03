@@ -188,20 +188,26 @@ heyvm connect pair-session --shell
 
 ---
 
-## Binding a Local Sandbox Port
+## Binding a Sandbox Port
 
 ### `heyvm bind <ID_OR_SLUG> <PORT>`
 
-Proxies a **local** sandbox port to a public hostname. Requires the `API_HOSTNAME` environment variable.
+Proxies a sandbox port to a public `*.heyo.computer` hostname. Works for both **local** and **deployed (cloud)** sandboxes — the command auto-detects which based on whether the id/slug resolves locally first.
 
 ```bash
-API_HOSTNAME=heyo.computer heyvm bind my-sandbox 8080
+# Local sandbox: requires API_HOSTNAME (the public hostname your local proxy answers on)
+API_HOSTNAME=heyo.computer heyvm bind my-local-vm 8080
+
+# Cloud (deployed) sandbox: no env vars needed, just be logged in
+heyvm bind my-deployed-sandbox 8080
+
+# Make the bound endpoint private (requires Heyo auth to reach it)
+heyvm bind my-sandbox 8080 --private
 ```
 
-**Important:** `heyvm bind` only works for **local** sandboxes. For
-deployed (cloud) sandboxes, expose ports at deploy time with `heyvm
-create --cloud --port <p>` (or `--deploy-from --port <p>` on Linux).
-See the **heyvm-deploy** skill.
+Behind the scenes, cloud sandboxes hit the `POST /proxy-endpoints/for-deployed` API; local sandboxes use the local proxy daemon. The `--private` flag flips `is_public` to `false` for either path.
+
+**Note on toggling privacy:** there is no in-place toggle. To change `is_public` on an existing binding, delete the endpoint first (`DELETE /proxy-endpoints/<subdomain>` via the cloud API) and then `heyvm bind` again with the desired `--private` flag.
 
 ---
 

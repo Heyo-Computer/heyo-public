@@ -244,8 +244,8 @@ pub struct ReviewArgs {
 
     /// Make a skill available to the review agent. Accepts a path to a
     /// `SKILL.md`, a single skill directory, or a parent directory of skill
-    /// directories (e.g. `.claude/skills/`). Repeatable. If omitted,
-    /// `.claude/skills/` in the agent cwd is auto-discovered.
+    /// directories (e.g. `skills/`). Repeatable. If omitted, `skills/` in the
+    /// agent cwd is auto-discovered.
     #[arg(long = "skill", value_name = "PATH")]
     pub skills: Vec<PathBuf>,
 
@@ -308,8 +308,8 @@ pub struct TestArgs {
     pub permission_mode: String,
 
     /// Make a skill available to the test agent (path to a `SKILL.md`, a skill
-    /// dir, or a parent dir). Repeatable. Defaults to auto-discovering
-    /// `.claude/skills/` in the agent cwd.
+    /// dir, or a parent dir). Repeatable. Defaults to auto-discovering `skills/`
+    /// in the agent cwd.
     #[arg(long = "skill", value_name = "PATH")]
     pub skills: Vec<PathBuf>,
 
