@@ -60,3 +60,64 @@ Next step:
 ```sh
 git switch -c step3
 ```
+
+## Step 3: Create The Preview VM
+
+Branch: `step3`
+
+```sh
+git switch step2
+git switch -c step3
+
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  create --cloud \
+  --name fremont-fishing-app \
+  --backend libvirt \
+  --region US \
+  --image ubuntu:24.04 \
+  --size-class small \
+  --start-command 'sleep infinity' \
+  --port 3000 \
+  --format json
+```
+
+Expected result:
+
+```text
+id: dep-5468531a
+name: fremont-fishing-app
+status: running
+url: https://7ghz33.heyo.computer
+```
+
+List the preview VM:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  list --all
+```
+
+Access the VM shell:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  sh dep-5468531a
+```
+
+The URL is allocated through the public Heyo ingress, but the VM belongs to
+preview because it was created with `HEYO_PREVIEW_CLOUD` and
+`HEYO_PREVIEW_AUTH`. It will not show the app until a later step starts a web
+server on port 3000:
+
+```text
+https://7ghz33.heyo.computer
+```
+
+Next step:
+
+```sh
+git switch -c step4
+```

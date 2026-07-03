@@ -33,8 +33,8 @@ heyvm --cloud-url "$HEYO_CLOUD_URL" --auth-url "$HEYO_AUTH_URL" <command> ...
 Common preview values:
 
 ```sh
-export HEYO_PREVIEW_CLOUD=https://server.preview.heyo.computer
-export HEYO_PREVIEW_AUTH=https://auth.preview.heyo.computer
+export HEYO_PREVIEW_CLOUD=https://preview.heyo.computer/cloud
+export HEYO_PREVIEW_AUTH=https://preview.heyo.computer/auth
 ```
 
 Preview and production backends should be Linux. For cloud dev sandboxes, use
@@ -96,7 +96,8 @@ heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" --auth-url "$HEYO_PREVIEW_AUTH" \
   --port 3000
 ```
 
-Ship local source to an existing deployed sandbox:
+Cloud sandboxes do not bind-mount the host working directory at creation time.
+Ship local source to `/workspace` with an archive:
 
 ```sh
 archive_id=$(heyvm archive-dir . --name <name>-$(date +%Y%m%d%H%M%S) --format json | jq -r '.id')
