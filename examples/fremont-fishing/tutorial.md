@@ -30,3 +30,33 @@ Next step:
 ```sh
 git switch -c step2
 ```
+
+## Step 2: Log In To Preview
+
+Branch: `step2`
+
+```sh
+git switch step1
+git switch -c step2
+
+export HEYO_PREVIEW_CLOUD=https://preview.heyo.computer/cloud
+export HEYO_PREVIEW_AUTH=https://preview.heyo.computer/auth
+
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  login --email bob.wilson@example.com
+```
+
+Verify:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  list --all
+```
+
+Next step:
+
+```sh
+git switch -c step3
+```
