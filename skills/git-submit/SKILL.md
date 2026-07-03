@@ -1,6 +1,6 @@
 ---
 name: git-submit
-description: Use and troubleshoot Heyo git submit CI/CD: install or upgrade the git-submit client, configure endpoints, submit branches, handle submodules, inspect CI runs, and clean up retained VM-backed jobs.
+description: "Use and troubleshoot Heyo git submit CI/CD: install or upgrade the git-submit client, configure endpoints, submit branches, handle submodules, inspect CI runs, and clean up retained VM-backed jobs."
 ---
 
 # git-submit
