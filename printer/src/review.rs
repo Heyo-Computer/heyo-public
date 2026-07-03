@@ -208,8 +208,8 @@ pub async fn review_with_sandbox(
     let injected_block = agent_contrib.render_prompt_block();
 
     let default_skills_root = cwd_ref
-        .map(|d| d.join(".claude").join("skills"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".claude/skills"));
+        .map(|d| d.join("skills"))
+        .unwrap_or_else(|| std::path::PathBuf::from("skills"));
     // Merge user-supplied --skill paths with hook-contributed skill paths.
     let mut all_skill_paths = args.skills.clone();
     all_skill_paths.extend(agent_contrib.skills.iter().cloned());

@@ -1,4 +1,20 @@
-# Printer
+# Heyo Public
+
+This is the public Heyo monorepo. It contains the open-source `printer` code
+factory CLI, supporting CLIs, plugins, examples, docs, and reusable agent
+skills.
+
+## Repository layout
+
+- `printer/` — core CLI that manages agent sessions against a spec file.
+- `computer/` — CLI for programmatic desktop interactions on Linux/Wayland.
+- `codegraph/` — tree-sitter based code graph, search, and patch tooling.
+- `plugins/` — printer plugins for agent integrations, codegraph, heyvm, and related tooling.
+- `skills/` — reusable public skills and skill guides for agents; see `skills/README.md`.
+- `examples/` — example projects and specs.
+
+## Printer
+
 In the "Bobiverse", the printer is the technology that enables the Bobs' self replicating journey across the stars. The printer works at the atomic level and can produce any good, including more printers and the equipment to replicate the Bobs themselves. In this future, humans trade time on the printers as currency. They are the foundation of the universe's economic and scientific ambitions.
 
 LLMs are good at writing code. Actually, that's probably what they are best at. Integrating "tools" and running in a loop creates the powerful "agent" paradigm. One more layer of abstraction is the "code factory" which uses a system of agents to produce software autonomously from a specification. Now, humans can produce a lot of software by managing an agent and poking it when it needs to keep going; this commands a lot of attention from a human and ultimately becomes a bottleneck in agentic development and the code factory pattern tries to solve for that particular bottleneck by allowing the human to draft requirements and then startup the factory before moving on to another task or factory. There are complications of course; a system of agents has a lot of moving parts and can burn tokens at an exorbitant rate. 
@@ -46,7 +62,9 @@ review`) when you need the `computer` tool to click-test.
 the Printer CLI can install a plugin for Claude and OpenCode agents to utilize `codegraph` for searching and patching files. 
 
 ### Skills
-Skills are made available to the agents during run and review.
+Skills are made available to the agents during run and review. The source of
+truth is the top-level `skills/` directory. Broader skill authoring and workflow
+guides live alongside individual skills, for example `skills/SKILLS.md`.
 ```bash
 npx skills add heyo-computer/printer
 ```

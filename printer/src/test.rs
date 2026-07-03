@@ -52,8 +52,8 @@ pub async fn test(args: TestArgs) -> Result<()> {
     eprintln!("[printer] click-testing change against base ref: {base}");
 
     let default_skills_root = cwd_ref
-        .map(|d| d.join(".claude").join("skills"))
-        .unwrap_or_else(|| PathBuf::from(".claude/skills"));
+        .map(|d| d.join("skills"))
+        .unwrap_or_else(|| PathBuf::from("skills"));
     let resolved_skills = skills::resolve(&args.skills, Some(&default_skills_root))?;
     if !resolved_skills.is_empty() {
         let names: Vec<&str> = resolved_skills.iter().map(|s| s.name.as_str()).collect();
