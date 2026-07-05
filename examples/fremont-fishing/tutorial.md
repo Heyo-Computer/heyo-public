@@ -214,3 +214,53 @@ Next step:
 ```sh
 git switch -c step5
 ```
+
+## Step 5: Build The App Inside The VM
+
+Branch: `step5`
+
+Inside the VM:
+
+```sh
+cd /workspace
+codex
+```
+
+Use this prompt:
+
+```text
+Read spec.md and tutorial.md. Build the Fremont fishing app in /workspace.
+Use Vite + React + TypeScript. Keep npm start serving the production build on
+0.0.0.0:3000. Verify with npm install, npm run build, npm start, curl -I
+http://localhost:3000/, and npm audit --audit-level=moderate.
+```
+
+Expected result:
+
+```text
+npm install passes
+npm run build passes
+npm start serves on 0.0.0.0:3000
+curl -I http://localhost:3000/ returns HTTP/1.1 200 OK
+npm audit --audit-level=moderate reports 0 vulnerabilities
+```
+
+Copy the VM workspace back to this branch, excluding generated directories:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  exec dep-0a30245b -- bash -lc \
+  'cd /workspace && tar --exclude=node_modules --exclude=dist --exclude=.git -czf - . | base64 -w 0' \
+  > /tmp/fremont-fishing-step5.b64
+
+tail -n +2 /tmp/fremont-fishing-step5.b64 > /tmp/fremont-fishing-step5.clean.b64
+base64 -D < /tmp/fremont-fishing-step5.clean.b64 > /tmp/fremont-fishing-step5.tar.gz
+tar -xzf /tmp/fremont-fishing-step5.tar.gz -C examples/fremont-fishing
+```
+
+Next step:
+
+```sh
+git switch -c step6
+```
