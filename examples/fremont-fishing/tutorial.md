@@ -85,10 +85,10 @@ heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
 Expected result:
 
 ```text
-id: dep-5468531a
+id: <deployment-id>
 name: fremont-fishing-app
 status: running
-url: https://7ghz33.heyo.computer
+url: https://<subdomain>.preview.heyo.computer
 ```
 
 List the preview VM:
@@ -99,21 +99,33 @@ heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
   list --all
 ```
 
+Verified in this run:
+
+```text
+id: dep-0a30245b
+name: fremont-fishing-app
+status: running
+url: https://vxze11.preview.heyo.computer
+```
+
 Access the VM shell:
 
 ```sh
 heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
   --auth-url "$HEYO_PREVIEW_AUTH" \
-  sh dep-5468531a
+  sh dep-0a30245b
 ```
 
-The URL is allocated through the public Heyo ingress, but the VM belongs to
-preview because it was created with `HEYO_PREVIEW_CLOUD` and
-`HEYO_PREVIEW_AUTH`. It will not show the app until a later step starts a web
-server on port 3000:
+The VM belongs to preview because it was created with `HEYO_PREVIEW_CLOUD` and
+`HEYO_PREVIEW_AUTH` and appears in the preview `list --all` output. It will not
+show the app until a later step starts a web server on port 3000.
+
+Known issue observed in this run: `create --format json` printed
+`https://vxze11.heyo.computer`, while `list --all` returned the correct preview
+URL:
 
 ```text
-https://7ghz33.heyo.computer
+https://vxze11.preview.heyo.computer
 ```
 
 Next step:
