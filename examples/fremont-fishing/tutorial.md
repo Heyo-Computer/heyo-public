@@ -133,3 +133,84 @@ Next step:
 ```sh
 git switch -c step4
 ```
+
+## Step 4: Enter The VM And Start Codex
+
+Branch: `step4`
+
+Upload the current tutorial workspace into the VM:
+
+```sh
+ARCHIVE_ID=$(heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  archive-dir examples/fremont-fishing \
+  --name fremont-fishing-step4 \
+  --format json | jq -r '.id')
+
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  update dep-0a30245b --archive "$ARCHIVE_ID"
+```
+
+Verified archive:
+
+```text
+ar-e4888e6f
+```
+
+Install the tools needed for Codex work inside the preview VM:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  exec dep-0a30245b -- bash -lc '
+    set -euo pipefail
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends ca-certificates curl git jq
+    if ! command -v node >/dev/null 2>&1; then
+      curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
+      sudo apt-get install -y nodejs
+    fi
+    if ! command -v codex >/dev/null 2>&1; then
+      sudo npm install -g @openai/codex
+    fi
+    node --version
+    npm --version
+    codex --version
+  '
+```
+
+Verified versions:
+
+```text
+node v22.23.1
+npm 10.9.8
+codex-cli 0.142.5
+```
+
+Open a shell in the VM:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  sh dep-0a30245b
+```
+
+Inside the VM:
+
+```sh
+cd /workspace
+codex
+```
+
+Use this first prompt:
+
+```text
+Read /workspace/spec.md and this tutorial. Do not edit files yet. Summarize the app requirements and the next implementation steps.
+```
+
+Next step:
+
+```sh
+git switch -c step5
+```
