@@ -10,7 +10,7 @@ skills.
 - `computer/` — CLI for programmatic desktop interactions on Linux/Wayland.
 - `codegraph/` — tree-sitter based code graph, search, and patch tooling.
 - `plugins/` — printer plugins for agent integrations, codegraph, heyvm, and related tooling.
-- `skills/` — reusable public skills and skill guides for agents; see `skills/README.md`.
+- `skills/` — reusable public agent skills. The top-level catalog is intentionally small: `heyvm` and `git-submit`.
 - `examples/` — example projects and specs.
 
 ## Printer
@@ -62,9 +62,14 @@ review`) when you need the `computer` tool to click-test.
 the Printer CLI can install a plugin for Claude and OpenCode agents to utilize `codegraph` for searching and patching files. 
 
 ### Skills
-Skills are made available to the agents during run and review. The source of
-truth is the top-level `skills/` directory. Broader skill authoring and workflow
-guides live alongside individual skills, for example `skills/SKILLS.md`.
+Skills are made available to agents during run and review. The top-level
+`skills/` directory is intentionally small and uses CLI help as the source of
+truth:
+
+- `skills/heyvm/SKILL.md` — Heyo VM, sandbox, cloud, proxy, database, image, and backend workflows.
+- `skills/git-submit/SKILL.md` — Heyo git submit CI/CD, upgrades, submodules, run inspection, and cleanup.
+
+Plugin-specific skills still live under their plugin packages in `plugins/*/skills`.
 ```bash
 npx skills add heyo-computer/printer
 ```

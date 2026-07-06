@@ -1,7 +1,7 @@
 {
-  "name": "fremont-fishing-holes",
+  "name": "fremont-fishing",
+  "version": "1.0.0",
   "private": true,
-  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
@@ -10,15 +10,14 @@
     "start": "vite preview --host 0.0.0.0 --port 3000"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^5.1.2",
-    "vite": "^7.3.0",
-    "typescript": "^5.9.3",
-    "react": "^19.2.3",
-    "react-dom": "^19.2.3",
-    "lucide-react": "^0.562.0"
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.7",
+    "typescript": "^5.7.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@types/react": "^19.2.7",
-    "@types/react-dom": "^19.2.3"
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2"
   }
 }
