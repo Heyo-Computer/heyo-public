@@ -69,10 +69,12 @@ Branch: `step3`
 git switch step2
 git switch -c step3
 
+export FREMONT_VM=fremont-fishing-app
+
 heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
   --auth-url "$HEYO_PREVIEW_AUTH" \
   create --cloud \
-  --name fremont-fishing-app \
+  --name "$FREMONT_VM" \
   --backend libvirt \
   --region US \
   --image ubuntu:24.04 \
@@ -99,34 +101,17 @@ heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
   list --all
 ```
 
-Verified in this run:
-
-```text
-id: dep-0a30245b
-name: fremont-fishing-app
-status: running
-url: https://vxze11.preview.heyo.computer
-```
-
 Access the VM shell:
 
 ```sh
 heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
   --auth-url "$HEYO_PREVIEW_AUTH" \
-  sh dep-0a30245b
+  sh "$FREMONT_VM"
 ```
 
 The VM belongs to preview because it was created with `HEYO_PREVIEW_CLOUD` and
 `HEYO_PREVIEW_AUTH` and appears in the preview `list --all` output. It will not
 show the app until a later step starts a web server on port 3000.
-
-Known issue observed in this run: `create --format json` printed
-`https://vxze11.heyo.computer`, while `list --all` returned the correct preview
-URL:
-
-```text
-https://vxze11.preview.heyo.computer
-```
 
 Next step:
 
@@ -149,13 +134,7 @@ ARCHIVE_ID=$(heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
 
 heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
   --auth-url "$HEYO_PREVIEW_AUTH" \
-  update dep-0a30245b --archive "$ARCHIVE_ID"
-```
-
-Verified archive:
-
-```text
-ar-e4888e6f
+  update "$FREMONT_VM" --archive "$ARCHIVE_ID"
 ```
 
 Install the tools needed for Codex work inside the preview VM:
@@ -163,7 +142,7 @@ Install the tools needed for Codex work inside the preview VM:
 ```sh
 heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
   --auth-url "$HEYO_PREVIEW_AUTH" \
-  exec dep-0a30245b -- bash -lc '
+  exec "$FREMONT_VM" -- bash -lc '
     set -euo pipefail
     sudo apt-get update
     sudo apt-get install -y --no-install-recommends ca-certificates curl git jq
@@ -193,7 +172,7 @@ Open a shell in the VM:
 ```sh
 heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
   --auth-url "$HEYO_PREVIEW_AUTH" \
-  sh dep-0a30245b
+  sh "$FREMONT_VM"
 ```
 
 Inside the VM:
@@ -250,7 +229,7 @@ Copy the VM workspace back to this branch, excluding generated directories:
 ```sh
 heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
   --auth-url "$HEYO_PREVIEW_AUTH" \
-  exec dep-0a30245b -- bash -lc \
+  exec "$FREMONT_VM" -- bash -lc \
   'cd /workspace && tar --exclude=node_modules --exclude=dist --exclude=.git -czf - . | base64 -w 0' \
   > /tmp/fremont-fishing-step5.b64
 
@@ -263,4 +242,63 @@ Next step:
 
 ```sh
 git switch -c step6
+```
+
+## Step 6: Run And Verify The Preview App
+
+Branch: `step6`
+
+Use the same preview VM from Step 3:
+
+```sh
+git switch step5
+git switch -c step6
+
+export HEYO_PREVIEW_CLOUD=https://preview.heyo.computer/cloud
+export HEYO_PREVIEW_AUTH=https://preview.heyo.computer/auth
+export FREMONT_VM=fremont-fishing-app
+```
+
+Install dependencies and build inside the VM:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  exec "$FREMONT_VM" -- bash -lc \
+  'cd /workspace && npm ci && npm run build && npm audit --audit-level=moderate'
+```
+
+Make the VM start the production server on port 3000:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  edit-start-command "$FREMONT_VM" \
+  --working-directory /workspace \
+  --start-command 'npm start'
+```
+
+Wait for the app to answer:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  wait-for "$FREMONT_VM" 3000 --path / --timeout 120s
+```
+
+Find and verify the preview URL:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" \
+  --auth-url "$HEYO_PREVIEW_AUTH" \
+  list --all
+
+export FREMONT_URL=https://<subdomain>.preview.heyo.computer
+curl -I "$FREMONT_URL"
+```
+
+Expected result:
+
+```text
+HTTP/2 200
 ```
