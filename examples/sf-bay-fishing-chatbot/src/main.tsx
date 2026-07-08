@@ -68,6 +68,50 @@ function tokens(value: string) {
     .filter((token) => token.length > 2);
 }
 
+const genericSpotTokens = new Set([
+  "area",
+  "bay",
+  "creek",
+  "fishing",
+  "lake",
+  "marina",
+  "park",
+  "pier",
+  "point",
+  "pond",
+  "recreation",
+  "regional",
+  "reservoir",
+  "shoreline",
+  "the",
+]);
+
+function spotMatchScore(text: string, spot: FishingSpot) {
+  const textTokens = new Set(tokens(text));
+  const nameTokens = tokens(spot.name).filter((token) => !genericSpotTokens.has(token));
+  const areaTokens = tokens(spot.area).filter((token) => !genericSpotTokens.has(token));
+  let score = 0;
+  for (const token of nameTokens) {
+    if (textTokens.has(token)) {
+      score += 3;
+    }
+  }
+  for (const token of areaTokens) {
+    if (textTokens.has(token)) {
+      score += 1;
+    }
+  }
+  return score;
+}
+
+function findSpotInText(text: string) {
+  const [best] = fishingSpots
+    .map((spot) => ({ spot, score: spotMatchScore(text, spot) }))
+    .filter(({ score }) => score >= 3)
+    .sort((a, b) => b.score - a.score);
+  return best?.spot;
+}
+
 function findSpotByName(name: string | undefined) {
   if (!name) {
     return undefined;
@@ -151,9 +195,32 @@ function noteSummary(spot: FishingSpot, notes: CommunityNote[]) {
     .join(" ");
 }
 
+function noteSearchText(note: CommunityNote) {
+  return [note.spotName, note.area, note.species, note.bait, note.condition, note.note, note.sourceLabel].filter(Boolean).join(" ");
+}
+
+function matchingGeneralNotes(query: string, notes: CommunityNote[]) {
+  const queryTokens = tokens(query).filter((token) => !["community", "group", "imported", "notes", "private", "people"].includes(token));
+  if (!queryTokens.length) {
+    return [];
+  }
+  return notes
+    .filter((note) => !note.spotId)
+    .map((note) => {
+      const haystack = normalize(noteSearchText(note));
+      const score = queryTokens.reduce((sum, token) => sum + (haystack.includes(token) ? 1 : 0), 0);
+      return { note, score };
+    })
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map(({ note }) => note);
+}
+
 function buildAnswer(query: string, notes: CommunityNote[], reports: CatchReport[]): ChatMessage {
   const normalized = normalize(query);
   const matches = topMatches(normalized, notes, reports);
+  const generalNotes = matchingGeneralNotes(normalized, notes);
   const needsClarifying =
     !/(fresh|salt|bay|ocean|pier|shore|kid|family|trout|bass|halibut|perch|catfish|fremont|san jose|sf|san francisco|boat)/.test(
       normalized,
@@ -185,11 +252,19 @@ function buildAnswer(query: string, notes: CommunityNote[], reports: CatchReport
     lines.push(`Community/user context: ${noteSummary(spot, notes)} ${reportSummary(spot, reports)}`);
   }
 
+  if (generalNotes.length) {
+    lines.push("Relevant unmatched private notes:");
+    for (const note of generalNotes) {
+      lines.push(`${note.sourceLabel}: ${note.species ? `${note.species} - ` : ""}${note.note}`);
+    }
+  }
+
   lines.push(
     "Before going, verify current rules, closures, licenses, water quality, fish consumption advisories, tides, and posted signs.",
   );
 
-  const hasPrivateNotes = notes.length > 0 && matches.some(({ spot }) => notes.some((note) => note.spotId === spot.id));
+  const hasPrivateNotes =
+    notes.length > 0 && (generalNotes.length > 0 || matches.some(({ spot }) => notes.some((note) => note.spotId === spot.id)));
   const hasReports = reports.length > 0 && matches.some(({ spot }) => reports.some((report) => report.spotId === spot.id));
 
   return {
@@ -267,7 +342,7 @@ function parseCommunityNotes(input: string): CommunityNote[] {
     .map((paragraph) => paragraph.trim())
     .filter(Boolean)
     .map((paragraph) => {
-      const spot = fishingSpots.find((candidate) => normalize(paragraph).includes(normalize(candidate.name)));
+      const spot = findSpotInText(paragraph);
       return {
         id: id("note"),
         spotId: spot?.id,

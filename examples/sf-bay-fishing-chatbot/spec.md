@@ -12,7 +12,7 @@ Primary community context for this example:
 
 - San Francisco Bay Area Fishing Group on Facebook
 
-Treat the Facebook group as a private/community source. A member may manually summarize, paste, or import material they are allowed to use. The app may store redacted community notes locally, and may support user-provided photos or source references when the user has permission to use them. Do not publish private member-identifying information. Automated Facebook login or scraping is out of scope for v1; keep the first version reproducible with manual imports.
+Treat the Facebook group as a private/community source. A member may manually summarize, paste, or import material they are allowed to use. If group admins approve automated assistance, a separate user-supervised collector such as OpenClaw may help turn visible group content into redacted import notes at a conservative pace. The app may store redacted community notes locally, and may support user-provided photos or source references when the user has permission to use them. Do not publish private member-identifying information. Do not bypass login, permissions, CAPTCHA, rate limits, or platform restrictions. Keep the shipped chatbot app reproducible with local imports; any group collection workflow should be optional and separate from the app runtime.
 
 ## Source Data
 
@@ -125,7 +125,7 @@ Filters should include:
 ## Community Notes Import
 
 Support a paste/import flow for user-provided notes.
-also can use a user login to get some info from the group.
+For admin-approved group collection, use a separate human-supervised workflow that emits the same redacted import format. Do not embed Facebook login, scraping, or browser automation inside the chatbot app itself.
 
 Accepted v1 formats:
 
