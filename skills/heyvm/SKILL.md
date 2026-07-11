@@ -27,15 +27,20 @@ tokens; ask the user to run interactive login when credentials are needed.
 Global options can be passed before the command or on most subcommands:
 
 ```sh
-heyvm --cloud-url "$HEYO_CLOUD_URL" --auth-url "$HEYO_AUTH_URL" <command> ...
+heyvm --heyo-env preview <command> ...
+heyvm --heyo-env stage <command> ...
+heyvm --heyo-env production <command> ...
 ```
 
-Common preview values:
+Use the named environment selector first. It resolves auth/cloud URLs as:
 
-```sh
-export HEYO_PREVIEW_CLOUD=https://preview.heyo.computer/cloud
-export HEYO_PREVIEW_AUTH=https://preview.heyo.computer/auth
-```
+- `preview`: `https://preview.heyo.computer/auth` and `https://preview.heyo.computer/cloud`
+- `stage`: `https://stage.heyo.computer/auth` and `https://stage.heyo.computer/cloud`
+- `production`: legacy split hosts until production front-door routes exist
+
+Raw URL flags and URL environment variables override the named environment:
+`--cloud-url`, `--auth-url`, `HEYO_CLOUD_URL`, `HEYO_AUTH_SERVER_URL`, and
+`AUTH_SERVER_URL`. Unset those when verifying `--heyo-env`.
 
 Preview and production backends should be Linux. For cloud dev sandboxes, use
 `--cloud --backend libvirt --image ubuntu:24.04` unless the task explicitly
@@ -47,7 +52,7 @@ requires a different Linux backend or image.
 heyvm --version
 heyvm --upgrade
 heyvm login --email <email>
-heyvm --auth-url "$HEYO_PREVIEW_AUTH" --cloud-url "$HEYO_PREVIEW_CLOUD" login --email <email>
+heyvm --heyo-env preview login --email <email>
 ```
 
 If login fails with TLS/certificate errors, do not bypass verification. Report
@@ -84,8 +89,7 @@ network access.
 Create a fresh Linux cloud sandbox:
 
 ```sh
-heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" --auth-url "$HEYO_PREVIEW_AUTH" \
-  create --cloud \
+heyvm --heyo-env preview create --cloud \
   --name <name> \
   --backend libvirt \
   --region US \
