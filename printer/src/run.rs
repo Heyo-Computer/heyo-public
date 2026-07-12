@@ -321,7 +321,7 @@ async fn run_inner(
                 anyhow::bail!("agent reported blocked: {reason}");
             }
             tasks = store::list_all(tasks_dir)?;
-            commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task);
+            commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task, args.push_each_task);
             if all_done(&tasks) {
                 eprintln!("[printer] all tasks done.");
                 return Ok(session.usage_total);
@@ -344,7 +344,7 @@ async fn run_inner(
                 anyhow::bail!("agent reported blocked during post-rotation planning: {reason}");
             }
             tasks = store::list_all(tasks_dir)?;
-            commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task);
+            commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task, args.push_each_task);
             prev_state_hash = state_hash(&tasks);
             if all_done(&tasks) {
                 eprintln!("[printer] all tasks done.");
@@ -366,7 +366,7 @@ async fn run_inner(
         }
 
         tasks = store::list_all(tasks_dir)?;
-        commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task);
+        commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task, args.push_each_task);
 
         if outcome.result_text.contains(SENTINEL_DONE) {
             if all_done(&tasks) {
@@ -463,8 +463,10 @@ fn all_done(tasks: &[Task]) -> bool {
 
 /// Commit the working tree when tasks newly transitioned to Done this turn,
 /// so a run leaves one commit per completed task (or per batch, when a single
-/// turn finishes several) instead of an opaque end-of-run blob. Always updates
-/// `done_ids` (the transition tracker); only touches git when `enabled`.
+/// turn finishes several) instead of an opaque end-of-run blob. With `push`
+/// the branch is pushed afterwards (`git push origin HEAD`), so completed-task
+/// progress is retained remotely even if the run later dies. Always updates
+/// `done_ids` (the transition tracker); only touches git when `commit`.
 /// Printer's own `.printer/` bookkeeping is excluded from the commit. Git
 /// failures are logged, never fatal — committing is a convenience layered on
 /// top of task execution, not part of it.
@@ -472,7 +474,8 @@ fn commit_newly_done(
     cwd: &std::path::Path,
     tasks: &[Task],
     done_ids: &mut std::collections::HashSet<String>,
-    enabled: bool,
+    commit: bool,
+    push: bool,
 ) {
     let newly: Vec<&Task> = tasks
         .iter()
@@ -484,7 +487,7 @@ fn commit_newly_done(
     for t in &newly {
         done_ids.insert(t.meta.id.clone());
     }
-    if !enabled {
+    if !commit {
         return;
     }
     let titles: Vec<&str> = newly.iter().map(|t| t.meta.title.as_str()).collect();
@@ -503,6 +506,22 @@ fn commit_newly_done(
             .current_dir(cwd)
             .output()
     };
+    // Push even when this call stages nothing new — an earlier per-task
+    // commit may still be unpushed, and pushing an up-to-date branch is a
+    // cheap no-op.
+    let push_now = |git: &dyn Fn(&[&str]) -> std::io::Result<std::process::Output>| {
+        if !push {
+            return;
+        }
+        match git(&["push", "origin", "HEAD"]) {
+            Ok(o) if o.status.success() => eprintln!("[printer] pushed per-task progress"),
+            Ok(o) => eprintln!(
+                "[printer] per-task push failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => eprintln!("[printer] per-task push failed: {e}"),
+        }
+    };
     match git(&["add", "-A", "--", ".", ":(exclude).printer", ":(exclude).printer/**"]) {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
@@ -519,6 +538,7 @@ fn commit_newly_done(
     }
     // `diff --cached --quiet` exits 0 when nothing is staged.
     if matches!(git(&["diff", "--cached", "--quiet"]), Ok(o) if o.status.success()) {
+        push_now(&git);
         return;
     }
     match git(&["commit", "-m", &message]) {
@@ -529,6 +549,7 @@ fn commit_newly_done(
         ),
         Err(e) => eprintln!("[printer] per-task commit failed: {e}"),
     }
+    push_now(&git);
 }
 
 fn state_hash(tasks: &[Task]) -> u64 {

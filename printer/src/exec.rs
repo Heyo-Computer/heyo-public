@@ -1112,6 +1112,7 @@ fn build_run_args(
         // own.
         no_sandbox: true,
         commit_each_task: args.commit_each_task,
+        push_each_task: args.push_each_task,
         acp_bin: args.acp_bin.clone(),
         acp_args: args.acp_args.clone(),
         // Resume-aware: when the planning pass already completed in a
