@@ -531,7 +531,6 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
     )
     .await;
     let run_success = run_result.is_ok();
-    let _outcome = run_result.unwrap_or_default();
     if let Some(sb) = sandbox.as_ref() {
         sb.sync_out();
     }
@@ -544,7 +543,7 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
         let _ = hooks.run_cli(Event::AfterExec, &ctx);
     }
 
-    Ok(())
+    run_result.map(|_| ())
 }
 
 /// Run `printer exec` for each ready task, spawning a sandbox for each.
