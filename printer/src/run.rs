@@ -288,6 +288,13 @@ async fn run_inner(
     let mut tasks = store::list_all(tasks_dir)?;
     let mut prev_state_hash = state_hash(&tasks);
     let mut stalls: u32 = 0;
+    // Baseline of already-done tasks: only transitions *during* this run get
+    // per-task commits.
+    let mut done_ids: std::collections::HashSet<String> = tasks
+        .iter()
+        .filter(|t| t.meta.status == Status::Done)
+        .map(|t| t.meta.id.clone())
+        .collect();
 
     if all_done(&tasks) {
         eprintln!("[printer] all tasks already done; nothing to do.");
@@ -314,6 +321,7 @@ async fn run_inner(
                 anyhow::bail!("agent reported blocked: {reason}");
             }
             tasks = store::list_all(tasks_dir)?;
+            commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task);
             if all_done(&tasks) {
                 eprintln!("[printer] all tasks done.");
                 return Ok(session.usage_total);
@@ -336,6 +344,7 @@ async fn run_inner(
                 anyhow::bail!("agent reported blocked during post-rotation planning: {reason}");
             }
             tasks = store::list_all(tasks_dir)?;
+            commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task);
             prev_state_hash = state_hash(&tasks);
             if all_done(&tasks) {
                 eprintln!("[printer] all tasks done.");
@@ -357,6 +366,7 @@ async fn run_inner(
         }
 
         tasks = store::list_all(tasks_dir)?;
+        commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task);
 
         if outcome.result_text.contains(SENTINEL_DONE) {
             if all_done(&tasks) {
@@ -449,6 +459,76 @@ fn any_tasks(tasks_dir: &std::path::Path) -> Result<bool> {
 
 fn all_done(tasks: &[Task]) -> bool {
     !tasks.is_empty() && tasks.iter().all(|t| t.meta.status == Status::Done)
+}
+
+/// Commit the working tree when tasks newly transitioned to Done this turn,
+/// so a run leaves one commit per completed task (or per batch, when a single
+/// turn finishes several) instead of an opaque end-of-run blob. Always updates
+/// `done_ids` (the transition tracker); only touches git when `enabled`.
+/// Printer's own `.printer/` bookkeeping is excluded from the commit. Git
+/// failures are logged, never fatal — committing is a convenience layered on
+/// top of task execution, not part of it.
+fn commit_newly_done(
+    cwd: &std::path::Path,
+    tasks: &[Task],
+    done_ids: &mut std::collections::HashSet<String>,
+    enabled: bool,
+) {
+    let newly: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| t.meta.status == Status::Done && !done_ids.contains(&t.meta.id))
+        .collect();
+    if newly.is_empty() {
+        return;
+    }
+    for t in &newly {
+        done_ids.insert(t.meta.id.clone());
+    }
+    if !enabled {
+        return;
+    }
+    let titles: Vec<&str> = newly.iter().map(|t| t.meta.title.as_str()).collect();
+    let message = if titles.len() == 1 {
+        format!("printer: complete task: {}", titles[0])
+    } else {
+        format!(
+            "printer: complete {} tasks: {}",
+            titles.len(),
+            titles.join("; ")
+        )
+    };
+    let git = |argv: &[&str]| {
+        std::process::Command::new("git")
+            .args(argv)
+            .current_dir(cwd)
+            .output()
+    };
+    match git(&["add", "-A", "--", ".", ":(exclude).printer", ":(exclude).printer/**"]) {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            eprintln!(
+                "[printer] per-task commit skipped (git add failed): {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("[printer] per-task commit skipped (git unavailable): {e}");
+            return;
+        }
+    }
+    // `diff --cached --quiet` exits 0 when nothing is staged.
+    if matches!(git(&["diff", "--cached", "--quiet"]), Ok(o) if o.status.success()) {
+        return;
+    }
+    match git(&["commit", "-m", &message]) {
+        Ok(o) if o.status.success() => eprintln!("[printer] committed: {message}"),
+        Ok(o) => eprintln!(
+            "[printer] per-task commit failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => eprintln!("[printer] per-task commit failed: {e}"),
+    }
 }
 
 fn state_hash(tasks: &[Task]) -> u64 {
