@@ -136,6 +136,12 @@ pub struct RunArgs {
     #[arg(long, default_value_t = false)]
     pub no_sandbox: bool,
 
+    /// Commit the working tree (git add -A, excluding `.printer/`) each time
+    /// tasks in the spec transition to done, so the run leaves a
+    /// commit-per-task history instead of one opaque blob at the end.
+    #[arg(long, default_value_t = false)]
+    pub commit_each_task: bool,
+
     /// Path/command to launch the ACP agent server. Required with bare
     /// `--agent acp`; optional with `--agent acp:<name>`, where it overrides
     /// the binary the plugin's `[[agent]]` block points at.
@@ -408,6 +414,11 @@ pub struct ExecArgs {
     /// each one in its own sandbox (requires heyvm plugin).
     #[arg(long, default_value_t = false)]
     pub recursive: bool,
+
+    /// Commit the working tree each time tasks transition to done during the
+    /// run phase (see `printer run --commit-each-task`).
+    #[arg(long, default_value_t = false)]
+    pub commit_each_task: bool,
 
     /// Path/command to launch the ACP agent server when `--agent acp`.
     #[arg(long)]

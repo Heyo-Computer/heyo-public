@@ -127,17 +127,27 @@ impl<'a> Session<'a> {
         let stdout_bytes_total = Arc::new(AtomicU64::new(0));
 
         // Stream stderr from the child to our own stderr in real time so the
-        // user can watch progress.
+        // user can watch progress. Keep a bounded tail so a failing child's
+        // diagnostics can be included in the error (its stdout is often empty).
+        const STDERR_TAIL_LINES: usize = 40;
+        let stderr_tail: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let child_stderr = child.stderr.take();
         let verbose = self.verbose;
         let tty = std::io::stderr().is_terminal();
         let last_stderr_clone = last_stderr.clone();
+        let stderr_tail_clone = stderr_tail.clone();
         let stderr_task = tokio::spawn(async move {
             if let Some(stderr) = child_stderr {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
                     if let Ok(mut g) = last_stderr_clone.lock() {
                         *g = Some(Instant::now());
+                    }
+                    if let Ok(mut g) = stderr_tail_clone.lock() {
+                        if g.len() == STDERR_TAIL_LINES {
+                            g.remove(0);
+                        }
+                        g.push(line.clone());
                     }
                     if verbose && tty {
                         // Clear any spinner line, then print the agent line.
@@ -216,8 +226,13 @@ impl<'a> Session<'a> {
         let stdout_buf = String::from_utf8_lossy(&stdout_bytes).into_owned();
 
         if !status.success() {
+            let stderr_buf = stderr_tail
+                .lock()
+                .map(|g| g.join("\n"))
+                .unwrap_or_default();
             anyhow::bail!(
-                "agent exited with status {status}\n--- stdout ---\n{stdout_buf}"
+                "agent exited with status {status}\n--- stdout ---\n{stdout_buf}\n\
+                 --- stderr (last {STDERR_TAIL_LINES} lines) ---\n{stderr_buf}"
             );
         }
 

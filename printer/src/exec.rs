@@ -1053,6 +1053,7 @@ fn build_run_args(
         // explicitly via run_with_sandbox; the inner run must not create its
         // own.
         no_sandbox: true,
+        commit_each_task: args.commit_each_task,
         acp_bin: args.acp_bin.clone(),
         acp_args: args.acp_args.clone(),
         // Resume-aware: when the planning pass already completed in a
