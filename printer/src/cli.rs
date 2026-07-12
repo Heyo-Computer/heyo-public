@@ -145,6 +145,12 @@ pub struct RunArgs {
     #[arg(long, default_value_t = false)]
     pub commit_each_task: bool,
 
+    /// Push the branch (`git push origin HEAD`) after each per-task commit,
+    /// so progress is retained remotely even if the run dies. Only meaningful
+    /// with --commit-each-task.
+    #[arg(long, default_value_t = false)]
+    pub push_each_task: bool,
+
     /// Path/command to launch the ACP agent server. Required with bare
     /// `--agent acp`; optional with `--agent acp:<name>`, where it overrides
     /// the binary the plugin's `[[agent]]` block points at.
@@ -422,6 +428,10 @@ pub struct ExecArgs {
     /// run phase (see `printer run --commit-each-task`).
     #[arg(long, default_value_t = false)]
     pub commit_each_task: bool,
+
+    /// Push after each per-task commit (see `printer run --push-each-task`).
+    #[arg(long, default_value_t = false)]
+    pub push_each_task: bool,
 
     /// Path/command to launch the ACP agent server when `--agent acp`.
     #[arg(long)]
