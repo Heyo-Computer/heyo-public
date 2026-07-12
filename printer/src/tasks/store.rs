@@ -34,8 +34,8 @@ pub fn write_task(dir: &Path, task: &Task) -> Result<()> {
     let tmp = dir.join(format!("{}.md.tmp", task.meta.id));
     let content = to_file_string(task)?;
     {
-        let mut f = fs::File::create(&tmp)
-            .with_context(|| format!("creating temp {}", tmp.display()))?;
+        let mut f =
+            fs::File::create(&tmp).with_context(|| format!("creating temp {}", tmp.display()))?;
         f.write_all(content.as_bytes())?;
         f.sync_all()?;
     }
@@ -128,10 +128,13 @@ pub fn compute_ready(tasks: &[Task]) -> Vec<&Task> {
         .iter()
         .filter(|t| t.meta.status == Status::Open)
         .filter(|t| {
-            t.meta.depends_on.iter().all(|dep| match by_id.get(dep.as_str()) {
-                Some(dep_task) => dep_task.meta.status == Status::Done,
-                None => true,
-            })
+            t.meta
+                .depends_on
+                .iter()
+                .all(|dep| match by_id.get(dep.as_str()) {
+                    Some(dep_task) => dep_task.meta.status == Status::Done,
+                    None => true,
+                })
         })
         .collect();
     ready.sort_by(|a, b| {

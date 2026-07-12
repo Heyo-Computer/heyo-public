@@ -20,8 +20,8 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
@@ -167,13 +167,15 @@ impl AcpClient {
             .spawn()
             .with_context(|| format!("spawning ACP server `{bin}`"))?;
         let stdin = child.stdin.take().context("ACP child has no stdin pipe")?;
-        let stdout = child.stdout.take().context("ACP child has no stdout pipe")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("ACP child has no stdout pipe")?;
         let stderr = child.stderr.take();
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (notif_tx, notif_rx) = mpsc::unbounded_channel::<SessionUpdate>();
-        let diagnostic: Arc<Mutex<DiagnosticBuf>> =
-            Arc::new(Mutex::new(DiagnosticBuf::default()));
+        let diagnostic: Arc<Mutex<DiagnosticBuf>> = Arc::new(Mutex::new(DiagnosticBuf::default()));
         let dead = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
         // Build the writer Arc up-front so the reader can clone it and
@@ -183,7 +185,10 @@ impl AcpClient {
         // that gets no reply blocks forever.)
         let writer: Arc<Mutex<ChildStdin>> = Arc::new(Mutex::new(stdin));
 
-        let trace = std::env::var("PRINTER_ACP_TRACE").ok().map(|v| v != "0").unwrap_or(false);
+        let trace = std::env::var("PRINTER_ACP_TRACE")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(false);
         let pending_for_reader = pending.clone();
         let diag_for_reader = diagnostic.clone();
         let dead_for_reader = dead.clone();
@@ -200,7 +205,11 @@ impl AcpClient {
                 let trimmed = line.trim();
                 if trace {
                     let preview: String = trimmed.chars().take(120).collect();
-                    let suffix = if trimmed.chars().count() > 120 { "…" } else { "" };
+                    let suffix = if trimmed.chars().count() > 120 {
+                        "…"
+                    } else {
+                        ""
+                    };
                     eprintln!(
                         "[acp:trace] read line #{} ({} bytes): {preview}{suffix}",
                         total_lines,
@@ -230,9 +239,7 @@ impl AcpClient {
                 .await;
             }
             if trace {
-                eprintln!(
-                    "[acp:trace] reader exiting after {total_lines} line(s) (stdout EOF)"
-                );
+                eprintln!("[acp:trace] reader exiting after {total_lines} line(s) (stdout EOF)");
             }
             // EOF on stdout — server is no longer talking to us. Drain any
             // pending requests so callers don't sit forever waiting for a
@@ -300,7 +307,9 @@ impl AcpClient {
                     let diag = diag_for_watcher.lock().await;
                     let head = match exit_status {
                         Some(s) => format!("ACP server `{bin_label}` exited unexpectedly ({s})."),
-                        None => format!("ACP server `{bin_label}` exited unexpectedly (status unavailable)."),
+                        None => format!(
+                            "ACP server `{bin_label}` exited unexpectedly (status unavailable)."
+                        ),
                     };
                     format!("{head}{}", diag.render())
                 };
@@ -340,11 +349,7 @@ impl AcpClient {
     /// ignore unknown fields, so this is a best-effort hint that an
     /// ACP-aware server may pick up. The authoritative permission policy is
     /// always whatever the ACP server itself enforces.
-    pub async fn session_new(
-        &self,
-        cwd: &Path,
-        permission_hint: Option<&str>,
-    ) -> Result<String> {
+    pub async fn session_new(&self, cwd: &Path, permission_hint: Option<&str>) -> Result<String> {
         let mut params = json!({
             "cwd": cwd.to_string_lossy(),
             "mcpServers": [],
@@ -482,12 +487,20 @@ impl AcpClient {
                 }
                 TokenUsage::default()
             });
-        Ok(TurnOutcome { result_text: text, usage, tools: Vec::new() })
+        Ok(TurnOutcome {
+            result_text: text,
+            usage,
+            backend_session_id: None,
+            tools: Vec::new(),
+        })
     }
 
     /// Send a JSON-RPC 2.0 request and await its response.
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let trace = std::env::var("PRINTER_ACP_TRACE").ok().map(|v| v != "0").unwrap_or(false);
+        let trace = std::env::var("PRINTER_ACP_TRACE")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(false);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
 
@@ -501,9 +514,7 @@ impl AcpClient {
             if self.dead.load(Ordering::SeqCst) {
                 drop(map);
                 let diag = self.diagnostic.lock().await.render();
-                return Err(anyhow!(
-                    "ACP {method}: server is not running.{diag}"
-                ));
+                return Err(anyhow!("ACP {method}: server is not running.{diag}"));
             }
             map.insert(id, tx);
         }
@@ -556,7 +567,9 @@ impl AcpClient {
             Ok(RpcResult::Transport(msg)) => Err(anyhow!("ACP {method} aborted: {msg}")),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                Err(anyhow!("ACP {method} response channel dropped (server exited?)"))
+                Err(anyhow!(
+                    "ACP {method} response channel dropped (server exited?)"
+                ))
             }
         }
     }
@@ -574,7 +587,8 @@ impl AcpClient {
         if self.dead.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.notify("session/cancel", json!({ "sessionId": id })).await
+        self.notify("session/cancel", json!({ "sessionId": id }))
+            .await
     }
 
     /// Mark the client shut down and ask the watcher to kill the child's
@@ -712,9 +726,7 @@ async fn dispatch_message(
                 eprintln!("[acp] failed to reply to server request `{method}`: {e}");
             }
         } else {
-            eprintln!(
-                "[acp] no writer available to reply to `{method}` (id={id}); test path?"
-            );
+            eprintln!("[acp] no writer available to reply to `{method}` (id={id}); test path?");
         }
     }
 }
@@ -790,7 +802,10 @@ fn extract_acp_usage(result: &Value) -> Option<TokenUsage> {
         cache
             .and_then(|c| c.get(nested))
             .and_then(|v| v.as_u64())
-            .or_else(|| flat.iter().find_map(|k| obj.get(*k).and_then(|v| v.as_u64())))
+            .or_else(|| {
+                flat.iter()
+                    .find_map(|k| obj.get(*k).and_then(|v| v.as_u64()))
+            })
             .unwrap_or(0)
     };
 
@@ -799,11 +814,19 @@ fn extract_acp_usage(result: &Value) -> Option<TokenUsage> {
         output_tokens: pick(&["output_tokens", "outputTokens", "output"]),
         cache_creation_input_tokens: cache_pick(
             "write",
-            &["cache_creation_input_tokens", "cacheCreationInputTokens", "cache_write"],
+            &[
+                "cache_creation_input_tokens",
+                "cacheCreationInputTokens",
+                "cache_write",
+            ],
         ),
         cache_read_input_tokens: cache_pick(
             "read",
-            &["cache_read_input_tokens", "cacheReadInputTokens", "cache_read"],
+            &[
+                "cache_read_input_tokens",
+                "cacheReadInputTokens",
+                "cache_read",
+            ],
         ),
     };
 
@@ -843,11 +866,26 @@ fn collect_update_text(update: &Value, sink: &mut String) {
 /// updates, available-commands updates, etc.) so they still leave a trace.
 #[derive(Debug, Clone)]
 enum UpdateKind {
-    AgentMessage { text: String, is_thought: bool },
-    ToolCall { id: String, title: String, kind: String },
-    ToolCallUpdate { id: String, status: String, title: String },
-    Plan { entry_count: usize },
-    Other { kind: String },
+    AgentMessage {
+        text: String,
+        is_thought: bool,
+    },
+    ToolCall {
+        id: String,
+        title: String,
+        kind: String,
+    },
+    ToolCallUpdate {
+        id: String,
+        status: String,
+        title: String,
+    },
+    Plan {
+        entry_count: usize,
+    },
+    Other {
+        kind: String,
+    },
 }
 
 fn classify(update: &Value) -> Option<UpdateKind> {
@@ -902,10 +940,18 @@ fn extract_text(update: &Value) -> String {
 /// One-line label used by the heartbeat to describe the most recent activity.
 fn summary(kind: &UpdateKind) -> String {
     match kind {
-        UpdateKind::AgentMessage { is_thought: true, .. } => "thinking".to_string(),
-        UpdateKind::AgentMessage { is_thought: false, .. } => "writing message".to_string(),
+        UpdateKind::AgentMessage {
+            is_thought: true, ..
+        } => "thinking".to_string(),
+        UpdateKind::AgentMessage {
+            is_thought: false, ..
+        } => "writing message".to_string(),
         UpdateKind::ToolCall { kind: k, title, .. } => {
-            let label = if k.is_empty() { "tool".to_string() } else { format!("tool/{k}") };
+            let label = if k.is_empty() {
+                "tool".to_string()
+            } else {
+                format!("tool/{k}")
+            };
             if title.is_empty() {
                 label
             } else {
@@ -971,7 +1017,11 @@ fn observe_update(
         UpdateKind::ToolCall { id, title, kind: k } => {
             clear_spinner(verbose, tty);
             let id_short = id_short(id);
-            let label = if k.is_empty() { "tool".to_string() } else { format!("tool/{k}") };
+            let label = if k.is_empty() {
+                "tool".to_string()
+            } else {
+                format!("tool/{k}")
+            };
             let title = if title.is_empty() {
                 "(no title)".to_string()
             } else {
@@ -1071,9 +1121,7 @@ async fn heartbeat_loop(
             i = i.wrapping_add(1);
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         } else if last_text_heartbeat.elapsed().as_secs() >= 10 {
-            eprintln!(
-                "[printer] still working… {elapsed}s (last update {ago}s ago: {label})"
-            );
+            eprintln!("[printer] still working… {elapsed}s (last update {ago}s ago: {label})");
             last_text_heartbeat = Instant::now();
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         } else {
@@ -1271,15 +1319,23 @@ mod tests {
 
     #[test]
     fn classify_recognizes_known_kinds() {
-        let v = json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}});
+        let v =
+            json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}});
         match classify(&v).unwrap() {
-            UpdateKind::AgentMessage { text, is_thought: false } => assert_eq!(text, "hi"),
+            UpdateKind::AgentMessage {
+                text,
+                is_thought: false,
+            } => assert_eq!(text, "hi"),
             other => panic!("expected AgentMessage, got {other:?}"),
         }
 
-        let v = json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"hmm"}});
+        let v =
+            json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"hmm"}});
         match classify(&v).unwrap() {
-            UpdateKind::AgentMessage { text, is_thought: true } => assert_eq!(text, "hmm"),
+            UpdateKind::AgentMessage {
+                text,
+                is_thought: true,
+            } => assert_eq!(text, "hmm"),
             other => panic!("expected thought, got {other:?}"),
         }
 
@@ -1333,11 +1389,17 @@ mod tests {
     #[test]
     fn summary_describes_each_kind() {
         assert_eq!(
-            summary(&UpdateKind::AgentMessage { text: "x".into(), is_thought: true }),
+            summary(&UpdateKind::AgentMessage {
+                text: "x".into(),
+                is_thought: true
+            }),
             "thinking"
         );
         assert_eq!(
-            summary(&UpdateKind::AgentMessage { text: "x".into(), is_thought: false }),
+            summary(&UpdateKind::AgentMessage {
+                text: "x".into(),
+                is_thought: false
+            }),
             "writing message"
         );
         let s = summary(&UpdateKind::ToolCall {
@@ -1356,9 +1418,14 @@ mod tests {
         assert!(s.contains("abcdef01"));
         assert!(s.ends_with("→ completed"));
 
-        assert_eq!(summary(&UpdateKind::Plan { entry_count: 2 }), "plan (2 entries)");
         assert_eq!(
-            summary(&UpdateKind::Other { kind: "current_mode_update".into() }),
+            summary(&UpdateKind::Plan { entry_count: 2 }),
+            "plan (2 entries)"
+        );
+        assert_eq!(
+            summary(&UpdateKind::Other {
+                kind: "current_mode_update".into()
+            }),
             "kind=current_mode_update"
         );
     }

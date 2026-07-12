@@ -1,8 +1,8 @@
 use crate::agent::{AgentInvocation, TokenUsage};
 use crate::cli::PlanArgs;
 use crate::prompts::{
-    interactive_planning_prompt, plan_resume_with_answers_prompt, SENTINEL_BLOCKED,
-    SENTINEL_PLAN_READY, SENTINEL_QUESTIONS_CLOSE, SENTINEL_QUESTIONS_OPEN,
+    SENTINEL_BLOCKED, SENTINEL_PLAN_READY, SENTINEL_QUESTIONS_CLOSE, SENTINEL_QUESTIONS_OPEN,
+    interactive_planning_prompt, plan_resume_with_answers_prompt,
 };
 use crate::session::Session;
 use crate::tasks::spec;
@@ -32,8 +32,8 @@ pub async fn plan(args: PlanArgs) -> Result<TokenUsage> {
     std::fs::create_dir_all(&tasks_dir)
         .with_context(|| format!("creating task store at {}", tasks_dir.display()))?;
 
-    let printer_bin = std::env::current_exe()
-        .context("resolving printer binary path for the agent prompt")?;
+    let printer_bin =
+        std::env::current_exe().context("resolving printer binary path for the agent prompt")?;
     let printer_bin_str = printer_bin.to_string_lossy().into_owned();
 
     // Sync spec → task store so the agent has tasks to refine.
@@ -43,11 +43,8 @@ pub async fn plan(args: PlanArgs) -> Result<TokenUsage> {
         report.created, report.existing, report.closed
     );
 
-    let acp = crate::agents::resolve_acp_launch(
-        &args.agent,
-        args.acp_bin.as_deref(),
-        &args.acp_args,
-    )?;
+    let acp =
+        crate::agents::resolve_acp_launch(&args.agent, args.acp_bin.as_deref(), &args.acp_args)?;
     let agent = AgentInvocation {
         kind: args.agent.clone(),
         model: args.model.as_deref(),
@@ -109,7 +106,10 @@ pub async fn plan(args: PlanArgs) -> Result<TokenUsage> {
     }
 
     write_checkpoint(&printer_dir, &spec_abs, &final_text)?;
-    eprintln!("[printer] plan checkpoint written to {}", printer_dir.join("plan.checkpoint").display());
+    eprintln!(
+        "[printer] plan checkpoint written to {}",
+        printer_dir.join("plan.checkpoint").display()
+    );
     Ok(session.usage_total)
 }
 
@@ -150,7 +150,9 @@ fn collect_answers(questions: &str) -> Result<String> {
     println!("--- End of questions ---");
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
-        println!("Type your answers below. End with a single line containing only `.` or press Ctrl-D when done.");
+        println!(
+            "Type your answers below. End with a single line containing only `.` or press Ctrl-D when done."
+        );
     }
     print!("> ");
     std::io::stdout().flush().ok();

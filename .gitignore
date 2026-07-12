@@ -9,5 +9,9 @@ target/
 # codegraph index (not source of truth, rebuild with `codegraph index`)
 .codegraph/
 
+# Generated JavaScript app output in examples
+examples/**/node_modules/
+examples/**/dist/
+
 # OS / editor cruft
 .DS_Store

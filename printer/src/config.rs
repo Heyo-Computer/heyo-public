@@ -42,11 +42,12 @@ mounts = []
 # Per-step overrides on top of the active driver's manifest. Any key you set
 # here replaces that step's template; anything you omit falls through to the
 # plugin's defaults. Same {var} interpolation as the plugin manifest, plus
-# {base_image} (from above) and {spec_slug} (the spec basename, sanitized).
+# {base_image} (from above), {agent_setup} (`--agent claude` or empty), and
+# {spec_slug} (the spec basename, sanitized).
 [sandbox.commands]
-# create = "heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude >&2 && echo printer-{spec_slug}"
+# create = "heyvm create --name printer-{spec_slug} --image {base_image} {agent_setup} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude >&2 && echo printer-{spec_slug}"
 # enter = "heyvm exec {handle} --session printer --env IS_SANDBOX=1 -- {child}"
-# destroy = "heyvm delete -y {handle}"
+# destroy = "heyvm rm -y {handle}"
 # sync_in / sync_out are not used: cwd is bind-mounted, so file edits
 # round-trip live and there's nothing to copy.
 
@@ -166,8 +167,8 @@ fn load_from(path: &Path) -> Result<GlobalConfig> {
     if !path.exists() {
         return Ok(GlobalConfig::default());
     }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let cfg: GlobalConfig =
         toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     Ok(cfg)
@@ -207,8 +208,7 @@ pub fn cli_edit() -> Result<()> {
         anyhow::bail!("$EDITOR ({editor}) exited with {}", status);
     }
     // Re-parse so the user gets immediate feedback if they broke the file.
-    load_from(&path)
-        .with_context(|| format!("re-parsing {} after edit", path.display()))?;
+    load_from(&path).with_context(|| format!("re-parsing {} after edit", path.display()))?;
     Ok(())
 }
 
@@ -301,7 +301,10 @@ mod tests {
             cfg.sandbox.commands.enter.as_deref(),
             Some("vm exec {handle} -- {child}")
         );
-        assert_eq!(cfg.sandbox.commands.post_create.as_deref(), Some("setup.sh"));
+        assert_eq!(
+            cfg.sandbox.commands.post_create.as_deref(),
+            Some("setup.sh")
+        );
         assert!(cfg.sandbox.commands.destroy.is_none());
     }
 

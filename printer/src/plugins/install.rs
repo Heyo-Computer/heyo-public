@@ -23,7 +23,10 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
         );
     }
     if args.force && plugin_dir.exists() {
-        eprintln!("[printer] --force: removing existing {}", plugin_dir.display());
+        eprintln!(
+            "[printer] --force: removing existing {}",
+            plugin_dir.display()
+        );
         fs::remove_dir_all(&plugin_dir)
             .with_context(|| format!("removing {}", plugin_dir.display()))?;
     }
@@ -126,8 +129,8 @@ pub fn reinstall_plugin(name: &str) -> Result<()> {
 pub fn reinstall_all() -> Result<()> {
     let plugins_dir = store::plugins_dir()?;
     let mut names: Vec<String> = Vec::new();
-    for entry in fs::read_dir(&plugins_dir)
-        .with_context(|| format!("reading {}", plugins_dir.display()))?
+    for entry in
+        fs::read_dir(&plugins_dir).with_context(|| format!("reading {}", plugins_dir.display()))?
     {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -140,7 +143,10 @@ pub fn reinstall_all() -> Result<()> {
     }
     names.sort();
     if names.is_empty() {
-        eprintln!("[printer] no plugins installed under {}", plugins_dir.display());
+        eprintln!(
+            "[printer] no plugins installed under {}",
+            plugins_dir.display()
+        );
         return Ok(());
     }
     let mut failed: Vec<String> = Vec::new();
@@ -256,8 +262,7 @@ fn install_cargo_git(
 ) -> Result<Installed> {
     let clone_dir = plugin_dir.join("src");
     eprintln!("[printer] cloning {url} -> {}", clone_dir.display());
-    run(Command::new("git").args(["clone", url]).arg(&clone_dir))
-        .context("git clone failed")?;
+    run(Command::new("git").args(["clone", url]).arg(&clone_dir)).context("git clone failed")?;
     if let Some(rev) = rev {
         eprintln!("[printer] checking out {rev}");
         run(Command::new("git")
@@ -334,8 +339,8 @@ fn install_cargo_path(plugin_dir: &Path, path: &Path) -> Result<Installed> {
 /// Run `cargo install --path <src> --root <plugin_dir>` and resolve the
 /// produced binary's path + version. Returns (relative `bin/<name>`, version).
 fn cargo_install_to(src: &Path, plugin_dir: &Path) -> Result<(String, String)> {
-    let cargo_toml = read_cargo_toml(src)
-        .with_context(|| format!("reading {}/Cargo.toml", src.display()))?;
+    let cargo_toml =
+        read_cargo_toml(src).with_context(|| format!("reading {}/Cargo.toml", src.display()))?;
     let package_name = cargo_toml.package.name.clone();
     let version = cargo_toml.package.version.clone();
 
@@ -383,8 +388,7 @@ fn install_shell(command: &str, binary: &str) -> Result<Installed> {
     let resolved_binary = expand_tilde(binary)?;
     eprintln!("[printer] running install command: {command}");
     eprintln!("[printer] expecting binary at: {resolved_binary}");
-    run(Command::new("sh").arg("-c").arg(command))
-        .context("install command failed")?;
+    run(Command::new("sh").arg("-c").arg(command)).context("install command failed")?;
     let bin_path = PathBuf::from(&resolved_binary);
     if !bin_path.is_file() {
         bail!(
@@ -465,9 +469,17 @@ struct ResolvedSpec {
 
 #[derive(Debug)]
 enum ResolvedKind {
-    CargoGit { url: String, subdir: Option<PathBuf> },
-    CargoPath { path: PathBuf },
-    Shell { command: String, binary: String },
+    CargoGit {
+        url: String,
+        subdir: Option<PathBuf>,
+    },
+    CargoPath {
+        path: PathBuf,
+    },
+    Shell {
+        command: String,
+        binary: String,
+    },
 }
 
 fn resolve_spec(args: &AddPluginArgs) -> Result<ResolvedSpec> {
@@ -504,7 +516,9 @@ fn resolve_spec(args: &AddPluginArgs) -> Result<ResolvedSpec> {
     // 2. Local path?
     if let Some(rest) = args.spec.strip_prefix("path:") {
         if subdir.is_some() {
-            bail!("--subdir is not supported with path: specs (point path: at the plugin dir directly)");
+            bail!(
+                "--subdir is not supported with path: specs (point path: at the plugin dir directly)"
+            );
         }
         let path = PathBuf::from(rest);
         if !path.exists() {
@@ -669,7 +683,10 @@ mod tests {
             validate_subdir("plugins/heyvm").unwrap(),
             PathBuf::from("plugins/heyvm")
         );
-        assert_eq!(validate_subdir("./skills").unwrap(), PathBuf::from("./skills"));
+        assert_eq!(
+            validate_subdir("./skills").unwrap(),
+            PathBuf::from("./skills")
+        );
     }
 
     #[test]
@@ -709,7 +726,9 @@ mod tests {
     #[test]
     fn args_from_manifest_path_round_trips() {
         let m = manifest_with(
-            Source::Path { path: "/abs/plugins/heyvm".into() },
+            Source::Path {
+                path: "/abs/plugins/heyvm".into(),
+            },
             "heyvm",
             "",
         );
@@ -743,7 +762,9 @@ mod tests {
     #[test]
     fn args_from_manifest_shell_carries_install_cmd_and_binary() {
         let m = manifest_with(
-            Source::Shell { command: "curl … | sh".into() },
+            Source::Shell {
+                command: "curl … | sh".into(),
+            },
             "vendor",
             "/home/u/.local/bin/vendor",
         );
@@ -756,16 +777,20 @@ mod tests {
 
     #[test]
     fn args_from_manifest_shell_without_binary_errors() {
-        let m = manifest_with(Source::Shell { command: "x".into() }, "vendor", "");
+        let m = manifest_with(
+            Source::Shell {
+                command: "x".into(),
+            },
+            "vendor",
+            "",
+        );
         let err = args_from_manifest(&m).unwrap_err();
         assert!(err.to_string().contains("no `binary` recorded"));
     }
 
     #[test]
     fn source_label_renders_each_variant() {
-        assert!(
-            source_label(&Source::Path { path: "/p".into() }).contains("path /p")
-        );
+        assert!(source_label(&Source::Path { path: "/p".into() }).contains("path /p"));
         let g = source_label(&Source::Git {
             url: "https://x/y".into(),
             rev: Some("0123456789abcdef".into()),
@@ -773,7 +798,9 @@ mod tests {
         });
         assert!(g.contains("git https://x/y@01234567"));
         assert!(g.contains("subdir=plugins/y"));
-        let s = source_label(&Source::Shell { command: "x".into() });
+        let s = source_label(&Source::Shell {
+            command: "x".into(),
+        });
         assert!(s.contains("shell `x`"));
     }
 

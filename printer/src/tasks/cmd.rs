@@ -327,4 +327,3 @@ fn print_table(tasks: &[&Task]) {
         );
     }
 }
-

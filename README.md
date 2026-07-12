@@ -1,4 +1,20 @@
-# Printer
+# Heyo Public
+
+This is the public Heyo monorepo. It contains the open-source `printer` code
+factory CLI, supporting CLIs, plugins, examples, docs, and reusable agent
+skills.
+
+## Repository layout
+
+- `printer/` — core CLI that manages agent sessions against a spec file.
+- `computer/` — CLI for programmatic desktop interactions on Linux/Wayland.
+- `codegraph/` — tree-sitter based code graph, search, and patch tooling.
+- `plugins/` — printer plugins for agent integrations, codegraph, heyvm, and related tooling.
+- `skills/` — reusable public agent skills. The top-level catalog is intentionally small: `heyvm` and `git-submit`.
+- `examples/` — example projects and specs.
+
+## Printer
+
 In the "Bobiverse", the printer is the technology that enables the Bobs' self replicating journey across the stars. The printer works at the atomic level and can produce any good, including more printers and the equipment to replicate the Bobs themselves. In this future, humans trade time on the printers as currency. They are the foundation of the universe's economic and scientific ambitions.
 
 LLMs are good at writing code. Actually, that's probably what they are best at. Integrating "tools" and running in a loop creates the powerful "agent" paradigm. One more layer of abstraction is the "code factory" which uses a system of agents to produce software autonomously from a specification. Now, humans can produce a lot of software by managing an agent and poking it when it needs to keep going; this commands a lot of attention from a human and ultimately becomes a bottleneck in agentic development and the code factory pattern tries to solve for that particular bottleneck by allowing the human to draft requirements and then startup the factory before moving on to another task or factory. There are complications of course; a system of agents has a lot of moving parts and can burn tokens at an exorbitant rate. 
@@ -46,7 +62,14 @@ review`) when you need the `computer` tool to click-test.
 the Printer CLI can install a plugin for Claude and OpenCode agents to utilize `codegraph` for searching and patching files. 
 
 ### Skills
-Skills are made available to the agents during run and review.
+Skills are made available to agents during run and review. The top-level
+`skills/` directory is intentionally small and uses CLI help as the source of
+truth:
+
+- `skills/heyvm/SKILL.md` — Heyo VM, sandbox, cloud, proxy, database, image, and backend workflows.
+- `skills/git-submit/SKILL.md` — Heyo git submit CI/CD, upgrades, submodules, run inspection, and cleanup.
+
+Plugin-specific skills still live under their plugin packages in `plugins/*/skills`.
 ```bash
 npx skills add heyo-computer/printer
 ```
@@ -57,6 +80,8 @@ npx skills add heyo-computer/printer
 
 - **Rust toolchain** — `rustc` and `cargo` (install via [rustup](https://rustup.rs))
 - **An agent CLI** — at least one of:
+  - [Codex CLI](https://developers.openai.com/codex/cli) — `codex` on `$PATH`
+  - [Amp CLI](https://ampcode.com/manual) — `amp` on `$PATH`
   - [OpenCode](https://opencode.ai) — `opencode` on `$PATH`
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) — `claude` on `$PATH`
 
@@ -167,6 +192,8 @@ This creates the `.printer/` task store and `.codegraph/` index directory.
 ```sh
 printer exec spec.md             # run + review in one command
 printer exec spec.md --verbose   # with live progress output
+printer exec spec.md --agent codex               # use Codex CLI backend
+printer exec spec.md --agent amp                 # use Amp CLI backend
 printer exec spec.md --agent opencode            # use opencode one-shot backend
 printer exec spec.md --agent acp:opencode-acp    # use opencode ACP (persistent sessions)
 printer test spec.md             # click-test a UI/web change with the computer tool

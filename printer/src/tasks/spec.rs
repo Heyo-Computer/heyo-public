@@ -1,8 +1,8 @@
 use super::model::{Status, Task};
 use super::store;
 use anyhow::Result;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 

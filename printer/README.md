@@ -1,6 +1,6 @@
 # printer
 
-A small Rust CLI that drives a child `claude` (or `opencode`) session through a
+A small Rust CLI that drives a child `claude`, `codex`, `amp`, or `opencode` session through a
 markdown spec — it asks the agent to build a plan into the spec file, then
 nudges it to keep executing, resumes the session across turns, and rotates to a
 fresh session when the context fills up. A separate `review` subcommand spawns
@@ -14,7 +14,7 @@ cargo build --release
 # binary at ./target/release/printer
 ```
 
-You'll need `claude` (and/or `opencode`) on your `PATH`.
+You'll need `claude`, `codex`, `amp`, and/or `opencode` on your `PATH`.
 
 If `codegraph` is also on `PATH` (or installed at
 `~/.printer/plugins/codegraph/bin/codegraph`), `printer run` and
@@ -184,14 +184,23 @@ also write it to a file.
 
 If `--base` is omitted, `printer` tries `main`, then `master`, then `HEAD~1`.
 
-### 6. Use opencode instead of claude
+### 6. Use codex, amp, or opencode instead of claude
+
+```sh
+printer run plan.md --agent codex
+```
+
+```sh
+printer run plan.md --agent amp
+```
 
 ```sh
 printer run plan.md --agent opencode
 ```
 
-(Note: opencode support is best-effort — token-based compaction is disabled
-for opencode, so only `--max-turns` will bound the run.)
+(Note: amp and opencode support are best-effort. Amp uses its
+Claude-compatible stream JSON mode; opencode token-based compaction is disabled,
+so only `--max-turns` will bound opencode runs.)
 
 ## Flags
 
@@ -199,24 +208,24 @@ for opencode, so only `--max-turns` will bound the run.)
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--agent claude\|opencode` | `claude` | Which agent binary to drive. |
+| `--agent claude\|codex\|amp\|opencode` | `claude` | Which agent binary to drive. |
 | `--model <name>` | (agent default) | Forwarded to the agent. |
 | `--max-turns <N>` | `40` | Hard cap on execution turns. |
 | `--compact-at <tokens>` | `150000` | Rotate session at this cumulative input-token count. |
 | `--cwd <path>` | current dir | Working dir for the child agent. |
-| `--permission-mode <mode>` | `bypassPermissions` | Forwarded to `claude --permission-mode`. Default bypasses all approval prompts because there is no human at the keyboard during a driver run. Set to `acceptEdits`, `default`, etc. if you want approvals to gate the run. |
+| `--permission-mode <mode>` | `bypassPermissions` | Forwarded to Claude as `--permission-mode`; for Codex, `bypassPermissions` maps to `--dangerously-bypass-approvals-and-sandbox`. Amp and opencode enforce permissions through their own config. Default bypasses prompts because there is no human at the keyboard during a driver run. |
 | `-v`, `--verbose` | off | Live spinner + per-turn timing/token heartbeats on stderr. |
 
 ### `printer review <SPEC>`
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--agent claude\|opencode` | `claude` | Which agent to drive. |
+| `--agent claude\|codex\|amp\|opencode` | `claude` | Which agent to drive. |
 | `--model <name>` | (agent default) | Forwarded to the agent. |
 | `--base <git-ref>` | autodetected | Ref to diff against (`git diff <base>...HEAD`). |
 | `--cwd <path>` | current dir | Working dir for the child agent. |
 | `--out <path>` | — | Also write the review report to this path. |
-| `--permission-mode <mode>` | `bypassPermissions` | Forwarded to `claude --permission-mode`. |
+| `--permission-mode <mode>` | `bypassPermissions` | Forwarded to Claude as `--permission-mode`; for Codex, `bypassPermissions` maps to `--dangerously-bypass-approvals-and-sandbox`. Amp and opencode enforce permissions through their own config. |
 | `-v`, `--verbose` | off | Live spinner + heartbeat during the review turn. |
 
 ## Task tracking

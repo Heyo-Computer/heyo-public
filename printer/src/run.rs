@@ -4,8 +4,8 @@ use crate::codegraph_watch;
 use crate::drivers::{ActiveSandbox, DriverSet};
 use crate::hooks::{AgentContribution, Event, HookContext, HookSet};
 use crate::prompts::{
-    bootstrap_prompt, fix_from_review_prompt, nudge_prompt_with, planning_prompt, rotation_prompt,
-    unstall_prompt, SENTINEL_BLOCKED, SENTINEL_DONE,
+    SENTINEL_BLOCKED, SENTINEL_DONE, bootstrap_prompt, fix_from_review_prompt, nudge_prompt_with,
+    planning_prompt, rotation_prompt, unstall_prompt,
 };
 use crate::session::{MetricsCtx, Session};
 use crate::skills;
@@ -24,10 +24,7 @@ pub async fn run(args: RunArgs) -> Result<TokenUsage> {
 /// shown the prior review report on its first turn and asked to add or reopen
 /// tasks to address the findings. Used by the exec review-cycle to feed
 /// reviewer output back into the coding agent.
-pub async fn run_with_feedback(
-    args: RunArgs,
-    review_feedback: Option<&str>,
-) -> Result<TokenUsage> {
+pub async fn run_with_feedback(args: RunArgs, review_feedback: Option<&str>) -> Result<TokenUsage> {
     // Public entry path: acquire our own sandbox (if any plugin contributes
     // one) and then dispatch. The CLI flag `--no-sandbox` short-circuits.
     let sandbox = acquire_sandbox(&args)?;
@@ -60,12 +57,8 @@ pub async fn run_with_sandbox(
         None => std::env::current_dir()?,
     };
     let tasks_dir = cwd.join(".printer").join("tasks");
-    std::fs::create_dir_all(&tasks_dir).with_context(|| {
-        format!(
-            "creating task store at {}",
-            tasks_dir.display()
-        )
-    })?;
+    std::fs::create_dir_all(&tasks_dir)
+        .with_context(|| format!("creating task store at {}", tasks_dir.display()))?;
 
     let _watch_guard = if args.no_codegraph_watch {
         None
@@ -78,8 +71,7 @@ pub async fn run_with_sandbox(
 
     hooks.run_cli(
         Event::BeforeRun,
-        &HookContext::new(Event::BeforeRun, cwd.clone())
-            .with_spec(spec_abs.clone()),
+        &HookContext::new(Event::BeforeRun, cwd.clone()).with_spec(spec_abs.clone()),
     )?;
     let agent_contrib = hooks.agent_for(Event::BeforeRun);
     let resolved_skills = resolve_agent_skills(&agent_contrib)?;
@@ -172,15 +164,12 @@ async fn run_inner(
     review_feedback: Option<&str>,
     command_wrapper: Option<&str>,
 ) -> Result<TokenUsage> {
-    let printer_bin = std::env::current_exe()
-        .context("resolving printer binary path for the agent prompt")?;
+    let printer_bin =
+        std::env::current_exe().context("resolving printer binary path for the agent prompt")?;
     let printer_bin_str = printer_bin.to_string_lossy().into_owned();
 
-    let acp = crate::agents::resolve_acp_launch(
-        &args.agent,
-        args.acp_bin.as_deref(),
-        &args.acp_args,
-    )?;
+    let acp =
+        crate::agents::resolve_acp_launch(&args.agent, args.acp_bin.as_deref(), &args.acp_args)?;
     let agent = AgentInvocation {
         kind: args.agent.clone(),
         model: args.model.as_deref(),
@@ -211,7 +200,9 @@ async fn run_inner(
     // If the spec has no checklist items at all, ask the agent to write one
     // into the spec. Then re-sync. If still empty, bail.
     if !any_tasks(tasks_dir)? {
-        eprintln!("[printer] spec has no checklist items; asking agent to bootstrap one into the spec");
+        eprintln!(
+            "[printer] spec has no checklist items; asking agent to bootstrap one into the spec"
+        );
         let outcome = session
             .turn(&bootstrap_prompt(&spec_abs.to_string_lossy()))
             .await?;
@@ -225,7 +216,10 @@ async fn run_inner(
             report.created, report.existing
         );
         if !any_tasks(tasks_dir)? {
-            anyhow::bail!("agent did not write any checklist items into `{}`", spec_abs.display());
+            anyhow::bail!(
+                "agent did not write any checklist items into `{}`",
+                spec_abs.display()
+            );
         }
     }
 
@@ -244,9 +238,15 @@ async fn run_inner(
     } else {
         let tasks = store::list_all(tasks_dir)?;
         if !all_done(&tasks) {
-            eprintln!("[printer] planning pass: refining {} task(s) into actionable plan entries", tasks.len());
+            eprintln!(
+                "[printer] planning pass: refining {} task(s) into actionable plan entries",
+                tasks.len()
+            );
             let outcome = session
-                .turn(&planning_prompt(&printer_bin_str, &spec_abs.to_string_lossy()))
+                .turn(&planning_prompt(
+                    &printer_bin_str,
+                    &spec_abs.to_string_lossy(),
+                ))
                 .await?;
             print_result_tail(&outcome.result_text);
             if let Some(reason) = blocked_reason(&outcome.result_text) {
@@ -259,12 +259,13 @@ async fn run_inner(
         // for standalone `printer run` invocations: they have no
         // checkpoint to advance.
         if let Some(cp_path) = args.checkpoint_path.as_deref()
-            && let Err(e) = crate::exec::write_phase_planning_done(cp_path, spec_abs) {
-                eprintln!(
-                    "[printer] warning: failed to advance checkpoint at {} to Running: {e}",
-                    cp_path.display()
-                );
-            }
+            && let Err(e) = crate::exec::write_phase_planning_done(cp_path, spec_abs)
+        {
+            eprintln!(
+                "[printer] warning: failed to advance checkpoint at {} to Running: {e}",
+                cp_path.display()
+            );
+        }
     }
 
     // If the caller supplied review feedback, give the agent one turn to
@@ -310,7 +311,10 @@ async fn run_inner(
             session.rotate().await;
             // First turn of the new session: orient the agent to the world.
             let outcome = session
-                .turn(&rotation_prompt(&printer_bin_str, &spec_abs.to_string_lossy()))
+                .turn(&rotation_prompt(
+                    &printer_bin_str,
+                    &spec_abs.to_string_lossy(),
+                ))
                 .await?;
             print_result_tail(&outcome.result_text);
             if let Some(reason) = blocked_reason(&outcome.result_text) {
@@ -326,9 +330,14 @@ async fn run_inner(
             // of the prior plan, so we ask it to refresh task notes against
             // the current state of the store + tree before the nudge loop
             // resumes.
-            eprintln!("[printer] post-rotation planning pass: refreshing plan against current state");
+            eprintln!(
+                "[printer] post-rotation planning pass: refreshing plan against current state"
+            );
             let outcome = session
-                .turn(&planning_prompt(&printer_bin_str, &spec_abs.to_string_lossy()))
+                .turn(&planning_prompt(
+                    &printer_bin_str,
+                    &spec_abs.to_string_lossy(),
+                ))
                 .await?;
             print_result_tail(&outcome.result_text);
             if let Some(reason) = blocked_reason(&outcome.result_text) {
@@ -428,7 +437,11 @@ fn acquire_sandbox(args: &RunArgs) -> Result<Option<ActiveSandbox>> {
         merged,
         cwd,
         Some(spec),
-        Some(cfg.sandbox.base_image.clone()),
+        Some(crate::drivers::base_image_for_agent(
+            &args.agent,
+            cfg.sandbox.base_image.clone(),
+        )),
+        crate::drivers::agent_setup_arg(&args.agent),
         None,
     )?))
 }

@@ -3,8 +3,8 @@ use crate::cli::{ExecArgs, HistoryArgs, ReviewArgs, RunArgs};
 use crate::codegraph_watch;
 use crate::drivers::{self, ActiveSandbox, DriverSet, shell_quote_argv};
 use crate::hooks::{Event, HookContext, HookSet};
-use crate::tasks::store::{self, compute_ready};
 use crate::tasks::model::Task;
+use crate::tasks::store::{self, compute_ready};
 use crate::{review, run};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -208,8 +208,7 @@ impl Checkpoint {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let body = serde_json::to_string_pretty(self)
-            .context("serializing checkpoint")?;
+        let body = serde_json::to_string_pretty(self).context("serializing checkpoint")?;
         std::fs::write(path, body)
             .with_context(|| format!("writing checkpoint {}", path.display()))?;
         Ok(())
@@ -258,9 +257,7 @@ pub fn list_checkpoints(cwd: &Path) -> Result<Vec<(PathBuf, Checkpoint)>> {
         return Ok(Vec::new());
     }
     let mut out: Vec<(PathBuf, Checkpoint)> = Vec::new();
-    for entry in std::fs::read_dir(&dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
@@ -326,11 +323,7 @@ enum Action {
 /// Resolve the (action, checkpoint-path-on-disk) pair from CLI args plus
 /// whatever checkpoints already exist on disk under `cwd`. Pure-ish:
 /// `list_checkpoints` is a directory read but no agents spawn here.
-fn decide(
-    cwd: &Path,
-    cli_spec: Option<&Path>,
-    cont: bool,
-) -> Result<(Action, PathBuf)> {
+fn decide(cwd: &Path, cli_spec: Option<&Path>, cont: bool) -> Result<(Action, PathBuf)> {
     let all = list_checkpoints(cwd)?;
 
     match (cont, cli_spec) {
@@ -387,7 +380,12 @@ fn decide(
                 None
             };
             match cp {
-                None => Ok((Action::Fresh { spec: spec.to_path_buf() }, path)),
+                None => Ok((
+                    Action::Fresh {
+                        spec: spec.to_path_buf(),
+                    },
+                    path,
+                )),
                 Some(cp) if matches!(cp.phase, Phase::Done | Phase::Cancelled) => {
                     // Re-running a finished (or cancelled) spec: archive + restart.
                     Ok((
@@ -413,10 +411,20 @@ fn decide(
 /// Map a checkpoint's `Phase` to the action we'd take to resume from it.
 fn action_from_phase(cp: &Checkpoint) -> Action {
     match cp.phase {
-        Phase::Planning => Action::ResumeRun { spec: cp.spec.clone(), skip_planning: false },
-        Phase::Running => Action::ResumeRun { spec: cp.spec.clone(), skip_planning: true },
-        Phase::ReviewPending => Action::ResumeReview { spec: cp.spec.clone() },
-        Phase::Done | Phase::Cancelled => Action::AlreadyDone { spec: cp.spec.clone() },
+        Phase::Planning => Action::ResumeRun {
+            spec: cp.spec.clone(),
+            skip_planning: false,
+        },
+        Phase::Running => Action::ResumeRun {
+            spec: cp.spec.clone(),
+            skip_planning: true,
+        },
+        Phase::ReviewPending => Action::ResumeReview {
+            spec: cp.spec.clone(),
+        },
+        Phase::Done | Phase::Cancelled => Action::AlreadyDone {
+            spec: cp.spec.clone(),
+        },
     }
 }
 
@@ -461,8 +469,7 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
         None => None,
     };
 
-    let (action, checkpoint_path) =
-        decide(&cwd, cli_spec_abs.as_deref(), args.r#continue)?;
+    let (action, checkpoint_path) = decide(&cwd, cli_spec_abs.as_deref(), args.r#continue)?;
     // We need the existing checkpoint for ResumeRun's bookkeeping (bumping
     // updated_at). Re-load from the resolved path — it's the same file
     // `decide` looked at.
@@ -500,7 +507,7 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
     let sandbox = if args.no_sandbox {
         None
     } else {
-        acquire_exec_sandbox(&cwd, exec_spec.clone(), None)?
+        acquire_exec_sandbox(&cwd, exec_spec.clone(), &args.agent, None)?
     };
     if let Some(sb) = sandbox.as_ref() {
         sb.sync_in()?;
@@ -514,7 +521,15 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
         hooks.run_cli(Event::BeforeExec, &ctx)?;
     }
 
-    let run_result = run_action(&args, &cwd, &checkpoint_path, action, existing, sandbox.as_ref()).await;
+    let run_result = run_action(
+        &args,
+        &cwd,
+        &checkpoint_path,
+        action,
+        existing,
+        sandbox.as_ref(),
+    )
+    .await;
     let run_success = run_result.is_ok();
     if let Some(sb) = sandbox.as_ref() {
         sb.sync_out();
@@ -545,7 +560,10 @@ async fn exec_recursive(args: ExecArgs, cwd: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("[printer] recursive exec: {} ready task(s)", ready_tasks.len());
+    eprintln!(
+        "[printer] recursive exec: {} ready task(s)",
+        ready_tasks.len()
+    );
 
     for task in ready_tasks {
         eprintln!("[printer] processing task: {}", task.meta.id);
@@ -559,9 +577,11 @@ async fn exec_recursive(args: ExecArgs, cwd: PathBuf) -> Result<()> {
 /// This provides process isolation per task as required by the spec.
 async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<TokenUsage> {
     use tokio::process::Command as TokioCommand;
-    
+
     let worktree_path = cwd.join(".printer").join("worktrees").join(&task.meta.id);
-    let worktree_abs = worktree_path.canonicalize().unwrap_or_else(|_| worktree_path.clone());
+    let worktree_abs = worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.clone());
 
     // Check if we have a git repo for stacked PR pattern
     let has_git = std::process::Command::new("sh")
@@ -586,11 +606,19 @@ async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<Token
     let sandbox = if args.no_sandbox {
         None
     } else {
-        acquire_exec_sandbox(&worktree_abs, Some(task_spec_path.clone()), Some(task.meta.id.clone()))
-            .unwrap_or_else(|e| {
-                eprintln!("[printer] failed to acquire sandbox for task {}: {e}; continuing without sandbox", task.meta.id);
-                None
-            })
+        acquire_exec_sandbox(
+            &worktree_abs,
+            Some(task_spec_path.clone()),
+            &args.agent,
+            Some(task.meta.id.clone()),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "[printer] failed to acquire sandbox for task {}: {e}; continuing without sandbox",
+                task.meta.id
+            );
+            None
+        })
     };
 
     // Spawn a codegraph watch instance in the worktree directory
@@ -606,13 +634,13 @@ async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<Token
 
     // Spawn a subprocess to run printer for this task
     // This provides process isolation per task as required by the spec
-    let printer_bin = std::env::current_exe()
-        .context("resolving printer binary path for subprocess")?;
-    
+    let printer_bin =
+        std::env::current_exe().context("resolving printer binary path for subprocess")?;
+
     let mut cmd = TokioCommand::new(&printer_bin);
     cmd.args(["exec", task_spec_path.to_str().unwrap_or(".")]);
     cmd.arg("--cwd").arg(&worktree_abs);
-    
+
     if args.verbose {
         cmd.arg("--verbose");
     }
@@ -623,12 +651,12 @@ async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<Token
     if args.skip_plugin_check {
         cmd.arg("--skip-plugin-check");
     }
-    
+
     // Wrap the subprocess through the sandbox if we have one
     if let Some(sb) = sandbox.as_ref() {
         // Sync in before running
         sb.sync_in()?;
-        
+
         // Build the command with sandbox wrapper
         let enter_template = sb.enter_template();
         let mut task_argv = vec![
@@ -646,36 +674,56 @@ async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<Token
         if args.skip_plugin_check {
             task_argv.push("--skip-plugin-check".to_string());
         }
-        
+
         let child_cmd = shell_quote_argv(&task_argv);
         let wrapped = enter_template.replace("{child}", &child_cmd);
-        
-        eprintln!("[printer] spawning agent subprocess for task {} in {} (sandboxed)", task.meta.id, worktree_abs.display());
-        
+
+        eprintln!(
+            "[printer] spawning agent subprocess for task {} in {} (sandboxed)",
+            task.meta.id,
+            worktree_abs.display()
+        );
+
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(&wrapped)
             .current_dir(&worktree_abs)
             .output()
-            .with_context(|| format!("spawning sandboxed printer subprocess for task {}", task.meta.id))?;
-        
+            .with_context(|| {
+                format!(
+                    "spawning sandboxed printer subprocess for task {}",
+                    task.meta.id
+                )
+            })?;
+
         if !output.status.success() {
-            eprintln!("[printer] task {} subprocess failed: {}", task.meta.id, 
-                String::from_utf8_lossy(&output.stderr));
+            eprintln!(
+                "[printer] task {} subprocess failed: {}",
+                task.meta.id,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
-        
+
         // Sync out after the run
         sb.sync_out();
     } else {
-        eprintln!("[printer] spawning agent subprocess for task {} in {}", task.meta.id, worktree_abs.display());
-        
-        let output = cmd.output()
+        eprintln!(
+            "[printer] spawning agent subprocess for task {} in {}",
+            task.meta.id,
+            worktree_abs.display()
+        );
+
+        let output = cmd
+            .output()
             .await
             .with_context(|| format!("spawning printer subprocess for task {}", task.meta.id))?;
 
         if !output.status.success() {
-            eprintln!("[printer] task {} subprocess failed: {}", task.meta.id, 
-                String::from_utf8_lossy(&output.stderr));
+            eprintln!(
+                "[printer] task {} subprocess failed: {}",
+                task.meta.id,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -760,9 +808,16 @@ fn ensure_worktree(cwd: &Path, worktree_path: &Path, task_id: &str, has_git: boo
             .output()
             .with_context(|| format!("git worktree add for task {}", task_id))?;
         if !output.status.success() {
-            eprintln!("[printer] git worktree add failed: {}", String::from_utf8_lossy(&output.stderr));
-            std::fs::create_dir_all(worktree_path)
-                .with_context(|| format!("creating worktree directory (fallback) {}", worktree_path.display()))?;
+            eprintln!(
+                "[printer] git worktree add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::create_dir_all(worktree_path).with_context(|| {
+                format!(
+                    "creating worktree directory (fallback) {}",
+                    worktree_path.display()
+                )
+            })?;
         }
     } else {
         std::fs::create_dir_all(worktree_path)
@@ -827,7 +882,10 @@ async fn run_action(
             cp.save(checkpoint_path)?;
             do_run_then_review(args, &spec, checkpoint_path, false, sandbox).await?
         }
-        Action::ResumeRun { spec, skip_planning } => {
+        Action::ResumeRun {
+            spec,
+            skip_planning,
+        } => {
             // Bump updated_at so the file reflects this resume.
             let mut cp = existing.unwrap();
             cp.updated_at = Utc::now();
@@ -1083,7 +1141,12 @@ fn build_review_args(args: &ExecArgs, spec: &Path) -> ReviewArgs {
     }
 }
 
-fn acquire_exec_sandbox(cwd: &Path, spec: Option<PathBuf>, task_id: Option<String>) -> Result<Option<ActiveSandbox>> {
+fn acquire_exec_sandbox(
+    cwd: &Path,
+    spec: Option<PathBuf>,
+    agent: &crate::cli::AgentKind,
+    task_id: Option<String>,
+) -> Result<Option<ActiveSandbox>> {
     let cfg = match crate::config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -1106,7 +1169,11 @@ fn acquire_exec_sandbox(cwd: &Path, spec: Option<PathBuf>, task_id: Option<Strin
         merged,
         cwd.to_path_buf(),
         spec,
-        Some(cfg.sandbox.base_image.clone()),
+        Some(crate::drivers::base_image_for_agent(
+            agent,
+            cfg.sandbox.base_image.clone(),
+        )),
+        crate::drivers::agent_setup_arg(agent),
         task_id,
     )?))
 }
@@ -1144,7 +1211,10 @@ mod tests {
     fn checkpoint_key_distinguishes_same_basename_in_different_dirs() {
         let k1 = checkpoint_key_for_spec(Path::new("/projects/a/spec.md"));
         let k2 = checkpoint_key_for_spec(Path::new("/projects/b/spec.md"));
-        assert_ne!(k1, k2, "same-basename specs in different dirs must hash apart");
+        assert_ne!(
+            k1, k2,
+            "same-basename specs in different dirs must hash apart"
+        );
         assert!(k1.starts_with("spec-"));
         assert!(k2.starts_with("spec-"));
     }
@@ -1152,9 +1222,13 @@ mod tests {
     #[test]
     fn fresh_with_spec_no_checkpoint() {
         let dir = empty_cwd();
-        let (action, _path) =
-            decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
-        assert_eq!(action, Action::Fresh { spec: PathBuf::from("/tmp/a.md") });
+        let (action, _path) = decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
+        assert_eq!(
+            action,
+            Action::Fresh {
+                spec: PathBuf::from("/tmp/a.md")
+            }
+        );
     }
 
     #[test]
@@ -1175,8 +1249,7 @@ mod tests {
     fn continue_with_planning_phase_redoes_planning() {
         let dir = empty_cwd();
         seed(dir.path(), "/tmp/a.md", Phase::Planning);
-        let (action, _) =
-            decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
+        let (action, _) = decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
         assert_eq!(
             action,
             Action::ResumeRun {
@@ -1190,8 +1263,7 @@ mod tests {
     fn continue_with_running_phase_skips_planning() {
         let dir = empty_cwd();
         seed(dir.path(), "/tmp/a.md", Phase::Running);
-        let (action, _) =
-            decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
+        let (action, _) = decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
         assert_eq!(
             action,
             Action::ResumeRun {
@@ -1205,18 +1277,26 @@ mod tests {
     fn continue_with_review_pending_yields_resume_review() {
         let dir = empty_cwd();
         seed(dir.path(), "/tmp/a.md", Phase::ReviewPending);
-        let (action, _) =
-            decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
-        assert_eq!(action, Action::ResumeReview { spec: PathBuf::from("/tmp/a.md") });
+        let (action, _) = decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
+        assert_eq!(
+            action,
+            Action::ResumeReview {
+                spec: PathBuf::from("/tmp/a.md")
+            }
+        );
     }
 
     #[test]
     fn continue_with_done_yields_already_done() {
         let dir = empty_cwd();
         seed(dir.path(), "/tmp/a.md", Phase::Done);
-        let (action, _) =
-            decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
-        assert_eq!(action, Action::AlreadyDone { spec: PathBuf::from("/tmp/a.md") });
+        let (action, _) = decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
+        assert_eq!(
+            action,
+            Action::AlreadyDone {
+                spec: PathBuf::from("/tmp/a.md")
+            }
+        );
     }
 
     #[test]
@@ -1224,9 +1304,13 @@ mod tests {
         // A cancelled spec resumes the same as a done one: nothing to do.
         let dir = empty_cwd();
         seed(dir.path(), "/tmp/a.md", Phase::Cancelled);
-        let (action, _) =
-            decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
-        assert_eq!(action, Action::AlreadyDone { spec: PathBuf::from("/tmp/a.md") });
+        let (action, _) = decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
+        assert_eq!(
+            action,
+            Action::AlreadyDone {
+                spec: PathBuf::from("/tmp/a.md")
+            }
+        );
     }
 
     #[test]
@@ -1243,8 +1327,7 @@ mod tests {
     fn fresh_with_cancelled_checkpoint_archives_and_restarts() {
         let dir = empty_cwd();
         seed(dir.path(), "/tmp/a.md", Phase::Cancelled);
-        let (action, _) =
-            decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
+        let (action, _) = decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
         match action {
             Action::FreshAfterDone { spec, prior } => {
                 assert_eq!(spec, PathBuf::from("/tmp/a.md"));
@@ -1321,8 +1404,7 @@ mod tests {
     fn fresh_with_done_checkpoint_archives_and_restarts() {
         let dir = empty_cwd();
         seed(dir.path(), "/tmp/a.md", Phase::Done);
-        let (action, _) =
-            decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
+        let (action, _) = decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
         match action {
             Action::FreshAfterDone { spec, prior } => {
                 assert_eq!(spec, PathBuf::from("/tmp/a.md"));
@@ -1337,9 +1419,13 @@ mod tests {
     fn fresh_with_existing_checkpoint_same_spec_resumes() {
         let dir = empty_cwd();
         seed(dir.path(), "/tmp/a.md", Phase::ReviewPending);
-        let (action, _) =
-            decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
-        assert_eq!(action, Action::ResumeReview { spec: PathBuf::from("/tmp/a.md") });
+        let (action, _) = decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
+        assert_eq!(
+            action,
+            Action::ResumeReview {
+                spec: PathBuf::from("/tmp/a.md")
+            }
+        );
     }
 
     #[test]
@@ -1349,9 +1435,13 @@ mod tests {
         // does not error and does not touch A's checkpoint.
         let dir = empty_cwd();
         let a_path = seed(dir.path(), "/tmp/a.md", Phase::Running);
-        let (action, b_path) =
-            decide(dir.path(), Some(Path::new("/tmp/b.md")), false).unwrap();
-        assert_eq!(action, Action::Fresh { spec: PathBuf::from("/tmp/b.md") });
+        let (action, b_path) = decide(dir.path(), Some(Path::new("/tmp/b.md")), false).unwrap();
+        assert_eq!(
+            action,
+            Action::Fresh {
+                spec: PathBuf::from("/tmp/b.md")
+            }
+        );
         assert_ne!(a_path, b_path, "per-spec files must use different paths");
         // A's checkpoint untouched.
         assert!(a_path.exists());
@@ -1367,7 +1457,10 @@ mod tests {
         // Already past Planning — must not regress (or progress).
         let path2 = seed(dir.path(), "/tmp/b.md", Phase::ReviewPending);
         write_phase_planning_done(&path2, Path::new("/tmp/b.md")).unwrap();
-        assert_eq!(Checkpoint::load(&path2).unwrap().phase, Phase::ReviewPending);
+        assert_eq!(
+            Checkpoint::load(&path2).unwrap().phase,
+            Phase::ReviewPending
+        );
     }
 
     #[test]
@@ -1400,15 +1493,21 @@ mod tests {
 
         let loaded = History::load(&path).unwrap();
         assert_eq!(loaded.entries.len(), 2);
-        assert_eq!(loaded.entries[0].checkpoint.spec, PathBuf::from("/tmp/a.md"));
-        assert_eq!(loaded.entries[1].checkpoint.spec, PathBuf::from("/tmp/b.md"));
+        assert_eq!(
+            loaded.entries[0].checkpoint.spec,
+            PathBuf::from("/tmp/a.md")
+        );
+        assert_eq!(
+            loaded.entries[1].checkpoint.spec,
+            PathBuf::from("/tmp/b.md")
+        );
     }
 
     #[test]
     /// Create a git worktree for the task, or fall back to a plain directory.
-fn create_task_spec_content_formats_title_and_body() {
+    fn create_task_spec_content_formats_title_and_body() {
         use crate::tasks::model::{Status, TaskMeta};
-        
+
         let task = Task {
             meta: TaskMeta {
                 id: "T-001".to_string(),
@@ -1425,7 +1524,7 @@ fn create_task_spec_content_formats_title_and_body() {
             },
             body: "Implementation details here.".to_string(),
         };
-        
+
         let content = create_task_spec_content(&task);
         assert!(content.starts_with("# Implement feature X"));
         assert!(content.contains("Implementation details here."));
@@ -1433,9 +1532,9 @@ fn create_task_spec_content_formats_title_and_body() {
 
     #[test]
     /// Create a git worktree for the task, or fall back to a plain directory.
-fn create_task_spec_content_handles_empty_body() {
+    fn create_task_spec_content_handles_empty_body() {
         use crate::tasks::model::{Status, TaskMeta};
-        
+
         let task = Task {
             meta: TaskMeta {
                 id: "T-002".to_string(),
@@ -1452,7 +1551,7 @@ fn create_task_spec_content_handles_empty_body() {
             },
             body: String::new(),
         };
-        
+
         let content = create_task_spec_content(&task);
         assert_eq!(content, "# Simple task\n\n");
     }

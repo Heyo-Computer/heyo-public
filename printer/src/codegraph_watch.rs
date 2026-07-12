@@ -73,7 +73,8 @@ pub fn try_spawn(cwd: &Path) -> Result<Option<Guard>> {
     let pid = child.id();
     eprintln!(
         "[printer] launched codegraph watch ({}); logs → {}",
-        pid.map(|p| format!("pid {p}")).unwrap_or_else(|| "no pid".into()),
+        pid.map(|p| format!("pid {p}"))
+            .unwrap_or_else(|| "no pid".into()),
         log_path.display()
     );
 

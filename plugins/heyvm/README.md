@@ -91,15 +91,15 @@ is the only thing that lands), but the next `printer exec` will fail at
 A single sandbox spans both run and review phases (provisioned in
 `exec.rs::acquire_exec_sandbox`). The lifecycle is:
 
-1. **`create`** — `heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude`.
+1. **`create`** — `heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude --mount $HOME/.codex:$HOME/.codex --mount $HOME/.config/amp:$HOME/.config/amp`.
    The host cwd is bind-mounted into the sandbox at `/workspace`, and
-   the host's `~/.claude` is bind-mounted RW at the same path inside the
-   sandbox so claude code can persist its session state and reuse host
-   credentials. We redirect heyvm's normal multi-line output to stderr
+   the host's `~/.claude`, `~/.codex`, and `~/.config/amp` are bind-mounted
+   RW at the same paths inside the sandbox so agent CLIs can persist session
+   state and reuse host credentials/config. We redirect heyvm's normal multi-line output to stderr
    and `echo` the deterministic slug, so printer captures
-   `printer-{spec_slug}` as `{handle}`. The `~/.claude` mount **does**
-   share state with the host: the sandbox can mutate your local claude
-   credentials/conversations. Override `[sandbox.commands] create` to
+   `printer-{spec_slug}` as `{handle}`. These mounts **do** share state with
+   the host: the sandbox can mutate your local agent credentials/conversations.
+   Override `[sandbox.commands] create` to
    drop the mount if you need stricter isolation (and pair it with a
    `post_create` that copies a credential file into a sandbox-local HOME).
 2. **`post_create`** — `cd /workspace`, wrapped through `enter` so it runs
@@ -114,7 +114,7 @@ A single sandbox spans both run and review phases (provisioned in
    mount. `IS_SANDBOX=1` is a documented opt-in that claude code reads to
    allow its bypass-permissions mode under root — without it claude
    exits early with a safety check.
-4. **`destroy`** — `heyvm delete -y {handle}`. Runs from `Drop`, so it
+4. **`destroy`** — `heyvm rm -y {handle}`. Runs from `Drop`, so it
    fires on panic, early return, or Ctrl-C.
 
 `sync_in` and `sync_out` are intentionally not set: the bind mount means
