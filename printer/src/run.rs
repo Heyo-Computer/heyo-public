@@ -321,7 +321,13 @@ async fn run_inner(
                 anyhow::bail!("agent reported blocked: {reason}");
             }
             tasks = store::list_all(tasks_dir)?;
-            commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task, args.push_each_task);
+            commit_newly_done(
+                cwd,
+                &tasks,
+                &mut done_ids,
+                args.commit_each_task,
+                args.push_each_task,
+            );
             if all_done(&tasks) {
                 eprintln!("[printer] all tasks done.");
                 return Ok(session.usage_total);
@@ -344,7 +350,13 @@ async fn run_inner(
                 anyhow::bail!("agent reported blocked during post-rotation planning: {reason}");
             }
             tasks = store::list_all(tasks_dir)?;
-            commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task, args.push_each_task);
+            commit_newly_done(
+                cwd,
+                &tasks,
+                &mut done_ids,
+                args.commit_each_task,
+                args.push_each_task,
+            );
             prev_state_hash = state_hash(&tasks);
             if all_done(&tasks) {
                 eprintln!("[printer] all tasks done.");
@@ -366,7 +378,13 @@ async fn run_inner(
         }
 
         tasks = store::list_all(tasks_dir)?;
-        commit_newly_done(cwd, &tasks, &mut done_ids, args.commit_each_task, args.push_each_task);
+        commit_newly_done(
+            cwd,
+            &tasks,
+            &mut done_ids,
+            args.commit_each_task,
+            args.push_each_task,
+        );
 
         if outcome.result_text.contains(SENTINEL_DONE) {
             if all_done(&tasks) {
@@ -522,7 +540,14 @@ fn commit_newly_done(
             Err(e) => eprintln!("[printer] per-task push failed: {e}"),
         }
     };
-    match git(&["add", "-A", "--", ".", ":(exclude).printer", ":(exclude).printer/**"]) {
+    match git(&[
+        "add",
+        "-A",
+        "--",
+        ".",
+        ":(exclude).printer",
+        ":(exclude).printer/**",
+    ]) {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
             eprintln!(
