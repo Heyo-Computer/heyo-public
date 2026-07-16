@@ -84,6 +84,32 @@ Use `--agent codex` when the sandbox should be provisioned for Codex CLI work.
 Use `--needs-network` when package installs, external APIs, or agent CLIs need
 network access.
 
+On macOS, choose the image according to the Apple backend:
+
+- `apple_container` accepts standard OCI registry references such as `node:22`
+  from Docker Hub or `ghcr.io/org/image:tag` from GHCR. `heyvm create` pulls a
+  missing image automatically.
+- `apple_virt` requires a bootable VM image name or ID from the heyvm image
+  catalog. It cannot boot an OCI container image directly.
+
+```sh
+heyvm create --name node-box --backend apple_container --image node:22 \
+  --mount "$PWD:/workspace"
+heyvm create --name app-box --backend apple_container \
+  --image ghcr.io/org/image:tag
+heyvm create --name linux-vm --backend apple_virt \
+  --image ubuntu-24.04-node --mount "$PWD:/workspace"
+```
+
+Use `heyvm pull` to prefetch or refresh an Apple Container image. It is
+optional before `create` because sandbox creation also pulls missing images.
+
+```sh
+heyvm pull node:22
+heyvm pull ghcr.io/org/image:tag
+heyvm pull --force node:22
+```
+
 ## Cloud Linux Sandboxes
 
 Create a fresh Linux cloud sandbox:
@@ -118,6 +144,7 @@ images.
 Start image work by checking the current CLI surface and inventory:
 
 ```sh
+heyvm pull --help
 heyvm images --help
 heyvm images list --help
 heyvm images publish --help
@@ -129,6 +156,12 @@ heyvm images list --local
 
 Image concepts:
 
+- Apple Container images are OCI registry references managed by Apple's
+  `container` runtime. They can be pulled explicitly with `heyvm pull`, but do
+  not need to appear in the heyvm bootable-VM or cloud image catalogs before
+  use.
+- Apple Virt images are bootable VM artifacts from the heyvm image catalog;
+  standard OCI references such as `node:22` are not Apple Virt images.
 - Built-in supported images come from the CLI/backend catalog and are not cloud
   catalog rows. Examples: `ubuntu:24.04`, `debian:12`, `alpine:3.23`.
 - Backend-local files under paths such as `/var/lib/heyvm/images` are only a

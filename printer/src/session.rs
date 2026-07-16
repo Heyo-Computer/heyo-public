@@ -243,10 +243,7 @@ impl<'a> Session<'a> {
         let stdout_buf = String::from_utf8_lossy(&stdout_bytes).into_owned();
 
         if !status.success() {
-            let stderr_buf = stderr_tail
-                .lock()
-                .map(|g| g.join("\n"))
-                .unwrap_or_default();
+            let stderr_buf = stderr_tail.lock().map(|g| g.join("\n")).unwrap_or_default();
             anyhow::bail!(
                 "agent exited with status {status}\n--- stdout ---\n{stdout_buf}\n\
                  --- stderr (last {STDERR_TAIL_LINES} lines) ---\n{stderr_buf}"
