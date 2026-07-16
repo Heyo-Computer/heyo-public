@@ -1,0 +1,30 @@
+[package]
+name = "app-lb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Proxy data plane. No TLS feature: pingora's `default = []` is plain HTTP, and
+# upstreams are plaintext guest_ip on the tap network. Enabling `openssl` here
+# would link a second TLS stack alongside the rustls that heyo-sdk pulls in
+# through reqwest, for no benefit.
+pingora-core = "0.8.1"
+pingora-proxy = "0.8.1"
+pingora-http = "0.8.1"
+# Shared with pingora's own public API (RequestHeader/ResponseHeader are built
+# on `http`, and response bodies are `bytes::Bytes`), so these must stay on the
+# same major versions pingora resolves.
+http = "1"
+bytes = "1"
+
+heyo-sdk = "0.1.6"
+
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
+arc-swap = "1"
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
