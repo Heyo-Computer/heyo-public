@@ -134,6 +134,35 @@ archive_id=$(heyvm archive-dir . --name <name>-$(date +%Y%m%d%H%M%S) --format js
 heyvm update <sandbox-id-or-name> --archive "$archive_id"
 ```
 
+For a new deployment, pass the archive during creation so the backend
+materializes `/workspace` before it runs the start command:
+
+```sh
+archive_id=$(heyvm --heyo-env stage archive-dir examples/fremont-fishing --name fremont-fishing-$(date +%Y%m%d%H%M%S) --format json | jq -r '.id')
+heyvm --heyo-env stage create --cloud --archive "$archive_id" --name <name> --backend <backend> --image <general-image> --region EU --working-directory /workspace --start-command 'npm ci && npm run build && exec npm start' --port 3000 --health-path /
+```
+
+Use a reusable runtime image, not an app-specific image. Image formats remain
+backend-specific even though every backend receives the same source archive:
+
+| Backend | General Node image | Source delivery |
+| --- | --- | --- |
+| `libvirt` | compatible Node-enabled `qcow2` catalog image | archive mounted at `/workspace` |
+| `kvm` | Node-enabled `ext4` catalog image | archive converted to a workspace disk |
+| `firecracker` | the same compatible Node-enabled `ext4` image | archive converted to a workspace disk |
+| `firecracker_containerd` | standard OCI image such as Docker Hub `node:22` | archive copied into the container at `/workspace` |
+
+`firecracker_containerd` pulls ordinary Docker Hub, GHCR, and other OCI
+registry references automatically, just like `apple_container`. Do not publish
+a Fishing-specific image, and do not use `--mount` with
+`firecracker_containerd`; use `--archive` for cloud application source.
+
+To compare the same application concurrently, reuse one archive ID and create
+four deployments with distinct names and the image appropriate for each row.
+Each deployment gets its own public URL even when all four expose guest port
+3000. Verify `/` and the JavaScript and CSS asset URLs before declaring the
+comparison successful.
+
 On macOS, prefer `create --cloud` plus `archive-dir`/`update`. Do not use
 `--deploy-from` from macOS unless `heyvm create --help` says the selected source
 backend can publish to the cloud; local macOS VM backends are not Linux cloud
