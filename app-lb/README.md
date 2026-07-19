@@ -32,9 +32,11 @@ Configuration is environment-only:
 | `APP_LB_PROXY_ADDR` | `0.0.0.0:6188` | Proxy listener |
 | `APP_LB_ADMIN_ADDR` | `127.0.0.1:9090` | Admin API listener |
 | `APP_LB_STATE_PATH` | `app-lb-state.json` | Where deployment specs persist |
+| `APP_LB_NAME` | `app-lb` | Display name in the dashboard header and page title |
 | `APP_LB_DAEMON_URL` | `http://127.0.0.1:34099` | heyvm daemon |
 | `APP_LB_DASHBOARD_PASSWORD` | *(unset)* | Set to gate the dashboard behind HTTP Basic Auth |
 | `APP_LB_DASHBOARD_USER` | `admin` | Basic Auth username (only used when a password is set) |
+| `APP_LB_ADMIN_AUTH` | `false` | `1`/`true` to extend the gate to the deployment CRUD API (needs a password) |
 | `APP_LB_TLS_CERT` | *(unset)* | PEM cert path; set with `APP_LB_TLS_KEY` to enable HTTPS |
 | `APP_LB_TLS_KEY` | *(unset)* | PEM private-key path |
 | `APP_LB_PROXY_TLS_ADDR` | `0.0.0.0:6189` | HTTPS listener (only bound when cert+key are set) |
@@ -71,11 +73,58 @@ curl localhost:9090/deployments/demo     # one deployment
 curl -XDELETE localhost:9090/deployments/demo   # drain and reap every VM
 curl localhost:9090/healthz
 curl localhost:9090/metrics              # metrics snapshot (JSON)
+
+# Edit a deployment in place (full spec). The pool is preserved unless the `vm`
+# template changes, in which case the VMs are rebuilt.
+curl -XPUT localhost:9090/deployments/demo -H 'content-type: application/json' -d @demo.json
+
+# Scale: partial update of just the scaling policy (fields omitted are kept).
+curl -XPATCH localhost:9090/deployments/demo/scaling -H 'content-type: application/json' \
+  -d '{"min_replicas": 2, "max_replicas": 8}'
+
+# Evict (delete) a single VM. The x-vm-id header / metrics give the sandbox id.
+curl -XDELETE localhost:9090/deployments/demo/vms/sb-abc123            # graceful drain
+curl -XDELETE 'localhost:9090/deployments/demo/vms/sb-abc123?force=true'  # kill now
 ```
 
 Then: `curl -H 'Host: demo.local' localhost:6188/`
 
 Responses carry an `x-vm-id` header naming the VM that served them.
+
+### Editing & scaling a deployment
+
+`PUT /deployments/:id` replaces a deployment's spec **in place**. The path id
+wins (the body's id can't retarget another deployment). Crucially, the running
+pool is *preserved* whenever the `vm` template is unchanged — a scaling, route,
+or health edit never disturbs live VMs; only a change to the `vm` block reboots
+them, because the existing VMs were built from the old template. (This is unlike
+`POST /deployments`, which always replaces and tears the pool down.)
+
+`PATCH /deployments/:id/scaling` is a **partial** update of just the scaling
+policy: fields you omit keep their current values, so `{"min_replicas": 2}`
+raises the floor without resetting `target_concurrency` or the timeouts. It
+always preserves the pool; the autoscaler grows or drains it to match. Both
+endpoints validate (e.g. `min_replicas > max_replicas` is a `400`).
+
+### Evicting a VM
+
+`DELETE /deployments/:id/vms/:sandbox_id` removes one VM from a deployment's
+pool, as opposed to `DELETE /deployments/:id` which tears the whole deployment
+down. The autoscaler boots a replacement on its next tick if the scaling policy
+still wants the capacity, so this is "recycle this instance", not "shrink the
+deployment" — to shrink, lower `max_replicas` instead.
+
+- Default (**graceful**): the VM stops taking new requests, finishes its
+  in-flight ones, and is reaped once idle or at `drain_timeout_secs`. Returns
+  `202 Accepted` with `{"outcome":"draining"}`.
+- `?force=true` (**immediate**): the VM is killed now; its in-flight requests
+  fail over to another VM via the proxy's retry. Returns `200 OK` with
+  `{"outcome":"killed"}`.
+
+A still-booting (pending) VM is simply killed in either mode. Evicting the sole
+VM of a `max_replicas: 1` deployment leaves a brief capacity gap until the
+replacement boots (a request arriving in that window eats a cold start).
+Unknown deployment or VM id is a `404`.
 
 ## Dashboard
 
@@ -88,6 +137,14 @@ assets, so it works over an SSH tunnel to the admin port.
 
 `GET /metrics` returns the same data as JSON (host usage, a global rollup, and a
 per-deployment breakdown), suitable for scraping into your own tooling.
+
+The dashboard is also interactive. Each deployment card has **Scale** (a form
+over min/max replicas, warm pool, and target concurrency → `PATCH .../scaling`)
+and **Edit** (a JSON editor over the full spec → `PUT`), and each VM row has
+**Drain**/**Kill** buttons (→ `DELETE .../vms/:id`). While a form is open the
+cards stop re-rendering so an in-progress edit isn't wiped, though the stat tiles
+keep updating live. These buttons call the admin CRUD API — set
+`APP_LB_ADMIN_AUTH` (see below) to require the dashboard credentials for them.
 
 ### Auth
 
@@ -102,10 +159,23 @@ APP_LB_DASHBOARD_PASSWORD=s3cret ./target/release/app-lb
 curl -u admin:s3cret localhost:9090/metrics
 ```
 
-Only the dashboard routes are gated; deployment CRUD and `/healthz` are
-unaffected and stay on `admin_addr` (localhost by default). The credentials are
-compared in constant time, but the admin listener is plain HTTP — terminate TLS
-in front of it, or reach it over an SSH tunnel, if it leaves localhost.
+By default only the dashboard view (`/dashboard` + `/metrics`) is gated;
+deployment CRUD stays open. Set `APP_LB_ADMIN_AUTH=1` to extend the same gate to
+the CRUD API — register/edit/scale/delete/evict **and** the reads that expose a
+spec (env vars can hold secrets like API keys). It reuses the dashboard
+credentials, so the dashboard's own write buttons keep working (the browser
+replays the cached creds), and `curl` needs `-u`:
+
+```sh
+APP_LB_DASHBOARD_PASSWORD=s3cret APP_LB_ADMIN_AUTH=1 ./target/release/app-lb
+curl -u admin:s3cret -XDELETE localhost:9090/deployments/demo/vms/sb-abc123
+```
+
+`APP_LB_ADMIN_AUTH` requires a password — enabling it without one is a hard
+startup error, never a silently-open gate. `/healthz` is always open so probes
+keep working. The credentials are compared in constant time, but the admin
+listener is plain HTTP — terminate TLS in front of it, or reach it over an SSH
+tunnel, if it leaves localhost.
 
 Two data sources feed it:
 

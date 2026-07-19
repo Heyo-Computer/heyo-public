@@ -13,6 +13,9 @@ fn default_admin_addr() -> String {
 fn default_state_path() -> String {
     "app-lb-state.json".into()
 }
+fn default_name() -> String {
+    "app-lb".into()
+}
 
 /// Process-level configuration, supplied via CLI/env rather than the admin API.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -23,6 +26,10 @@ pub struct LbConfig {
     pub admin_addr: String,
     #[serde(default = "default_state_path")]
     pub state_path: String,
+    /// Display name shown in the dashboard header and page title. Defaults to
+    /// `app-lb`.
+    #[serde(default = "default_name")]
+    pub name: String,
     /// heyvm daemon base URL. Defaults to `HeyoClient::local()`'s target.
     pub daemon_url: Option<String>,
     /// Optional HTTP Basic Auth gate on the dashboard and its `/metrics` data
@@ -33,6 +40,12 @@ pub struct LbConfig {
     pub dashboard_user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dashboard_password: Option<String>,
+    /// When true, the Basic-auth gate also covers the deployment CRUD API
+    /// (register/edit/scale/delete/evict and the spec-revealing reads), not just
+    /// the dashboard view. It reuses the dashboard credentials, so this requires
+    /// `dashboard_password` to be set. `/healthz` stays open for probes.
+    #[serde(default)]
+    pub admin_auth: bool,
     /// Optional HTTPS listener for the proxy data plane. TLS is enabled when
     /// both `tls_cert_path` and `tls_key_path` are set; the HTTPS listener then
     /// binds `tls_addr` *in addition to* the plaintext `proxy_addr`. Upstreams
@@ -55,9 +68,11 @@ impl Default for LbConfig {
             proxy_addr: default_proxy_addr(),
             admin_addr: default_admin_addr(),
             state_path: default_state_path(),
+            name: default_name(),
             daemon_url: None,
             dashboard_user: None,
             dashboard_password: None,
+            admin_auth: false,
             tls_addr: default_tls_addr(),
             tls_cert_path: None,
             tls_key_path: None,
@@ -244,7 +259,10 @@ impl Default for HealthCheck {
 ///
 /// Note the SDK cannot express vcpu/memory/mounts directly — `size_class` is the
 /// only resource knob, and the daemon resolves it host-side.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// `PartialEq` is load-bearing: an in-place edit keeps the running pool only
+/// when the VM *template* is unchanged, so the update path compares old and new
+/// `VmSpec`s to decide whether the VMs must be rebuilt.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct VmSpec {
     /// Must be `firecracker` or `kvm`; `libvirt` is rejected at registration.
     pub driver: SandboxDriver,

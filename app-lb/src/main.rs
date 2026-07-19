@@ -36,6 +36,9 @@ fn config_from_env() -> LbConfig {
     if let Ok(v) = std::env::var("APP_LB_STATE_PATH") {
         cfg.state_path = v;
     }
+    if let Ok(v) = std::env::var("APP_LB_NAME") {
+        cfg.name = v;
+    }
     if let Ok(v) = std::env::var("APP_LB_DAEMON_URL") {
         cfg.daemon_url = Some(v);
     }
@@ -44,6 +47,12 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_DASHBOARD_PASSWORD") {
         cfg.dashboard_password = Some(v);
+    }
+    if let Ok(v) = std::env::var("APP_LB_ADMIN_AUTH") {
+        cfg.admin_auth = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
     }
     if let Ok(v) = std::env::var("APP_LB_PROXY_TLS_ADDR") {
         cfg.tls_addr = v;
@@ -66,6 +75,15 @@ fn main() {
         .init();
 
     let cfg = config_from_env();
+
+    // Fail fast on a gate that can't enforce anything: asking to protect the
+    // admin API while giving it no credential would silently leave it open.
+    if cfg.admin_auth && cfg.dashboard_password.is_none() {
+        panic!(
+            "APP_LB_ADMIN_AUTH is set but APP_LB_DASHBOARD_PASSWORD is not; the admin \
+             gate reuses the dashboard credentials, so set a password or unset APP_LB_ADMIN_AUTH"
+        );
+    }
 
     let registry = Arc::new(Registry::new(&cfg.state_path));
     match registry.load() {
@@ -103,8 +121,10 @@ fn main() {
             registry.clone(),
             autoscaler,
             metrics.clone(),
+            cfg.name.clone(),
             cfg.dashboard_user.clone(),
             cfg.dashboard_password.clone(),
+            cfg.admin_auth,
         ),
     );
 

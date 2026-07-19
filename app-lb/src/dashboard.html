@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>app-lb dashboard</title>
+<title>{{APP_NAME}} dashboard</title>
 <style>
   :root {
     color-scheme: light;
@@ -164,12 +164,62 @@
   .swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
   .empty { color: var(--muted); padding: 30px 0; text-align: center; }
   .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+
+  /* Action buttons */
+  .dep-head .actions { margin-left: auto; display: flex; gap: 6px; }
+  .btn {
+    font: inherit; font-size: 12px; line-height: 1; color: var(--text-2);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; cursor: pointer; white-space: nowrap;
+  }
+  .btn:hover { color: var(--text); border-color: var(--axis); }
+  .btn.primary { color: #fff; background: var(--series-1); border-color: transparent; }
+  .btn.primary:hover { filter: brightness(1.06); }
+  .btn.danger { color: var(--critical); }
+  .btn.danger:hover { background: color-mix(in srgb, var(--critical) 12%, transparent); border-color: var(--critical); }
+  .btn.mini { padding: 3px 7px; font-size: 11px; border-radius: 5px; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  table.vms td.rowactions { display: flex; gap: 5px; }
+
+  /* Modal */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+    display: none; align-items: flex-start; justify-content: center;
+    padding: 6vh 16px; z-index: 50; overflow-y: auto;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    width: 100%; max-width: 620px; box-shadow: 0 12px 40px rgba(0,0,0,0.3);
+  }
+  .modal h2 { font-size: 16px; font-weight: 650; margin: 0; padding: 18px 20px 0; }
+  .modal .modal-sub { color: var(--muted); font-size: 12px; padding: 4px 20px 0; }
+  .modal-body { padding: 16px 20px; }
+  .modal-body label { display: block; font-size: 12px; color: var(--text-2); margin: 12px 0 4px; }
+  .modal-body input[type=number], .modal-body textarea {
+    width: 100%; font: inherit; color: var(--text); background: var(--plane);
+    border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px;
+  }
+  .modal-body textarea { min-height: 320px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; resize: vertical; }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px; }
+  .modal-err { color: var(--critical); font-size: 12px; padding: 0 20px; min-height: 16px; white-space: pre-wrap; }
+  .modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px 18px; }
+
+  /* Toast */
+  #toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: var(--surface); font-size: 13px;
+    padding: 9px 16px; border-radius: 8px; opacity: 0; transition: opacity .25s;
+    pointer-events: none; z-index: 60; max-width: 90vw;
+  }
+  #toast.show { opacity: 1; }
+  #toast.err { background: var(--critical); color: #fff; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header class="top">
-    <h1>app-lb</h1>
+    <h1>{{APP_NAME}}</h1>
     <span class="sub" id="uptime">—</span>
     <span class="spacer"></span>
     <span class="pill"><span class="dot" id="livedot"></span><span id="updated">connecting…</span></span>
@@ -214,6 +264,20 @@
   <div id="deployments"></div>
 </div>
 
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2 id="modal-title"></h2>
+    <div class="modal-sub" id="modal-sub"></div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-err" id="modal-err"></div>
+    <div class="modal-foot">
+      <button class="btn" id="modal-cancel">Cancel</button>
+      <button class="btn primary" id="modal-ok">Save</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
 <script>
 "use strict";
 const REFRESH_MS = 2000;
@@ -221,6 +285,10 @@ const HISTORY = 90;          // samples retained for sparklines (~3 min at 2s)
 const hist = [];             // rolling raw snapshots for client-side rate derivation
 let paused = false;
 let timer = null;
+// While a modal is open the deployment cards are not re-rendered, so an open
+// form/editor isn't wiped out from under the operator by the 2s poll.
+let interacting = false;
+let depsById = {};   // id -> latest deployment view, for form prefills
 
 const $ = (id) => document.getElementById(id);
 const fmt = (n, d = 0) => (n == null || !isFinite(n)) ? "—" :
@@ -426,6 +494,13 @@ function render(data) {
 }
 
 function renderDeployments(deps) {
+  // Keep the id->deployment map fresh every poll (the scale form prefills from
+  // it), but leave the DOM cards alone while a modal is open so an in-progress
+  // edit isn't wiped.
+  depsById = {};
+  deps.forEach(d => { depsById[d.id] = d; });
+  if (interacting) return;
+
   if (!deps.length) {
     $("deployments").innerHTML = `<div class="card empty">No deployments registered.</div>`;
     return;
@@ -449,6 +524,10 @@ function renderDeployments(deps) {
               : `<span class="tag ok">serving</span>`;
       // CPU is percent-of-a-core; normalise the bar to one core but show the raw number.
       const cpuBar = v.cpu_percent == null ? 0 : Math.min(100, v.cpu_percent);
+      const evictBtns = v.draining
+        ? `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`
+        : `<button class="btn mini" data-act="drain" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Drain</button>`
+          + `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`;
       return `<tr>
         <td class="mono">${esc(v.sandbox_id)}</td>
         <td class="mono">${esc(v.addr)}</td>
@@ -457,14 +536,19 @@ function renderDeployments(deps) {
         <td>${v.memory_bytes == null ? "—" : fmtBytes(v.memory_bytes)}</td>
         <td>${fmtDur(v.uptime_secs)}</td>
         <td>${st}</td>
+        <td class="rowactions">${evictBtns}</td>
       </tr>`;
-    }).join("") : `<tr><td colspan="7" class="empty" style="padding:14px">No ready VMs — ${p.pending} booting.</td></tr>`;
+    }).join("") : `<tr><td colspan="8" class="empty" style="padding:14px">No ready VMs — ${p.pending} booting.</td></tr>`;
 
     return `<div class="card dep">
       <div class="dep-head">
         <span class="name">${esc(d.id)}</span>
         <span class="badge">${p.ready}/${p.max_replicas} replicas · want ${p.desired_replicas}</span>
         <span class="badge">min ${p.min_replicas} · warm ${p.warm_pool} · target ${p.target_concurrency}</span>
+        <span class="actions">
+          <button class="btn mini" data-act="scale" data-id="${esc(d.id)}">Scale</button>
+          <button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>
+        </span>
       </div>
       <div class="dep-grid">
         <div>
@@ -485,7 +569,7 @@ function renderDeployments(deps) {
         </div>
         <div style="overflow-x:auto">
           <table class="vms">
-            <thead><tr><th>sandbox</th><th>addr</th><th>in-flight</th><th>CPU</th><th>memory</th><th>uptime</th><th>state</th></tr></thead>
+            <thead><tr><th>sandbox</th><th>addr</th><th>in-flight</th><th>CPU</th><th>memory</th><th>uptime</th><th>state</th><th>actions</th></tr></thead>
             <tbody>${vmRows}</tbody>
           </table>
         </div>
@@ -493,6 +577,142 @@ function renderDeployments(deps) {
     </div>`;
   }).join("");
 }
+
+// ---- Writes: scale / edit / evict --------------------------------------
+
+async function api(method, path, body) {
+  const opts = { method, cache: "no-store", headers: {} };
+  if (body !== undefined) {
+    opts.headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opts);
+  let data = null, text = "";
+  try { text = await r.text(); data = text ? JSON.parse(text) : null; } catch (_) {}
+  return { ok: r.ok, status: r.status, data, text };
+}
+const errMsg = (res) => (res.data && res.data.error) || res.text || ("HTTP " + res.status);
+const intval = (id) => { const n = parseInt($(id).value, 10); return isNaN(n) ? 0 : n; };
+
+let toastTimer = null;
+function toast(msg, isErr) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "show" + (isErr ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ""; }, 2800);
+}
+
+// --- modal ---
+let modalSubmit = null;
+function openModal(title, sub, bodyHtml, onSubmit, okLabel) {
+  interacting = true;                 // freeze card re-renders (tiles keep updating)
+  $("modal-title").textContent = title;
+  $("modal-sub").textContent = sub || "";
+  $("modal-body").innerHTML = bodyHtml;
+  $("modal-err").textContent = "";
+  $("modal-ok").textContent = okLabel || "Save";
+  $("modal-ok").disabled = false;
+  modalSubmit = onSubmit;
+  $("modal-overlay").classList.add("open");
+}
+function closeModal() {
+  $("modal-overlay").classList.remove("open");
+  modalSubmit = null;
+  interacting = false;
+  if (!paused) poll();                // immediate refresh with the new state
+}
+function modalErr(msg) { $("modal-err").textContent = msg; $("modal-ok").disabled = false; }
+
+$("modal-cancel").addEventListener("click", closeModal);
+$("modal-overlay").addEventListener("click", (e) => { if (e.target.id === "modal-overlay") closeModal(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && $("modal-overlay").classList.contains("open")) closeModal();
+});
+$("modal-ok").addEventListener("click", async () => {
+  if (!modalSubmit) return;
+  $("modal-ok").disabled = true;
+  $("modal-err").textContent = "";
+  try { await modalSubmit(); }
+  catch (e) { modalErr(String((e && e.message) || e)); }
+});
+
+// --- scale: PATCH the scaling policy (pool preserved) ---
+function openScale(id) {
+  const p = (depsById[id] || {}).pool || {};
+  const num = (name, label, val) =>
+    `<div><label for="f-${name}">${label}</label><input type="number" min="0" id="f-${name}" value="${val ?? 0}"></div>`;
+  const body = `<div class="form-grid">
+      ${num("min_replicas", "Min replicas", p.min_replicas)}
+      ${num("max_replicas", "Max replicas", p.max_replicas)}
+      ${num("warm_pool", "Warm pool", p.warm_pool)}
+      ${num("target_concurrency", "Target concurrency", p.target_concurrency)}
+    </div>`;
+  openModal(
+    `Scale · ${id}`,
+    "Adjusts the scaling policy. Running VMs are kept; the autoscaler grows or drains the pool to match.",
+    body,
+    async () => {
+      const patch = {
+        min_replicas: intval("f-min_replicas"),
+        max_replicas: intval("f-max_replicas"),
+        warm_pool: intval("f-warm_pool"),
+        target_concurrency: intval("f-target_concurrency"),
+      };
+      const res = await api("PATCH", `deployments/${encodeURIComponent(id)}/scaling`, patch);
+      if (!res.ok) return modalErr(errMsg(res));
+      toast(`Scaled ${id}`);
+      closeModal();
+    },
+    "Apply",
+  );
+}
+
+// --- edit: GET the full spec, PUT it back ---
+async function openEdit(id) {
+  const res = await api("GET", `deployments/${encodeURIComponent(id)}`);
+  if (!res.ok) { toast(errMsg(res), true); return; }
+  const spec = res.data.spec;
+  const body = `<label for="f-spec">Deployment spec (JSON)</label>
+    <textarea id="f-spec" spellcheck="false">${esc(JSON.stringify(spec, null, 2))}</textarea>`;
+  openModal(
+    `Edit · ${id}`,
+    "Full spec. Editing the vm block reboots the pool; scaling/route/health edits keep it live.",
+    body,
+    async () => {
+      let parsed;
+      try { parsed = JSON.parse($("f-spec").value); }
+      catch (e) { return modalErr("Invalid JSON: " + e.message); }
+      const put = await api("PUT", `deployments/${encodeURIComponent(id)}`, parsed);
+      if (!put.ok) return modalErr(errMsg(put));
+      toast(`Updated ${id}`);
+      closeModal();
+    },
+    "Save",
+  );
+}
+
+// --- evict a single VM ---
+async function evictVm(id, sb, force) {
+  const verb = force ? "Force-kill" : "Drain";
+  if (!confirm(`${verb} VM ${sb} of deployment ${id}?`)) return;
+  const path = `deployments/${encodeURIComponent(id)}/vms/${encodeURIComponent(sb)}${force ? "?force=true" : ""}`;
+  const res = await api("DELETE", path);
+  if (!res.ok) { toast(errMsg(res), true); return; }
+  toast(`${res.data && res.data.outcome === "killed" ? "Killed" : "Draining"} ${sb}`);
+  if (!interacting && !paused) poll();
+}
+
+// Delegated so the buttons survive every card re-render.
+$("deployments").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-act]");
+  if (!b) return;
+  const { act, id, sb } = b.dataset;
+  if (act === "scale") openScale(id);
+  else if (act === "edit") openEdit(id);
+  else if (act === "drain") evictVm(id, sb, false);
+  else if (act === "kill") evictVm(id, sb, true);
+});
 
 async function poll() {
   try {

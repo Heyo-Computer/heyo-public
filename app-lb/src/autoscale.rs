@@ -442,6 +442,95 @@ impl Autoscaler {
         d.set_backends(Vec::new());
         d.set_pending(Vec::new());
     }
+
+    /// Evict a single VM from a deployment's pool.
+    ///
+    /// Two modes, both consistent with the rule that the autoscaler is the only
+    /// writer of the `backends`/`pending` vecs — this never mutates them, it
+    /// flips the backend's atomic drain flag and/or kills the sandbox, and lets
+    /// the next reconcile tick reconcile the vecs:
+    ///
+    /// - **graceful** (`force = false`): mark the VM draining so it stops taking
+    ///   new requests but finishes in-flight ones; `reap_drained` kills it once
+    ///   idle or at `drain_timeout_secs`. Returns [`EvictOutcome::Draining`].
+    /// - **force** (`force = true`): kill the sandbox now, dropping in-flight
+    ///   requests (they fail over to another VM via the proxy's retry). Returns
+    ///   [`EvictOutcome::Killed`].
+    ///
+    /// A pending (still-booting) VM holds no traffic, so it is simply killed in
+    /// either mode. After eviction the autoscaler is nudged, so a replacement
+    /// boots immediately if the scaling policy still wants the capacity.
+    pub async fn evict(&self, d: &Arc<Deployment>, sandbox_id: &str, force: bool) -> EvictOutcome {
+        // A ready backend.
+        if let Some(b) = d
+            .backends()
+            .iter()
+            .find(|b| b.sandbox_id == sandbox_id)
+            .cloned()
+        {
+            // Stop new traffic regardless of mode; a draining VM is skipped by
+            // `select`, so no request is routed to it after this point.
+            b.set_draining();
+
+            if !force {
+                tracing::info!(
+                    deployment = %d.spec.id,
+                    sandbox = %sandbox_id,
+                    in_flight = b.in_flight(),
+                    "evicting VM (draining)",
+                );
+                d.scale_signal.notify_one();
+                return EvictOutcome::Draining;
+            }
+
+            tracing::info!(
+                deployment = %d.spec.id,
+                sandbox = %sandbox_id,
+                in_flight = b.in_flight(),
+                "evicting VM (force kill)",
+            );
+            if let Err(e) = self.vms.kill(sandbox_id).await {
+                tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill evicted VM");
+                return EvictOutcome::KillFailed(e.to_string());
+            }
+            // `prune` removes the now-dead backend next tick and won't record a
+            // reap, so count it here to keep the dashboard's reaped total honest.
+            self.metrics.record_reaped(&d.spec.id, 1);
+            d.scale_signal.notify_one();
+            return EvictOutcome::Killed;
+        }
+
+        // A pending, still-booting VM: nothing in-flight, so just kill it. The
+        // next `promote_pending` drops it from the pending vec.
+        if d.pending().iter().any(|p| p.sandbox_id == sandbox_id) {
+            tracing::info!(
+                deployment = %d.spec.id,
+                sandbox = %sandbox_id,
+                "evicting pending VM",
+            );
+            if let Err(e) = self.vms.kill(sandbox_id).await {
+                tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill evicted pending VM");
+                return EvictOutcome::KillFailed(e.to_string());
+            }
+            d.scale_signal.notify_one();
+            return EvictOutcome::Killed;
+        }
+
+        EvictOutcome::NotFound
+    }
+}
+
+/// The result of an [`Autoscaler::evict`] call.
+#[derive(Debug)]
+pub enum EvictOutcome {
+    /// The sandbox was killed and is gone now.
+    Killed,
+    /// The VM was marked draining; the autoscaler will reap it once idle.
+    Draining,
+    /// No VM with that id is in the deployment's pool (ready or pending).
+    NotFound,
+    /// The VM was found but the daemon refused to kill it.
+    KillFailed(String),
 }
 
 #[async_trait]
@@ -488,4 +577,79 @@ async fn wait_for_any_scale_signal(registry: &Arc<Registry>) {
         })
         .collect();
     let _ = futures::future::select_all(waits).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DeploymentSpec, HealthCheck, RouteRule, ScalingPolicy, VmSpec};
+    use crate::deployment::VmBackend;
+    use crate::metrics::Metrics;
+    use heyo_sdk::SandboxDriver;
+
+    fn spec() -> DeploymentSpec {
+        DeploymentSpec {
+            id: "demo".into(),
+            routes: vec![RouteRule {
+                host: Some("demo.local".into()),
+                host_suffix: None,
+                path_prefix: None,
+            }],
+            vm: VmSpec {
+                driver: SandboxDriver::Firecracker,
+                image: None,
+                port: 8080,
+                start_command: None,
+                size_class: None,
+                disk_size_gb: None,
+                working_directory: None,
+                env_vars: None,
+                setup_hooks: None,
+                open_ports: vec![],
+                ttl_seconds: 3600,
+            },
+            scaling: ScalingPolicy::default(),
+            health: HealthCheck::default(),
+        }
+    }
+
+    fn autoscaler() -> (Autoscaler, Arc<Registry>) {
+        let registry = Arc::new(Registry::new("unused.json"));
+        registry.upsert(spec());
+        // A daemon URL nothing listens on: fine, because the graceful and
+        // not-found paths never call it.
+        let vms = VmManager::new(Some("http://127.0.0.1:1".into()));
+        (
+            Autoscaler::new(registry.clone(), vms, Arc::new(Metrics::new())),
+            registry,
+        )
+    }
+
+    #[tokio::test]
+    async fn graceful_eviction_marks_the_backend_draining() {
+        let (a, reg) = autoscaler();
+        let d = reg.get("demo").unwrap();
+        let b = Arc::new(VmBackend::new("sb-1".into(), "10.0.0.1:80".parse().unwrap()));
+        d.set_backends(vec![b.clone()]);
+
+        let out = a.evict(&d, "sb-1", false).await;
+        assert!(matches!(out, EvictOutcome::Draining), "got {out:?}");
+        assert!(b.is_draining(), "eviction must stop new traffic to the VM");
+        // The backend is still in the pool (the autoscaler reaps it later), but
+        // is no longer selectable.
+        assert!(d.select(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn evicting_an_unknown_vm_is_not_found() {
+        let (a, reg) = autoscaler();
+        let d = reg.get("demo").unwrap();
+        d.set_backends(vec![Arc::new(VmBackend::new(
+            "sb-1".into(),
+            "10.0.0.1:80".parse().unwrap(),
+        ))]);
+
+        let out = a.evict(&d, "sb-does-not-exist", false).await;
+        assert!(matches!(out, EvictOutcome::NotFound), "got {out:?}");
+    }
 }

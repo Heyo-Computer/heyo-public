@@ -97,6 +97,31 @@ impl Registry {
         deployment
     }
 
+    /// Update a deployment's spec in place, **preserving its live VM pool**.
+    ///
+    /// Unlike `upsert` (which abandons the old pool for the autoscaler to reap),
+    /// this carries the existing backends and pending VMs onto a fresh
+    /// `Deployment` built from the new spec. The pool is a vec of shared
+    /// `Arc<VmBackend>`, so the moved VMs keep their in-flight counters and
+    /// drain flags, and requests in flight during the edit are unaffected.
+    /// Returns `None` if the id is unknown.
+    ///
+    /// Only valid when the VM *template* is unchanged; a template change means
+    /// the running VMs were built from a different spec and must be rebuilt,
+    /// which is `upsert` plus a teardown of the old pool. The admin layer makes
+    /// that decision.
+    pub fn update(&self, spec: DeploymentSpec) -> Option<Arc<Deployment>> {
+        let old = self.get(&spec.id)?;
+        let new = Arc::new(Deployment::new(spec));
+        new.set_backends((*old.backends()).clone());
+        new.set_pending((*old.pending()).clone());
+        let id = new.spec.id.clone();
+        self.mutate(|map| {
+            map.insert(id.clone(), new.clone());
+        });
+        Some(new)
+    }
+
     pub fn remove(&self, id: &str) -> Option<Arc<Deployment>> {
         let mut removed = None;
         self.mutate(|map| {
@@ -305,6 +330,38 @@ mod tests {
             r.route(Some("a.local"), "/api/x").unwrap().spec.id,
             "site-api"
         );
+    }
+
+    #[test]
+    fn update_preserves_the_live_pool_and_swaps_routes() {
+        use crate::deployment::VmBackend;
+        use std::sync::Arc;
+
+        let r = Registry::new("unused.json");
+        r.upsert(spec("a", vec![host("old.local")]));
+        let before = r.get("a").unwrap();
+        let backend = Arc::new(VmBackend::new("sb-1".into(), "10.0.0.1:80".parse().unwrap()));
+        backend.acquire(); // 1 in-flight, to prove the counter survives the edit
+        before.set_backends(vec![backend.clone()]);
+
+        // Edit the routes (not the VM template).
+        let updated = r.update(spec("a", vec![host("new.local")])).unwrap();
+
+        // The same backend Arc moved across, in-flight intact.
+        let pool = updated.backends();
+        assert_eq!(pool.len(), 1);
+        assert!(Arc::ptr_eq(&pool[0], &backend), "the running VM must be carried over");
+        assert_eq!(pool[0].in_flight(), 1, "in-flight counter preserved across the edit");
+
+        // Routing follows the new spec.
+        assert!(r.route(Some("old.local"), "/").is_none());
+        assert_eq!(r.route(Some("new.local"), "/").unwrap().spec.id, "a");
+    }
+
+    #[test]
+    fn update_of_unknown_deployment_is_none() {
+        let r = Registry::new("unused.json");
+        assert!(r.update(spec("ghost", vec![host("x.local")])).is_none());
     }
 
     #[test]
