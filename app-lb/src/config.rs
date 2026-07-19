@@ -25,6 +25,28 @@ pub struct LbConfig {
     pub state_path: String,
     /// heyvm daemon base URL. Defaults to `HeyoClient::local()`'s target.
     pub daemon_url: Option<String>,
+    /// Optional HTTP Basic Auth gate on the dashboard and its `/metrics` data
+    /// source. Auth is enabled iff `password` is set; `user` defaults to
+    /// `"admin"`. The rest of the admin API (deployment CRUD, healthz) is
+    /// unaffected — it stays bound to `admin_addr`, localhost by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_password: Option<String>,
+    /// Optional HTTPS listener for the proxy data plane. TLS is enabled when
+    /// both `tls_cert_path` and `tls_key_path` are set; the HTTPS listener then
+    /// binds `tls_addr` *in addition to* the plaintext `proxy_addr`. Upstreams
+    /// stay plaintext regardless — the guest IP is on a host-local tap network.
+    #[serde(default = "default_tls_addr")]
+    pub tls_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key_path: Option<String>,
+}
+
+fn default_tls_addr() -> String {
+    "0.0.0.0:6189".into()
 }
 
 impl Default for LbConfig {
@@ -34,6 +56,11 @@ impl Default for LbConfig {
             admin_addr: default_admin_addr(),
             state_path: default_state_path(),
             daemon_url: None,
+            dashboard_user: None,
+            dashboard_password: None,
+            tls_addr: default_tls_addr(),
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }
@@ -49,6 +76,15 @@ pub struct RouteRule {
     /// is matched against `:authority`, which carries no `Host` header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Subdomain (wildcard) host match: a domain whose apex *and* any subdomain
+    /// match — `host_suffix: "apps.example.com"` routes `apps.example.com`,
+    /// `a.apps.example.com`, and `x.y.apps.example.com`, but not
+    /// `notapps.example.com` (the match is anchored at a label boundary). A
+    /// leading dot is accepted and ignored, so `.apps.example.com` is equivalent.
+    /// An exact `host` always outranks a `host_suffix`, and a longer suffix
+    /// outranks a shorter one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_suffix: Option<String>,
     /// Path prefix match, e.g. `/api`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
@@ -56,14 +92,21 @@ pub struct RouteRule {
 
 impl RouteRule {
     pub fn is_empty(&self) -> bool {
-        self.host.is_none() && self.path_prefix.is_none()
+        self.host.is_none() && self.host_suffix.is_none() && self.path_prefix.is_none()
     }
 
     /// Longer/more-specific rules must win, so rules are ranked before matching.
-    /// Host is a stronger signal than path, and a longer prefix beats a shorter.
+    /// The tiers don't overlap: an exact host beats *any* subdomain rule, which
+    /// beats any path-only rule; within a tier a longer suffix or path wins.
     pub fn specificity(&self) -> usize {
-        let host = if self.host.is_some() { 1_000 } else { 0 };
-        host + self.path_prefix.as_ref().map_or(0, |p| p.len())
+        let mut score = 0usize;
+        if self.host.is_some() {
+            score += 1_000_000;
+        }
+        if let Some(s) = &self.host_suffix {
+            score += 100_000 + s.trim_start_matches('.').len();
+        }
+        score + self.path_prefix.as_ref().map_or(0, |p| p.len())
     }
 
     pub fn matches(&self, host: Option<&str>, path: &str) -> bool {
@@ -76,6 +119,12 @@ impl RouteRule {
                 _ => return false,
             }
         }
+        if let Some(suffix) = &self.host_suffix {
+            match host {
+                Some(got) if host_in_domain(got, suffix) => {}
+                _ => return false,
+            }
+        }
         if let Some(prefix) = &self.path_prefix
             && !path.starts_with(prefix.as_str())
         {
@@ -83,6 +132,24 @@ impl RouteRule {
         }
         true
     }
+}
+
+/// Whether `host` is the domain `suffix` itself or a subdomain of it, matched at
+/// a label boundary so `apps.example.com` covers `a.apps.example.com` but never
+/// `notapps.example.com`. Case-insensitive; a leading dot on `suffix` is ignored.
+fn host_in_domain(host: &str, suffix: &str) -> bool {
+    let suffix = suffix.trim_start_matches('.');
+    if suffix.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case(suffix) {
+        return true; // apex
+    }
+    // A proper subdomain: the char just before the suffix must be a dot, so
+    // `notapps.example.com` doesn't match suffix `apps.example.com`.
+    host.len() > suffix.len()
+        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+        && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 fn default_target_concurrency() -> u32 {
@@ -306,6 +373,7 @@ mod tests {
             id: "demo".into(),
             routes: vec![RouteRule {
                 host: Some("demo.local".into()),
+                host_suffix: None,
                 path_prefix: None,
             }],
             vm: VmSpec {
@@ -381,6 +449,7 @@ mod tests {
     fn host_match_is_case_insensitive() {
         let r = RouteRule {
             host: Some("Demo.Local".into()),
+            host_suffix: None,
             path_prefix: None,
         };
         assert!(r.matches(Some("demo.local"), "/"));
@@ -393,6 +462,7 @@ mod tests {
     fn host_and_path_must_both_match() {
         let r = RouteRule {
             host: Some("demo.local".into()),
+            host_suffix: None,
             path_prefix: Some("/api".into()),
         };
         assert!(r.matches(Some("demo.local"), "/api/v1"));
@@ -401,17 +471,102 @@ mod tests {
     }
 
     #[test]
+    fn host_suffix_matches_apex_and_subdomains_at_a_label_boundary() {
+        let r = RouteRule {
+            host: None,
+            host_suffix: Some("apps.example.com".into()),
+            path_prefix: None,
+        };
+        // Apex and any depth of subdomain.
+        assert!(r.matches(Some("apps.example.com"), "/"));
+        assert!(r.matches(Some("a.apps.example.com"), "/"));
+        assert!(r.matches(Some("x.y.apps.example.com"), "/"));
+        // Case-insensitive.
+        assert!(r.matches(Some("A.Apps.Example.Com"), "/"));
+        // Boundary is anchored: a label that merely ends with the string is not
+        // a subdomain of it.
+        assert!(!r.matches(Some("notapps.example.com"), "/"));
+        assert!(!r.matches(Some("example.com"), "/"));
+        assert!(!r.matches(None, "/"));
+    }
+
+    #[test]
+    fn host_suffix_accepts_a_leading_dot() {
+        let r = RouteRule {
+            host: None,
+            host_suffix: Some(".example.com".into()),
+            path_prefix: None,
+        };
+        assert!(r.matches(Some("a.example.com"), "/"));
+        assert!(r.matches(Some("example.com"), "/"));
+    }
+
+    #[test]
+    fn host_suffix_and_path_must_both_match() {
+        let r = RouteRule {
+            host: None,
+            host_suffix: Some("example.com".into()),
+            path_prefix: Some("/api".into()),
+        };
+        assert!(r.matches(Some("a.example.com"), "/api/v1"));
+        assert!(!r.matches(Some("a.example.com"), "/web"));
+        assert!(!r.matches(Some("a.other.com"), "/api/v1"));
+    }
+
+    #[test]
+    fn exact_host_outranks_subdomain_outranks_path() {
+        let exact = RouteRule {
+            host: Some("a.example.com".into()),
+            host_suffix: None,
+            path_prefix: None,
+        };
+        let wild = RouteRule {
+            host: None,
+            host_suffix: Some("example.com".into()),
+            path_prefix: None,
+        };
+        let long_wild = RouteRule {
+            host: None,
+            host_suffix: Some("apps.example.com".into()),
+            path_prefix: None,
+        };
+        let path_only = RouteRule {
+            host: None,
+            host_suffix: None,
+            path_prefix: Some("/some/long/path".into()),
+        };
+        assert!(exact.specificity() > long_wild.specificity());
+        assert!(long_wild.specificity() > wild.specificity(), "longer suffix wins");
+        assert!(wild.specificity() > path_only.specificity(), "subdomain beats path");
+    }
+
+    #[test]
+    fn empty_and_dot_only_suffix_match_nothing() {
+        assert!(RouteRule::default().is_empty());
+        let dot = RouteRule {
+            host: None,
+            host_suffix: Some(".".into()),
+            path_prefix: None,
+        };
+        assert!(!dot.is_empty(), "a suffix field is set");
+        assert!(!dot.matches(Some("example.com"), "/"), "but it matches nothing");
+    }
+
+    #[test]
     fn host_outranks_path_and_longer_prefix_wins() {
         let host_only = RouteRule {
             host: Some("a".into()),
+            host_suffix: None,
             path_prefix: None,
         };
         let long_path = RouteRule {
             host: None,
+            host_suffix: None,
             path_prefix: Some("/a/very/long/prefix".into()),
         };
         let short_path = RouteRule {
             host: None,
+            host_suffix: None,
             path_prefix: Some("/a".into()),
         };
         assert!(host_only.specificity() > long_path.specificity());

@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Proxy data plane. No TLS feature: pingora's `default = []` is plain HTTP, and
-# upstreams are plaintext guest_ip on the tap network. Enabling `openssl` here
-# would link a second TLS stack alongside the rustls that heyo-sdk pulls in
-# through reqwest, for no benefit.
-pingora-core = "0.8.1"
+# Proxy data plane. The `rustls` feature enables the optional client-facing
+# HTTPS listener (see `APP_LB_TLS_*`); upstreams stay plaintext guest_ip on the
+# tap network regardless. rustls — not openssl/boringssl — is deliberate: it is
+# the same TLS stack heyo-sdk already pulls in through reqwest, so enabling it
+# adds no second TLS library to the link.
+pingora-core = { version = "0.8.1", features = ["rustls"] }
 pingora-proxy = "0.8.1"
 pingora-http = "0.8.1"
 # Shared with pingora's own public API (RequestHeader/ResponseHeader are built
@@ -26,5 +27,8 @@ arc-swap = "1"
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Encoding the configured dashboard credentials into the expected Basic-auth
+# header once at startup. Already in the tree transitively (reqwest/pingora).
+base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

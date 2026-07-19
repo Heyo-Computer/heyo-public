@@ -27,6 +27,16 @@ pub struct VmBackend {
     draining: AtomicBool,
     healthy: AtomicBool,
     last_active: AtomicU64,
+    /// When this VM joined the pool (LB clock). Serving uptime, as opposed to
+    /// the daemon's `uptime_secs` which counts provisioning too; this is what
+    /// the LB actually watched the VM serve for.
+    ready_at: u64,
+    /// Latest CPU/memory sample from the daemon's `/system/usage`, refreshed by
+    /// the autoscaler each tick. CPU is stored as f64 bits (percent of a core);
+    /// `has_usage` distinguishes "no sample yet" from a genuine zero.
+    cpu_percent_bits: AtomicU64,
+    mem_bytes: AtomicU64,
+    has_usage: AtomicBool,
 }
 
 impl VmBackend {
@@ -38,7 +48,35 @@ impl VmBackend {
             draining: AtomicBool::new(false),
             healthy: AtomicBool::new(true),
             last_active: AtomicU64::new(now_secs()),
+            ready_at: now_secs(),
+            cpu_percent_bits: AtomicU64::new(0),
+            mem_bytes: AtomicU64::new(0),
+            has_usage: AtomicBool::new(false),
         }
+    }
+
+    /// Seconds this VM has been in the pool.
+    pub fn uptime_secs(&self) -> u64 {
+        now_secs().saturating_sub(self.ready_at)
+    }
+
+    /// Record the latest resource sample for this VM.
+    pub fn set_usage(&self, cpu_percent: f64, mem_bytes: u64) {
+        self.cpu_percent_bits
+            .store(cpu_percent.to_bits(), Ordering::Relaxed);
+        self.mem_bytes.store(mem_bytes, Ordering::Relaxed);
+        self.has_usage.store(true, Ordering::Relaxed);
+    }
+
+    /// Latest `(cpu_percent, mem_bytes)`, or `None` if the daemon has not yet
+    /// reported usage for this VM (freshly promoted, or usage unavailable).
+    pub fn usage(&self) -> Option<(f64, u64)> {
+        self.has_usage.load(Ordering::Relaxed).then(|| {
+            (
+                f64::from_bits(self.cpu_percent_bits.load(Ordering::Relaxed)),
+                self.mem_bytes.load(Ordering::Relaxed),
+            )
+        })
     }
 
     pub fn in_flight(&self) -> usize {
@@ -260,6 +298,7 @@ mod tests {
             id: "demo".into(),
             routes: vec![RouteRule {
                 host: Some("demo.local".into()),
+                host_suffix: None,
                 path_prefix: None,
             }],
             vm: VmSpec {

@@ -13,8 +13,10 @@
 
 use crate::config::VmSpec;
 use heyo_sdk::{
-    HeyoClientOptions, Sandbox, SandboxCreateOptions, SandboxDriver, SandboxInfo, SandboxStatus,
+    HeyoClient, HeyoClientOptions, RequestOptions, Sandbox, SandboxCreateOptions, SandboxDriver,
+    SandboxInfo, SandboxStatus,
 };
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -102,6 +104,60 @@ impl From<heyo_sdk::HeyoError> for VmError {
     }
 }
 
+/// Live host + per-sandbox resource usage from the daemon's `GET /system/usage`.
+///
+/// The daemon serves this from a background poller (~5s) sampling the host
+/// processes that back each VM, so it is cheap to fetch — a cache read, not a
+/// per-VM probe — and safe to poll on the reconcile tick. Only backends with a
+/// local host process are reported, which for app-lb (Firecracker/KVM on a local
+/// daemon) is all of them. Disk and network throughput are not exposed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SystemUsage {
+    /// False while the poller is still warming up; `snapshot` is then absent.
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub snapshot: Option<UsageSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSnapshot {
+    pub host: HostUsage,
+    #[serde(default)]
+    pub sampled_at_ms: u64,
+    #[serde(default)]
+    pub sandboxes: Vec<SandboxUsage>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostUsage {
+    #[serde(default)]
+    pub cpu_count: u32,
+    /// Whole-host CPU utilisation, 0–100.
+    #[serde(default)]
+    pub cpu_percent: f64,
+    #[serde(default)]
+    pub memory_total_bytes: u64,
+    #[serde(default)]
+    pub memory_used_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxUsage {
+    #[serde(default)]
+    pub sandbox_id: String,
+    /// `top`-style CPU: percent of a *single* core, so a busy multi-vCPU VM can
+    /// exceed 100.
+    #[serde(default)]
+    pub cpu_percent: f64,
+    /// Resident set size of the backing host process(es).
+    #[serde(default)]
+    pub memory_bytes: u64,
+}
+
 /// Talks to the heyvm daemon.
 #[derive(Debug, Clone)]
 pub struct VmManager {
@@ -173,6 +229,25 @@ impl VmManager {
 
     pub fn connect(&self, sandbox_id: String) -> Result<Sandbox, VmError> {
         Ok(Sandbox::connect(sandbox_id, self.opts.clone())?)
+    }
+
+    /// Fetch the daemon's cached host + per-sandbox usage snapshot.
+    ///
+    /// Like `list`, this is a single daemon round-trip meant for once-per-tick
+    /// use — the daemon already samples in the background, so this just reads
+    /// its cache. There is no typed SDK method for it, so we go through the
+    /// client's generic request helper.
+    pub async fn system_usage(&self) -> Result<SystemUsage, VmError> {
+        let client = HeyoClient::new(self.opts.clone())?;
+        let usage = client
+            .request::<SystemUsage>(
+                http::Method::GET,
+                "/system/usage",
+                None::<&serde_json::Value>,
+                RequestOptions::default(),
+            )
+            .await?;
+        Ok(usage)
     }
 
     /// Destroy a VM. A VM the daemon has already forgotten counts as killed.

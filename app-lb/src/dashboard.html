@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>app-lb dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --plane:        #f9f9f7;
+    --surface:      #fcfcfb;
+    --text:         #0b0b0b;
+    --text-2:       #52514e;
+    --muted:        #898781;
+    --grid:         #e1e0d9;
+    --axis:         #c3c2b7;
+    --border:       rgba(11,11,11,0.10);
+    --series-1:     #2a78d6;  /* blue   — requests / primary */
+    --series-1-dim: #cde2fb;
+    --series-2:     #1baf7a;  /* aqua   — created / positive flow */
+    --series-3:     #eb6834;  /* orange — reaped / drained flow */
+    --good:         #0ca30c;
+    --warning:      #fab219;
+    --serious:      #ec835a;
+    --critical:     #d03b3b;
+    --success-text: #006300;
+  }
+  :root[data-theme="dark"], :root.dark {
+    color-scheme: dark;
+    --plane:        #0d0d0d;
+    --surface:      #1a1a19;
+    --text:         #ffffff;
+    --text-2:       #c3c2b7;
+    --muted:        #898781;
+    --grid:         #2c2c2a;
+    --axis:         #383835;
+    --border:       rgba(255,255,255,0.10);
+    --series-1:     #3987e5;
+    --series-1-dim: #184f95;
+    --series-2:     #199e70;
+    --series-3:     #d95926;
+    --good:         #0ca30c;
+    --warning:      #fab219;
+    --serious:      #ec835a;
+    --critical:     #d03b3b;
+    --success-text: #0ca30c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
+      --muted:#898781; --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+      --series-1:#3987e5; --series-1-dim:#184f95; --series-2:#199e70; --series-3:#d95926;
+      --success-text:#0ca30c;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--plane);
+    color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--series-1); }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 20px 64px; }
+
+  header.top {
+    display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px 20px;
+    margin-bottom: 20px;
+  }
+  header.top h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  header.top .sub { color: var(--muted); font-size: 13px; }
+  header.top .spacer { flex: 1 1 auto; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--text-2);
+    border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px;
+    background: var(--surface);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+  .dot.stale { background: var(--warning); }
+  button.ghost {
+    font: inherit; font-size: 12px; color: var(--text-2);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 999px; padding: 4px 12px; cursor: pointer;
+  }
+  button.ghost:hover { color: var(--text); }
+
+  .section-title {
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted); margin: 28px 0 12px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+
+  /* Stat tiles */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .tile .value { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
+  .tile .value .unit { font-size: 13px; font-weight: 500; color: var(--text-2); margin-left: 3px; }
+  .tile .sub { font-size: 12px; color: var(--text-2); margin-top: 4px; }
+
+  /* Charts grid */
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .chart-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px; }
+  .chart-head h3 { font-size: 14px; font-weight: 600; margin: 0; }
+  .chart-head .meta { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  /* Histogram bars */
+  .hist { display: flex; flex-direction: column; gap: 5px; }
+  .hbar { display: grid; grid-template-columns: 68px 1fr 52px; align-items: center; gap: 8px; }
+  .hbar .k { font-size: 11px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+  .hbar .track { height: 14px; background: var(--grid); border-radius: 4px; overflow: hidden; }
+  .hbar .fill { height: 100%; background: var(--series-1); border-radius: 4px; min-width: 2px; }
+  .hbar .v { font-size: 11px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .spark-empty { color: var(--muted); font-size: 12px; padding: 20px 0; text-align: center; }
+
+  /* Deployment cards */
+  .dep { margin-bottom: 14px; }
+  .dep-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .dep-head .name { font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
+  .dep-head .badge {
+    font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--text-2);
+    font-variant-numeric: tabular-nums;
+  }
+  .dep-grid { display: grid; grid-template-columns: minmax(220px, 300px) 1fr; gap: 20px; }
+  @media (max-width: 720px) { .dep-grid { grid-template-columns: 1fr; } }
+
+  .gauge-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-2); margin-bottom: 5px; }
+  .gauge-track { height: 10px; border-radius: 5px; background: var(--grid); overflow: hidden; position: relative; }
+  .gauge-fill { height: 100%; border-radius: 5px; background: var(--series-1); transition: width .3s ease; }
+  .gauge-fill.warn { background: var(--warning); }
+  .gauge-fill.crit { background: var(--critical); }
+
+  .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(88px,1fr)); gap: 10px 14px; margin-top: 14px; }
+  .kv .label { font-size: 11px; color: var(--muted); }
+  .kv .value { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .kv .value.err { color: var(--critical); }
+
+  table.vms { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.vms th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--grid); }
+  table.vms td { padding: 5px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  table.vms td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-2); }
+  .vm-load { display: inline-flex; align-items: center; gap: 6px; }
+  .vm-load .track { width: 60px; height: 8px; background: var(--grid); border-radius: 4px; overflow: hidden; }
+  .vm-load .fill { height: 100%; background: var(--series-1); border-radius: 4px; }
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; }
+  .tag.drain { background: color-mix(in srgb, var(--serious) 22%, transparent); color: var(--serious); }
+  .tag.down { background: color-mix(in srgb, var(--critical) 22%, transparent); color: var(--critical); }
+  .tag.ok { background: color-mix(in srgb, var(--good) 20%, transparent); color: var(--success-text); }
+
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--text-2); flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .empty { color: var(--muted); padding: 30px 0; text-align: center; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>app-lb</h1>
+    <span class="sub" id="uptime">—</span>
+    <span class="spacer"></span>
+    <span class="pill"><span class="dot" id="livedot"></span><span id="updated">connecting…</span></span>
+    <button class="ghost" id="pausebtn">Pause</button>
+    <button class="ghost" id="themebtn">Theme</button>
+  </header>
+
+  <div class="section-title">Host &amp; fleet</div>
+  <div class="tiles" id="fleet-tiles"></div>
+
+  <div class="section-title">Request latency &amp; throughput</div>
+  <div class="grid-2">
+    <div class="card">
+      <div class="chart-head"><h3>Requests / sec</h3><span class="meta" id="rps-meta"></span></div>
+      <div id="rps-chart"></div>
+    </div>
+    <div class="card">
+      <div class="chart-head"><h3>Latency distribution</h3><span class="meta" id="lat-meta"></span></div>
+      <div class="hist" id="lat-hist"></div>
+    </div>
+  </div>
+
+  <div class="section-title">Cold starts &amp; autoscaling</div>
+  <div class="grid-2">
+    <div class="card">
+      <div class="chart-head"><h3>Cold-start time</h3><span class="meta" id="cs-meta"></span></div>
+      <div class="hist" id="cs-hist"></div>
+      <div class="note" id="cs-note"></div>
+    </div>
+    <div class="card">
+      <div class="chart-head"><h3>Autoscaling activity</h3><span class="meta" id="as-meta"></span></div>
+      <div id="as-chart"></div>
+      <div class="legend" style="margin-top:10px">
+        <span><span class="swatch" style="background:var(--series-2)"></span>VMs created</span>
+        <span><span class="swatch" style="background:var(--series-3)"></span>VMs reaped</span>
+      </div>
+      <div class="kv" id="as-kv"></div>
+    </div>
+  </div>
+
+  <div class="section-title">Deployments</div>
+  <div id="deployments"></div>
+</div>
+
+<script>
+"use strict";
+const REFRESH_MS = 2000;
+const HISTORY = 90;          // samples retained for sparklines (~3 min at 2s)
+const hist = [];             // rolling raw snapshots for client-side rate derivation
+let paused = false;
+let timer = null;
+
+const $ = (id) => document.getElementById(id);
+const fmt = (n, d = 0) => (n == null || !isFinite(n)) ? "—" :
+  n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+
+function fmtMs(ms) {
+  if (ms == null || !isFinite(ms)) return "—";
+  if (ms < 1) return ms.toFixed(2) + " ms";
+  if (ms < 1000) return Math.round(ms) + " ms";
+  return (ms / 1000).toFixed(2) + " s";
+}
+function fmtBytes(b) {
+  if (b == null || !isFinite(b)) return "—";
+  if (b < 1024) return b + " B";
+  const u = ["KB", "MB", "GB", "TB"];
+  let i = -1, n = b;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n < 10 ? 1 : 0) + " " + u[i];
+}
+function fmtDur(s) {
+  s = Math.floor(s || 0);
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
+        m = Math.floor(s % 3600 / 60), sec = s % 60;
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;" }[c])); }
+
+// Bucket key label: "≤N" for finite bounds, "> last" for overflow.
+function bucketLabel(buckets, i) {
+  const b = buckets[i];
+  if (b.le != null) return "≤" + b.le;
+  const prev = buckets[i - 1];
+  return "> " + (prev && prev.le != null ? prev.le : "");
+}
+
+function renderHist(el, snap, unitLabel) {
+  const buckets = snap.buckets || [];
+  const max = Math.max(1, ...buckets.map(b => b.count));
+  el.innerHTML = buckets.map((b, i) => {
+    const w = (b.count / max) * 100;
+    return `<div class="hbar">
+      <span class="k">${esc(bucketLabel(buckets, i))} ${unitLabel}</span>
+      <span class="track"><span class="fill" style="width:${w}%"></span></span>
+      <span class="v">${fmt(b.count)}</span>
+    </div>`;
+  }).join("");
+}
+
+// Minimal SVG line chart from an array of {t, v}. Recessive grid, single series.
+function lineChart(points, color, unitFn) {
+  const W = 100, H = 40, pad = 2;
+  if (points.length < 2) return `<div class="spark-empty">collecting…</div>`;
+  const vals = points.map(p => p.v);
+  const max = Math.max(1e-9, ...vals);
+  const n = points.length;
+  const x = i => pad + (i / (n - 1)) * (W - 2 * pad);
+  const y = v => H - pad - (v / max) * (H - 2 * pad);
+  const line = points.map((p, i) => `${x(i).toFixed(2)},${y(p.v).toFixed(2)}`).join(" ");
+  const area = `${x(0)},${H - pad} ${line} ${x(n - 1)},${H - pad}`;
+  const last = vals[vals.length - 1];
+  return `
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="time series">
+      <line x1="0" y1="${(H - pad).toFixed(1)}" x2="${W}" y2="${(H - pad).toFixed(1)}" stroke="var(--axis)" stroke-width="0.4"/>
+      <polygon points="${area}" fill="${color}" opacity="0.10"/>
+      <polyline points="${line}" fill="none" stroke="${color}" stroke-width="1.1" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="${x(n - 1).toFixed(2)}" cy="${y(last).toFixed(2)}" r="1.5" fill="${color}"/>
+    </svg>
+    <div class="chart-head" style="margin:8px 0 0"><span class="meta">now ${unitFn(last)}</span><span class="meta">peak ${unitFn(max)}</span></div>`;
+}
+
+// Two-series overlaid line chart (created vs reaped rates).
+function dualLineChart(points, keyA, colorA, keyB, colorB, unitFn) {
+  const W = 100, H = 40, pad = 2;
+  if (points.length < 2) return `<div class="spark-empty">collecting…</div>`;
+  const max = Math.max(1e-9, ...points.flatMap(p => [p[keyA], p[keyB]]));
+  const n = points.length;
+  const x = i => pad + (i / (n - 1)) * (W - 2 * pad);
+  const y = v => H - pad - (v / max) * (H - 2 * pad);
+  const poly = (key) => points.map((p, i) => `${x(i).toFixed(2)},${y(p[key]).toFixed(2)}`).join(" ");
+  return `
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="autoscaling activity">
+      <line x1="0" y1="${(H - pad).toFixed(1)}" x2="${W}" y2="${(H - pad).toFixed(1)}" stroke="var(--axis)" stroke-width="0.4"/>
+      <polyline points="${poly(keyA)}" fill="none" stroke="${colorA}" stroke-width="1.1" stroke-linejoin="round"/>
+      <polyline points="${poly(keyB)}" fill="none" stroke="${colorB}" stroke-width="1.1" stroke-linejoin="round"/>
+    </svg>`;
+}
+
+function tile(label, value, unit, sub) {
+  return `<div class="tile card">
+    <div class="label">${esc(label)}</div>
+    <div class="value">${value}${unit ? `<span class="unit">${esc(unit)}</span>` : ""}</div>
+    ${sub ? `<div class="sub">${sub}</div>` : ""}
+  </div>`;
+}
+
+// Derive a per-second rate for a counter between the two most recent samples.
+function rate(key, getter) {
+  if (hist.length < 2) return null;
+  const a = hist[hist.length - 2], b = hist[hist.length - 1];
+  const dt = b.t - a.t;
+  if (dt <= 0) return null;
+  return Math.max(0, (getter(b) - getter(a)) / dt);
+}
+
+// Average latency over the last interval: Δsum / Δcount (ms).
+function intervalAvgLatency(getSum, getCount) {
+  if (hist.length < 2) return null;
+  const a = hist[hist.length - 2], b = hist[hist.length - 1];
+  const dc = getCount(b) - getCount(a);
+  if (dc <= 0) return null;
+  return (getSum(b) - getSum(a)) / dc;
+}
+
+function render(data) {
+  // --- accumulate rolling history for client-derived rates ---
+  const g = data.global;
+  hist.push({
+    t: data.generated_at,
+    req: g.requests.total,
+    latSum: g.latency_ms.sum,
+    latCount: g.latency_ms.count,
+    created: g.autoscale.vms_created,
+    reaped: g.autoscale.vms_reaped,
+  });
+  while (hist.length > HISTORY) hist.shift();
+
+  // per-interval derived rate series for sparklines
+  const rateSeries = [];
+  for (let i = 1; i < hist.length; i++) {
+    const dt = hist[i].t - hist[i - 1].t || 1;
+    rateSeries.push({
+      t: hist[i].t,
+      v: Math.max(0, (hist[i].req - hist[i - 1].req) / dt),
+      cr: Math.max(0, (hist[i].created - hist[i - 1].created) / dt),
+      rp: Math.max(0, (hist[i].reaped - hist[i - 1].reaped) / dt),
+    });
+  }
+
+  // --- host + fleet tiles ---
+  const h = data.host || {};
+  const memPct = h.memory_total_bytes ? (h.memory_used_bytes / h.memory_total_bytes) * 100 : null;
+  const rps = rate("req", s => s.req);
+  const avgLat = intervalAvgLatency(s => s.latSum, s => s.latCount);
+  const errTotal = g.requests.c5xx + g.requests.errors;
+  const errRate = g.requests.total ? (errTotal / g.requests.total) * 100 : 0;
+  $("fleet-tiles").innerHTML = [
+    tile("Host CPU", h.available ? fmt(h.cpu_percent, 1) : "—", h.available ? "%" : "",
+         h.available ? `${fmt(h.cpu_count)} cores` : "usage unavailable"),
+    tile("Host memory", h.available ? fmt(memPct, 0) + "%" : "—", "",
+         h.available ? `${fmtBytes(h.memory_used_bytes)} / ${fmtBytes(h.memory_total_bytes)}` : ""),
+    tile("Deployments", fmt(data.fleet.deployments)),
+    tile("Ready VMs", fmt(data.fleet.ready), "", `${fmt(data.fleet.pending)} pending · ${fmt(data.fleet.draining)} draining`),
+    tile("In-flight", fmt(data.fleet.total_in_flight), "", "requests being served"),
+    tile("Requests / sec", rps == null ? "—" : fmt(rps, rps < 10 ? 1 : 0)),
+    tile("Avg latency", avgLat == null ? "—" : fmtMs(avgLat), "", `p99 ${fmtMs(g.latency_ms.p99)}`),
+    tile("Cold-start p50", g.cold_start_s.count ? fmt(g.cold_start_s.p50, 1) : "—", g.cold_start_s.count ? "s" : "",
+         `${fmt(g.cold_start_s.count)} boots`),
+    tile("Requests", fmt(g.requests.total), "", `${fmt(g.requests.c2xx)} ok`),
+    tile("Error rate", fmt(errRate, errRate ? 1 : 0), "%", `${fmt(errTotal)} of ${fmt(g.requests.total)}`),
+  ].join("");
+
+  // --- throughput sparkline ---
+  $("rps-chart").innerHTML = lineChart(rateSeries.map(p => ({ t: p.t, v: p.v })), "var(--series-1)",
+    v => fmt(v, v < 10 ? 1 : 0) + "/s");
+  $("rps-meta").textContent = `${fmt(g.requests.total)} total`;
+
+  // --- latency histogram ---
+  renderHist($("lat-hist"), g.latency_ms, "ms");
+  $("lat-meta").textContent = g.latency_ms.count
+    ? `p50 ${fmtMs(g.latency_ms.p50)} · p90 ${fmtMs(g.latency_ms.p90)} · p99 ${fmtMs(g.latency_ms.p99)}`
+    : "no requests yet";
+
+  // --- cold-start histogram ---
+  renderHist($("cs-hist"), g.cold_start_s, "s");
+  $("cs-meta").textContent = g.cold_start_s.count
+    ? `p50 ${fmt(g.cold_start_s.p50, 1)}s · p99 ${fmt(g.cold_start_s.p99, 1)}s · n=${fmt(g.cold_start_s.count)}`
+    : "no cold starts yet";
+  const a = g.autoscale;
+  $("cs-note").textContent =
+    `${fmt(a.cold_start_waits)} requests waited on a boot · ${fmt(a.cold_start_hits)} served · ${fmt(a.cold_start_timeouts)} timed out`;
+
+  // --- autoscale activity ---
+  $("as-chart").innerHTML = dualLineChart(rateSeries, "cr", "var(--series-2)", "rp", "var(--series-3)");
+  $("as-meta").textContent = `${fmt(data.fleet.ready + data.fleet.pending)} live VMs`;
+  $("as-kv").innerHTML = [
+    ["Created", fmt(a.vms_created)],
+    ["Drained", fmt(a.vms_drained)],
+    ["Reaped", fmt(a.vms_reaped)],
+    ["Scale-ups", fmt(a.scale_up_events)],
+    ["Scale-downs", fmt(a.scale_down_events)],
+  ].map(([k, v]) => `<div><div class="label">${k}</div><div class="value">${v}</div></div>`).join("");
+
+  // --- per-deployment ---
+  renderDeployments(data.deployments);
+
+  // --- freshness ---
+  $("uptime").textContent = "up " + fmtDur(data.uptime_secs);
+  $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  $("livedot").classList.remove("stale");
+}
+
+function renderDeployments(deps) {
+  if (!deps.length) {
+    $("deployments").innerHTML = `<div class="card empty">No deployments registered.</div>`;
+    return;
+  }
+  $("deployments").innerHTML = deps.map(d => {
+    const p = d.pool, m = d.metrics;
+    const util = p.utilization;
+    const utilPct = util == null ? null : util * 100;
+    let cls = "", label = "—";
+    if (utilPct != null) {
+      label = fmt(utilPct, 0) + "%";
+      cls = utilPct >= 100 ? "crit" : utilPct >= 80 ? "warn" : "";
+    }
+    const errTotal = m.requests.c5xx + m.requests.errors;
+    const errPct = m.requests.total ? (errTotal / m.requests.total) * 100 : 0;
+
+    const vmRows = d.vms.length ? d.vms.map(v => {
+      const load = Math.min(1, v.in_flight / Math.max(1, p.target_concurrency)) * 100;
+      const st = v.draining ? `<span class="tag drain">draining</span>`
+              : !v.healthy ? `<span class="tag down">unhealthy</span>`
+              : `<span class="tag ok">serving</span>`;
+      // CPU is percent-of-a-core; normalise the bar to one core but show the raw number.
+      const cpuBar = v.cpu_percent == null ? 0 : Math.min(100, v.cpu_percent);
+      return `<tr>
+        <td class="mono">${esc(v.sandbox_id)}</td>
+        <td class="mono">${esc(v.addr)}</td>
+        <td><span class="vm-load"><span class="track"><span class="fill" style="width:${load}%"></span></span>${v.in_flight}</span></td>
+        <td>${v.cpu_percent == null ? "—" : `<span class="vm-load"><span class="track"><span class="fill" style="width:${cpuBar}%"></span></span>${fmt(v.cpu_percent, 0)}%</span>`}</td>
+        <td>${v.memory_bytes == null ? "—" : fmtBytes(v.memory_bytes)}</td>
+        <td>${fmtDur(v.uptime_secs)}</td>
+        <td>${st}</td>
+      </tr>`;
+    }).join("") : `<tr><td colspan="7" class="empty" style="padding:14px">No ready VMs — ${p.pending} booting.</td></tr>`;
+
+    return `<div class="card dep">
+      <div class="dep-head">
+        <span class="name">${esc(d.id)}</span>
+        <span class="badge">${p.ready}/${p.max_replicas} replicas · want ${p.desired_replicas}</span>
+        <span class="badge">min ${p.min_replicas} · warm ${p.warm_pool} · target ${p.target_concurrency}</span>
+      </div>
+      <div class="dep-grid">
+        <div>
+          <div class="gauge-label"><span>Utilization</span><span>${label}</span></div>
+          <div class="gauge-track"><div class="gauge-fill ${cls}" style="width:${Math.min(100, utilPct || 0)}%"></div></div>
+          <div class="kv">
+            <div><div class="label">In-flight</div><div class="value">${fmt(p.total_in_flight)}</div></div>
+            <div><div class="label">Pending</div><div class="value">${fmt(p.pending)}</div></div>
+            <div><div class="label">Draining</div><div class="value">${fmt(p.draining)}</div></div>
+            <div><div class="label">Requests</div><div class="value">${fmt(m.requests.total)}</div></div>
+            <div><div class="label">Lat p50</div><div class="value">${m.latency_ms.count ? fmtMs(m.latency_ms.p50) : "—"}</div></div>
+            <div><div class="label">Lat p99</div><div class="value">${m.latency_ms.count ? fmtMs(m.latency_ms.p99) : "—"}</div></div>
+            <div><div class="label">Cold p50</div><div class="value">${m.cold_start_s.count ? fmt(m.cold_start_s.p50,1)+"s" : "—"}</div></div>
+            <div><div class="label">Errors</div><div class="value ${errPct ? "err" : ""}">${fmt(errPct, errPct ? 1 : 0)}%</div></div>
+            <div><div class="label">CPU (pool)</div><div class="value">${p.cpu_percent == null ? "—" : fmt(p.cpu_percent, 0)+"%"}</div></div>
+            <div><div class="label">Memory</div><div class="value">${p.memory_bytes == null ? "—" : fmtBytes(p.memory_bytes)}</div></div>
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="vms">
+            <thead><tr><th>sandbox</th><th>addr</th><th>in-flight</th><th>CPU</th><th>memory</th><th>uptime</th><th>state</th></tr></thead>
+            <tbody>${vmRows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function poll() {
+  try {
+    const r = await fetch("metrics", { headers: { accept: "application/json" }, cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+  } catch (e) {
+    $("updated").textContent = "disconnected — retrying";
+    $("livedot").classList.add("stale");
+  } finally {
+    if (!paused) timer = setTimeout(poll, REFRESH_MS);
+  }
+}
+
+$("pausebtn").addEventListener("click", () => {
+  paused = !paused;
+  $("pausebtn").textContent = paused ? "Resume" : "Pause";
+  if (!paused) poll(); else if (timer) clearTimeout(timer);
+});
+$("themebtn").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.getAttribute("data-theme") === "dark"
+    || (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
+  root.setAttribute("data-theme", dark ? "light" : "dark");
+});
+
+poll();
+</script>
+</body>
+</html>

@@ -198,6 +198,7 @@ mod tests {
     fn host(h: &str) -> RouteRule {
         RouteRule {
             host: Some(h.into()),
+            host_suffix: None,
             path_prefix: None,
         }
     }
@@ -205,8 +206,50 @@ mod tests {
     fn path(p: &str) -> RouteRule {
         RouteRule {
             host: None,
+            host_suffix: None,
             path_prefix: Some(p.into()),
         }
+    }
+
+    fn suffix(s: &str) -> RouteRule {
+        RouteRule {
+            host: None,
+            host_suffix: Some(s.into()),
+            path_prefix: None,
+        }
+    }
+
+    #[test]
+    fn routes_by_subdomain() {
+        let r = Registry::new("unused.json");
+        r.upsert(spec("apps", vec![suffix("apps.example.com")]));
+        assert_eq!(
+            r.route(Some("foo.apps.example.com"), "/").unwrap().spec.id,
+            "apps"
+        );
+        assert_eq!(
+            r.route(Some("apps.example.com"), "/").unwrap().spec.id,
+            "apps"
+        );
+        assert!(r.route(Some("foo.other.com"), "/").is_none());
+    }
+
+    #[test]
+    fn exact_host_beats_subdomain_wildcard() {
+        let r = Registry::new("unused.json");
+        r.upsert(spec("wild", vec![suffix("example.com")]));
+        r.upsert(spec("exact", vec![host("special.example.com")]));
+
+        // A generic subdomain falls to the wildcard...
+        assert_eq!(
+            r.route(Some("other.example.com"), "/").unwrap().spec.id,
+            "wild"
+        );
+        // ...but the exact host wins for its own name.
+        assert_eq!(
+            r.route(Some("special.example.com"), "/").unwrap().spec.id,
+            "exact"
+        );
     }
 
     #[test]
@@ -253,6 +296,7 @@ mod tests {
             "site-api",
             vec![RouteRule {
                 host: Some("a.local".into()),
+                host_suffix: None,
                 path_prefix: Some("/api".into()),
             }],
         ));

@@ -9,6 +9,7 @@ mod autoscale;
 mod config;
 mod deployment;
 mod health;
+mod metrics;
 mod proxy;
 mod registry;
 mod vm;
@@ -16,6 +17,7 @@ mod vm;
 use crate::admin::AdminApi;
 use crate::autoscale::Autoscaler;
 use crate::config::LbConfig;
+use crate::metrics::Metrics;
 use crate::proxy::LbProxy;
 use crate::registry::Registry;
 use crate::vm::VmManager;
@@ -36,6 +38,21 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_DAEMON_URL") {
         cfg.daemon_url = Some(v);
+    }
+    if let Ok(v) = std::env::var("APP_LB_DASHBOARD_USER") {
+        cfg.dashboard_user = Some(v);
+    }
+    if let Ok(v) = std::env::var("APP_LB_DASHBOARD_PASSWORD") {
+        cfg.dashboard_password = Some(v);
+    }
+    if let Ok(v) = std::env::var("APP_LB_PROXY_TLS_ADDR") {
+        cfg.tls_addr = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_TLS_CERT") {
+        cfg.tls_cert_path = Some(v);
+    }
+    if let Ok(v) = std::env::var("APP_LB_TLS_KEY") {
+        cfg.tls_key_path = Some(v);
     }
     cfg
 }
@@ -61,6 +78,11 @@ fn main() {
 
     let vms = VmManager::new(cfg.daemon_url.clone());
 
+    // One metrics registry, shared by the proxy (request latency), the
+    // autoscaler (cold-start timing, scaling activity), and the admin API
+    // (which serves the dashboard from it).
+    let metrics = Arc::new(Metrics::new());
+
     // Note: nothing above may spawn threads or build a runtime — `run_forever`
     // may fork for daemonization and anything created before it would be lost.
     let mut server = Server::new(None).expect("failed to create server");
@@ -68,17 +90,48 @@ fn main() {
 
     // `background_service` hands back an Arc to the same task the service runs,
     // which is how the admin API reaches the autoscaler to tear deployments down.
-    let autoscaler_svc = background_service("autoscaler", Autoscaler::new(registry.clone(), vms));
+    let autoscaler_svc = background_service(
+        "autoscaler",
+        Autoscaler::new(registry.clone(), vms, metrics.clone()),
+    );
     let autoscaler = autoscaler_svc.task();
 
     let admin_svc = background_service(
         "admin",
-        AdminApi::new(cfg.admin_addr.clone(), registry.clone(), autoscaler),
+        AdminApi::new(
+            cfg.admin_addr.clone(),
+            registry.clone(),
+            autoscaler,
+            metrics.clone(),
+            cfg.dashboard_user.clone(),
+            cfg.dashboard_password.clone(),
+        ),
     );
 
-    let mut proxy_svc =
-        pingora_proxy::http_proxy_service(&server.configuration, LbProxy::new(registry));
+    let mut proxy_svc = pingora_proxy::http_proxy_service(
+        &server.configuration,
+        LbProxy::new(registry, metrics),
+    );
     proxy_svc.add_tcp(&cfg.proxy_addr);
+
+    // Optional HTTPS listener, alongside the plaintext one. Enabled only when
+    // both a cert and key are configured; a half-configured TLS is a hard error
+    // rather than a silent fallback to plaintext, so nobody thinks a listener is
+    // encrypted when it isn't.
+    match (&cfg.tls_cert_path, &cfg.tls_key_path) {
+        (Some(cert), Some(key)) => {
+            proxy_svc
+                .add_tls(&cfg.tls_addr, cert, key)
+                .unwrap_or_else(|e| {
+                    panic!("failed to enable TLS on {} with cert {cert}: {e}", cfg.tls_addr)
+                });
+            tracing::info!(tls = %cfg.tls_addr, %cert, "HTTPS listener enabled");
+        }
+        (None, None) => {}
+        _ => panic!(
+            "TLS is half-configured: set both APP_LB_TLS_CERT and APP_LB_TLS_KEY, or neither",
+        ),
+    }
 
     tracing::info!(proxy = %cfg.proxy_addr, admin = %cfg.admin_addr, "starting app-lb");
 

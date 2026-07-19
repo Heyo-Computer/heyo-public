@@ -10,6 +10,7 @@
 
 use crate::deployment::{Deployment, PendingVm, VmBackend, now_secs};
 use crate::health;
+use crate::metrics::Metrics;
 use crate::registry::Registry;
 use crate::vm::{self, VmManager};
 use async_trait::async_trait;
@@ -26,16 +27,18 @@ const TICK: Duration = Duration::from_secs(2);
 pub struct Autoscaler {
     registry: Arc<Registry>,
     vms: VmManager,
+    metrics: Arc<Metrics>,
     /// Monotonic source for replica-name nonces. Not for addressing — the
     /// daemon assigns sandbox ids — just to keep our names unique.
     nonce: AtomicU64,
 }
 
 impl Autoscaler {
-    pub fn new(registry: Arc<Registry>, vms: VmManager) -> Self {
+    pub fn new(registry: Arc<Registry>, vms: VmManager, metrics: Arc<Metrics>) -> Self {
         Self {
             registry,
             vms,
+            metrics,
             nonce: AtomicU64::new(now_secs()),
         }
     }
@@ -56,12 +59,57 @@ impl Autoscaler {
             }
         };
 
+        // Fetch host + per-VM resource usage alongside the fleet list. It is a
+        // best-effort gauge: a failure here must not derail scaling, so we log
+        // and carry on with an empty index (VMs keep their last sample).
+        let usage = self.sample_usage().await;
+
         for deployment in self.registry.deployments().values() {
-            self.reconcile_one(deployment, &fleet).await;
+            self.reconcile_one(deployment, &fleet, &usage).await;
         }
     }
 
-    async fn reconcile_one(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
+    /// Read the daemon's cached usage snapshot, push the host figures into the
+    /// metrics gauge, and return a per-sandbox index for `apply_usage`.
+    async fn sample_usage(&self) -> HashMap<String, vm::SandboxUsage> {
+        let usage = match self.vms.system_usage().await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to fetch system usage; skipping this tick");
+                return HashMap::new();
+            }
+        };
+
+        match usage.snapshot {
+            Some(snap) => {
+                self.metrics.record_host_usage(
+                    usage.available,
+                    snap.host.cpu_count,
+                    snap.host.cpu_percent,
+                    snap.host.memory_total_bytes,
+                    snap.host.memory_used_bytes,
+                    snap.sampled_at_ms,
+                );
+                snap.sandboxes
+                    .into_iter()
+                    .map(|s| (s.sandbox_id.clone(), s))
+                    .collect()
+            }
+            None => {
+                // Poller not ready yet: mark the host gauge unavailable so the
+                // dashboard shows "—" rather than stale numbers.
+                self.metrics.record_host_usage(false, 0, 0.0, 0, 0, 0);
+                HashMap::new()
+            }
+        }
+    }
+
+    async fn reconcile_one(
+        &self,
+        d: &Arc<Deployment>,
+        fleet: &HashMap<String, SandboxInfo>,
+        usage: &HashMap<String, vm::SandboxUsage>,
+    ) {
         self.prune(d, fleet);
         self.promote_pending(d, fleet).await;
 
@@ -78,6 +126,19 @@ impl Autoscaler {
 
         self.reap_drained(d).await;
         self.renew_ttls(d, fleet).await;
+        self.apply_usage(d, usage);
+    }
+
+    /// Copy the latest per-VM CPU/memory sample onto each live backend.
+    fn apply_usage(&self, d: &Arc<Deployment>, usage: &HashMap<String, vm::SandboxUsage>) {
+        if usage.is_empty() {
+            return;
+        }
+        for b in d.backends().iter() {
+            if let Some(u) = usage.get(&b.sandbox_id) {
+                b.set_usage(u.cpu_percent, u.memory_bytes);
+            }
+        }
     }
 
     /// Keep long-lived VMs from hitting their TTL backstop.
@@ -168,13 +229,15 @@ impl Autoscaler {
             match vm::routable_addr(info, d.spec.vm.port) {
                 Ok(addr) => {
                     if health::probe(addr, &d.spec.health).await {
+                        let boot_secs = now_secs().saturating_sub(p.created_at);
                         tracing::info!(
                             deployment = %d.spec.id,
                             sandbox = %p.sandbox_id,
                             %addr,
-                            boot_secs = now_secs().saturating_sub(p.created_at),
+                            boot_secs,
                             "VM ready",
                         );
+                        self.metrics.record_cold_start(&d.spec.id, boot_secs);
                         promoted.push(Arc::new(VmBackend::new(p.sandbox_id.clone(), addr)));
                     } else {
                         still_pending.push(p.clone()); // booting; try next tick
@@ -218,6 +281,7 @@ impl Autoscaler {
         tracing::info!(deployment = %d.spec.id, count, "scaling up");
         let mut pending = (*d.pending()).clone();
 
+        let mut created = 0u64;
         for _ in 0..count {
             let name = vm::replica_name(&d.spec.id, self.next_nonce());
             match self.vms.create(&d.spec.vm, name).await {
@@ -226,6 +290,7 @@ impl Autoscaler {
                         sandbox_id: sandbox.sandbox_id().to_string(),
                         created_at: now_secs(),
                     });
+                    created += 1;
                 }
                 Err(e) => {
                     tracing::error!(deployment = %d.spec.id, error = %e, "failed to create VM");
@@ -234,6 +299,9 @@ impl Autoscaler {
             }
         }
 
+        // Record only VMs the daemon actually accepted, so the dashboard's
+        // create count matches what booted rather than what was attempted.
+        self.metrics.record_scale_up(&d.spec.id, created);
         d.set_pending(pending);
     }
 
@@ -251,6 +319,7 @@ impl Autoscaler {
         // Prefer idle VMs so draining finishes quickly.
         candidates.sort_by_key(|b| (b.in_flight(), b.last_active()));
 
+        let mut drained = 0u64;
         for b in candidates.iter().take(count) {
             tracing::info!(
                 deployment = %d.spec.id,
@@ -259,7 +328,9 @@ impl Autoscaler {
                 "draining VM",
             );
             b.set_draining();
+            drained += 1;
         }
+        self.metrics.record_scale_down(&d.spec.id, drained);
     }
 
     /// Kill drained VMs, and force-kill any that overstay the drain deadline.
@@ -289,6 +360,7 @@ impl Autoscaler {
         }
         d.set_backends(keep);
 
+        self.metrics.record_reaped(&d.spec.id, done.len() as u64);
         for b in done {
             tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "killing VM");
             if let Err(e) = self.vms.kill(&b.sandbox_id).await {

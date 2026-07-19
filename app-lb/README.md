@@ -33,6 +33,11 @@ Configuration is environment-only:
 | `APP_LB_ADMIN_ADDR` | `127.0.0.1:9090` | Admin API listener |
 | `APP_LB_STATE_PATH` | `app-lb-state.json` | Where deployment specs persist |
 | `APP_LB_DAEMON_URL` | `http://127.0.0.1:34099` | heyvm daemon |
+| `APP_LB_DASHBOARD_PASSWORD` | *(unset)* | Set to gate the dashboard behind HTTP Basic Auth |
+| `APP_LB_DASHBOARD_USER` | `admin` | Basic Auth username (only used when a password is set) |
+| `APP_LB_TLS_CERT` | *(unset)* | PEM cert path; set with `APP_LB_TLS_KEY` to enable HTTPS |
+| `APP_LB_TLS_KEY` | *(unset)* | PEM private-key path |
+| `APP_LB_PROXY_TLS_ADDR` | `0.0.0.0:6189` | HTTPS listener (only bound when cert+key are set) |
 | `RUST_LOG` | `info,app_lb=debug` | Log filter |
 
 ## Admin API
@@ -41,7 +46,7 @@ Configuration is environment-only:
 # Register (or replace) a deployment.
 curl -XPOST localhost:9090/deployments -H 'content-type: application/json' -d '{
   "id": "demo",
-  "routes": [{"host": "demo.local"}, {"path_prefix": "/demo"}],
+  "routes": [{"host": "demo.local"}, {"host_suffix": "apps.example.com"}, {"path_prefix": "/demo"}],
   "vm": {
     "driver": "firecracker",
     "image": "nginx",
@@ -65,18 +70,91 @@ curl localhost:9090/deployments          # list, with live VM state
 curl localhost:9090/deployments/demo     # one deployment
 curl -XDELETE localhost:9090/deployments/demo   # drain and reap every VM
 curl localhost:9090/healthz
+curl localhost:9090/metrics              # metrics snapshot (JSON)
 ```
 
 Then: `curl -H 'Host: demo.local' localhost:6188/`
 
 Responses carry an `x-vm-id` header naming the VM that served them.
 
+## Dashboard
+
+Open `http://<admin-addr>/dashboard` (default `http://127.0.0.1:9090/dashboard`)
+for a live view of the fleet: host and per-VM CPU/memory, per-deployment pool
+utilisation and per-VM load, request latency (distribution + p50/p90/p99 and a
+client-derived requests/sec), cold-start times, and autoscaling activity. It is
+a single self-contained page that polls `GET /metrics` every 2s — no external
+assets, so it works over an SSH tunnel to the admin port.
+
+`GET /metrics` returns the same data as JSON (host usage, a global rollup, and a
+per-deployment breakdown), suitable for scraping into your own tooling.
+
+### Auth
+
+The dashboard is open by default. Set `APP_LB_DASHBOARD_PASSWORD` to put HTTP
+Basic Auth in front of both `/dashboard` and its `/metrics` data source (gating
+the page alone would be pointless — the JSON carries the same data). The
+username defaults to `admin`; override it with `APP_LB_DASHBOARD_USER`. A
+browser prompts once and reuses the credentials for the metric polls.
+
+```sh
+APP_LB_DASHBOARD_PASSWORD=s3cret ./target/release/app-lb
+curl -u admin:s3cret localhost:9090/metrics
+```
+
+Only the dashboard routes are gated; deployment CRUD and `/healthz` are
+unaffected and stay on `admin_addr` (localhost by default). The credentials are
+compared in constant time, but the admin listener is plain HTTP — terminate TLS
+in front of it, or reach it over an SSH tunnel, if it leaves localhost.
+
+Two data sources feed it:
+
+- **What the LB observes directly** — request latency and status from the proxy
+  path; cold-start duration and scale up/down/reap from the reconcile loop;
+  in-flight concurrency, pool occupancy, and serving uptime per VM. These
+  counters are cumulative since process start; rates (requests/sec, VMs
+  created/reaped per second) are derived by the dashboard by diffing polls.
+- **What the daemon reports** — the autoscaler reads `GET /system/usage` once
+  per reconcile tick (a daemon-side cached sample, so it's a cache read rather
+  than a per-VM probe) for host CPU/memory and per-VM CPU% (percent of a core)
+  and RSS. Only backends with a local host process are covered, which for
+  app-lb's Firecracker/KVM-on-local-daemon constraint is all of them. Per-VM
+  disk and network throughput are **not** exposed by the daemon and so are
+  absent here.
+
 ### Routing
 
-A request matches a rule when every field the rule sets matches. Rules are tried
-most-specific-first: a `host` beats a bare `path_prefix`, and a longer prefix beats a shorter
-one. `host` matching is case-insensitive, strips the port, and falls back to HTTP/2's
-`:authority` (which carries no `Host` header). No match is a 404.
+A rule matches a request when every field it sets matches. A rule may set:
+
+- `host` — exact hostname (case-insensitive, port stripped).
+- `host_suffix` — **subdomain / wildcard** match. A rule with `host_suffix:
+  "apps.example.com"` matches the apex `apps.example.com` and any subdomain
+  (`a.apps.example.com`, `x.y.apps.example.com`), anchored at a label boundary
+  so `notapps.example.com` does **not** match. A leading dot is accepted and
+  ignored.
+- `path_prefix` — path prefix, e.g. `/api`.
+
+Rules are tried most-specific-first, and the tiers don't overlap: an exact
+`host` beats any `host_suffix`, which beats any bare `path_prefix`. Within a tier
+a longer suffix or a longer prefix wins. Host matching (exact or suffix) is
+case-insensitive, strips the port, and falls back to HTTP/2's `:authority`
+(which carries no `Host` header). No match is a 404.
+
+### TLS
+
+The proxy serves plaintext HTTP on `proxy_addr` by default. Set `APP_LB_TLS_CERT`
+and `APP_LB_TLS_KEY` (PEM paths) to *also* bind an HTTPS listener on
+`APP_LB_PROXY_TLS_ADDR` (default `0.0.0.0:6189`); both listeners then run at once.
+Setting only one of cert/key is a hard startup error rather than a silent
+plaintext fallback. Upstreams stay plaintext regardless — the guest IP is on a
+host-local tap network — so this is TLS *termination* at the edge. The TLS stack
+is rustls (the same one heyo-sdk already links through reqwest), enabled via the
+`rustls` feature on `pingora-core`.
+
+```sh
+APP_LB_TLS_CERT=cert.pem APP_LB_TLS_KEY=key.pem ./target/release/app-lb
+curl -k https://localhost:6189/ -H 'Host: demo.local'
+```
 
 ### Scaling
 

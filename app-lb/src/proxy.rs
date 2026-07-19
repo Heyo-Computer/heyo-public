@@ -9,6 +9,7 @@
 //! is the cold-start `Notify`, which yields.
 
 use crate::deployment::{Deployment, VmBackend};
+use crate::metrics::Metrics;
 use crate::registry::Registry;
 use async_trait::async_trait;
 use pingora_core::prelude::HttpPeer;
@@ -17,7 +18,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How many upstreams one request may try before giving up.
 const MAX_ATTEMPTS: usize = 3;
@@ -30,6 +31,10 @@ pub struct Ctx {
     /// Upstreams already tried; `upstream_peer` must not hand these back.
     failed: Vec<SocketAddr>,
     attempts: usize,
+    /// When the request entered the proxy, for latency. Set in `request_filter`
+    /// so the measured span covers cold-start waits too, and `None` before then
+    /// so a request rejected pre-routing simply isn't timed.
+    started_at: Option<Instant>,
 }
 
 impl Ctx {
@@ -46,11 +51,12 @@ impl Ctx {
 
 pub struct LbProxy {
     registry: Arc<Registry>,
+    metrics: Arc<Metrics>,
 }
 
 impl LbProxy {
-    pub fn new(registry: Arc<Registry>) -> Self {
-        Self { registry }
+    pub fn new(registry: Arc<Registry>, metrics: Arc<Metrics>) -> Self {
+        Self { registry, metrics }
     }
 }
 
@@ -108,6 +114,10 @@ impl ProxyHttp for LbProxy {
     /// Resolve the deployment up front so an unroutable request is rejected
     /// before any upstream work.
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        // Start the latency clock before anything else so the span reflects the
+        // whole time app-lb held the request, cold-start wait included.
+        ctx.started_at = Some(Instant::now());
+
         let (host, path) = {
             let req = session.req_header();
             (request_host(req), req.uri.path().to_string())
@@ -149,7 +159,7 @@ impl ProxyHttp for LbProxy {
             None => {
                 // Nothing ready. If the deployment can still grow, hold the
                 // request while a VM boots rather than failing the caller.
-                match wait_for_capacity(&deployment, &ctx.failed).await {
+                match wait_for_capacity(&deployment, &ctx.failed, &self.metrics).await {
                     Some(b) => b,
                     None => {
                         return Err(Error::explain(
@@ -220,6 +230,16 @@ impl ProxyHttp for LbProxy {
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
         ctx.release();
 
+        // Record latency and outcome for any request that got as far as being
+        // routed. A request rejected before routing (404, no deployment) has no
+        // `started_at`/`deployment` and is intentionally left out of a
+        // deployment's numbers.
+        if let (Some(started), Some(deployment)) = (ctx.started_at, ctx.deployment.as_ref()) {
+            let status = session.response_written().map(|r| r.status.as_u16());
+            self.metrics
+                .record_request(&deployment.spec.id, status, started.elapsed());
+        }
+
         if let Some(err) = e {
             tracing::warn!(
                 deployment = ctx.deployment.as_ref().map(|d| d.spec.id.as_str()),
@@ -239,8 +259,11 @@ impl ProxyHttp for LbProxy {
 async fn wait_for_capacity(
     deployment: &Arc<Deployment>,
     exclude: &[SocketAddr],
+    metrics: &Metrics,
 ) -> Option<Arc<VmBackend>> {
     if !deployment.can_grow() {
+        // Not a cold-start wait — the pool is at max with nothing healthy, so
+        // there is nothing to hold for. Left out of the cold-start tally.
         return None;
     }
 
@@ -248,6 +271,7 @@ async fn wait_for_capacity(
     // in-flight slot (it has no backend yet), so without this the autoscaler
     // sees an idle deployment and leaves it at zero while we wait.
     let _waiter = deployment.track_waiter();
+    metrics.record_cold_start_wait(&deployment.spec.id);
 
     // Nudge the autoscaler: this deployment may be at zero and nothing else
     // would wake it.
@@ -266,6 +290,7 @@ async fn wait_for_capacity(
         // check and the wait can't be missed.
         let notified = deployment.ready_signal.notified();
         if let Some(b) = deployment.select(exclude) {
+            metrics.record_cold_start_hit(&deployment.spec.id);
             return Some(b);
         }
         if tokio::time::timeout_at(deadline, notified).await.is_err() {
@@ -273,6 +298,7 @@ async fn wait_for_capacity(
                 deployment = %deployment.spec.id,
                 "cold start timed out with no VM available",
             );
+            metrics.record_cold_start_timeout(&deployment.spec.id);
             return None;
         }
     }
@@ -348,6 +374,7 @@ mod tests {
             id: "demo".into(),
             routes: vec![RouteRule {
                 host: Some("demo.local".into()),
+                host_suffix: None,
                 path_prefix: None,
             }],
             vm: VmSpec {
@@ -404,7 +431,7 @@ mod tests {
         d.set_backends(vec![b]);
 
         let started = std::time::Instant::now();
-        assert!(wait_for_capacity(&d, &[]).await.is_none());
+        assert!(wait_for_capacity(&d, &[], &Metrics::new()).await.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -415,7 +442,7 @@ mod tests {
             cold_start_timeout_secs: 1,
             ..Default::default()
         });
-        assert!(wait_for_capacity(&d, &[]).await.is_none());
+        assert!(wait_for_capacity(&d, &[], &Metrics::new()).await.is_none());
     }
 
     #[tokio::test]
@@ -437,7 +464,7 @@ mod tests {
             d2.ready_signal.notify_waiters();
         });
 
-        let got = wait_for_capacity(&d, &[]).await;
+        let got = wait_for_capacity(&d, &[], &Metrics::new()).await;
         assert_eq!(got.unwrap().addr, "10.0.0.1:80".parse().unwrap());
     }
 
@@ -451,6 +478,6 @@ mod tests {
             ..Default::default()
         });
         d.set_backends(vec![backend("10.0.0.1:80")]);
-        assert!(wait_for_capacity(&d, &[]).await.is_some());
+        assert!(wait_for_capacity(&d, &[], &Metrics::new()).await.is_some());
     }
 }
