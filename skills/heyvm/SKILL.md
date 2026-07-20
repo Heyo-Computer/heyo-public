@@ -157,6 +157,36 @@ registry references automatically, just like `apple_container`. Do not publish
 a Fishing-specific image, and do not use `--mount` with
 `firecracker_containerd`; use `--archive` for cloud application source.
 
+OCI image support is backend-specific:
+
+| Backend | Runs standard OCI images directly | Host requirement |
+| --- | --- | --- |
+| `apple_container` | yes | Apple Container runtime on macOS |
+| `firecracker_containerd` | yes | configured Firecracker-containerd runtime on a Linux KVM host |
+| `windows_sandbox` | no | built-in disposable Windows environment; deliver the application through a mount and start command |
+| `libvirt`, `kvm`, `firecracker`, `apple_virt`, `hyperv` | no | compatible bootable VM image |
+
+After Firecracker-containerd is installed and configured on a Linux backend
+host, ordinary OCI references such as `node:22` work without conversion to a
+bootable VM image. The host needs a running `firecracker-containerd` daemon,
+`firecracker-ctr`, KVM, the `aws.firecracker` runtime, CNI networking, and a
+devmapper snapshotter. HeyVM detects the runtime socket and CLI and advertises
+`firecracker_containerd` on the host's next registration.
+
+If Cloud reports
+`No available backend ... supports firecracker_containerd`, do not replace the
+OCI reference with a bootable VM image and do not claim that OCI images are
+unsupported. The environment has no registered capable backend host in the
+selected region; provision the Firecracker-containerd runtime on a backend host
+for that region and let it register again.
+
+`heyvm backends` lists backend types for the platform where the CLI is running;
+it does not query cloud capacity. There is no user-facing cloud capacity command
+yet, so use the cloud `create` request above as the operational check. The
+repository also does not yet provide a pinned host installer; do not describe
+an ad hoc installation as repeatable provisioning. Verify the public
+application URL and restart behavior before declaring the backend ready.
+
 To compare the same application concurrently, reuse one archive ID and create
 four deployments with distinct names and the image appropriate for each row.
 Each deployment gets its own public URL even when all four expose guest port
