@@ -9,6 +9,7 @@ skills.
 - `printer/` — core CLI that manages agent sessions against a spec file.
 - `computer/` — CLI for programmatic desktop interactions on Linux/Wayland.
 - `codegraph/` — tree-sitter based code graph, search, and patch tooling.
+- `heyosecret/` — single-tenant encrypted secrets store with a machine API and a web dashboard for inspecting/managing secrets.
 - `plugins/` — printer plugins for agent integrations, codegraph, heyvm, and related tooling.
 - `skills/` — reusable public agent skills. The top-level catalog is intentionally small: `heyvm` and `git-submit`.
 - `examples/` — example projects and specs.

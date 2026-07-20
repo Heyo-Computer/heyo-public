@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>HeyoSecret Dashboard</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --border: #e2e5ea;
+        --text: #1b1f24;
+        --muted: #6b7280;
+        --accent: #2f6feb;
+        --accent-text: #ffffff;
+        --danger: #c23b3b;
+        --ok: #1f8a4c;
+        --code-bg: #f0f2f5;
+        --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 4px 12px rgba(16, 24, 40, 0.05);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0f1216;
+          --panel: #171b21;
+          --border: #262c35;
+          --text: #e6e9ee;
+          --muted: #9aa4b2;
+          --accent: #5b8cff;
+          --accent-text: #0b0e12;
+          --danger: #ef6b6b;
+          --ok: #4bd07f;
+          --code-bg: #11151a;
+          --shadow: none;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 20px;
+        border-bottom: 1px solid var(--border);
+        background: var(--panel);
+      }
+      header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+      header .sub { color: var(--muted); font-size: 12px; margin-left: 8px; font-weight: 400; }
+      main { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(360px, 1.2fr); gap: 16px; padding: 16px 20px; align-items: start; }
+      @media (max-width: 820px) { main { grid-template-columns: 1fr; } }
+      .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); }
+      .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+      .card-body { padding: 14px 16px; }
+      .toolbar { display: flex; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+      input, textarea, select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; width: 100%; }
+      textarea { resize: vertical; min-height: 64px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+      button { font: inherit; cursor: pointer; border: 1px solid var(--border); background: var(--panel); color: var(--text); border-radius: 7px; padding: 8px 12px; }
+      button:hover { border-color: var(--accent); }
+      button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+      button.danger { color: var(--danger); border-color: var(--danger); }
+      button.ghost { background: transparent; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { text-align: left; padding: 9px 16px; border-bottom: 1px solid var(--border); font-size: 13px; }
+      th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
+      tbody tr { cursor: pointer; }
+      tbody tr:hover { background: var(--code-bg); }
+      tbody tr.selected { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+      code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code-bg); border-radius: 6px; }
+      code { padding: 1px 5px; font-size: 12px; }
+      pre { padding: 10px 12px; overflow-x: auto; margin: 6px 0; white-space: pre-wrap; word-break: break-all; }
+      .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); }
+      .status-active { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, var(--border)); }
+      .status-retiring { color: var(--muted); }
+      .status-revoked, .status-deleted { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
+      .tag { display: inline-block; padding: 0 6px; margin: 0 3px 3px 0; border-radius: 5px; background: var(--code-bg); font-size: 11px; color: var(--muted); }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+      .muted { color: var(--muted); }
+      .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
+      .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 16px; box-shadow: var(--shadow); max-width: 90vw; }
+      .toast.err { border-color: var(--danger); color: var(--danger); }
+      .toast.ok { border-color: var(--ok); color: var(--ok); }
+      .hidden { display: none !important; }
+      /* Login overlay */
+      #login { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--bg); z-index: 10; }
+      #login .box { width: min(360px, 90vw); }
+      details { border-top: 1px solid var(--border); padding: 8px 0; }
+      details:first-of-type { border-top: none; }
+      summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+      .field-note { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    </style>
+  </head>
+  <body>
+    <!-- Login gate -->
+    <div id="login" class="hidden">
+      <div class="card box">
+        <h2>HeyoSecret — Sign in</h2>
+        <div class="card-body">
+          <p id="login-msg" class="muted">Enter the admin password to manage secrets.</p>
+          <form id="login-form">
+            <label for="password">Admin password</label>
+            <input id="password" type="password" autocomplete="current-password" autofocus />
+            <div class="row" style="margin-top: 12px;">
+              <button class="primary" type="submit">Sign in</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Disabled notice -->
+    <div id="disabled" class="hidden">
+      <div class="card box" style="max-width: 420px; margin: 80px auto;">
+        <h2>Dashboard disabled</h2>
+        <div class="card-body">
+          <p class="muted">
+            No admin password is configured. Set <code>HEYOSECRET_ADMIN_PASSWORD</code>
+            and restart the service to enable the dashboard. The machine
+            <code>/v1/secrets/*</code> API is unaffected.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- App -->
+    <div id="app" class="hidden">
+      <header>
+        <div>
+          <h1>HeyoSecret <span class="sub" id="count"></span></h1>
+        </div>
+        <div class="row">
+          <button id="refresh" class="ghost">Refresh</button>
+          <button id="logout" class="ghost">Sign out</button>
+        </div>
+      </header>
+      <main>
+        <section class="card">
+          <div class="toolbar">
+            <input id="prefix" placeholder="Filter by path prefix (e.g. platform/)" />
+            <button id="filter">Filter</button>
+          </div>
+          <div id="list"></div>
+        </section>
+
+        <section>
+          <div class="card" id="detail-card">
+            <h2>Details</h2>
+            <div class="card-body" id="detail">
+              <p class="empty">Select a secret to inspect it, or create a new one below.</p>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top: 16px;">
+            <h2>Write / create secret</h2>
+            <div class="card-body">
+              <form id="write-form">
+                <label for="w-path">Path *</label>
+                <input id="w-path" placeholder="platform/jwt/signing-key" required />
+                <label for="w-value">Value (plaintext) *</label>
+                <textarea id="w-value" placeholder="Stored encrypted; a new version is created on each write." required></textarea>
+                <div class="field-note">Writing an existing path creates a new active version and retires the previous one.</div>
+                <div class="grid2">
+                  <div><label for="w-owner">Owner</label><input id="w-owner" /></div>
+                  <div><label for="w-actor">Actor (audit)</label><input id="w-actor" /></div>
+                </div>
+                <label for="w-desc">Description</label>
+                <input id="w-desc" />
+                <details>
+                  <summary>Access &amp; tags (metadata only)</summary>
+                  <label for="w-tags">Tags (comma separated)</label>
+                  <input id="w-tags" />
+                  <div class="grid2">
+                    <div><label for="w-read">Read access (comma separated)</label><input id="w-read" /></div>
+                    <div><label for="w-write">Write access (comma separated)</label><input id="w-write" /></div>
+                  </div>
+                </details>
+                <div class="row" style="margin-top: 12px;">
+                  <button class="primary" type="submit">Write secret</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      let selected = null;
+
+      // ---- helpers ---------------------------------------------------------
+      function toast(msg, kind) {
+        const el = $("toast");
+        el.textContent = msg;
+        el.className = "toast " + (kind || "");
+        setTimeout(() => el.classList.add("hidden"), 3200);
+      }
+      function esc(s) {
+        return String(s ?? "").replace(/[&<>"']/g, (c) =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      }
+      // UTF-8 safe base64 encode of a string.
+      function toBase64(str) {
+        const bytes = new TextEncoder().encode(str);
+        let bin = "";
+        bytes.forEach((b) => (bin += String.fromCharCode(b)));
+        return btoa(bin);
+      }
+      // Decode base64 -> printable string when it is valid UTF-8 text, else null.
+      function decodeMaybeText(b64) {
+        try {
+          const bin = atob(b64);
+          const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+          const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          // eslint-disable-next-line no-control-regex
+          if (/[\x00-\x08\x0e-\x1f]/.test(text)) return null;
+          return text;
+        } catch {
+          return null;
+        }
+      }
+      function splitList(v) {
+        return (v || "").split(",").map((s) => s.trim()).filter(Boolean);
+      }
+      async function api(path, opts) {
+        const res = await fetch(path, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
+        if (res.status === 401) {
+          showLogin("Session expired — please sign in again.");
+          throw new Error("unauthorized");
+        }
+        const body = res.headers.get("content-type")?.includes("json") ? await res.json() : {};
+        if (!res.ok) throw new Error(body.error || res.statusText);
+        return body;
+      }
+
+      // ---- auth flow -------------------------------------------------------
+      function showLogin(msg) {
+        $("app").classList.add("hidden");
+        $("disabled").classList.add("hidden");
+        $("login").classList.remove("hidden");
+        if (msg) $("login-msg").textContent = msg;
+        $("password").focus();
+      }
+      function showDisabled() {
+        $("app").classList.add("hidden");
+        $("login").classList.add("hidden");
+        $("disabled").classList.remove("hidden");
+      }
+      function showApp() {
+        $("login").classList.add("hidden");
+        $("disabled").classList.add("hidden");
+        $("app").classList.remove("hidden");
+        loadList();
+      }
+      async function boot() {
+        try {
+          const s = await api("/dashboard/api/session");
+          if (!s.dashboardEnabled) return showDisabled();
+          if (s.authenticated) return showApp();
+          showLogin();
+        } catch (e) {
+          showLogin();
+        }
+      }
+      $("login-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        try {
+          await api("/dashboard/login", { method: "POST", body: JSON.stringify({ password: $("password").value }) });
+          $("password").value = "";
+          showApp();
+        } catch (e) {
+          $("login-msg").textContent = "Incorrect password.";
+        }
+      });
+      $("logout").addEventListener("click", async () => {
+        try { await api("/dashboard/logout", { method: "POST" }); } catch {}
+        showLogin("Signed out.");
+      });
+
+      // ---- list ------------------------------------------------------------
+      async function loadList() {
+        const prefix = $("prefix").value.trim();
+        const q = prefix ? "?prefix=" + encodeURIComponent(prefix) : "";
+        try {
+          const data = await api("/dashboard/api/secrets" + q);
+          renderList(data.secrets || []);
+        } catch (e) {
+          if (e.message !== "unauthorized") toast(e.message, "err");
+        }
+      }
+      function renderList(secrets) {
+        $("count").textContent = secrets.length + (secrets.length === 1 ? " secret" : " secrets");
+        if (!secrets.length) {
+          $("list").innerHTML = '<p class="empty">No secrets found.</p>';
+          return;
+        }
+        const rows = secrets.map((s) => {
+          const tags = (s.tags || []).map((t) => '<span class="tag">' + esc(t) + "</span>").join("");
+          const ver = s.activeVersion != null ? "v" + s.activeVersion : '<span class="muted">none</span>';
+          return (
+            '<tr data-path="' + esc(s.path) + '">' +
+            "<td><code>" + esc(s.path) + "</code><div>" + tags + "</div></td>" +
+            "<td>" + esc(s.owner || "—") + "</td>" +
+            "<td>" + ver + "</td>" +
+            '<td class="muted">' + esc((s.updatedAt || "").slice(0, 10)) + "</td>" +
+            "</tr>"
+          );
+        }).join("");
+        $("list").innerHTML =
+          "<table><thead><tr><th>Path</th><th>Owner</th><th>Active</th><th>Updated</th></tr></thead><tbody>" +
+          rows + "</tbody></table>";
+        $("list").querySelectorAll("tr[data-path]").forEach((tr) => {
+          tr.addEventListener("click", () => selectSecret(tr.dataset.path, tr));
+        });
+        if (selected) {
+          const cur = $("list").querySelector('tr[data-path="' + CSS.escape(selected) + '"]');
+          if (cur) cur.classList.add("selected");
+        }
+      }
+
+      // ---- detail ----------------------------------------------------------
+      async function selectSecret(path, tr) {
+        selected = path;
+        $("list").querySelectorAll("tr.selected").forEach((r) => r.classList.remove("selected"));
+        if (tr) tr.classList.add("selected");
+        $("detail").innerHTML = '<p class="empty">Loading…</p>';
+        try {
+          const [meta, hist] = await Promise.all([
+            api("/dashboard/api/secret/metadata?path=" + encodeURIComponent(path)),
+            api("/dashboard/api/secret/history?path=" + encodeURIComponent(path)),
+          ]);
+          renderDetail(meta, hist.versions || []);
+        } catch (e) {
+          if (e.message !== "unauthorized") toast(e.message, "err");
+        }
+      }
+      function renderDetail(meta, versions) {
+        const tags = (meta.tags || []).map((t) => '<span class="tag">' + esc(t) + "</span>").join(" ") || '<span class="muted">none</span>';
+        const rows = versions.map((v) => {
+          const isActive = v.status === "active";
+          const revokeBtn = v.status === "revoked" || v.status === "deleted"
+            ? ""
+            : '<button class="danger ghost" data-revoke="' + v.version + '">Revoke</button>';
+          return (
+            "<tr>" +
+            "<td>v" + v.version + "</td>" +
+            '<td><span class="pill status-' + esc(v.status) + '">' + esc(v.status) + "</span></td>" +
+            '<td class="muted">' + esc((v.createdAt || "").slice(0, 19).replace("T", " ")) + "</td>" +
+            "<td>" + esc(v.createdBy || "—") + "</td>" +
+            '<td class="row">' +
+              '<button class="ghost" data-reveal="' + v.version + '">Reveal</button>' +
+              revokeBtn +
+            "</td>" +
+            "</tr>" +
+            '<tr class="hidden" id="reveal-' + v.version + '"><td colspan="5"><pre>—</pre></td></tr>'
+          );
+        }).join("");
+
+        $("detail").innerHTML =
+          '<div class="row" style="justify-content: space-between;">' +
+            "<code>" + esc(meta.path) + "</code>" +
+            '<button class="ghost" id="rotate">Rotate random →</button>' +
+          "</div>" +
+          '<p class="muted" style="margin:8px 0;">' + esc(meta.description || "No description.") + "</p>" +
+          '<div class="grid2" style="margin-bottom:8px;">' +
+            "<div><label>Owner</label>" + esc(meta.owner || "—") + "</div>" +
+            "<div><label>Active version</label>" + (meta.activeVersion != null ? "v" + meta.activeVersion : "none") + "</div>" +
+          "</div>" +
+          "<label>Tags</label><div>" + tags + "</div>" +
+          "<label>Read access</label><div>" + ((meta.readAccess || []).map((a) => '<span class="tag">' + esc(a) + "</span>").join(" ") || '<span class="muted">unrestricted (not enforced)</span>') + "</div>" +
+          "<label>Write access</label><div>" + ((meta.writeAccess || []).map((a) => '<span class="tag">' + esc(a) + "</span>").join(" ") || '<span class="muted">unrestricted (not enforced)</span>') + "</div>" +
+          '<h2 style="border:none;padding:14px 0 4px;">Versions</h2>' +
+          "<table><thead><tr><th>Ver</th><th>Status</th><th>Created</th><th>By</th><th></th></tr></thead><tbody>" +
+          rows + "</tbody></table>";
+
+        $("detail").querySelectorAll("[data-reveal]").forEach((b) =>
+          b.addEventListener("click", () => reveal(meta.path, parseInt(b.dataset.reveal, 10))));
+        $("detail").querySelectorAll("[data-revoke]").forEach((b) =>
+          b.addEventListener("click", () => revoke(meta.path, parseInt(b.dataset.revoke, 10))));
+        $("rotate").addEventListener("click", () => rotate(meta.path));
+      }
+
+      async function reveal(path, version) {
+        const row = $("reveal-" + version);
+        const pre = row.querySelector("pre");
+        if (!row.classList.contains("hidden")) { row.classList.add("hidden"); return; }
+        try {
+          const data = await api("/dashboard/api/secret/read", {
+            method: "POST",
+            body: JSON.stringify({ path, version }),
+          });
+          const text = decodeMaybeText(data.valueBase64);
+          pre.textContent = text != null
+            ? text
+            : "(binary) base64:\n" + data.valueBase64;
+          row.classList.remove("hidden");
+        } catch (e) {
+          if (e.message !== "unauthorized") toast(e.message, "err");
+        }
+      }
+      async function revoke(path, version) {
+        if (!confirm("Revoke " + path + " v" + version + "? This cannot be undone.")) return;
+        try {
+          await api("/dashboard/api/secret/revoke", { method: "POST", body: JSON.stringify({ path, version }) });
+          toast("Revoked v" + version, "ok");
+          selectSecret(path);
+          loadList();
+        } catch (e) {
+          if (e.message !== "unauthorized") toast(e.message, "err");
+        }
+      }
+      async function rotate(path) {
+        const bytesStr = prompt("Generate a new random value for " + path + ". Number of bytes:", "32");
+        if (bytesStr == null) return;
+        const bytes = parseInt(bytesStr, 10);
+        if (!Number.isFinite(bytes) || bytes < 1) { toast("Invalid byte count", "err"); return; }
+        try {
+          const r = await api("/dashboard/api/secret/rotate-random", { method: "POST", body: JSON.stringify({ path, bytes }) });
+          toast("Rotated " + path + " → v" + r.version, "ok");
+          selectSecret(path);
+          loadList();
+        } catch (e) {
+          if (e.message !== "unauthorized") toast(e.message, "err");
+        }
+      }
+
+      // ---- write -----------------------------------------------------------
+      $("write-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const payload = {
+          path: $("w-path").value.trim(),
+          valueBase64: toBase64($("w-value").value),
+          owner: $("w-owner").value.trim() || null,
+          description: $("w-desc").value.trim() || null,
+          actor: $("w-actor").value.trim() || null,
+          tags: splitList($("w-tags").value),
+          readAccess: splitList($("w-read").value),
+          writeAccess: splitList($("w-write").value),
+        };
+        try {
+          const r = await api("/dashboard/api/secret/write", { method: "POST", body: JSON.stringify(payload) });
+          toast("Wrote " + r.path + " → v" + r.version, "ok");
+          $("w-value").value = "";
+          loadList();
+          selectSecret(r.path);
+        } catch (e) {
+          if (e.message !== "unauthorized") toast(e.message, "err");
+        }
+      });
+
+      // ---- wire up ---------------------------------------------------------
+      $("refresh").addEventListener("click", loadList);
+      $("filter").addEventListener("click", loadList);
+      $("prefix").addEventListener("keydown", (e) => { if (e.key === "Enter") loadList(); });
+      boot();
+    </script>
+  </body>
+</html>
