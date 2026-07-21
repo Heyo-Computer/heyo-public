@@ -132,13 +132,27 @@ restores the sandbox before upload. Only public Linux `hyperv`/`vhdx`/
 `linux-amd64` images are supported; private and Windows-guest Hyper-V image
 publishing are not supported yet.
 
-For Windows Sandbox, reuse an **application bundle/template** instead of a root
-image. A useful bundle records the application files or build output, mapped
-runtime/tool directories, setup requirements, startup command, working
-directory, environment variables, and declared ports. Create the sandbox from
-`windows-sandbox/default`, map or copy the bundle into it, and run the recorded
-startup command. `heyvm images publish` does not publish Windows Sandbox root
-disks.
+For Windows Sandbox, reuse a reviewed **application bundle** instead of a root
+image:
+
+```sh
+heyvm bundles publish <windows-sandbox-id> --name <bundle-name> --description <description>
+heyvm bundles list
+heyvm bundles add <approved-bundle-id> --name <local-alias>
+heyvm bundles run <bundle-id-or-alias> --name <sandbox-name>
+```
+
+Publishing packages the writable `/workspace` application files plus a
+versioned manifest containing the sandbox type, runtime requirements, setup
+hooks, startup command, working directory, environment variables, and ports.
+Publishing is public: remove secrets from the workspace, environment values,
+hooks, and command first. The bundle does not package Windows, Node, or
+arbitrary host paths. `bundles run`
+creates a fresh workspace on the Windows host, boots
+`windows-sandbox/default`, and restores that portable configuration. If the
+bundle requires Node, `node.exe` must be installed on the Windows host and
+available on `PATH`; HeyVM maps that host runtime read-only into the sandbox.
+`heyvm images publish` does not publish Windows Sandbox root disks.
 
 ## Cloud Linux Sandboxes
 
@@ -193,7 +207,7 @@ OCI image support is backend-specific:
 | --- | --- | --- |
 | `apple_container` | yes | Apple Container runtime on macOS |
 | `firecracker_containerd` | yes | configured Firecracker-containerd runtime on a Linux KVM host |
-| `windows_sandbox` | no | built-in disposable Windows environment; deliver the application through a mount and start command |
+| `windows_sandbox` | no | built-in disposable Windows environment; bundles that require Node need host `node.exe` on `PATH` |
 | `libvirt`, `kvm`, `firecracker`, `apple_virt`, `hyperv` | no | compatible bootable VM image |
 
 After Firecracker-containerd is installed and configured on a Linux backend
@@ -235,8 +249,10 @@ Start image work by checking the current CLI surface and inventory:
 ```sh
 heyvm pull --help
 heyvm images --help
+heyvm bundles --help
 heyvm images list --help
 heyvm images publish --help
+heyvm bundles list
 heyvm images supported
 heyvm --heyo-env stage images list
 heyvm --heyo-env preview images list
@@ -256,8 +272,9 @@ Image concepts:
   `heyvm images add`, then create with `--backend hyperv --image
   <id-or-alias>`.
 - Windows Sandbox has a fixed `windows-sandbox/default` base. Its portable
-  reusable artifact is an application bundle/template, not a custom root image
-  or standard OCI image.
+  reusable artifact is a reviewed application bundle, not a custom root image
+  or standard OCI image. Use `heyvm bundles publish/list/add/run`; bundles are
+  intentionally omitted from `heyvm images list`.
 - Built-in supported images come from the CLI/backend catalog and are not cloud
   catalog rows. Examples: `ubuntu:24.04`, `debian:12`, `alpine:3.23`.
 - Backend-local files under paths such as `/var/lib/heyvm/images` are only a
