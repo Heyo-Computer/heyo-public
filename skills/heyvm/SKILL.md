@@ -110,6 +110,36 @@ heyvm pull ghcr.io/org/image:tag
 heyvm pull --force node:22
 ```
 
+On Windows, Hyper-V and Windows Sandbox use different kinds of reusable
+artifacts:
+
+- `hyperv` boots a real Linux VM image. A public Hyper-V image is a standalone
+  dynamic VHDX, not a differencing disk and not an OCI image.
+- `windows_sandbox` always boots Microsoft's host-provided
+  `windows-sandbox/default` base. That base is fixed; it is not a custom image
+  that users download or publish.
+
+Publish and reuse a Linux Hyper-V image on Windows:
+
+```sh
+heyvm images publish <hyperv-sandbox> --name <image-name>
+heyvm images add <approved-image-id> --name <local-alias>
+heyvm create --name <name> --backend hyperv --image <local-alias>
+```
+
+Publishing stops a running Hyper-V VM long enough to flatten its disk, then
+restores the sandbox before upload. Only public Linux `hyperv`/`vhdx`/
+`linux-amd64` images are supported; private and Windows-guest Hyper-V image
+publishing are not supported yet.
+
+For Windows Sandbox, reuse an **application bundle/template** instead of a root
+image. A useful bundle records the application files or build output, mapped
+runtime/tool directories, setup requirements, startup command, working
+directory, environment variables, and declared ports. Create the sandbox from
+`windows-sandbox/default`, map or copy the bundle into it, and run the recorded
+startup command. `heyvm images publish` does not publish Windows Sandbox root
+disks.
+
 ## Cloud Linux Sandboxes
 
 Create a fresh Linux cloud sandbox:
@@ -221,6 +251,13 @@ Image concepts:
   use.
 - Apple Virt images are bootable VM artifacts from the heyvm image catalog;
   standard OCI references such as `node:22` are not Apple Virt images.
+- Linux Hyper-V public images are standalone dynamic VHDX artifacts. On
+  Windows, publish with `heyvm images publish`, download an approved image with
+  `heyvm images add`, then create with `--backend hyperv --image
+  <id-or-alias>`.
+- Windows Sandbox has a fixed `windows-sandbox/default` base. Its portable
+  reusable artifact is an application bundle/template, not a custom root image
+  or standard OCI image.
 - Built-in supported images come from the CLI/backend catalog and are not cloud
   catalog rows. Examples: `ubuntu:24.04`, `debian:12`, `alpine:3.23`.
 - Backend-local files under paths such as `/var/lib/heyvm/images` are only a
