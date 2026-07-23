@@ -299,11 +299,22 @@ fn default_vm_ttl_secs() -> u64 {
 pub struct DeploymentSpec {
     pub id: String,
     pub routes: Vec<RouteRule>,
-    pub vm: VmSpec,
+    /// The VM template for a *managed* deployment: app-lb boots and autoscales a
+    /// pool of microVMs. Mutually exclusive with `upstreams`; exactly one of the
+    /// two must be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<VmSpec>,
     #[serde(default)]
     pub scaling: ScalingPolicy,
     #[serde(default)]
     pub health: HealthCheck,
+    /// A *static* (proxy_pass) deployment: forward matched requests to a fixed
+    /// set of upstream addresses (`host:port` or `ip:port`) with no VM lifecycle
+    /// and no autoscaling. Load-balanced least-in-flight with failover, and
+    /// health-re-probed by the autoscaler so a recovered upstream rejoins.
+    /// Mutually exclusive with `vm`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstreams: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -315,6 +326,12 @@ pub enum SpecError {
     BadReplicaRange { min: u32, max: u32 },
     ZeroTargetConcurrency,
     ZeroPort,
+    /// Both a `vm` template and a static `upstreams` list were set.
+    BothBackendKinds,
+    /// Neither a `vm` template nor a static `upstreams` list was set.
+    NoBackendKind,
+    /// A static upstream address is not a valid `host:port`.
+    BadUpstream(String),
 }
 
 impl std::fmt::Display for SpecError {
@@ -338,6 +355,20 @@ impl std::fmt::Display for SpecError {
             }
             Self::ZeroTargetConcurrency => write!(f, "target_concurrency must be greater than 0"),
             Self::ZeroPort => write!(f, "vm.port must be greater than 0"),
+            Self::BothBackendKinds => write!(
+                f,
+                "a deployment sets both `vm` and `upstreams`: pick one — a managed VM \
+                 pool or a static proxy_pass upstream list, not both"
+            ),
+            Self::NoBackendKind => write!(
+                f,
+                "a deployment must set exactly one of `vm` (managed VM pool) or \
+                 `upstreams` (static proxy_pass)"
+            ),
+            Self::BadUpstream(a) => write!(
+                f,
+                "static upstream {a:?} is not a valid `host:port` address"
+            ),
         }
     }
 }
@@ -345,10 +376,29 @@ impl std::fmt::Display for SpecError {
 impl std::error::Error for SpecError {}
 
 impl DeploymentSpec {
+    /// A static (proxy_pass) deployment forwards to fixed upstreams instead of a
+    /// managed VM pool. Determined by which backend field is populated; a valid
+    /// spec sets exactly one (enforced by [`validate`](Self::validate)).
+    pub fn is_static(&self) -> bool {
+        !self.upstreams.is_empty()
+    }
+
+    /// The VM template of a *managed* deployment. Panics if called on a static
+    /// deployment — the VM-lifecycle code (autoscaler) only reaches this after
+    /// confirming the deployment is managed, and `validate` guarantees a managed
+    /// spec has a `vm`.
+    pub fn vm_spec(&self) -> &VmSpec {
+        self.vm
+            .as_ref()
+            .expect("vm_spec() on a static deployment; guard on is_static() first")
+    }
+
     /// Rejects specs the data plane could not serve.
     ///
-    /// The driver check is the load-bearing one: `SandboxInfo.guest_ip` is only
-    /// populated for tap-networked Firecracker/KVM on a local daemon, so a
+    /// A deployment is either *managed* (a `vm` template, autoscaled) or *static*
+    /// (a fixed `upstreams` list, proxy_pass); exactly one must be set. For the
+    /// managed kind the driver check is load-bearing: `SandboxInfo.guest_ip` is
+    /// only populated for tap-networked Firecracker/KVM on a local daemon, so a
     /// Libvirt VM would boot fine and then be unroutable.
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.id.trim().is_empty() {
@@ -360,26 +410,60 @@ impl DeploymentSpec {
         if self.routes.iter().any(RouteRule::is_empty) {
             return Err(SpecError::EmptyRoute);
         }
-        if !matches!(
-            self.vm.driver,
-            SandboxDriver::Firecracker | SandboxDriver::Kvm
-        ) {
-            return Err(SpecError::UnsupportedDriver(self.vm.driver));
+
+        // Exactly one backend kind.
+        match (&self.vm, self.upstreams.is_empty()) {
+            (Some(_), false) => return Err(SpecError::BothBackendKinds),
+            (None, true) => return Err(SpecError::NoBackendKind),
+            _ => {}
         }
-        if self.vm.port == 0 {
-            return Err(SpecError::ZeroPort);
-        }
-        if self.scaling.min_replicas > self.scaling.max_replicas {
-            return Err(SpecError::BadReplicaRange {
-                min: self.scaling.min_replicas,
-                max: self.scaling.max_replicas,
-            });
-        }
-        if self.scaling.target_concurrency == 0 {
-            return Err(SpecError::ZeroTargetConcurrency);
+
+        if let Some(vm) = &self.vm {
+            // Managed: validate the VM template and scaling policy.
+            if !matches!(vm.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm) {
+                return Err(SpecError::UnsupportedDriver(vm.driver));
+            }
+            if vm.port == 0 {
+                return Err(SpecError::ZeroPort);
+            }
+            if self.scaling.min_replicas > self.scaling.max_replicas {
+                return Err(SpecError::BadReplicaRange {
+                    min: self.scaling.min_replicas,
+                    max: self.scaling.max_replicas,
+                });
+            }
+            if self.scaling.target_concurrency == 0 {
+                return Err(SpecError::ZeroTargetConcurrency);
+            }
+        } else {
+            // Static: every upstream must be a well-formed `host:port`. Actual
+            // name resolution happens at request time (pingora) and per tick (the
+            // health re-probe), so a temporarily-unresolvable name is not a
+            // registration error — only a malformed address is.
+            for addr in &self.upstreams {
+                if !is_valid_host_port(addr) {
+                    return Err(SpecError::BadUpstream(addr.clone()));
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// Whether `s` is a syntactically valid `host:port` (or `ip:port`) upstream: a
+/// non-empty host and a numeric port in `1..=65535`. Splits on the last colon so
+/// IPv6 literals like `[::1]:8080` are handled; the host is not otherwise
+/// resolved here.
+fn is_valid_host_port(s: &str) -> bool {
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return false;
+    };
+    // Strip brackets from an IPv6 literal for the emptiness check.
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if host.is_empty() {
+        return false;
+    }
+    matches!(port.parse::<u16>(), Ok(p) if p > 0)
 }
 
 #[cfg(test)]
@@ -394,7 +478,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
             }],
-            vm: VmSpec {
+            vm: Some(VmSpec {
                 driver: SandboxDriver::Firecracker,
                 image: None,
                 port: 8080,
@@ -406,29 +490,79 @@ mod tests {
                 setup_hooks: None,
                 open_ports: vec![],
                 ttl_seconds: 3600,
-            },
+            }),
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
+            upstreams: vec![],
+        }
+    }
+
+    /// A static (proxy_pass) deployment: `upstreams` set, no `vm`.
+    fn static_spec(upstreams: &[&str]) -> DeploymentSpec {
+        DeploymentSpec {
+            id: "proxy".into(),
+            routes: vec![RouteRule {
+                host: None,
+                host_suffix: None,
+                path_prefix: Some("/legacy".into()),
+            }],
+            vm: None,
+            scaling: ScalingPolicy::default(),
+            health: HealthCheck::default(),
+            upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     #[test]
     fn accepts_supported_drivers() {
         let mut s = spec();
-        s.vm.driver = SandboxDriver::Firecracker;
+        s.vm.as_mut().unwrap().driver = SandboxDriver::Firecracker;
         assert!(s.validate().is_ok());
-        s.vm.driver = SandboxDriver::Kvm;
+        s.vm.as_mut().unwrap().driver = SandboxDriver::Kvm;
         assert!(s.validate().is_ok());
     }
 
     #[test]
     fn rejects_libvirt_because_it_has_no_guest_ip() {
         let mut s = spec();
-        s.vm.driver = SandboxDriver::Libvirt;
+        s.vm.as_mut().unwrap().driver = SandboxDriver::Libvirt;
         assert_eq!(
             s.validate(),
             Err(SpecError::UnsupportedDriver(SandboxDriver::Libvirt))
         );
+    }
+
+    #[test]
+    fn accepts_a_static_upstream_spec() {
+        assert!(!spec().is_static());
+        let s = static_spec(&["10.0.0.9:8080", "backend.internal:8080", "[::1]:9000"]);
+        assert!(s.is_static());
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_both_or_neither_backend_kind() {
+        // Both `vm` and `upstreams`.
+        let mut both = spec();
+        both.upstreams = vec!["10.0.0.9:8080".into()];
+        assert_eq!(both.validate(), Err(SpecError::BothBackendKinds));
+
+        // Neither.
+        let mut neither = spec();
+        neither.vm = None;
+        assert_eq!(neither.validate(), Err(SpecError::NoBackendKind));
+    }
+
+    #[test]
+    fn rejects_malformed_upstreams() {
+        for bad in ["no-port", "host:", ":8080", "host:0", "host:notaport"] {
+            let s = static_spec(&[bad]);
+            assert_eq!(
+                s.validate(),
+                Err(SpecError::BadUpstream(bad.to_string())),
+                "{bad:?} should be rejected",
+            );
+        }
     }
 
     #[test]
@@ -454,7 +588,7 @@ mod tests {
         assert_eq!(s.validate(), Err(SpecError::ZeroTargetConcurrency));
 
         let mut s = spec();
-        s.vm.port = 0;
+        s.vm.as_mut().unwrap().port = 0;
         assert_eq!(s.validate(), Err(SpecError::ZeroPort));
     }
 

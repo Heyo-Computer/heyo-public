@@ -3,9 +3,18 @@
 An application load balancer for [heyvm](https://heyo.computer) Firecracker/KVM microVMs,
 built on [Pingora](https://github.com/cloudflare/pingora).
 
-Register a *deployment* — a VM template plus routing rules and a scaling policy — and app-lb
-routes HTTP traffic to a pool of VMs, booting and reaping them to match load. Deployments are
-registered at runtime over an admin API; multiple deployments coexist in one process.
+Register a *deployment* — routing rules plus a backend — and app-lb routes HTTP traffic to it.
+Deployments are registered at runtime over an admin API; multiple deployments coexist in one
+process. A deployment is one of two kinds:
+
+- **Managed** (`vm`): a VM template plus a scaling policy. app-lb boots and reaps a pool of
+  microVMs to match load.
+- **Static / `proxy_pass`** (`upstreams`): a fixed set of upstream addresses (`host:port` or
+  `ip:port`) to forward to — another app or service. No VM lifecycle and no autoscaling; the
+  upstreams are load-balanced least-in-flight with failover, and health-re-probed so a
+  recovered upstream rejoins. See [Static / proxy_pass deployments](#static--proxy_pass-deployments).
+
+A deployment sets exactly one of `vm` or `upstreams`.
 
 Only Firecracker and KVM are supported. This is not a limitation of taste: app-lb routes
 directly to `SandboxInfo.guest_ip`, which the daemon only populates for tap-networked
@@ -24,6 +33,9 @@ unroutable, so the driver is rejected at registration.
 cargo build --release
 ./target/release/app-lb
 ```
+
+To run it as a managed, auto-restarting service, see the supervisord unit in
+[`deploy/supervisor/`](deploy/supervisor/).
 
 Configuration is environment-only:
 
@@ -89,7 +101,30 @@ curl -XDELETE 'localhost:9090/deployments/demo/vms/sb-abc123?force=true'  # kill
 
 Then: `curl -H 'Host: demo.local' localhost:6188/`
 
-Responses carry an `x-vm-id` header naming the VM that served them.
+Responses carry an `x-vm-id` header naming the VM (or, for a static deployment, the upstream
+address) that served them.
+
+### Static / proxy_pass deployments
+
+A deployment with an `upstreams` list (instead of a `vm` template) forwards matched requests to
+a fixed set of upstream addresses — another app or service — like nginx `proxy_pass`. There is
+no VM lifecycle and no autoscaling: the upstreams are load-balanced least-in-flight with
+per-request failover, and the autoscaler health-re-probes them each tick (using the
+deployment's `health` check) so a recovered upstream rejoins routing and a dead one is skipped.
+
+```sh
+curl -XPOST localhost:9090/deployments -H 'content-type: application/json' -d '{
+  "id": "legacy-api",
+  "routes": [{"path_prefix": "/legacy"}],
+  "upstreams": ["10.0.0.9:8080", "backend.internal:8080"],
+  "health": {"path": "/healthz", "timeout_secs": 2}
+}'
+```
+
+Each upstream is a `host:port` (or `ip:port`); a hostname is re-resolved per connection. To
+change the targets, `PUT` the deployment with a new `upstreams` list (the backends are rebuilt).
+Scaling (`PATCH .../scaling`) and per-VM eviction (`DELETE .../vms/...`) do not apply to a
+static deployment and are rejected. Upstreams are proxied over **plaintext HTTP**.
 
 ### Editing & scaling a deployment
 

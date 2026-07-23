@@ -49,12 +49,26 @@ impl Autoscaler {
 
     /// One full pass over every deployment.
     async fn reconcile(&self) {
+        let deployments = self.registry.deployments();
+
+        // Static (proxy_pass) deployments need no daemon interaction — health-
+        // re-probe them first, and unconditionally, so they keep working even
+        // when the daemon is unreachable (or app-lb runs with no VM deployments
+        // at all and heyvmd isn't running).
+        for deployment in deployments.values() {
+            if deployment.spec.is_static() {
+                self.reconcile_static(deployment).await;
+            }
+        }
+
+        // Managed deployments need the fleet list; if it fails, skip the VM work
+        // this tick (the static probes above have already run).
         let fleet = match self.vms.list().await {
             Ok(list) => vm::index_by_id(list),
             Err(e) => {
                 // Log explicitly: without this the loop fails silently and the
                 // pool just quietly stops updating.
-                tracing::error!(error = %e, "failed to list sandboxes; skipping tick");
+                tracing::error!(error = %e, "failed to list sandboxes; skipping VM reconcile this tick");
                 return;
             }
         };
@@ -64,8 +78,10 @@ impl Autoscaler {
         // and carry on with an empty index (VMs keep their last sample).
         let usage = self.sample_usage().await;
 
-        for deployment in self.registry.deployments().values() {
-            self.reconcile_one(deployment, &fleet, &usage).await;
+        for deployment in deployments.values() {
+            if !deployment.spec.is_static() {
+                self.reconcile_one(deployment, &fleet, &usage).await;
+            }
         }
     }
 
@@ -110,6 +126,10 @@ impl Autoscaler {
         fleet: &HashMap<String, SandboxInfo>,
         usage: &HashMap<String, vm::SandboxUsage>,
     ) {
+        // Managed-only: static deployments are reconciled separately in
+        // `reconcile` (they own no VMs and need no daemon interaction).
+        debug_assert!(!d.spec.is_static(), "reconcile_one called on a static deployment");
+
         self.prune(d, fleet);
         self.promote_pending(d, fleet).await;
 
@@ -127,6 +147,43 @@ impl Autoscaler {
         self.reap_drained(d).await;
         self.renew_ttls(d, fleet).await;
         self.apply_usage(d, usage);
+    }
+
+    /// Health-re-probe the fixed upstreams of a static (proxy_pass) deployment.
+    ///
+    /// A static deployment has no VM lifecycle, but its upstreams can still come
+    /// and go. `select` skips backends that `fail_to_connect` marked unhealthy;
+    /// this is what brings a recovered upstream back — and what proactively skips
+    /// one that is down but hasn't been dialed since. A hostname is re-resolved
+    /// each tick, so a name that fails to resolve reads as unhealthy.
+    async fn reconcile_static(&self, d: &Arc<Deployment>) {
+        for b in d.backends().iter() {
+            let healthy = match tokio::net::lookup_host(&b.peer).await {
+                Ok(mut addrs) => match addrs.next() {
+                    Some(addr) => health::probe(addr, &d.spec.health).await,
+                    None => false, // resolved to nothing
+                },
+                Err(e) => {
+                    tracing::debug!(
+                        deployment = %d.spec.id,
+                        upstream = %b.peer,
+                        error = %e,
+                        "static upstream did not resolve; marking unhealthy",
+                    );
+                    false
+                }
+            };
+            let was = b.is_healthy();
+            b.set_healthy(healthy);
+            if was != healthy {
+                tracing::info!(
+                    deployment = %d.spec.id,
+                    upstream = %b.peer,
+                    healthy,
+                    "static upstream health changed",
+                );
+            }
+        }
     }
 
     /// Copy the latest per-VM CPU/memory sample onto each live backend.
@@ -147,7 +204,7 @@ impl Autoscaler {
     /// While we *are* alive, renew it past the halfway mark so a healthy VM
     /// under steady traffic doesn't get culled out from under us.
     async fn renew_ttls(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
-        let ttl = d.spec.vm.ttl_seconds;
+        let ttl = d.spec.vm_spec().ttl_seconds;
         for b in d.backends().iter() {
             let Some(info) = fleet.get(&b.sandbox_id) else {
                 continue;
@@ -226,7 +283,7 @@ impl Autoscaler {
                 continue;
             };
 
-            match vm::routable_addr(info, d.spec.vm.port) {
+            match vm::routable_addr(info, d.spec.vm_spec().port) {
                 Ok(addr) => {
                     if health::probe(addr, &d.spec.health).await {
                         let boot_secs = now_secs().saturating_sub(p.created_at);
@@ -284,7 +341,7 @@ impl Autoscaler {
         let mut created = 0u64;
         for _ in 0..count {
             let name = vm::replica_name(&d.spec.id, self.next_nonce());
-            match self.vms.create(&d.spec.vm, name).await {
+            match self.vms.create(d.spec.vm_spec(), name).await {
                 Ok(sandbox) => {
                     pending.push(PendingVm {
                         sandbox_id: sandbox.sandbox_id().to_string(),
@@ -395,7 +452,13 @@ impl Autoscaler {
                 orphans.push(info.id.clone());
                 continue;
             };
-            match vm::routable_addr(info, d.spec.vm.port) {
+            if d.spec.is_static() {
+                // The deployment id was reused for a static one since this VM was
+                // created; it owns no VMs, so this sandbox is an orphan.
+                orphans.push(info.id.clone());
+                continue;
+            }
+            match vm::routable_addr(info, d.spec.vm_spec().port) {
                 Ok(addr) if health::probe(addr, &d.spec.health).await => {
                     tracing::info!(
                         deployment = %owner,
@@ -428,6 +491,12 @@ impl Autoscaler {
 
     /// Drain and kill every VM of a deployment, e.g. on DELETE.
     pub async fn teardown(&self, d: &Arc<Deployment>) {
+        // A static deployment's backends are not sandboxes — there is nothing to
+        // kill on the daemon. Just drop them from routing.
+        if d.spec.is_static() {
+            d.set_backends(Vec::new());
+            return;
+        }
         for b in d.backends().iter() {
             b.set_draining();
             if let Err(e) = self.vms.kill(&b.sandbox_id).await {
@@ -595,7 +664,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
             }],
-            vm: VmSpec {
+            vm: Some(VmSpec {
                 driver: SandboxDriver::Firecracker,
                 image: None,
                 port: 8080,
@@ -607,9 +676,26 @@ mod tests {
                 setup_hooks: None,
                 open_ports: vec![],
                 ttl_seconds: 3600,
-            },
+            }),
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
+            upstreams: vec![],
+        }
+    }
+
+    /// A static (proxy_pass) deployment with fixed upstreams.
+    fn static_spec() -> DeploymentSpec {
+        DeploymentSpec {
+            id: "proxy".into(),
+            routes: vec![RouteRule {
+                host: None,
+                host_suffix: None,
+                path_prefix: Some("/legacy".into()),
+            }],
+            vm: None,
+            scaling: ScalingPolicy::default(),
+            health: HealthCheck::default(),
+            upstreams: vec!["127.0.0.1:9".into()],
         }
     }
 
@@ -651,5 +737,19 @@ mod tests {
 
         let out = a.evict(&d, "sb-does-not-exist", false).await;
         assert!(matches!(out, EvictOutcome::NotFound), "got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn tearing_down_a_static_deployment_just_clears_routing() {
+        let (a, reg) = autoscaler();
+        reg.upsert(static_spec());
+        let d = reg.get("proxy").unwrap();
+        // Prepopulated from the spec's upstreams.
+        assert_eq!(d.backends().len(), 1);
+
+        // Static backends are not sandboxes, so teardown must not dial the
+        // daemon (the test VmManager points at a dead port); it just drops them.
+        a.teardown(&d).await;
+        assert!(d.backends().is_empty());
     }
 }

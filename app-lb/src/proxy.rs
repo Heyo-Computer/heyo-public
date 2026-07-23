@@ -28,8 +28,9 @@ pub struct Ctx {
     /// The backend currently serving, if we've incremented its counter.
     backend: Option<Arc<VmBackend>>,
     deployment: Option<Arc<Deployment>>,
-    /// Upstreams already tried; `upstream_peer` must not hand these back.
-    failed: Vec<SocketAddr>,
+    /// Upstreams already tried (by peer address); `upstream_peer` must not hand
+    /// these back.
+    failed: Vec<String>,
     attempts: usize,
     /// When the request entered the proxy, for latency. Set in `request_filter`
     /// so the measured span covers cold-start waits too, and `None` before then
@@ -86,6 +87,14 @@ fn request_host(req: &RequestHeader) -> Option<String> {
     };
 
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Resolve a `host:port` (or `ip:port`) upstream to a concrete address, async so
+/// a DNS lookup never blocks the proxy runtime. An `ip:port` literal resolves
+/// without touching DNS; a hostname is resolved here and re-resolved on every
+/// request, so DNS changes are picked up. `None` on failure or an empty result.
+async fn resolve_peer(peer: &str) -> Option<SocketAddr> {
+    tokio::net::lookup_host(peer).await.ok()?.next()
 }
 
 async fn write_error(session: &mut Session, code: u16, message: &str) -> Result<()> {
@@ -154,19 +163,43 @@ impl ProxyHttp for LbProxy {
             ));
         }
 
-        let backend = match deployment.select(&ctx.failed) {
-            Some(b) => b,
-            None => {
-                // Nothing ready. If the deployment can still grow, hold the
-                // request while a VM boots rather than failing the caller.
-                match wait_for_capacity(&deployment, &ctx.failed, &self.metrics).await {
-                    Some(b) => b,
-                    None => {
-                        return Err(Error::explain(
-                            ErrorType::ConnectProxyFailure,
-                            "no healthy VM available for deployment",
-                        ));
+        // Pick a backend and resolve its address to a concrete `SocketAddr`. We
+        // resolve here — with async DNS — rather than handing the `host:port`
+        // string to `HttpPeer::new`, because that constructor resolves with a
+        // *blocking* `to_socket_addrs().unwrap()` that would stall the runtime on
+        // a static hostname and panic if it failed to resolve. A backend whose
+        // address doesn't resolve is treated like a connect failure: marked
+        // unhealthy and skipped, so a bad static upstream fails over to a good one
+        // (and the autoscaler's health re-probe restores it once it resolves).
+        let (backend, addr) = loop {
+            let backend = match deployment.select(&ctx.failed) {
+                Some(b) => b,
+                None => {
+                    // Nothing ready. If the deployment can still grow, hold the
+                    // request while a VM boots rather than failing the caller.
+                    // (A static deployment never grows, so this returns at once.)
+                    match wait_for_capacity(&deployment, &ctx.failed, &self.metrics).await {
+                        Some(b) => b,
+                        None => {
+                            return Err(Error::explain(
+                                ErrorType::ConnectProxyFailure,
+                                "no healthy backend available for deployment",
+                            ));
+                        }
                     }
+                }
+            };
+
+            match resolve_peer(&backend.peer).await {
+                Some(addr) => break (backend, addr),
+                None => {
+                    tracing::warn!(
+                        peer = %backend.peer,
+                        "upstream address did not resolve; marking unhealthy",
+                    );
+                    backend.set_healthy(false);
+                    ctx.failed.push(backend.peer.clone());
+                    // Loop: pick another backend (or give up when none remain).
                 }
             }
         };
@@ -174,10 +207,10 @@ impl ProxyHttp for LbProxy {
         // Release any slot held from a previous attempt before taking a new one.
         ctx.release();
         backend.acquire();
-        let addr = backend.addr;
         ctx.backend = Some(backend);
 
-        // Plaintext: the guest IP is on a host-local tap network.
+        // Plaintext, in both modes: a managed VM's guest IP is on a host-local
+        // tap network, and static proxy_pass upstreams are plaintext by design.
         Ok(Box::new(HttpPeer::new(addr, false, String::new())))
     }
 
@@ -207,11 +240,11 @@ impl ProxyHttp for LbProxy {
         if let Some(b) = &ctx.backend {
             tracing::warn!(
                 sandbox = %b.sandbox_id,
-                addr = %b.addr,
+                addr = %b.peer,
                 "upstream connect failed; marking unhealthy",
             );
             b.set_healthy(false);
-            ctx.failed.push(b.addr);
+            ctx.failed.push(b.peer.clone());
         } else {
             tracing::warn!(peer = %peer, "upstream connect failed with no backend in ctx");
         }
@@ -258,7 +291,7 @@ impl ProxyHttp for LbProxy {
 /// case waiting cannot help).
 async fn wait_for_capacity(
     deployment: &Arc<Deployment>,
-    exclude: &[SocketAddr],
+    exclude: &[String],
     metrics: &Metrics,
 ) -> Option<Arc<VmBackend>> {
     if !deployment.can_grow() {
@@ -336,6 +369,24 @@ mod tests {
         assert_eq!(request_host(&header(None, "/")), None);
     }
 
+    #[tokio::test]
+    async fn resolve_peer_handles_literals_and_bad_addresses() {
+        // An ip:port literal resolves without DNS.
+        assert_eq!(
+            resolve_peer("127.0.0.1:8080").await,
+            Some("127.0.0.1:8080".parse().unwrap()),
+        );
+        // localhost resolves to a loopback address.
+        let local = resolve_peer("localhost:8080").await;
+        assert!(local.is_some_and(|a| a.ip().is_loopback()), "got {local:?}");
+        // A malformed / unresolvable address is None, not a panic — this is what
+        // keeps a bad static upstream from taking down the proxy runtime.
+        assert_eq!(resolve_peer("no-port").await, None);
+        assert!(
+            resolve_peer("definitely-not-a-real-host.invalid:80").await.is_none()
+        );
+    }
+
     #[test]
     fn ipv6_literal_host_survives_port_stripping() {
         assert_eq!(
@@ -377,7 +428,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
             }],
-            vm: VmSpec {
+            vm: Some(VmSpec {
                 driver: SandboxDriver::Firecracker,
                 image: None,
                 port: 8080,
@@ -389,9 +440,10 @@ mod tests {
                 setup_hooks: None,
                 open_ports: vec![],
                 ttl_seconds: 3600,
-            },
+            }),
             scaling,
             health: HealthCheck::default(),
+            upstreams: vec![],
         }))
     }
 
@@ -465,7 +517,7 @@ mod tests {
         });
 
         let got = wait_for_capacity(&d, &[], &Metrics::new()).await;
-        assert_eq!(got.unwrap().addr, "10.0.0.1:80".parse().unwrap());
+        assert_eq!(got.unwrap().peer, "10.0.0.1:80");
     }
 
     /// The pool can fill between the availability check and the wait; the

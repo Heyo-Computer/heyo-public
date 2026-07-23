@@ -1,0 +1,8 @@
+{
+  "id": "pg-fc-dashboard",
+  "routes": [
+    { "host": "pg-dashboard.local" }
+  ],
+  "upstreams": ["127.0.0.1:8080"],
+  "health": { "path": null, "timeout_secs": 2 }
+}

@@ -202,7 +202,7 @@ mod tests {
         DeploymentSpec {
             id: id.into(),
             routes,
-            vm: VmSpec {
+            vm: Some(VmSpec {
                 driver: SandboxDriver::Firecracker,
                 image: None,
                 port: 8080,
@@ -214,9 +214,21 @@ mod tests {
                 setup_hooks: None,
                 open_ports: vec![],
                 ttl_seconds: 3600,
-            },
+            }),
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
+            upstreams: vec![],
+        }
+    }
+
+    fn static_spec(id: &str, routes: Vec<RouteRule>, upstreams: &[&str]) -> DeploymentSpec {
+        DeploymentSpec {
+            id: id.into(),
+            routes,
+            vm: None,
+            scaling: ScalingPolicy::default(),
+            health: HealthCheck::default(),
+            upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -406,5 +418,38 @@ mod tests {
     fn load_missing_file_is_a_clean_first_run() {
         let r = Registry::new("/nonexistent/definitely/not/here.json");
         assert_eq!(r.load().unwrap(), 0);
+    }
+
+    #[test]
+    fn static_deployment_routes_and_is_prepopulated() {
+        let r = Registry::new("unused.json");
+        r.upsert(static_spec(
+            "proxy",
+            vec![path("/legacy")],
+            &["10.0.0.9:8080", "backend.internal:8080"],
+        ));
+        let d = r.route(None, "/legacy/x").unwrap();
+        assert_eq!(d.spec.id, "proxy");
+        // Backends come straight from the spec — no autoscaler needed.
+        assert_eq!(d.backends().len(), 2);
+    }
+
+    #[test]
+    fn static_deployment_survives_persist_round_trip() {
+        let dir = std::env::temp_dir().join(format!("app-lb-static-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_file = dir.join("state.json");
+
+        let r = Registry::new(&state_file);
+        r.upsert(static_spec("proxy", vec![path("/legacy")], &["10.0.0.9:8080"]));
+        r.persist().unwrap();
+
+        let r2 = Registry::new(&state_file);
+        assert_eq!(r2.load().unwrap(), 1);
+        let d = r2.route(None, "/legacy").unwrap();
+        assert!(d.spec.is_static());
+        assert_eq!(d.backends().len(), 1, "backends rebuilt from upstreams on load");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

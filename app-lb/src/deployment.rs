@@ -14,15 +14,20 @@ pub fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// A single ready VM.
+/// A single routable backend — a ready VM, or a static proxy_pass upstream.
 ///
 /// `in_flight` is the one number that matters: it picks the upstream *and*
 /// drives the autoscaler, which is why we track it ourselves instead of using
 /// pingora-load-balancing (whose selection algorithms cannot see it).
+///
+/// `peer` is the address handed to pingora (`HttpPeer`) and the identity used
+/// for retry-exclusion and display. It is a `host:port` *string* rather than a
+/// resolved `SocketAddr` so a static upstream can be a hostname that pingora
+/// re-resolves per connection.
 #[derive(Debug)]
 pub struct VmBackend {
     pub sandbox_id: String,
-    pub addr: SocketAddr,
+    pub peer: String,
     in_flight: AtomicUsize,
     draining: AtomicBool,
     healthy: AtomicBool,
@@ -40,10 +45,22 @@ pub struct VmBackend {
 }
 
 impl VmBackend {
+    /// A backend for a managed VM, addressed by its resolved guest `SocketAddr`.
     pub fn new(sandbox_id: String, addr: SocketAddr) -> Self {
+        Self::with_peer(sandbox_id, addr.to_string())
+    }
+
+    /// A backend for a static proxy_pass upstream, addressed by a `host:port`
+    /// string (which pingora resolves per connection). The address doubles as the
+    /// backend's display id, since there is no sandbox.
+    pub fn for_upstream(address: String) -> Self {
+        Self::with_peer(address.clone(), address)
+    }
+
+    fn with_peer(sandbox_id: String, peer: String) -> Self {
         Self {
             sandbox_id,
-            addr,
+            peer,
             in_flight: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
             healthy: AtomicBool::new(true),
@@ -155,9 +172,17 @@ pub struct Deployment {
 
 impl Deployment {
     pub fn new(spec: DeploymentSpec) -> Self {
+        // A static (proxy_pass) deployment has a fixed set of backends known at
+        // registration; populate them now so it is routable immediately and the
+        // autoscaler never has to (indeed, it skips static deployments entirely).
+        let backends: Vec<Arc<VmBackend>> = spec
+            .upstreams
+            .iter()
+            .map(|addr| Arc::new(VmBackend::for_upstream(addr.clone())))
+            .collect();
         Self {
             spec,
-            backends: ArcSwap::from_pointee(Vec::new()),
+            backends: ArcSwap::from_pointee(backends),
             pending: ArcSwap::from_pointee(Vec::new()),
             waiters: AtomicUsize::new(0),
             ready_signal: Notify::new(),
@@ -202,18 +227,26 @@ impl Deployment {
     /// Least-in-flight pick, skipping backends already tried on this request.
     ///
     /// `exclude` is what makes retry work: on `fail_to_connect` we re-enter
-    /// `upstream_peer` and must not hand back the VM that just failed.
-    pub fn select(&self, exclude: &[SocketAddr]) -> Option<Arc<VmBackend>> {
+    /// `upstream_peer` and must not hand back the backend that just failed. The
+    /// exclusion key is the peer address string (see [`VmBackend::peer`]).
+    pub fn select(&self, exclude: &[String]) -> Option<Arc<VmBackend>> {
         self.backends()
             .iter()
-            .filter(|b| b.is_available() && !exclude.contains(&b.addr))
+            .filter(|b| b.is_available() && !exclude.contains(&b.peer))
             .min_by_key(|b| b.in_flight())
             .cloned()
     }
 
     /// Whether the autoscaler could still add capacity, i.e. whether a request
     /// arriving now is worth holding for a cold start.
+    ///
+    /// Always false for a static (proxy_pass) deployment: its upstream set is
+    /// fixed, so a request that finds nothing available must fail fast rather
+    /// than hold for a VM boot that will never come.
     pub fn can_grow(&self) -> bool {
+        if self.spec.is_static() {
+            return false;
+        }
         let live = self.backends().len() + self.pending().len();
         (live as u32) < self.spec.scaling.max_replicas
     }
@@ -301,7 +334,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
             }],
-            vm: VmSpec {
+            vm: Some(VmSpec {
                 driver: SandboxDriver::Firecracker,
                 image: None,
                 port: 8080,
@@ -313,9 +346,26 @@ mod tests {
                 setup_hooks: None,
                 open_ports: vec![],
                 ttl_seconds: 3600,
-            },
+            }),
             scaling,
             health: HealthCheck::default(),
+            upstreams: vec![],
+        })
+    }
+
+    /// A static (proxy_pass) deployment with the given upstreams.
+    fn static_deployment(upstreams: &[&str]) -> Deployment {
+        Deployment::new(DeploymentSpec {
+            id: "proxy".into(),
+            routes: vec![RouteRule {
+                host: None,
+                host_suffix: None,
+                path_prefix: Some("/legacy".into()),
+            }],
+            vm: None,
+            scaling: ScalingPolicy::default(),
+            health: HealthCheck::default(),
+            upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
         })
     }
 
@@ -328,7 +378,7 @@ mod tests {
         a.acquire();
         b.acquire();
         d.set_backends(vec![a, b.clone()]);
-        assert_eq!(d.select(&[]).unwrap().addr, b.addr);
+        assert_eq!(d.select(&[]).unwrap().peer, b.peer);
     }
 
     #[test]
@@ -340,12 +390,27 @@ mod tests {
         d.set_backends(vec![a.clone(), b.clone(), c.clone()]);
 
         // Excluding the first (e.g. it just failed to connect) moves on.
-        assert_eq!(d.select(&[a.addr]).unwrap().addr, b.addr);
+        assert_eq!(d.select(std::slice::from_ref(&a.peer)).unwrap().peer, b.peer);
 
         b.set_draining();
         c.set_healthy(false);
-        assert!(d.select(&[a.addr]).is_none());
-        assert_eq!(d.select(&[]).unwrap().addr, a.addr);
+        assert!(d.select(std::slice::from_ref(&a.peer)).is_none());
+        assert_eq!(d.select(&[]).unwrap().peer, a.peer);
+    }
+
+    #[test]
+    fn static_deployment_is_routable_immediately_and_cannot_grow() {
+        let d = static_deployment(&["10.0.0.9:8080", "backend.internal:8080"]);
+        // Backends are populated from the spec at construction, no autoscaler.
+        assert_eq!(d.backends().len(), 2);
+        assert!(d.spec.is_static());
+        // Never holds a request for a cold start.
+        assert!(!d.can_grow());
+        // Load-balances least-in-flight across the fixed upstreams.
+        let first = d.select(&[]).unwrap();
+        first.acquire();
+        let second = d.select(&[]).unwrap();
+        assert_ne!(first.peer, second.peer, "second request picks the idle upstream");
     }
 
     #[test]

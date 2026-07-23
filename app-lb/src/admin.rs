@@ -187,11 +187,18 @@ struct VmStatus {
 #[derive(Serialize)]
 struct DeploymentStatus {
     spec: DeploymentSpec,
+    /// `"vm"` (managed pool) or `"static"` (fixed proxy_pass upstreams).
+    kind: &'static str,
     desired_replicas: u32,
     ready: usize,
     pending: usize,
     total_in_flight: usize,
     vms: Vec<VmStatus>,
+}
+
+/// The backend kind of a deployment, as a stable string for the API/dashboard.
+fn deployment_kind(d: &crate::deployment::Deployment) -> &'static str {
+    if d.spec.is_static() { "static" } else { "vm" }
 }
 
 #[derive(Serialize)]
@@ -212,6 +219,7 @@ fn status_of(d: &Arc<crate::deployment::Deployment>) -> DeploymentStatus {
     let backends = d.backends();
     DeploymentStatus {
         spec: d.spec.clone(),
+        kind: deployment_kind(d),
         desired_replicas: d.desired_replicas(),
         ready: backends.len(),
         pending: d.pending().len(),
@@ -220,7 +228,7 @@ fn status_of(d: &Arc<crate::deployment::Deployment>) -> DeploymentStatus {
             .iter()
             .map(|b| VmStatus {
                 sandbox_id: b.sandbox_id.clone(),
-                addr: b.addr.to_string(),
+                addr: b.peer.clone(),
                 in_flight: b.in_flight(),
                 healthy: b.is_healthy(),
                 draining: b.is_draining(),
@@ -272,6 +280,12 @@ struct VmView {
 #[derive(Serialize)]
 struct DeploymentView {
     id: String,
+    /// `"vm"` (managed pool) or `"static"` (proxy_pass). The dashboard renders
+    /// the two differently — a static deployment hides scaling controls.
+    kind: &'static str,
+    /// For a static deployment, the configured upstream addresses; empty for a
+    /// managed one.
+    upstreams: Vec<String>,
     pool: PoolStatus,
     vms: Vec<VmView>,
     metrics: DeploymentMetricsSnapshot,
@@ -348,6 +362,8 @@ async fn metrics_snapshot(State(state): State<AdminState>) -> impl IntoResponse 
             let backends = d.backends();
             DeploymentView {
                 id: d.spec.id.clone(),
+                kind: deployment_kind(d),
+                upstreams: d.spec.upstreams.clone(),
                 pool: pool_status_of(d),
                 vms: backends
                     .iter()
@@ -355,7 +371,7 @@ async fn metrics_snapshot(State(state): State<AdminState>) -> impl IntoResponse 
                         let usage = b.usage();
                         VmView {
                             sandbox_id: b.sandbox_id.clone(),
-                            addr: b.addr.to_string(),
+                            addr: b.peer.clone(),
                             in_flight: b.in_flight(),
                             healthy: b.is_healthy(),
                             draining: b.is_draining(),
@@ -444,9 +460,12 @@ async fn update(
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
 
-    let deployment = if old.spec.vm != spec.vm {
-        // Template changed: the running VMs no longer match the spec, so rebuild.
-        tracing::info!(deployment = %id, "updating deployment (VM template changed; rebuilding pool)");
+    let deployment = if old.spec.vm != spec.vm || old.spec.upstreams != spec.upstreams {
+        // The backend set changed — a managed VM *template*, or a static
+        // deployment's upstream list (or a switch between the two kinds). The
+        // running backends no longer match the spec, so rebuild from scratch
+        // (`teardown` is a no-op-that-clears-routing for the static kind).
+        tracing::info!(deployment = %id, "updating deployment (backends changed; rebuilding)");
         state.autoscaler.teardown(&old).await;
         state.registry.upsert(spec)
     } else {
@@ -482,6 +501,16 @@ async fn scale(
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+
+    // A static (proxy_pass) deployment isn't autoscaled — its scaling policy is
+    // inert — so a scale request is a mistake, not a no-op. Reject it explicitly.
+    if old.spec.is_static() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("deployment {id:?} is static (proxy_pass) and cannot be scaled; edit its `upstreams` via PUT instead"),
+        )
+        .into_response();
+    }
 
     let Some(patch) = patch.as_object() else {
         return err(StatusCode::BAD_REQUEST, "scaling patch must be a JSON object").into_response();
@@ -574,6 +603,17 @@ async fn evict_vm(
     let Some(d) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+
+    // A static (proxy_pass) deployment has no autoscaler to boot a replacement,
+    // so evicting one of its fixed upstreams is meaningless — reject it. Edit the
+    // `upstreams` list via PUT to change targets instead.
+    if d.spec.is_static() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("deployment {id:?} is static (proxy_pass); its upstreams cannot be evicted — edit the spec instead"),
+        )
+        .into_response();
+    }
 
     match state.autoscaler.evict(&d, &sandbox_id, params.force).await {
         EvictOutcome::Killed => {

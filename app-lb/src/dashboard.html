@@ -517,37 +517,80 @@ function renderDeployments(deps) {
     const errTotal = m.requests.c5xx + m.requests.errors;
     const errPct = m.requests.total ? (errTotal / m.requests.total) * 100 : 0;
 
-    const vmRows = d.vms.length ? d.vms.map(v => {
-      const load = Math.min(1, v.in_flight / Math.max(1, p.target_concurrency)) * 100;
-      const st = v.draining ? `<span class="tag drain">draining</span>`
-              : !v.healthy ? `<span class="tag down">unhealthy</span>`
-              : `<span class="tag ok">serving</span>`;
-      // CPU is percent-of-a-core; normalise the bar to one core but show the raw number.
-      const cpuBar = v.cpu_percent == null ? 0 : Math.min(100, v.cpu_percent);
-      const evictBtns = v.draining
-        ? `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`
-        : `<button class="btn mini" data-act="drain" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Drain</button>`
-          + `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`;
-      return `<tr>
-        <td class="mono">${esc(v.sandbox_id)}</td>
-        <td class="mono">${esc(v.addr)}</td>
-        <td><span class="vm-load"><span class="track"><span class="fill" style="width:${load}%"></span></span>${v.in_flight}</span></td>
-        <td>${v.cpu_percent == null ? "—" : `<span class="vm-load"><span class="track"><span class="fill" style="width:${cpuBar}%"></span></span>${fmt(v.cpu_percent, 0)}%</span>`}</td>
-        <td>${v.memory_bytes == null ? "—" : fmtBytes(v.memory_bytes)}</td>
-        <td>${fmtDur(v.uptime_secs)}</td>
-        <td>${st}</td>
-        <td class="rowactions">${evictBtns}</td>
-      </tr>`;
-    }).join("") : `<tr><td colspan="8" class="empty" style="padding:14px">No ready VMs — ${p.pending} booting.</td></tr>`;
+    // A static (proxy_pass) deployment forwards to fixed upstreams: no
+    // autoscaling, no VM lifecycle, so it hides scale/drain/kill controls and
+    // the VM-only columns (CPU/memory come from the daemon, which static
+    // upstreams have no sample from).
+    const isStatic = d.kind === "static";
+
+    let vmRows;
+    if (isStatic) {
+      vmRows = d.vms.length ? d.vms.map(v => {
+        const load = Math.min(1, v.in_flight / Math.max(1, p.target_concurrency)) * 100;
+        const st = !v.healthy ? `<span class="tag down">down</span>`
+                : `<span class="tag ok">serving</span>`;
+        return `<tr>
+          <td class="mono">${esc(v.addr)}</td>
+          <td><span class="vm-load"><span class="track"><span class="fill" style="width:${load}%"></span></span>${v.in_flight}</span></td>
+          <td>${fmtDur(v.uptime_secs)}</td>
+          <td>${st}</td>
+        </tr>`;
+      }).join("") : `<tr><td colspan="4" class="empty" style="padding:14px">No upstreams configured.</td></tr>`;
+    } else {
+      vmRows = d.vms.length ? d.vms.map(v => {
+        const load = Math.min(1, v.in_flight / Math.max(1, p.target_concurrency)) * 100;
+        const st = v.draining ? `<span class="tag drain">draining</span>`
+                : !v.healthy ? `<span class="tag down">unhealthy</span>`
+                : `<span class="tag ok">serving</span>`;
+        // CPU is percent-of-a-core; normalise the bar to one core but show the raw number.
+        const cpuBar = v.cpu_percent == null ? 0 : Math.min(100, v.cpu_percent);
+        const evictBtns = v.draining
+          ? `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`
+          : `<button class="btn mini" data-act="drain" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Drain</button>`
+            + `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`;
+        return `<tr>
+          <td class="mono">${esc(v.sandbox_id)}</td>
+          <td class="mono">${esc(v.addr)}</td>
+          <td><span class="vm-load"><span class="track"><span class="fill" style="width:${load}%"></span></span>${v.in_flight}</span></td>
+          <td>${v.cpu_percent == null ? "—" : `<span class="vm-load"><span class="track"><span class="fill" style="width:${cpuBar}%"></span></span>${fmt(v.cpu_percent, 0)}%</span>`}</td>
+          <td>${v.memory_bytes == null ? "—" : fmtBytes(v.memory_bytes)}</td>
+          <td>${fmtDur(v.uptime_secs)}</td>
+          <td>${st}</td>
+          <td class="rowactions">${evictBtns}</td>
+        </tr>`;
+      }).join("") : `<tr><td colspan="8" class="empty" style="padding:14px">No ready VMs — ${p.pending} booting.</td></tr>`;
+    }
+
+    const vmHead = isStatic
+      ? `<tr><th>upstream</th><th>in-flight</th><th>uptime</th><th>state</th></tr>`
+      : `<tr><th>sandbox</th><th>addr</th><th>in-flight</th><th>CPU</th><th>memory</th><th>uptime</th><th>state</th><th>actions</th></tr>`;
+
+    const headBadges = isStatic
+      ? `<span class="badge">static · proxy_pass</span>
+         <span class="badge">${d.upstreams.length} upstream${d.upstreams.length === 1 ? "" : "s"}</span>`
+      : `<span class="badge">${p.ready}/${p.max_replicas} replicas · want ${p.desired_replicas}</span>
+         <span class="badge">min ${p.min_replicas} · warm ${p.warm_pool} · target ${p.target_concurrency}</span>`;
+
+    // Static deployments can't be scaled; only Edit (to change the upstream list).
+    const headActions = isStatic
+      ? `<button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`
+      : `<button class="btn mini" data-act="scale" data-id="${esc(d.id)}">Scale</button>
+         <button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`;
+
+    // Pool-only tiles (pending/draining/cold-start) are meaningless for a static
+    // deployment; omit them.
+    const poolTiles = isStatic ? "" :
+        `<div><div class="label">Pending</div><div class="value">${fmt(p.pending)}</div></div>
+         <div><div class="label">Draining</div><div class="value">${fmt(p.draining)}</div></div>`;
+    const coldTile = isStatic ? "" :
+        `<div><div class="label">Cold p50</div><div class="value">${m.cold_start_s.count ? fmt(m.cold_start_s.p50,1)+"s" : "—"}</div></div>`;
 
     return `<div class="card dep">
       <div class="dep-head">
         <span class="name">${esc(d.id)}</span>
-        <span class="badge">${p.ready}/${p.max_replicas} replicas · want ${p.desired_replicas}</span>
-        <span class="badge">min ${p.min_replicas} · warm ${p.warm_pool} · target ${p.target_concurrency}</span>
+        ${headBadges}
         <span class="actions">
-          <button class="btn mini" data-act="scale" data-id="${esc(d.id)}">Scale</button>
-          <button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>
+          ${headActions}
         </span>
       </div>
       <div class="dep-grid">
@@ -556,12 +599,11 @@ function renderDeployments(deps) {
           <div class="gauge-track"><div class="gauge-fill ${cls}" style="width:${Math.min(100, utilPct || 0)}%"></div></div>
           <div class="kv">
             <div><div class="label">In-flight</div><div class="value">${fmt(p.total_in_flight)}</div></div>
-            <div><div class="label">Pending</div><div class="value">${fmt(p.pending)}</div></div>
-            <div><div class="label">Draining</div><div class="value">${fmt(p.draining)}</div></div>
+            ${poolTiles}
             <div><div class="label">Requests</div><div class="value">${fmt(m.requests.total)}</div></div>
             <div><div class="label">Lat p50</div><div class="value">${m.latency_ms.count ? fmtMs(m.latency_ms.p50) : "—"}</div></div>
             <div><div class="label">Lat p99</div><div class="value">${m.latency_ms.count ? fmtMs(m.latency_ms.p99) : "—"}</div></div>
-            <div><div class="label">Cold p50</div><div class="value">${m.cold_start_s.count ? fmt(m.cold_start_s.p50,1)+"s" : "—"}</div></div>
+            ${coldTile}
             <div><div class="label">Errors</div><div class="value ${errPct ? "err" : ""}">${fmt(errPct, errPct ? 1 : 0)}%</div></div>
             <div><div class="label">CPU (pool)</div><div class="value">${p.cpu_percent == null ? "—" : fmt(p.cpu_percent, 0)+"%"}</div></div>
             <div><div class="label">Memory</div><div class="value">${p.memory_bytes == null ? "—" : fmtBytes(p.memory_bytes)}</div></div>
@@ -569,7 +611,7 @@ function renderDeployments(deps) {
         </div>
         <div style="overflow-x:auto">
           <table class="vms">
-            <thead><tr><th>sandbox</th><th>addr</th><th>in-flight</th><th>CPU</th><th>memory</th><th>uptime</th><th>state</th><th>actions</th></tr></thead>
+            <thead>${vmHead}</thead>
             <tbody>${vmRows}</tbody>
           </table>
         </div>
