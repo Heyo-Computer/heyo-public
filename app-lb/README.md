@@ -161,6 +161,72 @@ VM of a `max_replicas: 1` deployment leaves a brief capacity gap until the
 replacement boots (a request arriving in that window eats a cold start).
 Unknown deployment or VM id is a `404`.
 
+## Routing
+
+A deployment's `routes` is an array of **rules**. The rules are the only knob
+that decides which requests reach a deployment — matching is identical for
+managed and static/`proxy_pass` deployments (the kind only changes what a matched
+request is forwarded *to*). A request is routed to a deployment when **any** one
+of its rules matches (rules are OR'd); within a single rule, **every** field the
+rule sets must match (fields are AND'd).
+
+A rule may set any combination of three fields:
+
+| Field | Matches | Notes |
+| --- | --- | --- |
+| `host` | exact hostname | case-insensitive, port stripped |
+| `host_suffix` | a domain and its subdomains | anchored at a label boundary |
+| `path_prefix` | a leading path segment, e.g. `/api` | prefix, not exact; not stripped |
+
+- **`host`** — exact hostname match, e.g. `{"host": "demo.local"}` matches only
+  `demo.local` (any port).
+- **`host_suffix`** — **subdomain / wildcard** match. `{"host_suffix":
+  "apps.example.com"}` matches the apex `apps.example.com` **and** any subdomain
+  (`a.apps.example.com`, `x.y.apps.example.com`), anchored at a label boundary so
+  `notapps.example.com` does **not** match. A leading dot is accepted and ignored.
+- **`path_prefix`** — the request path *starts with* this string, e.g.
+  `{"path_prefix": "/api"}` matches `/api`, `/api/v1`, and also `/apidocs` (it is
+  a raw string prefix, not a path-segment match). The prefix is **not stripped** —
+  the upstream sees the full original path, so front apps that serve their routes
+  at the root by `host`/`host_suffix`, not a prefix.
+
+Fields combine within a rule. `{"host": "demo.local", "path_prefix": "/api"}`
+matches only requests that are *both* for `demo.local` *and* under `/api`. Use
+several rules in the array to express alternatives:
+
+```jsonc
+"routes": [
+  { "host": "demo.local" },                          // exact host …
+  { "host_suffix": "apps.example.com" },             // … OR any *.apps.example.com …
+  { "host": "demo.local", "path_prefix": "/admin" }  // … OR /admin on that host
+]
+```
+
+### Precedence — most specific wins
+
+When more than one deployment's rules could match a request, the **single
+most-specific rule across all deployments** decides — not registration order. The
+tiers don't overlap:
+
+1. an exact **`host`** rule beats
+2. any **`host_suffix`** rule, which beats
+3. any bare **`path_prefix`** rule.
+
+Within a tier, a **longer** suffix or a **longer** prefix wins (e.g.
+`host_suffix: "eu.apps.example.com"` outranks `host_suffix: "apps.example.com"`;
+`path_prefix: "/api/v2"` outranks `/api`). A rule that sets both a host tier and a
+path adds the two together, so `{host, path_prefix}` outranks the same host with
+no path. Exactly-equal-specificity rules on two deployments are broken by
+deployment id (lexicographic) so resolution is deterministic regardless of
+registration order. This lets a specific carve-out (`{"host": "x", "path_prefix":
+"/legacy"}` → an old backend) sit alongside a catch-all (`{"host": "x"}` → the
+new backend) and win for its prefix only.
+
+Host matching (exact or suffix) is case-insensitive, strips the port, and falls
+back to HTTP/2's `:authority` when there is no `Host` header. A request that
+matches no rule anywhere is a **404**. Every route must set at least one field —
+an empty rule `{}` is rejected at registration.
+
 ## Dashboard
 
 Open `http://<admin-addr>/dashboard` (default `http://127.0.0.1:9090/dashboard`)
@@ -227,24 +293,6 @@ Two data sources feed it:
   disk and network throughput are **not** exposed by the daemon and so are
   absent here.
 
-### Routing
-
-A rule matches a request when every field it sets matches. A rule may set:
-
-- `host` — exact hostname (case-insensitive, port stripped).
-- `host_suffix` — **subdomain / wildcard** match. A rule with `host_suffix:
-  "apps.example.com"` matches the apex `apps.example.com` and any subdomain
-  (`a.apps.example.com`, `x.y.apps.example.com`), anchored at a label boundary
-  so `notapps.example.com` does **not** match. A leading dot is accepted and
-  ignored.
-- `path_prefix` — path prefix, e.g. `/api`.
-
-Rules are tried most-specific-first, and the tiers don't overlap: an exact
-`host` beats any `host_suffix`, which beats any bare `path_prefix`. Within a tier
-a longer suffix or a longer prefix wins. Host matching (exact or suffix) is
-case-insensitive, strips the port, and falls back to HTTP/2's `:authority`
-(which carries no `Host` header). No match is a 404.
-
 ### TLS
 
 The proxy serves plaintext HTTP on `proxy_addr` by default. Set `APP_LB_TLS_CERT`
@@ -260,6 +308,16 @@ is rustls (the same one heyo-sdk already links through reqwest), enabled via the
 APP_LB_TLS_CERT=cert.pem APP_LB_TLS_KEY=key.pem ./target/release/app-lb
 curl -k https://localhost:6189/ -H 'Host: demo.local'
 ```
+
+This HTTPS listener terminates TLS for **proxied deployment traffic** only. The
+admin API and dashboard bind a *separate* plaintext listener (`APP_LB_ADMIN_ADDR`)
+with no TLS of its own — to serve the dashboard over HTTPS at a DNS name, either
+terminate TLS in a reverse proxy (nginx / Caddy) in front of `127.0.0.1:9090`, or
+front it through this same proxy with a static/`proxy_pass` deployment: see
+[`examples/app-lb-admin.json`](examples/app-lb-admin.json) and
+[`examples/README.md`](examples/README.md). To bind the HTTPS listener on `443`
+under the non-root `app-lb` user, grant the bind capability:
+`setcap 'cap_net_bind_service=+ep' /usr/local/bin/app-lb`.
 
 ### Scaling
 

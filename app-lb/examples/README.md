@@ -69,3 +69,44 @@ So the pooler **cannot** be fronted by app-lb.
 Front the pooler's Postgres port directly, or with an L4/TCP proxy (HAProxy in
 `mode tcp`, nginx `stream`, etc.) — not app-lb. Only the dashboard (HTTP) belongs
 here.
+
+## `app-lb-admin.json` — put app-lb's own dashboard behind TLS
+
+app-lb's admin API and dashboard bind their own **plaintext HTTP** listener
+(`APP_LB_ADMIN_ADDR`, default `127.0.0.1:9090`) and have no TLS of their own. To
+reach the dashboard over HTTPS at a DNS name, front it through app-lb's *own* TLS
+proxy listener with a static deployment whose upstream is the admin address:
+
+```sh
+curl -XPOST localhost:9090/deployments \
+  -H 'content-type: application/json' \
+  -d @examples/app-lb-admin.json
+```
+
+Point a DNS record (here `lb-admin.example.com`) at the app-lb host and reach the
+dashboard at `https://lb-admin.example.com/dashboard`. app-lb terminates TLS on
+the HTTPS proxy port and forwards to the loopback admin listener; the proxy and
+the admin listener are separate Pingora/axum services, so this loopback hop is a
+normal upstream.
+
+### Prerequisites & notes
+
+- **The HTTPS proxy listener must be enabled** — set `APP_LB_TLS_CERT`,
+  `APP_LB_TLS_KEY`, and (to be on 443) `APP_LB_PROXY_TLS_ADDR=0.0.0.0:443`. See
+  the root README's TLS section; binding 443 as the non-root `app-lb` user needs
+  `setcap 'cap_net_bind_service=+ep'` on the binary.
+- **Keep the admin listener on loopback.** Leave `APP_LB_ADMIN_ADDR` on
+  `127.0.0.1` so the *only* external path to the dashboard is the TLS one; don't
+  also expose `:9090` on `0.0.0.0`.
+- **Gate the admin API.** Set `APP_LB_ADMIN_AUTH=1` (+ `APP_LB_DASHBOARD_PASSWORD`)
+  so registering/editing/deleting deployments requires the dashboard credentials —
+  otherwise anyone who reaches the hostname can rewrite your routes. The Basic-auth
+  header passes through the proxy unchanged.
+- **Health is `GET /healthz`** — the admin API's always-open, unauthenticated
+  probe endpoint (returns `200` regardless of `APP_LB_ADMIN_AUTH`), so the static
+  re-probe stays green without credentials.
+- **Trade-off vs. an external proxy.** Because the control plane now rides the
+  data plane, a bad proxy/deployment edit can in principle disrupt the very
+  dashboard you'd use to fix it. If you want the dashboard reachable independent
+  of proxy state, terminate TLS in a dedicated reverse proxy (nginx / Caddy) on
+  `443` → `127.0.0.1:9090` instead of using this deployment.
