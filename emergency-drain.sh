@@ -34,6 +34,22 @@
 #            a reclaim pass every few kills and a hard stop on repeated
 #            failure. Serial matters: at most one VM's transient boot+dump
 #            growth is ever in flight.
+#   ghosts   (read-only) reconcile running firecracker processes against
+#            heyvmd's inventory and the registry. A "ghost" is a running VM
+#            heyvmd has forgotten — typically created/started while the disk
+#            was full (heyvmd acked but couldn't persist, then restarted).
+#            Ghosts serve Postgres at their guest IP but every control op
+#            (exec/stop/kill) 404s, so reap/freeze can never succeed on them,
+#            and their held-open disks are invisible to reclaim.
+#   rescue   offload each ghost's live schema WITHOUT heyvmd: pg_dump it from
+#            the host over the direct guest-IP TCP path (the same `pg_dump
+#            -Fc` the in-guest job runs, so the file is a drop-in frozen-tier
+#            dump), verify size (+ pg_restore --list when available),
+#            CHECKPOINT, kill the firecracker process, flip the schema to
+#            `frozen` in registry.tsv (backup kept), and delete the orphaned
+#            sb-<id> dir heyvmd no longer tracks. Pooler must be stopped.
+#            Needs pg_dump/psql on the host with a major version >= the
+#            guest's Postgres; exports PGPASSWORD from --pg-password.
 #
 # If you skip `drain` (no dashboard, or you prefer the local freeze tier),
 # the endgame after `dumps` is: set PG_VM_POOL_FREEZE_AFTER_SECS low (e.g.
@@ -44,8 +60,9 @@
 # Usage:
 #   sudo ./emergency-drain.sh --spare-dir /mnt/spare/pg-rescue [phases…]
 #
-#   Phases (default: halt purge reclaim dumps — everything except drain):
-#     halt purge reclaim dumps drain
+#   Phases (default: halt purge reclaim dumps — everything except drain,
+#   ghosts, rescue):
+#     halt purge reclaim dumps drain ghosts rescue
 #
 #   Options:
 #     --spare-dir DIR    directory on the disk WITH room (required for dumps)
@@ -56,6 +73,8 @@
 #     --dash URL         pooler dashboard base URL (enables drain), e.g. http://127.0.0.1:8080
 #     --dash-auth U:P    dashboard basic auth (PG_VM_POOL_DASHBOARD_USER/PASSWORD)
 #     --pooler-unit NAME supervisor program name   (default: pg-vm-pool)
+#     --pg-user U        guest Postgres user for rescue (default: postgres)
+#     --pg-password P    guest Postgres password for rescue (or export PGPASSWORD)
 #     --keep-spares      don't delete unclaimed warm spares in `purge`
 #     --reap-timeout S   drain: max wait for one schema's tier flip (default 2100,
 #                        matching the pooler's 1800s archive deadline + slack)
@@ -92,6 +111,8 @@ SPARE_DIR=""
 DASH=""
 DASH_AUTH=""
 POOLER_UNIT="pg-vm-pool"
+PG_USER="postgres"
+PG_PASSWORD="${PGPASSWORD:-}"
 KEEP_SPARES=0
 REAP_TIMEOUT=2100
 YES=0
@@ -108,12 +129,14 @@ while [ $# -gt 0 ]; do
         --dash)        DASH="$2"; shift 2 ;;
         --dash-auth)   DASH_AUTH="$2"; shift 2 ;;
         --pooler-unit) POOLER_UNIT="$2"; shift 2 ;;
+        --pg-user)     PG_USER="$2"; shift 2 ;;
+        --pg-password) PG_PASSWORD="$2"; shift 2 ;;
         --keep-spares) KEEP_SPARES=1; shift ;;
         --reap-timeout) REAP_TIMEOUT="$2"; shift 2 ;;
         --yes)         YES=1; shift ;;
         --dry-run)     DRY_RUN=1; shift ;;
-        halt|purge|reclaim|dumps|drain) PHASES+=("$1"); shift ;;
-        -h|--help)     sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        halt|purge|reclaim|dumps|drain|ghosts|rescue) PHASES+=("$1"); shift ;;
+        -h|--help)     sed -n '2,88p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -175,6 +198,48 @@ heyvmd_delete() {
         *) echo "   delete $id failed (HTTP $code)" >&2; return 1 ;;
     esac
 }
+
+# Point-in-time device:inode → holding-pid map of every open file on the host
+# (same technique and caveats as reclaim-disks.sh: jailer chroots make fd
+# *paths* useless, device:inode is chroot-proof; needs root to see all fds).
+declare -A OPEN_INODES=()
+scan_open_files() {
+    OPEN_INODES=()
+    local key path pid
+    while read -r key path; do
+        [ -n "$key" ] || continue
+        pid="${path#/proc/}"
+        pid="${pid%%/*}"
+        OPEN_INODES["$key"]="${OPEN_INODES[$key]:-$pid}"
+    done < <(find /proc/[0-9]*/fd -maxdepth 1 -type l -exec stat -L -c '%d:%i %n' {} + 2>/dev/null)
+}
+
+# PID holding $1 open, or empty. Prints nothing (in-use unknown) if the file
+# can't be stat'd.
+holder_pid() {
+    local key
+    key=$(stat -c '%d:%i' "$1" 2>/dev/null) || return 0
+    echo "${OPEN_INODES[$key]:-}"
+}
+
+# Best-effort guest IP of the firecracker process $1: its --config-file (read
+# through /proc/<pid>/root, so the jailer chroot is transparent) carries the
+# kernel boot_args, which embed `ip=<guest>:<server>:<gw>:…`.
+ghost_ip() {
+    local pid="$1" cfg args
+    cfg=$(tr '\0' '\n' </proc/"$pid"/cmdline 2>/dev/null \
+        | awk '/^--config-file$/ {getline; print; exit}')
+    [ -n "$cfg" ] || return 1
+    args=$(jq -r '."boot-source".boot_args // empty' "/proc/$pid/root/$cfg" 2>/dev/null)
+    if [[ "$args" =~ ip=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+# schema for sandbox id $1 per the registry (empty if unbound).
+schema_of_id() { awk -F'\t' -v id="$1" '$2==id {print $1; exit}' "$STATE_FILE"; }
 
 # ---------------------------------------------------------------- halt ----
 phase_halt() {
@@ -365,6 +430,177 @@ phase_drain() {
     df_report
 }
 
+# -------------------------------------------------------------- ghosts ----
+# One reconciliation row per sb-* dir under RUN_DIR. Emits TSV to stdout:
+#   id \t held_by_pid \t in_heyvmd(yes/no) \t schema \t tier \t guest_ip
+# so `ghosts` can pretty-print it and `rescue` can act on it. Empty fields are
+# emitted as "-" — tab is IFS whitespace, so `read` would otherwise collapse
+# adjacent tabs and shift every later column left.
+reconcile_rows() {
+    local sandboxes dir id disk pid known schema tier ip
+    sandboxes=$(heyvmd_list 2>/dev/null) || sandboxes="[]"
+    scan_open_files
+    for dir in "$RUN_DIR"/sb-*/; do
+        [ -d "$dir" ] || continue
+        id=$(basename "$dir")
+        disk="$dir/data.ext4"
+        pid=""
+        [ -f "$disk" ] && pid=$(holder_pid "$disk")
+        if jq -e --arg id "$id" '.[] | select(.id==$id)' >/dev/null 2>&1 <<<"$sandboxes"; then
+            known=yes
+        else
+            known=no
+        fi
+        schema=$(schema_of_id "$id")
+        tier=""
+        [ -n "$schema" ] && tier=$(tier_of "$schema")
+        ip=""
+        [ -n "$pid" ] && ip=$(ghost_ip "$pid" || true)
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "${pid:--}" "$known" "${schema:--}" "${tier:--}" "${ip:--}"
+    done
+}
+
+phase_ghosts() {
+    note "ghosts: running-VM / heyvmd / registry reconciliation (read-only)"
+    if [ "$(id -u)" != 0 ]; then
+        echo "   warning: not root — the open-fd scan may miss holders (ghosts under-reported)"
+    fi
+    if ! curl -fsS --max-time 10 -o /dev/null "$HEYVMD/deployed-sandboxes" 2>/dev/null; then
+        echo "   warning: heyvmd NOT answering at $HEYVMD — every sandbox below will read"
+        echo "   as unknown to heyvmd; fix heyvmd before trusting the GHOST flags"
+    fi
+    local rows ghosts=0 orphans=0
+    rows=$(reconcile_rows)
+    printf '   %-24s %-8s %-8s %-14s %-9s %s\n' SANDBOX PID HEYVMD SCHEMA TIER GUEST-IP
+    local id pid known schema tier ip flag
+    while IFS=$'\t' read -r id pid known schema tier ip; do
+        [ -n "$id" ] || continue
+        flag=""
+        if [ "$pid" != - ] && [ "$known" = no ]; then
+            flag="  <-- GHOST (running, heyvmd forgot it)"
+            ghosts=$((ghosts + 1))
+        elif [ "$pid" = - ] && [ "$known" = no ]; then
+            flag="  (orphaned dir: not running, not in heyvmd)"
+            orphans=$((orphans + 1))
+        fi
+        printf '   %-24s %-8s %-8s %-14s %-9s %-15s%s\n' \
+            "$id" "$pid" "$known" "$schema" "$tier" "$ip" "$flag"
+    done <<<"$rows"
+    echo "   $ghosts ghost(s), $orphans orphaned dir(s)"
+    if [ "$ghosts" -gt 0 ]; then
+        echo "   ghosts can't be reaped through the pooler (guest exec 404s) — use the"
+        echo "   rescue phase to dump them host-side over the guest IP and retire them."
+    fi
+}
+
+# -------------------------------------------------------------- rescue ----
+phase_rescue() {
+    note "rescue: host-side dump + retire for ghost VMs of live schemas"
+    [ "$(id -u)" = 0 ] || die "rescue needs root (fd scan + kill + chroot config reads)"
+    for tool in pg_dump psql; do
+        command -v "$tool" >/dev/null || die "rescue needs $tool on the host (matching the guest's Postgres major)"
+    done
+    # The pooler MUST be down: it would race us on the registry file and could
+    # rebind a live schema to a fresh empty VM the moment we kill its ghost.
+    if command -v supervisorctl >/dev/null \
+        && supervisorctl status "$POOLER_UNIT" 2>/dev/null | grep -q RUNNING; then
+        die "pooler is running — run the halt phase first (rescue edits registry.tsv and kills VMs)"
+    fi
+    # heyvmd MUST be answering: "ghost" means "running but heyvmd forgot it",
+    # and with heyvmd down EVERY sandbox looks forgotten — rescue would retire
+    # the whole fleet. Refuse rather than guess.
+    heyvmd_list >/dev/null || exit 1
+    local dump_target="$DUMP_DIR"
+    [ -d "$dump_target" ] || [ -L "$dump_target" ] || die "dump dir $dump_target missing (run the dumps phase, or pass --dump-dir)"
+    export PGPASSWORD="$PG_PASSWORD"
+
+    local rows rescued=0 skipped=0
+    rows=$(reconcile_rows)
+    local id pid known schema tier ip
+    while IFS=$'\t' read -r id pid known schema tier ip; do
+        # Normalize the "-" empty-field placeholders back to empty strings.
+        [ "$pid" = - ] && pid=""
+        [ "$schema" = - ] && schema=""
+        [ "$tier" = - ] && tier=""
+        [ "$ip" = - ] && ip=""
+        [ -n "$id" ] && [ -n "$pid" ] && [ "$known" = no ] || continue  # ghosts only
+        if [ -z "$schema" ]; then
+            echo "   $id (pid $pid): not bound to any schema — leaving alone (unknown data)"
+            skipped=$((skipped + 1)); continue
+        fi
+        if [ "$tier" = frozen ] || [ "$tier" = archived ]; then
+            # Data already durably offloaded; the ghost is pure waste.
+            echo "   $id (pid $pid): schema $schema already $tier — killing and removing dir"
+            run kill "$pid"
+            [ "$DRY_RUN" = 1 ] || sleep 2
+            run rm -rf --one-file-system "$RUN_DIR/$id"
+            rescued=$((rescued + 1)); continue
+        fi
+        if [ -z "$ip" ]; then
+            echo "   $id (pid $pid, schema $schema): could not determine guest IP — skipping"
+            echo "     (find it in the pooler log: 'direct connection to pg-$schema at <ip>')"
+            skipped=$((skipped + 1)); continue
+        fi
+
+        echo "   $id (pid $pid): dumping schema $schema from $ip…"
+        local out="$dump_target/$schema.dump" tmp="$dump_target/.$schema.dump.rescue"
+        if [ "$DRY_RUN" = 1 ]; then
+            echo "DRY-RUN: pg_dump -h $ip -U $PG_USER -Fc -d $schema -f $tmp && verify && kill $pid && tier->frozen"
+            continue
+        fi
+        if ! pg_dump -h "$ip" -U "$PG_USER" -Fc -d "$schema" -f "$tmp"; then
+            echo "     pg_dump failed — ghost left running, nothing changed"
+            rm -f "$tmp"; skipped=$((skipped + 1)); continue
+        fi
+        local sz
+        sz=$(stat -c %s "$tmp" 2>/dev/null || echo 0)
+        if [ "$sz" -lt 512 ]; then
+            echo "     dump is only ${sz}B — refusing (no real -Fc dump is that small)"
+            rm -f "$tmp"; skipped=$((skipped + 1)); continue
+        fi
+        # Structural integrity: -Fc has a TOC; a truncated file fails --list.
+        if command -v pg_restore >/dev/null && ! pg_restore --list "$tmp" >/dev/null 2>&1; then
+            echo "     pg_restore --list rejects the dump — refusing"
+            rm -f "$tmp"; skipped=$((skipped + 1)); continue
+        fi
+        mv "$tmp" "$out"
+        echo "     dump ok ($(human "$sz")) -> $out"
+
+        # Same courtesy the idle reaper pays before its unclean stop: flush
+        # acked commits so the on-disk state is clean too (best-effort — the
+        # dump above is the durable copy either way).
+        psql -h "$ip" -U "$PG_USER" -d "$schema" -c CHECKPOINT >/dev/null 2>&1 || true
+        kill "$pid" 2>/dev/null || true
+        local waited=0
+        while [ "$waited" -lt 15 ] && kill -0 "$pid" 2>/dev/null; do
+            sleep 1; waited=$((waited + 1))
+        done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+
+        # Durable tier flip so the pooler restores from the dump instead of
+        # rebinding the schema to a fresh empty VM. Backup kept alongside.
+        cp -p "$STATE_FILE" "$STATE_FILE.bak-rescue" 2>/dev/null || true
+        awk -F'\t' -v OFS='\t' -v s="$schema" \
+            '$1==s {$4="frozen"} {print}' "$STATE_FILE" >"$STATE_FILE.tmp" \
+            && chown --reference="$STATE_FILE" "$STATE_FILE.tmp" 2>/dev/null \
+            ; mv "$STATE_FILE.tmp" "$STATE_FILE"
+        echo "     schema $schema -> frozen (registry backup: $STATE_FILE.bak-rescue)"
+
+        # heyvmd has no record of this sandbox, so nothing else will ever
+        # clean its dir up. The data now lives in the verified dump.
+        scan_open_files
+        if [ -z "$(holder_pid "$RUN_DIR/$id/data.ext4")" ]; then
+            rm -rf --one-file-system "$RUN_DIR/$id"
+            echo "     removed orphaned $RUN_DIR/$id"
+        else
+            echo "     $RUN_DIR/$id/data.ext4 still held open — dir left for a later pass"
+        fi
+        rescued=$((rescued + 1))
+    done <<<"$rows"
+    echo "   rescued $rescued ghost(s), skipped $skipped"
+    df_report
+}
+
 # -------------------------------------------------------------- main ------
 echo "emergency-drain: phases [${PHASES[*]}] (dry-run=$DRY_RUN)"
 echo "   run-dir:  $RUN_DIR"
@@ -372,7 +608,7 @@ echo "   registry: $STATE_FILE"
 [ -n "$SPARE_DIR" ] && echo "   spare:    $SPARE_DIR"
 df_report
 
-if has_phase purge || has_phase drain; then
+if has_phase purge || has_phase drain || has_phase rescue; then
     confirm "This will delete VMs / archive schemas on this host. Proceed?" || die "aborted"
 fi
 
@@ -383,6 +619,8 @@ for p in "${PHASES[@]}"; do
         reclaim) phase_reclaim ;;
         dumps)   phase_dumps ;;
         drain)   phase_drain ;;
+        ghosts)  phase_ghosts ;;
+        rescue)  phase_rescue ;;
     esac
 done
 
