@@ -66,6 +66,20 @@
 #            backup to --spare-dir/fsck-backups when there's room, then runs
 #            the full `e2fsck -fy`. Only touches disks that are not held open
 #            and whose schema is not already offloaded.
+#   readopt  bring quarantined live-tier schemas back under normal management
+#            so the standard archive strategy (drain / sweeps / on-demand
+#            restore) applies to them again. The archive tiers store pg_dump
+#            files, so a raw quarantined data.ext4 can't go to S3 directly;
+#            instead, per schema: connect to the POOLER once (it creates a
+#            fresh, heyvmd-tracked VM and rebinds the registry), then stop
+#            the pooler, stop that VM, fsck the quarantined image, and
+#            sparse-copy it OVER the new VM's data.ext4 (in place, keeping
+#            the inode so jailer hard-links survive). The VM is left stopped;
+#            the next client connect boots it on the adopted disk (init.sh
+#            only initdbs when PG_VERSION is absent — an adopted pgdata just
+#            crash-recovers, same as any VM restart). The quarantine copy is
+#            KEPT as a backup; delete it after verifying the schema. Needs
+#            psql + the pooler up (it is started/stopped by the phase).
 #
 # If you skip `drain` (no dashboard, or you prefer the local freeze tier),
 # the endgame after `dumps` is: set PG_VM_POOL_FREEZE_AFTER_SECS low (e.g.
@@ -77,8 +91,8 @@
 #   sudo ./emergency-drain.sh --spare-dir /mnt/spare/pg-rescue [phases…]
 #
 #   Phases (default: halt purge reclaim dumps — the read-only ghosts and the
-#   heavier drain/rescue/orphans/badfs are opt-in):
-#     halt purge reclaim dumps drain ghosts rescue orphans badfs
+#   heavier drain/rescue/orphans/badfs/readopt are opt-in):
+#     halt purge reclaim dumps drain ghosts rescue orphans badfs readopt
 #
 #   Options:
 #     --spare-dir DIR    directory on the disk WITH room (required for dumps)
@@ -89,8 +103,9 @@
 #     --dash URL         pooler dashboard base URL (enables drain), e.g. http://127.0.0.1:8080
 #     --dash-auth U:P    dashboard basic auth (PG_VM_POOL_DASHBOARD_USER/PASSWORD)
 #     --pooler-unit NAME supervisor program name   (default: pg-vm-pool)
-#     --pg-user U        guest Postgres user for rescue (default: postgres)
-#     --pg-password P    guest Postgres password for rescue (or export PGPASSWORD)
+#     --pg-user U        guest Postgres user for rescue/readopt (default: postgres)
+#     --pg-password P    Postgres password for rescue/readopt (or export PGPASSWORD)
+#     --pooler HOST:PORT pooler client address for readopt (default: 127.0.0.1:6432)
 #     --keep-spares      don't delete unclaimed warm spares in `purge`
 #     --reap-timeout S   drain: max wait for one schema's tier flip (default 2100,
 #                        matching the pooler's 1800s archive deadline + slack)
@@ -129,6 +144,7 @@ DASH_AUTH=""
 POOLER_UNIT="pg-vm-pool"
 PG_USER="postgres"
 PG_PASSWORD="${PGPASSWORD:-}"
+POOLER_ADDR="127.0.0.1:6432"
 KEEP_SPARES=0
 REAP_TIMEOUT=2100
 YES=0
@@ -147,12 +163,13 @@ while [ $# -gt 0 ]; do
         --pooler-unit) POOLER_UNIT="$2"; shift 2 ;;
         --pg-user)     PG_USER="$2"; shift 2 ;;
         --pg-password) PG_PASSWORD="$2"; shift 2 ;;
+        --pooler)      POOLER_ADDR="$2"; shift 2 ;;
         --keep-spares) KEEP_SPARES=1; shift ;;
         --reap-timeout) REAP_TIMEOUT="$2"; shift 2 ;;
         --yes)         YES=1; shift ;;
         --dry-run)     DRY_RUN=1; shift ;;
-        halt|purge|reclaim|dumps|drain|ghosts|rescue|orphans|badfs) PHASES+=("$1"); shift ;;
-        -h|--help)     sed -n '2,104p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        halt|purge|reclaim|dumps|drain|ghosts|rescue|orphans|badfs|readopt) PHASES+=("$1"); shift ;;
+        -h|--help)     sed -n '2,119p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -779,6 +796,127 @@ phase_badfs() {
     df_report
 }
 
+# ------------------------------------------------------------- readopt ----
+phase_readopt() {
+    note "readopt: swapping quarantined disks under fresh pooler-created VMs"
+    [ "$(id -u)" = 0 ] || [ "$DRY_RUN" = 1 ] || die "readopt needs root (fd scan + disk swap)"
+    command -v psql >/dev/null || die "readopt needs psql on the host"
+    command -v e2fsck >/dev/null || die "readopt needs e2fsck"
+    local quarantine="$SPARE_DIR/quarantine"
+    [ -n "$SPARE_DIR" ] && [ -d "$quarantine" ] || die "no quarantine dir at ${quarantine:-<unset>} (pass --spare-dir)"
+    heyvmd_list >/dev/null || exit 1
+    local pooler_host="${POOLER_ADDR%:*}" pooler_port="${POOLER_ADDR##*:}"
+
+    # Pass 1 — collect candidates: quarantined dirs whose schema is still tier
+    # live (i.e. the registry has no other copy of its data).
+    local qdir old_id schema tier
+    local schemas=() old_ids=()
+    for qdir in "$quarantine"/sb-*/; do
+        [ -f "$qdir/data.ext4" ] || continue
+        old_id=$(basename "$qdir")
+        schema=$(schema_of_id "$old_id")
+        if [ -z "$schema" ]; then
+            echo "   $old_id: not bound to any schema — cannot readopt (leaving in quarantine)"
+            continue
+        fi
+        tier=$(tier_of "$schema")
+        if [ "$tier" = frozen ] || [ "$tier" = archived ]; then
+            echo "   $old_id: schema $schema is now $tier (recovered elsewhere) — quarantine copy is deletable"
+            continue
+        fi
+        schemas+=("$schema"); old_ids+=("$old_id")
+    done
+    [ ${#schemas[@]} -gt 0 ] || { echo "   nothing to readopt"; return 0; }
+    echo "   ${#schemas[@]} schema(s) to readopt: ${schemas[*]}"
+
+    # Pass 2 — with the pooler UP, connect once per schema: the cold start
+    # creates a fresh heyvmd-tracked VM and rebinds the registry to its id
+    # (`store.put` runs before the connection is served, so once psql returns
+    # the new binding is durable).
+    if command -v supervisorctl >/dev/null; then
+        run supervisorctl start "$POOLER_UNIT"
+        [ "$DRY_RUN" = 1 ] || sleep 5
+    fi
+    local i new_id ok_schemas=() ok_new=() ok_q=()
+    for i in "${!schemas[@]}"; do
+        schema="${schemas[$i]}"; old_id="${old_ids[$i]}"
+        echo "   $schema: connecting through the pooler to materialize a fresh VM…"
+        if [ "$DRY_RUN" = 1 ]; then
+            echo "DRY-RUN: psql -h $pooler_host -p $pooler_port -U $PG_USER -d $schema -c 'SELECT 1'"
+            echo "DRY-RUN: then stop new VM, fsck quarantine copy, cp --sparse=always over its data.ext4"
+            continue
+        fi
+        if ! PGPASSWORD="$PG_PASSWORD" PGCONNECT_TIMEOUT=330 \
+            psql -h "$pooler_host" -p "$pooler_port" -U "$PG_USER" -d "$schema" \
+                 -tAc 'SELECT 1' >/dev/null; then
+            echo "     pooler connect failed — skipping $schema (check pooler log)"
+            continue
+        fi
+        new_id=$(awk -F'\t' -v s="$schema" '$1==s {print $2; exit}' "$STATE_FILE")
+        if [ -z "$new_id" ] || [ "$new_id" = "$old_id" ]; then
+            echo "     registry still maps $schema -> ${new_id:-nothing}; expected a fresh id — skipping"
+            continue
+        fi
+        [ -f "$RUN_DIR/$new_id/data.ext4" ] || { echo "     $RUN_DIR/$new_id/data.ext4 missing — skipping"; continue; }
+        ok_schemas+=("$schema"); ok_new+=("$new_id"); ok_q+=("$quarantine/$old_id")
+        echo "     $schema now bound to $new_id"
+    done
+    [ "$DRY_RUN" = 1 ] && return 0
+    [ ${#ok_schemas[@]} -gt 0 ] || { echo "   no schema reached the swap step"; return 0; }
+
+    # Pass 3 — pooler DOWN (no sweep may boot anything mid-swap), then per
+    # schema: stop the new VM, wait for its disk to be released, fsck the
+    # quarantined image, and copy it over the new disk IN PLACE (same inode,
+    # so any jailer hard-link still points at the adopted bytes).
+    run supervisorctl stop "$POOLER_UNIT" || true
+    sleep 2
+    local adopted=0 failed=0 disk waited rc
+    for i in "${!ok_schemas[@]}"; do
+        schema="${ok_schemas[$i]}"; new_id="${ok_new[$i]}"; qdir="${ok_q[$i]}"
+        disk="$RUN_DIR/$new_id/data.ext4"
+        curl -fsS --max-time 30 -o /dev/null -X POST "$HEYVMD/sandbox/$new_id/stop" \
+            || echo "     stop request for $new_id failed (may already be stopped)"
+        waited=0
+        scan_open_files
+        while [ -n "$(holder_pid "$disk")" ] && [ "$waited" -lt 60 ]; do
+            sleep 3; waited=$((waited + 3)); scan_open_files
+        done
+        if [ -n "$(holder_pid "$disk")" ]; then
+            echo "   $schema: $new_id still holds its disk after ${waited}s — skipping swap"
+            failed=$((failed + 1)); continue
+        fi
+        # Clean journal/fs before adoption; -fy fallback mirrors badfs.
+        e2fsck -fp "$qdir/data.ext4" >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" -ge 4 ]; then
+            e2fsck -fy "$qdir/data.ext4" >/dev/null 2>&1
+            rc=$?
+        fi
+        if [ "$rc" -ge 4 ]; then
+            echo "   $schema: quarantined image fails fsck ($rc) — NOT adopted; VM left stopped+empty"
+            failed=$((failed + 1)); continue
+        fi
+        if cp --sparse=always "$qdir/data.ext4" "$disk"; then
+            adopted=$((adopted + 1))
+            echo "   $schema: adopted quarantined disk into $new_id (VM left stopped; next"
+            echo "     connect boots it on the real data — quarantine copy kept as backup)"
+        else
+            failed=$((failed + 1))
+            echo "   $schema: COPY FAILED — $new_id still has its fresh EMPTY disk; do not"
+            echo "     serve this schema until resolved (quarantine copy untouched)"
+        fi
+    done
+    echo "   readopted $adopted schema(s), $failed failed"
+    if [ "$adopted" -gt 0 ]; then
+        echo "   These schemas are back under normal management: the drain phase or the"
+        echo "   pooler's own freeze/archive sweeps will move them to S3, and clients"
+        echo "   restore them on demand. Verify a schema (connect, check data), then its"
+        echo "   quarantine copy in $quarantine can be deleted."
+        echo "   NOTE: the pooler is stopped; start it when ready: supervisorctl start $POOLER_UNIT"
+    fi
+    df_report
+}
+
 # -------------------------------------------------------------- main ------
 echo "emergency-drain: phases [${PHASES[*]}] (dry-run=$DRY_RUN)"
 echo "   run-dir:  $RUN_DIR"
@@ -786,7 +924,8 @@ echo "   registry: $STATE_FILE"
 [ -n "$SPARE_DIR" ] && echo "   spare:    $SPARE_DIR"
 df_report
 
-if has_phase purge || has_phase drain || has_phase rescue || has_phase orphans || has_phase badfs; then
+if has_phase purge || has_phase drain || has_phase rescue || has_phase orphans \
+    || has_phase badfs || has_phase readopt; then
     confirm "This will delete/move VMs, disks, or schemas on this host. Proceed?" || die "aborted"
 fi
 
@@ -801,6 +940,7 @@ for p in "${PHASES[@]}"; do
         rescue)  phase_rescue ;;
         orphans) phase_orphans ;;
         badfs)   phase_badfs ;;
+        readopt) phase_readopt ;;
     esac
 done
 
