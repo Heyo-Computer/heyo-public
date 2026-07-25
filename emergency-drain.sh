@@ -50,6 +50,22 @@
 #            sb-<id> dir heyvmd no longer tracks. Pooler must be stopped.
 #            Needs pg_dump/psql on the host with a major version >= the
 #            guest's Postgres; exports PGPASSWORD from --pg-password.
+#   orphans  act on sb-* dirs that are NOT running and NOT in heyvmd's
+#            inventory (the dirs `ghosts` lists as orphaned — débris of
+#            creates/deletes that happened while heyvmd couldn't persist):
+#              - schema tier frozen/archived  -> delete (data is offloaded)
+#              - tier live, or unbound        -> QUARANTINE: sparse-copy the
+#                dir to --spare-dir/quarantine and delete the original. Never
+#                deleted: a live-tier orphan dir may hold the ONLY copy of
+#                that schema's data (heyvmd forgot the sandbox, so the pooler
+#                would rebuild the schema as an EMPTY database on next
+#                connect). See the recovery note the phase prints.
+#   badfs    repair data disks the reclaim pass reported as FAIL (preen
+#            e2fsck exited >= 4 — typical of ENOSPC writes during the
+#            incident). Re-identifies them with `e2fsck -fp`, sparse-copies a
+#            backup to --spare-dir/fsck-backups when there's room, then runs
+#            the full `e2fsck -fy`. Only touches disks that are not held open
+#            and whose schema is not already offloaded.
 #
 # If you skip `drain` (no dashboard, or you prefer the local freeze tier),
 # the endgame after `dumps` is: set PG_VM_POOL_FREEZE_AFTER_SECS low (e.g.
@@ -60,9 +76,9 @@
 # Usage:
 #   sudo ./emergency-drain.sh --spare-dir /mnt/spare/pg-rescue [phases…]
 #
-#   Phases (default: halt purge reclaim dumps — everything except drain,
-#   ghosts, rescue):
-#     halt purge reclaim dumps drain ghosts rescue
+#   Phases (default: halt purge reclaim dumps — the read-only ghosts and the
+#   heavier drain/rescue/orphans/badfs are opt-in):
+#     halt purge reclaim dumps drain ghosts rescue orphans badfs
 #
 #   Options:
 #     --spare-dir DIR    directory on the disk WITH room (required for dumps)
@@ -135,8 +151,8 @@ while [ $# -gt 0 ]; do
         --reap-timeout) REAP_TIMEOUT="$2"; shift 2 ;;
         --yes)         YES=1; shift ;;
         --dry-run)     DRY_RUN=1; shift ;;
-        halt|purge|reclaim|dumps|drain|ghosts|rescue) PHASES+=("$1"); shift ;;
-        -h|--help)     sed -n '2,88p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        halt|purge|reclaim|dumps|drain|ghosts|rescue|orphans|badfs) PHASES+=("$1"); shift ;;
+        -h|--help)     sed -n '2,104p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -491,12 +507,16 @@ phase_ghosts() {
         echo "   ghosts can't be reaped through the pooler (guest exec 404s) — use the"
         echo "   rescue phase to dump them host-side over the guest IP and retire them."
     fi
+    if [ "$orphans" -gt 0 ]; then
+        echo "   orphaned dirs are handled by the orphans phase (delete if offloaded,"
+        echo "   quarantine to --spare-dir otherwise)."
+    fi
 }
 
 # -------------------------------------------------------------- rescue ----
 phase_rescue() {
     note "rescue: host-side dump + retire for ghost VMs of live schemas"
-    [ "$(id -u)" = 0 ] || die "rescue needs root (fd scan + kill + chroot config reads)"
+    [ "$(id -u)" = 0 ] || [ "$DRY_RUN" = 1 ] || die "rescue needs root (fd scan + kill + chroot config reads)"
     for tool in pg_dump psql; do
         command -v "$tool" >/dev/null || die "rescue needs $tool on the host (matching the guest's Postgres major)"
     done
@@ -601,6 +621,164 @@ phase_rescue() {
     df_report
 }
 
+# ------------------------------------------------------------- orphans ----
+phase_orphans() {
+    note "orphans: sb-* dirs that are not running and unknown to heyvmd"
+    [ "$(id -u)" = 0 ] || [ "$DRY_RUN" = 1 ] || die "orphans needs root (fd scan + file moves)"
+    # Fail closed exactly like rescue: with heyvmd down, EVERYTHING looks
+    # orphaned and this phase would quarantine the whole fleet.
+    heyvmd_list >/dev/null || exit 1
+    local quarantine=""
+    if [ -n "$SPARE_DIR" ]; then
+        quarantine="$SPARE_DIR/quarantine"
+        run mkdir -p "$quarantine"
+    fi
+
+    local rows deleted=0 moved=0 kept=0 freed=0
+    local live_quarantined=()
+    rows=$(reconcile_rows)
+    local id pid known schema tier ip alloc avail
+    while IFS=$'\t' read -r id pid known schema tier ip; do
+        [ "$pid" = - ] && pid=""
+        [ "$schema" = - ] && schema=""
+        [ "$tier" = - ] && tier=""
+        [ -n "$id" ] && [ -z "$pid" ] && [ "$known" = no ] || continue  # orphan dirs only
+        alloc=$(du -sB1 "$RUN_DIR/$id" 2>/dev/null | cut -f1)
+        alloc=${alloc:-0}
+
+        if [ "$tier" = frozen ] || [ "$tier" = archived ]; then
+            echo "   $id: schema $schema already $tier — deleting ($(human "$alloc"))"
+            run rm -rf --one-file-system "$RUN_DIR/$id"
+            deleted=$((deleted + 1)); freed=$((freed + alloc))
+            continue
+        fi
+
+        # Live-tier or unbound: the bytes here may be the only copy of real
+        # data, so they are moved intact to the spare disk, never deleted.
+        if [ -z "$quarantine" ]; then
+            echo "   $id (schema ${schema:-unbound}): would quarantine but no --spare-dir; keeping"
+            kept=$((kept + 1)); continue
+        fi
+        # df against SPARE_DIR, not the quarantine subdir — same filesystem,
+        # but the subdir doesn't exist yet under --dry-run.
+        avail=$(df -B1 --output=avail "$SPARE_DIR" 2>/dev/null | awk 'NR==2 {print $1}')
+        if [ -z "$avail" ] || [ "$avail" -lt $((alloc + alloc / 5)) ]; then
+            echo "   $id: spare disk lacks room for $(human "$alloc"); keeping"
+            kept=$((kept + 1)); continue
+        fi
+        echo "   $id (schema ${schema:-unbound}, tier ${tier:-live}): quarantining $(human "$alloc")"
+        if [ "$DRY_RUN" = 1 ]; then
+            echo "DRY-RUN: cp -a --sparse=always $RUN_DIR/$id $quarantine/ && rm -rf $RUN_DIR/$id"
+            moved=$((moved + 1))
+            [ -n "$schema" ] && live_quarantined+=("$schema")
+            continue
+        fi
+        # Copy to a .partial name and rename, so an interrupted copy can never
+        # be mistaken for a complete quarantine.
+        rm -rf "$quarantine/$id.partial"
+        if cp -a --sparse=always "$RUN_DIR/$id" "$quarantine/$id.partial" \
+            && mv "$quarantine/$id.partial" "$quarantine/$id"; then
+            rm -rf --one-file-system "$RUN_DIR/$id"
+            moved=$((moved + 1)); freed=$((freed + alloc))
+            [ -n "$schema" ] && live_quarantined+=("$schema")
+        else
+            rm -rf "$quarantine/$id.partial"
+            echo "     copy failed — original left in place"
+            kept=$((kept + 1))
+        fi
+    done <<<"$rows"
+
+    echo "   deleted $deleted offloaded orphan(s), quarantined $moved, kept $kept — ~$(human "$freed") freed"
+    if [ ${#live_quarantined[@]} -gt 0 ]; then
+        echo
+        echo "   *** IMPORTANT: these schemas' data now lives ONLY in $quarantine: ***"
+        printf '       %s\n' "${live_quarantined[@]}"
+        echo "   Their registry tier is still 'live' with a dead sandbox id, so the pooler"
+        echo "   would serve them as EMPTY databases on next connect. Before re-enabling"
+        echo "   traffic for them, either recover each one:"
+        echo "     1. connect once so the pooler creates a fresh pg-<schema> VM, then halt"
+        echo "     2. stop that VM; replace its \$RUN_DIR/sb-<new>/data.ext4 with the"
+        echo "        quarantined one (fsck it first); start it — data is back under a"
+        echo "        sandbox heyvmd tracks"
+        echo "   or dump the quarantined disk offline (loop-mount + a matching-major"
+        echo "   Postgres) into $DUMP_DIR/<schema>.dump and flip its tier to frozen."
+    fi
+    df_report
+}
+
+# -------------------------------------------------------------- badfs -----
+phase_badfs() {
+    note "badfs: full-repair pass over data disks that fail preen fsck"
+    [ "$(id -u)" = 0 ] || [ "$DRY_RUN" = 1 ] || die "badfs needs root"
+    command -v e2fsck >/dev/null || die "badfs needs e2fsck"
+    local backups=""
+    if [ -n "$SPARE_DIR" ]; then
+        backups="$SPARE_DIR/fsck-backups"
+        run mkdir -p "$backups"
+    fi
+    scan_open_files
+
+    local checked=0 bad=0 repaired=0 unfixed=0
+    local disk id schema tier rc avail alloc
+    for disk in "$RUN_DIR"/sb-*/data.ext4; do
+        [ -f "$disk" ] || continue
+        id=$(basename "$(dirname "$disk")")
+        [ -n "$(holder_pid "$disk")" ] && continue  # running VM — never touch
+        schema=$(schema_of_id "$id")
+        tier=""
+        [ -n "$schema" ] && tier=$(tier_of "$schema")
+        if [ "$tier" = frozen ] || [ "$tier" = archived ]; then
+            continue  # data offloaded; purge/orphans territory, not worth repairing
+        fi
+        checked=$((checked + 1))
+        # Same probe reclaim-disks.sh uses: preen replays the journal and makes
+        # safe fixes; exit >= 4 means real damage preen won't touch. Dry-run
+        # substitutes the read-only -fn (it can over-report on a dirty journal,
+        # but changes nothing).
+        if [ "$DRY_RUN" = 1 ]; then
+            e2fsck -fn "$disk" >/dev/null 2>&1
+        else
+            e2fsck -fp "$disk" >/dev/null 2>&1
+        fi
+        rc=$?
+        [ "$rc" -ge 4 ] || continue
+        bad=$((bad + 1))
+        echo "   $id (schema ${schema:-unbound}): preen fsck=$rc — attempting full repair"
+        if [ "$DRY_RUN" = 1 ]; then
+            echo "DRY-RUN: backup to ${backups:-<none>} then e2fsck -fy $disk"
+            continue
+        fi
+        if [ -n "$backups" ]; then
+            alloc=$(du -sB1 "$disk" 2>/dev/null | cut -f1)
+            alloc=${alloc:-0}
+            avail=$(df -B1 --output=avail "$SPARE_DIR" 2>/dev/null | awk 'NR==2 {print $1}')
+            if [ -n "$avail" ] && [ "$avail" -ge $((alloc + alloc / 5)) ]; then
+                if ! cp -a --sparse=always "$disk" "$backups/$id.data.ext4"; then
+                    echo "     backup copy failed — repairing WITHOUT a backup"
+                    rm -f "$backups/$id.data.ext4"
+                fi
+            else
+                echo "     spare disk lacks room for a $(human "$alloc") backup — repairing without one"
+            fi
+        fi
+        # -fy answers yes to every fix. It can discard damaged files into
+        # lost+found, but preen already refused this disk: the alternative is
+        # a filesystem no VM can safely mount at all.
+        e2fsck -fy "$disk" >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" -lt 4 ]; then
+            repaired=$((repaired + 1))
+            echo "     repaired (fsck=$rc)"
+        else
+            unfixed=$((unfixed + 1))
+            echo "     STILL BAD (fsck=$rc) — leaving disk and backup for manual recovery"
+        fi
+    done
+    echo "   checked $checked live disk(s): $bad bad, $repaired repaired, $unfixed beyond -fy"
+    [ "$repaired" -gt 0 ] && echo "   re-run the reclaim phase to trim the freshly repaired disks"
+    df_report
+}
+
 # -------------------------------------------------------------- main ------
 echo "emergency-drain: phases [${PHASES[*]}] (dry-run=$DRY_RUN)"
 echo "   run-dir:  $RUN_DIR"
@@ -608,8 +786,8 @@ echo "   registry: $STATE_FILE"
 [ -n "$SPARE_DIR" ] && echo "   spare:    $SPARE_DIR"
 df_report
 
-if has_phase purge || has_phase drain || has_phase rescue; then
-    confirm "This will delete VMs / archive schemas on this host. Proceed?" || die "aborted"
+if has_phase purge || has_phase drain || has_phase rescue || has_phase orphans || has_phase badfs; then
+    confirm "This will delete/move VMs, disks, or schemas on this host. Proceed?" || die "aborted"
 fi
 
 for p in "${PHASES[@]}"; do
@@ -621,6 +799,8 @@ for p in "${PHASES[@]}"; do
         drain)   phase_drain ;;
         ghosts)  phase_ghosts ;;
         rescue)  phase_rescue ;;
+        orphans) phase_orphans ;;
+        badfs)   phase_badfs ;;
     esac
 done
 
