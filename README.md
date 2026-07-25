@@ -164,6 +164,8 @@ Config via env (all optional):
 | `PG_VM_POOL_PRESSURE_CHECK_SECS` | `60` | how often the pressure watchdog reads disk usage |
 | `PG_VM_POOL_RECLAIM_CMD` | unset (off) | shell command that offline-trims stopped VMs' disks (normally `sudo -n .../reclaim-disks.sh <run-dir>`); setting it enables automatic disk reclamation — see "Reclaiming disk slack" |
 | `PG_VM_POOL_RECLAIM_INTERVAL_SECS` | `3600` | how often the periodic reclaim run fires (extra runs also fire right after idle reaps) |
+| `PG_VM_POOL_RUN_DIR` | falls back to `PG_VM_POOL_PRESSURE_PATH` | the heyvmd run dir (holds each VM's `sb-<id>/`). Used to verify a killed VM's disk directory is actually gone after archive/freeze, and to locate orphaned directories for the sweep below. When a kill leaves the directory behind (stranding the disk) the pooler logs it loudly instead of reporting "disk reclaimed". Unset ⇒ that removal is left unverified and the orphan sweep is disabled |
+| `PG_VM_POOL_ORPHAN_SWEEP_SECS` | unset (off) | how often to sweep the run dir for **orphaned** disk directories — an `sb-<id>/` heyvmd has forgotten (a kill it acked but didn't act on). Requires `PG_VM_POOL_RUN_DIR`. Deletes only directories the daemon confirms gone (per-id 404) that are also not held open and belong to an offloaded/unreferenced schema; a `live` schema whose VM vanished is logged as a data-loss orphan and never deleted — see "Reclaiming disk slack" |
 
 Postgres inside each VM **tunes itself to the VM's resources at every boot**:
 `init.sh` reads live RAM/vCPUs/disk and regenerates
@@ -360,6 +362,52 @@ trim — but every legacy VM gets fully converted at its first idle stop.
 Pin the script at a root-owned path (`chown root:root`, `chmod 0755`) so the
 sudoers entry can't be repointed by editing a user-writable file, and pass the
 run dir in the sudoers line exactly as in the command so `sudo -n` matches.
+
+#### Orphaned disks (`PG_VM_POOL_ORPHAN_SWEEP_SECS`)
+
+Slack reclamation trims a *live* schema's disk; it does nothing for a disk whose
+VM is **gone**. When a schema is archived to S3 or frozen, the pooler kills its
+VM to reclaim the whole `sb-<id>/` directory — but the kill is a
+`DELETE /deployed-sandboxes/:id` the SDK treats as success on a 404, and heyvmd
+has been observed to drop the sandbox record while leaving the directory on
+disk. The VM count falls, the bytes don't, and nothing above reclaims them
+(`reclaim-disks.sh` only trims live schemas' disks). Left alone this strands
+hundreds of GB — a fleet can archive most of its schemas and barely move total
+storage.
+
+Two mechanisms address it. First, after every archive/freeze the pooler now
+**verifies** the directory is actually gone (needs `PG_VM_POOL_RUN_DIR`) and
+logs a loud warning with the path and size instead of a false "disk reclaimed"
+when it isn't. Second, set `PG_VM_POOL_ORPHAN_SWEEP_SECS` to have the pooler
+periodically **sweep and delete** the orphans itself:
+
+```
+PG_VM_POOL_RUN_DIR=/workbooks/heyvm/run
+PG_VM_POOL_ORPHAN_SWEEP_SECS=3600
+```
+
+A directory is deleted only when every one of these holds, checked cheapest-first
+so a live disk is ruled out before any daemon call or destructive action:
+
+1. it's older than 30 min (not a VM mid-create, whose fresh dir the daemon may
+   not report yet);
+2. no process holds a file in it open — the same chroot-proof `device:inode`
+   check `reclaim-disks.sh` uses (not a running VM);
+3. heyvmd's **per-id** endpoint returns 404 — the daemon truly forgot it. The
+   *list* endpoint is unreliable (it can omit stopped VMs and is truncated on a
+   large fleet), so classification never uses it;
+4. its schema is offloaded (`frozen`/`archived`, data safe elsewhere) or the id
+   is unreferenced by any registry entry (dead).
+
+Conditions 2–3 are re-checked against a fresh snapshot immediately before each
+delete. A `live`-tier schema whose VM vanished is a **data-loss orphan** — its
+disk is the only copy — so it is reported at error level and *never* deleted;
+resolve those (restore, or mark archived/frozen) before they serve an empty DB.
+Deletions are capped per pass and a flaking daemon aborts the sweep, so a "gone?"
+ambiguity can never become a destructive action. Unlike slack reclamation this
+needs no root — just delete permission on the run dir (the pooler runs as the
+same user heyvmd creates the directories as); if jailer left root-owned files a
+removal fails and is logged rather than silently half-done.
 
 ### Managing with supervisord
 

@@ -9,6 +9,7 @@ mod auth;
 mod config;
 mod dashboard;
 mod dumpsrv;
+mod orphans;
 mod proxy;
 mod reclaim;
 mod registry;
@@ -88,6 +89,10 @@ async fn main() -> Result<()> {
     // host (Firecracker has no discard passthrough). No-op unless
     // PG_VM_POOL_RECLAIM_CMD is configured.
     registry.spawn_reclaimer();
+    // Orphan-disk sweep: delete sb-<id>/ directories heyvmd has forgotten (a
+    // kill it acked but didn't act on), reclaiming the stranded disk. No-op
+    // unless PG_VM_POOL_ORPHAN_SWEEP_SECS (and PG_VM_POOL_RUN_DIR) are set.
+    registry.spawn_orphan_reaper();
 
     // Optional admin dashboard: enabled only when PG_VM_POOL_DASHBOARD_LISTEN is
     // set. Runs in its own task sharing the registry, so it never blocks the PG

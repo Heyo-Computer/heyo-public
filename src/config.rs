@@ -107,6 +107,24 @@ pub struct Config {
     /// virtio-blk has no discard passthrough, so they never come back on their
     /// own). `None` (the default) disables it — enabled by `PG_VM_POOL_RECLAIM_CMD`.
     pub reclaim: Option<ReclaimConfig>,
+    /// The heyvmd run dir (e.g. `/workbooks/heyvm/run`), under which each VM
+    /// owns an `sb-<id>/` directory holding its `data.ext4`. Used only to
+    /// *verify* that killing a VM actually removed its disk: after a successful
+    /// `kill()`, the pooler checks that `run_dir/sb-<id>` is gone, so a daemon
+    /// that drops the sandbox record but leaves the directory (stranding the
+    /// disk) is caught in the log instead of silently leaking storage. `None`
+    /// (the default) leaves that removal unverified. Env `PG_VM_POOL_RUN_DIR`;
+    /// falls back to `PG_VM_POOL_PRESSURE_PATH` when that points at the run dir.
+    pub run_dir: Option<PathBuf>,
+    /// How often to sweep the run dir for **orphaned** VM disk directories: an
+    /// `sb-<id>/` whose sandbox heyvmd no longer knows about (a kill the daemon
+    /// acked but didn't act on, leaving the disk behind). The sweep deletes only
+    /// directories the daemon confirms gone (per-id 404) that are also not held
+    /// open and belong to an offloaded/unreferenced schema — never a `live`
+    /// schema's disk. `None` (the default) disables it. Requires [`Self::run_dir`];
+    /// set without it, it stays off with a warning. Env
+    /// `PG_VM_POOL_ORPHAN_SWEEP_SECS`.
+    pub orphan_sweep: Option<Duration>,
 }
 
 /// Settings for automatic disk-slack reclamation. Present (`Some`) only when
@@ -355,6 +373,8 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_ARCHIVE_SWEEP_SECS",
     "PG_VM_POOL_RECLAIM_CMD",
     "PG_VM_POOL_RECLAIM_INTERVAL_SECS",
+    "PG_VM_POOL_RUN_DIR",
+    "PG_VM_POOL_ORPHAN_SWEEP_SECS",
     "PG_VM_POOL_WARM_SPARES",
     "PG_VM_POOL_FREEZE_AFTER_SECS",
     "PG_VM_POOL_FREEZE_SWEEP_SECS",
@@ -484,6 +504,33 @@ impl Config {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
         let freeze = FreezeConfig::from_env()?;
+        // Explicit run dir, else reuse the pressure path (same directory: the
+        // heyvmd run dir holding every VM's sb-<id>/). `None` means kill
+        // verification is skipped, never that anything breaks.
+        let run_dir = std::env::var("PG_VM_POOL_RUN_DIR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                archive
+                    .as_ref()
+                    .and_then(|a| a.pressure.as_ref())
+                    .map(|p| p.path.clone())
+            });
+        // Orphan-disk sweep interval; needs the run dir to locate sb-<id>/ dirs.
+        let mut orphan_sweep = std::env::var("PG_VM_POOL_ORPHAN_SWEEP_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs);
+        if orphan_sweep.is_some() && run_dir.is_none() {
+            tracing::warn!(
+                "PG_VM_POOL_ORPHAN_SWEEP_SECS is set but no run dir is known \
+                 (set PG_VM_POOL_RUN_DIR) — the orphan-disk sweep is disabled"
+            );
+            orphan_sweep = None;
+        }
         if let (Some(f), Some(a)) = (&freeze, &archive)
             && f.freeze_after >= a.archive_after
         {
@@ -517,6 +564,8 @@ impl Config {
             freeze,
             warm_spares,
             reclaim,
+            run_dir,
+            orphan_sweep,
         })
     }
 }

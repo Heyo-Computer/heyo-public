@@ -268,6 +268,74 @@ const RESTORE_JOB: DetachedJob = DetachedJob {
 /// the VM and reclaims its disk on our `Ok`, destroying the only other copy.
 /// The guest sentinel is kept as a best-effort fast path: it turns a failed dump
 /// into an immediate, explained error instead of a 30-minute timeout.
+/// How long to keep looking for a killed VM's `sb-<id>/` directory to vanish
+/// before declaring the disk leaked. heyvmd answers the DELETE and *then*
+/// tears the sandbox down, so the directory can linger a moment after `kill()`
+/// returns; poll briefly and exit the instant it's gone rather than crying leak
+/// on the first look. A genuinely stranded disk simply never disappears and we
+/// warn after the cap — cheap, since the check is a single `stat`.
+const KILL_VERIFY_ATTEMPTS: u32 = 8;
+const KILL_VERIFY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Kill `sandbox` and confirm its data-disk directory is actually gone.
+///
+/// The kill is `DELETE /deployed-sandboxes/:id`, and the SDK treats a 404 as
+/// success — so `Ok` proves only that the daemon no longer holds the record,
+/// **not** that the VM's `sb-<id>/` directory (its `data.ext4`, rootfs copy,
+/// logs) left the host. We have seen the daemon drop the record while leaving
+/// the directory behind: the VM count falls but the bytes don't come back, and
+/// nothing else reclaims them (`reclaim-disks.sh` only trims *live* schemas'
+/// disks, it never deletes dead sandboxes). Left unchecked this silently
+/// strands hundreds of GB. So after a successful kill we poll for the directory
+/// and, if it survives, log it loudly with the path and on-disk size instead of
+/// the usual "disk reclaimed".
+///
+/// `accomplished` is the tier-specific thing the caller just did (e.g. "dumped
+/// to s3://…" / "frozen to a 12345-byte local dump"), woven into the one log
+/// line so it reads naturally. Best-effort and non-fatal: the data is already
+/// durable in its new tier before we get here, so a surviving disk is a reclaim
+/// task, never a reason to fail the operation. Returns the kill call's own
+/// error so the caller can report an outright kill *failure* — the worse case,
+/// since the VM may still be running.
+pub async fn kill_and_reclaim(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    accomplished: &str,
+) -> Result<()> {
+    let id = sandbox.sandbox_id().to_string();
+    sandbox.kill().await.context("killing the VM")?;
+
+    let Some(dir) = cfg.run_dir.as_ref().map(|d| d.join(&id)) else {
+        info!(
+            "schema {schema}: {accomplished}; VM {id} killed \
+             (disk removal unverified — set PG_VM_POOL_RUN_DIR to confirm)"
+        );
+        return Ok(());
+    };
+
+    for attempt in 0..KILL_VERIFY_ATTEMPTS {
+        if !dir.exists() {
+            info!("schema {schema}: {accomplished}; VM {id} killed, data disk reclaimed");
+            return Ok(());
+        }
+        if attempt + 1 < KILL_VERIFY_ATTEMPTS {
+            sleep(KILL_VERIFY_INTERVAL).await;
+        }
+    }
+
+    let size = crate::orphans::dir_allocated_bytes(dir.clone()).await;
+    warn!(
+        "schema {schema}: {accomplished}, but its VM's data disk survived the kill — \
+         {} still exists ({}). The daemon dropped the sandbox record without removing \
+         the directory, so the space is stranded until it's reclaimed (the orphan-disk \
+         sweep will remove it if PG_VM_POOL_ORPHAN_SWEEP_SECS is set)",
+        dir.display(),
+        crate::orphans::human_iec(size),
+    );
+    Ok(())
+}
+
 pub async fn dump_to_s3(
     cfg: &Config,
     sandbox: &Sandbox,
@@ -1659,6 +1727,7 @@ mod tests {
     fn pool_at(port: u16) -> Pool {
         build_pool("127.0.0.1", port, "postgres", "postgres", None).unwrap()
     }
+
 
     /// The launch script is parsed by the guest's `sh`, and its heredoc carries
     /// a presigned URL (`&`, `=`, `%`, `?`) plus literal `$ec`/`$?`. Run the

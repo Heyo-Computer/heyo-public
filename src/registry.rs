@@ -3,13 +3,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use deadpool_postgres::Pool;
-use heyo_sdk::{P2pTunnel, Sandbox};
+use heyo_sdk::{HeyoError, P2pTunnel, Sandbox};
 use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
@@ -46,6 +47,31 @@ const ARCHIVE_FIRST_SWEEP_DELAY: Duration = Duration::from_secs(120);
 /// pressure sweeps get windows in between; the pressure reaper remains the
 /// urgent path if disk demands faster.
 const FREEZE_MAX_PER_SWEEP: usize = 25;
+
+/// Delay before the orphan-disk sweep's first pass after startup — long enough
+/// to let the pooler finish coming up and reattach warm VMs (so their disks are
+/// held open and never misread as orphans), short enough that frequent
+/// redeploys can't starve the sweep (see [`supervise`]).
+const ORPHAN_FIRST_DELAY: Duration = Duration::from_secs(180);
+
+/// A disk directory must be at least this old (by mtime) to be an orphan
+/// candidate. A VM mid-create/mid-boot has a brand-new `sb-<id>/` that the
+/// daemon may not report yet (`get` 404s during provisioning) and whose disk
+/// isn't open yet — deleting it would be catastrophic. A genuine orphan is
+/// stale by definition (its schema was offloaded long ago), so an age floor
+/// costs nothing and closes the create race outright.
+const ORPHAN_MIN_AGE: Duration = Duration::from_secs(1800);
+
+/// Cap on directory deletions per orphan sweep. Bounds the blast radius of any
+/// misclassification to a batch, and keeps a first run over a large backlog
+/// from doing hundreds of `remove_dir_all`s (and daemon round-trips) in one
+/// pass; the rest drain over subsequent sweeps.
+const ORPHAN_MAX_DELETES_PER_SWEEP: usize = 100;
+
+/// Abort an orphan sweep after this many consecutive daemon errors while
+/// checking sandbox liveness: a flaking/restarting heyvmd must never let a
+/// "gone?" ambiguity turn into a deletion, so we stop and try again next sweep.
+const ORPHAN_MAX_DAEMON_ERRORS: usize = 5;
 
 /// Circuit breaker for one eviction sweep: after this many *consecutive*
 /// archive failures the pass aborts instead of grinding on. Each failed archive
@@ -276,6 +302,11 @@ pub struct SchemaRegistry {
     // periodic timer and a manual "sweep now" can't stack overlapping passes over
     // the same candidates.
     sweeping: AtomicBool,
+    // True while an orphan-disk sweep is running. Its own single-flight (not
+    // shared with `sweeping`) because it touches no VMs or checkouts — it only
+    // deletes directories the daemon confirms gone — so it may run alongside an
+    // eviction sweep; this just stops two orphan passes from racing.
+    orphan_sweeping: AtomicBool,
     // Offline-trims stopped VMs' data disks (Firecracker has no discard
     // passthrough, so freed guest blocks never return to the host on their
     // own). `Some` when PG_VM_POOL_RECLAIM_CMD is configured.
@@ -306,6 +337,7 @@ impl SchemaRegistry {
             store,
             archiving: StdMutex::new(HashSet::new()),
             sweeping: AtomicBool::new(false),
+            orphan_sweeping: AtomicBool::new(false),
             reclaimer,
             spares,
             dumps,
@@ -1110,14 +1142,14 @@ impl SchemaRegistry {
             .with_context(|| format!("dumping schema {schema} to S3"))?;
 
         self.store.set_tier(schema, Tier::Archived).await;
-        info!("schema {schema}: dumped to s3://{}/{}", archive.s3.bucket, archive.s3.object_key(schema));
+        let accomplished = format!("dumped to s3://{}/{}", archive.s3.bucket, archive.s3.object_key(schema));
 
-        if let Err(e) = entry.sandbox.kill().await {
-            // The dump is safe in S3 and the store is marked archived, so this
-            // only orphans a (stopped) VM + disk — undesirable but not data loss.
+        // Kill and confirm the disk directory is actually gone — a kill the
+        // daemon acks but doesn't act on strands the disk (see kill_and_reclaim).
+        // The dump is safe in S3 and the store is marked archived, so a kill
+        // *failure* only orphans a (stopped) VM + disk — undesirable, not data loss.
+        if let Err(e) = vm::kill_and_reclaim(&self.cfg, &entry.sandbox, schema, &accomplished).await {
             warn!("schema {schema}: archived to S3 but killing the VM failed (orphaned): {e:#}");
-        } else {
-            info!("schema {schema}: VM killed, disk reclaimed");
         }
         // Dropping `entry` tears down its pool/tunnel.
         Ok(())
@@ -1349,12 +1381,245 @@ impl SchemaRegistry {
         .with_context(|| format!("dumping schema {schema} to the local dump store"))?;
 
         self.store.set_tier(schema, Tier::Frozen).await;
-        if let Err(e) = entry.sandbox.kill().await {
+        let accomplished = format!("frozen to a {bytes}-byte local dump");
+        if let Err(e) = vm::kill_and_reclaim(&self.cfg, &entry.sandbox, schema, &accomplished).await {
             warn!("schema {schema}: frozen locally but killing the VM failed (orphaned): {e:#}");
-        } else {
-            info!("schema {schema}: frozen ({bytes}-byte local dump), VM deleted, disk reclaimed");
         }
         Ok(())
+    }
+
+    // ---- orphan-disk reclamation --------------------------------------------
+
+    /// Spawn the orphan-disk sweep if `PG_VM_POOL_ORPHAN_SWEEP_SECS` (and a run
+    /// dir) are configured: periodically delete `sb-<id>/` directories heyvmd no
+    /// longer knows about, reclaiming disks a kill acked but didn't remove.
+    pub fn spawn_orphan_reaper(self: &Arc<Self>) {
+        let Some(interval) = self.cfg.orphan_sweep else {
+            info!("orphan-disk sweep disabled (PG_VM_POOL_ORPHAN_SWEEP_SECS unset/0)");
+            return;
+        };
+        // config guarantees run_dir is Some whenever orphan_sweep is Some.
+        let Some(run_dir) = self.cfg.run_dir.clone() else {
+            return;
+        };
+        info!(
+            "orphan-disk sweep: reclaiming forgotten sb-<id>/ dirs under {} every {:?} \
+             (min age {:?}, ≤{} deletions/pass)",
+            run_dir.display(),
+            interval,
+            ORPHAN_MIN_AGE,
+            ORPHAN_MAX_DELETES_PER_SWEEP,
+        );
+        let registry = self.clone();
+        let first = ORPHAN_FIRST_DELAY.min(interval);
+        tokio::spawn(supervise("orphan-reaper", first, interval, move || {
+            let registry = registry.clone();
+            async move { registry.sweep_orphans().await }
+        }));
+    }
+
+    /// One orphan-disk pass. Returns the number of directories deleted (for the
+    /// supervisor heartbeat). Single-flighted on its own flag.
+    ///
+    /// A directory is deleted only when **all** of these hold, checked in
+    /// cheapest-first order so a live disk is ruled out before any daemon
+    /// round-trip or destructive call:
+    ///   1. it's older than [`ORPHAN_MIN_AGE`] (not a VM mid-create);
+    ///   2. no process holds a file in it open (not a running VM — the
+    ///      chroot-proof device:inode check in [`crate::orphans`]);
+    ///   3. heyvmd's per-id endpoint returns 404 (the daemon truly forgot it —
+    ///      the *list* is unreliable, so we never classify off it);
+    ///   4. its schema is offloaded (`frozen`/`archived`, data safe elsewhere)
+    ///      or the id is unreferenced by any registry entry (dead).
+    /// A `live`-tier schema whose VM is gone is a data-loss orphan: its disk is
+    /// the only copy, so it is reported at error level and never deleted.
+    /// Conditions 2 and 3 are re-checked immediately before each `remove_dir_all`
+    /// against a fresh snapshot, since classification does many awaits.
+    async fn sweep_orphans(&self) -> usize {
+        let Some(run_dir) = self.cfg.run_dir.clone() else {
+            return 0;
+        };
+        if self.orphan_sweeping.swap(true, Ordering::SeqCst) {
+            info!("orphan-disk sweep: a pass is already running; skipping");
+            return 0;
+        }
+        let _guard = SweepGuard(&self.orphan_sweeping);
+
+        // Registry view: sandbox-id → (schema, tier). The authoritative map of
+        // which disks a schema still depends on.
+        let by_id: HashMap<String, (String, Tier)> = self
+            .store_records()
+            .into_iter()
+            .map(|(schema, r)| (r.sandbox_id, (schema, r.tier)))
+            .collect();
+
+        // Enumerate old-enough sb-* dirs. Fresh dirs (a VM mid-create) are
+        // skipped by the age floor.
+        let entries = match std::fs::read_dir(&run_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("orphan-disk sweep: cannot read run dir {}: {e}", run_dir.display());
+                return 0;
+            }
+        };
+        let now = SystemTime::now();
+        let mut dirs: Vec<(PathBuf, String)> = Vec::new();
+        let mut too_new = 0usize;
+        for ent in entries.flatten() {
+            let name = ent.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("sb-") {
+                continue;
+            }
+            let path = ent.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let Ok(md) = ent.metadata()
+                && let Ok(mtime) = md.modified()
+                && now
+                    .duration_since(mtime)
+                    .map(|age| age < ORPHAN_MIN_AGE)
+                    .unwrap_or(true)
+            {
+                too_new += 1;
+                continue;
+            }
+            dirs.push((path, name.to_string()));
+        }
+        if dirs.is_empty() {
+            debug!("orphan-disk sweep: no candidate dirs ({too_new} too new)");
+            return 0;
+        }
+
+        let open = crate::orphans::open_inodes();
+
+        // Classify. Held-open first (a local filesystem check), then the daemon
+        // round-trip only for dirs that survive it.
+        let mut deletable: Vec<(PathBuf, String, String)> = Vec::new(); // (path, id, why)
+        let mut dataloss: Vec<(String, String)> = Vec::new(); // (schema, id)
+        let (mut alive, mut held, mut daemon_errs) = (0usize, 0usize, 0usize);
+        let mut aborted = false;
+        for (path, id) in dirs {
+            if crate::orphans::dir_held_open(&path, &open) {
+                held += 1;
+                continue;
+            }
+            match self.daemon_state(&id).await {
+                DaemonState::Present => alive += 1,
+                DaemonState::Error => {
+                    daemon_errs += 1;
+                    if daemon_errs >= ORPHAN_MAX_DAEMON_ERRORS {
+                        warn!(
+                            "orphan-disk sweep: aborting after {daemon_errs} consecutive daemon \
+                             errors — heyvmd looks unhealthy; a 'gone?' ambiguity must never \
+                             become a deletion. Retrying next sweep"
+                        );
+                        aborted = true;
+                        break;
+                    }
+                    continue;
+                }
+                DaemonState::Gone => {
+                    daemon_errs = 0;
+                    match by_id.get(&id) {
+                        Some((schema, Tier::Live)) => dataloss.push((schema.clone(), id.clone())),
+                        Some((schema, _)) => {
+                            deletable.push((path, id, format!("offloaded schema {schema}")))
+                        }
+                        None => deletable.push((path, id, "unreferenced by any schema".into())),
+                    }
+                }
+            }
+        }
+
+        // Data-loss orphans: never delete — shout so an operator acts.
+        for (schema, id) in &dataloss {
+            error!(
+                "orphan-disk sweep: schema {schema}'s VM {id} is gone from heyvmd but its tier \
+                 is still `live` — its data disk {}/{id} is the ONLY copy and the next connect \
+                 will serve an EMPTY database. NOT deleting. Restore it, or mark it \
+                 archived/frozen if the data is durable elsewhere.",
+                run_dir.display(),
+            );
+        }
+
+        let backlog = deletable.len().saturating_sub(ORPHAN_MAX_DELETES_PER_SWEEP);
+        deletable.truncate(ORPHAN_MAX_DELETES_PER_SWEEP);
+        info!(
+            "orphan-disk sweep: {} deletable, {alive} live, {held} in use, {} data-loss orphan(s), \
+             {too_new} too new{}{}",
+            deletable.len() + backlog,
+            dataloss.len(),
+            if backlog > 0 { format!(", {backlog} deferred to later passes") } else { String::new() },
+            if aborted { " (classification aborted early — daemon unhealthy)" } else { "" },
+        );
+
+        // Fresh open-file snapshot for the destructive phase: classification did
+        // many awaits, during which a VM could have grabbed one of these disks.
+        let open = crate::orphans::open_inodes();
+        let (mut removed, mut freed, mut failed) = (0usize, 0u64, 0usize);
+        for (path, id, why) in deletable {
+            // Re-confirm not-held and still-gone immediately before deleting.
+            if crate::orphans::dir_held_open(&path, &open) {
+                continue;
+            }
+            if !matches!(self.daemon_state(&id).await, DaemonState::Gone) {
+                continue;
+            }
+            let bytes = crate::orphans::dir_allocated_bytes(path.clone()).await;
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    removed += 1;
+                    freed += bytes;
+                    info!(
+                        "orphan-disk sweep: reclaimed {} ({}) — {why}",
+                        path.display(),
+                        crate::orphans::human_iec(bytes),
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    warn!(
+                        "orphan-disk sweep: failed to remove {} ({why}): {e} — \
+                         (jailer may have left root-owned files; the pooler needs \
+                         delete permission on the run dir)",
+                        path.display(),
+                    );
+                }
+            }
+        }
+        if removed > 0 || failed > 0 {
+            info!(
+                "orphan-disk sweep: reclaimed {removed} disk(s), {} freed{}",
+                crate::orphans::human_iec(freed),
+                if failed > 0 { format!(", {failed} could not be removed") } else { String::new() },
+            );
+        }
+        removed
+    }
+
+    /// What heyvmd's per-id endpoint says about sandbox `id`. Uses `get`
+    /// (`GET /deployed-sandboxes/:id`), which resolves by id and reports even a
+    /// stopped sandbox — unlike the list, which is unreliable. `Gone` is the
+    /// only state that permits deletion; `Error` (daemon down/flaking) is
+    /// deliberately distinct from `Gone` so ambiguity never deletes.
+    async fn daemon_state(&self, id: &str) -> DaemonState {
+        let sb = match Sandbox::connect(id.to_string(), vm::local_opts()) {
+            Ok(sb) => sb,
+            Err(e) => {
+                debug!("orphan-disk sweep: cannot connect to check {id}: {e:#}");
+                return DaemonState::Error;
+            }
+        };
+        match sb.get().await {
+            Ok(_) => DaemonState::Present,
+            Err(HeyoError::NotFound(_)) => DaemonState::Gone,
+            Err(e) => {
+                debug!("orphan-disk sweep: daemon error checking {id}: {e:#}");
+                DaemonState::Error
+            }
+        }
     }
 
     fn is_archiving(&self, schema: &str) -> bool {
@@ -1448,6 +1713,15 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 /// Clears the `sweeping` flag on drop, so a panic or early return in the middle
 /// of a sweep can't leave the registry permanently believing a sweep is running.
+/// heyvmd's verdict on one sandbox id, from the authoritative per-id endpoint.
+/// `Error` is kept distinct from `Gone` on purpose: only `Gone` may delete, so
+/// a flaking daemon can never turn "I can't tell" into a destructive action.
+enum DaemonState {
+    Present,
+    Gone,
+    Error,
+}
+
 struct SweepGuard<'a>(&'a AtomicBool);
 
 impl Drop for SweepGuard<'_> {
