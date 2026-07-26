@@ -42,9 +42,11 @@
 #   sudo SHRINK=1 ./reclaim-disks.sh [DIR]   # also shrink filesystems (slower)
 #   sudo PRUNE_SWAP=1 ./reclaim-disks.sh [DIR]  # also delete guest swapfiles
 #
-# PRUNE_SWAP=1 deletes each stopped VM's /swapfile (via debugfs, no mount;
-# the journal-recovery fsck that follows frees the unlinked blocks and the
-# discard pass punches them). Swap contents are dead the moment a VM stops
+# PRUNE_SWAP=1 deletes each stopped VM's /swapfile (via debugfs, no mount —
+# but only AFTER the journal-recovery fsck: debugfs surgery under a dirty
+# journal gets overwritten by the replay and strands the swapfile as an
+# "Unattached inode" preen can't fix; the script also auto-repairs disks
+# damaged that way by an earlier version). Swap contents are dead the moment a VM stops
 # (swap never survives a boot), and init.sh recreates the file — sized to the
 # filesystem — on the next boot, so this is pure reclaim: the swapfile is
 # fully allocated (fallocate/dd, not sparse), up to 2GB per VM on large-RAM
@@ -217,22 +219,46 @@ trim_one() {
         return 0
     fi
 
-    # Drop the dead swapfile first: debugfs unlinks it without a mount, the
-    # journal-recovery fsck below frees the now-orphaned blocks, and the
-    # discard pass punches them out of the backing file.
-    if [ "$PRUNE_SWAP" = 1 ]; then
-        debugfs -w -R "rm /swapfile" "$disk" >/dev/null 2>&1
-    fi
-
-    # Recover the journal (VMs are killed uncleanly, so it's usually dirty).
-    # -p auto-fixes and exits 1 when it did — expected, not a failure. Only a
-    # code >= 4 means the filesystem is still bad; then leave it alone.
-    # Output is captured and surfaced on failure: a whole fleet FAILing for one
-    # systemic reason (host e2fsck too old for the guest's ext4 features, OOM,
-    # permissions) is undiagnosable from a bare exit code.
+    # Recover the journal FIRST (VMs are killed uncleanly, so it's usually
+    # dirty) — before any debugfs surgery. An earlier version pruned the
+    # swapfile before this fsck; the journal replay then overwrote the
+    # modified metadata and left an "Unattached inode 12" (the swapfile) that
+    # preen refuses to fix, FAILing the whole fleet. -p auto-fixes and exits 1
+    # when it did — expected, not a failure. Only a code >= 4 means the
+    # filesystem is still bad. Output is captured and surfaced on failure: a
+    # whole fleet FAILing for one systemic reason (host e2fsck too old for the
+    # guest's ext4 features, OOM, permissions) is undiagnosable from a bare
+    # exit code.
     local fsck_out
     fsck_out=$(e2fsck -fp "$disk" 2>&1)
     local fsck_rc=$?
+
+    # Remediate the damage that old ordering left behind: preen reports
+    # "Unattached inode N" and gives up. Strictly NAMELESS inodes (no dirent
+    # anywhere — ncheck prints nothing) are unreachable dead weight, i.e. the
+    # ex-swapfile; kill_file frees their blocks, clri zeroes the inode so
+    # nothing resurrects it, and a re-preen leaves a clean filesystem. An
+    # unattached inode that still has a name anywhere is a real file and is
+    # never touched (the FAIL stands, for badfs/manual recovery).
+    if [ "$fsck_rc" -ge 4 ] && echo "$fsck_out" | grep -q "Unattached inode"; then
+        local ino killed=0
+        for ino in $(echo "$fsck_out" | grep -oE 'Unattached (zero-length )?inode [0-9]+' \
+                     | grep -oE '[0-9]+$' | sort -un); do
+            if ! debugfs -R "ncheck $ino" "$disk" 2>/dev/null \
+                 | awk 'NR>1 && NF>=2 {f=1} END {exit !f}'; then
+                debugfs -w -R "kill_file <$ino>" "$disk" >/dev/null 2>&1
+                debugfs -w -R "clri <$ino>" "$disk" >/dev/null 2>&1
+                killed=$((killed + 1))
+            fi
+        done
+        if [ "$killed" -gt 0 ]; then
+            fsck_out=$(e2fsck -fp "$disk" 2>&1)
+            fsck_rc=$?
+            [ "$fsck_rc" -lt 4 ] \
+                && echo "note  (freed $killed nameless unattached inode(s): stale pruned swap)  $disk"
+        fi
+    fi
+
     if [ "$fsck_rc" -ge 4 ]; then
         echo "FAIL  (fsck=$fsck_rc)     $disk"
         [ -n "$fsck_out" ] && echo "$fsck_out" | grep -v '^$' | head -n 2 | sed 's/^/      /'
@@ -243,6 +269,21 @@ trim_one() {
         esac
         failed=$((failed + 1))
         return 1
+    fi
+
+    # Drop the dead swapfile — only now, on a recovered journal (see above).
+    # On a clean filesystem debugfs's rm fully deallocates (1.47+); older
+    # debugfs leaves a zero-dtime deleted inode, which the preen right after
+    # (and the discard fsck below) auto-fix.
+    if [ "$PRUNE_SWAP" = 1 ] \
+        && debugfs -R "stat /swapfile" "$disk" >/dev/null 2>&1; then
+        debugfs -w -R "rm /swapfile" "$disk" >/dev/null 2>&1
+        e2fsck -fp "$disk" >/dev/null 2>&1
+        if [ $? -ge 4 ]; then
+            echo "FAIL  (fsck after swap prune)  $disk"
+            failed=$((failed + 1))
+            return 1
+        fi
     fi
 
     # Optional filesystem shrink (see shrink_fs).

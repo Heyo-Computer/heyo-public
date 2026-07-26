@@ -1529,6 +1529,44 @@ async fn resolve_sandbox(
     create_vm(cfg, name, keepalive).await
 }
 
+/// Best-effort stop of whatever VM a failed offload bring-up may have left
+/// running — the ready-timeout case: the sandbox started, but Postgres never
+/// answered (sick disk, wedged boot), so `ensure_vm` errored without ever
+/// returning a handle to stop. Nothing else owns such a VM (the warm entry
+/// was evicted before the attempt), so without this it runs forever, burning
+/// RAM and pinning its disk against reclaim. Matches by the stored id and by
+/// `pg-<schema>` name (covers a VM freshly created inside the failed
+/// attempt); every step is logged, none propagate.
+pub(crate) async fn stop_after_failed_bringup(schema: &str, known_id: Option<&str>) {
+    let name = format!("pg-{schema}");
+    let list = match Sandbox::list(local_opts()).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("schema {schema}: cannot list sandboxes to stop a leaked bring-up: {e:#}");
+            return;
+        }
+    };
+    for info in list {
+        if info.name != name && known_id != Some(info.id.as_str()) {
+            continue;
+        }
+        let Ok(sb) = Sandbox::connect(info.id.clone(), local_opts()) else {
+            continue;
+        };
+        match tokio::time::timeout(Duration::from_secs(30), sb.stop()).await {
+            Ok(Ok(())) => info!(
+                "schema {schema}: stopped VM {} left running by the failed bring-up",
+                info.id
+            ),
+            Ok(Err(e)) => warn!(
+                "schema {schema}: stopping leaked VM {} failed (may already be stopped): {e:#}",
+                info.id
+            ),
+            Err(_) => warn!("schema {schema}: stopping leaked VM {} timed out", info.id),
+        }
+    }
+}
+
 /// Create one warm-spare VM (see `spares`): identical to a schema VM — same
 /// image, size class, thin data disk, TTL 0 — just parked with an empty
 /// cluster until claimed.

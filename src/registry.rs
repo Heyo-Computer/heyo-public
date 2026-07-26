@@ -1193,9 +1193,17 @@ impl SchemaRegistry {
         let known_id = self.store.record(schema).map(|r| r.sandbox_id);
         // No spare pool here: this bring-up exists to dump an *existing* VM's
         // data — a fresh spare would have nothing to dump.
-        let entry = vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), None, None)
-            .await
-            .with_context(|| format!("bringing up VM for schema {schema} to archive it"))?;
+        let entry = match vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), None, None).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                // A bring-up that started the VM but never reached a ready
+                // Postgres (ready-timeout on a sick disk) has no handle to
+                // clean up through — the same leak class as a failed dump.
+                vm::stop_after_failed_bringup(schema, known_id.as_deref()).await;
+                return Err(e)
+                    .with_context(|| format!("bringing up VM for schema {schema} to archive it"));
+            }
+        };
 
         // On dump failure, stop the VM this attempt booted before propagating.
         // Without this every failed archive leaks a running VM — nothing else
@@ -1471,9 +1479,15 @@ impl SchemaRegistry {
         }
 
         let known_id = self.store.record(schema).map(|r| r.sandbox_id);
-        let entry = vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), None, None)
-            .await
-            .with_context(|| format!("bringing up VM for schema {schema} to freeze it"))?;
+        let entry = match vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), None, None).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                // Same leak guard as archive_schema_inner's bring-up.
+                vm::stop_after_failed_bringup(schema, known_id.as_deref()).await;
+                return Err(e)
+                    .with_context(|| format!("bringing up VM for schema {schema} to freeze it"));
+            }
+        };
 
         // Same leak guard as archive_schema_inner: a failed dump must not
         // leave the VM it booted running and unowned.
