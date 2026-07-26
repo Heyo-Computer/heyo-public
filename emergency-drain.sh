@@ -66,6 +66,14 @@
 #            backup to --spare-dir/fsck-backups when there's room, then runs
 #            the full `e2fsck -fy`. Only touches disks that are not held open
 #            and whose schema is not already offloaded.
+#   disks    (read-only) per-VM disk-footprint report: provisioned ceiling
+#            (sparse apparent size), filesystem size, filesystem used, and
+#            real host allocation, per sb-* dir, with totals split by
+#            running/stopped. `fs == ceiling` marks a LEGACY disk formatted
+#            across the whole device by a pre-thin-provisioning image — those
+#            ratchet toward the ceiling forever and only a SHRINK reclaim
+#            pass retrofits them. Answers "where does the space actually sit
+#            and do new VMs start small".
 #   readopt  bring quarantined live-tier schemas back under normal management
 #            so the standard archive strategy (drain / sweeps / on-demand
 #            restore) applies to them again. The archive tiers store pg_dump
@@ -168,7 +176,7 @@ while [ $# -gt 0 ]; do
         --reap-timeout) REAP_TIMEOUT="$2"; shift 2 ;;
         --yes)         YES=1; shift ;;
         --dry-run)     DRY_RUN=1; shift ;;
-        halt|purge|reclaim|dumps|drain|ghosts|rescue|orphans|badfs|readopt) PHASES+=("$1"); shift ;;
+        halt|purge|reclaim|dumps|drain|ghosts|rescue|orphans|badfs|readopt|disks) PHASES+=("$1"); shift ;;
         -h|--help)     sed -n '2,119p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -781,7 +789,8 @@ phase_badfs() {
         # -fy answers yes to every fix. It can discard damaged files into
         # lost+found, but preen already refused this disk: the alternative is
         # a filesystem no VM can safely mount at all.
-        e2fsck -fy "$disk" >/dev/null 2>&1
+        local fy_out
+        fy_out=$(e2fsck -fy "$disk" 2>&1)
         rc=$?
         if [ "$rc" -lt 4 ]; then
             repaired=$((repaired + 1))
@@ -789,11 +798,81 @@ phase_badfs() {
         else
             unfixed=$((unfixed + 1))
             echo "     STILL BAD (fsck=$rc) — leaving disk and backup for manual recovery"
+            echo "$fy_out" | grep -v '^$' | tail -n 3 | sed 's/^/       /'
         fi
     done
     echo "   checked $checked live disk(s): $bad bad, $repaired repaired, $unfixed beyond -fy"
     [ "$repaired" -gt 0 ] && echo "   re-run the reclaim phase to trim the freshly repaired disks"
     df_report
+}
+
+# -------------------------------------------------------------- disks -----
+phase_disks() {
+    note "disks: per-VM footprint (read-only)"
+    command -v dumpe2fs >/dev/null || die "disks needs dumpe2fs"
+    if [ "$(id -u)" != 0 ]; then
+        echo "   warning: not root — running/stopped detection may under-report"
+    fi
+    scan_open_files
+    printf '   %-16s %-12s %-8s %9s %9s %9s %10s  %s\n' \
+        SANDBOX SCHEMA STATE CEILING FS-SIZE FS-USED ALLOCATED FLAGS
+    local disk id schema tier state apparent alloc geom bs blocks free
+    local fs_b used_b legacy n=0
+    local total_alloc=0 running_alloc=0 stopped_alloc=0 legacy_n=0 stopped_slack=0
+    # Sorted by real allocation, biggest first — the offenders lead.
+    for disk in $(du -B1 "$RUN_DIR"/sb-*/data.ext4 2>/dev/null | sort -rn | cut -f2); do
+        id=$(basename "$(dirname "$disk")")
+        schema=$(schema_of_id "$id")
+        tier=""
+        [ -n "$schema" ] && tier=$(tier_of "$schema")
+        apparent=$(stat -c %s "$disk" 2>/dev/null || echo 0)
+        alloc=$(du -B1 "$disk" 2>/dev/null | cut -f1); alloc=${alloc:-0}
+        if [ -n "$(holder_pid "$disk")" ]; then state=running; else state=stopped; fi
+        # Superblock read; on a running guest's disk it's racy but read-only —
+        # numbers for running rows are approximate.
+        geom=$(dumpe2fs -h "$disk" 2>/dev/null)
+        bs=$(awk -F: '/^Block size:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+        blocks=$(awk -F: '/^Block count:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+        free=$(awk -F: '/^Free blocks:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+        fs_b=""; used_b=""; legacy=""
+        if [ -n "$bs" ] && [ -n "$blocks" ] && [ -n "$free" ]; then
+            fs_b=$((blocks * bs))
+            used_b=$(((blocks - free) * bs))
+            # fs spanning (>= 99% of) the device = formatted before thin
+            # provisioning — it ratchets to the ceiling and needs SHRINK.
+            if [ "$apparent" -gt 0 ] && [ "$fs_b" -ge $((apparent * 99 / 100)) ]; then
+                legacy="LEGACY-FULL-FORMAT"
+                legacy_n=$((legacy_n + 1))
+            fi
+        fi
+        n=$((n + 1))
+        total_alloc=$((total_alloc + alloc))
+        if [ "$state" = running ]; then
+            running_alloc=$((running_alloc + alloc))
+        else
+            stopped_alloc=$((stopped_alloc + alloc))
+            # What a trim pass should return on this stopped disk: allocated
+            # blocks beyond what the filesystem actually uses.
+            if [ -n "$used_b" ] && [ "$alloc" -gt "$used_b" ]; then
+                stopped_slack=$((stopped_slack + alloc - used_b))
+            fi
+        fi
+        printf '   %-16s %-12s %-8s %9s %9s %9s %10s  %s\n' \
+            "$id" "${schema:--}" "$state" \
+            "$(human "$apparent")" \
+            "$([ -n "$fs_b" ] && human "$fs_b" || echo '?')" \
+            "$([ -n "$used_b" ] && human "$used_b" || echo '?')" \
+            "$(human "$alloc")" \
+            "${legacy}${tier:+ [$tier]}"
+    done
+    echo "   ----"
+    echo "   $n disk(s): $(human "$total_alloc") allocated total —" \
+         "$(human "$running_alloc") under RUNNING VMs (untrimmable until stopped)," \
+         "$(human "$stopped_alloc") under stopped"
+    echo "   $legacy_n legacy full-format disk(s) (fs spans the ceiling; fix: SHRINK reclaim once stopped)"
+    echo "   ~$(human "$stopped_slack") immediately reclaimable on stopped disks (allocated beyond fs-used)"
+    echo "   Note: allocation under running VMs only returns after stop + reclaim; a"
+    echo "   thin-image VM allocates ~600MB at birth and grows with data."
 }
 
 # ------------------------------------------------------------- readopt ----
@@ -941,11 +1020,12 @@ for p in "${PHASES[@]}"; do
         orphans) phase_orphans ;;
         badfs)   phase_badfs ;;
         readopt) phase_readopt ;;
+        disks)   phase_disks ;;
     esac
 done
 
 note "done"
-if ! has_phase drain; then
+if has_phase halt && ! has_phase drain; then
     cat <<EOF
 Next steps:
   - To drain the remaining live schemas to S3 one at a time:

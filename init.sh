@@ -86,7 +86,14 @@ if [ -b "$DATA_DEV" ]; then
         fs_mb="$INIT_FS_MB"
         [ "$fs_mb" -gt "$dev_mb" ] && fs_mb="$dev_mb"
         echo "[init] $DATA_DEV is blank, creating ${fs_mb}MB ext4 filesystem (device cap ${dev_mb}MB)"
-        mkfs.ext4 -q -L pgdata -b 4096 "$DATA_DEV" $((fs_mb * 256))
+        # ^orphan_file,^metadata_csum_seed: these disks are maintained from the
+        # HOST (reclaim-disks.sh fscks, shrinks, and hole-punches them), so the
+        # feature set must stay within what a host e2fsprogs <= 1.46 understands.
+        # Both features are e2fsprogs-1.47 newcomers that newer images would
+        # silently enable by default — and one host with older tools than the
+        # guest then fails fsck on EVERY disk, disabling reclaim fleet-wide.
+        mkfs.ext4 -q -L pgdata -b 4096 -O '^orphan_file,^metadata_csum_seed' \
+            "$DATA_DEV" $((fs_mb * 256))
     fi
     echo "[init] mounting $DATA_DEV at $WORKSPACE"
     # `discard`: issue TRIM inline as ext4 frees blocks (recycled WAL, dropped

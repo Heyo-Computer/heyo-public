@@ -39,6 +39,7 @@ fn shell_with_head(title: &str, extra_head: Markup, body: Markup) -> Markup {
                     nav {
                         a href="/" { "Databases" }
                         a href="/monitoring" { "monitoring" }
+                        a href="/events" { "events" }
                         a href="/logs/pooler" { "pooler log" }
                         a href="/logs/heyvmd" { "heyvmd log" }
                     }
@@ -104,6 +105,14 @@ pub fn databases_page(st: &DashState, p: &SandboxPage) -> Markup {
     )
 }
 
+/// Per-hour event series for the monitoring page's activity charts, each as
+/// oldest-first `(hour_start_unix, count)` buckets from `crate::events`.
+pub struct ActivitySeries {
+    pub restores_s3: Vec<(u64, u32)>,
+    pub restores_local: Vec<(u64, u32)>,
+    pub vms_created: Vec<(u64, u32)>,
+}
+
 /// The monitoring view: whole-host CPU/memory/disk saturation plus pooler-fleet
 /// aggregates rolled up from the VM inventory.
 pub fn monitoring_page(
@@ -112,6 +121,7 @@ pub fn monitoring_page(
     host: Option<&HostUsage>,
     disks: &[HostDisk],
     history: &[Sample],
+    activity: &ActivitySeries,
     b: &Banner,
 ) -> Markup {
     let running: Vec<&VmRow> = rows.iter().filter(|r| r.is_running()).collect();
@@ -210,6 +220,15 @@ pub fn monitoring_page(
 
             h3.sub-head { "live VMs over time" }
             (vm_history_chart(history, running.len()))
+
+            h3.sub-head { "restores from S3" }
+            (hourly_bar_chart(&activity.restores_s3, "restore"))
+
+            h3.sub-head { "restores from local dumps" }
+            (hourly_bar_chart(&activity.restores_local, "restore"))
+
+            h3.sub-head { "VMs created" }
+            (hourly_bar_chart(&activity.vms_created, "VM"))
 
             (alerts_section(st))
         },
@@ -310,6 +329,160 @@ fn vm_history_chart(samples: &[Sample], current: usize) -> Markup {
                 (n) " sample" (if n == 1 { "" } else { "s" })
                 " · spanning " (fmt_span(span))
                 " · now " (current) " running"
+            }
+        }
+    }
+}
+
+/// The events view: the pooler's journal of failures and sweep summaries,
+/// newest first — the page that answers "why are there N running VMs with no
+/// sessions all started at the same minute" (a sweep's worth of boot-to-dump
+/// attempts that failed and were never stopped shows up here as a cluster of
+/// `archive`/`freeze` errors around one timestamp).
+pub fn events_page(st: &DashState, entries: &[crate::events::JournalEntry]) -> Markup {
+    use crate::events::{Level, fmt_ts};
+    let errors = entries.iter().filter(|e| e.level == Level::Error).count();
+    shell(
+        "Events",
+        html! {
+            div.pagehead {
+                h1 { "Events" }
+                a.button-link href="/events" { "↻ refresh" }
+            }
+            @if st.cfg.basic_auth.is_none() {
+                div.summary { span.warn { "auth: OFF" } }
+            }
+            div.summary {
+                span { "showing " b { (entries.len()) } " most recent" }
+                @if errors > 0 { span.warn { (errors) " error(s)" } }
+            }
+            @if entries.is_empty() {
+                p.note {
+                    "Nothing journaled yet. Failures (bring-ups, archives, freezes) and "
+                    "archive/freeze sweep summaries land here as they happen; entries are "
+                    "persisted in daily partitions under the metrics dir and survive restarts."
+                }
+            } @else {
+                table.events {
+                    thead {
+                        tr { th { "time (UTC)" } th { "level" } th { "kind" } th { "what happened" } }
+                    }
+                    tbody {
+                        @for e in entries {
+                            tr {
+                                td.dim { (fmt_ts(e.t)) }
+                                td {
+                                    @match e.level {
+                                        Level::Error => { span.lvl.lvl-err { "error" } }
+                                        Level::Info => { span.lvl.lvl-info { "info" } }
+                                    }
+                                }
+                                td { code { (e.kind) } }
+                                td.ev-msg { (e.msg) }
+                            }
+                        }
+                    }
+                }
+                p.note.dim {
+                    "Failures include bring-ups, archives (S3), freezes (local), and frozen-dump "
+                    "promotions; sweep rows summarize each archive/freeze/pressure pass that had "
+                    "work to do. Backed by daily " code { "journal-YYYY-MM-DD.tsv" }
+                    " partitions (14-day retention)."
+                }
+            }
+        },
+    )
+}
+
+/// A self-contained inline-SVG bar chart of per-hour event counts — same
+/// no-JS/no-libs idiom as [`vm_history_chart`]. `buckets` is oldest-first
+/// `(hour_start_unix, count)` pairs (the events module emits whole UTC clock
+/// hours; the last bucket is the current, partial hour). One series, so the
+/// section heading is the only legend; each bar carries a native SVG `<title>`
+/// tooltip and the peak bar is direct-labeled. `noun` names the unit in the
+/// caption ("restore", "VM").
+fn hourly_bar_chart(buckets: &[(u64, u32)], noun: &str) -> Markup {
+    const W: f64 = 640.0;
+    const H: f64 = 160.0;
+    const PAD_L: f64 = 32.0;
+    const PAD_R: f64 = 12.0;
+    const PAD_T: f64 = 12.0;
+    const PAD_B: f64 = 20.0;
+    let plot_w = W - PAD_L - PAD_R;
+    let plot_h = H - PAD_T - PAD_B;
+    let baseline = PAD_T + plot_h;
+
+    if buckets.is_empty() {
+        return html! {
+            div.chart-wrap {
+                p.note.chart-empty { "No event history yet." }
+            }
+        };
+    }
+
+    let n = buckets.len();
+    let max = buckets.iter().map(|(_, c)| *c).max().unwrap_or(0);
+    let total: u64 = buckets.iter().map(|(_, c)| u64::from(*c)).sum();
+    let axis_max = f64::from(max.max(1));
+    let slot_w = plot_w / n as f64;
+    // 2px surface gap between adjacent bars, and never thinner than 1px.
+    let bar_w = (slot_w - 2.0).max(1.0);
+    let bar_x = |i: usize| PAD_L + i as f64 * slot_w + 1.0;
+    let y = |c: u32| PAD_T + (1.0 - f64::from(c) / axis_max) * plot_h;
+    let hour_of = |t: u64| (t / 3600) % 24;
+
+    let ticks: Vec<u32> = if max >= 2 { vec![0, max / 2, max] } else { vec![0, 1] };
+    // Index of the tallest bar, for the one direct label.
+    let peak = buckets
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, c))| *c)
+        .map(|(i, _)| i)
+        .filter(|_| max > 0);
+
+    html! {
+        div.chart-wrap {
+            svg.chart-svg viewBox="0 0 640 160" role="img"
+                aria-label=(format!("{noun}s per hour over the last {n} hours")) {
+                @for t in &ticks {
+                    @let gy = y(*t);
+                    // Empty `{}` (not `;`) — see vm_history_chart: SVG shapes
+                    // are not HTML void elements under maud.
+                    line.chart-grid x1=(fmt(PAD_L)) y1=(fmt(gy)) x2=(fmt(W - PAD_R)) y2=(fmt(gy)) {}
+                    text.chart-ylabel x=(fmt(PAD_L - 5.0)) y=(fmt(gy + 3.0)) text-anchor="end" {
+                        (t)
+                    }
+                }
+                @for (i, (t, count)) in buckets.iter().enumerate() {
+                    // Clock labels at 00/06/12/18 UTC so ticks stay put as the
+                    // window slides.
+                    @if hour_of(*t) % 6 == 0 {
+                        text.chart-xlabel x=(fmt(bar_x(i) + bar_w / 2.0)) y=(fmt(H - 6.0))
+                            text-anchor="middle" {
+                            (format!("{:02}:00", hour_of(*t)))
+                        }
+                    }
+                    @if *count > 0 {
+                        rect.chart-bar x=(fmt(bar_x(i))) y=(fmt(y(*count)))
+                            width=(fmt(bar_w)) height=(fmt(baseline - y(*count))) rx="2" {
+                            title {
+                                (format!("{:02}:00–{:02}:00 UTC · {count} {noun}{}",
+                                    hour_of(*t), (hour_of(*t) + 1) % 24,
+                                    if *count == 1 { "" } else { "s" }))
+                            }
+                        }
+                        @if peak == Some(i) {
+                            text.chart-now x=(fmt(bar_x(i) + bar_w / 2.0))
+                                y=(fmt((y(*count) - 4.0).max(10.0))) text-anchor="middle" {
+                                (count)
+                            }
+                        }
+                    }
+                }
+            }
+            p.chart-caption.dim {
+                (total) " " (noun) (if total == 1 { "" } else { "s" })
+                " in the last " (n) "h · one bar per UTC clock hour"
             }
         }
     }
@@ -1112,6 +1285,38 @@ mod tests {
     }
 
     #[test]
+    fn hourly_bar_chart_draws_bars_tooltips_and_peak_label() {
+        // Empty input: a note, no SVG.
+        let empty = hourly_bar_chart(&[], "restore").into_string();
+        assert!(!empty.contains("<svg"), "empty series should not draw a chart");
+
+        // All-zero window: the frame renders (axes prove the chart is alive)
+        // but no bars, and the caption says 0.
+        let base = 1_753_600 * 3600; // an exact hour boundary
+        let zeroes: Vec<(u64, u32)> = (0..24).map(|i| (base + i * 3600, 0)).collect();
+        let flat = hourly_bar_chart(&zeroes, "restore").into_string();
+        assert!(flat.contains("<svg"));
+        assert!(!flat.contains("chart-bar"), "no bars for zero counts");
+        assert!(flat.contains("0 restores in the last 24h"));
+
+        // Real counts: one rect per non-zero bucket, closed (maud void-element
+        // trap, as above), a native <title> tooltip, and exactly one direct
+        // label on the peak bar.
+        let counts: Vec<(u64, u32)> = vec![(base, 1), (base + 3600, 0), (base + 7200, 3)];
+        let bars = hourly_bar_chart(&counts, "VM").into_string();
+        assert_eq!(bars.matches("<rect").count(), 2, "one bar per non-zero hour");
+        assert!(bars.contains("</rect>"), "bars must be closed");
+        assert!(bars.contains("<title>"), "bars carry native tooltips");
+        assert!(bars.contains("4 VMs in the last 3h"));
+        assert_eq!(
+            bars.matches("chart-now").count(),
+            1,
+            "exactly one peak label: {bars}"
+        );
+        assert!(bars.contains(">3</text>"), "peak label shows the max count");
+    }
+
+    #[test]
     fn metric_renders_clamped_bar_and_band() {
         // A hot disk: fill clamps to 100%, gets the crit color, shows the caption.
         let html = metric("/data", 1.4, "140%", Some("/dev/sda1")).into_string();
@@ -1204,6 +1409,16 @@ h1 { font-size:1.3rem; }
 .chart-area { fill:var(--link); fill-opacity:.12; stroke:none; }
 .chart-line { fill:none; stroke:var(--link); stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
 .chart-dot { fill:var(--link); stroke:var(--card); stroke-width:1.5; }
+.chart-bar { fill:var(--link); fill-opacity:.8; }
+.chart-bar:hover { fill-opacity:1; }
+.chart-xlabel { fill:var(--muted); font-size:10px; }
+.lvl { display:inline-block; padding:.05rem .45rem; border-radius:999px; font-size:.75rem;
+        font-weight:600; border:1px solid; }
+.lvl-err { background:var(--err-bg); color:var(--err-fg); border-color:var(--err-border); }
+.lvl-info { background:var(--code-bg); color:var(--dim); border-color:var(--border); }
+table.events td { vertical-align:top; }
+table.events td.dim { white-space:nowrap; }
+td.ev-msg { word-break:break-word; }
 .chart-caption { margin:.2rem .2rem .5rem; font-size:.8rem; }
 h2 { font-size:1rem; margin:1.4rem 0 .5rem; }
 .summary { display:flex; gap:1.5rem; margin:.5rem 0 1rem; color:var(--dim); }

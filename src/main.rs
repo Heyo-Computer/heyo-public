@@ -9,6 +9,7 @@ mod auth;
 mod config;
 mod dashboard;
 mod dumpsrv;
+mod events;
 mod orphans;
 mod proxy;
 mod reclaim;
@@ -42,6 +43,9 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env()?;
     let listen_addr = cfg.listen_addr;
+    // File-backed event metrics (daily partitions) for the monitoring charts;
+    // memory-only if the dir can't be created.
+    events::init(cfg.metrics_dir.clone());
     // Client-facing TLS: certbot (or any external renewer) owns the PEM files;
     // the reloader picks up rotations without a restart. Built before the
     // registry so a bad cert fails startup fast.

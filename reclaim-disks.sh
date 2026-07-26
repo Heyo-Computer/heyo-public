@@ -227,10 +227,20 @@ trim_one() {
     # Recover the journal (VMs are killed uncleanly, so it's usually dirty).
     # -p auto-fixes and exits 1 when it did — expected, not a failure. Only a
     # code >= 4 means the filesystem is still bad; then leave it alone.
-    e2fsck -fp "$disk" >/dev/null 2>&1
+    # Output is captured and surfaced on failure: a whole fleet FAILing for one
+    # systemic reason (host e2fsck too old for the guest's ext4 features, OOM,
+    # permissions) is undiagnosable from a bare exit code.
+    local fsck_out
+    fsck_out=$(e2fsck -fp "$disk" 2>&1)
     local fsck_rc=$?
     if [ "$fsck_rc" -ge 4 ]; then
         echo "FAIL  (fsck=$fsck_rc)     $disk"
+        [ -n "$fsck_out" ] && echo "$fsck_out" | grep -v '^$' | head -n 2 | sed 's/^/      /'
+        case "$fsck_out" in
+            *"unsupported feature"*|*"Get a newer version"*|*"unknown ROCOMPAT"*|*"unknown INCOMPAT"*)
+                echo "      hint: the guest's mkfs enabled ext4 features this host's e2fsprogs" \
+                     "($(e2fsck -V 2>&1 | head -n1)) doesn't know — upgrade e2fsprogs on the host" ;;
+        esac
         failed=$((failed + 1))
         return 1
     fi
@@ -251,9 +261,10 @@ trim_one() {
     # The reclaim itself: punch every free block and unused inode-table block
     # out of the backing file. File-level fallocate(PUNCH_HOLE) — works even
     # where loop-device discard doesn't.
-    e2fsck -fp -E discard "$disk" >/dev/null 2>&1
+    fsck_out=$(e2fsck -fp -E discard "$disk" 2>&1)
     if [ $? -ge 4 ]; then
         echo "FAIL  (discard fsck)  $disk"
+        [ -n "$fsck_out" ] && echo "$fsck_out" | grep -v '^$' | head -n 2 | sed 's/^/      /'
         failed=$((failed + 1))
         return 1
     fi
@@ -270,7 +281,7 @@ trim_one() {
 # Announce the active flags: env vars silently stripped by sudo's env_reset
 # (`SHRINK=1 sudo …` instead of `sudo SHRINK=1 …`) have twice produced runs
 # that "did nothing" — make a flagless run visible in the first line.
-echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR (dry-run=$DRY_RUN shrink=$SHRINK prune-swap=$PRUNE_SWAP)"
+echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR (dry-run=$DRY_RUN shrink=$SHRINK prune-swap=$PRUNE_SWAP; $(e2fsck -V 2>&1 | head -n1))"
 snapshot_open_files
 for disk in "${disks[@]}"; do
     trim_one "$disk"

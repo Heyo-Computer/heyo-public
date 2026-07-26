@@ -75,6 +75,11 @@ pub struct Config {
     /// to the right VM (by id) after a restart instead of creating a duplicate
     /// with a fresh data disk. Env `PG_VM_POOL_STATE_FILE`.
     pub state_file: PathBuf,
+    /// Where the monitoring event metrics keep their daily partition files
+    /// (`events-YYYY-MM-DD.tsv`), so the restore/create charts survive
+    /// restarts. Env `PG_VM_POOL_METRICS_DIR`; defaults to `metrics/` next to
+    /// the state file.
+    pub metrics_dir: PathBuf,
     /// TLS certificate chain + private key (PEM) for client-facing TLS. Both
     /// set → the pooler answers the Postgres `SSLRequest` with `S` and speaks
     /// TLS; unset → it declines (`N`) as before. Files are re-read on change,
@@ -359,6 +364,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_DATA_DISK_GB",
     "PG_VM_POOL_KEEPALIVE_SCHEMAS",
     "PG_VM_POOL_STATE_FILE",
+    "PG_VM_POOL_METRICS_DIR",
     "PG_VM_POOL_TLS_CERT",
     "PG_VM_POOL_TLS_KEY",
     "PG_VM_POOL_DASHBOARD_LISTEN",
@@ -457,6 +463,18 @@ impl Config {
             .unwrap_or_else(|_| {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 PathBuf::from(home).join(".heyo/pg-vm-pool/registry.tsv")
+            });
+        // Daily-partitioned event metrics live beside the state file unless
+        // pointed elsewhere.
+        let metrics_dir = std::env::var("PG_VM_POOL_METRICS_DIR")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                state_file
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("metrics")
             });
         // TLS cert/key PEM paths; empty treated as unset (like PASSWORD above).
         // Setting only one of the pair is a configuration mistake — fail fast
@@ -557,6 +575,7 @@ impl Config {
             keepalive_schemas,
             direct_connect,
             state_file,
+            metrics_dir,
             tls_cert,
             tls_key,
             dashboard,

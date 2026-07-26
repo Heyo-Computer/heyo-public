@@ -11,6 +11,7 @@ pub fn build(state: DashState) -> Router {
     Router::new()
         .route("/", get(handlers::databases))
         .route("/monitoring", get(handlers::monitoring))
+        .route("/events", get(handlers::events))
         .route("/monitoring/alerts", post(handlers::alert_add))
         .route("/monitoring/alerts/{id}/delete", post(handlers::alert_delete))
         .route("/monitoring/sweep", post(handlers::action_sweep_now))

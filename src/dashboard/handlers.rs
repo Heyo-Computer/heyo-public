@@ -74,14 +74,29 @@ pub async fn monitoring(
         Vec::new()
     });
     let history = st.history.snapshot();
+    // Per-hour event series for the activity charts (trailing 24 clock hours).
+    let activity = views::ActivitySeries {
+        restores_s3: crate::events::hourly_counts(crate::events::Event::RestoreS3, 24),
+        restores_local: crate::events::hourly_counts(crate::events::Event::RestoreLocal, 24),
+        vms_created: crate::events::hourly_counts(crate::events::Event::VmCreated, 24),
+    };
     Ok(views::monitoring_page(
         &st,
         &rows,
         host_usage.as_ref(),
         &disks,
         &history,
+        &activity,
         &banner,
     ))
+}
+
+/// Recent pooler events (failures + sweep summaries) from the journal —
+/// newest first, in-memory + reloaded from the daily partition files on
+/// startup. Read-only; no daemon or guest access.
+pub async fn events(State(st): State<DashState>) -> Markup {
+    let entries = crate::events::journal_recent(200);
+    views::events_page(&st, &entries)
 }
 
 /// Form for adding a webhook alert rule from the monitoring page.

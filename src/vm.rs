@@ -891,7 +891,9 @@ pub async fn restore_from_local(
         restore_job_body(&user, &db, "", &url)
     );
     RESTORE_JOB.launch(cfg, sandbox, &body, RESTORE_PATH).await?;
-    await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await
+    await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await?;
+    crate::events::record(crate::events::Event::RestoreLocal);
+    Ok(())
 }
 
 /// What the guest says about a detached job.
@@ -995,7 +997,9 @@ async fn restore_from_s3(
             RESTORE_PATH,
         )
         .await?;
-    await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await
+    await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await?;
+    crate::events::record(crate::events::Event::RestoreS3);
+    Ok(())
 }
 
 /// Wait for a detached job whose only completion signal is its own sentinel.
@@ -1571,7 +1575,7 @@ async fn create_vm(cfg: &Config, name: &str, keepalive: bool) -> Result<Sandbox>
         "creating VM {name}{}",
         if keepalive { " (keep-alive)" } else { "" }
     );
-    Sandbox::create(
+    let sandbox = Sandbox::create(
         SandboxCreateOptions {
             name: Some(name.to_string()),
             image: Some(cfg.image.clone()),
@@ -1591,7 +1595,9 @@ async fn create_vm(cfg: &Config, name: &str, keepalive: bool) -> Result<Sandbox>
         local_opts(),
     )
     .await
-    .with_context(|| format!("creating VM {name}"))
+    .with_context(|| format!("creating VM {name}"))?;
+    crate::events::record(crate::events::Event::VmCreated);
+    Ok(sandbox)
 }
 
 /// Resolve the VM's direct host-reachable Postgres address from the daemon's

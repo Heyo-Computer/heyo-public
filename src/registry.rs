@@ -603,6 +603,13 @@ impl SchemaRegistry {
                         "schema {schema}: bring-up failed after {:?}: {e:#}",
                         started.elapsed()
                     );
+                    crate::events::journal_error(
+                        "bring-up",
+                        format!(
+                            "schema {schema}: bring-up failed after {:?}: {e:#}",
+                            started.elapsed()
+                        ),
+                    );
                     return Err(e);
                 }
             }
@@ -676,30 +683,7 @@ impl SchemaRegistry {
         let stopped = victims.len();
         for (schema, entry) in victims {
             info!("idle-stopping VM for schema {schema} (no connections for >= {timeout:?})");
-            // Checkpoint before the kill. `sandbox.stop()` is an unclean
-            // power-off (Postgres never sees a shutdown signal), and the VMs
-            // run synchronous_commit=off — so without this, up to the last
-            // ~600ms of acked commits ride on luck and every restart replays
-            // WAL back to the previous checkpoint. One CHECKPOINT over the
-            // warm pool flushes everything acked and empties the replay
-            // queue, making the next boot's recovery a no-op. Best-effort:
-            // if it fails or times out we stop anyway — crash recovery
-            // handles it, that's the design.
-            let checkpoint = async {
-                let client = entry.pool.get().await?;
-                client.batch_execute("CHECKPOINT").await?;
-                Ok::<(), anyhow::Error>(())
-            };
-            match tokio::time::timeout(PRE_STOP_CHECKPOINT_TIMEOUT, checkpoint).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("pre-stop CHECKPOINT for schema {schema} failed: {e:#}"),
-                Err(_) => warn!(
-                    "pre-stop CHECKPOINT for schema {schema} timed out after {PRE_STOP_CHECKPOINT_TIMEOUT:?}"
-                ),
-            }
-            if let Err(e) = entry.sandbox.stop().await {
-                warn!("failed to stop idle VM for schema {schema}: {e:#}");
-            }
+            checkpoint_and_stop(&entry, &schema).await;
             // Dropping the last Arc here tears down the tunnel + pool. Data on
             // the VM's /dev/vdb persists; a later connect restarts the VM.
         }
@@ -867,6 +851,14 @@ impl SchemaRegistry {
             p.high_pct,
             p.low_pct
         );
+        crate::events::journal_error(
+            "sweep.pressure",
+            format!(
+                "{} at {pct:.1}% (>= {:.1}%) — emergency archiving engaged",
+                p.path.display(),
+                p.high_pct
+            ),
+        );
 
         // Live view for skipping busy schemas without paying a bring-up.
         let active: HashMap<String, usize> = self
@@ -897,6 +889,12 @@ impl SchemaRegistry {
                         p.path.display(),
                         p.low_pct
                     );
+                    crate::events::journal_info(
+                        "sweep.pressure",
+                        format!(
+                            "stood down at {cur:.1}% after {archived} emergency archive(s)"
+                        ),
+                    );
                     return archived;
                 }
                 _ => {}
@@ -923,6 +921,12 @@ impl SchemaRegistry {
                              failures — environment unhealthy; re-checking in {:?}",
                             p.check_interval
                         );
+                        crate::events::journal_error(
+                            "sweep.pressure",
+                            format!(
+                                "ABORTED after 3 consecutive failures ({archived} archived first)"
+                            ),
+                        );
                         return archived;
                     }
                 }
@@ -936,6 +940,13 @@ impl SchemaRegistry {
                  the remaining usage is running/keepalive VMs or non-VM data; eviction alone \
                  cannot relieve this",
                 p.path.display()
+            );
+            crate::events::journal_error(
+                "sweep.pressure",
+                format!(
+                    "exhausted all candidates, disk still at {cur:.1}% — eviction alone \
+                     cannot relieve this ({archived} archived)"
+                ),
             );
         }
         archived
@@ -1049,21 +1060,38 @@ impl SchemaRegistry {
 
         // Promote frozen dumps first: cheap (a file upload, no VM), and every
         // success frees local disk.
+        let n_frozen = frozen_candidates.len();
         let mut archived_frozen = 0usize;
         for schema in frozen_candidates {
             match self.archive_frozen_schema(&schema).await {
                 Ok(()) => archived_frozen += 1,
-                Err(e) => warn!(
-                    "promoting frozen schema {schema} to S3 failed (will retry next sweep): {e:#}"
-                ),
+                Err(e) => {
+                    warn!(
+                        "promoting frozen schema {schema} to S3 failed (will retry next sweep): {e:#}"
+                    );
+                    crate::events::journal_error(
+                        "archive",
+                        format!("promoting frozen schema {schema} to S3 failed: {e:#}"),
+                    );
+                }
             }
         }
 
         if candidates.is_empty() {
+            // Journal only sweeps that had work; a quiet fleet's no-op passes
+            // would drown the events page.
+            if n_frozen > 0 {
+                crate::events::journal_info(
+                    "sweep.archive",
+                    format!("promoted {archived_frozen}/{n_frozen} frozen dump(s) to S3"),
+                );
+            }
             return archived_frozen;
         }
+        let n_live = candidates.len();
         let mut archived = archived_frozen;
         let mut consecutive_failures = 0usize;
+        let mut aborted = false;
         for schema in candidates {
             match self.archive_schema(&schema).await {
                 Ok(()) => {
@@ -1080,11 +1108,24 @@ impl SchemaRegistry {
                              or S3), and each failure burns minutes of wedged bring-up; remaining \
                              candidates will be retried next sweep"
                         );
+                        aborted = true;
                         break;
                     }
                 }
             }
         }
+        crate::events::journal_info(
+            "sweep.archive",
+            format!(
+                "archived {archived}/{} ({n_live} live + {n_frozen} frozen promotion(s)){}",
+                n_live + n_frozen,
+                if aborted {
+                    " — ABORTED after 3 consecutive failures"
+                } else {
+                    ""
+                }
+            ),
+        );
         archived
     }
 
@@ -1092,7 +1133,26 @@ impl SchemaRegistry {
     /// Also the target of the dashboard's manual "reap" button. Refuses if the
     /// VM has live client sessions. Serializes against [`Self::checkout`] via the
     /// `archiving` set so a client can't bring the VM back up mid-operation.
+    ///
+    /// Every outcome is journaled for the dashboard's events page — this
+    /// wrapper is the single choke point all archive callers (periodic sweep,
+    /// pressure reaper, manual reap) go through.
     pub async fn archive_schema(&self, schema: &str) -> Result<()> {
+        let res = self.archive_schema_inner(schema).await;
+        match &res {
+            Ok(()) => crate::events::journal_info(
+                "archive",
+                format!("schema {schema} → archived (S3)"),
+            ),
+            Err(e) => crate::events::journal_error(
+                "archive",
+                format!("schema {schema}: {e:#}"),
+            ),
+        }
+        res
+    }
+
+    async fn archive_schema_inner(&self, schema: &str) -> Result<()> {
         let Some(archive) = self.cfg.archive.clone() else {
             bail!("S3 eviction tier is not configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*)");
         };
@@ -1137,9 +1197,17 @@ impl SchemaRegistry {
             .await
             .with_context(|| format!("bringing up VM for schema {schema} to archive it"))?;
 
-        vm::dump_to_s3(&self.cfg, &entry.sandbox, schema, &archive.s3)
-            .await
-            .with_context(|| format!("dumping schema {schema} to S3"))?;
+        // On dump failure, stop the VM this attempt booted before propagating.
+        // Without this every failed archive leaks a running VM — nothing else
+        // owns it (the warm entry was evicted above, so the idle reaper never
+        // sees it), it burns RAM, and it pins its disk open against reclaim.
+        // A whole sweep of failures leaks a fleet of them at once. Stop, not
+        // kill: the data on its disk is still the only copy.
+        if let Err(e) = vm::dump_to_s3(&self.cfg, &entry.sandbox, schema, &archive.s3).await {
+            warn!("schema {schema}: dump failed; stopping the VM booted for this attempt");
+            checkpoint_and_stop(&entry, schema).await;
+            return Err(e).with_context(|| format!("dumping schema {schema} to S3"));
+        }
 
         self.store.set_tier(schema, Tier::Archived).await;
         let accomplished = format!("dumped to s3://{}/{}", archive.s3.bucket, archive.s3.object_key(schema));
@@ -1313,8 +1381,10 @@ impl SchemaRegistry {
                 String::new()
             }
         );
+        let n = candidates.len();
         let mut frozen = 0usize;
         let mut consecutive_failures = 0usize;
+        let mut aborted = false;
         for schema in candidates {
             match self.freeze_schema(&schema).await {
                 Ok(()) => {
@@ -1330,11 +1400,28 @@ impl SchemaRegistry {
                              consecutive failures — environment looks unhealthy; remaining \
                              candidates will be retried next sweep"
                         );
+                        aborted = true;
                         break;
                     }
                 }
             }
         }
+        crate::events::journal_info(
+            "sweep.freeze",
+            format!(
+                "froze {frozen}/{n} candidate(s){}{}",
+                if backlog > 0 {
+                    format!(" ({backlog} deferred)")
+                } else {
+                    String::new()
+                },
+                if aborted {
+                    " — ABORTED after 3 consecutive failures"
+                } else {
+                    ""
+                }
+            ),
+        );
         frozen
     }
 
@@ -1343,7 +1430,25 @@ impl SchemaRegistry {
     /// claim (checkouts wait), live-session refusal, dump verified complete
     /// (size-checked by `dump_to_local`) *before* the durable tier flip, and
     /// the tier flip durable *before* the kill.
+    ///
+    /// Journaled like [`Self::archive_schema`], as the choke point for all
+    /// freeze callers.
     pub async fn freeze_schema(&self, schema: &str) -> Result<()> {
+        let res = self.freeze_schema_inner(schema).await;
+        match &res {
+            Ok(()) => crate::events::journal_info(
+                "freeze",
+                format!("schema {schema} → frozen (local dump)"),
+            ),
+            Err(e) => crate::events::journal_error(
+                "freeze",
+                format!("schema {schema}: {e:#}"),
+            ),
+        }
+        res
+    }
+
+    async fn freeze_schema_inner(&self, schema: &str) -> Result<()> {
         let (Some(freeze), Some(dumps)) = (self.cfg.freeze.clone(), self.dumps.clone()) else {
             bail!("local freeze tier is not configured (set PG_VM_POOL_FREEZE_AFTER_SECS)");
         };
@@ -1370,7 +1475,9 @@ impl SchemaRegistry {
             .await
             .with_context(|| format!("bringing up VM for schema {schema} to freeze it"))?;
 
-        let bytes = vm::dump_to_local(
+        // Same leak guard as archive_schema_inner: a failed dump must not
+        // leave the VM it booted running and unowned.
+        let bytes = match vm::dump_to_local(
             &self.cfg,
             &entry.sandbox,
             schema,
@@ -1378,7 +1485,15 @@ impl SchemaRegistry {
             freeze.listen.port(),
         )
         .await
-        .with_context(|| format!("dumping schema {schema} to the local dump store"))?;
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("schema {schema}: dump failed; stopping the VM booted for this attempt");
+                checkpoint_and_stop(&entry, schema).await;
+                return Err(e)
+                    .with_context(|| format!("dumping schema {schema} to the local dump store"));
+            }
+        };
 
         self.store.set_tier(schema, Tier::Frozen).await;
         let accomplished = format!("frozen to a {bytes}-byte local dump");
@@ -1624,6 +1739,37 @@ impl SchemaRegistry {
 
     fn is_archiving(&self, schema: &str) -> bool {
         self.archiving.lock().unwrap().contains(schema)
+    }
+}
+
+/// Best-effort CHECKPOINT over the warm pool, then stop the VM.
+///
+/// `sandbox.stop()` is an unclean power-off (Postgres never sees a shutdown
+/// signal), and the VMs run `synchronous_commit=off` — so without the
+/// checkpoint, up to the last ~600ms of acked commits ride on luck and every
+/// restart replays WAL back to the previous checkpoint. One CHECKPOINT
+/// flushes everything acked and empties the replay queue, making the next
+/// boot's recovery a no-op. Best-effort throughout: if the checkpoint fails
+/// or times out we stop anyway (crash recovery handles it — that's the
+/// design), and a failed stop is logged, not propagated.
+///
+/// Used by the idle reaper and by the archive/freeze failure paths (a failed
+/// dump must not leak the VM it booted).
+async fn checkpoint_and_stop(entry: &SchemaEntry, schema: &str) {
+    let checkpoint = async {
+        let client = entry.pool.get().await?;
+        client.batch_execute("CHECKPOINT").await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    match tokio::time::timeout(PRE_STOP_CHECKPOINT_TIMEOUT, checkpoint).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("pre-stop CHECKPOINT for schema {schema} failed: {e:#}"),
+        Err(_) => warn!(
+            "pre-stop CHECKPOINT for schema {schema} timed out after {PRE_STOP_CHECKPOINT_TIMEOUT:?}"
+        ),
+    }
+    if let Err(e) = entry.sandbox.stop().await {
+        warn!("failed to stop VM for schema {schema}: {e:#}");
     }
 }
 
