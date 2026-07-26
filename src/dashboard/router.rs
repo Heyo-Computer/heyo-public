@@ -25,6 +25,7 @@ pub fn build(state: DashState) -> Router {
         .route("/vm/{id}/reboot", post(handlers::action_reboot))
         .route("/vm/{id}/resize", post(handlers::action_resize))
         .route("/vm/{id}/reap", post(handlers::action_reap))
+        .route("/stop-idle", post(handlers::action_stop_idle))
         .layer(middleware::from_fn_with_state(state.clone(), auth::basic_auth))
         .with_state(state)
 }

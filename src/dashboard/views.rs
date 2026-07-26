@@ -71,7 +71,15 @@ pub fn databases_page(st: &DashState, p: &SandboxPage) -> Markup {
         html! {
             div.pagehead {
                 h1 { "Databases" }
-                a.button-link href=(list_href(&p.q, &p.state, p.page, p.per)) { "↻ refresh" }
+                div.pagehead-actions {
+                    a.button-link href=(list_href(&p.q, &p.state, p.page, p.per)) { "↻ refresh" }
+                    form method="post" action="/stop-idle" class="inline-form" {
+                        button.stop
+                            title="Stop every running VM that has zero live client sessions (keep-alive schemas are skipped). Runs in the background; VMs restart on the next client connection."
+                            onclick="return confirm('Stop ALL running VMs with no live sessions? Keep-alive schemas are skipped; stopped VMs restart automatically on the next client connection.')"
+                            { "stop idle VMs" }
+                    }
+                }
             }
             form.search method="get" action="/" {
                 input type="search" name="q" value=(p.q)
@@ -98,7 +106,8 @@ pub fn databases_page(st: &DashState, p: &SandboxPage) -> Markup {
                 }
             }
             @if p.matched > 0 {
-                (vm_table(&p.rows, st.registry.archive_enabled()))
+                (vm_table(&p.rows, st.registry.archive_enabled(),
+                    &list_href(&p.q, &p.state, p.page, p.per)))
                 (pager(p))
             }
         },
@@ -890,7 +899,7 @@ pub fn vm_detail_page(
 
             section.controls {
                 h2 { "controls" }
-                div.actions { (action_buttons(r, st.registry.archive_enabled())) }
+                div.actions { (action_buttons(r, st.registry.archive_enabled(), None)) }
                 form.resize method="post" action={ "/vm/" (r.id) "/resize" } {
                     label { "resize to " }
                     select name="size_class" {
@@ -1053,7 +1062,7 @@ pub fn error_page(err: &anyhow::Error) -> Markup {
 // ---- fragments -------------------------------------------------------------
 
 /// The VM list table, shared by the index and the paged all-sandboxes view.
-fn vm_table(rows: &[VmRow], archive_enabled: bool) -> Markup {
+fn vm_table(rows: &[VmRow], archive_enabled: bool, next: &str) -> Markup {
     html! {
         table {
             thead {
@@ -1078,7 +1087,7 @@ fn vm_table(rows: &[VmRow], archive_enabled: bool) -> Markup {
                         td { (cpu_cell(r)) }
                         td { (if r.is_running() { human_secs(r.uptime_secs) } else { "—".into() }) }
                         td { (sessions_cell(r)) }
-                        td.actions { (action_buttons(r, archive_enabled)) }
+                        td.actions { (action_buttons(r, archive_enabled, Some(next))) }
                     }
                 }
             }
@@ -1086,7 +1095,10 @@ fn vm_table(rows: &[VmRow], archive_enabled: bool) -> Markup {
     }
 }
 
-fn action_buttons(r: &VmRow, archive_enabled: bool) -> Markup {
+/// `next`: where the action should land afterwards. `Some(list URL)` from the
+/// Databases table (stay on the list — stopping 40 VMs must not mean 40 detail
+/// pages); `None` from the detail page (stay on the detail page).
+fn action_buttons(r: &VmRow, archive_enabled: bool, next: Option<&str>) -> Markup {
     let running = r.status == SandboxStatus::Running;
     // Offer manual reap only for an idle, pooler-managed, running schema VM —
     // archiving one with live sessions is refused server-side, so don't tempt it.
@@ -1096,15 +1108,23 @@ fn action_buttons(r: &VmRow, archive_enabled: bool) -> Markup {
         && r.offload.is_none()
         && r.schema.is_some()
         && r.live_sessions.unwrap_or(0) == 0;
+    let next_input = || {
+        html! {
+            @if let Some(n) = next {
+                input type="hidden" name="next" value=(n);
+            }
+        }
+    };
     html! {
         @if running {
-            form method="post" action={ "/vm/" (r.id) "/stop" } { button.stop { "stop" } }
-            form method="post" action={ "/vm/" (r.id) "/reboot" } { button { "reboot" } }
+            form method="post" action={ "/vm/" (r.id) "/stop" } { (next_input()) button.stop { "stop" } }
+            form method="post" action={ "/vm/" (r.id) "/reboot" } { (next_input()) button { "reboot" } }
         } @else {
-            form method="post" action={ "/vm/" (r.id) "/start" } { button.start { "start" } }
+            form method="post" action={ "/vm/" (r.id) "/start" } { (next_input()) button.start { "start" } }
         }
         @if can_reap {
             form method="post" action={ "/vm/" (r.id) "/reap" } {
+                (next_input())
                 button.reap
                     onclick="return confirm('Reap this VM to S3? The VM and its data disk will be deleted; the data is restored from S3 on the next connection.')"
                     { "reap → S3" }

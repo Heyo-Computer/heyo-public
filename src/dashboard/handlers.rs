@@ -242,26 +242,112 @@ async fn run_lifecycle(id: &str, act: Lifecycle) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn redirect(id: &str, result: anyhow::Result<()>, ok_msg: &str) -> Redirect {
-    match result {
-        Ok(()) => Redirect::to(&format!("/vm/{id}?msg={}", qenc(ok_msg))),
-        Err(e) => Redirect::to(&format!("/vm/{id}?err={}", qenc(&e.to_string()))),
+/// Optional `next` a form can post: where to land after the action. The
+/// Databases list sets it to its own (filtered, paged) URL so a row action
+/// returns to the list instead of opening the VM's detail page; detail-page
+/// forms omit it and keep the old behavior.
+#[derive(Deserialize)]
+pub struct NextForm {
+    pub next: Option<String>,
+}
+
+impl NextForm {
+    /// The posted destination, if it's a safe local path (open-redirect guard:
+    /// absolute-path only, no scheme-relative `//host`).
+    fn dest(&self) -> Option<&str> {
+        self.next
+            .as_deref()
+            .filter(|n| n.starts_with('/') && !n.starts_with("//"))
     }
 }
 
-pub async fn action_start(Path(id): Path<String>) -> Redirect {
+fn redirect(id: &str, result: anyhow::Result<()>, ok_msg: &str, next: Option<&str>) -> Redirect {
+    let (key, val) = match result {
+        Ok(()) => ("msg", ok_msg.to_string()),
+        Err(e) => ("err", e.to_string()),
+    };
+    match next {
+        Some(n) => {
+            let sep = if n.contains('?') { '&' } else { '?' };
+            Redirect::to(&format!("{n}{sep}{key}={}", qenc(&val)))
+        }
+        None => Redirect::to(&format!("/vm/{id}?{key}={}", qenc(&val))),
+    }
+}
+
+pub async fn action_start(Path(id): Path<String>, Form(f): Form<NextForm>) -> Redirect {
     let r = run_lifecycle(&id, Lifecycle::Start).await;
-    redirect(&id, r, "started")
+    redirect(&id, r, "started", f.dest())
 }
 
-pub async fn action_stop(Path(id): Path<String>) -> Redirect {
+pub async fn action_stop(Path(id): Path<String>, Form(f): Form<NextForm>) -> Redirect {
     let r = run_lifecycle(&id, Lifecycle::Stop).await;
-    redirect(&id, r, "stopped")
+    redirect(&id, r, "stopped", f.dest())
 }
 
-pub async fn action_reboot(Path(id): Path<String>) -> Redirect {
+pub async fn action_reboot(Path(id): Path<String>, Form(f): Form<NextForm>) -> Redirect {
     let r = run_lifecycle(&id, Lifecycle::Reboot).await;
-    redirect(&id, r, "rebooting")
+    redirect(&id, r, "rebooting", f.dest())
+}
+
+/// Bulk stop: every running VM with zero live sessions (keep-alive schemas
+/// excluded, non-pool VMs untouched). The exact remedy for a fleet of VMs
+/// left running by failed offload attempts — one button instead of one detail
+/// page per VM. Stops run sequentially in the background (48 VMs × a slow
+/// stop would blow the request timeout); the outcome lands in the journal.
+pub async fn action_stop_idle(State(st): State<DashState>) -> Redirect {
+    tokio::spawn(async move {
+        use anyhow::Context;
+        let rows = match model::build_rows(&st).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("stop-idle: reading VM inventory failed: {e:#}");
+                return;
+            }
+        };
+        let (mut stopped, mut failed) = (0usize, 0usize);
+        for r in rows {
+            if !r.is_running()
+                || r.keepalive
+                || r.live_sessions.unwrap_or(0) > 0
+                || !(r.pool_managed || r.name.starts_with("spare-pg-"))
+            {
+                continue;
+            }
+            let res = async {
+                let sb = Sandbox::connect(r.id.clone(), vm::local_opts())
+                    .context("connecting to VM")?;
+                tokio::time::timeout(ACTION_TIMEOUT, sb.stop())
+                    .await
+                    .context("stop timed out")??;
+                anyhow::Ok(())
+            }
+            .await;
+            match res {
+                Ok(()) => stopped += 1,
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!("stop-idle: stopping {} ({}) failed: {e:#}", r.name, r.id);
+                }
+            }
+        }
+        tracing::info!("stop-idle: stopped {stopped} VM(s), {failed} failed");
+        crate::events::journal_info(
+            "stop-idle",
+            format!(
+                "bulk-stopped {stopped} session-less running VM(s){}",
+                if failed > 0 {
+                    format!(", {failed} failed")
+                } else {
+                    String::new()
+                }
+            ),
+        );
+    });
+    Redirect::to(&format!(
+        "/?msg={}",
+        qenc("stopping all session-less running VMs in the background; outcome lands on the events page")
+    ))
 }
 
 #[derive(Deserialize)]
@@ -286,7 +372,8 @@ pub async fn action_resize(Path(id): Path<String>, Form(form): Form<ResizeForm>)
         anyhow::Ok(())
     }
     .await;
-    redirect(&id, result, &format!("resized to {}", size.as_str()))
+    // Resize lives only on the detail page; no `next` to honor.
+    redirect(&id, result, &format!("resized to {}", size.as_str()), None)
 }
 
 /// Manually reap a pool-managed VM to S3: dump its database and kill the VM to
@@ -294,21 +381,35 @@ pub async fn action_resize(Path(id): Path<String>, Form(form): Form<ResizeForm>)
 /// dump+kill can take minutes for a large database, so it runs in the background
 /// and this redirects immediately — watch the pooler log (and the VM's status,
 /// which flips to "Archived (S3)") for the outcome.
-pub async fn action_reap(State(st): State<DashState>, Path(id): Path<String>) -> Redirect {
+pub async fn action_reap(
+    State(st): State<DashState>,
+    Path(id): Path<String>,
+    Form(f): Form<NextForm>,
+) -> Redirect {
+    // Land back where the form was submitted from (list or detail).
+    let back = |query: String| -> Redirect {
+        match f.dest() {
+            Some(n) => {
+                let sep = if n.contains('?') { '&' } else { '?' };
+                Redirect::to(&format!("{n}{sep}{query}"))
+            }
+            None => Redirect::to(&format!("/vm/{id}?{query}")),
+        }
+    };
     if !st.registry.archive_enabled() {
-        return Redirect::to(&format!(
-            "/vm/{id}?err={}",
+        return back(format!(
+            "err={}",
             qenc("S3 eviction tier is not configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*)")
         ));
     }
     let schema = match model::find_row(&st, &id).await {
         Ok(Some(row)) => row.schema,
         Ok(None) => None,
-        Err(e) => return Redirect::to(&format!("/vm/{id}?err={}", qenc(&e.to_string()))),
+        Err(e) => return back(format!("err={}", qenc(&e.to_string()))),
     };
     let Some(schema) = schema else {
-        return Redirect::to(&format!(
-            "/vm/{id}?err={}",
+        return back(format!(
+            "err={}",
             qenc("not a pooler-managed schema VM — nothing to archive")
         ));
     };
@@ -318,8 +419,8 @@ pub async fn action_reap(State(st): State<DashState>, Path(id): Path<String>) ->
             tracing::warn!("manual reap of schema {schema} to S3 failed: {e:#}");
         }
     });
-    Redirect::to(&format!(
-        "/vm/{id}?msg={}",
+    back(format!(
+        "msg={}",
         qenc("reap to S3 started; watch the pooler log")
     ))
 }
