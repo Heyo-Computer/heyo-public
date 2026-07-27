@@ -1529,6 +1529,55 @@ async fn resolve_sandbox(
     create_vm(cfg, name, keepalive).await
 }
 
+/// Grow a sandbox's persistent data device to `target_gb` through the
+/// daemon's offline workspace resize (`POST /deployed-sandboxes/{id}/resize`
+/// with `disk_size_gb`; heyvmd's workspace-resize feature, grow-only).
+///
+/// The daemon takes the sandbox's lifecycle lock, stops it, grows the image
+/// and its ext4 in place, cold-boots once to verify the new capacity from
+/// inside the guest, and restores the stopped state — so calling this on a
+/// VM that was just idle-stopped is free of client disruption. The whole
+/// round-trip can take minutes (a cold boot is embedded in it); the timeout
+/// reflects that.
+///
+/// Raw HTTP rather than the SDK: the published heyo-sdk (0.1.5) predates
+/// `Sandbox::resize_disk`. Swap to the SDK call once 0.1.6 ships — the wire
+/// format here is byte-identical to it.
+pub(crate) async fn resize_disk(sandbox_id: &str, target_gb: u64) -> Result<()> {
+    resize_disk_at(DEFAULT_LOCAL_BASE_URL, sandbox_id, target_gb).await
+}
+
+/// [`resize_disk`] against an explicit daemon base URL — split out so tests
+/// can exercise the real HTTP round-trip against an in-process server.
+async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Result<()> {
+    anyhow::ensure!(
+        (1..=250).contains(&target_gb),
+        "disk_size_gb must be within 1–250 GiB (daemon limit)"
+    );
+    let url = format!("{base_url}/deployed-sandboxes/{sandbox_id}/resize");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .context("building HTTP client for daemon resize")?;
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(format!("{{\"disk_size_gb\":{target_gb}}}"))
+        .send()
+        .await
+        .context("calling the daemon's workspace resize")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!(
+            "daemon workspace resize returned {status}: {} (a 404/405 means the \
+             deployed heyvmd predates the workspace-resize feature)",
+            body.trim()
+        );
+    }
+    Ok(())
+}
+
 /// Best-effort stop of whatever VM a failed offload bring-up may have left
 /// running — the ready-timeout case: the sandbox started, but Postgres never
 /// answered (sick disk, wedged boot), so `ensure_vm` errored without ever
@@ -2277,6 +2326,65 @@ mod tests {
         assert!(
             !matches!(probe_pg(&pool_at(port)).await, PgProbe::Unreachable(_)),
             "a slow-but-listening VM must not be classified Unreachable"
+        );
+    }
+
+    /// Spin an in-process daemon stub that records resize requests and answers
+    /// with `status`, returning (base_url, received-request log).
+    async fn resize_stub(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+        use axum::extract::Path as AxPath;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+        let log = seen.clone();
+        let app = axum::Router::new().route(
+            "/deployed-sandboxes/{id}/resize",
+            axum::routing::post(move |AxPath(id): AxPath<String>, req_body: String| {
+                log.lock().unwrap().push((id, req_body));
+                async move { (status, body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(axum::serve(listener, app).into_future());
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn resize_disk_posts_the_daemon_wire_format() {
+        let (base, seen) = resize_stub(axum::http::StatusCode::OK, "{}").await;
+        resize_disk_at(&base, "sb-abc123", 8).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        // Exactly the SDK's ResizeDiskRequest shape, addressed to the right VM.
+        assert_eq!(seen[0].0, "sb-abc123");
+        assert_eq!(seen[0].1, r#"{"disk_size_gb":8}"#);
+    }
+
+    #[tokio::test]
+    async fn resize_disk_surfaces_daemon_errors_with_body() {
+        let (base, _) = resize_stub(
+            axum::http::StatusCode::BAD_REQUEST,
+            "insufficient host storage for 8 GiB workspace",
+        )
+        .await;
+        let err = resize_disk_at(&base, "sb-x", 8).await.unwrap_err().to_string();
+        assert!(err.contains("400"), "status surfaced: {err}");
+        assert!(
+            err.contains("insufficient host storage"),
+            "daemon's own reason surfaced: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resize_disk_rejects_out_of_range_sizes_without_calling_out() {
+        let (base, seen) = resize_stub(axum::http::StatusCode::OK, "{}").await;
+        assert!(resize_disk_at(&base, "sb-x", 0).await.is_err());
+        assert!(resize_disk_at(&base, "sb-x", 251).await.is_err());
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "invalid sizes must be rejected before any daemon call"
         );
     }
 }

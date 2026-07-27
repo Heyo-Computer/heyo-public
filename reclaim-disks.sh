@@ -30,7 +30,7 @@
 # provisioned size, and the ~1GB of full-device ext4 metadata stays allocated
 # forever. Shrinking retro-fits the thin-provisioning cap the image now applies
 # at first format (see init.sh): target = used * 1.25, floored at MIN_FS_MB
-# (default 4096, matching init.sh's initial size); the guest's grow watcher
+# (default 2048, matching init.sh's initial size); the guest's grow watcher
 # re-extends the filesystem online if the database needs more. Blocks past the
 # new filesystem end are hole-punched out of the backing file directly (fstrim
 # can't reach past the fs). The shrunk fs is re-fscked before anything mounts
@@ -58,7 +58,7 @@ set -uo pipefail
 RUN_DIR="${1:-${HOME}/.heyo/run}"
 DRY_RUN="${DRY_RUN:-0}"
 SHRINK="${SHRINK:-0}"
-MIN_FS_MB="${MIN_FS_MB:-4096}"
+MIN_FS_MB="${MIN_FS_MB:-2048}"
 PRUNE_SWAP="${PRUNE_SWAP:-0}"
 
 die() { echo "error: $*" >&2; exit 1; }

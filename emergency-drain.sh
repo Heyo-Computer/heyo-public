@@ -872,7 +872,7 @@ phase_disks() {
     echo "   $legacy_n legacy full-format disk(s) (fs spans the ceiling; fix: SHRINK reclaim once stopped)"
     echo "   ~$(human "$stopped_slack") immediately reclaimable on stopped disks (allocated beyond fs-used)"
     echo "   Note: allocation under running VMs only returns after stop + reclaim; a"
-    echo "   thin-image VM allocates ~600MB at birth and grows with data."
+    echo "   thin-image VM allocates ~400MB at birth and grows with data."
 }
 
 # ------------------------------------------------------------- readopt ----

@@ -80,6 +80,13 @@ pub struct Config {
     /// restarts. Env `PG_VM_POOL_METRICS_DIR`; defaults to `metrics/` next to
     /// the state file.
     pub metrics_dir: PathBuf,
+    /// Automatic on-demand growth of a VM's data *device* through the
+    /// daemon's offline workspace resize. `None` (the default) disables it —
+    /// enabled by `PG_VM_POOL_DISK_GROW_PCT`, and requires a heyvmd with the
+    /// workspace-resize feature. Pairs with a small
+    /// `PG_VM_POOL_DATA_DISK_GB` so VMs start at the minimum and the ceiling
+    /// grows with real data instead of being provisioned at the maximum.
+    pub disk_grow: Option<DiskGrowConfig>,
     /// TLS certificate chain + private key (PEM) for client-facing TLS. Both
     /// set → the pooler answers the Postgres `SSLRequest` with `S` and speaks
     /// TLS; unset → it declines (`N`) as before. Files are re-read on change,
@@ -245,6 +252,44 @@ impl FreezeConfig {
     }
 }
 
+/// Settings for automatic data-device growth (see `Config::disk_grow`).
+#[derive(Clone, Copy)]
+pub struct DiskGrowConfig {
+    /// Guest-filesystem used% at or above which the device is grown at the
+    /// next idle stop. Env `PG_VM_POOL_DISK_GROW_PCT` — setting it (> 0) is
+    /// the on/off switch; sensible range 50–95.
+    pub pct: f64,
+    /// Ceiling the device is never grown past, in GiB. Env
+    /// `PG_VM_POOL_DISK_MAX_GB` (default 100; the daemon caps at 250).
+    pub max_gb: u64,
+}
+
+impl DiskGrowConfig {
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        let pct = match std::env::var("PG_VM_POOL_DISK_GROW_PCT") {
+            Ok(v) => match v.trim().parse::<f64>() {
+                Ok(p) if p > 0.0 => p,
+                Ok(_) => return Ok(None),
+                Err(_) => anyhow::bail!("invalid PG_VM_POOL_DISK_GROW_PCT: {v:?}"),
+            },
+            Err(_) => return Ok(None),
+        };
+        anyhow::ensure!(
+            (1.0..=99.0).contains(&pct),
+            "PG_VM_POOL_DISK_GROW_PCT ({pct}) must be within 1–99"
+        );
+        let max_gb = std::env::var("PG_VM_POOL_DISK_MAX_GB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(100);
+        anyhow::ensure!(
+            (1..=250).contains(&max_gb),
+            "PG_VM_POOL_DISK_MAX_GB ({max_gb}) must be within 1–250 (daemon limit)"
+        );
+        Ok(Some(Self { pct, max_gb }))
+    }
+}
+
 /// Settings for emergency disk-pressure eviction: when the VM-disk filesystem
 /// crosses a high-water mark, the pooler archives the *oldest-idle* schemas to
 /// S3 — ignoring `archive_after`; pressure overrides the TTL — until usage
@@ -365,6 +410,8 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_KEEPALIVE_SCHEMAS",
     "PG_VM_POOL_STATE_FILE",
     "PG_VM_POOL_METRICS_DIR",
+    "PG_VM_POOL_DISK_GROW_PCT",
+    "PG_VM_POOL_DISK_MAX_GB",
     "PG_VM_POOL_TLS_CERT",
     "PG_VM_POOL_TLS_KEY",
     "PG_VM_POOL_DASHBOARD_LISTEN",
@@ -451,7 +498,7 @@ impl Config {
         let data_disk_gb = std::env::var("PG_VM_POOL_DATA_DISK_GB")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4u32);
+            .unwrap_or(2u32);
         // Default on; only "0"/"false"/"no" (case-insensitive) disables it.
         let direct_connect = match std::env::var("PG_VM_POOL_DIRECT_CONNECT") {
             Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"),
@@ -576,6 +623,7 @@ impl Config {
             direct_connect,
             state_file,
             metrics_dir,
+            disk_grow: DiskGrowConfig::from_env()?,
             tls_cert,
             tls_key,
             dashboard,

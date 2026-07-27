@@ -14,7 +14,7 @@ use heyo_sdk::{HeyoError, P2pTunnel, Sandbox};
 use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, PressureConfig};
+use crate::config::{Config, DiskGrowConfig, PressureConfig};
 use crate::dumpsrv::DumpServer;
 use crate::reclaim::{POST_STOP_RECLAIM_DELAY, RECLAIM_FIRST_DELAY, Reclaimer};
 use crate::spares::SparePool;
@@ -651,6 +651,14 @@ impl SchemaRegistry {
             return;
         };
         info!("idle reaper: stopping VMs after {timeout:?} without connections");
+        match self.cfg.disk_grow {
+            Some(g) => info!(
+                "disk growth: at idle-stop, devices spanned by a >= {:.0}%-full data fs \
+                 are doubled offline (cap {}GiB, via the daemon's workspace resize)",
+                g.pct, g.max_gb
+            ),
+            None => info!("disk growth disabled (PG_VM_POOL_DISK_GROW_PCT unset)"),
+        }
         let registry = self.clone();
         // Check a few times per timeout window so shutdown lands close to the
         // deadline, but not so often it busies the daemon.
@@ -681,8 +689,25 @@ impl SchemaRegistry {
             });
         }
         let stopped = victims.len();
+        // Device-growth candidates discovered while stopping: (schema, id,
+        // target GiB). Sampled over the still-warm pool BEFORE the stop tears
+        // it down — after the stop there's no cheap way to ask the guest, and
+        // the resize is cheapest exactly then (the daemon's resize is offline;
+        // on an already-stopped VM it costs no client disruption at all).
+        let mut grow: Vec<(String, String, u64)> = Vec::new();
         for (schema, entry) in victims {
             info!("idle-stopping VM for schema {schema} (no connections for >= {timeout:?})");
+            if let Some(gc) = self.cfg.disk_grow
+                && let Some((fs, dev)) = sample_disk(&entry).await
+                && let Some(target) = grow_target_gb(fs, dev, &gc)
+            {
+                info!(
+                    "schema {schema}: data fs is >= {:.0}% full and spans its device — \
+                     queueing offline device grow to {target}GiB",
+                    gc.pct
+                );
+                grow.push((schema.clone(), entry.sandbox_id(), target));
+            }
             checkpoint_and_stop(&entry, &schema).await;
             // Dropping the last Arc here tears down the tunnel + pool. Data on
             // the VM's /dev/vdb persists; a later connect restarts the VM.
@@ -695,6 +720,34 @@ impl SchemaRegistry {
             && let Some(reclaimer) = &self.reclaimer
         {
             reclaimer.spawn_soon(POST_STOP_RECLAIM_DELAY);
+        }
+        // Run queued device grows in the background, strictly sequential (the
+        // daemon single-flights resizes anyway) and each under the boot
+        // permit: the daemon's resize fscks and cold-boots the stopped disk,
+        // which must never interleave with a reclaim pass fsck'ing the same
+        // file (see reclaim::BOOT_GATE).
+        if !grow.is_empty() {
+            tokio::spawn(async move {
+                for (schema, id, target) in grow {
+                    let _permit = crate::reclaim::boot_permit().await;
+                    match vm::resize_disk(&id, target).await {
+                        Ok(()) => {
+                            info!("schema {schema}: data device grown to {target}GiB");
+                            crate::events::journal_info(
+                                "disk-grow",
+                                format!("schema {schema}: device grown to {target}GiB ({id})"),
+                            );
+                        }
+                        Err(e) => {
+                            warn!("schema {schema}: device grow to {target}GiB failed: {e:#}");
+                            crate::events::journal_error(
+                                "disk-grow",
+                                format!("schema {schema}: grow of {id} to {target}GiB failed: {e:#}"),
+                            );
+                        }
+                    }
+                }
+            });
         }
         stopped
     }
@@ -1756,6 +1809,62 @@ impl SchemaRegistry {
     }
 }
 
+/// One GiB, for device-size math.
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Sample a warm VM's data filesystem (total, used, avail bytes via `df` over
+/// the pool, like `guest_stats`) plus its backing *device* size (sysfs sector
+/// count × 512 via `pg_read_file` — the same source the daemon's own resize
+/// verification reads in-guest). `None` when either read fails within the
+/// stats timeout; the caller just skips growth this cycle.
+async fn sample_disk(entry: &SchemaEntry) -> Option<((u64, u64, u64), u64)> {
+    let query = async {
+        let mut client = entry.pool.get().await.ok()?;
+        // Explicit (offset, length): sysfs files stat as 0 bytes, so the
+        // whole-file form of pg_read_file reads nothing (same as /proc).
+        let sectors: String = client
+            .query_one(
+                "SELECT pg_read_file('/sys/class/block/vdb/size', 0, 64)",
+                &[],
+            )
+            .await
+            .ok()?
+            .get(0);
+        let device = sectors.trim().parse::<u64>().ok()?.checked_mul(512)?;
+        let fs = df_data_dir(&mut client).await?;
+        Some((fs, device))
+    };
+    tokio::time::timeout(STATS_TIMEOUT, query).await.ok()?
+}
+
+/// Decide whether (and to what) an idle-stopping VM's data device should
+/// grow. `fs` is the guest data filesystem's (total, used, avail) and
+/// `device_bytes` its backing device size.
+///
+/// Grows only when BOTH hold:
+/// - used% (df semantics: used / (used + avail)) is at/above the trigger, and
+/// - the filesystem spans (>= 90% of) the device — a thin fs below its cap is
+///   the guest grow-watcher's job (it extends the fs online long before the
+///   device matters); the device is only the binding constraint once the fs
+///   has nowhere left to grow inside it.
+///
+/// The step doubles the device (whole GiB, current size rounded up), capped
+/// at `cfg.max_gb` — the same amortization policy as the guest fs watcher.
+fn grow_target_gb(fs: (u64, u64, u64), device_bytes: u64, cfg: &DiskGrowConfig) -> Option<u64> {
+    let (total, used, avail) = fs;
+    if used_pct(used, avail)? < cfg.pct {
+        return None;
+    }
+    if total < device_bytes.saturating_mul(9) / 10 {
+        return None;
+    }
+    let current_gb = device_bytes.div_ceil(GIB).max(1);
+    if current_gb >= cfg.max_gb {
+        return None;
+    }
+    Some((current_gb * 2).min(cfg.max_gb))
+}
+
 /// Best-effort CHECKPOINT over the warm pool, then stop the VM.
 ///
 /// `sandbox.stop()` is an unclean power-off (Postgres never sees a shutdown
@@ -2118,6 +2227,40 @@ fn used_pct(used: u64, avail: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grow_target_doubles_capped_and_gates_correctly() {
+        let cfg = DiskGrowConfig { pct: 80.0, max_gb: 100 };
+        let gib = |n: u64| n * GIB;
+
+        // 4GiB device, fs spans it, 90% used → double to 8.
+        assert_eq!(
+            grow_target_gb((gib(4), gib(4) * 9 / 10, gib(4) / 10), gib(4), &cfg),
+            Some(8)
+        );
+        // Below the trigger → no growth.
+        assert_eq!(
+            grow_target_gb((gib(4), gib(2), gib(2)), gib(4), &cfg),
+            None
+        );
+        // Full fs but THIN under a bigger device → the guest watcher's job.
+        assert_eq!(
+            grow_target_gb((gib(4), gib(4) * 9 / 10, gib(4) / 10), gib(16), &cfg),
+            None
+        );
+        // Doubling past the cap clamps to it.
+        assert_eq!(
+            grow_target_gb((gib(64), gib(60), gib(4)), gib(64), &cfg),
+            Some(100)
+        );
+        // Already at the cap → never grows.
+        assert_eq!(
+            grow_target_gb((gib(100), gib(95), gib(5)), gib(100), &cfg),
+            None
+        );
+        // Unreadable df (0/0) → no decision.
+        assert_eq!(grow_target_gb((0, 0, 0), gib(4), &cfg), None);
+    }
 
     #[test]
     fn used_pct_matches_df_semantics() {

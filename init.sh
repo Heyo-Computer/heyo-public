@@ -38,7 +38,14 @@ PGDATA="${PGDATA:-/workspace/pgdata}"
 # this also bounds how much host disk one VM can strand — and skips the ~1GB of
 # ext4 metadata a full-device format writes up front. Override via the kernel
 # cmdline (`pgdata_init_mb=8192`).
-INIT_FS_MB=4096
+#
+# 2048 is a sized choice, not a guess: at 2GB the fixed floors — ~100MB ext4
+# metadata/journal, fs/8 = 256MB swap, the 256MB max_wal_size floor (below),
+# ~40MB fresh cluster — commit ~0.65GB (~32%), leaving ~1GB of data room
+# before the pooler's device-grow trigger. Matches the pooler's default
+# PG_VM_POOL_DATA_DISK_GB=2 (fs == device at birth) and reclaim-disks.sh's
+# MIN_FS_MB shrink floor; change the three together.
+INIT_FS_MB=2048
 
 echo "[init] mounting pseudo-filesystems"
 mount -t proc     proc     /proc      2>/dev/null || true
@@ -132,7 +139,7 @@ if [ -b "$DATA_DEV" ]; then
         # device — the fs starts small under thin provisioning and the device
         # size is just the cap), and only create it with 2x headroom so it
         # can't crowd out the data it exists to save. Created once at first
-        # boot, so on a thin fs it starts small (512MB on the 4GB initial fs)
+        # boot, so on a thin fs it starts small (256MB on the 2GB initial fs)
         # and stays that size as the fs grows — it's an emergency spillway,
         # not a working set.
         disk_eighth=$(df -Pm "$WORKSPACE" | awk 'NR==2 {print int($2/8)}')
@@ -299,16 +306,18 @@ autovac_mem_mb=$((maint_mem_mb / 4)); [ "$autovac_mem_mb" -gt 256 ] && autovac_m
 # table (~1x dataset), the destination sheet table (~1x), WAL, and the
 # swapfile all share this disk at once. WAL gets disk/8 — a soft cap that
 # only overshoots when checkpoints lag — leaving ~2x-dataset headroom plus
-# swap (also capped at disk/8, above) on the default 4GB volume. The 512MB
-# floor trades checkpoint frequency for safety on tiny disks: worst case is
-# more checkpoints during a big load, never a WAL-full PANIC.
+# swap (also capped at disk/8, above). The 256MB floor trades checkpoint
+# frequency for safety on tiny disks: worst case is more checkpoints during a
+# big load, never a WAL-full PANIC. (Was 512MB when disks started at 4GB;
+# halved with the 2GB initial size so the floor stays disk/8, not disk/4 —
+# the same proportional budget, one checkpoint-frequency notch tighter.)
 # Both are derived from the *current filesystem* size, not the device: under
 # thin provisioning the fs starts small and grows, and the grow watcher (below)
 # recomputes + SIGHUPs these on every growth step, so they track the space that
 # actually exists. Shared helpers so boot and watcher can't drift apart.
 wal_mb_for() {
     v=$(($1 / 8))
-    [ "$v" -lt 512 ] && v=512
+    [ "$v" -lt 256 ] && v=256
     [ "$v" -gt 4096 ] && v=4096
     echo "$v"
 }
@@ -479,7 +488,7 @@ fi
 # below 1GB or 1/8 of the filesystem, whichever is larger. That headroom covers
 # several seconds of worst-case bulk-load writes between 5s polls; if a burst
 # outruns it anyway the damage is one query's disk-full error, and the next poll
-# still grows the filesystem (WAL keeps 512MB+ of budget, so the PANIC path
+# still grows the filesystem (WAL keeps 256MB+ of budget, so the PANIC path
 # stays guarded). After each step the disk-derived Postgres knobs are recomputed
 # and reloaded (both are SIGHUP-safe). Exits once the filesystem spans the
 # device — immediately on legacy disks formatted before thin provisioning.
