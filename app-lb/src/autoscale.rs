@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use heyo_sdk::SandboxInfo;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -45,6 +45,78 @@ impl Autoscaler {
 
     fn next_nonce(&self) -> u64 {
         self.nonce.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Whether `d` is still the registry's object for its id.
+    ///
+    /// It may not be. `reconcile` works from a snapshot taken at the top of the
+    /// tick, and then awaits — on a VM create, on a health probe — for long
+    /// enough that an admin request can deregister the deployment or rebuild it
+    /// underneath us. `Registry::remove`, `upsert` and `update` all install a
+    /// *different* `Arc<Deployment>` (or none), so pointer identity is the test.
+    fn is_live(&self, d: &Arc<Deployment>) -> bool {
+        self.registry
+            .get(&d.spec.id)
+            .is_some_and(|live| Arc::ptr_eq(&live, d))
+    }
+
+    /// Which of `ids` no live deployment is tracking any more.
+    ///
+    /// This is the fix for a leak with no other backstop than the VM's TTL: a
+    /// sandbox created (or promoted) against a `Deployment` the registry has
+    /// since dropped is published to an object nothing reads, so no `prune`,
+    /// `reap_drained` or `teardown` will ever see it. It keeps running, unrouted,
+    /// until `ttl_seconds` expires — potentially an hour later.
+    ///
+    /// Whether that has happened cannot be decided from the stale object alone,
+    /// because one of the replacement paths is benign: a pool-preserving edit
+    /// (`Registry::update`) copies the pending and backend lists onto the new
+    /// object, which then owns those VMs. So ask the registry what the live
+    /// deployment claims; anything left over is unreachable and must be killed.
+    ///
+    /// Pure, so the decision is testable without a daemon; [`kill_unclaimed`]
+    /// acts on it.
+    ///
+    /// [`kill_unclaimed`]: Self::kill_unclaimed
+    fn unclaimed(&self, d: &Arc<Deployment>, ids: &[String]) -> Vec<String> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let live = self.registry.get(&d.spec.id);
+        if live.as_ref().is_some_and(|l| Arc::ptr_eq(l, d)) {
+            return Vec::new(); // still ours: the ids are tracked where we put them
+        }
+
+        let claimed: HashSet<String> = live
+            .iter()
+            .flat_map(|l| {
+                let (pending, backends) = (l.pending(), l.backends());
+                pending
+                    .iter()
+                    .map(|p| p.sandbox_id.clone())
+                    .chain(backends.iter().map(|b| b.sandbox_id.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        ids.iter()
+            .filter(|id| !claimed.contains(*id))
+            .cloned()
+            .collect()
+    }
+
+    /// Kill the VMs [`unclaimed`](Self::unclaimed) identifies as abandoned.
+    async fn kill_unclaimed(&self, d: &Arc<Deployment>, ids: &[String]) {
+        for id in self.unclaimed(d, ids) {
+            tracing::info!(
+                deployment = %d.spec.id,
+                sandbox = %id,
+                "deployment was deregistered or rebuilt while this VM was being created; killing it",
+            );
+            if let Err(e) = self.vms.kill(&id).await {
+                tracing::warn!(sandbox = %id, error = %e, "failed to kill abandoned VM");
+            }
+        }
     }
 
     /// One full pass over every deployment.
@@ -129,6 +201,14 @@ impl Autoscaler {
         // Managed-only: static deployments are reconciled separately in
         // `reconcile` (they own no VMs and need no daemon interaction).
         debug_assert!(!d.spec.is_static(), "reconcile_one called on a static deployment");
+
+        // The tick's snapshot can already be stale: an admin request may have
+        // deregistered or rebuilt this deployment while we were reconciling an
+        // earlier one. Everything below would then act on an object nobody
+        // reads — including booting VMs that nothing would ever reap.
+        if !self.is_live(d) {
+            return;
+        }
 
         self.prune(d, fleet);
         self.promote_pending(d, fleet).await;
@@ -272,6 +352,10 @@ impl Autoscaler {
         let mut still_pending = Vec::new();
         let mut promoted = Vec::new();
         let mut doomed = Vec::new();
+        // Sandbox ids of the promoted VMs, for the post-publish ownership check:
+        // the probes below are awaits, so this deployment can be replaced while
+        // they run, and a VM promoted onto a dropped object is unreachable.
+        let mut promoted_ids = Vec::new();
 
         for p in pending.iter() {
             let Some(info) = fleet.get(&p.sandbox_id) else {
@@ -295,6 +379,7 @@ impl Autoscaler {
                             "VM ready",
                         );
                         self.metrics.record_cold_start(&d.spec.id, boot_secs);
+                        promoted_ids.push(p.sandbox_id.clone());
                         promoted.push(Arc::new(VmBackend::new(p.sandbox_id.clone(), addr)));
                     } else {
                         still_pending.push(p.clone()); // booting; try next tick
@@ -332,22 +417,38 @@ impl Autoscaler {
                 tracing::warn!(sandbox = %id, error = %e, "failed to kill doomed VM");
             }
         }
+
+        // A promotion moves a VM out of `pending` and into `backends`; if the
+        // deployment was replaced between those two stores, the replacement
+        // inherited neither and the VM is now tracked nowhere.
+        self.kill_unclaimed(d, &promoted_ids).await;
     }
 
     async fn scale_up(&self, d: &Arc<Deployment>, count: usize) {
         tracing::info!(deployment = %d.spec.id, count, "scaling up");
         let mut pending = (*d.pending()).clone();
+        let mut created = Vec::new();
 
-        let mut created = 0u64;
         for _ in 0..count {
+            // Each create is a slow await, so re-check between boots: an admin
+            // request can have deregistered this deployment since the last one,
+            // and every further VM would be born abandoned.
+            if !self.is_live(d) {
+                tracing::info!(
+                    deployment = %d.spec.id,
+                    "deployment is no longer registered; stopping scale-up",
+                );
+                break;
+            }
             let name = vm::replica_name(&d.spec.id, self.next_nonce());
             match self.vms.create(d.spec.vm_spec(), name).await {
                 Ok(sandbox) => {
+                    let sandbox_id = sandbox.sandbox_id().to_string();
+                    created.push(sandbox_id.clone());
                     pending.push(PendingVm {
-                        sandbox_id: sandbox.sandbox_id().to_string(),
+                        sandbox_id,
                         created_at: now_secs(),
                     });
-                    created += 1;
                 }
                 Err(e) => {
                     tracing::error!(deployment = %d.spec.id, error = %e, "failed to create VM");
@@ -358,8 +459,14 @@ impl Autoscaler {
 
         // Record only VMs the daemon actually accepted, so the dashboard's
         // create count matches what booted rather than what was attempted.
-        self.metrics.record_scale_up(&d.spec.id, created);
+        self.metrics.record_scale_up(&d.spec.id, created.len() as u64);
+
+        // Publish *before* the ownership check, never after: a pool-preserving
+        // edit copies whatever is visible here, so anything already published is
+        // safely inherited and must not be killed. Whatever the replacement did
+        // not take, `kill_unclaimed` reaps.
         d.set_pending(pending);
+        self.kill_unclaimed(d, &created).await;
     }
 
     /// Retire surplus VMs, most-idle first, by marking them draining.
@@ -737,6 +844,97 @@ mod tests {
 
         let out = a.evict(&d, "sb-does-not-exist", false).await;
         assert!(matches!(out, EvictOutcome::NotFound), "got {out:?}");
+    }
+
+    fn pending(id: &str) -> PendingVm {
+        PendingVm {
+            sandbox_id: id.into(),
+            created_at: now_secs(),
+        }
+    }
+
+    #[test]
+    fn a_deployment_is_live_only_while_the_registry_holds_that_object() {
+        let (a, reg) = autoscaler();
+        let d = reg.get("demo").unwrap();
+        assert!(a.is_live(&d));
+
+        // A rebuild installs a different object; the old handle is stale even
+        // though the id is still registered.
+        let fresh = reg.upsert(spec());
+        assert!(!a.is_live(&d));
+        assert!(a.is_live(&fresh));
+
+        reg.remove("demo");
+        assert!(!a.is_live(&fresh));
+    }
+
+    /// The leak this guards: a VM created while an admin request deregisters the
+    /// deployment lands in a pool nobody reconciles, and runs until its TTL.
+    #[test]
+    fn vms_created_for_a_deregistered_deployment_are_unclaimed() {
+        let (a, reg) = autoscaler();
+        let d = reg.get("demo").unwrap();
+        let created = vec!["sb-1".to_string()];
+
+        assert!(
+            a.unclaimed(&d, &created).is_empty(),
+            "while it is live, the autoscaler owns what it created",
+        );
+
+        reg.remove("demo");
+        assert_eq!(a.unclaimed(&d, &created), created);
+    }
+
+    /// A rebuild (`POST`, or a `PUT` that changes the VM template) starts from an
+    /// empty pool, so nothing it left behind is inherited.
+    #[test]
+    fn a_rebuild_inherits_nothing() {
+        let (a, reg) = autoscaler();
+        let d = reg.get("demo").unwrap();
+        d.set_pending(vec![pending("sb-1")]);
+
+        reg.upsert(spec());
+        assert_eq!(a.unclaimed(&d, &["sb-1".to_string()]), vec!["sb-1".to_string()]);
+    }
+
+    /// …but a pool-preserving edit carries the pool over, so those VMs are still
+    /// tracked and must *not* be killed.
+    #[test]
+    fn a_pool_preserving_edit_keeps_the_vms_it_inherited() {
+        let (a, reg) = autoscaler();
+        let d = reg.get("demo").unwrap();
+        d.set_pending(vec![pending("sb-inherited")]);
+        d.set_backends(vec![Arc::new(VmBackend::new(
+            "sb-running".into(),
+            "10.0.0.1:80".parse().unwrap(),
+        ))]);
+
+        // A scaling-only edit: `Registry::update` copies both lists onto the new
+        // object, which now owns those VMs.
+        let mut edited = spec();
+        edited.scaling.max_replicas = 9;
+        let new = reg.update(edited).unwrap();
+        assert!(!Arc::ptr_eq(&new, &d), "the edit installs a new object");
+
+        assert!(
+            a.unclaimed(&d, &["sb-inherited".into(), "sb-running".into()]).is_empty(),
+            "the replacement inherited these; killing them would drop live capacity",
+        );
+        // One created *after* the copy is in neither list, so it is abandoned.
+        assert_eq!(
+            a.unclaimed(&d, &["sb-too-late".to_string()]),
+            vec!["sb-too-late".to_string()],
+        );
+    }
+
+    #[test]
+    fn nothing_created_means_nothing_to_reap() {
+        let (a, reg) = autoscaler();
+        let d = reg.get("demo").unwrap();
+        reg.remove("demo");
+        // Stale, but there is nothing to check — and no registry lookup to make.
+        assert!(a.unclaimed(&d, &[]).is_empty());
     }
 
     #[tokio::test]

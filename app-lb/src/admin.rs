@@ -444,11 +444,18 @@ async fn register(
     let id = spec.id.clone();
     // Replacing a deployment abandons its old pool; tear it down explicitly so
     // the VMs don't linger until their TTL.
-    if let Some(old) = state.registry.get(&id) {
+    //
+    // The swap happens *first*, for the same reason `deregister` removes before
+    // tearing down: while the old deployment is still the registry's, a
+    // concurrent autoscaler tick will happily boot VMs into it, and those would
+    // be orphaned by the swap that follows. Once it is no longer live the
+    // autoscaler stops creating for it and kills anything it created (see
+    // `Autoscaler::unclaimed`).
+    let old = state.registry.get(&id);
+    let deployment = state.registry.upsert(spec);
+    if let Some(old) = old {
         state.autoscaler.teardown(&old).await;
     }
-
-    let deployment = state.registry.upsert(spec);
     if let Err(e) = state.registry.persist() {
         tracing::error!(error = %e, "failed to persist state");
     }
@@ -489,9 +496,12 @@ async fn update(
         // deployment's upstream list (or a switch between the two kinds). The
         // running backends no longer match the spec, so rebuild from scratch
         // (`teardown` is a no-op-that-clears-routing for the static kind).
+        //
+        // Swap first, tear down second: see the note in `register`.
         tracing::info!(deployment = %id, "updating deployment (backends changed; rebuilding)");
+        let deployment = state.registry.upsert(spec);
         state.autoscaler.teardown(&old).await;
-        state.registry.upsert(spec)
+        deployment
     } else {
         // Scaling/routes/health only: keep the pool live.
         tracing::info!(deployment = %id, "updating deployment (pool preserved)");

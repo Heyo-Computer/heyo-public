@@ -57,6 +57,28 @@ Configuration is environment-only:
 | `APP_LB_ACME_DIRECTORY` | LE production | ACME directory URL — point at staging for testing |
 | `RUST_LOG` | `info,app_lb=debug` | Log filter |
 
+## CLI
+
+[`serverctl`](serverctl/README.md) is a kubectl-shaped CLI over the admin API below — the same
+operations without hand-written `curl`, plus saved server/credential contexts, tables, `$EDITOR`
+round-trips and rollout waiting. It is a separate crate, so installing it doesn't pull in pingora
+or the ACME stack.
+
+```sh
+cargo build --release -p serverctl
+
+serverctl login --server 127.0.0.1:9090   # saves a context; prompts if the server is gated
+serverctl create deployment demo --host demo.local --image nginx --port 80 --min 0 --max 4
+serverctl rollout status demo
+serverctl get deployments -o wide
+serverctl scale demo --min 2 --max 8
+serverctl restart demo                    # drain every VM; the autoscaler replaces them
+serverctl top                             # per-deployment CPU, memory, latency, 5xx
+```
+
+See [`serverctl/README.md`](serverctl/README.md) for the full command set, the context/credential
+model, and which commands apply to managed versus static deployments.
+
 ## Admin API
 
 ```sh
@@ -412,6 +434,12 @@ so it finishes in-flight work, then kills it once idle or at `drain_timeout_secs
 is renewed while app-lb is alive, and VMs from a previous run are re-adopted on startup
 (matched by their `applb-<deployment>-<nonce>` name). VMs app-lb did not create are never
 touched.
+
+Booting a VM takes long enough that an admin request can delete or rebuild the deployment
+while a create is still in flight. The autoscaler therefore re-checks, after every create and
+promotion, that the deployment it is working on is still the registry's — and kills any VM the
+replacement did not inherit, rather than leaving it running until its TTL. A pool-preserving
+edit (one that doesn't change the `vm` block) carries its VMs over and keeps them.
 
 ## Design notes
 

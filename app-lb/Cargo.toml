@@ -3,6 +3,12 @@ name = "app-lb"
 version = "0.1.0"
 edition = "2024"
 
+# `serverctl` — the CLI for the admin API — is a separate crate rather than a
+# second binary here, so installing it doesn't drag in pingora, openssl and the
+# ACME stack. It shares nothing with the LB but the wire format.
+[workspace]
+members = ["serverctl"]
+
 [dependencies]
 # Proxy data plane. The `openssl` feature enables the client-facing HTTPS
 # listener (see `APP_LB_TLS_*` / `APP_LB_ACME_*`); upstreams stay plaintext

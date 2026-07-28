@@ -1,0 +1,33 @@
+[package]
+name = "serverctl"
+version = "0.1.0"
+edition = "2024"
+description = "kubectl-shaped CLI for the app-lb admin API"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4"
+
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` keeps a spec's key order stable through the read-modify-write
+# commands (`set`, `scale`, `edit`), so an edit doesn't reshuffle the file the
+# user is looking at.
+serde_json = { version = "1", features = ["preserve_order"] }
+# Deprecated upstream but still the only maintained-enough YAML reader for
+# `serde_json::Value`; used for `-o yaml` and for accepting YAML spec files.
+serde_yaml = "0.9"
+
+# A blocking HTTP client: a CLI makes one request at a time, so an async runtime
+# would be pure weight. rustls is turned off in favour of the platform's native
+# TLS (openssl here, already a build requirement of app-lb) because that gives us
+# the system trust store and a one-line `--insecure-skip-tls-verify`.
+ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"] }
+
+base64 = "0.22"
+anyhow = "1"
+# Only for restoring the default SIGPIPE disposition. Rust ignores SIGPIPE, so
+# without this `serverctl get deployments | head` panics on a closed pipe
+# instead of exiting quietly. Already in the tree under openssl-sys.
+libc = "0.2"
+dirs = "6"
+rpassword = "7"
