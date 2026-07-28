@@ -177,6 +177,7 @@ dependencies = [
  "pingora-core",
  "pingora-http",
  "pingora-proxy",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

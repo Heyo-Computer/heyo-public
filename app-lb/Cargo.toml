@@ -38,6 +38,15 @@ instant-acme = { version = "0.8", features = ["rcgen"] }
 # threshold needs `Asn1Time`. Must resolve to the same 0.10.x that
 # pingora-openssl picks, or the `X509`/`PKey` types won't unify across crates.
 openssl = "0.10"
+# Not used directly for anything but installing the process-level
+# `CryptoProvider`. rustls is still in the tree under instant-acme's HTTP client
+# (and reqwest), and 0.23 refuses to pick a provider automatically when both
+# `ring` and `aws-lc-rs` are present — which they are, via iroh/hickory and
+# instant-acme respectively. pingora's *rustls* build used to install one for us
+# inside `TlsSettings::build()`; the openssl build never calls that, so app-lb
+# has to do it. Must match the version the rest of the graph resolves to, or the
+# provider gets installed into a different crate's static and the panic remains.
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 async-trait = "0.1"
 futures = "0.3"

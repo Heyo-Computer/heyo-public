@@ -88,6 +88,25 @@ fn main() {
         )
         .init();
 
+    // rustls needs a process-level `CryptoProvider` chosen explicitly whenever
+    // more than one is compiled in, and app-lb's graph has both `ring` (iroh,
+    // hickory) and `aws-lc-rs` (instant-acme). Without this the *first* rustls
+    // handshake panics rather than erroring — which lands in the ACME background
+    // service, the only part of app-lb that speaks TLS as a client.
+    //
+    // pingora installed this itself under its `rustls` feature; the `openssl`
+    // feature app-lb now uses never runs that code, so it belongs here. Must
+    // happen before any service starts.
+    //
+    // `Err` means a provider is already installed, which is the desired end
+    // state either way.
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        tracing::debug!("rustls crypto provider was already installed");
+    }
+
     let cfg = config_from_env();
 
     // Fail fast on a gate that can't enforce anything: asking to protect the
