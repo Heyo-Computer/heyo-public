@@ -46,20 +46,42 @@ pub struct LbConfig {
     /// `dashboard_password` to be set. `/healthz` stays open for probes.
     #[serde(default)]
     pub admin_auth: bool,
-    /// Optional HTTPS listener for the proxy data plane. TLS is enabled when
-    /// both `tls_cert_path` and `tls_key_path` are set; the HTTPS listener then
-    /// binds `tls_addr` *in addition to* the plaintext `proxy_addr`. Upstreams
-    /// stay plaintext regardless — the guest IP is on a host-local tap network.
+    /// HTTPS listener for the proxy data plane, bound *in addition to* the
+    /// plaintext `proxy_addr`. Enabled when ACME is on or a static cert pair is
+    /// configured. Upstreams stay plaintext regardless — the guest IP is on a
+    /// host-local tap network.
     #[serde(default = "default_tls_addr")]
     pub tls_addr: String,
+    /// A static certificate pair. Once ACME is enabled this is the *fallback*,
+    /// served for any SNI with no issued certificate of its own (a `host_suffix`
+    /// deployment, or a host whose issuance hasn't completed). Both or neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_cert_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key_path: Option<String>,
+    /// ACME account contact. Setting it is what enables automatic certificates;
+    /// leaving it unset keeps app-lb's behaviour entirely static.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme_email: Option<String>,
+    /// Where the ACME account key and issued certificates are stored. Should be
+    /// mode `0700` — it holds private keys.
+    #[serde(default = "default_acme_dir")]
+    pub acme_dir: String,
+    /// ACME directory URL. Defaults to Let's Encrypt production; point it at
+    /// staging for any testing, because production rate limits are per-account
+    /// per-week and a failed-validation loop will lock issuance out for hours.
+    #[serde(default = "default_acme_directory")]
+    pub acme_directory: String,
 }
 
 fn default_tls_addr() -> String {
     "0.0.0.0:6189".into()
+}
+fn default_acme_dir() -> String {
+    "/var/lib/app-lb/acme".into()
+}
+fn default_acme_directory() -> String {
+    crate::acme::AcmeConfig::production_directory()
 }
 
 impl Default for LbConfig {
@@ -76,7 +98,23 @@ impl Default for LbConfig {
             tls_addr: default_tls_addr(),
             tls_cert_path: None,
             tls_key_path: None,
+            acme_email: None,
+            acme_dir: default_acme_dir(),
+            acme_directory: default_acme_directory(),
         }
+    }
+}
+
+impl LbConfig {
+    /// ACME is on iff a contact address was configured.
+    pub fn acme_enabled(&self) -> bool {
+        self.acme_email.is_some()
+    }
+
+    /// Whether to bind the HTTPS listener at all. ACME alone is enough: it will
+    /// have certificates shortly even if none exist at startup.
+    pub fn tls_enabled(&self) -> bool {
+        self.acme_enabled() || self.tls_cert_path.is_some()
     }
 }
 

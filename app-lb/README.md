@@ -49,9 +49,12 @@ Configuration is environment-only:
 | `APP_LB_DASHBOARD_PASSWORD` | *(unset)* | Set to gate the dashboard behind HTTP Basic Auth |
 | `APP_LB_DASHBOARD_USER` | `admin` | Basic Auth username (only used when a password is set) |
 | `APP_LB_ADMIN_AUTH` | `false` | `1`/`true` to extend the gate to the deployment CRUD API (needs a password) |
-| `APP_LB_TLS_CERT` | *(unset)* | PEM cert path; set with `APP_LB_TLS_KEY` to enable HTTPS |
+| `APP_LB_TLS_CERT` | *(unset)* | PEM cert path; set with `APP_LB_TLS_KEY`. The fallback cert when ACME is on |
 | `APP_LB_TLS_KEY` | *(unset)* | PEM private-key path |
-| `APP_LB_PROXY_TLS_ADDR` | `0.0.0.0:6189` | HTTPS listener (only bound when cert+key are set) |
+| `APP_LB_PROXY_TLS_ADDR` | `0.0.0.0:6189` | HTTPS listener (bound when ACME is on or cert+key are set) |
+| `APP_LB_ACME_EMAIL` | *(unset)* | Let's Encrypt account contact; **setting it enables automatic certificates** |
+| `APP_LB_ACME_DIR` | `/var/lib/app-lb/acme` | ACME account key and issued certificates (should be `0700`) |
+| `APP_LB_ACME_DIRECTORY` | LE production | ACME directory URL — point at staging for testing |
 | `RUST_LOG` | `info,app_lb=debug` | Log filter |
 
 ## Admin API
@@ -85,6 +88,7 @@ curl localhost:9090/deployments/demo     # one deployment
 curl -XDELETE localhost:9090/deployments/demo   # drain and reap every VM
 curl localhost:9090/healthz
 curl localhost:9090/metrics              # metrics snapshot (JSON)
+curl localhost:9090/certs                # issued TLS certificates and expiry
 
 # Edit a deployment in place (full spec). The pool is preserved unless the `vm`
 # template changes, in which case the VMs are rebuilt.
@@ -295,19 +299,78 @@ Two data sources feed it:
 
 ### TLS
 
-The proxy serves plaintext HTTP on `proxy_addr` by default. Set `APP_LB_TLS_CERT`
-and `APP_LB_TLS_KEY` (PEM paths) to *also* bind an HTTPS listener on
-`APP_LB_PROXY_TLS_ADDR` (default `0.0.0.0:6189`); both listeners then run at once.
-Setting only one of cert/key is a hard startup error rather than a silent
-plaintext fallback. Upstreams stay plaintext regardless — the guest IP is on a
-host-local tap network — so this is TLS *termination* at the edge. The TLS stack
-is rustls (the same one heyo-sdk already links through reqwest), enabled via the
-`rustls` feature on `pingora-core`.
+The proxy serves plaintext HTTP on `proxy_addr` by default. The HTTPS listener
+binds `APP_LB_PROXY_TLS_ADDR` (default `0.0.0.0:6189`) *in addition to* it —
+both run at once — and turns on when either ACME is enabled or a static
+`APP_LB_TLS_CERT`/`APP_LB_TLS_KEY` pair is set. Setting only one of cert/key is a
+hard startup error rather than a silent plaintext fallback. Upstreams stay
+plaintext regardless — the guest IP is on a host-local tap network — so this is
+TLS *termination* at the edge.
+
+Certificates are chosen **per handshake from the client's SNI**, not fixed at
+startup: the acceptor holds no certificate of its own and asks the cert store for
+one on every connection. That is what lets a certificate issued seconds ago serve
+without a restart. It also means the TLS stack is openssl rather than rustls —
+pingora only supports handshake callbacks under openssl/boringssl — so the build
+needs `libssl-dev` and links openssl alongside the rustls that heyo-sdk pulls in
+through reqwest.
 
 ```sh
 APP_LB_TLS_CERT=cert.pem APP_LB_TLS_KEY=key.pem ./target/release/app-lb
 curl -k https://localhost:6189/ -H 'Host: demo.local'
 ```
+
+#### Automatic certificates (Let's Encrypt)
+
+Set `APP_LB_ACME_EMAIL` and app-lb obtains a certificate for every deployment
+hostname itself, renewing 30 days before expiry:
+
+```sh
+APP_LB_PROXY_ADDR=0.0.0.0:80 \
+APP_LB_PROXY_TLS_ADDR=0.0.0.0:443 \
+APP_LB_ACME_EMAIL=ops@example.com \
+./target/release/app-lb
+```
+
+Register a deployment with an exact `host` route pointing at a real DNS name and
+the certificate arrives within seconds — no restart, no reload:
+
+```sh
+curl -XPOST localhost:9090/deployments -H 'content-type: application/json' \
+  -d '{"id":"demo","routes":[{"host":"demo.example.com"}],"upstreams":["127.0.0.1:8080"]}'
+curl -s localhost:9090/certs | jq   # hostname, expiry, issuer
+```
+
+Certificates and the ACME account key are cached under `APP_LB_ACME_DIR` and
+reloaded on boot, so a restart involves no CA traffic at all.
+
+Four things to know before enabling it:
+
+- **Port 80 is required.** Let's Encrypt fetches HTTP-01 challenges on port 80
+  and nowhere else, so `APP_LB_PROXY_ADDR` must be `0.0.0.0:80` (app-lb answers
+  `/.well-known/acme-challenge/` itself, ahead of routing). app-lb logs a warning
+  at startup if ACME is on and the proxy is bound elsewhere. Binding 80 and 443
+  as the non-root `app-lb` user needs the bind capability:
+  `setcap 'cap_net_bind_service=+ep' /usr/local/bin/app-lb`.
+- **Only exact `host` routes are covered.** A `host_suffix` rule matches a whole
+  subtree and would need a wildcard certificate, which Let's Encrypt issues only
+  over DNS-01 — a different challenge requiring DNS provider credentials, which
+  app-lb does not implement. Those deployments are served the static fallback
+  certificate, and the gap is logged once per suffix at startup.
+- **Test against staging first.** Set
+  `APP_LB_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory`.
+  Production rate limits are per-account per-week; a misconfigured hostname in a
+  retry loop can lock out issuance for every other hostname for hours. app-lb
+  backs off exponentially per host (1 min doubling to 6 h) for exactly this
+  reason, but staging is still the right place to find out that DNS is wrong.
+- **`APP_LB_TLS_CERT` becomes the fallback.** It is served for any SNI without an
+  issued certificate of its own — a `host_suffix` deployment, or a hostname whose
+  first issuance hasn't finished. With no fallback configured, such a handshake
+  fails cleanly rather than presenting a certificate for the wrong name.
+
+The `APP_LB_ACME_DIR` holds private keys and the account key; it should be mode
+`0700` and owned by the user app-lb runs as. app-lb writes the files it creates
+`0600`.
 
 This HTTPS listener terminates TLS for **proxied deployment traffic** only. The
 admin API and dashboard bind a *separate* plaintext listener (`APP_LB_ADMIN_ADDR`)
@@ -318,6 +381,9 @@ front it through this same proxy with a static/`proxy_pass` deployment: see
 [`examples/README.md`](examples/README.md). To bind the HTTPS listener on `443`
 under the non-root `app-lb` user, grant the bind capability:
 `setcap 'cap_net_bind_service=+ep' /usr/local/bin/app-lb`.
+
+With ACME enabled that example gets simpler: give the admin deployment an exact
+`host` route and its certificate is issued automatically like any other.
 
 ### Scaling
 

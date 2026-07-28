@@ -8,6 +8,7 @@
 //! Nothing here may block: VM boots happen only in the autoscaler. The one wait
 //! is the cold-start `Notify`, which yields.
 
+use crate::acme::ChallengeTable;
 use crate::deployment::{Deployment, VmBackend};
 use crate::metrics::Metrics;
 use crate::registry::Registry;
@@ -50,14 +51,28 @@ impl Ctx {
     }
 }
 
+/// The URL prefix Let's Encrypt fetches to validate an HTTP-01 challenge.
+const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
+
 pub struct LbProxy {
     registry: Arc<Registry>,
     metrics: Arc<Metrics>,
+    /// Outstanding HTTP-01 challenge responses, published by the ACME manager.
+    /// Empty (and the lookup therefore a single miss) whenever ACME is off.
+    challenges: Arc<ChallengeTable>,
 }
 
 impl LbProxy {
-    pub fn new(registry: Arc<Registry>, metrics: Arc<Metrics>) -> Self {
-        Self { registry, metrics }
+    pub fn new(
+        registry: Arc<Registry>,
+        metrics: Arc<Metrics>,
+        challenges: Arc<ChallengeTable>,
+    ) -> Self {
+        Self {
+            registry,
+            metrics,
+            challenges,
+        }
     }
 }
 
@@ -97,7 +112,17 @@ async fn resolve_peer(peer: &str) -> Option<SocketAddr> {
     tokio::net::lookup_host(peer).await.ok()?.next()
 }
 
-async fn write_error(session: &mut Session, code: u16, message: &str) -> Result<()> {
+/// The key authorization to serve for `path`, if it names an outstanding
+/// HTTP-01 challenge.
+///
+/// `None` for anything else — including a challenge-shaped path whose token is
+/// unknown — so this can only ever intercept a request when a challenge for that
+/// exact token is genuinely in flight. Everything else falls through to routing.
+fn acme_challenge_response(challenges: &ChallengeTable, path: &str) -> Option<String> {
+    challenges.get(path.strip_prefix(ACME_CHALLENGE_PREFIX)?)
+}
+
+async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<()> {
     let mut header = ResponseHeader::build(code, Some(2))?;
     header.insert_header(http::header::CONTENT_LENGTH, message.len().to_string())?;
     header.insert_header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")?;
@@ -132,6 +157,18 @@ impl ProxyHttp for LbProxy {
             (request_host(req), req.uri.path().to_string())
         };
 
+        // ACME HTTP-01 validation, answered before routing on purpose. The CA
+        // sends an arbitrary `Host` and the hostname being certified often has
+        // no matching deployment yet, so routing this would 404 and fail the
+        // order. An unknown token falls through to normal routing, so this
+        // cannot shadow a real route unless a challenge is genuinely
+        // outstanding for that exact token.
+        if let Some(key_authorization) = acme_challenge_response(&self.challenges, &path) {
+            tracing::debug!(%path, "answering ACME http-01 challenge");
+            write_plain(session, 200, &key_authorization).await?;
+            return Ok(true);
+        }
+
         match self.registry.route(host.as_deref(), &path) {
             Some(deployment) => {
                 ctx.deployment = Some(deployment);
@@ -139,7 +176,7 @@ impl ProxyHttp for LbProxy {
             }
             None => {
                 tracing::debug!(?host, %path, "no deployment matches request");
-                write_error(session, 404, "no deployment matches this request\n").await?;
+                write_plain(session, 404, "no deployment matches this request\n").await?;
                 Ok(true) // response already written; stop proxying
             }
         }
@@ -343,6 +380,39 @@ mod tests {
     use crate::config::{DeploymentSpec, HealthCheck, RouteRule, ScalingPolicy, VmSpec};
     use crate::deployment::PendingVm;
     use heyo_sdk::SandboxDriver;
+
+    #[test]
+    fn acme_challenge_answers_only_outstanding_tokens() {
+        let challenges = ChallengeTable::new();
+        challenges.publish("live-token".into(), "live-token.thumbprint".into());
+
+        assert_eq!(
+            acme_challenge_response(&challenges, "/.well-known/acme-challenge/live-token")
+                .as_deref(),
+            Some("live-token.thumbprint"),
+        );
+
+        // An unknown token must fall through to routing rather than 404 from
+        // here — otherwise the branch would shadow a real route.
+        assert_eq!(
+            acme_challenge_response(&challenges, "/.well-known/acme-challenge/stale-token"),
+            None,
+        );
+        assert_eq!(acme_challenge_response(&challenges, "/.well-known/acme-challenge/"), None);
+        assert_eq!(acme_challenge_response(&challenges, "/live-token"), None);
+        assert_eq!(acme_challenge_response(&challenges, "/"), None);
+    }
+
+    #[test]
+    fn acme_challenge_is_inert_when_acme_is_disabled() {
+        // The table is empty whenever ACME is off, so no request can be
+        // intercepted — the branch costs one map lookup and nothing else.
+        let challenges = ChallengeTable::new();
+        assert_eq!(
+            acme_challenge_response(&challenges, "/.well-known/acme-challenge/anything"),
+            None,
+        );
+    }
 
     fn header(host: Option<&str>, path: &str) -> RequestHeader {
         let mut h = RequestHeader::build("GET", path.as_bytes(), None).unwrap();

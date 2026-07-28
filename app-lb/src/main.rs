@@ -4,6 +4,7 @@
 //! admin API and the proxy routes traffic to a pool of VMs, booting and reaping
 //! them to match load.
 
+mod acme;
 mod admin;
 mod autoscale;
 mod config;
@@ -12,15 +13,19 @@ mod health;
 mod metrics;
 mod proxy;
 mod registry;
+mod tls;
 mod vm;
 
+use crate::acme::{AcmeConfig, AcmeManager, ChallengeTable};
 use crate::admin::AdminApi;
 use crate::autoscale::Autoscaler;
 use crate::config::LbConfig;
 use crate::metrics::Metrics;
 use crate::proxy::LbProxy;
 use crate::registry::Registry;
+use crate::tls::{CertStore, SniResolver};
 use crate::vm::VmManager;
+use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::services::background::background_service;
 use std::sync::Arc;
@@ -63,6 +68,15 @@ fn config_from_env() -> LbConfig {
     if let Ok(v) = std::env::var("APP_LB_TLS_KEY") {
         cfg.tls_key_path = Some(v);
     }
+    if let Ok(v) = std::env::var("APP_LB_ACME_EMAIL") {
+        cfg.acme_email = Some(v);
+    }
+    if let Ok(v) = std::env::var("APP_LB_ACME_DIR") {
+        cfg.acme_dir = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_ACME_DIRECTORY") {
+        cfg.acme_directory = v;
+    }
     cfg
 }
 
@@ -85,6 +99,19 @@ fn main() {
         );
     }
 
+    // HTTP-01 validation is fetched on port 80 and nowhere else, so a proxy
+    // bound anywhere else can only be validated if something in front forwards
+    // that path. Worth saying loudly at startup rather than leaving it to be
+    // diagnosed from a CA error much later.
+    if cfg.acme_enabled() && !cfg.proxy_addr.ends_with(":80") {
+        tracing::warn!(
+            proxy = %cfg.proxy_addr,
+            "ACME is enabled but the plaintext proxy is not on port 80; Let's Encrypt \
+             validates http-01 on port 80 only, so issuance will fail unless something \
+             forwards /.well-known/acme-challenge/ to this listener",
+        );
+    }
+
     let registry = Arc::new(Registry::new(&cfg.state_path));
     match registry.load() {
         Ok(0) => {
@@ -95,6 +122,38 @@ fn main() {
     }
 
     let vms = VmManager::new(cfg.daemon_url.clone());
+
+    // The static cert pair, if configured. With ACME on it is the *fallback*,
+    // served for any SNI without an issued cert of its own; with ACME off it is
+    // the only certificate. Half-configured TLS stays a hard error rather than a
+    // silent fallback to plaintext, so nobody thinks a listener is encrypted
+    // when it isn't.
+    let fallback = match (&cfg.tls_cert_path, &cfg.tls_key_path) {
+        (Some(cert), Some(key)) => Some(Arc::new(
+            CertStore::load_pair(cert, key)
+                .unwrap_or_else(|e| panic!("failed to load TLS cert {cert} / key {key}: {e}")),
+        )),
+        (None, None) => None,
+        _ => panic!("TLS is half-configured: set both APP_LB_TLS_CERT and APP_LB_TLS_KEY, or neither"),
+    };
+
+    // Loaded from disk *before* the listener binds: the acceptor holds no
+    // certificate of its own, so anything not in the store at bind time gets the
+    // fallback (or a failed handshake) until ACME reissues it.
+    let certs = Arc::new(CertStore::new(
+        std::path::Path::new(&cfg.acme_dir).join("certs"),
+        fallback,
+    ));
+    if cfg.tls_enabled() {
+        match certs.load_from_disk() {
+            0 => tracing::info!("no cached certificates"),
+            n => tracing::info!(count = n, "loaded cached certificates"),
+        }
+    }
+
+    // Shared between the ACME manager (which publishes challenge responses) and
+    // the proxy (which serves them).
+    let challenges = Arc::new(ChallengeTable::new());
 
     // One metrics registry, shared by the proxy (request latency), the
     // autoscaler (cold-start timing, scaling activity), and the admin API
@@ -114,6 +173,26 @@ fn main() {
     );
     let autoscaler = autoscaler_svc.task();
 
+    // ACME runs only when a contact address is configured. Its `Notify` goes to
+    // the admin API so registering a deployment starts issuance immediately
+    // rather than at the next 12-hour sweep.
+    let acme_svc = cfg.acme_email.clone().map(|email| {
+        background_service(
+            "acme",
+            AcmeManager::new(
+                registry.clone(),
+                certs.clone(),
+                challenges.clone(),
+                AcmeConfig {
+                    email,
+                    dir: cfg.acme_dir.clone().into(),
+                    directory_url: cfg.acme_directory.clone(),
+                },
+            ),
+        )
+    });
+    let acme_signal = acme_svc.as_ref().map(|svc| svc.task().signal());
+
     let admin_svc = background_service(
         "admin",
         AdminApi::new(
@@ -125,38 +204,35 @@ fn main() {
             cfg.dashboard_user.clone(),
             cfg.dashboard_password.clone(),
             cfg.admin_auth,
+            certs.clone(),
+            acme_signal,
         ),
     );
 
     let mut proxy_svc = pingora_proxy::http_proxy_service(
         &server.configuration,
-        LbProxy::new(registry, metrics),
+        LbProxy::new(registry, metrics, challenges),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);
 
-    // Optional HTTPS listener, alongside the plaintext one. Enabled only when
-    // both a cert and key are configured; a half-configured TLS is a hard error
-    // rather than a silent fallback to plaintext, so nobody thinks a listener is
-    // encrypted when it isn't.
-    match (&cfg.tls_cert_path, &cfg.tls_key_path) {
-        (Some(cert), Some(key)) => {
-            proxy_svc
-                .add_tls(&cfg.tls_addr, cert, key)
-                .unwrap_or_else(|e| {
-                    panic!("failed to enable TLS on {} with cert {cert}: {e}", cfg.tls_addr)
-                });
-            tracing::info!(tls = %cfg.tls_addr, %cert, "HTTPS listener enabled");
-        }
-        (None, None) => {}
-        _ => panic!(
-            "TLS is half-configured: set both APP_LB_TLS_CERT and APP_LB_TLS_KEY, or neither",
-        ),
+    // HTTPS listener, alongside the plaintext one. The acceptor is built with no
+    // certificate attached: `CertStore` supplies one per handshake keyed on SNI,
+    // which is what lets a certificate issued moments ago serve without a
+    // restart. See `src/tls.rs`.
+    if cfg.tls_enabled() {
+        let settings = TlsSettings::with_callbacks(Box::new(SniResolver::new(certs)))
+            .expect("failed to build TLS settings");
+        proxy_svc.add_tls_with_settings(&cfg.tls_addr, None, settings);
+        tracing::info!(tls = %cfg.tls_addr, "HTTPS listener enabled");
     }
 
     tracing::info!(proxy = %cfg.proxy_addr, admin = %cfg.admin_addr, "starting app-lb");
 
     let autoscaler_handle = server.add_service(autoscaler_svc);
     server.add_service(admin_svc);
+    if let Some(acme_svc) = acme_svc {
+        server.add_service(acme_svc);
+    }
     let proxy_handle = server.add_service(proxy_svc);
     // Don't accept traffic until the autoscaler has adopted existing VMs and
     // built the warm pool; otherwise the first requests all eat a cold start.

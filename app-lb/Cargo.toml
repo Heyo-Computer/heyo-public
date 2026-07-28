@@ -4,12 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Proxy data plane. The `rustls` feature enables the optional client-facing
-# HTTPS listener (see `APP_LB_TLS_*`); upstreams stay plaintext guest_ip on the
-# tap network regardless. rustls — not openssl/boringssl — is deliberate: it is
-# the same TLS stack heyo-sdk already pulls in through reqwest, so enabling it
-# adds no second TLS library to the link.
-pingora-core = { version = "0.8.1", features = ["rustls"] }
+# Proxy data plane. The `openssl` feature enables the client-facing HTTPS
+# listener (see `APP_LB_TLS_*` / `APP_LB_ACME_*`); upstreams stay plaintext
+# guest_ip on the tap network regardless.
+#
+# openssl — not rustls — because per-deployment ACME certificates need a cert
+# chosen per handshake from the SNI. That is `TlsSettings::with_callbacks`, and
+# pingora supports it only under openssl/boringssl: the rustls build returns a
+# hard "Certificate callbacks are not supported" error and exposes no
+# `ResolvesServerCert` hook. The cost is a second TLS stack in the link, since
+# heyo-sdk still pulls rustls through reqwest, plus a libssl-dev build
+# dependency. See `src/tls.rs`.
+pingora-core = { version = "0.8.1", features = ["openssl"] }
 pingora-proxy = "0.8.1"
 pingora-http = "0.8.1"
 # Shared with pingora's own public API (RequestHeader/ResponseHeader are built
@@ -19,6 +25,19 @@ http = "1"
 bytes = "1"
 
 heyo-sdk = "0.1.6"
+
+# ACME (Let's Encrypt) client for per-deployment certificates. In-process rather
+# than shelling out to certbot: no external binary, and no root — the account key
+# and issued certs live under `APP_LB_ACME_DIR`, owned by the non-root `app-lb`
+# user. The `rcgen` feature is what makes `Order::finalize()` available, which
+# generates each certificate's keypair and CSR for us, so rcgen needs no direct
+# dependency here.
+instant-acme = { version = "0.8", features = ["rcgen"] }
+# Certificate parsing and expiry arithmetic. pingora-openssl re-exports `x509`
+# and `pkey` but not `asn1`, and comparing a cert's notAfter against a renewal
+# threshold needs `Asn1Time`. Must resolve to the same 0.10.x that
+# pingora-openssl picks, or the `X509`/`PKey` types won't unify across crates.
+openssl = "0.10"
 
 async-trait = "0.1"
 futures = "0.3"

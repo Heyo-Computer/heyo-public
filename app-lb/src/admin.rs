@@ -10,6 +10,7 @@ use crate::config::DeploymentSpec;
 use crate::deployment::now_secs;
 use crate::metrics::{DeploymentMetricsSnapshot, HostUsageSnapshot, Metrics};
 use crate::registry::Registry;
+use crate::tls::CertStore;
 use async_trait::async_trait;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
@@ -22,6 +23,7 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// The live dashboard page. Self-contained (no external fetches beyond the
 /// same-origin `/metrics` poll) so it works over an SSH tunnel with no assets.
@@ -88,6 +90,21 @@ struct AdminState {
     /// Process start (LB clock), so the dashboard can show how long the numbers
     /// have been accumulating.
     started_at: u64,
+    /// Issued certificates, for `GET /certs`.
+    certs: Arc<CertStore>,
+    /// Nudges the ACME manager to issue for a newly-registered hostname instead
+    /// of waiting out its sweep interval. `None` when ACME is disabled.
+    acme: Option<Arc<Notify>>,
+}
+
+impl AdminState {
+    /// Ask for an immediate ACME sweep. Issuance is asynchronous — the request
+    /// that triggered this returns without waiting for a certificate.
+    fn nudge_acme(&self) {
+        if let Some(acme) = &self.acme {
+            acme.notify_one();
+        }
+    }
 }
 
 pub struct AdminApi {
@@ -106,6 +123,8 @@ impl AdminApi {
         dashboard_user: Option<String>,
         dashboard_password: Option<String>,
         gate_admin: bool,
+        certs: Arc<CertStore>,
+        acme: Option<Arc<Notify>>,
     ) -> Self {
         // Render the display name into the page once; the placeholder appears in
         // both the <title> and the <h1>.
@@ -137,6 +156,8 @@ impl AdminApi {
                 auth,
                 gate_admin,
                 started_at: now_secs(),
+                certs,
+                acme,
             },
         }
     }
@@ -435,6 +456,9 @@ async fn register(
 
     // Let the autoscaler build the warm pool without waiting for the next tick.
     deployment.scale_signal.notify_one();
+    // ...and let ACME start issuing for any new hostname. Asynchronous: this
+    // response does not wait for a certificate.
+    state.nudge_acme();
 
     (StatusCode::CREATED, Json(status_of(&deployment))).into_response()
 }
@@ -482,6 +506,9 @@ async fn update(
     }
     // Reconcile to the new policy immediately (scale up/down, warm pool).
     deployment.scale_signal.notify_one();
+    // An edit can introduce a hostname, so this needs the same nudge as
+    // registration.
+    state.nudge_acme();
 
     Json(status_of(&deployment)).into_response()
 }
@@ -640,6 +667,17 @@ async fn healthz() -> &'static str {
     "ok\n"
 }
 
+/// Issued certificates: `GET /certs`.
+///
+/// The only way to see *why* a hostname is not yet serving its own certificate —
+/// issuance is asynchronous, so a deployment can be live and routing while its
+/// certificate is still pending or failing. A hostname with a route but no entry
+/// here is either still in flight, backing off after a failure, or a
+/// `host_suffix` rule (which ACME cannot cover; see `src/acme.rs`).
+async fn certs(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.certs.status())
+}
+
 fn router(state: AdminState) -> Router {
     // The dashboard view + its data source are always behind the optional gate.
     let view = Router::new()
@@ -653,7 +691,10 @@ fn router(state: AdminState) -> Router {
         .route("/deployments", post(register).get(list))
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
         .route("/deployments/:id/scaling", patch(scale))
-        .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm));
+        .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
+        // Grouped with the CRUD routes so it inherits the `APP_LB_ADMIN_AUTH`
+        // gate: it reports which hostnames app-lb holds keys for.
+        .route("/certs", get(certs));
 
     let (gated, open) = if state.gate_admin {
         (view.merge(crud), Router::new())

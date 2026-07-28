@@ -11,6 +11,10 @@ Pingora's graceful shutdown.
 ## One-time host setup
 
 ```sh
+# Build dependency: app-lb terminates TLS with openssl (pingora only supports
+# per-SNI certificate callbacks there, which the ACME feature needs).
+sudo apt-get install -y libssl-dev pkg-config
+
 # Build and install the binary.
 cargo build --release
 sudo install -m0755 target/release/app-lb /usr/local/bin/app-lb
@@ -22,6 +26,12 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin app-lb
 
 # Data dir (persisted deployment state) and log dir.
 sudo install -d -o app-lb -g app-lb /var/lib/app-lb /var/log/app-lb
+
+# ACME storage: holds the account key and issued private keys, so 0700.
+sudo install -d -m0700 -o app-lb -g app-lb /var/lib/app-lb/acme
+
+# Only if using ACME or binding :80/:443 as the non-root user.
+sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/app-lb
 ```
 
 Requirements (see the top-level `README.md`): a running `heyvmd` daemon
@@ -59,3 +69,9 @@ sudo supervisorctl tail -f app-lb stderr
 - The default listeners (`6188`, `6189`, `9090`) are unprivileged, so no root is
   needed. If you rebind the proxy to `:80`/`:443`, you must run as root or grant
   `CAP_NET_BIND_SERVICE`.
+- **Automatic certificates need port 80.** Let's Encrypt validates HTTP-01 there
+  and nowhere else, so `APP_LB_ACME_EMAIL` is only useful together with
+  `APP_LB_PROXY_ADDR="0.0.0.0:80"` and the `setcap` above. app-lb logs a warning
+  at startup if ACME is enabled while the proxy is bound elsewhere. Test with
+  `APP_LB_ACME_DIRECTORY` pointed at Let's Encrypt staging before going live —
+  production rate limits are weekly and shared across every hostname.
