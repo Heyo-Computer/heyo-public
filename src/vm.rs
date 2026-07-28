@@ -1409,12 +1409,26 @@ async fn power_cycle(
     Ok((target, tunnel, pool))
 }
 
-/// Best-effort one-line diagnosis of a guest whose Postgres won't start:
-/// the tail of the server log if one exists, else the tail of the kernel
-/// ring buffer. Never fails — every failure mode becomes descriptive text.
+/// Best-effort one-line diagnosis of a guest whose Postgres won't start.
+/// Ordered by decisiveness:
+///
+/// 1. cluster major (`PG_VERSION`) vs server major — a mismatch is the
+///    instant-death "database files are incompatible" case (a disk adopted
+///    under a newer image) and explains everything by itself;
+/// 2. live postgres process count (0 = it died, not "it's slow");
+/// 3. this boot's startup stderr (`pg-startup.log`, written by init.sh —
+///    where pre-logging-collector fatals land);
+/// 4. the newest server-log tail — which can be DAYS old on a VM whose
+///    current boot never got far enough to log; the timestamps say so.
+///
+/// Never fails — every failure mode becomes descriptive text.
 async fn boot_evidence(cfg: &Config, sandbox: &Sandbox) -> String {
-    let cmd = "tail -n 6 /workspace/pgdata/log/*.log 2>/dev/null \
-               || { echo NO-PG-LOG; dmesg 2>/dev/null | tail -n 4; }";
+    let cmd = "v=$(cat /workspace/pgdata/PG_VERSION 2>/dev/null || echo '?'); \
+               s=$(postgres --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo '?'); \
+               echo \"pgdata=v$v server=v$s pg-procs=$(pgrep -c postgres 2>/dev/null || echo 0)\"; \
+               tail -n 4 /workspace/pg-startup.log 2>/dev/null; \
+               tail -n 3 \"$(ls -t /workspace/pgdata/log/*.log 2>/dev/null | head -1)\" 2>/dev/null \
+               || dmesg 2>/dev/null | tail -n 3";
     match exec_guest(cfg, sandbox, cmd, false, "collecting boot evidence").await {
         Ok(res) => {
             let text = exec_detail(&res).replace(['\n', '\r'], " | ");

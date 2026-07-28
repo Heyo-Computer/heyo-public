@@ -559,7 +559,14 @@ echo "[init] starting postgres"
 # means our pooler-side power-cycle).
 export PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj
 export PG_OOM_ADJUST_VALUE=0
-sh -c "echo -900 > /proc/self/oom_score_adj 2>/dev/null || true; exec gosu postgres postgres -D '$PGDATA'" &
+# Startup stdout/stderr go to a per-boot file (truncated each launch), not the
+# console: everything Postgres says BEFORE its logging collector takes over —
+# most importantly instant-death diagnostics like "database files are
+# incompatible with server" — used to vanish into ttyS0, leaving a VM whose
+# server log went stale days ago and no way to see why this boot produced no
+# listener. The pooler's boot-evidence probe reads this file.
+sh -c "echo -900 > /proc/self/oom_score_adj 2>/dev/null || true; exec gosu postgres postgres -D '$PGDATA'" \
+    >"$WORKSPACE/pg-startup.log" 2>&1 &
 
 # heyvm's `wait_for_ready` scans the serial console for this exact marker and
 # times out (panicking the create) if it never appears. Postgres binds 5432
