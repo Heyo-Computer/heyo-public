@@ -66,6 +66,11 @@
 #            backup to --spare-dir/fsck-backups when there's room, then runs
 #            the full `e2fsck -fy`. Only touches disks that are not held open
 #            and whose schema is not already offloaded.
+#   spares   (read-only) classify every spare-pg-* sandbox: CLAIMED (bound to
+#            a schema in registry.tsv — it IS that schema's VM), verified
+#            EMPTY (its Postgres has no non-system databases; purge-safe), or
+#            unbound-with-data (registry binding lost — investigate). Uses
+#            psql against running spares' guest IPs for the definitive check.
 #   disks    (read-only) per-VM disk-footprint report: provisioned ceiling
 #            (sparse apparent size), filesystem size, filesystem used, and
 #            real host allocation, per sb-* dir, with totals split by
@@ -176,7 +181,7 @@ while [ $# -gt 0 ]; do
         --reap-timeout) REAP_TIMEOUT="$2"; shift 2 ;;
         --yes)         YES=1; shift ;;
         --dry-run)     DRY_RUN=1; shift ;;
-        halt|purge|reclaim|dumps|drain|ghosts|rescue|orphans|badfs|readopt|disks) PHASES+=("$1"); shift ;;
+        halt|purge|reclaim|dumps|drain|ghosts|rescue|orphans|badfs|readopt|disks|spares) PHASES+=("$1"); shift ;;
         -h|--help)     sed -n '2,119p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -806,6 +811,72 @@ phase_badfs() {
     df_report
 }
 
+# -------------------------------------------------------------- spares ----
+# A claimed spare KEEPS its spare-pg-* name — only the registry binding tells
+# it apart from a never-used one. This report classifies every spare-named
+# sandbox:
+#   - bound in registry.tsv       -> CLAIMED: it IS some schema's VM, has data
+#   - unbound + running           -> ask its Postgres directly (definitive):
+#                                    any non-system database = data
+#   - unbound + stopped           -> fs-used heuristic from the disk image
+phase_spares() {
+    note "spares: claimed/empty classification (read-only)"
+    local sandboxes ids_bound
+    sandboxes=$(heyvmd_list) || exit 1
+    ids_bound=$(reg_rows | cut -f2 | sort -u)
+    local n=0 claimed=0 empty=0 suspicious=0 unknown=0
+    local id name status ip schema verdict dbs used geom bs blocks free
+    while IFS=$'\t' read -r id name status ip; do
+        [ -n "$id" ] || continue
+        n=$((n + 1))
+        schema=$(schema_of_id "$id")
+        if [ -n "$schema" ]; then
+            claimed=$((claimed + 1))
+            printf '   %-16s %-22s %-8s CLAIMED by schema %s — this is that schema'\''s VM\n' \
+                "$id" "$name" "$status" "$schema"
+            continue
+        fi
+        if [ "$status" = running ] || [ "$status" = Running ]; then
+            if [ -n "$ip" ] && command -v psql >/dev/null; then
+                dbs=$(PGPASSWORD="$PG_PASSWORD" PGCONNECT_TIMEOUT=5 \
+                    psql -h "$ip" -U "$PG_USER" -d postgres -tAc \
+                    "SELECT datname||' ('||pg_size_pretty(pg_database_size(datname))||')' \
+                     FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'" \
+                    2>/dev/null | paste -sd, -)
+                if [ $? -ne 0 ]; then
+                    unknown=$((unknown + 1)); verdict="? (psql failed — check --pg-user/--pg-password)"
+                elif [ -z "$dbs" ]; then
+                    empty=$((empty + 1)); verdict="EMPTY — initdb only, never claimed; purge-safe"
+                else
+                    suspicious=$((suspicious + 1))
+                    verdict="UNBOUND but HAS DATABASES: $dbs — registry may have lost its binding; investigate before deleting"
+                fi
+            else
+                unknown=$((unknown + 1)); verdict="? (no guest IP or psql missing)"
+            fi
+        else
+            # Stopped + unbound: read the image. A pristine spare's fs holds
+            # initdb (~40MB) + swapfile; real data pushes used well past that.
+            used="?"
+            geom=$(dumpe2fs -h "$RUN_DIR/$id/data.ext4" 2>/dev/null)
+            bs=$(awk -F: '/^Block size:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+            blocks=$(awk -F: '/^Block count:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+            free=$(awk -F: '/^Free blocks:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+            if [ -n "$bs" ] && [ -n "$blocks" ] && [ -n "$free" ]; then
+                used=$(human $(((blocks - free) * bs)))
+            fi
+            unknown=$((unknown + 1))
+            verdict="stopped, unbound — fs-used $used (pristine ≈ initdb + swapfile; start it and re-run for a definitive answer)"
+        fi
+        printf '   %-16s %-22s %-8s %s\n' "$id" "$name" "$status" "$verdict"
+    done < <(jq -r '.[] | select(.name // "" | startswith("spare-pg-"))
+        | "\(.id)\t\(.name)\t\(.status)\t\(.guest_ip // "")"' <<<"$sandboxes")
+    echo "   ----"
+    echo "   $n spare-named sandbox(es): $claimed claimed (keep), $empty verified empty," \
+         "$suspicious unbound-with-data (INVESTIGATE), $unknown undetermined"
+    [ "$empty" -gt 0 ] && echo "   verified-empty spares are deleted by the purge phase (unbound + spare-named)"
+}
+
 # -------------------------------------------------------------- disks -----
 phase_disks() {
     note "disks: per-VM footprint (read-only)"
@@ -1021,6 +1092,7 @@ for p in "${PHASES[@]}"; do
         badfs)   phase_badfs ;;
         readopt) phase_readopt ;;
         disks)   phase_disks ;;
+        spares)  phase_spares ;;
     esac
 done
 

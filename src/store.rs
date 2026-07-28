@@ -55,7 +55,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Tier::Live => "live",
             Tier::Frozen => "frozen",

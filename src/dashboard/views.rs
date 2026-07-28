@@ -171,6 +171,12 @@ pub fn monitoring_page(
                             }
                         }
                     }
+                    form method="post" action="/monitoring/purge" class="inline-form" {
+                        button.stop type="submit"
+                            title="Permanently delete VMs that are pure waste: leftover VMs of schemas already frozen/archived (their data is durably offloaded) and unclaimed warm spares (empty by construction). Double confirmation required."
+                            onclick="return confirm('Purge deletes VMs PERMANENTLY: leftovers of already-frozen/archived schemas (data is safe in their dumps) and unclaimed spares (empty). Continue?') && prompt('Type PURGE to confirm') === 'PURGE'"
+                            { "purge waste VMs" }
+                    }
                 }
             }
             (banner(b))

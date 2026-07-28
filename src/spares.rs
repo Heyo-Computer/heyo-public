@@ -60,6 +60,13 @@ impl SparePool {
         }
     }
 
+    /// Snapshot of the ids this process has claimed (or is mid-claim on) —
+    /// the exclusion set a purge needs so it never deletes a spare that a
+    /// bring-up is loading a schema into right now.
+    pub fn claimed_ids(&self) -> HashSet<String> {
+        self.claimed.lock().unwrap().clone()
+    }
+
     /// Claim one warm spare, excluding `bound` ids (schema-bound per the
     /// registry). Returns a connected handle, or `None` when no spare is
     /// available (caller falls back to a cold create).
@@ -96,11 +103,25 @@ impl SparePool {
         }
     }
 
-    /// One replenish pass: count available spares (running, spare-named,
-    /// neither schema-bound nor claimed) and create the deficit, serially.
-    /// Returns how many were created, for the supervisor's heartbeat. A
-    /// creation failure ends the pass — the supervisor retries next tick, and
-    /// grinding on during an outage (disk full, daemon down) helps nobody.
+    /// One replenish pass, in three moves (see [`plan_replenish`]):
+    ///
+    /// 1. **Restart** stranded stopped spares back into the pool — far
+    ///    cheaper than create+boot+initdb, and it heals the leak where a
+    ///    stopped spare (pooler restart, bulk stop, daemon hiccup) became
+    ///    invisible forever: not Running so never counted as available, never
+    ///    claimable, never cleaned up — while the replenisher kept building
+    ///    fresh ones on top.
+    /// 2. **Create** whatever deficit remains.
+    /// 3. **Delete** stopped surplus. Safe by construction: a successfully
+    ///    claimed spare is bound in the durable registry (`store.put` is
+    ///    fsync'd before the schema is ever served), so a spare that is
+    ///    stopped AND unbound AND unclaimed was never anyone's database —
+    ///    it holds an empty initdb cluster and nothing else. Running spares
+    ///    are never auto-deleted, surplus or not.
+    ///
+    /// Returns how many sandboxes were acted on, for the supervisor's
+    /// heartbeat. A creation failure ends the pass — the supervisor retries
+    /// next tick, and grinding on during an outage helps nobody.
     pub async fn replenish(&self, cfg: &Config, bound: &HashSet<String>) -> usize {
         let infos = match Sandbox::list(vm::local_opts()).await {
             Ok(l) => l,
@@ -109,26 +130,39 @@ impl SparePool {
                 return 0;
             }
         };
-        let available = {
+        let spares: Vec<(String, bool)> = infos
+            .iter()
+            .filter(|s| s.name.starts_with(SPARE_PREFIX))
+            .map(|s| (s.id.clone(), s.status == SandboxStatus::Running))
+            .collect();
+        let plan = {
             let claimed = self.claimed.lock().unwrap();
-            infos
-                .iter()
-                .filter(|s| {
-                    s.name.starts_with(SPARE_PREFIX)
-                        && s.status == SandboxStatus::Running
-                        && !bound.contains(&s.id)
-                        && !claimed.contains(&s.id)
-                })
-                .count()
+            plan_replenish(&spares, bound, &claimed, self.target)
         };
-        let deficit = self.target.saturating_sub(available);
-        let mut created = 0usize;
-        for _ in 0..deficit {
+
+        let mut acted = 0usize;
+        for id in &plan.start {
+            match Sandbox::connect(id.clone(), vm::local_opts()) {
+                Ok(sb) => {
+                    // Opening a stopped disk — exclusive with reclaim passes.
+                    let _permit = crate::reclaim::boot_permit().await;
+                    match sb.start().await {
+                        Ok(()) => {
+                            info!("warm-spares: restarted stranded spare {id}");
+                            acted += 1;
+                        }
+                        Err(e) => warn!("warm-spares: restarting spare {id} failed: {e:#}"),
+                    }
+                }
+                Err(e) => warn!("warm-spares: connecting to spare {id} failed: {e:#}"),
+            }
+        }
+        for _ in 0..plan.create {
             let name = format!("{SPARE_PREFIX}{}", suffix());
             match vm::create_spare(cfg, &name).await {
                 Ok(sb) => {
                     info!("warm-spares: created spare {name} ({})", sb.sandbox_id());
-                    created += 1;
+                    acted += 1;
                 }
                 Err(e) => {
                     warn!("warm-spares: creating {name} failed; ending pass (will retry): {e:#}");
@@ -136,14 +170,63 @@ impl SparePool {
                 }
             }
         }
-        if created > 0 {
+        for id in &plan.delete {
+            match Sandbox::connect(id.clone(), vm::local_opts()) {
+                Ok(sb) => match sb.kill().await {
+                    Ok(()) => {
+                        info!("warm-spares: deleted surplus stopped spare {id} (never claimed)");
+                        acted += 1;
+                    }
+                    Err(e) => warn!("warm-spares: deleting surplus spare {id} failed: {e:#}"),
+                },
+                Err(e) => warn!("warm-spares: connecting to surplus spare {id} failed: {e:#}"),
+            }
+        }
+        if acted > 0 {
             info!(
-                "warm-spares: pool at {}/{} after creating {created}",
-                available + created,
+                "warm-spares: pass done — restarted {}, created up to {}, deleted {} surplus \
+                 (target {})",
+                plan.start.len(),
+                plan.create,
+                plan.delete.len(),
                 self.target
             );
         }
-        created
+        acted
+    }
+}
+
+/// What one replenish pass should do. `spares` is every spare-named sandbox
+/// as `(id, is_running)`; `bound` are registry-bound ids (claimed spares),
+/// `claimed` this process's in-flight claims. Free running spares count
+/// toward the target; the deficit is filled from free STOPPED spares first
+/// (restart beats create), then by creating; free stopped spares beyond that
+/// are surplus to delete. Bound/claimed spares are untouchable in every set.
+struct ReplenishPlan {
+    start: Vec<String>,
+    create: usize,
+    delete: Vec<String>,
+}
+
+fn plan_replenish(
+    spares: &[(String, bool)],
+    bound: &HashSet<String>,
+    claimed: &HashSet<String>,
+    target: usize,
+) -> ReplenishPlan {
+    let free = |id: &String| !bound.contains(id) && !claimed.contains(id);
+    let running = spares.iter().filter(|(id, up)| *up && free(id)).count();
+    let stopped: Vec<&String> = spares
+        .iter()
+        .filter(|(id, up)| !*up && free(id))
+        .map(|(id, _)| id)
+        .collect();
+    let deficit = target.saturating_sub(running);
+    let start: Vec<String> = stopped.iter().take(deficit).map(|s| (*s).clone()).collect();
+    ReplenishPlan {
+        create: deficit - start.len(),
+        delete: stopped.iter().skip(deficit).map(|s| (*s).clone()).collect(),
+        start,
     }
 }
 
@@ -172,5 +255,63 @@ mod tests {
         // The dashboard/find-by-name convention treats `pg-<schema>` as a
         // schema VM; a spare name must never parse that way.
         assert!(!SPARE_PREFIX.starts_with("pg-"));
+    }
+
+    fn ids(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plan_restarts_stranded_before_creating_and_deletes_surplus() {
+        let spares: Vec<(String, bool)> = vec![
+            ("run1".into(), true),   // free, running → counts toward target
+            ("stop1".into(), false), // free, stopped → restart candidate
+            ("stop2".into(), false), // free, stopped → restart candidate
+            ("stop3".into(), false), // free, stopped → surplus once target met
+        ];
+        let none = HashSet::new();
+        // Target 3: 1 running + restart 2 stopped; the 3rd stopped is surplus.
+        let p = plan_replenish(&spares, &none, &none, 3);
+        assert_eq!(p.start, vec!["stop1".to_string(), "stop2".into()]);
+        assert_eq!(p.create, 0);
+        assert_eq!(p.delete, vec!["stop3".to_string()]);
+
+        // Target 5: all stopped restarted, remainder created, nothing deleted.
+        let p = plan_replenish(&spares, &none, &none, 5);
+        assert_eq!(p.start.len(), 3);
+        assert_eq!(p.create, 1);
+        assert!(p.delete.is_empty());
+
+        // Target met by running spares alone: nothing started or created,
+        // every free stopped spare is surplus.
+        let p = plan_replenish(&spares, &none, &none, 1);
+        assert!(p.start.is_empty());
+        assert_eq!(p.create, 0);
+        assert_eq!(p.delete.len(), 3);
+    }
+
+    #[test]
+    fn plan_never_touches_bound_or_claimed_spares() {
+        // The data-safety property: a spare bound to a schema in the registry
+        // (a claimed spare that was later idle-stopped) must never appear in
+        // start OR delete — it is that schema's database.
+        let spares: Vec<(String, bool)> = vec![
+            ("bound-stopped".into(), false),
+            ("claimed-stopped".into(), false),
+            ("free-stopped".into(), false),
+        ];
+        let bound = ids(&["bound-stopped"]);
+        let claimed = ids(&["claimed-stopped"]);
+        let p = plan_replenish(&spares, &bound, &claimed, 0);
+        assert!(p.start.is_empty());
+        assert_eq!(
+            p.delete,
+            vec!["free-stopped".to_string()],
+            "only the never-claimed spare is deletable"
+        );
+        // And bound/claimed running spares don't count as available either.
+        let running: Vec<(String, bool)> = vec![("bound-run".into(), true)];
+        let p = plan_replenish(&running, &ids(&["bound-run"]), &HashSet::new(), 1);
+        assert_eq!(p.create, 1, "a bound spare is not pool inventory");
     }
 }

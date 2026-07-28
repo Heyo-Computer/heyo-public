@@ -327,6 +327,8 @@ pub struct SchemaRegistry {
     // Per-schema failure memory so the sweeps skip recently-failed offloads
     // instead of burning a ready-timeout on the same sick schemas every pass.
     offload_backoff: OffloadBackoff,
+    // Single-flights the dashboard's purge action.
+    purging: AtomicBool,
 }
 
 impl SchemaRegistry {
@@ -352,6 +354,7 @@ impl SchemaRegistry {
             spares,
             dumps,
             offload_backoff: OffloadBackoff::new(),
+            purging: AtomicBool::new(false),
         }
     }
 
@@ -1395,6 +1398,96 @@ impl SchemaRegistry {
         Ok(())
     }
 
+    /// Kick off one purge pass now, in the background — the dashboard's
+    /// double-opt-in "purge" button. Deletes sandboxes that are pure waste:
+    ///
+    /// - VMs still backing schemas whose tier is `frozen`/`archived` — the
+    ///   tier flip is only ever written after a size-verified durable dump,
+    ///   so these are leftovers of a failed post-offload kill;
+    /// - unclaimed spares: spare-named sandboxes neither bound to a schema in
+    ///   the registry nor mid-claim in this process (an empty initdb cluster
+    ///   by construction). A spare being restored into when the pooler last
+    ///   crashed can look unclaimed and get deleted — its source dump is
+    ///   still durable, so the restore just retries; never data loss.
+    ///
+    /// Errors if a purge is already running.
+    pub fn spawn_purge_now(self: &Arc<Self>) -> Result<()> {
+        if self.purging.swap(true, Ordering::SeqCst) {
+            bail!("a purge is already running");
+        }
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let _guard = SweepGuard(&registry.purging);
+            registry.purge_pass().await;
+        });
+        Ok(())
+    }
+
+    async fn purge_pass(&self) {
+        let infos = match heyo_sdk::Sandbox::list(vm::local_opts()).await {
+            Ok(l) => l,
+            Err(e) => {
+                crate::events::journal_error("purge", format!("listing sandboxes failed: {e:#}"));
+                return;
+            }
+        };
+        let live_ids: HashSet<String> = infos.iter().map(|s| s.id.clone()).collect();
+        let bound: HashSet<String> = self
+            .store_records()
+            .into_iter()
+            .map(|(_, r)| r.sandbox_id)
+            .collect();
+        let claimed = self
+            .spares
+            .as_ref()
+            .map(|p| p.claimed_ids())
+            .unwrap_or_default();
+
+        let (mut offloaded, mut spares, mut failed) = (0usize, 0usize, 0usize);
+        // 1. Leftover VMs of durably offloaded schemas.
+        for (schema, rec) in self.store_records() {
+            if rec.tier == Tier::Live || !live_ids.contains(&rec.sandbox_id) {
+                continue;
+            }
+            info!("purge: schema {schema} is {} but VM {} still exists — deleting",
+                rec.tier.as_str(), rec.sandbox_id);
+            match kill_by_id(&rec.sandbox_id).await {
+                Ok(()) => offloaded += 1,
+                Err(e) => {
+                    failed += 1;
+                    warn!("purge: deleting {} failed: {e:#}", rec.sandbox_id);
+                }
+            }
+        }
+        // 2. Unclaimed spares.
+        for s in &infos {
+            if !s.name.starts_with(crate::spares::SPARE_PREFIX)
+                || bound.contains(&s.id)
+                || claimed.contains(&s.id)
+            {
+                continue;
+            }
+            info!("purge: unclaimed spare {} — deleting", s.id);
+            match kill_by_id(&s.id).await {
+                Ok(()) => spares += 1,
+                Err(e) => {
+                    failed += 1;
+                    warn!("purge: deleting spare {} failed: {e:#}", s.id);
+                }
+            }
+        }
+        let msg = format!(
+            "deleted {offloaded} offloaded-schema VM(s) + {spares} unclaimed spare(s){}",
+            if failed > 0 {
+                format!(", {failed} failed")
+            } else {
+                String::new()
+            }
+        );
+        info!("purge: {msg}");
+        crate::events::journal_info("purge", msg);
+    }
+
     // ---- local frozen tier --------------------------------------------------
 
     /// Start the local dump HTTP server (frozen tier). Serves guest uploads
@@ -1981,6 +2074,15 @@ fn grow_target_gb(fs: (u64, u64, u64), device_bytes: u64, cfg: &DiskGrowConfig) 
         return None;
     }
     Some((current_gb * 2).min(cfg.max_gb))
+}
+
+/// Permanently delete sandbox `id` (kill = sandbox + disk; the SDK treats an
+/// already-gone sandbox as success).
+async fn kill_by_id(id: &str) -> Result<()> {
+    let sb = heyo_sdk::Sandbox::connect(id.to_string(), vm::local_opts())
+        .context("connecting to sandbox")?;
+    sb.kill().await.context("killing sandbox")?;
+    Ok(())
 }
 
 /// Best-effort CHECKPOINT over the warm pool, then stop the VM.

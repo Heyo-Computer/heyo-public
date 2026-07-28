@@ -91,6 +91,19 @@ pub async fn monitoring(
     ))
 }
 
+/// The double-opt-in "purge" button: delete leftover VMs of already-offloaded
+/// schemas plus unclaimed spares. Both opt-ins happen client-side (a confirm
+/// dialog, then typing PURGE); the server just single-flights the pass.
+pub async fn action_purge(State(st): State<DashState>) -> Redirect {
+    match st.registry.spawn_purge_now() {
+        Ok(()) => Redirect::to(&format!(
+            "/monitoring?msg={}",
+            qenc("purge started in the background; outcome lands on the events page")
+        )),
+        Err(e) => Redirect::to(&format!("/monitoring?err={}", qenc(&e.to_string()))),
+    }
+}
+
 /// Recent pooler events (failures + sweep summaries) from the journal —
 /// newest first, in-memory + reloaded from the daily partition files on
 /// startup. Read-only; no daemon or guest access.
@@ -307,11 +320,13 @@ pub async fn action_stop_idle(State(st): State<DashState>) -> Redirect {
         };
         let (mut stopped, mut failed) = (0usize, 0usize);
         for r in rows {
-            if !r.is_running()
-                || r.keepalive
-                || r.live_sessions.unwrap_or(0) > 0
-                || !(r.pool_managed || r.name.starts_with("spare-pg-"))
-            {
+            // Spares: a CLAIMED spare (bound to a schema — `schema` resolves
+            // via the registry despite the spare name) is an ordinary schema
+            // VM and stops like one. An UNCLAIMED spare is the warm pool —
+            // stopping it just orphans it (the replenisher only counts
+            // running spares) and defeats the pre-boot it exists for.
+            let stoppable = r.pool_managed || (r.name.starts_with("spare-pg-") && r.schema.is_some());
+            if !r.is_running() || r.keepalive || r.live_sessions.unwrap_or(0) > 0 || !stoppable {
                 continue;
             }
             let res = async {
