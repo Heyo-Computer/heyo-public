@@ -73,6 +73,13 @@ const ORPHAN_MAX_DELETES_PER_SWEEP: usize = 100;
 /// "gone?" ambiguity turn into a deletion, so we stop and try again next sweep.
 const ORPHAN_MAX_DAEMON_ERRORS: usize = 5;
 
+/// First-failure backoff for offloads (archive/freeze) of one schema.
+/// Doubles per consecutive failure, capped at [`OFFLOAD_BACKOFF_CAP`].
+const OFFLOAD_BACKOFF_BASE: Duration = Duration::from_secs(30 * 60);
+/// Ceiling on the offload backoff: even a permanently sick schema is retried
+/// this often, so a fixed environment heals without operator action.
+const OFFLOAD_BACKOFF_CAP: Duration = Duration::from_secs(24 * 3600);
+
 /// Circuit breaker for one eviction sweep: after this many *consecutive*
 /// archive failures the pass aborts instead of grinding on. Each failed archive
 /// can cost a full ready-timeout (~5 min of a wedged bring-up), and a run of
@@ -317,6 +324,9 @@ pub struct SchemaRegistry {
     // Local dump store + token registry for the frozen tier. `Some` when
     // PG_VM_POOL_FREEZE_AFTER_SECS is configured.
     dumps: Option<Arc<DumpServer>>,
+    // Per-schema failure memory so the sweeps skip recently-failed offloads
+    // instead of burning a ready-timeout on the same sick schemas every pass.
+    offload_backoff: OffloadBackoff,
 }
 
 impl SchemaRegistry {
@@ -341,6 +351,7 @@ impl SchemaRegistry {
             reclaimer,
             spares,
             dumps,
+            offload_backoff: OffloadBackoff::new(),
         }
     }
 
@@ -955,6 +966,13 @@ impl SchemaRegistry {
             if active.get(&schema).copied().unwrap_or(0) > 0 {
                 continue; // live sessions — archive_schema would refuse anyway
             }
+            if self.offload_backoff.active(&schema, Instant::now()).is_some() {
+                // Recently failed: retrying now burns ~5 min of wedged
+                // bring-up while the disk keeps filling. The next candidates
+                // (or the exhausted-candidates error) serve the emergency
+                // better than repeating a known failure.
+                continue;
+            }
             let idle_hours = now.saturating_sub(last_active) / 3600;
             info!(
                 "disk-pressure: emergency-archiving schema {schema} (idle ~{idle_hours}h, \
@@ -1064,6 +1082,7 @@ impl SchemaRegistry {
         // S3 without any VM (the dump already exists on the host).
         let mut frozen_candidates: Vec<String> = Vec::new();
         let mut total = 0usize;
+        let mut backing_off = 0usize;
         let (mut refreshed, mut keepalive, mut already, mut not_idle) = (0usize, 0usize, 0usize, 0usize);
         for (schema, rec) in self.store_records() {
             total += 1;
@@ -1094,7 +1113,16 @@ impl SchemaRegistry {
                     refreshed += 1;
                     self.store.touch(&schema);
                 }
-                SweepAction::Archive => candidates.push(schema),
+                // A candidate still in failure backoff is skipped: each retry
+                // of a sick schema costs a full wedged bring-up, and three in
+                // a row abort the pass for the healthy candidates behind them.
+                SweepAction::Archive => {
+                    if self.offload_backoff.active(&schema, Instant::now()).is_some() {
+                        backing_off += 1;
+                    } else {
+                        candidates.push(schema);
+                    }
+                }
             }
         }
 
@@ -1103,9 +1131,9 @@ impl SchemaRegistry {
         // "sweep now" button and the periodic pass both surface here.
         info!(
             "S3 eviction sweep: evaluated {total} schema(s) — {} live candidate(s) + \
-             {} frozen promotion(s), {refreshed} refreshed (warm), skipped {} \
-             ({keepalive} keepalive, {already} already archived, {not_idle} idle < \
-             {threshold_secs}s)",
+             {} frozen promotion(s), {refreshed} refreshed (warm), {backing_off} in \
+             failure backoff, skipped {} ({keepalive} keepalive, {already} already \
+             archived, {not_idle} idle < {threshold_secs}s)",
             candidates.len(),
             frozen_candidates.len(),
             keepalive + already + not_idle,
@@ -1193,14 +1221,20 @@ impl SchemaRegistry {
     pub async fn archive_schema(&self, schema: &str) -> Result<()> {
         let res = self.archive_schema_inner(schema).await;
         match &res {
-            Ok(()) => crate::events::journal_info(
-                "archive",
-                format!("schema {schema} → archived (S3)"),
-            ),
-            Err(e) => crate::events::journal_error(
-                "archive",
-                format!("schema {schema}: {e:#}"),
-            ),
+            Ok(()) => {
+                self.offload_backoff.clear(schema);
+                crate::events::journal_info("archive", format!("schema {schema} → archived (S3)"));
+            }
+            Err(e) => {
+                let (n, delay) = self.offload_backoff.record_failure(schema, Instant::now());
+                crate::events::journal_error(
+                    "archive",
+                    format!(
+                        "schema {schema}: {e:#} (failure {n}; sweeps skip this schema for {})",
+                        fmt_backoff(delay)
+                    ),
+                );
+            }
         }
         res
     }
@@ -1420,13 +1454,22 @@ impl SchemaRegistry {
             .collect();
 
         let mut candidates: Vec<String> = Vec::new();
+        let mut backing_off = 0usize;
         for (schema, rec) in self.store_records() {
             let ka = self.cfg.is_keepalive(&schema);
             if classify_candidate(&rec, ka, now, threshold_secs, live.get(&schema).copied())
                 == SweepAction::Archive
             {
-                candidates.push(schema);
+                // Same backoff skip as the S3 sweep — see sweep_archive.
+                if self.offload_backoff.active(&schema, Instant::now()).is_some() {
+                    backing_off += 1;
+                } else {
+                    candidates.push(schema);
+                }
             }
+        }
+        if backing_off > 0 {
+            info!("local freeze sweep: {backing_off} candidate(s) skipped in failure backoff");
         }
         if candidates.is_empty() {
             return 0;
@@ -1497,14 +1540,23 @@ impl SchemaRegistry {
     pub async fn freeze_schema(&self, schema: &str) -> Result<()> {
         let res = self.freeze_schema_inner(schema).await;
         match &res {
-            Ok(()) => crate::events::journal_info(
-                "freeze",
-                format!("schema {schema} → frozen (local dump)"),
-            ),
-            Err(e) => crate::events::journal_error(
-                "freeze",
-                format!("schema {schema}: {e:#}"),
-            ),
+            Ok(()) => {
+                self.offload_backoff.clear(schema);
+                crate::events::journal_info(
+                    "freeze",
+                    format!("schema {schema} → frozen (local dump)"),
+                );
+            }
+            Err(e) => {
+                let (n, delay) = self.offload_backoff.record_failure(schema, Instant::now());
+                crate::events::journal_error(
+                    "freeze",
+                    format!(
+                        "schema {schema}: {e:#} (failure {n}; sweeps skip this schema for {})",
+                        fmt_backoff(delay)
+                    ),
+                );
+            }
         }
         res
     }
@@ -1811,6 +1863,72 @@ impl SchemaRegistry {
 
 /// One GiB, for device-size math.
 const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Per-schema failure memory for offloads, so the archive/freeze/pressure
+/// sweeps stop re-trying the same sick schemas every pass. Each failed
+/// attempt on a schema costs up to a full ready-timeout (~5 min of wedged
+/// bring-up), and the sweeps' consecutive-failure breaker means a handful of
+/// permanently sick schemas can abort pass after pass — starving every
+/// healthy candidate behind them. With backoff, a failed schema is skipped by
+/// the sweeps for an exponentially growing window (30m, 1h, 2h … capped at
+/// 24h) and retried after; any success clears it. Deliberately NOT consulted
+/// by the dashboard's manual per-schema reap — a human clicking the button is
+/// an explicit retry (and its success resets the backoff).
+///
+/// In-memory only: a pooler restart retries everything once, which is the
+/// behavior you want after deploying a fix.
+struct OffloadBackoff {
+    map: StdMutex<HashMap<String, (u32, Instant)>>,
+}
+
+impl OffloadBackoff {
+    fn new() -> Self {
+        Self {
+            map: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record one failure at `now`; returns (consecutive failures, how long
+    /// sweeps will now skip this schema).
+    fn record_failure(&self, schema: &str, now: Instant) -> (u32, Duration) {
+        let mut map = self.map.lock().unwrap();
+        let entry = map.entry(schema.to_string()).or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = now;
+        (entry.0, offload_backoff_delay(entry.0))
+    }
+
+    /// A success (or a completed restore) forgets the schema's failures.
+    fn clear(&self, schema: &str) {
+        self.map.lock().unwrap().remove(schema);
+    }
+
+    /// Time remaining in `schema`'s backoff window at `now`, if any.
+    fn active(&self, schema: &str, now: Instant) -> Option<Duration> {
+        let map = self.map.lock().unwrap();
+        let (failures, last) = map.get(schema)?;
+        offload_backoff_delay(*failures).checked_sub(now.saturating_duration_since(*last))
+            .filter(|d| !d.is_zero())
+    }
+}
+
+/// 30m, 1h, 2h, 4h, … capped at [`OFFLOAD_BACKOFF_CAP`].
+fn offload_backoff_delay(failures: u32) -> Duration {
+    let exp = failures.saturating_sub(1).min(6); // 2^6 * 30m > cap already
+    OFFLOAD_BACKOFF_BASE
+        .saturating_mul(1u32 << exp)
+        .min(OFFLOAD_BACKOFF_CAP)
+}
+
+/// Compact duration for backoff messages: "30m", "2h".
+fn fmt_backoff(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 {
+        format!("{}h", s.div_ceil(3600))
+    } else {
+        format!("{}m", s.div_ceil(60))
+    }
+}
 
 /// Sample a warm VM's data filesystem (total, used, avail bytes via `df` over
 /// the pool, like `guest_stats`) plus its backing *device* size (sysfs sector
@@ -2227,6 +2345,39 @@ fn used_pct(used: u64, avail: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offload_backoff_doubles_caps_and_clears() {
+        let b = OffloadBackoff::new();
+        let t0 = Instant::now();
+        assert!(b.active("s", t0).is_none(), "no failures yet");
+
+        let (n, d) = b.record_failure("s", t0);
+        assert_eq!((n, d), (1, Duration::from_secs(30 * 60)));
+        assert!(b.active("s", t0 + Duration::from_secs(29 * 60)).is_some());
+        assert!(b.active("s", t0 + Duration::from_secs(30 * 60)).is_none(), "window elapsed");
+
+        // Second failure doubles; other schemas are unaffected.
+        let (_, d2) = b.record_failure("s", t0);
+        assert_eq!(d2, Duration::from_secs(60 * 60));
+        assert!(b.active("other", t0).is_none());
+
+        // Many failures clamp to the cap.
+        for _ in 0..10 {
+            b.record_failure("s", t0);
+        }
+        let (_, dcap) = b.record_failure("s", t0);
+        assert_eq!(dcap, OFFLOAD_BACKOFF_CAP);
+
+        // A success forgets everything.
+        b.clear("s");
+        assert!(b.active("s", t0).is_none());
+        let (n, _) = b.record_failure("s", t0);
+        assert_eq!(n, 1, "counter restarts after a clear");
+
+        assert_eq!(fmt_backoff(Duration::from_secs(30 * 60)), "30m");
+        assert_eq!(fmt_backoff(Duration::from_secs(2 * 3600)), "2h");
+    }
 
     #[test]
     fn grow_target_doubles_capped_and_gates_correctly() {

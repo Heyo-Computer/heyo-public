@@ -1390,9 +1390,46 @@ async fn power_cycle(
     // Reconnect from scratch: the guest_ip/tunnel from before the reboot may no
     // longer be valid.
     let (target, tunnel, pool) = connect_pg(cfg, sandbox, name).await?;
-    wait_pg_ready(&pool, cfg.ready_timeout, name).await?;
+    match wait_pg_ready(&pool, cfg.ready_timeout, name).await {
+        Ok(()) => {}
+        Err(e) => {
+            // Postgres didn't come up even on a FRESH boot — a persistently
+            // sick guest (unmountable data disk killing init, a crash-looping
+            // postmaster, an incompatible pgdata). The timeout alone is a dead
+            // end to debug, so grab whatever the guest can still say. Exec
+            // rides the serial console, which only answers while PID-1
+            // survived — an exec failure here usually means init.sh itself
+            // died (e.g. `set -e` at the data-disk mount), which is evidence
+            // too, and is reported as such.
+            let evidence = boot_evidence(cfg, sandbox).await;
+            return Err(e).with_context(|| format!("{name} failed a fresh boot ({evidence})"));
+        }
+    }
     info!("{name}: Postgres recovered after power-cycle");
     Ok((target, tunnel, pool))
+}
+
+/// Best-effort one-line diagnosis of a guest whose Postgres won't start:
+/// the tail of the server log if one exists, else the tail of the kernel
+/// ring buffer. Never fails — every failure mode becomes descriptive text.
+async fn boot_evidence(cfg: &Config, sandbox: &Sandbox) -> String {
+    let cmd = "tail -n 6 /workspace/pgdata/log/*.log 2>/dev/null \
+               || { echo NO-PG-LOG; dmesg 2>/dev/null | tail -n 4; }";
+    match exec_guest(cfg, sandbox, cmd, false, "collecting boot evidence").await {
+        Ok(res) => {
+            let text = exec_detail(&res).replace(['\n', '\r'], " | ");
+            let text = text.trim();
+            if text.is_empty() {
+                "guest exec answered but produced no output".to_string()
+            } else {
+                truncate(text, 400).to_string()
+            }
+        }
+        Err(e) => format!(
+            "guest exec unavailable — init likely died during boot (data-disk \
+             mount failure?): {e:#}"
+        ),
+    }
 }
 
 /// What a bounded `SELECT 1` attempt tells us about the server behind `pool`.
