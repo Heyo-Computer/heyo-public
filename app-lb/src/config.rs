@@ -52,6 +52,12 @@ pub struct LbConfig {
     /// host-local tap network.
     #[serde(default = "default_tls_addr")]
     pub tls_addr: String,
+    /// Whether `tls_addr` was configured explicitly rather than defaulted.
+    /// Setting it while TLS stays disabled is a misconfiguration worth warning
+    /// about — the HTTPS listener is silently skipped otherwise. Not part of the
+    /// serialized form; it describes how the config was built, not what it says.
+    #[serde(skip)]
+    pub tls_addr_explicit: bool,
     /// A static certificate pair. Once ACME is enabled this is the *fallback*,
     /// served for any SNI with no issued certificate of its own (a `host_suffix`
     /// deployment, or a host whose issuance hasn't completed). Both or neither.
@@ -96,6 +102,7 @@ impl Default for LbConfig {
             dashboard_password: None,
             admin_auth: false,
             tls_addr: default_tls_addr(),
+            tls_addr_explicit: false,
             tls_cert_path: None,
             tls_key_path: None,
             acme_email: None,

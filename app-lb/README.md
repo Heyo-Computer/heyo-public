@@ -361,8 +361,20 @@ Four things to know before enabling it:
   `APP_LB_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory`.
   Production rate limits are per-account per-week; a misconfigured hostname in a
   retry loop can lock out issuance for every other hostname for hours. app-lb
-  backs off exponentially per host (1 min doubling to 6 h) for exactly this
-  reason, but staging is still the right place to find out that DNS is wrong.
+  backs off exponentially per host (1 min doubling to 6 h) and **persists that
+  backoff across restarts**, so a supervisor restart loop can't reset it and
+  hammer the CA — but staging is still the right place to find out DNS is wrong.
+
+  Switching between staging and production needs no manual cleanup: app-lb
+  records which directory the cached state belongs to and discards the account
+  and every certificate when it changes, logging why. That matters because
+  neither would otherwise correct itself — a saved account reconnects to the
+  directory baked into *its own* credentials regardless of this variable, and a
+  staging certificate stays valid for months so it never comes up for renewal.
+  The result would be untrusted certificates served indefinitely with nothing in
+  the log. (State written by a version predating this check is left alone, since
+  an upgrade isn't a change; the first run after upgrading records the current
+  directory and acts on changes from then on.)
 - **`APP_LB_TLS_CERT` becomes the fallback.** It is served for any SNI without an
   issued certificate of its own — a `host_suffix` deployment, or a hostname whose
   first issuance hasn't finished. With no fallback configured, such a handshake

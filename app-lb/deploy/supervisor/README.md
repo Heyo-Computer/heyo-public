@@ -62,10 +62,15 @@ sudo supervisorctl tail -f app-lb stderr
 ## Notes
 
 - A startup misconfiguration causes an immediate panic-exit: setting only one of
-  `APP_LB_TLS_CERT` / `APP_LB_TLS_KEY`, or `APP_LB_ADMIN_AUTH=1` without
-  `APP_LB_DASHBOARD_PASSWORD`. `startretries=3` bounds the resulting crash-loop,
-  after which supervisord marks the program `FATAL` — check
-  `supervisorctl tail app-lb stderr` for the panic message.
+  `APP_LB_TLS_CERT` / `APP_LB_TLS_KEY`, `APP_LB_ADMIN_AUTH=1` without
+  `APP_LB_DASHBOARD_PASSWORD`, or a listen address that cannot be bound.
+  `startretries=3` bounds the resulting crash-loop, after which supervisord marks
+  the program `FATAL` — check `supervisorctl tail app-lb stderr` for the message.
+- **Listen addresses are pre-flighted at startup**, deliberately. Pingora binds
+  inside a service task and a failure there panics only *that task*: the process
+  survives with a dead proxy, the admin API still answering, and supervisord
+  reporting `RUNNING`. app-lb binds each address up front so that becomes a clean
+  startup failure naming the port and the cause instead of a half-dead service.
 - The default listeners (`6188`, `6189`, `9090`) are unprivileged, so no root is
   needed. If you rebind the proxy to `:80`/`:443`, you must run as root or grant
   `CAP_NET_BIND_SERVICE`.

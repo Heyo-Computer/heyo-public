@@ -16,6 +16,7 @@
 //! issues those over DNS-01 — a different challenge with a different set of
 //! credentials to manage. Those deployments fall back to the static cert.
 
+use crate::deployment::now_secs;
 use crate::registry::Registry;
 use crate::tls::CertStore;
 use arc_swap::ArcSwap;
@@ -26,10 +27,11 @@ use instant_acme::{
 };
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Notify;
 
 /// How often to sweep for certificates approaching expiry. Renewal starts 30
@@ -132,9 +134,28 @@ impl From<std::io::Error> for AcmeError {
 }
 
 /// Per-host retry state after a failure.
+///
+/// Wall-clock seconds rather than `Instant`, because this is persisted: a
+/// monotonic clock is meaningless across a restart, and a restart resetting the
+/// backoff is exactly the failure this guards against. A supervisor restart loop
+/// with in-memory backoff re-attempts issuance on every boot and can exhaust the
+/// CA's failed-validation budget in a couple of minutes.
+#[derive(Clone, Serialize, Deserialize)]
 struct Backoff {
-    next_attempt: Instant,
-    delay: Duration,
+    next_attempt_secs: u64,
+    delay_secs: u64,
+}
+
+impl Backoff {
+    /// `true` once the cooldown has passed.
+    ///
+    /// A `next_attempt` implausibly far in the future means the clock moved
+    /// backwards since it was written (or the file was tampered with); treat
+    /// that as expired rather than stranding the host forever.
+    fn expired(&self, now: u64) -> bool {
+        now >= self.next_attempt_secs
+            || self.next_attempt_secs > now.saturating_add(BACKOFF_MAX.as_secs())
+    }
 }
 
 pub struct AcmeConfig {
@@ -145,6 +166,9 @@ pub struct AcmeConfig {
     /// ACME directory URL. Point at Let's Encrypt *staging* for any testing —
     /// production rate limits are per-account-per-week and unforgiving.
     pub directory_url: String,
+    /// The plaintext proxy address, used to confirm the listener is actually up
+    /// before the first issuance. Not otherwise used.
+    pub proxy_addr: String,
 }
 
 impl AcmeConfig {
@@ -152,6 +176,105 @@ impl AcmeConfig {
         LetsEncrypt::Production.url().to_string()
     }
 }
+
+/// The file recording which ACME directory the cached state belongs to.
+const DIRECTORY_STAMP: &str = "directory";
+
+/// Discard cached ACME state when the configured directory URL changes.
+///
+/// Certificates and the account are directory-specific, and nothing in either
+/// carries that association: an account restored from `account.json` reconnects
+/// to the URL baked into *its* credentials, ignoring `APP_LB_ACME_DIRECTORY`
+/// entirely (see `instant_acme::AccountBuilder::from_credentials`). So switching
+/// from staging to production without clearing state silently keeps talking to
+/// staging, and the still-valid staging certificate isn't due for renewal, so
+/// nothing reissues. The result is untrusted certificates served indefinitely
+/// with no error anywhere.
+///
+/// Runs before the cert store loads, so a stale certificate never reaches it.
+/// Returns `true` if state was discarded.
+///
+/// A missing stamp means state predates this check; that is an upgrade, not a
+/// change, so it is recorded rather than acted on — wiping a working production
+/// setup on upgrade would be far worse than the problem being solved.
+pub fn reset_if_directory_changed(dir: &Path, directory_url: &str) -> bool {
+    let stamp = dir.join(DIRECTORY_STAMP);
+    let previous = std::fs::read_to_string(&stamp).ok();
+    let previous = previous.as_deref().map(str::trim);
+
+    let changed = match previous {
+        Some(prev) if prev == directory_url => false,
+        Some(prev) => {
+            tracing::warn!(
+                from = %prev,
+                to = %directory_url,
+                "ACME directory changed; discarding the cached account and every \
+                 certificate issued by the previous directory (they would otherwise \
+                 be served until expiry, and the saved account would keep talking to \
+                 the old directory)",
+            );
+            for path in [dir.join("account.json"), dir.join("backoff.json")] {
+                if let Err(e) = std::fs::remove_file(&path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::error!(path = %path.display(), error = %e, "could not remove stale ACME state");
+                }
+            }
+            if let Err(e) = std::fs::remove_dir_all(dir.join("certs"))
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::error!(error = %e, "could not remove stale certificates");
+            }
+            true
+        }
+        None => false, // first run, or an upgrade from before the stamp existed
+    };
+
+    if previous.is_none_or(|prev| prev != directory_url)
+        && let Err(e) =
+            crate::tls::create_dir_private(dir).and_then(|()| std::fs::write(&stamp, directory_url))
+    {
+        tracing::error!(error = %e, "could not record the ACME directory; a future \
+                                     change to it will not be detected");
+    }
+    changed
+}
+
+/// Wait until the plaintext proxy is accepting connections, up to `timeout`.
+///
+/// ACME starts before the proxy service binds, so without this the first sweep
+/// can publish challenges and tell the CA they are ready while nothing is
+/// listening — spending the failed-validation budget on a listener that may
+/// never come up. Returns `false` on timeout, in which case issuance is skipped
+/// rather than attempted blind.
+async fn wait_for_proxy(addr: &str, timeout: Duration) -> bool {
+    // Probe loopback on the configured port: the listener is typically bound to
+    // 0.0.0.0, which is not itself a connectable address on every platform.
+    let port = match addr.rsplit_once(':') {
+        Some((_, port)) => port,
+        None => {
+            tracing::warn!(addr, "could not parse a port from the proxy address");
+            return false;
+        }
+    };
+    let target = format!("127.0.0.1:{port}");
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tokio::net::TcpStream::connect(&target).await.is_ok() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// How long to wait for the proxy at startup before giving up on the first
+/// sweep. Generous: the cost of waiting is a delayed certificate, the cost of
+/// not waiting is a wasted validation attempt.
+const PROXY_WAIT: Duration = Duration::from_secs(30);
 
 pub struct AcmeManager {
     registry: Arc<Registry>,
@@ -180,11 +303,11 @@ impl AcmeManager {
             registry,
             certs,
             challenges,
-            config,
             signal: Arc::new(Notify::new()),
             account: tokio::sync::Mutex::new(None),
-            backoff: Mutex::new(HashMap::new()),
+            backoff: Mutex::new(Self::load_backoff(&config.dir)),
             warned: Mutex::new(HashSet::new()),
+            config,
         }
     }
 
@@ -288,9 +411,8 @@ impl AcmeManager {
         let Ok(backoff) = self.backoff.lock() else {
             return true;
         };
-        backoff
-            .get(host)
-            .is_none_or(|b| Instant::now() >= b.next_attempt)
+        let now = now_secs();
+        backoff.get(host).is_none_or(|b| b.expired(now))
     }
 
     fn record_failure(&self, host: &str) {
@@ -298,17 +420,62 @@ impl AcmeManager {
             return;
         };
         let entry = backoff.entry(host.to_string()).or_insert(Backoff {
-            next_attempt: Instant::now(),
-            delay: BACKOFF_START,
+            next_attempt_secs: 0,
+            delay_secs: BACKOFF_START.as_secs(),
         });
-        entry.next_attempt = Instant::now() + entry.delay;
-        entry.delay = (entry.delay * 2).min(BACKOFF_MAX);
-        tracing::debug!(host, retry_in_secs = entry.delay.as_secs(), "backing off");
+        entry.next_attempt_secs = now_secs().saturating_add(entry.delay_secs);
+        entry.delay_secs = (entry.delay_secs * 2).min(BACKOFF_MAX.as_secs());
+        tracing::debug!(host, retry_in_secs = entry.delay_secs, "backing off");
+        let snapshot = backoff.clone();
+        drop(backoff);
+        self.persist_backoff(&snapshot);
     }
 
     fn record_success(&self, host: &str) {
-        if let Ok(mut backoff) = self.backoff.lock() {
-            backoff.remove(host);
+        let Ok(mut backoff) = self.backoff.lock() else {
+            return;
+        };
+        if backoff.remove(host).is_none() {
+            return; // nothing recorded; no need to rewrite the file
+        }
+        let snapshot = backoff.clone();
+        drop(backoff);
+        self.persist_backoff(&snapshot);
+    }
+
+    fn backoff_path(&self) -> PathBuf {
+        self.config.dir.join("backoff.json")
+    }
+
+    /// Best-effort: losing the backoff file degrades to the old in-memory
+    /// behaviour, which is worth a log line but not a failed issuance.
+    fn persist_backoff(&self, backoff: &HashMap<String, Backoff>) {
+        let write = || -> std::io::Result<()> {
+            crate::tls::create_dir_private(&self.config.dir)?;
+            let json = serde_json::to_vec_pretty(backoff)?;
+            let path = self.backoff_path();
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, json)?;
+            std::fs::rename(&tmp, &path)
+        };
+        if let Err(e) = write() {
+            tracing::warn!(error = %e, "could not persist ACME backoff state");
+        }
+    }
+
+    /// Restore the cooldowns a previous run recorded. A missing or unreadable
+    /// file is a normal first run.
+    fn load_backoff(dir: &Path) -> HashMap<String, Backoff> {
+        let path = dir.join("backoff.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return HashMap::new();
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(error = %e, "ignoring unreadable ACME backoff state");
+                HashMap::new()
+            }
         }
     }
 
@@ -449,8 +616,20 @@ impl BackgroundService for AcmeManager {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Issue for anything already registered (restored from persisted state)
-        // without waiting out the first tick.
-        self.reconcile().await;
+        // without waiting out the first tick — but only once the proxy is
+        // actually accepting, since it answers the http-01 challenge and this
+        // service starts before it binds.
+        if wait_for_proxy(&self.config.proxy_addr, PROXY_WAIT).await {
+            self.reconcile().await;
+        } else {
+            tracing::error!(
+                proxy = %self.config.proxy_addr,
+                timeout_secs = PROXY_WAIT.as_secs(),
+                "proxy is not accepting connections; skipping the startup certificate \
+                 sweep rather than failing http-01 validation against a listener that \
+                 is not there. Check for a bind failure in the error log.",
+            );
+        }
 
         loop {
             tokio::select! {
@@ -485,22 +664,36 @@ mod tests {
         registry
     }
 
-    fn manager(registry: Arc<Registry>) -> AcmeManager {
+    /// A per-test directory, since backoff state is now persisted and shared
+    /// directories would let tests see each other's writes.
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("app-lb-acme-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn manager_in(dir: &Path, registry: Arc<Registry>) -> AcmeManager {
         AcmeManager::new(
             registry,
-            Arc::new(CertStore::new("/tmp/app-lb-acme-test", None)),
+            Arc::new(CertStore::new(dir.join("certs"), None)),
             Arc::new(ChallengeTable::new()),
             AcmeConfig {
                 email: "test@example.com".into(),
-                dir: "/tmp/app-lb-acme-test".into(),
+                dir: dir.to_path_buf(),
                 directory_url: LetsEncrypt::Staging.url().to_string(),
+                proxy_addr: "127.0.0.1:0".into(),
             },
         )
     }
 
+    fn manager(tag: &str, registry: Arc<Registry>) -> AcmeManager {
+        manager_in(&tmpdir(tag), registry)
+    }
+
     #[test]
     fn desired_hosts_collects_exact_hosts_only() {
-        let manager = manager(registry_with(vec![
+        let manager = manager("desired", registry_with(vec![
             RouteRule {
                 host: Some("A.example.com".into()),
                 host_suffix: None,
@@ -534,7 +727,7 @@ mod tests {
 
     #[test]
     fn wildcard_warning_is_logged_once_per_suffix() {
-        let manager = manager(registry_with(vec![RouteRule {
+        let manager = manager("wildcard", registry_with(vec![RouteRule {
             host: None,
             host_suffix: Some("apps.example.com".into()),
             path_prefix: None,
@@ -563,31 +756,138 @@ mod tests {
 
     #[test]
     fn backoff_grows_and_clears_on_success() {
-        let manager = manager(registry_with(vec![]));
+        let manager = manager("grows", registry_with(vec![]));
         assert!(manager.may_attempt("a.example.com"), "no history, no wait");
 
         manager.record_failure("a.example.com");
         assert!(!manager.may_attempt("a.example.com"), "cooling down");
 
-        let first = manager.backoff.lock().unwrap()["a.example.com"].delay;
+        let first = manager.backoff.lock().unwrap()["a.example.com"].delay_secs;
         manager.record_failure("a.example.com");
-        let second = manager.backoff.lock().unwrap()["a.example.com"].delay;
+        let second = manager.backoff.lock().unwrap()["a.example.com"].delay_secs;
         assert!(second > first, "delay must grow");
 
         manager.record_success("a.example.com");
         assert!(manager.may_attempt("a.example.com"), "success clears backoff");
+        let _ = std::fs::remove_dir_all(&manager.config.dir);
     }
 
     #[test]
     fn backoff_is_capped() {
-        let manager = manager(registry_with(vec![]));
+        let manager = manager("capped", registry_with(vec![]));
         for _ in 0..50 {
             manager.record_failure("a.example.com");
         }
         assert_eq!(
-            manager.backoff.lock().unwrap()["a.example.com"].delay,
-            BACKOFF_MAX,
+            manager.backoff.lock().unwrap()["a.example.com"].delay_secs,
+            BACKOFF_MAX.as_secs(),
             "unbounded growth would strand a host forever",
         );
+        let _ = std::fs::remove_dir_all(&manager.config.dir);
+    }
+
+    #[test]
+    fn backoff_survives_a_restart() {
+        // The whole point: a supervisor restart loop must not reset the
+        // cooldown and re-attempt issuance on every boot.
+        let dir = tmpdir("restart");
+        {
+            let manager = manager_in(&dir, registry_with(vec![]));
+            manager.record_failure("a.example.com");
+            manager.record_failure("a.example.com");
+            assert!(!manager.may_attempt("a.example.com"));
+        }
+
+        // A fresh manager over the same directory is what a restart produces.
+        let restarted = manager_in(&dir, registry_with(vec![]));
+        assert!(
+            !restarted.may_attempt("a.example.com"),
+            "restart must not clear the cooldown",
+        );
+        assert_eq!(
+            restarted.backoff.lock().unwrap()["a.example.com"].delay_secs,
+            BACKOFF_START.as_secs() * 4,
+            "the accumulated delay must survive too, not just the fact of a failure",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backoff_ignores_a_clock_that_moved_backwards() {
+        let entry = Backoff {
+            next_attempt_secs: 1_000_000,
+            delay_secs: 60,
+        };
+        // Normal case: still cooling down.
+        assert!(!entry.expired(999_000));
+        // Cooldown elapsed.
+        assert!(entry.expired(1_000_001));
+        // "Now" is implausibly far behind the recorded time — a backwards clock
+        // must not strand the host until that timestamp arrives for real.
+        assert!(entry.expired(1));
+    }
+
+    #[test]
+    fn changing_the_acme_directory_discards_cached_state() {
+        let dir = tmpdir("dirchange");
+        std::fs::create_dir_all(dir.join("certs")).unwrap();
+        std::fs::write(dir.join("account.json"), b"{}").unwrap();
+        std::fs::write(dir.join("backoff.json"), b"{}").unwrap();
+        std::fs::write(dir.join("certs/demo.example.com.crt.pem"), b"cert").unwrap();
+
+        // First call records the directory without touching anything: state that
+        // predates the stamp is an upgrade, not a change.
+        assert!(!reset_if_directory_changed(&dir, "https://staging.example/dir"));
+        assert!(dir.join("account.json").exists(), "upgrade must not wipe");
+        assert!(dir.join("certs/demo.example.com.crt.pem").exists());
+
+        // Same directory again: still a no-op.
+        assert!(!reset_if_directory_changed(&dir, "https://staging.example/dir"));
+        assert!(dir.join("account.json").exists());
+
+        // A different directory invalidates the account and every certificate.
+        assert!(reset_if_directory_changed(&dir, "https://production.example/dir"));
+        assert!(
+            !dir.join("account.json").exists(),
+            "a staging account would keep talking to staging",
+        );
+        assert!(!dir.join("backoff.json").exists());
+        assert!(
+            !dir.join("certs/demo.example.com.crt.pem").exists(),
+            "a staging cert is valid for months and would never come up for renewal",
+        );
+
+        // The new directory is now the recorded one.
+        assert!(!reset_if_directory_changed(&dir, "https://production.example/dir"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn wait_for_proxy_detects_a_listening_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        assert!(
+            wait_for_proxy(&addr, Duration::from_secs(2)).await,
+            "a bound port must be detected",
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_proxy_times_out_when_nothing_is_listening() {
+        // Bind to claim a port, then drop it so nothing is accepting.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        assert!(
+            !wait_for_proxy(&addr, Duration::from_millis(400)).await,
+            "a dead listener must time out, so issuance is skipped rather than \
+             validated against nothing",
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_proxy_rejects_an_unparseable_address() {
+        assert!(!wait_for_proxy("no-port-here", Duration::from_millis(100)).await);
     }
 }

@@ -61,6 +61,7 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_PROXY_TLS_ADDR") {
         cfg.tls_addr = v;
+        cfg.tls_addr_explicit = true;
     }
     if let Ok(v) = std::env::var("APP_LB_TLS_CERT") {
         cfg.tls_cert_path = Some(v);
@@ -118,6 +119,43 @@ fn main() {
         );
     }
 
+    // Pre-flight the listener addresses.
+    //
+    // Pingora binds inside a service task, and a failure there panics *that task
+    // only* — the process survives with a dead proxy, the admin API still
+    // answering, and the supervisor reporting a healthy service. Checking here
+    // turns that silent half-dead state into a startup failure naming the port
+    // and the reason.
+    for addr in [Some(&cfg.proxy_addr), cfg.tls_enabled().then_some(&cfg.tls_addr)]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(e) = std::net::TcpListener::bind(addr) {
+            let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                "; binding a port below 1024 as a non-root user needs \
+                 `setcap 'cap_net_bind_service=+ep'` on the binary (re-run it after every \
+                 reinstall — capabilities do not survive replacing the file), or \
+                 `sysctl net.ipv4.ip_unprivileged_port_start=80`"
+            } else {
+                ""
+            };
+            panic!("cannot bind {addr}: {e}{hint}");
+        }
+    }
+
+    // Setting the HTTPS address is a clear statement of intent, but it only says
+    // *where* to bind, not whether to. Without ACME or a static cert there is
+    // nothing to serve, and the listener is skipped — previously in silence,
+    // which looks identical to a bind that failed.
+    if cfg.tls_addr_explicit && !cfg.tls_enabled() {
+        tracing::warn!(
+            tls = %cfg.tls_addr,
+            "APP_LB_PROXY_TLS_ADDR is set but no HTTPS listener will be bound: TLS needs \
+             either APP_LB_ACME_EMAIL (automatic certificates) or an APP_LB_TLS_CERT / \
+             APP_LB_TLS_KEY pair. Set one of them, or unset APP_LB_PROXY_TLS_ADDR.",
+        );
+    }
+
     // HTTP-01 validation is fetched on port 80 and nowhere else, so a proxy
     // bound anywhere else can only be validated if something in front forwards
     // that path. Worth saying loudly at startup rather than leaving it to be
@@ -155,6 +193,16 @@ fn main() {
         (None, None) => None,
         _ => panic!("TLS is half-configured: set both APP_LB_TLS_CERT and APP_LB_TLS_KEY, or neither"),
     };
+
+    // Before anything reads the cert directory: a change of ACME directory makes
+    // every cached certificate and the saved account invalid, and neither
+    // announces that itself.
+    if cfg.acme_enabled() {
+        acme::reset_if_directory_changed(
+            std::path::Path::new(&cfg.acme_dir),
+            &cfg.acme_directory,
+        );
+    }
 
     // Loaded from disk *before* the listener binds: the acceptor holds no
     // certificate of its own, so anything not in the store at bind time gets the
@@ -206,6 +254,7 @@ fn main() {
                     email,
                     dir: cfg.acme_dir.clone().into(),
                     directory_url: cfg.acme_directory.clone(),
+                    proxy_addr: cfg.proxy_addr.clone(),
                 },
             ),
         )
