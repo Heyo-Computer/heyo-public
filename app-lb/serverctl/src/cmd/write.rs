@@ -8,7 +8,7 @@
 use super::{Ctx, Resource, deployment_name, parse_ref};
 use crate::output::{self, Table};
 use crate::spec::{self, EnvChange};
-use crate::types::DeploymentStatus;
+use crate::types::{DeploymentStatus, JobRecord, SecretSummary};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde_json::{Map, Value};
@@ -80,6 +80,31 @@ pub struct CreateDeploymentArgs {
     #[arg(long = "upstream", value_name = "ADDR", help_heading = "Static upstreams")]
     pub upstreams: Vec<String>,
 
+    // Build source. Recording it here does not build anything — `serverctl
+    // build <name>` does that — so a deployment can be created against an
+    // existing image and switched to built images later.
+    /// Git remote the guest image is built from.
+    #[arg(long, value_name = "URL", help_heading = "Build source")]
+    pub repo: Option<String>,
+    /// Branch, tag or commit to build. Unset follows the remote's default branch.
+    #[arg(long = "ref", value_name = "REF", help_heading = "Build source", requires = "repo")]
+    pub git_ref: Option<String>,
+    /// Dockerfile path within the repo. Unset lets app-lb look for one.
+    #[arg(long, value_name = "PATH", help_heading = "Build source", requires = "repo")]
+    pub dockerfile: Option<String>,
+    /// Build context within the repo. Defaults to the Dockerfile's directory.
+    #[arg(long = "build-context", value_name = "PATH", help_heading = "Build source", requires = "repo")]
+    pub build_context: Option<String>,
+    /// Base name for built images; the commit is appended.
+    #[arg(long, value_name = "NAME", help_heading = "Build source", requires = "repo")]
+    pub image_name: Option<String>,
+    /// Rootfs size for the built image.
+    #[arg(long = "size-mb", value_name = "MB", help_heading = "Build source", requires = "repo")]
+    pub image_size_mb: Option<u64>,
+    /// Stored secret holding the git credential, as `NAME` or `NAME/KEY`.
+    #[arg(long = "secret", value_name = "NAME[/KEY]", help_heading = "Build source", requires = "repo")]
+    pub secret: Option<String>,
+
     #[command(flatten)]
     pub scaling: ScalingFlags,
 
@@ -146,7 +171,17 @@ pub fn create(ctx: &Ctx, args: &CreateDeploymentArgs) -> Result<()> {
         return print_spec(ctx, &spec);
     }
     let created = ctx.client.create_deployment(&spec)?;
-    report_write(ctx, &created, &args.name, "created")
+    report_write(ctx, &created, &args.name, "created")?;
+    // Recording a build source does not build anything; say so, because the
+    // deployment is otherwise sitting on whatever --image named.
+    if args.repo.is_some() && !ctx.out.is_machine() {
+        println!(
+            "\nIts image is not built yet — run `serverctl build {}` to check out the repo, \
+             build the Dockerfile and roll the pool onto the result.",
+            args.name
+        );
+    }
+    Ok(())
 }
 
 fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
@@ -236,6 +271,28 @@ fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
         spec.insert("vm".into(), Value::Object(vm));
     }
 
+    if let Some(repo) = &args.repo {
+        if !args.upstreams.is_empty() {
+            bail!(
+                "--repo builds a guest image, which a static (proxy_pass) deployment does \
+                 not have — drop --upstream, or drop the build flags"
+            );
+        }
+        let mut build = Map::new();
+        build.insert("repo".into(), Value::String(repo.clone()));
+        insert_opt_str(&mut build, "ref", args.git_ref.as_deref());
+        insert_opt_str(&mut build, "dockerfile", args.dockerfile.as_deref());
+        insert_opt_str(&mut build, "context", args.build_context.as_deref());
+        insert_opt_str(&mut build, "image_name", args.image_name.as_deref());
+        if let Some(mb) = args.image_size_mb {
+            build.insert("image_size_mb".into(), Value::from(mb));
+        }
+        if let Some(s) = &args.secret {
+            build.insert("auth".into(), spec::parse_secret_ref(s)?);
+        }
+        spec.insert("build".into(), Value::Object(build));
+    }
+
     let scaling = args.scaling.patch();
     if !scaling.is_empty() {
         if !args.upstreams.is_empty() {
@@ -269,6 +326,863 @@ fn insert_opt_str(map: &mut Map<String, Value>, key: &str, value: Option<&str>) 
     if let Some(v) = value {
         map.insert(key.to_string(), Value::String(v.to_string()));
     }
+}
+
+// -- create secret ---------------------------------------------------------
+
+/// Where a secret's values come from.
+///
+/// Four sources rather than one because a credential on the command line is
+/// visible in `ps` and lands in shell history — that is the convenient form, so
+/// it stays, but the alternatives have to be just as easy to reach.
+#[derive(Args, Debug, Default)]
+pub struct SecretSourceFlags {
+    /// Read the value from a file: `KEY=/path/to/token`. A single trailing
+    /// newline is stripped, which is what `openssl rand … > file` leaves.
+    #[arg(long = "from-file", value_name = "KEY=PATH", help_heading = "Sources")]
+    pub from_file: Vec<String>,
+    /// Take the value from this process's environment: `KEY=VAR`, or just `KEY`
+    /// to use the key's own name as the variable.
+    #[arg(long = "from-env", value_name = "KEY[=VAR]", help_heading = "Sources")]
+    pub from_env: Vec<String>,
+    /// Read one value from stdin: `--from-stdin KEY`. Everything up to EOF is
+    /// the value, minus a trailing newline.
+    #[arg(long = "from-stdin", value_name = "KEY", help_heading = "Sources")]
+    pub from_stdin: Option<String>,
+}
+
+impl SecretSourceFlags {
+    /// Collect every source into `KEY -> value`, in flag order.
+    fn collect(&self, literals: &[String]) -> Result<Map<String, Value>> {
+        let mut data = Map::new();
+        for arg in literals {
+            match spec::parse_env(arg)? {
+                EnvChange::Set(k, v) => {
+                    data.insert(k, Value::String(v));
+                }
+                EnvChange::Remove(k) => bail!(
+                    "{k}- removes a key; there is nothing to remove while creating a secret"
+                ),
+            }
+        }
+        for arg in &self.from_file {
+            let (key, path) = arg.split_once('=').with_context(|| {
+                format!("--from-file {arg:?} is not KEY=PATH")
+            })?;
+            let value = std::fs::read_to_string(path)
+                .with_context(|| format!("reading the value for {key:?} from {path}"))?;
+            data.insert(key.to_string(), Value::String(trim_one_newline(&value)));
+        }
+        for arg in &self.from_env {
+            let (key, var) = match arg.split_once('=') {
+                Some((k, v)) => (k, v),
+                None => (arg.as_str(), arg.as_str()),
+            };
+            let value = std::env::var(var).with_context(|| {
+                format!("${var} is not set, so there is no value for {key:?}")
+            })?;
+            data.insert(key.to_string(), Value::String(value));
+        }
+        if let Some(key) = &self.from_stdin {
+            let value = std::io::read_to_string(std::io::stdin())
+                .with_context(|| format!("reading the value for {key:?} from stdin"))?;
+            data.insert(key.clone(), Value::String(trim_one_newline(&value)));
+        }
+        Ok(data)
+    }
+}
+
+fn trim_one_newline(s: &str) -> String {
+    s.strip_suffix('\n')
+        .map(|t| t.strip_suffix('\r').unwrap_or(t))
+        .unwrap_or(s)
+        .to_string()
+}
+
+#[derive(Args, Debug)]
+pub struct CreateSecretArgs {
+    /// The secret id, unique across the load balancer.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// `KEY=VALUE`, repeatable. Visible in `ps` and in shell history — prefer
+    /// --from-file, --from-env or --from-stdin for anything real.
+    #[arg(value_name = "KEY=VALUE")]
+    pub literals: Vec<String>,
+
+    #[command(flatten)]
+    pub sources: SecretSourceFlags,
+
+    /// What this secret is for. Shown by `serverctl get secrets`.
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+
+    /// Print what would be sent — with the values redacted — and send nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+pub fn create_secret(ctx: &Ctx, args: &CreateSecretArgs) -> Result<()> {
+    let data = args.sources.collect(&args.literals)?;
+    if data.is_empty() {
+        bail!(
+            "a secret needs at least one key — pass KEY=VALUE, --from-file, --from-env \
+             or --from-stdin"
+        );
+    }
+
+    let mut body = Map::new();
+    body.insert("id".into(), Value::String(args.name.clone()));
+    if let Some(d) = &args.description {
+        body.insert("description".into(), Value::String(d.clone()));
+    }
+    body.insert("data".into(), Value::Object(data.clone()));
+
+    if args.dry_run {
+        // Never print the values, not even here: a dry run is the command people
+        // paste into a terminal that somebody else is watching.
+        let mut shown = body.clone();
+        shown.insert(
+            "data".into(),
+            Value::Object(
+                data.keys()
+                    .map(|k| (k.clone(), Value::String("<redacted>".into())))
+                    .collect(),
+            ),
+        );
+        return print_spec(ctx, &Value::Object(shown));
+    }
+
+    // POST upserts, so say which one actually happened.
+    let existed = ctx.client.secret_exists(&args.name).unwrap_or(false);
+    let result = ctx.client.create_secret(&Value::Object(body))?;
+    report_secret(ctx, &result, &args.name, if existed { "replaced" } else { "created" })
+}
+
+#[derive(Args, Debug)]
+pub struct SetSecretArgs {
+    /// The secret, e.g. `github` or `secret/github`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+
+    /// `KEY=VALUE` to set, `KEY-` to remove. Repeatable. Keys not mentioned are
+    /// left as they are — which matters here, because there is no way to read
+    /// them back and resend them.
+    #[arg(value_name = "KEY=VALUE")]
+    pub changes: Vec<String>,
+
+    #[command(flatten)]
+    pub sources: SecretSourceFlags,
+
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+pub fn set_secret(ctx: &Ctx, args: &SetSecretArgs) -> Result<()> {
+    let id = secret_name(&args.resource)?;
+
+    // Sets and removals share one map: `null` is how the API spells "remove".
+    let mut data = Map::new();
+    let mut removed = Vec::new();
+    for arg in &args.changes {
+        match spec::parse_env(arg)? {
+            EnvChange::Set(k, v) => {
+                data.insert(k, Value::String(v));
+            }
+            EnvChange::Remove(k) => {
+                data.insert(k.clone(), Value::Null);
+                removed.push(k);
+            }
+        }
+    }
+    for (k, v) in args.sources.collect(&[])? {
+        data.insert(k, v);
+    }
+    if data.is_empty() && args.description.is_none() {
+        bail!(
+            "nothing to change — pass KEY=VALUE, KEY-, --from-file, --from-env, \
+             --from-stdin or --description"
+        );
+    }
+
+    let mut body = Map::new();
+    body.insert("data".into(), Value::Object(data.clone()));
+    if let Some(d) = &args.description {
+        body.insert("description".into(), Value::String(d.clone()));
+    }
+
+    if args.dry_run {
+        let redacted: Map<String, Value> = data
+            .iter()
+            .map(|(k, v)| {
+                let shown = if v.is_null() {
+                    Value::Null
+                } else {
+                    Value::String("<redacted>".into())
+                };
+                (k.clone(), shown)
+            })
+            .collect();
+        let mut shown = body.clone();
+        shown.insert("data".into(), Value::Object(redacted));
+        return print_spec(ctx, &Value::Object(shown));
+    }
+
+    let result = ctx.client.patch_secret(&id, &Value::Object(body))?;
+    report_secret(ctx, &result, &id, "updated")
+}
+
+/// A single `secret/NAME` or bare-name argument.
+fn secret_name(arg: &str) -> Result<String> {
+    let (kind, names) = parse_ref(std::slice::from_ref(&arg.to_string()), Some(Resource::Secret))?;
+    if kind != Resource::Secret {
+        bail!("expected a secret, got {}", kind.singular());
+    }
+    match names.len() {
+        1 => Ok(names.into_iter().next().expect("len == 1")),
+        _ => bail!("expected a secret name, e.g. `github` or `secret/github`"),
+    }
+}
+
+fn report_secret(ctx: &Ctx, result: &Value, id: &str, verb: &str) -> Result<()> {
+    if ctx.out.is_machine() {
+        return output::emit(result, ctx.out, &[format!("secret/{id}")]);
+    }
+    match serde_json::from_value::<SecretSummary>(result.clone()) {
+        Ok(s) => println!(
+            "secret/{id} {verb} — {} key(s): {}{}",
+            s.keys.len(),
+            s.keys.join(", "),
+            if s.encrypted_at_rest {
+                " (encrypted at rest)"
+            } else {
+                " (stored in plaintext; set APP_LB_SECRET_KEY on the server to encrypt)"
+            }
+        ),
+        Err(_) => println!("secret/{id} {verb}"),
+    }
+    Ok(())
+}
+
+// -- set build -------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct SetBuildArgs {
+    /// The deployment, e.g. `web` or `deployment/web`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+
+    /// Git remote to build from: `https://…`, `git@host:path`, or a path on the
+    /// app-lb host. Required the first time.
+    #[arg(long, value_name = "URL")]
+    pub repo: Option<String>,
+    /// Branch, tag or commit to build. Unset follows the remote's default branch.
+    #[arg(long = "ref", value_name = "REF")]
+    pub git_ref: Option<String>,
+    /// Dockerfile path within the repo. Unset lets app-lb look for one.
+    #[arg(long, value_name = "PATH")]
+    pub dockerfile: Option<String>,
+    /// Build context within the repo. Defaults to the Dockerfile's directory.
+    #[arg(long = "build-context", value_name = "PATH")]
+    pub build_context: Option<String>,
+    /// Base name for built images; the commit is appended. Defaults to the
+    /// deployment id.
+    #[arg(long, value_name = "NAME")]
+    pub image_name: Option<String>,
+    /// Rootfs size for the built image. Unset lets heyvm size it from the image
+    /// contents.
+    #[arg(long = "size-mb", value_name = "MB")]
+    pub image_size_mb: Option<u64>,
+    /// Credential for a private repo: a stored secret, as `NAME` or `NAME/KEY`
+    /// (default key `token`).
+    #[arg(long = "secret", value_name = "NAME[/KEY]")]
+    pub secret: Option<String>,
+    /// Username to pair with the token. Only needed by forges that reject a
+    /// placeholder; GitHub, GitLab and Bitbucket do not.
+    #[arg(long, value_name = "NAME", requires = "secret")]
+    pub username: Option<String>,
+    /// Build without credentials (drops `build.auth`).
+    #[arg(long, conflicts_with_all = ["secret", "username"])]
+    pub no_auth: bool,
+    /// Remove the build source entirely; the deployment keeps its current image.
+    #[arg(long, conflicts_with_all = [
+        "repo", "git_ref", "dockerfile", "build_context", "image_name",
+        "image_size_mb", "secret", "username", "no_auth",
+    ])]
+    pub clear: bool,
+
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+pub fn set_build(ctx: &Ctx, args: &SetBuildArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+
+    if args.clear {
+        return edit_spec(ctx, &id, args.dry_run, "build source removed", |spec| {
+            if let Some(map) = spec.as_object_mut() {
+                map.remove("build");
+            }
+            Ok(())
+        });
+    }
+
+    let touched = args.repo.is_some()
+        || args.git_ref.is_some()
+        || args.dockerfile.is_some()
+        || args.build_context.is_some()
+        || args.image_name.is_some()
+        || args.image_size_mb.is_some()
+        || args.secret.is_some()
+        || args.no_auth;
+    if !touched {
+        bail!(
+            "nothing to set — pass --repo, --ref, --dockerfile, --context, --image-name, \
+             --size-mb, --secret or --no-auth (or --clear to remove the build source)"
+        );
+    }
+
+    let auth = match &args.secret {
+        Some(s) => {
+            let mut r = spec::parse_secret_ref(s)?;
+            if let (Some(u), Some(map)) = (&args.username, r.as_object_mut()) {
+                map.insert("username".into(), Value::String(u.clone()));
+            }
+            Some(r)
+        }
+        None => None,
+    };
+
+    edit_spec(ctx, &id, args.dry_run, "build source updated", |spec| {
+        let build = spec::build_mut(spec, &id)?;
+        if build.get("repo").and_then(Value::as_str).is_none() && args.repo.is_none() {
+            bail!(
+                "deployment {id:?} has no build source yet, so --repo is required \
+                 (e.g. --repo https://github.com/acme/web.git)"
+            );
+        }
+        for (key, value) in [
+            ("repo", args.repo.as_deref()),
+            ("ref", args.git_ref.as_deref()),
+            ("dockerfile", args.dockerfile.as_deref()),
+            ("context", args.build_context.as_deref()),
+            ("image_name", args.image_name.as_deref()),
+        ] {
+            if let Some(v) = value {
+                build.insert(key.to_string(), Value::String(v.to_string()));
+            }
+        }
+        if let Some(mb) = args.image_size_mb {
+            build.insert("image_size_mb".into(), Value::from(mb));
+        }
+        if let Some(auth) = &auth {
+            build.insert("auth".into(), auth.clone());
+        }
+        if args.no_auth {
+            build.remove("auth");
+        }
+        Ok(())
+    })
+}
+
+// -- set update ------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct SetUpdateArgs {
+    /// The static deployment, e.g. `app-obs` or `deployment/app-obs`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+
+    /// Working directory on the **app-lb host** — where the commands run.
+    /// Required the first time. Must be absolute.
+    #[arg(long = "workdir", visible_alias = "working-dir", value_name = "DIR")]
+    pub working_dir: Option<String>,
+
+    /// A command to run, in order. Repeatable; each is a shell line, so
+    /// `--command 'git pull && cargo build --release'` is one step. Passing any
+    /// replaces the whole list.
+    #[arg(long = "command", short = 'c', value_name = "CMD")]
+    pub commands: Vec<String>,
+
+    /// Environment for the commands, `KEY=VALUE`. Repeatable; replaces the
+    /// existing set.
+    #[arg(long = "env", short = 'e', value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+
+    /// Environment from a stored secret: `NAME/KEY`, or `ENV=NAME/KEY` to choose
+    /// the variable name. Repeatable; replaces the existing set.
+    #[arg(long = "secret-env", value_name = "[ENV=]NAME/KEY")]
+    pub secret_env: Vec<String>,
+
+    /// Stored secret holding a git credential, for commands that fetch
+    /// (`git pull`): `NAME` or `NAME/KEY`.
+    #[arg(long = "secret", value_name = "NAME[/KEY]")]
+    pub secret: Option<String>,
+
+    /// Run without a git credential (drops `update.auth`).
+    #[arg(long, conflicts_with = "secret")]
+    pub no_auth: bool,
+
+    /// Ceiling on a single command.
+    #[arg(long = "command-timeout", value_name = "SECS")]
+    pub timeout_secs: Option<u64>,
+
+    /// How long to wait for the upstreams to answer afterwards. `0` skips the
+    /// check — right only when the commands restart nothing.
+    #[arg(long = "verify-timeout", value_name = "SECS")]
+    pub verify_timeout_secs: Option<u64>,
+
+    /// Remove the update block entirely.
+    #[arg(long, conflicts_with_all = [
+        "working_dir", "commands", "env", "secret_env", "secret", "no_auth",
+        "timeout_secs", "verify_timeout_secs",
+    ])]
+    pub clear: bool,
+
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+pub fn set_update(ctx: &Ctx, args: &SetUpdateArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+
+    if args.clear {
+        return edit_spec(ctx, &id, args.dry_run, "update commands removed", |spec| {
+            if let Some(map) = spec.as_object_mut() {
+                map.remove("update");
+            }
+            Ok(())
+        });
+    }
+
+    let touched = args.working_dir.is_some()
+        || !args.commands.is_empty()
+        || !args.env.is_empty()
+        || !args.secret_env.is_empty()
+        || args.secret.is_some()
+        || args.no_auth
+        || args.timeout_secs.is_some()
+        || args.verify_timeout_secs.is_some();
+    if !touched {
+        bail!(
+            "nothing to set — pass --workdir, --command, --env, --secret-env, --secret, \
+             --command-timeout or --verify-timeout (or --clear to remove the update block)"
+        );
+    }
+
+    // Parse everything before the read-modify-write, so a typo fails without
+    // having touched the server.
+    let auth = match &args.secret {
+        Some(s) => Some(spec::parse_secret_ref(s)?),
+        None => None,
+    };
+    let secret_env: Vec<Value> = args
+        .secret_env
+        .iter()
+        .map(|s| spec::parse_secret_env(s))
+        .collect::<Result<_>>()?;
+    let mut env = Map::new();
+    for e in &args.env {
+        match spec::parse_env(e)? {
+            EnvChange::Set(k, v) => {
+                env.insert(k, Value::String(v));
+            }
+            EnvChange::Remove(k) => bail!(
+                "--env {k}- removes a variable, but --env replaces the whole set here; \
+                 pass the variables you want to keep"
+            ),
+        }
+    }
+
+    edit_spec(ctx, &id, args.dry_run, "update commands set", |spec| {
+        let update = spec::update_mut(spec, &id)?;
+        if update.get("working_dir").and_then(Value::as_str).is_none()
+            && args.working_dir.is_none()
+        {
+            bail!(
+                "deployment {id:?} has no update block yet, so --workdir is required \
+                 (the directory on the app-lb host where the commands run)"
+            );
+        }
+        if update.get("commands").and_then(Value::as_array).is_none_or(|c| c.is_empty())
+            && args.commands.is_empty()
+        {
+            bail!(
+                "deployment {id:?} has no update commands yet, so at least one --command is \
+                 required (e.g. -c 'git pull --ff-only' -c 'cargo build --release')"
+            );
+        }
+
+        if let Some(dir) = &args.working_dir {
+            update.insert("working_dir".into(), Value::String(dir.clone()));
+        }
+        if !args.commands.is_empty() {
+            update.insert(
+                "commands".into(),
+                Value::Array(args.commands.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        if !args.env.is_empty() {
+            update.insert("env".into(), Value::Object(env.clone()));
+        }
+        if !secret_env.is_empty() {
+            update.insert("env_from".into(), Value::Array(secret_env.clone()));
+        }
+        if let Some(auth) = &auth {
+            update.insert("auth".into(), auth.clone());
+        }
+        if args.no_auth {
+            update.remove("auth");
+        }
+        if let Some(t) = args.timeout_secs {
+            update.insert("timeout_secs".into(), Value::from(t));
+        }
+        if let Some(t) = args.verify_timeout_secs {
+            update.insert("verify_timeout_secs".into(), Value::from(t));
+        }
+        Ok(())
+    })
+}
+
+// -- set auth --------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct SetAuthArgs {
+    /// The deployment to gate, e.g. `web` or `deployment/web`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+
+    /// OAuth client id from the Google Cloud console. Required the first time.
+    #[arg(long, value_name = "ID")]
+    pub client_id: Option<String>,
+
+    /// Stored secret holding the client secret: `NAME` or `NAME/KEY`.
+    /// Required the first time.
+    #[arg(long = "secret", value_name = "NAME[/KEY]")]
+    pub secret: Option<String>,
+
+    /// A Google Workspace domain whose accounts may enter. Repeatable; passing
+    /// any replaces the list. `*` means any Google account.
+    #[arg(long = "allow-domain", value_name = "DOMAIN")]
+    pub allow_domains: Vec<String>,
+
+    /// An individual address allowed regardless of domain. Repeatable; passing
+    /// any replaces the list.
+    #[arg(long = "allow-email", value_name = "EMAIL")]
+    pub allow_emails: Vec<String>,
+
+    /// A path prefix served without the gate — health endpoints, webhook
+    /// receivers. Repeatable; passing any replaces the list.
+    #[arg(long = "public-path", value_name = "PATH")]
+    pub public_paths: Vec<String>,
+
+    /// Where app-lb's sign-in endpoints live under this deployment's hostname.
+    /// Defaults to `/__applb/auth`; set it under a path prefix if the deployment
+    /// is routed by one.
+    #[arg(long, value_name = "PATH")]
+    pub base_path: Option<String>,
+
+    /// How long a session lasts.
+    #[arg(long = "session-ttl", value_name = "SECS")]
+    pub session_ttl_secs: Option<u64>,
+
+    /// Session cookie name.
+    #[arg(long, value_name = "NAME")]
+    pub cookie_name: Option<String>,
+
+    /// Stop sending `x-auth-request-*` headers upstream.
+    #[arg(long)]
+    pub no_forward_identity: bool,
+
+    /// Remove the gate; the deployment serves everyone again.
+    #[arg(long, conflicts_with_all = [
+        "client_id", "secret", "allow_domains", "allow_emails", "public_paths",
+        "base_path", "session_ttl_secs", "cookie_name", "no_forward_identity",
+    ])]
+    pub clear: bool,
+
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+pub fn set_auth(ctx: &Ctx, args: &SetAuthArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+
+    if args.clear {
+        return edit_spec(ctx, &id, args.dry_run, "sign-in gate removed", |spec| {
+            if let Some(map) = spec.as_object_mut() {
+                map.remove("auth");
+            }
+            Ok(())
+        });
+    }
+
+    let touched = args.client_id.is_some()
+        || args.secret.is_some()
+        || !args.allow_domains.is_empty()
+        || !args.allow_emails.is_empty()
+        || !args.public_paths.is_empty()
+        || args.base_path.is_some()
+        || args.session_ttl_secs.is_some()
+        || args.cookie_name.is_some()
+        || args.no_forward_identity;
+    if !touched {
+        bail!(
+            "nothing to set — pass --client-id, --secret, --allow-domain, --allow-email, \
+             --public-path, --base-path, --session-ttl, --cookie-name or \
+             --no-forward-identity (or --clear to remove the gate)"
+        );
+    }
+
+    let secret = match &args.secret {
+        Some(s) => Some(spec::parse_secret_ref(s)?),
+        None => None,
+    };
+
+    edit_spec(ctx, &id, args.dry_run, "sign-in gate set", |spec| {
+        let auth = spec::auth_mut(spec)?;
+        let fresh = auth.is_empty();
+        if fresh && (args.client_id.is_none() || secret.is_none()) {
+            bail!(
+                "deployment {id:?} has no sign-in gate yet, so --client-id and --secret are \
+                 both required (store the client secret first: `serverctl create secret \
+                 google --from-stdin client_secret`)"
+            );
+        }
+        if fresh && args.allow_domains.is_empty() && args.allow_emails.is_empty() {
+            bail!(
+                "a new gate needs an allow-list: --allow-domain <workspace-domain> and/or \
+                 --allow-email <address>. Use --allow-domain '*' to admit any Google account"
+            );
+        }
+
+        if let Some(cid) = &args.client_id {
+            auth.insert("client_id".into(), Value::String(cid.clone()));
+        }
+        if let Some(s) = &secret {
+            auth.insert("client_secret".into(), s.clone());
+        }
+        for (key, values) in [
+            ("allowed_domains", &args.allow_domains),
+            ("allowed_emails", &args.allow_emails),
+            ("public_paths", &args.public_paths),
+        ] {
+            if !values.is_empty() {
+                auth.insert(
+                    key.to_string(),
+                    Value::Array(values.iter().cloned().map(Value::String).collect()),
+                );
+            }
+        }
+        insert_opt_str(auth, "base_path", args.base_path.as_deref());
+        insert_opt_str(auth, "cookie_name", args.cookie_name.as_deref());
+        if let Some(ttl) = args.session_ttl_secs {
+            auth.insert("session_ttl_secs".into(), Value::from(ttl));
+        }
+        if args.no_forward_identity {
+            auth.insert("forward_identity".into(), Value::Bool(false));
+        }
+        Ok(())
+    })
+}
+
+// -- update ----------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct UpdateArgs {
+    /// The static deployment to update, e.g. `app-obs`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+
+    /// Wait for the update to finish and report the outcome.
+    #[arg(long, short = 'w')]
+    pub wait: bool,
+
+    /// Print the commands' output as it arrives. Implies --wait.
+    #[arg(long)]
+    pub logs: bool,
+
+    #[arg(long, value_name = "SECS", default_value_t = 1800)]
+    pub timeout: u64,
+}
+
+pub fn update(ctx: &Ctx, args: &UpdateArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+    let started = ctx.client.start_update(&id)?;
+
+    if ctx.out.is_machine() && !(args.wait || args.logs) {
+        let record: JobRecord = serde_json::from_value(started.clone()).unwrap_or_default();
+        return output::emit(&started, ctx.out, &[format!("job/{}", record.id)]);
+    }
+
+    let record: JobRecord =
+        serde_json::from_value(started).context("parsing the job the server started")?;
+    if !ctx.out.is_machine() {
+        println!(
+            "job/{} started for deployment/{id} — {} command(s) in {}",
+            record.id,
+            record.commands_total.unwrap_or(0),
+            record.working_dir.as_deref().unwrap_or("its working directory"),
+        );
+    }
+
+    if !(args.wait || args.logs) {
+        println!(
+            "\nIt runs on the app-lb host. Follow it with `serverctl get job {}`.",
+            record.id
+        );
+        return Ok(());
+    }
+    wait_job(ctx, &record.id, Duration::from_secs(args.timeout), args.logs)
+}
+
+// -- build -----------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct BuildArgs {
+    /// The deployment to build, e.g. `web` or `deployment/web`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+
+    /// Build this ref instead of the one in the spec. A one-off: the stored
+    /// `build.ref` is left alone.
+    #[arg(long = "ref", value_name = "REF")]
+    pub git_ref: Option<String>,
+
+    /// Wait for the build to finish and report the outcome.
+    #[arg(long, short = 'w')]
+    pub wait: bool,
+
+    /// Print the build's output when it finishes. Implies --wait.
+    #[arg(long)]
+    pub logs: bool,
+
+    #[arg(long, value_name = "SECS", default_value_t = 1800)]
+    pub timeout: u64,
+}
+
+pub fn build(ctx: &Ctx, args: &BuildArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+
+    let mut body = Map::new();
+    if let Some(r) = &args.git_ref {
+        body.insert("ref".into(), Value::String(r.clone()));
+    }
+    let started = ctx.client.start_build(&id, &Value::Object(body))?;
+
+    if ctx.out.is_machine() && !(args.wait || args.logs) {
+        let record: JobRecord = serde_json::from_value(started.clone()).unwrap_or_default();
+        return output::emit(&started, ctx.out, &[format!("job/{}", record.id)]);
+    }
+
+    let record: JobRecord =
+        serde_json::from_value(started).context("parsing the job the server started")?;
+    if !ctx.out.is_machine() {
+        println!(
+            "job/{} started for deployment/{id} — {}",
+            record.id,
+            record.git_ref.as_deref().unwrap_or("(default branch)")
+        );
+    }
+
+    if !(args.wait || args.logs) {
+        println!(
+            "\nIt runs on the app-lb host and takes as long as `docker build` does. \
+             Follow it with `serverctl get job {}`.",
+            record.id
+        );
+        return Ok(());
+    }
+    wait_job(ctx, &record.id, Duration::from_secs(args.timeout), args.logs)
+}
+
+/// Poll one job — build or update — to completion.
+fn wait_job(ctx: &Ctx, job_id: &str, timeout: Duration, show_logs: bool) -> Result<()> {
+    let started = Instant::now();
+    let mut last_lines = 0usize;
+    loop {
+        let raw = ctx.client.get_job(job_id)?;
+        let record: JobRecord =
+            serde_json::from_value(raw.clone()).context("parsing the job record")?;
+
+        // Stream whatever is new since the last poll, so a long `docker build`
+        // or `cargo build` shows progress rather than a cursor.
+        if show_logs && record.log.len() > last_lines {
+            for line in &record.log[last_lines..] {
+                println!("  {line}");
+            }
+            last_lines = record.log.len();
+        }
+
+        if !record.is_running() {
+            if ctx.out.is_machine() {
+                return output::emit(&raw, ctx.out, &[format!("job/{job_id}")]);
+            }
+            // With --logs the output is already on screen; reprinting the tail
+            // would show every line twice for a job that failed fast.
+            return report_job(&record, !show_logs);
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "timed out after {}s waiting for job/{job_id}; it is still running on the \
+                 server — check it with `serverctl get job {job_id}`",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+}
+
+fn report_job(record: &JobRecord, show_tail: bool) -> Result<()> {
+    if record.succeeded() {
+        if record.is_update() {
+            println!(
+                "job/{} succeeded — {} ran in {}{}",
+                record.id,
+                record.result_summary(),
+                record.working_dir.as_deref().unwrap_or("its working directory"),
+                match record.verified {
+                    Some(true) => "; the upstreams are answering again",
+                    // The server fails a job whose upstreams never came back, so
+                    // this is the verification-disabled case.
+                    _ => "; the upstreams were not re-checked",
+                }
+            );
+            return Ok(());
+        }
+        println!(
+            "job/{} succeeded — image {} from commit {}{}",
+            record.id,
+            record.image.as_deref().unwrap_or("?"),
+            record.short_commit(),
+            if record.rolled_out {
+                "; the pool is recycling onto it"
+            } else {
+                "; the deployment was NOT updated"
+            }
+        );
+        println!(
+            "\nWatch the replacements with `serverctl rollout status {}`.",
+            record.deployment
+        );
+        return Ok(());
+    }
+
+    // A failure ends the command non-zero, and the last few log lines are what
+    // says why, so print them even without --logs.
+    if show_tail {
+        for line in record.log.iter().rev().take(15).collect::<Vec<_>>().into_iter().rev() {
+            eprintln!("  {line}");
+        }
+    }
+    bail!(
+        "job/{} failed: {}",
+        record.id,
+        record.error.as_deref().unwrap_or("no reason reported")
+    )
 }
 
 // -- apply -----------------------------------------------------------------
@@ -749,12 +1663,49 @@ pub fn delete(ctx: &Ctx, args: &DeleteArgs) -> Result<()> {
     match kind {
         Resource::Deployment => delete_deployments(ctx, &names, args),
         Resource::Vm => delete_vms(ctx, &names, args),
+        Resource::Secret => delete_secrets(ctx, &names, args),
         Resource::Cert => bail!(
             "certificates are managed by app-lb's ACME loop and cannot be deleted through \
              the API; remove them from APP_LB_ACME_DIR on the host instead"
         ),
+        Resource::Job => bail!(
+            "jobs are a record of something that already happened and cannot be deleted; \
+             the server keeps the most recent ones and forgets the rest"
+        ),
         Resource::All => bail!("`delete all` is not supported — name the deployments, or use --all"),
     }
+}
+
+fn delete_secrets(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {
+    let targets: Vec<String> = if args.all {
+        let list: Vec<SecretSummary> = serde_json::from_value(ctx.client.list_secrets()?)?;
+        list.into_iter().map(|s| s.id).collect()
+    } else {
+        if names.is_empty() {
+            bail!("delete secret needs a name, or --all");
+        }
+        names.to_vec()
+    };
+
+    if targets.is_empty() {
+        println!("No secrets to delete.");
+        return Ok(());
+    }
+    if args.all && !args.yes {
+        confirm(&format!(
+            "About to delete {} secret(s), permanently: {}",
+            targets.len(),
+            targets.join(", ")
+        ))?;
+    }
+
+    for id in &targets {
+        // The server refuses (409) while a deployment's build still references
+        // the secret; --force is how you say you meant it.
+        ctx.client.delete_secret(id, args.force)?;
+        println!("secret/{id} deleted");
+    }
+    Ok(())
 }
 
 fn delete_deployments(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {

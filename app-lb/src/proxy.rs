@@ -9,6 +9,7 @@
 //! is the cold-start `Notify`, which yields.
 
 use crate::acme::ChallengeTable;
+use crate::auth::{Authenticator, Decision, Identity, RequestInfo};
 use crate::deployment::{Deployment, VmBackend};
 use crate::metrics::Metrics;
 use crate::registry::Registry;
@@ -37,6 +38,10 @@ pub struct Ctx {
     /// so the measured span covers cold-start waits too, and `None` before then
     /// so a request rejected pre-routing simply isn't timed.
     started_at: Option<Instant>,
+    /// Who the caller is, for a deployment behind a sign-in gate. Decided in
+    /// `request_filter` and applied to the upstream request later, so the gate
+    /// runs once per request rather than once per upstream attempt.
+    identity: Option<Identity>,
 }
 
 impl Ctx {
@@ -60,6 +65,9 @@ pub struct LbProxy {
     /// Outstanding HTTP-01 challenge responses, published by the ACME manager.
     /// Empty (and the lookup therefore a single miss) whenever ACME is off.
     challenges: Arc<ChallengeTable>,
+    /// Runs the sign-in gate for deployments that declare one. Inert for the
+    /// rest: a deployment without `auth` never reaches it.
+    auth: Arc<Authenticator>,
 }
 
 impl LbProxy {
@@ -67,11 +75,13 @@ impl LbProxy {
         registry: Arc<Registry>,
         metrics: Arc<Metrics>,
         challenges: Arc<ChallengeTable>,
+        auth: Arc<Authenticator>,
     ) -> Self {
         Self {
             registry,
             metrics,
             challenges,
+            auth,
         }
     }
 }
@@ -137,6 +147,91 @@ async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<
         .await
 }
 
+/// Write a response the sign-in gate decided on: a redirect to the provider, the
+/// end of a callback, or a refusal.
+async fn write_gate_response(session: &mut Session, r: crate::auth::Response) -> Result<()> {
+    let mut header = ResponseHeader::build(r.status, Some(6))?;
+    header.insert_header(http::header::CONTENT_LENGTH, r.body.len().to_string())?;
+    header.insert_header(http::header::CONTENT_TYPE, r.content_type)?;
+    if let Some(location) = &r.location {
+        header.insert_header(http::header::LOCATION, location)?;
+    }
+    // Nothing in the sign-in flow may be cached: a stored redirect would replay
+    // a spent authorization code, and a stored 403 would outlive the allow-list
+    // change that fixes it.
+    header.insert_header(http::header::CACHE_CONTROL, "no-store")?;
+    for cookie in &r.cookies {
+        // Appended, not inserted: a callback sets the session cookie *and*
+        // clears the flow cookie, and one `Set-Cookie` cannot carry both.
+        header.append_header(http::header::SET_COOKIE, cookie)?;
+    }
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(
+            Some(bytes::Bytes::copy_from_slice(r.body.as_bytes())),
+            true,
+        )
+        .await
+}
+
+/// Collect what the gate needs out of the live request.
+fn request_info<'a>(
+    session: &'a Session,
+    host: &'a str,
+    path: &'a str,
+    secure: bool,
+) -> RequestInfo<'a> {
+    let req = session.req_header();
+    let cookies = req
+        .headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::to_string)
+        .collect();
+    // A browser navigating asks for HTML; an API client asks for JSON or says
+    // nothing. The difference decides whether an unauthenticated request is
+    // redirected or refused with a 401 it can act on.
+    let wants_html = req
+        .headers
+        .get(http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"));
+
+    RequestInfo {
+        host,
+        path,
+        query: req.uri.query(),
+        cookies,
+        secure,
+        wants_html,
+    }
+}
+
+/// Whether the client reached app-lb over TLS.
+///
+/// The TLS digest is the truth for a connection app-lb terminated itself.
+/// `x-forwarded-proto` is consulted only as a fallback, for a deployment behind
+/// something that already terminated TLS — it is a client-settable header, and
+/// the cost of believing a false one is a `Secure` cookie the browser then
+/// refuses to send back, not a leaked session.
+fn is_secure_request(session: &Session) -> bool {
+    if session
+        .digest()
+        .is_some_and(|d| d.ssl_digest.is_some())
+    {
+        return true;
+    }
+    session
+        .req_header()
+        .headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|p| p.eq_ignore_ascii_case("https"))
+}
+
 #[async_trait]
 impl ProxyHttp for LbProxy {
     type CTX = Ctx;
@@ -169,17 +264,80 @@ impl ProxyHttp for LbProxy {
             return Ok(true);
         }
 
-        match self.registry.route(host.as_deref(), &path) {
-            Some(deployment) => {
+        let Some(deployment) = self.registry.route(host.as_deref(), &path) else {
+            tracing::debug!(?host, %path, "no deployment matches request");
+            write_plain(session, 404, "no deployment matches this request\n").await?;
+            return Ok(true); // response already written; stop proxying
+        };
+
+        // The sign-in gate, for the deployments that declare one. It runs after
+        // routing (the gate is the deployment's own configuration) and before
+        // anything touches a backend — including the cold-start wait, so an
+        // unauthenticated request never boots a VM.
+        if let Some(gate) = deployment.spec.auth.clone() {
+            // A gate needs a hostname to build its callback URL against; a
+            // request routed purely by path prefix with no Host header cannot
+            // complete a sign-in, and saying so beats redirecting to a URL the
+            // provider will refuse.
+            let Some(host) = host.as_deref() else {
+                write_plain(
+                    session,
+                    400,
+                    "this deployment requires sign-in, which needs a Host header\n",
+                )
+                .await?;
                 ctx.deployment = Some(deployment);
-                Ok(false)
-            }
-            None => {
-                tracing::debug!(?host, %path, "no deployment matches request");
-                write_plain(session, 404, "no deployment matches this request\n").await?;
-                Ok(true) // response already written; stop proxying
+                return Ok(true);
+            };
+
+            let secure = is_secure_request(session);
+            let info = request_info(session, host, &path, secure);
+            match self.auth.decide(&gate, &deployment.spec.id, &info).await {
+                Decision::Allow(identity) => ctx.identity = *identity,
+                Decision::Answered(response) => {
+                    write_gate_response(session, response).await?;
+                    // Recorded against the deployment: a wall of 302s or 403s
+                    // here is exactly the symptom of a misconfigured gate, and
+                    // it should show up in its metrics.
+                    ctx.deployment = Some(deployment);
+                    return Ok(true);
+                }
             }
         }
+
+        ctx.deployment = Some(deployment);
+        Ok(false)
+    }
+
+    /// Attach the caller's identity for a gated deployment — and strip the same
+    /// headers when there is none, so a client cannot present its own.
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let Some(gate) = ctx.deployment.as_ref().and_then(|d| d.spec.auth.as_ref()) else {
+            return Ok(());
+        };
+        // Unconditional, before anything is set: on a gated deployment these
+        // header names belong to app-lb, and an inbound one is either a mistake
+        // or an attempt to impersonate a signed-in user.
+        for name in crate::auth::IDENTITY_HEADERS {
+            upstream.remove_header(name);
+        }
+
+        if let (true, Some(identity)) = (gate.forward_identity, ctx.identity.as_ref()) {
+            upstream.insert_header("x-auth-request-email", crate::auth::header_safe(&identity.email))?;
+            upstream.insert_header("x-auth-request-user", crate::auth::header_safe(&identity.subject))?;
+            if let Some(name) = &identity.name {
+                let name = crate::auth::header_safe(name);
+                if !name.is_empty() {
+                    upstream.insert_header("x-auth-request-name", name)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn upstream_peer(
@@ -514,6 +672,9 @@ mod tests {
             scaling,
             health: HealthCheck::default(),
             upstreams: vec![],
+            build: None,
+            update: None,
+            auth: None,
         }))
     }
 

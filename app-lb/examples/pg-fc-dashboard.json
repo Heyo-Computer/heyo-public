@@ -1,7 +1,7 @@
 {
   "id": "pg-fc-dashboard",
   "routes": [
-    { "host": "pg-dashboard.local" }
+    { "host": "pg.us2.heyo.work" }
   ],
   "upstreams": ["127.0.0.1:8080"],
   "health": { "path": null, "timeout_secs": 2 }

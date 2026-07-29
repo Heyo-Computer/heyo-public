@@ -219,6 +219,82 @@ impl Client {
         self.delete(&path)
     }
 
+    // -- secrets -----------------------------------------------------------
+    //
+    // There is no `get_secret_value`, and there will not be one: app-lb has no
+    // endpoint that reveals a stored value. A secret is written once and read
+    // only in-process, by the builder resolving a deployment's `build.auth`.
+
+    pub fn list_secrets(&self) -> Result<Value> {
+        self.get("/secrets")
+    }
+
+    pub fn get_secret(&self, id: &str) -> Result<Value> {
+        self.get(&format!("/secrets/{}", escape(id)))
+    }
+
+    pub fn secret_exists(&self, id: &str) -> Result<bool> {
+        match self.status_of(&format!("/secrets/{}", escape(id)))? {
+            200 => Ok(true),
+            404 => Ok(false),
+            401 | 403 => bail!(
+                "not authorized to read secret {id:?} — run `serverctl login`, \
+                 or pass --user/--password"
+            ),
+            code => bail!("unexpected HTTP {code} while looking up secret {id:?}"),
+        }
+    }
+
+    pub fn create_secret(&self, spec: &Value) -> Result<Value> {
+        self.post("/secrets", spec)
+    }
+
+    /// Merge keys into an existing secret: `{"data": {"K": "v", "GONE": null}}`.
+    pub fn patch_secret(&self, id: &str, patch: &Value) -> Result<Value> {
+        self.patch(&format!("/secrets/{}", escape(id)), patch)
+    }
+
+    pub fn delete_secret(&self, id: &str, force: bool) -> Result<()> {
+        let path = format!(
+            "/secrets/{}{}",
+            escape(id),
+            if force { "?force=true" } else { "" }
+        );
+        self.delete(&path).map(|_| ())
+    }
+
+    // -- jobs --------------------------------------------------------------
+    //
+    // Two verbs, one history: `build` produces a managed deployment's guest
+    // image, `update` runs a static one's commands on the app-lb host, and both
+    // are polled from `/jobs`.
+
+    /// Start an image build. Returns immediately with a record; the build itself
+    /// takes minutes.
+    pub fn start_build(&self, id: &str, body: &Value) -> Result<Value> {
+        self.post(&format!("/deployments/{}/build", escape(id)), body)
+    }
+
+    /// Start a host update. Same shape as a build: scheduled, then polled.
+    pub fn start_update(&self, id: &str) -> Result<Value> {
+        self.post(
+            &format!("/deployments/{}/update", escape(id)),
+            &Value::Object(Default::default()),
+        )
+    }
+
+    pub fn list_jobs(&self) -> Result<Value> {
+        self.get("/jobs")
+    }
+
+    pub fn deployment_jobs(&self, id: &str) -> Result<Value> {
+        self.get(&format!("/deployments/{}/jobs", escape(id)))
+    }
+
+    pub fn get_job(&self, job_id: &str) -> Result<Value> {
+        self.get(&format!("/jobs/{}", escape(job_id)))
+    }
+
     pub fn metrics(&self) -> Result<Value> {
         self.get("/metrics")
     }

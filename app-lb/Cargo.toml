@@ -54,9 +54,23 @@ openssl = "0.10"
 # provider gets installed into a different crate's static and the panic remains.
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
+# The OAuth token exchange for the Google sign-in gate (`src/auth.rs`) — one
+# HTTPS POST per login. Already compiled in the graph via heyo-sdk, so this is a
+# dependency line rather than a new build; the features match heyo-sdk's so the
+# two resolve to one copy.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Query-string building (the authorize URL) and parsing (the callback). Small,
+# already present under reqwest/url, and hand-rolling percent-encoding is a
+# classic source of bugs.
+form_urlencoded = "1"
+
 async-trait = "0.1"
 futures = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
+# `process` is for the image builder (`src/build.rs`), which shells out to `git`
+# and `heyvm mvm build`: heyvm exposes no build API, so this is the only way to
+# turn a Dockerfile into a guest rootfs. It buys `kill_on_drop`, which is what
+# lets a timed-out `docker build` actually die instead of outliving its future.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "process"] }
 arc-swap = "1"
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }

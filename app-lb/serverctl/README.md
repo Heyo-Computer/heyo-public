@@ -116,10 +116,13 @@ or a bare `web` where the kind is unambiguous.
 
 ```sh
 serverctl get deployments                 # NAME KIND ROUTES DESIRED READY PENDING IN-FLIGHT
-serverctl get deployments -o wide         # + MIN MAX WARM TARGET BACKEND
+serverctl get deployments -o wide         # + MIN MAX WARM TARGET BACKEND SOURCE AUTH
 serverctl get deployment/web -o yaml      # the server's JSON, as YAML
 serverctl get vms -d web                  # backends of one deployment
 serverctl get certs                       # issued TLS certificates and expiry
+serverctl get secrets                     # ids and key *names* — never values
+serverctl get jobs -d web                 # builds and updates, newest first
+serverctl get job job-3f2a1c8e            # one job in full, with its log
 serverctl get deployments -w              # re-render every 2s
 
 serverctl describe deployment web         # spec, pool, backends and traffic in one page
@@ -169,6 +172,108 @@ Every `set` command and `edit` is a read-modify-write against `PUT /deployments/
 replaces the whole spec. serverctl edits the server's JSON rather than a struct of its own, so
 fields it has never heard of survive the round trip.
 
+### Building an image from git
+
+A managed deployment can carry a *build source* — a git repo and a Dockerfile — instead of only
+an image name. `serverctl build` checks the repo out on the app-lb host, builds the image with
+`heyvm mvm build`, and rolls the pool onto the result.
+
+```sh
+# Store the credential first, if the repo is private. The value is never readable back.
+serverctl create secret github --from-stdin token < ~/.github-pat
+serverctl create secret github --from-env token=GITHUB_TOKEN --description 'CI PAT for acme/*'
+
+# Record where the image comes from. This builds nothing on its own.
+serverctl set build web --repo https://github.com/acme/web.git --ref main --secret github
+serverctl set build web --dockerfile deploy/Dockerfile --size-mb 768
+
+# Or say it at creation time.
+serverctl create deployment web --host web.example.com --port 8080 \
+  --repo https://github.com/acme/web.git --ref main --secret github
+
+# Build and roll out.
+serverctl build web --wait                 # blocks until it succeeds or fails
+serverctl build web --ref v2.1.0 --logs    # a one-off ref; streams the build output
+serverctl build web                        # fire and forget; poll with `get job <id>`
+
+serverctl set build web --clear             # stop tracking a source; keep the current image
+```
+
+A build is asynchronous server-side, so plain `serverctl build` returns as soon as it is
+scheduled and prints the id to follow. `--wait` polls to completion, `--logs` also streams the
+output as it arrives; either way a failed build exits non-zero after printing the tail of the
+log. One job runs per deployment at a time — a second is refused, not queued.
+
+Each build produces an image named `<deployment>-<short sha>`, so `serverctl describe` and
+`get -o wide` say which commit is actually running. Rotating a token is
+`serverctl set secret github token=ghp_new…`; keys you don't mention keep their values, which
+matters because there is no way to read them back and resend them.
+
+### Updating a static deployment
+
+A static deployment has no image to build — its backend is a process on the app-lb host. Its
+update path is a working directory and the commands to run in it: what you would otherwise ssh
+in and do.
+
+```sh
+serverctl set update app-obs \
+  --workdir /home/sarocu/Projects/app-obs \
+  -c 'git pull --ff-only' \
+  -c 'cargo build --release' \
+  -c 'supervisorctl restart app-obs'
+
+serverctl update app-obs --wait --logs     # run them, then check the upstreams answer
+serverctl update app-obs                   # fire and forget; poll with `get job <id>`
+
+# Optional extras.
+serverctl set update app-obs --secret github            # credential for a private `git pull`
+serverctl set update app-obs --secret-env APP_OBS_INGEST_TOKEN=obs/ingest_token
+serverctl set update app-obs --verify-timeout 0         # skip the post-update health check
+serverctl set update app-obs --clear                    # stop tracking how it updates
+```
+
+Each `--command` is a shell line run in `--workdir`, in order, and the first failure stops the
+job — `serverctl get jobs` shows how far it got (`1/3 commands`). Afterwards the deployment's
+upstreams are re-probed with its own health check: **a job whose commands exited 0 but whose
+service never came back is a failure**, and says so rather than reporting success.
+
+Passing `--command` replaces the whole list (as do `--env` and `--secret-env`), so send the
+steps you want, not a delta. Everything else you don't pass is kept.
+
+The commands run as app-lb's user. Restarting a service usually needs a grant for exactly that
+verb — access to supervisord's socket, or a `sudo -n` entry for one `systemctl restart` — and
+nothing broader; the admin API is what triggers this.
+
+### Putting a deployment behind Google sign-in
+
+Any deployment — managed or static — can be gated. The gate runs in app-lb's proxy, so the
+application behind it is unchanged and unaware.
+
+```sh
+# The client secret is a stored secret, never a spec field.
+serverctl create secret google --from-stdin client_secret < ~/.google-oauth-secret
+
+serverctl set auth web \
+  --client-id 1234-abc.apps.googleusercontent.com \
+  --secret google/client_secret \
+  --allow-domain example.com \
+  --allow-email contractor@gmail.com \
+  --public-path /healthz
+
+serverctl describe deployment web     # prints the redirect URI to register with Google
+serverctl get deployments -o wide     # AUTH column: which deployments are gated
+serverctl set auth web --clear        # remove the gate
+```
+
+`--allow-domain` matches Google's `hd` claim — the Workspace that *governs* the account, not
+the text after `@` — so a personal account with a lookalike address is refused. List personal
+accounts with `--allow-email`. `--allow-domain '*'` admits any Google account, and is the only
+way to say that: an empty allow-list is rejected.
+
+Passing any `--allow-domain`/`--allow-email`/`--public-path` replaces that whole list. Changing
+the allow-list signs out sessions issued under the old one, so removing someone takes effect
+immediately rather than when their cookie expires.
+
 ### Scaling and rollouts
 
 ```sh
@@ -192,6 +297,8 @@ serverctl delete deployment web           # deregister, then drain and reap ever
 serverctl delete deployments --all
 serverctl delete vm sb-abc123 -d web      # drain one VM
 serverctl delete vm sb-abc123 -d web --force   # kill it, dropping in-flight requests
+serverctl delete secret github            # refused while a deployment's build refers to it
+serverctl delete secret github --force    # delete anyway; those builds stop authenticating
 ```
 
 Evicting a VM is *recycle*, not *shrink* — the autoscaler boots a replacement on its next tick if
@@ -214,6 +321,9 @@ The distinction runs through every command, because app-lb enforces it:
 | `scale` | yes | rejected — the policy is inert |
 | `restart` / `delete vm` | yes | rejected — nothing to evict |
 | `set image` / `set env` | yes | rejected — no VM template |
+| `set build` / `build` | yes | rejected — no guest image to build |
+| `set update` / `update` | rejected — its backends are VMs | yes |
+| `set auth` | yes | yes — the gate is in the proxy, ahead of either |
 | `set upstreams` | rejected | yes |
 | `DESIRED` column | the autoscaler's target | `—` |
 

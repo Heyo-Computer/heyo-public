@@ -1,5 +1,6 @@
 //! Deployment specs and LB configuration.
 
+use crate::secrets::SecretRef;
 use heyo_sdk::{SandboxDriver, SandboxSize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,6 +13,9 @@ fn default_admin_addr() -> String {
 }
 fn default_state_path() -> String {
     "app-lb-state.json".into()
+}
+fn default_secrets_path() -> String {
+    "app-lb-secrets.json".into()
 }
 fn default_name() -> String {
     "app-lb".into()
@@ -26,6 +30,10 @@ pub struct LbConfig {
     pub admin_addr: String,
     #[serde(default = "default_state_path")]
     pub state_path: String,
+    /// Where stored secrets live. A separate file from `state_path` because it
+    /// has different handling: `0600`, and sealed when a key is configured.
+    #[serde(default = "default_secrets_path")]
+    pub secrets_path: String,
     /// Display name shown in the dashboard header and page title. Defaults to
     /// `app-lb`.
     #[serde(default = "default_name")]
@@ -78,10 +86,54 @@ pub struct LbConfig {
     /// per-week and a failed-validation loop will lock issuance out for hours.
     #[serde(default = "default_acme_directory")]
     pub acme_directory: String,
+    /// Scratch space for git checkouts driven by `build`. One directory per
+    /// deployment, kept between builds so a rebuild is a fetch rather than a
+    /// full clone.
+    #[serde(default = "default_build_dir")]
+    pub build_dir: String,
+    /// The `heyvm` CLI that turns a Dockerfile into a guest rootfs. Image
+    /// building has no daemon API — it needs a local `docker`, `mke2fs` and
+    /// `fakeroot` — so app-lb shells out to the binary on this host.
+    #[serde(default = "default_heyvm_bin")]
+    pub heyvm_bin: String,
+    #[serde(default = "default_git_bin")]
+    pub git_bin: String,
+    /// Shell that a static deployment's `update.commands` run through. They are
+    /// written as shell lines (`git pull && cargo build --release`), so there is
+    /// one; pointing this at `bash` buys bashisms.
+    #[serde(default = "default_update_shell")]
+    pub update_shell: String,
+    /// Ceiling on one build step (checkout, then image build), after which the
+    /// child is killed. A stuck `docker build` must not hold a deployment's
+    /// build slot forever.
+    #[serde(default = "default_build_timeout_secs")]
+    pub build_timeout_secs: u64,
+    /// `HOME` for the `heyvm` child, when app-lb does not run as the same user
+    /// as heyvmd. It decides where the built image lands
+    /// (`$HOME/.heyo/images/firecracker/<name>.ext4`) — and the daemon only
+    /// finds images under *its own* home, so a mismatch builds successfully and
+    /// then boots nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heyvm_home: Option<String>,
 }
 
 fn default_tls_addr() -> String {
     "0.0.0.0:6189".into()
+}
+fn default_build_dir() -> String {
+    "/var/lib/app-lb/builds".into()
+}
+fn default_heyvm_bin() -> String {
+    "heyvm".into()
+}
+fn default_git_bin() -> String {
+    "git".into()
+}
+fn default_update_shell() -> String {
+    "/bin/sh".into()
+}
+fn default_build_timeout_secs() -> u64 {
+    1800
 }
 fn default_acme_dir() -> String {
     "/var/lib/app-lb/acme".into()
@@ -96,6 +148,7 @@ impl Default for LbConfig {
             proxy_addr: default_proxy_addr(),
             admin_addr: default_admin_addr(),
             state_path: default_state_path(),
+            secrets_path: default_secrets_path(),
             name: default_name(),
             daemon_url: None,
             dashboard_user: None,
@@ -108,6 +161,12 @@ impl Default for LbConfig {
             acme_email: None,
             acme_dir: default_acme_dir(),
             acme_directory: default_acme_directory(),
+            build_dir: default_build_dir(),
+            heyvm_bin: default_heyvm_bin(),
+            git_bin: default_git_bin(),
+            update_shell: default_update_shell(),
+            build_timeout_secs: default_build_timeout_secs(),
+            heyvm_home: None,
         }
     }
 }
@@ -340,6 +399,531 @@ fn default_vm_ttl_secs() -> u64 {
     3600
 }
 
+/// Where a deployment's guest image comes from: a git checkout plus a Dockerfile.
+///
+/// This is the *source*, not the running image. A build clones (or fetches)
+/// `repo` at `ref`, hands the Dockerfile to `heyvm mvm build`, and only then
+/// writes the resulting image name into [`VmSpec::image`] — so the spec always
+/// says which image is actually booting, and this block says where the next one
+/// will come from. Editing it never disturbs running VMs; running a build does.
+///
+/// Note what is deliberately absent: build arguments and a registry. The image
+/// is an ext4 rootfs on this host, built from a Dockerfile the daemon never
+/// sees, and `heyvm mvm build` exposes neither `--build-arg` nor a push target
+/// for the local-only path.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct BuildSpec {
+    /// Git remote: `https://…`, `ssh://…`, `git@host:path`, or a local path.
+    pub repo: String,
+    /// Branch, tag or commit to build. `None` follows the remote's default
+    /// branch, which is what makes `POST …/build` mean "ship what is on main".
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// Dockerfile path *within the checkout*. `None` looks for one: `Dockerfile`
+    /// at the context root, else a unique `Dockerfile` within three directories
+    /// of it. Ambiguity is an error, never a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<String>,
+    /// Build context within the checkout. Defaults to the Dockerfile's directory,
+    /// matching `heyvm mvm build`'s own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Base name for built images; the commit is appended, so one deployment's
+    /// builds are `<name>-<short sha>`. Defaults to the deployment id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_name: Option<String>,
+    /// Rootfs size passed to `heyvm mvm build --size-mb`. Unset lets heyvm size
+    /// it from the exported tar (×1.2 + 64 MB), which is right until the guest
+    /// writes to its own rootfs at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size_mb: Option<u64>,
+    /// Credential for a private repo, as a reference into the secret store. Only
+    /// meaningful for HTTP(S) remotes — an `ssh://` or `git@` remote authenticates
+    /// with the host's own key material and should leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<SecretRef>,
+}
+
+impl BuildSpec {
+    /// The image name for a given commit. Lowercased and stripped to what both
+    /// `docker build -t` and heyvm's `<name>.ext4` filename accept, because the
+    /// deployment id it defaults to is only constrained by the route table.
+    pub fn image_for(&self, deployment_id: &str, commit: &str) -> String {
+        let base = self.image_name.as_deref().unwrap_or(deployment_id);
+        let base = sanitize_image_name(base);
+        let short: String = commit.chars().take(12).collect();
+        if short.is_empty() {
+            base
+        } else {
+            format!("{base}-{short}")
+        }
+    }
+
+    fn validate(&self) -> Result<(), SpecError> {
+        if self.repo.trim().is_empty() {
+            return Err(SpecError::EmptyRepo);
+        }
+        if !is_supported_repo_url(&self.repo) {
+            return Err(SpecError::UnsupportedRepoUrl(self.repo.clone()));
+        }
+        if let Some(r) = &self.git_ref
+            && !is_safe_git_ref(r)
+        {
+            return Err(SpecError::BadBuildRef(r.clone()));
+        }
+        for path in [&self.dockerfile, &self.context].into_iter().flatten() {
+            if !is_safe_relative_path(path) {
+                return Err(SpecError::BadBuildPath(path.clone()));
+            }
+        }
+        if let Some(name) = &self.image_name
+            && sanitize_image_name(name).is_empty()
+        {
+            return Err(SpecError::BadImageName(name.clone()));
+        }
+        if let Some(auth) = &self.auth {
+            auth.validate()
+                .map_err(|e| SpecError::BadSecretRef(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+/// Keep to what a docker tag component and an ext4 filename both allow.
+fn sanitize_image_name(name: &str) -> String {
+    let lowered: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // A docker tag must start with an alphanumeric, and a filename starting with
+    // a dot would be hidden from `heyvm mvm images`.
+    lowered
+        .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+        .trim_end_matches(['-', '.', '_'])
+        .chars()
+        .take(64)
+        .collect()
+}
+
+/// Remotes app-lb will hand to `git fetch`.
+///
+/// The list is short on purpose: `git` treats an argument beginning with `-` as
+/// a flag, and `ext::`/`--upload-pack=` style remotes run a command of the
+/// remote's choosing on this host. A spec comes in over the admin API, so the
+/// URL is input, not configuration.
+fn is_supported_repo_url(repo: &str) -> bool {
+    let repo = repo.trim();
+    if repo.starts_with('-') || repo.contains(char::is_whitespace) {
+        return false;
+    }
+    for scheme in ["https://", "http://", "ssh://", "file://"] {
+        if let Some(rest) = repo.strip_prefix(scheme) {
+            return !rest.is_empty();
+        }
+    }
+    if repo.starts_with('/') {
+        return true; // a path on this host, for testing and vendored sources
+    }
+    // scp-like: user@host:path, which git accepts and which has no scheme.
+    matches!(repo.split_once('@'), Some((user, rest))
+        if !user.is_empty() && rest.contains(':') && !rest.starts_with(':'))
+}
+
+/// A ref is passed to `git fetch` as an argument and appears in an image name,
+/// so it may not look like a flag or carry anything a shell or a path would
+/// reinterpret. Git's own rules already forbid most of this in a real ref.
+fn is_safe_git_ref(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= 255
+        && !r.starts_with('-')
+        && !r.contains("..")
+        && !r.starts_with('/')
+        && r.chars().all(|c| {
+            !c.is_whitespace()
+                && !c.is_control()
+                && !matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\' | '\'' | '"')
+        })
+}
+
+/// A path inside the checkout: relative, and unable to climb out of it.
+fn is_safe_relative_path(p: &str) -> bool {
+    let p = p.trim();
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with('-')
+        && !p.contains('\0')
+        && std::path::Path::new(p)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+}
+
+/// How a *static* (proxy_pass) deployment's backend is updated: a working
+/// directory on the app-lb host, and commands to run in it.
+///
+/// The managed counterpart of this is [`BuildSpec`], and the asymmetry is the
+/// point. A managed deployment's backend is a microVM app-lb owns, so updating
+/// it means producing a new image. A static deployment's backend is a process
+/// somebody else runs — usually on this same host, under supervisord or systemd
+/// — so updating it means doing on the host what a person would otherwise ssh in
+/// and do: pull, build, restart.
+///
+/// Nothing in the spec changes when this runs. The upstreams are the same
+/// addresses; what moved is the code answering on them. That is why the job
+/// re-probes those addresses afterwards: "the commands exited 0" is not the same
+/// claim as "the service is serving".
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct UpdateSpec {
+    /// Absolute path on the app-lb host. Must exist when the job runs — app-lb
+    /// never creates it, because a typo that silently created an empty directory
+    /// and ran `git pull` in it would be worse than an error.
+    pub working_dir: String,
+    /// Commands, run in order, each through `sh -c` in `working_dir`. The first
+    /// non-zero exit stops the job.
+    pub commands: Vec<String>,
+    /// Extra environment for every command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+    /// Environment pulled from the secret store, so a deploy key or registry
+    /// token reaches the commands without being written into this spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_from: Vec<SecretEnv>,
+    /// Git credential for commands that fetch (`git pull`), supplied through
+    /// `GIT_ASKPASS`. Only meaningful for HTTP(S) remotes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<SecretRef>,
+    /// Ceiling on a single command. Defaults to `APP_LB_BUILD_TIMEOUT_SECS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// How long to wait, after the commands, for every upstream to answer its
+    /// health check. `0` skips verification — appropriate when the commands do
+    /// not restart anything, and wrong otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_timeout_secs: Option<u64>,
+}
+
+fn default_verify_timeout_secs() -> u64 {
+    60
+}
+
+impl UpdateSpec {
+    pub fn verify_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.verify_timeout_secs
+                .unwrap_or_else(default_verify_timeout_secs),
+        )
+    }
+
+    fn validate(&self) -> Result<(), SpecError> {
+        let dir = self.working_dir.trim();
+        if dir.is_empty() {
+            return Err(SpecError::EmptyWorkingDir);
+        }
+        // Absolute, because the job's CWD is app-lb's own and a relative path
+        // would resolve somewhere nobody intended.
+        if !dir.starts_with('/')
+            || dir.contains('\0')
+            || std::path::Path::new(dir)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(SpecError::BadWorkingDir(self.working_dir.clone()));
+        }
+        if self.commands.is_empty() {
+            return Err(SpecError::NoCommands);
+        }
+        for c in &self.commands {
+            if c.trim().is_empty() || c.contains('\0') {
+                return Err(SpecError::BadCommand(c.clone()));
+            }
+        }
+        for from in &self.env_from {
+            from.validate()?;
+        }
+        if let Some(auth) = &self.auth {
+            auth.validate()
+                .map_err(|e| SpecError::BadSecretRef(e.to_string()))?;
+        }
+        if self.timeout_secs == Some(0) {
+            return Err(SpecError::ZeroTimeout);
+        }
+        Ok(())
+    }
+}
+
+/// One secret value, exported to the update commands as an environment variable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SecretEnv {
+    pub secret: String,
+    #[serde(default = "default_env_secret_key")]
+    pub key: String,
+    /// Variable name. Defaults to the key, upper-cased — `{"secret": "obs",
+    /// "key": "ingest_token"}` arrives as `INGEST_TOKEN`.
+    #[serde(default, rename = "as", skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+}
+
+fn default_env_secret_key() -> String {
+    "token".into()
+}
+
+impl SecretEnv {
+    pub fn secret_ref(&self) -> SecretRef {
+        SecretRef {
+            secret: self.secret.clone(),
+            key: self.key.clone(),
+            username: None,
+        }
+    }
+
+    pub fn env_name(&self) -> String {
+        self.env
+            .clone()
+            .unwrap_or_else(|| self.key.to_ascii_uppercase())
+    }
+
+    fn validate(&self) -> Result<(), SpecError> {
+        self.secret_ref()
+            .validate()
+            .map_err(|e| SpecError::BadSecretRef(e.to_string()))?;
+        let name = self.env_name();
+        // Not a hard requirement of execve, but a variable name that needs
+        // quoting is one the shell cannot read back — so it would be set and
+        // then invisible to the command that wanted it.
+        let usable = !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if usable {
+            Ok(())
+        } else {
+            Err(SpecError::BadEnvName(name))
+        }
+    }
+}
+
+/// An optional sign-in gate in front of a deployment.
+///
+/// Orthogonal to the backend kind on purpose: a managed VM pool and a static
+/// `proxy_pass` target are gated identically, because this happens in the proxy
+/// before either is reached. The application behind it needs to know nothing
+/// about OAuth — it sees only requests that got past the gate, optionally with
+/// the caller's identity in headers.
+///
+/// The client *secret* is a [`SecretRef`], not a value, for the same reason a
+/// build's git token is: the admin API echoes specs back and the state file
+/// holds them in the clear.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AuthGate {
+    /// Which identity provider. Only Google today; the field exists so a spec
+    /// written now still parses when there is a second one.
+    #[serde(default)]
+    pub provider: AuthProvider,
+    /// OAuth client id from the provider's console.
+    pub client_id: String,
+    /// Where the client secret is stored.
+    pub client_secret: SecretRef,
+    /// Google Workspace domains whose accounts may enter, matched against the
+    /// `hd` claim (not the email's suffix — see `AuthGate::allows`). `["*"]`
+    /// means *any* Google account, which is a real choice and has to be spelled
+    /// out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
+    /// Individual addresses allowed regardless of domain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_emails: Vec<String>,
+    /// Path prefixes served without the gate: health endpoints, webhook
+    /// receivers, anything with its own authentication.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_paths: Vec<String>,
+    /// Where app-lb's own endpoints live under this deployment's hostname:
+    /// `<base_path>/callback`, `/login` and `/logout`. The callback is the URL
+    /// that must be registered with the provider.
+    #[serde(default = "default_auth_base_path")]
+    pub base_path: String,
+    /// How long a session lasts before the user is sent back to the provider.
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    /// The session cookie's name. Worth changing only if it collides with one
+    /// the application already sets.
+    #[serde(default = "default_auth_cookie_name")]
+    pub cookie_name: String,
+    /// Redirect URI to send the provider, when app-lb cannot derive it from the
+    /// request — something in front rewriting the host or terminating TLS
+    /// elsewhere. Normally unset: `https://<request host><base_path>/callback`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_url: Option<String>,
+    /// Pass the identity upstream as `x-auth-request-{email,user,name}`
+    /// (oauth2-proxy's spelling, so apps that already read those work unchanged).
+    /// Those headers are stripped from the incoming request either way, so a
+    /// client cannot forge them.
+    #[serde(default = "default_true")]
+    pub forward_identity: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthProvider {
+    #[default]
+    Google,
+}
+
+fn default_auth_base_path() -> String {
+    "/__applb/auth".into()
+}
+fn default_session_ttl_secs() -> u64 {
+    43_200 // 12h — a working day plus slack, short enough that a revoked
+           // account loses access the same day.
+}
+fn default_auth_cookie_name() -> String {
+    "applb_session".into()
+}
+fn default_true() -> bool {
+    true
+}
+
+impl AuthGate {
+    /// `<base_path>/callback` — the URL the provider redirects back to, and the
+    /// one that has to be registered with it.
+    pub fn callback_path(&self) -> String {
+        format!("{}/callback", self.base_path.trim_end_matches('/'))
+    }
+
+    pub fn login_path(&self) -> String {
+        format!("{}/login", self.base_path.trim_end_matches('/'))
+    }
+
+    pub fn logout_path(&self) -> String {
+        format!("{}/logout", self.base_path.trim_end_matches('/'))
+    }
+
+    /// Whether `path` is served without the gate.
+    pub fn is_public(&self, path: &str) -> bool {
+        self.public_paths.iter().any(|p| path.starts_with(p.as_str()))
+    }
+
+    /// Whether this identity may enter.
+    ///
+    /// The domain is matched on the provider's `hd` claim rather than the part
+    /// after `@`, because only `hd` says the account is *governed by* that
+    /// Workspace domain. A personal Gmail account can carry any email address a
+    /// Workspace admin has not claimed, so trusting the suffix would let
+    /// `someone@yourcompany.com` in from an account you do not control.
+    pub fn allows(&self, email: &str, hosted_domain: Option<&str>) -> bool {
+        let email = email.to_ascii_lowercase();
+        if self.allowed_emails.iter().any(|e| e.eq_ignore_ascii_case(&email)) {
+            return true;
+        }
+        self.allowed_domains.iter().any(|d| {
+            d == "*"
+                || hosted_domain.is_some_and(|hd| hd.eq_ignore_ascii_case(d.trim_start_matches('@')))
+        })
+    }
+
+    /// A fingerprint of everything that decides *who* may enter. It goes into
+    /// each session, so tightening the allow-list or rotating the client id
+    /// invalidates the sessions issued under the old policy instead of leaving
+    /// a removed user signed in until their cookie expires.
+    pub fn policy_fingerprint(&self) -> String {
+        let mut domains: Vec<String> = self
+            .allowed_domains
+            .iter()
+            .map(|d| d.to_ascii_lowercase())
+            .collect();
+        let mut emails: Vec<String> = self
+            .allowed_emails
+            .iter()
+            .map(|e| e.to_ascii_lowercase())
+            .collect();
+        domains.sort();
+        emails.sort();
+        let material = format!(
+            "{:?}|{}|{}|{}",
+            self.provider,
+            self.client_id,
+            domains.join(","),
+            emails.join(",")
+        );
+        let digest = openssl::hash::hash(
+            openssl::hash::MessageDigest::sha256(),
+            material.as_bytes(),
+        )
+        .expect("sha256 of a byte string cannot fail");
+        digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn validate(&self, routes: &[RouteRule]) -> Result<(), SpecError> {
+        if self.client_id.trim().is_empty() {
+            return Err(SpecError::EmptyClientId);
+        }
+        self.client_secret
+            .validate()
+            .map_err(|e| SpecError::BadSecretRef(e.to_string()))?;
+
+        // An empty allow-list would gate the deployment behind "has a Google
+        // account", which is nearly everyone. That is a legitimate thing to
+        // want, so it can be asked for — but only in writing.
+        if self.allowed_domains.is_empty() && self.allowed_emails.is_empty() {
+            return Err(SpecError::EmptyAllowList);
+        }
+        for d in &self.allowed_domains {
+            // Surrounding whitespace is rejected rather than trimmed: the match
+            // is exact, so a stored " example.com " would let nobody in while
+            // looking exactly like a rule that does.
+            if d.trim().len() != d.len() || d.is_empty() || (d != "*" && !d.contains('.')) {
+                return Err(SpecError::BadAllowedDomain(d.clone()));
+            }
+        }
+        for e in &self.allowed_emails {
+            if !e.contains('@') || e.trim().len() != e.len() {
+                return Err(SpecError::BadAllowedEmail(e.clone()));
+            }
+        }
+
+        let base = self.base_path.trim_end_matches('/');
+        if !base.starts_with('/') || base.len() < 2 || base.contains(char::is_whitespace) {
+            return Err(SpecError::BadAuthBasePath(self.base_path.clone()));
+        }
+        for p in &self.public_paths {
+            if !p.starts_with('/') {
+                return Err(SpecError::BadPublicPath(p.clone()));
+            }
+        }
+        if self.session_ttl_secs == 0 {
+            return Err(SpecError::ZeroSessionTtl);
+        }
+        if self.cookie_name.is_empty()
+            || !self
+                .cookie_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        {
+            return Err(SpecError::BadCookieName(self.cookie_name.clone()));
+        }
+
+        // The provider redirects the browser to `<host><callback>`, and that
+        // request has to route back to *this* deployment or the login can never
+        // complete. A rule with a path prefix only matches paths under it, so a
+        // deployment routed at `/app` needs its base_path there too. Caught here
+        // rather than as a 404 halfway through someone's first sign-in.
+        let callback = self.callback_path();
+        let routable = routes
+            .iter()
+            .any(|r| r.path_prefix.as_ref().is_none_or(|p| callback.starts_with(p.as_str())));
+        if !routable {
+            return Err(SpecError::AuthCallbackUnroutable(callback));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeploymentSpec {
     pub id: String,
@@ -360,6 +944,25 @@ pub struct DeploymentSpec {
     /// Mutually exclusive with `vm`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstreams: Vec<String>,
+    /// Where `vm.image` is built from: a git repo and a Dockerfile. Optional —
+    /// a deployment can go on naming a prebuilt image — and only valid on a
+    /// managed deployment, since a static one has no image to build.
+    ///
+    /// Not part of `VmSpec`, so editing it is not a template change and does not
+    /// recycle the pool. The pool moves when a build finishes and rewrites
+    /// `vm.image`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildSpec>,
+    /// How a *static* deployment's backend is updated: a working directory on
+    /// this host and commands to run in it. The static counterpart of `build`,
+    /// and mutually exclusive with it for the same reason the backend kinds are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateSpec>,
+    /// An optional sign-in gate in front of everything this deployment serves.
+    /// Applies to either backend kind — it runs in the proxy, before a backend
+    /// is chosen — so the application behind it needs to know nothing about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthGate>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -377,6 +980,34 @@ pub enum SpecError {
     NoBackendKind,
     /// A static upstream address is not a valid `host:port`.
     BadUpstream(String),
+    /// A static deployment declared a `build` block; there is no image to build.
+    BuildOnStaticDeployment,
+    /// A managed deployment declared an `update` block; its backend is a VM, not
+    /// a process on this host.
+    UpdateOnManagedDeployment,
+    EmptyWorkingDir,
+    BadWorkingDir(String),
+    NoCommands,
+    BadCommand(String),
+    BadEnvName(String),
+    ZeroTimeout,
+    EmptyClientId,
+    /// Neither an allowed domain nor an allowed address was given.
+    EmptyAllowList,
+    BadAllowedDomain(String),
+    BadAllowedEmail(String),
+    BadAuthBasePath(String),
+    BadPublicPath(String),
+    ZeroSessionTtl,
+    BadCookieName(String),
+    /// The provider's redirect would not route back to this deployment.
+    AuthCallbackUnroutable(String),
+    EmptyRepo,
+    UnsupportedRepoUrl(String),
+    BadBuildRef(String),
+    BadBuildPath(String),
+    BadImageName(String),
+    BadSecretRef(String),
 }
 
 impl std::fmt::Display for SpecError {
@@ -414,6 +1045,97 @@ impl std::fmt::Display for SpecError {
                 f,
                 "static upstream {a:?} is not a valid `host:port` address"
             ),
+            Self::BuildOnStaticDeployment => write!(
+                f,
+                "a static (proxy_pass) deployment cannot declare `build`: it has no guest \
+                 image, it forwards to upstreams somebody else runs. Use `update` to run \
+                 commands on the host instead"
+            ),
+            Self::UpdateOnManagedDeployment => write!(
+                f,
+                "a managed (vm) deployment cannot declare `update`: its backends are microVMs, \
+                 not processes on this host, so a working directory here would update nothing. \
+                 Use `build` to rebuild its image instead"
+            ),
+            Self::EmptyWorkingDir => write!(f, "update.working_dir must not be empty"),
+            Self::BadWorkingDir(d) => write!(
+                f,
+                "update.working_dir {d:?} must be an absolute path on the app-lb host, with \
+                 no `..` components"
+            ),
+            Self::NoCommands => write!(
+                f,
+                "update.commands must list at least one command — a working directory with \
+                 nothing to run in it updates nothing"
+            ),
+            Self::BadCommand(c) => write!(f, "update command {c:?} is empty or unusable"),
+            Self::BadEnvName(n) => write!(
+                f,
+                "{n:?} is not a usable environment variable name: use [A-Za-z_][A-Za-z0-9_]*, \
+                 or set `as` on the env_from entry"
+            ),
+            Self::ZeroTimeout => write!(
+                f,
+                "update.timeout_secs must be greater than 0; omit it to use the server default"
+            ),
+            Self::EmptyClientId => write!(f, "auth.client_id must not be empty"),
+            Self::EmptyAllowList => write!(
+                f,
+                "auth sets neither `allowed_domains` nor `allowed_emails`, which would let \
+                 in anyone with a Google account. Name the Workspace domain(s) or the \
+                 address(es) — or set `\"allowed_domains\": [\"*\"]` if any Google account \
+                 really is the intent"
+            ),
+            Self::BadAllowedDomain(d) => write!(
+                f,
+                "auth.allowed_domains entry {d:?} is not a domain: use a Workspace domain \
+                 like \"example.com\", or \"*\" for any Google account"
+            ),
+            Self::BadAllowedEmail(e) => write!(
+                f,
+                "auth.allowed_emails entry {e:?} is not an email address"
+            ),
+            Self::BadAuthBasePath(p) => write!(
+                f,
+                "auth.base_path {p:?} must be an absolute path with at least one segment, \
+                 e.g. \"/__applb/auth\""
+            ),
+            Self::BadPublicPath(p) => {
+                write!(f, "auth.public_paths entry {p:?} must start with `/`")
+            }
+            Self::ZeroSessionTtl => write!(f, "auth.session_ttl_secs must be greater than 0"),
+            Self::BadCookieName(c) => write!(
+                f,
+                "auth.cookie_name {c:?} is not a usable cookie name"
+            ),
+            Self::AuthCallbackUnroutable(c) => write!(
+                f,
+                "no route would match the sign-in callback {c:?}, so the provider's redirect \
+                 would 404 and the login could never finish. Set `auth.base_path` under a \
+                 path prefix this deployment serves"
+            ),
+            Self::EmptyRepo => write!(f, "build.repo must not be empty"),
+            Self::UnsupportedRepoUrl(r) => write!(
+                f,
+                "build.repo {r:?} is not a supported remote: use https://, ssh://, \
+                 user@host:path or an absolute path on this host"
+            ),
+            Self::BadBuildRef(r) => write!(
+                f,
+                "build.ref {r:?} is not a usable git ref: no whitespace, no leading `-`, \
+                 and none of ~^:?*[\\'\""
+            ),
+            Self::BadBuildPath(p) => write!(
+                f,
+                "build path {p:?} must be relative to the checkout and must not climb out \
+                 of it with `..`"
+            ),
+            Self::BadImageName(n) => write!(
+                f,
+                "build.image_name {n:?} has no usable characters: image names are \
+                 [a-z0-9._-] and must start with a letter or digit"
+            ),
+            Self::BadSecretRef(e) => write!(f, "build.auth is unusable: {e}"),
         }
     }
 }
@@ -456,6 +1178,12 @@ impl DeploymentSpec {
             return Err(SpecError::EmptyRoute);
         }
 
+        // Checked for either backend kind: the gate runs in the proxy, ahead of
+        // whichever backend the deployment has.
+        if let Some(auth) = &self.auth {
+            auth.validate(&self.routes)?;
+        }
+
         // Exactly one backend kind.
         match (&self.vm, self.upstreams.is_empty()) {
             (Some(_), false) => return Err(SpecError::BothBackendKinds),
@@ -480,7 +1208,25 @@ impl DeploymentSpec {
             if self.scaling.target_concurrency == 0 {
                 return Err(SpecError::ZeroTargetConcurrency);
             }
+            if let Some(build) = &self.build {
+                build.validate()?;
+            }
+            // An `update` runs commands in a directory on this host; a managed
+            // deployment's backend is a microVM, so there is nothing here for
+            // those commands to act on.
+            if self.update.is_some() {
+                return Err(SpecError::UpdateOnManagedDeployment);
+            }
         } else {
+            // A `build` produces a guest image, and a static deployment has no
+            // guest. Rejecting it here beats accepting a spec whose build block
+            // could never run.
+            if self.build.is_some() {
+                return Err(SpecError::BuildOnStaticDeployment);
+            }
+            if let Some(update) = &self.update {
+                update.validate()?;
+            }
             // Static: every upstream must be a well-formed `host:port`. Actual
             // name resolution happens at request time (pingora) and per tick (the
             // health re-probe), so a temporarily-unresolvable name is not a
@@ -539,6 +1285,21 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: vec![],
+            build: None,
+            update: None,
+            auth: None,
+        }
+    }
+
+    fn build_spec() -> BuildSpec {
+        BuildSpec {
+            repo: "https://github.com/acme/web.git".into(),
+            git_ref: Some("main".into()),
+            dockerfile: None,
+            context: None,
+            image_name: None,
+            image_size_mb: None,
+            auth: None,
         }
     }
 
@@ -555,7 +1316,571 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
+            build: None,
+            update: None,
+            auth: None,
         }
+    }
+
+    #[test]
+    fn accepts_a_git_and_dockerfile_build_source() {
+        let mut s = spec();
+        s.build = Some(build_spec());
+        assert_eq!(s.validate(), Ok(()));
+
+        // scp-like and local remotes are accepted too.
+        for repo in [
+            "git@github.com:acme/web.git",
+            "ssh://git@github.com/acme/web.git",
+            "/srv/src/web",
+        ] {
+            let mut s = spec();
+            s.build = Some(BuildSpec {
+                repo: repo.into(),
+                ..build_spec()
+            });
+            assert_eq!(s.validate(), Ok(()), "{repo} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_remotes_and_refs_that_git_would_read_as_flags_or_commands() {
+        for repo in [
+            "--upload-pack=/bin/sh",
+            "ext::sh -c whoami",
+            "https://",
+            "https://host/a b",
+            "",
+        ] {
+            let mut s = spec();
+            s.build = Some(BuildSpec {
+                repo: repo.into(),
+                ..build_spec()
+            });
+            assert!(s.validate().is_err(), "{repo:?} should be rejected");
+        }
+
+        for git_ref in ["--upload-pack=x", "a b", "a..b", "/refs/heads/main", "v1^"] {
+            let mut s = spec();
+            s.build = Some(BuildSpec {
+                git_ref: Some(git_ref.into()),
+                ..build_spec()
+            });
+            assert_eq!(
+                s.validate(),
+                Err(SpecError::BadBuildRef(git_ref.to_string())),
+                "{git_ref:?} should be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn build_paths_cannot_escape_the_checkout() {
+        for path in ["../../etc/passwd", "/etc/passwd", "a/../../b", "-f"] {
+            let mut s = spec();
+            s.build = Some(BuildSpec {
+                dockerfile: Some(path.into()),
+                ..build_spec()
+            });
+            assert_eq!(
+                s.validate(),
+                Err(SpecError::BadBuildPath(path.to_string())),
+                "{path:?} should be rejected",
+            );
+        }
+        // Ordinary in-tree paths are fine.
+        let mut s = spec();
+        s.build = Some(BuildSpec {
+            dockerfile: Some("deploy/Dockerfile".into()),
+            context: Some("./".into()),
+            ..build_spec()
+        });
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_static_deployment_cannot_declare_a_build() {
+        let mut s = static_spec(&["10.0.0.9:8080"]);
+        s.build = Some(build_spec());
+        assert_eq!(s.validate(), Err(SpecError::BuildOnStaticDeployment));
+    }
+
+    fn update_spec() -> UpdateSpec {
+        UpdateSpec {
+            working_dir: "/srv/app-obs".into(),
+            commands: vec![
+                "git pull --ff-only".into(),
+                "cargo build --release".into(),
+                "supervisorctl restart app-obs".into(),
+            ],
+            env: None,
+            env_from: vec![],
+            auth: None,
+            timeout_secs: None,
+            verify_timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn accepts_a_working_directory_and_commands_on_a_static_deployment() {
+        let mut s = static_spec(&["127.0.0.1:9600"]);
+        s.update = Some(update_spec());
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    /// The two update paths are exclusive, and each error has to point at the
+    /// other one — landing on the wrong verb is the obvious mistake to make.
+    #[test]
+    fn each_kind_of_deployment_gets_exactly_one_update_path() {
+        let mut managed = spec();
+        managed.update = Some(update_spec());
+        assert_eq!(managed.validate(), Err(SpecError::UpdateOnManagedDeployment));
+        assert!(
+            SpecError::UpdateOnManagedDeployment.to_string().contains("build"),
+            "the error should name the path that does apply"
+        );
+
+        let mut static_dep = static_spec(&["10.0.0.9:8080"]);
+        static_dep.build = Some(build_spec());
+        assert!(
+            SpecError::BuildOnStaticDeployment.to_string().contains("update"),
+            "and likewise in the other direction"
+        );
+        assert_eq!(static_dep.validate(), Err(SpecError::BuildOnStaticDeployment));
+    }
+
+    #[test]
+    fn a_working_directory_must_be_absolute_and_cannot_climb() {
+        for dir in ["", "   "] {
+            let mut s = static_spec(&["10.0.0.9:8080"]);
+            s.update = Some(UpdateSpec {
+                working_dir: dir.into(),
+                ..update_spec()
+            });
+            assert_eq!(s.validate(), Err(SpecError::EmptyWorkingDir));
+        }
+        for dir in ["srv/app", "./app", "/srv/../../etc", "~/app"] {
+            let mut s = static_spec(&["10.0.0.9:8080"]);
+            s.update = Some(UpdateSpec {
+                working_dir: dir.into(),
+                ..update_spec()
+            });
+            assert_eq!(
+                s.validate(),
+                Err(SpecError::BadWorkingDir(dir.to_string())),
+                "{dir:?} should be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn an_update_needs_something_to_run() {
+        let mut s = static_spec(&["10.0.0.9:8080"]);
+        s.update = Some(UpdateSpec {
+            commands: vec![],
+            ..update_spec()
+        });
+        assert_eq!(s.validate(), Err(SpecError::NoCommands));
+
+        let mut s = static_spec(&["10.0.0.9:8080"]);
+        s.update = Some(UpdateSpec {
+            commands: vec!["  ".into()],
+            ..update_spec()
+        });
+        assert_eq!(s.validate(), Err(SpecError::BadCommand("  ".to_string())));
+    }
+
+    #[test]
+    fn secret_env_defaults_to_the_upper_cased_key_and_must_be_a_usable_name() {
+        let from = SecretEnv {
+            secret: "obs".into(),
+            key: "ingest_token".into(),
+            env: None,
+        };
+        assert_eq!(from.env_name(), "INGEST_TOKEN");
+        assert_eq!(from.secret_ref().key, "ingest_token");
+
+        let renamed = SecretEnv {
+            env: Some("APP_OBS_INGEST_TOKEN".into()),
+            ..from.clone()
+        };
+        assert_eq!(renamed.env_name(), "APP_OBS_INGEST_TOKEN");
+
+        // A name the shell cannot read back would be set and then invisible.
+        let mut s = static_spec(&["10.0.0.9:8080"]);
+        s.update = Some(UpdateSpec {
+            env_from: vec![SecretEnv {
+                env: Some("2FA-TOKEN".into()),
+                ..from
+            }],
+            ..update_spec()
+        });
+        assert_eq!(
+            s.validate(),
+            Err(SpecError::BadEnvName("2FA-TOKEN".to_string()))
+        );
+    }
+
+    #[test]
+    fn verification_defaults_to_a_minute_and_can_be_switched_off() {
+        assert_eq!(update_spec().verify_timeout().as_secs(), 60);
+        let off = UpdateSpec {
+            verify_timeout_secs: Some(0),
+            ..update_spec()
+        };
+        assert!(off.verify_timeout().is_zero());
+
+        // A zero *command* timeout is a mistake, not a switch.
+        let mut s = static_spec(&["10.0.0.9:8080"]);
+        s.update = Some(UpdateSpec {
+            timeout_secs: Some(0),
+            ..update_spec()
+        });
+        assert_eq!(s.validate(), Err(SpecError::ZeroTimeout));
+    }
+
+    #[test]
+    fn an_update_block_round_trips_and_is_absent_when_unset() {
+        let mut s = static_spec(&["127.0.0.1:9600"]);
+        s.update = Some(UpdateSpec {
+            env_from: vec![SecretEnv {
+                secret: "obs".into(),
+                key: "token".into(),
+                env: Some("APP_OBS_TOKEN".into()),
+            }],
+            ..update_spec()
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""working_dir":"/srv/app-obs""#), "{json}");
+        assert!(json.contains(r#""as":"APP_OBS_TOKEN""#), "{json}");
+        let parsed: DeploymentSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.update, s.update);
+
+        // An older persisted spec has no `update` key at all.
+        let plain: DeploymentSpec =
+            serde_json::from_str(&serde_json::to_string(&static_spec(&["10.0.0.9:80"])).unwrap())
+                .unwrap();
+        assert!(plain.update.is_none());
+    }
+
+    #[test]
+    fn image_names_are_derived_from_the_commit_and_kept_docker_safe() {
+        let b = build_spec();
+        assert_eq!(
+            b.image_for("web", "0123456789abcdef0123"),
+            "web-0123456789ab",
+            "the short sha is what makes each build a distinct image"
+        );
+        // The deployment id is only constrained by routing, so it is sanitized.
+        assert_eq!(b.image_for("Web.API_v2", "abc"), "web.api_v2-abc");
+        assert_eq!(b.image_for("--weird--", "abc"), "weird-abc");
+
+        let named = BuildSpec {
+            image_name: Some("Custom Name".into()),
+            ..build_spec()
+        };
+        assert_eq!(named.image_for("web", "deadbeef"), "custom-name-deadbeef");
+
+        let mut s = spec();
+        s.build = Some(BuildSpec {
+            image_name: Some("///".into()),
+            ..build_spec()
+        });
+        assert_eq!(
+            s.validate(),
+            Err(SpecError::BadImageName("///".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_build_credential_is_a_reference_not_a_value() {
+        let mut s = spec();
+        s.build = Some(BuildSpec {
+            auth: Some(crate::secrets::SecretRef {
+                secret: "github".into(),
+                key: "token".into(),
+                username: None,
+            }),
+            ..build_spec()
+        });
+        assert_eq!(s.validate(), Ok(()));
+        // Round-tripping a spec must not require the value to exist.
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""auth":{"secret":"github","key":"token"}"#), "{json}");
+
+        s.build = Some(BuildSpec {
+            auth: Some(crate::secrets::SecretRef {
+                secret: "../etc".into(),
+                key: "token".into(),
+                username: None,
+            }),
+            ..build_spec()
+        });
+        assert!(matches!(s.validate(), Err(SpecError::BadSecretRef(_))));
+    }
+
+    #[test]
+    fn a_build_block_is_optional_and_absent_from_a_spec_that_has_none() {
+        let json = serde_json::to_string(&spec()).unwrap();
+        assert!(!json.contains("build"), "{json}");
+        // And an old persisted spec (no `build` key) still parses.
+        let parsed: DeploymentSpec = serde_json::from_str(&json).unwrap();
+        assert!(parsed.build.is_none());
+    }
+
+    fn auth_gate() -> AuthGate {
+        AuthGate {
+            provider: AuthProvider::Google,
+            client_id: "cid.apps.googleusercontent.com".into(),
+            client_secret: crate::secrets::SecretRef {
+                secret: "google".into(),
+                key: "client_secret".into(),
+                username: None,
+            },
+            allowed_domains: vec!["example.com".into()],
+            allowed_emails: vec![],
+            public_paths: vec![],
+            base_path: default_auth_base_path(),
+            session_ttl_secs: default_session_ttl_secs(),
+            cookie_name: default_auth_cookie_name(),
+            redirect_url: None,
+            forward_identity: true,
+        }
+    }
+
+    #[test]
+    fn a_gate_applies_to_either_backend_kind() {
+        // The gate runs in the proxy, ahead of whichever backend the deployment
+        // has, so both shapes accept one.
+        let mut managed = spec();
+        managed.auth = Some(auth_gate());
+        assert_eq!(managed.validate(), Ok(()));
+
+        // `static_spec` routes on a path prefix, so its gate has to put its
+        // endpoints under that prefix for the callback to route back — which is
+        // the check below, and the reason this is spelled out rather than
+        // defaulted.
+        let mut static_dep = static_spec(&["127.0.0.1:9600"]);
+        static_dep.auth = Some(AuthGate {
+            base_path: "/legacy/__auth".into(),
+            ..auth_gate()
+        });
+        assert_eq!(static_dep.validate(), Ok(()));
+    }
+
+    /// Gating behind "has a Google account" is a real choice, and a very
+    /// different one from what an empty list looks like it means.
+    #[test]
+    fn an_empty_allow_list_is_refused_and_the_escape_hatch_is_explicit() {
+        let mut s = spec();
+        s.auth = Some(AuthGate {
+            allowed_domains: vec![],
+            allowed_emails: vec![],
+            ..auth_gate()
+        });
+        assert_eq!(s.validate(), Err(SpecError::EmptyAllowList));
+        assert!(
+            SpecError::EmptyAllowList.to_string().contains("\"*\""),
+            "the error has to name the way to say what was meant"
+        );
+
+        s.auth = Some(AuthGate {
+            allowed_domains: vec!["*".into()],
+            allowed_emails: vec![],
+            ..auth_gate()
+        });
+        assert_eq!(s.validate(), Ok(()));
+
+        // An address alone is enough.
+        s.auth = Some(AuthGate {
+            allowed_domains: vec![],
+            allowed_emails: vec!["someone@gmail.com".into()],
+            ..auth_gate()
+        });
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_gate_rejects_unusable_allow_list_entries() {
+        for domain in ["", "not-a-domain", " example.com "] {
+            let mut s = spec();
+            s.auth = Some(AuthGate {
+                allowed_domains: vec![domain.into()],
+                ..auth_gate()
+            });
+            assert!(
+                matches!(s.validate(), Err(SpecError::BadAllowedDomain(_))),
+                "{domain:?} should be rejected",
+            );
+        }
+        let mut s = spec();
+        s.auth = Some(AuthGate {
+            allowed_emails: vec!["not-an-address".into()],
+            ..auth_gate()
+        });
+        assert!(matches!(s.validate(), Err(SpecError::BadAllowedEmail(_))));
+    }
+
+    /// Regression: a deployment routed only at `/app` would 404 the provider's
+    /// redirect to `/__applb/auth/callback`, and the sign-in could never finish.
+    #[test]
+    fn the_callback_must_route_back_to_this_deployment() {
+        let mut s = spec();
+        s.routes = vec![RouteRule {
+            host: None,
+            host_suffix: None,
+            path_prefix: Some("/app".into()),
+        }];
+        s.auth = Some(auth_gate());
+        assert_eq!(
+            s.validate(),
+            Err(SpecError::AuthCallbackUnroutable(
+                "/__applb/auth/callback".to_string()
+            ))
+        );
+
+        // Putting the gate's endpoints inside the prefix fixes it.
+        s.auth = Some(AuthGate {
+            base_path: "/app/__auth".into(),
+            ..auth_gate()
+        });
+        assert_eq!(s.validate(), Ok(()));
+
+        // A host route matches any path, so the default is fine there.
+        let mut hosted = spec();
+        hosted.auth = Some(auth_gate());
+        assert_eq!(hosted.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_gate_rejects_degenerate_settings() {
+        let cases: Vec<(AuthGate, SpecError)> = vec![
+            (
+                AuthGate { client_id: "  ".into(), ..auth_gate() },
+                SpecError::EmptyClientId,
+            ),
+            (
+                AuthGate { base_path: "relative".into(), ..auth_gate() },
+                SpecError::BadAuthBasePath("relative".into()),
+            ),
+            (
+                AuthGate { base_path: "/".into(), ..auth_gate() },
+                SpecError::BadAuthBasePath("/".into()),
+            ),
+            (
+                AuthGate { public_paths: vec!["healthz".into()], ..auth_gate() },
+                SpecError::BadPublicPath("healthz".into()),
+            ),
+            (
+                AuthGate { session_ttl_secs: 0, ..auth_gate() },
+                SpecError::ZeroSessionTtl,
+            ),
+            (
+                AuthGate { cookie_name: "bad name".into(), ..auth_gate() },
+                SpecError::BadCookieName("bad name".into()),
+            ),
+        ];
+        for (gate, want) in cases {
+            let mut s = spec();
+            s.auth = Some(gate);
+            assert_eq!(s.validate(), Err(want));
+        }
+    }
+
+    #[test]
+    fn the_gates_endpoints_hang_off_its_base_path() {
+        let g = AuthGate {
+            base_path: "/app/__auth/".into(),
+            ..auth_gate()
+        };
+        assert_eq!(g.callback_path(), "/app/__auth/callback");
+        assert_eq!(g.login_path(), "/app/__auth/login");
+        assert_eq!(g.logout_path(), "/app/__auth/logout");
+    }
+
+    #[test]
+    fn public_paths_are_prefixes() {
+        let g = AuthGate {
+            public_paths: vec!["/healthz".into(), "/hooks/".into()],
+            ..auth_gate()
+        };
+        assert!(g.is_public("/healthz"));
+        assert!(g.is_public("/hooks/github"));
+        assert!(!g.is_public("/hooks"), "the trailing slash was deliberate");
+        assert!(!g.is_public("/"));
+    }
+
+    /// The fingerprint is what makes a session stop working when the policy
+    /// changes, so it has to move for every input that decides who gets in —
+    /// and stay put for everything else.
+    #[test]
+    fn the_policy_fingerprint_tracks_who_may_enter() {
+        let base = auth_gate();
+        let same_order = AuthGate {
+            allowed_emails: vec!["b@x.com".into(), "a@x.com".into()],
+            ..base.clone()
+        };
+        let other_order = AuthGate {
+            allowed_emails: vec!["a@x.com".into(), "B@x.com".into()],
+            ..base.clone()
+        };
+        assert_eq!(
+            same_order.policy_fingerprint(),
+            other_order.policy_fingerprint(),
+            "order and case are not policy",
+        );
+
+        for changed in [
+            AuthGate { client_id: "other".into(), ..base.clone() },
+            AuthGate { allowed_domains: vec!["other.example".into()], ..base.clone() },
+            AuthGate { allowed_emails: vec!["extra@x.com".into()], ..base.clone() },
+        ] {
+            assert_ne!(changed.policy_fingerprint(), base.policy_fingerprint());
+        }
+
+        // Cosmetic settings must not sign everybody out.
+        let cosmetic = AuthGate {
+            session_ttl_secs: 999,
+            public_paths: vec!["/healthz".into()],
+            forward_identity: false,
+            ..base.clone()
+        };
+        assert_eq!(cosmetic.policy_fingerprint(), base.policy_fingerprint());
+    }
+
+    #[test]
+    fn a_gate_round_trips_and_keeps_the_secret_a_reference() {
+        let mut s = spec();
+        s.auth = Some(auth_gate());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""provider":"google""#), "{json}");
+        assert!(
+            json.contains(r#""client_secret":{"secret":"google","key":"client_secret"}"#),
+            "{json}"
+        );
+        let parsed: DeploymentSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.auth, s.auth);
+
+        // A spec written before the gate existed still parses.
+        let plain: DeploymentSpec =
+            serde_json::from_str(&serde_json::to_string(&spec()).unwrap()).unwrap();
+        assert!(plain.auth.is_none());
+    }
+
+    /// The minimum a spec has to say: everything else defaults.
+    #[test]
+    fn a_gate_parses_from_just_a_client_id_secret_and_allow_list() {
+        let gate: AuthGate = serde_json::from_str(
+            r#"{"client_id":"cid","client_secret":{"secret":"google"},
+                "allowed_domains":["example.com"]}"#,
+        )
+        .unwrap();
+        assert_eq!(gate.provider, AuthProvider::Google);
+        assert_eq!(gate.client_secret.key, "token", "the SecretRef default");
+        assert_eq!(gate.base_path, "/__applb/auth");
+        assert_eq!(gate.cookie_name, "applb_session");
+        assert!(gate.forward_identity);
+        assert_eq!(gate.session_ttl_secs, 43_200);
     }
 
     #[test]

@@ -218,6 +218,9 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: vec![],
+            build: None,
+            update: None,
+            auth: None,
         }
     }
 
@@ -229,6 +232,9 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
+            build: None,
+            update: None,
+            auth: None,
         }
     }
 

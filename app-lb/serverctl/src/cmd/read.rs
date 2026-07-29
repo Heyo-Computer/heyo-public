@@ -2,7 +2,7 @@
 
 use super::{Ctx, Resource, parse_ref};
 use crate::output::{self, OutputFormat, Table};
-use crate::types::{CertStatus, DeploymentStatus, MetricsResponse};
+use crate::types::{CertStatus, DeploymentStatus, JobRecord, MetricsResponse, SecretSummary};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde_json::Value;
@@ -10,12 +10,12 @@ use std::time::Duration;
 
 #[derive(Args, Debug)]
 pub struct GetArgs {
-    /// What to list: deployments, vms, certs, or all. Accepts `deployment/web`
-    /// and trailing names, e.g. `get deploy web api`.
+    /// What to list: deployments, vms, certs, secrets, jobs, or all. Accepts
+    /// `deployment/web` and trailing names, e.g. `get deploy web api`.
     #[arg(value_name = "RESOURCE", required = true)]
     pub args: Vec<String>,
 
-    /// Only show VMs belonging to this deployment.
+    /// Only show VMs or jobs belonging to this deployment.
     #[arg(long, short = 'd', value_name = "NAME")]
     pub deployment: Option<String>,
 
@@ -45,6 +45,8 @@ fn get_once(ctx: &Ctx, kind: Resource, names: &[String], args: &GetArgs) -> Resu
         Resource::Deployment => get_deployments(ctx, names),
         Resource::Vm => get_vms(ctx, names, args.deployment.as_deref()),
         Resource::Cert => get_certs(ctx),
+        Resource::Secret => get_secrets(ctx, names),
+        Resource::Job => get_jobs(ctx, names, args.deployment.as_deref()),
         Resource::All => {
             get_deployments(ctx, &[])?;
             println!();
@@ -106,7 +108,7 @@ fn get_deployments(ctx: &Ctx, names: &[String]) -> Result<()> {
     let mut table = if ctx.out.is_wide() {
         Table::new([
             "NAME", "KIND", "ROUTES", "DESIRED", "READY", "PENDING", "IN-FLIGHT", "MIN", "MAX",
-            "WARM", "TARGET", "BACKEND",
+            "WARM", "TARGET", "BACKEND", "SOURCE", "AUTH",
         ])
     } else {
         Table::new(["NAME", "KIND", "ROUTES", "DESIRED", "READY", "PENDING", "IN-FLIGHT"])
@@ -141,6 +143,21 @@ fn get_deployments(ctx: &Ctx, names: &[String]) -> Result<()> {
                 ]);
             }
             row.push(d.spec.backend_summary());
+            // How this deployment is updated, which the BACKEND column (what is
+            // running now) deliberately does not say. A managed deployment
+            // builds from a repo; a static one runs commands on the host.
+            row.push(match (&d.spec.build, &d.spec.update) {
+                (Some(b), _) => b.summary(),
+                (None, Some(u)) => u.summary(),
+                (None, None) => "—".into(),
+            });
+            // Whether anything stands in front of this deployment at all — the
+            // one property you want to be able to scan a whole fleet for.
+            row.push(match &d.spec.auth {
+                Some(a) if a.provider.is_empty() => "google".to_string(),
+                Some(a) => a.provider.clone(),
+                None => "—".into(),
+            });
         }
         table.row(row);
     }
@@ -224,6 +241,220 @@ fn get_certs(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// `get secrets` — names and key names. There is no flag that prints a value:
+/// app-lb has no endpoint that returns one.
+fn get_secrets(ctx: &Ctx, names: &[String]) -> Result<()> {
+    let raw = if names.is_empty() {
+        ctx.client.list_secrets()?
+    } else {
+        let mut out = Vec::new();
+        for name in names {
+            out.push(
+                ctx.client
+                    .get_secret(name)
+                    .with_context(|| format!("getting secret {name:?}"))?,
+            );
+        }
+        Value::Array(out)
+    };
+
+    let secrets: Vec<SecretSummary> = match &raw {
+        Value::Array(items) => items
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()))
+            .collect::<Result<_, _>>()
+            .context("parsing the secret list")?,
+        other => vec![serde_json::from_value(other.clone()).context("parsing the secret")?],
+    };
+
+    if ctx.out.is_machine() {
+        let refs: Vec<String> = secrets.iter().map(|s| format!("secret/{}", s.id)).collect();
+        return output::emit(&raw, ctx.out, &refs);
+    }
+
+    if secrets.is_empty() {
+        println!(
+            "No secrets stored. (`serverctl create secret github --from-stdin token` \
+             stores one; values are never readable back.)"
+        );
+        return Ok(());
+    }
+
+    let mut table = if ctx.out.is_wide() {
+        Table::new(["NAME", "KEYS", "AT-REST", "UPDATED", "DESCRIPTION"])
+    } else {
+        Table::new(["NAME", "KEYS", "UPDATED"])
+    };
+    for s in &secrets {
+        let mut row = vec![
+            s.id.clone(),
+            if s.keys.is_empty() {
+                "<none>".into()
+            } else {
+                s.keys.join(",")
+            },
+        ];
+        if ctx.out.is_wide() {
+            row.push(if s.encrypted_at_rest {
+                "encrypted".into()
+            } else {
+                "plaintext".into()
+            });
+        }
+        row.push(if s.updated_at == 0 {
+            "—".into()
+        } else {
+            format!("{} (server clock)", s.updated_at)
+        });
+        if ctx.out.is_wide() {
+            row.push(output::opt_str(s.description.as_deref()));
+        }
+        table.row(row);
+    }
+    table.print();
+    Ok(())
+}
+
+/// `get jobs [-d DEPLOYMENT] [ID...]` — the image builds and host updates this
+/// LB has run, newest first.
+fn get_jobs(ctx: &Ctx, names: &[String], deployment: Option<&str>) -> Result<()> {
+    let raw = match (names, deployment) {
+        // A named job is looked up directly, so `get job job-abc` works without
+        // knowing which deployment it belonged to.
+        ([id], _) => ctx.client.get_job(id)?,
+        ([], Some(d)) => ctx.client.deployment_jobs(d)?,
+        ([], None) => ctx.client.list_jobs()?,
+        _ => bail!("get job takes at most one job id; use -d to scope by deployment"),
+    };
+
+    let jobs: Vec<JobRecord> = match &raw {
+        Value::Array(items) => items
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()))
+            .collect::<Result<_, _>>()
+            .context("parsing the job list")?,
+        other => vec![serde_json::from_value(other.clone()).context("parsing the job")?],
+    };
+
+    if ctx.out.is_machine() {
+        let refs: Vec<String> = jobs.iter().map(|j| format!("job/{}", j.id)).collect();
+        return output::emit(&raw, ctx.out, &refs);
+    }
+
+    if jobs.is_empty() {
+        println!(
+            "No jobs yet. (`serverctl set build <deployment> --repo <url>` records where an \
+             image comes from; `serverctl set update <deployment> --workdir <dir> --command \
+             '<cmd>'` records how a static one is updated.)"
+        );
+        return Ok(());
+    }
+
+    // A single named job is worth spelling out — its log is the reason somebody
+    // asked for it by id.
+    if let ([_], Some(record)) = (names, jobs.first())
+        && jobs.len() == 1
+    {
+        return describe_job(record);
+    }
+
+    // TARGET and RESULT mean different things per kind (a ref and an image for a
+    // build; a directory and a command count for an update), which is why the
+    // KIND column is there.
+    let mut table = Table::new([
+        "JOB", "DEPLOYMENT", "KIND", "STATUS", "TARGET", "RESULT", "TOOK",
+    ]);
+    // Jobs are timestamped on the server's clock, so measure elapsed time
+    // against the newest record rather than this machine's idea of now.
+    let now = jobs
+        .iter()
+        .map(|j| j.finished_at.unwrap_or(j.started_at))
+        .max()
+        .unwrap_or(0);
+    for j in &jobs {
+        table.row([
+            j.id.clone(),
+            j.deployment.clone(),
+            j.kind.clone(),
+            j.status.clone(),
+            j.target_summary(),
+            j.result_summary(),
+            output::duration(j.elapsed_secs(now)),
+        ]);
+    }
+    table.print();
+    Ok(())
+}
+
+fn describe_job(j: &JobRecord) -> Result<()> {
+    output::top_field("Job", &j.id);
+    output::top_field("Deployment", &j.deployment);
+    output::top_field("Kind", &j.kind);
+
+    output::section("Source");
+    if j.is_update() {
+        output::field("Working dir", output::opt_str(j.working_dir.as_deref()));
+        output::field(
+            "Commands",
+            match (j.commands_run, j.commands_total) {
+                (Some(run), Some(total)) => format!("{run} of {total} completed"),
+                (_, Some(total)) => format!("{total}"),
+                _ => "—".into(),
+            },
+        );
+    } else {
+        output::field("Repo", &j.repo);
+        output::field("Ref", j.git_ref.as_deref().unwrap_or("(default branch)"));
+        output::field("Commit", output::opt_str(j.commit.as_deref()));
+        output::field("Dockerfile", output::opt_str(j.dockerfile.as_deref()));
+    }
+
+    output::section("Result");
+    output::field("Status", &j.status);
+    if j.is_update() {
+        output::field(
+            "Upstreams",
+            match j.verified {
+                Some(true) => "healthy after the update",
+                Some(false) => "did NOT come back — the host has already been changed",
+                None if j.is_running() => "not checked yet",
+                // No verdict on a finished job means it never got that far —
+                // except when it succeeded, which can only mean the check is off.
+                None if j.succeeded() => "not checked (verify_timeout_secs is 0)",
+                None => "not checked — the job failed before that point",
+            },
+        );
+    } else {
+        output::field("Image", output::opt_str(j.image.as_deref()));
+        output::field(
+            "Rolled out",
+            if j.rolled_out {
+                "yes — vm.image updated, pool recycled"
+            } else if j.is_running() {
+                "not yet"
+            } else {
+                "no"
+            },
+        );
+    }
+    output::field(
+        "Took",
+        output::duration(j.elapsed_secs(j.finished_at.unwrap_or(j.started_at))),
+    );
+    if let Some(e) = &j.error {
+        output::field("Error", e);
+    }
+
+    output::section("Log");
+    if j.log.is_empty() {
+        println!("  (no output yet)");
+    }
+    for line in &j.log {
+        println!("  {line}");
+    }
+    Ok(())
+}
+
 #[derive(Args, Debug)]
 pub struct DescribeArgs {
     /// The deployment to describe, e.g. `web` or `deployment/web`.
@@ -292,6 +523,41 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
         for u in &d.spec.upstreams {
             println!("  {u}");
         }
+
+        // The static counterpart of a managed deployment's "Build source": what
+        // `serverctl update` would run, and where.
+        if let Some(update) = &d.spec.update {
+            output::section("Update (on the app-lb host)");
+            output::field("Working dir", &update.working_dir);
+            output::field(
+                "Verify",
+                match update.verify_timeout_secs {
+                    Some(0) => "off — a successful job only means the commands exited 0".into(),
+                    Some(s) => format!("re-probe the upstreams, up to {}", output::duration(s)),
+                    None => "re-probe the upstreams, up to 1m".into(),
+                },
+            );
+            if let Some(t) = update.timeout_secs {
+                output::field("Command timeout", output::duration(t));
+            }
+            if let Some(env) = &update.env {
+                let keys: Vec<&str> = env.keys().map(String::as_str).collect();
+                if !keys.is_empty() {
+                    output::field("Env", keys.join(", "));
+                }
+            }
+            if !update.env_from.is_empty() {
+                let refs: Vec<String> = update.env_from.iter().map(|e| e.render()).collect();
+                output::field("Env from secrets", refs.join(", "));
+            }
+            if let Some(auth) = &update.auth {
+                output::field("Git credential", format!("secret {}", auth.render()));
+            }
+            println!("  Commands:");
+            for (i, c) in update.commands.iter().enumerate() {
+                println!("    {}. {c}", i + 1);
+            }
+        }
     } else if let Some(vm) = &d.spec.vm {
         output::section("VM template");
         output::field("Driver", &vm.driver);
@@ -331,6 +597,41 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
             output::field("Setup hooks", hooks.join(" ; "));
         }
 
+        if let Some(build) = &d.spec.build {
+            output::section("Build source");
+            output::field("Repo", &build.repo);
+            output::field("Ref", build.git_ref.as_deref().unwrap_or("(default branch)"));
+            output::field(
+                "Dockerfile",
+                build
+                    .dockerfile
+                    .as_deref()
+                    .unwrap_or("(found in the checkout)"),
+            );
+            if let Some(c) = &build.context {
+                output::field("Context", c);
+            }
+            output::field(
+                "Image name",
+                build
+                    .image_name
+                    .as_deref()
+                    .unwrap_or("(the deployment id) + commit"),
+            );
+            if let Some(mb) = build.image_size_mb {
+                output::field("Rootfs size", format!("{mb} MB"));
+            }
+            // A reference, not a value: the credential itself is only ever
+            // resolved server-side, when a build runs.
+            output::field(
+                "Credential",
+                match &build.auth {
+                    Some(a) => format!("secret {}", a.render()),
+                    None => "none (public repo, or host ssh keys)".to_string(),
+                },
+            );
+        }
+
         output::section("Scaling");
         let s = &d.spec.scaling;
         output::field("Desired", d.desired_replicas.to_string());
@@ -343,6 +644,46 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
         );
         output::field("Cold start timeout", output::duration(s.cold_start_timeout_secs));
         output::field("Drain timeout", output::duration(s.drain_timeout_secs));
+    }
+
+    if let Some(auth) = &d.spec.auth {
+        output::section("Sign-in gate");
+        output::field(
+            "Provider",
+            if auth.provider.is_empty() {
+                "google"
+            } else {
+                &auth.provider
+            },
+        );
+        output::field("Client id", &auth.client_id);
+        output::field("Client secret", format!("secret {}", auth.client_secret.render()));
+        output::field("Who may enter", auth.allow_summary());
+        if !auth.public_paths.is_empty() {
+            output::field("Public paths", auth.public_paths.join(", "));
+        }
+        // The single most common reason a gate doesn't work is that this exact
+        // URL is not registered with the provider, so print it rather than
+        // leaving it to be assembled by hand.
+        let host = d
+            .spec
+            .routes
+            .iter()
+            .find_map(|r| r.host.clone())
+            .unwrap_or_else(|| "<this deployment's hostname>".into());
+        output::field("Redirect URI", match &auth.redirect_url {
+            Some(u) => format!("{u} (overridden)"),
+            None => auth.callback_url(&host),
+        });
+        output::field("Session lifetime", output::duration(auth.session_ttl_secs));
+        output::field(
+            "Identity headers",
+            if auth.forward_identity {
+                "x-auth-request-email, -user, -name"
+            } else {
+                "not forwarded"
+            },
+        );
     }
 
     output::section("Health check");

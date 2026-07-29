@@ -787,6 +787,9 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: vec![],
+            build: None,
+            update: None,
+            auth: None,
         }
     }
 
@@ -803,6 +806,9 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: vec!["127.0.0.1:9".into()],
+            build: None,
+            update: None,
+            auth: None,
         }
     }
 

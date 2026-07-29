@@ -44,6 +44,9 @@ Configuration is environment-only:
 | `APP_LB_PROXY_ADDR` | `0.0.0.0:6188` | Proxy listener |
 | `APP_LB_ADMIN_ADDR` | `127.0.0.1:9090` | Admin API listener |
 | `APP_LB_STATE_PATH` | `app-lb-state.json` | Where deployment specs persist |
+| `APP_LB_SECRETS_PATH` | `app-lb-secrets.json` | Where stored secrets persist (written `0600`) |
+| `APP_LB_SECRET_KEY` | *(unset)* | 32-byte hex key (or any passphrase) that seals the secrets file with AES-256-GCM |
+| `APP_LB_AUTH_KEY` | `app-lb-auth-key` | Signing key for sign-in sessions; generated `0600` on first use |
 | `APP_LB_NAME` | `app-lb` | Display name in the dashboard header and page title |
 | `APP_LB_DAEMON_URL` | `http://127.0.0.1:34099` | heyvm daemon |
 | `APP_LB_DASHBOARD_PASSWORD` | *(unset)* | Set to gate the dashboard behind HTTP Basic Auth |
@@ -55,6 +58,12 @@ Configuration is environment-only:
 | `APP_LB_ACME_EMAIL` | *(unset)* | Let's Encrypt account contact; **setting it enables automatic certificates** |
 | `APP_LB_ACME_DIR` | `/var/lib/app-lb/acme` | ACME account key and issued certificates (should be `0700`) |
 | `APP_LB_ACME_DIRECTORY` | LE production | ACME directory URL — point at staging for testing |
+| `APP_LB_BUILD_DIR` | `/var/lib/app-lb/builds` | Git checkouts for image builds (one per deployment, `0700`) |
+| `APP_LB_HEYVM_BIN` | `heyvm` | The heyvm CLI that builds guest images |
+| `APP_LB_GIT_BIN` | `git` | The git binary used for checkouts |
+| `APP_LB_UPDATE_SHELL` | `/bin/sh` | Shell a static deployment's `update.commands` run through |
+| `APP_LB_BUILD_TIMEOUT_SECS` | `1800` | Ceiling on one build step or update command, after which the child is killed |
+| `APP_LB_HEYVM_HOME` | *(unset)* | `HOME` for the heyvm child — set it when app-lb and heyvmd run as different users |
 | `RUST_LOG` | `info,app_lb=debug` | Log filter |
 
 ## CLI
@@ -186,6 +195,315 @@ A still-booting (pending) VM is simply killed in either mode. Evicting the sole
 VM of a `max_replicas: 1` deployment leaves a brief capacity gap until the
 replacement boots (a request arriving in that window eats a cold start).
 Unknown deployment or VM id is a `404`.
+
+## Google sign-in
+
+Any deployment can be put behind Google sign-in by adding an `auth` block. The
+gate runs in the proxy, before a backend is chosen, so it works the same for a
+managed VM pool and a static `proxy_pass` target — and the application behind it
+needs to know nothing about OAuth. It sees only requests that got through.
+
+```jsonc
+{
+  "id": "web",
+  "routes": [{"host": "web.example.com"}],
+  "upstreams": ["127.0.0.1:8080"],
+  "auth": {
+    "client_id": "1234-abc.apps.googleusercontent.com",
+    "client_secret": {"secret": "google", "key": "client_secret"},
+    "allowed_domains": ["example.com"],       // matched on the Workspace `hd` claim
+    "allowed_emails": ["contractor@gmail.com"],
+    "public_paths": ["/healthz", "/hooks/"],  // served without the gate
+    "session_ttl_secs": 43200,
+    "base_path": "/__applb/auth",             // where app-lb's own endpoints live
+    "forward_identity": true
+  }
+}
+```
+
+### Setting it up
+
+1. In the Google Cloud console, create an **OAuth 2.0 Client ID** of type *Web
+   application*, and register the redirect URI — `https://<hostname><base_path>/callback`,
+   so with the defaults above: `https://web.example.com/__applb/auth/callback`.
+   `serverctl describe deployment web` prints the exact string to paste.
+2. Store the client secret. It is a [secret](#secrets), not a spec field:
+
+   ```sh
+   serverctl create secret google --from-stdin client_secret < ~/.google-oauth-secret
+   ```
+3. Add the gate:
+
+   ```sh
+   serverctl set auth web \
+     --client-id 1234-abc.apps.googleusercontent.com \
+     --secret google/client_secret \
+     --allow-domain example.com \
+     --public-path /healthz
+   ```
+
+The pool is untouched — the gate is proxy configuration, not part of the VM
+template, so turning it on or off never restarts anything.
+
+### What a request meets
+
+| | |
+| --- | --- |
+| No session, browser | `302` to Google, then back to what was originally asked for |
+| No session, API client | `401` + `{"error":…,"login_url":…}` — a redirect it would only mis-parse |
+| Valid session | proxied, with `x-auth-request-{email,user,name}` |
+| Signed in, not on the allow-list | `403` naming the account, and a link to sign in as someone else |
+| A path under `public_paths` | proxied, gate skipped |
+
+`<base_path>/login` starts a sign-in (useful as a "sign in" link, and after a
+logout); `<base_path>/logout` clears app-lb's cookie. Logging out of Google
+itself is deliberately not app-lb's business — it would sign the user out of
+every other tab.
+
+### How it works, and what that buys
+
+The flow is the OAuth 2.0 authorization code grant **with PKCE**. Both cookies
+are self-describing and signed with HMAC-SHA256 (`APP_LB_AUTH_KEY`, generated
+`0600` on first use), so:
+
+- **There is no session store** to grow, replicate or lose. A restart does not
+  sign anyone out — the key is persisted.
+- **A session is bound to its deployment**, so a cookie from one gated
+  deployment is not a cookie for another with a narrower allow-list.
+- **Tightening the allow-list signs people out.** Each session carries a
+  fingerprint of the policy that admitted it; changing `client_id`,
+  `allowed_domains` or `allowed_emails` invalidates every session issued under
+  the old one, rather than leaving a removed user signed in until their cookie
+  expires.
+
+**Domains are matched on the `hd` claim, not the email suffix.** Only `hd` says
+the account is *governed by* that Workspace domain. A personal Google account
+can carry any address a Workspace admin has not claimed, so trusting the suffix
+would let `someone@yourcompany.com` in from an account you do not control. The
+consequence worth knowing: a personal account must be listed in
+`allowed_emails`, because it has no `hd` at all.
+
+**An empty allow-list is rejected.** Gating behind "has a Google account" admits
+most of the internet, which is a real thing to want and has to be said out loud:
+`"allowed_domains": ["*"]`.
+
+**The identity headers are stripped from every incoming request** to a gated
+deployment before app-lb sets them, so a client cannot present its own
+`x-auth-request-email`.
+
+### Limits
+
+- **One provider.** Google only; `provider` exists so a spec written today still
+  parses when there is a second.
+- **The `Secure` cookie attribute follows the connection.** Over plaintext
+  `:6188` the session cookie is not `Secure` — fine for a local trial, but a
+  gate is only meaningfully protecting anything over HTTPS. Use the [TLS
+  listener](#tls).
+- **A path-routed deployment needs `base_path` under its prefix.** A deployment
+  routed only at `/app` would 404 the provider's redirect to
+  `/__applb/auth/callback`; set `base_path` to something like `/app/__auth`.
+  Registration rejects the combination rather than letting the first sign-in
+  discover it.
+- **Sessions are not revocable individually.** Ending one specific person's
+  access means removing them from the allow-list, which ends everyone's sessions
+  (they simply sign in again). There is no session list to revoke from — that is
+  the trade for having no session store.
+
+## Building images from git
+
+A managed deployment can say where its guest image *comes from*, not just what it
+is called. Add a `build` block naming a git repo and a Dockerfile, and
+`POST /deployments/:id/build` will check the repo out on the app-lb host, hand
+the Dockerfile to `heyvm mvm build`, and — when that succeeds — rewrite the
+deployment's `vm.image` to the image it produced, which recycles the pool onto
+it.
+
+```jsonc
+{
+  "id": "web",
+  "routes": [{"host": "web.example.com"}],
+  "vm": {"driver": "firecracker", "image": "web-3f2a1c8e9b0d", "port": 8080},
+  "build": {
+    "repo": "https://github.com/acme/web.git",
+    "ref": "main",              // branch, tag or commit; omit for the default branch
+    "dockerfile": "Dockerfile", // omit to let app-lb find one
+    "context": ".",             // omit to use the Dockerfile's directory
+    "image_size_mb": 768,       // omit to let heyvm size it from the image contents
+    "auth": {"secret": "github", "key": "token"}   // omit for a public repo
+  }
+}
+```
+
+```sh
+# Build the ref in the spec, and roll the pool onto the result.
+curl -XPOST localhost:9090/deployments/web/build          # 202 + a job record
+
+# Build a different ref, just this once. The spec's `ref` is left alone.
+curl -XPOST localhost:9090/deployments/web/build -H 'content-type: application/json' \
+  -d '{"ref": "v2.1.0"}'
+
+curl localhost:9090/jobs                  # every remembered job, newest first
+curl localhost:9090/deployments/web/jobs
+curl localhost:9090/jobs/job-3f2a1c8e     # status, commit, image and log tail
+```
+
+Builds are asynchronous — a `docker build` takes minutes, so `POST` returns `202`
+with a record and the outcome is polled from `GET /jobs/:id`. One job runs per
+deployment at a time; a second request while one is in flight is a `409`. Job
+records live in memory and the most recent 50 are kept, so they do not survive a
+restart — the durable outcome of a build is the `image` in the persisted spec.
+
+**Where it runs.** On the app-lb host, because heyvm has no build API: turning a
+Dockerfile into an ext4 rootfs needs a local `docker`, `mke2fs` (e2fsprogs) and
+`fakeroot`. The image lands in `$HOME/.heyo/images/firecracker/<name>.ext4`, and
+the daemon only looks under *its own* home — so app-lb should run as the same
+user as `heyvmd`, or be given `APP_LB_HEYVM_HOME`. Otherwise the build succeeds
+and then nothing boots.
+
+**Image names carry the commit.** Each build produces `<name>-<short sha>`
+(`<name>` defaults to the deployment id, override with `build.image_name`), so
+the running spec answers "what is deployed?" with something you can look up in
+the repo. Old images stay on disk — `heyvm mvm images` lists them, and pruning
+them is manual.
+
+**Finding the Dockerfile.** With `build.dockerfile` set, that path is used and a
+miss is an error. Without it, app-lb looks for `Dockerfile` at the context root,
+then searches up to three directories deep (skipping `.git`, `node_modules`,
+`target`, `vendor`, `dist`, `.venv`). Exactly one match is used; several is an
+error naming them, because picking one would make the deployed image depend on
+directory iteration order.
+
+**Editing `build` never disturbs running VMs.** It is not part of the `vm`
+template — it says where the *next* image comes from. The pool moves when a build
+finishes.
+
+A static (`upstreams`) deployment cannot have a `build` block: it has no guest
+image, it forwards to something somebody else runs. Its update path is
+[`update`](#updating-a-static-deployment) instead, and declaring the wrong one is
+rejected at registration.
+
+## Updating a static deployment
+
+A static deployment's backend is a process on some host — usually *this* host,
+under supervisord or systemd. There is no image to build, so its update path is
+the thing a person would otherwise ssh in and do: a working directory, and
+commands to run in it.
+
+```jsonc
+{
+  "id": "app-obs",
+  "routes": [{"host": "obs.example.com"}],
+  "upstreams": ["127.0.0.1:9600"],
+  "health": {"path": "/healthz", "timeout_secs": 2},
+  "update": {
+    "working_dir": "/home/sarocu/Projects/app-obs",
+    "commands": [
+      "git pull --ff-only",
+      "cargo build --release",
+      "supervisorctl restart app-obs"
+    ],
+    "verify_timeout_secs": 60,   // 0 disables the post-update health check
+    "timeout_secs": 1800,        // per command
+    "env": {"CARGO_TERM_COLOR": "never"},
+    "env_from": [{"secret": "obs", "key": "ingest_token", "as": "APP_OBS_INGEST_TOKEN"}],
+    "auth": {"secret": "github", "key": "token"}   // for a private `git pull`
+  }
+}
+```
+
+```sh
+curl -XPOST localhost:9090/deployments/app-obs/update   # 202 + a job record
+curl localhost:9090/jobs/job-2c9d7d7d          # commands_run, verified, log tail
+```
+
+Same shape as a build: `202` immediately, one job per deployment at a time, and
+the outcome polled from `GET /jobs/:id`. Each command is run through `sh -c`
+(`APP_LB_UPDATE_SHELL`) with `working_dir` as its CWD, in order, and the first
+non-zero exit stops the job — `commands_run` says how far it got.
+
+**Nothing in the spec changes.** The upstreams are the same addresses; what moved
+is the code answering on them. That is exactly why the job then **re-probes those
+addresses** with the deployment's own health check, until they all answer or
+`verify_timeout_secs` runs out. A job whose commands exited 0 but whose service
+never came back is reported as *failed*, and says so:
+
+```
+every command succeeded, but 1 of 1 upstream(s) did not answer within 60s
+(127.0.0.1:9600). The host has already been changed — check the service and its logs
+```
+
+The probe is a fresh one, not the autoscaler's cached `healthy` flag: a flag set
+two seconds ago describes the process that was just replaced.
+
+**The commands run as app-lb's user**, in app-lb's environment. Two things follow:
+
+- The working directory has to be readable and writable by that user. app-lb never
+  creates it — a typo that silently created an empty directory and ran `git pull`
+  in it would be worse than an error.
+- Restarting a service usually needs a little more. `supervisorctl` needs access
+  to supervisord's socket (add the app-lb user to the socket's `chown` group in
+  `supervisord.conf`); `systemctl restart` needs a polkit rule or a specific
+  `sudo -n` entry. Grant exactly the one verb, not general sudo — the admin API
+  is what triggers this.
+
+`env_from` pulls values from the [secret store](#secrets) rather than putting them
+in the spec, and `auth` supplies a git credential the same way a build does. A
+managed (`vm`) deployment cannot declare `update`: its backends are microVMs, and
+a directory on this host would update nothing.
+
+### Secrets
+
+A private repo needs a credential, and a deployment spec is the wrong place for
+one — the admin API echoes specs back verbatim and the state file holds them in
+the clear. So credentials are their own object, stored apart from deployments,
+and a spec refers to one by name:
+
+```sh
+# Store one. Values go in and are never readable back out.
+curl -XPOST localhost:9090/secrets -H 'content-type: application/json' \
+  -d '{"id": "github", "description": "CI PAT for acme/*", "data": {"token": "ghp_…"}}'
+
+curl localhost:9090/secrets          # ids, key *names*, and when each changed
+curl localhost:9090/secrets/github   # the same, for one secret
+
+# Rotate one key without resending the others (`null` removes a key).
+curl -XPATCH localhost:9090/secrets/github -H 'content-type: application/json' \
+  -d '{"data": {"token": "ghp_new…"}}'
+
+curl -XDELETE localhost:9090/secrets/github   # 409 while a deployment still refers to it
+```
+
+There is deliberately no endpoint that returns a value. Nothing app-lb does
+needs one: the builder resolves `build.auth` in-process, and a read-back would
+turn the admin API into a credential store with a `GET`.
+
+The token reaches git through `GIT_ASKPASS` and the child's environment, never
+through the URL or the command line — a credential in a remote URL lands in
+`.git/config` and in every `ps` on the box. `build.auth` only applies to HTTP(S)
+remotes; an `ssh://` or `git@` remote authenticates with the host's own key
+material and should leave it unset.
+
+**At rest**, secrets live in `APP_LB_SECRETS_PATH` (default
+`app-lb-secrets.json`) with mode `0600`. Set `APP_LB_SECRET_KEY` and the file is
+sealed with AES-256-GCM instead — ids, key names and values all — so a copied
+backup of the state directory is not a copied credential:
+
+```sh
+APP_LB_SECRET_KEY=$(openssl rand -hex 32) ./target/release/app-lb
+```
+
+A 64-character hex value is used as the key directly; anything else is hashed to
+32 bytes, so a passphrase works too. Setting the key on an existing plaintext
+file adopts it and encrypts on the next write. Starting **without** the key that
+sealed a file is a hard startup failure rather than an empty store — coming up
+empty would let the next write destroy secrets that are perfectly good and merely
+unreadable.
+
+> A build runs `git` and `docker` on the app-lb host, and an update runs whatever
+> the deployment's `commands` say, so an ungated admin API is a remote code
+> execution surface. It binds loopback by default; set `APP_LB_ADMIN_AUTH=1`
+> (with `APP_LB_DASHBOARD_PASSWORD`) before exposing it. app-lb warns at startup
+> when it is open.
 
 ## Routing
 

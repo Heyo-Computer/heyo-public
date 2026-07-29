@@ -7,9 +7,11 @@
 
 use crate::autoscale::{Autoscaler, EvictOutcome};
 use crate::config::DeploymentSpec;
+use crate::jobs::{Jobs, StartError};
 use crate::deployment::now_secs;
 use crate::metrics::{DeploymentMetricsSnapshot, HostUsageSnapshot, Metrics};
 use crate::registry::Registry;
+use crate::secrets::{SecretSpec, SecretStore};
 use crate::tls::CertStore;
 use async_trait::async_trait;
 use axum::extract::{Path, Query, Request, State};
@@ -22,6 +24,7 @@ use base64::Engine;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -92,6 +95,10 @@ struct AdminState {
     started_at: u64,
     /// Issued certificates, for `GET /certs`.
     certs: Arc<CertStore>,
+    /// Stored secrets. Values enter through this API and never leave it.
+    secrets: Arc<SecretStore>,
+    /// Runs image builds and host updates, and remembers what they did.
+    jobs: Arc<Jobs>,
     /// Nudges the ACME manager to issue for a newly-registered hostname instead
     /// of waiting out its sweep interval. `None` when ACME is disabled.
     acme: Option<Arc<Notify>>,
@@ -125,6 +132,8 @@ impl AdminApi {
         gate_admin: bool,
         certs: Arc<CertStore>,
         acme: Option<Arc<Notify>>,
+        secrets: Arc<SecretStore>,
+        jobs: Arc<Jobs>,
     ) -> Self {
         // Render the display name into the page once; the placeholder appears in
         // both the <title> and the <h1>.
@@ -158,6 +167,8 @@ impl AdminApi {
                 started_at: now_secs(),
                 certs,
                 acme,
+                secrets,
+                jobs,
             },
         }
     }
@@ -688,6 +699,251 @@ async fn certs(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.certs.status())
 }
 
+// -- secrets ---------------------------------------------------------------
+
+/// Persist the secret store, mapping a failure onto a 500.
+///
+/// Unlike the deployment registry — where a failed write is logged and the
+/// in-memory change stands — a secret that only exists in memory is a rotation
+/// that silently un-rotates on the next restart. Better to fail the request.
+fn persist_secrets(state: &AdminState) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state.secrets.persist().map_err(|e| {
+        tracing::error!(error = %e, "failed to persist secrets");
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the secret was not saved: {e}"),
+        )
+    })
+}
+
+/// Deployments whose build block points at a secret. Used to keep a delete from
+/// breaking a deployment that still needs it.
+fn secret_users(state: &AdminState, id: &str) -> Vec<String> {
+    let mut users: Vec<String> = state
+        .registry
+        .deployments()
+        .values()
+        .filter(|d| {
+            d.spec
+                .build
+                .as_ref()
+                .and_then(|b| b.auth.as_ref())
+                .is_some_and(|a| a.secret == id)
+        })
+        .map(|d| d.spec.id.clone())
+        .collect();
+    users.sort();
+    users
+}
+
+/// `POST /secrets` — create or replace a secret wholesale.
+async fn put_secret(
+    State(state): State<AdminState>,
+    Json(spec): Json<SecretSpec>,
+) -> impl IntoResponse {
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let id = spec.id.clone();
+    let existed = state.secrets.get(&id).is_some();
+    state.secrets.put(spec);
+    if let Err(e) = persist_secrets(&state) {
+        return e.into_response();
+    }
+    // Keys, never values — the same rule the read path follows, so enabling
+    // debug logging can't turn into a credential dump.
+    tracing::info!(secret = %id, replaced = existed, "secret stored");
+    let summary = state.secrets.summary(&id).expect("just stored");
+    let code = if existed { StatusCode::OK } else { StatusCode::CREATED };
+    (code, Json(summary)).into_response()
+}
+
+/// `PUT /secrets/:id` — as `POST`, with the path id winning.
+async fn replace_secret(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(mut spec): Json<SecretSpec>,
+) -> impl IntoResponse {
+    spec.id = id;
+    put_secret(State(state), Json(spec)).await.into_response()
+}
+
+#[derive(Deserialize)]
+struct SecretPatch {
+    /// `"KEY": "value"` sets, `"KEY": null` removes. Anything absent is left
+    /// alone, so one key can be rotated without resending the others — which
+    /// matters here, because there is no way to read the others back.
+    data: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+async fn patch_secret(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(patch): Json<SecretPatch>,
+) -> impl IntoResponse {
+    if state.secrets.get(&id).is_none() {
+        return err(StatusCode::NOT_FOUND, format!("no secret {id:?}")).into_response();
+    }
+    let updated = match state.secrets.patch(&id, patch.data) {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    if let Some(description) = patch.description {
+        let mut next = (*updated).clone();
+        next.description = Some(description);
+        state.secrets.put(next);
+    }
+    if let Err(e) = persist_secrets(&state) {
+        return e.into_response();
+    }
+    tracing::info!(secret = %id, "secret updated");
+    Json(state.secrets.summary(&id).expect("just stored")).into_response()
+}
+
+async fn list_secrets(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.secrets.list())
+}
+
+async fn get_secret(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
+    match state.secrets.summary(&id) {
+        Some(s) => Json(s).into_response(),
+        None => err(StatusCode::NOT_FOUND, format!("no secret {id:?}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ForceParams {
+    #[serde(default)]
+    force: bool,
+}
+
+/// `DELETE /secrets/:id[?force=true]`.
+///
+/// Refused while a deployment's build still references it: the failure would
+/// otherwise surface much later, as a build that cannot authenticate.
+async fn delete_secret(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(params): Query<ForceParams>,
+) -> impl IntoResponse {
+    if state.secrets.get(&id).is_none() {
+        return err(StatusCode::NOT_FOUND, format!("no secret {id:?}")).into_response();
+    }
+    let users = secret_users(&state, &id);
+    if !users.is_empty() && !params.force {
+        return err(
+            StatusCode::CONFLICT,
+            format!(
+                "secret {id:?} is referenced by deployment(s) {}; their builds would stop \
+                 authenticating. Repoint them first, or delete with ?force=true",
+                users.join(", ")
+            ),
+        )
+        .into_response();
+    }
+    state.secrets.remove(&id);
+    if let Err(e) = persist_secrets(&state) {
+        return e.into_response();
+    }
+    tracing::info!(secret = %id, forced = params.force, "secret deleted");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// -- jobs ------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct BuildRequest {
+    /// Build this ref instead of the spec's. A one-off: the stored `build.ref`
+    /// is left alone, so a hotfix tag doesn't quietly become the new default.
+    #[serde(default, rename = "ref")]
+    git_ref: Option<String>,
+}
+
+/// Map a start failure onto a status. Shared by both job kinds, because the
+/// reasons a job can't start are the same for either.
+fn job_start_error(e: StartError) -> Response {
+    match e {
+        e @ StartError::NoDeployment(_) => {
+            err(StatusCode::NOT_FOUND, e.to_string()).into_response()
+        }
+        e @ StartError::AlreadyRunning(_) => {
+            err(StatusCode::CONFLICT, e.to_string()).into_response()
+        }
+        e => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+/// `POST /deployments/:id/build` — clone, build the image, roll the pool.
+///
+/// Returns `202` with a job record as soon as the work is scheduled. A build
+/// takes minutes; poll `GET /jobs/:job_id` for the outcome.
+async fn start_build(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<BuildRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match state.jobs.start_build(&id, req.git_ref) {
+        Ok(record) => {
+            tracing::info!(deployment = %id, job = %record.id, "image build started");
+            (StatusCode::ACCEPTED, Json(record)).into_response()
+        }
+        Err(e) => job_start_error(e),
+    }
+}
+
+/// `POST /deployments/:id/update` — run a static deployment's update commands on
+/// this host, then re-probe its upstreams.
+///
+/// The static counterpart of `build`, and `202` for the same reason: `cargo
+/// build && systemctl restart` is not something to hold an HTTP request open
+/// for. Nothing in the spec changes — the upstreams are the same addresses, and
+/// what moved is the code answering on them.
+async fn start_update(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.jobs.start_update(&id) {
+        Ok(record) => {
+            tracing::info!(deployment = %id, job = %record.id, "host update started");
+            (StatusCode::ACCEPTED, Json(record)).into_response()
+        }
+        Err(e) => job_start_error(e),
+    }
+}
+
+async fn list_jobs(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.jobs.records(None))
+}
+
+async fn deployment_jobs(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.registry.get(&id).is_none() {
+        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    }
+    Json(state.jobs.records(Some(&id))).into_response()
+}
+
+async fn get_job(
+    State(state): State<AdminState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    match state.jobs.record(&job_id) {
+        Some(r) => Json(r).into_response(),
+        // History is in memory and bounded, so an id can be forgotten rather
+        // than never having existed. Say so.
+        None => err(
+            StatusCode::NOT_FOUND,
+            format!("no job {job_id:?} — it may have aged out of the job history"),
+        )
+        .into_response(),
+    }
+}
+
 fn router(state: AdminState) -> Router {
     // The dashboard view + its data source are always behind the optional gate.
     let view = Router::new()
@@ -704,7 +960,26 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
         // Grouped with the CRUD routes so it inherits the `APP_LB_ADMIN_AUTH`
         // gate: it reports which hostnames app-lb holds keys for.
-        .route("/certs", get(certs));
+        .route("/certs", get(certs))
+        // Secrets: write-only by design. `GET` returns key *names*, never values.
+        .route("/secrets", post(put_secret).get(list_secrets))
+        .route(
+            "/secrets/:id",
+            get(get_secret)
+                .put(replace_secret)
+                .patch(patch_secret)
+                .delete(delete_secret),
+        )
+        // Jobs. `build` runs `git` and `docker` on this host and `update` runs
+        // the deployment's own commands, which is why they belong firmly on the
+        // gated side of the API. One history covers both kinds: they have the
+        // same lifecycle, and "what happened to this deployment lately?" should
+        // have one answer.
+        .route("/deployments/:id/build", post(start_build))
+        .route("/deployments/:id/update", post(start_update))
+        .route("/deployments/:id/jobs", get(deployment_jobs))
+        .route("/jobs", get(list_jobs))
+        .route("/jobs/:job_id", get(get_job));
 
     let (gated, open) = if state.gate_admin {
         (view.merge(crud), Router::new())

@@ -115,18 +115,26 @@ enum Command {
         cmd: cmd::auth::ConfigCmd,
     },
 
-    /// List deployments, VMs or certificates.
+    /// List deployments, VMs, certificates, secrets or jobs.
     #[command(visible_alias = "list")]
     Get(cmd::read::GetArgs),
 
     /// Show everything about a deployment: spec, pool, backends and traffic.
     Describe(cmd::read::DescribeArgs),
 
-    /// Register a new deployment from flags.
+    /// Register a new deployment, or store a secret.
     Create {
         #[command(subcommand)]
         cmd: CreateCmd,
     },
+
+    /// Build a managed deployment's guest image from its git repo and
+    /// Dockerfile, and roll the pool onto the result.
+    Build(cmd::write::BuildArgs),
+
+    /// Update a static (proxy_pass) deployment: run its commands in its working
+    /// directory on the app-lb host, then check that its upstreams came back.
+    Update(cmd::write::UpdateArgs),
 
     /// Create or replace deployments from a spec file (JSON or YAML).
     Apply(cmd::write::ApplyArgs),
@@ -177,6 +185,11 @@ enum CreateCmd {
     /// Register a deployment: a managed VM pool, or a static proxy_pass target.
     #[command(visible_aliases = ["deploy", "dep"])]
     Deployment(Box<cmd::write::CreateDeploymentArgs>),
+
+    /// Store secret values — a git token, an API key. Values go in and are
+    /// never readable back out; deployments refer to them by name.
+    #[command(visible_alias = "sec")]
+    Secret(cmd::write::CreateSecretArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -195,6 +208,24 @@ enum SetCmd {
     /// Replace (or, with --add, extend) a deployment's route rules.
     #[command(visible_alias = "routes")]
     Route(cmd::write::SetRouteArgs),
+
+    /// Set where a managed deployment's image is built from: git repo, ref,
+    /// Dockerfile. Recording it changes nothing on its own — `serverctl build`
+    /// runs it.
+    Build(cmd::write::SetBuildArgs),
+
+    /// Set how a static deployment is updated: a working directory on the app-lb
+    /// host and the commands to run in it. `serverctl update` runs them.
+    Update(cmd::write::SetUpdateArgs),
+
+    /// Put a deployment behind Google sign-in, or change who may enter. Applies
+    /// to either kind of deployment; the application behind it is unchanged.
+    Auth(cmd::write::SetAuthArgs),
+
+    /// Rotate keys of a stored secret (`KEY=VALUE`, or `KEY-`). Keys you don't
+    /// mention are left alone.
+    #[command(visible_alias = "sec")]
+    Secret(cmd::write::SetSecretArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -242,7 +273,10 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Describe(args) => cmd::read::describe(&Ctx::new(g)?, args),
         Command::Create { cmd } => match cmd {
             CreateCmd::Deployment(args) => cmd::write::create(&Ctx::new(g)?, args),
+            CreateCmd::Secret(args) => cmd::write::create_secret(&Ctx::new(g)?, args),
         },
+        Command::Build(args) => cmd::write::build(&Ctx::new(g)?, args),
+        Command::Update(args) => cmd::write::update(&Ctx::new(g)?, args),
         Command::Apply(args) => cmd::write::apply(&Ctx::new(g)?, args),
         Command::Edit(args) => cmd::write::edit(&Ctx::new(g)?, args),
         Command::Set { cmd } => {
@@ -252,6 +286,10 @@ fn run(cli: &Cli) -> Result<()> {
                 SetCmd::Env(args) => cmd::write::set_env(&ctx, args),
                 SetCmd::Upstreams(args) => cmd::write::set_upstreams(&ctx, args),
                 SetCmd::Route(args) => cmd::write::set_route(&ctx, args),
+                SetCmd::Build(args) => cmd::write::set_build(&ctx, args),
+                SetCmd::Update(args) => cmd::write::set_update(&ctx, args),
+                SetCmd::Auth(args) => cmd::write::set_auth(&ctx, args),
+                SetCmd::Secret(args) => cmd::write::set_secret(&ctx, args),
             }
         }
         Command::Scale(args) => cmd::write::scale(&Ctx::new(g)?, args),
@@ -332,5 +370,200 @@ mod tests {
         assert_eq!(args.port, Some(8080));
         assert_eq!(args.routes, vec!["path=/api".to_string()]);
         assert_eq!(args.env, vec!["RUST_LOG=info".to_string()]);
+    }
+
+    #[test]
+    fn create_takes_a_build_source() {
+        let cli = Cli::try_parse_from([
+            "serverctl",
+            "create",
+            "deployment",
+            "web",
+            "--host",
+            "web.local",
+            "--port",
+            "8080",
+            "--repo",
+            "https://github.com/acme/web.git",
+            "--ref",
+            "main",
+            "--secret",
+            "github/token",
+        ])
+        .unwrap();
+        let Command::Create {
+            cmd: CreateCmd::Deployment(args),
+        } = &cli.command
+        else {
+            panic!("expected create deployment");
+        };
+        assert_eq!(args.repo.as_deref(), Some("https://github.com/acme/web.git"));
+        assert_eq!(args.git_ref.as_deref(), Some("main"));
+        assert_eq!(args.secret.as_deref(), Some("github/token"));
+
+        // The build knobs describe a repo, so they need one.
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "create", "deployment", "web", "--host", "w.local", "--port", "80",
+                "--ref", "main",
+            ])
+            .is_err(),
+            "--ref without --repo should be refused"
+        );
+    }
+
+    #[test]
+    fn a_secret_can_be_created_without_putting_the_value_on_the_command_line() {
+        let cli = Cli::try_parse_from([
+            "serverctl",
+            "create",
+            "secret",
+            "github",
+            "--from-stdin",
+            "token",
+            "--description",
+            "CI PAT",
+        ])
+        .unwrap();
+        let Command::Create {
+            cmd: CreateCmd::Secret(args),
+        } = &cli.command
+        else {
+            panic!("expected create secret");
+        };
+        assert_eq!(args.name, "github");
+        assert_eq!(args.sources.from_stdin.as_deref(), Some("token"));
+        assert!(args.literals.is_empty());
+        assert_eq!(args.description.as_deref(), Some("CI PAT"));
+    }
+
+    #[test]
+    fn build_takes_a_one_off_ref_and_can_wait() {
+        let cli =
+            Cli::try_parse_from(["serverctl", "build", "web", "--ref", "v2.1", "--wait"]).unwrap();
+        let Command::Build(args) = &cli.command else {
+            panic!("expected build");
+        };
+        assert_eq!(args.resource, "web");
+        assert_eq!(args.git_ref.as_deref(), Some("v2.1"));
+        assert!(args.wait);
+    }
+
+    #[test]
+    fn update_takes_a_working_directory_and_commands() {
+        let cli = Cli::try_parse_from([
+            "serverctl",
+            "set",
+            "update",
+            "app-obs",
+            "--workdir",
+            "/srv/app-obs",
+            "-c",
+            "git pull --ff-only",
+            "-c",
+            "cargo build --release",
+            "-c",
+            "supervisorctl restart app-obs",
+            "--secret-env",
+            "APP_OBS_INGEST_TOKEN=obs/ingest_token",
+            "--verify-timeout",
+            "90",
+        ])
+        .unwrap();
+        let Command::Set {
+            cmd: SetCmd::Update(args),
+        } = &cli.command
+        else {
+            panic!("expected set update");
+        };
+        assert_eq!(args.working_dir.as_deref(), Some("/srv/app-obs"));
+        assert_eq!(args.commands.len(), 3);
+        assert_eq!(args.commands[0], "git pull --ff-only");
+        assert_eq!(args.secret_env, vec!["APP_OBS_INGEST_TOKEN=obs/ingest_token"]);
+        assert_eq!(args.verify_timeout_secs, Some(90));
+    }
+
+    #[test]
+    fn running_an_update_can_wait_and_stream() {
+        let cli = Cli::try_parse_from(["serverctl", "update", "app-obs", "--logs"]).unwrap();
+        let Command::Update(args) = &cli.command else {
+            panic!("expected update");
+        };
+        assert_eq!(args.resource, "app-obs");
+        assert!(args.logs);
+        assert!(!args.wait, "--logs implies waiting without setting the flag");
+    }
+
+    #[test]
+    fn a_gate_takes_a_client_id_a_secret_and_an_allow_list() {
+        let cli = Cli::try_parse_from([
+            "serverctl",
+            "set",
+            "auth",
+            "web",
+            "--client-id",
+            "cid.apps.googleusercontent.com",
+            "--secret",
+            "google/client_secret",
+            "--allow-domain",
+            "example.com",
+            "--allow-email",
+            "contractor@gmail.com",
+            "--public-path",
+            "/healthz",
+        ])
+        .unwrap();
+        let Command::Set {
+            cmd: SetCmd::Auth(args),
+        } = &cli.command
+        else {
+            panic!("expected set auth");
+        };
+        assert_eq!(args.client_id.as_deref(), Some("cid.apps.googleusercontent.com"));
+        assert_eq!(args.secret.as_deref(), Some("google/client_secret"));
+        assert_eq!(args.allow_domains, vec!["example.com".to_string()]);
+        assert_eq!(args.allow_emails, vec!["contractor@gmail.com".to_string()]);
+        assert_eq!(args.public_paths, vec!["/healthz".to_string()]);
+        assert!(!args.clear);
+    }
+
+    #[test]
+    fn clearing_a_gate_excludes_editing_it() {
+        assert!(Cli::try_parse_from(["serverctl", "set", "auth", "web", "--clear"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "set", "auth", "web", "--clear", "--allow-domain", "example.com",
+            ])
+            .is_err(),
+            "--clear and --allow-domain say opposite things"
+        );
+    }
+
+    #[test]
+    fn clearing_an_update_excludes_editing_it() {
+        assert!(Cli::try_parse_from(["serverctl", "set", "update", "obs", "--clear"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "set", "update", "obs", "--clear", "-c", "make deploy",
+            ])
+            .is_err(),
+            "--clear and --command say opposite things"
+        );
+    }
+
+    #[test]
+    fn clearing_a_build_source_excludes_editing_it() {
+        assert!(Cli::try_parse_from(["serverctl", "set", "build", "web", "--clear"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "set", "build", "web", "--clear", "--repo", "https://x/y.git",
+            ])
+            .is_err(),
+            "--clear and --repo say opposite things"
+        );
+        // --username is only meaningful next to the secret it belongs to.
+        assert!(
+            Cli::try_parse_from(["serverctl", "set", "build", "web", "--username", "bot"]).is_err()
+        );
     }
 }

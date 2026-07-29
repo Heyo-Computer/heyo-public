@@ -660,6 +660,9 @@ mod tests {
             scaling: Default::default(),
             health: Default::default(),
             upstreams: vec!["127.0.0.1:8080".into()],
+            build: None,
+            update: None,
+            auth: None,
         });
         registry
     }

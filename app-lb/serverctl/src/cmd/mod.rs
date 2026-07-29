@@ -53,6 +53,9 @@ pub enum Resource {
     Deployment,
     Vm,
     Cert,
+    Secret,
+    /// A deploy job: an image build, or a host update.
+    Job,
     /// `get all` — every kind that has a listing.
     All,
 }
@@ -63,6 +66,11 @@ impl Resource {
             "deployment" | "deploy" | "dep" | "d" | "app" => Some(Self::Deployment),
             "vm" | "instance" | "backend" | "replica" => Some(Self::Vm),
             "cert" | "certificate" | "tl" => Some(Self::Cert),
+            "secret" | "sec" => Some(Self::Secret),
+            // `build` and `update` name the two verbs; both list the same jobs,
+            // so `get builds` and `get updates` are the same listing filtered by
+            // eye. One resource kind, several spellings people will reach for.
+            "job" | "build" | "bld" | "update" | "run" => Some(Self::Job),
             "all" => Some(Self::All),
             _ => None,
         }
@@ -73,6 +81,8 @@ impl Resource {
             Self::Deployment => "deployment",
             Self::Vm => "vm",
             Self::Cert => "cert",
+            Self::Secret => "secret",
+            Self::Job => "job",
             Self::All => "all",
         }
     }
@@ -96,7 +106,7 @@ pub fn parse_ref(args: &[String], default_kind: Option<Resource>) -> Result<(Res
         (kind, vec![first.clone()])
     } else {
         bail!(
-            "unknown resource type {first:?} — expected deployments, vms or certs"
+            "unknown resource type {first:?} — expected deployments, vms, certs, secrets or jobs"
         );
     };
 

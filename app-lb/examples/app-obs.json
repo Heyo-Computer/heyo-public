@@ -1,0 +1,21 @@
+{
+  "id": "app-obs",
+  "routes": [
+    { "host": "obs.us2.heyo.work" }
+  ],
+  "upstreams": ["127.0.0.1:9600"],
+  "health": { "path": "/healthz", "timeout_secs": 2 },
+  "update": {
+    "working_dir": "/home/sarocu/Projects/app-obs",
+    "commands": [
+      "git pull --ff-only",
+      "cargo build --release",
+      "supervisorctl restart app-obs"
+    ],
+    "env": {
+      "CARGO_TERM_COLOR": "never"
+    },
+    "timeout_secs": 1800,
+    "verify_timeout_secs": 60
+  }
+}

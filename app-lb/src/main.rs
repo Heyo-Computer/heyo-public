@@ -6,23 +6,29 @@
 
 mod acme;
 mod admin;
+mod auth;
 mod autoscale;
 mod config;
 mod deployment;
 mod health;
+mod jobs;
 mod metrics;
 mod proxy;
 mod registry;
+mod secrets;
 mod tls;
 mod vm;
 
 use crate::acme::{AcmeConfig, AcmeManager, ChallengeTable};
 use crate::admin::AdminApi;
+use crate::auth::Authenticator;
 use crate::autoscale::Autoscaler;
 use crate::config::LbConfig;
+use crate::jobs::{JobConfig, Jobs};
 use crate::metrics::Metrics;
 use crate::proxy::LbProxy;
 use crate::registry::Registry;
+use crate::secrets::SecretStore;
 use crate::tls::{CertStore, SniResolver};
 use crate::vm::VmManager;
 use pingora_core::listeners::tls::TlsSettings;
@@ -40,6 +46,9 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_STATE_PATH") {
         cfg.state_path = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_SECRETS_PATH") {
+        cfg.secrets_path = v;
     }
     if let Ok(v) = std::env::var("APP_LB_NAME") {
         cfg.name = v;
@@ -77,6 +86,27 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_ACME_DIRECTORY") {
         cfg.acme_directory = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_BUILD_DIR") {
+        cfg.build_dir = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_HEYVM_BIN") {
+        cfg.heyvm_bin = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_GIT_BIN") {
+        cfg.git_bin = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_UPDATE_SHELL") {
+        cfg.update_shell = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_BUILD_TIMEOUT_SECS") {
+        match v.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => cfg.build_timeout_secs = secs,
+            _ => panic!("APP_LB_BUILD_TIMEOUT_SECS must be a positive number of seconds, got {v:?}"),
+        }
+    }
+    if let Ok(v) = std::env::var("APP_LB_HEYVM_HOME") {
+        cfg.heyvm_home = Some(v);
     }
     cfg
 }
@@ -178,6 +208,63 @@ fn main() {
         Err(e) => tracing::error!(error = %e, "failed to load persisted state; starting empty"),
     }
 
+    // Secrets are read straight from the environment rather than through
+    // `LbConfig`, which derives `Debug` and `Serialize` — key material that is
+    // never in the struct can never be printed out of it.
+    let secret_key = std::env::var("APP_LB_SECRET_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .map(|k| secrets::derive_key(&k));
+    let secrets = Arc::new(SecretStore::new(&cfg.secrets_path, secret_key));
+    match secrets.load() {
+        Ok(0) => tracing::info!(path = %secrets.path().display(), "no stored secrets"),
+        Ok(n) => tracing::info!(
+            count = n,
+            encrypted = secrets.is_encrypted(),
+            "loaded secrets"
+        ),
+        // Fatal, unlike a bad deployment spec: starting with an empty store
+        // would let the first write replace secrets that are perfectly good and
+        // merely unreadable with the key this process was given.
+        Err(e) => panic!(
+            "cannot read {}: {e}",
+            std::path::Path::new(&cfg.secrets_path).display()
+        ),
+    }
+    if !secrets.is_encrypted() {
+        tracing::info!(
+            path = %secrets.path().display(),
+            "secrets are stored in plaintext (mode 0600); set APP_LB_SECRET_KEY to encrypt them",
+        );
+    }
+
+    // Jobs run `git`, `docker` and — for a static deployment's update — whatever
+    // its spec says, on this host. An ungated admin API is a remote code
+    // execution surface. It was already a "boot VMs of your choosing" surface,
+    // but this is worth saying out loud.
+    if !cfg.admin_auth {
+        tracing::warn!(
+            admin = %cfg.admin_addr,
+            "the deployment/secret/job API is not authenticated (set APP_LB_ADMIN_AUTH=1 \
+             with APP_LB_DASHBOARD_PASSWORD); POST /deployments/:id/build runs git and \
+             docker on this host, and POST /deployments/:id/update runs that deployment's \
+             own commands",
+        );
+    }
+
+    // The key that signs sign-in sessions. Generated on first use and kept, so
+    // a restart doesn't sign every user of a gated deployment out. Loaded even
+    // when no deployment is gated — one file read, and it means enabling a gate
+    // later needs no restart.
+    let auth_key_path = std::env::var("APP_LB_AUTH_KEY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| auth::default_key_path());
+    let auth = Arc::new(Authenticator::new(
+        Authenticator::load_key(&auth_key_path)
+            .unwrap_or_else(|e| panic!("cannot read or create {}: {e}", auth_key_path.display())),
+        secrets.clone(),
+    ));
+
     let vms = VmManager::new(cfg.daemon_url.clone());
 
     // The static cert pair, if configured. With ACME on it is the *fallback*,
@@ -240,6 +327,24 @@ fn main() {
     );
     let autoscaler = autoscaler_svc.task();
 
+    // The job runner is not a service: it has no loop of its own, it runs a task
+    // per job. It needs the autoscaler because finishing an image build means
+    // rewriting `vm.image` and tearing the old pool down — the same swap the
+    // admin API's update path does.
+    let jobs = Arc::new(Jobs::new(
+        JobConfig {
+            work_dir: cfg.build_dir.clone().into(),
+            heyvm_bin: cfg.heyvm_bin.clone(),
+            git_bin: cfg.git_bin.clone(),
+            shell: cfg.update_shell.clone(),
+            timeout: std::time::Duration::from_secs(cfg.build_timeout_secs),
+            home: cfg.heyvm_home.clone(),
+        },
+        registry.clone(),
+        autoscaler.clone(),
+        secrets.clone(),
+    ));
+
     // ACME runs only when a contact address is configured. Its `Notify` goes to
     // the admin API so registering a deployment starts issuance immediately
     // rather than at the next 12-hour sweep.
@@ -274,12 +379,14 @@ fn main() {
             cfg.admin_auth,
             certs.clone(),
             acme_signal,
+            secrets,
+            jobs,
         ),
     );
 
     let mut proxy_svc = pingora_proxy::http_proxy_service(
         &server.configuration,
-        LbProxy::new(registry, metrics, challenges),
+        LbProxy::new(registry, metrics, challenges, auth),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);
 

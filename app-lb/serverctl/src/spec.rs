@@ -253,6 +253,116 @@ pub fn apply_env(spec: &mut Value, id: &str, changes: &[EnvChange]) -> Result<Ve
     Ok(applied)
 }
 
+/// The `build` block, created if the deployment has none.
+///
+/// A static deployment is refused for the same reason the server refuses it:
+/// there is no guest image to build, only upstreams somebody else runs.
+pub fn build_mut<'a>(spec: &'a mut Value, id: &str) -> Result<&'a mut Map<String, Value>> {
+    if is_static(spec) {
+        bail!(
+            "deployment {id:?} is static (proxy_pass) and has no image to build — \
+             a build produces a guest rootfs, and a static deployment has no guest"
+        );
+    }
+    let entry = spec
+        .as_object_mut()
+        .with_context(|| format!("deployment {id:?} spec is not an object"))?
+        .entry("build")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if entry.is_null() {
+        *entry = Value::Object(Map::new());
+    }
+    entry
+        .as_object_mut()
+        .with_context(|| format!("deployment {id:?} has a non-object `build`"))
+}
+
+/// The `update` block of a static deployment, created if it has none.
+///
+/// The mirror of [`build_mut`], and refused on a managed deployment for the
+/// mirror-image reason: a working directory on the app-lb host has nothing to do
+/// with a microVM's rootfs.
+pub fn update_mut<'a>(spec: &'a mut Value, id: &str) -> Result<&'a mut Map<String, Value>> {
+    if !is_static(spec) {
+        bail!(
+            "deployment {id:?} is a managed VM pool, not a static (proxy_pass) one — its \
+             backends are microVMs, so there is no working directory on this host to update. \
+             Use `serverctl set build {id} --repo <url>` instead"
+        );
+    }
+    let entry = spec
+        .as_object_mut()
+        .with_context(|| format!("deployment {id:?} spec is not an object"))?
+        .entry("update")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if entry.is_null() {
+        *entry = Value::Object(Map::new());
+    }
+    entry
+        .as_object_mut()
+        .with_context(|| format!("deployment {id:?} has a non-object `update`"))
+}
+
+/// The `auth` block, created if the deployment has none.
+///
+/// Unlike `build` and `update` there is no backend-kind check: the gate runs in
+/// the proxy, ahead of whichever backend the deployment has, so both kinds can
+/// carry one.
+pub fn auth_mut(spec: &mut Value) -> Result<&mut Map<String, Value>> {
+    let entry = spec
+        .as_object_mut()
+        .context("the deployment spec is not an object")?
+        .entry("auth")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if entry.is_null() {
+        *entry = Value::Object(Map::new());
+    }
+    entry
+        .as_object_mut()
+        .context("the deployment has a non-object `auth`")
+}
+
+/// One `--secret-env` argument: `NAME/KEY` (the variable is the key, upper-cased,
+/// as the server defaults it) or `ENV=NAME/KEY` to name it.
+pub fn parse_secret_env(arg: &str) -> Result<Value> {
+    let (env, reference) = match arg.split_once('=') {
+        Some((e, r)) => (Some(e.trim()), r.trim()),
+        None => (None, arg.trim()),
+    };
+    let mut value = parse_secret_ref(reference)?;
+    if reference.split_once('/').is_none() {
+        bail!(
+            "--secret-env {arg:?} needs a key: use NAME/KEY, or ENV=NAME/KEY to choose the \
+             variable name"
+        );
+    }
+    if let Some(env) = env {
+        if env.is_empty() {
+            bail!("--secret-env {arg:?} has an empty variable name");
+        }
+        if let Some(map) = value.as_object_mut() {
+            map.insert("as".into(), Value::String(env.to_string()));
+        }
+    }
+    Ok(value)
+}
+
+/// One `--secret` argument: `NAME` (key defaults to `token`, as the API does) or
+/// `NAME/KEY`.
+pub fn parse_secret_ref(arg: &str) -> Result<Value> {
+    let (name, key) = match arg.split_once('/') {
+        Some((n, k)) => (n.trim(), k.trim()),
+        None => (arg.trim(), "token"),
+    };
+    if name.is_empty() {
+        bail!("{arg:?} has an empty secret name — expected NAME or NAME/KEY");
+    }
+    if key.is_empty() {
+        bail!("{arg:?} has an empty key — expected NAME or NAME/KEY");
+    }
+    Ok(serde_json::json!({ "secret": name, "key": key }))
+}
+
 /// Merge only the fields that were given onto a partial scaling patch. The API
 /// keeps every field it isn't sent, so an empty patch is a no-op rather than a
 /// reset to defaults.
@@ -340,6 +450,86 @@ mod tests {
         let mut spec = json!({"id": "proxy", "upstreams": ["10.0.0.9:8080"]});
         let err = vm_mut(&mut spec, "proxy").unwrap_err().to_string();
         assert!(err.contains("static"), "{err}");
+    }
+
+    #[test]
+    fn a_build_block_is_created_on_a_deployment_that_has_none() {
+        let mut spec = json!({"id": "web", "vm": {"port": 8080}});
+        let build = build_mut(&mut spec, "web").unwrap();
+        build.insert("repo".into(), json!("https://example.com/acme/web.git"));
+        assert_eq!(spec["build"]["repo"], json!("https://example.com/acme/web.git"));
+
+        // An existing block is edited in place, not replaced.
+        let build = build_mut(&mut spec, "web").unwrap();
+        build.insert("ref".into(), json!("main"));
+        assert_eq!(spec["build"]["repo"], json!("https://example.com/acme/web.git"));
+        assert_eq!(spec["build"]["ref"], json!("main"));
+    }
+
+    #[test]
+    fn a_static_deployment_has_nothing_to_build() {
+        let mut spec = json!({"id": "proxy", "upstreams": ["10.0.0.9:8080"]});
+        let err = build_mut(&mut spec, "proxy").unwrap_err().to_string();
+        assert!(err.contains("static"), "{err}");
+    }
+
+    #[test]
+    fn an_update_block_is_created_on_a_static_deployment() {
+        let mut spec = json!({"id": "obs", "upstreams": ["127.0.0.1:9600"]});
+        let update = update_mut(&mut spec, "obs").unwrap();
+        update.insert("working_dir".into(), json!("/srv/app-obs"));
+        update.insert("commands".into(), json!(["git pull"]));
+        assert_eq!(spec["update"]["working_dir"], json!("/srv/app-obs"));
+
+        // Edited in place, not replaced.
+        let update = update_mut(&mut spec, "obs").unwrap();
+        update.insert("verify_timeout_secs".into(), json!(90));
+        assert_eq!(spec["update"]["commands"], json!(["git pull"]));
+    }
+
+    /// The two update paths are exclusive, and each refusal names the other —
+    /// reaching for the wrong verb is the obvious mistake.
+    #[test]
+    fn a_managed_deployment_has_no_working_directory_on_this_host() {
+        let mut spec = json!({"id": "web", "vm": {"port": 8080}});
+        let err = update_mut(&mut spec, "web").unwrap_err().to_string();
+        assert!(err.contains("managed"), "{err}");
+        assert!(err.contains("set build"), "{err}");
+
+        let mut spec = json!({"id": "obs", "upstreams": ["10.0.0.9:80"]});
+        let err = build_mut(&mut spec, "obs").unwrap_err().to_string();
+        assert!(err.contains("static"), "{err}");
+    }
+
+    #[test]
+    fn secret_env_takes_a_reference_and_an_optional_name() {
+        assert_eq!(
+            parse_secret_env("obs/ingest_token").unwrap(),
+            json!({"secret": "obs", "key": "ingest_token"}),
+            "unnamed: the server upper-cases the key"
+        );
+        assert_eq!(
+            parse_secret_env("APP_OBS_TOKEN=obs/ingest_token").unwrap(),
+            json!({"secret": "obs", "key": "ingest_token", "as": "APP_OBS_TOKEN"})
+        );
+        // A bare secret name is ambiguous here — unlike --secret, which defaults
+        // to the `token` key, this decides a variable name too.
+        assert!(parse_secret_env("obs").is_err());
+        assert!(parse_secret_env("=obs/token").is_err());
+    }
+
+    #[test]
+    fn a_secret_reference_defaults_to_the_token_key() {
+        assert_eq!(
+            parse_secret_ref("github").unwrap(),
+            json!({"secret": "github", "key": "token"})
+        );
+        assert_eq!(
+            parse_secret_ref("forge/ci_pat").unwrap(),
+            json!({"secret": "forge", "key": "ci_pat"})
+        );
+        assert!(parse_secret_ref("/token").is_err());
+        assert!(parse_secret_ref("github/").is_err());
     }
 
     #[test]
