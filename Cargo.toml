@@ -1,0 +1,96 @@
+[package]
+name = "artifacts"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "artifacts"
+path = "src/lib.rs"
+
+[[bin]]
+name = "art"
+path = "src/main.rs"
+
+[features]
+default = ["daemon"]
+# The HTTP server. On by default for the `art` binary; mvm-ctrl should depend
+# with `default-features = false`, because it is pinned to axum 0.7 and there is
+# no reason to compile a second axum tree into `heyvm`.
+daemon = [
+    "dep:axum",
+    "dep:axum-extra",
+    "dep:base64",
+    "dep:tower-http",
+    "dep:tokio-util",
+    "dep:maud",
+    "dep:subtle",
+    "dep:futures-util",
+    "tokio/net",
+]
+
+[dependencies]
+# `fs` and `io-util` cover the async wrappers; every raw syscall runs under
+# `rt`'s spawn_blocking pool. `net` arrives with the `daemon` feature.
+tokio = { version = "1.52", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "io-util",
+    "sync",
+    "signal",
+] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# sha2, not blake3: the digest must match `sha256sum` and mvm-ctrl's
+# `BlobRef.sha256` (heyo/mvm-ctrl/src/driver/sync.rs:79-85) byte for byte, or
+# the bundle bridge silently stops interoperating. sha2 also picks up the
+# SHA-NI extensions on this host, where import is hash-bound, not IO-bound.
+sha2 = "0.10"
+hex = "0.4"
+
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The store lock. Same crate mvm-ctrl uses for `lock_store()`
+# (heyo/mvm-ctrl/src/bundles.rs:93-106), so the flock semantics match.
+fs2 = "0.4"
+
+# -- daemon feature ---------------------------------------------------------
+# axum 0.8, matching vault (path params are `{name}`, not `:name`). This is a
+# separate process from app-lb, so its axum 0.7 is not a conflict.
+axum = { version = "0.8", optional = true }
+# The session cookie for the dashboard. Same crate/version vault uses.
+axum-extra = { version = "0.10", features = ["cookie"], optional = true }
+# Decoding the Basic-auth header. Already in the tree transitively.
+base64 = { version = "0.22", optional = true }
+tower-http = { version = "0.6", features = ["trace", "limit"], optional = true }
+# `io` gives ReaderStream/StreamReader; `io-util` is where SyncIoBridge lives,
+# which lets an uploaded body reach the store's blocking insert path without
+# buffering it.
+tokio-util = { version = "0.7", features = ["io", "io-util"], optional = true }
+# Only for `TryStreamExt::map_err`, to turn axum's body errors into io errors.
+# Already in the tree via axum and tower.
+futures-util = { version = "0.3", default-features = false, optional = true }
+# SSR with no JavaScript and no external assets — the VM has no route to a CDN.
+maud = { version = "0.27", features = ["axum"], optional = true }
+# Constant-time API-key comparison.
+subtle = { version = "2.6", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# Raw ioctl/fallocate/statx/copy_file_range. Confined to src/sys/; no `unsafe`
+# appears anywhere else in the crate.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+# `ServiceExt::oneshot`, to drive the router in-process without binding a port.
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+# The zero-run scanner in sys/sparse.rs relies on the autovectorizer for
+# `chunk.iter().all(|&b| b == 0)`. Do not lower this.
+opt-level = 3
