@@ -34,9 +34,11 @@
 #   --run-dir DIR      heyvmd run dir                     (default: <home>/.heyo/run)
 #   --state FILE       pooler registry.tsv                (default: <home>/.heyo/pg-vm-pool/registry.tsv)
 #   --dump-dir DIR     pooler local dump dir              (default: <home>/.heyo/pg-vm-pool/dumps)
-#   --work-dir DIR     scratch for disk copies + sockets  (default: /tmp; put it
-#                      on the spare disk if /tmp is tight — each copy is the
-#                      disk's allocated size)
+#   --work-dir DIR     scratch for disk copies + sockets  (default: /var/tmp;
+#                      each copy costs the disk's ALLOCATED size, so point it
+#                      at the spare disk for big disks. Must be traversable by
+#                      --pg-user: a 0700 home directory ("~/scratch") is NOT —
+#                      the throwaway postmaster runs as that user)
 #   --pg-bin DIR       old-major binaries                 (default: /usr/lib/postgresql/<major>/bin;
 #                      `apt install postgresql-16` provides them)
 #   --pg-user U        host user to run the postmaster as (default: postgres)
@@ -79,7 +81,7 @@ MAJOR=16
 RUN_DIR="$USER_HOME/.heyo/run"
 STATE_FILE="$USER_HOME/.heyo/pg-vm-pool/registry.tsv"
 DUMP_DIR="$USER_HOME/.heyo/pg-vm-pool/dumps"
-WORK_DIR="/tmp"
+WORK_DIR="/var/tmp"
 PG_BIN=""
 PG_USER="postgres"
 IN_PLACE=0
@@ -120,6 +122,13 @@ if [ "$LIST_ONLY" != 1 ]; then
     done
     id "$PG_USER" >/dev/null 2>&1 || die "host user '$PG_USER' does not exist (--pg-user)"
     [ -d "$DUMP_DIR" ] || [ -L "$DUMP_DIR" ] || die "dump dir $DUMP_DIR missing"
+    mkdir -p "$WORK_DIR" 2>/dev/null
+    # The postmaster runs as $PG_USER and must reach its socket/log under the
+    # work dir; a 0700 home directory in the path breaks everything downstream
+    # with confusing per-step errors, so fail it here with the real reason.
+    sudo -u "$PG_USER" test -d "$WORK_DIR" 2>/dev/null \
+        || die "work dir $WORK_DIR is not traversable by user '$PG_USER' \
+(a 0700 \$HOME, e.g. ~/scratch, is the usual cause) — use /var/tmp or a spare-disk path"
     if [ "$NO_REGISTRY" != 1 ] && command -v supervisorctl >/dev/null \
         && supervisorctl status pg-vm-pool 2>/dev/null | grep -q RUNNING; then
         die "pooler is running — stop it first (this edits registry.tsv), or use --no-registry"
@@ -218,6 +227,12 @@ for i in "${!CAND_SCHEMAS[@]}"; do
 
     work_disk="$disk"
     if [ "$IN_PLACE" != 1 ]; then
+        need=$(du -B1 "$disk" | cut -f1)
+        avail=$(df -B1 --output=avail "$WORK_DIR" 2>/dev/null | awk 'NR==2 {print $1}')
+        if [ -n "$avail" ] && [ "$avail" -lt $((need + need / 10)) ]; then
+            echo "   $WORK_DIR lacks room for a $(du -h "$disk" | cut -f1) copy — skipping"
+            cleanup_current; failed=$((failed + 1)); continue
+        fi
         echo "   copying disk ($(du -h "$disk" | cut -f1) allocated)…"
         if ! cp --sparse=always "$disk" "$CUR_WORK/data.ext4"; then
             echo "   copy failed — skipping"; cleanup_current; failed=$((failed + 1)); continue
@@ -225,10 +240,26 @@ for i in "${!CAND_SCHEMAS[@]}"; do
         work_disk="$CUR_WORK/data.ext4"
     fi
 
-    e2fsck -fp "$work_disk" >/dev/null 2>&1
-    if [ $? -ge 4 ]; then
-        echo "   e2fsck failed on the work copy — repair the disk first (badfs); skipping"
-        cleanup_current; failed=$((failed + 1)); continue
+    fsck_out=$(e2fsck -fp "$work_disk" 2>&1)
+    fsck_rc=$?
+    if [ "$fsck_rc" -ge 4 ]; then
+        echo "   preen fsck failed (rc=$fsck_rc):"
+        echo "$fsck_out" | grep -v '^$' | head -n 3 | sed 's/^/     /'
+        if [ "$IN_PLACE" = 1 ]; then
+            echo "   refusing a full repair on the ORIGINAL — drop --in-place or run badfs first; skipping"
+            cleanup_current; failed=$((failed + 1)); continue
+        fi
+        # On the work COPY a full -fy repair is risk-free (the original is
+        # untouched); it's also the only way through ENOSPC-era damage.
+        echo "   running full repair on the work copy…"
+        fsck_out=$(e2fsck -fy "$work_disk" 2>&1)
+        fsck_rc=$?
+        if [ "$fsck_rc" -ge 4 ]; then
+            echo "   full repair failed too (rc=$fsck_rc):"
+            echo "$fsck_out" | grep -v '^$' | tail -n 3 | sed 's/^/     /'
+            cleanup_current; failed=$((failed + 1)); continue
+        fi
+        echo "   repaired"
     fi
     if ! mount -o loop "$work_disk" "$CUR_MNT"; then
         echo "   loop mount failed — skipping"; cleanup_current; failed=$((failed + 1)); continue
@@ -244,18 +275,26 @@ for i in "${!CAND_SCHEMAS[@]}"; do
     # stale postmaster remnants from the unclean guest kill.
     chown -R "$PG_USER:$PG_USER" "$CUR_PGDATA"
     if [ -L "$CUR_PGDATA/base/pgsql_tmp" ]; then
+        # Root does the mkdir (no traversal dependence), then hands it over.
         rm -f "$CUR_PGDATA/base/pgsql_tmp"
-        sudo -u "$PG_USER" mkdir -p "$CUR_PGDATA/base/pgsql_tmp"
+        mkdir -p "$CUR_PGDATA/base/pgsql_tmp"
+        chown "$PG_USER:$PG_USER" "$CUR_PGDATA/base/pgsql_tmp"
     fi
     rm -f "$CUR_PGDATA/postmaster.pid"
-    sock="$CUR_WORK/sock"; mkdir -p "$sock"; chown "$PG_USER:$PG_USER" "$sock" "$CUR_WORK"
+    sock="$CUR_WORK/sock"
+    if ! mkdir -p "$sock" || ! chown "$PG_USER:$PG_USER" "$sock" "$CUR_WORK"; then
+        echo "   could not prepare $CUR_WORK for user $PG_USER — skipping"
+        cleanup_current; failed=$((failed + 1)); continue
+    fi
 
     echo "   starting v$MAJOR postmaster (crash recovery runs now)…"
-    if ! sudo -u "$PG_USER" "$PG_BIN/pg_ctl" -D "$CUR_PGDATA" -w -t 180 \
+    start_out=$(sudo -u "$PG_USER" "$PG_BIN/pg_ctl" -D "$CUR_PGDATA" -w -t 180 \
         -l "$CUR_WORK/pg.log" \
         -o "-c listen_addresses='' -c unix_socket_directories='$sock' -p $PGPORT -c archive_mode=off" \
-        start >/dev/null 2>&1; then
-        echo "   postmaster failed to start; log tail:"
+        start 2>&1)
+    if [ $? -ne 0 ]; then
+        echo "   postmaster failed to start:"
+        echo "$start_out" | grep -v '^$' | tail -n 3 | sed 's/^/     /'
         tail -n 8 "$CUR_WORK/pg.log" 2>/dev/null | sed 's/^/     /'
         cleanup_current; failed=$((failed + 1)); continue
     fi
