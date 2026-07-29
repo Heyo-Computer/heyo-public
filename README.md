@@ -98,6 +98,11 @@ chart.
 
 ## Configuration
 
+To run it as a managed, auto-restarting service, see the supervisord unit in
+[`deploy/supervisor/`](deploy/supervisor/).
+
+Configuration is environment-only:
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `APP_OBS_DATA_DIR` | `/var/lib/app-obs/data` | Parquet root |
