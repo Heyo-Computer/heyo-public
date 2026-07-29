@@ -134,6 +134,12 @@ for dir in "$RUN_DIR"/sb-*/; do
     [ -f "$dir/data.ext4" ] || continue
     id=$(basename "$dir")
     ver=$(debugfs -R "cat /pgdata/PG_VERSION" "$dir/data.ext4" 2>/dev/null | tr -dc '0-9.')
+    # A dirty journal (unclean VM kill) fails the normal open with "block
+    # bitmap checksum does not match" — the bitmap update is journaled but
+    # not replayed. Catastrophic mode (-c) opens without reading bitmaps and
+    # still reads file contents; both modes are read-only. The exhume flow
+    # replays the journal properly anyway (e2fsck -fp on the work copy).
+    [ -z "$ver" ] && ver=$(debugfs -c -R "cat /pgdata/PG_VERSION" "$dir/data.ext4" 2>/dev/null | tr -dc '0-9.')
     [ "$ver" = "$MAJOR" ] || continue
     schema=$(schema_of_id "$id")
     tier=""
