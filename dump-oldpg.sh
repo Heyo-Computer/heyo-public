@@ -42,7 +42,21 @@
 #   --pg-user U        host user to run the postmaster as (default: postgres)
 #   --in-place         operate on the original disk (skips the copy; crash
 #                      recovery then writes to the only copy — default is safer)
-#   --no-registry      dump only; skip the tier flip
+#   --adopt-unbound    also process old-major disks NOT bound to any schema in
+#                      the registry (orphans of lost bindings). The owner is
+#                      identified from inside the cluster — the pooler names
+#                      each database exactly after its schema — then:
+#                        · registry has no such schema  -> dump to
+#                          <schema>.dump and APPEND a frozen row (the schema
+#                          restores normally on its next connect)
+#                        · registry already binds that schema elsewhere ->
+#                          dump saved as <schema>.recovered-from-<sb-id>.dump,
+#                          registry untouched, reported for a human to compare
+#                          (the existing binding may be an empty VM created
+#                          during an incident — do not assume either side wins)
+#                        · cluster has no databases -> reported empty (an old
+#                          spare); the disk holds nothing
+#   --no-registry      dump only; skip all registry writes
 #   --list             report candidates and exit
 #   --yes              no confirmation prompt
 #
@@ -69,6 +83,7 @@ WORK_DIR="/tmp"
 PG_BIN=""
 PG_USER="postgres"
 IN_PLACE=0
+ADOPT_UNBOUND=0
 NO_REGISTRY=0
 LIST_ONLY=0
 YES=0
@@ -85,6 +100,7 @@ while [ $# -gt 0 ]; do
         --pg-bin)      PG_BIN="$2"; shift 2 ;;
         --pg-user)     PG_USER="$2"; shift 2 ;;
         --in-place)    IN_PLACE=1; shift ;;
+        --adopt-unbound) ADOPT_UNBOUND=1; shift ;;
         --no-registry) NO_REGISTRY=1; shift ;;
         --list)        LIST_ONLY=1; shift ;;
         --yes)         YES=1; shift ;;
@@ -112,6 +128,7 @@ fi
 
 schema_of_id() { awk -F'\t' -v id="$1" '$2==id {print $1; exit}' "$STATE_FILE"; }
 tier_of() { awk -F'\t' -v s="$1" '$1==s {print ($4==""?"live":$4); exit}' "$STATE_FILE"; }
+schema_known() { awk -F'\t' -v s="$1" '$1==s {f=1} END {exit !f}' "$STATE_FILE"; }
 wanted() {
     [ ${#SCHEMAS[@]} -eq 0 ] && return 0
     local s
@@ -145,7 +162,12 @@ for dir in "$RUN_DIR"/sb-*/; do
     tier=""
     [ -n "$schema" ] && tier=$(tier_of "$schema")
     if [ -z "$schema" ]; then
-        echo "   $id: pgdata v$ver but not bound to any schema — skipping (unknown owner)"
+        if [ "$ADOPT_UNBOUND" = 1 ]; then
+            echo "   $id: pgdata v$ver, unbound — CANDIDATE (owner identified from the cluster)"
+            CAND_SCHEMAS+=(""); CAND_IDS+=("$id"); CAND_DISKS+=("$dir/data.ext4")
+        else
+            echo "   $id: pgdata v$ver but not bound to any schema — skipping (use --adopt-unbound)"
+        fi
         continue
     fi
     if [ "$tier" != live ]; then
@@ -181,10 +203,10 @@ cleanup_current() {
 }
 trap cleanup_current EXIT
 
-ok=0; failed=0
+ok=0; failed=0; empty=0; recovered=0
 for i in "${!CAND_SCHEMAS[@]}"; do
     schema="${CAND_SCHEMAS[$i]}"; id="${CAND_IDS[$i]}"; disk="${CAND_DISKS[$i]}"
-    note "exhuming schema $schema ($id)"
+    note "exhuming ${schema:+schema $schema }${schema:-unbound disk (owner TBD) }($id)"
     if disk_in_use "$disk"; then
         echo "   disk is held open by a running process — skipping"
         failed=$((failed + 1)); continue
@@ -240,43 +262,96 @@ for i in "${!CAND_SCHEMAS[@]}"; do
 
     dbs=$(sudo -u "$PG_USER" "$PG_BIN/psql" -h "$sock" -p "$PGPORT" -d postgres -Atc \
         "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'" 2>/dev/null)
-    if ! grep -qxF "$schema" <<<"$dbs"; then
-        echo "   cluster's databases [$(paste -sd, - <<<"$dbs")] do not include '$schema' — refusing to guess; skipping"
-        cleanup_current; failed=$((failed + 1)); continue
+
+    # Decide what to dump and how to record it. actions: flip (tier -> frozen),
+    # add (append a new frozen registry row), none (dump only — human decides).
+    PLAN_DB=(); PLAN_DEST=(); PLAN_ACT=()
+    if [ -n "$schema" ]; then
+        if ! grep -qxF "$schema" <<<"$dbs"; then
+            echo "   cluster's databases [$(paste -sd, - <<<"$dbs")] do not include '$schema' — refusing to guess; skipping"
+            cleanup_current; failed=$((failed + 1)); continue
+        fi
+        PLAN_DB+=("$schema"); PLAN_DEST+=("$DUMP_DIR/$schema.dump"); PLAN_ACT+=(flip)
+    else
+        # Unbound disk (--adopt-unbound): the database names ARE the owners —
+        # the pooler creates each schema's database under the schema's name.
+        if [ -z "$dbs" ]; then
+            echo "   cluster is EMPTY (initdb only — an old spare); nothing to recover, disk deletable"
+            cleanup_current; empty=$((empty + 1)); continue
+        fi
+        ndb=$(wc -l <<<"$dbs")
+        while IFS= read -r db; do
+            case "$db" in
+                */*|*[[:space:]]*|.*)
+                    echo "   owner db '$db' has an unsafe name — skipping it"
+                    continue ;;
+            esac
+            if schema_known "$db"; then
+                # The registry binds this schema elsewhere. That binding may be
+                # a fresh EMPTY VM created mid-incident, or a legitimately newer
+                # copy — a script cannot know which. Preserve, don't decide.
+                echo "   owner identified: '$db' — but the registry already binds it (tier $(tier_of "$db"));"
+                echo "     saving as a .recovered dump, registry untouched — compare the two by hand"
+                PLAN_DB+=("$db"); PLAN_DEST+=("$DUMP_DIR/$db.recovered-from-$id.dump"); PLAN_ACT+=(none)
+            elif [ "$ndb" -gt 1 ]; then
+                # A multi-database cluster is not something the pooler builds;
+                # recover the bytes but let a human sort out ownership.
+                echo "   owner db '$db' (one of $ndb — anomalous): saving as .recovered, registry untouched"
+                PLAN_DB+=("$db"); PLAN_DEST+=("$DUMP_DIR/$db.recovered-from-$id.dump"); PLAN_ACT+=(none)
+            else
+                echo "   owner identified: '$db' — unknown to the registry; will adopt as frozen"
+                PLAN_DB+=("$db"); PLAN_DEST+=("$DUMP_DIR/$db.dump"); PLAN_ACT+=(add)
+            fi
+        done <<<"$dbs"
+        if [ ${#PLAN_DB[@]} -eq 0 ]; then
+            cleanup_current; failed=$((failed + 1)); continue
+        fi
     fi
 
-    echo "   dumping database $schema…"
-    if ! sudo -u "$PG_USER" "$PG_BIN/pg_dump" -h "$sock" -p "$PGPORT" -Fc \
-        -d "$schema" -f "$CUR_WORK/out.dump"; then
-        echo "   pg_dump failed; log tail:"
-        tail -n 8 "$CUR_WORK/pg.log" 2>/dev/null | sed 's/^/     /'
-        cleanup_current; failed=$((failed + 1)); continue
-    fi
-    sz=$(stat -c %s "$CUR_WORK/out.dump" 2>/dev/null || echo 0)
-    if [ "$sz" -lt 512 ] || ! "$PG_BIN/pg_restore" --list "$CUR_WORK/out.dump" >/dev/null 2>&1; then
-        echo "   dump failed verification (${sz}B) — skipping"
-        cleanup_current; failed=$((failed + 1)); continue
-    fi
+    this_ok=1
+    for j in "${!PLAN_DB[@]}"; do
+        db="${PLAN_DB[$j]}"; dest="${PLAN_DEST[$j]}"; act="${PLAN_ACT[$j]}"
+        echo "   dumping database $db…"
+        if ! sudo -u "$PG_USER" "$PG_BIN/pg_dump" -h "$sock" -p "$PGPORT" -Fc \
+            -d "$db" -f "$CUR_WORK/out.dump"; then
+            echo "   pg_dump of $db failed; log tail:"
+            tail -n 8 "$CUR_WORK/pg.log" 2>/dev/null | sed 's/^/     /'
+            this_ok=0; continue
+        fi
+        sz=$(stat -c %s "$CUR_WORK/out.dump" 2>/dev/null || echo 0)
+        if [ "$sz" -lt 512 ] || ! "$PG_BIN/pg_restore" --list "$CUR_WORK/out.dump" >/dev/null 2>&1; then
+            echo "   dump of $db failed verification (${sz}B)"
+            this_ok=0; continue
+        fi
+        mv "$CUR_WORK/out.dump" "$dest"
+        chown --reference="$STATE_FILE" "$dest" 2>/dev/null || true
+        echo "   dump ok ($(numfmt --to=iec --suffix=B "$sz" 2>/dev/null || echo "${sz}B")) -> $dest"
 
-    out="$DUMP_DIR/$schema.dump"
-    mv "$CUR_WORK/out.dump" "$out"
-    chown --reference="$STATE_FILE" "$out" 2>/dev/null || true
-    echo "   dump ok ($(numfmt --to=iec --suffix=B "$sz" 2>/dev/null || echo "${sz}B")) -> $out"
-
-    if [ "$NO_REGISTRY" != 1 ]; then
-        cp -p "$STATE_FILE" "$STATE_FILE.bak-exhume" 2>/dev/null || true
-        awk -F'\t' -v OFS='\t' -v s="$schema" '$1==s {$4="frozen"} {print}' \
-            "$STATE_FILE" >"$STATE_FILE.tmp" \
-            && chown --reference="$STATE_FILE" "$STATE_FILE.tmp" 2>/dev/null \
-            ; mv "$STATE_FILE.tmp" "$STATE_FILE"
-        echo "   schema $schema -> frozen (registry backup: $STATE_FILE.bak-exhume)"
-    fi
+        if [ "$NO_REGISTRY" != 1 ]; then
+            case "$act" in
+                flip)
+                    cp -p "$STATE_FILE" "$STATE_FILE.bak-exhume" 2>/dev/null || true
+                    awk -F'\t' -v OFS='\t' -v s="$db" '$1==s {$4="frozen"} {print}' \
+                        "$STATE_FILE" >"$STATE_FILE.tmp" \
+                        && chown --reference="$STATE_FILE" "$STATE_FILE.tmp" 2>/dev/null \
+                        ; mv "$STATE_FILE.tmp" "$STATE_FILE"
+                    echo "   schema $db -> frozen (registry backup: $STATE_FILE.bak-exhume)"
+                    ;;
+                add)
+                    cp -p "$STATE_FILE" "$STATE_FILE.bak-exhume" 2>/dev/null || true
+                    printf '%s\t%s\t%s\tfrozen\n' "$db" "$id" "$(date +%s)" >>"$STATE_FILE"
+                    echo "   schema $db ADDED to the registry as frozen (restores on next connect)"
+                    ;;
+                none) recovered=$((recovered + 1)) ;;
+            esac
+        fi
+    done
 
     cleanup_current
-    ok=$((ok + 1))
+    if [ "$this_ok" = 1 ]; then ok=$((ok + 1)); else failed=$((failed + 1)); fi
 done
 
-note "done: $ok exhumed, $failed failed/skipped"
+note "done: $ok exhumed, $empty empty (old spares), $recovered saved as .recovered (conflicts — compare by hand), $failed failed/skipped"
 if [ "$ok" -gt 0 ]; then
     cat <<EOF
 Next steps:
