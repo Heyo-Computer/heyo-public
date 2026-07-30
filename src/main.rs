@@ -114,6 +114,10 @@ async fn run(cfg: Config) {
         }
     });
 
+    // The poller tells the daemon log tailer which sandboxes exist and which
+    // deployment each serves; the channel starts empty so the tailer idles
+    // until the first successful poll.
+    let (targets_tx, targets_rx) = tokio::sync::watch::channel(Vec::new());
     tokio::spawn(
         Poller::new(
             &cfg.applb_url,
@@ -121,9 +125,29 @@ async fn run(cfg: Config) {
             cfg.applb_password.clone(),
             cfg.poll_interval,
             sink.clone(),
+            Some(targets_tx),
         )
         .run(),
     );
+
+    match cfg.heyvm_url.clone() {
+        Some(heyvm_url) => {
+            tracing::info!(url = %heyvm_url, "tailing native sandbox logs from the daemon");
+            tokio::spawn(
+                sources::heyvm::Tailers::new(
+                    heyvm_url,
+                    cfg.heyvm_token.clone(),
+                    targets_rx,
+                    sink.clone(),
+                )
+                .run(),
+            );
+        }
+        None => tracing::info!(
+            "daemon log tailing disabled (set HEYVM_URL to collect sandbox \
+             stdout/stderr/console without an in-guest shipper)",
+        ),
+    }
 
     tokio::spawn(Retention::new(&cfg.data_dir, cfg.retain_days).run());
 

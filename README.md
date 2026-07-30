@@ -11,17 +11,32 @@ is.
 > **Status: phase 2.** Collection, storage, retention-by-deletion, the query API
 > and the dashboard work. S3 tiering and webhook alerts are not built yet.
 
-## Why push, not pull
+## How logs arrive: native tail, or push
 
-The obvious source for VM logs — the daemon's `GET /sandboxes/:id/logs` — cannot
-be used. Its store is written from exactly one place, the output of explicit
-`execute_command` calls, so an application started through app-lb's
-`start_command` writes to a file inside the guest that the daemon never sees. It
-is also capped at 1000 in-memory entries per sandbox and discarded when the
-sandbox stops. Polling it would additionally mean exec'ing into live VMs.
+Two paths, complementary:
 
-So applications push to app-obs, and metrics are polled from app-lb, which
-already measures everything worth keeping.
+**Native tail (no guest cooperation).** The daemon now captures each sandbox's
+serial console and its `start_command`'s stdout/stderr natively and serves
+them over a WebSocket at `GET /sandboxes/:id/logs/stream`. With `HEYVM_URL`
+set, app-obs tails that stream for every VM the app-lb poll reports, so every
+line a managed VM prints is collected — attributed to its deployment and
+sandbox, with `source` `stdout`, `stderr`, or `console` — without a shipper,
+an ingest token, or any code inside the guest. Which sandboxes to tail, and
+which deployment each belongs to, comes from the app-lb poll: app-lb is the
+authority on that mapping, the daemon only knows sandbox ids.
+
+This used to be impossible — the daemon's log store held nothing but
+`execute_command` output, which is why this collector was built push-only.
+That constraint is gone; the push paths remain because they carry things the
+console never sees.
+
+**Push (structured, app-authored).** An application that knows its levels and
+fields ships records itself over HTTP or syslog, as below. Note an app that
+both prints to stdout *and* pushes the same lines will store them twice, under
+different `source` values — pick one per line.
+
+Metrics are polled from app-lb, which already measures everything worth
+keeping.
 
 ## Where guests send logs
 
@@ -162,6 +177,8 @@ Configuration is environment-only:
 | `APP_LB_URL` | `http://127.0.0.1:9090` | app-lb admin API to poll |
 | `APP_LB_USER` | `admin` | Only used when a password is set |
 | `APP_LB_PASSWORD` | *(unset)* | Set when app-lb has `APP_LB_ADMIN_AUTH=1` |
+| `HEYVM_URL` | *(unset)* | Sandbox daemon whose native log streams to tail (e.g. `http://127.0.0.1:34099`); **unset disables native tailing** |
+| `HEYVM_TOKEN` | *(unset)* | Bearer token for the daemon, needed when it runs with `JWT_SECRET` |
 | `APP_OBS_POLL_SECS` | `10` | Metrics poll interval |
 | `APP_OBS_RETAIN_DAYS` | `30` | Partitions older than this are deleted |
 | `APP_OBS_FLUSH_ROWS` | `10000` | Flush a partition at this many buffered rows... |

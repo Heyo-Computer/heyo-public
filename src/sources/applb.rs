@@ -9,6 +9,7 @@
 //! app-lb can add to its response without breaking this.
 
 use crate::ingest::Sink;
+use crate::sources::VmTarget;
 use crate::store::schema::{MetricRecord, Record};
 use serde::Deserialize;
 use std::time::Duration;
@@ -37,6 +38,10 @@ struct HostUsage {
 #[derive(Debug, Deserialize)]
 struct DeploymentView {
     id: String,
+    /// `vm` or `static`. Optional because an older app-lb may not send it;
+    /// see [`vm_targets`] for how that absence is handled.
+    #[serde(default)]
+    kind: Option<String>,
     pool: PoolStatus,
     #[serde(default)]
     vms: Vec<VmView>,
@@ -95,6 +100,11 @@ pub struct Poller {
     auth: Option<(String, String)>,
     interval: Duration,
     sink: Sink,
+    /// Where the current VM set goes after each successful poll, for the
+    /// daemon log tailer. Deliberately never cleared on a failed poll: app-lb
+    /// restarting must not stop log collection from sandboxes that are still
+    /// running.
+    targets: Option<tokio::sync::watch::Sender<Vec<VmTarget>>>,
 }
 
 impl Poller {
@@ -104,6 +114,7 @@ impl Poller {
         password: Option<String>,
         interval: Duration,
         sink: Sink,
+        targets: Option<tokio::sync::watch::Sender<Vec<VmTarget>>>,
     ) -> Self {
         // app-lb's admin API is loopback and answers promptly or not at all; a
         // short timeout keeps a wedged connection from stalling the poll loop
@@ -124,6 +135,7 @@ impl Poller {
             auth,
             interval,
             sink,
+            targets,
         }
     }
 
@@ -153,6 +165,20 @@ impl Poller {
         let response = request.send().await?.error_for_status()?;
         let snapshot: MetricsResponse = response.json().await?;
 
+        if let Some(targets) = &self.targets {
+            // send_if_modified so an unchanged fleet doesn't wake the tailer
+            // manager every poll tick.
+            let current = vm_targets(&snapshot);
+            targets.send_if_modified(|previous| {
+                if *previous == current {
+                    false
+                } else {
+                    *previous = current;
+                    true
+                }
+            });
+        }
+
         let records = flatten(&snapshot);
         let count = records.len();
         for record in records {
@@ -160,6 +186,31 @@ impl Poller {
         }
         Ok(count)
     }
+}
+
+/// The sandboxes worth tailing daemon logs from: every backend of a VM
+/// deployment. Static deployments are excluded — their "vms" entries hold
+/// `host:port` upstreams, which the daemon has never heard of. When an older
+/// app-lb omits `kind`, the backend's shape decides: a `host:port` always
+/// contains a colon, a sandbox id never does.
+fn vm_targets(snapshot: &MetricsResponse) -> Vec<VmTarget> {
+    let mut targets = Vec::new();
+    for deployment in &snapshot.deployments {
+        for vm in &deployment.vms {
+            let is_vm = match deployment.kind.as_deref() {
+                Some("vm") => true,
+                Some(_) => false,
+                None => !vm.backend.contains(':'),
+            };
+            if is_vm {
+                targets.push(VmTarget {
+                    deployment: deployment.id.clone(),
+                    backend: vm.backend.clone(),
+                });
+            }
+        }
+    }
+    targets
 }
 
 /// Turn one snapshot into rows: one for the host, one per deployment, one per VM.
@@ -422,5 +473,44 @@ mod tests {
             r#""generated_at": 1785260096, "some_new_field": {"nested": true},"#,
         );
         assert!(serde_json::from_str::<MetricsResponse>(&extended).is_ok());
+    }
+
+    #[test]
+    fn vm_deployments_yield_one_target_per_backend() {
+        let targets = vm_targets(&parse());
+        assert_eq!(
+            targets,
+            vec![
+                VmTarget {
+                    deployment: "demo".into(),
+                    backend: "sb-aaa".into(),
+                },
+                VmTarget {
+                    deployment: "demo".into(),
+                    backend: "sb-bbb".into(),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn static_deployments_are_not_tailed() {
+        // A static deployment's "vms" hold host:port upstreams; asking the
+        // daemon to stream logs for "10.0.0.5:3000" would 404 forever.
+        let mut snapshot = parse();
+        snapshot.deployments[0].kind = Some("static".into());
+        assert!(vm_targets(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn a_missing_kind_falls_back_to_the_backend_shape() {
+        // Older app-lb: no `kind`. Sandbox ids never contain a colon;
+        // host:port upstreams always do.
+        let mut snapshot = parse();
+        snapshot.deployments[0].kind = None;
+        snapshot.deployments[0].vms[1].backend = "10.0.0.5:3000".into();
+        let targets = vm_targets(&snapshot);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].backend, "sb-aaa");
     }
 }

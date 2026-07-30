@@ -1,12 +1,12 @@
 //! Getting records in.
 //!
-//! # Why push, and why bind every interface
+//! # Why push exists, and why it binds every interface
 //!
-//! The daemon cannot supply application logs: its `GET /sandboxes/:id/logs`
-//! only ever holds the output of explicit `execute_command` calls, capped at
-//! 1000 in-memory entries and discarded when the sandbox stops. An app started
-//! through app-lb's `start_command` writes to a file inside the guest that the
-//! daemon never sees. So senders push to us.
+//! Push was originally the only way to get application logs at all — the
+//! daemon's log store used to hold nothing but `execute_command` output. The
+//! daemon now streams a sandbox's console and start-command output natively
+//! (see `sources::heyvm`), so push remains for what the console never sees:
+//! records with application-authored levels and structured fields.
 //!
 //! Each microVM sits on its own /30 — the host is at `guest_ip - 1` — so there
 //! is no single address every guest could be pointed at. Guests instead send to

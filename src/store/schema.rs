@@ -23,7 +23,8 @@ pub struct LogRecord {
     pub deployment: String,
     /// `None` for a static (proxy_pass) upstream, which has no sandbox.
     pub backend: Option<String>,
-    /// `stdout`, `stderr`, or `syslog`.
+    /// `stdout`, `stderr`, or `console` from the daemon tail; `syslog` from
+    /// the syslog listener; whatever the sender said on the push path.
     pub source: String,
     pub level: Option<String>,
     pub message: String,
