@@ -98,6 +98,7 @@ Every value resolves flag → environment → default.
 | `ART_READ_ONLY` | `--read-only` | `false` | Reject every mutating route with `403`. For a pull-only mirror. |
 | `ART_ADMIN_PASSWORD` | `--admin-password` | *(unset)* | Dashboard password. **Unset means the dashboard is not served at all.** |
 | `ART_ADMIN_USER` | `--admin-user` | `admin` | Dashboard username. |
+| `ART_DASHBOARD_OPEN` | `--dashboard-open` | `false` | Serve the dashboard with no login. For a listener already on a private network. Takes `1`/`true`/`yes`/`on`. Conflicts with `ART_ADMIN_PASSWORD`. |
 | `ART_FORCE_NO_TMPFILE` | — | unset | Force the named-temp-file insert path. Testing only. |
 | `ART_TEST_DIR` | — | `$TMPDIR` | Where tests create their scratch directories. |
 | `RUST_LOG` | — | `art=info,artifacts=info` | Tracing filter. |
@@ -168,11 +169,35 @@ manifests reference a given blob.
 ART_ADMIN_PASSWORD=… art serve --listen 0.0.0.0:8080
 ```
 
-**It is not served unless `ART_ADMIN_PASSWORD` is set** — off, not open. A
-store's tag names and blob sizes describe what an organisation builds and
-deploys, and that should not become public because a variable went unset.
+**It is not served unless you ask for it** — off, not open. A store's tag names
+and blob sizes describe what an organisation builds and deploys, and that should
+not become public because a variable went unset.
 
-Its credentials are **separate from `ART_API_KEY`**. That key authenticates
+There are two ways to ask, and the default is neither of them:
+
+| | Dashboard |
+|---|---|
+| *(nothing set)* | not mounted — every path under `/dashboard` is a `404` |
+| `ART_ADMIN_PASSWORD=…` | mounted, behind a login |
+| `ART_DASHBOARD_OPEN=1` | mounted, no login at all |
+
+```sh
+# private network — the listener is already the access control
+ART_DASHBOARD_OPEN=1 art serve --listen 10.0.0.4:8080
+```
+
+Use `ART_DASHBOARD_OPEN` when the listener is already unreachable from anywhere
+you do not trust — a wireguard address, a VPC-internal bind, a VM whose port is
+only forwarded to its host. It is an explicit opt-in because this process cannot
+check that claim; it can only log it, which it does at `warn` on every start.
+Setting both a password and `ART_DASHBOARD_OPEN` is an error rather than a
+precedence rule: whichever won, half the configuration would be a lie, and the
+half that lost would be the half someone believed was protecting the page.
+
+Bind matters more than the flag. `--listen 0.0.0.0:8080` with `ART_DASHBOARD_OPEN=1`
+publishes the store's contents to every network the host is on.
+
+When it is behind a login, its credentials are **separate from `ART_API_KEY`**. That key authenticates
 machines and travels in a header no browser sends; the dashboard is read by
 people, so it gets a username, a password, a login form, and an HttpOnly
 `SameSite=Strict` session cookie carrying a random per-process token — never the

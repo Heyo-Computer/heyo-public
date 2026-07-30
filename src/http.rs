@@ -49,8 +49,8 @@ pub struct ServeOptions {
     pub addr: SocketAddr,
     pub api_key: Option<String>,
     pub read_only: bool,
-    /// Dashboard credentials. `None` leaves the dashboard unmounted.
-    pub admin: Option<crate::config::AdminCredentials>,
+    /// Whether the dashboard is unmounted, gated, or open.
+    pub dashboard: crate::config::DashboardAccess,
 }
 
 /// Serve until SIGTERM or Ctrl-C.
@@ -67,23 +67,36 @@ pub async fn serve(config: &Config, opts: ServeOptions) -> crate::Result<()> {
         read_only: opts.read_only,
     };
 
-    let web = match &opts.admin {
-        Some(creds) => {
+    let web = match &opts.dashboard {
+        crate::config::DashboardAccess::Password(creds) => {
             tracing::info!(user = %creds.user, "dashboard enabled at /dashboard");
             Some(crate::web::WebState {
                 store,
-                auth: Arc::new(crate::admin::AdminAuth::new(
+                auth: Some(Arc::new(crate::admin::AdminAuth::new(
                     creds.user.clone(),
                     creds.password.clone(),
-                )),
+                ))),
             })
         }
-        None => {
+        crate::config::DashboardAccess::Open => {
+            // Warn, not info: this one was asked for explicitly, but the
+            // operator's reason for it ("the listener is private") is a fact
+            // about the network that this process cannot verify, and the log is
+            // the only place the assumption is written down.
+            tracing::warn!(
+                addr = %opts.addr,
+                "dashboard open at /dashboard with no login (ART_DASHBOARD_OPEN); \
+                 anyone who can reach this listener can read every tag and blob listing"
+            );
+            Some(crate::web::WebState { store, auth: None })
+        }
+        crate::config::DashboardAccess::Off => {
             // Off, not open. Tag names and blob sizes describe what an
             // organisation builds; that is not a thing to expose because a
             // variable went unset.
             tracing::info!(
-                "dashboard disabled — set ART_ADMIN_PASSWORD to enable it at /dashboard"
+                "dashboard disabled — set ART_ADMIN_PASSWORD to enable it at /dashboard, \
+                 or ART_DASHBOARD_OPEN=1 if the listener is already private"
             );
             None
         }
@@ -139,7 +152,8 @@ pub fn router(state: ServeState) -> Router {
         .with_state(state)
 }
 
-/// The dashboard, on its own credentials.
+/// The dashboard, on its own credentials — or on none, when the operator has
+/// declared the listener private.
 ///
 /// Deliberately a second router with a second auth layer rather than another
 /// branch inside the API's: the two have different identities, different
@@ -843,18 +857,35 @@ mod tests {
     /// getting it wrong is silent: a dashboard reachable with the machine key,
     /// or a store listing readable with none.
     fn dashboard_app(d: &tempfile::TempDir, password: Option<&str>) -> Router {
-        let store = Store::open(&Config {
+        let store = store_at(d);
+        let web = password.map(|p| crate::web::WebState {
+            store,
+            auth: Some(Arc::new(crate::admin::AdminAuth::new(
+                "admin".into(),
+                p.into(),
+            ))),
+        });
+        web_router(web)
+    }
+
+    /// The third state: mounted, no gate. Only reachable from an explicit
+    /// `ART_DASHBOARD_OPEN`, which [`crate::config::DashboardAccess::resolve`]
+    /// is what enforces.
+    fn open_dashboard_app(d: &tempfile::TempDir) -> Router {
+        web_router(Some(crate::web::WebState {
+            store: store_at(d),
+            auth: None,
+        }))
+    }
+
+    fn store_at(d: &tempfile::TempDir) -> Store {
+        Store::open(&Config {
             root: d.path().join("store"),
             min_free_bytes: 0,
             gc_min_age: Duration::ZERO,
             heyvm_images_dir: d.path().join("images"),
         })
-        .unwrap();
-        let web = password.map(|p| crate::web::WebState {
-            store,
-            auth: Arc::new(crate::admin::AdminAuth::new("admin".into(), p.into())),
-        });
-        web_router(web)
+        .unwrap()
     }
 
     #[tokio::test]
@@ -870,6 +901,73 @@ mod tests {
                 .unwrap();
             assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path} was served");
         }
+    }
+
+    #[tokio::test]
+    async fn an_open_dashboard_serves_every_page_without_credentials() {
+        // The private-network deployment: the gate is off because the operator
+        // said so, not because a variable went missing.
+        let d = tmpdir();
+        let app = open_dashboard_app(&d);
+        for path in ["/dashboard", "/dashboard/blobs", "/dashboard/manifests"] {
+            let r = app
+                .clone()
+                .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_dashboard_has_no_login_and_no_sign_out() {
+        // A login form that accepts anything, or a sign-out button that ends no
+        // session, would both be theatre. Neither is offered.
+        let d = tmpdir();
+        let app = open_dashboard_app(&d);
+        let r = app
+            .clone()
+            .oneshot(HttpRequest::get("/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SEE_OTHER);
+        assert_eq!(r.headers().get(header::LOCATION).unwrap(), "/dashboard");
+
+        let r = app
+            .oneshot(HttpRequest::get("/dashboard").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_string(r).await;
+        assert!(!html.contains("sign out"), "sign-out button on open dashboard");
+        assert!(!html.contains("/logout"), "logout form on open dashboard");
+    }
+
+    #[tokio::test]
+    async fn an_open_dashboard_does_not_open_the_api() {
+        // The two gates stay independent in both directions, and the merge is
+        // where that could quietly stop being true: `serve` hands both routers
+        // to one listener, so this composes them the same way.
+        let d = tmpdir();
+        let store = store_at(&d);
+        let api = router(ServeState {
+            store: store.clone(),
+            api_key: Some(Arc::new("secret".to_string())),
+            read_only: false,
+        });
+        let merged = api.merge(web_router(Some(crate::web::WebState { store, auth: None })));
+
+        let r = merged
+            .clone()
+            .oneshot(HttpRequest::get("/tags").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "/tags went open");
+
+        let r = merged
+            .oneshot(HttpRequest::get("/dashboard").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "/dashboard should be open");
     }
 
     #[tokio::test]

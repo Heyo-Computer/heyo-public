@@ -1,4 +1,6 @@
-//! Server-rendered dashboard, gated on admin credentials.
+//! Server-rendered dashboard, gated on admin credentials unless the operator
+//! has declared the listener private (`ART_DASHBOARD_OPEN`), in which case
+//! [`WebState::auth`] is `None` and every request authorizes.
 //!
 //! Zero JavaScript and zero external assets. Not minimalism for its own sake:
 //! this runs inside a Firecracker microVM with no route to a CDN, so a remote
@@ -44,7 +46,10 @@ const OVERVIEW_ROWS: usize = 12;
 #[derive(Clone)]
 pub struct WebState {
     pub store: Store,
-    pub auth: Arc<AdminAuth>,
+    /// `None` is the open dashboard: mounted, no login, no session. Reachable
+    /// only from an explicit `ART_DASHBOARD_OPEN`, never from an unset variable
+    /// — see [`crate::config::DashboardAccess`].
+    pub auth: Option<Arc<AdminAuth>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -58,7 +63,12 @@ pub struct LoginForm {
 }
 
 pub async fn login_page(State(st): State<WebState>, jar: CookieJar) -> Response {
-    if session_ok(&st, &jar) {
+    // No gate means no login to present. Rendering a form that accepts nothing
+    // would be a worse lie than the redirect.
+    let Some(auth) = st.auth.as_deref() else {
+        return Redirect::to("/dashboard").into_response();
+    };
+    if session_ok(auth, &jar) {
         return Redirect::to("/dashboard").into_response();
     }
     page_bare("sign in", login_body(false)).into_response()
@@ -69,7 +79,10 @@ pub async fn login_submit(
     jar: CookieJar,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    if !st.auth.verify_login(&form.user, &form.password) {
+    let Some(auth) = st.auth.as_deref() else {
+        return Redirect::to("/dashboard").into_response();
+    };
+    if !auth.verify_login(&form.user, &form.password) {
         tracing::warn!(user = %form.user, "dashboard login failed");
         // Same page, same status shape, no hint about which field was wrong.
         return (
@@ -78,7 +91,7 @@ pub async fn login_submit(
         )
             .into_response();
     }
-    let cookie = Cookie::build((SESSION_COOKIE, st.auth.session_token().to_string()))
+    let cookie = Cookie::build((SESSION_COOKIE, auth.session_token().to_string()))
         // HttpOnly: script must never be able to read it. SameSite=Strict: the
         // dashboard has no cross-site flows, so nothing legitimate is lost and
         // CSRF against the login POST is closed off.
@@ -95,21 +108,28 @@ pub async fn logout(jar: CookieJar) -> Response {
     (jar.remove(removal), Redirect::to("/login")).into_response()
 }
 
-fn session_ok(st: &WebState, jar: &CookieJar) -> bool {
+fn session_ok(auth: &AdminAuth, jar: &CookieJar) -> bool {
     jar.get(SESSION_COOKIE)
-        .map(|c| st.auth.verify_session(c.value()))
+        .map(|c| auth.verify_session(c.value()))
         .unwrap_or(false)
 }
 
 /// Authorize a dashboard request: session cookie, or Basic auth for `curl -u`.
+///
+/// An unconfigured gate authorizes everything. That is the whole of the open
+/// mode — one `None` here, rather than a bypass flag threaded through the
+/// checks, so there is no branch that can be reached with a gate configured.
 pub fn dashboard_authorized(st: &WebState, headers: &header::HeaderMap, jar: &CookieJar) -> bool {
-    if session_ok(st, jar) {
+    let Some(auth) = st.auth.as_deref() else {
+        return true;
+    };
+    if session_ok(auth, jar) {
         return true;
     }
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(|h| st.auth.verify_basic(h))
+        .map(|h| auth.verify_basic(h))
         .unwrap_or(false)
 }
 
@@ -132,6 +152,7 @@ pub async fn overview(State(st): State<WebState>) -> Result<Markup, WebError> {
     Ok(page(
         "overview",
         "/dashboard",
+        st.auth.is_some(),
         html! {
             // Hero: the one number this store exists to improve. Exactly one
             // per view, proportional figures (tabular-nums is for columns).
@@ -187,6 +208,7 @@ pub async fn blobs_page(State(st): State<WebState>) -> Result<Markup, WebError> 
     Ok(page(
         "blobs",
         "/dashboard/blobs",
+        st.auth.is_some(),
         html! {
             section {
                 (section_head("All blobs", blobs.len(), None))
@@ -228,6 +250,7 @@ pub async fn blob_page(
     Ok(page(
         "blob",
         "/dashboard/blobs",
+        st.auth.is_some(),
         html! {
             section {
                 h2 { "Blob" }
@@ -292,6 +315,7 @@ pub async fn manifests_page(State(st): State<WebState>) -> Result<Markup, WebErr
     Ok(page(
         "manifests",
         "/dashboard/manifests",
+        st.auth.is_some(),
         html! {
             section {
                 (section_head("Manifests", rows.len(), None))
@@ -326,6 +350,7 @@ pub async fn manifest_page(
     Ok(page(
         "manifest",
         "/dashboard/manifests",
+        st.auth.is_some(),
         html! {
             section {
                 h2 { "Manifest" }
@@ -513,7 +538,9 @@ fn human(n: u64) -> String {
 // Shell
 // ---------------------------------------------------------------------------
 
-fn page(title: &str, active: &str, body: Markup) -> Markup {
+/// `signout` is false on the open dashboard: there is no session to end, and a
+/// button that logs nobody out is a claim the page cannot keep.
+fn page(title: &str, active: &str, signout: bool, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -531,7 +558,9 @@ fn page(title: &str, active: &str, body: Markup) -> Markup {
                         (nav_link("Blobs", "/dashboard/blobs", active))
                         (nav_link("Manifests", "/dashboard/manifests", active))
                     }
-                    form method="post" action="/logout" { button.signout type="submit" { "sign out" } }
+                    @if signout {
+                        form method="post" action="/logout" { button.signout type="submit" { "sign out" } }
+                    }
                 }
                 main { (body) }
             }
@@ -811,7 +840,7 @@ mod tests {
         (
             WebState {
                 store,
-                auth: Arc::new(AdminAuth::new("admin".into(), "pw".into())),
+                auth: Some(Arc::new(AdminAuth::new("admin".into(), "pw".into()))),
             },
             dir,
         )
@@ -905,7 +934,7 @@ mod tests {
 
     #[test]
     fn page_shell_marks_the_active_nav_item() {
-        let html = page("overview", "/dashboard", html! {}).into_string();
+        let html = page("overview", "/dashboard", true, html! {}).into_string();
         assert!(html.contains("nav-link active"));
         assert!(html.contains("/dashboard/blobs"));
         assert!(!html.contains("<script"));

@@ -45,6 +45,50 @@ impl AdminCredentials {
     }
 }
 
+/// How the dashboard is exposed.
+///
+/// Three states rather than two, because "already behind a private network" is
+/// a real deployment: an operator who has put the listener on a VPN or a
+/// wireguard interface has already made the access decision, and making them
+/// invent a password only creates a secret that can leak from somewhere else.
+///
+/// [`Open`](DashboardAccess::Open) must be asked for by name. An unset variable
+/// still means [`Off`](DashboardAccess::Off) — the point of the default is that
+/// forgetting something can never widen access.
+#[derive(Debug, Clone)]
+pub enum DashboardAccess {
+    /// Not mounted at all. The default.
+    Off,
+    /// Mounted behind a login.
+    Password(AdminCredentials),
+    /// Mounted with no gate. Only ever from an explicit opt-in.
+    Open,
+}
+
+impl DashboardAccess {
+    /// Resolve the tri-state from a password and the open opt-in.
+    ///
+    /// Setting both is an error rather than a precedence rule: whichever way it
+    /// resolved, half the configuration would be a lie, and the half that loses
+    /// is the half someone believed was protecting the page.
+    pub fn resolve(
+        password: Option<String>,
+        user: String,
+        open: bool,
+    ) -> Result<DashboardAccess, String> {
+        match (password.filter(|p| !p.is_empty()), open) {
+            (Some(_), true) => Err("ART_ADMIN_PASSWORD and ART_DASHBOARD_OPEN are both set; \
+                 pick one — a password means gated, open means no gate at all"
+                .to_string()),
+            (Some(password), false) => {
+                Ok(DashboardAccess::Password(AdminCredentials { user, password }))
+            }
+            (None, true) => Ok(DashboardAccess::Open),
+            (None, false) => Ok(DashboardAccess::Off),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub root: PathBuf,
@@ -164,6 +208,46 @@ mod tests {
         // store would mean different directories to the CLI and a daemon.
         let e = Config::resolve(Some(PathBuf::from("art")), Some(0), None).unwrap_err();
         assert!(e.contains("absolute"), "{e}");
+    }
+
+    #[test]
+    fn dashboard_is_off_unless_something_asks_for_it() {
+        // The default has to stay the closed one: a forgotten variable must
+        // never be the reason a store's contents became readable.
+        assert!(matches!(
+            DashboardAccess::resolve(None, "admin".into(), false).unwrap(),
+            DashboardAccess::Off
+        ));
+        // An empty password is a variable that was set to nothing, not a
+        // request for an ungated dashboard.
+        assert!(matches!(
+            DashboardAccess::resolve(Some(String::new()), "admin".into(), false).unwrap(),
+            DashboardAccess::Off
+        ));
+    }
+
+    #[test]
+    fn a_password_gates_and_the_opt_in_opens() {
+        match DashboardAccess::resolve(Some("hunter2".into()), "ops".into(), false).unwrap() {
+            DashboardAccess::Password(c) => {
+                assert_eq!(c.user, "ops");
+                assert_eq!(c.password, "hunter2");
+            }
+            other => panic!("expected a gated dashboard, got {other:?}"),
+        }
+        assert!(matches!(
+            DashboardAccess::resolve(None, "admin".into(), true).unwrap(),
+            DashboardAccess::Open
+        ));
+    }
+
+    #[test]
+    fn a_password_and_the_open_opt_in_together_are_an_error() {
+        // Neither precedence rule is safe to pick silently: one of the two
+        // settings would be a lie, and the operator cannot tell which.
+        let e = DashboardAccess::resolve(Some("hunter2".into()), "admin".into(), true).unwrap_err();
+        assert!(e.contains("ART_ADMIN_PASSWORD"), "{e}");
+        assert!(e.contains("ART_DASHBOARD_OPEN"), "{e}");
     }
 
     #[test]

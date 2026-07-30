@@ -7,10 +7,15 @@
 //! carrying `WWW-Authenticate`). Giving a person the machine key so they can
 //! look at a usage page is how machine keys end up in browser histories.
 //!
-//! **The dashboard is off unless a password is set.** Not open — off. A store's
-//! tag names and blob sizes describe what an organisation builds and deploys,
-//! and defaulting that to public because someone forgot a variable is not a
-//! trade this module is willing to make on the operator's behalf.
+//! **The dashboard is off unless something asks for it.** Not open — off. A
+//! store's tag names and blob sizes describe what an organisation builds and
+//! deploys, and defaulting that to public because someone forgot a variable is
+//! not a trade this module is willing to make on the operator's behalf.
+//!
+//! A password is one way to ask; `ART_DASHBOARD_OPEN` is the other, for a
+//! listener that is already private. Nothing in this module implements that
+//! second case — an open dashboard simply has no [`AdminAuth`] at all, so there
+//! is no bypass here to get wrong. See [`crate::config::DashboardAccess`].
 //!
 //! The session cookie carries a random token minted at startup, never the
 //! password and never anything derived from it. A restart invalidates every

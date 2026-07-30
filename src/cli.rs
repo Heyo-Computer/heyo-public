@@ -128,6 +128,21 @@ pub enum Command {
         /// Dashboard username.
         #[arg(long, env = "ART_ADMIN_USER", default_value = crate::config::DEFAULT_ADMIN_USER)]
         admin_user: String,
+        /// Serve the dashboard with no login at all. For a listener already on
+        /// a private network; conflicts with `--admin-password`.
+        ///
+        /// Boolish rather than clap's strict `true`/`false`, because the thing
+        /// people actually write in a unit file or a compose file is `=1`, and
+        /// a refusal to start is a poor answer to a correctly-expressed intent.
+        #[arg(
+            long,
+            env = "ART_DASHBOARD_OPEN",
+            value_parser = clap::builder::BoolishValueParser::new(),
+            default_value = "false",
+            default_missing_value = "true",
+            num_args = 0..=1,
+        )]
+        dashboard_open: bool,
     },
     /// heyvm integration.
     #[command(subcommand)]
@@ -393,13 +408,17 @@ pub async fn run(cli: Cli) -> Result<()> {
             read_only,
             admin_password,
             admin_user,
+            dashboard_open,
         } => {
-            let admin = admin_password
-                .filter(|p| !p.is_empty())
-                .map(|password| crate::config::AdminCredentials {
-                    user: admin_user,
-                    password,
-                });
+            let dashboard =
+                crate::config::DashboardAccess::resolve(admin_password, admin_user, dashboard_open)
+                    .map_err(|m| Error::Io {
+                        context: m,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "bad configuration",
+                        ),
+                    })?;
             // `Store::open` above already created the layout, so the daemon
             // starts against a store that exists.
             crate::http::serve(
@@ -408,7 +427,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     addr: listen,
                     api_key,
                     read_only,
-                    admin,
+                    dashboard,
                 },
             )
             .await?;
