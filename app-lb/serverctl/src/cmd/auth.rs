@@ -283,6 +283,49 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
         output::field("TLS", "certificate verification disabled");
     }
 
+    // The artifact store is a second identity against a second service, and a
+    // `403` on a push has nothing to do with the credentials above. Reported
+    // only when one is configured — most LBs have no store.
+    // `None` for the name: whoami reports what the *next* command would reach
+    // for by default, and `--registry` is scoped to `serverctl artifact`.
+    if let Ok(reg) = crate::config::resolve_registry_endpoint(
+        &config,
+        None,
+        None,
+        None,
+        globals.insecure_skip_tls_verify,
+    ) {
+        output::section("Artifact store");
+        output::field("Registry", &reg.name);
+        output::field("URL", &reg.url);
+        output::field("API key", reg.api_key_source.describe_api_key());
+        let c = crate::artifact::RegistryClient::new(
+            &reg.url,
+            reg.api_key.as_deref(),
+            reg.insecure_skip_tls_verify,
+            Duration::from_secs(globals.request_timeout),
+        )?;
+        match c.healthz() {
+            Err(e) => output::field("Reachable", format!("no — {e:#}")),
+            Ok(()) => {
+                output::field("Reachable", "yes (GET /healthz)");
+                // `/tags` is gated when `ART_API_KEY` is set and open when it
+                // is not, so one request answers both "is it gated" and "does
+                // this key work" — which is what somebody about to push wants.
+                output::field(
+                    "Writes",
+                    match c.tags() {
+                        Ok(_) => "allowed".to_string(),
+                        Err(e) if !c.has_credentials() => {
+                            format!("denied (no API key) — {e:#}")
+                        }
+                        Err(e) => format!("denied — {e:#}"),
+                    },
+                );
+            }
+        }
+    }
+
     let client = Client::new(
         &endpoint.server,
         endpoint.user.as_deref(),

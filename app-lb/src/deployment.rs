@@ -381,6 +381,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             build: None,
+            artifact: None,
             update: None,
             auth: None,
         })
@@ -400,6 +401,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             build: None,
+            artifact: None,
             update: None,
             auth: None,
         })

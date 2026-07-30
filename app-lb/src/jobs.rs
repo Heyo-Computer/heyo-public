@@ -7,14 +7,23 @@
 //!   Dockerfile to `heyvm mvm build`, then rewrite `vm.image` to the image that
 //!   produced, which recycles the pool onto it. heyvm has no build API, so this
 //!   is app-lb driving child processes.
+//! * **`artifact-pull`** (managed deployments) — resolve a reference in an
+//!   artifact store to a rootfs blob, materialize it as an `.ext4` heyvmd can
+//!   boot, and rewrite `vm.image` the same way. The difference from a build is
+//!   that nothing is produced: the digest names bytes that already exist, so the
+//!   same reference gives the same rootfs on every host that can reach the
+//!   store. See [`crate::artifact`].
 //! * **`host-update`** (static/`proxy_pass` deployments) — run a list of
 //!   commands in a working directory on this host, then re-probe the upstreams
 //!   to prove the service came back. A static deployment's backend is a process
 //!   somebody else runs; this is the "somebody else" being app-lb.
 //!
-//! The two are deliberately exclusive, and each is rejected on the other kind of
-//! deployment: there is no image to build for a `proxy_pass` upstream, and a
-//! working directory on the host has nothing to do with a microVM's rootfs.
+//! Each is rejected on the wrong kind of deployment: there is no image to build
+//! or pull for a `proxy_pass` upstream, and a working directory on the host has
+//! nothing to do with a microVM's rootfs. The two managed kinds are exclusive
+//! per deployment too — `DeploymentSpec::validate` refuses a spec holding both
+//! `build` and `artifact`, because both rewrite `vm.image` and a deployment with
+//! two sources for it cannot say where the running image came from.
 //!
 //! Things this module is careful about, all because both specs arrive over the
 //! admin API rather than from a config file:
@@ -29,8 +38,9 @@
 //!   conflict, not a queue — two `heyvm mvm build`s writing the same
 //!   `<image>.ext4`, or two `cargo build`s in one directory, would race.
 
+use crate::artifact::{Puller, human as human_bytes};
 use crate::autoscale::Autoscaler;
-use crate::config::{BuildSpec, UpdateSpec};
+use crate::config::{ArtifactSpec, BuildSpec, UpdateSpec};
 use crate::deployment::{Deployment, now_secs};
 use crate::health;
 use crate::registry::Registry;
@@ -65,6 +75,8 @@ const VERIFY_INTERVAL: Duration = Duration::from_secs(2);
 pub enum JobKind {
     /// Build a guest image from git + a Dockerfile (managed deployments).
     ImageBuild,
+    /// Materialize a guest image from an artifact store (managed deployments).
+    ArtifactPull,
     /// Run commands in a working directory on this host (static deployments).
     HostUpdate,
 }
@@ -73,8 +85,15 @@ impl JobKind {
     fn label(self) -> &'static str {
         match self {
             Self::ImageBuild => "build",
+            Self::ArtifactPull => "pull",
             Self::HostUpdate => "update",
         }
+    }
+
+    /// Whether this kind acts on a managed deployment. Both image sources do;
+    /// only `host-update` does not.
+    fn is_managed(self) -> bool {
+        matches!(self, Self::ImageBuild | Self::ArtifactPull)
     }
 }
 
@@ -114,9 +133,29 @@ pub struct JobRecord {
     pub dockerfile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
-    /// Whether `vm.image` was updated and the pool told to roll.
+    /// Whether `vm.image` was updated and the pool told to roll. Set by both
+    /// image sources — it describes the roll-out, not how the image was made.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub rolled_out: bool,
+
+    // -- artifact-pull ----------------------------------------------------
+    /// The store this pulled from, URL or path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
+    /// What was asked for: a tag or a digest.
+    #[serde(rename = "artifact", skip_serializing_if = "Option::is_none")]
+    pub artifact_ref: Option<String>,
+    /// What it resolved to. The artifact counterpart of `commit`, and the answer
+    /// to "which bytes are live?" — a tag can move, a digest cannot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Bytes transferred or copied. `0` with `reused` set means the
+    /// content-addressed image was already on disk and nothing moved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Whether the fetch was skipped because the image was already present.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
 
     // -- host-update ------------------------------------------------------
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,6 +191,11 @@ impl JobRecord {
             dockerfile: None,
             image: None,
             rolled_out: false,
+            store: None,
+            artifact_ref: None,
+            digest: None,
+            bytes: None,
+            reused: false,
             working_dir: None,
             commands_total: None,
             commands_run: None,
@@ -202,11 +246,20 @@ impl std::fmt::Display for StartError {
             ),
             Self::WrongKind {
                 id,
+                kind: JobKind::ArtifactPull,
+            } => write!(
+                f,
+                "deployment {id:?} is static (proxy_pass); it has no guest image to pull a \
+                 rootfs into. Use `update` to run commands on the host instead"
+            ),
+            Self::WrongKind {
+                id,
                 kind: JobKind::HostUpdate,
             } => write!(
                 f,
                 "deployment {id:?} is a managed VM pool, not a static (proxy_pass) one; its \
-                 backends are microVMs, not host processes. Use `build` to rebuild its image"
+                 backends are microVMs, not host processes. Use `build` or `pull` to change \
+                 its image"
             ),
             Self::NoSpec {
                 id,
@@ -215,6 +268,15 @@ impl std::fmt::Display for StartError {
                 f,
                 "deployment {id:?} has no `build` block — set `build.repo` (and optionally \
                  `build.dockerfile`) on the spec first"
+            ),
+            Self::NoSpec {
+                id,
+                kind: JobKind::ArtifactPull,
+            } => write!(
+                f,
+                "deployment {id:?} has no `artifact` block — set `artifact.store` (an \
+                 `art serve` URL or a store root on this host) and `artifact.ref` on the \
+                 spec first"
             ),
             Self::NoSpec {
                 id,
@@ -239,6 +301,12 @@ pub struct JobConfig {
     /// Parent of the per-deployment checkouts.
     pub work_dir: PathBuf,
     pub heyvm_bin: String,
+    /// The `art` CLI, for pulling from a store on this host.
+    pub art_bin: String,
+    /// Where a pulled rootfs is written, which must be the directory heyvmd
+    /// resolves image names in. `Err` when it could not be worked out at
+    /// startup; see [`crate::artifact::Puller`] for why that is not fatal.
+    pub images_dir: Result<PathBuf, String>,
     pub git_bin: String,
     /// Shell that host-update commands are run through.
     pub shell: String,
@@ -249,6 +317,9 @@ pub struct JobConfig {
 
 pub struct Jobs {
     cfg: JobConfig,
+    /// Built once and shared: it holds an HTTP client whose connection pool is
+    /// worth keeping between pulls of the same store.
+    puller: Puller,
     registry: Arc<Registry>,
     autoscaler: Arc<Autoscaler>,
     secrets: Arc<SecretStore>,
@@ -269,6 +340,11 @@ impl Jobs {
         obs: Option<crate::obs::LogSink>,
     ) -> Self {
         Self {
+            puller: Puller::new(
+                cfg.art_bin.clone(),
+                cfg.images_dir.clone(),
+                cfg.home.clone(),
+            ),
             cfg,
             registry,
             autoscaler,
@@ -339,6 +415,56 @@ impl Jobs {
         })
     }
 
+    /// Pull a managed deployment's guest rootfs from an artifact store, then
+    /// roll the pool onto it.
+    ///
+    /// The same shape as [`start_build`](Self::start_build), including the
+    /// one-off reference override: `POST …/pull {"ref": "web-v2"}` pulls that
+    /// tag without making it the deployment's default, which is what a rollback
+    /// to a known digest looks like.
+    ///
+    /// `force` re-fetches even when the content-addressed image is already on
+    /// disk. There is normally no reason to — the filename *is* the digest — so
+    /// it exists for the one case the name cannot describe: a file that was
+    /// damaged after it was written.
+    pub fn start_pull(
+        self: &Arc<Self>,
+        deployment_id: &str,
+        ref_override: Option<String>,
+        force: bool,
+    ) -> Result<JobRecord, StartError> {
+        let deployment = self.claimable(deployment_id, JobKind::ArtifactPull)?;
+        let Some(mut spec) = deployment.spec.artifact.clone() else {
+            return Err(StartError::NoSpec {
+                id: deployment_id.to_string(),
+                kind: JobKind::ArtifactPull,
+            });
+        };
+        if let Some(r) = ref_override {
+            spec.artifact_ref = r;
+            // The stored spec was validated on registration; an override was not.
+            let probe = crate::config::DeploymentSpec {
+                artifact: Some(spec.clone()),
+                ..deployment.spec.clone()
+            };
+            probe.validate().map_err(|e| StartError::BadRef(e.to_string()))?;
+        }
+
+        let store = spec.store.clone();
+        let reference = spec.artifact_ref.clone();
+        self.spawn(
+            deployment_id,
+            JobKind::ArtifactPull,
+            move |r| {
+                r.store = Some(store);
+                r.artifact_ref = Some(reference);
+            },
+            move |jobs, job_id, deployment_id| async move {
+                jobs.run_pull(&job_id, &deployment_id, &spec, force).await
+            },
+        )
+    }
+
     /// Run a static deployment's update commands on this host.
     pub fn start_update(
         self: &Arc<Self>,
@@ -373,8 +499,7 @@ impl Jobs {
         let Some(deployment) = self.registry.get(deployment_id) else {
             return Err(StartError::NoDeployment(deployment_id.to_string()));
         };
-        let wants_static = kind == JobKind::HostUpdate;
-        if deployment.spec.is_static() != wants_static {
+        if deployment.spec.is_static() == kind.is_managed() {
             return Err(StartError::WrongKind {
                 id: deployment_id.to_string(),
                 kind,
@@ -683,6 +808,58 @@ impl Jobs {
             "rolled deployment onto its new image",
         );
         Ok(())
+    }
+
+    // -- artifact pulls ----------------------------------------------------
+
+    /// Resolve the reference, materialize the rootfs, roll the pool onto it.
+    ///
+    /// Shorter than a build because there is no source to fetch and nothing to
+    /// compile — the work is entirely in [`crate::artifact`], and what is left
+    /// here is the same "rewrite `vm.image` and recycle" ending a build has.
+    async fn run_pull(
+        &self,
+        job_id: &str,
+        deployment_id: &str,
+        spec: &ArtifactSpec,
+        force: bool,
+    ) -> Result<String, String> {
+        // Resolved here rather than inside the puller, so the one place that
+        // reads secrets is the one place that already does for a build.
+        let api_key = match &spec.auth {
+            None => None,
+            Some(r) => Some(self.secrets.resolve(r).map_err(|e| {
+                format!("{e} — `serverctl get secrets` lists what this LB holds")
+            })?),
+        };
+
+        let mut log = |line: String| self.log(job_id, line);
+        let pulled = self
+            .puller
+            .pull(deployment_id, spec, api_key.as_deref(), force, &mut log)
+            .await?;
+
+        self.update_record(job_id, |r| {
+            r.digest = Some(pulled.digest.clone());
+            r.image = Some(pulled.image.clone());
+            r.bytes = Some(pulled.bytes_written);
+            r.reused = pulled.reused;
+        });
+        self.log(
+            job_id,
+            format!(
+                "{} is {} ({})",
+                pulled.path.display(),
+                pulled.digest,
+                human_bytes(pulled.size)
+            ),
+        );
+
+        // Unconditional, exactly as a build's is. A pull that reused an image
+        // already on disk still has to roll: the running VMs hold a copy of
+        // whatever rootfs they booted from, which is not necessarily this one.
+        self.roll_out(job_id, deployment_id, &pulled.image).await?;
+        Ok(pulled.image)
     }
 
     // -- host updates ------------------------------------------------------
@@ -1402,6 +1579,35 @@ mod tests {
         assert!(json.contains(r#""working_dir":"/srv/app""#), "{json}");
         assert!(!json.contains("dockerfile"), "no image fields: {json}");
         assert!(!json.contains("rolled_out"), "{json}");
+
+        let mut pull = JobRecord::new("job-3".into(), "web".into(), JobKind::ArtifactPull);
+        pull.store = Some("http://127.0.0.1:8080".into());
+        pull.artifact_ref = Some("debian-hermes".into());
+        pull.digest = Some("c74abee2ce84".into());
+        pull.bytes = Some(609_222_656);
+        let json = serde_json::to_string(&pull).unwrap();
+        assert!(json.contains(r#""kind":"artifact-pull""#), "{json}");
+        assert!(json.contains(r#""artifact":"debian-hermes""#), "{json}");
+        assert!(json.contains(r#""digest":"c74abee2ce84""#), "{json}");
+        // A pull has no repo and no commit; those belong to the other source.
+        assert!(!json.contains("commit"), "no build fields: {json}");
+        assert!(!json.contains("working_dir"), "no host-update fields: {json}");
+        // And a pull that fetched nothing does not claim to have reused
+        // anything until it did.
+        assert!(!json.contains("reused"), "{json}");
+    }
+
+    #[test]
+    fn a_reused_image_is_reported_as_zero_bytes_rather_than_omitted() {
+        // `bytes: 0` and `reused: true` together are the difference between
+        // "the fetch was skipped" and "the fetch never ran", which is exactly
+        // what somebody looking at a suspiciously fast pull wants to know.
+        let mut pull = JobRecord::new("job-4".into(), "web".into(), JobKind::ArtifactPull);
+        pull.bytes = Some(0);
+        pull.reused = true;
+        let json = serde_json::to_string(&pull).unwrap();
+        assert!(json.contains(r#""bytes":0"#), "{json}");
+        assert!(json.contains(r#""reused":true"#), "{json}");
     }
 
     #[test]
@@ -1415,6 +1621,14 @@ mod tests {
         .to_string();
         assert!(build_on_static.contains("static"), "{build_on_static}");
         assert!(build_on_static.contains("update"), "{build_on_static}");
+
+        let pull_on_static = StartError::WrongKind {
+            id: "obs".into(),
+            kind: JobKind::ArtifactPull,
+        }
+        .to_string();
+        assert!(pull_on_static.contains("static"), "{pull_on_static}");
+        assert!(pull_on_static.contains("update"), "{pull_on_static}");
 
         let update_on_managed = StartError::WrongKind {
             id: "web".into(),

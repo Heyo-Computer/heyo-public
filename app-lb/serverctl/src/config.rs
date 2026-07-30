@@ -16,6 +16,34 @@ pub struct Config {
     pub current_context: Option<String>,
     #[serde(default)]
     pub contexts: BTreeMap<String, ContextEntry>,
+    /// Artifact stores, kept apart from `contexts` on purpose.
+    ///
+    /// A store is not an app-lb: it is a different service, on a different host
+    /// more often than not, authenticated by a shared key rather than by a
+    /// username and password. Folding it into `ContextEntry` would mean every
+    /// context carrying four fields most of them never use, and `--server`
+    /// silently pointing the registry commands at a load balancer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub registries: BTreeMap<String, RegistryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_registry: Option<String>,
+}
+
+/// One artifact store: where it is and how to prove you may write to it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RegistryEntry {
+    pub url: String,
+    /// `ART_API_KEY`, presented as `Authorization: Bearer`. Stored in the clear
+    /// in a `0600` file, exactly as a context's password is; `api_key_command`
+    /// is here for anyone who would rather it live in a keychain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// A shell command whose stdout is the key. Takes precedence over a stored
+    /// `api_key`; run via `sh -c` on every request that needs one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_command: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub insecure_skip_tls_verify: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -55,6 +83,19 @@ impl PasswordSource {
             Self::None => "none",
             Self::Flag => "--password / SERVERCTL_PASSWORD",
             Self::Command => "password_command",
+            Self::Stored => "stored in the config file",
+        }
+    }
+
+    /// The same question for an artifact store's key, which arrives by different
+    /// flags. Two methods rather than a format argument because the answer is
+    /// what somebody reads when a `401` surprises them, and naming the wrong
+    /// flag there sends them to edit something that was never in play.
+    pub fn describe_api_key(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Flag => "--api-key / SERVERCTL_ART_API_KEY",
+            Self::Command => "api_key_command",
             Self::Stored => "stored in the config file",
         }
     }
@@ -144,6 +185,94 @@ impl Config {
         }
         Ok(None)
     }
+
+    /// The artifact store this invocation should use, by the same rules as
+    /// [`resolve`](Self::resolve): `--registry`, else `current_registry`, else
+    /// the only one if there is exactly one.
+    ///
+    /// Unlike a context there is no built-in default. An app-lb answers on a
+    /// known loopback port; a store does not, and guessing one would mean
+    /// `artifact push` could upload a rootfs to whatever happens to be
+    /// listening.
+    pub fn resolve_registry(&self, requested: Option<&str>) -> Result<Option<(String, RegistryEntry)>> {
+        if let Some(name) = requested {
+            let entry = self.registries.get(name).with_context(|| {
+                format!("no registry named {name:?} — `serverctl artifact registries` lists them")
+            })?;
+            return Ok(Some((name.to_string(), entry.clone())));
+        }
+        if let Some(name) = &self.current_registry
+            && let Some(entry) = self.registries.get(name)
+        {
+            return Ok(Some((name.clone(), entry.clone())));
+        }
+        if self.registries.len() == 1 {
+            let (name, entry) = self.registries.iter().next().expect("len == 1");
+            return Ok(Some((name.clone(), entry.clone())));
+        }
+        if self.current_registry.is_some() {
+            bail!(
+                "current registry {:?} is not in the config file — pick one with \
+                 `serverctl artifact use`",
+                self.current_registry.as_deref().unwrap_or_default()
+            );
+        }
+        Ok(None)
+    }
+}
+
+/// A registry resolved against the command line: what this invocation will use.
+#[derive(Debug, Clone)]
+pub struct RegistryEndpoint {
+    pub name: String,
+    pub url: String,
+    pub api_key: Option<String>,
+    pub api_key_source: PasswordSource,
+    pub insecure_skip_tls_verify: bool,
+}
+
+/// Merge a stored registry with the command-line/env overrides.
+///
+/// Errors rather than defaulting when nothing names a store: see
+/// [`Config::resolve_registry`] for why there is no fallback URL.
+pub fn resolve_registry_endpoint(
+    config: &Config,
+    registry: Option<&str>,
+    url: Option<&str>,
+    api_key: Option<&str>,
+    insecure: bool,
+) -> Result<RegistryEndpoint> {
+    let resolved = config.resolve_registry(registry)?;
+    let (name, entry) = match resolved {
+        Some((n, e)) => (n, e),
+        None if url.is_some() => ("(none)".to_string(), RegistryEntry::default()),
+        None => bail!(
+            "no artifact store configured — run `serverctl artifact login <url>` first, \
+             or pass --registry-url"
+        ),
+    };
+
+    let (api_key, api_key_source) = match api_key {
+        Some(k) => (Some(k.to_string()), PasswordSource::Flag),
+        None => match &entry.api_key_command {
+            Some(cmd) => (Some(run_password_command(cmd)?), PasswordSource::Command),
+            None => match &entry.api_key {
+                Some(k) => (Some(k.clone()), PasswordSource::Stored),
+                None => (None, PasswordSource::None),
+            },
+        },
+    };
+
+    Ok(RegistryEndpoint {
+        name,
+        url: url
+            .map(str::to_string)
+            .or_else(|| (!entry.url.is_empty()).then(|| entry.url.clone()))
+            .ok_or_else(|| anyhow::anyhow!("the stored registry has no url"))?,
+        api_key,
+        api_key_source,
+        insecure_skip_tls_verify: insecure || entry.insecure_skip_tls_verify,
+    })
 }
 
 /// Merge a stored context with the command-line/env overrides.
@@ -239,7 +368,78 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..Default::default()
         }
+    }
+
+    fn cfg_with_registries(names: &[&str], current: Option<&str>) -> Config {
+        Config {
+            current_registry: current.map(str::to_string),
+            registries: names
+                .iter()
+                .map(|n| {
+                    (
+                        n.to_string(),
+                        RegistryEntry {
+                            url: format!("http://{n}:8080"),
+                            api_key: Some("k".into()),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_lone_registry_is_used_without_being_selected() {
+        let cfg = cfg_with_registries(&["store"], None);
+        let ep = resolve_registry_endpoint(&cfg, None, None, None, false).unwrap();
+        assert_eq!(ep.name, "store");
+        assert_eq!(ep.url, "http://store:8080");
+        assert_eq!(ep.api_key_source, PasswordSource::Stored);
+    }
+
+    #[test]
+    fn no_registry_is_an_error_rather_than_a_guessed_url() {
+        // A push has to go somewhere deliberate: there is no conventional port
+        // for an artifact store the way there is for an app-lb admin listener.
+        assert!(resolve_registry_endpoint(&Config::default(), None, None, None, false).is_err());
+        // ...unless the URL is given outright, which is deliberate enough.
+        let ep = resolve_registry_endpoint(
+            &Config::default(),
+            None,
+            Some("http://art:8080"),
+            Some("key"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(ep.url, "http://art:8080");
+        assert_eq!(ep.api_key_source, PasswordSource::Flag);
+    }
+
+    #[test]
+    fn an_unknown_registry_is_an_error() {
+        assert!(cfg_with_registries(&["prod"], None).resolve_registry(Some("dev")).is_err());
+    }
+
+    #[test]
+    fn registries_and_contexts_are_stored_side_by_side_without_colliding() {
+        let mut cfg = cfg_with(&["prod"], Some("prod"));
+        cfg.registries = cfg_with_registries(&["store"], None).registries;
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.contexts["prod"].server, "http://prod:9090");
+        assert_eq!(back.registries["store"].url, "http://store:8080");
+    }
+
+    #[test]
+    fn a_config_written_before_registries_existed_still_parses() {
+        let old = r#"{"current_context":"prod","contexts":{"prod":{"server":"http://prod:9090"}}}"#;
+        let cfg: Config = serde_json::from_str(old).unwrap();
+        assert!(cfg.registries.is_empty());
+        assert!(cfg.current_registry.is_none());
     }
 
     #[test]

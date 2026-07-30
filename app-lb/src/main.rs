@@ -6,6 +6,7 @@
 
 mod acme;
 mod admin;
+mod artifact;
 mod auth;
 mod autoscale;
 mod config;
@@ -93,6 +94,12 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_HEYVM_BIN") {
         cfg.heyvm_bin = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_ART_BIN") {
+        cfg.art_bin = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_IMAGES_DIR") {
+        cfg.images_dir = Some(v);
     }
     if let Ok(v) = std::env::var("APP_LB_GIT_BIN") {
         cfg.git_bin = v;
@@ -362,6 +369,19 @@ fn main() {
     );
     let autoscaler = autoscaler_svc.task();
 
+    // Where an artifact pull writes a rootfs. Resolved once, and kept as a
+    // `Result` rather than unwrapped: without `HOME` or `MVM_DATA_DIR` there is
+    // no way to know where heyvmd looks, but an LB whose deployments all name
+    // prebuilt images never needs to know, and it should not refuse to start
+    // over a directory it will not use. The error travels to the pull instead.
+    let images_dir = match &cfg.images_dir {
+        Some(dir) => Ok(std::path::PathBuf::from(dir)),
+        None => artifact::default_images_dir(cfg.heyvm_home.as_deref()),
+    };
+    if let Err(e) = &images_dir {
+        tracing::warn!("{e}. Artifact pulls will fail until APP_LB_IMAGES_DIR is set");
+    }
+
     // The job runner is not a service: it has no loop of its own, it runs a task
     // per job. It needs the autoscaler because finishing an image build means
     // rewriting `vm.image` and tearing the old pool down — the same swap the
@@ -370,6 +390,8 @@ fn main() {
         JobConfig {
             work_dir: cfg.build_dir.clone().into(),
             heyvm_bin: cfg.heyvm_bin.clone(),
+            art_bin: cfg.art_bin.clone(),
+            images_dir,
             git_bin: cfg.git_bin.clone(),
             shell: cfg.update_shell.clone(),
             timeout: std::time::Duration::from_secs(cfg.build_timeout_secs),

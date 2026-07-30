@@ -277,6 +277,39 @@ pub fn build_mut<'a>(spec: &'a mut Value, id: &str) -> Result<&'a mut Map<String
         .with_context(|| format!("deployment {id:?} has a non-object `build`"))
 }
 
+/// The `artifact` block of a managed deployment, created if it has none.
+///
+/// The other image source, and refused on a static deployment for the same
+/// reason [`build_mut`] is. It also refuses to sit next to a `build`: app-lb
+/// rejects a spec holding both, and catching it here means the error names the
+/// flag that caused it instead of arriving as a validation failure on `PUT`.
+pub fn artifact_mut<'a>(spec: &'a mut Value, id: &str) -> Result<&'a mut Map<String, Value>> {
+    if is_static(spec) {
+        bail!(
+            "deployment {id:?} is static (proxy_pass) and has no image to pull a rootfs \
+             into — it forwards to upstreams somebody else runs"
+        );
+    }
+    if spec.get("build").is_some_and(|b| !b.is_null()) {
+        bail!(
+            "deployment {id:?} already builds its image from git; a deployment cannot both \
+             build and pull. Drop the build source first with \
+             `serverctl set build {id} --clear`"
+        );
+    }
+    let entry = spec
+        .as_object_mut()
+        .with_context(|| format!("deployment {id:?} spec is not an object"))?
+        .entry("artifact")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if entry.is_null() {
+        *entry = Value::Object(Map::new());
+    }
+    entry
+        .as_object_mut()
+        .with_context(|| format!("deployment {id:?} has a non-object `artifact`"))
+}
+
 /// The `update` block of a static deployment, created if it has none.
 ///
 /// The mirror of [`build_mut`], and refused on a managed deployment for the

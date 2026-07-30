@@ -949,6 +949,21 @@ struct BuildRequest {
     git_ref: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+struct PullRequest {
+    /// Pull this reference instead of the spec's. A one-off, like a build's:
+    /// `{"ref": "<digest>"}` is what a rollback to known bytes looks like,
+    /// without making that digest the deployment's default.
+    #[serde(default, rename = "ref")]
+    artifact_ref: Option<String>,
+    /// Re-fetch even when the image is already on disk. Rarely wanted — the
+    /// filename is the digest, so the image being there is proof the bytes are
+    /// right — and it exists for the case where the file was damaged after it
+    /// was written.
+    #[serde(default)]
+    force: bool,
+}
+
 /// Map a start failure onto a status. Shared by both job kinds, because the
 /// reasons a job can't start are the same for either.
 fn job_start_error(e: StartError) -> Response {
@@ -976,6 +991,28 @@ async fn start_build(
     match state.jobs.start_build(&id, req.git_ref) {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "image build started");
+            (StatusCode::ACCEPTED, Json(record)).into_response()
+        }
+        Err(e) => job_start_error(e),
+    }
+}
+
+/// `POST /deployments/:id/pull` — materialize a rootfs from an artifact store
+/// and roll the pool onto it.
+///
+/// `202` for the same reason a build is: the bytes may be gigabytes across a
+/// network. It is often much faster than a build — an image already on disk is
+/// resolved and skipped in one round trip — but "often fast" is not something to
+/// hold a request open on.
+async fn start_pull(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<PullRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match state.jobs.start_pull(&id, req.artifact_ref, req.force) {
+        Ok(record) => {
+            tracing::info!(deployment = %id, job = %record.id, "artifact pull started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
         }
         Err(e) => job_start_error(e),
@@ -1064,6 +1101,7 @@ fn router(state: AdminState) -> Router {
         // same lifecycle, and "what happened to this deployment lately?" should
         // have one answer.
         .route("/deployments/:id/build", post(start_build))
+        .route("/deployments/:id/pull", post(start_pull))
         .route("/deployments/:id/update", post(start_update))
         .route("/deployments/:id/jobs", get(deployment_jobs))
         .route("/jobs", get(list_jobs))

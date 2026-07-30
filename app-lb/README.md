@@ -60,6 +60,8 @@ Configuration is environment-only:
 | `APP_LB_ACME_DIRECTORY` | LE production | ACME directory URL — point at staging for testing |
 | `APP_LB_BUILD_DIR` | `/var/lib/app-lb/builds` | Git checkouts for image builds (one per deployment, `0700`) |
 | `APP_LB_HEYVM_BIN` | `heyvm` | The heyvm CLI that builds guest images |
+| `APP_LB_ART_BIN` | `art` | The `art` CLI that materializes a rootfs from a **local** artifact store; unused when `artifact.store` is a URL |
+| `APP_LB_IMAGES_DIR` | `$MVM_DATA_DIR/images/firecracker`, else `<home>/.heyo/images/firecracker` | Where a pulled rootfs is written. Must be the directory heyvmd resolves image names in |
 | `APP_LB_GIT_BIN` | `git` | The git binary used for checkouts |
 | `APP_LB_UPDATE_SHELL` | `/bin/sh` | Shell a static deployment's `update.commands` run through |
 | `APP_LB_BUILD_TIMEOUT_SECS` | `1800` | Ceiling on one build step or update command, after which the child is killed |
@@ -92,6 +94,11 @@ serverctl get deployments -o wide
 serverctl scale demo --min 2 --max 8
 serverctl restart demo                    # drain every VM; the autoscaler replaces them
 serverctl top                             # per-deployment CPU, memory, latency, 5xx
+
+# Ship a rootfs through an artifact store, and boot it somewhere else.
+serverctl artifact login http://10.0.0.4:8080   # saves a registry; prompts for the API key
+serverctl artifact push --image web-v2          # a heyvm image, or a path to an .ext4
+serverctl pull demo --wait                      # materialize it here and roll the pool
 ```
 
 See [`serverctl/README.md`](serverctl/README.md) for the full command set, the context/credential
@@ -397,6 +404,11 @@ curl localhost:9090/deployments/web/jobs
 curl localhost:9090/jobs/job-3f2a1c8e     # status, commit, image and log tail
 ```
 
+The same job history covers the other two verbs —
+[`pull`](#pulling-images-from-an-artifact-store) and
+[`update`](#updating-a-static-deployment) — so `GET /jobs` is one listing of
+everything that has changed a backend.
+
 Builds are asynchronous — a `docker build` takes minutes, so `POST` returns `202`
 with a record and the outcome is polled from `GET /jobs/:id`. One job runs per
 deployment at a time; a second request while one is in flight is a `409`. Job
@@ -431,6 +443,102 @@ A static (`upstreams`) deployment cannot have a `build` block: it has no guest
 image, it forwards to something somebody else runs. Its update path is
 [`update`](#updating-a-static-deployment) instead, and declaring the wrong one is
 rejected at registration.
+
+## Pulling images from an artifact store
+
+Building is one way to get a `vm.image`. The other is to pull one somebody
+already built. An `artifact` block names a store and a reference;
+`POST /deployments/:id/pull` resolves that reference to a rootfs blob,
+materializes it as an `.ext4` heyvmd can boot, and rewrites `vm.image` — the same
+ending a build has, without the build.
+
+The store is [artifacts](https://github.com/sarocu/artifacts): content-addressed,
+ext4-native, and already where `art heyvm import` keeps heyvm's base images.
+
+```jsonc
+{
+  "id": "web",
+  "routes": [{"host": "web.example.com"}],
+  "vm": {"driver": "firecracker", "image": "web-1b9b737b73e2", "port": 8080},
+  "artifact": {
+    "store": "http://10.0.0.4:8080",   // an `art serve`, or an absolute store root
+    "ref": "web-v2",                    // a tag, or a 64-hex digest
+    "grow_gb": 8,                       // omit to keep the image at its stored size
+    "auth": {"secret": "art", "key": "api_key"}   // omit for an ungated store
+  }
+}
+```
+
+```sh
+# Pull the ref in the spec, and roll the pool onto the result.
+curl -XPOST localhost:9090/deployments/web/pull           # 202 + a job record
+
+# Pull a different ref, just this once. The spec's `ref` is left alone, which is
+# what makes a digest here a rollback rather than a config change.
+curl -XPOST localhost:9090/deployments/web/pull -H 'content-type: application/json' \
+  -d '{"ref": "1b9b737b73e26aa4c55d7b609351fa51f0e21b0b6afbaa9ef9f4561dd18337d7"}'
+
+# Re-fetch even if the image is already on disk.
+curl -XPOST localhost:9090/deployments/web/pull -H 'content-type: application/json' \
+  -d '{"force": true}'
+```
+
+Pulls share the job machinery with builds: `202` with a record, polled from
+`GET /jobs/:id`, one job per deployment at a time. A record carries the `store`,
+the `artifact` reference asked for, the `digest` it resolved to, and the `bytes`
+transferred.
+
+**Two transports, chosen by how `store` is spelled.** They are not fallbacks for
+each other — they are different situations:
+
+| `artifact.store` | What happens |
+| --- | --- |
+| `http://host:port` | app-lb resolves and streams the blob itself, verifying the sha256 as it lands. One store feeds a fleet; no `art` binary needed on this host. |
+| `/abs/path` | app-lb runs `art heyvm materialize`, which skips the blob's holes instead of copying its zeros. Needs the `art` CLI here (`APP_LB_ART_BIN`), and is dramatically cheaper. |
+
+The difference is not small. Materializing a 48 MiB image from a local store
+writes **48 KiB**; the same image over HTTP transfers all 48 MiB. A host running
+its own store should name the path.
+
+**The digest is verified on the way in.** A rootfs fetched over a network is what
+the kernel boots, so the wire path hashes what arrives and refuses anything that
+does not match the digest it asked for — the partial file is removed, the job
+fails, and `vm.image` is untouched. The local path gets this for free, because
+`art` hashes on materialize.
+
+**Image names carry the digest.** Each pull produces `<name>-<12 hex>` (`<name>`
+defaults to the deployment id, override with `artifact.image_name`). That is a
+pure function of the content, so an image already on disk is proof the right
+bytes are there and the fetch is skipped entirely — a re-pull of unchanged bytes
+costs one round trip. The job still rolls the pool, because running VMs hold a
+copy of whatever rootfs *they* booted from.
+
+**A tag is resolved at pull time; a digest is not.** A deployment pinned to a tag
+follows wherever that tag is moved, which is what makes `serverctl artifact push
+--tag web-v2` a deploy. Naming a digest pins the bytes forever, which is what a
+rollback should do.
+
+**`grow_gb` is sparse.** The file is extended with `ftruncate`, so it costs no
+disk until the guest writes; heyvm runs the `resize2fs` that lets the guest
+filesystem use the room. Set it when the image was built small and the workload
+needs space on `/`.
+
+**Where it lands.** `APP_LB_IMAGES_DIR`, defaulting to
+`$MVM_DATA_DIR/images/firecracker` and then to
+`<home>/.heyo/images/firecracker` — where `<home>` honours `APP_LB_HEYVM_HOME`,
+because the daemon only finds images under its own home. If none of those can be
+worked out, app-lb still starts and warns; only pulls fail.
+
+**`build` and `artifact` are mutually exclusive.** Both rewrite `vm.image` when
+they run, so a deployment holding both would have no answer to where the running
+image came from. To do both, build on one host and
+[`serverctl artifact push`](serverctl/README.md#pushing-an-image-to-an-artifact-store)
+the result for the others to pull. A static (`upstreams`) deployment cannot have
+an `artifact` block either, for the same reason it cannot have a `build`.
+
+The CLI side is `serverctl pull` and `serverctl set artifact`, plus
+`serverctl artifact` for talking to the store itself — see
+[`serverctl/README.md`](serverctl/README.md#artifact-stores).
 
 ## Updating a static deployment
 

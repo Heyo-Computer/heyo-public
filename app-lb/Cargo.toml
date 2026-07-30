@@ -58,7 +58,11 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] }
 # HTTPS POST per login. Already compiled in the graph via heyo-sdk, so this is a
 # dependency line rather than a new build; the features match heyo-sdk's so the
 # two resolve to one copy.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+#
+# `stream` is for the artifact puller (`src/artifact.rs`), which reads a rootfs
+# blob off the wire chunk by chunk. A rootfs is gigabytes; `bytes()` would hold
+# the whole thing in memory before the first byte reached disk.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # Query-string building (the authorize URL) and parsing (the callback). Small,
 # already present under reqwest/url, and hand-rolling percent-encoding is a
 # classic source of bugs.
@@ -70,7 +74,11 @@ futures = "0.3"
 # and `heyvm mvm build`: heyvm exposes no build API, so this is the only way to
 # turn a Dockerfile into a guest rootfs. It buys `kill_on_drop`, which is what
 # lets a timed-out `docker build` actually die instead of outliving its future.
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "process"] }
+#
+# `fs` and `io-util` are the artifact puller's write side: a streamed blob lands
+# in a file, and the copy must not block the runtime for the minutes a
+# multi-gigabyte rootfs takes.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "process", "fs", "io-util"] }
 arc-swap = "1"
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
@@ -78,5 +86,10 @@ serde_json = "1"
 # Encoding the configured dashboard credentials into the expected Basic-auth
 # header once at startup. Already in the tree transitively (reqwest/pingora).
 base64 = "0.22"
+# Verifying a rootfs pulled over the wire against the digest that named it
+# (`src/artifact.rs`). sha256 and not something faster because the digest has to
+# be the one the artifact store computed, which is the one `sha256sum` reports.
+# Already in the tree via pingora and heyo-sdk.
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

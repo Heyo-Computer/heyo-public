@@ -121,7 +121,7 @@ serverctl get deployment/web -o yaml      # the server's JSON, as YAML
 serverctl get vms -d web                  # backends of one deployment
 serverctl get certs                       # issued TLS certificates and expiry
 serverctl get secrets                     # ids and key *names* — never values
-serverctl get jobs -d web                 # builds and updates, newest first
+serverctl get jobs -d web                 # builds, pulls and updates, newest first
 serverctl get job job-3f2a1c8e            # one job in full, with its log
 serverctl get deployments -w              # re-render every 2s
 
@@ -208,6 +208,103 @@ Each build produces an image named `<deployment>-<short sha>`, so `serverctl des
 `get -o wide` say which commit is actually running. Rotating a token is
 `serverctl set secret github token=ghp_new…`; keys you don't mention keep their values, which
 matters because there is no way to read them back and resend them.
+
+### Pulling an image from an artifact store
+
+The other way a managed deployment gets its image: instead of building one, pull one somebody
+already built. `serverctl set artifact` records where from, and `serverctl pull` fetches it,
+materializes it as an `.ext4` the daemon can boot, and rolls the pool onto it.
+
+```sh
+# Store the API key first, if the store is gated. As with a build's, it stays write-only.
+serverctl create secret art api_key=…
+serverctl create secret art --from-stdin api_key < ~/.art-key
+
+# Record where the image comes from. This pulls nothing on its own.
+serverctl set artifact web --store http://10.0.0.4:8080 --ref web-v2 --secret art/api_key
+serverctl set artifact web --grow-gb 8         # extend the rootfs (sparsely) on materialize
+
+# A store root on the app-lb host instead of a URL — much cheaper, see below.
+serverctl set artifact web --store /srv/artifacts --ref web-v2
+
+# Pull and roll out.
+serverctl pull web --wait                      # blocks until it succeeds or fails
+serverctl pull web --ref <digest> --logs       # a one-off ref; the spec's is left alone
+serverctl pull web --force                     # re-fetch even if the image is already here
+
+serverctl set artifact web --clear             # stop tracking a source; keep the current image
+```
+
+A pull is the same kind of job as a build — asynchronous, `--wait`/`--logs`, one per deployment
+at a time, listed by `serverctl get jobs` — and its record answers the question a pull exists to
+answer: which *bytes* are running.
+
+```
+JOB                DEPLOYMENT   KIND            STATUS      TARGET   RESULT             TOOK
+job-c628fbe1ef07   web          artifact-pull   succeeded   web-v2   web-1b9b737b73e2   1s
+```
+
+Three things worth knowing:
+
+- **A tag resolves at pull time; a digest does not.** `--ref web-v2` follows wherever that tag is
+  moved, so pushing over it is a deploy. `--ref <digest>` pins the bytes, which is what a
+  rollback should do — and as a one-off flag it does not touch the stored spec.
+- **A re-pull of unchanged bytes is free.** Images are named `<deployment>-<12 hex of digest>`,
+  so the file already being there proves the content is right and the transfer is skipped. The
+  pool still rolls, because the running VMs booted from whatever rootfs *they* were given.
+- **A local store is dramatically cheaper than a URL.** `--store /path` runs `art heyvm
+  materialize`, which skips the blob's holes — 48 KiB written for a 48 MiB image against 48 MiB
+  transferred over HTTP. Use a URL when the store is on another host; use a path when it is not.
+
+`build` and `artifact` are mutually exclusive on one deployment: both rewrite `vm.image`, so
+`set artifact` on a deployment that already builds is refused, and vice versa. To do both, build
+on one host and push the result for the others to pull.
+
+## Artifact stores
+
+An artifact store (`art serve`) is a separate service from app-lb, so `serverctl artifact` keeps
+its own saved *registries* rather than using the `--server` context. A store is authenticated by
+a shared key, not a username and password, and `--context` never retargets a push.
+
+```sh
+serverctl artifact login http://10.0.0.4:8080          # prompts for the key
+serverctl artifact login http://10.0.0.4:8080 --api-key-stdin < ~/.art-key
+serverctl artifact login … --api-key-command 'pass show art/prod'   # keep it in a keychain
+serverctl artifact login … --no-store-key              # verify only; supply SERVERCTL_ART_API_KEY
+
+serverctl artifact registries                          # CURRENT NAME URL KEY
+serverctl artifact use prod-store
+serverctl artifact logout --key-only                   # drop the key, keep the url
+```
+
+Registries live in the same `0600` config file as the contexts, under their own key, and
+`serverctl whoami` reports both identities — which is the answer to "why did my push get a 401
+when everything else works".
+
+### Pushing an image to an artifact store
+
+```sh
+serverctl artifact push --image web-v2                 # a heyvm image, by name
+serverctl artifact push ./rootfs.ext4 --tag web-v2     # or a path
+serverctl artifact push ./rootfs.ext4 --no-tag         # upload only; name the manifest digest
+serverctl artifact push ./rootfs.ext4 --force          # upload even if the store has the bytes
+```
+
+`--image NAME` resolves `~/.heyo/images/firecracker/<name>.ext4` (or `$MVM_DATA_DIR/…`), which is
+where `heyvm mvm build` puts one — so building locally and pushing is two commands. The tag
+defaults to the filename without `.ext4`.
+
+A push hashes the file, asks the store whether it already holds those bytes, uploads only if not,
+then writes a manifest and moves the tag onto it. The manifest matters: it is what makes a pushed
+image indistinguishable from one `art heyvm import` put in, and therefore pullable. Re-pushing
+unchanged bytes is two round trips and reports `uploaded: false`.
+
+```sh
+serverctl artifact ls                                  # the store's tags
+serverctl artifact describe web-v2                     # what a tag or digest resolves to
+serverctl artifact usage                               # blobs, logical vs stored, free space
+serverctl artifact untag web-v2                        # the blob stays until the store's `art gc`
+```
 
 ### Updating a static deployment
 
@@ -341,6 +438,7 @@ The distinction runs through every command, because app-lb enforces it:
 | `restart` / `delete vm` | yes | rejected — nothing to evict |
 | `set image` / `set env` | yes | rejected — no VM template |
 | `set build` / `build` | yes | rejected — no guest image to build |
+| `set artifact` / `pull` | yes — but not alongside `build` | rejected — no guest image to pull into |
 | `set update` / `update` | rejected — its backends are VMs | yes |
 | `set auth` | yes | yes — the gate is in the proxy, ahead of either |
 | `set upstreams` | rejected | yes |

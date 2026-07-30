@@ -724,6 +724,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             build: None,
+            artifact: None,
             update: None,
             auth: None,
         }))

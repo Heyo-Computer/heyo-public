@@ -24,6 +24,10 @@ serde_yaml = "0.9"
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"] }
 
 base64 = "0.22"
+# `artifact push` addresses a rootfs by the sha256 of its bytes, so the digest
+# has to be computed here — the store's `PUT /blobs/{digest}` takes the name as
+# part of the URL and answers 409 if what arrives hashes to anything else.
+sha2 = "0.10"
 anyhow = "1"
 # Only for restoring the default SIGPIPE disposition. Rust ignores SIGPIPE, so
 # without this `serverctl get deployments | head` panics on a closed pipe

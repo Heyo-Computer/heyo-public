@@ -57,6 +57,7 @@ pub struct DeploymentSpec {
     pub health: HealthCheck,
     pub upstreams: Vec<String>,
     pub build: Option<BuildSpec>,
+    pub artifact: Option<ArtifactSpec>,
     pub update: Option<UpdateSpec>,
     pub auth: Option<AuthGate>,
 }
@@ -172,6 +173,34 @@ impl BuildSpec {
             Some(r) => format!("{repo}@{r}"),
             None => format!("{repo}@(default branch)"),
         }
+    }
+}
+
+/// Where a managed deployment's image is pulled from. The other image source,
+/// and mutually exclusive with [`BuildSpec`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ArtifactSpec {
+    pub store: String,
+    #[serde(rename = "ref")]
+    pub artifact_ref: String,
+    pub image_name: Option<String>,
+    pub grow_gb: Option<u64>,
+    pub auth: Option<SecretRef>,
+}
+
+impl ArtifactSpec {
+    /// One column: `10.0.0.4:8080/web-v2`. Shaped like [`BuildSpec::summary`] on
+    /// purpose — the two share the SOURCE column, and a reader scanning a fleet
+    /// should be able to tell a repo from a store at a glance without the
+    /// column changing format underneath them.
+    pub fn summary(&self) -> String {
+        let store = self
+            .store
+            .trim_end_matches('/')
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        format!("{store}/{}", self.artifact_ref)
     }
 }
 
@@ -320,6 +349,18 @@ pub struct JobRecord {
     pub image: Option<String>,
     pub rolled_out: bool,
 
+    // artifact-pull
+    pub store: Option<String>,
+    /// What was asked for: a tag or a digest. Spelled `artifact` on the wire so
+    /// it does not collide with a build's `ref`.
+    #[serde(rename = "artifact")]
+    pub artifact_ref: Option<String>,
+    /// What it resolved to — the pull's answer to "which bytes are live?".
+    pub digest: Option<String>,
+    /// Bytes transferred. `0` with `reused` is a skipped fetch, not a no-op job.
+    pub bytes: Option<u64>,
+    pub reused: bool,
+
     // host-update
     pub working_dir: Option<String>,
     pub commands_total: Option<usize>,
@@ -343,6 +384,14 @@ impl JobRecord {
         self.kind == "host-update"
     }
 
+    /// Whether this job pulled its image from an artifact store rather than
+    /// building it. The two produce the same thing — a new `vm.image` and a
+    /// recycled pool — but describe it with different fields, so every renderer
+    /// has to tell them apart.
+    pub fn is_pull(&self) -> bool {
+        self.kind == "artifact-pull"
+    }
+
     /// The commit, short enough for a column.
     pub fn short_commit(&self) -> String {
         match &self.commit {
@@ -351,8 +400,17 @@ impl JobRecord {
         }
     }
 
-    /// What this job produced, as one column: the image for a build, how far
-    /// the commands got for an update.
+    /// The resolved digest, short enough for a column. The pull's counterpart of
+    /// [`short_commit`](Self::short_commit).
+    pub fn short_digest(&self) -> String {
+        match &self.digest {
+            Some(d) => d.chars().take(12).collect(),
+            None => "—".into(),
+        }
+    }
+
+    /// What this job produced, as one column: the image for either image
+    /// source, how far the commands got for an update.
     pub fn result_summary(&self) -> String {
         if self.is_update() {
             return match (self.commands_run, self.commands_total) {
@@ -363,11 +421,14 @@ impl JobRecord {
         self.image.clone().unwrap_or_else(|| "—".into())
     }
 
-    /// What it was asked to act on: a git ref for a build, the directory for an
-    /// update.
+    /// What it was asked to act on: a git ref for a build, a store reference for
+    /// a pull, the directory for an update.
     pub fn target_summary(&self) -> String {
         if self.is_update() {
             return self.working_dir.clone().unwrap_or_else(|| "—".into());
+        }
+        if self.is_pull() {
+            return self.artifact_ref.clone().unwrap_or_else(|| "—".into());
         }
         self.git_ref.clone().unwrap_or_else(|| "(default)".into())
     }
@@ -666,6 +727,63 @@ mod tests {
         assert_eq!(update.target_summary(), "/srv/app-obs");
         assert_eq!(update.result_summary(), "1/3 commands");
         assert_eq!(update.verified, Some(false));
+    }
+
+    #[test]
+    fn an_artifact_source_renders_as_one_column_shaped_like_a_build_one() {
+        let a = ArtifactSpec {
+            store: "http://10.0.0.4:8080/".into(),
+            artifact_ref: "web-v2".into(),
+            ..Default::default()
+        };
+        assert_eq!(a.summary(), "10.0.0.4:8080/web-v2");
+
+        // A store root keeps its leading slash — it is a path, and stripping it
+        // would make an absolute one look relative in the SOURCE column.
+        let local = ArtifactSpec {
+            store: "/srv/artifacts".into(),
+            artifact_ref: "debian-hermes".into(),
+            ..Default::default()
+        };
+        assert_eq!(local.summary(), "/srv/artifacts/debian-hermes");
+    }
+
+    #[test]
+    fn a_pull_record_summarizes_the_store_side_fields_not_the_git_ones() {
+        let pull: JobRecord = serde_json::from_str(
+            r#"{"id":"job-3","kind":"artifact-pull","status":"succeeded","started_at":100,
+                "store":"http://127.0.0.1:8080","artifact":"debian-hermes",
+                "digest":"c74abee2ce8409f1aaaa","image":"web-c74abee2ce84",
+                "bytes":609222656,"rolled_out":true}"#,
+        )
+        .unwrap();
+        assert!(pull.is_pull());
+        assert!(!pull.is_update());
+        // The reference asked for, not a git ref it does not have.
+        assert_eq!(pull.target_summary(), "debian-hermes");
+        assert_eq!(pull.result_summary(), "web-c74abee2ce84");
+        assert_eq!(pull.short_digest(), "c74abee2ce84");
+        assert_eq!(pull.short_commit(), "—", "a pull has no commit");
+        assert!(!pull.reused);
+    }
+
+    #[test]
+    fn a_reused_image_is_distinguishable_from_a_pull_that_never_ran() {
+        let reused: JobRecord = serde_json::from_str(
+            r#"{"id":"job-4","kind":"artifact-pull","status":"succeeded","started_at":1,
+                "bytes":0,"reused":true}"#,
+        )
+        .unwrap();
+        assert!(reused.reused);
+        assert_eq!(reused.bytes, Some(0));
+
+        // A record with neither is one that failed before it got that far.
+        let failed: JobRecord = serde_json::from_str(
+            r#"{"id":"job-5","kind":"artifact-pull","status":"failed","started_at":1}"#,
+        )
+        .unwrap();
+        assert!(!failed.reused);
+        assert_eq!(failed.bytes, None);
     }
 
     #[test]

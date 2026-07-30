@@ -145,11 +145,14 @@ fn get_deployments(ctx: &Ctx, names: &[String]) -> Result<()> {
             row.push(d.spec.backend_summary());
             // How this deployment is updated, which the BACKEND column (what is
             // running now) deliberately does not say. A managed deployment
-            // builds from a repo; a static one runs commands on the host.
-            row.push(match (&d.spec.build, &d.spec.update) {
-                (Some(b), _) => b.summary(),
-                (None, Some(u)) => u.summary(),
-                (None, None) => "—".into(),
+            // builds from a repo or pulls from an artifact store — never both,
+            // which is what lets one column carry either; a static one runs
+            // commands on the host.
+            row.push(match (&d.spec.build, &d.spec.artifact, &d.spec.update) {
+                (Some(b), _, _) => b.summary(),
+                (None, Some(a), _) => a.summary(),
+                (None, None, Some(u)) => u.summary(),
+                (None, None, None) => "—".into(),
             });
             // Whether anything stands in front of this deployment at all — the
             // one property you want to be able to scan a whole fleet for.
@@ -402,6 +405,20 @@ fn describe_job(j: &JobRecord) -> Result<()> {
                 _ => "—".into(),
             },
         );
+    } else if j.is_pull() {
+        output::field("Store", output::opt_str(j.store.as_deref()));
+        output::field("Ref", output::opt_str(j.artifact_ref.as_deref()));
+        // The whole point of a pull: a tag can move, so the digest is what
+        // actually says which bytes the pool is running.
+        output::field("Digest", output::opt_str(j.digest.as_deref()));
+        output::field(
+            "Transferred",
+            match (j.bytes, j.reused) {
+                (Some(0), true) => "nothing — the image was already on the host".to_string(),
+                (Some(n), _) => output::bytes(n),
+                (None, _) => "—".into(),
+            },
+        );
     } else {
         output::field("Repo", &j.repo);
         output::field("Ref", j.git_ref.as_deref().unwrap_or("(default branch)"));
@@ -628,6 +645,61 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
                 match &build.auth {
                     Some(a) => format!("secret {}", a.render()),
                     None => "none (public repo, or host ssh keys)".to_string(),
+                },
+            );
+        }
+
+        // The other image source. Never both — app-lb refuses a spec holding
+        // one of each — so these two sections cannot appear together.
+        if let Some(artifact) = &d.spec.artifact {
+            output::section("Artifact source");
+            output::field("Store", &artifact.store);
+            let remote = artifact.store.starts_with("http://")
+                || artifact.store.starts_with("https://");
+            output::field(
+                "Transport",
+                if remote {
+                    "streamed over HTTP, digest verified on arrival"
+                } else {
+                    "materialized locally by `art` (hole-aware)"
+                },
+            );
+            // Which of the two it is decides whether the deployment follows a
+            // moving tag or is pinned, and that is the thing worth knowing.
+            output::field(
+                "Ref",
+                match artifact.artifact_ref.len() == 64
+                    && artifact.artifact_ref.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    true => format!("{} (a digest — pinned)", artifact.artifact_ref),
+                    false => format!("{} (a tag — resolved at pull time)", artifact.artifact_ref),
+                },
+            );
+            output::field(
+                "Image name",
+                artifact
+                    .image_name
+                    .as_deref()
+                    .unwrap_or("(the deployment id) + digest"),
+            );
+            output::field(
+                "Grow to",
+                match artifact.grow_gb {
+                    Some(gb) => format!("{gb} GiB (sparse)"),
+                    None => "(the image's stored size)".to_string(),
+                },
+            );
+            output::field(
+                "Credential",
+                match (&artifact.auth, remote) {
+                    (Some(a), true) => format!("secret {}", a.render()),
+                    // Said rather than shown as configured: the server logs it
+                    // as unused on every pull, and this is where somebody would
+                    // look first.
+                    (Some(a), false) => {
+                        format!("secret {} — UNUSED, a local store has no API key", a.render())
+                    }
+                    (None, _) => "none (an ungated store)".to_string(),
                 },
             );
         }

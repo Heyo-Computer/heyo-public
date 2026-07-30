@@ -1,5 +1,6 @@
 //! Command implementations, and the context they share.
 
+pub mod artifact;
 pub mod auth;
 pub mod observe;
 pub mod read;
@@ -54,7 +55,7 @@ pub enum Resource {
     Vm,
     Cert,
     Secret,
-    /// A deploy job: an image build, or a host update.
+    /// A deploy job: an image build, an artifact pull, or a host update.
     Job,
     /// `get all` — every kind that has a listing.
     All,
@@ -67,10 +68,11 @@ impl Resource {
             "vm" | "instance" | "backend" | "replica" => Some(Self::Vm),
             "cert" | "certificate" | "tl" => Some(Self::Cert),
             "secret" | "sec" => Some(Self::Secret),
-            // `build` and `update` name the two verbs; both list the same jobs,
-            // so `get builds` and `get updates` are the same listing filtered by
-            // eye. One resource kind, several spellings people will reach for.
-            "job" | "build" | "bld" | "update" | "run" => Some(Self::Job),
+            // `build`, `pull` and `update` name the three verbs; all list the
+            // same jobs, so `get builds` and `get pulls` are the same listing
+            // filtered by eye. One resource kind, several spellings people will
+            // reach for.
+            "job" | "build" | "bld" | "pull" | "update" | "run" => Some(Self::Job),
             "all" => Some(Self::All),
             _ => None,
         }

@@ -11,6 +11,7 @@
 //! *static* one proxy_passes to fixed upstreams and has neither a scaling policy
 //! nor VMs to evict.
 
+mod artifact;
 mod client;
 mod cmd;
 mod config;
@@ -132,6 +133,23 @@ enum Command {
     /// Dockerfile, and roll the pool onto the result.
     Build(cmd::write::BuildArgs),
 
+    /// Pull a managed deployment's guest rootfs from an artifact store, and
+    /// roll the pool onto it. The alternative to `build` for a deployment whose
+    /// image somebody else already made.
+    Pull(cmd::write::PullArgs),
+
+    /// Talk to an artifact store: log in, and push guest images others can pull.
+    ///
+    /// A store is a separate service from app-lb, so these commands use their
+    /// own saved registries rather than the `--server` context.
+    #[command(visible_aliases = ["art", "registry"])]
+    Artifact {
+        #[command(flatten)]
+        opts: cmd::artifact::RegistryOpts,
+        #[command(subcommand)]
+        cmd: cmd::artifact::ArtifactCmd,
+    },
+
     /// Update a static (proxy_pass) deployment: run its commands in its working
     /// directory on the app-lb host, then check that its upstreams came back.
     Update(cmd::write::UpdateArgs),
@@ -214,6 +232,12 @@ enum SetCmd {
     /// runs it.
     Build(cmd::write::SetBuildArgs),
 
+    /// Set where a managed deployment's image is *pulled* from: an artifact
+    /// store and a reference. Recording it changes nothing on its own —
+    /// `serverctl pull` runs it. Mutually exclusive with `set build`.
+    #[command(visible_alias = "art")]
+    Artifact(cmd::write::SetArtifactArgs),
+
     /// Set how a static deployment is updated: a working directory on the app-lb
     /// host and the commands to run in it. `serverctl update` runs them.
     Update(cmd::write::SetUpdateArgs),
@@ -269,6 +293,10 @@ fn run(cli: &Cli) -> Result<()> {
             Ok(())
         }
 
+        // An artifact store is not an app-lb, so these build their own client
+        // from a saved registry and never touch `Ctx`.
+        Command::Artifact { opts, cmd } => cmd::artifact::run(g, opts, cmd),
+
         Command::Get(args) => cmd::read::get(&Ctx::new(g)?, args),
         Command::Describe(args) => cmd::read::describe(&Ctx::new(g)?, args),
         Command::Create { cmd } => match cmd {
@@ -276,6 +304,7 @@ fn run(cli: &Cli) -> Result<()> {
             CreateCmd::Secret(args) => cmd::write::create_secret(&Ctx::new(g)?, args),
         },
         Command::Build(args) => cmd::write::build(&Ctx::new(g)?, args),
+        Command::Pull(args) => cmd::write::pull(&Ctx::new(g)?, args),
         Command::Update(args) => cmd::write::update(&Ctx::new(g)?, args),
         Command::Apply(args) => cmd::write::apply(&Ctx::new(g)?, args),
         Command::Edit(args) => cmd::write::edit(&Ctx::new(g)?, args),
@@ -287,6 +316,7 @@ fn run(cli: &Cli) -> Result<()> {
                 SetCmd::Upstreams(args) => cmd::write::set_upstreams(&ctx, args),
                 SetCmd::Route(args) => cmd::write::set_route(&ctx, args),
                 SetCmd::Build(args) => cmd::write::set_build(&ctx, args),
+                SetCmd::Artifact(args) => cmd::write::set_artifact(&ctx, args),
                 SetCmd::Update(args) => cmd::write::set_update(&ctx, args),
                 SetCmd::Auth(args) => cmd::write::set_auth(&ctx, args),
                 SetCmd::Secret(args) => cmd::write::set_secret(&ctx, args),
@@ -548,6 +578,134 @@ mod tests {
             ])
             .is_err(),
             "--clear and --command say opposite things"
+        );
+    }
+
+    #[test]
+    fn a_pull_takes_a_one_off_ref_and_can_wait() {
+        let cli = Cli::try_parse_from([
+            "serverctl", "pull", "web", "--ref", "debian-hermes", "--wait",
+        ])
+        .unwrap();
+        let Command::Pull(args) = &cli.command else {
+            panic!("expected pull");
+        };
+        assert_eq!(args.resource, "web");
+        assert_eq!(args.artifact_ref.as_deref(), Some("debian-hermes"));
+        assert!(args.wait);
+        assert!(!args.force);
+    }
+
+    #[test]
+    fn an_artifact_source_takes_a_store_and_a_ref() {
+        let cli = Cli::try_parse_from([
+            "serverctl",
+            "set",
+            "artifact",
+            "web",
+            "--store",
+            "http://127.0.0.1:8080",
+            "--ref",
+            "debian-hermes",
+            "--grow-gb",
+            "8",
+            "--secret",
+            "art/api_key",
+        ])
+        .unwrap();
+        let Command::Set {
+            cmd: SetCmd::Artifact(args),
+        } = &cli.command
+        else {
+            panic!("expected set artifact");
+        };
+        assert_eq!(args.store.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(args.artifact_ref.as_deref(), Some("debian-hermes"));
+        assert_eq!(args.grow_gb, Some(8));
+        assert_eq!(args.secret.as_deref(), Some("art/api_key"));
+    }
+
+    #[test]
+    fn clearing_an_artifact_source_excludes_editing_it() {
+        assert!(Cli::try_parse_from(["serverctl", "set", "artifact", "web", "--clear"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "set", "artifact", "web", "--clear", "--ref", "debian-hermes",
+            ])
+            .is_err(),
+            "--clear and --ref say opposite things"
+        );
+    }
+
+    #[test]
+    fn a_push_takes_a_file_or_an_image_but_not_both() {
+        let cli = Cli::try_parse_from([
+            "serverctl", "artifact", "push", "/tmp/rootfs.ext4", "--tag", "web-v2",
+        ])
+        .unwrap();
+        let Command::Artifact {
+            cmd: cmd::artifact::ArtifactCmd::Push(args),
+            ..
+        } = &cli.command
+        else {
+            panic!("expected artifact push");
+        };
+        assert_eq!(args.file.as_deref(), Some(std::path::Path::new("/tmp/rootfs.ext4")));
+        assert_eq!(args.tag.as_deref(), Some("web-v2"));
+
+        assert!(
+            Cli::try_parse_from(["serverctl", "artifact", "push", "--image", "artifacts"]).is_ok(),
+            "--image is the other way to name the source"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "artifact", "push", "/tmp/a.ext4", "--image", "artifacts",
+            ])
+            .is_err(),
+            "a path and an image name are two answers to one question"
+        );
+        // Something has to be pushed.
+        assert!(Cli::try_parse_from(["serverctl", "artifact", "push"]).is_err());
+        // And a tag cannot be both given and refused.
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "artifact", "push", "/tmp/a.ext4", "--tag", "x", "--no-tag",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_login_takes_a_url_and_a_key_out_of_band() {
+        let cli = Cli::try_parse_from([
+            "serverctl",
+            "artifact",
+            "login",
+            "http://art.example.com:8080",
+            "--api-key-stdin",
+            "--name",
+            "prod-store",
+        ])
+        .unwrap();
+        let Command::Artifact {
+            cmd: cmd::artifact::ArtifactCmd::Login(args),
+            ..
+        } = &cli.command
+        else {
+            panic!("expected artifact login");
+        };
+        assert_eq!(args.url, "http://art.example.com:8080");
+        assert!(args.api_key_stdin);
+        assert_eq!(args.name.as_deref(), Some("prod-store"));
+
+        // The three ways of supplying a key are alternatives, not a precedence
+        // chain: two of them set would leave half the command a lie.
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "artifact", "login", "http://art:8080", "--api-key", "k",
+                "--api-key-stdin",
+            ])
+            .is_err()
         );
     }
 

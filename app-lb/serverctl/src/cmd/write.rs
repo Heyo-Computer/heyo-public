@@ -693,6 +693,190 @@ pub fn set_build(ctx: &Ctx, args: &SetBuildArgs) -> Result<()> {
     })
 }
 
+// -- set artifact ----------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct SetArtifactArgs {
+    /// The deployment, e.g. `web` or `deployment/web`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+
+    /// The artifact store: an `art serve` URL (`http://host:8080`) or an
+    /// absolute path to a store root on the app-lb host. Required the first time.
+    #[arg(long, value_name = "URL|PATH")]
+    pub store: Option<String>,
+    /// Tag or digest naming the rootfs. A tag follows whatever it is moved to;
+    /// a digest is immutable, and is what a rollback should name.
+    #[arg(long = "ref", value_name = "REF")]
+    pub artifact_ref: Option<String>,
+    /// Base name for pulled images; the digest is appended. Defaults to the
+    /// deployment id.
+    #[arg(long, value_name = "NAME")]
+    pub image_name: Option<String>,
+    /// Grow the pulled rootfs to this many gigabytes. Sparse, so it costs no
+    /// disk until the guest writes to it.
+    #[arg(long = "grow-gb", value_name = "GB")]
+    pub grow_gb: Option<u64>,
+    /// API key for a gated store: a stored secret, as `NAME` or `NAME/KEY`
+    /// (default key `token`). Only meaningful for the URL form.
+    #[arg(long = "secret", value_name = "NAME[/KEY]")]
+    pub secret: Option<String>,
+    /// Pull without credentials (drops `artifact.auth`).
+    #[arg(long, conflicts_with = "secret")]
+    pub no_auth: bool,
+    /// Remove the artifact source entirely; the deployment keeps its current
+    /// image.
+    #[arg(long, conflicts_with_all = [
+        "store", "artifact_ref", "image_name", "grow_gb", "secret", "no_auth",
+    ])]
+    pub clear: bool,
+
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+pub fn set_artifact(ctx: &Ctx, args: &SetArtifactArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+
+    if args.clear {
+        return edit_spec(ctx, &id, args.dry_run, "artifact source removed", |spec| {
+            if let Some(map) = spec.as_object_mut() {
+                map.remove("artifact");
+            }
+            Ok(())
+        });
+    }
+
+    let touched = args.store.is_some()
+        || args.artifact_ref.is_some()
+        || args.image_name.is_some()
+        || args.grow_gb.is_some()
+        || args.secret.is_some()
+        || args.no_auth;
+    if !touched {
+        bail!(
+            "nothing to set — pass --store, --ref, --image-name, --grow-gb, --secret or \
+             --no-auth (or --clear to remove the artifact source)"
+        );
+    }
+
+    let auth = match &args.secret {
+        Some(s) => Some(spec::parse_secret_ref(s)?),
+        None => None,
+    };
+
+    edit_spec(ctx, &id, args.dry_run, "artifact source updated", |spec| {
+        let artifact = spec::artifact_mut(spec, &id)?;
+        // Both are required to pull at all, and a block with one of them is a
+        // spec app-lb would reject on `PUT` — so say which is missing here,
+        // where the flag that would fix it is still in view.
+        if artifact.get("store").and_then(Value::as_str).is_none() && args.store.is_none() {
+            bail!(
+                "deployment {id:?} has no artifact source yet, so --store is required \
+                 (e.g. --store http://127.0.0.1:8080, or --store /srv/artifacts)"
+            );
+        }
+        if artifact.get("ref").and_then(Value::as_str).is_none() && args.artifact_ref.is_none() {
+            bail!(
+                "deployment {id:?} has no artifact ref yet, so --ref is required \
+                 (a tag like `debian-hermes`, or a digest). \
+                 `serverctl artifact ls` lists a store's tags"
+            );
+        }
+        for (key, value) in [
+            ("store", args.store.as_deref()),
+            ("ref", args.artifact_ref.as_deref()),
+            ("image_name", args.image_name.as_deref()),
+        ] {
+            if let Some(v) = value {
+                artifact.insert(key.to_string(), Value::String(v.to_string()));
+            }
+        }
+        if let Some(gb) = args.grow_gb {
+            artifact.insert("grow_gb".into(), Value::from(gb));
+        }
+        if let Some(auth) = &auth {
+            artifact.insert("auth".into(), auth.clone());
+        }
+        if args.no_auth {
+            artifact.remove("auth");
+        }
+        Ok(())
+    })
+}
+
+// -- pull ------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct PullArgs {
+    /// The deployment to pull for, e.g. `web` or `deployment/web`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+
+    /// Pull this reference instead of the one in the spec. A one-off: the
+    /// stored `artifact.ref` is left alone, which is what makes
+    /// `--ref <digest>` a rollback rather than a config change.
+    #[arg(long = "ref", value_name = "REF")]
+    pub artifact_ref: Option<String>,
+
+    /// Re-fetch even when the image is already on the app-lb host. Rarely
+    /// wanted: the image filename is its digest, so its presence already proves
+    /// the bytes are right.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Wait for the pull to finish and report the outcome.
+    #[arg(long, short = 'w')]
+    pub wait: bool,
+
+    /// Print the pull's output when it finishes. Implies --wait.
+    #[arg(long)]
+    pub logs: bool,
+
+    #[arg(long, value_name = "SECS", default_value_t = 1800)]
+    pub timeout: u64,
+}
+
+pub fn pull(ctx: &Ctx, args: &PullArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+
+    let mut body = Map::new();
+    if let Some(r) = &args.artifact_ref {
+        body.insert("ref".into(), Value::String(r.clone()));
+    }
+    if args.force {
+        body.insert("force".into(), Value::Bool(true));
+    }
+    let started = ctx.client.start_pull(&id, &Value::Object(body))?;
+
+    if ctx.out.is_machine() && !(args.wait || args.logs) {
+        let record: JobRecord = serde_json::from_value(started.clone()).unwrap_or_default();
+        return output::emit(&started, ctx.out, &[format!("job/{}", record.id)]);
+    }
+
+    let record: JobRecord =
+        serde_json::from_value(started).context("parsing the job the server started")?;
+    if !ctx.out.is_machine() {
+        println!(
+            "job/{} started for deployment/{id} — {} from {}",
+            record.id,
+            record.artifact_ref.as_deref().unwrap_or("(spec ref)"),
+            record.store.as_deref().unwrap_or("(spec store)"),
+        );
+    }
+
+    if !(args.wait || args.logs) {
+        println!(
+            "\nIt runs on the app-lb host, and takes as long as the transfer does — or no \
+             time at all if the image is already there. Follow it with \
+             `serverctl get job {}`.",
+            record.id
+        );
+        return Ok(());
+    }
+    wait_job(ctx, &record.id, Duration::from_secs(args.timeout), args.logs)
+}
+
 // -- set update ------------------------------------------------------------
 
 #[derive(Args, Debug)]
@@ -1158,17 +1342,33 @@ fn report_job(record: &JobRecord, show_tail: bool) -> Result<()> {
             );
             return Ok(());
         }
-        println!(
-            "job/{} succeeded — image {} from commit {}{}",
-            record.id,
-            record.image.as_deref().unwrap_or("?"),
-            record.short_commit(),
-            if record.rolled_out {
-                "; the pool is recycling onto it"
-            } else {
-                "; the deployment was NOT updated"
-            }
-        );
+        let rolled = if record.rolled_out {
+            "; the pool is recycling onto it"
+        } else {
+            "; the deployment was NOT updated"
+        };
+        if record.is_pull() {
+            println!(
+                "job/{} succeeded — image {} from digest {} ({}){}",
+                record.id,
+                record.image.as_deref().unwrap_or("?"),
+                record.short_digest(),
+                match (record.bytes, record.reused) {
+                    (_, true) => "already on the host".to_string(),
+                    (Some(n), false) => format!("{} transferred", output::bytes(n)),
+                    (None, false) => "transferred".to_string(),
+                },
+                rolled,
+            );
+        } else {
+            println!(
+                "job/{} succeeded — image {} from commit {}{}",
+                record.id,
+                record.image.as_deref().unwrap_or("?"),
+                record.short_commit(),
+                rolled,
+            );
+        }
         println!(
             "\nWatch the replacements with `serverctl rollout status {}`.",
             record.deployment

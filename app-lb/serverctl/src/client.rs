@@ -275,6 +275,12 @@ impl Client {
         self.post(&format!("/deployments/{}/build", escape(id)), body)
     }
 
+    /// Start an artifact pull: materialize a rootfs from a store and roll the
+    /// pool onto it. Same shape as a build, and polled from the same `/jobs`.
+    pub fn start_pull(&self, id: &str, body: &Value) -> Result<Value> {
+        self.post(&format!("/deployments/{}/pull", escape(id)), body)
+    }
+
     /// Start a host update. Same shape as a build: scheduled, then polled.
     pub fn start_update(&self, id: &str) -> Result<Value> {
         self.post(

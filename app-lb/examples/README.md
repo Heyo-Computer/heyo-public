@@ -8,6 +8,53 @@ curl -XPOST localhost:9090/deployments \
   -d @examples/pg-fc-dashboard.json
 ```
 
+## `artifact-pull.json` — a deployment whose rootfs comes from the store
+
+The mirror image of [`artifacts.json`](#artifactsjson--managed-vm-pool-for-the-artifacts-store):
+that one *runs* a store, this one *pulls from* one. Note there is no `vm.image` —
+a pull writes it, so the spec starts without one and gains one the first time
+`serverctl pull` succeeds.
+
+```sh
+serverctl create secret art api_key=…          # the store's ART_API_KEY
+serverctl apply -f examples/artifact-pull.json
+serverctl pull web --wait
+```
+
+The image it names has to exist first. Either side of the store works:
+
+```sh
+# On the store's host, from heyvm's own images:
+art heyvm import web-v2
+
+# Or from anywhere, over the API:
+serverctl artifact login http://127.0.0.1:8080
+serverctl artifact push --image web-v2
+```
+
+### Notes on the spec
+
+- **`store` decides the transport.** `http://…` makes app-lb stream the blob and
+  verify its sha256 as it lands; an absolute path makes it run
+  `art heyvm materialize`, which skips the blob's holes and is far cheaper. Use
+  the path form whenever the store is on the same host as app-lb.
+
+- **`ref` is a tag here, so the deployment follows it.** Pushing over `web-v2`
+  and re-running `serverctl pull web` is a deploy. Put a digest here instead to
+  pin the bytes permanently, or pass one to `serverctl pull web --ref <digest>`
+  for a one-off rollback that leaves the spec alone.
+
+- **`grow_gb` is sparse and is about the guest, not the store.** The image is
+  built at whatever size it was built at; this extends the file so the guest has
+  room to write. It costs no disk until it is used.
+
+- **`auth` is only read for the URL form.** A store root on this host is
+  protected by file permissions, and a key configured next to one is logged as
+  unused rather than silently ignored.
+
+- **There is no `build` block, and there cannot be.** Both would rewrite
+  `vm.image`; app-lb rejects a spec holding both.
+
 ## `artifacts-gated.json` — one app, two surfaces, one gate
 
 The same deployment as [`artifacts.json`](#artifactsjson--managed-vm-pool-for-the-artifacts-store)

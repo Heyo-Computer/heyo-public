@@ -899,6 +899,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             build: None,
+            artifact: None,
             update: None,
             auth: None,
         }
@@ -918,6 +919,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec!["127.0.0.1:9".into()],
             build: None,
+            artifact: None,
             update: None,
             auth: None,
         }

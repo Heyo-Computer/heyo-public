@@ -96,6 +96,19 @@ pub struct LbConfig {
     /// `fakeroot` — so app-lb shells out to the binary on this host.
     #[serde(default = "default_heyvm_bin")]
     pub heyvm_bin: String,
+    /// The `art` CLI that materializes a rootfs out of a *local* artifact store.
+    /// Only reached when a deployment's `artifact.store` is a path; a store
+    /// reached by URL needs no binary here, because app-lb streams the blob
+    /// itself.
+    #[serde(default = "default_art_bin")]
+    pub art_bin: String,
+    /// Where a pulled rootfs is written so heyvmd can boot it. Unset resolves
+    /// the same way mvm-ctrl does: `$MVM_DATA_DIR/images/firecracker`, else
+    /// `<home>/.heyo/images/firecracker` — where `<home>` is `heyvm_home` when
+    /// set, because that is the daemon's home and the daemon only finds images
+    /// under its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images_dir: Option<String>,
     #[serde(default = "default_git_bin")]
     pub git_bin: String,
     /// Shell that a static deployment's `update.commands` run through. They are
@@ -125,6 +138,9 @@ fn default_build_dir() -> String {
 }
 fn default_heyvm_bin() -> String {
     "heyvm".into()
+}
+fn default_art_bin() -> String {
+    "art".into()
 }
 fn default_git_bin() -> String {
     "git".into()
@@ -163,6 +179,8 @@ impl Default for LbConfig {
             acme_directory: default_acme_directory(),
             build_dir: default_build_dir(),
             heyvm_bin: default_heyvm_bin(),
+            art_bin: default_art_bin(),
+            images_dir: None,
             git_bin: default_git_bin(),
             update_shell: default_update_shell(),
             build_timeout_secs: default_build_timeout_secs(),
@@ -502,11 +520,158 @@ impl BuildSpec {
             return Err(SpecError::BadImageName(name.clone()));
         }
         if let Some(auth) = &self.auth {
-            auth.validate()
-                .map_err(|e| SpecError::BadSecretRef(e.to_string()))?;
+            auth.validate().map_err(|e| SpecError::BadSecretRef {
+                field: "build.auth",
+                detail: e.to_string(),
+            })?;
         }
         Ok(())
     }
+}
+
+/// Where a deployment's guest image comes from: a rootfs already in an artifact
+/// store, addressed by content.
+///
+/// The counterpart of [`BuildSpec`], and the same shape of thing: the *source*
+/// of the next image, not the running one. A pull resolves `reference` to a
+/// blob digest, materializes that blob as an ext4 rootfs heyvmd can boot, and
+/// only then rewrites [`VmSpec::image`] — so the spec still says which image is
+/// actually booting and this block says where the next one comes from.
+///
+/// What makes this different from a build is that nothing is *produced*. The
+/// digest names bytes that already exist, so the same `artifact` block resolves
+/// to the same rootfs on every host that can reach the store, which is the whole
+/// reason to prefer it over rebuilding a Dockerfile per machine.
+///
+/// See <https://github.com/sarocu/artifacts> — `art heyvm import` puts heyvm's
+/// base images in, `serverctl artifact push` puts a locally-built one in, and
+/// either is pullable here.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ArtifactSpec {
+    /// The store to pull from, in one of two forms:
+    ///
+    /// * `http://host:port` — a remote `art serve`. app-lb resolves and streams
+    ///   the blob itself, verifying the digest as the bytes land.
+    /// * `/abs/path` — a store root (`ART_ROOT`) on this host. app-lb shells out
+    ///   to `art heyvm materialize`, which skips the blob's holes instead of
+    ///   copying its zeros.
+    ///
+    /// A local store is by far the faster of the two and is what a host running
+    /// its own store should use; the URL form is what makes one store serve a
+    /// fleet.
+    pub store: String,
+    /// A tag (`debian-hermes`) or a 64-hex digest. A tag is resolved at pull
+    /// time, so a deployment pinned to one follows whatever the tag moves to; a
+    /// digest is immutable and is what a rollback should name.
+    #[serde(rename = "ref")]
+    pub artifact_ref: String,
+    /// API key for a store started with `ART_API_KEY`, as a reference into the
+    /// secret store. Only meaningful for the URL form — a local store is
+    /// protected by file permissions, not a header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<SecretRef>,
+    /// Extend the materialized rootfs to this many gigabytes. Sparse, so it
+    /// costs no disk until the guest writes; heyvm still runs the `resize2fs`
+    /// that lets the guest filesystem use the room. Set it when the image was
+    /// built small and the workload needs space on `/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grow_gb: Option<u64>,
+    /// Base name for the materialized image; the digest is appended, so one
+    /// deployment's pulls are `<name>-<short digest>`. Defaults to the
+    /// deployment id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_name: Option<String>,
+}
+
+impl ArtifactSpec {
+    /// The image name for a given blob digest, in the same shape
+    /// [`BuildSpec::image_for`] gives a commit.
+    ///
+    /// Content-addressed on purpose: the same digest always materializes to the
+    /// same filename, so a re-pull of bytes already on disk is a no-op the job
+    /// can detect by name alone, and two deployments pulling one image share it.
+    pub fn image_for(&self, deployment_id: &str, digest: &str) -> String {
+        let base = self.image_name.as_deref().unwrap_or(deployment_id);
+        let base = sanitize_image_name(base);
+        let short: String = digest.chars().take(12).collect();
+        if short.is_empty() {
+            base
+        } else {
+            format!("{base}-{short}")
+        }
+    }
+
+    /// Whether `store` names a remote `art serve` rather than a path on this
+    /// host. The two are told apart by the scheme, which is also what decides
+    /// whether `auth` means anything.
+    pub fn is_remote(&self) -> bool {
+        let s = self.store.trim();
+        s.starts_with("http://") || s.starts_with("https://")
+    }
+
+    fn validate(&self) -> Result<(), SpecError> {
+        let store = self.store.trim();
+        if store.is_empty() {
+            return Err(SpecError::EmptyArtifactStore);
+        }
+        let store_ok = if let Some(rest) = store
+            .strip_prefix("http://")
+            .or_else(|| store.strip_prefix("https://"))
+        {
+            !rest.is_empty() && !rest.contains(char::is_whitespace)
+        } else {
+            // A store root, and only an absolute one: app-lb's working
+            // directory is not something a spec author can see, so a relative
+            // path would name a different store depending on how the LB was
+            // started.
+            std::path::Path::new(store).is_absolute()
+                && !store.contains("..")
+                && !store.contains('\0')
+        };
+        if !store_ok {
+            return Err(SpecError::UnsupportedArtifactStore(self.store.clone()));
+        }
+
+        if !is_valid_artifact_ref(&self.artifact_ref) {
+            return Err(SpecError::BadArtifactRef(self.artifact_ref.clone()));
+        }
+        if let Some(name) = &self.image_name
+            && sanitize_image_name(name).is_empty()
+        {
+            return Err(SpecError::BadImageName(name.clone()));
+        }
+        if self.grow_gb == Some(0) {
+            return Err(SpecError::ZeroGrow);
+        }
+        if let Some(auth) = &self.auth {
+            auth.validate().map_err(|e| SpecError::BadSecretRef {
+                field: "artifact.auth",
+                detail: e.to_string(),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// A tag or a digest, as the artifact store itself defines them.
+///
+/// Mirrors `TagName::parse` and `Digest::parse` in the `artifacts` crate rather
+/// than deferring to the store, because a reference that store would reject
+/// should be a registration error here and not a job that fails minutes later.
+/// A digest is 64 lowercase hex characters; a tag is `[A-Za-z0-9._-]`, not
+/// starting with `-` or `.` — which also means it can never contain a path
+/// separator or a `..`, and so can never travel outside the store when it is
+/// pasted into a URL path.
+fn is_valid_artifact_ref(r: &str) -> bool {
+    if r.is_empty() || r.len() > 128 {
+        return false;
+    }
+    let first = r.as_bytes()[0];
+    if first == b'-' || first == b'.' {
+        return false;
+    }
+    r.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
 }
 
 /// Keep to what a docker tag component and an ext4 filename both allow.
@@ -667,8 +832,10 @@ impl UpdateSpec {
             from.validate()?;
         }
         if let Some(auth) = &self.auth {
-            auth.validate()
-                .map_err(|e| SpecError::BadSecretRef(e.to_string()))?;
+            auth.validate().map_err(|e| SpecError::BadSecretRef {
+                field: "update.auth",
+                detail: e.to_string(),
+            })?;
         }
         if self.timeout_secs == Some(0) {
             return Err(SpecError::ZeroTimeout);
@@ -711,7 +878,10 @@ impl SecretEnv {
     fn validate(&self) -> Result<(), SpecError> {
         self.secret_ref()
             .validate()
-            .map_err(|e| SpecError::BadSecretRef(e.to_string()))?;
+            .map_err(|e| SpecError::BadSecretRef {
+                field: "update.env_from",
+                detail: e.to_string(),
+            })?;
         let name = self.env_name();
         // Not a hard requirement of execve, but a variable name that needs
         // quoting is one the shell cannot read back — so it would be set and
@@ -885,7 +1055,10 @@ impl AuthGate {
         }
         self.client_secret
             .validate()
-            .map_err(|e| SpecError::BadSecretRef(e.to_string()))?;
+            .map_err(|e| SpecError::BadSecretRef {
+                field: "auth.client_secret",
+                detail: e.to_string(),
+            })?;
 
         // An empty allow-list would gate the deployment behind "has a Google
         // account", which is nearly everyone. That is a legitimate thing to
@@ -973,6 +1146,15 @@ pub struct DeploymentSpec {
     /// `vm.image`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildSpec>,
+    /// Where `vm.image` is pulled from: a rootfs already in an artifact store.
+    /// The alternative to `build` and mutually exclusive with it — both rewrite
+    /// `vm.image`, and a deployment with two sources for it would have no
+    /// answer to "where did this image come from".
+    ///
+    /// Like `build`, editing it disturbs nothing; the pool moves when a pull
+    /// finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ArtifactSpec>,
     /// How a *static* deployment's backend is updated: a working directory on
     /// this host and commands to run in it. The static counterpart of `build`,
     /// and mutually exclusive with it for the same reason the backend kinds are.
@@ -1002,6 +1184,11 @@ pub enum SpecError {
     BadUpstream(String),
     /// A static deployment declared a `build` block; there is no image to build.
     BuildOnStaticDeployment,
+    /// A static deployment declared an `artifact` block; there is no image to
+    /// pull one into.
+    ArtifactOnStaticDeployment,
+    /// Both `build` and `artifact` were set; both claim to produce `vm.image`.
+    BothImageSources,
     /// A managed deployment declared an `update` block; its backend is a VM, not
     /// a process on this host.
     UpdateOnManagedDeployment,
@@ -1027,7 +1214,17 @@ pub enum SpecError {
     BadBuildRef(String),
     BadBuildPath(String),
     BadImageName(String),
-    BadSecretRef(String),
+    EmptyArtifactStore,
+    UnsupportedArtifactStore(String),
+    BadArtifactRef(String),
+    ZeroGrow,
+    /// A secret reference somewhere in the spec is malformed. Carries the field
+    /// it came from: four blocks can hold one, and "a secret ref is unusable"
+    /// with no idea which is not an error message anyone can act on.
+    BadSecretRef {
+        field: &'static str,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for SpecError {
@@ -1070,6 +1267,18 @@ impl std::fmt::Display for SpecError {
                 "a static (proxy_pass) deployment cannot declare `build`: it has no guest \
                  image, it forwards to upstreams somebody else runs. Use `update` to run \
                  commands on the host instead"
+            ),
+            Self::ArtifactOnStaticDeployment => write!(
+                f,
+                "a static (proxy_pass) deployment cannot declare `artifact`: it has no guest \
+                 image to pull a rootfs into, it forwards to upstreams somebody else runs"
+            ),
+            Self::BothImageSources => write!(
+                f,
+                "a deployment sets both `build` and `artifact`: pick one — both rewrite \
+                 `vm.image` when they run, so with both there is no answer to where the \
+                 running image came from. Build from git, or pull a rootfs somebody already \
+                 built; to do both, build on one host and `serverctl artifact push` the result"
             ),
             Self::UpdateOnManagedDeployment => write!(
                 f,
@@ -1155,7 +1364,25 @@ impl std::fmt::Display for SpecError {
                 "build.image_name {n:?} has no usable characters: image names are \
                  [a-z0-9._-] and must start with a letter or digit"
             ),
-            Self::BadSecretRef(e) => write!(f, "build.auth is unusable: {e}"),
+            Self::EmptyArtifactStore => write!(f, "artifact.store must not be empty"),
+            Self::UnsupportedArtifactStore(s) => write!(
+                f,
+                "artifact.store {s:?} is not a usable store: give either an `art serve` URL \
+                 (http://host:port) or an absolute path to a store root on this host"
+            ),
+            Self::BadArtifactRef(r) => write!(
+                f,
+                "artifact.ref {r:?} is neither a tag nor a digest: a tag is [A-Za-z0-9._-] \
+                 and may not start with `-` or `.`, and a digest is 64 lowercase hex characters"
+            ),
+            Self::ZeroGrow => write!(
+                f,
+                "artifact.grow_gb must be greater than 0; omit it to keep the image at its \
+                 stored size"
+            ),
+            Self::BadSecretRef { field, detail } => {
+                write!(f, "{field} is unusable: {detail}")
+            }
         }
     }
 }
@@ -1228,8 +1455,18 @@ impl DeploymentSpec {
             if self.scaling.target_concurrency == 0 {
                 return Err(SpecError::ZeroTargetConcurrency);
             }
+            // `build` and `artifact` are the two ways `vm.image` gets rewritten,
+            // and each has its own explicit trigger. Two of them on one
+            // deployment would make the running image depend on which job ran
+            // last, which is not something the spec says anywhere.
+            if self.build.is_some() && self.artifact.is_some() {
+                return Err(SpecError::BothImageSources);
+            }
             if let Some(build) = &self.build {
                 build.validate()?;
+            }
+            if let Some(artifact) = &self.artifact {
+                artifact.validate()?;
             }
             // An `update` runs commands in a directory on this host; a managed
             // deployment's backend is a microVM, so there is nothing here for
@@ -1243,6 +1480,11 @@ impl DeploymentSpec {
             // could never run.
             if self.build.is_some() {
                 return Err(SpecError::BuildOnStaticDeployment);
+            }
+            // Same reasoning for a pull: there is no `vm.image` to point at the
+            // rootfs it would materialize.
+            if self.artifact.is_some() {
+                return Err(SpecError::ArtifactOnStaticDeployment);
             }
             if let Some(update) = &self.update {
                 update.validate()?;
@@ -1306,6 +1548,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             build: None,
+            artifact: None,
             update: None,
             auth: None,
         }
@@ -1337,6 +1580,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             build: None,
+            artifact: None,
             update: None,
             auth: None,
         }
@@ -1636,7 +1880,10 @@ mod tests {
             }),
             ..build_spec()
         });
-        assert!(matches!(s.validate(), Err(SpecError::BadSecretRef(_))));
+        assert!(matches!(
+            s.validate(),
+            Err(SpecError::BadSecretRef { field: "build.auth", .. })
+        ));
     }
 
     #[test]
@@ -1646,6 +1893,129 @@ mod tests {
         // And an old persisted spec (no `build` key) still parses.
         let parsed: DeploymentSpec = serde_json::from_str(&json).unwrap();
         assert!(parsed.build.is_none());
+    }
+
+    fn artifact_spec() -> ArtifactSpec {
+        ArtifactSpec {
+            store: "http://127.0.0.1:8080".into(),
+            artifact_ref: "debian-hermes".into(),
+            auth: None,
+            grow_gb: None,
+            image_name: None,
+        }
+    }
+
+    #[test]
+    fn an_artifact_store_is_a_url_or_an_absolute_path_and_nothing_else() {
+        let ok = ["http://127.0.0.1:8080", "https://art.example.com", "/srv/artifacts"];
+        for store in ok {
+            let s = DeploymentSpec {
+                artifact: Some(ArtifactSpec { store: store.into(), ..artifact_spec() }),
+                ..spec()
+            };
+            assert!(s.validate().is_ok(), "{store} should be accepted");
+        }
+
+        // A relative root would resolve against app-lb's working directory,
+        // which nobody writing a spec can see; the rest are not stores at all.
+        for store in ["", ".artifacts", "art.example.com", "/srv/../etc", "file:///srv/art"] {
+            let s = DeploymentSpec {
+                artifact: Some(ArtifactSpec { store: store.into(), ..artifact_spec() }),
+                ..spec()
+            };
+            assert!(s.validate().is_err(), "{store:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn only_the_url_form_is_remote() {
+        assert!(artifact_spec().is_remote());
+        assert!(
+            !ArtifactSpec { store: "/srv/artifacts".into(), ..artifact_spec() }.is_remote(),
+            "a store root is materialized locally, not fetched"
+        );
+    }
+
+    #[test]
+    fn an_artifact_ref_is_a_tag_or_a_digest() {
+        let digest = "c74abee2ce84".repeat(5) + "abcd";
+        assert_eq!(digest.len(), 64);
+        for r in ["debian-hermes", "ubuntu-24.04", "web_v2", digest.as_str()] {
+            let s = DeploymentSpec {
+                artifact: Some(ArtifactSpec { artifact_ref: r.into(), ..artifact_spec() }),
+                ..spec()
+            };
+            assert!(s.validate().is_ok(), "{r} should be accepted");
+        }
+        // A leading `-` reads as a flag to anything that shells out, and a
+        // slash or a `..` would leave the store when pasted into a URL path.
+        for r in ["", "-flag", ".hidden", "a/b", "../etc/passwd", "has space"] {
+            let s = DeploymentSpec {
+                artifact: Some(ArtifactSpec { artifact_ref: r.into(), ..artifact_spec() }),
+                ..spec()
+            };
+            assert!(
+                matches!(s.validate(), Err(SpecError::BadArtifactRef(_))),
+                "{r:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pulled_image_is_named_after_the_digest_it_came_from() {
+        let a = artifact_spec();
+        assert_eq!(
+            a.image_for("web", "c74abee2ce8409f1"),
+            "web-c74abee2ce84",
+            "the short digest is what makes a re-pull of the same bytes detectable by name",
+        );
+        let named = ArtifactSpec { image_name: Some("Custom Name".into()), ..artifact_spec() };
+        assert_eq!(named.image_for("web", "deadbeefcafe0"), "custom-name-deadbeefcafe");
+    }
+
+    #[test]
+    fn a_deployment_cannot_both_build_and_pull_its_image() {
+        let s = DeploymentSpec {
+            build: Some(build_spec()),
+            artifact: Some(artifact_spec()),
+            ..spec()
+        };
+        assert_eq!(s.validate(), Err(SpecError::BothImageSources));
+    }
+
+    #[test]
+    fn a_static_deployment_has_no_image_to_pull_into() {
+        let s = DeploymentSpec {
+            artifact: Some(artifact_spec()),
+            ..static_spec(&["127.0.0.1:9000"])
+        };
+        assert_eq!(s.validate(), Err(SpecError::ArtifactOnStaticDeployment));
+    }
+
+    #[test]
+    fn growing_to_zero_is_refused_rather_than_silently_shrinking_nothing() {
+        let s = DeploymentSpec {
+            artifact: Some(ArtifactSpec { grow_gb: Some(0), ..artifact_spec() }),
+            ..spec()
+        };
+        assert_eq!(s.validate(), Err(SpecError::ZeroGrow));
+    }
+
+    #[test]
+    fn an_artifact_block_is_optional_and_absent_from_a_spec_that_has_none() {
+        let json = serde_json::to_string(&spec()).unwrap();
+        assert!(!json.contains("artifact"), "{json}");
+        let parsed: DeploymentSpec = serde_json::from_str(&json).unwrap();
+        assert!(parsed.artifact.is_none());
+    }
+
+    #[test]
+    fn an_artifact_block_round_trips_with_ref_spelled_the_way_a_spec_spells_it() {
+        let s = DeploymentSpec { artifact: Some(artifact_spec()), ..spec() };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""ref":"debian-hermes""#), "{json}");
+        let parsed: DeploymentSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.artifact, Some(artifact_spec()));
     }
 
     fn auth_gate() -> AuthGate {
