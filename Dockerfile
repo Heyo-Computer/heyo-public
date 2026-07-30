@@ -44,6 +44,29 @@ COPY --from=builder /app/target/release/art /usr/local/bin/art
 COPY init.sh /init.sh
 RUN chmod +x /init.sh /usr/local/bin/art
 
+# Prove the rootfs can actually serve before it ships. From app-lb's side a
+# binary that cannot start is indistinguishable from one that was misconfigured:
+# both are a VM that boots, prints HEYVM_READY, and never answers /healthz. This
+# turns the first class into a build failure with the error attached.
+#
+# Deliberately no ART_API_KEY and no dashboard: this checks that the daemon binds
+# and answers, not how it is gated in production. `/healthz` is open either way.
+RUN set -eu; \
+    /usr/local/bin/art --help >/dev/null; \
+    ART_ROOT=/tmp/smoke ART_LISTEN=127.0.0.1:8080 /usr/local/bin/art serve \
+        >/tmp/smoke.log 2>&1 & \
+    pid=$!; ok=0; \
+    for _ in $(seq 60); do \
+        if curl -fsS -m 1 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then ok=1; break; fi; \
+        kill -0 "$pid" 2>/dev/null || break; \
+        sleep 0.25; \
+    done; \
+    kill "$pid" 2>/dev/null || true; \
+    if [ "$ok" != 1 ]; then \
+        echo "smoke test: art serve never answered GET /healthz"; cat /tmp/smoke.log; exit 1; \
+    fi; \
+    rm -rf /tmp/smoke /tmp/smoke.log
+
 EXPOSE 22 8080
 
 CMD ["/init.sh"]
