@@ -390,6 +390,7 @@ pub struct ScalingPolicy {
     pub scale_to_zero_after_secs: u64,
     pub cold_start_timeout_secs: u64,
     pub drain_timeout_secs: u64,
+    pub boot_timeout_secs: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]

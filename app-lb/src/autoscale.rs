@@ -24,6 +24,11 @@ use std::time::Duration;
 
 const TICK: Duration = Duration::from_secs(2);
 
+/// How long a still-booting VM may go without a log line. Chosen far above
+/// [`TICK`]: the point is to prove a stuck boot is still stuck, not to narrate
+/// every poll of a VM that will be up in ten seconds.
+const BOOT_HEARTBEAT: u64 = 30;
+
 pub struct Autoscaler {
     registry: Arc<Registry>,
     vms: VmManager,
@@ -337,18 +342,27 @@ impl Autoscaler {
         }
     }
 
-    /// Move booted VMs into the pool.
+    /// Move booted VMs into the pool, and say what the rest are waiting on.
     ///
     /// A VM is only promoted when the daemon says `Running`, it has a
     /// `guest_ip`, *and* it answers a probe. The first two are not sufficient:
     /// `wait_for_ready` reports `Ok` for stopped VMs, and `Running` says nothing
     /// about whether the guest's server is listening yet.
+    ///
+    /// The other half of this function is the case where that never happens. A VM
+    /// whose guest boots but whose *server* doesn't — a bad `start_command`, an
+    /// env var pointing at a directory that isn't there, a binary that exits — is
+    /// `Running` with a `guest_ip` and fails the probe forever. Without the
+    /// progress logging and the deadline below, that is completely invisible:
+    /// nothing is logged, `min_replicas` is silently never met, and the only
+    /// symptom is requests timing out on a cold start that will never end.
     async fn promote_pending(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
         let pending = d.pending();
         if pending.is_empty() {
             return;
         }
 
+        let boot_timeout = d.spec.scaling.boot_timeout_secs;
         let mut still_pending = Vec::new();
         let mut promoted = Vec::new();
         let mut doomed = Vec::new();
@@ -362,44 +376,64 @@ impl Autoscaler {
                 tracing::warn!(
                     deployment = %d.spec.id,
                     sandbox = %p.sandbox_id,
+                    age_secs = p.age_secs(),
                     "pending VM vanished from the daemon",
                 );
                 continue;
             };
+            let age = p.age_secs();
 
-            match vm::routable_addr(info, d.spec.vm_spec().port) {
-                Ok(addr) => {
-                    if health::probe(addr, &d.spec.health).await {
-                        let boot_secs = now_secs().saturating_sub(p.created_at);
-                        tracing::info!(
-                            deployment = %d.spec.id,
-                            sandbox = %p.sandbox_id,
-                            %addr,
-                            boot_secs,
-                            "VM ready",
-                        );
-                        self.metrics.record_cold_start(&d.spec.id, boot_secs);
-                        promoted_ids.push(p.sandbox_id.clone());
-                        promoted.push(Arc::new(VmBackend::new(p.sandbox_id.clone(), addr)));
-                    } else {
-                        still_pending.push(p.clone()); // booting; try next tick
-                    }
-                }
-                Err(vm::VmError::NotRunning { status, .. }) if !vm::is_terminal(&status) => {
-                    still_pending.push(p.clone()); // provisioning
-                }
+            let addr = match vm::routable_addr(info, d.spec.vm_spec().port) {
+                Ok(addr) => health::probe(addr, &d.spec.health).await.then_some(addr),
+                // Provisioning, or a status the daemon hasn't classified yet.
+                Err(vm::VmError::NotRunning { status, .. }) if !vm::is_terminal(&status) => None,
                 Err(e) => {
                     // Terminal, or unroutable (no guest_ip). Either way it will
                     // never serve, so stop waiting on it and reclaim the slot.
                     tracing::error!(
                         deployment = %d.spec.id,
                         sandbox = %p.sandbox_id,
+                        age_secs = age,
                         error = %e,
                         "giving up on VM",
                     );
                     doomed.push(p.sandbox_id.clone());
+                    continue;
                 }
+            };
+
+            if let Some(addr) = addr {
+                tracing::info!(
+                    deployment = %d.spec.id,
+                    sandbox = %p.sandbox_id,
+                    %addr,
+                    boot_secs = age,
+                    "VM ready",
+                );
+                self.metrics.record_cold_start(&d.spec.id, age);
+                promoted_ids.push(p.sandbox_id.clone());
+                promoted.push(Arc::new(VmBackend::new(p.sandbox_id.clone(), addr)));
+                continue;
             }
+
+            // Still booting. Either it gets a deadline or it gets a heartbeat,
+            // but it does not get silence.
+            if boot_timeout > 0 && age >= boot_timeout {
+                tracing::error!(
+                    deployment = %d.spec.id,
+                    sandbox = %p.sandbox_id,
+                    age_secs = age,
+                    boot_timeout_secs = boot_timeout,
+                    status = ?info.status,
+                    waiting_on = %boot_stall(info, &d.spec.health, d.spec.vm_spec().port),
+                    "VM never became ready inside its boot timeout; killing it so the pool \
+                     can try again",
+                );
+                self.metrics.record_boot_timeout(&d.spec.id);
+                doomed.push(p.sandbox_id.clone());
+                continue;
+            }
+            still_pending.push(self.note_boot_progress(d, p, info, age));
         }
 
         d.set_pending(still_pending);
@@ -424,6 +458,57 @@ impl Autoscaler {
         self.kill_unclaimed(d, &promoted_ids).await;
     }
 
+    /// Log a still-booting VM's progress when there is something new to say, and
+    /// return it with the bookkeeping for the next tick.
+    ///
+    /// "Something new" is a status transition or [`BOOT_HEARTBEAT`] elapsed —
+    /// a line per pending VM per 2s tick would drown the log it is meant to make
+    /// readable, and a warm pool booting normally has nothing to report. The first
+    /// sighting always logs, because until then nothing anywhere has named this
+    /// sandbox id: `scale_up` only counts what it created.
+    fn note_boot_progress(
+        &self,
+        d: &Arc<Deployment>,
+        p: &PendingVm,
+        info: &SandboxInfo,
+        age: u64,
+    ) -> PendingVm {
+        let next = PendingVm {
+            status: Some(info.status.clone()),
+            ..p.clone()
+        };
+        let changed = p.status.as_ref() != Some(&info.status);
+        if !changed && age.saturating_sub(p.reported_at_secs) < BOOT_HEARTBEAT {
+            return next;
+        }
+
+        // Past the request budget this boot has already cost somebody a 503, so
+        // it stops being routine progress.
+        if age >= d.spec.scaling.cold_start_timeout_secs {
+            tracing::warn!(
+                deployment = %d.spec.id,
+                sandbox = %p.sandbox_id,
+                age_secs = age,
+                status = ?info.status,
+                waiting_on = %boot_stall(info, &d.spec.health, d.spec.vm_spec().port),
+                "VM is taking longer to boot than a request will wait for",
+            );
+        } else {
+            tracing::info!(
+                deployment = %d.spec.id,
+                sandbox = %p.sandbox_id,
+                age_secs = age,
+                status = ?info.status,
+                waiting_on = %boot_stall(info, &d.spec.health, d.spec.vm_spec().port),
+                "VM is still booting",
+            );
+        }
+        PendingVm {
+            reported_at_secs: age,
+            ..next
+        }
+    }
+
     async fn scale_up(&self, d: &Arc<Deployment>, count: usize) {
         tracing::info!(deployment = %d.spec.id, count, "scaling up");
         let mut pending = (*d.pending()).clone();
@@ -445,10 +530,7 @@ impl Autoscaler {
                 Ok(sandbox) => {
                     let sandbox_id = sandbox.sandbox_id().to_string();
                     created.push(sandbox_id.clone());
-                    pending.push(PendingVm {
-                        sandbox_id,
-                        created_at: now_secs(),
-                    });
+                    pending.push(PendingVm::new(sandbox_id));
                 }
                 Err(e) => {
                     tracing::error!(deployment = %d.spec.id, error = %e, "failed to create VM");
@@ -737,6 +819,35 @@ impl BackgroundService for Autoscaler {
     }
 }
 
+/// Why a VM that has not joined the pool yet has not joined the pool yet.
+///
+/// This one string is the whole diagnosis, and it is not derivable from a status:
+/// `Provisioning` means the daemon hasn't finished starting the VM and there is
+/// nothing to do but wait, while `Running` plus a failing probe means the *guest*
+/// is the problem — the start command, an env var, a binary that exited — and
+/// waiting will not fix it. Naming the probe target is what turns "it hangs" into
+/// something to go and check.
+/// `vm_port` is the deployment's proxied port, which the health check's own `port`
+/// overrides when set — the same resolution `health::probe` does, so the message
+/// names the port actually dialled rather than the one in the spec.
+fn boot_stall(info: &SandboxInfo, check: &crate::config::HealthCheck, vm_port: u16) -> String {
+    if info.status != heyo_sdk::SandboxStatus::Running {
+        return match info.error_message.as_deref() {
+            Some(e) => format!("the daemon reports {:?}: {e}", info.status),
+            None => format!("the daemon has not reported it Running yet ({:?})", info.status),
+        };
+    }
+    let port = check.port.unwrap_or(vm_port);
+    let where_ = match info.guest_ip.as_deref() {
+        Some(ip) => format!("{ip}:{port}"),
+        None => format!("port {port}"),
+    };
+    match check.path.as_deref() {
+        Some(path) => format!("the guest is up but has not answered GET {path} on {where_}"),
+        None => format!("the guest is up but is not accepting TCP connections on {where_}"),
+    }
+}
+
 /// Resolve as soon as *any* deployment asks to be scaled.
 async fn wait_for_any_scale_signal(registry: &Arc<Registry>) {
     let deployments = registry.deployments();
@@ -853,10 +964,7 @@ mod tests {
     }
 
     fn pending(id: &str) -> PendingVm {
-        PendingVm {
-            sandbox_id: id.into(),
-            created_at: now_secs(),
-        }
+        PendingVm::new(id.into())
     }
 
     #[test]
@@ -941,6 +1049,108 @@ mod tests {
         reg.remove("demo");
         // Stale, but there is nothing to check — and no registry lookup to make.
         assert!(a.unclaimed(&d, &[]).is_empty());
+    }
+
+    fn info(status: heyo_sdk::SandboxStatus, guest_ip: Option<&str>) -> SandboxInfo {
+        SandboxInfo {
+            id: "sb-1".into(),
+            name: "applb-demo-000000000001".into(),
+            status,
+            image: "artifacts".into(),
+            region: None,
+            start_command: None,
+            working_directory: None,
+            size_class: None,
+            env_vars: None,
+            setup_hooks: None,
+            uptime_secs: 0,
+            ttl_seconds: None,
+            is_deployed: true,
+            error_message: None,
+            status_changed_at: String::new(),
+            urls: vec![],
+            guest_ip: guest_ip.map(Into::into),
+            metadata: None,
+        }
+    }
+
+    /// The message is the deliverable here: "it hangs on VM creation" has two
+    /// completely different causes, and only one of them is worth waiting out.
+    #[test]
+    fn a_stalled_boot_says_whether_the_daemon_or_the_guest_is_the_problem() {
+        let check = crate::config::HealthCheck {
+            path: Some("/healthz".into()),
+            port: None,
+            timeout_secs: 2,
+        };
+
+        // Daemon side: nothing to do but wait.
+        let waiting = boot_stall(&info(heyo_sdk::SandboxStatus::Provisioning, None), &check, 8080);
+        assert!(waiting.contains("daemon"), "{waiting}");
+        assert!(!waiting.contains("guest"), "{waiting}");
+
+        // Guest side — the artifacts case: the VM is up, the server inside is
+        // not, and no amount of waiting will change that. The probe target has to
+        // be named, because that is what somebody goes and checks.
+        let stalled = boot_stall(&info(heyo_sdk::SandboxStatus::Running, Some("172.16.0.2")), &check, 8080);
+        assert!(stalled.contains("guest is up"), "{stalled}");
+        assert!(stalled.contains("/healthz"), "{stalled}");
+        // The address actually dialled, so it can be tried by hand from the host.
+        assert!(stalled.contains("172.16.0.2:8080"), "{stalled}");
+
+        // A daemon that has an explanation gets to give it.
+        let mut failing = info(heyo_sdk::SandboxStatus::Provisioning, None);
+        failing.error_message = Some("no space left on device".into());
+        assert!(
+            boot_stall(&failing, &check, 8080).contains("no space left on device"),
+            "the daemon's own reason must survive",
+        );
+
+        // A TCP-only check names no path, so it must not claim to have requested one.
+        let tcp = crate::config::HealthCheck { path: None, port: Some(9000), timeout_secs: 2 };
+        let msg = boot_stall(&info(heyo_sdk::SandboxStatus::Running, Some("172.16.0.2")), &tcp, 8080);
+        assert!(msg.contains("TCP") && msg.contains("9000"), "{msg}");
+    }
+
+    /// A pending VM per 2s tick per line would bury the log this is meant to make
+    /// readable; a pending VM with *no* line is the bug being fixed. So: first
+    /// sighting, every transition, and a heartbeat.
+    #[test]
+    fn boot_progress_is_logged_on_change_and_on_a_heartbeat_but_not_every_tick() {
+        use heyo_sdk::SandboxStatus;
+        let (a, reg) = autoscaler();
+        let d = reg.get("demo").unwrap();
+        let p = pending("sb-1");
+
+        // First sighting: nothing has named this sandbox id yet, so it reports.
+        let first = a.note_boot_progress(&d, &p, &info(SandboxStatus::Provisioning, None), 2);
+        assert_eq!(first.status, Some(SandboxStatus::Provisioning));
+        assert_eq!(first.reported_at_secs, 2);
+
+        // Same status a tick later: quiet.
+        let quiet = a.note_boot_progress(&d, &first, &info(SandboxStatus::Provisioning, None), 4);
+        assert_eq!(quiet.reported_at_secs, 2, "should not have reported again");
+
+        // Transition to Running: reports immediately, without waiting out the
+        // heartbeat — this is the moment the diagnosis changes from "the daemon is
+        // slow" to "the guest is not answering".
+        let moved = a.note_boot_progress(&d, &quiet, &info(SandboxStatus::Running, Some("172.16.0.2")), 6);
+        assert_eq!(moved.reported_at_secs, 6);
+        assert_eq!(moved.status, Some(SandboxStatus::Running));
+
+        // Unchanged, but the heartbeat is due.
+        let beat = a.note_boot_progress(
+            &d,
+            &moved,
+            &info(SandboxStatus::Running, Some("172.16.0.2")),
+            6 + BOOT_HEARTBEAT,
+        );
+        assert_eq!(beat.reported_at_secs, 6 + BOOT_HEARTBEAT);
+
+        // The identity that makes any of this safe: nothing but the bookkeeping
+        // changes, so the VM keeps its id and its birthday across every tick.
+        assert_eq!(beat.sandbox_id, p.sandbox_id);
+        assert_eq!(beat.created_at, p.created_at);
     }
 
     #[tokio::test]

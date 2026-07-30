@@ -255,6 +255,9 @@ pub struct Jobs {
     history: Mutex<VecDeque<JobRecord>>,
     /// Deployment ids with a job in flight.
     running: Mutex<HashSet<String>>,
+    /// Mirrors step output into app-obs, so a transcript outlives this process's
+    /// bounded in-memory history. `None` when log shipping is off.
+    obs: Option<crate::obs::LogSink>,
 }
 
 impl Jobs {
@@ -263,6 +266,7 @@ impl Jobs {
         registry: Arc<Registry>,
         autoscaler: Arc<Autoscaler>,
         secrets: Arc<SecretStore>,
+        obs: Option<crate::obs::LogSink>,
     ) -> Self {
         Self {
             cfg,
@@ -271,6 +275,7 @@ impl Jobs {
             secrets,
             history: Mutex::new(VecDeque::new()),
             running: Mutex::new(HashSet::new()),
+            obs,
         }
     }
 
@@ -456,8 +461,24 @@ impl Jobs {
         }
     }
 
+    /// Record one line of a job's output — in the record, and in app-obs.
+    ///
+    /// The deployment id is read off the record rather than passed in, so a line
+    /// can only be attributed to a job that is still in the history; one whose
+    /// record has aged out has nowhere honest to go and is dropped with it.
     fn log(&self, job_id: &str, line: impl Into<String>) {
-        self.update_record(job_id, |r| r.push_log(line));
+        let line = line.into();
+        // Only pay for the copy when there is somewhere to send it.
+        let shipped = self.obs.is_some().then(|| line.clone());
+        let mut deployment = None;
+        self.update_record(job_id, |r| {
+            deployment = Some(r.deployment.clone());
+            r.push_log(line);
+        });
+
+        if let (Some(sink), Some(line), Some(deployment)) = (&self.obs, shipped, deployment) {
+            sink.send(crate::obs::job_line(&deployment, job_id, line));
+        }
     }
 
     fn finish(&self, job_id: &str, status: JobStatus, error: Option<String>) {

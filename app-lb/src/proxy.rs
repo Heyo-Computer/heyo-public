@@ -486,9 +486,10 @@ impl ProxyHttp for LbProxy {
         }
 
         // The access log app-obs stores. Unlike the metrics above it also carries
-        // requests that matched no deployment, under `_lb` — a wall of 404s for a
-        // hostname somebody expected to work is invisible in a per-deployment
-        // view by construction. `started_at` is set first thing in
+        // requests that matched no deployment, under the sink's own deployment id
+        // (`_lb` unless `APP_LB_OBS_DEPLOYMENT` says otherwise) — a wall of 404s
+        // for a hostname somebody expected to work is invisible in a
+        // per-deployment view by construction. `started_at` is set first thing in
         // `request_filter`, so its absence means the request never got that far
         // and there is nothing to describe.
         if let (Some(sink), Some(started)) = (&self.access_log, ctx.started_at) {
@@ -499,26 +500,23 @@ impl ProxyHttp for LbProxy {
             // credential should come to rest.
             let path = req.uri.path().to_string();
             let host = request_host(req);
-            sink.send(
-                Access {
-                    deployment: ctx.deployment.as_ref().map(|d| d.spec.id.as_str()),
-                    backend,
-                    method: &method,
-                    path: &path,
-                    host: host.as_deref(),
-                    status,
-                    duration: started.elapsed(),
-                    bytes: session.body_bytes_sent(),
-                    // The address only. The ephemeral port identifies the
-                    // connection, not the caller.
-                    client: session.client_addr().map(|addr| match addr.as_inet() {
-                        Some(inet) => inet.ip().to_string(),
-                        None => addr.to_string(),
-                    }),
-                    error: e.map(|err| err.to_string()),
-                }
-                .into_record(),
-            );
+            sink.send_access(Access {
+                deployment: ctx.deployment.as_ref().map(|d| d.spec.id.as_str()),
+                backend,
+                method: &method,
+                path: &path,
+                host: host.as_deref(),
+                status,
+                duration: started.elapsed(),
+                bytes: session.body_bytes_sent(),
+                // The address only. The ephemeral port identifies the
+                // connection, not the caller.
+                client: session.client_addr().map(|addr| match addr.as_inet() {
+                    Some(inet) => inet.ip().to_string(),
+                    None => addr.to_string(),
+                }),
+                error: e.map(|err| err.to_string()),
+            });
         }
 
         if let Some(err) = e {
@@ -788,10 +786,7 @@ mod tests {
             cold_start_timeout_secs: 30,
             ..Default::default()
         });
-        d.set_pending(vec![PendingVm {
-            sandbox_id: "sb-1".into(),
-            created_at: 0,
-        }]);
+        d.set_pending(vec![PendingVm::new("sb-1".into())]);
 
         let d2 = d.clone();
         tokio::spawn(async move {

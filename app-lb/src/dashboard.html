@@ -91,7 +91,10 @@
   .section-title {
     font-size: 12px; font-weight: 600; text-transform: uppercase;
     letter-spacing: 0.06em; color: var(--muted); margin: 28px 0 12px;
+    display: flex; align-items: center; gap: 10px;
   }
+  .section-title .spacer { flex: 1 1 auto; }
+  .section-title .count { text-transform: none; letter-spacing: 0; font-weight: 500; }
 
   .card {
     background: var(--surface);
@@ -158,6 +161,29 @@
   .tag.drain { background: color-mix(in srgb, var(--serious) 22%, transparent); color: var(--serious); }
   .tag.down { background: color-mix(in srgb, var(--critical) 22%, transparent); color: var(--critical); }
   .tag.ok { background: color-mix(in srgb, var(--good) 20%, transparent); color: var(--success-text); }
+  /* A VM still booting, and the same VM once its boot has outlasted what a
+     request will wait for — the point at which it stops being routine. */
+  .tag.boot { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
+  .tag.slow { background: color-mix(in srgb, var(--warning) 26%, transparent); color: var(--serious); }
+  .tag.idle { background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--text-2); }
+  /* Rows whose subject is on its way out (a cert near expiry, a failed job). */
+  tr.attn td { background: color-mix(in srgb, var(--critical) 7%, transparent); }
+
+  /* Key chips — a secret's key names, which is all a secret ever shows. */
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chip {
+    font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 1px 6px; border-radius: 4px; background: var(--grid); color: var(--text-2);
+  }
+
+  /* Job transcript in the modal. */
+  pre.log {
+    margin: 0; max-height: 46vh; overflow: auto; background: var(--plane);
+    border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+    line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+  .log-foot { display: flex; gap: 10px; align-items: center; font-size: 12px; color: var(--muted); margin-top: 8px; }
 
   .legend { display: flex; gap: 14px; font-size: 12px; color: var(--text-2); flex-wrap: wrap; }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
@@ -262,6 +288,23 @@
 
   <div class="section-title">Deployments</div>
   <div id="deployments"></div>
+
+  <div class="section-title">
+    Certificates <span class="count" id="certs-count"></span>
+  </div>
+  <div class="card" id="certs"></div>
+
+  <div class="section-title">
+    Secrets <span class="count" id="secrets-count"></span>
+    <span class="spacer"></span>
+    <button class="btn mini" id="secret-new">New secret</button>
+  </div>
+  <div class="card" id="secrets"></div>
+
+  <div class="section-title">
+    Deploy jobs <span class="count" id="jobs-count"></span>
+  </div>
+  <div class="card" id="jobs"></div>
 </div>
 
 <div class="modal-overlay" id="modal-overlay">
@@ -281,10 +324,13 @@
 <script>
 "use strict";
 const REFRESH_MS = 2000;
+// Certs, secrets and jobs move on human timescales; see `pollSlow`.
+const SLOW_REFRESH_MS = 10000;
 const HISTORY = 90;          // samples retained for sparklines (~3 min at 2s)
 const hist = [];             // rolling raw snapshots for client-side rate derivation
 let paused = false;
 let timer = null;
+let slowTimer = null;
 // While a modal is open the deployment cards are not re-rendered, so an open
 // form/editor isn't wiped out from under the operator by the 2s poll.
 let interacting = false;
@@ -318,6 +364,13 @@ function fmtDur(s) {
   return `${sec}s`;
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;" }[c])); }
+
+// app-lb's clock, refreshed from every /metrics poll. Secrets' `updated_at` and
+// jobs' `started_at` are seconds on the *LB's* clock, so ages have to be derived
+// against it — a browser a minute out of sync would otherwise render a job that
+// started two seconds ago as having started in the future.
+let lbNow = 0;
+function nowSecs() { return lbNow || Math.floor(Date.now() / 1000); }
 
 // Bucket key label: "≤N" for finite bounds, "> last" for overflow.
 function bucketLabel(buckets, i) {
@@ -406,6 +459,7 @@ function intervalAvgLatency(getSum, getCount) {
 }
 
 function render(data) {
+  lbNow = data.generated_at;
   // --- accumulate rolling history for client-derived rates ---
   const g = data.global;
   hist.push({
@@ -470,8 +524,11 @@ function render(data) {
     ? `p50 ${fmt(g.cold_start_s.p50, 1)}s · p99 ${fmt(g.cold_start_s.p99, 1)}s · n=${fmt(g.cold_start_s.count)}`
     : "no cold starts yet";
   const a = g.autoscale;
+  // `boot_timeouts` is the one that means something is actually broken: VMs the
+  // autoscaler gave up on because the guest never answered its health check.
   $("cs-note").textContent =
-    `${fmt(a.cold_start_waits)} requests waited on a boot · ${fmt(a.cold_start_hits)} served · ${fmt(a.cold_start_timeouts)} timed out`;
+    `${fmt(a.cold_start_waits)} requests waited on a boot · ${fmt(a.cold_start_hits)} served · `
+    + `${fmt(a.cold_start_timeouts)} timed out · ${fmt(a.boot_timeouts)} boots abandoned`;
 
   // --- autoscale activity ---
   $("as-chart").innerHTML = dualLineChart(rateSeries, "cr", "var(--series-2)", "rp", "var(--series-3)");
@@ -537,7 +594,7 @@ function renderDeployments(deps) {
         </tr>`;
       }).join("") : `<tr><td colspan="4" class="empty" style="padding:14px">No upstreams configured.</td></tr>`;
     } else {
-      vmRows = d.vms.length ? d.vms.map(v => {
+      const readyRows = d.vms.map(v => {
         const load = Math.min(1, v.in_flight / Math.max(1, p.target_concurrency)) * 100;
         const st = v.draining ? `<span class="tag drain">draining</span>`
                 : !v.healthy ? `<span class="tag down">unhealthy</span>`
@@ -558,7 +615,33 @@ function renderDeployments(deps) {
           <td>${st}</td>
           <td class="rowactions">${evictBtns}</td>
         </tr>`;
-      }).join("") : `<tr><td colspan="8" class="empty" style="padding:14px">No ready VMs — ${p.pending} booting.</td></tr>`;
+      }).join("");
+
+      // Booting VMs, in the same table as the ready ones. A pending *count* can't
+      // tell a normal 10-second boot from a guest whose server never started, and
+      // that distinction is the whole diagnosis when a deployment "hangs on VM
+      // creation": here the sandbox id, its age and the daemon's status are all
+      // visible, and the row goes amber once the boot has outlasted what a request
+      // will wait for.
+      const pendingRows = (d.pending_vms || []).map(v => {
+        const slow = v.age_secs >= p.cold_start_timeout_secs;
+        const st = `<span class="tag ${slow ? "slow" : "boot"}">booting${v.status ? " · " + esc(v.status) : ""}</span>`;
+        const deadline = p.boot_timeout_secs
+          ? ` / ${fmtDur(p.boot_timeout_secs)}` : "";
+        return `<tr${slow ? ' class="attn"' : ""}>
+          <td class="mono">${esc(v.sandbox_id)}</td>
+          <td class="mono">—</td>
+          <td>—</td>
+          <td>—</td>
+          <td>—</td>
+          <td>${fmtDur(v.age_secs)}${deadline}</td>
+          <td>${st}</td>
+          <td class="rowactions"><button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button></td>
+        </tr>`;
+      }).join("");
+
+      vmRows = (readyRows + pendingRows)
+        || `<tr><td colspan="8" class="empty" style="padding:14px">No VMs — the pool wants ${fmt(p.desired_replicas)}.</td></tr>`;
     }
 
     const vmHead = isStatic
@@ -571,11 +654,20 @@ function renderDeployments(deps) {
       : `<span class="badge">${p.ready}/${p.max_replicas} replicas · want ${p.desired_replicas}</span>
          <span class="badge">min ${p.min_replicas} · warm ${p.warm_pool} · target ${p.target_concurrency}</span>`;
 
+    // A redeploy button only where there is something to redeploy: `build` needs a
+    // repo in the spec, `update` needs a command list, and a deployment with
+    // neither has no job to start.
+    const jobBtn = d.job_kind === "build"
+      ? `<button class="btn mini" data-act="build" data-id="${esc(d.id)}">Build</button>`
+      : d.job_kind === "update"
+      ? `<button class="btn mini" data-act="update" data-id="${esc(d.id)}">Update</button>`
+      : "";
+
     // Static deployments can't be scaled; only Edit (to change the upstream list).
-    const headActions = isStatic
+    const headActions = (isStatic
       ? `<button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`
       : `<button class="btn mini" data-act="scale" data-id="${esc(d.id)}">Scale</button>
-         <button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`;
+         <button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`) + jobBtn;
 
     // Pool-only tiles (pending/draining/cold-start) are meaningless for a static
     // deployment; omit them.
@@ -620,6 +712,155 @@ function renderDeployments(deps) {
   }).join("");
 }
 
+// ---- Certificates -------------------------------------------------------
+
+// `not_after` is OpenSSL's ASN1 display form ("Oct 21 12:00:00 2026 GMT"), which
+// browsers do parse — but fall back to showing it verbatim rather than "Invalid
+// Date" if one ever doesn't.
+function fmtExpiry(notAfter) {
+  const t = Date.parse(notAfter);
+  if (isNaN(t)) return esc(notAfter);
+  const days = Math.floor((t - Date.now()) / 86400000);
+  const when = new Date(t).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  const rel = days < 0 ? "expired" : days === 0 ? "today" : `in ${days}d`;
+  return `${esc(when)} <span class="sub" style="color:var(--muted)">(${rel})</span>`;
+}
+
+// The issuer DN is `C=US, O=Let's Encrypt, CN=R11`; the CN is the useful part.
+function issuerName(dn) {
+  const cn = /(?:^|,\s*)CN=([^,]+)/.exec(dn || "");
+  return cn ? cn[1] : (dn || "—");
+}
+
+function renderCerts(certs) {
+  $("certs-count").textContent = certs.length ? `${certs.length} issued` : "";
+
+  // Hostnames app-lb routes but holds no certificate for. Issuance is
+  // asynchronous, so this is the normal state for a few seconds after registering
+  // a deployment and the *symptom* if ACME is failing — and neither is visible
+  // from a list of what did get issued.
+  const held = new Set(certs.map(c => c.host.toLowerCase()));
+  const uncovered = [];
+  Object.values(depsById).forEach(d => {
+    (d.hosts || []).forEach(h => { if (!held.has(h.toLowerCase())) uncovered.push(h); });
+  });
+
+  const note = uncovered.length
+    ? `<div class="note">No certificate yet for ${uncovered.map(h => `<code>${esc(h)}</code>`).join(", ")} —
+       issuance is asynchronous, so this is normal for a moment after registering. If it persists,
+       app-lb is either not configured for ACME (<code>APP_LB_ACME_EMAIL</code>) or is backing off after a failure;
+       its own log says which.</div>`
+    : "";
+
+  if (!certs.length) {
+    $("certs").innerHTML = `<div class="empty">No certificates issued.</div>` + note;
+    return;
+  }
+
+  const rows = certs.map(c => `<tr${c.needs_renewal ? ' class="attn"' : ""}>
+      <td class="mono">${esc(c.host)}</td>
+      <td>${esc(issuerName(c.issuer))}</td>
+      <td>${fmtExpiry(c.not_after)}</td>
+      <td>${c.needs_renewal ? `<span class="tag slow">renewing</span>` : `<span class="tag ok">valid</span>`}</td>
+    </tr>`).join("");
+
+  $("certs").innerHTML = `<div style="overflow-x:auto"><table class="vms">
+      <thead><tr><th>hostname</th><th>issuer</th><th>expires</th><th>state</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>` + note;
+}
+
+// ---- Secrets ------------------------------------------------------------
+
+function renderSecrets(secrets) {
+  $("secrets-count").textContent = secrets.length ? `${secrets.length} stored` : "";
+  if (!secrets.length) {
+    $("secrets").innerHTML =
+      `<div class="empty">No secrets stored. A deployment's <code>build.auth</code> and
+       <code>env_from</code> reference these by id.</div>`;
+    return;
+  }
+  const rows = secrets.map(s => {
+    const keys = (s.keys || []).map(k => `<span class="chip">${esc(k)}</span>`).join("");
+    return `<tr>
+      <td class="mono">${esc(s.id)}</td>
+      <td>${s.description ? esc(s.description) : "—"}</td>
+      <td><div class="chips">${keys || "—"}</div></td>
+      <td>${fmtDur(Math.max(0, nowSecs() - s.updated_at))} ago</td>
+      <td>${s.encrypted_at_rest ? `<span class="tag ok">sealed</span>` : `<span class="tag idle">plaintext</span>`}</td>
+      <td class="rowactions">
+        <button class="btn mini" data-sact="rotate" data-sid="${esc(s.id)}">Rotate</button>
+        <button class="btn mini danger" data-sact="delete" data-sid="${esc(s.id)}">Delete</button>
+      </td>
+    </tr>`;
+  }).join("");
+
+  // Values are write-only by design: the API returns key *names* only, so there is
+  // nothing here to reveal and nothing to prefill a rotation with.
+  $("secrets").innerHTML = `<div style="overflow-x:auto"><table class="vms">
+      <thead><tr><th>id</th><th>description</th><th>keys</th><th>updated</th><th>at rest</th><th>actions</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="note">Values never leave app-lb — only key names are readable, so a rotation
+      sets new values rather than editing existing ones.</div>`;
+}
+
+// ---- Deploy jobs --------------------------------------------------------
+
+const JOB_TAG = { running: "boot", succeeded: "ok", failed: "down" };
+// The API's kind names; the buttons that start them say Build and Update.
+const JOB_KIND = { "image-build": "build", "host-update": "update" };
+
+// What a job actually did, in one cell: the commit and image for a build, the
+// step count and verification for a host update.
+function jobDetail(j) {
+  const bits = [];
+  if (j.commit) bits.push(`<code>${esc(j.commit.slice(0, 12))}</code>`);
+  if (j.ref) bits.push(esc(j.ref));
+  if (j.image) bits.push(`→ <code>${esc(j.image)}</code>`);
+  if (j.rolled_out) bits.push(`<span class="tag ok">rolled out</span>`);
+  if (j.commands_total != null) bits.push(`${fmt(j.commands_run || 0)}/${fmt(j.commands_total)} steps`);
+  if (j.verified === true) bits.push(`<span class="tag ok">verified</span>`);
+  if (j.verified === false) bits.push(`<span class="tag down">unverified</span>`);
+  if (j.error) bits.push(`<span style="color:var(--critical)">${esc(j.error)}</span>`);
+  return bits.join(" ") || "—";
+}
+
+function renderJobs(jobs) {
+  const running = jobs.filter(j => j.status === "running").length;
+  $("jobs-count").textContent = running ? `${running} running` : (jobs.length ? `${jobs.length} recent` : "");
+  if (!jobs.length) {
+    $("jobs").innerHTML =
+      `<div class="empty">No jobs yet. A managed deployment's <b>Build</b> clones its repo and
+       builds a guest image; a static one's <b>Update</b> runs its commands on this host.</div>`;
+    return;
+  }
+  const rows = jobs.map(j => {
+    const took = j.finished_at != null
+      ? fmtDur(j.finished_at - j.started_at)
+      : fmtDur(Math.max(0, nowSecs() - j.started_at)) + "…";
+    return `<tr${j.status === "failed" ? ' class="attn"' : ""}>
+      <td class="mono">${esc(j.id)}</td>
+      <td>${esc(j.deployment)}</td>
+      <td>${esc(JOB_KIND[j.kind] || j.kind)}</td>
+      <td><span class="tag ${JOB_TAG[j.status] || "idle"}">${esc(j.status)}</span></td>
+      <td>${fmtDur(Math.max(0, nowSecs() - j.started_at))} ago</td>
+      <td>${took}</td>
+      <td>${jobDetail(j)}</td>
+      <td class="rowactions"><button class="btn mini" data-jact="log" data-jid="${esc(j.id)}">Log</button></td>
+    </tr>`;
+  }).join("");
+
+  $("jobs").innerHTML = `<div style="overflow-x:auto"><table class="vms">
+      <thead><tr><th>job</th><th>deployment</th><th>kind</th><th>state</th><th>started</th>
+        <th>took</th><th>result</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="note">History is in memory and bounded, so old jobs age out. With
+      <code>APP_LB_OBS_URL</code> set, every line also ships to app-obs under the deployment's
+      own logs (<code>source=job</code>), where it outlives this list.</div>`;
+}
+
 // ---- Writes: scale / edit / evict --------------------------------------
 
 async function api(method, path, body) {
@@ -647,22 +888,31 @@ function toast(msg, isErr) {
 
 // --- modal ---
 let modalSubmit = null;
+// Cleared on close, so a read-only view that refreshes itself (the job log) stops
+// polling the moment it is dismissed.
+let modalTimer = null;
 function openModal(title, sub, bodyHtml, onSubmit, okLabel) {
   interacting = true;                 // freeze card re-renders (tiles keep updating)
   $("modal-title").textContent = title;
   $("modal-sub").textContent = sub || "";
   $("modal-body").innerHTML = bodyHtml;
   $("modal-err").textContent = "";
+  // A modal with nothing to submit — a log viewer — shows only a Close button
+  // rather than an OK that would do nothing.
+  $("modal-ok").hidden = !onSubmit;
   $("modal-ok").textContent = okLabel || "Save";
   $("modal-ok").disabled = false;
+  $("modal-cancel").textContent = onSubmit ? "Cancel" : "Close";
   modalSubmit = onSubmit;
   $("modal-overlay").classList.add("open");
 }
 function closeModal() {
   $("modal-overlay").classList.remove("open");
   modalSubmit = null;
+  clearInterval(modalTimer);
+  modalTimer = null;
   interacting = false;
-  if (!paused) poll();                // immediate refresh with the new state
+  if (!paused) { poll(); pollSlow(); }   // immediate refresh with the new state
 }
 function modalErr(msg) { $("modal-err").textContent = msg; $("modal-ok").disabled = false; }
 
@@ -745,6 +995,153 @@ async function evictVm(id, sb, force) {
   if (!interacting && !paused) poll();
 }
 
+// --- deploy jobs: start one, and watch its output ---
+
+// A build clones a repo and runs `docker build` on the LB host; an update runs the
+// deployment's own commands there. Both take minutes and both return 202 with a
+// job record, so this starts the job and opens its log.
+async function startJob(id, kind) {
+  const what = kind === "build"
+    ? `Build a new guest image for ${id} from its repo and roll the pool onto it?`
+    : `Run ${id}'s update commands on this host?`;
+  if (!confirm(what)) return;
+  const res = await api("POST", `deployments/${encodeURIComponent(id)}/${kind}`, {});
+  if (!res.ok) { toast(errMsg(res), true); return; }
+  toast(`Started ${kind} for ${id}`);
+  if (res.data && res.data.id) openJobLog(res.data.id);
+  if (!paused) pollSlow();
+}
+
+// The job's transcript, refreshed while it runs.
+//
+// This is the view for a job that is *hanging*: the record's `log` is the tail of
+// everything its steps have written, so where it stopped is visible without
+// waiting for the job to fail. Polling stops as soon as the job is no longer
+// running, and on close.
+async function openJobLog(jobId) {
+  const draw = async () => {
+    const res = await api("GET", `jobs/${encodeURIComponent(jobId)}`);
+    if (!res.ok) {
+      $("modal-err").textContent = errMsg(res);
+      clearInterval(modalTimer);
+      return;
+    }
+    const j = res.data;
+    const lines = (j.log || []).join("\n") || "(no output yet)";
+    const body = $("modal-body");
+    // Keep the viewer pinned to the bottom unless the reader has scrolled up to
+    // look at something.
+    const pre = body.querySelector("pre.log");
+    const pinned = !pre || pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+    const scrollTop = pre ? pre.scrollTop : 0;
+
+    body.innerHTML = `<pre class="log">${esc(lines)}</pre>
+      <div class="log-foot">
+        <span class="tag ${JOB_TAG[j.status] || "idle"}">${esc(j.status)}</span>
+        <span>${esc(JOB_KIND[j.kind] || j.kind)} · ${esc(j.deployment)}</span>
+        <span>${j.finished_at != null
+          ? "took " + fmtDur(j.finished_at - j.started_at)
+          : fmtDur(Math.max(0, nowSecs() - j.started_at)) + " elapsed"}</span>
+        ${j.error ? `<span style="color:var(--critical)">${esc(j.error)}</span>` : ""}
+      </div>`;
+    const next = body.querySelector("pre.log");
+    next.scrollTop = pinned ? next.scrollHeight : scrollTop;
+
+    if (j.status !== "running") clearInterval(modalTimer);
+  };
+
+  openModal(`Job · ${jobId}`, "Tail of the job's output. Refreshes while it runs.",
+            `<pre class="log">loading…</pre>`, null);
+  await draw();
+  modalTimer = setInterval(draw, REFRESH_MS);
+}
+
+// --- secrets: create, rotate, delete ---
+
+// Values are write-only, so both forms take JSON rather than prefilling anything:
+// there is nothing readable to prefill with.
+function secretForm(id, data, description) {
+  return `<div class="form-grid">
+      <div><label for="f-sid">Secret id</label>
+        <input type="text" id="f-sid" value="${esc(id || "")}" ${id ? "readonly" : ""}
+               style="width:100%;font:inherit;color:var(--text);background:var(--plane);
+                      border:1px solid var(--border);border-radius:7px;padding:8px 10px"></div>
+      <div><label for="f-sdesc">Description</label>
+        <input type="text" id="f-sdesc" value="${esc(description || "")}"
+               style="width:100%;font:inherit;color:var(--text);background:var(--plane);
+                      border:1px solid var(--border);border-radius:7px;padding:8px 10px"></div>
+    </div>
+    <label for="f-sdata">Data (JSON object of KEY → value)</label>
+    <textarea id="f-sdata" spellcheck="false" style="min-height:180px">${esc(data)}</textarea>`;
+}
+
+function readSecretForm() {
+  const parsed = JSON.parse($("f-sdata").value);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("data must be a JSON object of key → value");
+  }
+  return {
+    id: $("f-sid").value.trim(),
+    description: $("f-sdesc").value.trim() || undefined,
+    data: parsed,
+  };
+}
+
+function openNewSecret() {
+  openModal(
+    "New secret",
+    "Stored by app-lb and referenced by id from a deployment's build.auth or env_from. Values are never readable again.",
+    secretForm("", `{\n  "token": ""\n}`, ""),
+    async () => {
+      let body;
+      try { body = readSecretForm(); }
+      catch (e) { return modalErr("Invalid JSON: " + e.message); }
+      if (!body.id) return modalErr("A secret needs an id.");
+      const res = await api("POST", "secrets", body);
+      if (!res.ok) return modalErr(errMsg(res));
+      toast(`Stored ${body.id}`);
+      closeModal();
+    },
+    "Store",
+  );
+}
+
+// PATCH, not PUT: absent keys are left alone, so one key can be rotated without
+// resending the others — which matters when the others cannot be read back.
+function openRotateSecret(id) {
+  openModal(
+    `Rotate · ${id}`,
+    "Keys you list are replaced; keys you omit are left alone. Set a key to null to remove it.",
+    secretForm(id, `{\n  "token": ""\n}`, ""),
+    async () => {
+      let body;
+      try { body = readSecretForm(); }
+      catch (e) { return modalErr("Invalid JSON: " + e.message); }
+      const patch = { data: body.data };
+      if (body.description) patch.description = body.description;
+      const res = await api("PATCH", `secrets/${encodeURIComponent(id)}`, patch);
+      if (!res.ok) return modalErr(errMsg(res));
+      toast(`Rotated ${id}`);
+      closeModal();
+    },
+    "Rotate",
+  );
+}
+
+async function deleteSecret(id) {
+  if (!confirm(`Delete secret ${id}? Its values cannot be recovered.`)) return;
+  let res = await api("DELETE", `secrets/${encodeURIComponent(id)}`);
+  // A 409 means a deployment's build still references it; that is worth asking
+  // about rather than forcing silently.
+  if (res.status === 409) {
+    if (!confirm(`${errMsg(res)}\n\nDelete anyway?`)) return;
+    res = await api("DELETE", `secrets/${encodeURIComponent(id)}?force=true`);
+  }
+  if (!res.ok) { toast(errMsg(res), true); return; }
+  toast(`Deleted ${id}`);
+  if (!paused) pollSlow();
+}
+
 // Delegated so the buttons survive every card re-render.
 $("deployments").addEventListener("click", (e) => {
   const b = e.target.closest("[data-act]");
@@ -754,6 +1151,20 @@ $("deployments").addEventListener("click", (e) => {
   else if (act === "edit") openEdit(id);
   else if (act === "drain") evictVm(id, sb, false);
   else if (act === "kill") evictVm(id, sb, true);
+  else if (act === "build" || act === "update") startJob(id, act);
+});
+
+$("secrets").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-sact]");
+  if (!b) return;
+  if (b.dataset.sact === "rotate") openRotateSecret(b.dataset.sid);
+  else if (b.dataset.sact === "delete") deleteSecret(b.dataset.sid);
+});
+$("secret-new").addEventListener("click", openNewSecret);
+
+$("jobs").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-jact]");
+  if (b) openJobLog(b.dataset.jid);
 });
 
 async function poll() {
@@ -769,10 +1180,42 @@ async function poll() {
   }
 }
 
+// Certificates, secrets and jobs change on human timescales, not per-request ones,
+// so they ride a slower loop than the metrics poll — three extra requests every
+// two seconds would be three requests wasted. The exception is a job in flight:
+// while one is running its record is the only progress there is, so the loop
+// tightens to the metrics cadence until it finishes.
+async function pollSlow() {
+  clearTimeout(slowTimer);
+  let interval = SLOW_REFRESH_MS;
+  try {
+    const [certs, secrets, jobs] = await Promise.all([
+      api("GET", "certs"),
+      api("GET", "secrets"),
+      api("GET", "jobs"),
+    ]);
+    // Each renders independently: gating all three on one failing endpoint would
+    // blank the sections that are working.
+    if (certs.ok) renderCerts(certs.data || []);
+    if (secrets.ok) renderSecrets(secrets.data || []);
+    if (jobs.ok) {
+      const list = jobs.data || [];
+      renderJobs(list);
+      if (list.some(j => j.status === "running")) interval = REFRESH_MS;
+    }
+  } catch (e) {
+    // Nothing to do — the sections keep their last content and the next tick
+    // retries. The metrics poll owns the connection indicator.
+  } finally {
+    if (!paused) slowTimer = setTimeout(pollSlow, interval);
+  }
+}
+
 $("pausebtn").addEventListener("click", () => {
   paused = !paused;
   $("pausebtn").textContent = paused ? "Resume" : "Pause";
-  if (!paused) poll(); else if (timer) clearTimeout(timer);
+  if (!paused) { poll(); pollSlow(); }
+  else { clearTimeout(timer); clearTimeout(slowTimer); }
 });
 $("themebtn").addEventListener("click", () => {
   const root = document.documentElement;
@@ -782,6 +1225,9 @@ $("themebtn").addEventListener("click", () => {
 });
 
 poll();
+// Second, independent loop. Started after `poll` so `depsById` is usually already
+// populated by the time `renderCerts` cross-references it for routed hostnames.
+pollSlow();
 </script>
 </body>
 </html>

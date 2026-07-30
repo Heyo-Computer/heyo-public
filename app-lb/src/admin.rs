@@ -237,6 +237,21 @@ fn deployment_kind(d: &crate::deployment::Deployment) -> &'static str {
     if d.spec.is_static() { "static" } else { "vm" }
 }
 
+/// Which `POST` a deployment's code is redeployed with, if either.
+///
+/// The two are mutually exclusive by validation — there is no image to build for a
+/// `proxy_pass` upstream, and no host directory behind a microVM — so this is one
+/// answer rather than two flags.
+fn job_kind_of(spec: &DeploymentSpec) -> Option<&'static str> {
+    if spec.build.is_some() {
+        Some("build")
+    } else if spec.update.is_some() {
+        Some("update")
+    } else {
+        None
+    }
+}
+
 #[derive(Serialize)]
 struct ApiError {
     error: String,
@@ -298,6 +313,29 @@ struct PoolStatus {
     /// until the daemon reports usage for at least one of them.
     cpu_percent: Option<f64>,
     memory_bytes: Option<u64>,
+    /// How long a booting VM gets before the autoscaler kills it; `0` means it
+    /// waits indefinitely. Shown so a pending VM's age can be read against the
+    /// deadline it is heading for rather than as a bare number.
+    boot_timeout_secs: u64,
+    /// How long a request waits on a cold start. The dashboard reads a pending
+    /// VM's age against this: past it, the boot has already cost somebody a 503.
+    cold_start_timeout_secs: u64,
+}
+
+/// A VM that has been created but has not joined the pool.
+///
+/// Reported because a booting VM is otherwise a *count* only, and a count cannot
+/// distinguish "a VM is 3 seconds into a normal boot" from "a VM has been failing
+/// its health check for six minutes" — which is the difference between waiting and
+/// having a broken guest.
+#[derive(Serialize)]
+struct PendingVmView {
+    sandbox_id: String,
+    /// Seconds since the daemon accepted the create call.
+    age_secs: u64,
+    /// The daemon's last reported status, absent before the first observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<heyo_sdk::SandboxStatus>,
 }
 
 #[derive(Serialize)]
@@ -322,8 +360,21 @@ struct DeploymentView {
     /// For a static deployment, the configured upstream addresses; empty for a
     /// managed one.
     upstreams: Vec<String>,
+    /// Exact hostnames this deployment is routed on — `host` rules only, since a
+    /// `host_suffix` names no single certificate subject and a `path_prefix` names
+    /// no hostname at all. Reported so the dashboard can say which routed names
+    /// have no certificate yet, which is otherwise a join nobody can make from
+    /// `/certs` alone.
+    hosts: Vec<String>,
+    /// The deploy job this deployment accepts — `"build"` for a managed one with a
+    /// `build` block, `"update"` for a static one with an `update` block, `None`
+    /// when neither is configured and there is nothing to trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_kind: Option<&'static str>,
     pool: PoolStatus,
     vms: Vec<VmView>,
+    /// Booting VMs, oldest first — the ones holding a cold start open.
+    pending_vms: Vec<PendingVmView>,
     metrics: DeploymentMetricsSnapshot,
 }
 
@@ -391,7 +442,25 @@ fn pool_status_of(d: &Arc<crate::deployment::Deployment>) -> PoolStatus {
         utilization,
         cpu_percent,
         memory_bytes,
+        boot_timeout_secs: d.spec.scaling.boot_timeout_secs,
+        cold_start_timeout_secs: d.spec.scaling.cold_start_timeout_secs,
     }
+}
+
+/// The booting VMs of a deployment, oldest first.
+fn pending_vms_of(d: &Arc<crate::deployment::Deployment>) -> Vec<PendingVmView> {
+    let mut views: Vec<PendingVmView> = d
+        .pending()
+        .iter()
+        .map(|p| PendingVmView {
+            sandbox_id: p.sandbox_id.clone(),
+            age_secs: p.age_secs(),
+            status: p.status.clone(),
+        })
+        .collect();
+    // Oldest first: the one closest to its boot timeout is the one to look at.
+    views.sort_by(|a, b| b.age_secs.cmp(&a.age_secs));
+    views
 }
 
 /// The dashboard's data source: live pool gauges joined with accumulated
@@ -406,6 +475,13 @@ async fn metrics_snapshot(State(state): State<AdminState>) -> impl IntoResponse 
                 id: d.spec.id.clone(),
                 kind: deployment_kind(d),
                 upstreams: d.spec.upstreams.clone(),
+                hosts: d
+                    .spec
+                    .routes
+                    .iter()
+                    .filter_map(|r| r.host.clone())
+                    .collect(),
+                job_kind: job_kind_of(&d.spec),
                 pool: pool_status_of(d),
                 vms: backends
                     .iter()
@@ -423,6 +499,7 @@ async fn metrics_snapshot(State(state): State<AdminState>) -> impl IntoResponse 
                         }
                     })
                     .collect(),
+                pending_vms: pending_vms_of(d),
                 metrics: state.metrics.deployment_snapshot(&d.spec.id),
             }
         })

@@ -251,6 +251,12 @@ struct AutoscaleCounts {
     /// …of those, the ones a VM eventually served vs. the ones that timed out.
     cold_start_hits: AtomicU64,
     cold_start_timeouts: AtomicU64,
+    /// VMs killed for never passing their health check inside
+    /// `scaling.boot_timeout_secs`. Distinct from `vms_reaped`, which counts
+    /// deliberate retirements: a boot failure is the pool trying and failing to
+    /// reach its own `min_replicas`, and a deployment that only ever produces
+    /// these is one whose guest never starts.
+    boot_timeouts: AtomicU64,
 }
 
 impl AutoscaleCounts {
@@ -264,6 +270,7 @@ impl AutoscaleCounts {
             cold_start_waits: self.cold_start_waits.load(Ordering::Relaxed),
             cold_start_hits: self.cold_start_hits.load(Ordering::Relaxed),
             cold_start_timeouts: self.cold_start_timeouts.load(Ordering::Relaxed),
+            boot_timeouts: self.boot_timeouts.load(Ordering::Relaxed),
         }
     }
 }
@@ -278,6 +285,7 @@ pub struct AutoscaleSnapshot {
     pub cold_start_waits: u64,
     pub cold_start_hits: u64,
     pub cold_start_timeouts: u64,
+    pub boot_timeouts: u64,
 }
 
 impl AutoscaleSnapshot {
@@ -290,6 +298,7 @@ impl AutoscaleSnapshot {
         self.cold_start_waits += o.cold_start_waits;
         self.cold_start_hits += o.cold_start_hits;
         self.cold_start_timeouts += o.cold_start_timeouts;
+        self.boot_timeouts += o.boot_timeouts;
     }
 }
 
@@ -513,6 +522,11 @@ impl Metrics {
     /// A cold-start wait ended in timeout with no VM.
     pub fn record_cold_start_timeout(&self, deployment: &str) {
         self.deployment(deployment).autoscale.cold_start_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A booting VM was given up on for never passing its health check.
+    pub fn record_boot_timeout(&self, deployment: &str) {
+        self.deployment(deployment).autoscale.boot_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
     // --- Reading (dashboard poll) ----------------------------------------

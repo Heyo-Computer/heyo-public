@@ -144,10 +144,40 @@ impl VmBackend {
 }
 
 /// A VM that has been created but is not yet serving.
+///
+/// The two progress fields exist because a boot that never finishes is otherwise
+/// completely silent: the autoscaler simply re-queues the VM every tick, forever,
+/// with nothing logged and nothing on the dashboard but a `pending` count. They
+/// are plain values rather than atomics because `promote_pending` rebuilds this
+/// vec on every tick and is the only writer — it carries the previous tick's
+/// values forward, so there is nothing to share.
 #[derive(Debug, Clone)]
 pub struct PendingVm {
     pub sandbox_id: String,
     pub created_at: u64,
+    /// The daemon's last reported status, `None` before the first observation.
+    /// Kept so a *transition* (Provisioning → Running, or → Stopped) can be
+    /// logged the moment it happens instead of at the next heartbeat.
+    pub status: Option<heyo_sdk::SandboxStatus>,
+    /// Age in seconds at which this VM's progress was last logged. Bounds the
+    /// heartbeat: a pool of stuck VMs must not write a line per VM per 2s tick.
+    pub reported_at_secs: u64,
+}
+
+impl PendingVm {
+    pub fn new(sandbox_id: String) -> Self {
+        Self {
+            sandbox_id,
+            created_at: now_secs(),
+            status: None,
+            reported_at_secs: 0,
+        }
+    }
+
+    /// How long this VM has been booting.
+    pub fn age_secs(&self) -> u64 {
+        now_secs().saturating_sub(self.created_at)
+    }
 }
 
 #[derive(Debug)]
@@ -625,10 +655,7 @@ mod tests {
         d.set_backends(vec![backend("10.0.0.1:80")]);
         assert!(d.can_grow());
         // A booting VM already counts, so we don't over-provision.
-        d.set_pending(vec![PendingVm {
-            sandbox_id: "sb-2".into(),
-            created_at: now_secs(),
-        }]);
+        d.set_pending(vec![PendingVm::new("sb-2".into())]);
         assert!(!d.can_grow());
     }
 }

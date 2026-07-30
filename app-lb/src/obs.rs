@@ -40,16 +40,26 @@ use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
 
-/// Deployment id app-lb's own events land under, for the ones that name no
-/// deployment of their own. Underscore-prefixed to match app-obs's `_host`
+/// Default deployment id app-lb's own events land under, for the ones that name
+/// no deployment of their own. Underscore-prefixed to match app-obs's `_host`
 /// convention for rows that belong to no deployment; it does appear in app-obs's
 /// fleet list, which is the point — app-lb's own errors should be visible
 /// somewhere.
+///
+/// Overridable with `APP_LB_OBS_DEPLOYMENT`, because one app-obs collects from
+/// more than one app-lb: with every LB shipping to the same reserved id, two
+/// hosts' events interleave under one name and "which LB logged this?" is only
+/// answerable from the batch-level `host`. Naming them `lb-us2`, `lb-eu1` splits
+/// them into partitions you can query separately.
 pub const LB_DEPLOYMENT: &str = "_lb";
 
-/// `source` values, distinguishing the two streams inside a deployment's log.
+/// Longest id app-obs will store, from its `store::partition::check_deployment`.
+const MAX_DEPLOYMENT_LEN: usize = 128;
+
+/// `source` values, distinguishing the streams inside a deployment's log.
 const ACCESS_SOURCE: &str = "access";
 const EVENT_SOURCE: &str = "app-lb";
+const JOB_SOURCE: &str = "job";
 
 /// This module's tracing target, never shipped: a failed POST logs a warning,
 /// and shipping that warning would generate another POST.
@@ -106,6 +116,9 @@ pub struct ObsConfig {
     pub token: Option<String>,
     /// Batch-level `host`, identifying which machine these records came from.
     pub host: Option<String>,
+    /// Deployment id for records that name no deployment of their own; see
+    /// [`LB_DEPLOYMENT`]. `Arc<str>` because every such record clones it.
+    pub deployment: Arc<str>,
     pub queue_capacity: usize,
     /// Records per POST. A batch is also flushed early when [`Self::flush`]
     /// elapses, so this is a ceiling, not a threshold to wait for.
@@ -198,6 +211,37 @@ fn ingest_endpoint(raw: &str) -> Result<String, String> {
     Ok(format!("{}/ingest", url.as_str().trim_end_matches('/')))
 }
 
+/// Read `APP_LB_OBS_DEPLOYMENT`, or fall back to [`LB_DEPLOYMENT`].
+///
+/// Validated here rather than left to app-obs, because app-obs's rejection is
+/// invisible from this side: it 400s the *batch*, the shipper counts it as a
+/// failed POST, and the reason ("bad deployment") never surfaces as anything
+/// more specific than `HTTP 400` in a warning. Worse, the batch it kills also
+/// carried other deployments' records — one bad label would silently cost every
+/// log line that travelled with it.
+///
+/// The rule is app-obs's own (`store::partition::check_deployment`): the id
+/// becomes a directory name, so it is letters, digits, dot, dash and underscore,
+/// and not all dots.
+fn lb_deployment(raw: Option<&str>) -> Result<Arc<str>, String> {
+    let Some(id) = raw.map(str::trim).filter(|id| !id.is_empty()) else {
+        return Ok(Arc::from(LB_DEPLOYMENT));
+    };
+    let legal = id.len() <= MAX_DEPLOYMENT_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        && id.bytes().any(|b| b != b'.');
+    if !legal {
+        return Err(format!(
+            "APP_LB_OBS_DEPLOYMENT={id:?} is not a deployment id app-obs can store; \
+             use 1-{MAX_DEPLOYMENT_LEN} characters of [A-Za-z0-9._-] (it becomes a \
+             directory name there)",
+        ));
+    }
+    Ok(Arc::from(id))
+}
+
 fn set_host(url: &mut reqwest::Url, host: &str, raw: &str) -> Result<(), String> {
     url.set_host(Some(host))
         .map_err(|e| format!("cannot read {raw:?} as an address ({e})"))
@@ -239,12 +283,13 @@ pub fn from_env() -> Result<Option<Obs>, String> {
             .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
             .map(|h| h.trim().to_string())
             .filter(|h| !h.is_empty()),
+        deployment: lb_deployment(std::env::var("APP_LB_OBS_DEPLOYMENT").ok().as_deref())?,
         queue_capacity: env_usize("APP_LB_OBS_QUEUE_CAPACITY", 8192),
         batch: env_usize("APP_LB_OBS_BATCH", 500),
         flush: Duration::from_secs(env_usize("APP_LB_OBS_FLUSH_SECS", 2) as u64),
     };
 
-    let (sink, rx) = LogSink::new(config.queue_capacity);
+    let (sink, rx) = LogSink::new(config.queue_capacity, config.deployment.clone());
     let stats = sink.stats.clone();
     Ok(Some(Obs {
         access: env_flag("APP_LB_OBS_ACCESS_LOG", true).then(|| sink.clone()),
@@ -335,15 +380,20 @@ pub struct ObsSnapshot {
 pub struct LogSink {
     tx: mpsc::Sender<Record>,
     stats: Arc<Stats>,
+    /// Where records that name no deployment go. Carried on the sink rather than
+    /// read from a global, so every source attributes them the same way and the
+    /// value is settable in a test.
+    deployment: Arc<str>,
 }
 
 impl LogSink {
-    fn new(capacity: usize) -> (Self, mpsc::Receiver<Record>) {
+    fn new(capacity: usize, deployment: Arc<str>) -> (Self, mpsc::Receiver<Record>) {
         let (tx, rx) = mpsc::channel(capacity.max(1));
         (
             Self {
                 tx,
                 stats: Arc::new(Stats::default()),
+                deployment,
             },
             rx,
         )
@@ -358,6 +408,13 @@ impl LogSink {
             Err(_) => &self.stats.dropped,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Queue one proxied request, attributing an unrouted one to this sink's
+    /// deployment id. The proxy goes through this rather than building the record
+    /// itself so it never has to know what that id is.
+    pub fn send_access(&self, access: Access<'_>) {
+        self.send(access.into_record(&self.deployment));
     }
 }
 
@@ -398,7 +455,9 @@ pub struct Access<'a> {
 }
 
 impl Access<'_> {
-    pub fn into_record(self) -> Record {
+    /// `lb_deployment` attributes a request that matched nothing; see
+    /// [`LogSink::send_access`], which supplies it.
+    pub fn into_record(self, lb_deployment: &str) -> Record {
         let path = truncate(self.path.to_string(), MAX_PATH);
         let ms = self.duration.as_secs_f64() * 1000.0;
         let status = self.status;
@@ -438,13 +497,44 @@ impl Access<'_> {
 
         Record {
             ts: now_millis(),
-            deployment: self.deployment.unwrap_or(LB_DEPLOYMENT).to_string(),
+            deployment: self.deployment.unwrap_or(lb_deployment).to_string(),
             backend: self.backend,
             source: ACCESS_SOURCE,
             level: access_level(status),
             message,
             fields: Some(serde_json::Value::Object(fields)),
         }
+    }
+}
+
+/// One line of a deploy job's output, attributed to the deployment it is for.
+///
+/// A job's output otherwise lives only in its in-memory [`JobRecord`], which is
+/// capped at a few hundred lines, kept for a bounded history, and gone on restart.
+/// That is fine for "why did this build fail?" asked within the hour and useless
+/// for anything else — including the case that matters most, a build or update
+/// that *hangs*, where the record shows `running` and the transcript that would
+/// say where it stopped is only readable by polling the admin API at the time.
+///
+/// Attributed to the deployment rather than to app-lb itself, because "what
+/// happened to this deployment lately" should have one answer: the build that
+/// produced the image, the roll-out, and the traffic that followed all sit in one
+/// stream, separable by `source`.
+///
+/// [`JobRecord`]: crate::jobs::JobRecord
+pub fn job_line(deployment: &str, job_id: &str, line: String) -> Record {
+    Record {
+        ts: now_millis(),
+        deployment: deployment.to_string(),
+        // A build runs on the host, not in any VM; there is no backend to name.
+        backend: None,
+        source: JOB_SOURCE,
+        // Step output is not levelled — a compiler warning and a fatal error
+        // arrive on the same stream. The job's *outcome* is a separate event, and
+        // that one is an error when it failed.
+        level: "info",
+        message: truncate(line, MAX_MESSAGE),
+        fields: Some(serde_json::json!({ "job": job_id })),
     }
 }
 
@@ -506,7 +596,7 @@ impl<S: Subscriber> Layer<S> for EventLayer {
             ts: now_millis(),
             deployment: visitor
                 .deployment
-                .unwrap_or_else(|| LB_DEPLOYMENT.to_string()),
+                .unwrap_or_else(|| self.sink.deployment.to_string()),
             // An event names a deployment, never an individual backend; the
             // sandbox, where one is relevant, stays in `fields`.
             backend: None,
@@ -741,6 +831,10 @@ impl BackgroundService for Shipper {
             batch = self.config.batch,
             flush_secs = self.config.flush.as_secs(),
             authenticated = self.config.token.is_some(),
+            // Which app-obs partition app-lb's own lines will appear under. Worth
+            // one field at startup: the alternative is looking for a deployment id
+            // in app-obs that you have to already know the value of.
+            lb_deployment = %self.config.deployment,
             "shipping logs to app-obs",
         );
 
@@ -817,7 +911,7 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     fn sink() -> (LogSink, mpsc::Receiver<Record>) {
-        LogSink::new(64)
+        LogSink::new(64, Arc::from(LB_DEPLOYMENT))
     }
 
     /// The value written here is nearly always copied from an *address*, so the
@@ -909,9 +1003,9 @@ mod tests {
     async fn a_full_queue_drops_instead_of_blocking() {
         // The defining property: this is called from the request path, so it may
         // never await a free slot.
-        let (sink, _rx) = LogSink::new(1);
-        sink.send(access(Some("demo"), Some(200)).into_record());
-        sink.send(access(Some("demo"), Some(200)).into_record());
+        let (sink, _rx) = LogSink::new(1, Arc::from(LB_DEPLOYMENT));
+        sink.send_access(access(Some("demo"), Some(200)));
+        sink.send_access(access(Some("demo"), Some(200)));
 
         assert_eq!(sink.stats.queued.load(Ordering::Relaxed), 1);
         assert_eq!(sink.stats.dropped.load(Ordering::Relaxed), 1);
@@ -938,7 +1032,7 @@ mod tests {
     /// deserialize, and nothing in this repo compiles against those types.
     #[test]
     fn an_access_record_serializes_into_app_obs_ingest_shape() {
-        let record = access(Some("demo"), Some(200)).into_record();
+        let record = access(Some("demo"), Some(200)).into_record(LB_DEPLOYMENT);
         let json = serde_json::to_value(&record).unwrap();
 
         assert_eq!(json["deployment"], "demo");
@@ -973,18 +1067,62 @@ mod tests {
     fn a_request_that_matched_no_deployment_is_still_attributable() {
         // app-obs rejects a record with no deployment outright, so these would
         // vanish rather than land somewhere useful.
-        let record = access(None, Some(404)).into_record();
+        let record = access(None, Some(404)).into_record(LB_DEPLOYMENT);
         assert_eq!(record.deployment, LB_DEPLOYMENT);
         assert_eq!(record.level, "warn");
         let fields = serde_json::to_value(record.fields).unwrap();
         assert_eq!(fields["unrouted"], true);
     }
 
+    /// Both streams have to honour `APP_LB_OBS_DEPLOYMENT`, or one app-lb's
+    /// unrouted 404s would still land under `_lb` while its events moved.
+    #[tokio::test]
+    async fn a_configured_id_replaces_the_default_on_both_streams() {
+        let (sink, mut rx) = LogSink::new(64, Arc::from("lb-us2"));
+        sink.send_access(access(None, Some(404)));
+        assert_eq!(rx.try_recv().unwrap().deployment, "lb-us2");
+
+        let subscriber = tracing_subscriber::registry().with(EventLayer::new(sink));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: AS_IF_FROM, "cannot bind");
+        });
+        assert_eq!(rx.try_recv().unwrap().deployment, "lb-us2");
+
+        // A record that names its own deployment is untouched by the override.
+        let record = access(Some("demo"), Some(200)).into_record("lb-us2");
+        assert_eq!(record.deployment, "demo");
+    }
+
+    /// app-obs 400s the whole *batch* for one illegal deployment id, taking every
+    /// other deployment's records in it down too — so this has to be caught here,
+    /// at startup, and not discovered as an opaque `HTTP 400` later.
+    #[test]
+    fn only_ids_app_obs_can_store_are_accepted() {
+        assert_eq!(&*lb_deployment(None).unwrap(), LB_DEPLOYMENT);
+        assert_eq!(&*lb_deployment(Some("")).unwrap(), LB_DEPLOYMENT);
+        assert_eq!(&*lb_deployment(Some("  ")).unwrap(), LB_DEPLOYMENT);
+        assert_eq!(&*lb_deployment(Some(" lb-us2 ")).unwrap(), "lb-us2");
+        assert_eq!(&*lb_deployment(Some("_lb.eu1")).unwrap(), "_lb.eu1");
+
+        for bad in [
+            "lb/us2",     // a path separator: the id becomes a directory name
+            "..",         // all dots: a relative path component
+            "lb us2",     // a space
+            "lb:us2",
+            "lb\u{2019}", // non-ASCII
+        ] {
+            let err = lb_deployment(Some(bad)).expect_err("should be rejected: {bad:?}");
+            assert!(err.contains(&format!("{bad:?}")), "{bad:?} -> {err}");
+        }
+        assert!(lb_deployment(Some(&"x".repeat(MAX_DEPLOYMENT_LEN + 1))).is_err());
+        assert!(lb_deployment(Some(&"x".repeat(MAX_DEPLOYMENT_LEN))).is_ok());
+    }
+
     #[test]
     fn a_failed_request_records_the_error_and_a_null_status() {
         let mut a = access(Some("demo"), None);
         a.error = Some("connect refused".into());
-        let record = a.into_record();
+        let record = a.into_record(LB_DEPLOYMENT);
         assert_eq!(record.level, "error");
         assert_eq!(record.message, "GET /things - 12.0ms");
         let fields = serde_json::to_value(record.fields).unwrap();
@@ -992,12 +1130,36 @@ mod tests {
         assert_eq!(fields["error"], "connect refused");
     }
 
+    /// A build's transcript has to land in the *deployment's* stream, separable
+    /// from its traffic by `source` and from another build by `job`.
+    #[test]
+    fn a_job_line_is_attributed_to_the_deployment_it_builds() {
+        let record = job_line("artifacts", "job-7", "Step 3/9 : RUN cargo build".into());
+        let json = serde_json::to_value(&record).unwrap();
+
+        assert_eq!(json["deployment"], "artifacts");
+        assert_eq!(json["source"], "job");
+        assert_eq!(json["level"], "info");
+        assert_eq!(json["message"], "Step 3/9 : RUN cargo build");
+        assert_eq!(json["fields"]["job"], "job-7");
+        assert!(
+            json.get("backend").is_none(),
+            "a build runs on the host; there is no VM to name",
+        );
+
+        // `docker build` output can contain a single absurd line (a minified
+        // bundle, a base64 blob); one must not decide the batch size.
+        let long = job_line("artifacts", "job-7", "x".repeat(MAX_MESSAGE * 3));
+        assert!(long.message.len() <= MAX_MESSAGE + 3, "got {}", long.message.len());
+        assert!(long.message.ends_with('…'));
+    }
+
     #[test]
     fn a_pathological_path_cannot_decide_the_batch_size() {
         let long = "/".to_string() + &"a".repeat(MAX_PATH * 4);
         let mut a = access(Some("demo"), Some(200));
         a.path = &long;
-        let record = a.into_record();
+        let record = a.into_record(LB_DEPLOYMENT);
         let fields = serde_json::to_value(record.fields).unwrap();
         let path = fields["path"].as_str().unwrap();
         assert!(path.len() <= MAX_PATH + 3, "got {} bytes", path.len());

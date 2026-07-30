@@ -67,8 +67,9 @@ Configuration is environment-only:
 | `APP_LB_OBS_URL` | *(unset)* | Where app-obs listens (e.g. `127.0.0.1:9500`); **setting it enables log shipping** |
 | `APP_LB_OBS_TOKEN` | *(unset)* | Bearer token for app-obs's `/ingest` — must match its `APP_OBS_INGEST_TOKEN` |
 | `APP_LB_OBS_HOST` | `/etc/hostname` | Machine name stamped on every batch |
+| `APP_LB_OBS_DEPLOYMENT` | `_lb` | Deployment id in app-obs for app-lb's *own* records — name it per host (`lb-us2`) when several LBs ship to one collector |
 | `APP_LB_OBS_ACCESS_LOG` | `true` | `0` to stop shipping the per-request access log |
-| `APP_LB_OBS_EVENTS` | `true` | `0` to stop shipping app-lb's own log events |
+| `APP_LB_OBS_EVENTS` | `true` | `0` to stop shipping app-lb's own log events (and deploy-job output) |
 | `APP_LB_OBS_QUEUE_CAPACITY` | `8192` | Records buffered before new ones are dropped |
 | `APP_LB_OBS_BATCH` | `500` | Records per POST |
 | `APP_LB_OBS_FLUSH_SECS` | `2` | How long a record may wait for a fuller batch |
@@ -117,7 +118,8 @@ curl -XPOST localhost:9090/deployments -H 'content-type: application/json' -d '{
     "target_concurrency": 10,
     "scale_to_zero_after_secs": 300,
     "cold_start_timeout_secs": 120,
-    "drain_timeout_secs": 30
+    "drain_timeout_secs": 30,
+    "boot_timeout_secs": 300
   },
   "health": {"path": "/", "timeout_secs": 2}
 }'
@@ -625,19 +627,46 @@ Open `http://<admin-addr>/dashboard` (default `http://127.0.0.1:9090/dashboard`)
 for a live view of the fleet: host and per-VM CPU/memory, per-deployment pool
 utilisation and per-VM load, request latency (distribution + p50/p90/p99 and a
 client-derived requests/sec), cold-start times, and autoscaling activity. It is
-a single self-contained page that polls `GET /metrics` every 2s — no external
-assets, so it works over an SSH tunnel to the admin port.
+a single self-contained page — no external assets, so it works over an SSH tunnel
+to the admin port.
 
 `GET /metrics` returns the same data as JSON (host usage, a global rollup, and a
 per-deployment breakdown), suitable for scraping into your own tooling.
 
-The dashboard is also interactive. Each deployment card has **Scale** (a form
-over min/max replicas, warm pool, and target concurrency → `PATCH .../scaling`)
-and **Edit** (a JSON editor over the full spec → `PUT`), and each VM row has
-**Drain**/**Kill** buttons (→ `DELETE .../vms/:id`). While a form is open the
-cards stop re-rendering so an in-progress edit isn't wiped, though the stat tiles
-keep updating live. These buttons call the admin CRUD API — set
-`APP_LB_ADMIN_AUTH` (see below) to require the dashboard credentials for them.
+Every object type the [CLI](#cli) addresses has a section on the page, so the
+dashboard is a complete view of what app-lb holds rather than a metrics screen:
+
+| Section | Shows | Source |
+| --- | --- | --- |
+| Deployments | pool gauges, per-VM load, **booting VMs with their age and daemon status** | `GET /metrics` |
+| Certificates | issued hostnames, issuer, expiry, renewal state — plus routed hostnames that have *no* certificate yet | `GET /certs` |
+| Secrets | ids, descriptions, key *names*, last update, whether the store is sealed | `GET /secrets` |
+| Deploy jobs | recent builds and host updates, their result, and a live transcript | `GET /jobs` |
+
+Two polling loops: the metrics view refreshes every 2s, and certificates, secrets
+and jobs — which change on human timescales — every 10s. The slow loop tightens to
+2s while a job is running, since its record is the only progress there is.
+
+The dashboard is also interactive:
+
+- **Scale** (a form over min/max replicas, warm pool, and target concurrency →
+  `PATCH .../scaling`) and **Edit** (a JSON editor over the full spec → `PUT`) on
+  each deployment card, and **Drain**/**Kill** on each VM row (→
+  `DELETE .../vms/:id`). A booting VM can be killed too.
+- **Build** / **Update** on deployments that have a `build` or `update` block,
+  which start the job and open its log.
+- **New secret**, **Rotate** and **Delete** in the Secrets section. Values are
+  write-only throughout: the API returns key names only, so a rotation sets new
+  values rather than editing readable ones, and a delete that would break a
+  deployment's build asks before forcing.
+- **Log** on any job — the tail of its output, refreshing while it runs. This is
+  the view for a build that is *hanging*: where it stopped is visible without
+  waiting for it to fail.
+
+While a form is open the cards stop re-rendering so an in-progress edit isn't
+wiped, though the stat tiles keep updating live. These buttons call the admin CRUD
+API — set `APP_LB_ADMIN_AUTH` (see below) to require the dashboard credentials for
+them.
 
 ### Auth
 
@@ -796,6 +825,35 @@ at an empty pool is held (up to `cold_start_timeout_secs`) while a VM boots, rat
 failing — in practice a Firecracker VM is serving in ~1–2s. Scaling down marks a VM draining
 so it finishes in-flight work, then kills it once idle or at `drain_timeout_secs`.
 
+#### When a boot never finishes
+
+A VM is only added to the pool once the daemon reports it `Running`, it has a
+`guest_ip`, *and* it answers its health check. The failure mode worth knowing about
+is the third one: a VM whose guest boots but whose *server* doesn't — a wrong
+`start_command`, an env var pointing at a directory that isn't there, a binary that
+exits — looks perfectly healthy to the daemon and fails the probe forever.
+
+Two things bound and expose that:
+
+- **Progress logging.** Every still-booting VM is logged with its sandbox id, its
+  age, the daemon's status, and what it is waiting on — on first sighting, on every
+  status change, and every 30s thereafter. The `waiting_on` field is the diagnosis:
+  *"the daemon has not reported it Running yet"* means wait, while *"the guest is up
+  but has not answered GET /healthz"* means go and look at the guest. Once a boot
+  outlasts `cold_start_timeout_secs` — the point at which it has already cost a
+  request a 503 — the line becomes a `WARN`.
+- **`boot_timeout_secs`** (default `300`). Past this the autoscaler logs an `ERROR`,
+  kills the VM and lets the next tick create a replacement, so a deployment retries
+  visibly instead of sitting at zero replicas forever. It is deliberately much
+  larger than `cold_start_timeout_secs`: a request gives up long before the VM does,
+  because a boot that overran one caller's patience may still be the boot that
+  serves the next one. Set it to `0` to wait indefinitely.
+
+The count of abandoned boots is in `/metrics`
+(`autoscale.boot_timeouts`) and on the dashboard's cold-start card, and booting VMs
+appear as rows in each deployment's VM table with their age and status — so a stall
+is visible without reading logs at all.
+
 `ttl_seconds` is a backstop: VMs expire on their own if app-lb dies without reaping them. It
 is renewed while app-lb is alive, and VMs from a previous run are re-adopted on startup
 (matched by their `applb-<deployment>-<nonce>` name). VMs app-lb did not create are never
@@ -810,7 +868,7 @@ edit (one that doesn't change the `vm` block) carries its VMs over and keeps the
 ## Shipping logs to app-obs
 
 [app-obs](../app-obs) polls `/metrics` for numbers, but the *logs* it stores have
-to be pushed to it. Set `APP_LB_OBS_URL` and app-lb pushes two streams:
+to be pushed to it. Set `APP_LB_OBS_URL` and app-lb pushes three streams:
 
 ```sh
 APP_LB_OBS_URL=127.0.0.1:9500 \
@@ -831,10 +889,43 @@ configuration must not be able to take the data plane down.
   ever have, because there is no guest to run a shipper inside; for a VM
   deployment it is the only account of what the *proxy* saw, as opposed to what
   the application chose to write about itself.
-- **app-lb's own events** at INFO and above — scaling decisions, upstreams going
-  unhealthy, ACME issuance, job outcomes. An event that names a deployment lands
-  in that deployment's log, so a scale-up appears next to the traffic that caused
-  it; everything else lands under the reserved deployment id `_lb`.
+- **app-lb's own events** at INFO and above — scaling decisions, boots that are
+  taking too long, upstreams going unhealthy, ACME issuance, job outcomes. An event
+  that names a deployment lands in that deployment's log, so a scale-up appears
+  next to the traffic that caused it; everything else lands under
+  `APP_LB_OBS_DEPLOYMENT` (`_lb` by default).
+- **Deploy-job output** — every line an image build or host update writes,
+  attributed to the deployment being deployed and tagged `source=job`. The job
+  record served by `GET /jobs/:id` holds only a bounded tail, in memory, until the
+  process restarts; this is the copy that survives, and the one to read when a
+  build *hangs* rather than fails.
+
+Records carry a `source` — `access`, `app-lb` or `job` — so the three are
+separable inside one deployment's log.
+
+### Naming the LB itself
+
+app-lb's own records need a deployment id like everything else app-obs stores, and
+by default it is the reserved `_lb`. Override it with `APP_LB_OBS_DEPLOYMENT` when
+more than one app-lb ships to the same collector: otherwise both hosts' events
+interleave under one name, and "which LB logged this?" is only answerable from the
+batch-level `host` field.
+
+```sh
+APP_LB_OBS_DEPLOYMENT=lb-us2 app-lb
+```
+
+It applies to both streams that can lack a deployment of their own — app-lb's
+events *and* the access-log records for requests that matched no route — so the
+two never diverge. The value becomes a directory name in app-obs, so it is
+validated at startup against the same rule app-obs uses (up to 128 characters of
+`[A-Za-z0-9._-]`); a value app-obs would reject is refused here instead, because
+app-obs answers a bad id by rejecting the whole *batch* it arrived in, taking
+every other deployment's records with it. The resolved id is in the startup line:
+
+```
+INFO shipping logs to app-obs endpoint=… lb_deployment=lb-us2
+```
 
 The token must match app-obs's `APP_OBS_INGEST_TOKEN`. app-obs leaves ingest open
 when *it* has none, so the failure worth anticipating is the other direction: an
@@ -861,8 +952,8 @@ should come to rest. The signed-in user's email is left out for the same reason 
 a gated deployment receives the identity headers and can log what it needs of
 them itself.
 
-Requests that matched **no** deployment ship too, under `_lb` with
-`"unrouted": true`. A wall of 404s for a hostname somebody expected to work is
+Requests that matched **no** deployment ship too, under `APP_LB_OBS_DEPLOYMENT`
+with `"unrouted": true`. A wall of 404s for a hostname somebody expected to work is
 invisible in a per-deployment view by construction, and it is one of the more
 common things to have to diagnose. The cost is that internet background noise —
 scanners probing `/wp-login.php` — accumulates there against app-obs's retention;

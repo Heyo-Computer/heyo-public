@@ -378,6 +378,9 @@ fn main() {
         registry.clone(),
         autoscaler.clone(),
         secrets.clone(),
+        // Job output is app-lb's own output, so it rides the same switch as the
+        // event stream (`APP_LB_OBS_EVENTS`) rather than getting a third one.
+        obs.as_ref().and_then(|o| o.events.clone()),
     ));
 
     // ACME runs only when a contact address is configured. Its `Notify` goes to

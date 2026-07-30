@@ -149,6 +149,10 @@ pub struct ScalingFlags {
     /// How long a draining VM may keep serving before it is killed anyway.
     #[arg(long, value_name = "SECS", help_heading = "Scaling")]
     pub drain_timeout: Option<u64>,
+    /// How long a booting VM has to pass its health check before the autoscaler
+    /// gives up on it and replaces it. 0 waits indefinitely.
+    #[arg(long, value_name = "SECS", help_heading = "Scaling")]
+    pub boot_timeout: Option<u64>,
 }
 
 impl ScalingFlags {
@@ -161,6 +165,7 @@ impl ScalingFlags {
             ("scale_to_zero_after_secs", self.scale_to_zero_after),
             ("cold_start_timeout_secs", self.cold_start_timeout),
             ("drain_timeout_secs", self.drain_timeout),
+            ("boot_timeout_secs", self.boot_timeout),
         ])
     }
 }

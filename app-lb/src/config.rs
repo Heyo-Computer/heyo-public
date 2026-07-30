@@ -286,6 +286,14 @@ fn default_cold_start_timeout_secs() -> u64 {
 fn default_drain_timeout_secs() -> u64 {
     30
 }
+/// Deliberately several times `default_cold_start_timeout_secs`. The two bound
+/// different things: a request gives up long before the VM does, because a boot
+/// that overran one caller's patience may still be the boot that serves the next
+/// one. Five minutes is past the point where a Firecracker guest that is going to
+/// come up has come up, so what is left is a guest whose server never started.
+fn default_boot_timeout_secs() -> u64 {
+    300
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScalingPolicy {
@@ -308,6 +316,17 @@ pub struct ScalingPolicy {
     /// killed anyway.
     #[serde(default = "default_drain_timeout_secs")]
     pub drain_timeout_secs: u64,
+    /// How long a booting VM has to pass its health check before the autoscaler
+    /// gives up on it, kills it and lets the next tick create a replacement.
+    ///
+    /// Without a deadline here a VM that boots but never serves — the daemon says
+    /// `Running`, the guest's process died or never started — is re-queued every
+    /// tick indefinitely, so the deployment sits at zero replicas with no error
+    /// anywhere. The pool's own `min_replicas` can never be met and nothing says
+    /// why. `0` restores that unbounded wait for a deployment whose boots are
+    /// genuinely open-ended.
+    #[serde(default = "default_boot_timeout_secs")]
+    pub boot_timeout_secs: u64,
 }
 
 impl Default for ScalingPolicy {
@@ -320,6 +339,7 @@ impl Default for ScalingPolicy {
             scale_to_zero_after_secs: default_scale_to_zero_after_secs(),
             cold_start_timeout_secs: default_cold_start_timeout_secs(),
             drain_timeout_secs: default_drain_timeout_secs(),
+            boot_timeout_secs: default_boot_timeout_secs(),
         }
     }
 }
