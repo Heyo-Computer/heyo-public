@@ -64,7 +64,7 @@ Configuration is environment-only:
 | `APP_LB_UPDATE_SHELL` | `/bin/sh` | Shell a static deployment's `update.commands` run through |
 | `APP_LB_BUILD_TIMEOUT_SECS` | `1800` | Ceiling on one build step or update command, after which the child is killed |
 | `APP_LB_HEYVM_HOME` | *(unset)* | `HOME` for the heyvm child — set it when app-lb and heyvmd run as different users |
-| `APP_LB_OBS_URL` | *(unset)* | app-obs base URL (e.g. `http://127.0.0.1:9500`); **setting it enables log shipping** |
+| `APP_LB_OBS_URL` | *(unset)* | Where app-obs listens (e.g. `127.0.0.1:9500`); **setting it enables log shipping** |
 | `APP_LB_OBS_TOKEN` | *(unset)* | Bearer token for app-obs's `/ingest` — must match its `APP_OBS_INGEST_TOKEN` |
 | `APP_LB_OBS_HOST` | `/etc/hostname` | Machine name stamped on every batch |
 | `APP_LB_OBS_ACCESS_LOG` | `true` | `0` to stop shipping the per-request access log |
@@ -813,10 +813,18 @@ edit (one that doesn't change the `vm` block) carries its VMs over and keeps the
 to be pushed to it. Set `APP_LB_OBS_URL` and app-lb pushes two streams:
 
 ```sh
-APP_LB_OBS_URL=http://127.0.0.1:9500 \
+APP_LB_OBS_URL=127.0.0.1:9500 \
 APP_LB_OBS_TOKEN="$(cat /etc/app-obs/ingest-token)" \
 app-lb
 ```
+
+A bare `host:port` is fine — the scheme defaults to `http`, which is what
+app-obs's ingest speaks. `0.0.0.0` is accepted too and read as this host, since
+that is app-obs's *bind* address rather than anywhere you can send to; the
+resolved endpoint is in the startup line, so check it there. A URL that cannot be
+salvaged (`ftp://`, no host) logs an error at startup and leaves shipping off —
+it never stops app-lb from serving, because a typo in the observability
+configuration must not be able to take the data plane down.
 
 - **An access log** — one record per request, attributed to the deployment that
   served it. For a static (`proxy_pass`) deployment this is the only log it will

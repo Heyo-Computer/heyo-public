@@ -148,24 +148,89 @@ fn env_usize(name: &str, default: usize) -> usize {
     }
 }
 
-/// Build the pipeline from the environment, or `None` to leave app-lb exactly as
-/// it was.
+/// Turn `APP_LB_OBS_URL` into the full ingest endpoint, or say what is wrong
+/// with it.
+///
+/// Two accommodations, because the value that gets typed here is almost always
+/// copied from an *address* rather than written as a URL:
+///
+/// * **A missing scheme is filled in.** Every other address in this system is a
+///   bare `host:port` (`APP_LB_ADMIN_ADDR`, `APP_OBS_INGEST_ADDR`), so that is
+///   what people write. app-obs's ingest is plaintext HTTP and there is no second
+///   reading of `127.0.0.1:9500`, so it is not a guess. Detected on `://` rather
+///   than `:`, because `Url::parse` would otherwise read `127.0.0.1:9500` as the
+///   *scheme* `127.0.0.1` and be perfectly happy about it.
+/// * **A wildcard host becomes loopback.** `0.0.0.0` is what app-obs *binds*; as
+///   a destination it can only have meant this host. Linux will connect to it,
+///   which is worse than failing — it works until app-obs moves to another host.
+///
+/// Anything left over is a real error: a scheme that isn't HTTP, or no host at
+/// all. Reported rather than repaired, since there is no defensible guess.
+fn ingest_endpoint(raw: &str) -> Result<String, String> {
+    let with_scheme = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+
+    let mut url = reqwest::Url::parse(&with_scheme)
+        .map_err(|e| format!("{raw:?} is not a URL ({e}); expected something like http://127.0.0.1:9500"))?;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "{raw:?} has scheme {:?}; app-obs ingest is http (or https behind a proxy)",
+            url.scheme(),
+        ));
+    }
+    match url.host_str() {
+        Some("0.0.0.0") => set_host(&mut url, "127.0.0.1", raw)?,
+        Some("::" | "[::]") => set_host(&mut url, "[::1]", raw)?,
+        Some(_) => {}
+        None => {
+            return Err(format!(
+                "{raw:?} names no host; expected something like http://127.0.0.1:9500",
+            ));
+        }
+    }
+
+    // `/ingest` on whatever path prefix was given, so app-obs behind a proxy at
+    // `https://obs.example/collector` works as well as a bare host does.
+    Ok(format!("{}/ingest", url.as_str().trim_end_matches('/')))
+}
+
+fn set_host(url: &mut reqwest::Url, host: &str, raw: &str) -> Result<(), String> {
+    url.set_host(Some(host))
+        .map_err(|e| format!("cannot read {raw:?} as an address ({e})"))
+}
+
+/// Build the pipeline from the environment: `Ok(None)` leaves app-lb exactly as
+/// it was, `Err` names a misconfiguration.
 ///
 /// `APP_LB_OBS_URL` is the switch, in the same way `APP_LB_ACME_EMAIL` is the
 /// switch for certificates: there is no default endpoint, because POSTing every
 /// second to a port nobody is listening on is worse than shipping nothing.
 ///
-/// Panics on a malformed numeric setting rather than falling back to a default —
+/// A bad URL is returned as an error rather than panicking, and the caller
+/// disables shipping and carries on. Panicking would make the observability
+/// configuration able to take down the data plane, which is the one thing this
+/// whole module is built not to do. A bad *numeric* setting still panics —
 /// silently ignoring `APP_LB_OBS_QUEUE_CAPACITY=big` would leave a queue sized
 /// nothing like what was asked for.
-pub fn from_env() -> Option<Obs> {
-    let url = std::env::var("APP_LB_OBS_URL")
+///
+/// Note this runs *before* the tracing subscriber exists (installing the event
+/// layer is why), so it cannot log a thing; everything it wants to say has to
+/// come back through the return value.
+pub fn from_env() -> Result<Option<Obs>, String> {
+    let Some(url) = std::env::var("APP_LB_OBS_URL")
         .ok()
         .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty())?;
+        .filter(|u| !u.is_empty())
+    else {
+        return Ok(None);
+    };
 
     let config = ObsConfig {
-        endpoint: format!("{}/ingest", url.trim_end_matches('/')),
+        endpoint: ingest_endpoint(&url)?,
         token: std::env::var("APP_LB_OBS_TOKEN")
             .ok()
             .filter(|t| !t.trim().is_empty()),
@@ -181,7 +246,7 @@ pub fn from_env() -> Option<Obs> {
 
     let (sink, rx) = LogSink::new(config.queue_capacity);
     let stats = sink.stats.clone();
-    Some(Obs {
+    Ok(Some(Obs {
         access: env_flag("APP_LB_OBS_ACCESS_LOG", true).then(|| sink.clone()),
         events: env_flag("APP_LB_OBS_EVENTS", true).then(|| sink.clone()),
         shipper: Shipper {
@@ -190,7 +255,7 @@ pub fn from_env() -> Option<Obs> {
             stats: stats.clone(),
         },
         stats,
-    })
+    }))
 }
 
 /// One log line, in app-obs's ingest shape. `host` is set once per batch by the
@@ -617,10 +682,32 @@ impl Shipper {
             // 202, in app-obs's case: queued, not yet on disk.
             Ok(response) if response.status().is_success() => self.mark(true, count, ""),
             Ok(response) => self.mark(false, count, &format!("HTTP {}", response.status())),
-            Err(e) => self.mark(false, count, &e.to_string()),
+            Err(e) => self.mark(false, count, &error_chain(&e)),
         }
         batch.clear();
     }
+}
+
+/// Flatten an error and its causes into one line.
+///
+/// reqwest's own `Display` is frequently useless on its own — a bad URL reads
+/// only as `builder error`, and the cause that actually names the problem
+/// (`relative URL without a base`) is a level down. This is the difference
+/// between a warning somebody can act on and one they have to go read the source
+/// to interpret.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut message = e.to_string();
+    let mut cause = e.source();
+    while let Some(e) = cause {
+        let text = e.to_string();
+        // Skip a cause that only repeats what the outer layer already said.
+        if !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        cause = e.source();
+    }
+    message
 }
 
 #[async_trait]
@@ -731,6 +818,78 @@ mod tests {
 
     fn sink() -> (LogSink, mpsc::Receiver<Record>) {
         LogSink::new(64)
+    }
+
+    /// The value written here is nearly always copied from an *address*, so the
+    /// forms people actually type have to work rather than fail at the first
+    /// flush with reqwest's `builder error`.
+    #[test]
+    fn an_address_is_accepted_as_readily_as_a_url() {
+        let cases = [
+            // What a URL looks like.
+            ("http://127.0.0.1:9500", "http://127.0.0.1:9500/ingest"),
+            ("http://127.0.0.1:9500/", "http://127.0.0.1:9500/ingest"),
+            ("https://obs.example.com", "https://obs.example.com/ingest"),
+            // Bare host:port, matching every other address in this system. Note
+            // `Url::parse` would read the host as a *scheme* here, which is why
+            // the check is on `://`.
+            ("127.0.0.1:9500", "http://127.0.0.1:9500/ingest"),
+            ("localhost:9500", "http://localhost:9500/ingest"),
+            // The wildcard app-obs binds. As a destination it can only mean this
+            // host, and Linux would connect to it — working right up until
+            // app-obs moves elsewhere.
+            ("0.0.0.0:9500", "http://127.0.0.1:9500/ingest"),
+            ("http://0.0.0.0:9500", "http://127.0.0.1:9500/ingest"),
+            ("[::]:9500", "http://[::1]:9500/ingest"),
+            // app-obs behind a proxy on a path prefix.
+            ("https://obs.example.com/collector", "https://obs.example.com/collector/ingest"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(ingest_endpoint(raw).as_deref(), Ok(expected), "for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn an_unusable_endpoint_says_what_is_wrong_with_it() {
+        // Each message has to name the offending value, because it is read out of
+        // a startup log by somebody who just edited a supervisor unit.
+        for raw in ["", "http://", "ftp://obs:9500", "not a url at all"] {
+            let err = ingest_endpoint(raw).expect_err("should be rejected: {raw:?}");
+            assert!(err.contains(&format!("{raw:?}")), "{raw:?} -> {err}");
+        }
+    }
+
+    /// The failure that prompted this: `0.0.0.0:9500/ingest` with no scheme
+    /// reached reqwest, which said only "builder error".
+    #[test]
+    fn error_chain_reaches_the_cause_that_names_the_problem() {
+        #[derive(Debug)]
+        struct Outer(Inner);
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("builder error")
+            }
+        }
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("relative URL without a base")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        assert_eq!(
+            error_chain(&Outer(Inner)),
+            "builder error: relative URL without a base",
+        );
+        // A cause that merely repeats the outer text adds nothing.
+        assert_eq!(error_chain(&Inner), "relative URL without a base");
     }
 
     #[test]

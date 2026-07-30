@@ -136,8 +136,23 @@ fn main() {
     // Before the subscriber, because shipping app-lb's own events means adding a
     // layer to it, and a subscriber can only be built once. Reads the environment
     // and allocates a channel — no threads, nothing that a later fork would lose.
-    let obs = obs::from_env();
+    //
+    // A misconfigured endpoint disables shipping and is reported once the
+    // subscriber exists; it is deliberately not fatal. Panicking here would let a
+    // typo in the *observability* configuration take the data plane down, which is
+    // the one thing `obs` is built not to do.
+    let (obs, obs_error) = match obs::from_env() {
+        Ok(obs) => (obs, None),
+        Err(e) => (None, Some(e)),
+    };
     init_tracing(obs.as_ref().and_then(|o| o.events.clone()));
+    if let Some(e) = obs_error {
+        tracing::error!(
+            error = %e,
+            "APP_LB_OBS_URL is unusable, so no logs will be shipped to app-obs; \
+             everything else starts normally",
+        );
+    }
 
     // rustls needs a process-level `CryptoProvider` chosen explicitly whenever
     // more than one is compiled in, and app-lb's graph has both `ring` (iroh,
