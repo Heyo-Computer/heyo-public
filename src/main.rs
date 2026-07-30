@@ -6,15 +6,19 @@
 //! a host process, not a microVM, so it is fronted the same way the pg-fc
 //! dashboard is.
 
+mod api;
 mod config;
 mod ingest;
+mod query;
 mod retention;
 mod sources;
 mod store;
 
+use api::ApiState;
 use config::Config;
 use ingest::Sink;
 use ingest::http::IngestState;
+use query::Engine;
 use retention::Retention;
 use sources::applb::Poller;
 use store::schema::Record;
@@ -76,6 +80,9 @@ async fn run(cfg: Config) {
     // The writer owns everything below the queue and is the only thing that
     // touches the data directory, so it needs no locking.
     let writer = Writer::new(&cfg.data_dir, cfg.flush_rows, cfg.flush_interval);
+    // Taken before the writer moves into the drain task; it is the only window
+    // onto how much is buffered but not yet queryable.
+    let buffered = writer.buffered_handle();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let drain = tokio::spawn(drain(rx, writer, cfg.flush_interval, shutdown_rx));
 
@@ -120,29 +127,28 @@ async fn run(cfg: Config) {
 
     tokio::spawn(Retention::new(&cfg.data_dir, cfg.retain_days).run());
 
-    // A minimal status endpoint so the ingest counters are visible before the
-    // dashboard exists. This is where the query API and UI will live.
+    // The query layer and the dashboard it serves. Building it creates the two
+    // table directories, which is the same condition the writer needs to flush
+    // at all — so a failure here means this process could never have stored
+    // anything, and starting anyway would only accept records to lose them.
+    let engine = match Engine::new(&cfg.data_dir, cfg.query_concurrency, cfg.query_timeout).await {
+        Ok(engine) => Arc::new(engine),
+        Err(e) => panic!("cannot open the query layer over {}: {e}", cfg.data_dir),
+    };
+
+    let api_state = ApiState {
+        engine,
+        sink: sink.clone(),
+        buffered,
+        flush_secs: cfg.flush_interval.as_secs(),
+        retain_days: cfg.retain_days,
+    };
     let api_addr = cfg.api_addr.clone();
-    let api_sink = sink.clone();
     tokio::spawn(async move {
-        let app = axum::Router::new()
-            .route("/healthz", axum::routing::get(|| async { "ok\n" }))
-            .route(
-                "/stats",
-                axum::routing::get(move || {
-                    let sink = api_sink.clone();
-                    async move {
-                        axum::Json(serde_json::json!({
-                            "accepted": sink.accepted(),
-                            "dropped": sink.dropped(),
-                        }))
-                    }
-                }),
-            );
         match tokio::net::TcpListener::bind(&api_addr).await {
             Ok(listener) => {
                 tracing::info!(addr = %api_addr, "api listening");
-                if let Err(e) = axum::serve(listener, app).await {
+                if let Err(e) = axum::serve(listener, api::router(api_state)).await {
                     tracing::error!(error = %e, "api server stopped");
                 }
             }

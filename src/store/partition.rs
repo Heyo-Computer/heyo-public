@@ -60,7 +60,7 @@ impl std::error::Error for PartitionError {}
 /// one directory and mix their logs; rejecting is unambiguous and gives the
 /// sender a 400 to fix. The character set also makes `..` and `/` unrepresentable,
 /// so no input can escape the data directory.
-fn check_deployment(deployment: &str) -> Result<(), PartitionError> {
+pub fn check_deployment(deployment: &str) -> Result<(), PartitionError> {
     let ok = !deployment.is_empty()
         && deployment.len() <= MAX_DEPLOYMENT_LEN
         && deployment

@@ -1,8 +1,14 @@
 {
   "id": "app-obs",
   "routes": [
-    { "host": "obs.example.com" }
+    { "host": "obs.us2.heyo.work" }
   ],
   "upstreams": ["127.0.0.1:9600"],
-  "health": { "path": "/healthz", "timeout_secs": 2 }
+  "health": { "path": "/healthz", "timeout_secs": 2 },
+  "auth": {
+    "client_id": "REPLACE.apps.googleusercontent.com",
+    "client_secret": { "secret": "google", "key": "client_secret" },
+    "allowed_domains": ["heyo.work"],
+    "public_paths": ["/healthz"]
+  }
 }

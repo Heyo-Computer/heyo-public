@@ -24,6 +24,8 @@ use datafusion::parquet::basic::Compression;
 use datafusion::parquet::file::properties::WriterProperties;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// A partition's pending rows.
@@ -41,6 +43,12 @@ pub struct Writer {
     /// Monotonically increasing suffix, so two files flushed inside the same
     /// millisecond cannot collide.
     sequence: u64,
+    /// Published for the API to read.
+    ///
+    /// An atomic rather than sharing the writer behind a lock: the writer runs
+    /// alone in the drain task precisely so it never has to synchronise, and a
+    /// dashboard poll must not be able to make a parquet flush wait.
+    buffered: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
@@ -95,7 +103,13 @@ impl Writer {
             flush_rows: flush_rows.max(1),
             flush_interval,
             sequence: 0,
+            buffered: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// A handle on the buffered-row count, for whoever reports status.
+    pub fn buffered_handle(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.buffered)
     }
 
     /// Buffer one record, flushing its partition if that fills it.
@@ -115,6 +129,7 @@ impl Writer {
         if buffer.records.len() >= self.flush_rows {
             self.flush_partition(&key)?;
         }
+        self.publish();
         Ok(())
     }
 
@@ -132,6 +147,7 @@ impl Writer {
         for key in &expired {
             self.flush_partition(key)?;
         }
+        self.publish();
         Ok(expired.len())
     }
 
@@ -142,15 +158,24 @@ impl Writer {
         for key in &keys {
             self.flush_partition(key)?;
         }
+        self.publish();
         Ok(keys.len())
     }
 
     /// Rows sitting in memory, not yet on disk.
-    // Read by tests today; the query layer will report it alongside the
-    // on-disk row count so a dashboard can show how much is still in flight.
-    #[allow(dead_code)]
     pub fn buffered_rows(&self) -> usize {
         self.buffers.values().map(|b| b.records.len()).sum()
+    }
+
+    /// Republish the buffered count.
+    ///
+    /// Recomputed rather than tracked incrementally: it is a sum over a handful
+    /// of open partitions, and a count maintained by hand at every push, flush
+    /// and rejection is exactly the kind of thing that drifts and then lies on a
+    /// status page.
+    fn publish(&self) {
+        self.buffered
+            .store(self.buffered_rows(), Ordering::Relaxed);
     }
 
     fn flush_partition(&mut self, key: &PartitionKey) -> Result<(), WriteError> {
@@ -269,6 +294,8 @@ fn build_metrics_batch(records: &[Record]) -> Result<RecordBatch, WriteError> {
     let mut p50 = Float64Builder::with_capacity(n);
     let mut p90 = Float64Builder::with_capacity(n);
     let mut p99 = Float64Builder::with_capacity(n);
+    let mut latency_count = UInt64Builder::with_capacity(n);
+    let mut latency_sum = UInt64Builder::with_capacity(n);
 
     for record in records {
         let Record::Metric(r) = record else {
@@ -287,6 +314,8 @@ fn build_metrics_batch(records: &[Record]) -> Result<RecordBatch, WriteError> {
         p50.append_option(r.p50_ms);
         p90.append_option(r.p90_ms);
         p99.append_option(r.p99_ms);
+        latency_count.append_option(r.latency_count);
+        latency_sum.append_option(r.latency_sum);
     }
 
     let schema = Table::Metrics.schema();
@@ -304,6 +333,8 @@ fn build_metrics_batch(records: &[Record]) -> Result<RecordBatch, WriteError> {
         std::sync::Arc::new(p50.finish()),
         std::sync::Arc::new(p90.finish()),
         std::sync::Arc::new(p99.finish()),
+        std::sync::Arc::new(latency_count.finish()),
+        std::sync::Arc::new(latency_sum.finish()),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }

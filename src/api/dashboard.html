@@ -1,0 +1,1110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>app-obs</title>
+<style>
+  /* Palette, surfaces and type carried over from app-lb's dashboard so the two
+     pages read as one system. The three series hues are validated for
+     colour-vision separation against both surfaces; do not substitute one
+     without re-checking the set. */
+  :root {
+    color-scheme: light;
+    --plane:        #f9f9f7;
+    --surface:      #fcfcfb;
+    --text:         #0b0b0b;
+    --text-2:       #52514e;
+    --muted:        #898781;
+    --grid:         #e1e0d9;
+    --axis:         #c3c2b7;
+    --border:       rgba(11,11,11,0.10);
+    --series-1:     #2a78d6;  /* blue   — requests, throughput */
+    --series-1-dim: #cde2fb;
+    --series-2:     #1baf7a;  /* green  — ready, healthy capacity */
+    --series-3:     #eb6834;  /* orange — pending, warming up */
+    --good:         #0ca30c;
+    --warning:      #fab219;
+    --serious:      #ec835a;
+    --critical:     #d03b3b;  /* errors — a status, not a series slot */
+    --success-text: #006300;
+  }
+  :root[data-theme="dark"], :root.dark {
+    color-scheme: dark;
+    --plane:        #0d0d0d;
+    --surface:      #1a1a19;
+    --text:         #ffffff;
+    --text-2:       #c3c2b7;
+    --muted:        #898781;
+    --grid:         #2c2c2a;
+    --axis:         #383835;
+    --border:       rgba(255,255,255,0.10);
+    --series-1:     #3987e5;
+    --series-1-dim: #184f95;
+    --series-2:     #199e70;
+    --series-3:     #d95926;
+    --good:         #0ca30c;
+    --warning:      #fab219;
+    --serious:      #ec835a;
+    --critical:     #e35a5a;
+    --success-text: #0ca30c;
+  }
+  /* Dark mode is stepped deliberately, not flipped: each hue is its own value
+     chosen against the dark surface. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
+      --muted:#898781; --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+      --series-1:#3987e5; --series-1-dim:#184f95; --series-2:#199e70; --series-3:#d95926;
+      --critical:#e35a5a; --success-text:#0ca30c;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--plane);
+    color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--series-1); text-decoration: none; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 20px 64px; }
+
+  header.top {
+    display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px 20px;
+    margin-bottom: 18px;
+  }
+  header.top h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  header.top h1 a { color: inherit; }
+  header.top .sub { color: var(--muted); font-size: 13px; }
+  header.top .spacer { flex: 1 1 auto; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--text-2);
+    border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px;
+    background: var(--surface);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+  .dot.stale { background: var(--warning); }
+  .dot.dead { background: var(--critical); }
+
+  /* One filter row above everything it scopes — never inside a chart card. */
+  .controls {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+    margin-bottom: 18px;
+  }
+  .segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
+  .segmented button {
+    font: inherit; font-size: 12px; color: var(--text-2);
+    background: var(--surface); border: 0; border-right: 1px solid var(--border);
+    padding: 5px 11px; cursor: pointer; min-height: 26px;
+  }
+  .segmented button:last-child { border-right: 0; }
+  .segmented button[aria-pressed="true"] { background: var(--series-1); color: #fff; }
+  button.ghost {
+    font: inherit; font-size: 12px; color: var(--text-2);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 999px; padding: 5px 12px; cursor: pointer; min-height: 26px;
+  }
+  button.ghost:hover { color: var(--text); }
+  button.ghost[aria-pressed="true"] { color: var(--text); border-color: var(--axis); }
+  input.text, select.text {
+    font: inherit; font-size: 13px; color: var(--text);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 9px; min-height: 28px;
+  }
+  input.text { min-width: 200px; flex: 1 1 220px; }
+
+  .section-title {
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted); margin: 28px 0 12px;
+  }
+  .note { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+
+  /* Stat tiles. Proportional figures on the values — tabular-nums makes a large
+     standalone number look loose. */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .tile .value { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
+  .tile .value .unit { font-size: 13px; font-weight: 500; color: var(--text-2); margin-left: 3px; }
+  .tile .sub { font-size: 12px; color: var(--text-2); margin-top: 4px; }
+  .tile.hero .value { font-size: 48px; }
+
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
+  .chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+  .chart-head h3 { font-size: 14px; font-weight: 600; margin: 0; }
+  .chart-head .meta { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  /* A legend is always present for two or more series. */
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 2px 0 6px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
+  .legend i { width: 11px; height: 2px; border-radius: 1px; display: inline-block; }
+
+  .plot { position: relative; }
+  .plot svg { display: block; width: 100%; height: auto; }
+  .plot .empty {
+    display: flex; align-items: center; justify-content: center;
+    height: 150px; font-size: 12px; color: var(--muted);
+  }
+  .tip {
+    position: absolute; pointer-events: none; opacity: 0; transition: opacity .08s;
+    background: var(--surface); border: 1px solid var(--axis); border-radius: 8px;
+    padding: 7px 9px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.10);
+    white-space: nowrap; z-index: 5;
+  }
+  .tip.on { opacity: 1; }
+  .tip .when { color: var(--muted); margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+  .tip .row { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+  .tip .row i { width: 9px; height: 2px; border-radius: 1px; }
+  .plot:focus-visible { outline: 2px solid var(--series-1); outline-offset: 3px; border-radius: 6px; }
+
+  /* Fleet rows */
+  .fleet { display: flex; flex-direction: column; gap: 8px; }
+  .row {
+    display: grid; align-items: center; gap: 14px;
+    grid-template-columns: minmax(120px, 1.1fr) minmax(90px, 130px) repeat(4, minmax(72px, 0.8fr)) 16px;
+    padding: 12px 16px; color: inherit;
+  }
+  .row:hover { border-color: var(--axis); }
+  .row .id { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+  .row .id .seen { display: block; font-weight: 400; font-size: 12px; color: var(--muted); }
+  .row .fig { font-variant-numeric: tabular-nums; }
+  .row .fig .k { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .row .fig .v { font-size: 15px; }
+  .row .chev { color: var(--muted); text-align: right; }
+  .row .spark svg { display: block; width: 100%; height: auto; }
+  @media (max-width: 760px) {
+    .row { grid-template-columns: 1fr 1fr; }
+    .row .spark, .row .chev { display: none; }
+  }
+
+  /* Tables — the WCAG-clean twin of every chart, and the log view itself. */
+  table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.data th, table.data td {
+    text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  table.data th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; }
+  table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .scroll-x { overflow-x: auto; }
+
+  .logs td.ts { white-space: nowrap; color: var(--text-2); font-variant-numeric: tabular-nums; }
+  .logs td.msg { width: 100%; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .logs td.who { white-space: nowrap; color: var(--muted); font-size: 12px; }
+  .logs tr.has-fields { cursor: pointer; }
+  .logs pre.fields {
+    margin: 6px 0 2px; padding: 8px 10px; background: var(--plane);
+    border: 1px solid var(--border); border-radius: 8px;
+    font-size: 12px; overflow-x: auto; white-space: pre;
+  }
+  .lvl {
+    display: inline-block; min-width: 58px; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  /* Level colour is a status, and never the only channel — the word is there too. */
+  .lvl.error { color: var(--critical); }
+  .lvl.warning { color: var(--warning); }
+  .lvl.info { color: var(--text-2); }
+  .lvl.debug { color: var(--muted); }
+
+  .view { display: none; }
+  .view.on { display: block; }
+  /* Refetch holds the previous render rather than flashing a skeleton. */
+  .view.busy { opacity: 0.6; }
+  .banner {
+    border: 1px solid var(--border); border-left: 3px solid var(--warning);
+    background: var(--surface); border-radius: 8px; padding: 10px 14px;
+    font-size: 13px; color: var(--text-2); margin-bottom: 14px;
+  }
+  .banner.bad { border-left-color: var(--critical); }
+  .banner[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <h1><a href="#/">app-obs</a></h1>
+  <span class="sub" id="subtitle">logs and metrics</span>
+  <span class="spacer"></span>
+  <span class="pill"><span class="dot" id="livedot"></span><span id="updated">loading…</span></span>
+  <button class="ghost" id="pause" aria-pressed="false">pause</button>
+  <button class="ghost" id="theme">theme</button>
+</header>
+
+<div class="banner" id="banner" hidden></div>
+
+<!-- One control row, scoping every chart and table below it. -->
+<div class="controls">
+  <div class="segmented" id="windows" role="group" aria-label="Time range"></div>
+  <span class="spacer"></span>
+  <button class="ghost" id="tables" aria-pressed="false">table view</button>
+</div>
+
+<section class="view on" id="view-fleet">
+  <div id="host-wrap"></div>
+  <div class="section-title">Deployments</div>
+  <div class="fleet" id="fleet"></div>
+  <p class="note" id="fleet-note"></p>
+</section>
+
+<section class="view" id="view-detail">
+  <div class="tiles" id="d-tiles"></div>
+  <div class="section-title">Charts</div>
+  <div class="grid-2" id="d-charts"></div>
+  <div id="d-tables"></div>
+
+  <div class="section-title">Logs</div>
+  <div class="controls">
+    <select class="text" id="f-level" aria-label="Level">
+      <option value="">any level</option>
+      <option value="error">error</option>
+      <option value="warning">warning</option>
+      <option value="info">info</option>
+      <option value="debug">debug</option>
+    </select>
+    <select class="text" id="f-backend" aria-label="Backend"></select>
+    <input class="text" id="f-q" type="search" placeholder="search messages" aria-label="Search messages">
+    <button class="ghost" id="f-go">search</button>
+  </div>
+  <div class="card scroll-x">
+    <table class="data logs"><tbody id="log-rows"></tbody></table>
+  </div>
+  <div class="controls" style="margin-top:12px">
+    <button class="ghost" id="log-more">load older</button>
+    <span class="note" id="log-note"></span>
+  </div>
+</section>
+
+</div>
+
+<script>
+"use strict";
+
+const REFRESH_MS = 10_000;   // matches the metrics poll interval; finer just re-reads the same rows
+const LOG_PAGE = 200;
+
+const $ = (id) => document.getElementById(id);
+
+let state = {
+  window: "24h",
+  route: { view: "fleet", id: null },
+  paused: false,
+  tables: false,
+  timer: null,
+  data: null,          // last fleet or detail payload
+  logRows: [],
+  logSeen: new Set(),
+  logNext: null,
+  logBusy: false,
+};
+
+/* ---------- formatting ---------- */
+
+const fmt = (n, d = 0) => (n == null || !isFinite(n)) ? "—" :
+  n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+
+// A rate reads better with a decimal while it is small and without once it isn't.
+const fmtRate = (v) => v == null ? "—" : fmt(v, v < 10 ? (v < 1 ? 2 : 1) : 0) + "/s";
+
+function fmtMs(ms) {
+  if (ms == null || !isFinite(ms)) return "—";
+  if (ms < 1) return ms.toFixed(2) + " ms";
+  if (ms < 1000) return Math.round(ms) + " ms";
+  return (ms / 1000).toFixed(2) + " s";
+}
+
+function fmtBytes(b) {
+  if (b == null || !isFinite(b)) return "—";
+  if (b < 1024) return Math.round(b) + " B";
+  const u = ["KB", "MB", "GB", "TB"];
+  let i = -1, n = b;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n < 10 ? 1 : 0) + " " + u[i];
+}
+
+function fmtCount(n) {
+  if (n == null) return "—";
+  if (n < 1000) return String(n);
+  if (n < 1e6) return (n / 1000).toFixed(n < 10_000 ? 1 : 0) + "K";
+  return (n / 1e6).toFixed(1) + "M";
+}
+
+/// Clock time, with seconds only when the buckets are finer than a minute —
+/// otherwise a 10s-bucket axis prints the same label three times.
+function fmtClock(ms, stepSecs) {
+  return new Date(ms).toLocaleTimeString([], stepSecs != null && stepSecs < 60
+    ? { hour: "2-digit", minute: "2-digit", second: "2-digit" }
+    : { hour: "2-digit", minute: "2-digit" });
+}
+
+function fmtStamp(ms) {
+  const d = new Date(ms);
+  return d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " +
+    d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function fmtAgo(ms) {
+  if (ms == null) return "never";
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+const plural = (n, one, many) => `${fmtCount(n)} ${n === 1 ? one : many}`;
+
+/* ---------- charts ----------
+   Hand-rolled SVG: no library, so the page stays self-contained and loads on a
+   host with no route out. Rendered at the container's measured pixel width so a
+   2px stroke is 2px, not 2px scaled by whatever the viewBox happened to be. */
+
+const PLOT_H = 168;
+const PAD = { top: 12, right: 14, bottom: 22, left: 46 };
+
+/// Round a value up to a clean axis maximum.
+///
+/// The steps are all evenly halvable, because the middle gridline is labelled
+/// too — a 2.5 ceiling would put a tick at 1.25 and print it as "1.3", a number
+/// that is on the axis but not where the line is.
+function niceMax(max) {
+  if (!(max > 0)) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(max)));
+  for (const step of [1, 2, 4, 5, 10]) {
+    if (max <= step * mag) return step * mag;
+  }
+  return 10 * mag;
+}
+
+/**
+ * A time-series chart.
+ *
+ * `series` is `[{key, label, color, mark}]` over `rows` of `{t, [key]: value}`.
+ * A null value is a hole, not a zero: the line breaks and the column is absent.
+ * Everything the storage layer does to keep "not measured" distinct from
+ * "measured as zero" would be wasted if the chart quietly closed the gap.
+ */
+function chart(host, rows, series, opts = {}) {
+  const fmtV = opts.format || ((v) => fmt(v, 1));
+  const multi = series.length > 1;
+
+  host.innerHTML = "";
+  if (!rows.length) {
+    host.innerHTML = `<div class="empty">no data in this range</div>`;
+    return;
+  }
+
+  const W = Math.max(280, host.clientWidth || 340);
+  const H = PLOT_H;
+  const iw = W - PAD.left - PAD.right;
+  const ih = H - PAD.top - PAD.bottom;
+
+  let max = 0;
+  for (const row of rows) {
+    for (const s of series) {
+      const v = row[s.key];
+      if (v != null && isFinite(v) && v > max) max = v;
+    }
+  }
+  const top = niceMax(max);
+
+  const n = rows.length;
+  const x = (i) => PAD.left + (n === 1 ? iw / 2 : (i / (n - 1)) * iw);
+  const y = (v) => PAD.top + ih - (v / top) * ih;
+
+  const ticks = [0, top / 2, top];
+  let svg = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img"
+    aria-label="${esc(opts.label || "time series")}">`;
+
+  // Gridlines: solid hairlines one step off the surface, never dashed.
+  for (const t of ticks) {
+    svg += `<line x1="${PAD.left}" y1="${y(t).toFixed(1)}" x2="${W - PAD.right}" y2="${y(t).toFixed(1)}"
+      stroke="var(--grid)" stroke-width="1" shape-rendering="crispEdges"/>`;
+    svg += `<text x="${PAD.left - 7}" y="${(y(t) + 3.5).toFixed(1)}" text-anchor="end"
+      font-size="10" fill="var(--muted)" style="font-variant-numeric:tabular-nums">${esc(fmtV(t))}</text>`;
+  }
+  svg += `<line x1="${PAD.left}" y1="${PAD.top + ih}" x2="${W - PAD.right}" y2="${PAD.top + ih}"
+    stroke="var(--axis)" stroke-width="1" shape-rendering="crispEdges"/>`;
+
+  const columns = series.filter((s) => s.mark === "column");
+
+  for (const s of series) {
+    if (s.mark === "column") {
+      // Counts per bucket are discrete, so they get columns. Grouped side by
+      // side rather than drawn at the same x: overlapping them would read as a
+      // stacked bar, which claims the shorter series is a *part* of the taller
+      // one. Capped at 24px and inset by the 2px surface gap, so neighbours
+      // separate without a stroke drawn round them.
+      const group = columns.indexOf(s);
+      const slot = n > 1 ? iw / (n - 1) : iw;
+      const band = Math.max(1, Math.min(24, slot - 2)) / columns.length;
+      const w = Math.max(1, band - (columns.length > 1 ? 2 : 0));
+      const shift = (group - (columns.length - 1) / 2) * band;
+      for (let i = 0; i < n; i++) {
+        const v = rows[i][s.key];
+        if (v == null || !isFinite(v) || v <= 0) continue;
+        const h = Math.max(1, PAD.top + ih - y(v));
+        const r = Math.min(4, w / 2, h);
+        // Clamped inside the plot: the first and last groups are centred on the
+        // axis ends, so half of an outer column would otherwise sit on top of
+        // the y-axis labels.
+        const left = Math.max(PAD.left,
+          Math.min(x(i) + shift - w / 2, W - PAD.right - w));
+        svg += `<path d="M${left.toFixed(2)},${(PAD.top + ih).toFixed(2)}
+          v${(-(h - r)).toFixed(2)} a${r},${r} 0 0 1 ${r},${-r}
+          h${(w - 2 * r).toFixed(2)} a${r},${r} 0 0 1 ${r},${r}
+          v${(h - r).toFixed(2)} z" fill="${s.color}"/>`;
+      }
+      continue;
+    }
+
+    // Break the line wherever a value is missing.
+    const runs = [];
+    let run = [];
+    for (let i = 0; i < n; i++) {
+      const v = rows[i][s.key];
+      if (v == null || !isFinite(v)) {
+        if (run.length) runs.push(run);
+        run = [];
+      } else {
+        run.push([x(i), y(v)]);
+      }
+    }
+    if (run.length) runs.push(run);
+
+    for (const points of runs) {
+      const path = points.map(([px, py]) => `${px.toFixed(2)},${py.toFixed(2)}`).join(" ");
+      if (!multi && points.length > 1) {
+        // A wash under a single series, never a saturated block.
+        svg += `<polygon points="${points[0][0].toFixed(2)},${PAD.top + ih} ${path} ${points[points.length - 1][0].toFixed(2)},${PAD.top + ih}"
+          fill="${s.color}" opacity="0.10"/>`;
+      }
+      if (points.length === 1) {
+        // A lone sample would be an invisible zero-length line.
+        svg += `<circle cx="${points[0][0].toFixed(2)}" cy="${points[0][1].toFixed(2)}" r="4"
+          fill="${s.color}" stroke="var(--surface)" stroke-width="2"/>`;
+      } else {
+        svg += `<polyline points="${path}" fill="none" stroke="${s.color}" stroke-width="2"
+          stroke-linejoin="round" stroke-linecap="round"/>`;
+      }
+    }
+
+    // Direct end-label on the last known value: the one number worth putting on
+    // the chart itself.
+    const lastIndex = lastKnown(rows, s.key);
+    if (lastIndex >= 0) {
+      const v = rows[lastIndex][s.key];
+      svg += `<circle cx="${x(lastIndex).toFixed(2)}" cy="${y(v).toFixed(2)}" r="4"
+        fill="${s.color}" stroke="var(--surface)" stroke-width="2"/>`;
+      if (!multi) {
+        const anchor = x(lastIndex) > W - PAD.right - 46 ? "end" : "start";
+        const dx = anchor === "end" ? -8 : 8;
+        svg += `<text x="${(x(lastIndex) + dx).toFixed(1)}" y="${(y(v) - 8).toFixed(1)}"
+          text-anchor="${anchor}" font-size="11" fill="var(--text-2)">${esc(fmtV(v))}</text>`;
+      }
+    }
+  }
+
+  // x-axis: first, middle and last bucket only. More labels than that collide.
+  for (const i of [...new Set([0, Math.floor((n - 1) / 2), n - 1])]) {
+    if (i < 0) continue;
+    const anchor = i === 0 ? "start" : i === n - 1 ? "end" : "middle";
+    svg += `<text x="${x(i).toFixed(1)}" y="${H - 6}" text-anchor="${anchor}"
+      font-size="10" fill="var(--muted)" style="font-variant-numeric:tabular-nums">${esc(fmtClock(rows[i].t, opts.stepSecs))}</text>`;
+  }
+
+  svg += `<line class="cross" x1="0" y1="${PAD.top}" x2="0" y2="${PAD.top + ih}"
+    stroke="var(--axis)" stroke-width="1" opacity="0"/>`;
+  svg += `</svg><div class="tip"></div>`;
+  host.innerHTML = svg;
+
+  hover(host, rows, series, { x, W, fmtV });
+}
+
+/// Index of the last non-null value of `key`, or -1.
+function lastKnown(rows, key) {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const v = rows[i][key];
+    if (v != null && isFinite(v)) return i;
+  }
+  return -1;
+}
+
+/**
+ * Crosshair and tooltip.
+ *
+ * Nearest-bucket by x rather than a per-point hit target: at 140 buckets a dot
+ * is a few pixels wide, and a chart you have to land on exactly is a chart
+ * nobody reads. Arrow keys move the same cursor, so the values are reachable
+ * without a pointer — the tooltip enhances, it never gates (the table view has
+ * every number).
+ */
+function hover(host, rows, series, geom) {
+  const svg = host.querySelector("svg");
+  const tip = host.querySelector(".tip");
+  const cross = host.querySelector(".cross");
+  if (!svg || !tip) return;
+  let index = -1;
+
+  const show = (i) => {
+    index = i;
+    const row = rows[i];
+    const px = geom.x(i);
+    cross.setAttribute("x1", px);
+    cross.setAttribute("x2", px);
+    cross.setAttribute("opacity", "1");
+
+    let html = `<div class="when">${esc(fmtStamp(row.t))}</div>`;
+    for (const s of series) {
+      const v = row[s.key];
+      html += `<div class="row"><i style="background:${s.color}"></i>
+        <span>${esc(s.label)}</span>
+        <span style="margin-left:auto;padding-left:10px">${v == null ? "no data" : esc(geom.fmtV(v))}</span></div>`;
+    }
+    tip.innerHTML = html;
+    tip.classList.add("on");
+
+    // Flip before the tooltip runs off the right edge.
+    const scale = (host.clientWidth || geom.W) / geom.W;
+    const at = px * scale;
+    const w = tip.offsetWidth;
+    tip.style.left = Math.max(0, Math.min(at + 12, (host.clientWidth || geom.W) - w)) + "px";
+    tip.style.top = "6px";
+  };
+
+  const hide = () => {
+    tip.classList.remove("on");
+    cross.setAttribute("opacity", "0");
+    index = -1;
+  };
+
+  const nearest = (clientX) => {
+    const box = svg.getBoundingClientRect();
+    const px = ((clientX - box.left) / box.width) * geom.W;
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < rows.length; i++) {
+      const d = Math.abs(geom.x(i) - px);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  };
+
+  host.addEventListener("pointermove", (e) => show(nearest(e.clientX)));
+  host.addEventListener("pointerleave", hide);
+  host.tabIndex = 0;
+  host.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const from = index < 0 ? rows.length - 1 : index;
+    show(Math.max(0, Math.min(rows.length - 1, from + (e.key === "ArrowRight" ? 1 : -1))));
+  });
+  host.addEventListener("blur", hide);
+}
+
+/// A row-height sparkline. One series, no axes — the figures beside it carry the
+/// numbers.
+function spark(rows, key, color) {
+  const W = 120, H = 30, pad = 3;
+  const values = rows.map((r) => r[key]).filter((v) => v != null && isFinite(v));
+  if (!values.length) return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"></svg>`;
+  const top = Math.max(1e-9, ...values);
+  const n = rows.length;
+  const x = (i) => pad + (n === 1 ? (W - 2 * pad) / 2 : (i / (n - 1)) * (W - 2 * pad));
+  const y = (v) => H - pad - (v / top) * (H - 2 * pad);
+
+  const runs = [];
+  let run = [];
+  for (let i = 0; i < n; i++) {
+    const v = rows[i][key];
+    if (v == null || !isFinite(v)) { if (run.length) runs.push(run); run = []; }
+    else run.push(`${x(i).toFixed(1)},${y(v).toFixed(1)}`);
+  }
+  if (run.length) runs.push(run);
+
+  const lines = runs.map((points) => points.length === 1
+    ? `<circle cx="${points[0].split(",")[0]}" cy="${points[0].split(",")[1]}" r="1.8" fill="${color}"/>`
+    : `<polyline points="${points.join(" ")}" fill="none" stroke="${color}" stroke-width="1.5"
+        stroke-linejoin="round" stroke-linecap="round"/>`).join("");
+
+  return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img"
+    aria-label="trend, peak ${esc(fmt(top, 1))}">
+    <line x1="0" y1="${H - pad}" x2="${W}" y2="${H - pad}" stroke="var(--grid)" stroke-width="1"/>
+    ${lines}</svg>`;
+}
+
+function tile(label, value, unit, sub, cls) {
+  return `<div class="tile card ${cls || ""}">
+    <div class="label">${esc(label)}</div>
+    <div class="value">${value}${unit ? `<span class="unit">${esc(unit)}</span>` : ""}</div>
+    ${sub ? `<div class="sub">${sub}</div>` : ""}
+  </div>`;
+}
+
+function legend(series) {
+  return `<div class="legend">${series.map((s) =>
+    `<span><i style="background:${s.color}"></i>${esc(s.label)}</span>`).join("")}</div>`;
+}
+
+/* ---------- fetching ---------- */
+
+async function api(path) {
+  const r = await fetch(path, { headers: { accept: "application/json" }, cache: "no-store" });
+  if (!r.ok) {
+    let detail = `HTTP ${r.status}`;
+    try {
+      const body = await r.json();
+      if (body && body.error) detail = body.error;
+    } catch { /* a non-JSON error page is still an error */ }
+    const err = new Error(detail);
+    err.status = r.status;
+    throw err;
+  }
+  return r.json();
+}
+
+function banner(message, bad) {
+  const el = $("banner");
+  if (!message) { el.hidden = true; return; }
+  el.hidden = false;
+  el.textContent = message;
+  el.classList.toggle("bad", !!bad);
+}
+
+/// What the page should say about how current it is.
+function freshnessNote(f) {
+  const parts = [];
+  if (f.buffered_rows > 0) {
+    parts.push(`${plural(f.buffered_rows, "row", "rows")} still buffered in memory` +
+      ` — partitions flush every ${f.flush_secs}s, so the newest lines may not be queryable yet`);
+  }
+  if (f.dropped > 0) {
+    parts.push(`${plural(f.dropped, "record", "records")} dropped since start (ingest queue full)`);
+  }
+  return parts.join(" · ");
+}
+
+/* ---------- fleet view ---------- */
+
+function renderFleet(data) {
+  state.data = data;
+  $("subtitle").textContent = `${data.deployments.length} deployment${data.deployments.length === 1 ? "" : "s"} · ${data.retain_days}d retention`;
+
+  // Whole-host usage, which belongs to no deployment.
+  const host = $("host-wrap");
+  if (data.host == null) {
+    host.innerHTML = `<div class="section-title">Host</div>
+      <div class="card"><div class="sub" style="color:var(--muted);font-size:13px">
+      app-lb has not reported host usage — the daemon supplies it only once it has sampled the host.</div></div>`;
+  } else {
+    const latest = latestOf(data.host);
+    host.innerHTML = `<div class="section-title">Host</div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="chart-head"><h3>CPU</h3><span class="meta">${latest.cpu_percent == null ? "—" : fmt(latest.cpu_percent, 1) + "%"}</span></div>
+          <div class="plot" id="host-cpu"></div>
+        </div>
+        <div class="card">
+          <div class="chart-head"><h3>Memory used</h3><span class="meta">${fmtBytes(latest.memory_bytes)}</span></div>
+          <div class="plot" id="host-mem"></div>
+        </div>
+      </div>`;
+    chart($("host-cpu"), data.host, [{ key: "cpu_percent", label: "CPU", color: "var(--series-1)" }],
+      { format: (v) => fmt(v, 0) + "%", stepSecs: data.step_secs, label: "host CPU percent over time" });
+    chart($("host-mem"), data.host, [{ key: "memory_bytes", label: "Memory", color: "var(--series-1)" }],
+      { format: fmtBytes, stepSecs: data.step_secs, label: "host memory used over time" });
+  }
+
+  const fleet = $("fleet");
+  if (!data.deployments.length) {
+    fleet.innerHTML = `<div class="card"><span style="color:var(--muted)">Nothing collected yet.
+      Logs arrive on the ingest port; metrics are polled from app-lb.</span></div>`;
+  } else {
+    fleet.innerHTML = data.deployments.map((d) => {
+      const l = d.latest;
+      return `<a class="card row" href="#/d/${encodeURIComponent(d.id)}">
+        <span class="id">${esc(d.id)}<span class="seen">${d.log_lines ? esc(plural(d.log_lines, "line", "lines")) : "no logs"} · ${esc(fmtAgo(lastBucketAt(d)))}</span></span>
+        <span class="spark">${spark(d.buckets, "requests_per_sec", "var(--series-1)")}</span>
+        <span class="fig"><span class="k">req/s</span><span class="v">${esc(fmtRate(l.requests_per_sec))}</span></span>
+        <span class="fig"><span class="k">err/s</span><span class="v">${esc(fmtRate(l.errors_per_sec))}</span></span>
+        <span class="fig"><span class="k">latency</span><span class="v">${esc(fmtMs(l.mean_latency_ms))}</span></span>
+        <span class="fig"><span class="k">err logs</span><span class="v">${d.error_logs ? fmtCount(d.error_logs) : "0"}</span></span>
+        <span class="chev">›</span>
+      </a>`;
+    }).join("");
+  }
+
+  $("fleet-note").textContent = freshnessNote(data.freshness);
+  renderFleetTables(data);
+  stamp(data.generated_at_ms);
+}
+
+/// Latest non-null of each measure, mirroring the server's own `latest_of` for
+/// the host strip (which the fleet payload sends as a plain bucket list).
+function latestOf(buckets) {
+  const out = {};
+  for (const b of buckets) {
+    for (const k of Object.keys(b)) {
+      if (b[k] != null) out[k] = b[k];
+    }
+  }
+  return out;
+}
+
+function lastBucketAt(d) {
+  const last = d.log_buckets[d.log_buckets.length - 1] || d.buckets[d.buckets.length - 1];
+  return last ? last.t : null;
+}
+
+/// The table twin of the overview: every figure the sparklines encode, as text.
+function renderFleetTables(data) {
+  const old = $("fleet-table");
+  if (old) old.remove();
+  if (!state.tables || !data.deployments.length) return;
+
+  const rows = data.deployments.map((d) => `<tr>
+    <td>${esc(d.id)}</td>
+    <td class="num">${esc(fmtRate(d.latest.requests_per_sec))}</td>
+    <td class="num">${esc(fmtRate(d.latest.errors_per_sec))}</td>
+    <td class="num">${esc(fmtMs(d.latest.mean_latency_ms))}</td>
+    <td class="num">${esc(fmtMs(d.latest.p50_ms))}</td>
+    <td class="num">${d.latest.ready == null ? "—" : fmt(d.latest.ready, 0)}</td>
+    <td class="num">${fmt(d.log_lines)}</td>
+    <td class="num">${fmt(d.error_logs)}</td>
+  </tr>`).join("");
+
+  const wrap = document.createElement("div");
+  wrap.id = "fleet-table";
+  wrap.innerHTML = `<div class="section-title">Table view</div>
+    <div class="card scroll-x"><table class="data">
+      <thead><tr><th>Deployment</th><th class="num">Req/s</th><th class="num">Err/s</th>
+        <th class="num">Latency</th><th class="num">p50 *</th><th class="num">Ready</th>
+        <th class="num">Log lines</th><th class="num">Error logs</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+      <p class="note">* p50 is cumulative since app-lb started, not windowed.</p></div>`;
+  $("view-fleet").appendChild(wrap);
+}
+
+/* ---------- detail view ---------- */
+
+const POOL_SERIES = [
+  { key: "ready", label: "Ready", color: "var(--series-2)" },
+  { key: "pending", label: "Pending", color: "var(--series-3)" },
+  { key: "draining", label: "Draining", color: "var(--series-1)" },
+];
+const LOG_SERIES = [
+  { key: "lines", label: "All lines", color: "var(--series-1)" },
+  // Red because it means bad, which is what a status colour is for.
+  { key: "errors", label: "Error lines", color: "var(--critical)" },
+];
+
+function renderDetail(data) {
+  state.data = data;
+  $("subtitle").innerHTML = `<a href="#/">fleet</a> › ${esc(data.id)}`;
+
+  const l = data.latest;
+  $("d-tiles").innerHTML = [
+    tile("Requests / sec", esc(fmtRate(l.requests_per_sec)), "", "", "hero"),
+    tile("Errors / sec", esc(fmtRate(l.errors_per_sec)), "",
+      esc(plural(data.error_logs, "error log", "error logs"))),
+    tile("Mean latency", esc(fmtMs(l.mean_latency_ms)), "", "over the last bucket"),
+    // Kept off the time axis on purpose: app-lb's histogram never decays, so
+    // these are lifetime figures that barely move and reset when it restarts.
+    tile("Percentiles", esc(fmtMs(l.p50_ms)), "",
+      `p90 ${esc(fmtMs(l.p90_ms))} · p99 ${esc(fmtMs(l.p99_ms))} — cumulative since app-lb started`),
+    tile("CPU", l.cpu_percent == null ? "—" : fmt(l.cpu_percent, 1), l.cpu_percent == null ? "" : "%"),
+    tile("Memory", esc(fmtBytes(l.memory_bytes))),
+    tile("Ready", l.ready == null ? "—" : fmt(l.ready, 0), "",
+      `${l.pending == null ? "—" : fmt(l.pending, 0)} pending · ${l.draining == null ? "—" : fmt(l.draining, 0)} draining`),
+    tile("In flight", l.in_flight == null ? "—" : fmt(l.in_flight, 0), "", "requests being served"),
+    tile("Log lines", esc(fmtCount(data.log_lines)), "", `in the last ${esc(data.window)}`),
+  ].join("");
+
+  const panels = [
+    { id: "c-req", title: "Requests / sec", rows: data.buckets, series: [{ key: "requests_per_sec", label: "Requests", color: "var(--series-1)" }], format: (v) => fmt(v, v < 10 ? 1 : 0) },
+    { id: "c-err", title: "Errors / sec", rows: data.buckets, series: [{ key: "errors_per_sec", label: "Errors", color: "var(--critical)" }], format: (v) => fmt(v, v < 10 ? 1 : 0) },
+    { id: "c-lat", title: "Mean latency", rows: data.buckets, series: [{ key: "mean_latency_ms", label: "Mean latency", color: "var(--series-1)" }], format: fmtMs, note: "Δsum ÷ Δcount per bucket — not the cumulative percentiles" },
+    { id: "c-cpu", title: "CPU", rows: data.buckets, series: [{ key: "cpu_percent", label: "CPU", color: "var(--series-1)" }], format: (v) => fmt(v, 0) + "%" },
+    { id: "c-mem", title: "Memory", rows: data.buckets, series: [{ key: "memory_bytes", label: "Memory", color: "var(--series-1)" }], format: fmtBytes },
+    { id: "c-pool", title: "Pool", rows: data.buckets, series: POOL_SERIES, format: (v) => fmt(v, 0) },
+    { id: "c-logs", title: "Log volume", rows: data.log_buckets, series: LOG_SERIES, format: fmtCount, mark: "column" },
+  ];
+
+  for (const p of panels) p.stepSecs = data.step_secs;
+
+  $("d-charts").innerHTML = panels.map((p) => `<div class="card">
+    <div class="chart-head"><h3>${esc(p.title)}</h3>
+      <span class="meta">${esc(data.step_secs)}s buckets</span></div>
+    ${p.series.length > 1 ? legend(p.series) : ""}
+    <div class="plot" id="${p.id}"></div>
+    ${p.note ? `<p class="note">${esc(p.note)}</p>` : ""}
+  </div>`).join("");
+
+  for (const p of panels) {
+    const series = p.mark ? p.series.map((s) => ({ ...s, mark: p.mark })) : p.series;
+    chart($(p.id), p.rows, series,
+      { format: p.format, stepSecs: p.stepSecs, label: `${p.title} over time` });
+  }
+
+  renderDetailTables(data);
+
+  const select = $("f-backend");
+  const chosen = select.value;
+  select.innerHTML = `<option value="">any backend</option>` +
+    data.backends.map((b) => `<option value="${esc(b)}"${b === chosen ? " selected" : ""}>${esc(b)}</option>`).join("");
+
+  $("log-note").textContent = freshnessNote(data.freshness);
+  stamp(data.generated_at_ms);
+}
+
+function renderDetailTables(data) {
+  const host = $("d-tables");
+  if (!state.tables) { host.innerHTML = ""; return; }
+
+  const volume = new Map(data.log_buckets.map((b) => [b.t, b]));
+  const rows = data.buckets.map((b) => {
+    const v = volume.get(b.t) || { lines: 0, errors: 0 };
+    const cell = (x) => `<td class="num">${x == null ? "—" : esc(x)}</td>`;
+    return `<tr><td>${esc(fmtStamp(b.t))}</td>
+      ${cell(b.requests_per_sec == null ? null : fmt(b.requests_per_sec, 2))}
+      ${cell(b.errors_per_sec == null ? null : fmt(b.errors_per_sec, 2))}
+      ${cell(b.mean_latency_ms == null ? null : fmtMs(b.mean_latency_ms))}
+      ${cell(b.cpu_percent == null ? null : fmt(b.cpu_percent, 1))}
+      ${cell(b.memory_bytes == null ? null : fmtBytes(b.memory_bytes))}
+      ${cell(b.ready == null ? null : fmt(b.ready, 0))}
+      ${cell(fmt(v.lines))}${cell(fmt(v.errors))}</tr>`;
+  }).join("");
+
+  host.innerHTML = `<div class="section-title">Table view</div>
+    <div class="card scroll-x"><table class="data">
+      <thead><tr><th>Bucket</th><th class="num">Req/s</th><th class="num">Err/s</th>
+        <th class="num">Latency</th><th class="num">CPU %</th><th class="num">Memory</th>
+        <th class="num">Ready</th><th class="num">Lines</th><th class="num">Errors</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="9" style="color:var(--muted)">no buckets in this range</td></tr>`}</tbody>
+    </table></div>`;
+}
+
+/* ---------- logs ---------- */
+
+function logQuery(before) {
+  const p = new URLSearchParams({ window: state.window, limit: String(LOG_PAGE) });
+  const level = $("f-level").value, backend = $("f-backend").value, q = $("f-q").value.trim();
+  if (level) p.set("level", level);
+  if (backend) p.set("backend", backend);
+  if (q) p.set("q", q);
+  if (before != null) p.set("before", String(before));
+  return p.toString();
+}
+
+async function loadLogs(append) {
+  if (state.logBusy || !state.route.id) return;
+  state.logBusy = true;
+  $("log-more").disabled = true;
+  try {
+    const before = append ? state.logNext : null;
+    if (!append) { state.logRows = []; state.logSeen = new Set(); }
+    const data = await api(`/api/deployments/${encodeURIComponent(state.route.id)}/logs?${logQuery(before)}`);
+
+    // `before` is inclusive, so the boundary millisecond comes back twice. The
+    // server cannot drop it without risking losing lines from a burst that
+    // straddles a page edge, so the de-duplication belongs here.
+    let added = 0;
+    for (const row of data.rows) {
+      const key = `${row.ts}|${row.source}|${row.message}`;
+      if (state.logSeen.has(key)) continue;
+      state.logSeen.add(key);
+      state.logRows.push(row);
+      added++;
+    }
+    state.logNext = data.next_before_ms;
+    renderLogs(added === 0 && append);
+  } catch (e) {
+    banner(`logs: ${e.message}`, true);
+  } finally {
+    state.logBusy = false;
+    $("log-more").disabled = false;
+  }
+}
+
+function renderLogs(exhausted) {
+  const body = $("log-rows");
+  if (!state.logRows.length) {
+    body.innerHTML = `<tr><td style="color:var(--muted)">No matching lines in this range.</td></tr>`;
+  } else {
+    body.innerHTML = state.logRows.map((r, i) => {
+      const cls = levelClass(r.level);
+      const who = [r.backend, r.host].filter(Boolean).join(" · ");
+      return `<tr class="${r.fields ? "has-fields" : ""}" data-i="${i}">
+        <td class="ts">${esc(fmtStamp(r.ts))}</td>
+        <td><span class="lvl ${cls}">${esc(r.level || r.source)}</span></td>
+        <td class="msg">${esc(r.message)}${r.fields ? `<pre class="fields" hidden>${esc(pretty(r.fields))}</pre>` : ""}</td>
+        <td class="who">${esc(who)}</td>
+      </tr>`;
+    }).join("");
+  }
+  $("log-more").hidden = !state.logNext || exhausted;
+  if (exhausted) $("log-note").textContent = "reached the end of the range";
+}
+
+/// Map a sender's spelling onto the four classes the page styles.
+function levelClass(level) {
+  const l = (level || "").toLowerCase();
+  if (["error", "err", "fatal", "critical", "crit", "emergency", "emerg", "alert", "panic"].includes(l)) return "error";
+  if (["warning", "warn"].includes(l)) return "warning";
+  if (l === "debug" || l === "trace") return "debug";
+  return "info";
+}
+
+/// Fields are stored as a JSON string. Anything that doesn't parse is shown
+/// verbatim rather than swallowed — it is what the sender actually sent.
+function pretty(fields) {
+  try {
+    return JSON.stringify(JSON.parse(fields), null, 2);
+  } catch {
+    return fields;
+  }
+}
+
+$("log-rows").addEventListener("click", (e) => {
+  const row = e.target.closest("tr.has-fields");
+  if (!row) return;
+  const pre = row.querySelector("pre.fields");
+  if (pre) pre.hidden = !pre.hidden;
+});
+
+/* ---------- routing and polling ---------- */
+
+function parseRoute() {
+  const hash = location.hash.replace(/^#/, "");
+  const detail = hash.match(/^\/d\/(.+)$/);
+  return detail
+    ? { view: "detail", id: decodeURIComponent(detail[1]) }
+    : { view: "fleet", id: null };
+}
+
+function stamp(generatedMs) {
+  $("updated").textContent = "updated " + fmtClock(generatedMs || Date.now());
+  $("livedot").className = "dot" + (state.paused ? " stale" : "");
+}
+
+async function refresh() {
+  const route = state.route;
+  const view = route.view === "detail" ? $("view-detail") : $("view-fleet");
+  view.classList.add("busy");
+  try {
+    if (route.view === "detail") {
+      renderDetail(await api(`/api/deployments/${encodeURIComponent(route.id)}?window=${state.window}`));
+    } else {
+      renderFleet(await api(`/api/fleet?window=${state.window}`));
+    }
+    banner(null);
+  } catch (e) {
+    // 503 is the query layer protecting ingest, not a fault. Say so, keep the
+    // last good render, and try again on the next tick.
+    const soft = e.status === 503 || e.status === 504;
+    banner(soft
+      ? `${e.message} — showing the last successful refresh`
+      : `could not refresh: ${e.message}`, !soft);
+    $("livedot").className = "dot " + (soft ? "stale" : "dead");
+  } finally {
+    view.classList.remove("busy");
+  }
+}
+
+function show() {
+  state.route = parseRoute();
+  const detail = state.route.view === "detail";
+  $("view-fleet").classList.toggle("on", !detail);
+  $("view-detail").classList.toggle("on", detail);
+  if (!detail) $("subtitle").textContent = "logs and metrics";
+  refresh();
+  if (detail) loadLogs(false);
+}
+
+function schedule() {
+  clearTimeout(state.timer);
+  if (state.paused) return;
+  state.timer = setTimeout(async () => {
+    await refresh();
+    schedule();
+  }, REFRESH_MS);
+}
+
+/* ---------- controls ---------- */
+
+function buildWindows(labels) {
+  $("windows").innerHTML = labels.map((l) =>
+    `<button data-w="${esc(l)}" aria-pressed="${l === state.window}">${esc(l)}</button>`).join("");
+}
+
+$("windows").addEventListener("click", (e) => {
+  const button = e.target.closest("button[data-w]");
+  if (!button) return;
+  state.window = button.dataset.w;
+  for (const b of $("windows").children) b.setAttribute("aria-pressed", String(b === button));
+  refresh();
+  if (state.route.view === "detail") loadLogs(false);
+});
+
+$("pause").addEventListener("click", () => {
+  state.paused = !state.paused;
+  $("pause").setAttribute("aria-pressed", String(state.paused));
+  $("pause").textContent = state.paused ? "resume" : "pause";
+  if (state.paused) clearTimeout(state.timer); else schedule();
+  stamp(state.data ? state.data.generated_at_ms : Date.now());
+});
+
+$("tables").addEventListener("click", () => {
+  state.tables = !state.tables;
+  $("tables").setAttribute("aria-pressed", String(state.tables));
+  if (!state.data) return;
+  if (state.route.view === "detail") renderDetailTables(state.data);
+  else renderFleetTables(state.data);
+});
+
+$("theme").addEventListener("click", () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const current = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  document.documentElement.dataset.theme = current === "dark" ? "light" : "dark";
+  // Charts carry literal `var(--…)` strings, so the redraw is only needed for
+  // the measured geometry — but it is cheap and keeps everything consistent.
+  if (state.data) state.route.view === "detail" ? renderDetail(state.data) : renderFleet(state.data);
+});
+
+$("f-go").addEventListener("click", () => loadLogs(false));
+$("f-q").addEventListener("keydown", (e) => { if (e.key === "Enter") loadLogs(false); });
+$("f-level").addEventListener("change", () => loadLogs(false));
+$("f-backend").addEventListener("change", () => loadLogs(false));
+$("log-more").addEventListener("click", () => loadLogs(true));
+
+window.addEventListener("hashchange", show);
+
+// Charts are drawn at a measured pixel width, so a resize needs a redraw.
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (!state.data) return;
+    state.route.view === "detail" ? renderDetail(state.data) : renderFleet(state.data);
+  }, 150);
+});
+
+buildWindows(["15m", "1h", "6h", "24h", "7d", "30d"]);
+show();
+schedule();
+</script>
+</body>
+</html>

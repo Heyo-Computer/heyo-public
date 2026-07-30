@@ -59,6 +59,13 @@ pub struct Config {
     /// never blocked. A collector falling behind must not turn into
     /// backpressure on somebody's application.
     pub queue_capacity: usize,
+    /// Dashboard queries allowed in flight at once. Reading parquet is CPU-bound
+    /// work on the same runtime that accepts ingest, so this is a limit on how
+    /// much of the machine looking at the data may take from collecting it.
+    pub query_concurrency: usize,
+    /// Ceiling on a single query. A dashboard that gets a 504 is a nuisance; one
+    /// that pins a core for ten minutes is a problem.
+    pub query_timeout: Duration,
 }
 
 impl Default for Config {
@@ -77,6 +84,8 @@ impl Default for Config {
             flush_rows: 10_000,
             flush_interval: Duration::from_secs(60),
             queue_capacity: 65_536,
+            query_concurrency: 4,
+            query_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -122,6 +131,12 @@ impl Config {
         }
         if let Some(v) = parse_env("APP_OBS_QUEUE_CAPACITY") {
             cfg.queue_capacity = v;
+        }
+        if let Some(v) = parse_env("APP_OBS_QUERY_CONCURRENCY") {
+            cfg.query_concurrency = v;
+        }
+        if let Some(v) = parse_env("APP_OBS_QUERY_TIMEOUT_SECS") {
+            cfg.query_timeout = Duration::from_secs(v);
         }
         cfg
     }

@@ -61,6 +61,18 @@ pub struct MetricRecord {
     /// interpolating a number the source never measured.
     pub p90_ms: Option<f64>,
     pub p99_ms: Option<f64>,
+    /// Requests measured and their total latency, both cumulative since app-lb
+    /// started.
+    ///
+    /// Stored because the percentiles above are cumulative too: app-lb's
+    /// histogram never decays (`app-lb/src/metrics.rs`), so a stored p50 is a
+    /// lifetime figure that barely moves and drops back on restart. Differencing
+    /// these two between consecutive samples gives the mean latency *over that
+    /// interval*, which is the only honest latency a chart can plot from a
+    /// cumulative source.
+    pub latency_count: Option<u64>,
+    /// Milliseconds, matching `p50_ms` and friends.
+    pub latency_sum: Option<u64>,
 }
 
 /// Either kind of row. The writer is generic over this so ingest and polling
@@ -164,6 +176,11 @@ pub fn metrics_schema() -> Arc<Schema> {
         Field::new("p50_ms", DataType::Float64, true),
         Field::new("p90_ms", DataType::Float64, true),
         Field::new("p99_ms", DataType::Float64, true),
+        // Appended, and nullable like everything else here, so parquet written
+        // before these existed still reads: DataFusion fills a nullable column
+        // missing from a file with nulls rather than failing the scan.
+        Field::new("latency_count", DataType::UInt64, true),
+        Field::new("latency_sum", DataType::UInt64, true),
     ]))
 }
 

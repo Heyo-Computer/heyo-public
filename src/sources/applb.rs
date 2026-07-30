@@ -80,6 +80,10 @@ struct StatusCounts {
 #[derive(Debug, Deserialize)]
 struct Histogram {
     count: u64,
+    /// Total of every sample, in the histogram's base unit. Cumulative like
+    /// `count`, so the two together give a per-interval mean once differenced —
+    /// see `MetricRecord::latency_count`.
+    sum: u64,
     p50: f64,
     p90: f64,
     p99: f64,
@@ -197,6 +201,11 @@ fn flatten(snapshot: &MetricsResponse) -> Vec<Record> {
             p50_ms: measured.then_some(deployment.metrics.latency_ms.p50),
             p90_ms: measured.then_some(deployment.metrics.latency_ms.p90),
             p99_ms: measured.then_some(deployment.metrics.latency_ms.p99),
+            // Unlike the percentiles, these are kept even at count = 0: a zero
+            // count is a real measurement ("nothing has been timed yet"), and
+            // the next sample's delta against it is the first honest interval.
+            latency_count: Some(deployment.metrics.latency_ms.count),
+            latency_sum: Some(deployment.metrics.latency_ms.sum),
         }));
 
         // Per-VM rows. Pool and traffic figures are deployment-wide and are left
@@ -330,6 +339,26 @@ mod tests {
         assert_eq!(deployment.p50_ms, Some(8.0));
         assert_eq!(deployment.p90_ms, Some(25.0));
         assert_eq!(deployment.p99_ms, Some(90.0));
+        assert_eq!(deployment.latency_count, Some(100));
+        assert_eq!(deployment.latency_sum, Some(1000));
+    }
+
+    #[test]
+    fn latency_totals_are_kept_even_when_nothing_has_been_timed() {
+        // The percentiles go null at count = 0 because 0ms is not a measurement.
+        // The totals are the opposite case: a zero count *is* one, and it is
+        // what the next sample's delta is taken against. Dropping it would make
+        // the first interval after a restart unchartable.
+        let mut snapshot = parse();
+        snapshot.deployments[0].metrics.latency_ms.count = 0;
+        snapshot.deployments[0].metrics.latency_ms.sum = 0;
+        let records = flatten(&snapshot);
+        let Record::Metric(deployment) = &records[1] else {
+            panic!("expected a metric");
+        };
+        assert_eq!(deployment.p50_ms, None);
+        assert_eq!(deployment.latency_count, Some(0));
+        assert_eq!(deployment.latency_sum, Some(0));
     }
 
     #[test]
@@ -367,6 +396,11 @@ mod tests {
         assert_eq!(vm.requests_total, None);
         assert_eq!(vm.ready, None);
         assert_eq!(vm.p50_ms, None);
+        // Latency is measured at the proxy per deployment, not per VM. Copying
+        // the totals down would make a sum across replicas count every request
+        // once per VM.
+        assert_eq!(vm.latency_count, None);
+        assert_eq!(vm.latency_sum, None);
     }
 
     #[test]
