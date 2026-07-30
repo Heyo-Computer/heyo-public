@@ -8,6 +8,74 @@ curl -XPOST localhost:9090/deployments \
   -d @examples/pg-fc-dashboard.json
 ```
 
+## `artifacts-gated.json` — one app, two surfaces, one gate
+
+The same deployment as [`artifacts.json`](#artifactsjson--managed-vm-pool-for-the-artifacts-store)
+with two blocks added: a `build` source, and a Google sign-in gate over the
+dashboard only. **Apply one or the other** — they share the id `artifacts`,
+because they are two configurations of one deployment, not two deployments.
+
+This is the interesting shape for a gate. `art serve` puts two surfaces on port
+8080:
+
+| Paths | Who calls it | How it authenticates today |
+| --- | --- | --- |
+| `/blobs/…`, `/manifests…`, `/tags…`, `/usage` | CI, the `art` client | `ART_API_KEY`, in a header no browser sends |
+| `/`, `/dashboard/…`, `/login`, `/logout` | people | `ART_ADMIN_PASSWORD` + a login form |
+| `/healthz` | probes | nothing, by design |
+
+So the machine API goes in `public_paths` and the dashboard is gated. A CI job
+cannot complete an OAuth flow, and a browser cannot produce an API key.
+
+```sh
+serverctl create secret google --from-stdin client_secret < ~/.google-oauth-secret
+serverctl create secret github --from-stdin token < ~/.github-pat
+serverctl apply -f examples/artifacts-gated.json
+serverctl build artifacts --wait      # optional: build the image from the repo
+```
+
+### Notes on the spec
+
+- **`public_paths` entries are prefixes, and the split is load-bearing.** `/blobs/`
+  keeps its trailing slash so it matches `/blobs/{digest}` and nothing adjacent;
+  `/manifests` and `/tags` cover both their collection and item routes. Anything
+  not listed — including `/` — is gated, which is what puts the dashboard behind
+  Google while leaving the API reachable.
+
+- **The gate does not protect the API.** Everything in `public_paths` is exactly
+  as exposed as it was before, guarded only by `ART_API_KEY`. If that is not
+  acceptable, the gate is the wrong tool for those paths — there is no way for a
+  headless client to sign in with Google. Worth being explicit about, because
+  "the store is behind Google sign-in" would be a fair reading of this spec and a
+  wrong one.
+
+- **The dashboard now asks twice.** artifacts refuses to serve its dashboard at
+  all unless `ART_ADMIN_PASSWORD` is set, and then presents its own login form —
+  app-lb cannot supply those credentials for you. So a person meets the Google
+  gate and then the app's password. That is defence in depth rather than a bug:
+  Google decides *who can reach the login page*, the password stays as a second
+  factor. If the double prompt is not worth it, the alternative is to keep the
+  dashboard on loopback and reach it over an SSH tunnel.
+
+- **No path collision.** artifacts has its own `/login` and `/logout`; app-lb's
+  live under `/__applb/auth/`, which is why the default `base_path` is that ugly.
+  Both sets coexist, and artifacts' pair sits *behind* the gate where it belongs.
+
+- **`forward_identity: false`** because artifacts reads no `x-auth-request-*`
+  headers — there is nothing on the other end to receive them. app-lb still
+  strips those headers from incoming requests, so the setting only controls
+  whether it sets them.
+
+- **`build` and `auth` are independent.** The build source produces
+  `artifacts-<short sha>` and recycles the pool; the gate is proxy configuration
+  and survives that untouched. Drop either block and the other still works. See
+  [`git-build.json`](#git-buildjson--a-deployment-that-builds-its-own-image-from-git)
+  for what the build half needs on the host.
+
+- **Still pinned to one replica.** Everything in `artifacts.json`'s notes about
+  that applies unchanged — each VM is its own store, so a pool of *N* is *N*
+  independent stores. The gate does not change that arithmetic.
+
 ## `gated-dashboard.json` — an internal app behind Google sign-in
 
 An admin dashboard with no authentication of its own, made reachable to a
@@ -45,6 +113,11 @@ serverctl apply -f examples/gated-dashboard.json
   text after `@` would admit an account your admins do not control. The
   consequence: a contractor on a personal address needs an `allowed_emails`
   entry, because they have no `hd` at all.
+
+- **Both lists take several entries and are OR'd.** One Workspace domain here,
+  but `["sarocu.com", "heyo.computer"]` and a list of individual addresses work
+  the same way — a caller matching any entry gets in. A Workspace with secondary
+  domains needs each domain that appears in `hd`.
 
 - **`public_paths: ["/healthz"]`** keeps the app's own health endpoint reachable.
   app-lb's *health check* probes the backend directly and is unaffected by the

@@ -13,6 +13,7 @@ mod deployment;
 mod health;
 mod jobs;
 mod metrics;
+mod obs;
 mod proxy;
 mod registry;
 mod secrets;
@@ -111,13 +112,32 @@ fn config_from_env() -> LbConfig {
     cfg
 }
 
-fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+/// Install the subscriber: stderr always, plus a layer that forwards app-lb's own
+/// events to app-obs when one is configured.
+///
+/// The `EnvFilter` sits in front of both, so `RUST_LOG` still decides what app-lb
+/// logs *at all* and shipping only ever sees a subset of that. The layer applies
+/// its own INFO floor on top — see `obs::EventLayer`.
+fn init_tracing(events: Option<obs::LogSink>) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,app_lb=debug".into()),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(events.map(obs::EventLayer::new))
         .init();
+}
+
+fn main() {
+    // Before the subscriber, because shipping app-lb's own events means adding a
+    // layer to it, and a subscriber can only be built once. Reads the environment
+    // and allocates a channel — no threads, nothing that a later fork would lose.
+    let obs = obs::from_env();
+    init_tracing(obs.as_ref().and_then(|o| o.events.clone()));
 
     // rustls needs a process-level `CryptoProvider` chosen explicitly whenever
     // more than one is compiled in, and app-lb's graph has both `ring` (iroh,
@@ -381,12 +401,19 @@ fn main() {
             acme_signal,
             secrets,
             jobs,
+            obs.as_ref().map(|o| o.stats.clone()),
         ),
     );
 
     let mut proxy_svc = pingora_proxy::http_proxy_service(
         &server.configuration,
-        LbProxy::new(registry, metrics, challenges, auth),
+        LbProxy::new(
+            registry,
+            metrics,
+            challenges,
+            auth,
+            obs.as_ref().and_then(|o| o.access.clone()),
+        ),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);
 
@@ -405,6 +432,12 @@ fn main() {
 
     let autoscaler_handle = server.add_service(autoscaler_svc);
     server.add_service(admin_svc);
+    // Log shipping, when `APP_LB_OBS_URL` is set. Pointedly *not* a dependency of
+    // the proxy handle below: whether this service is running, and whether app-obs
+    // answers it, must make no difference to serving traffic.
+    if let Some(obs) = obs {
+        server.add_service(background_service("obs", obs.shipper));
+    }
     if let Some(acme_svc) = acme_svc {
         server.add_service(acme_svc);
     }

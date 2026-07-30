@@ -12,6 +12,7 @@ use crate::acme::ChallengeTable;
 use crate::auth::{Authenticator, Decision, Identity, RequestInfo};
 use crate::deployment::{Deployment, VmBackend};
 use crate::metrics::Metrics;
+use crate::obs::{Access, LogSink};
 use crate::registry::Registry;
 use async_trait::async_trait;
 use pingora_core::prelude::HttpPeer;
@@ -68,6 +69,9 @@ pub struct LbProxy {
     /// Runs the sign-in gate for deployments that declare one. Inert for the
     /// rest: a deployment without `auth` never reaches it.
     auth: Arc<Authenticator>,
+    /// Where the access log goes. `None` unless `APP_LB_OBS_URL` is configured,
+    /// in which case `logging` does no extra work at all.
+    access_log: Option<LogSink>,
 }
 
 impl LbProxy {
@@ -76,12 +80,14 @@ impl LbProxy {
         metrics: Arc<Metrics>,
         challenges: Arc<ChallengeTable>,
         auth: Arc<Authenticator>,
+        access_log: Option<LogSink>,
     ) -> Self {
         Self {
             registry,
             metrics,
             challenges,
             auth,
+            access_log,
         }
     }
 }
@@ -456,22 +462,69 @@ impl ProxyHttp for LbProxy {
     /// Runs on every request, success or failure. If this ever misses a path,
     /// `in_flight` leaks upward and the deployment pins at max replicas.
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
+        // Which backend served, read before `release` — it takes the backend out
+        // of the ctx, so anything that needs its identity must ask first.
+        // `sandbox_id` is the sandbox for a managed VM and the `host:port` for a
+        // static upstream, which is exactly how app-obs keys a backend. Skipped
+        // when nothing is shipping, so an app-lb without app-obs allocates
+        // nothing extra per request.
+        let backend = match &self.access_log {
+            Some(_) => ctx.backend.as_ref().map(|b| b.sandbox_id.clone()),
+            None => None,
+        };
         ctx.release();
+
+        let status = session.response_written().map(|r| r.status.as_u16());
 
         // Record latency and outcome for any request that got as far as being
         // routed. A request rejected before routing (404, no deployment) has no
         // `started_at`/`deployment` and is intentionally left out of a
         // deployment's numbers.
         if let (Some(started), Some(deployment)) = (ctx.started_at, ctx.deployment.as_ref()) {
-            let status = session.response_written().map(|r| r.status.as_u16());
             self.metrics
                 .record_request(&deployment.spec.id, status, started.elapsed());
+        }
+
+        // The access log app-obs stores. Unlike the metrics above it also carries
+        // requests that matched no deployment, under `_lb` — a wall of 404s for a
+        // hostname somebody expected to work is invisible in a per-deployment
+        // view by construction. `started_at` is set first thing in
+        // `request_filter`, so its absence means the request never got that far
+        // and there is nothing to describe.
+        if let (Some(sink), Some(started)) = (&self.access_log, ctx.started_at) {
+            let req = session.req_header();
+            let method = req.method.as_str().to_string();
+            // The path alone, never the query: a sign-in callback carries the
+            // OAuth `code` there, and a shared log store is the last place a
+            // credential should come to rest.
+            let path = req.uri.path().to_string();
+            let host = request_host(req);
+            sink.send(
+                Access {
+                    deployment: ctx.deployment.as_ref().map(|d| d.spec.id.as_str()),
+                    backend,
+                    method: &method,
+                    path: &path,
+                    host: host.as_deref(),
+                    status,
+                    duration: started.elapsed(),
+                    bytes: session.body_bytes_sent(),
+                    // The address only. The ephemeral port identifies the
+                    // connection, not the caller.
+                    client: session.client_addr().map(|addr| match addr.as_inet() {
+                        Some(inet) => inet.ip().to_string(),
+                        None => addr.to_string(),
+                    }),
+                    error: e.map(|err| err.to_string()),
+                }
+                .into_record(),
+            );
         }
 
         if let Some(err) = e {
             tracing::warn!(
                 deployment = ctx.deployment.as_ref().map(|d| d.spec.id.as_str()),
-                status = session.response_written().map(|r| r.status.as_u16()),
+                status,
                 error = %err,
                 "request failed",
             );

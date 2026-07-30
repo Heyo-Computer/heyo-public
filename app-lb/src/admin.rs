@@ -102,6 +102,8 @@ struct AdminState {
     /// Nudges the ACME manager to issue for a newly-registered hostname instead
     /// of waiting out its sweep interval. `None` when ACME is disabled.
     acme: Option<Arc<Notify>>,
+    /// Counters for the app-obs log shipper. `None` when log shipping is off.
+    obs: Option<Arc<crate::obs::Stats>>,
 }
 
 impl AdminState {
@@ -134,6 +136,7 @@ impl AdminApi {
         acme: Option<Arc<Notify>>,
         secrets: Arc<SecretStore>,
         jobs: Arc<Jobs>,
+        obs: Option<Arc<crate::obs::Stats>>,
     ) -> Self {
         // Render the display name into the page once; the placeholder appears in
         // both the <title> and the <h1>.
@@ -169,6 +172,7 @@ impl AdminApi {
                 acme,
                 secrets,
                 jobs,
+                obs,
             },
         }
     }
@@ -344,6 +348,12 @@ struct MetricsResponse {
     /// All deployments' metrics merged. Includes history from deregistered
     /// deployments, so totals don't drop when one is removed.
     global: DeploymentMetricsSnapshot,
+    /// Log-shipping counters, absent when it is off. Here because the pipeline
+    /// drops rather than blocks by design, and a drop is only visible if
+    /// somebody counts it — asking app-obs "are my logs arriving?" cannot
+    /// distinguish a quiet deployment from a full queue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    obs: Option<crate::obs::ObsSnapshot>,
     deployments: Vec<DeploymentView>,
 }
 
@@ -434,6 +444,7 @@ async fn metrics_snapshot(State(state): State<AdminState>) -> impl IntoResponse 
         host: state.metrics.host_snapshot(),
         fleet,
         global: state.metrics.global_snapshot(),
+        obs: state.obs.as_ref().map(|o| o.snapshot()),
         deployments: views,
     })
 }

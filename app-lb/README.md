@@ -64,6 +64,14 @@ Configuration is environment-only:
 | `APP_LB_UPDATE_SHELL` | `/bin/sh` | Shell a static deployment's `update.commands` run through |
 | `APP_LB_BUILD_TIMEOUT_SECS` | `1800` | Ceiling on one build step or update command, after which the child is killed |
 | `APP_LB_HEYVM_HOME` | *(unset)* | `HOME` for the heyvm child — set it when app-lb and heyvmd run as different users |
+| `APP_LB_OBS_URL` | *(unset)* | app-obs base URL (e.g. `http://127.0.0.1:9500`); **setting it enables log shipping** |
+| `APP_LB_OBS_TOKEN` | *(unset)* | Bearer token for app-obs's `/ingest` — must match its `APP_OBS_INGEST_TOKEN` |
+| `APP_LB_OBS_HOST` | `/etc/hostname` | Machine name stamped on every batch |
+| `APP_LB_OBS_ACCESS_LOG` | `true` | `0` to stop shipping the per-request access log |
+| `APP_LB_OBS_EVENTS` | `true` | `0` to stop shipping app-lb's own log events |
+| `APP_LB_OBS_QUEUE_CAPACITY` | `8192` | Records buffered before new ones are dropped |
+| `APP_LB_OBS_BATCH` | `500` | Records per POST |
+| `APP_LB_OBS_FLUSH_SECS` | `2` | How long a record may wait for a fuller batch |
 | `RUST_LOG` | `info,app_lb=debug` | Log filter |
 
 ## CLI
@@ -276,16 +284,56 @@ are self-describing and signed with HMAC-SHA256 (`APP_LB_AUTH_KEY`, generated
   the old one, rather than leaving a removed user signed in until their cookie
   expires.
 
+### Who may enter
+
+Both lists take any number of entries and are **OR'd** — one match admits the
+caller:
+
+```jsonc
+"allowed_domains": ["sarocu.com", "heyo.computer"],
+"allowed_emails": ["contractor@gmail.com", "auditor@example.org"]
+```
+
+```sh
+serverctl set auth web \
+  --allow-domain sarocu.com --allow-domain heyo.computer \
+  --allow-email contractor@gmail.com --allow-email auditor@example.org
+```
+
+Matching is case-insensitive, and a leading `@` on a domain is tolerated —
+`@example.com` and `example.com` are the same rule.
+
 **Domains are matched on the `hd` claim, not the email suffix.** Only `hd` says
 the account is *governed by* that Workspace domain. A personal Google account
 can carry any address a Workspace admin has not claimed, so trusting the suffix
-would let `someone@yourcompany.com` in from an account you do not control. The
-consequence worth knowing: a personal account must be listed in
-`allowed_emails`, because it has no `hd` at all.
+would let `someone@yourcompany.com` in from an account you do not control.
+
+Two consequences worth knowing:
+
+- **A personal Google account has no `hd` at all**, so no `allowed_domains` entry
+  can ever match it — list the address in `allowed_emails` instead. This is also
+  the answer when a domain you own is not actually a Workspace domain: check with
+  `dig +short MX <domain>`, and if the MX records are not Google's, every account
+  there is a personal one as far as this claim is concerned.
+- **A Workspace with several domains needs each domain that appears in `hd`.**
+  Secondary domains generally report their own; for *alias* domains verify against
+  a real sign-in before trusting it, since Google may return the primary domain
+  instead. `allowed_emails` sidesteps the question entirely.
 
 **An empty allow-list is rejected.** Gating behind "has a Google account" admits
 most of the internet, which is a real thing to want and has to be said out loud:
 `"allowed_domains": ["*"]`.
+
+**Editing a list replaces it.** Every `--allow-domain`/`--allow-email` you pass
+replaces that whole list rather than adding to it, so growing the list means
+resending all of it. `serverctl edit deployment <id>` is the incremental
+alternative — it opens the spec in `$EDITOR` and changes only what you change.
+
+**Adding or removing an entry signs everyone out once.** The allow-list is part
+of the policy fingerprint each session carries (see above), so a change bounces
+every current user through Google and straight back in. Reordering the list or
+changing its capitalisation costs nothing: the fingerprint sorts and lowercases
+first, so only a real change to *who* may enter invalidates anything.
 
 **The identity headers are stripped from every incoming request** to a gated
 deployment before app-lb sets them, so a client cannot present its own
@@ -758,6 +806,98 @@ while a create is still in flight. The autoscaler therefore re-checks, after eve
 promotion, that the deployment it is working on is still the registry's — and kills any VM the
 replacement did not inherit, rather than leaving it running until its TTL. A pool-preserving
 edit (one that doesn't change the `vm` block) carries its VMs over and keeps them.
+
+## Shipping logs to app-obs
+
+[app-obs](../app-obs) polls `/metrics` for numbers, but the *logs* it stores have
+to be pushed to it. Set `APP_LB_OBS_URL` and app-lb pushes two streams:
+
+```sh
+APP_LB_OBS_URL=http://127.0.0.1:9500 \
+APP_LB_OBS_TOKEN="$(cat /etc/app-obs/ingest-token)" \
+app-lb
+```
+
+- **An access log** — one record per request, attributed to the deployment that
+  served it. For a static (`proxy_pass`) deployment this is the only log it will
+  ever have, because there is no guest to run a shipper inside; for a VM
+  deployment it is the only account of what the *proxy* saw, as opposed to what
+  the application chose to write about itself.
+- **app-lb's own events** at INFO and above — scaling decisions, upstreams going
+  unhealthy, ACME issuance, job outcomes. An event that names a deployment lands
+  in that deployment's log, so a scale-up appears next to the traffic that caused
+  it; everything else lands under the reserved deployment id `_lb`.
+
+The token must match app-obs's `APP_OBS_INGEST_TOKEN`. app-obs leaves ingest open
+when *it* has none, so the failure worth anticipating is the other direction: an
+app-lb with no token against a collector that wants one loses every record to a
+401, which shows up as `failed` below rather than as anything app-obs can report.
+
+### What a request record carries
+
+```
+GET /things 200 1.4ms
+{"method":"GET","path":"/things","status":200,"duration_ms":1.416,
+ "bytes":254,"host":"demo.local","client":"10.1.2.3"}
+```
+
+`backend` is the sandbox id for a managed VM and the `host:port` for a static
+upstream — the same identity the `x-vm-id` response header carries. `status` is
+`null` and the level is `error` when no response was written at all: every
+upstream failed, or the cold start timed out. A failed request also carries
+`error`.
+
+**The query string is never logged**, only the path. A sign-in callback carries
+the OAuth `code` there, and a shared log store is the last place a credential
+should come to rest. The signed-in user's email is left out for the same reason —
+a gated deployment receives the identity headers and can log what it needs of
+them itself.
+
+Requests that matched **no** deployment ship too, under `_lb` with
+`"unrouted": true`. A wall of 404s for a hostname somebody expected to work is
+invisible in a per-deployment view by construction, and it is one of the more
+common things to have to diagnose. The cost is that internet background noise —
+scanners probing `/wp-login.php` — accumulates there against app-obs's retention;
+`APP_LB_OBS_ACCESS_LOG=0` turns the access log off entirely if that trade isn't
+worth it.
+
+### It is not a dependency of the data plane
+
+Recording is a `try_send` into a bounded queue and nothing else: no lock, no
+await, no I/O on the request path. Everything past that point is one background
+task, and every way it can fail resolves to *losing telemetry*, never to holding
+up a request:
+
+- A **full queue drops** and counts what it dropped. A collector that has fallen
+  behind must not turn into latency in somebody's application.
+- A **failed POST discards its batch** instead of retrying. A retry queue is a
+  memory leak with extra steps, and the records worth having are the ones still
+  arriving.
+- **app-obs being down is invisible to traffic.** It is logged once when shipping
+  starts failing and once when it recovers — not once per batch — and the running
+  count sits in `GET /metrics`:
+
+```json
+"obs": {"queued": 41201, "dropped": 0, "shipped": 41180, "failed": 21, "healthy": true}
+```
+
+`dropped` is the figure to watch, because it is the only trace those records
+leave anywhere: raise `APP_LB_OBS_QUEUE_CAPACITY` if it climbs. Asking app-obs
+instead cannot answer the question — nothing there can tell a quiet deployment
+from a full queue.
+
+### What is deliberately not shipped
+
+**Only app-lb's own events.** pingora's, reqwest's and hyper's stay in stdout:
+reqwest and hyper log *inside* the POST that ships the batch, so forwarding them
+would be a feedback loop, and pingora's per-connection lines are free text with no
+deployment to attribute them to. The supervisord log stays the complete record;
+app-obs gets the part worth querying.
+
+**DEBUG and below**, even though the default filter (`info,app_lb=debug`) emits
+it — DEBUG is where the per-request routing chatter lives, which is a worse copy
+of the access log. `RUST_LOG` still bounds what ships, since it decides what
+app-lb logs at all.
 
 ## Design notes
 

@@ -265,14 +265,33 @@ serverctl get deployments -o wide     # AUTH column: which deployments are gated
 serverctl set auth web --clear        # remove the gate
 ```
 
-`--allow-domain` matches Google's `hd` claim — the Workspace that *governs* the account, not
-the text after `@` — so a personal account with a lookalike address is refused. List personal
-accounts with `--allow-email`. `--allow-domain '*'` admits any Google account, and is the only
-way to say that: an empty allow-list is rejected.
+Both allow flags are repeatable and take any number of entries, and the two lists are **OR'd** —
+one match admits the caller:
 
-Passing any `--allow-domain`/`--allow-email`/`--public-path` replaces that whole list. Changing
-the allow-list signs out sessions issued under the old one, so removing someone takes effect
-immediately rather than when their cookie expires.
+```sh
+serverctl set auth web \
+  --allow-domain sarocu.com --allow-domain heyo.computer \
+  --allow-email contractor@gmail.com --allow-email auditor@example.org
+```
+
+`--allow-domain` matches Google's `hd` claim — the Workspace that *governs* the account, not the
+text after `@` — so a personal account with a lookalike address is refused. That also means a
+personal account can only be admitted by `--allow-email`, since it carries no `hd` at all; if
+`dig +short MX <domain>` shows something other than Google's servers, every account there is a
+personal one as far as this claim goes. A Workspace with several domains needs each domain that
+appears in `hd`.
+
+`--allow-domain '*'` admits any Google account, and is the only way to say that: an empty
+allow-list is rejected.
+
+**Passing any `--allow-domain`/`--allow-email`/`--public-path` replaces that whole list**, so
+growing one means resending all of it. There is no "add one" flag; `serverctl edit deployment web`
+is the incremental route — it opens the spec in `$EDITOR` and touches only what you change.
+
+Adding or removing an entry signs every current user out once — they bounce through Google and
+straight back in — which is what makes *removing* someone take effect immediately rather than
+when their cookie expires. Reordering or re-casing a list is free: the policy fingerprint sorts
+and lowercases before hashing, so only a real change to who may enter invalidates a session.
 
 ### Scaling and rollouts
 

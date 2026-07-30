@@ -410,7 +410,21 @@ pub struct MetricsResponse {
     pub host: HostUsage,
     pub fleet: FleetPool,
     pub global: DeploymentMetrics,
+    /// Absent when the LB is not shipping logs to app-obs.
+    pub obs: Option<ObsStats>,
     pub deployments: Vec<DeploymentView>,
+}
+
+/// Log-shipping counters. Worth surfacing because the pipeline drops rather than
+/// blocks by design, and `dropped` is the only trace a lost record leaves.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ObsStats {
+    pub queued: u64,
+    pub dropped: u64,
+    pub shipped: u64,
+    pub failed: u64,
+    pub healthy: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -247,6 +247,28 @@ pub fn status(ctx: &Ctx) -> Result<()> {
         ),
     );
 
+    // Only when the LB is shipping logs. `dropped` leads because it is the one
+    // number nothing else records: those lines never reached app-obs, so its
+    // dashboard cannot tell them from a deployment that had nothing to say.
+    if let Some(o) = &m.obs {
+        output::section("Log shipping (app-obs)");
+        output::field(
+            "Records",
+            format!(
+                "{} shipped, {} dropped (queue full), {} lost (ingest failed)",
+                o.shipped, o.dropped, o.failed
+            ),
+        );
+        output::field(
+            "Ingest",
+            if o.healthy {
+                "reachable"
+            } else {
+                "not answering — records are being discarded, traffic is unaffected"
+            },
+        );
+    }
+
     // Certificates share the CRUD gate, not the metrics one, so this can fail
     // on its own; a missing section is better than a failed `status`.
     if let Ok(certs) = ctx.client.certs()
