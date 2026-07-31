@@ -7,8 +7,8 @@
 //! the dashboard and `/metrics`, `APP_LB_ADMIN_AUTH` extends that to the
 //! deployment CRUD API — so login probes both and says which it found.
 
-use crate::GlobalOpts;
-use crate::client::{Client, probe_auth};
+use crate::cmd::GlobalOpts;
+use crate::cmd::Client;
 use crate::config::{Config, ContextEntry, resolve_endpoint};
 use crate::output::{self, Table};
 use anyhow::{Context, Result, bail};
@@ -67,7 +67,7 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
         .server
         .clone()
         .or_else(|| globals.server.clone())
-        .unwrap_or_else(|| crate::client::DEFAULT_SERVER.to_string());
+        .unwrap_or_else(|| crate::cmd::DEFAULT_SERVER.to_string());
     let user = args
         .user
         .clone()
@@ -77,10 +77,10 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
     let timeout = Duration::from_secs(globals.request_timeout);
 
     // Reachability first: a typo'd port should not look like a bad password.
-    let anon = Client::new(&server, None, None, insecure, timeout)?;
+    let anon = Client::connect(&server, None, None, insecure, timeout)?;
     anon.healthz()
         .with_context(|| format!("cannot reach an app-lb admin API at {server}"))?;
-    let gates = probe_auth(&anon)?;
+    let gates = Client::gates_of(&anon)?;
 
     if !gates.any() {
         println!(
@@ -125,8 +125,8 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
     }
 
     // Verify against whichever surface is actually gated.
-    let client = Client::new(&server, Some(&user), Some(&password), insecure, timeout)?;
-    let verify_path = if gates.crud_gated { "/deployments" } else { "/metrics" };
+    let client = Client::connect(&server, Some(&user), Some(&password), insecure, timeout)?;
+    let verify_path = if gates.crud { "/deployments" } else { "/metrics" };
     match client.status_of(verify_path)? {
         200 => {}
         401 => bail!("the server rejected these credentials — wrong user or password"),
@@ -136,7 +136,7 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
     println!(
         "Logged in to {} as {user}.\n  gated: {}",
         client.server(),
-        gate_summary(gates.metrics_gated, gates.crud_gated)
+        gate_summary(gates.view, gates.crud)
     );
     if args.no_store_password {
         println!("  password not stored — set SERVERCTL_PASSWORD for later commands");
@@ -326,7 +326,7 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
         }
     }
 
-    let client = Client::new(
+    let client = Client::connect(
         &endpoint.server,
         endpoint.user.as_deref(),
         endpoint.password.as_deref(),
@@ -341,8 +341,8 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
     }
     output::field("Reachable", "yes (GET /healthz)");
 
-    let gates = probe_auth(&client)?;
-    output::field("Auth required for", gate_summary(gates.metrics_gated, gates.crud_gated));
+    let gates = Client::gates_of(&client)?;
+    output::field("Auth required for", gate_summary(gates.view, gates.crud));
 
     // What this identity can actually do right now, which is the question
     // behind "why am I getting a 401".
@@ -435,7 +435,7 @@ pub fn config(globals: &GlobalOpts, cmd: &ConfigCmd) -> Result<()> {
             if config.contexts.is_empty() {
                 println!(
                     "No contexts. `serverctl login` creates one; without it, commands go to {}.",
-                    crate::client::DEFAULT_SERVER
+                    crate::cmd::DEFAULT_SERVER
                 );
                 return Ok(());
             }

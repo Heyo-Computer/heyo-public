@@ -5,17 +5,77 @@ pub mod auth;
 pub mod observe;
 pub mod read;
 pub mod session;
+pub mod token;
 pub mod write;
 
-use crate::client::Client;
+use crate::blocking::Client;
+use clap::Args;
+use std::path::PathBuf;
 use crate::config::{Config, Endpoint, resolve_endpoint};
 use crate::output::OutputFormat;
-use crate::GlobalOpts;
 use anyhow::{Result, bail};
 use std::time::Duration;
 
 /// Everything a command needs: a client pointed at the resolved endpoint, and
 /// the output format.
+/// Where to look when nothing says otherwise.
+pub const DEFAULT_SERVER: &str = "http://127.0.0.1:9090";
+
+/// The flags every subcommand shares.
+///
+/// Lives here rather than in `main.rs` because `Ctx` is built from it and both
+/// are now library code — the binary is a thin shell over this module.
+#[derive(Args, Debug, Clone)]
+pub struct GlobalOpts {
+    /// Output format.
+    #[arg(
+        long,
+        short = 'o',
+        global = true,
+        value_enum,
+        default_value_t = OutputFormat::Table,
+        value_name = "FORMAT",
+        help_heading = "Global options"
+    )]
+    pub output: OutputFormat,
+
+    /// Config file holding the saved contexts.
+    #[arg(long, global = true, env = "SERVERCTL_CONFIG", value_name = "PATH", help_heading = "Global options")]
+    pub config: Option<PathBuf>,
+
+    /// Which stored context to use.
+    #[arg(long, global = true, env = "SERVERCTL_CONTEXT", value_name = "NAME", help_heading = "Global options")]
+    pub context: Option<String>,
+
+    /// Admin API URL, overriding the context.
+    #[arg(long, global = true, env = "SERVERCTL_SERVER", value_name = "URL", help_heading = "Global options")]
+    pub server: Option<String>,
+
+    /// Basic-auth user, overriding the context.
+    #[arg(long, global = true, env = "SERVERCTL_USER", value_name = "NAME", help_heading = "Global options")]
+    pub user: Option<String>,
+
+    /// Basic-auth password, overriding the context. Prefer SERVERCTL_PASSWORD
+    /// or `serverctl login` — an argument is visible in `ps`.
+    #[arg(
+        long,
+        global = true,
+        env = "SERVERCTL_PASSWORD",
+        value_name = "PASSWORD",
+        hide_env_values = true,
+        help_heading = "Global options"
+    )]
+    pub password: Option<String>,
+
+    /// Accept any TLS certificate from the server.
+    #[arg(long, global = true, help_heading = "Global options")]
+    pub insecure_skip_tls_verify: bool,
+
+    /// Per-request timeout.
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 30, help_heading = "Global options")]
+    pub request_timeout: u64,
+}
+
 pub struct Ctx {
     pub client: Client,
     pub endpoint: Endpoint,
@@ -34,7 +94,7 @@ impl Ctx {
             globals.password.as_deref(),
             globals.insecure_skip_tls_verify,
         )?;
-        let client = Client::new(
+        let client = Client::connect(
             &endpoint.server,
             endpoint.user.as_deref(),
             endpoint.password.as_deref(),

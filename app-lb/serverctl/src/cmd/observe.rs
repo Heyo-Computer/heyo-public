@@ -61,7 +61,7 @@ pub fn top(ctx: &Ctx, args: &TopArgs) -> Result<()> {
 }
 
 fn fetch(ctx: &Ctx) -> Result<(serde_json::Value, MetricsResponse)> {
-    let raw = ctx.client.metrics().context(
+    let raw = ctx.client.raw().metrics(&crate::MetricsQuery::new()).context(
         "reading /metrics — it is gated by APP_LB_DASHBOARD_PASSWORD even when the CRUD API is open",
     )?;
     let parsed = serde_json::from_value(raw.clone()).context("parsing /metrics")?;
@@ -271,7 +271,7 @@ pub fn status(ctx: &Ctx) -> Result<()> {
 
     // Certificates share the CRUD gate, not the metrics one, so this can fail
     // on its own; a missing section is better than a failed `status`.
-    if let Ok(certs) = ctx.client.certs()
+    if let Ok(certs) = ctx.client.raw().certs()
         && let Some(list) = certs.as_array()
     {
         let due = list

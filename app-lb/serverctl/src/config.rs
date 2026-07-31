@@ -309,7 +309,7 @@ pub fn resolve_endpoint(
         server: server
             .map(str::to_string)
             .or_else(|| (!entry.server.is_empty()).then(|| entry.server.clone()))
-            .unwrap_or_else(|| crate::client::DEFAULT_SERVER.to_string()),
+            .unwrap_or_else(|| crate::cmd::DEFAULT_SERVER.to_string()),
         user: user.map(str::to_string).or(entry.user),
         password,
         password_source,
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn no_config_at_all_still_points_at_a_local_app_lb() {
         let ep = resolve_endpoint(&Config::default(), None, None, None, None, false).unwrap();
-        assert_eq!(ep.server, crate::client::DEFAULT_SERVER);
+        assert_eq!(ep.server, crate::cmd::DEFAULT_SERVER);
         assert_eq!(ep.password_source, PasswordSource::None);
     }
 

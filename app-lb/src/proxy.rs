@@ -346,6 +346,16 @@ fn request_info<'a>(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("text/html"));
 
+    // The credential an app-token gate looks for. Read here rather than in
+    // `auth.rs` so the gate stays a pure function of a plain struct.
+    let bearer = req
+        .headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
     RequestInfo {
         host,
         path,
@@ -353,6 +363,7 @@ fn request_info<'a>(
         cookies,
         secure,
         wants_html,
+        bearer,
     }
 }
 

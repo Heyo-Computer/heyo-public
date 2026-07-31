@@ -1,12 +1,34 @@
 //! Read-side views of the admin API's JSON.
 //!
-//! Deliberately lenient: every field defaults, so a serverctl that is a version
-//! behind the app-lb it is talking to still renders what it understands instead
-//! of failing to parse. These types are only ever used for *display* — writes
-//! go through `serde_json::Value` so nothing is dropped on a round trip.
+//! Deliberately lenient: every field defaults, so a client a version behind the
+//! app-lb it is talking to still renders what it understands instead of failing
+//! to parse. Writes go through `serde_json::Value` so nothing is dropped on a
+//! round trip — see [`crate::api`].
+//!
+//! # `extra`, and why leniency needed a counterweight
+//!
+//! Leniency alone is how these types silently fell behind: to a defaulting
+//! deserializer an unknown field and an absent one are the same thing, so
+//! `DeploymentView::urls`, `PoolStatus::boot_timeout_secs`,
+//! `MetricsResponse::matched` and two more went missing without a single test
+//! failing.
+//!
+//! Every response type therefore carries a `#[serde(flatten)] extra` map. It
+//! keeps the leniency — an unknown field parses fine, and is *reachable* rather
+//! than discarded — and it makes the gap visible: the tests in
+//! `tests/wire_contract.rs` read `testdata/wire/*.json`, written by app-lb's own
+//! response types, and assert `extra` is empty. A field this crate stops
+//! understanding fails a test instead of blanking a column.
 
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
+
+/// Fields the server sent that this build has no name for.
+///
+/// Empty in a matched pair of versions. Non-empty means app-lb is ahead, and
+/// what is in here is exactly what this crate is not yet reading.
+pub type Extra = serde_json::Map<String, Value>;
 
 // -- GET /deployments, GET /deployments/:id --------------------------------
 
@@ -14,13 +36,16 @@ use std::collections::BTreeMap;
 #[serde(default)]
 pub struct DeploymentStatus {
     pub spec: DeploymentSpec,
-    /// `"vm"` (managed pool) or `"static"` (fixed proxy_pass upstreams).
+    /// `"vm"` (managed pool), `"static"` (fixed proxy_pass upstreams) or
+    /// `"site"` (files served off disk).
     pub kind: String,
     pub desired_replicas: u32,
     pub ready: usize,
     pub pending: usize,
     pub total_in_flight: usize,
     pub vms: Vec<VmStatus>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +56,8 @@ pub struct VmStatus {
     pub in_flight: usize,
     pub healthy: bool,
     pub draining: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl VmStatus {
@@ -270,9 +297,15 @@ impl UpdateSpec {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct AuthGate {
-    pub provider: String,
-    pub client_id: String,
-    pub client_secret: SecretRef,
+    /// One provider (`"google"`) or several (`["google", "app-token"]`). A
+    /// `Value` rather than a `String` because the server serializes a
+    /// single-provider gate as a bare string and a multi-provider one as an
+    /// array — modelling only the first would fail to parse the second, and
+    /// with `#[serde(default)]` that failure would look like an *absent* gate.
+    pub provider: Value,
+    /// Required for `google`, absent on a token-only gate.
+    pub client_id: Option<String>,
+    pub client_secret: Option<SecretRef>,
     pub allowed_domains: Vec<String>,
     pub allowed_emails: Vec<String>,
     pub public_paths: Vec<String>,
@@ -298,6 +331,26 @@ impl AuthGate {
         } else {
             parts.join(", ")
         }
+    }
+
+    /// The providers this gate accepts, however the server spelled them.
+    ///
+    /// Empty in the payload means Google, which is what an `auth` block written
+    /// before app-tokens existed says by omission.
+    pub fn providers(&self) -> Vec<String> {
+        match &self.provider {
+            Value::String(s) if !s.is_empty() => vec![s.clone()],
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => vec!["google".to_string()],
+        }
+    }
+
+    /// Whether a program can get past this gate with an app-token.
+    pub fn accepts_app_token(&self) -> bool {
+        self.providers().iter().any(|p| p == "app-token")
     }
 
     /// The URL that has to be registered with the provider, given a hostname.
@@ -343,6 +396,8 @@ pub struct SecretSummary {
     pub keys: Vec<String>,
     pub updated_at: u64,
     pub encrypted_at_rest: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 // -- GET /jobs, POST /deployments/:id/{build,update} -----------------------
@@ -391,6 +446,8 @@ pub struct JobRecord {
 
     pub error: Option<String>,
     pub log: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl JobRecord {
@@ -501,6 +558,14 @@ pub struct MetricsResponse {
     /// Absent when the LB is not shipping logs to app-obs.
     pub obs: Option<ObsStats>,
     pub deployments: Vec<DeploymentView>,
+    /// How many deployments matched before `limit`/`offset`, so a caller can
+    /// page without guessing.
+    pub matched: usize,
+    /// How many deployments hold their own counters. Climbing past the number
+    /// registered means retirement is not keeping up.
+    pub tracked_deployments: usize,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// Log-shipping counters. Worth surfacing because the pipeline drops rather than
@@ -513,6 +578,8 @@ pub struct ObsStats {
     pub shipped: u64,
     pub failed: u64,
     pub healthy: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -525,6 +592,8 @@ pub struct HostUsage {
     pub memory_total_bytes: u64,
     pub memory_used_bytes: u64,
     pub sampled_at_ms: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -535,17 +604,53 @@ pub struct FleetPool {
     pub draining: usize,
     pub pending: usize,
     pub total_in_flight: usize,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct DeploymentView {
     pub id: String,
+    /// `"vm"`, `"static"` or `"site"`.
     pub kind: String,
     pub upstreams: Vec<String>,
+    /// Exact hostnames this deployment is routed on — `host` rules only, since
+    /// a `host_suffix` names no single certificate subject.
+    pub hosts: Vec<String>,
+    /// The same routes as URLs, with the *data plane's* scheme and port. Built
+    /// server-side because the admin listener knows neither.
+    pub urls: Vec<String>,
+    /// For a site, the directory it serves. Absent for every other kind.
+    pub site_root: Option<String>,
+    pub site_spa: bool,
+    /// `"build"` or `"update"` — which deploy job this deployment accepts, if
+    /// either.
+    pub job_kind: Option<String>,
     pub pool: PoolStatus,
     pub vms: Vec<VmView>,
+    /// Booting VMs, oldest first — the ones holding a cold start open. A count
+    /// alone cannot tell a 3-second boot from a guest that has been failing its
+    /// health check for six minutes.
+    pub pending_vms: Vec<PendingVmView>,
     pub metrics: DeploymentMetrics,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A VM created but not yet in the pool.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PendingVmView {
+    pub sandbox_id: String,
+    /// Seconds since the daemon accepted the create call.
+    pub age_secs: u64,
+    /// The daemon's last reported status, absent before the first observation:
+    /// `provisioning`, `running`, `stopped`, `paused`, `failed`, `cold-stored`
+    /// or `unknown`.
+    pub status: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -565,6 +670,14 @@ pub struct PoolStatus {
     pub utilization: Option<f64>,
     pub cpu_percent: Option<f64>,
     pub memory_bytes: Option<u64>,
+    /// How long a booting VM gets before the autoscaler kills it; `0` waits
+    /// indefinitely.
+    pub boot_timeout_secs: u64,
+    /// How long a request waits on a cold start. A pending VM older than this
+    /// has already cost somebody a 503.
+    pub cold_start_timeout_secs: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -578,6 +691,8 @@ pub struct VmView {
     pub uptime_secs: u64,
     pub cpu_percent: Option<f64>,
     pub memory_bytes: Option<u64>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl VmView {
@@ -599,6 +714,8 @@ pub struct DeploymentMetrics {
     pub latency_ms: Histogram,
     pub cold_start_s: Histogram,
     pub autoscale: AutoscaleCounts,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -610,6 +727,8 @@ pub struct StatusCounts {
     pub c4xx: u64,
     pub c5xx: u64,
     pub errors: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -621,6 +740,8 @@ pub struct Histogram {
     pub p50: f64,
     pub p90: f64,
     pub p99: f64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -634,6 +755,8 @@ pub struct AutoscaleCounts {
     pub cold_start_waits: u64,
     pub cold_start_hits: u64,
     pub cold_start_timeouts: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 // -- GET /certs ------------------------------------------------------------
@@ -645,6 +768,8 @@ pub struct CertStatus {
     pub not_after: String,
     pub issuer: String,
     pub needs_renewal: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[cfg(test)]
@@ -883,4 +1008,114 @@ mod tests {
         };
         assert_eq!(vm.status(), "Draining");
     }
+}
+
+// -- POST /deployments/:id/exec --------------------------------------------
+
+/// What a command did. A non-zero `exit_code` is a successful *request* — the
+/// command ran and failed, which is not the same as being unable to run it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ExecOutput {
+    /// Which VM ran it. Worth having even for a single-VM sandbox: after a
+    /// resume or a rebuild it is a different sandbox than last time.
+    pub sandbox_id: String,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    /// stdout and stderr interleaved as the guest wrote them. Not
+    /// `stdout + stderr` — the only faithful rendering of interleaved output.
+    pub output: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl ExecOutput {
+    /// Whether the command itself succeeded.
+    pub fn ok(&self) -> bool {
+        self.exit_code == 0
+    }
+}
+
+// -- DELETE /deployments/:id/vms/:sandbox_id -------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct EvictOutcome {
+    pub sandbox_id: String,
+    /// `"killed"` (immediate) or `"draining"` (still serving what it has).
+    pub outcome: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl EvictOutcome {
+    pub fn is_draining(&self) -> bool {
+        self.outcome == "draining"
+    }
+}
+
+// -- app-tokens -------------------------------------------------------------
+
+/// What a token may do on the admin API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminScope {
+    /// Nothing. Still usable against a deployment's own gate, which is the
+    /// point of a token handed to an application.
+    #[default]
+    None,
+    /// `/metrics` and `/dashboard`.
+    View,
+    /// Everything, within the token's `deployments` scope.
+    Admin,
+}
+
+impl std::fmt::Display for AdminScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::View => "view",
+            Self::Admin => "admin",
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct TokenSummary {
+    pub id: String,
+    pub name: String,
+    pub admin: AdminScope,
+    /// Deployment ids, or `["*"]` for all of them.
+    pub deployments: Vec<String>,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
+    /// `None` also means "not used since the store was last written" — the
+    /// stamp is flushed opportunistically, not per request, so a busy token can
+    /// still read as unused.
+    pub last_used_at: Option<u64>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl TokenSummary {
+    /// Whether this token's scope covers the whole fleet.
+    pub fn covers_fleet(&self) -> bool {
+        self.deployments.iter().any(|d| d == "*")
+    }
+
+    pub fn allows(&self, deployment: &str) -> bool {
+        self.deployments.iter().any(|d| d == "*" || d == deployment)
+    }
+}
+
+/// The reply to a mint. **`token` is the only time the secret is ever
+/// returned** — app-lb stores only its hash, and there is no endpoint that
+/// reads it back. Store it here or mint another one.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct MintedToken {
+    #[serde(flatten)]
+    pub summary: TokenSummary,
+    pub token: String,
 }

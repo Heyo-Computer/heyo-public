@@ -1,6 +1,6 @@
 //! The HTTP client for an artifact store (`art serve`).
 //!
-//! A second client rather than a mode of [`crate::client::Client`], because it
+//! A second client rather than a mode of [`crate::blocking::Client`], because it
 //! talks to a different service with a different auth scheme. app-lb's admin API
 //! is HTTP Basic and JSON bodies all the way down; a store is a bearer token and
 //! a route whose body is a twenty-gigabyte disk image. The one thing they share

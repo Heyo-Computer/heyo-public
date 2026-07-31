@@ -14,7 +14,7 @@ use crate::registry::Registry;
 use crate::secrets::{SecretSpec, SecretStore};
 use crate::tls::CertStore;
 use async_trait::async_trait;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{MatchedPath, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -115,7 +115,7 @@ impl DashboardAuth {
 
 /// Length-then-content comparison that doesn't short-circuit on the first
 /// differing byte, so a matching prefix can't be timed out of the credential.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -155,6 +155,8 @@ struct AdminState {
     certs: Arc<CertStore>,
     /// Stored secrets. Values enter through this API and never leave it.
     secrets: Arc<SecretStore>,
+    /// App-tokens. Verified on every gated request, so reads are lock-free.
+    tokens: Arc<crate::tokens::TokenStore>,
     /// Runs image builds and host updates, and remembers what they did.
     jobs: Arc<Jobs>,
     /// Nudges the ACME manager to issue for a newly-registered hostname instead
@@ -196,6 +198,7 @@ impl AdminApi {
         certs: Arc<CertStore>,
         acme: Option<Arc<Notify>>,
         secrets: Arc<SecretStore>,
+        tokens: Arc<crate::tokens::TokenStore>,
         jobs: Arc<Jobs>,
         obs: Option<Arc<crate::obs::Stats>>,
         public_url: PublicUrl,
@@ -233,6 +236,7 @@ impl AdminApi {
                 certs,
                 acme,
                 secrets,
+                tokens,
                 jobs,
                 obs,
                 public_url,
@@ -241,37 +245,274 @@ impl AdminApi {
     }
 }
 
-/// Gate the protected routes on Basic auth when configured. A `401` carries the
-/// `WWW-Authenticate` challenge so a browser shows its native login prompt and
-/// caches the credentials for the same-origin requests (`/metrics` polls, and
-/// the dashboard's own write buttons when the admin API is gated too).
-async fn require_dashboard_auth(
-    State(state): State<AdminState>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let Some(auth) = state.auth.as_ref() else {
-        return next.run(req).await; // gate disabled
+/// How a request was identified, and what that permits.
+///
+/// Placed in the request's extensions by the gate, so a handler that needs to
+/// know who is asking can say so in its signature. Most do not: the gate itself
+/// enforces both the tier and the deployment scope (see [`authorize`]), which
+/// keeps the policy in one auditable place rather than in fifteen handlers where
+/// exactly one would eventually be forgotten.
+#[derive(Clone, Debug)]
+pub(crate) enum Caller {
+    /// No gate is configured. This build is not checking credentials at all.
+    Ungated,
+    /// The configured Basic credential. Unscoped by definition — it is the
+    /// credential that *mints* tokens, so it necessarily outranks every token it
+    /// could produce.
+    Operator,
+    /// An app-token, carrying its own scope.
+    Token(Arc<crate::tokens::AppToken>),
+}
+
+impl Caller {
+    fn satisfies(&self, want: crate::tokens::AdminScope) -> bool {
+        match self {
+            Self::Ungated | Self::Operator => true,
+            Self::Token(t) => t.admin.satisfies(want),
+        }
+    }
+
+    fn may_touch(&self, deployment: &str) -> bool {
+        match self {
+            Self::Ungated | Self::Operator => true,
+            Self::Token(t) => t.allows(deployment),
+        }
+    }
+
+    /// Whether this caller may use a route that is not about any one deployment
+    /// — creating one, listing them all, reading the secret store.
+    fn covers_fleet(&self) -> bool {
+        match self {
+            Self::Ungated | Self::Operator => true,
+            Self::Token(t) => t.covers_fleet(),
+        }
+    }
+
+    /// The deployments this caller may see, or `None` for all of them. Used to
+    /// narrow `/metrics` rather than to refuse it: a token scoped to one sandbox
+    /// should be able to watch that sandbox.
+    fn visible(&self) -> Option<&[String]> {
+        match self {
+            Self::Ungated | Self::Operator => None,
+            Self::Token(t) if t.covers_fleet() => None,
+            Self::Token(t) => Some(&t.deployments),
+        }
+    }
+}
+
+/// Routes that are not about a single deployment but that a deployment-scoped
+/// token may still reach, because the handler narrows the answer to that token's
+/// scope instead of refusing it.
+fn narrows_itself(matched: &str) -> bool {
+    matches!(matched, "/metrics" | "/dashboard")
+}
+
+/// The deployment a matched route acts on, if it acts on one.
+///
+/// Read off the *matched* path rather than the raw URI so this cannot be fooled
+/// by a path that merely looks like a deployment route, and the id is then taken
+/// positionally from the real path — every such route is `/deployments/:id/…`,
+/// so the id is always the second segment.
+fn deployment_of<'a>(matched: &str, path: &'a str) -> Option<&'a str> {
+    if matched != "/deployments/:id" && !matched.starts_with("/deployments/:id/") {
+        return None;
+    }
+    path.split('/').nth(2).filter(|s| !s.is_empty())
+}
+
+/// `Bearer <token>`, if that is what was presented.
+fn bearer(header: Option<&str>) -> Option<&str> {
+    let raw = header?.strip_prefix("Bearer ")?.trim();
+    (!raw.is_empty()).then_some(raw)
+}
+
+/// `?app_token=…`, accepted on the shell route and nowhere else.
+///
+/// A credential in a URL is worse than one in a header — it lands in access
+/// logs, proxy logs and browser history — so this exists for exactly one reason:
+/// a browser's `WebSocket` constructor cannot set headers, and a query parameter
+/// is the only thing it *can* carry. Every other route can use a header, so
+/// every other route must.
+fn ws_query_token(matched: &str, query: Option<&str>) -> Option<String> {
+    if matched != "/deployments/:id/shell" {
+        return None;
+    }
+    form_urlencoded::parse(query?.as_bytes())
+        .find(|(k, _)| k == "app_token")
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.is_empty())
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            // Both schemes are advertised, in the order a browser should try
+            // them: a browser can only do Basic, and offering Bearer first would
+            // suppress its native login prompt on some clients.
+            "Basic realm=\"app-lb dashboard\", charset=\"UTF-8\", Bearer",
+        )],
+        "authentication required\n",
+    )
+        .into_response()
+}
+
+/// A 403 rather than a 401: the credential was good, the scope was not, and
+/// re-presenting it will not help. The message names the missing scope, because
+/// the alternative is somebody rotating a working token trying to fix a
+/// permission problem.
+fn forbidden(detail: impl Into<String>) -> Response {
+    err(StatusCode::FORBIDDEN, detail).into_response()
+}
+
+/// What the gate decided about one request.
+#[derive(Debug)]
+enum Verdict {
+    Allow(Caller),
+    /// No usable credential. Answered with a challenge.
+    Unauthorized,
+    /// The credential was good and the scope was not.
+    Forbidden(String),
+}
+
+/// Everything the gate needs to know about a request, as plain data.
+///
+/// A struct rather than a borrowed `Request` so the decision is a pure function
+/// — the same shape `auth.rs` uses for the data-plane gate, and for the same
+/// reason: authorization logic that can only be exercised through a live socket
+/// is authorization logic that does not get exercised.
+struct Presented<'a> {
+    /// The `Authorization` header, verbatim.
+    header: Option<&'a str>,
+    /// The route pattern axum matched, e.g. `/deployments/:id/exec`.
+    matched: Option<&'a str>,
+    /// The concrete request path.
+    path: &'a str,
+    query: Option<&'a str>,
+}
+
+/// Decide whether a request gets through, and as whom.
+///
+/// Two credentials are accepted:
+///
+/// - the configured Basic username/password, which is unscoped, and
+/// - an app-token as `Authorization: Bearer applb_…` (or `?app_token=` on the
+///   shell route only), which carries its own scope.
+///
+/// `auth: None` means no gate is configured and everything is permitted.
+fn decide_access(
+    auth: Option<&DashboardAuth>,
+    tokens: &crate::tokens::TokenStore,
+    req: &Presented<'_>,
+    want: crate::tokens::AdminScope,
+    now: u64,
+) -> Verdict {
+    let Some(auth) = auth else {
+        return Verdict::Allow(Caller::Ungated);
     };
 
-    let presented = req
+    let caller = if auth.accepts(req.header) {
+        Some(Caller::Operator)
+    } else {
+        bearer(req.header)
+            .map(str::to_owned)
+            .or_else(|| ws_query_token(req.matched.unwrap_or_default(), req.query))
+            .and_then(|raw| tokens.verify(&raw, now))
+            .map(Caller::Token)
+    };
+
+    let Some(caller) = caller else {
+        return Verdict::Unauthorized;
+    };
+
+    if !caller.satisfies(want) {
+        return Verdict::Forbidden(
+            match want {
+                crate::tokens::AdminScope::Admin => {
+                    "this token's admin scope is not `admin`, which this route requires"
+                }
+                _ => "this token has no admin scope, so it cannot read the admin API",
+            }
+            .into(),
+        );
+    }
+
+    // Deployment scope. Every route is one of three things: about a named
+    // deployment, able to narrow itself, or fleet-wide.
+    if let Some(matched) = req.matched {
+        match deployment_of(matched, req.path) {
+            Some(id) if !caller.may_touch(id) => {
+                return Verdict::Forbidden(format!(
+                    "this token is not scoped to deployment \"{id}\""
+                ));
+            }
+            None if !narrows_itself(matched) && !caller.covers_fleet() => {
+                return Verdict::Forbidden(
+                    "this token is scoped to specific deployments, so it cannot use a \
+                     fleet-wide route — mint one scoped to \"*\" if that is what you want"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Verdict::Allow(caller)
+}
+
+/// Gate the protected routes when a credential is configured.
+///
+/// A `401` carries the `WWW-Authenticate` challenge so a browser shows its
+/// native login prompt and caches the credentials for same-origin requests. A
+/// bad *scope* is a `403` and says so.
+async fn authorize(
+    state: AdminState,
+    mut req: Request,
+    next: Next,
+    want: crate::tokens::AdminScope,
+) -> Response {
+    let matched = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let header = req
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_owned);
 
-    if auth.accepts(presented) {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            [(
-                header::WWW_AUTHENTICATE,
-                "Basic realm=\"app-lb dashboard\", charset=\"UTF-8\"",
-            )],
-            "authentication required\n",
-        )
-            .into_response()
+    let verdict = decide_access(
+        state.auth.as_deref(),
+        &state.tokens,
+        &Presented {
+            header: header.as_deref(),
+            matched: matched.as_deref(),
+            path: &path,
+            query: query.as_deref(),
+        },
+        want,
+        now_secs(),
+    );
+
+    match verdict {
+        Verdict::Allow(caller) => {
+            req.extensions_mut().insert(caller);
+            next.run(req).await
+        }
+        Verdict::Unauthorized => unauthorized(),
+        Verdict::Forbidden(detail) => forbidden(detail),
     }
+}
+
+async fn require_view_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
+    authorize(state, req, next, crate::tokens::AdminScope::View).await
+}
+
+async fn require_crud_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
+    authorize(state, req, next, crate::tokens::AdminScope::Admin).await
 }
 
 #[derive(Serialize)]
@@ -584,22 +825,34 @@ fn pending_vms_of(d: &Arc<crate::deployment::Deployment>) -> Vec<PendingVmView> 
 async fn metrics_snapshot(
     State(state): State<AdminState>,
     Query(q): Query<MetricsQuery>,
+    caller: Option<axum::Extension<Caller>>,
 ) -> impl IntoResponse {
     let deployments = state.registry.deployments();
+
+    // A deployment-scoped token gets a *narrowed* answer rather than a 403: a
+    // token minted to drive one sandbox should be able to watch that sandbox.
+    // `None` means unscoped, which is the operator credential and the ungated
+    // case both.
+    let scope = caller.as_ref().and_then(|c| c.visible());
+    let in_scope = |id: &str| scope.is_none_or(|s| s.iter().any(|d| d == id));
 
     // The fleet rollup covers the whole registry, never the filter or the page.
     // It sits under "Host & fleet" alongside the global metrics, and a number
     // there that moved when somebody typed in the table's search box would be
     // describing the query rather than the system.
+    //
+    // "The whole registry" still means the whole *visible* registry: a scoped
+    // token must not learn the size of the fleet from a total it can't itemise.
     let mut fleet = FleetPool {
-        deployments: deployments.len(),
+        deployments: 0,
         ready: 0,
         draining: 0,
         pending: 0,
         total_in_flight: 0,
     };
-    for d in deployments.values() {
+    for d in deployments.values().filter(|d| in_scope(&d.spec.id)) {
         let pool = pool_status_of(d);
+        fleet.deployments += 1;
         fleet.ready += pool.ready;
         fleet.draining += pool.draining;
         fleet.pending += pool.pending;
@@ -611,6 +864,7 @@ async fn metrics_snapshot(
     // endpoint expensive.
     let mut selected: Vec<_> = deployments
         .values()
+        .filter(|d| in_scope(&d.spec.id))
         .filter(|d| q.deployment.as_ref().is_none_or(|id| &d.spec.id == id))
         .filter(|d| q.prefix.as_ref().is_none_or(|p| d.spec.id.starts_with(p)))
         .collect();
@@ -675,16 +929,36 @@ async fn metrics_snapshot(
         .collect();
 
     let now = now_secs();
+    // For a scoped token the rollup is over what it can see, not over the fleet.
+    // `global_snapshot` also folds in *retired* deployments' counters, which a
+    // scoped caller has no business receiving.
+    //
+    // `host` is left alone deliberately: whole-machine CPU and memory is not an
+    // inventory of deployments, and a sandbox operator watching the load on the
+    // box their VM sits on is reasonable.
+    let (global, tracked) = match scope {
+        None => (
+            state.metrics.global_snapshot(),
+            state.metrics.tracked_deployments(),
+        ),
+        Some(ids) => {
+            let mut merged = crate::metrics::DeploymentMetricsSnapshot::empty();
+            for id in ids {
+                merged.merge(&state.metrics.deployment_snapshot(id));
+            }
+            (merged, ids.len())
+        }
+    };
     Json(MetricsResponse {
         generated_at: now,
         uptime_secs: now.saturating_sub(state.started_at),
         host: state.metrics.host_snapshot(),
         fleet,
-        global: state.metrics.global_snapshot(),
+        global,
         obs: state.obs.as_ref().map(|o| o.snapshot()),
         deployments: views,
         matched,
-        tracked_deployments: state.metrics.tracked_deployments(),
+        tracked_deployments: tracked,
     })
 }
 
@@ -1616,24 +1890,43 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/update", post(start_update))
         .route("/deployments/:id/jobs", get(deployment_jobs))
         .route("/jobs", get(list_jobs))
-        .route("/jobs/:job_id", get(get_job));
+        .route("/jobs/:job_id", get(get_job))
+        // App-tokens. Firmly CRUD-tier: minting one is minting a credential, so
+        // the route that does it must be at least as protected as the things the
+        // credential can reach.
+        .route("/tokens", post(mint_token).get(list_tokens))
+        .route(
+            "/tokens/:id",
+            get(get_token).patch(patch_token).delete(revoke_token),
+        );
 
-    let (gated, open) = if state.gate_admin {
-        (view.merge(crud), Router::new())
+    // `route_layer` runs the auth middleware only for the routes it wraps, so a
+    // 404 elsewhere never triggers a challenge. `/healthz` is always open.
+    //
+    // Two layers rather than one, because the tiers want different scopes: a
+    // `view` token may read `/metrics`, and only an `admin` one may reach the
+    // CRUD routes. When `gate_admin` is off the CRUD routes carry no layer at
+    // all — the pre-existing behaviour, and what `main()` warns loudly about.
+    let (crud, open) = if state.gate_admin {
+        (
+            crud.route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_crud_auth,
+            )),
+            Router::new(),
+        )
     } else {
-        (view, crud)
+        (Router::new(), crud)
     };
-
-    // `route_layer` runs the auth middleware only for the gated routes, so a 404
-    // elsewhere never triggers a challenge. `/healthz` is always open for probes.
-    let gated = gated.route_layer(middleware::from_fn_with_state(
+    let view = view.route_layer(middleware::from_fn_with_state(
         state.clone(),
-        require_dashboard_auth,
+        require_view_auth,
     ));
 
     Router::new()
         .route("/healthz", get(healthz))
-        .merge(gated)
+        .merge(view)
+        .merge(crud)
         .merge(open)
         .with_state(state)
 }
@@ -1664,6 +1957,133 @@ impl BackgroundService for AdminApi {
             tracing::error!(error = %e, "admin API stopped");
         }
     }
+}
+
+// -- app-tokens --------------------------------------------------------------
+
+/// What `POST /tokens` answers with: the summary, plus the secret.
+///
+/// The secret appears here and in no other response, ever. There is no endpoint
+/// that reads one back, because only its hash is kept — losing a token means
+/// minting a replacement and revoking the old one, which is the behaviour you
+/// want from a credential anyway.
+#[derive(Serialize)]
+struct MintedToken {
+    #[serde(flatten)]
+    summary: crate::tokens::TokenSummary,
+    /// Store this now. It cannot be retrieved again.
+    token: String,
+}
+
+fn token_error(e: crate::tokens::TokenError) -> Response {
+    use crate::tokens::TokenError;
+    let code = match &e {
+        TokenError::NoToken(_) => StatusCode::NOT_FOUND,
+        TokenError::EmptyName | TokenError::NameTooLong | TokenError::BadScope(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(code, e.to_string()).into_response()
+}
+
+/// Write the token file, turning a failure into a 500.
+///
+/// Unlike a deployment write — which logs and carries on, because the running
+/// pool is the source of truth — a token that exists in memory but not on disk
+/// is a credential that silently stops working at the next restart. The caller
+/// is told instead.
+/// `Box`ed because axum's `Response` is a large type, and this sits in the
+/// `Err` half of a `Result` that several handlers thread through.
+fn persist_tokens(state: &AdminState) -> Result<(), Box<Response>> {
+    state.tokens.persist().map_err(|e| {
+        tracing::error!(path = %state.tokens.path().display(), error = %e, "token file write failed");
+        Box::new(
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the token was not saved: {e}"),
+            )
+            .into_response(),
+        )
+    })
+}
+
+async fn mint_token(
+    State(state): State<AdminState>,
+    Json(req): Json<crate::tokens::NewToken>,
+) -> Response {
+    let name = req.name.clone();
+    let (summary, token) = match state.tokens.mint(req, now_secs()) {
+        Ok(v) => v,
+        Err(e) => return token_error(e),
+    };
+    if let Err(e) = persist_tokens(&state) {
+        // Roll back, so a token that could not be saved is not one that works
+        // until the next restart and then mysteriously stops.
+        state.tokens.revoke(&summary.id);
+        return *e;
+    }
+    tracing::info!(
+        token = %summary.id,
+        name = %name,
+        admin = ?summary.admin,
+        deployments = ?summary.deployments,
+        "app-token minted",
+    );
+    (StatusCode::CREATED, Json(MintedToken { summary, token })).into_response()
+}
+
+async fn list_tokens(State(state): State<AdminState>) -> impl IntoResponse {
+    // Expired tokens already fail verification; drop them here so the listing
+    // shows live credentials rather than a graveyard that looks like one.
+    if state.tokens.sweep_expired(now_secs()) > 0 {
+        let _ = state.tokens.persist();
+    }
+    Json(state.tokens.list())
+}
+
+async fn get_token(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    match state.tokens.get(&id) {
+        Some(t) => Json(t.summary()).into_response(),
+        None => err(StatusCode::NOT_FOUND, format!("no token {id:?}")).into_response(),
+    }
+}
+
+async fn patch_token(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(patch): Json<crate::tokens::TokenPatch>,
+) -> Response {
+    let before = state.tokens.get(&id);
+    let summary = match state.tokens.patch(&id, patch) {
+        Ok(s) => s,
+        Err(e) => return token_error(e),
+    };
+    if let Err(e) = persist_tokens(&state) {
+        if let Some(before) = before {
+            state.tokens.restore(before);
+        }
+        return *e;
+    }
+    tracing::info!(token = %id, admin = ?summary.admin, deployments = ?summary.deployments, "app-token updated");
+    Json(summary).into_response()
+}
+
+async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    let before = state.tokens.get(&id);
+    if !state.tokens.revoke(&id) {
+        return err(StatusCode::NOT_FOUND, format!("no token {id:?}")).into_response();
+    }
+    if let Err(e) = persist_tokens(&state) {
+        // A revocation that did not reach disk would come back at the next
+        // restart, which is the worst possible direction for this to fail in.
+        if let Some(before) = before {
+            state.tokens.restore(before);
+        }
+        return *e;
+    }
+    tracing::info!(token = %id, "app-token revoked");
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[cfg(test)]
@@ -1781,6 +2201,455 @@ mod tests {
         assert!(auth.accepts(Some(&header_for("admin", "pass:word"))));
     }
 
+    // -- the gate ----------------------------------------------------------
+
+    mod gate {
+        use super::super::*;
+        use super::b64_basic;
+        use crate::tokens::{AdminScope, NewToken, TokenStore};
+
+        const NOW: u64 = 1_000;
+
+        fn store() -> TokenStore {
+            // Never persisted, so the path is never touched.
+            TokenStore::new("/nonexistent/tokens.json")
+        }
+
+        fn mint(s: &TokenStore, admin: AdminScope, deployments: &[&str]) -> String {
+            s.mint(
+                NewToken {
+                    name: "test".into(),
+                    admin,
+                    deployments: deployments.iter().map(|d| d.to_string()).collect(),
+                    expires_in_secs: None,
+                },
+                NOW,
+            )
+            .unwrap()
+            .1
+        }
+
+        fn basic() -> DashboardAuth {
+            DashboardAuth::new("admin", "hunter2")
+        }
+
+        /// `decide_access` with the common shape: a header, a route, no query.
+        fn on(
+            auth: Option<&DashboardAuth>,
+            tokens: &TokenStore,
+            header: Option<&str>,
+            matched: &str,
+            path: &str,
+            want: AdminScope,
+        ) -> Verdict {
+            decide_access(
+                auth,
+                tokens,
+                &Presented {
+                    header,
+                    matched: Some(matched),
+                    path,
+                    query: None,
+                },
+                want,
+                NOW,
+            )
+        }
+
+        fn allowed(v: Verdict) -> Caller {
+            match v {
+                Verdict::Allow(c) => c,
+                other => panic!("expected Allow, got {other:?}"),
+            }
+        }
+
+        fn forbidden_because(v: Verdict) -> String {
+            match v {
+                Verdict::Forbidden(d) => d,
+                other => panic!("expected Forbidden, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn no_configured_credential_means_no_gate() {
+            let t = store();
+            let v = on(None, &t, None, "/deployments", "/deployments", AdminScope::Admin);
+            assert!(matches!(allowed(v), Caller::Ungated));
+        }
+
+        #[test]
+        fn basic_auth_still_works_and_is_unscoped() {
+            let t = store();
+            let auth = basic();
+            let hdr = format!("Basic {}", b64_basic("admin", "hunter2"));
+
+            let caller = allowed(on(
+                Some(&auth),
+                &t,
+                Some(&hdr),
+                "/deployments/:id/exec",
+                "/deployments/anything/exec",
+                AdminScope::Admin,
+            ));
+            assert!(matches!(caller, Caller::Operator));
+            assert!(caller.may_touch("anything"));
+            assert!(caller.covers_fleet());
+            assert!(
+                caller.visible().is_none(),
+                "the operator credential must not be narrowed"
+            );
+        }
+
+        #[test]
+        fn a_bearer_token_authenticates_where_basic_would() {
+            let t = store();
+            let secret = mint(&t, AdminScope::Admin, &["*"]);
+            let hdr = format!("Bearer {secret}");
+            let caller = allowed(on(
+                Some(&basic()),
+                &t,
+                Some(&hdr),
+                "/deployments",
+                "/deployments",
+                AdminScope::Admin,
+            ));
+            assert!(matches!(caller, Caller::Token(_)));
+        }
+
+        #[test]
+        fn a_revoked_token_is_unauthorized_not_forbidden() {
+            let t = store();
+            let secret = mint(&t, AdminScope::Admin, &["*"]);
+            let id = t.list()[0].id.clone();
+            t.revoke(&id);
+
+            let hdr = format!("Bearer {secret}");
+            assert!(matches!(
+                on(Some(&basic()), &t, Some(&hdr), "/deployments", "/deployments", AdminScope::Admin),
+                Verdict::Unauthorized
+            ));
+        }
+
+        #[test]
+        fn garbage_credentials_are_unauthorized() {
+            let t = store();
+            let auth = basic();
+            for header in [
+                None,
+                Some("Bearer applb_000000000000_nope"),
+                Some("Bearer "),
+                Some("Basic bm9wZTpub3Bl"),
+                Some("applb_000000000000_nope"),
+                Some("Token applb_000000000000_nope"),
+            ] {
+                assert!(
+                    matches!(
+                        on(Some(&auth), &t, header, "/deployments", "/deployments", AdminScope::Admin),
+                        Verdict::Unauthorized
+                    ),
+                    "{header:?} should not authenticate",
+                );
+            }
+        }
+
+        #[test]
+        fn a_view_token_reads_metrics_but_cannot_reach_the_crud_tier() {
+            let t = store();
+            let secret = mint(&t, AdminScope::View, &["*"]);
+            let hdr = format!("Bearer {secret}");
+            let auth = basic();
+
+            allowed(on(Some(&auth), &t, Some(&hdr), "/metrics", "/metrics", AdminScope::View));
+
+            let why = forbidden_because(on(
+                Some(&auth),
+                &t,
+                Some(&hdr),
+                "/deployments",
+                "/deployments",
+                AdminScope::Admin,
+            ));
+            assert!(why.contains("admin scope"), "{why}");
+        }
+
+        #[test]
+        fn a_data_plane_only_token_cannot_read_the_admin_api_at_all() {
+            let t = store();
+            // `admin: none` — the token an application carries to get past its own
+            // deployment's gate, and nothing more.
+            let secret = mint(&t, AdminScope::None, &["sb-1"]);
+            let hdr = format!("Bearer {secret}");
+            let auth = basic();
+
+            assert!(matches!(
+                on(Some(&auth), &t, Some(&hdr), "/metrics", "/metrics", AdminScope::View),
+                Verdict::Forbidden(_)
+            ));
+            assert!(matches!(
+                on(Some(&auth), &t, Some(&hdr), "/deployments/:id/exec", "/deployments/sb-1/exec", AdminScope::Admin),
+                Verdict::Forbidden(_)
+            ));
+        }
+
+        #[test]
+        fn a_scoped_token_reaches_its_own_deployment_and_no_other() {
+            let t = store();
+            let secret = mint(&t, AdminScope::Admin, &["sb-1"]);
+            let hdr = format!("Bearer {secret}");
+            let auth = basic();
+
+            for route in [
+                ("/deployments/:id", "/deployments/sb-1"),
+                ("/deployments/:id/exec", "/deployments/sb-1/exec"),
+                ("/deployments/:id/shell", "/deployments/sb-1/shell"),
+                ("/deployments/:id/scaling", "/deployments/sb-1/scaling"),
+                ("/deployments/:id/jobs", "/deployments/sb-1/jobs"),
+                (
+                    "/deployments/:id/vms/:sandbox_id",
+                    "/deployments/sb-1/vms/applb-x",
+                ),
+            ] {
+                allowed(on(Some(&auth), &t, Some(&hdr), route.0, route.1, AdminScope::Admin));
+            }
+
+            let why = forbidden_because(on(
+                Some(&auth),
+                &t,
+                Some(&hdr),
+                "/deployments/:id/exec",
+                "/deployments/sb-2/exec",
+                AdminScope::Admin,
+            ));
+            assert!(why.contains("sb-2"), "the message should name the deployment: {why}");
+        }
+
+        #[test]
+        fn a_scoped_token_is_refused_the_fleet_wide_routes() {
+            let t = store();
+            let secret = mint(&t, AdminScope::Admin, &["sb-1"]);
+            let hdr = format!("Bearer {secret}");
+            let auth = basic();
+
+            // Creating deployments, reading the secret store and listing every job
+            // are not about the one deployment this token was given.
+            for route in [
+                "/deployments",
+                "/secrets",
+                "/secrets/:id",
+                "/jobs",
+                "/jobs/:job_id",
+                "/certs",
+                "/tokens",
+                "/tokens/:id",
+            ] {
+                assert!(
+                    matches!(
+                        on(Some(&auth), &t, Some(&hdr), route, route, AdminScope::Admin),
+                        Verdict::Forbidden(_)
+                    ),
+                    "{route} should be refused a deployment-scoped token",
+                );
+            }
+        }
+
+        /// Minting is how you escalate, so it must not be reachable by anything
+        /// less than a fleet-wide admin token.
+        #[test]
+        fn a_scoped_token_cannot_mint_itself_a_wider_one() {
+            let t = store();
+            let secret = mint(&t, AdminScope::Admin, &["sb-1"]);
+            let hdr = format!("Bearer {secret}");
+            assert!(matches!(
+                on(Some(&basic()), &t, Some(&hdr), "/tokens", "/tokens", AdminScope::Admin),
+                Verdict::Forbidden(_)
+            ));
+        }
+
+        #[test]
+        fn metrics_narrows_itself_rather_than_refusing_a_scoped_token() {
+            let t = store();
+            let secret = mint(&t, AdminScope::View, &["sb-1", "sb-2"]);
+            let hdr = format!("Bearer {secret}");
+
+            let caller = allowed(on(
+                Some(&basic()),
+                &t,
+                Some(&hdr),
+                "/metrics",
+                "/metrics",
+                AdminScope::View,
+            ));
+            assert_eq!(
+                caller.visible().expect("a scoped token narrows the answer"),
+                ["sb-1".to_string(), "sb-2".to_string()],
+            );
+        }
+
+        #[test]
+        fn a_fleet_scoped_token_narrows_nothing() {
+            let t = store();
+            let secret = mint(&t, AdminScope::View, &["*"]);
+            let hdr = format!("Bearer {secret}");
+            let caller = allowed(on(
+                Some(&basic()),
+                &t,
+                Some(&hdr),
+                "/metrics",
+                "/metrics",
+                AdminScope::View,
+            ));
+            assert!(caller.visible().is_none());
+        }
+
+        #[test]
+        fn a_query_token_works_on_the_shell_route_and_nowhere_else() {
+            let t = store();
+            let secret = mint(&t, AdminScope::Admin, &["sb-1"]);
+            let auth = basic();
+            let query = format!("cols=80&app_token={secret}&rows=24");
+
+            // The one route a browser cannot send a header to.
+            let v = decide_access(
+                Some(&auth),
+                &t,
+                &Presented {
+                    header: None,
+                    matched: Some("/deployments/:id/shell"),
+                    path: "/deployments/sb-1/shell",
+                    query: Some(&query),
+                },
+                AdminScope::Admin,
+                NOW,
+            );
+            assert!(matches!(allowed(v), Caller::Token(_)));
+
+            // Everywhere else it is not a credential at all, because everywhere
+            // else can use a header — and a token in a URL lands in access logs.
+            for (matched, path) in [
+                ("/deployments/:id/exec", "/deployments/sb-1/exec"),
+                ("/deployments/:id", "/deployments/sb-1"),
+                ("/metrics", "/metrics"),
+            ] {
+                assert!(
+                    matches!(
+                        decide_access(
+                            Some(&auth),
+                            &t,
+                            &Presented {
+                                header: None,
+                                matched: Some(matched),
+                                path,
+                                query: Some(&query),
+                            },
+                            AdminScope::Admin,
+                            NOW,
+                        ),
+                        Verdict::Unauthorized
+                    ),
+                    "{matched} must not accept a credential in the query string",
+                );
+            }
+        }
+
+        #[test]
+        fn the_query_token_still_has_to_be_in_scope() {
+            let t = store();
+            let secret = mint(&t, AdminScope::Admin, &["sb-1"]);
+            let query = format!("app_token={secret}");
+            assert!(matches!(
+                decide_access(
+                    Some(&basic()),
+                    &t,
+                    &Presented {
+                        header: None,
+                        matched: Some("/deployments/:id/shell"),
+                        path: "/deployments/sb-2/shell",
+                        query: Some(&query),
+                    },
+                    AdminScope::Admin,
+                    NOW,
+                ),
+                Verdict::Forbidden(_)
+            ));
+        }
+
+        #[test]
+        fn an_expired_token_stops_working_without_anyone_revoking_it() {
+            let t = store();
+            let secret = t
+                .mint(
+                    NewToken {
+                        name: "short".into(),
+                        admin: AdminScope::Admin,
+                        deployments: vec!["*".into()],
+                        expires_in_secs: Some(60),
+                    },
+                    NOW,
+                )
+                .unwrap()
+                .1;
+            let hdr = format!("Bearer {secret}");
+            let auth = basic();
+            let at = |now| {
+                decide_access(
+                    Some(&auth),
+                    &t,
+                    &Presented {
+                        header: Some(&hdr),
+                        matched: Some("/deployments"),
+                        path: "/deployments",
+                        query: None,
+                    },
+                    AdminScope::Admin,
+                    now,
+                )
+            };
+            assert!(matches!(at(NOW + 59), Verdict::Allow(_)));
+            assert!(matches!(at(NOW + 60), Verdict::Unauthorized));
+        }
+
+        /// The id is read positionally out of the real path, so this pins the
+        /// assumption that every deployment route is `/deployments/:id/…`.
+        #[test]
+        fn the_deployment_is_read_off_the_matched_route() {
+            assert_eq!(
+                deployment_of("/deployments/:id/exec", "/deployments/sb-1/exec"),
+                Some("sb-1")
+            );
+            assert_eq!(
+                deployment_of("/deployments/:id", "/deployments/sb-1"),
+                Some("sb-1")
+            );
+            assert_eq!(
+                deployment_of("/deployments/:id/vms/:sandbox_id", "/deployments/sb-1/vms/x"),
+                Some("sb-1")
+            );
+            // Not a deployment route, however much the path looks like one.
+            assert_eq!(deployment_of("/deployments", "/deployments"), None);
+            assert_eq!(deployment_of("/jobs/:job_id", "/jobs/deployments"), None);
+            assert_eq!(deployment_of("/metrics", "/metrics"), None);
+        }
+
+        #[test]
+        fn bearer_parsing_is_exact() {
+            assert_eq!(bearer(Some("Bearer abc")), Some("abc"));
+            assert_eq!(bearer(Some("Bearer  abc ")), Some("abc"));
+            assert_eq!(bearer(Some("bearer abc")), None, "the scheme is case-sensitive here");
+            assert_eq!(bearer(Some("Bearer")), None);
+            assert_eq!(bearer(Some("Bearer ")), None);
+            assert_eq!(bearer(Some("Basic abc")), None);
+            assert_eq!(bearer(None), None);
+        }
+    }
+
+    /// Basic credentials as the header value they must produce, for the gate
+    /// tests. Deliberately re-derived rather than reusing `DashboardAuth`'s own
+    /// encoding, so a change to that encoding fails a test instead of silently
+    /// agreeing with itself.
+    fn b64_basic(user: &str, password: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    }
+
     #[test]
     fn ct_eq_matches_std_eq() {
         assert!(ct_eq(b"", b""));
@@ -1790,3 +2659,10 @@ mod tests {
         assert!(!ct_eq(b"ab", b"abc"));
     }
 }
+
+/// Wire-contract fixtures for the clients that re-declare these types.
+/// A child module rather than part of `mod tests` above, because it needs to see
+/// the private response structs and nothing else in this file needs to see it.
+#[cfg(test)]
+#[path = "wire_golden.rs"]
+mod wire_golden;

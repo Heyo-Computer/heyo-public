@@ -343,7 +343,7 @@ pub struct DeploymentMetricsSnapshot {
 }
 
 impl DeploymentMetricsSnapshot {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             requests: StatusSnapshot::default(),
             latency_ms: HistogramSnapshot::empty(LATENCY_BOUNDS_MS),
@@ -352,7 +352,7 @@ impl DeploymentMetricsSnapshot {
         }
     }
 
-    fn merge(&mut self, o: &DeploymentMetricsSnapshot) {
+    pub(crate) fn merge(&mut self, o: &DeploymentMetricsSnapshot) {
         self.requests.merge(&o.requests);
         self.latency_ms.merge(&o.latency_ms);
         self.cold_start_s.merge(&o.cold_start_s);

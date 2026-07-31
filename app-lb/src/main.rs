@@ -21,6 +21,7 @@ mod registry;
 mod secrets;
 mod site;
 mod tls;
+mod tokens;
 mod vm;
 
 use crate::acme::{AcmeConfig, AcmeManager, ChallengeTable};
@@ -53,6 +54,9 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_SECRETS_PATH") {
         cfg.secrets_path = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_TOKENS_PATH") {
+        cfg.tokens_path = v;
     }
     if let Ok(v) = std::env::var("APP_LB_NAME") {
         cfg.name = v;
@@ -323,6 +327,22 @@ fn main() {
             std::path::Path::new(&cfg.secrets_path).display()
         ),
     }
+    let tokens = Arc::new(tokens::TokenStore::new(&cfg.tokens_path));
+    match tokens.load() {
+        Ok(0) => tracing::info!(path = %tokens.path().display(), "no app-tokens"),
+        Ok(n) => tracing::info!(count = n, "loaded app-tokens"),
+        // Fatal for the same reason the secret store is: starting with an empty
+        // token store would revoke every client at once, and would look exactly
+        // like a healthy server until their calls started failing.
+        Err(e) => panic!(
+            "cannot read {}: {e}",
+            std::path::Path::new(&cfg.tokens_path).display()
+        ),
+    }
+    if tokens.sweep_expired(deployment::now_secs()) > 0 {
+        let _ = tokens.persist();
+    }
+
     if !secrets.is_encrypted() {
         tracing::info!(
             path = %secrets.path().display(),
@@ -355,6 +375,7 @@ fn main() {
         Authenticator::load_key(&auth_key_path)
             .unwrap_or_else(|e| panic!("cannot read or create {}: {e}", auth_key_path.display())),
         secrets.clone(),
+        Some(tokens.clone()),
     ));
 
     let vms = VmManager::new(cfg.daemon_url.clone());
@@ -495,6 +516,7 @@ fn main() {
             certs.clone(),
             acme_signal,
             secrets,
+            tokens,
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),

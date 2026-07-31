@@ -341,6 +341,13 @@
   <div class="card" id="secrets"></div>
 
   <div class="section-title">
+    App-tokens <span class="count" id="tokens-count"></span>
+    <span class="spacer"></span>
+    <button class="btn mini" id="token-new">New token</button>
+  </div>
+  <div class="card" id="tokens"></div>
+
+  <div class="section-title">
     Deploy jobs <span class="count" id="jobs-count"></span>
   </div>
   <div class="card" id="jobs"></div>
@@ -1033,6 +1040,167 @@ function renderSecrets(secrets) {
       sets new values rather than editing existing ones.</div>`;
 }
 
+// ---- App-tokens ---------------------------------------------------------
+
+const ADMIN_TAG = { admin: "down", view: "boot", none: "idle" };
+
+// What a token can actually do, in one cell. `none` is not "broken": it is the
+// shape of a credential handed to an application, which reaches its deployment's
+// gate and no part of the admin API.
+function tokenScope(t) {
+  const admin = t.admin || "none";
+  const bits = [`<span class="tag ${ADMIN_TAG[admin] || "idle"}">${esc(admin)}</span>`];
+  const deps = t.deployments || [];
+  if (!deps.length) bits.push(`<span class="tag idle">no deployments</span>`);
+  else if (deps.includes("*")) bits.push(`<span class="chip">all deployments</span>`);
+  else bits.push(deps.map(d => `<span class="chip">${esc(d)}</span>`).join(""));
+  return `<div class="chips">${bits.join("")}</div>`;
+}
+
+function renderTokens(tokens) {
+  $("tokens-count").textContent = tokens.length ? `${tokens.length} live` : "";
+  if (!tokens.length) {
+    $("tokens").innerHTML =
+      `<div class="empty">No app-tokens. A token is how an SDK client authenticates —
+       scoped, revocable, and usable both here and against a deployment whose
+       <code>auth.provider</code> includes <code>app-token</code>.</div>`;
+    return;
+  }
+  const now = nowSecs();
+  const rows = tokens.map(t => {
+    const expires = t.expires_at
+      ? `in ${fmtDur(Math.max(0, t.expires_at - now))}`
+      : `<span style="color:var(--muted)">never</span>`;
+    // "Never used" and "not used since the last write" are indistinguishable
+    // here — the stamp is only flushed when the store is persisted for another
+    // reason, so a busy token can still read as unused.
+    const used = t.last_used_at
+      ? `${fmtDur(Math.max(0, now - t.last_used_at))} ago`
+      : `<span style="color:var(--muted)">—</span>`;
+    return `<tr>
+      <td>${esc(t.name)}</td>
+      <td class="mono">${esc(t.id)}</td>
+      <td>${tokenScope(t)}</td>
+      <td>${fmtDur(Math.max(0, now - t.created_at))} ago</td>
+      <td>${used}</td>
+      <td>${expires}</td>
+      <td class="rowactions">
+        <button class="btn mini danger" data-tact="revoke" data-tid="${esc(t.id)}"
+                data-tname="${esc(t.name)}">Revoke</button>
+      </td>
+    </tr>`;
+  }).join("");
+
+  $("tokens").innerHTML = `<div style="overflow-x:auto"><table class="vms">
+      <thead><tr><th>name</th><th>id</th><th>scope</th><th>created</th><th>last used</th>
+        <th>expires</th><th>actions</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="note">The secret is shown once, when the token is minted, and is not
+      recoverable — only its hash is stored. Revoking takes effect on the next request.</div>`;
+}
+
+function tokenForm() {
+  const options = Object.keys(depsById).sort()
+    .map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join("");
+  return `
+    <label>Name
+      <input id="tk-name" placeholder="ci, agent-runner, sb-7f3a9c" autocomplete="off">
+    </label>
+    <label>Admin API access
+      <select id="tk-admin">
+        <option value="none">none — data plane only</option>
+        <option value="view">view — metrics and dashboard</option>
+        <option value="admin">admin — full CRUD</option>
+      </select>
+    </label>
+    <label>Deployments
+      <select id="tk-scope">
+        <option value="">all deployments (*)</option>
+        ${options}
+      </select>
+    </label>
+    <label>Expires in (hours, blank for never)
+      <input id="tk-ttl" placeholder="" inputmode="numeric" autocomplete="off">
+    </label>`;
+}
+
+function openNewToken() {
+  openModal(
+    "New app-token",
+    "A scoped, revocable credential. The secret is shown once and cannot be retrieved again.",
+    tokenForm(),
+    async () => {
+      const name = $("tk-name").value.trim();
+      if (!name) return modalErr("A token needs a name — it is how you know what to revoke.");
+      const scope = $("tk-scope").value;
+      const body = {
+        name,
+        admin: $("tk-admin").value,
+        deployments: scope ? [scope] : ["*"],
+      };
+      const ttl = $("tk-ttl").value.trim();
+      if (ttl) {
+        const hours = parseInt(ttl, 10);
+        if (isNaN(hours) || hours <= 0) return modalErr("Expiry must be a positive number of hours.");
+        body.expires_in_secs = hours * 3600;
+      }
+      const res = await api("POST", "tokens", body);
+      if (!res.ok) return modalErr(errMsg(res));
+      showMintedToken(res.data);
+    },
+    "Mint",
+  );
+}
+
+// The one screen in the dashboard that shows a secret. Deliberately a dead end:
+// no auto-close, no refresh behind it, and the value is selectable rather than
+// only copyable, because a clipboard write can silently fail on an insecure
+// origin and losing this means reminting.
+function showMintedToken(t) {
+  openModal(
+    "Token minted",
+    "Copy it now. This is the only time it is shown — only its hash is stored.",
+    `<div class="note" style="margin-bottom:10px">
+       <strong>${esc(t.name)}</strong> · ${esc(t.admin)} ·
+       ${(t.deployments || []).includes("*") ? "all deployments" : esc((t.deployments || []).join(", "))}
+     </div>
+     <input id="tk-secret" class="mono" readonly value="${esc(t.token)}"
+            style="width:100%" onclick="this.select()">
+     <div class="note" style="margin-top:10px">
+       Present it as <code>Authorization: Bearer &lt;token&gt;</code>. On the shell
+       WebSocket only, <code>?app_token=</code> also works — that exists because a
+       browser cannot set headers on a WebSocket upgrade, and a credential in a URL
+       lands in access logs, so keep those short-lived.
+     </div>`,
+    null,
+  );
+  // Select it immediately so a copy is one keystroke away.
+  const el = $("tk-secret");
+  if (el) { el.focus(); el.select(); }
+}
+
+$("tokens").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-tact]");
+  if (!b) return;
+  const { tid, tname } = b.dataset;
+  openModal(
+    "Revoke token",
+    `${tname} (${tid})`,
+    `<div class="note">Anything using this token stops working on its next request.
+      There is no undo — a replacement has to be minted and distributed.</div>`,
+    async () => {
+      const res = await api("DELETE", "tokens/" + encodeURIComponent(tid));
+      if (!res.ok) return modalErr(errMsg(res));
+      toast(`Revoked ${tname}`);
+      closeModal();
+    },
+    "Revoke",
+  );
+});
+
+$("token-new").addEventListener("click", openNewToken);
+
 // ---- Deploy jobs --------------------------------------------------------
 
 const JOB_TAG = { running: "boot", succeeded: "ok", failed: "down" };
@@ -1443,15 +1611,17 @@ async function pollSlow() {
   clearTimeout(slowTimer);
   let interval = SLOW_REFRESH_MS;
   try {
-    const [certs, secrets, jobs] = await Promise.all([
+    const [certs, secrets, tokens, jobs] = await Promise.all([
       api("GET", "certs"),
       api("GET", "secrets"),
+      api("GET", "tokens"),
       api("GET", "jobs"),
     ]);
-    // Each renders independently: gating all three on one failing endpoint would
+    // Each renders independently: gating them all on one failing endpoint would
     // blank the sections that are working.
     if (certs.ok) renderCerts(certs.data || []);
     if (secrets.ok) renderSecrets(secrets.data || []);
+    if (tokens.ok) renderTokens(tokens.data || []);
     if (jobs.ok) {
       const list = jobs.data || [];
       renderJobs(list);

@@ -1,0 +1,367 @@
+{
+  "generated_at": 1722400000,
+  "uptime_secs": 86400,
+  "host": {
+    "available": true,
+    "cpu_count": 8,
+    "cpu_percent": 23.5,
+    "memory_total_bytes": 33554432000,
+    "memory_used_bytes": 9663676416,
+    "sampled_at_ms": 1722400000000
+  },
+  "fleet": {
+    "deployments": 3,
+    "ready": 4,
+    "draining": 1,
+    "pending": 1,
+    "total_in_flight": 7
+  },
+  "global": {
+    "requests": {
+      "total": 7,
+      "c2xx": 3,
+      "c3xx": 1,
+      "c4xx": 1,
+      "c5xx": 1,
+      "errors": 1
+    },
+    "latency_ms": {
+      "count": 7,
+      "sum": 969,
+      "mean": 138.42857142857142,
+      "p50": 7.5,
+      "p90": 649.9999999999999,
+      "p99": 964.9999999999999,
+      "buckets": [
+        {
+          "le": 1,
+          "count": 0
+        },
+        {
+          "le": 2,
+          "count": 1
+        },
+        {
+          "le": 5,
+          "count": 2
+        },
+        {
+          "le": 10,
+          "count": 1
+        },
+        {
+          "le": 25,
+          "count": 1
+        },
+        {
+          "le": 50,
+          "count": 1
+        },
+        {
+          "le": 100,
+          "count": 0
+        },
+        {
+          "le": 250,
+          "count": 0
+        },
+        {
+          "le": 500,
+          "count": 0
+        },
+        {
+          "le": 1000,
+          "count": 1
+        },
+        {
+          "le": 2500,
+          "count": 0
+        },
+        {
+          "le": 5000,
+          "count": 0
+        },
+        {
+          "le": 10000,
+          "count": 0
+        },
+        {
+          "le": null,
+          "count": 0
+        }
+      ]
+    },
+    "cold_start_s": {
+      "count": 2,
+      "sum": 25,
+      "mean": 12.5,
+      "p50": 5.0,
+      "p90": 19.4,
+      "p99": 20.84,
+      "buckets": [
+        {
+          "le": 1,
+          "count": 0
+        },
+        {
+          "le": 2,
+          "count": 0
+        },
+        {
+          "le": 3,
+          "count": 0
+        },
+        {
+          "le": 5,
+          "count": 1
+        },
+        {
+          "le": 8,
+          "count": 0
+        },
+        {
+          "le": 13,
+          "count": 0
+        },
+        {
+          "le": 21,
+          "count": 1
+        },
+        {
+          "le": 34,
+          "count": 0
+        },
+        {
+          "le": 55,
+          "count": 0
+        },
+        {
+          "le": 89,
+          "count": 0
+        },
+        {
+          "le": 120,
+          "count": 0
+        },
+        {
+          "le": null,
+          "count": 0
+        }
+      ]
+    },
+    "autoscale": {
+      "vms_created": 2,
+      "vms_drained": 1,
+      "vms_reaped": 1,
+      "scale_up_events": 1,
+      "scale_down_events": 1,
+      "cold_start_waits": 1,
+      "cold_start_hits": 1,
+      "cold_start_timeouts": 1,
+      "boot_timeouts": 1
+    }
+  },
+  "obs": {
+    "queued": 12004,
+    "dropped": 3,
+    "shipped": 11998,
+    "failed": 3,
+    "healthy": true
+  },
+  "deployments": [
+    {
+      "id": "sandbox",
+      "kind": "vm",
+      "upstreams": [],
+      "hosts": [
+        "sandbox.example.com"
+      ],
+      "urls": [
+        "https://sandbox.example.com"
+      ],
+      "job_kind": "build",
+      "pool": {
+        "desired_replicas": 1,
+        "ready": 2,
+        "draining": 1,
+        "pending": 1,
+        "total_in_flight": 3,
+        "target_concurrency": 1,
+        "min_replicas": 0,
+        "max_replicas": 1,
+        "warm_pool": 0,
+        "utilization": 3.0,
+        "cpu_percent": 41.25,
+        "memory_bytes": 1073741824,
+        "boot_timeout_secs": 300,
+        "cold_start_timeout_secs": 120
+      },
+      "vms": [
+        {
+          "sandbox_id": "applb-sandbox-a1b2c3",
+          "addr": "172.16.0.4:8080",
+          "in_flight": 3,
+          "healthy": true,
+          "draining": false,
+          "uptime_secs": 3600,
+          "cpu_percent": 41.25,
+          "memory_bytes": 1073741824
+        }
+      ],
+      "pending_vms": [
+        {
+          "sandbox_id": "applb-sandbox-d4e5f6",
+          "age_secs": 7,
+          "status": "provisioning"
+        }
+      ],
+      "metrics": {
+        "requests": {
+          "total": 7,
+          "c2xx": 3,
+          "c3xx": 1,
+          "c4xx": 1,
+          "c5xx": 1,
+          "errors": 1
+        },
+        "latency_ms": {
+          "count": 7,
+          "sum": 969,
+          "mean": 138.42857142857142,
+          "p50": 7.5,
+          "p90": 649.9999999999999,
+          "p99": 964.9999999999999,
+          "buckets": [
+            {
+              "le": 1,
+              "count": 0
+            },
+            {
+              "le": 2,
+              "count": 1
+            },
+            {
+              "le": 5,
+              "count": 2
+            },
+            {
+              "le": 10,
+              "count": 1
+            },
+            {
+              "le": 25,
+              "count": 1
+            },
+            {
+              "le": 50,
+              "count": 1
+            },
+            {
+              "le": 100,
+              "count": 0
+            },
+            {
+              "le": 250,
+              "count": 0
+            },
+            {
+              "le": 500,
+              "count": 0
+            },
+            {
+              "le": 1000,
+              "count": 1
+            },
+            {
+              "le": 2500,
+              "count": 0
+            },
+            {
+              "le": 5000,
+              "count": 0
+            },
+            {
+              "le": 10000,
+              "count": 0
+            },
+            {
+              "le": null,
+              "count": 0
+            }
+          ]
+        },
+        "cold_start_s": {
+          "count": 2,
+          "sum": 25,
+          "mean": 12.5,
+          "p50": 5.0,
+          "p90": 19.4,
+          "p99": 20.84,
+          "buckets": [
+            {
+              "le": 1,
+              "count": 0
+            },
+            {
+              "le": 2,
+              "count": 0
+            },
+            {
+              "le": 3,
+              "count": 0
+            },
+            {
+              "le": 5,
+              "count": 1
+            },
+            {
+              "le": 8,
+              "count": 0
+            },
+            {
+              "le": 13,
+              "count": 0
+            },
+            {
+              "le": 21,
+              "count": 1
+            },
+            {
+              "le": 34,
+              "count": 0
+            },
+            {
+              "le": 55,
+              "count": 0
+            },
+            {
+              "le": 89,
+              "count": 0
+            },
+            {
+              "le": 120,
+              "count": 0
+            },
+            {
+              "le": null,
+              "count": 0
+            }
+          ]
+        },
+        "autoscale": {
+          "vms_created": 2,
+          "vms_drained": 1,
+          "vms_reaped": 1,
+          "scale_up_events": 1,
+          "scale_down_events": 1,
+          "cold_start_waits": 1,
+          "cold_start_hits": 1,
+          "cold_start_timeouts": 1,
+          "boot_timeouts": 1
+        }
+      }
+    }
+  ],
+  "matched": 3,
+  "tracked_deployments": 3
+}

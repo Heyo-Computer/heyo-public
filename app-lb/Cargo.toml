@@ -1,13 +1,39 @@
 [package]
 name = "app-lb"
+version.workspace = true
+edition.workspace = true
+
+# `serverctl` — the CLI *and the client SDK* for the admin API — is a separate
+# crate rather than a second binary here, so installing it doesn't drag in
+# pingora, openssl and the ACME stack. It shares nothing with the LB but the wire
+# format, and deliberately: a `path` dependency would make the client's leniency
+# (unknown fields ignored, missing ones defaulted) impossible to test, because
+# the two would always be the same build. `testdata/wire/` is the contract
+# instead — this crate writes those fixtures, serverctl reads them.
+[workspace]
+members = ["serverctl"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-# `serverctl` — the CLI for the admin API — is a separate crate rather than a
-# second binary here, so installing it doesn't drag in pingora, openssl and the
-# ACME stack. It shares nothing with the LB but the wire format.
-[workspace]
-members = ["serverctl"]
+# Hoisted so the two crates cannot drift onto different major versions of a
+# shared dependency. Features stay per-crate — a member adds what it needs with
+# `features = [...]` alongside `workspace = true`, and cargo unifies them across
+# the workspace build anyway.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+futures = "0.3"
+tokio = "1"
+# `default-features = false` here rather than per-crate, because reqwest's
+# defaults include native-tls: with both TLS backends in one workspace build
+# reqwest silently prefers native-tls, which would move app-lb's outbound TLS off
+# rustls without anything in this file saying so. Both crates opt into
+# rustls-tls explicitly.
+reqwest = { version = "0.12", default-features = false }
 
 [dependencies]
 # Proxy data plane. The `openssl` feature enables the client-facing HTTPS
@@ -62,14 +88,14 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] }
 # `stream` is for the artifact puller (`src/artifact.rs`), which reads a rootfs
 # blob off the wire chunk by chunk. A rootfs is gigabytes; `bytes()` would hold
 # the whole thing in memory before the first byte reached disk.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 # Query-string building (the authorize URL) and parsing (the callback). Small,
 # already present under reqwest/url, and hand-rolling percent-encoding is a
 # classic source of bugs.
 form_urlencoded = "1"
 
 async-trait = "0.1"
-futures = "0.3"
+futures.workspace = true
 # `process` is for the image builder (`src/build.rs`), which shells out to `git`
 # and `heyvm mvm build`: heyvm exposes no build API, so this is the only way to
 # turn a Dockerfile into a guest rootfs. It buys `kill_on_drop`, which is what
@@ -78,22 +104,22 @@ futures = "0.3"
 # `fs` and `io-util` are the artifact puller's write side: a streamed blob lands
 # in a file, and the copy must not block the runtime for the minutes a
 # multi-gigabyte rootfs takes.
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "process", "fs", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "net", "process", "fs", "io-util"] }
 arc-swap = "1"
 # `ws` is for `GET /deployments/:id/shell`, where app-lb terminates the client's
 # WebSocket and pipes it to the sandbox's PTY. Proxying rather than handing the
 # client a daemon address is what lets the gate, the deployment→sandbox lookup
 # and the wake-a-suspended-VM step happen at all.
 axum = { version = "0.7", features = ["ws"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 # Encoding the configured dashboard credentials into the expected Basic-auth
 # header once at startup. Already in the tree transitively (reqwest/pingora).
-base64 = "0.22"
+base64.workspace = true
 # Verifying a rootfs pulled over the wire against the digest that named it
 # (`src/artifact.rs`). sha256 and not something faster because the digest has to
 # be the one the artifact store computed, which is the one `sha256sum` reports.
 # Already in the tree via pingora and heyo-sdk.
-sha2 = "0.10"
+sha2.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

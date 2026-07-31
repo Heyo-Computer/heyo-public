@@ -139,11 +139,17 @@ pub struct RequestInfo<'a> {
     /// True when the caller looks like a browser navigating, which is what makes
     /// a redirect the right answer instead of a 401.
     pub wants_html: bool,
+    /// The value of an `Authorization: Bearer …` header, if there was one. An
+    /// app-token gate checks this; a Google gate ignores it.
+    pub bearer: Option<String>,
 }
 
 pub struct Authenticator {
     key: Vec<u8>,
     secrets: Arc<SecretStore>,
+    /// Minted app-tokens, for gates that accept them. `None` in the tests that
+    /// only exercise the Google path.
+    tokens: Option<Arc<crate::tokens::TokenStore>>,
     http: reqwest::Client,
     /// Overridable so the token exchange can be pointed at a stub in tests.
     token_endpoint: String,
@@ -160,10 +166,15 @@ impl std::fmt::Debug for Authenticator {
 }
 
 impl Authenticator {
-    pub fn new(key: Vec<u8>, secrets: Arc<SecretStore>) -> Self {
+    pub fn new(
+        key: Vec<u8>,
+        secrets: Arc<SecretStore>,
+        tokens: Option<Arc<crate::tokens::TokenStore>>,
+    ) -> Self {
         Self {
             key,
             secrets,
+            tokens,
             http: reqwest::Client::builder()
                 .timeout(TOKEN_TIMEOUT)
                 // A login is a person waiting; there is no retry that helps.
@@ -238,6 +249,31 @@ impl Authenticator {
             return Decision::Allow(Box::new(None));
         }
 
+        // An app-token, if this gate takes them. Checked before the session
+        // cookie because a request carrying an explicit credential means it, and
+        // because a program presenting a token should never be handed a redirect
+        // to a sign-in page.
+        //
+        // Providers are alternatives: a gate listing both admits a person with a
+        // Google session *or* a program with a token, and neither has to know
+        // the other exists.
+        if gate.accepts_app_token()
+            && let Some(presented) = &req.bearer
+            && let Some(tokens) = &self.tokens
+            && let Some(token) = tokens.verify(presented, now_secs())
+            && token.allows(deployment_id)
+        {
+            // No `Identity`: a token is not a person, and forwarding
+            // `x-auth-request-email` for one would put a name upstream that
+            // belongs to nobody. The token's own name is in the LB's logs.
+            tracing::debug!(
+                deployment = %deployment_id,
+                token = %token.id,
+                "request admitted by app-token",
+            );
+            return Decision::Allow(Box::new(None));
+        }
+
         match self.session(gate, deployment_id, req) {
             Some(identity) => Decision::Allow(Box::new(Some(identity))),
             None => {
@@ -258,6 +294,20 @@ impl Authenticator {
         req: &RequestInfo<'_>,
         return_to: &str,
     ) -> Response {
+        // A token-only gate has no sign-in flow to start: there is no provider to
+        // redirect to and no cookie to set. Say what would actually work rather
+        // than sending a browser into an OAuth round trip that ends in a blank
+        // `client_id`.
+        let Some((client_id, _)) = gate.google_credentials() else {
+            return Response::json(
+                401,
+                "{\"error\":\"authentication required\",\"accepts\":[\"app-token\"],\
+                 \"detail\":\"present an app-token as `Authorization: Bearer applb_…` \
+                 or `?app_token=`\"}\n"
+                    .to_string(),
+            );
+        };
+
         // An API client gets a 401 it can act on rather than a redirect it would
         // follow into an HTML sign-in page and then fail to parse.
         if !req.wants_html {
@@ -285,7 +335,7 @@ impl Authenticator {
             "{}?{}",
             self.authorize_endpoint,
             form_urlencoded::Serializer::new(String::new())
-                .append_pair("client_id", &gate.client_id)
+                .append_pair("client_id", client_id)
                 .append_pair("redirect_uri", &redirect_uri)
                 .append_pair("response_type", "code")
                 .append_pair("scope", "openid email profile")
@@ -360,7 +410,14 @@ impl Authenticator {
             return Response::text(400, "the sign-in state did not match\n");
         }
 
-        let secret = match self.secrets.resolve(&gate.client_secret) {
+        let Some((client_id, client_secret)) = gate.google_credentials() else {
+            tracing::error!(
+                deployment = %deployment_id,
+                "a sign-in callback arrived for a gate with no Google credentials",
+            );
+            return Response::text(500, "the sign-in gate is misconfigured on the server\n");
+        };
+        let secret = match self.secrets.resolve(client_secret) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(deployment = %deployment_id, error = %e, "auth client secret is missing");
@@ -370,7 +427,7 @@ impl Authenticator {
 
         let redirect_uri = self.redirect_uri(gate, req);
         let claims = match self
-            .exchange(&gate.client_id, &secret, code, &flow.verifier, &redirect_uri)
+            .exchange(client_id, &secret, code, &flow.verifier, &redirect_uri)
             .await
         {
             Ok(c) => c,
@@ -380,7 +437,7 @@ impl Authenticator {
             }
         };
 
-        let identity = match validate_claims(&claims, &gate.client_id) {
+        let identity = match validate_claims(&claims, client_id) {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!(deployment = %deployment_id, error = %e, "id token rejected");
@@ -829,19 +886,20 @@ pub fn default_key_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::config::AuthProvider;
     use crate::secrets::{SecretRef, SecretSpec};
     use std::collections::BTreeMap;
 
     fn gate() -> AuthGate {
         AuthGate {
-            provider: AuthProvider::Google,
-            client_id: "cid.apps.googleusercontent.com".into(),
-            client_secret: SecretRef {
+            provider: Default::default(),
+            client_id: Some("cid.apps.googleusercontent.com".into()),
+            client_secret: Some(SecretRef {
                 secret: "google".into(),
                 key: "client_secret".into(),
                 username: None,
-            },
+            }),
             allowed_domains: vec!["example.com".into()],
             allowed_emails: vec![],
             public_paths: vec![],
@@ -861,7 +919,7 @@ mod tests {
             data: BTreeMap::from([("client_secret".to_string(), "s3cret".to_string())]),
             updated_at: 0,
         });
-        Authenticator::new(vec![7u8; 32], store)
+        Authenticator::new(vec![7u8; 32], store, None)
     }
 
     fn req<'a>(path: &'a str, cookies: Vec<String>) -> RequestInfo<'a> {
@@ -872,6 +930,7 @@ mod tests {
             cookies,
             secure: true,
             wants_html: true,
+            bearer: None,
         }
     }
 
@@ -895,6 +954,175 @@ mod tests {
             exp,
         };
         format!("{}={}", g.cookie_name, a.sign(&s.encode()))
+    }
+
+    // -- app-tokens at the data plane --------------------------------------
+
+    mod app_token {
+        use super::*;
+        use crate::tokens::{AdminScope, NewToken, TokenStore};
+
+        /// An authenticator that knows about tokens, plus the store to mint from.
+        fn with_tokens() -> (Authenticator, Arc<TokenStore>) {
+            let tokens = Arc::new(TokenStore::new("/nonexistent/tokens.json"));
+            let secrets = Arc::new(SecretStore::new("/nonexistent/secrets.json", None));
+            (
+                Authenticator::new(vec![7u8; 32], secrets, Some(tokens.clone())),
+                tokens,
+            )
+        }
+
+        fn mint(t: &TokenStore, deployments: &[&str]) -> String {
+            t.mint(
+                NewToken {
+                    name: "agent".into(),
+                    // No admin API access at all — the point of this credential is
+                    // to reach the application, not the LB.
+                    admin: AdminScope::None,
+                    deployments: deployments.iter().map(|d| d.to_string()).collect(),
+                    expires_in_secs: None,
+                },
+                now_secs(),
+            )
+            .unwrap()
+            .1
+        }
+
+        fn token_gate(providers: &str) -> AuthGate {
+            serde_json::from_str(&format!(
+                r#"{{"provider":{providers},"client_id":"cid","client_secret":{{"secret":"g"}},
+                    "allowed_domains":["example.com"]}}"#
+            ))
+            .unwrap()
+        }
+
+        fn bearing<'a>(path: &'a str, token: &str) -> RequestInfo<'a> {
+            RequestInfo {
+                bearer: Some(token.to_string()),
+                ..req(path, vec![])
+            }
+        }
+
+        #[tokio::test]
+        async fn a_scoped_token_gets_through_a_token_gate() {
+            let (a, t) = with_tokens();
+            let g = token_gate(r#""app-token""#);
+            let secret = mint(&t, &["web"]);
+
+            let Decision::Allow(identity) = a.decide(&g, "web", &bearing("/private", &secret)).await
+            else {
+                panic!("a scoped token should have been admitted");
+            };
+            assert!(
+                identity.is_none(),
+                "a token is not a person: nothing should be forwarded as an identity"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_token_scoped_elsewhere_does_not_get_through() {
+            let (a, t) = with_tokens();
+            let g = token_gate(r#""app-token""#);
+            let secret = mint(&t, &["other"]);
+
+            // Refused as if no credential were presented — the deployment it *is*
+            // scoped to is none of this deployment's business.
+            let Decision::Answered(r) = a.decide(&g, "web", &bearing("/private", &secret)).await
+            else {
+                panic!("expected a refusal");
+            };
+            assert_eq!(r.status, 401);
+        }
+
+        #[tokio::test]
+        async fn a_google_only_gate_ignores_tokens_entirely() {
+            let (a, t) = with_tokens();
+            let g = token_gate(r#""google""#);
+            let secret = mint(&t, &["web"]);
+
+            // A perfectly good token, on a gate that was never told to accept
+            // one. Opting in is the spec's job, not the token's.
+            let Decision::Answered(r) = a.decide(&g, "web", &bearing("/private", &secret)).await
+            else {
+                panic!("expected a redirect to the provider");
+            };
+            assert_eq!(r.status, 302);
+        }
+
+        /// The "both, either satisfies" shape: a person signs in, a program
+        /// presents a token, and neither has to know the other exists.
+        #[tokio::test]
+        async fn a_gate_can_accept_a_session_or_a_token() {
+            let (a, t) = with_tokens();
+            let g = token_gate(r#"["google","app-token"]"#);
+            let secret = mint(&t, &["web"]);
+
+            // Program.
+            assert!(matches!(
+                a.decide(&g, "web", &bearing("/private", &secret)).await,
+                Decision::Allow(_)
+            ));
+
+            // Person.
+            let id = identity("someone@example.com", Some("example.com"));
+            let cookie = session_cookie(&a, &g, &id, now_secs() + 3600);
+            let Decision::Allow(who) = a.decide(&g, "web", &req("/private", vec![cookie])).await
+            else {
+                panic!("a signed-in person should still get through");
+            };
+            assert_eq!(who.as_ref().as_ref().map(|i| i.email.as_str()), Some("someone@example.com"));
+
+            // Neither.
+            assert!(matches!(
+                a.decide(&g, "web", &req("/private", vec![])).await,
+                Decision::Answered(_)
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_revoked_token_stops_working_at_the_data_plane_too() {
+            let (a, t) = with_tokens();
+            let g = token_gate(r#""app-token""#);
+            let secret = mint(&t, &["web"]);
+            assert!(matches!(
+                a.decide(&g, "web", &bearing("/private", &secret)).await,
+                Decision::Allow(_)
+            ));
+
+            t.revoke(&t.list()[0].id);
+            assert!(matches!(
+                a.decide(&g, "web", &bearing("/private", &secret)).await,
+                Decision::Answered(_)
+            ));
+        }
+
+        /// A token-only gate has no sign-in flow, so a browser must be told what
+        /// would actually work rather than bounced into an OAuth round trip that
+        /// ends at an empty `client_id`.
+        #[tokio::test]
+        async fn a_browser_at_a_token_only_gate_is_told_what_it_needs() {
+            let (a, _) = with_tokens();
+            let g: AuthGate = serde_json::from_str(r#"{"provider":"app-token"}"#).unwrap();
+
+            let Decision::Answered(r) = a.decide(&g, "web", &req("/private", vec![])).await else {
+                panic!("expected a refusal");
+            };
+            assert_eq!(r.status, 401);
+            assert!(r.location.is_none(), "there is nowhere to redirect to");
+            assert!(r.body.contains("app-token"), "{}", r.body);
+        }
+
+        #[tokio::test]
+        async fn public_paths_are_still_public_on_a_token_gate() {
+            let (a, _) = with_tokens();
+            let g: AuthGate =
+                serde_json::from_str(r#"{"provider":"app-token","public_paths":["/healthz"]}"#)
+                    .unwrap();
+            assert!(matches!(
+                a.decide(&g, "web", &req("/healthz", vec![])).await,
+                Decision::Allow(_)
+            ));
+        }
     }
 
     #[tokio::test]
@@ -988,7 +1216,7 @@ mod tests {
         ));
 
         // Signed with a different key.
-        let other = Authenticator::new(vec![9u8; 32], Arc::new(SecretStore::new("x.json", None)));
+        let other = Authenticator::new(vec![9u8; 32], Arc::new(SecretStore::new("x.json", None)), None);
         let forged = session_cookie(&other, &g, &id, now_secs() + 600);
         assert!(matches!(
             a.decide(&g, "web", &req("/", vec![forged])).await,
@@ -1188,7 +1416,7 @@ mod tests {
         assert_eq!(a.verify("garbage"), None);
         assert_eq!(a.verify(&format!("{token}x")), None);
 
-        let other = Authenticator::new(vec![1u8; 32], Arc::new(SecretStore::new("x.json", None)));
+        let other = Authenticator::new(vec![1u8; 32], Arc::new(SecretStore::new("x.json", None)), None);
         assert_eq!(other.verify(&token), None, "a different key must not verify");
     }
 

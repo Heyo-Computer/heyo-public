@@ -48,6 +48,7 @@ Configuration is environment-only:
 | `APP_LB_STATE_PATH` | `app-lb-state.json` | Names the state *directory* — see below |
 | `APP_LB_SECRETS_PATH` | `app-lb-secrets.json` | Where stored secrets persist (written `0600`) |
 | `APP_LB_SECRET_KEY` | *(unset)* | 32-byte hex key (or any passphrase) that seals the secrets file with AES-256-GCM |
+| `APP_LB_TOKENS_PATH` | `app-lb-tokens.json` | Where minted [app-tokens](#app-tokens) persist (written `0600`; only hashes) |
 | `APP_LB_AUTH_KEY` | `app-lb-auth-key` | Signing key for sign-in sessions; generated `0600` on first use |
 | `APP_LB_NAME` | `app-lb` | Display name in the dashboard header and page title |
 | `APP_LB_DAEMON_URL` | `http://127.0.0.1:34099` | heyvm daemon |
@@ -1050,6 +1051,159 @@ startup error, never a silently-open gate. `/healthz` is always open so probes
 keep working. The credentials are compared in constant time, but the admin
 listener is plain HTTP — terminate TLS in front of it, or reach it over an SSH
 tunnel, if it leaves localhost.
+
+## Clients
+
+| | |
+|---|---|
+| [`serverctl`](serverctl/README.md) | Rust — a client library *and* the kubectl-shaped CLI. `cargo install serverctl` for the CLI, `default-features = false` for the library. |
+| [`serverctl` (npm)](sdk/typescript/README.md) | TypeScript — Node, Bun, Deno and browsers. |
+
+Both speak the same wire contract, and both are checked against it: the fixtures
+in `testdata/wire/` are written by app-lb's own response types, and each client
+has a test asserting it understands every field in them. A field app-lb starts
+sending fails a test in each client rather than going silently unread.
+
+```rust
+let lb = serverctl::Client::builder("127.0.0.1:9090").token(token).build()?;
+let out = lb.exec("sb-7f3a9c", &ExecRequest::new("uname -a")).await?;
+```
+
+```ts
+const lb = new Serverctl({ server: "127.0.0.1:9090", token });
+const { stdout } = await lb.exec("sb-7f3a9c", "uname -a");
+```
+
+## App-tokens
+
+Basic auth is one shared credential that cannot be scoped, cannot be revoked
+without a restart, and cannot ride on a WebSocket upgrade from a browser. That is
+fine for a person at a terminal and wrong for a program. An **app-token** is a
+credential app-lb mints for itself: scoped, revocable, optionally expiring, and
+accepted both by the admin API and by a deployment's own gate.
+
+Tokens are how SDK clients authenticate. Basic auth stays, because you need some
+credential to mint the first token.
+
+```sh
+curl -u admin:s3cret -XPOST localhost:9090/tokens -H 'content-type: application/json' \
+  -d '{"name":"agent-runner","admin":"admin","deployments":["sb-7f3a9c"]}'
+```
+
+```json
+{
+  "id": "7f3a9c2b1e4d",
+  "name": "agent-runner",
+  "admin": "admin",
+  "deployments": ["sb-7f3a9c"],
+  "created_at": 1722400000,
+  "token": "applb_7f3a9c2b1e4d_kJ8vQ2mN…"
+}
+```
+
+**`token` is shown once.** Only `sha256(secret)` is stored, so there is no
+endpoint that reads it back and no way to recover it — losing one means minting a
+replacement and revoking the old one. Present it as a header:
+
+```sh
+curl -H "Authorization: Bearer applb_7f3a9c2b1e4d_kJ8vQ2mN…" localhost:9090/deployments/sb-7f3a9c
+```
+
+### Scope
+
+Two axes, deliberately coarse.
+
+| `admin` | What it reaches on the admin API |
+|---|---|
+| `none` | nothing — a credential for a deployment's gate and nothing else |
+| `view` | `/metrics` and `/dashboard` |
+| `admin` | everything, within `deployments` |
+
+`deployments` is a list of ids, or `["*"]` for all of them. It governs both the
+per-deployment admin routes (`exec`, `shell`, scale, evict, delete) and the
+data-plane gate.
+
+A token scoped to specific deployments is **refused the fleet-wide routes** —
+creating deployments, listing them all, reading the secret store, and minting
+tokens. That last one matters: minting is how you escalate, so a narrow token
+cannot mint itself a wider one.
+
+`/metrics` is the exception. Rather than refusing a scoped token it *narrows the
+answer* — a token minted to drive one sandbox can watch that sandbox, and the
+fleet rollup counts only what it can see.
+
+Both scope fields default to nothing, so a forgotten field produces a token that
+can do nothing rather than one that can do everything.
+
+### Revoking and expiring
+
+```sh
+curl -u admin:s3cret localhost:9090/tokens                      # list; never shows a secret
+curl -u admin:s3cret -XDELETE localhost:9090/tokens/7f3a9c2b1e4d
+curl -u admin:s3cret -XPATCH localhost:9090/tokens/7f3a9c2b1e4d \
+  -H 'content-type: application/json' -d '{"deployments":["sb-other"]}'
+```
+
+Revocation takes effect on the next request — verification is a lookup in the
+store, not a signature check, which is exactly why tokens are opaque and stored
+rather than self-describing and signed. `PATCH` re-scopes a token *without*
+changing its secret, so narrowing a credential does not require redistributing
+it. Pass `expires_in_secs` at mint for one that retires itself.
+
+`last_used_at` is written when the store is next persisted for another reason
+rather than on every request — a token on a hot path would otherwise turn each
+call into a file write. So it lags, and a busy token can still read as unused.
+
+Tokens live in `app-lb-tokens.json` (`APP_LB_TOKENS_PATH`), mode `0600`. Only
+hashes are in it, so unlike the secret store there is nothing to encrypt.
+
+### Gating a deployment with app-tokens
+
+`auth.provider` takes one provider or several, and any one of them admits a
+request — they are alternatives, not requirements:
+
+```json
+{
+  "auth": {
+    "provider": ["google", "app-token"],
+    "client_id": "…apps.googleusercontent.com",
+    "client_secret": { "secret": "google-oauth" },
+    "allowed_domains": ["example.com"]
+  }
+}
+```
+
+That is the common shape for a sandbox hosting a UI: a person signs in with
+Google, the agent driving it presents `Authorization: Bearer applb_…`, and
+neither has to know the other exists. A token gets in when its `deployments`
+scope names the deployment.
+
+For a deployment only programs reach, `"provider": "app-token"` needs no OAuth
+configuration at all — no `client_id`, no allow-list, since neither describes a
+credential issued to a process. A browser landing on such a deployment gets a
+`401` naming what would work rather than a redirect into a sign-in flow that does
+not exist. Writing `client_id` on a gate that does not list `google` is a
+validation error rather than a field quietly ignored.
+
+A token admitted at the data plane forwards **no** `x-auth-request-*` identity
+headers: a token is not a person, and putting a name upstream that belongs to
+nobody would be worse than sending none.
+
+### Tokens in a URL
+
+The shell WebSocket — and only the shell WebSocket — also accepts
+`?app_token=…`. This exists for exactly one reason: a browser's `WebSocket`
+constructor cannot set headers, so a query parameter is the only credential it
+can carry. That is what makes a browser terminal possible at all.
+
+Every other route can send a header, so every other route refuses a token in the
+query string. A credential in a URL lands in access logs, proxy logs and browser
+history, so mint short-lived tokens for this:
+
+```sh
+curl -u admin:s3cret -XPOST localhost:9090/tokens -H 'content-type: application/json' \
+  -d '{"name":"terminal","admin":"admin","deployments":["sb-7f3a9c"],"expires_in_secs":120}'
+```
 
 ### Putting the dashboard behind Google
 

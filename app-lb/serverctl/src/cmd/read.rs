@@ -59,13 +59,14 @@ fn get_once(ctx: &Ctx, kind: Resource, names: &[String], args: &GetArgs) -> Resu
 /// view. Both are kept: `-o json` must print the server's own bytes.
 fn fetch_deployments(ctx: &Ctx, names: &[String]) -> Result<(Value, Vec<DeploymentStatus>)> {
     let raw = if names.is_empty() {
-        ctx.client.list_deployments()?
+        ctx.client.raw().deployments()?
     } else {
         let mut out = Vec::new();
         for name in names {
             out.push(
                 ctx.client
-                    .get_deployment(name)
+                    .raw()
+                    .deployment(name)
                     .with_context(|| format!("getting deployment {name:?}"))?,
             );
         }
@@ -157,8 +158,7 @@ fn get_deployments(ctx: &Ctx, names: &[String]) -> Result<()> {
             // Whether anything stands in front of this deployment at all — the
             // one property you want to be able to scan a whole fleet for.
             row.push(match &d.spec.auth {
-                Some(a) if a.provider.is_empty() => "google".to_string(),
-                Some(a) => a.provider.clone(),
+                Some(a) => a.providers().join("+"),
                 None => "—".into(),
             });
         }
@@ -214,7 +214,7 @@ fn get_vms(ctx: &Ctx, names: &[String], filter: Option<&str>) -> Result<()> {
 }
 
 fn get_certs(ctx: &Ctx) -> Result<()> {
-    let raw = ctx.client.certs()?;
+    let raw = ctx.client.raw().certs()?;
     let certs: Vec<CertStatus> =
         serde_json::from_value(raw.clone()).context("parsing the certificate list")?;
 
@@ -248,13 +248,14 @@ fn get_certs(ctx: &Ctx) -> Result<()> {
 /// app-lb has no endpoint that returns one.
 fn get_secrets(ctx: &Ctx, names: &[String]) -> Result<()> {
     let raw = if names.is_empty() {
-        ctx.client.list_secrets()?
+        ctx.client.raw().secrets()?
     } else {
         let mut out = Vec::new();
         for name in names {
             out.push(
                 ctx.client
-                    .get_secret(name)
+                    .raw()
+                    .secret(name)
                     .with_context(|| format!("getting secret {name:?}"))?,
             );
         }
@@ -324,9 +325,9 @@ fn get_jobs(ctx: &Ctx, names: &[String], deployment: Option<&str>) -> Result<()>
     let raw = match (names, deployment) {
         // A named job is looked up directly, so `get job job-abc` works without
         // knowing which deployment it belonged to.
-        ([id], _) => ctx.client.get_job(id)?,
-        ([], Some(d)) => ctx.client.deployment_jobs(d)?,
-        ([], None) => ctx.client.list_jobs()?,
+        ([id], _) => ctx.client.raw().job(id)?,
+        ([], Some(d)) => ctx.client.raw().deployment_jobs(d)?,
+        ([], None) => ctx.client.raw().jobs()?,
         _ => bail!("get job takes at most one job id; use -d to scope by deployment"),
     };
 
@@ -495,7 +496,8 @@ pub fn describe(ctx: &Ctx, args: &DescribeArgs) -> Result<()> {
         None
     } else {
         ctx.client
-            .metrics()
+            .raw()
+            .metrics(&crate::MetricsQuery::new())
             .ok()
             .and_then(|v| serde_json::from_value(v).ok())
     };
@@ -504,7 +506,7 @@ pub fn describe(ctx: &Ctx, args: &DescribeArgs) -> Result<()> {
         if i > 0 {
             println!();
         }
-        let raw = ctx.client.get_deployment(name)?;
+        let raw = ctx.client.raw().deployment(name)?;
         if ctx.out.is_machine() {
             output::emit(&raw, ctx.out, &[format!("deployment/{name}")])?;
             continue;
@@ -750,16 +752,16 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
 
     if let Some(auth) = &d.spec.auth {
         output::section("Sign-in gate");
-        output::field(
-            "Provider",
-            if auth.provider.is_empty() {
-                "google"
-            } else {
-                &auth.provider
-            },
-        );
-        output::field("Client id", &auth.client_id);
-        output::field("Client secret", format!("secret {}", auth.client_secret.render()));
+        // Joined rather than listed, because they are alternatives: any one of
+        // them admits a request.
+        output::field("Provider", auth.providers().join(" or "));
+        // Absent on a token-only gate, where neither describes anything.
+        if let Some(client_id) = &auth.client_id {
+            output::field("Client id", client_id);
+        }
+        if let Some(secret) = &auth.client_secret {
+            output::field("Client secret", format!("secret {}", secret.render()));
+        }
         output::field("Who may enter", auth.allow_summary());
         if !auth.public_paths.is_empty() {
             output::field("Public paths", auth.public_paths.join(", "));

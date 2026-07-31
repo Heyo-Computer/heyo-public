@@ -5,10 +5,47 @@
 //! `Value`, put it back. Editing the `Value` (rather than a typed struct) is
 //! what makes that safe — a field this CLI has never heard of survives the trip.
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
+#[cfg(feature = "cli")]
 use serde::Deserialize;
 use serde_json::{Map, Value};
+#[cfg(feature = "cli")]
 use std::path::Path;
+
+/// A local stand-in for `anyhow::Context`.
+///
+/// This module moved out of the CLI, where every fallible call ended in
+/// `.context("…")`. A library cannot return `anyhow::Error`, but the *messages*
+/// were the useful part — so the trait comes along and only the error type
+/// underneath changed.
+trait Context<T> {
+    fn context(self, msg: impl std::fmt::Display) -> Result<T>;
+    fn with_context<S: std::fmt::Display>(self, f: impl FnOnce() -> S) -> Result<T>;
+}
+
+impl<T, E: std::fmt::Display> Context<T> for std::result::Result<T, E> {
+    fn context(self, msg: impl std::fmt::Display) -> Result<T> {
+        self.map_err(|e| Error::Invalid(format!("{msg}: {e}")))
+    }
+    fn with_context<S: std::fmt::Display>(self, f: impl FnOnce() -> S) -> Result<T> {
+        self.map_err(|e| Error::Invalid(format!("{}: {e}", f())))
+    }
+}
+
+impl<T> Context<T> for Option<T> {
+    fn context(self, msg: impl std::fmt::Display) -> Result<T> {
+        self.ok_or_else(|| Error::Invalid(msg.to_string()))
+    }
+    fn with_context<S: std::fmt::Display>(self, f: impl FnOnce() -> S) -> Result<T> {
+        self.ok_or_else(|| Error::Invalid(f().to_string()))
+    }
+}
+
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err($crate::error::Error::Invalid(format!($($arg)*)))
+    };
+}
 
 /// One `--env` argument: `KEY=VALUE` to set, `KEY-` to remove (kubectl's syntax
 /// for `set env`).
@@ -107,6 +144,10 @@ pub fn route_from_parts(
 
 /// Read specs from a file (or `-` for stdin).
 ///
+/// Behind `cli` because it is a file-and-terminal concern, and because YAML
+/// support is the only reason this crate would link a YAML parser at all.
+#[cfg(feature = "cli")]
+///
 /// Accepts JSON or YAML, a single document or many: a JSON array, a multi-doc
 /// YAML stream, or one object. A `GET /deployments` response is unwrapped too,
 /// so `serverctl get deployment web -o json | serverctl apply -f -` round-trips.
@@ -129,10 +170,10 @@ pub fn read_specs(path: &Path) -> Result<Vec<Value>> {
             let mut docs = Vec::new();
             for doc in serde_yaml::Deserializer::from_str(&text) {
                 let v = Value::deserialize(doc).map_err(|yaml_err| {
-                    anyhow::anyhow!(
+                    Error::Invalid(format!(
                         "{} is neither JSON ({json_err}) nor YAML ({yaml_err})",
                         display_path(path)
-                    )
+                    ))
                 })?;
                 docs.push(v);
             }
@@ -159,6 +200,7 @@ pub fn read_specs(path: &Path) -> Result<Vec<Value>> {
     Ok(specs)
 }
 
+#[cfg(feature = "cli")]
 fn display_path(path: &Path) -> String {
     if path == Path::new("-") {
         "stdin".into()
@@ -167,6 +209,7 @@ fn display_path(path: &Path) -> String {
     }
 }
 
+#[cfg(feature = "cli")]
 fn kind_of(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -180,6 +223,7 @@ fn kind_of(v: &Value) -> &'static str {
 
 /// A `GET /deployments` entry wraps the spec in status fields; a spec file does
 /// not. Accept both by unwrapping the envelope when we see one.
+#[cfg(feature = "cli")]
 fn unwrap_envelope(v: Value) -> Value {
     match &v {
         Value::Object(map) if map.contains_key("spec") && map.contains_key("kind") => {
@@ -473,6 +517,7 @@ mod tests {
         assert!(route_from_parts(None, None, None).is_none());
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn a_get_response_unwraps_back_into_a_spec() {
         let envelope = json!({"spec": {"id": "web"}, "kind": "vm", "ready": 1});

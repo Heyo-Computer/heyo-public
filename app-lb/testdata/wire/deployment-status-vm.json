@@ -1,0 +1,98 @@
+{
+  "spec": {
+    "id": "sandbox",
+    "routes": [
+      {
+        "host": "sandbox.example.com"
+      },
+      {
+        "host_suffix": "sb.example.com",
+        "path_prefix": "/api"
+      }
+    ],
+    "vm": {
+      "driver": "firecracker",
+      "image": "agent-base",
+      "port": 8080,
+      "start_command": "/usr/local/bin/agent serve",
+      "size_class": "medium",
+      "disk_size_gb": 20,
+      "working_directory": "/workspace",
+      "env_vars": {
+        "RUST_LOG": "info"
+      },
+      "setup_hooks": [
+        "apt-get update"
+      ],
+      "open_ports": [
+        9229
+      ],
+      "ttl_seconds": 86400
+    },
+    "scaling": {
+      "min_replicas": 0,
+      "max_replicas": 1,
+      "warm_pool": 0,
+      "target_concurrency": 1,
+      "scale_to_zero_after_secs": 900,
+      "cold_start_timeout_secs": 120,
+      "drain_timeout_secs": 30,
+      "boot_timeout_secs": 300,
+      "idle_action": "retain"
+    },
+    "health": {
+      "path": "/healthz",
+      "port": 8080,
+      "timeout_secs": 2
+    },
+    "build": {
+      "repo": "https://github.com/example/agent",
+      "ref": "main",
+      "dockerfile": "Dockerfile",
+      "context": ".",
+      "image_name": "agent-base",
+      "image_size_mb": 4096,
+      "auth": {
+        "secret": "github",
+        "key": "token",
+        "username": "git"
+      }
+    },
+    "auth": {
+      "provider": "google",
+      "client_id": "1234.apps.googleusercontent.com",
+      "client_secret": {
+        "secret": "google-oauth",
+        "key": "client_secret"
+      },
+      "allowed_domains": [
+        "example.com"
+      ],
+      "allowed_emails": [
+        "someone@other.example"
+      ],
+      "public_paths": [
+        "/healthz"
+      ],
+      "base_path": "/__applb/auth",
+      "session_ttl_secs": 43200,
+      "cookie_name": "applb_session",
+      "redirect_url": "https://sandbox.example.com/__applb/auth/callback",
+      "forward_identity": true
+    }
+  },
+  "kind": "vm",
+  "desired_replicas": 1,
+  "ready": 1,
+  "pending": 1,
+  "total_in_flight": 3,
+  "vms": [
+    {
+      "sandbox_id": "applb-sandbox-a1b2c3",
+      "addr": "172.16.0.4:8080",
+      "in_flight": 3,
+      "healthy": true,
+      "draining": false
+    }
+  ]
+}

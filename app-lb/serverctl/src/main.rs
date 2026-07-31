@@ -11,20 +11,17 @@
 //! *static* one proxy_passes to fixed upstreams and has neither a scaling policy
 //! nor VMs to evict.
 
-mod artifact;
-mod client;
-mod cmd;
-mod config;
-mod output;
-mod spec;
-mod types;
+// The whole implementation is the library: this binary is argument parsing and
+// dispatch. That is the point of the split — every command below runs through
+// the same client an SDK caller gets, so a field the client stops understanding
+// breaks the build here rather than blanking a column at somebody's terminal.
+use serverctl::cmd;
+use serverctl::cmd::GlobalOpts;
 
 use anyhow::Result;
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use cmd::Ctx;
-use output::OutputFormat;
-use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -47,56 +44,6 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Args, Debug, Clone)]
-pub struct GlobalOpts {
-    /// Output format.
-    #[arg(
-        long,
-        short = 'o',
-        global = true,
-        value_enum,
-        default_value_t = OutputFormat::Table,
-        value_name = "FORMAT",
-        help_heading = "Global options"
-    )]
-    pub output: OutputFormat,
-
-    /// Config file holding the saved contexts.
-    #[arg(long, global = true, env = "SERVERCTL_CONFIG", value_name = "PATH", help_heading = "Global options")]
-    pub config: Option<PathBuf>,
-
-    /// Which stored context to use.
-    #[arg(long, global = true, env = "SERVERCTL_CONTEXT", value_name = "NAME", help_heading = "Global options")]
-    pub context: Option<String>,
-
-    /// Admin API URL, overriding the context.
-    #[arg(long, global = true, env = "SERVERCTL_SERVER", value_name = "URL", help_heading = "Global options")]
-    pub server: Option<String>,
-
-    /// Basic-auth user, overriding the context.
-    #[arg(long, global = true, env = "SERVERCTL_USER", value_name = "NAME", help_heading = "Global options")]
-    pub user: Option<String>,
-
-    /// Basic-auth password, overriding the context. Prefer SERVERCTL_PASSWORD
-    /// or `serverctl login` — an argument is visible in `ps`.
-    #[arg(
-        long,
-        global = true,
-        env = "SERVERCTL_PASSWORD",
-        value_name = "PASSWORD",
-        hide_env_values = true,
-        help_heading = "Global options"
-    )]
-    pub password: Option<String>,
-
-    /// Accept any TLS certificate from the server.
-    #[arg(long, global = true, help_heading = "Global options")]
-    pub insecure_skip_tls_verify: bool,
-
-    /// Per-request timeout.
-    #[arg(long, global = true, value_name = "SECS", default_value_t = 30, help_heading = "Global options")]
-    pub request_timeout: u64,
-}
 
 #[derive(Subcommand, Debug)]
 enum Command {
@@ -109,6 +56,11 @@ enum Command {
     /// Show which server and identity the next command would use, and what it
     /// is allowed to do.
     Whoami,
+
+    /// Mint, list and revoke app-tokens — the credential a program
+    /// authenticates with.
+    #[command(subcommand)]
+    Token(cmd::token::TokenCmd),
 
     /// Manage stored contexts.
     Config {
@@ -300,6 +252,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Logout(args) => cmd::auth::logout(g, args),
         Command::Config { cmd } => cmd::auth::config(g, cmd),
         Command::Whoami => cmd::auth::whoami(g),
+        Command::Token(cmd) => cmd::token::run(&Ctx::new(g)?, cmd),
         Command::Completion { shell } => {
             let mut command = Cli::command();
             let name = command.get_name().to_string();
@@ -355,6 +308,7 @@ fn run(cli: &Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use serverctl::output::OutputFormat;
     use super::*;
 
     #[test]

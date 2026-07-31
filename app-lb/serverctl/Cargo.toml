@@ -1,42 +1,100 @@
 [package]
 name = "serverctl"
-version = "0.1.0"
-edition = "2024"
-description = "kubectl-shaped CLI for the app-lb admin API"
+version.workspace = true
+edition.workspace = true
+description = "Client library and kubectl-shaped CLI for the app-lb admin API"
+
+# One crate, two products. The library is the whole crate minus `main.rs` and
+# `cmd/`; the CLI is a `[[bin]]` behind the default `cli` feature, so
+# `cargo install serverctl` still works and a library consumer writes
+# `default-features = false` to get none of clap, rpassword or a terminal.
+#
+# The CLI being the library's own first consumer is the point: a field the client
+# stops understanding becomes a compile error here rather than a silently blank
+# column at somebody's terminal.
+[[bin]]
+name = "serverctl"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# Everything the terminal needs and a library must not have to link.
+cli = [
+    "blocking",
+    "config-file",
+    "artifact",
+    "dep:anyhow",
+    "dep:clap",
+    "dep:clap_complete",
+    "dep:serde_yaml",
+    "dep:rpassword",
+    "dep:libc",
+]
+# A synchronous facade over the async client, for callers with no runtime.
+blocking = ["tokio/rt"]
+# kubeconfig-style context/credential discovery under ~/.config/serverctl.
+config-file = ["dep:dirs"]
+# The artifact-store client, which talks to `art serve` rather than to app-lb —
+# a different service with a different auth model (API key, not Basic).
+artifact = ["dep:sha2", "dep:ureq"]
+# Exposes the scripted `Transport` the tests use. Worth shipping: the thing most
+# worth testing in a program that drives app-lb is what it does when app-lb says
+# no, and that is hard to arrange against a real server.
+test-util = []
 
 [dependencies]
-clap = { version = "4", features = ["derive", "env", "wrap_help"] }
-clap_complete = "4"
-
-serde = { version = "1", features = ["derive"] }
-# `preserve_order` keeps a spec's key order stable through the read-modify-write
-# commands (`set`, `scale`, `edit`), so an edit doesn't reshuffle the file the
-# user is looking at.
-serde_json = { version = "1", features = ["preserve_order"] }
+# --- CLI only ---------------------------------------------------------------
+# The CLI keeps `anyhow`: it renders one error and exits, and a typed error buys
+# it nothing. The *library* must not, which is what `Error` in `error.rs` is for
+# — and because that type is a plain `std::error::Error`, `?` still bridges it
+# into `anyhow::Result` throughout `cmd/`.
+anyhow = { version = "1", optional = true }
+clap = { version = "4", features = ["derive", "env", "wrap_help"], optional = true }
+clap_complete = { version = "4", optional = true }
 # Deprecated upstream but still the only maintained-enough YAML reader for
 # `serde_json::Value`; used for `-o yaml` and for accepting YAML spec files.
-serde_yaml = "0.9"
+# Both are file/terminal concerns, so it stays on the CLI side of the line.
+serde_yaml = { version = "0.9", optional = true }
+rpassword = { version = "7", optional = true }
+# Restoring the default SIGPIPE disposition (Rust ignores it, so
+# `serverctl get deployments | head` would panic on a closed pipe), and the
+# termios dance that puts a terminal in raw mode for `serverctl shell`.
+libc = { version = "0.2", optional = true }
+dirs = { version = "6", optional = true }
 
-# A blocking HTTP client: a CLI makes one request at a time, so an async runtime
-# would be pure weight. rustls is turned off in favour of the platform's native
-# TLS (openssl here, already a build requirement of app-lb) because that gives us
-# the system trust store and a one-line `--insecure-skip-tls-verify`.
-ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"] }
+# --- library ----------------------------------------------------------------
+serde.workspace = true
+# `preserve_order` keeps a spec's key order stable through the read-modify-write
+# commands (`set`, `scale`, `edit`), so an edit doesn't reshuffle the file the
+# user is looking at. Note for library consumers: this is a global serde_json
+# feature, so enabling this crate also puts serde_json's maps in insertion order
+# for everything else in your build. That is the price of lossless spec
+# round-tripping, and it is why writes go through `Value` at all.
+serde_json = { workspace = true, features = ["preserve_order"] }
 
-base64 = "0.22"
-# A *synchronous* WebSocket client, for `serverctl shell`. Sync because this CLI
-# has no async runtime and does not want one for a single socket; native-tls to
-# match ureq, so a shell over app-lb's own HTTPS proxy uses the same trust store
-# and the same `--insecure-skip-tls-verify`.
-tungstenite = { version = "0.24", default-features = false, features = ["handshake", "native-tls"] }
+# rustls rather than the platform's native TLS, with the *system* trust store
+# rather than webpki's bundled roots. Two reasons, in order: app-lb resolves
+# reqwest with `rustls-tls`, and cargo unifies features across a workspace build
+# — adding `native-tls` here would flip reqwest's default connector for the LB
+# too, moving its outbound TLS without a line in either manifest saying so. And
+# `-native-roots` is what preserves today's behaviour, since the ureq client this
+# replaces used the platform store.
+reqwest = { workspace = true, features = ["json", "rustls-tls-native-roots"] }
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+futures.workspace = true
+base64.workspace = true
 # `artifact push` addresses a rootfs by the sha256 of its bytes, so the digest
 # has to be computed here — the store's `PUT /blobs/{digest}` takes the name as
 # part of the URL and answers 409 if what arrives hashes to anything else.
-sha2 = "0.10"
-anyhow = "1"
-# Only for restoring the default SIGPIPE disposition. Rust ignores SIGPIPE, so
-# without this `serverctl get deployments | head` panics on a closed pipe
-# instead of exiting quietly. Already in the tree under openssl-sys.
-libc = "0.2"
-dirs = "6"
-rpassword = "7"
+sha2 = { workspace = true, optional = true }
+# The artifact store is a *different service* on a different auth model, reached
+# only by the CLI. It keeps its own small blocking client rather than being
+# folded into the async one: a blob upload is a long streaming PUT with a
+# progress callback, and nothing about it wants a runtime.
+ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"], optional = true }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

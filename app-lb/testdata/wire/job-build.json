@@ -1,0 +1,19 @@
+{
+  "id": "job-001",
+  "deployment": "sandbox",
+  "kind": "image-build",
+  "status": "succeeded",
+  "started_at": 1722400000,
+  "finished_at": 1722400123,
+  "repo": "https://github.com/example/agent",
+  "ref": "main",
+  "commit": "9f3a1c2",
+  "dockerfile": "Dockerfile",
+  "image": "agent-base",
+  "rolled_out": true,
+  "error": null,
+  "log": [
+    "cloning …",
+    "done"
+  ]
+}

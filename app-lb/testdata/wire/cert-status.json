@@ -1,0 +1,6 @@
+{
+  "host": "sandbox.example.com",
+  "not_after": "2026-10-29T12:00:00Z",
+  "issuer": "R11",
+  "needs_renewal": false
+}

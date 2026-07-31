@@ -17,6 +17,9 @@ fn default_state_path() -> String {
 fn default_secrets_path() -> String {
     "app-lb-secrets.json".into()
 }
+fn default_tokens_path() -> String {
+    "app-lb-tokens.json".into()
+}
 fn default_name() -> String {
     "app-lb".into()
 }
@@ -34,6 +37,12 @@ pub struct LbConfig {
     /// has different handling: `0600`, and sealed when a key is configured.
     #[serde(default = "default_secrets_path")]
     pub secrets_path: String,
+    /// Where minted app-tokens live. Its own file, `0600`, for the same reason
+    /// the secret store has one: it holds credentials and wants different
+    /// handling from the deployment state. Only each token's hash is written, so
+    /// unlike the secret store there is nothing here to encrypt.
+    #[serde(default = "default_tokens_path")]
+    pub tokens_path: String,
     /// Display name shown in the dashboard header and page title. Defaults to
     /// `app-lb`.
     #[serde(default = "default_name")]
@@ -189,6 +198,7 @@ impl Default for LbConfig {
             admin_addr: default_admin_addr(),
             state_path: default_state_path(),
             secrets_path: default_secrets_path(),
+            tokens_path: default_tokens_path(),
             name: default_name(),
             daemon_url: None,
             dashboard_user: None,
@@ -968,14 +978,23 @@ impl SecretEnv {
 /// holds them in the clear.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct AuthGate {
-    /// Which identity provider. Only Google today; the field exists so a spec
-    /// written now still parses when there is a second one.
+    /// Which credentials get past the gate. A bare string for one
+    /// (`"provider": "google"`) or a list for several
+    /// (`"provider": ["google", "app-token"]`) — see [`Providers`].
+    ///
+    /// More than one is the common shape rather than an exotic one: a sandbox
+    /// hosting a UI wants a person to sign in with Google *and* the agent
+    /// driving it to present an app-token. Any one of the listed providers
+    /// admits a request; they are alternatives, not requirements.
     #[serde(default)]
-    pub provider: AuthProvider,
-    /// OAuth client id from the provider's console.
-    pub client_id: String,
-    /// Where the client secret is stored.
-    pub client_secret: SecretRef,
+    pub provider: Providers,
+    /// OAuth client id from the provider's console. Required for `google`,
+    /// meaningless without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// Where the client secret is stored. Required for `google`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<SecretRef>,
     /// Google Workspace domains whose accounts may enter, matched against the
     /// `hd` claim (not the email's suffix — see `AuthGate::allows`). `["*"]`
     /// means *any* Google account, which is a real choice and has to be spelled
@@ -1015,10 +1034,73 @@ pub struct AuthGate {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum AuthProvider {
+    /// Google sign-in: an OAuth redirect, a session cookie, an allow-list of
+    /// domains and addresses. For people in browsers.
     #[default]
     Google,
+    /// An app-token app-lb minted, presented as `Authorization: Bearer applb_…`
+    /// or `?app_token=`. For programs — and for a browser WebSocket, which
+    /// cannot set headers at all.
+    ///
+    /// The allow-list here is the *token's* `deployments` scope, not
+    /// `allowed_domains`/`allowed_emails`: those describe humans and mean
+    /// nothing for a credential issued to a process.
+    AppToken,
+}
+
+/// The providers a gate accepts.
+///
+/// Serialized as a bare string when there is exactly one, so every gate written
+/// before app-tokens existed round-trips through this byte-for-byte — a spec
+/// nobody has edited must not acquire an array in its state file just because
+/// the type behind the field grew.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Providers(Vec<AuthProvider>);
+
+impl Default for Providers {
+    fn default() -> Self {
+        Self(vec![AuthProvider::Google])
+    }
+}
+
+impl Providers {
+    pub fn contains(&self, p: AuthProvider) -> bool {
+        self.0.contains(&p)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[AuthProvider] {
+        &self.0
+    }
+}
+
+impl Serialize for Providers {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0.as_slice() {
+            [one] => one.serialize(s),
+            many => many.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Providers {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OneOrMany {
+            One(AuthProvider),
+            Many(Vec<AuthProvider>),
+        }
+        Ok(match OneOrMany::deserialize(d)? {
+            OneOrMany::One(p) => Self(vec![p]),
+            OneOrMany::Many(v) => Self(v),
+        })
+    }
 }
 
 fn default_auth_base_path() -> String {
@@ -1090,10 +1172,21 @@ impl AuthGate {
             .collect();
         domains.sort();
         emails.sort();
+        // A single provider renders exactly as the bare `AuthProvider` did
+        // before this field became a list, and an absent client_id as the empty
+        // string. That keeps the material byte-identical for every gate written
+        // before app-tokens existed — this digest keys the session signature, so
+        // any change here signs out every user of every gated deployment, and an
+        // upgrade is not a good reason to do that. A gate that genuinely *adds*
+        // a provider does change it, which is the point.
+        let providers = match self.provider.as_slice() {
+            [one] => format!("{one:?}"),
+            many => format!("{many:?}"),
+        };
         let material = format!(
-            "{:?}|{}|{}|{}",
-            self.provider,
-            self.client_id,
+            "{}|{}|{}|{}",
+            providers,
+            self.client_id.as_deref().unwrap_or(""),
             domains.join(","),
             emails.join(",")
         );
@@ -1105,22 +1198,61 @@ impl AuthGate {
         digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
     }
 
-    fn validate(&self, routes: &[RouteRule]) -> Result<(), SpecError> {
-        if self.client_id.trim().is_empty() {
-            return Err(SpecError::EmptyClientId);
-        }
-        self.client_secret
-            .validate()
-            .map_err(|e| SpecError::BadSecretRef {
-                field: "auth.client_secret",
-                detail: e.to_string(),
-            })?;
+    /// Whether a person can sign in with Google here.
+    pub fn accepts_google(&self) -> bool {
+        self.provider.contains(AuthProvider::Google)
+    }
 
-        // An empty allow-list would gate the deployment behind "has a Google
-        // account", which is nearly everyone. That is a legitimate thing to
-        // want, so it can be asked for — but only in writing.
-        if self.allowed_domains.is_empty() && self.allowed_emails.is_empty() {
-            return Err(SpecError::EmptyAllowList);
+    /// Whether an app-token scoped to this deployment gets past the gate.
+    pub fn accepts_app_token(&self) -> bool {
+        self.provider.contains(AuthProvider::AppToken)
+    }
+
+    /// The OAuth client id, present whenever `validate()` passed and Google is
+    /// among the providers. Returned as an `Option` rather than unwrapped
+    /// because the two are only linked by validation, and a gate reaching the
+    /// OAuth path without one should say so rather than send Google an empty
+    /// `client_id` and report whatever it says back.
+    pub fn google_credentials(&self) -> Option<(&str, &SecretRef)> {
+        match (&self.client_id, &self.client_secret) {
+            (Some(id), Some(secret)) if self.accepts_google() => Some((id.as_str(), secret)),
+            _ => None,
+        }
+    }
+
+    fn validate(&self, routes: &[RouteRule]) -> Result<(), SpecError> {
+        if self.provider.is_empty() {
+            return Err(SpecError::NoAuthProvider);
+        }
+
+        if self.accepts_google() {
+            let Some(client_id) = &self.client_id else {
+                return Err(SpecError::EmptyClientId);
+            };
+            if client_id.trim().is_empty() {
+                return Err(SpecError::EmptyClientId);
+            }
+            let Some(client_secret) = &self.client_secret else {
+                return Err(SpecError::EmptyClientId);
+            };
+            client_secret
+                .validate()
+                .map_err(|e| SpecError::BadSecretRef {
+                    field: "auth.client_secret",
+                    detail: e.to_string(),
+                })?;
+
+            // An empty allow-list would gate the deployment behind "has a Google
+            // account", which is nearly everyone. That is a legitimate thing to
+            // want, so it can be asked for — but only in writing.
+            if self.allowed_domains.is_empty() && self.allowed_emails.is_empty() {
+                return Err(SpecError::EmptyAllowList);
+            }
+        } else if self.client_id.is_some() || self.client_secret.is_some() {
+            // OAuth credentials on a gate that will never run an OAuth flow.
+            // Rejected rather than ignored: whoever wrote them believes this
+            // deployment is behind Google sign-in, and it is not.
+            return Err(SpecError::OauthWithoutGoogle);
         }
         for d in &self.allowed_domains {
             // Surrounding whitespace is rejected rather than trimmed: the match
@@ -1369,6 +1501,10 @@ pub enum SpecError {
     BadEnvName(String),
     ZeroTimeout,
     EmptyClientId,
+    /// `"provider": []` — a gate that admits nobody by any means.
+    NoAuthProvider,
+    /// OAuth credentials on a gate that never runs an OAuth flow.
+    OauthWithoutGoogle,
     /// Neither an allowed domain nor an allowed address was given.
     EmptyAllowList,
     BadAllowedDomain(String),
@@ -1510,7 +1646,21 @@ impl std::fmt::Display for SpecError {
                 f,
                 "update.timeout_secs must be greater than 0; omit it to use the server default"
             ),
-            Self::EmptyClientId => write!(f, "auth.client_id must not be empty"),
+            Self::EmptyClientId => write!(
+                f,
+                "auth.client_id and auth.client_secret are required for the `google` provider"
+            ),
+            Self::NoAuthProvider => write!(
+                f,
+                "auth.provider is empty, so nothing could ever get past the gate — \
+                 name at least one of \"google\" or \"app-token\""
+            ),
+            Self::OauthWithoutGoogle => write!(
+                f,
+                "auth sets client_id/client_secret but does not list the `google` provider, \
+                 so no OAuth flow will ever run — add \"google\" to auth.provider, or drop \
+                 the credentials"
+            ),
             Self::EmptyAllowList => write!(
                 f,
                 "auth sets neither `allowed_domains` nor `allowed_emails`, which would let \
@@ -2293,13 +2443,13 @@ mod tests {
 
     fn auth_gate() -> AuthGate {
         AuthGate {
-            provider: AuthProvider::Google,
-            client_id: "cid.apps.googleusercontent.com".into(),
-            client_secret: crate::secrets::SecretRef {
+            provider: Default::default(),
+            client_id: Some("cid.apps.googleusercontent.com".into()),
+            client_secret: Some(crate::secrets::SecretRef {
                 secret: "google".into(),
                 key: "client_secret".into(),
                 username: None,
-            },
+            }),
             allowed_domains: vec!["example.com".into()],
             allowed_emails: vec![],
             public_paths: vec![],
@@ -2419,7 +2569,7 @@ mod tests {
     fn a_gate_rejects_degenerate_settings() {
         let cases: Vec<(AuthGate, SpecError)> = vec![
             (
-                AuthGate { client_id: "  ".into(), ..auth_gate() },
+                AuthGate { client_id: Some("  ".into()), ..auth_gate() },
                 SpecError::EmptyClientId,
             ),
             (
@@ -2494,7 +2644,7 @@ mod tests {
         );
 
         for changed in [
-            AuthGate { client_id: "other".into(), ..base.clone() },
+            AuthGate { client_id: Some("other".into()), ..base.clone() },
             AuthGate { allowed_domains: vec!["other.example".into()], ..base.clone() },
             AuthGate { allowed_emails: vec!["extra@x.com".into()], ..base.clone() },
         ] {
@@ -2531,6 +2681,130 @@ mod tests {
     }
 
     /// The minimum a spec has to say: everything else defaults.
+    /// The reason `Providers` has a hand-written codec instead of being a plain
+    /// `Vec`: a gate written before app-tokens existed must round-trip through
+    /// the new type unchanged, because every spec in every state file is one.
+    #[test]
+    fn a_single_provider_round_trips_as_a_bare_string() {
+        let one: AuthGate = serde_json::from_str(
+            r#"{"provider":"google","client_id":"cid","client_secret":{"secret":"g"},
+                "allowed_domains":["example.com"]}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&one).unwrap();
+        assert!(
+            json.contains(r#""provider":"google""#),
+            "a one-provider gate must not acquire an array: {json}"
+        );
+
+        // And a gate that omits `provider` entirely still means Google, and
+        // still writes it back the same way.
+        let implied: AuthGate = serde_json::from_str(
+            r#"{"client_id":"cid","client_secret":{"secret":"g"},
+                "allowed_domains":["example.com"]}"#,
+        )
+        .unwrap();
+        assert_eq!(implied.provider, one.provider);
+    }
+
+    #[test]
+    fn several_providers_round_trip_as_a_list() {
+        let gate: AuthGate = serde_json::from_str(
+            r#"{"provider":["google","app-token"],"client_id":"cid",
+                "client_secret":{"secret":"g"},"allowed_domains":["example.com"]}"#,
+        )
+        .unwrap();
+        assert!(gate.accepts_google());
+        assert!(gate.accepts_app_token());
+        gate.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]).unwrap();
+
+        let json = serde_json::to_string(&gate).unwrap();
+        assert!(json.contains(r#""provider":["google","app-token"]"#), "{json}");
+        let back: AuthGate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.provider, gate.provider);
+    }
+
+    #[test]
+    fn a_token_only_gate_needs_no_oauth_credentials() {
+        let gate: AuthGate = serde_json::from_str(r#"{"provider":"app-token"}"#).unwrap();
+        assert!(!gate.accepts_google());
+        assert!(gate.accepts_app_token());
+        assert!(gate.google_credentials().is_none());
+        // No client_id, no allow-list, and still valid: neither describes a
+        // credential issued to a program.
+        gate.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]).unwrap();
+    }
+
+    #[test]
+    fn oauth_credentials_without_the_google_provider_are_refused() {
+        // Not ignored: whoever wrote these believes the deployment is behind
+        // Google sign-in, and it is not.
+        let gate: AuthGate = serde_json::from_str(
+            r#"{"provider":"app-token","client_id":"cid","client_secret":{"secret":"g"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gate.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]),
+            Err(SpecError::OauthWithoutGoogle)
+        );
+    }
+
+    #[test]
+    fn a_gate_that_admits_nobody_is_refused() {
+        let gate: AuthGate = serde_json::from_str(r#"{"provider":[]}"#).unwrap();
+        assert_eq!(
+            gate.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]),
+            Err(SpecError::NoAuthProvider)
+        );
+    }
+
+    #[test]
+    fn a_google_gate_still_demands_its_credentials_and_an_allow_list() {
+        let missing: AuthGate = serde_json::from_str(r#"{"provider":"google"}"#).unwrap();
+        assert_eq!(
+            missing.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]),
+            Err(SpecError::EmptyClientId)
+        );
+
+        let no_list: AuthGate = serde_json::from_str(
+            r#"{"provider":"google","client_id":"cid","client_secret":{"secret":"g"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            no_list.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]),
+            Err(SpecError::EmptyAllowList)
+        );
+    }
+
+    /// This digest signs sessions, so a change to it signs everyone out. Adding
+    /// a provider is a policy change and *should* invalidate; merely upgrading
+    /// app-lb is not and must not.
+    #[test]
+    fn the_session_fingerprint_is_unchanged_for_a_gate_nobody_edited() {
+        let before: AuthGate = serde_json::from_str(
+            r#"{"provider":"google","client_id":"cid","client_secret":{"secret":"g"},
+                "allowed_domains":["example.com"]}"#,
+        )
+        .unwrap();
+        let implied: AuthGate = serde_json::from_str(
+            r#"{"client_id":"cid","client_secret":{"secret":"g"},
+                "allowed_domains":["example.com"]}"#,
+        )
+        .unwrap();
+        assert_eq!(before.policy_fingerprint(), implied.policy_fingerprint());
+
+        let widened: AuthGate = serde_json::from_str(
+            r#"{"provider":["google","app-token"],"client_id":"cid",
+                "client_secret":{"secret":"g"},"allowed_domains":["example.com"]}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            before.policy_fingerprint(),
+            widened.policy_fingerprint(),
+            "adding a provider changes the gate's policy and must invalidate sessions"
+        );
+    }
+
     #[test]
     fn a_gate_parses_from_just_a_client_id_secret_and_allow_list() {
         let gate: AuthGate = serde_json::from_str(
@@ -2538,8 +2812,14 @@ mod tests {
                 "allowed_domains":["example.com"]}"#,
         )
         .unwrap();
-        assert_eq!(gate.provider, AuthProvider::Google);
-        assert_eq!(gate.client_secret.key, "token", "the SecretRef default");
+        assert_eq!(gate.provider.as_slice(), [AuthProvider::Google]);
+        assert!(gate.accepts_google());
+        assert!(!gate.accepts_app_token());
+        assert_eq!(
+            gate.client_secret.as_ref().unwrap().key,
+            "token",
+            "the SecretRef default"
+        );
         assert_eq!(gate.base_path, "/__applb/auth");
         assert_eq!(gate.cookie_name, "applb_session");
         assert!(gate.forward_identity);

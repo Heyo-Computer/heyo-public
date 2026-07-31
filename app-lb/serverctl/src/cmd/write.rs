@@ -223,7 +223,7 @@ pub fn create(ctx: &Ctx, args: &CreateDeploymentArgs) -> Result<()> {
     if args.dry_run {
         return print_spec(ctx, &spec);
     }
-    let created = ctx.client.create_deployment(&spec)?;
+    let created = ctx.client.raw().create_deployment(&spec)?;
     report_write(ctx, &created, &args.name, "created")?;
     // Recording a build source does not build anything; say so, because the
     // deployment is otherwise sitting on whatever --image named.
@@ -552,7 +552,7 @@ pub fn create_secret(ctx: &Ctx, args: &CreateSecretArgs) -> Result<()> {
 
     // POST upserts, so say which one actually happened.
     let existed = ctx.client.secret_exists(&args.name).unwrap_or(false);
-    let result = ctx.client.create_secret(&Value::Object(body))?;
+    let result = ctx.client.raw().put_secret(&Value::Object(body))?;
     report_secret(ctx, &result, &args.name, if existed { "replaced" } else { "created" })
 }
 
@@ -628,7 +628,7 @@ pub fn set_secret(ctx: &Ctx, args: &SetSecretArgs) -> Result<()> {
         return print_spec(ctx, &Value::Object(shown));
     }
 
-    let result = ctx.client.patch_secret(&id, &Value::Object(body))?;
+    let result = ctx.client.raw().patch_secret(&id, &Value::Object(body))?;
     report_secret(ctx, &result, &id, "updated")
 }
 
@@ -936,10 +936,11 @@ pub fn pull(ctx: &Ctx, args: &PullArgs) -> Result<()> {
     if let Some(r) = &args.artifact_ref {
         body.insert("ref".into(), Value::String(r.clone()));
     }
-    if args.force {
-        body.insert("force".into(), Value::Bool(true));
-    }
-    let started = ctx.client.start_pull(&id, &Value::Object(body))?;
+    let started = ctx.client.raw().start_pull(
+        &id,
+        body.get("ref").and_then(Value::as_str),
+        args.force,
+    )?;
 
     if ctx.out.is_machine() && !(args.wait || args.logs) {
         let record: JobRecord = serde_json::from_value(started.clone()).unwrap_or_default();
@@ -1064,7 +1065,7 @@ pub fn set_update(ctx: &Ctx, args: &SetUpdateArgs) -> Result<()> {
         .secret_env
         .iter()
         .map(|s| spec::parse_secret_env(s))
-        .collect::<Result<_>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut env = Map::new();
     for e in &args.env {
         match spec::parse_env(e)? {
@@ -1292,7 +1293,7 @@ pub struct UpdateArgs {
 
 pub fn update(ctx: &Ctx, args: &UpdateArgs) -> Result<()> {
     let id = deployment_name(&args.resource)?;
-    let started = ctx.client.start_update(&id)?;
+    let started = ctx.client.raw().start_update(&id)?;
 
     if ctx.out.is_machine() && !(args.wait || args.logs) {
         let record: JobRecord = serde_json::from_value(started.clone()).unwrap_or_default();
@@ -1348,11 +1349,7 @@ pub struct BuildArgs {
 pub fn build(ctx: &Ctx, args: &BuildArgs) -> Result<()> {
     let id = deployment_name(&args.resource)?;
 
-    let mut body = Map::new();
-    if let Some(r) = &args.git_ref {
-        body.insert("ref".into(), Value::String(r.clone()));
-    }
-    let started = ctx.client.start_build(&id, &Value::Object(body))?;
+    let started = ctx.client.raw().start_build(&id, args.git_ref.as_deref())?;
 
     if ctx.out.is_machine() && !(args.wait || args.logs) {
         let record: JobRecord = serde_json::from_value(started.clone()).unwrap_or_default();
@@ -1385,7 +1382,7 @@ fn wait_job(ctx: &Ctx, job_id: &str, timeout: Duration, show_logs: bool) -> Resu
     let started = Instant::now();
     let mut last_lines = 0usize;
     loop {
-        let raw = ctx.client.get_job(job_id)?;
+        let raw = ctx.client.raw().job(job_id)?;
         let record: JobRecord =
             serde_json::from_value(raw.clone()).context("parsing the job record")?;
 
@@ -1515,9 +1512,9 @@ pub fn apply(ctx: &Ctx, args: &ApplyArgs) -> Result<()> {
         // apply; PUT keeps VMs alive when only scaling or routing changed.
         let existed = ctx.client.deployment_exists(&id)?;
         let result = if existed {
-            ctx.client.replace_deployment(&id, s)?
+            ctx.client.raw().replace_deployment(&id, s)?
         } else {
-            ctx.client.create_deployment(s)?
+            ctx.client.raw().create_deployment(s)?
         };
         report_write(ctx, &result, &id, if existed { "configured" } else { "created" })?;
     }
@@ -1542,7 +1539,7 @@ pub fn edit(ctx: &Ctx, args: &EditArgs) -> Result<()> {
         bail!("edit takes exactly one deployment");
     };
 
-    let current = spec::spec_of(&ctx.client.get_deployment(id)?)?;
+    let current = spec::spec_of(&ctx.client.raw().deployment(id)?)?;
     let header = format!(
         "# Editing deployment {id:?} on {}.\n\
          # Save an unchanged file (or an empty one) to cancel.\n\
@@ -1571,7 +1568,7 @@ pub fn edit(ctx: &Ctx, args: &EditArgs) -> Result<()> {
     let new_spec: Value = serde_yaml::from_str(&edited)
         .with_context(|| format!("the edited spec is not valid YAML/JSON; it is kept at {}", path.display()))?;
 
-    match ctx.client.replace_deployment(id, &new_spec) {
+    match ctx.client.raw().replace_deployment(id, &new_spec) {
         Ok(result) => {
             std::fs::remove_file(&path).ok();
             report_write(ctx, &result, id, "edited")
@@ -1690,7 +1687,7 @@ pub fn set_env(ctx: &Ctx, args: &SetEnvArgs) -> Result<()> {
         .changes
         .iter()
         .map(|c| spec::parse_env(c))
-        .collect::<Result<_>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     edit_spec(ctx, &id, args.dry_run, "env updated", |spec| {
         spec::apply_env(spec, &id, &changes)?;
         Ok(())
@@ -1766,12 +1763,12 @@ fn edit_spec(
     verb: &str,
     mutate: impl FnOnce(&mut Value) -> Result<()>,
 ) -> Result<()> {
-    let mut spec = spec::spec_of(&ctx.client.get_deployment(id)?)?;
+    let mut spec = spec::spec_of(&ctx.client.raw().deployment(id)?)?;
     mutate(&mut spec)?;
     if dry_run {
         return print_spec(ctx, &spec);
     }
-    let result = ctx.client.replace_deployment(id, &spec)?;
+    let result = ctx.client.raw().replace_deployment(id, &spec)?;
     report_write(ctx, &result, id, verb)
 }
 
@@ -1807,7 +1804,7 @@ pub fn scale(ctx: &Ctx, args: &ScaleArgs) -> Result<()> {
         );
     }
 
-    let result = ctx.client.patch_scaling(&id, &Value::Object(patch))?;
+    let result = ctx.client.raw().patch_scaling(&id, &Value::Object(patch))?;
     if ctx.out.is_machine() {
         return output::emit(&result, ctx.out, &[format!("deployment/{id}")]);
     }
@@ -1845,7 +1842,7 @@ pub struct RestartArgs {
 
 pub fn restart(ctx: &Ctx, args: &RestartArgs) -> Result<()> {
     let id = deployment_name(&args.resource)?;
-    let status: DeploymentStatus = serde_json::from_value(ctx.client.get_deployment(&id)?)?;
+    let status: DeploymentStatus = serde_json::from_value(ctx.client.raw().deployment(&id)?)?;
 
     if status.spec.is_static() {
         bail!(
@@ -1867,7 +1864,7 @@ pub fn restart(ctx: &Ctx, args: &RestartArgs) -> Result<()> {
     );
     let mut table = Table::new(["SANDBOX", "OUTCOME"]);
     for vm in &status.vms {
-        let result = ctx.client.evict_vm(&id, &vm.sandbox_id, args.force)?;
+        let result = ctx.client.raw().evict_vm(&id, &vm.sandbox_id, args.force)?;
         let outcome = result
             .get("outcome")
             .and_then(Value::as_str)
@@ -1901,7 +1898,7 @@ pub struct RolloutStatusArgs {
 pub fn rollout_status(ctx: &Ctx, args: &RolloutStatusArgs) -> Result<()> {
     let id = deployment_name(&args.resource)?;
     if args.no_wait {
-        let status: DeploymentStatus = serde_json::from_value(ctx.client.get_deployment(&id)?)?;
+        let status: DeploymentStatus = serde_json::from_value(ctx.client.raw().deployment(&id)?)?;
         println!("{}", describe_progress(&status));
         return Ok(());
     }
@@ -1913,7 +1910,7 @@ fn wait_ready(ctx: &Ctx, id: &str, timeout: Duration) -> Result<()> {
     let started = Instant::now();
     let mut last = String::new();
     loop {
-        let status: DeploymentStatus = serde_json::from_value(ctx.client.get_deployment(id)?)?;
+        let status: DeploymentStatus = serde_json::from_value(ctx.client.raw().deployment(id)?)?;
         let line = describe_progress(&status);
         if line != last {
             println!("{line}");
@@ -1995,7 +1992,7 @@ pub fn delete(ctx: &Ctx, args: &DeleteArgs) -> Result<()> {
 
 fn delete_secrets(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {
     let targets: Vec<String> = if args.all {
-        let list: Vec<SecretSummary> = serde_json::from_value(ctx.client.list_secrets()?)?;
+        let list: Vec<SecretSummary> = serde_json::from_value(ctx.client.raw().secrets()?)?;
         list.into_iter().map(|s| s.id).collect()
     } else {
         if names.is_empty() {
@@ -2027,7 +2024,7 @@ fn delete_secrets(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> 
 
 fn delete_deployments(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {
     let targets: Vec<String> = if args.all {
-        let list: Vec<DeploymentStatus> = serde_json::from_value(ctx.client.list_deployments()?)?;
+        let list: Vec<DeploymentStatus> = serde_json::from_value(ctx.client.raw().deployments()?)?;
         list.into_iter().map(|d| d.spec.id).collect()
     } else {
         if names.is_empty() {
@@ -2063,7 +2060,7 @@ fn delete_vms(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {
     let id = deployment_name(&deployment)?;
 
     let targets: Vec<String> = if args.all {
-        let status: DeploymentStatus = serde_json::from_value(ctx.client.get_deployment(&id)?)?;
+        let status: DeploymentStatus = serde_json::from_value(ctx.client.raw().deployment(&id)?)?;
         status.vms.into_iter().map(|v| v.sandbox_id).collect()
     } else {
         if names.is_empty() {
@@ -2078,7 +2075,7 @@ fn delete_vms(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {
     }
 
     for sandbox in &targets {
-        let result = ctx.client.evict_vm(&id, sandbox, args.force)?;
+        let result = ctx.client.raw().evict_vm(&id, sandbox, args.force)?;
         let outcome = result
             .get("outcome")
             .and_then(Value::as_str)
@@ -2093,7 +2090,7 @@ fn delete_vms(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {
     Ok(())
 }
 
-fn confirm(prompt: &str) -> Result<()> {
+pub fn confirm(prompt: &str) -> Result<()> {
     println!("{prompt}");
     print!("Type 'yes' to continue: ");
     std::io::stdout().flush().ok();

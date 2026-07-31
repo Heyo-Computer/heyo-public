@@ -1,6 +1,17 @@
 # serverctl
 
-A kubectl-shaped CLI for the [app-lb](../README.md) admin API.
+A client library **and** a kubectl-shaped CLI for the [app-lb](../README.md)
+admin API.
+
+One crate, two products. `cargo install serverctl` gets the CLI;
+`serverctl = { version = "0.1", default-features = false }` gets the library
+with none of clap, rpassword or a terminal linked in. The CLI is the library's
+own first consumer, which is the point: a field the client stops understanding
+becomes a compile error rather than a silently blank column at somebody's
+terminal.
+
+There is a [TypeScript client](../sdk/typescript) with the same name, the same
+surface and the same wire contract.
 
 The verbs are kubectl's because the mental model is the same: declarative specs you `apply`,
 imperative helpers (`create`, `scale`, `set`) that write those specs for you, and read commands
@@ -14,6 +25,80 @@ install -m 0755 target/release/serverctl ~/.local/bin/
 
 It is a separate crate from the load balancer, so installing it doesn't drag in pingora, openssl
 or the ACME stack — it shares nothing with app-lb but the wire format.
+
+## As a library
+
+```toml
+[dependencies]
+serverctl = { version = "0.1", default-features = false }
+```
+
+```rust
+use serverctl::{Client, ExecRequest};
+
+let lb = Client::builder("127.0.0.1:9090")
+    .token(std::env::var("APP_LB_TOKEN")?)
+    .build()?;
+
+let out = lb.exec("sb-7f3a9c", &ExecRequest::new("uname -a")).await?;
+println!("{}", out.stdout);
+```
+
+Async by default. Under the `blocking` feature, `serverctl::blocking::Client` is
+the same surface with the `await`s taken out — it is what the CLI uses, and it
+returns a clear error rather than tokio's panic if you call it from inside a
+runtime.
+
+**Typed reads, `Value` writes.** Reads come back as structs; writes take
+`serde_json::Value`. That asymmetry is load-bearing: `PUT /deployments/:id`
+replaces a *whole* spec, so a client that parsed one into a struct it only half
+understood and wrote it back would silently delete every field this build has
+never heard of. Round-tripping the `Value` cannot lose anything. `client.raw()`
+gives the same reads unparsed, for printing a response or for the read half of a
+read-modify-write.
+
+**Shells own their framing.** `client.shell()` returns a session whose `write`
+and `resize` speak plain bytes — app-lb's wire protocol prefixes stdin with
+`0x01` and silently drops a frame that does not, which is the easiest way to
+write a shell client that connects perfectly and types nothing.
+
+**`ShellExit::is_clean()`, not `code == 0`.** app-lb reports an *unknown* exit
+code as `0`, so a VM dying under a live session and a clean logout are the same
+number. `is_clean()` is false when an error preceded the exit.
+
+**Waiting is provided.** `wait_for_job` reports new log lines as they arrive;
+`wait_for_ready` waits on *healthy* backends rather than `ready`, which counts
+VMs that are in the pool and failing their health check.
+
+```rust
+let job = lb.start_build("api", None).await?;
+lb.wait_for_job(&job.id)
+    .on_log(|line| println!("{line}"))
+    .await?;
+```
+
+Full API documentation: `cargo doc -p serverctl --no-default-features --open`.
+
+## App-tokens
+
+```sh
+serverctl token mint agent-runner --admin admin -d sb-7f3a9c --expires-in 24
+serverctl token list
+serverctl token set <id> --all-deployments      # re-scope, same secret
+serverctl token revoke <id>
+```
+
+The secret is printed once and cannot be recovered — app-lb stores only its
+hash. `mint` writes it to stdout and everything else to stderr, so capturing it
+works with or without `-q`:
+
+```sh
+APP_LB_TOKEN=$(serverctl token mint ci --admin admin --all-deployments -q)
+```
+
+A token scoped to specific deployments is refused the fleet-wide routes,
+*including minting* — so it cannot widen itself. See the
+[app-tokens section](../README.md#app-tokens) of app-lb's README.
 
 ## Quick start
 

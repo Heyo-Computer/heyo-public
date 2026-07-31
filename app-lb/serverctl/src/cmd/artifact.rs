@@ -14,7 +14,7 @@
 //! why a push writes a manifest and moves a tag rather than just uploading
 //! bytes — see [`crate::artifact`].
 
-use crate::GlobalOpts;
+use crate::cmd::GlobalOpts;
 use crate::artifact::{self, RegistryClient};
 use crate::config::{Config, PasswordSource, RegistryEntry, resolve_registry_endpoint};
 use crate::output::{self, Table};

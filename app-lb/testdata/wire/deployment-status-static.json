@@ -1,0 +1,35 @@
+{
+  "spec": {
+    "id": "legacy",
+    "routes": [
+      {
+        "path_prefix": "/legacy"
+      }
+    ],
+    "scaling": {
+      "min_replicas": 0,
+      "max_replicas": 5,
+      "warm_pool": 0,
+      "target_concurrency": 10,
+      "scale_to_zero_after_secs": 300,
+      "cold_start_timeout_secs": 120,
+      "drain_timeout_secs": 30,
+      "boot_timeout_secs": 300,
+      "idle_action": "destroy"
+    },
+    "health": {
+      "path": "/",
+      "timeout_secs": 2
+    },
+    "upstreams": [
+      "10.0.0.4:8080",
+      "10.0.0.5:8080"
+    ]
+  },
+  "kind": "static",
+  "desired_replicas": 0,
+  "ready": 0,
+  "pending": 0,
+  "total_in_flight": 0,
+  "vms": []
+}
