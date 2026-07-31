@@ -179,6 +179,20 @@ enum Command {
         cmd: RolloutCmd,
     },
 
+    /// Run one command inside a deployment's VM and print what it wrote.
+    ///
+    /// Goes through app-lb, not the heyvm daemon, so it works wherever the admin
+    /// API does and starts a VM for a deployment that has none running. The
+    /// guest's exit code becomes serverctl's.
+    Exec(cmd::session::ExecArgs),
+
+    /// Open an interactive shell in a deployment's VM.
+    ///
+    /// Together with `exec`, the only way into a deployment registered with no
+    /// routes — an agent sandbox, which takes no HTTP traffic at all.
+    #[command(visible_alias = "ssh")]
+    Shell(cmd::session::ShellArgs),
+
     /// Deregister a deployment, or evict a VM from one.
     #[command(visible_alias = "rm")]
     Delete(cmd::write::DeleteArgs),
@@ -331,6 +345,8 @@ fn run(cli: &Cli) -> Result<()> {
                 RolloutCmd::Restart(args) => cmd::write::restart(&ctx, args),
             }
         }
+        Command::Exec(args) => cmd::session::exec(&Ctx::new(g)?, args),
+        Command::Shell(args) => cmd::session::shell(&Ctx::new(g)?, args),
         Command::Delete(args) => cmd::write::delete(&Ctx::new(g)?, args),
         Command::Top(args) => cmd::observe::top(&Ctx::new(g)?, args),
         Command::Status => cmd::observe::status(&Ctx::new(g)?),

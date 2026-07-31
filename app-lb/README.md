@@ -43,7 +43,7 @@ Configuration is environment-only:
 | --- | --- | --- |
 | `APP_LB_PROXY_ADDR` | `0.0.0.0:6188` | Proxy listener |
 | `APP_LB_ADMIN_ADDR` | `127.0.0.1:9090` | Admin API listener |
-| `APP_LB_STATE_PATH` | `app-lb-state.json` | Where deployment specs persist |
+| `APP_LB_STATE_PATH` | `app-lb-state.json` | Names the state *directory* — see below |
 | `APP_LB_SECRETS_PATH` | `app-lb-secrets.json` | Where stored secrets persist (written `0600`) |
 | `APP_LB_SECRET_KEY` | *(unset)* | 32-byte hex key (or any passphrase) that seals the secrets file with AES-256-GCM |
 | `APP_LB_AUTH_KEY` | `app-lb-auth-key` | Signing key for sign-in sessions; generated `0600` on first use |
@@ -58,6 +58,9 @@ Configuration is environment-only:
 | `APP_LB_ACME_EMAIL` | *(unset)* | Let's Encrypt account contact; **setting it enables automatic certificates** |
 | `APP_LB_ACME_DIR` | `/var/lib/app-lb/acme` | ACME account key and issued certificates (should be `0700`) |
 | `APP_LB_ACME_DIRECTORY` | LE production | ACME directory URL — point at staging for testing |
+| `APP_LB_ACME_WILDCARD` | *(unset)* | Comma-separated domains to cover with a **wildcard** cert (`sb.example.com` → also `*.sb.example.com`). Issued over DNS-01; needs the zone id below |
+| `APP_LB_ROUTE53_ZONE_ID` | *(unset)* | Route 53 hosted zone where DNS-01 challenge records are written |
+| `APP_LB_AWS_BIN` | `aws` | The AWS CLI used for DNS-01. Only reached when a wildcard is configured |
 | `APP_LB_BUILD_DIR` | `/var/lib/app-lb/builds` | Git checkouts for image builds (one per deployment, `0700`) |
 | `APP_LB_HEYVM_BIN` | `heyvm` | The heyvm CLI that builds guest images |
 | `APP_LB_ART_BIN` | `art` | The `art` CLI that materializes a rootfs from a **local** artifact store; unused when `artifact.store` is a URL |
@@ -76,6 +79,30 @@ Configuration is environment-only:
 | `APP_LB_OBS_BATCH` | `500` | Records per POST |
 | `APP_LB_OBS_FLUSH_SECS` | `2` | How long a record may wait for a fuller batch |
 | `RUST_LOG` | `info,app_lb=debug` | Log filter |
+
+### Where state lives
+
+Deployments persist as one file per deployment, in a directory beside the path
+`APP_LB_STATE_PATH` names: `app-lb-state.json` → `app-lb-state.d/<id>.json`.
+Each file holds the spec and the runtime state app-lb has to remember across a
+restart.
+
+One file per deployment rather than one file for all of them, because writing
+every spec on every change is quadratic in a fleet: registering the thousandth
+sandbox would rewrite the other 999 with it. Registering, editing and
+deregistering are each a single file write or unlink, whatever the fleet size.
+
+**Upgrading is automatic and one-way.** On first start with this version an
+existing `app-lb-state.json` is imported and then renamed to
+`app-lb-state.json.migrated`. It is renamed rather than deleted so a downgrade
+still has the data, and so a second start cannot re-import deployments that were
+deregistered in between — which would resurrect them. Nothing to run by hand;
+the log says how many were migrated.
+
+A file whose spec no longer validates is skipped with a warning and **left
+alone**, because that file is the only copy of what somebody wrote. The startup
+sweep that removes files no deployment claims stands down entirely when that
+happens, for the same reason.
 
 ## CLI
 
@@ -212,6 +239,56 @@ A still-booting (pending) VM is simply killed in either mode. Evicting the sole
 VM of a `max_replicas: 1` deployment leaves a brief capacity gap until the
 replacement boots (a request arriving in that window eats a cold start).
 Unknown deployment or VM id is a `404`.
+
+## Running things inside a VM
+
+Two endpoints reach into a deployment's VM without going through the proxy.
+They matter most for a deployment with **no routes at all** — an agent sandbox —
+where they are the only ways in.
+
+```sh
+# One command. The guest's exit code comes back in the JSON.
+curl -XPOST localhost:9090/deployments/sb-7f3a9c/exec \
+  -H 'content-type: application/json' \
+  -d '{"command":"ls -la /workspace","cwd":"/workspace"}'
+
+# An interactive PTY, over a WebSocket.
+serverctl shell sb-7f3a9c
+```
+
+| | |
+| --- | --- |
+| `POST /deployments/:id/exec` | `{command, cwd?, env?, timeout_secs?, wake?}` → `{sandbox_id, exit_code, stdout, stderr, output}` |
+| `GET /deployments/:id/shell` | WebSocket upgrade; `?cols=&rows=&cwd=&wake=` |
+
+Both are on the CRUD tier, so `APP_LB_ADMIN_AUTH=1` covers them. It should:
+running a command in a VM is at least as powerful as editing the spec that boots
+it.
+
+**Both will start a VM.** `wake` defaults to true, so `exec` against a sandbox
+that has scaled to zero boots or resumes one and waits for it, bounded by
+`cold_start_timeout_secs`. That wait is the proxy's own cold-start path, which
+means it also gets the autoscaler's preference for resuming a suspended VM over
+booting a fresh one. Pass `wake: false` (or `--no-wake`) for a `409` instead,
+when you want to know rather than wait.
+
+**Both hold the VM for the session's life.** A command or an open shell takes an
+in-flight slot exactly as a proxied request does. Without that, an unrouted
+sandbox looks permanently idle — nothing else moves its activity clock — and a
+deployment with `scale_to_zero_after_secs` set would reap the VM out from under
+a live shell.
+
+Why these are proxied rather than app-lb handing back a daemon address: only
+app-lb knows which sandbox is currently serving a deployment id, only app-lb can
+apply the admin gate, and only app-lb can wake a suspended VM. A client talking
+to heyvmd directly would need daemon reachability and credentials, and would
+still find nothing running.
+
+An `exec` distinguishes two failures that look alike. A command that runs and
+fails is `200` with a non-zero `exit_code`; app-lb failing to *run* it is a
+`502`. The shell endpoint refuses **before** the WebSocket upgrade, so a bad
+request is a real status code with a JSON body rather than a socket that closes
+without saying why.
 
 ## Google sign-in
 
@@ -366,6 +443,30 @@ deployment before app-lb sets them, so a client cannot present its own
   (they simply sign in again). There is no session list to revoke from — that is
   the trade for having no session store.
 
+- **A gate admits browsers and nothing else.** There is no way for a headless
+  client to sign in with Google, so the gate refuses one rather than sending it
+  somewhere it cannot go. The split is `Accept: text/html`
+  (`proxy.rs`, `wants_html`):
+
+  | Client | Unauthenticated request gets |
+  | --- | --- |
+  | a browser navigating (`Accept: text/html`) | `302` to Google |
+  | anything else — curl, CI, serverctl, **and a page's own `fetch()`** | `401` + `{"error":"authentication required","login_url":"…"}` |
+
+  The `login_url` is only useful to something that can open a browser. Put every
+  path a machine calls in `public_paths` and protect those with a credential the
+  machine can actually present — an API key, Basic auth — exactly as
+  [`examples/artifacts-gated.json`](examples/artifacts-gated.json) does for the
+  store's API.
+
+  **`fetch()` from an already-signed-in page counts as a machine.** A browser
+  sends `Accept: text/html` when *navigating*, but its XHR does not, so a page
+  that loads fine can have every one of its background calls refused. app-lb's
+  own dashboard is the worked example: gating it puts the page behind Google
+  correctly, and then its `/metrics` poll — sent with `accept: application/json`
+  — gets a `401` and no numbers ever appear. See
+  [Putting the dashboard behind Google](#putting-the-dashboard-behind-google).
+
 ## Building images from git
 
 A managed deployment can say where its guest image *comes from*, not just what it
@@ -412,8 +513,14 @@ everything that has changed a backend.
 Builds are asynchronous — a `docker build` takes minutes, so `POST` returns `202`
 with a record and the outcome is polled from `GET /jobs/:id`. One job runs per
 deployment at a time; a second request while one is in flight is a `409`. Job
-records live in memory and the most recent 50 are kept, so they do not survive a
-restart — the durable outcome of a build is the `image` in the persisted spec.
+records live in memory, so they do not survive a restart — the durable outcome of
+a build is the `image` in the persisted spec.
+
+Retention is **per deployment**: the 20 most recent jobs each, under a 2000-job
+ceiling for the whole LB. Per-deployment rather than one global cap, because a
+global cap is a race and not a policy — one deployment pulling images in a loop
+would evict everybody else's history, and the job you came to investigate is the
+one already gone.
 
 **Where it runs.** On the app-lb host, because heyvm has no build API: turning a
 Dockerfile into an ext4 rootfs needs a local `docker`, `mke2fs` (e2fsprogs) and
@@ -729,6 +836,31 @@ back to HTTP/2's `:authority` when there is no `Host` header. A request that
 matches no rule anywhere is a **404**. Every route must set at least one field —
 an empty rule `{}` is rejected at registration.
 
+### Deployments with no routes
+
+`"routes": []` is legal for a **managed** deployment and means exactly what it
+says: nothing reaches it through the proxy. It is still registered, still
+autoscaled, and still reachable by id through the admin API.
+
+That is the normal shape for an agent sandbox. A sandbox is worked on by
+`serverctl exec` and `serverctl shell`, not by HTTP, and putting it on a
+hostname it doesn't need means putting it on the internet. Exposure becomes an
+explicit, reversible step:
+
+```sh
+serverctl create deployment sb-7f3a9c --no-route --port 8080 --size medium
+serverctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com   # expose
+serverctl set routes sb-7f3a9c --none                            # withdraw again
+```
+
+Withdrawing a route does not disturb the VM — the deployment keeps running and
+keeps its shell sessions; it simply stops matching requests.
+
+A **static** (`proxy_pass`) deployment may not do this. The proxy is the only way
+in, so an unrouted one would be unreachable by anything, and it is rejected at
+registration. A sign-in gate on an unrouted deployment is rejected too: `auth`
+runs on a proxied request, and there are none.
+
 ## Dashboard
 
 Open `http://<admin-addr>/dashboard` (default `http://127.0.0.1:9090/dashboard`)
@@ -740,6 +872,29 @@ to the admin port.
 
 `GET /metrics` returns the same data as JSON (host usage, a global rollup, and a
 per-deployment breakdown), suitable for scraping into your own tooling.
+
+The per-deployment breakdown can be scoped, which matters once the fleet is
+large — the unfiltered response carries a row per VM and a full set of histograms
+per deployment, and the dashboard polls it every two seconds:
+
+| Parameter | Effect |
+| --- | --- |
+| `deployment=<id>` | Just this one |
+| `prefix=<s>` | Only ids starting with `s` |
+| `summary=true` | Drop the per-VM rows; keep pool counts and metrics |
+| `limit=`, `offset=` | Page |
+
+`host`, `fleet` and `global` always describe the **whole** LB regardless of these
+— a filter narrows the table, not the system. `matched` reports how many
+deployments passed the filter before paging, so a client can page without
+guessing. The dashboard's deployment table has a matching filter box and pager,
+which appear only when there is more than one page.
+
+`tracked_deployments` is a self-check: it counts deployments holding their own
+counters, and should track the number registered. A figure that climbs past it
+means metrics for deregistered deployments are not being released. (Their totals
+are not lost when they are — a deregistered deployment's counters fold into
+`global`, so traffic that happened keeps counting.)
 
 Every object type the [CLI](#cli) addresses has a section on the page, so the
 dashboard is a complete view of what app-lb holds rather than a metrics screen:
@@ -806,6 +961,51 @@ startup error, never a silently-open gate. `/healthz` is always open so probes
 keep working. The credentials are compared in constant time, but the admin
 listener is plain HTTP — terminate TLS in front of it, or reach it over an SSH
 tunnel, if it leaves localhost.
+
+### Putting the dashboard behind Google
+
+Tempting, and it works for the *page* — but only if you also say which paths the
+machines may take, because [a gate admits browsers and nothing
+else](#limits).
+
+The recipe is a static deployment fronting the admin listener
+([`examples/app-lb-admin.json`](examples/app-lb-admin.json)) carrying an `auth`
+block. Measured against exactly that, through the gated hostname:
+
+```
+                                          browser      fetch()/curl/serverctl
+GET /dashboard   (Accept: text/html)       302 → Google
+GET /metrics     (accept: application/json)                          401
+GET /deployments (no Accept)                                         401
+```
+
+So a gate alone gives you a dashboard that loads, signs you in, and then shows
+nothing — its `/metrics` poll is refused — while `serverctl` is locked out
+entirely, since it cannot complete an OAuth flow and the `login_url` in the 401
+body means nothing to it.
+
+Both are fixed the same way: let the machine paths past the gate, and put a
+credential the machine *can* present behind them.
+
+```jsonc
+// on the deployment fronting the admin listener
+"public_paths": ["/healthz", "/metrics", "/deployments", "/secrets", "/jobs", "/certs"]
+```
+
+```sh
+# and on app-lb itself, so those paths are not simply open
+APP_LB_DASHBOARD_PASSWORD=s3cret APP_LB_ADMIN_AUTH=1
+```
+
+`/` and `/dashboard` stay behind Google; everything a machine calls passes the
+gate and meets Basic auth instead. **Set `APP_LB_ADMIN_AUTH=1` first and restart,
+then add `public_paths`** — the other order leaves a window where a full CRUD
+API, `/secrets` included, is on the internet with nothing in front of it.
+
+If you would rather not make that trade, don't: leave the hostname
+browser-only and reach the API over an SSH tunnel
+(`ssh -L 9090:127.0.0.1:9090 host`), which is what
+[`serverctl`](serverctl/README.md#connecting) expects.
 
 Two data sources feed it:
 
@@ -877,11 +1077,11 @@ Four things to know before enabling it:
   at startup if ACME is on and the proxy is bound elsewhere. Binding 80 and 443
   as the non-root `app-lb` user needs the bind capability:
   `setcap 'cap_net_bind_service=+ep' /usr/local/bin/app-lb`.
-- **Only exact `host` routes are covered.** A `host_suffix` rule matches a whole
-  subtree and would need a wildcard certificate, which Let's Encrypt issues only
-  over DNS-01 — a different challenge requiring DNS provider credentials, which
-  app-lb does not implement. Those deployments are served the static fallback
-  certificate, and the gap is logged once per suffix at startup.
+- **Exact `host` routes are covered per host; subtrees need a wildcard.** A
+  `host_suffix` rule matches a whole subtree, and a certificate for a subtree is
+  a wildcard — see [Wildcard certificates](#wildcard-certificates-for-a-fleet)
+  below. A suffix no configured wildcard covers is served the static fallback
+  certificate, and the gap is logged once per suffix.
 - **Test against staging first.** Set
   `APP_LB_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory`.
   Production rate limits are per-account per-week; a misconfigured hostname in a
@@ -909,6 +1109,64 @@ The `APP_LB_ACME_DIR` holds private keys and the account key; it should be mode
 `0700` and owned by the user app-lb runs as. app-lb writes the files it creates
 `0600`.
 
+#### Wildcard certificates for a fleet
+
+Per-host issuance stops working at scale, and not gradually: **Let's Encrypt
+allows 50 new certificates per registered domain per week.** A fleet of agent
+sandboxes on `<id>.sb.example.com` exhausts that on the first afternoon and then
+locks out every other hostname on the account for the rest of the week.
+
+One wildcard covers all of them:
+
+```sh
+APP_LB_ACME_EMAIL=ops@example.com \
+APP_LB_ACME_WILDCARD=sb.example.com \
+APP_LB_ROUTE53_ZONE_ID=Z0123456789ABCDEFGHIJ \
+./target/release/app-lb
+```
+
+That issues **one** certificate covering `sb.example.com` and
+`*.sb.example.com`, and it is renewed like any other. Exposing a sandbox is then
+free of certificate work entirely — add the route and it is already covered:
+
+```sh
+serverctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com
+```
+
+Pair it with a single wildcard `A` record (`*.sb.example.com → <lb-ip>`) and
+exposing a sandbox needs **no DNS write either** — no per-sandbox Route 53 call,
+which also keeps you clear of that zone's RRset limit and the 5-requests-per-
+second change quota.
+
+What to know:
+
+- **Hosts under a configured wildcard are skipped by the per-host issuer.** That
+  suppression is the point; without it the fleet queues an order per sandbox.
+- **A wildcard covers exactly one label.** `*.sb.example.com` serves
+  `a.sb.example.com` but not `a.b.sb.example.com`. Keep sandbox hostnames to a
+  single label under the domain — a deeper one falls through to per-host
+  issuance, which works but does not scale.
+- **DNS-01 needs the `aws` CLI on the app-lb host** (`APP_LB_AWS_BIN`), the same
+  way image builds need `heyvm` and pulls need `art`. It brings its own
+  credentials — profile, instance role, `AWS_*` — which is the part worth not
+  reimplementing. The IAM policy needs `route53:ChangeResourceRecordSets` and
+  `route53:TestDNSAnswer` on the zone.
+- **app-lb waits for the record to be answerable before telling the CA to look.**
+  Route 53 reporting `INSYNC` is not the same as its nameservers answering, and
+  the CA gets one attempt: a failed validation backs off *every* hostname on the
+  account for hours. app-lb polls `test-dns-answer` — which asks the zone's own
+  nameservers, exactly who the CA will ask — for up to 3 minutes, and refuses to
+  proceed rather than spend an attempt on a record that is not there yet.
+- **Serving is driven by the certificate, not the configuration.** A subdomain
+  with no certificate of its own is served its parent's *only if that
+  certificate actually carries a `*.` SAN*. A plain certificate for a parent
+  domain is never served for a subdomain, which would be a name mismatch at the
+  client.
+- **Both names come from one order.** `sb.example.com` and `*.sb.example.com`
+  are authorized at the same record, `_acme-challenge.sb.example.com`, so both
+  digests are published as two values of one TXT RRset. Publishing them
+  separately would have the second overwrite the first.
+
 This HTTPS listener terminates TLS for **proxied deployment traffic** only. The
 admin API and dashboard bind a *separate* plaintext listener (`APP_LB_ADMIN_ADDR`)
 with no TLS of its own — to serve the dashboard over HTTPS at a DNS name, either
@@ -931,7 +1189,53 @@ waiting on a cold start.
 Scale-to-zero applies only when both `min_replicas` and `warm_pool` are 0. A request arriving
 at an empty pool is held (up to `cold_start_timeout_secs`) while a VM boots, rather than
 failing — in practice a Firecracker VM is serving in ~1–2s. Scaling down marks a VM draining
-so it finishes in-flight work, then kills it once idle or at `drain_timeout_secs`.
+so it finishes in-flight work, then retires it once idle or at `drain_timeout_secs`.
+
+#### `idle_action` — destroy or retain
+
+What "retire" means is a per-deployment choice, because a *sandbox* is not a
+replica. Retiring one of four interchangeable web VMs should reclaim everything
+it held. Retiring the single VM that is somebody's working directory should not.
+
+| | `destroy` (default) | `retain` |
+| --- | --- | --- |
+| The VM is | killed | stopped |
+| Sandbox record | gone | kept |
+| `/workspace` data disk | **gone** | **kept** |
+| Rootfs writes | gone | gone |
+| Memory | gone | gone |
+| Next scale-up | boots a fresh VM | resumes this one |
+
+**Read the rootfs row again.** `retain` does not preserve the root filesystem,
+and cannot: mvm-ctrl gives each VM a private rootfs copy under `/tmp` and
+**recopies it from the base image on every cold boot**. The only thing that
+survives a stop is the persistent data disk at `~/.heyo/run/<id>/data.ext4`,
+attached as `/dev/vdb` and mounted at `/workspace` — and that disk only exists
+if `vm.disk_size_gb` is set.
+
+So a `retain` deployment is only meaningfully stateful when both hold:
+
+```jsonc
+"vm":      { "disk_size_gb": 20 },      // there is a /workspace to keep
+"scaling": { "idle_action": "retain" }  // and it isn't thrown away when idle
+```
+
+with the sandbox's real state living under `/workspace`. Setting `retain` without
+a data disk is allowed — it still saves a boot — but app-lb logs a warning at
+registration saying it keeps nothing, because that combination is almost always
+a mistake rather than a choice.
+
+**Suspended VMs are tracked by app-lb, because nothing else can.** mvm-ctrl drops
+a stopped sandbox from `GET /sandboxes`, so it is invisible to the fleet list the
+autoscaler reconciles against, and its TTL does not run while it is stopped. Its
+id is therefore written into the deployment's state file the moment it is
+stopped. Deregistering a deployment destroys its suspended VMs, and a slow sweep
+(every 5 minutes) destroys any stopped VM of ours that no deployment claims —
+the residue of a crash between stopping a VM and recording that we did.
+
+A scale-up prefers resuming a suspended VM over creating one, and not only to
+save time: creating a fresh VM while one sits stopped would strand that VM's
+`/workspace` and hand the caller an empty sandbox in its place.
 
 #### When a boot never finishes
 
@@ -972,6 +1276,77 @@ while a create is still in flight. The autoscaler therefore re-checks, after eve
 promotion, that the deployment it is working on is still the registry's — and kills any VM the
 replacement did not inherit, rather than leaving it running until its TTL. A pool-preserving
 edit (one that doesn't change the `vm` block) carries its VMs over and keeps them.
+
+## Fleets of sandboxes
+
+app-lb's usual shape is a few dozen deployments, each a pool of interchangeable
+VMs behind a hostname. A fleet of **agent sandboxes** inverts nearly all of that:
+thousands of deployments, one VM each, mostly unrouted, stateful, and created and
+destroyed all day. The pieces that make it work are documented in their own
+sections; this is the shape they add up to, and why each is there.
+
+One deployment per sandbox — see [`examples/sandbox.json`](examples/sandbox.json):
+
+```jsonc
+{
+  "id": "sb-7f3a9c",
+  "routes": [],                                  // no ingress; exec/shell only
+  "vm": { "driver": "firecracker", "port": 8080,
+          "disk_size_gb": 20,                    // /workspace, the part that survives
+          "working_directory": "/workspace" },
+  "scaling": { "min_replicas": 0, "max_replicas": 1, "target_concurrency": 1,
+               "scale_to_zero_after_secs": 900,
+               "idle_action": "retain" }         // stop when idle, don't destroy
+}
+```
+
+```sh
+serverctl create deployment sb-7f3a9c --no-route --port 8080 --disk-gb 20 \
+  --idle-action retain --max 1 --target-concurrency 1
+serverctl exec sb-7f3a9c -- ls /workspace
+serverctl shell sb-7f3a9c
+
+serverctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com   # expose it
+serverctl set routes sb-7f3a9c --none                             # take it back
+```
+
+| Need | What does it | Why not the obvious thing |
+| --- | --- | --- |
+| No public URL | [`"routes": []`](#deployments-with-no-routes) | A sandbox that serves nobody should not be on a hostname |
+| Get inside it | [`exec` / `shell`](#running-things-inside-a-vm) | Proxied, so the gate applies and a sleeping sandbox wakes |
+| Survive going idle | [`idle_action: retain`](#idle_action--destroy-or-retain) | Default `destroy` kills the disk, which *is* the sandbox |
+| Keep state | `disk_size_gb` + `/workspace` | The rootfs is recopied from the image every boot |
+| Expose one, sometimes | `set routes --host …` | Reversible, and disturbs neither the VM nor open shells |
+| Certificates for all of them | [one wildcard](#wildcard-certificates-for-a-fleet) | Per-host issuance hits Let's Encrypt's 50/domain/week cap |
+| DNS for all of them | one wildcard `A` record | Zero Route 53 calls per expose; no RRset or rate-limit ceiling |
+
+### What scaling to thousands actually required
+
+Four things in app-lb were fine for dozens and quadratic, unbounded, or simply
+wrong for thousands. They are fixed, and worth knowing about because each has an
+observable consequence:
+
+- **State is one file per deployment**
+  ([`app-lb-state.d/`](#where-state-lives)). Registering the thousandth sandbox
+  used to rewrite the other 999 with it.
+- **Routing is indexed by exact host**, not scanned. Thousands of hostnames no
+  longer cost a linear scan per request.
+- **The reconcile loop runs concurrently** and skips deployments at rest without
+  touching the daemon, so one slow VM cannot stall the fleet's tick.
+- **`/metrics` is scopeable** (`?prefix=`, `?limit=`, `?summary=`) and the
+  dashboard pages, because the unfiltered response is megabytes at this size.
+  Per-deployment counters are released when a deployment is deregistered, so the
+  metrics map no longer grows by one entry per sandbox ever created —
+  `tracked_deployments` in the response is the check on that.
+
+### One host, and what that bounds
+
+A single app-lb is a single heyvm host: `guest_ip` is only populated for a local
+daemon, so every VM it routes to is on this machine's tap network. Thousands of
+*deployments* is a registry question and works; thousands of *simultaneously
+running* VMs is a host-RAM question and does not. `idle_action: retain` with
+`scale_to_zero_after_secs` is what reconciles the two — a fleet of thousands with
+tens awake, each waking in a resume rather than a cold boot.
 
 ## Shipping logs to app-obs
 

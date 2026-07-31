@@ -52,10 +52,20 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// How many jobs are remembered. Records are in memory only: a job is a
-/// transient event, and the durable outcome of a successful one is either the
-/// `image` in the persisted spec or the state of the host itself.
-const HISTORY_LIMIT: usize = 50;
+/// How many jobs are remembered **per deployment**. Records are in memory only:
+/// a job is a transient event, and the durable outcome of a successful one is
+/// either the `image` in the persisted spec or the state of the host itself.
+///
+/// Per-deployment rather than global, because a global cap is not a retention
+/// policy at fleet scale — it is a race. One deployment pulling images in a loop
+/// would evict every other deployment's history, so the one job you came to
+/// investigate is the one already gone.
+const HISTORY_PER_DEPLOYMENT: usize = 20;
+
+/// Ceiling across all deployments, so the fleet as a whole cannot pin unbounded
+/// memory in job records. Reached only when thousands of deployments each have
+/// recent jobs; the per-deployment cap does the real work.
+const HISTORY_LIMIT: usize = 2_000;
 /// Log lines kept per record. Enough to hold a compiler error or a failing
 /// `RUN` step, not enough for a full `docker build` transcript.
 const LOG_LIMIT: usize = 400;
@@ -356,6 +366,7 @@ impl Jobs {
     }
 
     /// Jobs newest-first, optionally for one deployment.
+    /// Return the newest record first.
     pub fn records(&self, deployment: Option<&str>) -> Vec<JobRecord> {
         self.history
             .lock()
@@ -536,9 +547,7 @@ impl Jobs {
         {
             let mut history = self.history.lock().expect("job history mutex poisoned");
             history.push_back(record.clone());
-            while history.len() > HISTORY_LIMIT {
-                history.pop_front();
-            }
+            trim_history(&mut history, deployment_id);
         }
 
         let jobs = self.clone();
@@ -789,7 +798,7 @@ impl Jobs {
 
         let deployment = self.registry.upsert(spec);
         self.autoscaler.teardown(&old).await;
-        if let Err(e) = self.registry.persist() {
+        if let Err(e) = self.registry.persist_one(&deployment.spec.id) {
             tracing::error!(error = %e, "failed to persist state after a build");
         }
         deployment.scale_signal.notify_one();
@@ -1184,6 +1193,30 @@ async fn probe_peer(peer: &str, check: &crate::config::HealthCheck) -> bool {
 
 /// Who app-lb is running as, for the "that directory isn't there" message —
 /// which is very often a permissions or wrong-user problem, not a typo.
+/// Enforce the retention caps after pushing a record for `deployment`.
+///
+/// Two passes, in this order and not the other: the deployment that just gained
+/// a record is trimmed to [`HISTORY_PER_DEPLOYMENT`] first, so a busy deployment
+/// evicts *its own* oldest job rather than somebody else's. Only then does the
+/// global [`HISTORY_LIMIT`] apply, and by construction it almost never bites.
+///
+/// Oldest-first order is preserved, so `records` still reads newest-first.
+fn trim_history(history: &mut VecDeque<JobRecord>, deployment: &str) {
+    let mut mine = history.iter().filter(|r| r.deployment == deployment).count();
+    if mine > HISTORY_PER_DEPLOYMENT {
+        history.retain(|r| {
+            if r.deployment != deployment || mine <= HISTORY_PER_DEPLOYMENT {
+                return true;
+            }
+            mine -= 1;
+            false
+        });
+    }
+    while history.len() > HISTORY_LIMIT {
+        history.pop_front();
+    }
+}
+
 fn whoami() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
@@ -1379,6 +1412,69 @@ fn new_job_id() -> String {
     }
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     format!("job-{hex}")
+}
+
+#[cfg(test)]
+mod retention {
+    use super::*;
+
+    fn push(history: &mut VecDeque<JobRecord>, deployment: &str, n: usize) {
+        for i in 0..n {
+            history.push_back(JobRecord::new(
+                format!("{deployment}-{i}"),
+                deployment.to_string(),
+                JobKind::ImageBuild,
+            ));
+            trim_history(history, deployment);
+        }
+    }
+
+    fn ids_for(history: &VecDeque<JobRecord>, deployment: &str) -> Vec<String> {
+        history
+            .iter()
+            .filter(|r| r.deployment == deployment)
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_deployment_keeps_its_most_recent_jobs_and_no_more() {
+        let mut history = VecDeque::new();
+        push(&mut history, "a", HISTORY_PER_DEPLOYMENT + 5);
+
+        let ids = ids_for(&history, "a");
+        assert_eq!(ids.len(), HISTORY_PER_DEPLOYMENT);
+        assert_eq!(ids.last().unwrap(), &format!("a-{}", HISTORY_PER_DEPLOYMENT + 4));
+        assert_eq!(ids.first().unwrap(), &"a-5".to_string(), "the oldest go first");
+    }
+
+    /// The reason the cap is per-deployment. Under a global cap, one deployment
+    /// churning jobs would evict every other deployment's history — so the job
+    /// you came to investigate is the one already gone.
+    #[test]
+    fn a_busy_deployment_evicts_only_its_own_history() {
+        let mut history = VecDeque::new();
+        push(&mut history, "quiet", 1);
+        push(&mut history, "busy", HISTORY_PER_DEPLOYMENT * 3);
+
+        assert_eq!(ids_for(&history, "quiet"), vec!["quiet-0"]);
+        assert_eq!(ids_for(&history, "busy").len(), HISTORY_PER_DEPLOYMENT);
+    }
+
+    /// The fleet-wide ceiling still applies once enough deployments each hold
+    /// recent jobs, and it evicts oldest-first across the whole history.
+    #[test]
+    fn the_global_ceiling_bounds_the_whole_fleet() {
+        let mut history = VecDeque::new();
+        // One job each from more deployments than the ceiling allows.
+        for i in 0..HISTORY_LIMIT + 10 {
+            let id = format!("d{i}");
+            history.push_back(JobRecord::new(format!("{id}-0"), id.clone(), JobKind::ImageBuild));
+            trim_history(&mut history, &id);
+        }
+        assert_eq!(history.len(), HISTORY_LIMIT);
+        assert_eq!(history.front().unwrap().deployment, "d10", "oldest evicted");
+    }
 }
 
 #[cfg(test)]

@@ -40,6 +40,16 @@ pub struct CreateDeploymentArgs {
     /// `/api`. Repeatable.
     #[arg(long = "route", value_name = "RULE", help_heading = "Routing")]
     pub routes: Vec<String>,
+    /// Create with no ingress at all. The deployment takes no HTTP traffic and
+    /// is reached only by `serverctl exec` and `serverctl shell` — the usual
+    /// shape for an agent sandbox. Managed (VM) deployments only; add a route
+    /// later with `serverctl set routes` to expose it.
+    #[arg(
+        long,
+        conflicts_with_all = ["host", "host_suffix", "path_prefix", "routes"],
+        help_heading = "Routing"
+    )]
+    pub no_route: bool,
 
     // Managed VM pool.
     /// Guest image for the VM pool (defaults to ubuntu:24.04 daemon-side).
@@ -58,6 +68,9 @@ pub struct CreateDeploymentArgs {
     /// Size class: micro, mini, small, medium, large, xlarge.
     #[arg(long, value_name = "CLASS", help_heading = "VM pool")]
     pub size: Option<String>,
+    /// Size of the guest's persistent data disk, mounted at /workspace. This is
+    /// the *only* storage that survives a stop — the root filesystem is recopied
+    /// from the image on every boot — so a sandbox that keeps state needs it.
     #[arg(long, value_name = "GB", help_heading = "VM pool")]
     pub disk_gb: Option<u32>,
     #[arg(long, value_name = "DIR", help_heading = "VM pool")]
@@ -153,11 +166,23 @@ pub struct ScalingFlags {
     /// gives up on it and replaces it. 0 waits indefinitely.
     #[arg(long, value_name = "SECS", help_heading = "Scaling")]
     pub boot_timeout: Option<u64>,
+    /// What becomes of a VM the autoscaler retires. `destroy` (the default)
+    /// frees the sandbox and its disks. `retain` stops it instead, keeping its
+    /// /workspace data disk, and a later request or `exec` resumes that VM
+    /// rather than booting a fresh one — the setting for an agent sandbox,
+    /// whose working directory is the point.
+    #[arg(
+        long,
+        value_name = "ACTION",
+        value_parser = ["destroy", "retain"],
+        help_heading = "Scaling"
+    )]
+    pub idle_action: Option<String>,
 }
 
 impl ScalingFlags {
     fn patch(&self) -> Map<String, Value> {
-        spec::scaling_patch(&[
+        let mut patch = spec::scaling_patch(&[
             ("min_replicas", self.min),
             ("max_replicas", self.max),
             ("warm_pool", self.warm),
@@ -166,7 +191,11 @@ impl ScalingFlags {
             ("cold_start_timeout_secs", self.cold_start_timeout),
             ("drain_timeout_secs", self.drain_timeout),
             ("boot_timeout_secs", self.boot_timeout),
-        ])
+        ]);
+        if let Some(action) = &self.idle_action {
+            patch.insert("idle_action".into(), Value::String(action.clone()));
+        }
+        patch
     }
 }
 
@@ -201,10 +230,18 @@ fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
     for r in &args.routes {
         routes.push(spec::parse_route(r)?);
     }
-    if routes.is_empty() {
+    if routes.is_empty() && !args.no_route {
         bail!(
             "a deployment needs at least one route — pass --host, --host-suffix, \
-             --path-prefix or --route"
+             --path-prefix or --route, or --no-route for a sandbox reached only \
+             by exec/shell"
+        );
+    }
+    if args.no_route && !args.upstreams.is_empty() {
+        bail!(
+            "--no-route leaves nothing able to reach this deployment: a static \
+             (proxy_pass) deployment has no exec/shell door, so the proxy is its \
+             only way in"
         );
     }
 
@@ -1571,6 +1608,12 @@ pub struct SetRouteArgs {
     /// Keep the existing rules and add these, instead of replacing them.
     #[arg(long)]
     pub add: bool,
+    /// Remove every route, withdrawing the deployment from the proxy. The
+    /// counterpart to `create --no-route`: an exposed sandbox goes back to
+    /// being reachable only by exec/shell, without being torn down. Managed
+    /// (VM) deployments only.
+    #[arg(long, conflicts_with_all = ["host", "host_suffix", "path_prefix", "routes", "add"])]
+    pub none: bool,
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -1626,11 +1669,21 @@ pub fn set_route(ctx: &Ctx, args: &SetRouteArgs) -> Result<()> {
     for r in &args.routes {
         rules.push(spec::parse_route(r)?);
     }
-    if rules.is_empty() {
-        bail!("nothing to set — pass --host, --host-suffix, --path-prefix or --route");
+    if rules.is_empty() && !args.none {
+        bail!(
+            "nothing to set — pass --host, --host-suffix, --path-prefix or --route, \
+             or --none to withdraw the deployment from the proxy"
+        );
     }
 
-    edit_spec(ctx, &id, args.dry_run, "routes updated", |spec| {
+    let message = if args.none { "routes cleared" } else { "routes updated" };
+    edit_spec(ctx, &id, args.dry_run, message, |spec| {
+        if args.none && spec::is_static(spec) {
+            bail!(
+                "deployment {id:?} is a static (proxy_pass) one, and the proxy is the \
+                 only way to reach it — clearing its routes would leave it unreachable"
+            );
+        }
         let existing = spec
             .get("routes")
             .and_then(Value::as_array)
@@ -1691,7 +1744,8 @@ pub fn scale(ctx: &Ctx, args: &ScaleArgs) -> Result<()> {
     if patch.is_empty() {
         bail!(
             "nothing to change — pass --replicas, or one of --min/--max/--warm/\
-             --target-concurrency/--scale-to-zero-after/--cold-start-timeout/--drain-timeout"
+             --target-concurrency/--scale-to-zero-after/--cold-start-timeout/--drain-timeout/\
+             --boot-timeout/--idle-action"
         );
     }
 

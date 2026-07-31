@@ -19,7 +19,7 @@
 use arc_swap::ArcSwap;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -390,6 +390,15 @@ pub struct HostUsageSnapshot {
 #[derive(Debug)]
 pub struct Metrics {
     per_deployment: ArcSwap<HashMap<String, Arc<DeploymentMetrics>>>,
+    /// Counters folded in from deployments that have been deregistered.
+    ///
+    /// The global rollup has always included history from deployments that are
+    /// gone, and it should: traffic that happened, happened. Keeping their whole
+    /// `DeploymentMetrics` alive to achieve that was fine for a few dozen
+    /// long-lived services and a leak for a fleet of sandboxes, where ids churn
+    /// constantly and every one ever seen was retained. Retiring folds the
+    /// numbers in here and drops the entry.
+    retired: Mutex<DeploymentMetricsSnapshot>,
     host: HostGauge,
 }
 
@@ -403,6 +412,7 @@ impl Metrics {
     pub fn new() -> Self {
         Self {
             per_deployment: ArcSwap::from_pointee(HashMap::new()),
+            retired: Mutex::new(DeploymentMetricsSnapshot::empty()),
             host: HostGauge::default(),
         }
     }
@@ -463,6 +473,28 @@ impl Metrics {
             next
         });
         installed
+    }
+
+    /// Fold a deregistered deployment's counters into the retired total and
+    /// drop its entry.
+    ///
+    /// Called when a deployment goes away. Without it the map grows for the life
+    /// of the process — one entry per id ever seen — which is invisible for a
+    /// few dozen services and unbounded for a sandbox fleet whose ids are
+    /// created and destroyed all day. The numbers are not lost: they move to
+    /// `retired`, so the global rollup still counts traffic that happened.
+    pub fn retire(&self, id: &str) {
+        let mut removed = None;
+        self.per_deployment.rcu(|current| {
+            let mut next = (**current).clone();
+            removed = next.remove(id);
+            next
+        });
+        if let Some(m) = removed
+            && let Ok(mut retired) = self.retired.lock()
+        {
+            retired.merge(&m.snapshot());
+        }
     }
 
     // --- Recording (hot paths) -------------------------------------------
@@ -541,20 +573,64 @@ impl Metrics {
             .unwrap_or_else(DeploymentMetricsSnapshot::empty)
     }
 
-    /// Global rollup: every deployment's snapshot merged. Exact, because the
-    /// underlying buckets and counters are additive.
+    /// Global rollup: every live deployment's snapshot merged, plus the totals
+    /// carried over from deregistered ones. Exact, because the underlying
+    /// buckets and counters are additive.
     pub fn global_snapshot(&self) -> DeploymentMetricsSnapshot {
-        let mut global = DeploymentMetricsSnapshot::empty();
+        let mut global = match self.retired.lock() {
+            Ok(retired) => retired.clone(),
+            Err(_) => DeploymentMetricsSnapshot::empty(),
+        };
         for m in self.per_deployment.load().values() {
             global.merge(&m.snapshot());
         }
         global
+    }
+
+    /// How many deployments currently hold their own counters. The number that
+    /// used to grow without bound.
+    pub fn tracked_deployments(&self) -> usize {
+        self.per_deployment.load().len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Retiring a deployment must free its entry — the map used to grow by one
+    /// per id ever seen, which a sandbox fleet turns into an unbounded leak —
+    /// without losing the traffic it served from the global rollup.
+    #[test]
+    fn retiring_a_deployment_frees_its_entry_but_keeps_its_totals() {
+        let m = Metrics::new();
+        m.record_request("gone", Some(200), Duration::from_millis(7));
+        m.record_request("stays", Some(500), Duration::from_millis(3));
+        assert_eq!(m.tracked_deployments(), 2);
+
+        m.retire("gone");
+
+        assert_eq!(m.tracked_deployments(), 1, "the entry is dropped");
+        assert_eq!(
+            m.deployment_snapshot("gone").requests.total,
+            0,
+            "and it no longer reports as a live deployment",
+        );
+        let global = m.global_snapshot();
+        assert_eq!(global.requests.total, 2, "but its requests still count");
+        assert_eq!(global.requests.c2xx, 1);
+        assert_eq!(global.latency_ms.count, 2);
+    }
+
+    /// Retiring the same id twice must not double-count it into the rollup.
+    #[test]
+    fn retiring_twice_counts_once() {
+        let m = Metrics::new();
+        m.record_request("gone", Some(200), Duration::from_millis(1));
+        m.retire("gone");
+        m.retire("gone");
+        assert_eq!(m.global_snapshot().requests.total, 1);
+    }
 
     #[test]
     fn histogram_buckets_and_overflow() {

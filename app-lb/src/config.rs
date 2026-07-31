@@ -111,6 +111,27 @@ pub struct LbConfig {
     pub images_dir: Option<String>,
     #[serde(default = "default_git_bin")]
     pub git_bin: String,
+    /// The `aws` CLI, used for the DNS-01 challenge. Only reached when
+    /// `acme_wildcards` is non-empty.
+    #[serde(default = "default_aws_bin")]
+    pub aws_bin: String,
+    /// Domains to certify with a **wildcard** certificate, e.g.
+    /// `sb.example.com` → a cert covering `sb.example.com` and
+    /// `*.sb.example.com`.
+    ///
+    /// This is what makes a fleet of sandboxes possible. Let's Encrypt caps new
+    /// certificates at 50 per registered domain per week, so issuing per
+    /// hostname stops working on the first afternoon; one wildcard covers every
+    /// hostname under it forever. Any exact `host` route covered by one of these
+    /// is skipped by the per-host issuer for the same reason.
+    ///
+    /// Needs `route53_zone_id`: wildcards are only issued over DNS-01.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acme_wildcards: Vec<String>,
+    /// The Route 53 hosted zone holding `acme_wildcards`, where the DNS-01
+    /// challenge records are written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route53_zone_id: Option<String>,
     /// Shell that a static deployment's `update.commands` run through. They are
     /// written as shell lines (`git pull && cargo build --release`), so there is
     /// one; pointing this at `bash` buys bashisms.
@@ -144,6 +165,9 @@ fn default_art_bin() -> String {
 }
 fn default_git_bin() -> String {
     "git".into()
+}
+fn default_aws_bin() -> String {
+    "aws".into()
 }
 fn default_update_shell() -> String {
     "/bin/sh".into()
@@ -182,6 +206,9 @@ impl Default for LbConfig {
             art_bin: default_art_bin(),
             images_dir: None,
             git_bin: default_git_bin(),
+            aws_bin: default_aws_bin(),
+            acme_wildcards: Vec::new(),
+            route53_zone_id: None,
             update_shell: default_update_shell(),
             build_timeout_secs: default_build_timeout_secs(),
             heyvm_home: None,
@@ -313,6 +340,30 @@ fn default_boot_timeout_secs() -> u64 {
     300
 }
 
+/// What becomes of a VM the autoscaler no longer needs.
+///
+/// The distinction only exists because a *sandbox* is not a replica. Retiring
+/// one of four interchangeable web VMs should reclaim everything it held;
+/// retiring the single VM that is somebody's working directory should not.
+///
+/// Note what `Retain` can and cannot keep, because the daemon decides this and
+/// not app-lb: a stopped sandbox keeps its record and its **`/workspace` data
+/// disk** (`vm.disk_size_gb`), and loses its memory and any writes to the
+/// rootfs — mvm-ctrl recopies the rootfs from the base image on every cold boot.
+/// A `Retain` deployment with no data disk therefore saves boot time and nothing
+/// else. Persistent state has to live under `/workspace`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdleAction {
+    /// Kill it: the sandbox, its data disk and its rootfs all go. The default,
+    /// and right for a pool of interchangeable replicas.
+    #[default]
+    Destroy,
+    /// Stop it: the sandbox stays, keeping its data disk, and a later request or
+    /// `exec` resumes it instead of booting a fresh one.
+    Retain,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScalingPolicy {
     #[serde(default)]
@@ -345,6 +396,10 @@ pub struct ScalingPolicy {
     /// genuinely open-ended.
     #[serde(default = "default_boot_timeout_secs")]
     pub boot_timeout_secs: u64,
+    /// Whether a VM the autoscaler retires is destroyed or merely stopped. See
+    /// [`IdleAction`]; defaults to `destroy`, which is the historical behaviour.
+    #[serde(default)]
+    pub idle_action: IdleAction,
 }
 
 impl Default for ScalingPolicy {
@@ -358,6 +413,7 @@ impl Default for ScalingPolicy {
             cold_start_timeout_secs: default_cold_start_timeout_secs(),
             drain_timeout_secs: default_drain_timeout_secs(),
             boot_timeout_secs: default_boot_timeout_secs(),
+            idle_action: IdleAction::default(),
         }
     }
 }
@@ -1170,8 +1226,13 @@ pub struct DeploymentSpec {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpecError {
     EmptyId,
+    /// A *static* deployment declared no routes. Managed deployments may:
+    /// see [`DeploymentSpec::validate`].
     NoRoutes,
     EmptyRoute,
+    /// A sign-in gate on a deployment with no routes. The gate only ever runs
+    /// on a proxied request, and an unrouted deployment receives none.
+    AuthWithoutRoutes,
     UnsupportedDriver(SandboxDriver),
     BadReplicaRange { min: u32, max: u32 },
     ZeroTargetConcurrency,
@@ -1231,7 +1292,16 @@ impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyId => write!(f, "deployment id must not be empty"),
-            Self::NoRoutes => write!(f, "deployment must declare at least one route"),
+            Self::NoRoutes => write!(
+                f,
+                "a static deployment must declare at least one route; only a managed \
+                 (vm) deployment may have none, and is then reachable only by exec/shell"
+            ),
+            Self::AuthWithoutRoutes => write!(
+                f,
+                "a deployment with no routes takes no HTTP traffic, so there is nothing \
+                 for `auth` to gate"
+            ),
             Self::EmptyRoute => {
                 write!(
                     f,
@@ -1418,11 +1488,26 @@ impl DeploymentSpec {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
         }
-        if self.routes.is_empty() {
-            return Err(SpecError::NoRoutes);
-        }
         if self.routes.iter().any(RouteRule::is_empty) {
             return Err(SpecError::EmptyRoute);
+        }
+        // No routes means no ingress. For a *managed* deployment that is a
+        // legitimate shape — an agent sandbox reached only through `exec` and
+        // `shell`, never over HTTP — and it is the common one at fleet scale,
+        // where exposure is the exception. A *static* deployment has no such
+        // door: its backend is a fixed upstream list and the proxy is the only
+        // way to reach it, so an unrouted one is simply dead weight.
+        if self.routes.is_empty() {
+            if self.vm.is_none() {
+                return Err(SpecError::NoRoutes);
+            }
+            // Nothing arrives over HTTP, so there is no request for a sign-in
+            // gate to intercept and no browser to redirect. Rejected here
+            // because `AuthGate::validate` would otherwise fail this on
+            // callback routability, reporting a path the author never wrote.
+            if self.auth.is_some() {
+                return Err(SpecError::AuthWithoutRoutes);
+            }
         }
 
         // Checked for either backend kind: the gate runs in the proxy, ahead of
@@ -2327,7 +2412,7 @@ mod tests {
 
     #[test]
     fn rejects_degenerate_specs() {
-        let mut s = spec();
+        let mut s = static_spec(&["127.0.0.1:9000"]);
         s.routes.clear();
         assert_eq!(s.validate(), Err(SpecError::NoRoutes));
 
@@ -2350,6 +2435,50 @@ mod tests {
         let mut s = spec();
         s.vm.as_mut().unwrap().port = 0;
         assert_eq!(s.validate(), Err(SpecError::ZeroPort));
+    }
+
+    /// `destroy` is the historical behaviour, so a spec written before
+    /// `idle_action` existed must keep meaning what it meant.
+    #[test]
+    fn idle_action_defaults_to_destroy_and_round_trips() {
+        let s: ScalingPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.idle_action, IdleAction::Destroy);
+
+        let s: ScalingPolicy = serde_json::from_str(r#"{"idle_action":"retain"}"#).unwrap();
+        assert_eq!(s.idle_action, IdleAction::Retain);
+
+        let round = serde_json::to_string(&s).unwrap();
+        assert!(round.contains(r#""idle_action":"retain""#), "got {round}");
+    }
+
+    /// The agent-sandbox shape: a managed VM with no ingress at all, reached
+    /// only through exec/shell. It is the *common* case at fleet scale, so it
+    /// has to validate rather than being a special case someone works around.
+    #[test]
+    fn a_managed_deployment_may_have_no_routes() {
+        let mut s = spec();
+        s.routes.clear();
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    /// The same shape is meaningless for a static deployment: the proxy is the
+    /// only way in, so no route means nothing can ever reach it.
+    #[test]
+    fn a_static_deployment_may_not() {
+        let mut s = static_spec(&["127.0.0.1:9000"]);
+        s.routes.clear();
+        assert_eq!(s.validate(), Err(SpecError::NoRoutes));
+    }
+
+    /// A gate runs on a proxied request. With no routes there are none, and the
+    /// callback-routability check would otherwise reject this while talking
+    /// about a path the author never wrote.
+    #[test]
+    fn a_gate_needs_something_to_gate() {
+        let mut s = spec();
+        s.routes.clear();
+        s.auth = Some(auth_gate());
+        assert_eq!(s.validate(), Err(SpecError::AuthWithoutRoutes));
     }
 
     #[test]

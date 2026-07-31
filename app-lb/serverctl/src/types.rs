@@ -452,6 +452,10 @@ pub struct ScalingPolicy {
     pub cold_start_timeout_secs: u64,
     pub drain_timeout_secs: u64,
     pub boot_timeout_secs: u64,
+    /// `destroy` or `retain` — what becomes of a VM the autoscaler retires.
+    /// A `String` rather than an enum so a value this build has not heard of
+    /// displays as-is instead of failing the whole read.
+    pub idle_action: String,
 }
 
 #[derive(Debug, Default, Deserialize)]

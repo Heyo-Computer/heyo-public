@@ -72,6 +72,23 @@ impl CertifiedKey {
         self.leaf.not_after().to_string()
     }
 
+    /// The domain this certificate wildcards, if it has a `*.<domain>` SAN.
+    ///
+    /// Read from the certificate rather than from configuration, so what gets
+    /// served follows what was actually issued — including a wildcard installed
+    /// by hand through `APP_LB_TLS_CERT`. It is what lets
+    /// [`lookup`](CertStore::lookup) answer a subdomain with its parent's
+    /// certificate *without* ever doing so for a parent that is not a wildcard,
+    /// which would be a name mismatch at the client.
+    pub fn wildcard_of(&self) -> Option<String> {
+        let names = self.leaf.subject_alt_names()?;
+        names
+            .iter()
+            .filter_map(|n| n.dnsname())
+            .find_map(|n| n.strip_prefix("*."))
+            .map(|d| d.to_ascii_lowercase())
+    }
+
     /// Issuer DN, for the admin API — distinguishes a real Let's Encrypt cert
     /// from a self-signed fallback at a glance. Rendered as `C=US, O=…, CN=…`.
     pub fn issuer(&self) -> String {
@@ -152,11 +169,30 @@ impl CertStore {
     }
 
     /// The certificate for `host`, if one has been issued.
+    ///
+    /// On an exact miss, the parent domain is tried once — and its certificate
+    /// is served **only if it really is a wildcard for that parent**. This is
+    /// what makes a fleet of sandboxes possible: thousands of hostnames under
+    /// `sb.example.com` are served by the one `*.sb.example.com` certificate,
+    /// where per-host issuance would exhaust Let's Encrypt's 50-certificates-
+    /// per-domain-per-week limit on the first afternoon.
+    ///
+    /// A wildcard covers exactly one label, so the parent is tried once and not
+    /// walked up the whole domain — matching what the certificate actually
+    /// asserts rather than being generous with somebody else's name.
     pub fn lookup(&self, host: &str) -> Option<Arc<CertifiedKey>> {
         // SNI arrives in whatever case the client sent; routing lowercases
         // hostnames too (see `proxy::request_host`), so match that.
         let host = host.to_ascii_lowercase();
-        self.certs.load().get(&host).cloned()
+        let certs = self.certs.load();
+        if let Some(cert) = certs.get(&host) {
+            return Some(cert.clone());
+        }
+        let parent = host.split_once('.')?.1;
+        certs
+            .get(parent)
+            .filter(|c| c.wildcard_of().as_deref() == Some(parent))
+            .cloned()
     }
 
     /// Hosts whose cert is missing or inside the renewal window.
@@ -395,10 +431,85 @@ mod tests {
         )
     }
 
+    /// A self-signed cert covering `domain` *and* `*.domain`, the shape ACME
+    /// returns for a wildcard order.
+    fn self_signed_wildcard(domain: &str, days: u32) -> (Vec<u8>, Vec<u8>) {
+        use openssl::asn1::Asn1Time;
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::PKey;
+        use openssl::rsa::Rsa;
+        use openssl::x509::extension::SubjectAlternativeName;
+        use openssl::x509::{X509Name, X509};
+
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509Name::builder().unwrap();
+        name.append_entry_by_text("CN", domain).unwrap();
+        let name = name.build();
+
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        builder.set_not_after(&Asn1Time::days_from_now(days).unwrap()).unwrap();
+        let san = SubjectAlternativeName::new()
+            .dns(domain)
+            .dns(&format!("*.{domain}"))
+            .build(&builder.x509v3_context(None, None))
+            .unwrap();
+        builder.append_extension(san).unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+
+        (
+            builder.build().to_pem().unwrap(),
+            key.private_key_to_pem_pkcs8().unwrap(),
+        )
+    }
+
     fn tmpdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("app-lb-tls-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// One wildcard certificate serving thousands of sandbox hostnames is the
+    /// whole reason a fleet is possible; per-host issuance hits Let's Encrypt's
+    /// weekly cap immediately.
+    #[test]
+    fn a_wildcard_cert_serves_any_single_label_beneath_it() {
+        let dir = tmpdir("wildcard-lookup");
+        let store = CertStore::new(&dir, None);
+        let (chain, key) = self_signed_wildcard("sb.example.com", 60);
+        store.insert("sb.example.com", &chain, &key).unwrap();
+
+        assert!(store.lookup("sb.example.com").is_some(), "the apex itself");
+        assert!(store.lookup("sb-7f3a9c.sb.example.com").is_some());
+        assert!(store.lookup("ANYTHING.SB.EXAMPLE.COM").is_some(), "SNI case varies");
+        // A wildcard covers exactly one label.
+        assert!(store.lookup("a.b.sb.example.com").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback must consult what the certificate actually asserts. A plain
+    /// cert for a parent domain must never be served for a subdomain: the
+    /// client would reject it on the name, and the failure would look like a
+    /// broken LB rather than a missing certificate.
+    #[test]
+    fn a_plain_parent_cert_is_never_served_for_a_subdomain() {
+        let dir = tmpdir("no-wildcard-lookup");
+        let store = CertStore::new(&dir, None);
+        let (chain, key) = self_signed("example.com", 60);
+        store.insert("example.com", &chain, &key).unwrap();
+
+        assert!(store.lookup("example.com").is_some());
+        assert!(
+            store.lookup("app.example.com").is_none(),
+            "no `*.` SAN, so it covers nothing below itself",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

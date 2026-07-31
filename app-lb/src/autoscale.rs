@@ -8,12 +8,14 @@
 //! All VM creation happens here and never in a proxy filter, so a slow boot can
 //! never stall request handling.
 
+use crate::config::IdleAction;
 use crate::deployment::{Deployment, PendingVm, VmBackend, now_secs};
 use crate::health;
 use crate::metrics::Metrics;
 use crate::registry::Registry;
 use crate::vm::{self, VmManager};
 use async_trait::async_trait;
+use futures::StreamExt;
 use heyo_sdk::SandboxInfo;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
@@ -29,6 +31,32 @@ const TICK: Duration = Duration::from_secs(2);
 /// every poll of a VM that will be up in ten seconds.
 const BOOT_HEARTBEAT: u64 = 30;
 
+/// How many deployments reconcile at once.
+///
+/// The bound exists because the daemon is one process on one host: a fleet of
+/// thousands of sandboxes would otherwise open thousands of simultaneous
+/// connections to it and to guest health endpoints. High enough that one slow
+/// VM cannot stall the tick, low enough to stay a polite client.
+const RECONCILE_CONCURRENCY: usize = 32;
+
+/// How many VM creates may be in flight across the *whole fleet* at once.
+///
+/// Separate from — and much smaller than — [`RECONCILE_CONCURRENCY`], because a
+/// create is not just a request: it allocates a tap device, copies a rootfs and
+/// starts a hypervisor. Thirty-two concurrent reconciles each deciding to scale
+/// up is a host problem, not a loop problem, so the limit is on the expensive
+/// operation rather than on the loop that reaches it.
+const CREATE_CONCURRENCY: usize = 8;
+
+/// How often to look for suspended VMs no deployment claims.
+///
+/// Slow on purpose. The daemon answers `GET /sandboxes/inactive` by walking its
+/// persistence directory and loading metadata for every sandbox it has ever
+/// created, so this is the most expensive question app-lb asks it. It is also a
+/// backstop, not a control loop: what it catches is the residue of a crash
+/// between stopping a VM and recording that we did.
+const SUSPENDED_SWEEP: Duration = Duration::from_secs(300);
+
 pub struct Autoscaler {
     registry: Arc<Registry>,
     vms: VmManager,
@@ -36,6 +64,9 @@ pub struct Autoscaler {
     /// Monotonic source for replica-name nonces. Not for addressing — the
     /// daemon assigns sandbox ids — just to keep our names unique.
     nonce: AtomicU64,
+    /// Fleet-wide budget for simultaneous VM creates. See
+    /// [`CREATE_CONCURRENCY`].
+    creates: tokio::sync::Semaphore,
 }
 
 impl Autoscaler {
@@ -45,7 +76,14 @@ impl Autoscaler {
             vms,
             metrics,
             nonce: AtomicU64::new(now_secs()),
+            creates: tokio::sync::Semaphore::new(CREATE_CONCURRENCY),
         }
+    }
+
+    /// The daemon client, for callers that need to talk to a VM the autoscaler
+    /// owns — `exec` and `shell` in the admin API.
+    pub fn vms(&self) -> &VmManager {
+        &self.vms
     }
 
     fn next_nonce(&self) -> u64 {
@@ -125,17 +163,30 @@ impl Autoscaler {
     }
 
     /// One full pass over every deployment.
+    ///
+    /// Concurrent, not sequential. A fleet of agent sandboxes is thousands of
+    /// deployments; awaiting each one's health probes and daemon calls in turn
+    /// meant a single slow VM held up every other deployment's tick, and the
+    /// pass could outrun [`TICK`] entirely. Bounded by
+    /// [`RECONCILE_CONCURRENCY`] so a large fleet cannot open thousands of
+    /// simultaneous connections to the daemon.
     async fn reconcile(&self) {
         let deployments = self.registry.deployments();
+        let (statics, managed): (Vec<_>, Vec<_>) = deployments
+            .values()
+            .cloned()
+            .partition(|d| d.spec.is_static());
 
         // Static (proxy_pass) deployments need no daemon interaction — health-
         // re-probe them first, and unconditionally, so they keep working even
         // when the daemon is unreachable (or app-lb runs with no VM deployments
         // at all and heyvmd isn't running).
-        for deployment in deployments.values() {
-            if deployment.spec.is_static() {
-                self.reconcile_static(deployment).await;
-            }
+        futures::stream::iter(&statics)
+            .for_each_concurrent(RECONCILE_CONCURRENCY, |d| self.reconcile_static(d))
+            .await;
+
+        if managed.is_empty() {
+            return; // nothing needs the daemon; don't call it at all
         }
 
         // Managed deployments need the fleet list; if it fails, skip the VM work
@@ -155,12 +206,32 @@ impl Autoscaler {
         // and carry on with an empty index (VMs keep their last sample).
         let usage = self.sample_usage().await;
 
-        for deployment in deployments.values() {
-            if !deployment.spec.is_static() {
-                self.reconcile_one(deployment, &fleet, &usage).await;
+        // Split before dispatching: a deployment sitting at its desired size
+        // with nothing booting and nothing draining needs no `await` at all, and
+        // at fleet scale that is nearly all of them. Doing their bookkeeping
+        // inline keeps the concurrent stream carrying only real work.
+        let mut busy = Vec::new();
+        for d in &managed {
+            if !self.is_live(d) {
+                continue;
+            }
+            self.prune(d, &fleet);
+            if at_rest(d, &fleet) {
+                self.apply_usage(d, &usage);
+            } else {
+                busy.push(d);
             }
         }
+
+        futures::stream::iter(busy)
+            .for_each_concurrent(RECONCILE_CONCURRENCY, |d| {
+                self.reconcile_one(d, &fleet, &usage)
+            })
+            .await;
     }
+
+    // (`at_rest` is a free function below — it needs no autoscaler state, and
+    // being pure is what makes the fast path testable without a daemon.)
 
     /// Read the daemon's cached usage snapshot, push the host figures into the
     /// metrics gauge, and return a per-sandbox index for `apply_usage`.
@@ -208,14 +279,17 @@ impl Autoscaler {
         debug_assert!(!d.spec.is_static(), "reconcile_one called on a static deployment");
 
         // The tick's snapshot can already be stale: an admin request may have
-        // deregistered or rebuilt this deployment while we were reconciling an
-        // earlier one. Everything below would then act on an object nobody
-        // reads — including booting VMs that nothing would ever reap.
+        // deregistered or rebuilt this deployment while a *sibling* deployment
+        // was reconciling. Everything below would then act on an object nobody
+        // reads — including booting VMs that nothing would ever reap. Checked
+        // again here even though `reconcile` checked before dispatching,
+        // because the dispatch itself yields.
         if !self.is_live(d) {
             return;
         }
 
-        self.prune(d, fleet);
+        // `prune` already ran in `reconcile`, which needed a current backend
+        // list to decide this deployment had work at all.
         self.promote_pending(d, fleet).await;
 
         let desired = d.desired_replicas();
@@ -525,6 +599,44 @@ impl Autoscaler {
                 );
                 break;
             }
+            // Held across the create or resume. Reconciles run concurrently, so
+            // without this a fleet-wide scale-up event would ask the daemon to
+            // start `RECONCILE_CONCURRENCY` hypervisors at once.
+            let _permit = self.creates.acquire().await;
+
+            // A suspended sandbox is preferred over a fresh one, and not just to
+            // save a boot: it *is* the deployment's state. Creating a new VM
+            // while one sits stopped would strand that VM's `/workspace` disk
+            // and hand the caller an empty sandbox in its place.
+            if let Some(sandbox_id) = self.take_suspended(d) {
+                match self.vms.resume(&sandbox_id).await {
+                    Ok(_) => {
+                        tracing::info!(
+                            deployment = %d.spec.id,
+                            sandbox = %sandbox_id,
+                            "resumed suspended VM",
+                        );
+                        created.push(sandbox_id.clone());
+                        pending.push(PendingVm::new(sandbox_id));
+                        continue;
+                    }
+                    Err(e) => {
+                        // It is already forgotten, so it will not be resumed
+                        // again. Kill it rather than leave it stopped forever
+                        // holding a disk nothing tracks.
+                        tracing::warn!(
+                            deployment = %d.spec.id,
+                            sandbox = %sandbox_id,
+                            error = %e,
+                            "failed to resume suspended VM; destroying it and booting a fresh one",
+                        );
+                        if let Err(e) = self.vms.kill(&sandbox_id).await {
+                            tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill VM");
+                        }
+                    }
+                }
+            }
+
             let name = vm::replica_name(&d.spec.id, self.next_nonce());
             match self.vms.create(d.spec.vm_spec(), name).await {
                 Ok(sandbox) => {
@@ -607,10 +719,181 @@ impl Autoscaler {
         d.set_backends(keep);
 
         self.metrics.record_reaped(&d.spec.id, done.len() as u64);
+        let retain = d.spec.scaling.idle_action == IdleAction::Retain;
+        let mut suspended = Vec::new();
         for b in done {
-            tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "killing VM");
-            if let Err(e) = self.vms.kill(&b.sandbox_id).await {
-                tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to kill VM");
+            if retain {
+                tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "suspending VM");
+                match self.vms.suspend(&b.sandbox_id).await {
+                    // Recorded only on success. A sandbox we failed to stop is
+                    // still running and still in the fleet list, so recording it
+                    // as suspended would make the next tick skip a live VM.
+                    Ok(()) => suspended.push(b.sandbox_id.clone()),
+                    Err(e) => {
+                        tracing::warn!(
+                            deployment = %d.spec.id,
+                            sandbox = %b.sandbox_id,
+                            error = %e,
+                            "failed to suspend VM; killing it instead so it cannot leak",
+                        );
+                        if let Err(e) = self.vms.kill(&b.sandbox_id).await {
+                            tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to kill VM");
+                        }
+                    }
+                }
+            } else {
+                tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "killing VM");
+                if let Err(e) = self.vms.kill(&b.sandbox_id).await {
+                    tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to kill VM");
+                }
+            }
+        }
+        self.remember_suspended(d, suspended);
+    }
+
+    /// Record sandboxes we stopped, and persist that immediately.
+    ///
+    /// Immediately, and not on some later flush, because between the stop and
+    /// the write this id exists in exactly one place: memory. The daemon drops a
+    /// stopped sandbox from `GET /sandboxes`, so a crash in that window leaves a
+    /// VM holding a disk that nothing knows to resume or reap.
+    fn remember_suspended(&self, d: &Arc<Deployment>, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        let changed = d.mutate_state(|s| {
+            for id in ids {
+                if !s.suspended.contains(&id) {
+                    s.suspended.push(id);
+                }
+            }
+        });
+        if changed && let Err(e) = self.registry.persist_one(&d.spec.id) {
+            tracing::error!(
+                deployment = %d.spec.id,
+                error = %e,
+                "failed to persist suspended sandboxes; they may be leaked on restart",
+            );
+        }
+    }
+
+    /// Forget a sandbox we suspended — it has been resumed, or destroyed.
+    fn forget_suspended(&self, d: &Arc<Deployment>, sandbox_id: &str) {
+        let changed = d.mutate_state(|s| s.suspended.retain(|id| id != sandbox_id));
+        if changed && let Err(e) = self.registry.persist_one(&d.spec.id) {
+            tracing::error!(deployment = %d.spec.id, error = %e, "failed to persist state");
+        }
+    }
+
+    /// Claim the oldest suspended sandbox, removing it from the record.
+    ///
+    /// Claimed *before* the resume rather than after, so two concurrent
+    /// scale-ups cannot both try to start the same VM. The cost of that choice
+    /// is that a failed resume has already been forgotten, which is why
+    /// `scale_up` kills it rather than leaving it stopped and untracked.
+    fn take_suspended(&self, d: &Arc<Deployment>) -> Option<String> {
+        let mut taken = None;
+        let changed = d.mutate_state(|s| {
+            if !s.suspended.is_empty() {
+                taken = Some(s.suspended.remove(0));
+            }
+        });
+        if changed && let Err(e) = self.registry.persist_one(&d.spec.id) {
+            tracing::error!(deployment = %d.spec.id, error = %e, "failed to persist state");
+        }
+        taken
+    }
+
+    /// Destroy stopped sandboxes of ours that no deployment claims.
+    ///
+    /// The backstop for `idle_action: retain`. A stopped sandbox is invisible to
+    /// every other mechanism here — it is absent from the fleet list, so `prune`
+    /// and `adopt_existing` cannot see it, and its TTL does not run while it is
+    /// stopped. If the record of it is lost (a crash between the stop and the
+    /// state write, a state file deleted by hand), it keeps its disk forever with
+    /// nothing to reclaim it.
+    ///
+    /// Only sandboxes named `applb-<deployment>-<nonce>` are touched, and only
+    /// when their deployment either does not exist or does not list them. A
+    /// sandbox somebody else made is never destroyed.
+    async fn sweep_suspended(&self) {
+        // Both listings, because *where* a stopped sandbox turns up depends on
+        // the backend. mvm-ctrl re-adds every persisted **KVM** sandbox to
+        // `GET /sandboxes` on each call, so a stopped one appears there with
+        // status `Stopped` — and is therefore excluded from the inactive
+        // listing, which subtracts whatever the active list holds. A stopped
+        // **Firecracker** sandbox is the other way round: absent from the fleet
+        // list, present in the inactive one. Reading only one would sweep half
+        // the fleet and silently ignore the other.
+        let fleet = match self.vms.list().await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::debug!(error = %e, "no fleet list; skipping the suspended sweep");
+                return;
+            }
+        };
+        let inactive = match self.vms.list_inactive().await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not list inactive sandboxes; skipping sweep");
+                return;
+            }
+        };
+
+        let deployments = self.registry.deployments();
+
+        // Everything of ours the daemon does not report as running, from either
+        // listing. A *running* VM is out of scope here: `adopt_existing` and
+        // `kill_unclaimed` own that case, and killing one on this path would
+        // race them.
+        let stopped = inactive
+            .iter()
+            .chain(fleet.iter().filter(|i| vm::is_terminal(&i.status)));
+
+        let mut orphans: Vec<(String, String)> = Vec::new();
+        for info in stopped {
+            let Some(owner) = vm::owner_of(&info.name) else {
+                continue; // not ours
+            };
+            let claimed = deployments
+                .get(owner)
+                .is_some_and(|d| d.state().suspended.contains(&info.id));
+            if !claimed && !orphans.iter().any(|(id, _)| id == &info.id) {
+                orphans.push((info.id.clone(), owner.to_string()));
+            }
+        }
+
+        for (sandbox_id, owner) in &orphans {
+            tracing::warn!(deployment = %owner, sandbox = %sandbox_id, "destroying unclaimed suspended VM");
+            if let Err(e) = self.vms.kill(sandbox_id).await {
+                tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill suspended VM");
+            }
+        }
+
+        // And the other direction: ids we still think are suspended that the
+        // daemon has no record of at all — deleted out of band, or lost with the
+        // host's state. Left in place they would cost a doomed resume attempt on
+        // every scale-up.
+        let known: HashSet<&str> = inactive
+            .iter()
+            .chain(fleet.iter())
+            .map(|i| i.id.as_str())
+            .collect();
+        for d in deployments.values() {
+            let stale: Vec<String> = d
+                .state()
+                .suspended
+                .iter()
+                .filter(|id| !known.contains(id.as_str()))
+                .cloned()
+                .collect();
+            for id in stale {
+                tracing::warn!(
+                    deployment = %d.spec.id,
+                    sandbox = %id,
+                    "forgetting a suspended VM the daemon no longer has",
+                );
+                self.forget_suspended(d, &id);
             }
         }
     }
@@ -645,6 +928,24 @@ impl Autoscaler {
                 // The deployment id was reused for a static one since this VM was
                 // created; it owns no VMs, so this sandbox is an orphan.
                 orphans.push(info.id.clone());
+                continue;
+            }
+            // A VM this deployment deliberately suspended is neither adoptable
+            // nor an orphan: it is stopped on purpose and its data disk *is* the
+            // deployment's state. Without this it fails `routable_addr` and gets
+            // killed here — losing the sandbox on every restart, which is the
+            // exact opposite of what `idle_action: retain` was asked for.
+            //
+            // Checked rather than assumed absent, because whether a stopped
+            // sandbox appears in the fleet list at all is backend-dependent:
+            // mvm-ctrl re-adds every persisted *KVM* sandbox to `GET /sandboxes`
+            // on each call, while a stopped *Firecracker* one is simply missing.
+            if d.state().suspended.contains(&info.id) {
+                tracing::info!(
+                    deployment = %owner,
+                    sandbox = %info.id,
+                    "leaving a suspended VM stopped; it will be resumed on demand",
+                );
                 continue;
             }
             match vm::routable_addr(info, d.spec.vm_spec().port) {
@@ -697,8 +998,22 @@ impl Autoscaler {
                 tracing::warn!(sandbox = %p.sandbox_id, error = %e, "failed to kill pending VM");
             }
         }
+        // Suspended sandboxes are not in either list and are absent from the
+        // daemon's fleet list, so nothing else would ever find them. Teardown is
+        // the last moment this deployment's record of them exists.
+        for sandbox_id in &d.state().suspended {
+            tracing::info!(
+                deployment = %d.spec.id,
+                sandbox = %sandbox_id,
+                "destroying suspended VM as its deployment goes away",
+            );
+            if let Err(e) = self.vms.kill(sandbox_id).await {
+                tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill suspended VM");
+            }
+        }
         d.set_backends(Vec::new());
         d.set_pending(Vec::new());
+        d.mutate_state(|s| s.suspended.clear());
     }
 
     /// Evict a single VM from a deployment's pool.
@@ -799,6 +1114,12 @@ impl BackgroundService for Autoscaler {
 
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Deliberately a separate, much slower ticker: the sweep asks the daemon
+        // to walk its persistence directory, which is not something to do every
+        // two seconds. See `sweep_suspended`.
+        let mut sweeper = tokio::time::interval(SUSPENDED_SWEEP);
+        sweeper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        sweeper.tick().await; // the first tick is immediate; skip it
 
         loop {
             // A cold-start request nudges `scale_signal`, so a scaled-to-zero
@@ -808,6 +1129,7 @@ impl BackgroundService for Autoscaler {
             tokio::select! {
                 _ = ticker.tick() => self.reconcile().await,
                 _ = nudged => self.reconcile().await,
+                _ = sweeper.tick() => self.sweep_suspended().await,
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("autoscaler shutting down");
@@ -830,6 +1152,32 @@ impl BackgroundService for Autoscaler {
 /// `vm_port` is the deployment's proxied port, which the health check's own `port`
 /// overrides when set — the same resolution `health::probe` does, so the message
 /// names the port actually dialled rather than the one in the spec.
+/// Whether `d` needs nothing this tick beyond a usage sample.
+///
+/// This is the fast path that makes a fleet of thousands viable: at rest, a
+/// sandbox deployment is one healthy VM sitting at its desired size, and
+/// deciding that must not cost a daemon round trip. Every condition here is a
+/// count or a flag already in memory.
+///
+/// Call after `prune`, so the backend list reflects the fleet snapshot.
+fn at_rest(d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) -> bool {
+    let backends = d.backends();
+    if !d.pending().is_empty() || backends.iter().any(|b| b.is_draining()) {
+        return false;
+    }
+    if backends.len() != d.desired_replicas() as usize {
+        return false;
+    }
+    // A TTL past its halfway mark needs a renewal call, which is an await. A
+    // backend the fleet snapshot doesn't mention is *not* at rest either: it
+    // vanished between the snapshot and now, which `reconcile_one` must see.
+    backends.iter().all(|b| {
+        fleet.get(&b.sandbox_id).is_some_and(|info| {
+            info.uptime_secs < info.ttl_seconds.unwrap_or(d.spec.vm_spec().ttl_seconds) / 2
+        })
+    })
+}
+
 fn boot_stall(info: &SandboxInfo, check: &crate::config::HealthCheck, vm_port: u16) -> String {
     if info.status != heyo_sdk::SandboxStatus::Running {
         return match info.error_message.as_deref() {
@@ -925,8 +1273,17 @@ mod tests {
         }
     }
 
+    /// A registry whose state directory is scratch space. The suspended-VM
+    /// bookkeeping persists on every change, so this must not be the CWD — and
+    /// must not be shared, since tests run in parallel against the same id.
     fn autoscaler() -> (Autoscaler, Arc<Registry>) {
-        let registry = Arc::new(Registry::new("unused.json"));
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "app-lb-as-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        let registry = Arc::new(Registry::new(dir.join("state.json")));
         registry.upsert(spec());
         // A daemon URL nothing listens on: fine, because the graceful and
         // not-found paths never call it.
@@ -935,6 +1292,106 @@ mod tests {
             Autoscaler::new(registry.clone(), vms, Arc::new(Metrics::new())),
             registry,
         )
+    }
+
+    /// The record of a suspended sandbox is the *only* record: mvm-ctrl drops a
+    /// stopped sandbox from `GET /sandboxes`, so anything lost here is a VM
+    /// still holding a disk that nothing will ever resume or reap.
+    mod suspended_bookkeeping {
+        use super::*;
+
+        #[test]
+        fn remembering_is_idempotent() {
+            let (a, reg) = autoscaler();
+            let d = reg.get("demo").unwrap();
+
+            a.remember_suspended(&d, vec!["sb-1".into(), "sb-2".into()]);
+            a.remember_suspended(&d, vec!["sb-2".into(), "sb-3".into()]);
+
+            assert_eq!(d.state().suspended, vec!["sb-1", "sb-2", "sb-3"]);
+        }
+
+        /// Claimed before the resume is attempted, so two concurrent scale-ups
+        /// cannot both try to start the same VM.
+        #[test]
+        fn taking_removes_it_oldest_first() {
+            let (a, reg) = autoscaler();
+            let d = reg.get("demo").unwrap();
+            a.remember_suspended(&d, vec!["sb-1".into(), "sb-2".into()]);
+
+            assert_eq!(a.take_suspended(&d).as_deref(), Some("sb-1"));
+            assert_eq!(d.state().suspended, vec!["sb-2"]);
+            assert_eq!(a.take_suspended(&d).as_deref(), Some("sb-2"));
+            assert_eq!(a.take_suspended(&d), None, "an empty record yields nothing");
+        }
+
+        #[test]
+        fn forgetting_removes_only_the_named_one() {
+            let (a, reg) = autoscaler();
+            let d = reg.get("demo").unwrap();
+            a.remember_suspended(&d, vec!["sb-1".into(), "sb-2".into()]);
+
+            a.forget_suspended(&d, "sb-1");
+            assert_eq!(d.state().suspended, vec!["sb-2"]);
+            a.forget_suspended(&d, "never-there"); // not an error
+            assert_eq!(d.state().suspended, vec!["sb-2"]);
+        }
+
+        /// The record survives a restart, or the VM is stranded.
+        #[test]
+        fn the_record_is_persisted_as_it_changes() {
+            let (a, reg) = autoscaler();
+            let d = reg.get("demo").unwrap();
+            a.remember_suspended(&d, vec!["sb-1".into()]);
+
+            let reloaded = Registry::new(reg.state_dir().parent().unwrap().join("state.json"));
+            assert_eq!(reloaded.load().unwrap(), 1);
+            assert_eq!(reloaded.get("demo").unwrap().state().suspended, vec!["sb-1"]);
+        }
+
+        /// Startup adoption must leave suspended VMs alone.
+        ///
+        /// This is the bug that would have destroyed every `retain` sandbox on
+        /// every restart: a stopped **KVM** sandbox *is* in the daemon's fleet
+        /// list (mvm-ctrl reloads persisted KVM sandboxes on every `list`), it
+        /// is not routable, and `adopt_existing` kills whatever it cannot adopt.
+        #[test]
+        fn a_suspended_vm_is_neither_adopted_nor_orphaned() {
+            let (_a, reg) = autoscaler();
+            let d = reg.get("demo").unwrap();
+            d.set_state(crate::deployment::DeploymentState {
+                suspended: vec!["sb-1".into()],
+            });
+
+            // What the fleet list looks like for a stopped KVM sandbox of ours.
+            let mut stopped = info(heyo_sdk::SandboxStatus::Stopped, None);
+            stopped.id = "sb-1".into();
+            stopped.name = "applb-demo-000000000001".into();
+
+            assert_eq!(vm::owner_of(&stopped.name), Some("demo"), "it is ours");
+            assert!(
+                vm::routable_addr(&stopped, 8080).is_err(),
+                "and not routable, so adoption would otherwise treat it as an orphan",
+            );
+            assert!(
+                d.state().suspended.contains(&stopped.id),
+                "the suspended record is what has to save it",
+            );
+        }
+
+        /// Deregistering must not leave a stopped VM behind. Teardown is the
+        /// last moment anything knows the sandbox exists.
+        #[tokio::test]
+        async fn teardown_clears_the_record() {
+            let (a, reg) = autoscaler();
+            let d = reg.get("demo").unwrap();
+            a.remember_suspended(&d, vec!["sb-1".into()]);
+
+            // The kill calls fail against a dead daemon; teardown logs and
+            // carries on, which is what must not leave the record behind.
+            a.teardown(&d).await;
+            assert!(d.state().suspended.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1073,6 +1530,74 @@ mod tests {
             urls: vec![],
             guest_ip: guest_ip.map(Into::into),
             metadata: None,
+        }
+    }
+
+    /// `at_rest` decides whether a deployment is skipped for the tick, so every
+    /// false positive is a deployment that silently stops being reconciled.
+    /// These cases are the ones that would produce one.
+    mod at_rest {
+        use super::*;
+
+        /// One healthy VM at the desired size, TTL fresh: the shape of an idle
+        /// agent sandbox, and the case the fast path exists for.
+        fn settled() -> (Arc<Deployment>, HashMap<String, SandboxInfo>) {
+            let mut s = spec();
+            s.scaling.min_replicas = 1;
+            s.scaling.max_replicas = 1;
+            let d = Arc::new(Deployment::new(s));
+            d.set_backends(vec![Arc::new(VmBackend::new(
+                "sb-1".into(),
+                "10.0.0.1:8080".parse().unwrap(),
+            ))]);
+            let mut fleet = HashMap::new();
+            fleet.insert("sb-1".to_string(), info(heyo_sdk::SandboxStatus::Running, Some("10.0.0.1")));
+            (d, fleet)
+        }
+
+        #[test]
+        fn an_idle_pool_at_its_desired_size_is_at_rest() {
+            let (d, fleet) = settled();
+            assert!(at_rest(&d, &fleet));
+        }
+
+        #[test]
+        fn a_booting_vm_is_work() {
+            let (d, fleet) = settled();
+            d.set_pending(vec![PendingVm::new("sb-2".into())]);
+            assert!(!at_rest(&d, &fleet));
+        }
+
+        #[test]
+        fn a_draining_vm_is_work() {
+            let (d, fleet) = settled();
+            d.backends()[0].set_draining();
+            assert!(!at_rest(&d, &fleet));
+        }
+
+        #[test]
+        fn being_below_the_desired_size_is_work() {
+            let (d, fleet) = settled();
+            d.set_backends(vec![]);
+            assert!(!at_rest(&d, &fleet));
+        }
+
+        /// Half the TTL gone means a renewal call is due, and that is an await.
+        #[test]
+        fn a_ttl_past_its_halfway_mark_is_work() {
+            let (d, mut fleet) = settled();
+            let entry = fleet.get_mut("sb-1").unwrap();
+            entry.ttl_seconds = Some(3600);
+            entry.uptime_secs = 1800;
+            assert!(!at_rest(&d, &fleet));
+        }
+
+        /// A backend the daemon no longer reports has just disappeared. Reading
+        /// that as "nothing to do" would leave a dead VM in the routing pool.
+        #[test]
+        fn a_backend_missing_from_the_fleet_is_work() {
+            let (d, _) = settled();
+            assert!(!at_rest(&d, &HashMap::new()));
         }
     }
 

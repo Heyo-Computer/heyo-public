@@ -8,6 +8,46 @@ curl -XPOST localhost:9090/deployments \
   -d @examples/pg-fc-dashboard.json
 ```
 
+## `sandbox.json` — one agent sandbox, of a fleet of thousands
+
+The shape a sandbox fleet is made of: **one deployment per sandbox, one VM
+each**, unrouted, worked on by `exec` and `shell` rather than HTTP. A control
+plane creates these by the thousand and deletes them when the work is done.
+
+```sh
+serverctl apply -f examples/sandbox.json
+serverctl exec sb-7f3a9c -- git clone https://github.com/example/repo /workspace/repo
+serverctl shell sb-7f3a9c
+```
+
+Four fields carry the design, and each is load-bearing:
+
+- **`"routes": []`** — no ingress at all. A sandbox that does not serve traffic
+  should not be on a hostname, and putting it on one would put it on the
+  internet. Exposure is a later, reversible step:
+  `serverctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com`, and
+  `--none` to withdraw it again.
+- **`idle_action: "retain"`** — an idle sandbox is *stopped*, not destroyed, and
+  the next `exec` resumes that same VM. The default (`destroy`) is right for
+  interchangeable replicas and wrong for somebody's working directory.
+- **`disk_size_gb: 20`** — and it is not optional here. `retain` preserves the
+  `/workspace` data disk and **nothing else**: the daemon recopies the root
+  filesystem from the base image on every boot. Without a data disk this
+  deployment would come back empty, having saved only the boot.
+- **`working_directory` + `HOME` on `/workspace`** — so anything the agent
+  writes lands on the disk that survives, rather than on the rootfs that does
+  not.
+
+`min_replicas: 0` with `target_concurrency: 1` means a sandbox costs nothing
+while nobody is using it: it suspends after 15 idle minutes and wakes on the next
+`exec`, `shell`, or request. An open `shell` counts as in-flight work, so a
+session is never reaped out from under you.
+
+At fleet scale, expose sandboxes under one wildcard certificate
+(`APP_LB_ACME_WILDCARD=sb.example.com`) — per-host issuance hits Let's Encrypt's
+50-per-domain-per-week limit almost immediately. See the README's
+[Wildcard certificates](../README.md#wildcard-certificates-for-a-fleet).
+
 ## `artifact-pull.json` — a deployment whose rootfs comes from the store
 
 The mirror image of [`artifacts.json`](#artifactsjson--managed-vm-pool-for-the-artifacts-store):
@@ -540,6 +580,17 @@ normal upstream.
 - **Health is `GET /healthz`** — the admin API's always-open, unauthenticated
   probe endpoint (returns `200` regardless of `APP_LB_ADMIN_AUTH`), so the static
   re-probe stays green without credentials.
+- **Adding a Google `auth` block here locks `serverctl` out, and half-breaks the
+  dashboard.** A gate answers a browser with a `302` and everything else with a
+  `401` — including `serverctl`, which cannot do an OAuth flow, and including the
+  dashboard's own `fetch("metrics", {headers: {accept: "application/json"}})`.
+  The page then signs you in and displays no data. If you want the hostname
+  gated, list the machine paths in `public_paths`
+  (`/healthz`, `/metrics`, `/deployments`, `/secrets`, `/jobs`, `/certs`) and
+  turn on `APP_LB_ADMIN_AUTH=1` **first**, so they are never briefly open. The
+  root README's [Putting the dashboard behind
+  Google](../README.md#putting-the-dashboard-behind-google) has the measured
+  status codes.
 - **Trade-off vs. an external proxy.** Because the control plane now rides the
   data plane, a bad proxy/deployment edit can in principle disrupt the very
   dashboard you'd use to fix it. If you want the dashboard reachable independent

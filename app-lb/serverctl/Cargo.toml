@@ -24,6 +24,11 @@ serde_yaml = "0.9"
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"] }
 
 base64 = "0.22"
+# A *synchronous* WebSocket client, for `serverctl shell`. Sync because this CLI
+# has no async runtime and does not want one for a single socket; native-tls to
+# match ureq, so a shell over app-lb's own HTTPS proxy uses the same trust store
+# and the same `--insecure-skip-tls-verify`.
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "native-tls"] }
 # `artifact push` addresses a rootfs by the sha256 of its bytes, so the digest
 # has to be computed here — the store's `PUT /blobs/{digest}` takes the name as
 # part of the URL and answers 409 if what arrives hashes to anything else.

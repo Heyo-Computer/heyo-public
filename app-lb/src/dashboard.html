@@ -207,6 +207,16 @@
   .btn:disabled { opacity: .5; cursor: default; }
   table.vms td.rowactions { display: flex; gap: 5px; }
 
+  /* Deployment filter + pager. Hidden entirely for a fleet that fits on one
+     page, so a small install looks exactly as it did before. */
+  .dep-controls { display: none; align-items: center; gap: 8px; margin: -4px 0 10px; }
+  .dep-controls.on { display: flex; }
+  .dep-controls input[type=search] {
+    font: inherit; font-size: 12px; color: var(--text); background: var(--plane);
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; min-width: 220px;
+  }
+  .dep-range { font-size: 12px; color: var(--text-2); margin-left: auto; }
+
   /* Modal */
   .modal-overlay {
     position: fixed; inset: 0; background: rgba(0,0,0,0.45);
@@ -286,7 +296,17 @@
     </div>
   </div>
 
-  <div class="section-title">Deployments</div>
+  <div class="section-title">
+    Deployments <span class="count" id="deps-count"></span>
+  </div>
+  <!-- A fleet of sandboxes is thousands of deployments; the filter and pager
+       are how the table stays usable, and how the poll stays small. -->
+  <div class="dep-controls" id="dep-controls">
+    <input id="dep-filter" type="search" placeholder="filter by id prefix" autocomplete="off" spellcheck="false">
+    <span class="dep-range" id="dep-range"></span>
+    <button class="btn mini" id="dep-prev" type="button">Prev</button>
+    <button class="btn mini" id="dep-next" type="button">Next</button>
+  </div>
   <div id="deployments"></div>
 
   <div class="section-title">
@@ -335,6 +355,13 @@ let slowTimer = null;
 // form/editor isn't wiped out from under the operator by the 2s poll.
 let interacting = false;
 let depsById = {};   // id -> latest deployment view, for form prefills
+
+// How many deployments one page of the table holds. The poll asks the server
+// for exactly this many: an unpaged /metrics over a fleet of thousands is
+// megabytes of JSON every two seconds, most of it off-screen.
+const DEP_PAGE = 50;
+let depOffset = 0;   // first deployment on the current page
+let depPrefix = "";  // id-prefix filter, sent to the server, not applied here
 
 const $ = (id) => document.getElementById(id);
 const fmt = (n, d = 0) => (n == null || !isFinite(n)) ? "—" :
@@ -542,12 +569,38 @@ function render(data) {
   ].map(([k, v]) => `<div><div class="label">${k}</div><div class="value">${v}</div></div>`).join("");
 
   // --- per-deployment ---
+  renderDeploymentPager(data.matched);
   renderDeployments(data.deployments);
 
   // --- freshness ---
   $("uptime").textContent = "up " + fmtDur(data.uptime_secs);
   $("updated").textContent = "updated " + new Date().toLocaleTimeString();
   $("livedot").classList.remove("stale");
+}
+
+// The pager reflects `matched` — how many deployments passed the filter on the
+// server — not how many arrived, so the range reads correctly on every page.
+function renderDeploymentPager(matched) {
+  matched = matched ?? 0;
+  $("deps-count").textContent = matched ? `(${matched})` : "";
+
+  // A fleet that fits on one page and isn't being filtered gets no controls at
+  // all, so a handful of services looks the way it always did.
+  const needed = matched > DEP_PAGE || depOffset > 0 || depPrefix !== "";
+  $("dep-controls").classList.toggle("on", needed);
+  if (!needed) return;
+
+  // A page that emptied out — deployments deregistered, or the filter narrowed
+  // — would otherwise strand the operator on a blank page with no way back.
+  if (depOffset >= matched && matched > 0) {
+    depOffset = Math.max(0, Math.floor((matched - 1) / DEP_PAGE) * DEP_PAGE);
+  }
+
+  const first = matched === 0 ? 0 : depOffset + 1;
+  const last = Math.min(depOffset + DEP_PAGE, matched);
+  $("dep-range").textContent = matched ? `${first}–${last} of ${matched}` : "no matches";
+  $("dep-prev").disabled = depOffset === 0;
+  $("dep-next").disabled = last >= matched;
 }
 
 function renderDeployments(deps) {
@@ -559,7 +612,10 @@ function renderDeployments(deps) {
   if (interacting) return;
 
   if (!deps.length) {
-    $("deployments").innerHTML = `<div class="card empty">No deployments registered.</div>`;
+    const msg = depPrefix
+      ? `No deployment id starts with ${esc(depPrefix)}.`
+      : "No deployments registered.";
+    $("deployments").innerHTML = `<div class="card empty">${msg}</div>`;
     return;
   }
   $("deployments").innerHTML = deps.map(d => {
@@ -1167,9 +1223,35 @@ $("jobs").addEventListener("click", (e) => {
   if (b) openJobLog(b.dataset.jid);
 });
 
+// Filtering and paging both re-poll at once rather than waiting out the refresh
+// interval — a two-second lag on a keystroke reads as a broken control. The
+// filter is debounced so typing a prefix is one request, not one per letter.
+let depFilterTimer = null;
+function repage(offset) {
+  depOffset = offset;
+  clearTimeout(timer);
+  poll();
+}
+$("dep-filter").addEventListener("input", (e) => {
+  const next = e.target.value.trim();
+  clearTimeout(depFilterTimer);
+  depFilterTimer = setTimeout(() => {
+    depPrefix = next;
+    repage(0); // a new filter starts at the top; the old offset means nothing
+  }, 200);
+});
+$("dep-prev").addEventListener("click", () => repage(Math.max(0, depOffset - DEP_PAGE)));
+$("dep-next").addEventListener("click", () => repage(depOffset + DEP_PAGE));
+
+function metricsUrl() {
+  const q = new URLSearchParams({ limit: DEP_PAGE, offset: depOffset });
+  if (depPrefix) q.set("prefix", depPrefix);
+  return "metrics?" + q;
+}
+
 async function poll() {
   try {
-    const r = await fetch("metrics", { headers: { accept: "application/json" }, cache: "no-store" });
+    const r = await fetch(metricsUrl(), { headers: { accept: "application/json" }, cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     render(await r.json());
   } catch (e) {

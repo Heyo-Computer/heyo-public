@@ -80,7 +80,11 @@ futures = "0.3"
 # multi-gigabyte rootfs takes.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "process", "fs", "io-util"] }
 arc-swap = "1"
-axum = "0.7"
+# `ws` is for `GET /deployments/:id/shell`, where app-lb terminates the client's
+# WebSocket and pipes it to the sandbox's PTY. Proxying rather than handing the
+# client a daemon address is what lets the gate, the deployment→sandbox lookup
+# and the wake-a-suspended-VM step happen at all.
+axum = { version = "0.7", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Encoding the configured dashboard credentials into the expected Basic-auth

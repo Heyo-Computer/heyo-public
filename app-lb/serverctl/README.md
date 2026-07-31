@@ -47,6 +47,30 @@ serverctl login --server https://lb-admin.example.com --user admin
 
 `--insecure-skip-tls-verify` exists for a self-signed admin endpoint you control.
 
+**Do not point a context at a hostname behind a Google sign-in gate.** serverctl
+cannot complete an OAuth flow, and the gate knows it: a browser gets a `302` to
+Google, everything else gets a `401` carrying a `login_url` only a browser can
+use. Every command then fails with *"the server rejected these credentials"* —
+which is what it received, but the credentials were never the problem, and
+`whoami` will report the deployment API and `/metrics` both `denied` no matter
+what you store.
+
+Two ways out, in the order worth trying:
+
+```sh
+# 1. Tunnel to the admin listener and bypass the gate entirely.
+ssh -L 9090:127.0.0.1:9090 lb-host
+serverctl login --server 127.0.0.1:9090 --user "$APP_LB_DASHBOARD_USER"
+
+# 2. Or let the API paths past the gate, server-side, and gate them with Basic
+#    auth instead — see the app-lb README, "Putting the dashboard behind Google".
+```
+
+While you are there: `login` prompts for a password but never for a *username*,
+and defaults to `admin`. If the server sets `APP_LB_DASHBOARD_USER` to anything
+else, pass `--user` — a wrong username produces a `401` indistinguishable from a
+wrong password.
+
 ## Authentication
 
 app-lb authenticates with HTTP Basic and has **two independent gates**:
@@ -150,6 +174,9 @@ serverctl create deployment web \
 # A static (proxy_pass) deployment.
 serverctl create deployment legacy --path-prefix /legacy --upstream 10.0.0.9:8080 --health-tcp
 
+# A managed VM with no ingress — an agent sandbox, reached by exec/shell only.
+serverctl create deployment sb-7f3a9c --no-route --port 8080 --size medium
+
 # From a file — JSON or YAML, one spec, a JSON array, or a multi-doc YAML stream.
 serverctl apply -f deploy.yaml
 serverctl apply -f examples/heyosecret.json --dry-run
@@ -161,12 +188,19 @@ serverctl set env web RUST_LOG=debug FEATURE_X-        # `KEY=VALUE` sets, `KEY-
 serverctl set upstreams legacy 10.0.0.9:8080 10.0.0.10:8080
 serverctl set route web --host web.example.com --path-prefix /api
 serverctl set route web --route '*.apps.example.com' --add
+serverctl set route sb-7f3a9c --none                  # withdraw from the proxy
 ```
 
 Routing flags: `--host`, `--host-suffix` and `--path-prefix` describe **one** rule together, so
 `--host web.local --path-prefix /api` means "that host under that path". `--route` adds further
 rules and is repeatable — `--route host=a.example.com,path=/api`, or the shorthands `--route /api`,
 `--route '*.apps.example.com'`.
+
+`--no-route` (on `create`) and `--none` (on `set route`) are the two halves of
+leaving a managed deployment off the proxy entirely. Exposing a sandbox is then
+one `set route`, and withdrawing it is one more — neither disturbs the running
+VM or its shell sessions. Both are refused for a static (`proxy_pass`)
+deployment, which has no other door and would become unreachable.
 
 Every `set` command and `edit` is a read-modify-write against `PUT /deployments/:id`, which
 replaces the whole spec. serverctl edits the server's JSON rather than a struct of its own, so
@@ -396,6 +430,7 @@ and lowercases before hashing, so only a real change to who may enter invalidate
 serverctl scale web --replicas 3          # pin: min = max = 3
 serverctl scale web --min 1 --max 8 --warm 2 --target-concurrency 20
 serverctl scale web --scale-to-zero-after 600
+serverctl scale sb-7f3a9c --idle-action retain   # stop idle VMs instead of killing them
 
 serverctl restart web                     # drain every VM; the autoscaler boots replacements
 serverctl restart web --force --wait      # kill now, then block until the pool is healthy
@@ -405,6 +440,38 @@ serverctl rollout status web              # poll until desired == ready and noth
 `scale` uses the API's partial `PATCH .../scaling`, so fields you don't pass keep their values.
 `--replicas` is a pin, not a one-off: it sets both ends of the band, which is what stops the
 autoscaler moving off the number. Give it a `--min`/`--max` band again to hand control back.
+
+`--idle-action retain` stops an idle VM instead of killing it, so a later request
+or `exec` resumes that VM rather than booting a fresh one. It keeps the sandbox's
+`/workspace` data disk and nothing else — **not** the root filesystem, which the
+daemon recopies from the base image on every boot. Pair it with
+`--disk-gb` at create time and keep the sandbox's state under `/workspace`,
+or it only saves boot time; `serverctl describe` reports which mode a deployment
+is in under "When idle".
+
+### Getting inside a VM
+
+```sh
+serverctl exec sb-7f3a9c -- ls -la /workspace     # one command; its exit code becomes ours
+serverctl exec sb-7f3a9c --cwd /workspace -e RUST_LOG=debug -- cargo test
+serverctl shell sb-7f3a9c                          # an interactive PTY
+```
+
+`exec` is a pass-through: the guest's stdout goes to stdout, its stderr to
+stderr, and its exit code becomes serverctl's — so it composes in a pipeline,
+not only at a prompt. `-o json` returns the whole record instead, including
+which `sandbox_id` ran it.
+
+Both commands **start a VM** for a deployment that has none running, waiting up
+to the deployment's `cold_start_timeout_secs`; `--no-wake` asks for an error
+instead. Both go through app-lb rather than the heyvm daemon, so they work from
+anywhere the admin API does, use the credentials already in your context, and
+can wake a sandbox that was suspended by `--idle-action retain`.
+
+Together they are the only way into a deployment created with `--no-route`,
+which takes no HTTP traffic at all. An open `shell` holds the VM: it counts as
+in-flight work, so a sandbox will not be scaled to zero underneath a live
+session.
 
 ### Deleting
 

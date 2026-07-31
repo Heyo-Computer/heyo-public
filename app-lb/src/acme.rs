@@ -11,10 +11,23 @@
 //! proxy listener must be reachable on port 80**, which is where Let's Encrypt
 //! sends the validation request; there is no way to point it elsewhere.
 //!
-//! Only exact `host` route rules get certificates. A `host_suffix` rule matches
-//! a whole subtree, which needs a wildcard certificate, and Let's Encrypt only
-//! issues those over DNS-01 — a different challenge with a different set of
-//! credentials to manage. Those deployments fall back to the static cert.
+//! Two kinds of certificate are issued, over two different challenges:
+//!
+//! - **Per exact `host` route rule**, over HTTP-01. The default, and right for a
+//!   handful of named services.
+//! - **Per configured domain in `APP_LB_ACME_WILDCARD`**, over DNS-01, covering
+//!   `<domain>` and `*.<domain>`. Required for anything at fleet scale: Let's
+//!   Encrypt allows 50 certificates per registered domain per week, so a
+//!   thousand sandbox hostnames cannot each have their own. Publishing the
+//!   challenge record is [`crate::dns`]'s job.
+//!
+//! Hosts a configured wildcard covers are **excluded** from per-host issuance —
+//! that exclusion is the whole point, and without it the first sweep of a large
+//! fleet would exhaust the account's weekly quota.
+//!
+//! A `host_suffix` rule still gets no certificate of its own; it names a subtree,
+//! and the certificate for a subtree is the wildcard. One that no configured
+//! wildcard covers is warned about once and served the static fallback.
 
 use crate::deployment::now_secs;
 use crate::registry::Registry;
@@ -99,6 +112,12 @@ pub enum AcmeError {
     Io(std::io::Error),
     /// The CA offered no HTTP-01 challenge for an authorization.
     NoHttp01,
+    /// The CA offered no DNS-01 challenge for a wildcard authorization.
+    NoDns01,
+    /// A wildcard was asked for with no DNS provider configured.
+    NoDnsProvider,
+    /// Publishing or checking the challenge record failed.
+    Dns(crate::dns::DnsError),
     /// The order finished in a state other than valid.
     Order(OrderStatus),
 }
@@ -110,6 +129,13 @@ impl std::fmt::Display for AcmeError {
             Self::Cert(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
             Self::NoHttp01 => write!(f, "CA offered no http-01 challenge"),
+            Self::NoDns01 => write!(f, "CA offered no dns-01 challenge"),
+            Self::NoDnsProvider => write!(
+                f,
+                "a wildcard certificate needs a DNS-01 challenge, and no DNS provider is \
+                 configured — set APP_LB_ROUTE53_ZONE_ID"
+            ),
+            Self::Dns(e) => write!(f, "{e}"),
             Self::Order(s) => write!(f, "order ended in state {s:?}"),
         }
     }
@@ -169,6 +195,14 @@ pub struct AcmeConfig {
     /// The plaintext proxy address, used to confirm the listener is actually up
     /// before the first issuance. Not otherwise used.
     pub proxy_addr: String,
+    /// Domains to cover with a wildcard certificate (`APP_LB_ACME_WILDCARD`).
+    /// Each yields one certificate for `<domain>` **and** `*.<domain>`, issued
+    /// over DNS-01.
+    pub wildcards: Vec<String>,
+    /// Route 53, for the DNS-01 challenge. `None` when no wildcards are
+    /// configured — or when they are but the zone id is not, which is a
+    /// misconfiguration `main` warns about at startup.
+    pub dns: Option<crate::dns::Route53>,
 }
 
 impl AcmeConfig {
@@ -367,11 +401,18 @@ impl AcmeManager {
         Ok(account)
     }
 
-    /// Every exact hostname across all deployments.
+    /// Every hostname across all deployments that needs a certificate of its
+    /// own, with the ones a configured wildcard already covers removed.
     ///
-    /// `host_suffix` rules are deliberately excluded — see the module docs — and
-    /// warned about once each so the gap is visible in the log rather than
-    /// discovered at handshake time.
+    /// That removal is what makes a fleet viable rather than merely wasteful: a
+    /// thousand sandbox deployments each contribute an exact `host` rule, and
+    /// without this the first sweep would queue a thousand orders and exhaust
+    /// Let's Encrypt's 50-per-registered-domain-per-week limit before the
+    /// twentieth.
+    ///
+    /// `host_suffix` rules still get no certificate of their own — they name a
+    /// subtree, and a certificate for a subtree *is* the wildcard — but they are
+    /// only warned about when no configured wildcard covers them.
     fn desired_hosts(&self) -> Vec<String> {
         let mut hosts = HashSet::new();
         let mut unsupported = Vec::new();
@@ -379,10 +420,16 @@ impl AcmeManager {
         for deployment in self.registry.deployments().values() {
             for rule in &deployment.spec.routes {
                 if let Some(host) = &rule.host {
-                    hosts.insert(host.trim().to_ascii_lowercase());
+                    let host = host.trim().to_ascii_lowercase();
+                    if self.covering_wildcard(&host).is_none() {
+                        hosts.insert(host);
+                    }
                 }
                 if let Some(suffix) = &rule.host_suffix {
-                    unsupported.push((deployment.spec.id.clone(), suffix.clone()));
+                    let suffix = suffix.trim().trim_start_matches('.').to_ascii_lowercase();
+                    if self.covering_wildcard(&suffix).is_none() && !self.certifies(&suffix) {
+                        unsupported.push((deployment.spec.id.clone(), suffix));
+                    }
                 }
             }
         }
@@ -393,9 +440,10 @@ impl AcmeManager {
                     tracing::warn!(
                         deployment = %id,
                         host_suffix = %suffix,
-                        "no ACME certificate: wildcard hostnames need a DNS-01 challenge, \
-                         which app-lb does not implement; this deployment will be served \
-                         the static fallback certificate",
+                        "no ACME certificate: a wildcard hostname needs a wildcard \
+                         certificate, which is issued over DNS-01 — add this domain to \
+                         APP_LB_ACME_WILDCARD (with APP_LB_ROUTE53_ZONE_ID). Until then \
+                         this deployment is served the static fallback certificate",
                     );
                 }
             }
@@ -404,6 +452,23 @@ impl AcmeManager {
         let mut hosts: Vec<_> = hosts.into_iter().filter(|h| !h.is_empty()).collect();
         hosts.sort();
         hosts
+    }
+
+    /// Whether `domain` is one of the domains we issue a wildcard for.
+    fn certifies(&self, domain: &str) -> bool {
+        self.config.wildcards.iter().any(|w| w == domain)
+    }
+
+    /// The configured wildcard covering `host`, if any.
+    ///
+    /// A wildcard covers exactly one label — `*.sb.example.com` matches
+    /// `a.sb.example.com` but not `a.b.sb.example.com` — so this checks the
+    /// immediate parent and nothing further up. Being generous here would skip
+    /// issuing for a host the wildcard cannot actually serve, and the failure
+    /// would only show up as a name mismatch at somebody's TLS handshake.
+    fn covering_wildcard(&self, host: &str) -> Option<&String> {
+        let parent = host.split_once('.')?.1;
+        self.config.wildcards.iter().find(|w| *w == parent)
     }
 
     /// `true` if this host is not in a post-failure cooldown.
@@ -484,11 +549,18 @@ impl AcmeManager {
     /// Sequential on purpose: orders against one account share rate limits, and
     /// a burst of parallel orders is the fastest way to get throttled.
     async fn reconcile(&self) {
-        let wanted = self.desired_hosts();
-        if wanted.is_empty() {
-            return;
-        }
+        // Wildcards first and unconditionally: they are configured, not derived
+        // from what is registered, so one has to be issued before the first
+        // sandbox that needs it exists — otherwise the first request to a new
+        // hostname is served the fallback certificate.
+        let wildcards: Vec<String> = self
+            .certs
+            .needing_renewal(self.config.wildcards.iter().map(String::as_str))
+            .into_iter()
+            .filter(|d| self.may_attempt(d))
+            .collect();
 
+        let wanted = self.desired_hosts();
         let due: Vec<String> = self
             .certs
             .needing_renewal(wanted.iter().map(String::as_str))
@@ -496,7 +568,7 @@ impl AcmeManager {
             .filter(|h| self.may_attempt(h))
             .collect();
 
-        if due.is_empty() {
+        if due.is_empty() && wildcards.is_empty() {
             return;
         }
 
@@ -506,13 +578,30 @@ impl AcmeManager {
                 // Every host is blocked by this, so back them all off rather
                 // than hammering a CA that just refused us.
                 tracing::error!(error = %e, "could not obtain ACME account; deferring issuance");
-                for host in &due {
+                for host in due.iter().chain(wildcards.iter()) {
                     self.record_failure(host);
                 }
                 return;
             }
         };
 
+        for domain in wildcards {
+            tracing::info!(domain = %domain, "issuing a wildcard certificate");
+            match self.issue_wildcard(&account, &domain).await {
+                Ok(()) => {
+                    tracing::info!(domain = %domain, "wildcard certificate installed");
+                    self.record_success(&domain);
+                }
+                Err(e) => {
+                    tracing::error!(domain = %domain, error = %e, "wildcard issuance failed");
+                    self.record_failure(&domain);
+                }
+            }
+        }
+
+        if due.is_empty() {
+            return;
+        }
         tracing::info!(count = due.len(), "issuing certificates");
         for host in due {
             match self.issue(&account, &host).await {
@@ -526,6 +615,94 @@ impl AcmeManager {
                 }
             }
         }
+    }
+
+    /// Run one wildcard order end to end, over DNS-01, and install the result.
+    ///
+    /// The certificate covers `domain` **and** `*.domain`, ordered together
+    /// because they are both wanted and one order is one rate-limit unit. Both
+    /// authorizations resolve to the same challenge record —
+    /// `_acme-challenge.<domain>` — so their digests are published as two values
+    /// of one TXT RRset, not two records that would overwrite each other.
+    ///
+    /// Stored under the bare `domain`. `CertStore::lookup` finds it from any
+    /// subdomain by checking the parent, and serves it only because the
+    /// certificate itself carries the `*.` SAN.
+    async fn issue_wildcard(&self, account: &Account, domain: &str) -> Result<(), AcmeError> {
+        let Some(dns) = self.config.dns.as_ref() else {
+            return Err(AcmeError::NoDnsProvider);
+        };
+
+        let identifiers = [
+            Identifier::Dns(domain.to_string()),
+            Identifier::Dns(format!("*.{domain}")),
+        ];
+        let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
+
+        // Two passes over the authorizations, and that is the point. Every
+        // digest has to be *published* before any challenge is marked ready:
+        // both authorizations answer at the same name, so a per-authorization
+        // publish would have the second UPSERT replace the first and whichever
+        // the CA checked second would fail. A challenge handle borrows the
+        // order, so collecting them all and publishing in between is not an
+        // option — hence collect, publish, then walk them again to mark ready.
+        let mut digests = Vec::new();
+        {
+            let mut authorizations = order.authorizations();
+            while let Some(authorization) = authorizations.next().await {
+                let mut authorization = authorization?;
+                // The CA caches successful validations; a re-issue inside that
+                // window arrives already valid with nothing to answer.
+                if authorization.status == AuthorizationStatus::Valid {
+                    continue;
+                }
+                let Some(challenge) = authorization.challenge(ChallengeType::Dns01) else {
+                    return Err(AcmeError::NoDns01);
+                };
+                digests.push(challenge.key_authorization().dns_value());
+            }
+        }
+
+        if digests.is_empty() {
+            // Everything was already valid — nothing to publish, straight to
+            // finalization.
+            return self.finish_order(&mut order, domain).await;
+        }
+        digests.sort();
+        digests.dedup();
+
+        tracing::info!(
+            domain = %domain,
+            values = digests.len(),
+            "publishing the DNS-01 challenge and waiting for it to become answerable",
+        );
+        dns.publish_challenge(domain, &digests)
+            .await
+            .map_err(AcmeError::Dns)?;
+
+        // Everything past here must retract the record, so the result is held
+        // rather than propagated with `?`.
+        let result = async {
+            let mut authorizations = order.authorizations();
+            while let Some(authorization) = authorizations.next().await {
+                let mut authorization = authorization?;
+                if authorization.status == AuthorizationStatus::Valid {
+                    continue;
+                }
+                if let Some(mut challenge) = authorization.challenge(ChallengeType::Dns01) {
+                    challenge.set_ready().await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        let result = match result {
+            Ok(()) => self.finish_order(&mut order, domain).await,
+            Err(e) => Err(e),
+        };
+        dns.retract_challenge(domain, &digests).await;
+        result
     }
 
     /// Run one HTTP-01 order end to end and install the result.
@@ -678,6 +855,14 @@ mod tests {
     }
 
     fn manager_in(dir: &Path, registry: Arc<Registry>) -> AcmeManager {
+        manager_with_wildcards(dir, registry, Vec::new())
+    }
+
+    fn manager_with_wildcards(
+        dir: &Path,
+        registry: Arc<Registry>,
+        wildcards: Vec<String>,
+    ) -> AcmeManager {
         AcmeManager::new(
             registry,
             Arc::new(CertStore::new(dir.join("certs"), None)),
@@ -687,12 +872,98 @@ mod tests {
                 dir: dir.to_path_buf(),
                 directory_url: LetsEncrypt::Staging.url().to_string(),
                 proxy_addr: "127.0.0.1:0".into(),
+                wildcards,
+                // Never reached: these tests exercise which hosts are selected,
+                // never an order.
+                dns: None,
             },
         )
     }
 
     fn manager(tag: &str, registry: Arc<Registry>) -> AcmeManager {
         manager_in(&tmpdir(tag), registry)
+    }
+
+    /// The single most important consequence of configuring a wildcard: hosts
+    /// it covers must stop being ordered individually. Let's Encrypt allows 50
+    /// certificates per registered domain per week, so a fleet of a thousand
+    /// sandboxes would exhaust the quota — and lock out every other hostname on
+    /// the account — within the first sweep.
+    #[test]
+    fn a_wildcard_suppresses_per_host_issuance_underneath_it() {
+        let dir = tmpdir("wildcard-suppress");
+        let registry = registry_with(vec![
+            RouteRule {
+                host: Some("sb-1.sb.example.com".into()),
+                host_suffix: None,
+                path_prefix: None,
+            },
+            RouteRule {
+                host: Some("sb-2.sb.example.com".into()),
+                host_suffix: None,
+                path_prefix: None,
+            },
+            // A different domain: not covered, so it still gets its own.
+            RouteRule {
+                host: Some("web.example.com".into()),
+                host_suffix: None,
+                path_prefix: None,
+            },
+        ]);
+        let manager = manager_with_wildcards(&dir, registry, vec!["sb.example.com".into()]);
+
+        assert_eq!(
+            manager.desired_hosts(),
+            vec!["web.example.com".to_string()],
+            "only the host no wildcard covers",
+        );
+    }
+
+    /// A wildcard covers exactly one label. Treating it as covering the whole
+    /// subtree would skip issuing for a host the certificate cannot serve, and
+    /// the only symptom would be a name mismatch at somebody's handshake.
+    #[test]
+    fn a_wildcard_covers_one_label_and_no_more() {
+        let dir = tmpdir("wildcard-depth");
+        let registry = registry_with(vec![
+            RouteRule {
+                host: Some("a.sb.example.com".into()),
+                host_suffix: None,
+                path_prefix: None,
+            },
+            RouteRule {
+                host: Some("a.b.sb.example.com".into()),
+                host_suffix: None,
+                path_prefix: None,
+            },
+        ]);
+        let manager = manager_with_wildcards(&dir, registry, vec!["sb.example.com".into()]);
+
+        assert_eq!(
+            manager.desired_hosts(),
+            vec!["a.b.sb.example.com".to_string()],
+            "the two-label-deep host is not covered and still needs its own cert",
+        );
+    }
+
+    /// A `host_suffix` route is exactly what a wildcard is for, so configuring
+    /// one must silence the "no certificate for this" warning rather than
+    /// leaving an operator to wonder whether it took effect.
+    #[test]
+    fn a_configured_wildcard_is_not_warned_about() {
+        let dir = tmpdir("wildcard-warn");
+        let registry = registry_with(vec![RouteRule {
+            host: None,
+            host_suffix: Some("sb.example.com".into()),
+            path_prefix: None,
+        }]);
+        let manager = manager_with_wildcards(&dir, registry, vec!["sb.example.com".into()]);
+
+        assert!(manager.desired_hosts().is_empty());
+        assert!(
+            manager.warned.lock().unwrap().is_empty(),
+            "a covered suffix is served, not unsupported",
+        );
     }
 
     #[test]

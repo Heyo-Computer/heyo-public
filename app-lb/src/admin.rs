@@ -405,7 +405,42 @@ struct MetricsResponse {
     /// distinguish a quiet deployment from a full queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     obs: Option<crate::obs::ObsSnapshot>,
+    /// The slice of deployments this response carries. Scoped by the query
+    /// parameters on `MetricsQuery` — at fleet scale the full list is megabytes,
+    /// and the dashboard polls it every few seconds.
     deployments: Vec<DeploymentView>,
+    /// How many deployments matched before `limit`/`offset`, so a client can
+    /// page without guessing.
+    matched: usize,
+    /// How many deployments currently hold their own counters. Normally equal
+    /// to the number registered; a number that climbs past it means retirement
+    /// is not keeping up, which is the leak this used to have.
+    tracked_deployments: usize,
+}
+
+/// Query parameters for `GET /metrics`.
+///
+/// The unfiltered response used to be the only response. That is fine for a few
+/// dozen services and untenable for thousands of sandboxes, where every poll
+/// serialises every VM and every histogram. All fields are optional and the
+/// defaults reproduce the old behaviour for small fleets.
+#[derive(Debug, Default, Deserialize)]
+struct MetricsQuery {
+    /// Restrict to one deployment by id. The cheap path for "how is this one
+    /// sandbox doing", which is the common question about a fleet.
+    deployment: Option<String>,
+    /// Restrict to deployments whose id starts with this. Sandbox ids are
+    /// generated with a common prefix, so this is how a tenant is scoped.
+    prefix: Option<String>,
+    /// Drop the per-VM detail, keeping pool counts and metrics. The largest
+    /// single saving: VM rows dominate the payload for a fleet at rest.
+    #[serde(default)]
+    summary: bool,
+    /// Page size. Absent means no limit, which is what the dashboard sends for
+    /// a small fleet.
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: usize,
 }
 
 fn pool_status_of(d: &Arc<crate::deployment::Deployment>) -> PoolStatus {
@@ -465,10 +500,48 @@ fn pending_vms_of(d: &Arc<crate::deployment::Deployment>) -> Vec<PendingVmView> 
 
 /// The dashboard's data source: live pool gauges joined with accumulated
 /// metrics, per deployment plus a global rollup.
-async fn metrics_snapshot(State(state): State<AdminState>) -> impl IntoResponse {
+async fn metrics_snapshot(
+    State(state): State<AdminState>,
+    Query(q): Query<MetricsQuery>,
+) -> impl IntoResponse {
     let deployments = state.registry.deployments();
-    let mut views: Vec<DeploymentView> = deployments
+
+    // The fleet rollup covers the whole registry, never the filter or the page.
+    // It sits under "Host & fleet" alongside the global metrics, and a number
+    // there that moved when somebody typed in the table's search box would be
+    // describing the query rather than the system.
+    let mut fleet = FleetPool {
+        deployments: deployments.len(),
+        ready: 0,
+        draining: 0,
+        pending: 0,
+        total_in_flight: 0,
+    };
+    for d in deployments.values() {
+        let pool = pool_status_of(d);
+        fleet.ready += pool.ready;
+        fleet.draining += pool.draining;
+        fleet.pending += pool.pending;
+        fleet.total_in_flight += pool.total_in_flight;
+    }
+
+    // Filter and page *before* building views: a view snapshots every VM and
+    // every histogram, so the work skipped here is the work that made this
+    // endpoint expensive.
+    let mut selected: Vec<_> = deployments
         .values()
+        .filter(|d| q.deployment.as_ref().is_none_or(|id| &d.spec.id == id))
+        .filter(|d| q.prefix.as_ref().is_none_or(|p| d.spec.id.starts_with(p)))
+        .collect();
+    selected.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
+
+    let matched = selected.len();
+    let page = selected
+        .into_iter()
+        .skip(q.offset)
+        .take(q.limit.unwrap_or(usize::MAX));
+
+    let views: Vec<DeploymentView> = page
         .map(|d| {
             let backends = d.backends();
             DeploymentView {
@@ -483,36 +556,34 @@ async fn metrics_snapshot(State(state): State<AdminState>) -> impl IntoResponse 
                     .collect(),
                 job_kind: job_kind_of(&d.spec),
                 pool: pool_status_of(d),
-                vms: backends
-                    .iter()
-                    .map(|b| {
-                        let usage = b.usage();
-                        VmView {
-                            sandbox_id: b.sandbox_id.clone(),
-                            addr: b.peer.clone(),
-                            in_flight: b.in_flight(),
-                            healthy: b.is_healthy(),
-                            draining: b.is_draining(),
-                            uptime_secs: b.uptime_secs(),
-                            cpu_percent: usage.map(|(c, _)| c),
-                            memory_bytes: usage.map(|(_, m)| m),
-                        }
-                    })
-                    .collect(),
-                pending_vms: pending_vms_of(d),
+                // Skipped under `summary`: one row per VM is what makes this
+                // response large, and the pool counts above already say how
+                // many there are.
+                vms: if q.summary {
+                    Vec::new()
+                } else {
+                    backends
+                        .iter()
+                        .map(|b| {
+                            let usage = b.usage();
+                            VmView {
+                                sandbox_id: b.sandbox_id.clone(),
+                                addr: b.peer.clone(),
+                                in_flight: b.in_flight(),
+                                healthy: b.is_healthy(),
+                                draining: b.is_draining(),
+                                uptime_secs: b.uptime_secs(),
+                                cpu_percent: usage.map(|(c, _)| c),
+                                memory_bytes: usage.map(|(_, m)| m),
+                            }
+                        })
+                        .collect()
+                },
+                pending_vms: if q.summary { Vec::new() } else { pending_vms_of(d) },
                 metrics: state.metrics.deployment_snapshot(&d.spec.id),
             }
         })
         .collect();
-    views.sort_by(|a, b| a.id.cmp(&b.id));
-
-    let fleet = FleetPool {
-        deployments: views.len(),
-        ready: views.iter().map(|v| v.pool.ready).sum(),
-        draining: views.iter().map(|v| v.pool.draining).sum(),
-        pending: views.iter().map(|v| v.pool.pending).sum(),
-        total_in_flight: views.iter().map(|v| v.pool.total_in_flight).sum(),
-    };
 
     let now = now_secs();
     Json(MetricsResponse {
@@ -523,11 +594,33 @@ async fn metrics_snapshot(State(state): State<AdminState>) -> impl IntoResponse 
         global: state.metrics.global_snapshot(),
         obs: state.obs.as_ref().map(|o| o.snapshot()),
         deployments: views,
+        matched,
+        tracked_deployments: state.metrics.tracked_deployments(),
     })
 }
 
 async fn dashboard(State(state): State<AdminState>) -> impl IntoResponse {
     Html(state.dashboard_html.to_string())
+}
+
+/// Log the things a spec is allowed to say but probably didn't mean.
+///
+/// Not `validate`, because none of these make the spec unservable — refusing
+/// them would be app-lb deciding it knows better. Logged at the moment the
+/// author can still act on it.
+fn warn_about(spec: &DeploymentSpec) {
+    let Some(vm) = &spec.vm else { return };
+    if spec.scaling.idle_action == crate::config::IdleAction::Retain
+        && vm.disk_size_gb.unwrap_or(0) == 0
+    {
+        tracing::warn!(
+            deployment = %spec.id,
+            "idle_action is `retain` but the VM has no data disk: the daemon recopies the \
+             rootfs from the base image on every boot, so a suspended VM keeps nothing. \
+             Set `vm.disk_size_gb` and keep state under /workspace, or this only saves \
+             boot time",
+        );
+    }
 }
 
 async fn register(
@@ -539,6 +632,7 @@ async fn register(
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    warn_about(&spec);
 
     let id = spec.id.clone();
     // Replacing a deployment abandons its old pool; tear it down explicitly so
@@ -555,8 +649,8 @@ async fn register(
     if let Some(old) = old {
         state.autoscaler.teardown(&old).await;
     }
-    if let Err(e) = state.registry.persist() {
-        tracing::error!(error = %e, "failed to persist state");
+    if let Err(e) = state.registry.persist_one(&id) {
+        tracing::error!(deployment = %id, error = %e, "failed to persist state");
     }
     tracing::info!(deployment = %id, "registered");
 
@@ -585,6 +679,7 @@ async fn update(
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    warn_about(&spec);
 
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
@@ -610,8 +705,8 @@ async fn update(
         }
     };
 
-    if let Err(e) = state.registry.persist() {
-        tracing::error!(error = %e, "failed to persist state");
+    if let Err(e) = state.registry.persist_one(&id) {
+        tracing::error!(deployment = %id, error = %e, "failed to persist state");
     }
     // Reconcile to the new policy immediately (scale up/down, warm pool).
     deployment.scale_signal.notify_one();
@@ -676,8 +771,8 @@ async fn scale(
     let Some(deployment) = state.registry.update(spec) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
-    if let Err(e) = state.registry.persist() {
-        tracing::error!(error = %e, "failed to persist state");
+    if let Err(e) = state.registry.persist_one(&id) {
+        tracing::error!(deployment = %id, error = %e, "failed to persist state");
     }
     tracing::info!(deployment = %id, "scaled");
     deployment.scale_signal.notify_one();
@@ -705,8 +800,11 @@ async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> 
     };
     // Removed from routing first, so the teardown can't race new requests in.
     state.autoscaler.teardown(&d).await;
-    if let Err(e) = state.registry.persist() {
-        tracing::error!(error = %e, "failed to persist state");
+    // Its counters fold into the global rollup and its entry goes; a fleet whose
+    // ids churn would otherwise accumulate one per sandbox that ever existed.
+    state.metrics.retire(&id);
+    if let Err(e) = state.registry.forget(&id) {
+        tracing::error!(deployment = %id, error = %e, "failed to drop persisted state");
     }
     tracing::info!(deployment = %id, "deregistered");
     StatusCode::NO_CONTENT.into_response()
@@ -770,6 +868,319 @@ async fn evict_vm(
             err(StatusCode::BAD_GATEWAY, format!("failed to evict VM: {e}")).into_response()
         }
     }
+}
+
+// --- exec and shell -------------------------------------------------------
+//
+// The two ways into a VM that are not HTTP. Both matter most for a deployment
+// with no routes at all — an agent sandbox — where they are the *only* ways in.
+//
+// Both go through app-lb rather than handing the caller a daemon address,
+// because three things have to happen that only app-lb can do: resolve a
+// deployment id to whichever sandbox is currently serving it, apply the admin
+// gate, and wake a VM that has been scaled to zero or suspended.
+
+/// How long a command may run before the daemon gives up on it, when the caller
+/// names no timeout. Long enough for a build step, short enough that a hung
+/// command does not hold an admin connection for the rest of the day.
+const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 60;
+
+/// Ceiling on a caller-supplied exec timeout.
+const MAX_EXEC_TIMEOUT_SECS: u64 = 3600;
+
+#[derive(Debug, Deserialize)]
+struct ExecRequest {
+    /// Run through `sh -c` in the guest.
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Boot or resume a VM if none is running. On by default: a sandbox that
+    /// scaled to zero should still answer `exec`. `false` asks for a `409`
+    /// instead, for callers that want to know rather than wait.
+    #[serde(default = "default_true")]
+    wake: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+struct ExecResponse {
+    /// Which VM ran it. Worth returning even for a single-VM sandbox: after a
+    /// resume or a rebuild it is a different sandbox than last time.
+    sandbox_id: String,
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    /// stdout and stderr interleaved in the order the guest wrote them, as the
+    /// daemon captured it. The only faithful rendering of a command whose
+    /// output interleaves.
+    output: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ShellQuery {
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default = "default_true")]
+    wake: bool,
+}
+
+/// Resolve a deployment to a VM that can run something, waking one if asked.
+///
+/// The waiting half is the proxy's cold-start path (`proxy::wait_for_capacity`)
+/// reused verbatim, so an `exec` against a sleeping sandbox nudges the
+/// autoscaler and waits exactly as a request would — including the autoscaler's
+/// preference for resuming a suspended VM over booting a fresh one.
+///
+/// The returned guard holds an in-flight slot for as long as the caller keeps
+/// it, which is what stops the VM being scaled out from under a live session.
+async fn hold_a_vm(
+    state: &AdminState,
+    id: &str,
+    wake: bool,
+) -> Result<crate::deployment::BackendSlot, Response> {
+    let Some(d) = state.registry.get(id) else {
+        return Err(err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response());
+    };
+    if d.spec.is_static() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "deployment {id:?} is static (proxy_pass); its upstreams are addresses, \
+                 not VMs, so there is nothing to run a command in"
+            ),
+        )
+        .into_response());
+    }
+
+    if let Some(b) = d.select(&[]) {
+        return Ok(b.hold());
+    }
+    if !wake {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("deployment {id:?} has no running VM (pass wake=true to start one)"),
+        )
+        .into_response());
+    }
+    match crate::proxy::wait_for_capacity(&d, &[], &state.metrics).await {
+        Some(b) => Ok(b.hold()),
+        None => Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "deployment {id:?} has no VM and none became available within \
+                 cold_start_timeout_secs"
+            ),
+        )
+        .into_response()),
+    }
+}
+
+/// `POST /deployments/:id/exec` — run one command in the deployment's VM.
+async fn exec(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(req): Json<ExecRequest>,
+) -> impl IntoResponse {
+    if req.command.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "command must not be empty").into_response();
+    }
+
+    let slot = match hold_a_vm(&state, &id, req.wake).await {
+        Ok(slot) => slot,
+        Err(response) => return response,
+    };
+    let sandbox_id = slot.sandbox_id().to_string();
+
+    let timeout = std::time::Duration::from_secs(
+        req.timeout_secs
+            .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
+            .clamp(1, MAX_EXEC_TIMEOUT_SECS),
+    );
+    let options = heyo_sdk::CommandRunOptions {
+        cwd: req.cwd,
+        env: req.env,
+        timeout: Some(timeout),
+    };
+
+    tracing::info!(deployment = %id, sandbox = %sandbox_id, "exec");
+    match state
+        .autoscaler
+        .vms()
+        .exec(&sandbox_id, &req.command, options)
+        .await
+    {
+        Ok(result) => Json(ExecResponse {
+            sandbox_id,
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            output: result.output,
+        })
+        .into_response(),
+        // The command's own failure is a 200 with a non-zero `exit_code`; this
+        // is app-lb failing to *run* it, which is a different thing entirely and
+        // must not be mistaken for one.
+        Err(e) => err(
+            StatusCode::BAD_GATEWAY,
+            format!("could not run the command in {sandbox_id}: {e}"),
+        )
+        .into_response(),
+    }
+}
+
+/// `GET /deployments/:id/shell` — an interactive PTY, over a WebSocket.
+///
+/// Wire protocol with the client, which is the daemon's own minus the parts the
+/// SDK session already handles (sequence numbers and acks):
+///
+/// - client → server, binary `[0x01, ...stdin]`
+/// - client → server, text `{"type":"resize","cols":N,"rows":N}`
+/// - server → client, text `{"type":"ready","sandbox_id":"…"}` — sent once
+/// - server → client, binary `[0x02, ...stdout]` (the PTY merges stderr in)
+/// - server → client, text `{"type":"exit","code":N}` or
+///   `{"type":"error","message":"…"}`
+async fn shell(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(q): Query<ShellQuery>,
+    ws: axum::extract::WebSocketUpgrade,
+) -> Response {
+    // Everything that can fail with a status code has to fail *before* the
+    // upgrade: once the socket is a WebSocket, a client sees a close frame with
+    // no explanation instead of a 404.
+    let slot = match hold_a_vm(&state, &id, q.wake).await {
+        Ok(slot) => slot,
+        Err(response) => return response,
+    };
+    let sandbox_id = slot.sandbox_id().to_string();
+
+    let options = heyo_sdk::ShellOptions {
+        cwd: q.cwd,
+        env: None,
+        cols: q.cols.unwrap_or(80),
+        rows: q.rows.unwrap_or(24),
+        ..Default::default()
+    };
+    let session = match state.autoscaler.vms().shell(&sandbox_id, options).await {
+        Ok(s) => s,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("could not open a shell on {sandbox_id}: {e}"),
+            )
+            .into_response();
+        }
+    };
+
+    tracing::info!(deployment = %id, sandbox = %sandbox_id, "shell session opened");
+    ws.on_upgrade(move |socket| async move {
+        // `slot` moves in here, so the VM is held for the life of the session
+        // and released however it ends.
+        pump_shell(socket, session, sandbox_id.clone(), slot).await;
+        tracing::info!(deployment = %id, sandbox = %sandbox_id, "shell session closed");
+    })
+}
+
+/// Copy between the client's WebSocket and the sandbox's PTY until either ends.
+async fn pump_shell(
+    socket: axum::extract::ws::WebSocket,
+    session: heyo_sdk::ShellSession,
+    sandbox_id: String,
+    _slot: crate::deployment::BackendSlot,
+) {
+    use axum::extract::ws::Message;
+    use futures::{SinkExt, StreamExt};
+
+    const STDIN: u8 = 0x01;
+    const STDOUT: u8 = 0x02;
+
+    let (mut tx, mut rx) = socket.split();
+    if tx
+        .send(Message::Text(
+            serde_json::json!({ "type": "ready", "sandbox_id": sandbox_id }).to_string(),
+        ))
+        .await
+        .is_err()
+    {
+        return; // client hung up during the handshake
+    }
+
+    let mut output = session.output();
+    let mut events = session.events();
+    loop {
+        tokio::select! {
+            // Guest → client.
+            Some(chunk) = output.next() => {
+                let mut frame = Vec::with_capacity(chunk.len() + 1);
+                frame.push(STDOUT);
+                frame.extend_from_slice(&chunk);
+                if tx.send(Message::Binary(frame)).await.is_err() {
+                    break;
+                }
+            }
+            // Client → guest.
+            msg = rx.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        // Anything not marked stdin is a client bug, not data to
+                        // feed a shell — dropping it beats writing a stray frame
+                        // header into somebody's terminal.
+                        if bytes.first() == Some(&STDIN)
+                            && session.write(&bytes[1..]).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                            && v.get("type").and_then(|t| t.as_str()) == Some("resize")
+                        {
+                            let cols = v.get("cols").and_then(|c| c.as_u64()).unwrap_or(80) as u16;
+                            let rows = v.get("rows").and_then(|r| r.as_u64()).unwrap_or(24) as u16;
+                            let _ = session.resize(cols, rows).await;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}       // ping/pong: axum answers these itself
+                    Some(Err(_)) => break,  // socket is gone
+                }
+            }
+            // Lifecycle, so a client learns *why* its shell ended.
+            Some(event) = events.next() => {
+                let msg = match event {
+                    heyo_sdk::ShellEvent::Closed { exit_code } => {
+                        serde_json::json!({ "type": "exit", "code": exit_code.unwrap_or(0) })
+                    }
+                    heyo_sdk::ShellEvent::Error(message) => {
+                        serde_json::json!({ "type": "error", "message": message })
+                    }
+                    // Reconnects are the SDK's business; the client's stream is
+                    // continuous either way and saying so would only confuse it.
+                    _ => continue,
+                };
+                let closing = msg["type"] == "exit";
+                let _ = tx.send(Message::Text(msg.to_string())).await;
+                if closing {
+                    break;
+                }
+            }
+            else => break,
+        }
+    }
+
+    let _ = session.close().await;
+    let _ = tx.send(Message::Close(None)).await;
 }
 
 async fn healthz() -> &'static str {
@@ -1083,6 +1494,10 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
         .route("/deployments/:id/scaling", patch(scale))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
+        // CRUD-tier on purpose: running a command in a VM is at least as
+        // powerful as editing the spec that boots it.
+        .route("/deployments/:id/exec", post(exec))
+        .route("/deployments/:id/shell", get(shell))
         // Grouped with the CRUD routes so it inherits the `APP_LB_ADMIN_AUTH`
         // gate: it reports which hostnames app-lb holds keys for.
         .route("/certs", get(certs))

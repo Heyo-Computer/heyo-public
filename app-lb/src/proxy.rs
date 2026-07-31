@@ -535,7 +535,7 @@ impl ProxyHttp for LbProxy {
 /// Returns as soon as a backend becomes available, or `None` on timeout or if
 /// the deployment is already at `max_replicas` with nothing healthy (in which
 /// case waiting cannot help).
-async fn wait_for_capacity(
+pub async fn wait_for_capacity(
     deployment: &Arc<Deployment>,
     exclude: &[String],
     metrics: &Metrics,

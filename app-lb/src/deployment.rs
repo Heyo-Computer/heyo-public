@@ -2,6 +2,7 @@
 
 use crate::config::DeploymentSpec;
 use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -143,6 +144,43 @@ impl VmBackend {
     }
 }
 
+/// Holds an in-flight slot on a backend for as long as it lives.
+///
+/// The proxy releases its slot by hand (`Ctx::release`, which has to be
+/// idempotent across several exit paths). A shell session cannot: it lives for
+/// minutes or hours across an arbitrary number of failure modes, and a leaked
+/// slot pins the deployment at max replicas forever.
+///
+/// Holding a slot is also what keeps a session's VM alive. An unrouted sandbox
+/// serves no requests, so nothing else moves `last_active` — without this, a
+/// deployment with `scale_to_zero_after_secs` set would reap the VM out from
+/// under an open shell.
+pub struct BackendSlot {
+    backend: Arc<VmBackend>,
+}
+
+impl BackendSlot {
+    pub fn sandbox_id(&self) -> &str {
+        &self.backend.sandbox_id
+    }
+}
+
+impl Drop for BackendSlot {
+    fn drop(&mut self) {
+        self.backend.release();
+    }
+}
+
+impl VmBackend {
+    /// Take an in-flight slot, released when the returned guard drops.
+    pub fn hold(self: &Arc<Self>) -> BackendSlot {
+        self.acquire();
+        BackendSlot {
+            backend: self.clone(),
+        }
+    }
+}
+
 /// A VM that has been created but is not yet serving.
 ///
 /// The two progress fields exist because a boot that never finishes is otherwise
@@ -180,9 +218,30 @@ impl PendingVm {
     }
 }
 
+/// Per-deployment runtime state that has to outlive a restart.
+///
+/// Distinct from the spec: the spec is what the operator wrote, this is what the
+/// LB learned. It is persisted alongside the spec because losing it leaks real
+/// resources — a suspended sandbox that app-lb forgets is invisible to the
+/// daemon's running-VM list and so is never reaped by anything.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct DeploymentState {
+    /// Sandboxes this deployment stopped rather than destroyed, under
+    /// `scaling.idle_action: retain`. They hold their `/workspace` data disk and
+    /// are candidates for resume in preference to a cold create.
+    ///
+    /// Tracked here because a stopped sandbox is **absent** from the daemon's
+    /// `GET /sandboxes` (mvm-ctrl drops it from the in-memory map on stop), so
+    /// the fleet list cannot be asked what we suspended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspended: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct Deployment {
     pub spec: DeploymentSpec,
+    /// Runtime state, persisted with the spec. Copy-on-write like the pools.
+    state: ArcSwap<DeploymentState>,
     /// Ready, routable VMs. Copy-on-write: the autoscaler is the only writer.
     backends: ArcSwap<Vec<Arc<VmBackend>>>,
     /// Booting VMs, not yet routable.
@@ -212,12 +271,36 @@ impl Deployment {
             .collect();
         Self {
             spec,
+            state: ArcSwap::from_pointee(DeploymentState::default()),
             backends: ArcSwap::from_pointee(backends),
             pending: ArcSwap::from_pointee(Vec::new()),
             waiters: AtomicUsize::new(0),
             ready_signal: Notify::new(),
             scale_signal: Notify::new(),
         }
+    }
+
+    pub fn state(&self) -> Arc<DeploymentState> {
+        self.state.load_full()
+    }
+
+    pub fn set_state(&self, state: DeploymentState) {
+        self.state.store(Arc::new(state));
+    }
+
+    /// Read-modify-write the runtime state, returning whether it changed.
+    ///
+    /// The return value is what tells a caller whether the change is worth a
+    /// disk write; these paths run every tick and usually change nothing.
+    pub fn mutate_state(&self, f: impl FnOnce(&mut DeploymentState)) -> bool {
+        let before = self.state();
+        let mut next = (*before).clone();
+        f(&mut next);
+        if next == *before {
+            return false;
+        }
+        self.state.store(Arc::new(next));
+        true
     }
 
     pub fn waiters(&self) -> usize {

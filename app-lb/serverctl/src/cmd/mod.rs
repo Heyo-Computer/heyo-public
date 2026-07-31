@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod auth;
 pub mod observe;
 pub mod read;
+pub mod session;
 pub mod write;
 
 use crate::client::Client;

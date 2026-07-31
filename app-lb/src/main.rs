@@ -11,6 +11,7 @@ mod auth;
 mod autoscale;
 mod config;
 mod deployment;
+mod dns;
 mod health;
 mod jobs;
 mod metrics;
@@ -103,6 +104,19 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_GIT_BIN") {
         cfg.git_bin = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_AWS_BIN") {
+        cfg.aws_bin = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_ACME_WILDCARD") {
+        cfg.acme_wildcards = v
+            .split(',')
+            .map(|d| d.trim().trim_start_matches("*.").trim_end_matches('.').to_ascii_lowercase())
+            .filter(|d| !d.is_empty())
+            .collect();
+    }
+    if let Ok(v) = std::env::var("APP_LB_ROUTE53_ZONE_ID") {
+        cfg.route53_zone_id = Some(v.trim().to_string()).filter(|z| !z.is_empty());
     }
     if let Ok(v) = std::env::var("APP_LB_UPDATE_SHELL") {
         cfg.update_shell = v;
@@ -241,13 +255,48 @@ fn main() {
         );
     }
 
+    // A wildcard is only issued over DNS-01, which needs somewhere to write the
+    // challenge record. Warned rather than fatal: everything else — including
+    // per-host issuance — still works, and taking the LB down over a certificate
+    // that is not yet configured would be the wrong trade.
+    if !cfg.acme_wildcards.is_empty() {
+        if !cfg.acme_enabled() {
+            tracing::warn!(
+                "APP_LB_ACME_WILDCARD is set but APP_LB_ACME_EMAIL is not, so no \
+                 certificates are issued at all; set the contact address to enable ACME",
+            );
+        } else if cfg.route53_zone_id.is_none() {
+            tracing::warn!(
+                wildcards = ?cfg.acme_wildcards,
+                "APP_LB_ACME_WILDCARD is set without APP_LB_ROUTE53_ZONE_ID; wildcard \
+                 certificates are issued over DNS-01 and there is nowhere to publish the \
+                 challenge, so these domains will be served the fallback certificate",
+            );
+        } else {
+            tracing::info!(
+                wildcards = ?cfg.acme_wildcards,
+                aws_bin = %cfg.aws_bin,
+                "wildcard certificates enabled; hosts beneath these domains will not be \
+                 issued certificates of their own",
+            );
+        }
+    }
+
     let registry = Arc::new(Registry::new(&cfg.state_path));
     match registry.load() {
         Ok(0) => {
-            tracing::info!(path = %registry.persist_path().display(), "no persisted deployments")
+            tracing::info!(dir = %registry.state_dir().display(), "no persisted deployments")
         }
         Ok(n) => tracing::info!(count = n, "restored deployments"),
         Err(e) => tracing::error!(error = %e, "failed to load persisted state; starting empty"),
+    }
+    // A deregistration whose file removal failed would otherwise resurrect the
+    // deployment on this start. Declines to run if the load above skipped
+    // anything, so it can never delete a spec it merely failed to understand.
+    match registry.sweep_orphan_state() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "removed orphaned deployment state files"),
+        Err(e) => tracing::warn!(error = %e, "failed to sweep orphaned state files"),
     }
 
     // Secrets are read straight from the environment rather than through
@@ -420,6 +469,11 @@ fn main() {
                     dir: cfg.acme_dir.clone().into(),
                     directory_url: cfg.acme_directory.clone(),
                     proxy_addr: cfg.proxy_addr.clone(),
+                    wildcards: cfg.acme_wildcards.clone(),
+                    dns: cfg
+                        .route53_zone_id
+                        .clone()
+                        .map(|zone| dns::Route53::new(cfg.aws_bin.clone(), zone)),
                 },
             ),
         )

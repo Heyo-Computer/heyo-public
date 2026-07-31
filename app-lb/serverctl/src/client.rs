@@ -208,6 +208,52 @@ impl Client {
         self.delete(&format!("/deployments/{}", escape(id))).map(|_| ())
     }
 
+    /// Run one command in a deployment's VM.
+    ///
+    /// The HTTP timeout has to outlast the command's own, or the client gives up
+    /// on a request the server is still honouring — and the caller sees a
+    /// transport error where a slow command would have succeeded. `extra` is the
+    /// margin for the wake and the round trip.
+    pub fn exec(&self, id: &str, body: &Value, patience: Duration) -> Result<Value> {
+        let path = format!("/deployments/{}/exec", escape(id));
+        let url = format!("{}{}", self.base, path);
+        let mut req = self
+            .agent
+            .request("POST", &url)
+            .timeout(patience)
+            .set("accept", "application/json");
+        if let Some(auth) = &self.auth {
+            req = req.set("authorization", auth);
+        }
+        let (status, text) = match req.send_json(body.clone()) {
+            Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+            Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
+            Err(ureq::Error::Transport(t)) => {
+                bail!(
+                    "cannot reach {} ({t}) — is app-lb running, and is --server right?",
+                    self.base
+                )
+            }
+        };
+        if status >= 400 {
+            return Err(self.api_error(status, &text));
+        }
+        serde_json::from_str(&text)
+            .with_context(|| format!("the server's answer to POST {path} was not JSON"))
+    }
+
+    /// The `ws(s)://` URL for a deployment's shell, and the `Authorization`
+    /// header to present with it — the WebSocket client is a different library
+    /// and cannot reuse the agent.
+    pub fn shell_url(&self, id: &str, query: &str) -> (String, Option<String>) {
+        let base = self
+            .base
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        let url = format!("{base}/deployments/{}/shell?{query}", escape(id));
+        (url, self.auth.clone())
+    }
+
     /// Evict one VM. `force` kills it now; otherwise it drains.
     pub fn evict_vm(&self, id: &str, sandbox_id: &str, force: bool) -> Result<Value> {
         let path = format!(

@@ -13,8 +13,8 @@
 
 use crate::config::VmSpec;
 use heyo_sdk::{
-    HeyoClient, HeyoClientOptions, RequestOptions, Sandbox, SandboxCreateOptions, SandboxDriver,
-    SandboxInfo, SandboxStatus,
+    CommandResult, CommandRunOptions, HeyoClient, HeyoClientOptions, RequestOptions, Sandbox,
+    SandboxCreateOptions, SandboxDriver, SandboxInfo, SandboxStatus, ShellOptions, ShellSession,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -271,6 +271,138 @@ impl VmManager {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Run one command in a VM and wait for it to finish.
+    ///
+    /// `POST /sandbox/:id/exec` daemon-side, which runs the string through
+    /// `sh -c`. There is no streaming and no way to cancel: whatever the guest
+    /// prints is buffered until it exits, so `options.timeout` is the only thing
+    /// bounding a command that never returns.
+    pub async fn exec(
+        &self,
+        sandbox_id: &str,
+        command: &str,
+        options: CommandRunOptions,
+    ) -> Result<CommandResult, VmError> {
+        let sandbox = self.connect(sandbox_id.to_string())?;
+        Ok(sandbox.commands().run(command, options).await?)
+    }
+
+    /// Open an interactive PTY on a VM.
+    ///
+    /// Returns once the daemon has answered the session handshake, so a failure
+    /// to attach surfaces here rather than as a socket that closes immediately.
+    /// The session carries its own sequence/ack and reconnect handling.
+    pub async fn shell(
+        &self,
+        sandbox_id: &str,
+        options: ShellOptions,
+    ) -> Result<ShellSession, VmError> {
+        let sandbox = self.connect(sandbox_id.to_string())?;
+        Ok(sandbox.shell(options).await?)
+    }
+
+    /// Stop a VM without destroying it — `scaling.idle_action: retain`.
+    ///
+    /// The sandbox record and its `/workspace` data disk survive; memory and any
+    /// rootfs writes do not, because mvm-ctrl recopies the rootfs from the base
+    /// image on the next boot.
+    ///
+    /// **A stopped sandbox disappears from [`list`](Self::list).** mvm-ctrl's
+    /// `stop` removes it from the in-memory map that backs `GET /sandboxes`, so
+    /// after this returns the daemon will not mention this sandbox again until
+    /// it is resumed. Whoever calls this owns remembering the id — see
+    /// [`list_inactive`](Self::list_inactive) — or the VM is leaked, still
+    /// holding its disk, with nothing left to reap it.
+    pub async fn suspend(&self, sandbox_id: &str) -> Result<(), VmError> {
+        let sandbox = self.connect(sandbox_id.to_string())?;
+        match sandbox.stop().await {
+            Ok(()) => Ok(()),
+            // Already gone: the caller wanted it not running, and it isn't.
+            Err(heyo_sdk::HeyoError::NotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Restart a suspended VM and wait for the daemon to call it `Running`.
+    ///
+    /// The status check is not optional. `Sandbox::start` answers as soon as the
+    /// daemon accepts the request, and `wait_for_ready` cannot be used to
+    /// confirm the outcome — it has a `_ => return Ok(info)` arm, so a sandbox
+    /// that failed to come back reports `Stopped` *and* `Ok`. Reading the status
+    /// ourselves is what turns that into an error.
+    ///
+    /// Returns the info for the resumed VM; the caller still has to health-probe
+    /// the guest, exactly as it would after a cold boot.
+    pub async fn resume(&self, sandbox_id: &str) -> Result<SandboxInfo, VmError> {
+        let sandbox = self.connect(sandbox_id.to_string())?;
+        sandbox.start().await?;
+        let info = sandbox.info().await?;
+        if info.status != SandboxStatus::Running {
+            return Err(VmError::NotRunning {
+                sandbox_id: info.id.clone(),
+                status: info.status.clone(),
+                reason: info.error_message.clone(),
+            });
+        }
+        Ok(info)
+    }
+
+    /// Every sandbox the daemon has *stopped but not deleted*.
+    ///
+    /// The counterpart to [`list`](Self::list), which only reports running ones.
+    /// There is no SDK method for this, so it goes through the client's generic
+    /// request helper against `GET /sandboxes/inactive`.
+    ///
+    /// **Expensive.** The daemon answers it by walking its persistence directory
+    /// and loading metadata per sandbox — every sandbox ever created, not just
+    /// the stopped ones — and it is cursor-paginated with a default page of 10.
+    /// This pages to the end, so it belongs on a slow sweep and never on the
+    /// reconcile tick. `max_pages` bounds a cursor that fails to advance.
+    pub async fn list_inactive(&self) -> Result<Vec<SandboxInfo>, VmError> {
+        const PAGE: usize = 200;
+        const MAX_PAGES: usize = 200;
+
+        let client = HeyoClient::new(self.opts.clone())?;
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..MAX_PAGES {
+            let path = match &cursor {
+                Some(c) => format!("/sandboxes/inactive?count={PAGE}&cursor={c}"),
+                None => format!("/sandboxes/inactive?count={PAGE}"),
+            };
+            let page = client
+                .request::<InactivePage>(
+                    http::Method::GET,
+                    &path,
+                    None::<&serde_json::Value>,
+                    RequestOptions::default(),
+                )
+                .await?;
+            let empty = page.sandboxes.is_empty();
+            out.extend(page.sandboxes);
+            match page.next_cursor {
+                // A cursor that repeats itself would loop forever.
+                Some(next) if !empty && Some(&next) != cursor.as_ref() => cursor = Some(next),
+                _ => return Ok(out),
+            }
+        }
+        tracing::warn!(
+            pages = MAX_PAGES,
+            "inactive sandbox listing did not terminate; treating it as complete",
+        );
+        Ok(out)
+    }
+}
+
+/// One page of `GET /sandboxes/inactive`.
+#[derive(Debug, Deserialize)]
+struct InactivePage {
+    #[serde(default)]
+    sandboxes: Vec<SandboxInfo>,
+    #[serde(default)]
+    next_cursor: Option<String>,
 }
 
 /// Extract the routable address, rejecting anything we could not proxy to.
