@@ -966,7 +966,7 @@ impl Autoscaler {
         }
 
         for (id, backends) in adopted {
-            if let Some(d) = deployments.get(&id) {
+            if let Some(d) = deployments.get(id.as_str()) {
                 d.set_backends(backends);
             }
         }

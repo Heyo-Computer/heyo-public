@@ -11,7 +11,7 @@ use crate::config::DeploymentSpec;
 use crate::deployment::{Deployment, DeploymentState};
 use arc_swap::ArcSwap;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -32,33 +32,59 @@ pub struct RouteTable {
     /// Rules that name an exact `host`, bucketed by that host (lowercased) so
     /// the common case is one hash lookup. Each bucket is sorted the same way
     /// the flat list was, so a `host`+`/api` rule still beats a bare `host` one.
-    exact: HashMap<String, Vec<(crate::config::RouteRule, String)>>,
+    ///
+    /// Buckets are `Arc`d so a copy-on-write update can share every bucket it
+    /// does not touch. Registering one deployment then costs a table allocation
+    /// and a refcount bump per bucket, instead of deep-copying and re-sorting
+    /// every rule in the fleet.
+    exact: HashMap<Arc<str>, Arc<Vec<RouteEntry>>>,
     /// Everything else — `host_suffix` and path-only rules — still scanned
     /// linearly. It stays short: these are the platform-level catch-alls, not
-    /// the per-deployment routes.
-    rest: Vec<(crate::config::RouteRule, String)>,
+    /// the per-deployment routes. `Arc`d for the same reason, so a deployment
+    /// with only exact hosts (which is every sandbox) never copies it at all.
+    rest: Arc<Vec<RouteEntry>>,
 }
+
+/// One rule and the id of the deployment that declared it. The id is shared
+/// rather than copied per rule — a fleet has one per deployment, and they are
+/// cloned on every index update that touches the bucket.
+type RouteEntry = (crate::config::RouteRule, Arc<str>);
 
 /// Most specific first: a host+path rule must beat a bare path rule, and
 /// `/api/v2` must beat `/api`. Ties broken by id for determinism.
 fn by_specificity(
-    (a, ai): &(crate::config::RouteRule, String),
-    (b, bi): &(crate::config::RouteRule, String),
+    (a, ai): &RouteEntry,
+    (b, bi): &RouteEntry,
 ) -> std::cmp::Ordering {
     b.specificity()
         .cmp(&a.specificity())
         .then_with(|| ai.cmp(bi))
 }
 
+/// The bucket key for a rule's host: lowercased, since matching is
+/// case-insensitive.
+fn host_key(rule: &crate::config::RouteRule) -> Option<String> {
+    rule.host.as_ref().map(|h| h.to_ascii_lowercase())
+}
+
 impl RouteTable {
-    pub fn build(deployments: &HashMap<String, Arc<Deployment>>) -> Self {
-        let mut exact: HashMap<String, Vec<_>> = HashMap::new();
+    /// Build the whole index from scratch.
+    ///
+    /// Nothing in the running LB calls this any more — every write goes through
+    /// [`updated`](Self::updated). It is kept as the reference implementation
+    /// the incremental path is checked against: an index that drifts from a full
+    /// rebuild is the failure mode of incremental updating, and it would show up
+    /// as traffic routed to the wrong deployment rather than as a crash.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn build(deployments: &HashMap<Arc<str>, Arc<Deployment>>) -> Self {
+        let mut exact: HashMap<Arc<str>, Vec<RouteEntry>> = HashMap::new();
         let mut rest = Vec::new();
         for d in deployments.values() {
+            let id: Arc<str> = Arc::from(d.spec.id.as_str());
             for rule in &d.spec.routes {
-                let entry = (rule.clone(), d.spec.id.clone());
-                match &rule.host {
-                    Some(h) => exact.entry(h.to_ascii_lowercase()).or_default().push(entry),
+                let entry = (rule.clone(), id.clone());
+                match host_key(rule) {
+                    Some(h) => exact.entry(Arc::from(h.as_str())).or_default().push(entry),
                     None => rest.push(entry),
                 }
             }
@@ -67,6 +93,97 @@ impl RouteTable {
             bucket.sort_by(by_specificity);
         }
         rest.sort_by(by_specificity);
+        Self {
+            exact: exact.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
+            rest: Arc::new(rest),
+        }
+    }
+
+    /// This table with one deployment's rules replaced.
+    ///
+    /// `previous` is what it declared before (`None` when registering),
+    /// `next` what it declares now (`None` when deregistering). Only the buckets
+    /// named by either are rebuilt; every other bucket is shared with `self`.
+    ///
+    /// This is what keeps registering the thousandth sandbox as cheap as the
+    /// first. Rebuilding the whole index per write made a create storm quadratic
+    /// — measurably so: the marginal cost of a create tracked the size of the
+    /// fleet, which is exactly the thing a fleet cannot afford.
+    fn updated(
+        &self,
+        id: &str,
+        previous: Option<&[crate::config::RouteRule]>,
+        next: Option<&[crate::config::RouteRule]>,
+    ) -> Self {
+        // The union of the hosts this deployment used to name and the ones it
+        // names now. Anything outside it cannot have changed.
+        let mut touched: HashSet<String> = HashSet::new();
+        let mut touches_rest = false;
+        for rules in [previous, next].into_iter().flatten() {
+            for rule in rules {
+                match host_key(rule) {
+                    Some(h) => {
+                        touched.insert(h);
+                    }
+                    None => touches_rest = true,
+                }
+            }
+        }
+
+        if touched.is_empty() && !touches_rest {
+            // An unrouted deployment — the sandbox default — contributes no
+            // rules either way, so the index is unchanged.
+            return Self {
+                exact: self.exact.clone(),
+                rest: self.rest.clone(),
+            };
+        }
+
+        let id: Arc<str> = Arc::from(id);
+        let mut exact = self.exact.clone();
+        for host in &touched {
+            // Drop this deployment's old entries for the bucket, keeping every
+            // other deployment's; then add whatever it declares now.
+            let mut bucket: Vec<RouteEntry> = exact
+                .get(host.as_str())
+                .map(|b| b.iter().filter(|(_, i)| **i != *id).cloned().collect())
+                .unwrap_or_default();
+            if let Some(rules) = next {
+                for rule in rules {
+                    if host_key(rule).as_deref() == Some(host.as_str()) {
+                        bucket.push((rule.clone(), id.clone()));
+                    }
+                }
+            }
+            // An empty bucket is removed rather than kept: `resolve` treats a
+            // present-but-empty bucket as a miss anyway, and leaving them would
+            // grow the map by one entry per hostname ever used.
+            if bucket.is_empty() {
+                exact.remove(host.as_str());
+            } else {
+                bucket.sort_by(by_specificity);
+                exact.insert(Arc::from(host.as_str()), Arc::new(bucket));
+            }
+        }
+
+        let rest = if touches_rest {
+            let mut v: Vec<RouteEntry> = self
+                .rest
+                .iter()
+                .filter(|(_, i)| **i != *id)
+                .cloned()
+                .collect();
+            if let Some(rules) = next {
+                for rule in rules.iter().filter(|r| r.host.is_none()) {
+                    v.push((rule.clone(), id.clone()));
+                }
+            }
+            v.sort_by(by_specificity);
+            Arc::new(v)
+        } else {
+            self.rest.clone()
+        };
+
         Self { exact, rest }
     }
 
@@ -84,19 +201,19 @@ impl RouteTable {
             if let Some(bucket) = self.exact.get(key.as_ref())
                 && let Some((_, id)) = bucket.iter().find(|(rule, _)| rule.matches(Some(host), path))
             {
-                return Some(id.as_str());
+                return Some(id);
             }
         }
         self.rest
             .iter()
             .find(|(rule, _)| rule.matches(host, path))
-            .map(|(_, id)| id.as_str())
+            .map(|(_, id)| &**id)
     }
 }
 
 #[derive(Debug)]
 pub struct Registry {
-    deployments: ArcSwap<HashMap<String, Arc<Deployment>>>,
+    deployments: ArcSwap<HashMap<Arc<str>, Arc<Deployment>>>,
     routes: ArcSwap<RouteTable>,
     persist_path: PathBuf,
     /// Whether the last [`load`](Registry::load) left a file on disk that it
@@ -116,7 +233,7 @@ impl Registry {
         }
     }
 
-    pub fn deployments(&self) -> Arc<HashMap<String, Arc<Deployment>>> {
+    pub fn deployments(&self) -> Arc<HashMap<Arc<str>, Arc<Deployment>>> {
         self.deployments.load_full()
     }
 
@@ -140,10 +257,7 @@ impl Registry {
     /// its next tick by diffing against the daemon's list.
     pub fn upsert(&self, spec: DeploymentSpec) -> Arc<Deployment> {
         let deployment = Arc::new(Deployment::new(spec));
-        let id = deployment.spec.id.clone();
-        self.mutate(|map| {
-            map.insert(id.clone(), deployment.clone());
-        });
+        self.install(Some(deployment.clone()), &deployment.spec.id.clone());
         deployment
     }
 
@@ -170,29 +284,44 @@ impl Registry {
         // deployment had suspended — they are absent from the daemon's fleet
         // list, so nothing else remembers them.
         new.set_state((*old.state()).clone());
-        let id = new.spec.id.clone();
-        self.mutate(|map| {
-            map.insert(id.clone(), new.clone());
-        });
+        self.install(Some(new.clone()), &new.spec.id.clone());
         Some(new)
     }
 
     pub fn remove(&self, id: &str) -> Option<Arc<Deployment>> {
-        let mut removed = None;
-        self.mutate(|map| {
-            removed = map.remove(id);
-        });
-        removed
+        let removed = self.get(id)?;
+        self.install(None, id);
+        Some(removed)
     }
 
-    /// Copy-on-write mutation plus route-table rebuild.
+    /// Install or remove one deployment, updating the route index with it.
+    ///
+    /// Copy-on-write, so readers stay lock-free. The cost is one map allocation
+    /// and a refcount bump per entry — *not* a deep copy of every deployment's
+    /// routes and a re-sort of the whole index, which is what made the marginal
+    /// cost of a create grow with the size of the fleet.
     ///
     /// Not atomic against a concurrent writer, which is fine: the admin API is
-    /// the only writer of the deployment set, and it is a single service.
-    fn mutate(&self, f: impl FnOnce(&mut HashMap<String, Arc<Deployment>>)) {
-        let mut next = (**self.deployments.load()).clone();
-        f(&mut next);
-        let routes = RouteTable::build(&next);
+    /// the only writer of the deployment set, and it is a single service. The
+    /// two `store`s are ordered deployments-then-routes so a request that
+    /// resolves an id always finds it — the reverse order has a window where the
+    /// index names a deployment the map does not yet hold.
+    fn install(&self, deployment: Option<Arc<Deployment>>, id: &str) {
+        let current = self.deployments.load();
+        let previous = current.get(id).cloned();
+
+        let mut next = (**current).clone();
+        match &deployment {
+            Some(d) => next.insert(Arc::from(id), d.clone()),
+            None => next.remove(id),
+        };
+
+        let routes = self.routes.load().updated(
+            id,
+            previous.as_ref().map(|d| d.spec.routes.as_slice()),
+            deployment.as_ref().map(|d| d.spec.routes.as_slice()),
+        );
+
         self.deployments.store(Arc::new(next));
         self.routes.store(Arc::new(routes));
     }
@@ -635,6 +764,84 @@ mod tests {
         assert_eq!(r.route(Some("a.example.com"), "/").unwrap().spec.id, "both");
         // The suffix contradicts the host, so nothing can ever satisfy it.
         assert!(r.route(Some("a.other.com"), "/").is_none());
+    }
+
+    /// The incremental index must agree with a full rebuild after *every*
+    /// mutation, not just at the end.
+    ///
+    /// This is the test that matters for `RouteTable::updated`. Its failure mode
+    /// is not a crash — it is a stale or missing bucket, which routes somebody's
+    /// traffic to the wrong deployment or 404s a hostname that is registered.
+    /// Comparing against `build` after each step is the only way to see that.
+    #[test]
+    fn the_incremental_index_never_drifts_from_a_full_rebuild() {
+        // Route shapes chosen to cover every branch of `updated`: exact host,
+        // host+path (two rules sharing one bucket), a suffix and a bare path
+        // (both land in `rest`), several rules at once, and none at all.
+        let shapes: Vec<Vec<RouteRule>> = vec![
+            vec![host("a.local")],
+            vec![host("b.local")],
+            vec![RouteRule {
+                host: Some("a.local".into()),
+                host_suffix: None,
+                path_prefix: Some("/api".into()),
+            }],
+            vec![suffix("apps.example.com")],
+            vec![path("/legacy")],
+            vec![host("a.local"), suffix("example.com"), path("/x")],
+            vec![host("A.LOCAL")], // same bucket, different case
+            vec![],                // unrouted
+        ];
+        let probes: Vec<(Option<&str>, &str)> = vec![
+            (Some("a.local"), "/"),
+            (Some("a.local"), "/api/v1"),
+            (Some("A.Local"), "/api"),
+            (Some("b.local"), "/"),
+            (Some("x.apps.example.com"), "/"),
+            (Some("apps.example.com"), "/x"),
+            (Some("other.example.com"), "/"),
+            (None, "/legacy/thing"),
+            (None, "/x"),
+            (None, "/"),
+        ];
+
+        let r = Registry::new("unused.json");
+        // A fixed LCG rather than a random source: a failure has to be
+        // reproducible, and this is a correctness check, not a fuzz run.
+        let mut seed: u64 = 0x5eed;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+
+        for step in 0..400 {
+            let id = format!("d{}", next() % 12);
+            match next() % 4 {
+                0 => {
+                    r.remove(&id);
+                }
+                _ => {
+                    let routes = shapes[next() % shapes.len()].clone();
+                    // Exercise both write paths: `update` preserves the pool,
+                    // `upsert` replaces the deployment outright.
+                    if next() % 2 == 0 && r.get(&id).is_some() {
+                        r.update(spec(&id, routes));
+                    } else {
+                        r.upsert(spec(&id, routes));
+                    }
+                }
+            }
+
+            let reference = RouteTable::build(&r.deployments());
+            let live = r.routes.load();
+            for (h, p) in &probes {
+                assert_eq!(
+                    live.resolve(*h, p),
+                    reference.resolve(*h, p),
+                    "step {step}: incremental index disagrees for host={h:?} path={p}",
+                );
+            }
+        }
     }
 
     /// An unrouted deployment — the agent-sandbox shape — contributes nothing to

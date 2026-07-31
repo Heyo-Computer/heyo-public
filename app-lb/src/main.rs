@@ -496,6 +496,7 @@ fn main() {
             secrets,
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),
+            admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
         ),
     );
 

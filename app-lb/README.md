@@ -890,6 +890,23 @@ deployments passed the filter before paging, so a client can page without
 guessing. The dashboard's deployment table has a matching filter box and pager,
 which appear only when there is more than one page.
 
+The page updates in place rather than redrawing. Deployment cards are keyed by
+id and reused across polls, and the distribution bars and utilization gauges are
+mutated rather than rebuilt — which is what lets their CSS transitions animate at
+all, since a freshly-created element has no previous width to animate from. It
+also means a poll no longer destroys text selection, hover, or the VM table's
+horizontal scroll position every two seconds. A card whose numbers did not change
+does no DOM writes.
+
+Each deployment carries `urls` — its `host` routes as links a browser can
+follow, which the dashboard renders next to the deployment name. They are built
+server-side because the dashboard is served by the *admin* listener and knows
+nothing about the data plane: the scheme follows whether TLS is enabled, a
+non-default port is included, and a `path_prefix` is appended (linking the bare
+host would 404 against that same deployment). A deployment with no `host` route —
+a sandbox, or a `host_suffix`/path-only route — has no `urls`, and the dashboard
+shows no link rather than one that goes nowhere.
+
 `tracked_deployments` is a self-check: it counts deployments holding their own
 counters, and should track the number registered. A figure that climbs past it
 means metrics for deregistered deployments are not being released. (Their totals
@@ -1329,8 +1346,11 @@ observable consequence:
 - **State is one file per deployment**
   ([`app-lb-state.d/`](#where-state-lives)). Registering the thousandth sandbox
   used to rewrite the other 999 with it.
-- **Routing is indexed by exact host**, not scanned. Thousands of hostnames no
-  longer cost a linear scan per request.
+- **Routing is indexed by exact host**, not scanned, and the index is updated
+  **incrementally**. Thousands of hostnames no longer cost a linear scan per
+  request, and registering one deployment rebuilds only the buckets its own
+  routes belong to instead of the whole index — which is what stopped the
+  marginal cost of a create tracking the size of the fleet.
 - **The reconcile loop runs concurrently** and skips deployments at rest without
   touching the daemon, so one slow VM cannot stall the fleet's tick.
 - **`/metrics` is scopeable** (`?prefix=`, `?limit=`, `?summary=`) and the
@@ -1338,6 +1358,23 @@ observable consequence:
   Per-deployment counters are released when a deployment is deregistered, so the
   metrics map no longer grows by one entry per sandbox ever created —
   `tracked_deployments` in the response is the check on that.
+
+Measured on a release build, registering deployments through the admin API:
+
+| | 100 registered | 2000 | 5000 |
+| --- | --- | --- | --- |
+| Marginal cost of one create | 0.25 ms | 0.30 ms | 0.56 ms |
+| Register that many from empty | — | 0.6 s | 2.0 s |
+| Route lookup (proxy) | — | 0.3 ms | 0.3 ms |
+| Dashboard poll (`?limit=50`) | — | 1.7 ms / 68 KB | — |
+| `/metrics` unfiltered, for contrast | — | 14 ms / 2.6 MB | — |
+
+A write is still O(n) in the *shallowest* sense — copy-on-write means the
+deployment map and the route index each get a fresh hash table per write, so a
+few tens of nanoseconds per existing deployment. What it is no longer doing is
+deep-copying every rule in the fleet and re-sorting the whole index, which is
+what made a create storm genuinely quadratic. Readers stay lock-free, which is
+the constraint that rules out mutating either structure in place.
 
 ### One host, and what that bounds
 

@@ -121,7 +121,13 @@
   .hbar { display: grid; grid-template-columns: 68px 1fr 52px; align-items: center; gap: 8px; }
   .hbar .k { font-size: 11px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
   .hbar .track { height: 14px; background: var(--grid); border-radius: 4px; overflow: hidden; }
-  .hbar .fill { height: 100%; background: var(--series-1); border-radius: 4px; min-width: 2px; }
+  /* Transitioned because `renderHist` updates these in place rather than
+     rebuilding them — a rebuilt element has no previous width to animate from. */
+  .hbar .fill {
+    height: 100%; background: var(--series-1); border-radius: 4px; min-width: 2px;
+    transition: width .45s cubic-bezier(.22,.61,.36,1);
+  }
+  @media (prefers-reduced-motion: reduce) { .hbar .fill { transition: none; } }
   .hbar .v { font-size: 11px; color: var(--text-2); font-variant-numeric: tabular-nums; }
 
   svg { display: block; width: 100%; height: auto; overflow: visible; }
@@ -131,6 +137,19 @@
   .dep { margin-bottom: 14px; }
   .dep-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
   .dep-head .name { font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
+  /* Stable wrappers so the card can be updated in place instead of rebuilt.
+     `display: contents` keeps their children as direct flex items of the head,
+     so the layout is identical to when they were written inline. */
+  .dep-head .dep-links, .dep-head .dep-badges { display: contents; }
+  /* The deployment's public URL. Sized like a badge so a card with several
+     hostnames still reads as one line of metadata, not a wall of links. */
+  .dep-head .dep-link {
+    font-size: 12px; font-variant-numeric: tabular-nums; text-decoration: none;
+    padding: 1px 7px; border-radius: 4px; white-space: nowrap;
+    color: var(--series-1); border: 1px solid color-mix(in srgb, var(--series-1) 35%, transparent);
+  }
+  .dep-head .dep-link::after { content: " ↗"; opacity: .6; }
+  .dep-head .dep-link:hover { background: color-mix(in srgb, var(--series-1) 12%, transparent); }
   .dep-head .badge {
     font-size: 11px; padding: 2px 8px; border-radius: 999px;
     border: 1px solid var(--border); color: var(--text-2);
@@ -407,17 +426,50 @@ function bucketLabel(buckets, i) {
   return "> " + (prev && prev.le != null ? prev.le : "");
 }
 
+// Render a distribution, updating the existing bars in place where it can.
+//
+// The in-place part is what makes the bars animate. Replacing `innerHTML` every
+// poll builds *new* elements, and a new element is painted at its final width
+// with nothing to transition from — so a CSS transition on the fill never fires
+// and the chart just snaps. Rebuilding also throws away and recreates ~14 nodes
+// every two seconds for a chart that usually hasn't changed.
+//
+// The markup is only regenerated when the shape changes (first paint, or a
+// different bucket count), which is also what keeps this correct if the bounds
+// are ever retuned.
 function renderHist(el, snap, unitLabel) {
   const buckets = snap.buckets || [];
+
+  // An all-zero distribution renders as a row of empty tracks, which reads as
+  // "broken" rather than "nothing has happened yet". Say so instead, the same
+  // way the line charts say "collecting…".
+  if (!snap.count) {
+    if (!el.dataset.empty) {
+      el.innerHTML = `<div class="spark-empty">no data yet</div>`;
+      el.dataset.empty = "1";
+      el.dataset.bars = "";
+    }
+    return;
+  }
+
   const max = Math.max(1, ...buckets.map(b => b.count));
-  el.innerHTML = buckets.map((b, i) => {
-    const w = (b.count / max) * 100;
-    return `<div class="hbar">
-      <span class="k">${esc(bucketLabel(buckets, i))} ${unitLabel}</span>
-      <span class="track"><span class="fill" style="width:${w}%"></span></span>
-      <span class="v">${fmt(b.count)}</span>
-    </div>`;
-  }).join("");
+  if (el.dataset.bars !== String(buckets.length) || el.dataset.empty) {
+    el.innerHTML = buckets.map((b, i) =>
+      `<div class="hbar">
+        <span class="k">${esc(bucketLabel(buckets, i))} ${esc(unitLabel)}</span>
+        <span class="track"><span class="fill"></span></span>
+        <span class="v"></span>
+      </div>`).join("");
+    el.dataset.bars = String(buckets.length);
+    el.dataset.empty = "";
+  }
+
+  const fills = el.querySelectorAll(".fill");
+  const vals = el.querySelectorAll(".v");
+  buckets.forEach((b, i) => {
+    if (fills[i]) fills[i].style.width = ((b.count / max) * 100) + "%";
+    if (vals[i]) vals[i].textContent = fmt(b.count);
+  });
 }
 
 // Minimal SVG line chart from an array of {t, v}. Recessive grid, single series.
@@ -603,6 +655,202 @@ function renderDeploymentPager(matched) {
   $("dep-next").disabled = last >= matched;
 }
 
+// Write only when the markup actually changed.
+//
+// Every poll re-renders every visible card, and most polls change nothing. An
+// unconditional `innerHTML =` would still tear down and rebuild those nodes,
+// which loses text selection, hover and focus for no reason — and, for anything
+// with a CSS transition, restarts it from nowhere.
+function setHTML(el, html) {
+  if (el && el.innerHTML !== html) el.innerHTML = html;
+}
+
+// The skeleton of one deployment card: everything that never changes, with the
+// volatile regions left empty for `updateCard` to fill.
+//
+// Created once per deployment and then reused, which is what lets the
+// utilization gauge animate — a transition needs a previous width on the *same*
+// element, and a card rebuilt from scratch every two seconds never has one.
+function cardShell(id) {
+  const el = document.createElement("div");
+  el.className = "card dep";
+  el.dataset.id = id;
+  el.innerHTML = `
+    <div class="dep-head">
+      <span class="name"></span>
+      <span class="dep-links"></span>
+      <span class="dep-badges"></span>
+      <span class="actions"></span>
+    </div>
+    <div class="dep-grid">
+      <div>
+        <div class="gauge-label"><span>Utilization</span><span class="gauge-val">—</span></div>
+        <div class="gauge-track"><div class="gauge-fill" style="width:0%"></div></div>
+        <div class="kv"></div>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="vms"><thead></thead><tbody></tbody></table>
+      </div>
+    </div>`;
+  // textContent, not innerHTML: an id is data, and this is the one place it is
+  // written without going through `esc`.
+  el.querySelector(".name").textContent = id;
+  return el;
+}
+
+// Fill in everything about a card that can change between polls.
+//
+// The shell is created empty and filled by this, so a card created a moment ago
+// and one that has been on screen for an hour go through exactly the same code.
+// Splitting "create" and "update" markup is how those two drift apart.
+function updateCard(el, d) {
+  const p = d.pool, m = d.metrics;
+  const util = p.utilization;
+  const utilPct = util == null ? null : util * 100;
+  let cls = "", label = "—";
+  if (utilPct != null) {
+    label = fmt(utilPct, 0) + "%";
+    cls = utilPct >= 100 ? "crit" : utilPct >= 80 ? "warn" : "";
+  }
+  const errTotal = m.requests.c5xx + m.requests.errors;
+  const errPct = m.requests.total ? (errTotal / m.requests.total) * 100 : 0;
+
+  // A static (proxy_pass) deployment forwards to fixed upstreams: no
+  // autoscaling, no VM lifecycle, so it hides scale/drain/kill controls and
+  // the VM-only columns (CPU/memory come from the daemon, which static
+  // upstreams have no sample from).
+  const isStatic = d.kind === "static";
+
+  let vmRows;
+  if (isStatic) {
+    vmRows = d.vms.length ? d.vms.map(v => {
+      const load = Math.min(1, v.in_flight / Math.max(1, p.target_concurrency)) * 100;
+      const st = !v.healthy ? `<span class="tag down">down</span>`
+              : `<span class="tag ok">serving</span>`;
+      return `<tr>
+        <td class="mono">${esc(v.addr)}</td>
+        <td><span class="vm-load"><span class="track"><span class="fill" style="width:${load}%"></span></span>${v.in_flight}</span></td>
+        <td>${fmtDur(v.uptime_secs)}</td>
+        <td>${st}</td>
+      </tr>`;
+    }).join("") : `<tr><td colspan="4" class="empty" style="padding:14px">No upstreams configured.</td></tr>`;
+  } else {
+    const readyRows = d.vms.map(v => {
+      const load = Math.min(1, v.in_flight / Math.max(1, p.target_concurrency)) * 100;
+      const st = v.draining ? `<span class="tag drain">draining</span>`
+              : !v.healthy ? `<span class="tag down">unhealthy</span>`
+              : `<span class="tag ok">serving</span>`;
+      // CPU is percent-of-a-core; normalise the bar to one core but show the raw number.
+      const cpuBar = v.cpu_percent == null ? 0 : Math.min(100, v.cpu_percent);
+      const evictBtns = v.draining
+        ? `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`
+        : `<button class="btn mini" data-act="drain" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Drain</button>`
+          + `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`;
+      return `<tr>
+        <td class="mono">${esc(v.sandbox_id)}</td>
+        <td class="mono">${esc(v.addr)}</td>
+        <td><span class="vm-load"><span class="track"><span class="fill" style="width:${load}%"></span></span>${v.in_flight}</span></td>
+        <td><span class="vm-load"><span class="track"><span class="fill" style="width:${cpuBar}%"></span></span>${v.cpu_percent == null ? "—" : fmt(v.cpu_percent, 0) + "%"}</span></td>
+        <td>${v.memory_bytes == null ? "—" : fmtBytes(v.memory_bytes)}</td>
+        <td>${fmtDur(v.uptime_secs)}</td>
+        <td>${st}</td>
+        <td class="rowactions">${evictBtns}</td>
+      </tr>`;
+    }).join("");
+
+    const pendingRows = (d.pending_vms || []).map(v => {
+      // A boot past the cold-start budget has already cost a request a 503; say
+      // so on the row rather than leaving it looking like a normal boot.
+      const late = v.age_secs >= (p.cold_start_timeout_secs || 0);
+      const st = `<span class="tag boot">${late ? "boot stalled" : "booting"}</span>`;
+      const deadline = v.waiting_on ? `<div class="sub" style="color:var(--muted)">${esc(v.waiting_on)}</div>` : "";
+      return `<tr>
+        <td class="mono">${esc(v.sandbox_id)}</td>
+        <td>—</td>
+        <td>—</td>
+        <td>—</td>
+        <td>—</td>
+        <td>${fmtDur(v.age_secs)}${deadline}</td>
+        <td>${st}</td>
+        <td class="rowactions"><button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button></td>
+      </tr>`;
+    }).join("");
+
+    vmRows = (readyRows + pendingRows)
+      || `<tr><td colspan="8" class="empty" style="padding:14px">No VMs — the pool wants ${fmt(p.desired_replicas)}.</td></tr>`;
+  }
+
+  const vmHead = isStatic
+    ? `<tr><th>upstream</th><th>in-flight</th><th>uptime</th><th>state</th></tr>`
+    : `<tr><th>sandbox</th><th>addr</th><th>in-flight</th><th>CPU</th><th>memory</th><th>uptime</th><th>state</th><th>actions</th></tr>`;
+
+  const headBadges = isStatic
+    ? `<span class="badge">static · proxy_pass</span>
+       <span class="badge">${d.upstreams.length} upstream${d.upstreams.length === 1 ? "" : "s"}</span>`
+    : `<span class="badge">${p.ready}/${p.max_replicas} replicas · want ${p.desired_replicas}</span>
+       <span class="badge">min ${p.min_replicas} · warm ${p.warm_pool} · target ${p.target_concurrency}</span>`;
+
+  // A redeploy button only where there is something to redeploy: `build` needs a
+  // repo in the spec, `update` needs a command list, and a deployment with
+  // neither has no job to start.
+  const jobBtn = d.job_kind === "build"
+    ? `<button class="btn mini" data-act="build" data-id="${esc(d.id)}">Build</button>`
+    : d.job_kind === "update"
+    ? `<button class="btn mini" data-act="update" data-id="${esc(d.id)}">Update</button>`
+    : "";
+
+  // Static deployments can't be scaled; only Edit (to change the upstream list).
+  const headActions = (isStatic
+    ? `<button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`
+    : `<button class="btn mini" data-act="scale" data-id="${esc(d.id)}">Scale</button>
+       <button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`) + jobBtn;
+
+  // Pool-only tiles (pending/draining/cold-start) are meaningless for a static
+  // deployment; omit them.
+  const poolTiles = isStatic ? "" :
+      `<div><div class="label">Pending</div><div class="value">${fmt(p.pending)}</div></div>
+       <div><div class="label">Draining</div><div class="value">${fmt(p.draining)}</div></div>`;
+  const coldTile = isStatic ? "" :
+      `<div><div class="label">Cold p50</div><div class="value">${m.cold_start_s.count ? fmt(m.cold_start_s.p50,1)+"s" : "—"}</div></div>`;
+
+  // Where this deployment is actually reachable. The server builds these —
+  // the dashboard is served by the admin listener and has no idea what scheme
+  // or port the data plane is on. A deployment with no `host` route (a
+  // sandbox, a path-only route) has none, and shows nothing rather than a
+  // link that goes nowhere.
+  const links = (d.urls || []).map(u =>
+    `<a class="dep-link" href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u.replace(/^https?:\/\//, ""))}</a>`
+  ).join("");
+
+  const kv = `<div><div class="label">In-flight</div><div class="value">${fmt(p.total_in_flight)}</div></div>
+    ${poolTiles}
+    <div><div class="label">Requests</div><div class="value">${fmt(m.requests.total)}</div></div>
+    <div><div class="label">Lat p50</div><div class="value">${m.latency_ms.count ? fmtMs(m.latency_ms.p50) : "—"}</div></div>
+    <div><div class="label">Lat p99</div><div class="value">${m.latency_ms.count ? fmtMs(m.latency_ms.p99) : "—"}</div></div>
+    ${coldTile}
+    <div><div class="label">Errors</div><div class="value ${errPct ? "err" : ""}">${fmt(errPct, errPct ? 1 : 0)}%</div></div>
+    <div><div class="label">CPU (pool)</div><div class="value">${p.cpu_percent == null ? "—" : fmt(p.cpu_percent, 0)+"%"}</div></div>
+    <div><div class="label">Memory</div><div class="value">${p.memory_bytes == null ? "—" : fmtBytes(p.memory_bytes)}</div></div>`;
+
+  // The gauge is mutated in place rather than re-created. That is the whole
+  // point of reusing the card: a transition animates from the element's
+  // previous width, and a brand-new element has none.
+  const fill = el.querySelector(".gauge-fill");
+  const width = Math.min(100, utilPct || 0) + "%";
+  if (fill.style.width !== width) fill.style.width = width;
+  const fillClass = "gauge-fill" + (cls ? " " + cls : "");
+  if (fill.className !== fillClass) fill.className = fillClass;
+  const val = el.querySelector(".gauge-val");
+  if (val.textContent !== label) val.textContent = label;
+
+  setHTML(el.querySelector(".dep-links"), links);
+  setHTML(el.querySelector(".dep-badges"), headBadges);
+  setHTML(el.querySelector(".actions"), headActions);
+  setHTML(el.querySelector(".kv"), kv);
+  setHTML(el.querySelector("thead"), vmHead);
+  setHTML(el.querySelector("tbody"), vmRows);
+}
+
 function renderDeployments(deps) {
   // Keep the id->deployment map fresh every poll (the scale form prefills from
   // it), but leave the DOM cards alone while a modal is open so an in-progress
@@ -611,161 +859,38 @@ function renderDeployments(deps) {
   deps.forEach(d => { depsById[d.id] = d; });
   if (interacting) return;
 
+  const host = $("deployments");
+
   if (!deps.length) {
     const msg = depPrefix
       ? `No deployment id starts with ${esc(depPrefix)}.`
       : "No deployments registered.";
-    $("deployments").innerHTML = `<div class="card empty">${msg}</div>`;
+    setHTML(host, `<div class="card empty">${msg}</div>`);
     return;
   }
-  $("deployments").innerHTML = deps.map(d => {
-    const p = d.pool, m = d.metrics;
-    const util = p.utilization;
-    const utilPct = util == null ? null : util * 100;
-    let cls = "", label = "—";
-    if (utilPct != null) {
-      label = fmt(utilPct, 0) + "%";
-      cls = utilPct >= 100 ? "crit" : utilPct >= 80 ? "warn" : "";
-    }
-    const errTotal = m.requests.c5xx + m.requests.errors;
-    const errPct = m.requests.total ? (errTotal / m.requests.total) * 100 : 0;
 
-    // A static (proxy_pass) deployment forwards to fixed upstreams: no
-    // autoscaling, no VM lifecycle, so it hides scale/drain/kill controls and
-    // the VM-only columns (CPU/memory come from the daemon, which static
-    // upstreams have no sample from).
-    const isStatic = d.kind === "static";
+  // Index what is already on screen by deployment id, dropping anything that
+  // isn't a card (the empty-state placeholder above).
+  const existing = new Map();
+  for (const el of Array.from(host.children)) {
+    const id = el.dataset && el.dataset.id;
+    if (id) existing.set(id, el);
+    else el.remove();
+  }
 
-    let vmRows;
-    if (isStatic) {
-      vmRows = d.vms.length ? d.vms.map(v => {
-        const load = Math.min(1, v.in_flight / Math.max(1, p.target_concurrency)) * 100;
-        const st = !v.healthy ? `<span class="tag down">down</span>`
-                : `<span class="tag ok">serving</span>`;
-        return `<tr>
-          <td class="mono">${esc(v.addr)}</td>
-          <td><span class="vm-load"><span class="track"><span class="fill" style="width:${load}%"></span></span>${v.in_flight}</span></td>
-          <td>${fmtDur(v.uptime_secs)}</td>
-          <td>${st}</td>
-        </tr>`;
-      }).join("") : `<tr><td colspan="4" class="empty" style="padding:14px">No upstreams configured.</td></tr>`;
-    } else {
-      const readyRows = d.vms.map(v => {
-        const load = Math.min(1, v.in_flight / Math.max(1, p.target_concurrency)) * 100;
-        const st = v.draining ? `<span class="tag drain">draining</span>`
-                : !v.healthy ? `<span class="tag down">unhealthy</span>`
-                : `<span class="tag ok">serving</span>`;
-        // CPU is percent-of-a-core; normalise the bar to one core but show the raw number.
-        const cpuBar = v.cpu_percent == null ? 0 : Math.min(100, v.cpu_percent);
-        const evictBtns = v.draining
-          ? `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`
-          : `<button class="btn mini" data-act="drain" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Drain</button>`
-            + `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`;
-        return `<tr>
-          <td class="mono">${esc(v.sandbox_id)}</td>
-          <td class="mono">${esc(v.addr)}</td>
-          <td><span class="vm-load"><span class="track"><span class="fill" style="width:${load}%"></span></span>${v.in_flight}</span></td>
-          <td>${v.cpu_percent == null ? "—" : `<span class="vm-load"><span class="track"><span class="fill" style="width:${cpuBar}%"></span></span>${fmt(v.cpu_percent, 0)}%</span>`}</td>
-          <td>${v.memory_bytes == null ? "—" : fmtBytes(v.memory_bytes)}</td>
-          <td>${fmtDur(v.uptime_secs)}</td>
-          <td>${st}</td>
-          <td class="rowactions">${evictBtns}</td>
-        </tr>`;
-      }).join("");
+  deps.forEach((d, i) => {
+    let el = existing.get(d.id);
+    if (el) existing.delete(d.id);
+    else el = cardShell(d.id);
+    updateCard(el, d);
+    // Match the server's ordering by moving only the cards that are actually
+    // out of place; a card already in the right slot is not touched at all.
+    if (host.children[i] !== el) host.insertBefore(el, host.children[i] || null);
+  });
 
-      // Booting VMs, in the same table as the ready ones. A pending *count* can't
-      // tell a normal 10-second boot from a guest whose server never started, and
-      // that distinction is the whole diagnosis when a deployment "hangs on VM
-      // creation": here the sandbox id, its age and the daemon's status are all
-      // visible, and the row goes amber once the boot has outlasted what a request
-      // will wait for.
-      const pendingRows = (d.pending_vms || []).map(v => {
-        const slow = v.age_secs >= p.cold_start_timeout_secs;
-        const st = `<span class="tag ${slow ? "slow" : "boot"}">booting${v.status ? " · " + esc(v.status) : ""}</span>`;
-        const deadline = p.boot_timeout_secs
-          ? ` / ${fmtDur(p.boot_timeout_secs)}` : "";
-        return `<tr${slow ? ' class="attn"' : ""}>
-          <td class="mono">${esc(v.sandbox_id)}</td>
-          <td class="mono">—</td>
-          <td>—</td>
-          <td>—</td>
-          <td>—</td>
-          <td>${fmtDur(v.age_secs)}${deadline}</td>
-          <td>${st}</td>
-          <td class="rowactions"><button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button></td>
-        </tr>`;
-      }).join("");
-
-      vmRows = (readyRows + pendingRows)
-        || `<tr><td colspan="8" class="empty" style="padding:14px">No VMs — the pool wants ${fmt(p.desired_replicas)}.</td></tr>`;
-    }
-
-    const vmHead = isStatic
-      ? `<tr><th>upstream</th><th>in-flight</th><th>uptime</th><th>state</th></tr>`
-      : `<tr><th>sandbox</th><th>addr</th><th>in-flight</th><th>CPU</th><th>memory</th><th>uptime</th><th>state</th><th>actions</th></tr>`;
-
-    const headBadges = isStatic
-      ? `<span class="badge">static · proxy_pass</span>
-         <span class="badge">${d.upstreams.length} upstream${d.upstreams.length === 1 ? "" : "s"}</span>`
-      : `<span class="badge">${p.ready}/${p.max_replicas} replicas · want ${p.desired_replicas}</span>
-         <span class="badge">min ${p.min_replicas} · warm ${p.warm_pool} · target ${p.target_concurrency}</span>`;
-
-    // A redeploy button only where there is something to redeploy: `build` needs a
-    // repo in the spec, `update` needs a command list, and a deployment with
-    // neither has no job to start.
-    const jobBtn = d.job_kind === "build"
-      ? `<button class="btn mini" data-act="build" data-id="${esc(d.id)}">Build</button>`
-      : d.job_kind === "update"
-      ? `<button class="btn mini" data-act="update" data-id="${esc(d.id)}">Update</button>`
-      : "";
-
-    // Static deployments can't be scaled; only Edit (to change the upstream list).
-    const headActions = (isStatic
-      ? `<button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`
-      : `<button class="btn mini" data-act="scale" data-id="${esc(d.id)}">Scale</button>
-         <button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`) + jobBtn;
-
-    // Pool-only tiles (pending/draining/cold-start) are meaningless for a static
-    // deployment; omit them.
-    const poolTiles = isStatic ? "" :
-        `<div><div class="label">Pending</div><div class="value">${fmt(p.pending)}</div></div>
-         <div><div class="label">Draining</div><div class="value">${fmt(p.draining)}</div></div>`;
-    const coldTile = isStatic ? "" :
-        `<div><div class="label">Cold p50</div><div class="value">${m.cold_start_s.count ? fmt(m.cold_start_s.p50,1)+"s" : "—"}</div></div>`;
-
-    return `<div class="card dep">
-      <div class="dep-head">
-        <span class="name">${esc(d.id)}</span>
-        ${headBadges}
-        <span class="actions">
-          ${headActions}
-        </span>
-      </div>
-      <div class="dep-grid">
-        <div>
-          <div class="gauge-label"><span>Utilization</span><span>${label}</span></div>
-          <div class="gauge-track"><div class="gauge-fill ${cls}" style="width:${Math.min(100, utilPct || 0)}%"></div></div>
-          <div class="kv">
-            <div><div class="label">In-flight</div><div class="value">${fmt(p.total_in_flight)}</div></div>
-            ${poolTiles}
-            <div><div class="label">Requests</div><div class="value">${fmt(m.requests.total)}</div></div>
-            <div><div class="label">Lat p50</div><div class="value">${m.latency_ms.count ? fmtMs(m.latency_ms.p50) : "—"}</div></div>
-            <div><div class="label">Lat p99</div><div class="value">${m.latency_ms.count ? fmtMs(m.latency_ms.p99) : "—"}</div></div>
-            ${coldTile}
-            <div><div class="label">Errors</div><div class="value ${errPct ? "err" : ""}">${fmt(errPct, errPct ? 1 : 0)}%</div></div>
-            <div><div class="label">CPU (pool)</div><div class="value">${p.cpu_percent == null ? "—" : fmt(p.cpu_percent, 0)+"%"}</div></div>
-            <div><div class="label">Memory</div><div class="value">${p.memory_bytes == null ? "—" : fmtBytes(p.memory_bytes)}</div></div>
-          </div>
-        </div>
-        <div style="overflow-x:auto">
-          <table class="vms">
-            <thead>${vmHead}</thead>
-            <tbody>${vmRows}</tbody>
-          </table>
-        </div>
-      </div>
-    </div>`;
-  }).join("");
+  // Whatever is left was on the previous page of results, or has been
+  // deregistered since.
+  for (const el of existing.values()) el.remove();
 }
 
 // ---- Certificates -------------------------------------------------------

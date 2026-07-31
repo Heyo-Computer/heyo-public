@@ -32,6 +32,64 @@ use tokio::sync::Notify;
 /// same-origin `/metrics` poll) so it works over an SSH tunnel with no assets.
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
+/// How to turn a deployment's hostname into a URL somebody can click.
+///
+/// The dashboard runs on the *admin* listener, so it cannot infer the data
+/// plane's scheme or port from its own location — an app-lb serving HTTPS on
+/// 6189 would otherwise be linked as `http://host`, which connects to nothing.
+#[derive(Debug, Clone)]
+pub struct PublicUrl {
+    scheme: &'static str,
+    /// Appended as `:port`, unless it is the default for the scheme.
+    port: Option<u16>,
+}
+
+impl PublicUrl {
+    /// Derived from the listener config: the HTTPS listener when TLS is on
+    /// (that is where a browser should land), the plaintext one otherwise.
+    pub fn from_config(tls_enabled: bool, proxy_addr: &str, tls_addr: &str) -> Self {
+        let (scheme, addr, default) = if tls_enabled {
+            ("https", tls_addr, 443)
+        } else {
+            ("http", proxy_addr, 80)
+        };
+        Self {
+            scheme,
+            port: port_of(addr).filter(|p| *p != default),
+        }
+    }
+
+    /// The URL for one route rule, or `None` if it names no host.
+    ///
+    /// A rule with only a `path_prefix` or a `host_suffix` is deliberately not
+    /// linkable: neither names a single hostname a browser could be sent to.
+    fn of(&self, rule: &crate::config::RouteRule) -> Option<String> {
+        let host = rule.host.as_deref()?.trim();
+        if host.is_empty() {
+            return None;
+        }
+        let mut url = format!("{}://{host}", self.scheme);
+        if let Some(port) = self.port {
+            url.push_str(&format!(":{port}"));
+        }
+        // A host+path rule only matches under that prefix, so linking the bare
+        // host would land on a 404 from this very deployment.
+        if let Some(path) = &rule.path_prefix {
+            url.push_str(path);
+        }
+        Some(url)
+    }
+}
+
+/// The port from a `host:port` listen address, including `[::]:port`.
+fn port_of(addr: &str) -> Option<u16> {
+    let tail = match addr.rfind(']') {
+        Some(end) => addr.get(end + 1..)?.strip_prefix(':')?,
+        None => addr.rsplit_once(':')?.1,
+    };
+    tail.parse().ok()
+}
+
 /// The optional Basic-auth gate over the dashboard and `/metrics`.
 ///
 /// Credentials are collapsed to the exact `Authorization` header they must
@@ -104,6 +162,9 @@ struct AdminState {
     acme: Option<Arc<Notify>>,
     /// Counters for the app-obs log shipper. `None` when log shipping is off.
     obs: Option<Arc<crate::obs::Stats>>,
+    /// How to turn a deployment's hostname into a link, given where the data
+    /// plane actually listens.
+    public_url: PublicUrl,
 }
 
 impl AdminState {
@@ -137,6 +198,7 @@ impl AdminApi {
         secrets: Arc<SecretStore>,
         jobs: Arc<Jobs>,
         obs: Option<Arc<crate::obs::Stats>>,
+        public_url: PublicUrl,
     ) -> Self {
         // Render the display name into the page once; the placeholder appears in
         // both the <title> and the <h1>.
@@ -173,6 +235,7 @@ impl AdminApi {
                 secrets,
                 jobs,
                 obs,
+                public_url,
             },
         }
     }
@@ -366,6 +429,13 @@ struct DeploymentView {
     /// have no certificate yet, which is otherwise a join nobody can make from
     /// `/certs` alone.
     hosts: Vec<String>,
+    /// The same routes as URLs a browser can be sent to, scheme and non-default
+    /// port included. Built here rather than in the page because the dashboard
+    /// is served from the *admin* listener and knows nothing about the data
+    /// plane's scheme or port — it would guess `http://host` for an app-lb
+    /// serving HTTPS on 6189.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    urls: Vec<String>,
     /// The deploy job this deployment accepts — `"build"` for a managed one with a
     /// `build` block, `"update"` for a static one with an `update` block, `None`
     /// when neither is configured and there is nothing to trigger.
@@ -553,6 +623,12 @@ async fn metrics_snapshot(
                     .routes
                     .iter()
                     .filter_map(|r| r.host.clone())
+                    .collect(),
+                urls: d
+                    .spec
+                    .routes
+                    .iter()
+                    .filter_map(|r| state.public_url.of(r))
                     .collect(),
                 job_kind: job_kind_of(&d.spec),
                 pool: pool_status_of(d),
@@ -1573,6 +1649,87 @@ impl BackgroundService for AdminApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The link has to reach the *data plane*, which the dashboard cannot infer
+    /// from its own location — it is served by the admin listener, on a
+    /// different port and (usually) a different scheme.
+    mod public_url {
+        use super::*;
+
+        fn rule(host: Option<&str>, path: Option<&str>) -> crate::config::RouteRule {
+            crate::config::RouteRule {
+                host: host.map(str::to_string),
+                host_suffix: None,
+                path_prefix: path.map(str::to_string),
+            }
+        }
+
+        #[test]
+        fn plaintext_on_the_default_port_needs_no_port() {
+            let u = PublicUrl::from_config(false, "0.0.0.0:80", "0.0.0.0:6189");
+            assert_eq!(u.of(&rule(Some("web.example.com"), None)).unwrap(), "http://web.example.com");
+        }
+
+        /// The out-of-the-box config. Linking `http://host` here would connect
+        /// to nothing, which is worse than not linking at all.
+        #[test]
+        fn a_non_default_port_is_carried_into_the_link() {
+            let u = PublicUrl::from_config(false, "0.0.0.0:6188", "0.0.0.0:6189");
+            assert_eq!(
+                u.of(&rule(Some("web.example.com"), None)).unwrap(),
+                "http://web.example.com:6188",
+            );
+        }
+
+        /// With TLS on, a browser belongs on the HTTPS listener — not the
+        /// plaintext one, which would redirect at best.
+        #[test]
+        fn tls_links_the_https_listener() {
+            let u = PublicUrl::from_config(true, "0.0.0.0:80", "0.0.0.0:443");
+            assert_eq!(u.of(&rule(Some("web.example.com"), None)).unwrap(), "https://web.example.com");
+
+            let u = PublicUrl::from_config(true, "0.0.0.0:80", "0.0.0.0:6189");
+            assert_eq!(
+                u.of(&rule(Some("web.example.com"), None)).unwrap(),
+                "https://web.example.com:6189",
+            );
+        }
+
+        /// A host+path rule only matches under its prefix, so linking the bare
+        /// host would 404 against this very deployment.
+        #[test]
+        fn a_path_prefix_is_part_of_the_link() {
+            let u = PublicUrl::from_config(false, "0.0.0.0:80", "0.0.0.0:443");
+            assert_eq!(
+                u.of(&rule(Some("web.example.com"), Some("/api"))).unwrap(),
+                "http://web.example.com/api",
+            );
+        }
+
+        /// Neither a subtree nor a bare path names a hostname a browser could
+        /// be sent to, so neither is linkable.
+        #[test]
+        fn rules_without_a_host_are_not_linkable() {
+            let u = PublicUrl::from_config(false, "0.0.0.0:80", "0.0.0.0:443");
+            assert!(u.of(&rule(None, Some("/legacy"))).is_none());
+            assert!(u.of(&rule(Some("  "), None)).is_none());
+
+            let suffix = crate::config::RouteRule {
+                host: None,
+                host_suffix: Some("apps.example.com".into()),
+                path_prefix: None,
+            };
+            assert!(u.of(&suffix).is_none());
+        }
+
+        #[test]
+        fn ipv6_listen_addresses_parse() {
+            assert_eq!(port_of("[::]:6188"), Some(6188));
+            assert_eq!(port_of("[::1]:443"), Some(443));
+            assert_eq!(port_of("0.0.0.0:6188"), Some(6188));
+            assert_eq!(port_of("no-port"), None);
+        }
+    }
 
     fn header_for(user: &str, password: &str) -> String {
         let token =
