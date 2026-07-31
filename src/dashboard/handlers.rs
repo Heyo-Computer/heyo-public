@@ -440,6 +440,54 @@ pub async fn action_reap(
     ))
 }
 
+/// The per-VM "archive as image" action: archive the schema's raw disk to S3
+/// with no boot and no `pg_dump` — for schemas whose Postgres won't come up
+/// (version-mismatched pgdata, sick disks), where the reap path only burns
+/// minutes proving that again. Long-running (fsck + compress + upload), so it
+/// runs in the background like the reap.
+pub async fn action_archive_image(
+    State(st): State<DashState>,
+    Path(id): Path<String>,
+    Form(f): Form<NextForm>,
+) -> Redirect {
+    let back = |query: String| -> Redirect {
+        match f.dest() {
+            Some(n) => {
+                let sep = if n.contains('?') { '&' } else { '?' };
+                Redirect::to(&format!("{n}{sep}{query}"))
+            }
+            None => Redirect::to(&format!("/vm/{id}?{query}")),
+        }
+    };
+    if !st.registry.image_archive_enabled() {
+        return back(format!(
+            "err={}",
+            qenc("image archiving is not enabled (set PG_VM_POOL_IMAGE_ARCHIVE=1 + PG_VM_POOL_RUN_DIR)")
+        ));
+    }
+    let schema = match model::find_row(&st, &id).await {
+        Ok(Some(row)) => row.schema,
+        Ok(None) => None,
+        Err(e) => return back(format!("err={}", qenc(&e.to_string()))),
+    };
+    let Some(schema) = schema else {
+        return back(format!(
+            "err={}",
+            qenc("not a pooler-managed schema VM — nothing to archive")
+        ));
+    };
+    let registry = st.registry.clone();
+    tokio::spawn(async move {
+        if let Err(e) = registry.archive_schema_as_image(&schema).await {
+            tracing::warn!("manual image archive of schema {schema} failed: {e:#}");
+        }
+    });
+    back(format!(
+        "msg={}",
+        qenc("image archive started; watch the events page")
+    ))
+}
+
 /// Minimal query-value encoder: keep readable chars, map space→`+`, drop the
 /// rest, and cap length. `+` decodes back to a space via `Query`/serde_urlencoded.
 fn qenc(s: &str) -> String {

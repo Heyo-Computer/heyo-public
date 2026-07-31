@@ -54,6 +54,11 @@ pub(crate) fn local_opts() -> HeyoClientOptions {
 /// bring-up closure without lifetime gymnastics.
 pub enum RestoreSource {
     S3(S3Config),
+    /// Raw-disk image archive (`{schema}.img.zst`): the VM is materialized by
+    /// downloading the image and booting on it directly — no `pg_restore`, no
+    /// spare claim, no guest job. Chosen when the schema's S3 archive is an
+    /// image rather than a dump (see `imgarchive::pick_restore`).
+    S3Image(S3Config),
     Local {
         srv: std::sync::Arc<crate::dumpsrv::DumpServer>,
         port: u16,
@@ -76,7 +81,15 @@ pub async fn ensure_vm(
     // restore, whose database is partially loaded — which is why the restore
     // job runs `pg_restore --clean --if-exists` (idempotent over that débris).
     let known_id = if restore.is_some() { None } else { known_id };
-    let sandbox = resolve_sandbox(cfg, &name, keepalive, known_id, spares).await?;
+    let sandbox = match restore {
+        // An image restore builds its own VM (download, disk swap, boot on the
+        // real data) — the database is complete before Postgres first starts,
+        // so there is nothing to restore into and no spare worth claiming.
+        Some(RestoreSource::S3Image(s3)) => crate::imgarchive::materialize_from_image(cfg, schema, s3)
+            .await
+            .with_context(|| format!("restoring schema {schema} from its S3 disk image"))?,
+        _ => resolve_sandbox(cfg, &name, keepalive, known_id, spares).await?,
+    };
 
     // Pin keep-alive schemas idempotently: TTL 0 = never auto-stopped. This
     // covers a VM created before its schema was pinned (or created with a
@@ -104,6 +117,10 @@ pub async fn ensure_vm(
                 .await
                 .with_context(|| format!("restoring schema {schema} from the local dump"))?
         }
+        // Already restored above — the VM booted on the adopted disk. Counted
+        // with the S3 restores on the monitoring charts: same tier, same cost
+        // profile, and a fourth chart wouldn't earn its space.
+        Some(RestoreSource::S3Image(_)) => crate::events::record(crate::events::Event::RestoreS3),
         None => {}
     }
 
@@ -1708,7 +1725,9 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
 }
 
 /// Create a brand-new VM for a schema (with its persistent data disk).
-async fn create_vm(cfg: &Config, name: &str, keepalive: bool) -> Result<Sandbox> {
+/// `pub(crate)` for the image-restore path, which creates the VM itself and
+/// swaps the restored disk in under it before first use.
+pub(crate) async fn create_vm(cfg: &Config, name: &str, keepalive: bool) -> Result<Sandbox> {
     info!(
         "creating VM {name}{}",
         if keepalive { " (keep-alive)" } else { "" }

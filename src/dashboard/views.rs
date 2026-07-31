@@ -906,6 +906,25 @@ pub fn vm_detail_page(
             section.controls {
                 h2 { "controls" }
                 div.actions { (action_buttons(r, st.registry.archive_enabled(), None)) }
+                @if st.registry.image_archive_enabled()
+                    && r.pool_managed
+                    && r.schema.is_some()
+                    && r.offload.is_none()
+                {
+                    div.actions {
+                        form method="post" action={ "/vm/" (r.id) "/archive-image" } {
+                            button.reap
+                                onclick="return confirm('Archive this VM as a raw disk image? No pg_dump runs: the VM is stopped, its disk is trimmed, compressed, and uploaded to S3, then the VM is deleted. Meant for schemas whose Postgres will not boot — a healthy schema is better served by reap → S3.')"
+                                { "archive disk image → S3" }
+                        }
+                    }
+                    p.note {
+                        "The image archive needs no working Postgres — it uploads the raw "
+                        code { "data.ext4" }
+                        " — but it preserves the pgdata version, so restoring it requires a "
+                        "rootfs with a matching Postgres major."
+                    }
+                }
                 form.resize method="post" action={ "/vm/" (r.id) "/resize" } {
                     label { "resize to " }
                     select name="size_class" {

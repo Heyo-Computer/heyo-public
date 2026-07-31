@@ -102,6 +102,13 @@ pub struct Config {
     /// [`ArchiveConfig::archive_after`] to S3 and kills its VM to reclaim disk;
     /// the next connect restores it. Enabled by `PG_VM_POOL_ARCHIVE_AFTER_SECS`.
     pub archive: Option<ArchiveConfig>,
+    /// Image-level archive fallback: when a schema cannot be archived
+    /// logically (its Postgres won't boot or won't dump), stream its stopped
+    /// VM's raw `data.ext4` — zstd-compressed — to S3 instead, with no boot
+    /// required. `None` (the default) disables it — enabled by
+    /// `PG_VM_POOL_IMAGE_ARCHIVE=1`; requires both the S3 tier and
+    /// [`Self::run_dir`] (soft-disabled with a warning otherwise).
+    pub image_archive: Option<ImageArchiveConfig>,
     /// Local "frozen" tier: dump long-idle schemas to a local file and delete
     /// their VM entirely, so a cold schema costs dump-file bytes (~1-5MB)
     /// instead of a filesystem image. `None` (default) disables it — enabled
@@ -249,6 +256,43 @@ impl FreezeConfig {
             dump_dir,
             listen,
         }))
+    }
+}
+
+/// Settings for the image-level archive fallback (see `Config::image_archive`).
+#[derive(Clone)]
+pub struct ImageArchiveConfig {
+    /// Where the compressed image is spooled before upload (so the PUT has a
+    /// known length and the file is integrity-checked before any bytes leave
+    /// the box). Needs roughly the disk's *allocated* size free — compressed
+    /// images are smaller, the allocated size is just the safe bound checked
+    /// up front. Env `PG_VM_POOL_IMAGE_SPOOL_DIR`; defaults to `spool/` next
+    /// to the state file.
+    pub spool_dir: PathBuf,
+}
+
+impl ImageArchiveConfig {
+    /// `Ok(None)` when `PG_VM_POOL_IMAGE_ARCHIVE` is unset/falsy. The archive
+    /// tier and run-dir requirements are checked by the caller (`from_env`),
+    /// which has both in hand.
+    fn from_env(state_file: &std::path::Path) -> Option<Self> {
+        let on = std::env::var("PG_VM_POOL_IMAGE_ARCHIVE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if !on {
+            return None;
+        }
+        let spool_dir = std::env::var("PG_VM_POOL_IMAGE_SPOOL_DIR")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                state_file
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("spool")
+            });
+        Some(Self { spool_dir })
     }
 }
 
@@ -424,6 +468,8 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS",
     "PG_VM_POOL_ARCHIVE_AFTER_SECS",
     "PG_VM_POOL_ARCHIVE_SWEEP_SECS",
+    "PG_VM_POOL_IMAGE_ARCHIVE",
+    "PG_VM_POOL_IMAGE_SPOOL_DIR",
     "PG_VM_POOL_RECLAIM_CMD",
     "PG_VM_POOL_RECLAIM_INTERVAL_SECS",
     "PG_VM_POOL_RUN_DIR",
@@ -596,6 +642,25 @@ impl Config {
             );
             orphan_sweep = None;
         }
+        // Image archive is a mode of the S3 tier and needs the run dir to
+        // find `sb-<id>/data.ext4` — half-configured, it stays off loudly.
+        let mut image_archive = ImageArchiveConfig::from_env(&state_file);
+        if image_archive.is_some() {
+            if archive.is_none() {
+                tracing::warn!(
+                    "PG_VM_POOL_IMAGE_ARCHIVE is set but the S3 eviction tier is not \
+                     configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*) — \
+                     image archiving is disabled"
+                );
+                image_archive = None;
+            } else if run_dir.is_none() {
+                tracing::warn!(
+                    "PG_VM_POOL_IMAGE_ARCHIVE is set but no run dir is known \
+                     (set PG_VM_POOL_RUN_DIR) — image archiving is disabled"
+                );
+                image_archive = None;
+            }
+        }
         if let (Some(f), Some(a)) = (&freeze, &archive)
             && f.freeze_after >= a.archive_after
         {
@@ -628,6 +693,7 @@ impl Config {
             tls_key,
             dashboard,
             archive,
+            image_archive,
             freeze,
             warm_spares,
             reclaim,

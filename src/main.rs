@@ -10,6 +10,7 @@ mod config;
 mod dashboard;
 mod dumpsrv;
 mod events;
+mod imgarchive;
 mod orphans;
 mod proxy;
 mod reclaim;

@@ -69,6 +69,14 @@ impl S3Config {
         format!("{}{}.dump", self.prefix, schema)
     }
 
+    /// The object key for a schema's raw-disk image archive:
+    /// `{prefix}{schema}.img.zst`. Sits beside the dump key; at most one of
+    /// the two should hold data for a schema (the image path deletes a stale
+    /// dump object before the tier flip, so restore never prefers older data).
+    pub fn image_object_key(&self, schema: &str) -> String {
+        format!("{}{}.img.zst", self.prefix, schema)
+    }
+
     /// The virtual-hosted S3 host (`{bucket}.s3.{region}.amazonaws.com`) that a
     /// guest `curl` should be pinned to via `--resolve`, or `None` for a custom
     /// endpoint (MinIO/R2) — there the endpoint is expected to be resolvable by
@@ -99,6 +107,38 @@ impl S3Config {
     /// GET URL used with a HEAD request — it needs its own signature.
     pub fn presign_head(&self, key: &str, expires: std::time::Duration) -> String {
         self.presign("HEAD", key, expires.as_secs(), now_unix())
+    }
+
+    /// Presign a `DELETE` of `key` (used to remove a stale dump object once an
+    /// image archive supersedes it).
+    pub fn presign_delete(&self, key: &str, expires: std::time::Duration) -> String {
+        self.presign("DELETE", key, expires.as_secs(), now_unix())
+    }
+
+    /// Delete `key` from the pooler. Success is "the object is gone": S3
+    /// answers 204 whether or not the key existed, and a 404 from an
+    /// S3-compatible store means the same thing, so both count.
+    pub async fn delete_object(
+        &self,
+        http: &reqwest::Client,
+        key: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = self.presign_delete(key, std::time::Duration::from_secs(60));
+        let resp = http
+            .delete(&url)
+            .timeout(timeout)
+            .send()
+            .await
+            .with_context(|| format!("DELETE s3://{}/{key}", self.bucket))?;
+        anyhow::ensure!(
+            resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND,
+            "DELETE s3://{}/{key} returned {}",
+            self.bucket,
+            resp.status()
+        );
+        Ok(())
     }
 
     /// What the object at `key` currently is, as far as S3 is concerned:
@@ -258,6 +298,19 @@ impl S3Config {
     /// Core SigV4 query-string presign. `unix_secs` is the signing time (the
     /// tests pin it; the public methods pass the wall clock).
     fn presign(&self, method: &str, key: &str, expires: u64, unix_secs: u64) -> String {
+        self.presign_with_query(method, key, expires, unix_secs, &[])
+    }
+
+    /// [`Self::presign`] with additional query parameters signed into the URL —
+    /// what the multipart calls need (`uploads`, `partNumber`, `uploadId`).
+    fn presign_with_query(
+        &self,
+        method: &str,
+        key: &str,
+        expires: u64,
+        unix_secs: u64,
+        extra_query: &[(&str, &str)],
+    ) -> String {
         let (scheme, host, canonical_uri) = self.address(key);
         presign_core(PresignParams {
             method,
@@ -269,8 +322,184 @@ impl S3Config {
             secret_key: &self.secret_access_key,
             unix_secs,
             expires,
+            extra_query,
         })
     }
+
+    /// Start a multipart upload of `key`; returns the upload id. Used for
+    /// image archives too large for one PUT (S3 caps a single PUT at 5GB).
+    pub async fn initiate_multipart(
+        &self,
+        http: &reqwest::Client,
+        key: &str,
+    ) -> anyhow::Result<String> {
+        use anyhow::Context;
+        let url =
+            self.presign_with_query("POST", key, 600, now_unix(), &[("uploads", "")]);
+        let resp = http
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .with_context(|| format!("initiating multipart upload of s3://{}/{key}", self.bucket))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::ensure!(
+            status.is_success(),
+            "initiating multipart upload of s3://{}/{key} returned {status}: {}",
+            self.bucket,
+            body.trim()
+        );
+        xml_text(&body, "UploadId").map(str::to_string).ok_or_else(|| {
+            anyhow::anyhow!(
+                "multipart initiate response for s3://{}/{key} carries no <UploadId>: {}",
+                self.bucket,
+                body.trim()
+            )
+        })
+    }
+
+    /// Upload one part (1-based `part_number`); returns its ETag, needed to
+    /// complete the upload. Parts must be ≥ 5MB except the last.
+    pub async fn upload_part(
+        &self,
+        http: &reqwest::Client,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        bytes: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<String> {
+        use anyhow::Context;
+        let pn = part_number.to_string();
+        let url = self.presign_with_query(
+            "PUT",
+            key,
+            3600,
+            now_unix(),
+            &[("partNumber", &pn), ("uploadId", upload_id)],
+        );
+        let resp = http
+            .put(&url)
+            .body(bytes)
+            .timeout(timeout)
+            .send()
+            .await
+            .with_context(|| format!("uploading part {part_number} of s3://{}/{key}", self.bucket))?;
+        anyhow::ensure!(
+            resp.status().is_success(),
+            "uploading part {part_number} of s3://{}/{key} returned {}",
+            self.bucket,
+            resp.status()
+        );
+        resp.headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "part {part_number} of s3://{}/{key} was accepted without an ETag — \
+                     cannot complete the upload",
+                    self.bucket
+                )
+            })
+    }
+
+    /// Complete a multipart upload from its `(part_number, etag)` list.
+    ///
+    /// S3 can answer a Complete with **200 and an `<Error>` body** (it streams
+    /// whitespace while assembling, then reports failure inside the 200), so
+    /// the status alone proves nothing — the body must name a
+    /// `CompleteMultipartUploadResult`.
+    pub async fn complete_multipart(
+        &self,
+        http: &reqwest::Client,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u32, String)],
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (n, etag) in parts {
+            // ETags come back quoted; S3 accepts them quoted in the manifest.
+            xml.push_str(&format!(
+                "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        let url = self.presign_with_query(
+            "POST",
+            key,
+            600,
+            now_unix(),
+            &[("uploadId", upload_id)],
+        );
+        let resp = http
+            .post(&url)
+            .body(xml)
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await
+            .with_context(|| format!("completing multipart upload of s3://{}/{key}", self.bucket))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::ensure!(
+            status.is_success() && body.contains("CompleteMultipartUploadResult"),
+            "completing multipart upload of s3://{}/{key} failed ({status}): {}",
+            self.bucket,
+            truncate_body(&body)
+        );
+        Ok(())
+    }
+
+    /// Abort a multipart upload so its parts stop accruing storage. Best-effort
+    /// cleanup on a failed upload — the caller logs, never propagates.
+    pub async fn abort_multipart(
+        &self,
+        http: &reqwest::Client,
+        key: &str,
+        upload_id: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = self.presign_with_query(
+            "DELETE",
+            key,
+            60,
+            now_unix(),
+            &[("uploadId", upload_id)],
+        );
+        let resp = http
+            .delete(&url)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .with_context(|| format!("aborting multipart upload of s3://{}/{key}", self.bucket))?;
+        anyhow::ensure!(
+            resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND,
+            "aborting multipart upload of s3://{}/{key} returned {}",
+            self.bucket,
+            resp.status()
+        );
+        Ok(())
+    }
+}
+
+/// First text content of `<tag>…</tag>` in an XML body. The S3 responses this
+/// parses are flat and unambiguous, so a substring scan beats an XML dependency.
+fn xml_text<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(body[start..end].trim())
+}
+
+fn truncate_body(s: &str) -> &str {
+    let mut end = s.len().min(500);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Short-lived: a HEAD the pooler issues immediately, unlike the guest URLs that
@@ -309,6 +538,10 @@ struct PresignParams<'a> {
     secret_key: &'a str,
     unix_secs: u64,
     expires: u64,
+    /// Additional query params signed into the URL (multipart's `uploads`,
+    /// `partNumber`, `uploadId`). Merged and sorted with the `X-Amz-*` set —
+    /// SigV4 requires the canonical query in byte order regardless of origin.
+    extra_query: &'a [(&'a str, &'a str)],
 }
 
 /// The SigV4 signing procedure, decoupled from `S3Config`/wall-clock so a fixed
@@ -319,8 +552,9 @@ fn presign_core(p: PresignParams) -> String {
     let scope = format!("{date}/{}/s3/aws4_request", p.region);
     let credential = format!("{}/{scope}", p.access_key);
 
-    // Query params that participate in the signature, sorted by key (they are
-    // already in sorted order here, which S3 requires for the canonical query).
+    // Query params that participate in the signature, sorted by key — S3
+    // requires the canonical query in byte order, which the sort guarantees
+    // even after merging in the caller's extra params.
     let mut query: Vec<(String, String)> = vec![
         ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
         ("X-Amz-Credential".into(), credential),
@@ -328,6 +562,11 @@ fn presign_core(p: PresignParams) -> String {
         ("X-Amz-Expires".into(), p.expires.to_string()),
         ("X-Amz-SignedHeaders".into(), "host".into()),
     ];
+    query.extend(
+        p.extra_query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
     query.sort_by(|a, b| a.0.cmp(&b.0));
     let canonical_query = query
         .iter()
@@ -467,6 +706,7 @@ mod tests {
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             unix_secs: unix,
             expires: 86_400,
+            extra_query: &[],
         });
         assert!(
             url.ends_with(
@@ -500,6 +740,7 @@ mod tests {
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             unix_secs: unix,
             expires: 60,
+            extra_query: &[],
         };
         let head = presign_core(params("HEAD"));
         let get = presign_core(params("GET"));
@@ -586,6 +827,66 @@ mod tests {
             ..aws
         };
         assert_eq!(custom.resolve_host(), None);
+    }
+
+    /// Multipart's extra params must land in the canonical query in byte
+    /// order — `X-Amz-*` (uppercase) before `partNumber`/`uploadId`/`uploads`
+    /// (lowercase) — or the signature never verifies.
+    #[test]
+    fn extra_query_params_are_signed_in_sorted_order() {
+        let params = |extra: &'static [(&'static str, &'static str)]| PresignParams {
+            method: "POST",
+            scheme: "https",
+            host: "examplebucket.s3.amazonaws.com",
+            canonical_uri: "/big.img.zst",
+            region: "us-east-1",
+            access_key: "AKIAIOSFODNN7EXAMPLE",
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            unix_secs: 1_369_353_600,
+            expires: 600,
+            extra_query: extra,
+        };
+        let url = presign_core(params(&[("partNumber", "2"), ("uploadId", "a/b=c")]));
+        // Lowercase keys sort after the X-Amz-* block; values are
+        // component-encoded (the uploadId's `/` and `=` must not survive raw).
+        assert!(
+            url.contains("X-Amz-SignedHeaders=host&partNumber=2&uploadId=a%2Fb%3Dc"),
+            "unexpected query order/encoding: {url}"
+        );
+        // A bare `uploads` param canonicalizes as `uploads=`.
+        let url = presign_core(params(&[("uploads", "")]));
+        assert!(
+            url.contains("&uploads=&X-Amz-Signature="),
+            "bare uploads param must appear as uploads=: {url}"
+        );
+        // And the extra params change the signature (they are signed).
+        let plain = presign_core(params(&[]));
+        let strip = |u: &str| u.split("&X-Amz-Signature=").nth(1).unwrap().to_string();
+        assert_ne!(strip(&plain), strip(&presign_core(params(&[("uploads", "")]))));
+    }
+
+    #[test]
+    fn xml_text_extracts_upload_id() {
+        let body = "<?xml version=\"1.0\"?><InitiateMultipartUploadResult>\
+                    <Bucket>wb</Bucket><Key>a.img.zst</Key>\
+                    <UploadId>VXBsb2FkIElE</UploadId></InitiateMultipartUploadResult>";
+        assert_eq!(xml_text(body, "UploadId"), Some("VXBsb2FkIElE"));
+        assert_eq!(xml_text(body, "Missing"), None);
+    }
+
+    #[test]
+    fn image_key_sits_beside_dump_key() {
+        let cfg = S3Config {
+            bucket: "wb".into(),
+            prefix: "pg-vm-pool/".into(),
+            region: "us-east-1".into(),
+            discovered_region: Default::default(),
+            endpoint: None,
+            access_key_id: "AK".into(),
+            secret_access_key: "sk".into(),
+        };
+        assert_eq!(cfg.object_key("t1"), "pg-vm-pool/t1.dump");
+        assert_eq!(cfg.image_object_key("t1"), "pg-vm-pool/t1.img.zst");
     }
 
     #[test]

@@ -387,6 +387,12 @@ impl SchemaRegistry {
         self.cfg.archive.is_some()
     }
 
+    /// Whether the image-level archive is configured — gates the dashboard's
+    /// per-VM "archive as image" control.
+    pub fn image_archive_enabled(&self) -> bool {
+        self.cfg.image_archive.is_some()
+    }
+
     /// Whether automatic disk reclamation is configured — gates the dashboard's
     /// manual "reclaim disk slack" control.
     pub fn reclaim_enabled(&self) -> bool {
@@ -562,7 +568,19 @@ impl SchemaRegistry {
             let known_id = record.as_ref().map(|r| r.sandbox_id.clone());
             let restore = match record.as_ref().map(|r| r.tier) {
                 Some(Tier::Archived) => match self.cfg.archive.as_ref() {
-                    Some(a) => Some(RestoreSource::S3(a.s3.clone())),
+                    // "Archived" covers both archive formats — which S3 key
+                    // actually holds data decides the restore strategy (a HEAD
+                    // or two on the cold path; transport trouble defaults to
+                    // the dump path, exactly the pre-image behavior).
+                    Some(a) => Some(
+                        match crate::imgarchive::pick_restore(&a.s3, schema).await {
+                            crate::imgarchive::RestoreKind::Dump => RestoreSource::S3(a.s3.clone()),
+                            crate::imgarchive::RestoreKind::Image => {
+                                info!("schema {schema}: restoring from its disk-image archive");
+                                RestoreSource::S3Image(a.s3.clone())
+                            }
+                        },
+                    ),
                     None => bail!(
                         "schema {schema} is archived to S3, but the eviction tier is not \
                          configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*) — \
@@ -1290,8 +1308,17 @@ impl SchemaRegistry {
                 // Postgres (ready-timeout on a sick disk) has no handle to
                 // clean up through — the same leak class as a failed dump.
                 vm::stop_after_failed_bringup(schema, known_id.as_deref()).await;
-                return Err(e)
-                    .with_context(|| format!("bringing up VM for schema {schema} to archive it"));
+                // This is exactly the schema the image path exists for: its
+                // Postgres won't boot, so no dump will ever succeed — but the
+                // disk itself can still be archived. Only the *known* VM's
+                // disk qualifies: a fresh VM the failed bring-up may have
+                // created holds an empty cluster, and archiving that would
+                // durably shadow the real data.
+                let e = anyhow::Error::from(e)
+                    .context(format!("bringing up VM for schema {schema} to archive it"));
+                return self
+                    .image_archive_fallback(schema, known_id.as_deref(), &archive, e)
+                    .await;
             }
         };
 
@@ -1304,7 +1331,16 @@ impl SchemaRegistry {
         if let Err(e) = vm::dump_to_s3(&self.cfg, &entry.sandbox, schema, &archive.s3).await {
             warn!("schema {schema}: dump failed; stopping the VM booted for this attempt");
             checkpoint_and_stop(&entry, schema).await;
-            return Err(e).with_context(|| format!("dumping schema {schema} to S3"));
+            // The VM this attempt used is the one whose disk holds the data —
+            // the same disk the dump just failed to read a database out of.
+            // With the VM checkpointed and stopped, that disk is exactly what
+            // the image path archives.
+            let sb_id = entry.sandbox.sandbox_id().to_string();
+            drop(entry);
+            let e = anyhow::Error::from(e).context(format!("dumping schema {schema} to S3"));
+            return self
+                .image_archive_fallback(schema, Some(&sb_id), &archive, e)
+                .await;
         }
 
         self.store.set_tier(schema, Tier::Archived).await;
@@ -1396,6 +1432,161 @@ impl SchemaRegistry {
             archive.s3.bucket
         );
         Ok(())
+    }
+
+    /// Try the image-level archive after a failed dump-based attempt.
+    /// `Ok(())` means the schema is durably archived (as an image); otherwise
+    /// the original dump error comes back — annotated with the image failure
+    /// when an attempt was actually made. A missing sandbox id or a disabled
+    /// image tier just propagates the original error untouched.
+    async fn image_archive_fallback(
+        &self,
+        schema: &str,
+        sandbox_id: Option<&str>,
+        archive: &crate::config::ArchiveConfig,
+        original: anyhow::Error,
+    ) -> Result<()> {
+        if self.cfg.image_archive.is_none() {
+            return Err(original);
+        }
+        let Some(id) = sandbox_id else {
+            return Err(original);
+        };
+        info!(
+            "schema {schema}: dump-based archive failed; falling back to a \
+             disk-image archive of {id}"
+        );
+        match self.image_archive_now(schema, id, archive).await {
+            Ok(()) => Ok(()),
+            Err(img_e) => Err(original.context(format!(
+                "the disk-image fallback also failed: {img_e:#}"
+            ))),
+        }
+    }
+
+    /// The image-archive core: archive the disk, flip the tier, kill the VM,
+    /// journal. The caller must hold the schema's `ArchivingGuard` and have
+    /// stopped the VM (a still-running one fails the disk-release wait).
+    async fn image_archive_now(
+        &self,
+        schema: &str,
+        sandbox_id: &str,
+        archive: &crate::config::ArchiveConfig,
+    ) -> Result<()> {
+        let done =
+            crate::imgarchive::archive_disk(&self.cfg, &archive.s3, schema, sandbox_id).await?;
+        // Mark before kill, mirroring the dump path: if we crash between them
+        // the image is durable and the store says "archived", so the next
+        // connect restores — the reverse order could lose the mapping to a
+        // killed VM.
+        self.store.set_tier(schema, Tier::Archived).await;
+        if let Err(e) = kill_by_id(sandbox_id).await {
+            warn!(
+                "schema {schema}: image-archived but killing VM {sandbox_id} failed \
+                 (orphaned): {e:#}"
+            );
+        } else if let Some(dir) = self.cfg.run_dir.as_ref().map(|d| d.join(sandbox_id)) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if dir.exists() {
+                warn!(
+                    "schema {schema}: image-archived and VM killed, but {} still \
+                     exists — the orphan sweep will reclaim it",
+                    dir.display()
+                );
+            }
+        }
+        // The pgdata version travels with an image (unlike a dump), so a
+        // restore needs a matching-major rootfs — put the version on the
+        // record now, not when a restore fails on it.
+        crate::events::journal_info(
+            "archive.image",
+            format!(
+                "schema {schema} → archived as disk image ({}, pgdata v{})",
+                crate::orphans::human_iec(done.bytes),
+                done.pg_version.as_deref().unwrap_or("unknown"),
+            ),
+        );
+        Ok(())
+    }
+
+    /// Manually archive `schema` as a disk image — the dashboard's per-VM
+    /// "archive as image" action. Unlike the sweep's fallback this doesn't
+    /// wait for a failed dump: it stops the VM (checkpointing through the
+    /// warm entry when there is one) and archives the disk directly. For a
+    /// schema whose Postgres is known-unbootable, this skips the futile
+    /// minutes of bring-up the dump path would burn first.
+    pub async fn archive_schema_as_image(&self, schema: &str) -> Result<()> {
+        let res = self.archive_schema_as_image_inner(schema).await;
+        match &res {
+            Ok(()) => self.offload_backoff.clear(schema),
+            Err(e) => {
+                crate::events::journal_error("archive.image", format!("schema {schema}: {e:#}"));
+            }
+        }
+        res
+    }
+
+    async fn archive_schema_as_image_inner(&self, schema: &str) -> Result<()> {
+        let Some(archive) = self.cfg.archive.clone() else {
+            bail!(
+                "S3 eviction tier is not configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + \
+                 PG_VM_POOL_S3_*)"
+            );
+        };
+        anyhow::ensure!(
+            self.cfg.image_archive.is_some(),
+            "image archiving is not enabled (set PG_VM_POOL_IMAGE_ARCHIVE=1 + PG_VM_POOL_RUN_DIR)"
+        );
+        match self.store.record(schema).map(|r| r.tier) {
+            Some(Tier::Archived) => bail!("schema {schema} is already archived to S3"),
+            Some(Tier::Frozen) => bail!(
+                "schema {schema} is frozen to a local dump — the archive sweep promotes that \
+                 to S3; there is no VM disk to image"
+            ),
+            _ => {}
+        }
+        let Some(id) = self.store.record(schema).map(|r| r.sandbox_id) else {
+            bail!("schema {schema} has no VM in the registry — nothing to image");
+        };
+        let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
+            Some(g) => g,
+            None => bail!("schema {schema} is already being archived"),
+        };
+        // Evict the warm entry under the map lock, refusing live sessions —
+        // same serialization against checkout as the dump path.
+        let warm = {
+            let mut map = self.entries.lock().await;
+            let warm = map.get(schema).and_then(|c| c.get()).cloned();
+            if let Some(entry) = &warm {
+                let active = entry.active_count();
+                if active > 0 {
+                    bail!("schema {schema} has {active} live session(s); refusing to archive");
+                }
+            }
+            map.remove(schema);
+            warm
+        };
+        match warm {
+            // A warm entry means a live pool on a running VM: checkpoint
+            // through it, then stop — the image should carry as little
+            // unreplayed WAL as possible.
+            Some(entry) => checkpoint_and_stop(&entry, schema).await,
+            // No warm entry, but the VM may still be running (idle, or left
+            // over from before a pooler restart): best-effort stop by id.
+            None => {
+                if let Ok(sb) = heyo_sdk::Sandbox::connect(id.clone(), vm::local_opts()) {
+                    match tokio::time::timeout(Duration::from_secs(30), sb.stop()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => info!(
+                            "schema {schema}: pre-image stop of {id}: {e:#} \
+                             (it may already be stopped)"
+                        ),
+                        Err(_) => warn!("schema {schema}: pre-image stop of {id} timed out"),
+                    }
+                }
+            }
+        }
+        self.image_archive_now(schema, &id, &archive).await
     }
 
     /// Kick off one purge pass now, in the background — the dashboard's

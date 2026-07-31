@@ -154,6 +154,8 @@ Config via env (all optional):
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
 | `PG_VM_POOL_S3_ENDPOINT` | unset (AWS) | custom endpoint for an S3-compatible store (MinIO/R2); path-style addressing |
 | `PG_VM_POOL_S3_ACCESS_KEY_ID` / `PG_VM_POOL_S3_SECRET_ACCESS_KEY` | unset | S3 credentials (fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) |
+| `PG_VM_POOL_IMAGE_ARCHIVE` | unset (off) | `1` enables the image-level archive fallback: when a schema's dump-based archive fails (its Postgres won't boot or won't dump), its stopped VM's raw `data.ext4` is trimmed, zstd-compressed, and uploaded to S3 as `{prefix}{schema}.img.zst` instead — no boot needed; restore boots a fresh VM directly on the downloaded image. Also adds a per-VM "archive disk image" dashboard action. Requires the S3 tier and `PG_VM_POOL_RUN_DIR`, plus `zstd` (and ideally `e2fsck`/`debugfs`) on the host. Note an image preserves the pgdata version, so restoring needs a rootfs with a matching Postgres major |
+| `PG_VM_POOL_IMAGE_SPOOL_DIR` | `<state dir>/spool` | where the compressed image is staged (and integrity-checked) before upload; needs roughly the disk's allocated size free |
 | `PG_VM_POOL_FREEZE_AFTER_SECS` | `0` (off) | local freeze tier: dump a schema idle this long to a local file and delete its VM — see "Local freeze tier" |
 | `PG_VM_POOL_FREEZE_SWEEP_SECS` | `900` | how often the freeze sweep scans for candidates |
 | `PG_VM_POOL_DUMP_DIR` | `~/.heyo/pg-vm-pool/dumps` | where local dump files live |
