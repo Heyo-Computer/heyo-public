@@ -3,6 +3,7 @@ name = "serverctl"
 version.workspace = true
 edition.workspace = true
 description = "Client library and kubectl-shaped CLI for the app-lb admin API"
+license = "Apache-2.0"
 
 # One crate, two products. The library is the whole crate minus `main.rs` and
 # `cmd/`; the CLI is a `[[bin]]` behind the default `cli` feature, so
