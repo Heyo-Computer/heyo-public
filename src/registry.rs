@@ -1314,8 +1314,7 @@ impl SchemaRegistry {
                 // disk qualifies: a fresh VM the failed bring-up may have
                 // created holds an empty cluster, and archiving that would
                 // durably shadow the real data.
-                let e = anyhow::Error::from(e)
-                    .context(format!("bringing up VM for schema {schema} to archive it"));
+                let e = e.context(format!("bringing up VM for schema {schema} to archive it"));
                 return self
                     .image_archive_fallback(schema, known_id.as_deref(), &archive, e)
                     .await;
@@ -1337,7 +1336,7 @@ impl SchemaRegistry {
             // the image path archives.
             let sb_id = entry.sandbox.sandbox_id().to_string();
             drop(entry);
-            let e = anyhow::Error::from(e).context(format!("dumping schema {schema} to S3"));
+            let e = e.context(format!("dumping schema {schema} to S3"));
             return self
                 .image_archive_fallback(schema, Some(&sb_id), &archive, e)
                 .await;
@@ -1479,6 +1478,17 @@ impl SchemaRegistry {
         // the image is durable and the store says "archived", so the next
         // connect restores — the reverse order could lose the mapping to a
         // killed VM.
+        //
+        // An unbound VM (on the daemon but not in the registry — incident-era
+        // strays) needs its row *created* first: `set_tier` on a missing row
+        // is a silent no-op, and an archive the registry doesn't know about
+        // is unreachable — the next connect would serve a fresh empty DB.
+        // Crash windows stay safe: after `put` alone the schema is live and
+        // its VM still exists (the kill hasn't run), so a connect just boots
+        // it; the image in S3 is redundant, never load-bearing.
+        if self.store.record(schema).is_none() {
+            self.store.put(schema, sandbox_id);
+        }
         self.store.set_tier(schema, Tier::Archived).await;
         if let Err(e) = kill_by_id(sandbox_id).await {
             warn!(
@@ -1515,8 +1525,17 @@ impl SchemaRegistry {
     /// warm entry when there is one) and archives the disk directly. For a
     /// schema whose Postgres is known-unbootable, this skips the futile
     /// minutes of bring-up the dump path would burn first.
-    pub async fn archive_schema_as_image(&self, schema: &str) -> Result<()> {
-        let res = self.archive_schema_as_image_inner(schema).await;
+    ///
+    /// `viewed_id` is the sandbox the dashboard button was pressed on. It
+    /// lets a VM the registry has *no row for* (an incident-era stray: a
+    /// rescued ghost, a duplicate from the data-loss race, a row lost while
+    /// the disk was full) be archived and adopted — the row is created from
+    /// the verified archive, so the schema restores like any other. When the
+    /// registry *does* know the schema under a different id, this refuses
+    /// and names both VMs: two disks claim the same schema and only a human
+    /// knows which holds the truth.
+    pub async fn archive_schema_as_image(&self, schema: &str, viewed_id: Option<&str>) -> Result<()> {
+        let res = self.archive_schema_as_image_inner(schema, viewed_id).await;
         match &res {
             Ok(()) => self.offload_backoff.clear(schema),
             Err(e) => {
@@ -1526,7 +1545,7 @@ impl SchemaRegistry {
         res
     }
 
-    async fn archive_schema_as_image_inner(&self, schema: &str) -> Result<()> {
+    async fn archive_schema_as_image_inner(&self, schema: &str, viewed_id: Option<&str>) -> Result<()> {
         let Some(archive) = self.cfg.archive.clone() else {
             bail!(
                 "S3 eviction tier is not configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + \
@@ -1545,9 +1564,15 @@ impl SchemaRegistry {
             ),
             _ => {}
         }
-        let Some(id) = self.store.record(schema).map(|r| r.sandbox_id) else {
-            bail!("schema {schema} has no VM in the registry — nothing to image");
-        };
+        let recorded = self.store.record(schema).map(|r| r.sandbox_id);
+        let (id, adopting) =
+            resolve_image_target(schema, recorded.as_deref(), viewed_id)?;
+        if adopting {
+            info!(
+                "schema {schema}: VM {id} is not in the registry — archiving its disk \
+                 and adopting the schema from the verified image"
+            );
+        }
         let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
             Some(g) => g,
             None => bail!("schema {schema} is already being archived"),
@@ -2269,6 +2294,32 @@ fn grow_target_gb(fs: (u64, u64, u64), device_bytes: u64, cfg: &DiskGrowConfig) 
 
 /// Permanently delete sandbox `id` (kill = sandbox + disk; the SDK treats an
 /// already-gone sandbox as success).
+/// Which VM a manual image archive should target. `recorded` is the registry
+/// binding; `viewed` is the VM the dashboard button was pressed on. Returns
+/// `(sandbox_id, adopting)`, where `adopting` means the registry has no row
+/// for the schema — the caller creates one from the verified archive. A
+/// registry binding that contradicts the viewed VM is refused outright: two
+/// disks claim the same schema, only one holds the real data, and choosing
+/// automatically could archive (and then purge) the wrong bytes.
+fn resolve_image_target(
+    schema: &str,
+    recorded: Option<&str>,
+    viewed: Option<&str>,
+) -> Result<(String, bool)> {
+    match (recorded, viewed) {
+        (Some(rec), Some(v)) if rec != v => bail!(
+            "schema {schema} is bound to VM {rec} in the registry, but this is VM {v} — \
+             two VMs claim this schema and only one disk holds the real data; compare \
+             them (or archive from {rec}'s detail page) before touching either"
+        ),
+        (Some(rec), _) => Ok((rec.to_string(), false)),
+        (None, Some(v)) => Ok((v.to_string(), true)),
+        (None, None) => bail!(
+            "schema {schema} has no VM in the registry and no VM was named — nothing to image"
+        ),
+    }
+}
+
 async fn kill_by_id(id: &str) -> Result<()> {
     let sb = heyo_sdk::Sandbox::connect(id.to_string(), vm::local_opts())
         .context("connecting to sandbox")?;
@@ -2638,6 +2689,36 @@ fn used_pct(used: u64, avail: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manual image archive must work for a registry-less stray (adopt
+    /// the viewed VM), follow the registry when it agrees, and refuse — never
+    /// guess — when the registry names a *different* VM for the schema.
+    #[test]
+    fn image_target_adopts_strays_and_refuses_conflicts() {
+        // Normal: registry binding, viewed from that VM's page.
+        assert_eq!(
+            resolve_image_target("s", Some("sb-a"), Some("sb-a")).unwrap(),
+            ("sb-a".to_string(), false)
+        );
+        // Non-dashboard caller with no viewed VM: the registry decides.
+        assert_eq!(
+            resolve_image_target("s", Some("sb-a"), None).unwrap(),
+            ("sb-a".to_string(), false)
+        );
+        // Stray: the daemon knows pg-s, the registry has no row → adopt the
+        // VM the button was pressed on.
+        assert_eq!(
+            resolve_image_target("s", None, Some("sb-b")).unwrap(),
+            ("sb-b".to_string(), true)
+        );
+        // Conflict: two VMs claim the schema — refuse with both ids named.
+        let err = resolve_image_target("s", Some("sb-a"), Some("sb-b"))
+            .expect_err("a conflicting binding must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("sb-a") && msg.contains("sb-b"), "must name both VMs: {msg}");
+        // Nothing to go on at all.
+        assert!(resolve_image_target("s", None, None).is_err());
+    }
 
     #[test]
     fn offload_backoff_doubles_caps_and_clears() {

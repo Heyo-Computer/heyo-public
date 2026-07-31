@@ -477,8 +477,12 @@ pub async fn action_archive_image(
         ));
     };
     let registry = st.registry.clone();
+    let vm_id = id.clone();
     tokio::spawn(async move {
-        if let Err(e) = registry.archive_schema_as_image(&schema).await {
+        // Pass the VM the button was pressed on: it lets a registry-less
+        // stray be archived and adopted, and lets a conflicting binding be
+        // refused with both ids named.
+        if let Err(e) = registry.archive_schema_as_image(&schema, Some(&vm_id)).await {
             tracing::warn!("manual image archive of schema {schema} failed: {e:#}");
         }
     });
