@@ -20,7 +20,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -104,6 +104,10 @@ struct LogParams {
     q: Option<String>,
     limit: Option<usize>,
     before: Option<i64>,
+    /// Explicit range bounds, epoch milliseconds UTC. Either or both; see
+    /// `resolve_range`.
+    from: Option<i64>,
+    to: Option<i64>,
 }
 
 /// What is on disk right now, and how stale it might be.
@@ -269,6 +273,7 @@ async fn logs(
     Query(params): Query<LogParams>,
 ) -> Result<Json<LogsResponse>, ApiError> {
     let (_, window) = resolve_window(params.window.as_deref());
+    let window = resolve_range(window, params.from, params.to);
     let limit = params.limit.unwrap_or(200).clamp(1, MAX_LOG_LIMIT);
 
     let filter = LogFilter {
@@ -324,6 +329,44 @@ fn resolve_window(label: Option<&str>) -> (&'static str, Window) {
         .copied()
         .unwrap_or(("24h", 86_400));
     (label, Window::trailing(now, seconds))
+}
+
+/// Narrow a window to the range a caller named, in epoch milliseconds.
+///
+/// Logs are the one view a trailing window is not enough for. An incident is
+/// bounded by two instants somebody read off a chart, and "the last six hours"
+/// means something different every time the page refreshes — so a range, once
+/// given, is fixed, and the same URL shows the same lines tomorrow.
+///
+/// One end is enough: the window label supplies the span for the other, so
+/// "since 09:12" on a 1h window ends at now, and "until 09:12" starts an hour
+/// before it.
+///
+/// Nothing in here is a 400. These arrive from a bookmarked URL or from two
+/// pickers that can be dragged past each other, and a reversed pair is a
+/// mis-entry rather than a request for no rows.
+fn resolve_range(window: Window, from: Option<i64>, to: Option<i64>) -> Window {
+    let (from, to) = match (from, to) {
+        // Neither: the window picker above the page still scopes the list.
+        (None, None) => return window,
+        (Some(a), Some(b)) => (a, b),
+        (Some(a), None) => (a, window.end_ms()),
+        (None, Some(b)) => (b.saturating_sub(window.seconds().saturating_mul(1_000)), b),
+    };
+    // Ordered after conversion rather than before, so a value no timestamp can
+    // hold — which falls back to the window's own edge — cannot leave the range
+    // inverted either.
+    let (from, to) = (at_ms(from, window.from), at_ms(to, window.to));
+    Window {
+        from: from.min(to),
+        to: from.max(to),
+    }
+}
+
+/// Epoch milliseconds as a UTC instant, or `fallback` when the value is outside
+/// what a timestamp can represent.
+fn at_ms(ms: i64, fallback: DateTime<Utc>) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms).single().unwrap_or(fallback)
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -453,6 +496,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_range_pins_the_log_view_and_survives_being_dragged_backwards() {
+        let (_, window) = resolve_window(Some("1h"));
+        let now = window.end_ms();
+        let (earlier, later) = (now - 7_200_000, now - 3_600_000);
+
+        // No bounds at all: the window picker still scopes the list.
+        let following = resolve_range(window, None, None);
+        assert_eq!(
+            (following.start_ms(), following.end_ms()),
+            (window.start_ms(), window.end_ms()),
+        );
+
+        // Two ends, in either order, are the same range — a picker whose handles
+        // have crossed is a mis-entry, not a request for an empty page.
+        for (a, b) in [(earlier, later), (later, earlier)] {
+            let pinned = resolve_range(window, Some(a), Some(b));
+            assert_eq!((pinned.start_ms(), pinned.end_ms()), (earlier, later));
+        }
+
+        // One end, and the window label supplies the other.
+        let since = resolve_range(window, Some(earlier), None);
+        assert_eq!(since.start_ms(), earlier);
+        assert_eq!(since.end_ms(), now, "\"since\" runs up to now");
+
+        let until = resolve_range(window, None, Some(later));
+        assert_eq!(until.end_ms(), later);
+        assert_eq!(
+            until.start_ms(),
+            later - 3_600_000,
+            "an hour back, from the 1h label",
+        );
+    }
+
+    #[test]
+    fn an_instant_no_timestamp_can_hold_falls_back_to_the_window() {
+        // A hand-edited URL should show a day of logs, not an error about a
+        // query parameter — the same bargain `resolve_window` makes.
+        let (_, window) = resolve_window(Some("1h"));
+        let absurd = resolve_range(window, Some(i64::MIN), Some(i64::MAX));
+        assert_eq!(
+            (absurd.start_ms(), absurd.end_ms()),
+            (window.start_ms(), window.end_ms()),
+        );
     }
 
     #[test]

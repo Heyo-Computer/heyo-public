@@ -130,7 +130,9 @@ The dashboard lives on the API port, at `/dashboard` (and `/` redirects there). 
 is one self-contained HTML file compiled into the binary — no build step, no CDN,
 so it loads on a host with no route out. A fleet overview lists every deployment
 with a sparkline and its error count; clicking one opens per-deployment charts
-and a filterable view of its logs.
+and a filterable view of its logs — filterable by level, backend, message and by
+an explicit time range, with every line stamped to the millisecond and copyable
+on its own.
 
 The JSON behind it:
 
@@ -138,7 +140,7 @@ The JSON behind it:
 | --- | --- |
 | `GET /api/fleet?window=` | One row per deployment, plus whole-host CPU and memory |
 | `GET /api/deployments/<id>?window=` | Bucketed series and summary figures |
-| `GET /api/deployments/<id>/logs?window=&level=&backend=&q=&limit=&before=` | Log lines, newest first |
+| `GET /api/deployments/<id>/logs?window=&from=&to=&level=&backend=&q=&limit=&before=` | Log lines, newest first |
 | `GET /stats` | Ingest counters, and rows still buffered in memory |
 | `GET /healthz` | Always open, never queued behind a query |
 
@@ -149,6 +151,25 @@ case-insensitive substring — `%` and `_` are literal, not wildcards. `before` 
 an **inclusive** page boundary: log timestamps collide freely, and an exclusive
 one would silently drop lines from a burst that straddles a page edge, so the
 caller de-duplicates the boundary millisecond instead.
+
+`from` and `to` are epoch milliseconds, and pin the log list to a fixed range
+instead of a trailing window — an incident is bounded by two instants read off a
+chart, and "the last six hours" means something different every time the page
+refreshes. Either end alone is enough; `window` supplies the span for the other,
+so `from` on its own runs up to now and `to` on its own starts a window-length
+before it. Both ends are inclusive, both are optional, and neither is validated
+into a `400`: a reversed pair is ordered, and an instant no timestamp can hold
+falls back to the window's own edge, on the same reasoning that makes an unknown
+`window` label show a day of data rather than an error. Partition pruning follows
+the resolved range, not the label, so a five-minute range inside last Tuesday
+opens one hour's directory.
+
+The dashboard drives this from a `from`/`to` pair under the Logs heading, with a
+button that fills both ends from the range already on screen — the usual move is
+narrowing a window you are looking at, not naming an interval from memory. The
+fields hold whole seconds, so pinning rounds the start down and the end up: the
+pinned range covers at least what was on screen, because rounding both ends
+inward would quietly drop whatever landed in the last fraction of a second.
 
 There is no SQL passthrough. Every query is one the server built, so partition
 pruning and a row cap always apply — neither is something a caller can forget.

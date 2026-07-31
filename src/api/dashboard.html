@@ -117,6 +117,9 @@
     border-radius: 8px; padding: 5px 9px; min-height: 28px;
   }
   input.text { min-width: 200px; flex: 1 1 220px; }
+  /* A range end is a fixed-width thing; only the search box wants the slack. */
+  input.text[type="datetime-local"] { min-width: 0; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+  .field { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 
   .section-title {
     font-size: 12px; font-weight: 600; text-transform: uppercase;
@@ -207,6 +210,20 @@
     border: 1px solid var(--border); border-radius: 8px;
     font-size: 12px; overflow-x: auto; white-space: pre;
   }
+  .logs td.act { text-align: right; white-space: nowrap; padding-left: 10px; }
+  /* Always drawn, never hover-only: a control that materialises under the
+     pointer is unreachable by touch and invisible to anyone tabbing through. */
+  button.copy {
+    font: inherit; font-size: 11px; color: var(--muted);
+    background: transparent; border: 1px solid var(--border);
+    border-radius: 6px; padding: 2px 8px; cursor: pointer;
+    /* Holds its width when the label flips, so the row does not jump. */
+    min-width: 56px;
+  }
+  button.copy:hover { color: var(--text); border-color: var(--axis); }
+  button.copy[data-state="done"] { color: var(--success-text); border-color: var(--success-text); }
+  button.copy[data-state="failed"] { color: var(--critical); border-color: var(--critical); }
+
   .lvl {
     display: inline-block; min-width: 58px; font-size: 11px; font-weight: 600;
     text-transform: uppercase; letter-spacing: 0.04em;
@@ -228,6 +245,13 @@
   }
   .banner.bad { border-left-color: var(--critical); }
   .banner[hidden] { display: none; }
+
+  /* Announced, not shown: the copy button's own label changes carry the same
+     news to anyone who can see it. */
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
 </style>
 </head>
 <body>
@@ -265,6 +289,18 @@
   <div id="d-tables"></div>
 
   <div class="section-title">Logs</div>
+  <!-- When first, because the log list is indexed by time and everything below
+       narrows within whatever range this row resolves to. -->
+  <div class="controls" style="margin-bottom:10px">
+    <label class="field">from
+      <input class="text" id="f-from" type="datetime-local" step="1" aria-label="Range start">
+    </label>
+    <label class="field">to
+      <input class="text" id="f-to" type="datetime-local" step="1" aria-label="Range end">
+    </label>
+    <button class="ghost" id="f-range">pin range</button>
+    <span class="note" id="range-note" style="margin:0"></span>
+  </div>
   <div class="controls">
     <select class="text" id="f-level" aria-label="Level">
       <option value="">any level</option>
@@ -280,6 +316,7 @@
   <div class="card scroll-x">
     <table class="data logs"><tbody id="log-rows"></tbody></table>
   </div>
+  <div class="sr-only" id="copy-status" role="status" aria-live="polite"></div>
   <div class="controls" style="margin-top:12px">
     <button class="ghost" id="log-more">load older</button>
     <span class="note" id="log-note"></span>
@@ -307,6 +344,7 @@ let state = {
   logSeen: new Set(),
   logNext: null,
   logBusy: false,
+  logRange: null,      // {from, to} the server resolved for the last log query
 };
 
 /* ---------- formatting ---------- */
@@ -352,6 +390,44 @@ function fmtStamp(ms) {
   const d = new Date(ms);
   return d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " +
     d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+/// A log line's own stamp, down to the millisecond.
+///
+/// Charts bucket, so a second of resolution is plenty for them. A log list does
+/// not: a burst inside one second is ordinary, and the order within it is
+/// usually the reason the line is being read at all. The fraction is asked of
+/// the formatter rather than appended, so it lands before a locale's AM/PM
+/// marker instead of after it.
+function fmtLogStamp(ms) {
+  const d = new Date(ms);
+  return d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " +
+    d.toLocaleTimeString([], {
+      hour: "2-digit", minute: "2-digit", second: "2-digit", fractionalSecondDigits: 3,
+    });
+}
+
+/// Wall-clock for a `datetime-local` field, which carries no zone.
+///
+/// Both directions go through the local zone deliberately: the table prints
+/// local time, so a range picked against what is on screen has to mean the same
+/// instants. The wire format is epoch millis, which has no such ambiguity.
+function stampToMs(value) {
+  if (!value) return null;
+  const ms = new Date(value).getTime();
+  return isFinite(ms) ? ms : null;
+}
+
+/// The inverse, to the second — all such a field holds.
+///
+/// Which way it rounds is the point. A start floors and an end ceilings, so
+/// pinning the range on screen always covers at least what was on screen:
+/// rounding both ends down would quietly drop whatever landed in the last
+/// fraction of a second, and lines cluster in exactly those fractions.
+function msToStamp(ms, roundUp) {
+  const at = (roundUp ? Math.ceil(ms / 1000) : Math.floor(ms / 1000)) * 1000;
+  const shifted = new Date(at - new Date(at).getTimezoneOffset() * 60_000);
+  return shifted.toISOString().slice(0, 19);
 }
 
 function fmtAgo(ms) {
@@ -863,8 +939,13 @@ function renderDetail(data) {
 
   const select = $("f-backend");
   const chosen = select.value;
+  // A backend picked for a pinned range need not have logged inside the window
+  // this list is built from. Keeping it listed stops the selection resetting
+  // itself out from under the rows already on screen.
+  const options = !chosen || data.backends.includes(chosen)
+    ? data.backends : [chosen, ...data.backends];
   select.innerHTML = `<option value="">any backend</option>` +
-    data.backends.map((b) => `<option value="${esc(b)}"${b === chosen ? " selected" : ""}>${esc(b)}</option>`).join("");
+    options.map((b) => `<option value="${esc(b)}"${b === chosen ? " selected" : ""}>${esc(b)}</option>`).join("");
 
   $("log-note").textContent = freshnessNote(data.freshness);
   stamp(data.generated_at_ms);
@@ -899,12 +980,21 @@ function renderDetailTables(data) {
 
 /* ---------- logs ---------- */
 
+/// Whether the log list is pinned to a range of its own, or following the
+/// window picker at the top of the page. An empty field is not a bound.
+const rangePinned = () => !!($("f-from").value || $("f-to").value);
+
 function logQuery(before) {
   const p = new URLSearchParams({ window: state.window, limit: String(LOG_PAGE) });
   const level = $("f-level").value, backend = $("f-backend").value, q = $("f-q").value.trim();
   if (level) p.set("level", level);
   if (backend) p.set("backend", backend);
   if (q) p.set("q", q);
+  // Either end alone is a valid range — the server takes the span for the other
+  // from the window label, so "since 09:12" needs only one field filled in.
+  const from = stampToMs($("f-from").value), to = stampToMs($("f-to").value);
+  if (from != null) p.set("from", String(from));
+  if (to != null) p.set("to", String(to));
   if (before != null) p.set("before", String(before));
   return p.toString();
 }
@@ -929,8 +1019,12 @@ async function loadLogs(append) {
       state.logRows.push(row);
       added++;
     }
+    // The bounds the server settled on, not the ones asked for: a one-sided
+    // range is completed there, and paging never moves them.
+    state.logRange = { from_ms: data.from_ms, to_ms: data.to_ms };
     state.logNext = data.next_before_ms;
     renderLogs(added === 0 && append);
+    renderRange();
   } catch (e) {
     banner(`logs: ${e.message}`, true);
   } finally {
@@ -939,24 +1033,104 @@ async function loadLogs(append) {
   }
 }
 
+/// Say what the list is scoped to, and offer the other state of the range.
+///
+/// The bounds come from the response rather than from the fields, so a range
+/// the server completed — one end given, or two that had been dragged past each
+/// other — is reported as what was actually queried.
+function renderRange() {
+  const pinned = rangePinned();
+  const button = $("f-range");
+  button.textContent = pinned ? "follow window" : "pin range";
+  button.title = pinned
+    ? "clear the range and follow the window picker again"
+    : "fill the range with the window now on screen, ready to narrow";
+
+  const r = state.logRange;
+  $("range-note").textContent = !r ? ""
+    : `${fmtStamp(r.from_ms)} → ${fmtStamp(r.to_ms)}` +
+      (pinned ? "" : ` · following the ${state.window} window`);
+}
+
 function renderLogs(exhausted) {
   const body = $("log-rows");
   if (!state.logRows.length) {
-    body.innerHTML = `<tr><td style="color:var(--muted)">No matching lines in this range.</td></tr>`;
+    body.innerHTML = `<tr><td colspan="5" style="color:var(--muted)">No matching lines in this range.</td></tr>`;
   } else {
     body.innerHTML = state.logRows.map((r, i) => {
       const cls = levelClass(r.level);
       const who = [r.backend, r.host].filter(Boolean).join(" · ");
       return `<tr class="${r.fields ? "has-fields" : ""}" data-i="${i}">
-        <td class="ts">${esc(fmtStamp(r.ts))}</td>
+        <td class="ts" title="${esc(new Date(r.ts).toISOString())}">${esc(fmtLogStamp(r.ts))}</td>
         <td><span class="lvl ${cls}">${esc(r.level || r.source)}</span></td>
         <td class="msg">${esc(r.message)}${r.fields ? `<pre class="fields" hidden>${esc(pretty(r.fields))}</pre>` : ""}</td>
         <td class="who">${esc(who)}</td>
+        <td class="act"><button type="button" class="copy" data-i="${i}"
+          title="Copy this line — timestamp in UTC, fields included">copy</button></td>
       </tr>`;
     }).join("");
   }
   $("log-more").hidden = !state.logNext || exhausted;
   if (exhausted) $("log-note").textContent = "reached the end of the range";
+}
+
+/// One stored line as text.
+///
+/// The timestamp goes out as ISO-8601 UTC rather than the localised form in the
+/// table: a line pasted into an issue or a chat window has to carry an
+/// unambiguous instant, since the reader is rarely in the same zone as whoever
+/// copied it. Fields come along whether or not the row is expanded — the button
+/// copies the record, not the current view of it.
+function logLineText(r) {
+  const who = [r.backend, r.host].filter(Boolean).join(" ");
+  const head = [new Date(r.ts).toISOString(), (r.level || r.source).toUpperCase(), who]
+    .filter(Boolean).join(" ");
+  return r.fields ? `${head} ${r.message}\n${pretty(r.fields)}` : `${head} ${r.message}`;
+}
+
+/**
+ * Copy, on a page that is not always a secure context.
+ *
+ * app-lb usually fronts this with TLS, and loopback counts too — but the same
+ * dashboard is reachable over plain http on a hostname, where
+ * `navigator.clipboard` is not exposed at all. The textarea is the only thing
+ * that works there, and a copy button that silently does nothing is worse than
+ * no copy button.
+ */
+async function copyText(text) {
+  try {
+    if (window.isSecureContext && navigator.clipboard) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch { /* denied or unavailable — the fallback below still might not be */ }
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.cssText = "position:fixed;top:0;left:-9999px";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    area.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/// Report the outcome in the button, and to a screen reader.
+function flashCopied(button, ok) {
+  clearTimeout(button._flash);
+  button.dataset.state = ok ? "done" : "failed";
+  button.textContent = ok ? "copied" : "failed";
+  $("copy-status").textContent = ok
+    ? "log line copied to the clipboard"
+    : "could not copy — the clipboard is not available on this page";
+  button._flash = setTimeout(() => {
+    delete button.dataset.state;
+    button.textContent = "copy";
+  }, 1400);
 }
 
 /// Map a sender's spelling onto the four classes the page styles.
@@ -978,7 +1152,15 @@ function pretty(fields) {
   }
 }
 
-$("log-rows").addEventListener("click", (e) => {
+$("log-rows").addEventListener("click", async (e) => {
+  // Copying is not expanding: a click on the button must not also toggle the
+  // fields of the row it sits in.
+  const button = e.target.closest("button.copy");
+  if (button) {
+    const line = state.logRows[Number(button.dataset.i)];
+    if (line) flashCopied(button, await copyText(logLineText(line)));
+    return;
+  }
   const row = e.target.closest("tr.has-fields");
   if (!row) return;
   const pre = row.querySelector("pre.fields");
@@ -1088,7 +1270,28 @@ $("f-go").addEventListener("click", () => loadLogs(false));
 $("f-q").addEventListener("keydown", (e) => { if (e.key === "Enter") loadLogs(false); });
 $("f-level").addEventListener("change", () => loadLogs(false));
 $("f-backend").addEventListener("change", () => loadLogs(false));
+$("f-from").addEventListener("change", () => loadLogs(false));
+$("f-to").addEventListener("change", () => loadLogs(false));
 $("log-more").addEventListener("click", () => loadLogs(true));
+
+/* Pinning fills both ends from the range on screen rather than leaving someone
+   to type two timestamps from scratch — the usual move is to narrow a window
+   you are already looking at, not to name an interval out of the air. */
+$("f-range").addEventListener("click", () => {
+  if (rangePinned()) {
+    $("f-from").value = "";
+    $("f-to").value = "";
+  } else {
+    // Whatever the list last resolved to — or, if a log query has yet to
+    // succeed, the bounds the charts above are drawn from, which are the same
+    // range. Leaves the button useful rather than inert after a failed refresh.
+    const range = state.logRange || state.data;
+    if (!range) return;
+    $("f-from").value = msToStamp(range.from_ms);
+    $("f-to").value = msToStamp(range.to_ms, true);
+  }
+  loadLogs(false);
+});
 
 window.addEventListener("hashchange", show);
 
