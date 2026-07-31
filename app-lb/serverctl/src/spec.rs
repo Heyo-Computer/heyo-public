@@ -207,8 +207,19 @@ pub fn is_static(spec: &Value) -> bool {
         .is_some_and(|u| !u.is_empty())
 }
 
+/// Serves files off disk. Neither `vm` nor `upstreams` applies.
+pub fn is_site(spec: &Value) -> bool {
+    spec.get("site").is_some_and(|s| !s.is_null())
+}
+
 /// The `vm` block of a managed deployment, for editing.
 pub fn vm_mut<'a>(spec: &'a mut Value, id: &str) -> Result<&'a mut Map<String, Value>> {
+    if is_site(spec) {
+        bail!(
+            "deployment {id:?} is a static site and has no VM template — it serves \
+             files off disk. Edit its `site` block with `serverctl edit deployment {id}`."
+        );
+    }
     if is_static(spec) {
         bail!(
             "deployment {id:?} is static (proxy_pass) and has no VM template — \

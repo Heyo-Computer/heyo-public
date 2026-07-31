@@ -177,6 +177,9 @@ serverctl create deployment legacy --path-prefix /legacy --upstream 10.0.0.9:808
 # A managed VM with no ingress — an agent sandbox, reached by exec/shell only.
 serverctl create deployment sb-7f3a9c --no-route --port 8080 --size medium
 
+# A static site: no backend at all, files served off disk by app-lb itself.
+serverctl create deployment docs --host docs.example.com --site-root /srv/docs/dist
+
 # From a file — JSON or YAML, one spec, a JSON array, or a multi-doc YAML stream.
 serverctl apply -f deploy.yaml
 serverctl apply -f examples/heyosecret.json --dry-run
@@ -449,6 +452,29 @@ daemon recopies from the base image on every boot. Pair it with
 or it only saves boot time; `serverctl describe` reports which mode a deployment
 is in under "When idle".
 
+### Static sites
+
+```sh
+serverctl create deployment docs --host docs.example.com --site-root /srv/docs/dist
+serverctl create deployment app  --host app.example.com  --site-root /srv/app/dist --site-spa
+serverctl update docs             # run the build commands, then re-check the site
+```
+
+A site has no backend at all: app-lb serves the files itself, out of a directory
+on its own host. `--site-root` is what makes a deployment one; `--site-index`,
+`--site-404`, `--site-spa` and `--site-cache-control` configure it, and each is
+refused without a root rather than silently ignored.
+
+`--site-spa` serves the index for any unmatched path so a client-side router
+owns the URL space — for single-page apps only, since it turns every typo into a
+200.
+
+Pair it with `set update` for a git-backed deploy: `serverctl update` runs the
+build commands in a directory on the app-lb host and then checks that the index
+is actually in the root, so a build that writes its output elsewhere fails
+loudly instead of leaving a site that 404s everything. `serverctl describe`
+shows the root, index, 404 page and cache policy under "Site".
+
 ### Getting inside a VM
 
 ```sh
@@ -494,21 +520,22 @@ serverctl completion bash > /etc/bash_completion.d/serverctl
 serverctl completion zsh  > ~/.zfunc/_serverctl
 ```
 
-## Managed vs static deployments
+## The three kinds of deployment
 
 The distinction runs through every command, because app-lb enforces it:
 
-| | managed (`vm`) | static (`upstreams`) |
-| --- | --- | --- |
-| backends | an autoscaled pool of microVMs | fixed `host:port` addresses |
-| `scale` | yes | rejected — the policy is inert |
-| `restart` / `delete vm` | yes | rejected — nothing to evict |
-| `set image` / `set env` | yes | rejected — no VM template |
-| `set build` / `build` | yes | rejected — no guest image to build |
-| `set artifact` / `pull` | yes — but not alongside `build` | rejected — no guest image to pull into |
-| `set update` / `update` | rejected — its backends are VMs | yes |
-| `set auth` | yes | yes — the gate is in the proxy, ahead of either |
-| `set upstreams` | rejected | yes |
+| | managed (`vm`) | static (`upstreams`) | site (`site`) |
+| --- | --- | --- | --- |
+| backends | an autoscaled pool of microVMs | fixed `host:port` addresses | none — files off disk |
+| `scale` | yes | rejected — the policy is inert | rejected — nothing to scale |
+| `restart` / `delete vm` | yes | rejected — nothing to evict | rejected — nothing to evict |
+| `exec` / `shell` | yes | rejected — upstreams are addresses | rejected — a site is files |
+| `set image` / `set env` | yes | rejected — no VM template | rejected — no VM template |
+| `set build` / `build` | yes | rejected — no guest image to build | rejected — no guest image |
+| `set artifact` / `pull` | yes — but not alongside `build` | rejected — no guest image to pull into | rejected — no guest image |
+| `set update` / `update` | rejected — its backends are VMs | yes | yes — how a site is deployed |
+| `set auth` | yes | yes | yes — the gate is in the proxy, ahead of all three |
+| `set upstreams` | rejected | yes | rejected |
 | `DESIRED` column | the autoscaler's target | `—` |
 
 Where the API rejects one of these, serverctl passes the server's reason through and, where it

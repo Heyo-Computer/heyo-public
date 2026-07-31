@@ -8,6 +8,36 @@ curl -XPOST localhost:9090/deployments \
   -d @examples/pg-fc-dashboard.json
 ```
 
+## `site.json` — a static site, built from git
+
+The third kind of deployment: no VM, no upstream, no pool. app-lb serves the
+files itself, out of a directory on its own host — what nginx's `root` or a
+CloudFront origin bucket does.
+
+```sh
+serverctl create deployment docs --host docs.example.com \
+  --site-root /srv/docs/dist --site-404 404.html
+serverctl apply -f examples/site.json    # …or with a build attached
+serverctl update docs                    # git pull, npm run build, re-verify
+```
+
+The `update` block is what makes it a deploy rather than a directory: it runs
+those commands in `/srv/docs` on the app-lb host, then checks that `index.html`
+is actually in the root afterwards. A build that exits 0 but writes its output
+somewhere else fails the job instead of quietly leaving a site that 404s
+everything.
+
+For a single-page app, add `"spa": true` — any path that matches no file is
+served the index with a 200 so the client-side router can take over. It is off
+by default because it turns every typo into a 200, which is the wrong default
+for a docs site.
+
+Note what is deliberately absent: rewrites, redirects, per-location blocks,
+directory listings. A site that needs those wants a real web server behind a
+`proxy_pass` deployment. What is here is what a static host cannot be correct
+without — an index, a 404, content types, `ETag`/`304`, byte ranges, and a path
+resolver nothing escapes.
+
 ## `sandbox.json` — one agent sandbox, of a fleet of thousands
 
 The shape a sandbox fleet is made of: **one deployment per sandbox, one VM

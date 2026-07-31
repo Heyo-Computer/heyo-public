@@ -88,6 +88,25 @@ pub struct CreateDeploymentArgs {
     #[arg(long, value_name = "SECS", help_heading = "VM pool")]
     pub ttl: Option<u64>,
 
+    /// Serve files from this directory on the app-lb host instead of proxying
+    /// anywhere — a static site, the way nginx's `root` or a CloudFront origin
+    /// works. Absolute path.
+    #[arg(long, value_name = "DIR", help_heading = "Static site")]
+    pub site_root: Option<String>,
+    /// File served for a directory. Pass "" to 404 those instead.
+    #[arg(long, value_name = "FILE", help_heading = "Static site")]
+    pub site_index: Option<String>,
+    /// Page served with a 404, relative to the site root.
+    #[arg(long, value_name = "FILE", help_heading = "Static site")]
+    pub site_404: Option<String>,
+    /// Serve the index for any unmatched path, so a client-side router owns the
+    /// URL space. Turns every typo into a 200 — for single-page apps only.
+    #[arg(long, help_heading = "Static site")]
+    pub site_spa: bool,
+    /// `Cache-Control` for served files.
+    #[arg(long, value_name = "VALUE", help_heading = "Static site")]
+    pub site_cache_control: Option<String>,
+
     /// A fixed upstream `host:port` to proxy_pass to, instead of a VM pool.
     /// Repeatable; mutually exclusive with the VM-pool flags.
     #[arg(long = "upstream", value_name = "ADDR", help_heading = "Static upstreams")]
@@ -254,6 +273,42 @@ fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
         || args.start_command.is_some()
         || args.size.is_some()
         || !args.env.is_empty();
+
+    if let Some(root) = &args.site_root {
+        if vm_flags_used || !args.upstreams.is_empty() {
+            bail!(
+                "--site-root makes this a static site, which has no VM template and no \
+                 upstreams — it serves files off disk. Drop the other backend flags."
+            );
+        }
+        // Checked here because this branch returns early, and a scaling flag
+        // quietly dropped would look like it had been applied.
+        if !args.scaling.patch().is_empty() {
+            bail!("a static site has no pool to scale, so the scaling flags do nothing");
+        }
+        let mut site = Map::new();
+        site.insert("root".into(), Value::String(root.clone()));
+        insert_opt_str(&mut site, "index", args.site_index.as_deref());
+        insert_opt_str(&mut site, "not_found", args.site_404.as_deref());
+        insert_opt_str(&mut site, "cache_control", args.site_cache_control.as_deref());
+        if args.site_spa {
+            site.insert("spa".into(), Value::Bool(true));
+        }
+        spec.insert("site".into(), Value::Object(site));
+        return Ok(Value::Object(spec));
+    }
+    // The site flags only mean something with a root to apply them to; silently
+    // ignoring them would look like they took effect.
+    for (flag, set) in [
+        ("--site-index", args.site_index.is_some()),
+        ("--site-404", args.site_404.is_some()),
+        ("--site-cache-control", args.site_cache_control.is_some()),
+        ("--site-spa", args.site_spa),
+    ] {
+        if set {
+            bail!("{flag} needs --site-root — it configures a static site");
+        }
+    }
 
     if !args.upstreams.is_empty() {
         if vm_flags_used {
@@ -1646,10 +1701,12 @@ pub fn set_upstreams(ctx: &Ctx, args: &SetUpstreamsArgs) -> Result<()> {
     let id = deployment_name(&args.resource)?;
     edit_spec(ctx, &id, args.dry_run, "upstreams updated", |spec| {
         if !spec::is_static(spec) {
-            bail!(
-                "deployment {id:?} is a managed VM pool, not a static proxy_pass one — \
-                 its backends come from the `vm` template, not an upstream list"
-            );
+            let what = if spec::is_site(spec) {
+                "a static site, which serves files off disk"
+            } else {
+                "a managed VM pool, whose backends come from the `vm` template"
+            };
+            bail!("deployment {id:?} is {what} — it has no upstream list to set");
         }
         spec["upstreams"] = Value::Array(args.upstreams.iter().cloned().map(Value::String).collect());
         Ok(())
@@ -1678,10 +1735,11 @@ pub fn set_route(ctx: &Ctx, args: &SetRouteArgs) -> Result<()> {
 
     let message = if args.none { "routes cleared" } else { "routes updated" };
     edit_spec(ctx, &id, args.dry_run, message, |spec| {
-        if args.none && spec::is_static(spec) {
+        if args.none && (spec::is_static(spec) || spec::is_site(spec)) {
+            let kind = if spec::is_site(spec) { "a static site" } else { "a static (proxy_pass) one" };
             bail!(
-                "deployment {id:?} is a static (proxy_pass) one, and the proxy is the \
-                 only way to reach it — clearing its routes would leave it unreachable"
+                "deployment {id:?} is {kind}, and the proxy is the only way to reach it \
+                 — clearing its routes would leave it unreachable"
             );
         }
         let existing = spec

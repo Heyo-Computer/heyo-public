@@ -839,6 +839,7 @@ mod tests {
             upstreams: vec!["127.0.0.1:8080".into()],
             build: None,
             artifact: None,
+            site: None,
             update: None,
             auth: None,
         });

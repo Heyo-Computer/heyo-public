@@ -60,11 +60,30 @@ pub struct DeploymentSpec {
     pub artifact: Option<ArtifactSpec>,
     pub update: Option<UpdateSpec>,
     pub auth: Option<AuthGate>,
+    pub site: Option<SiteSpec>,
+}
+
+/// A static site: a directory on the app-lb host, served straight off disk.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SiteSpec {
+    pub root: String,
+    pub index: String,
+    pub not_found: Option<String>,
+    pub spa: bool,
+    pub cache_control: String,
 }
 
 impl DeploymentSpec {
+    /// Forwards to fixed upstreams. **Not** true for a site, which has no
+    /// backends of any kind.
     pub fn is_static(&self) -> bool {
         !self.upstreams.is_empty()
+    }
+
+    /// Serves files off disk rather than proxying anywhere.
+    pub fn is_site(&self) -> bool {
+        self.site.is_some()
     }
 
     /// The routes as one column: `secrets.local`, `*.apps.example.com/api`, …
@@ -82,8 +101,11 @@ impl DeploymentSpec {
     }
 
     /// What traffic actually lands on: the image for a managed pool, the
-    /// upstream list for a static one.
+    /// upstream list for a static one, the directory for a site.
     pub fn backend_summary(&self) -> String {
+        if let Some(site) = &self.site {
+            return site.root.clone();
+        }
         if self.is_static() {
             return self.upstreams.join(",");
         }

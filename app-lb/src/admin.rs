@@ -297,7 +297,11 @@ struct DeploymentStatus {
 
 /// The backend kind of a deployment, as a stable string for the API/dashboard.
 fn deployment_kind(d: &crate::deployment::Deployment) -> &'static str {
-    if d.spec.is_static() { "static" } else { "vm" }
+    match d.spec.backend() {
+        crate::config::Backend::Site => "site",
+        crate::config::Backend::Upstreams => "static",
+        crate::config::Backend::Vm => "vm",
+    }
 }
 
 /// Which `POST` a deployment's code is redeployed with, if either.
@@ -436,6 +440,13 @@ struct DeploymentView {
     /// serving HTTPS on 6189.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     urls: Vec<String>,
+    /// For a site, the directory it serves and whether unmatched paths fall back
+    /// to the index. Absent for every other kind, so the dashboard can tell the
+    /// three apart from the payload alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    site_root: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    site_spa: bool,
     /// The deploy job this deployment accepts — `"build"` for a managed one with a
     /// `build` block, `"update"` for a static one with an `update` block, `None`
     /// when neither is configured and there is nothing to trigger.
@@ -630,6 +641,8 @@ async fn metrics_snapshot(
                     .iter()
                     .filter_map(|r| state.public_url.of(r))
                     .collect(),
+                site_root: d.spec.site.as_ref().map(|s| s.root.clone()),
+                site_spa: d.spec.site.as_ref().is_some_and(|s| s.spa),
                 job_kind: job_kind_of(&d.spec),
                 pool: pool_status_of(d),
                 // Skipped under `summary`: one row per VM is what makes this
@@ -809,12 +822,17 @@ async fn scale(
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
 
-    // A static (proxy_pass) deployment isn't autoscaled — its scaling policy is
-    // inert — so a scale request is a mistake, not a no-op. Reject it explicitly.
-    if old.spec.is_static() {
+    // Only a managed deployment is autoscaled; for the others the scaling policy
+    // is inert, so a scale request is a mistake rather than a no-op.
+    if !old.spec.is_managed() {
+        let fix = if old.spec.is_site() {
+            "a site serves files off disk and has nothing to scale"
+        } else {
+            "edit its `upstreams` via PUT instead"
+        };
         return err(
             StatusCode::BAD_REQUEST,
-            format!("deployment {id:?} is static (proxy_pass) and cannot be scaled; edit its `upstreams` via PUT instead"),
+            format!("deployment {id:?} has no VM pool and cannot be scaled; {fix}"),
         )
         .into_response();
     }
@@ -914,13 +932,13 @@ async fn evict_vm(
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
 
-    // A static (proxy_pass) deployment has no autoscaler to boot a replacement,
-    // so evicting one of its fixed upstreams is meaningless — reject it. Edit the
-    // `upstreams` list via PUT to change targets instead.
-    if d.spec.is_static() {
+    // Eviction recycles a VM and lets the autoscaler boot a replacement, which
+    // only means something for a managed deployment. A static one's upstreams are
+    // addresses and a site has no backends at all.
+    if !d.spec.is_managed() {
         return err(
             StatusCode::BAD_REQUEST,
-            format!("deployment {id:?} is static (proxy_pass); its upstreams cannot be evicted — edit the spec instead"),
+            format!("deployment {id:?} has no VMs to evict — edit the spec instead"),
         )
         .into_response();
     }
@@ -1028,13 +1046,15 @@ async fn hold_a_vm(
     let Some(d) = state.registry.get(id) else {
         return Err(err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response());
     };
-    if d.spec.is_static() {
+    if !d.spec.is_managed() {
+        let why = if d.spec.is_site() {
+            "a site is files on disk"
+        } else {
+            "its upstreams are addresses, not VMs"
+        };
         return Err(err(
             StatusCode::BAD_REQUEST,
-            format!(
-                "deployment {id:?} is static (proxy_pass); its upstreams are addresses, \
-                 not VMs, so there is nothing to run a command in"
-            ),
+            format!("deployment {id:?} has no VM to run a command in — {why}"),
         )
         .into_response());
     }

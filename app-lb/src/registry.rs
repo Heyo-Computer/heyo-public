@@ -573,6 +573,7 @@ mod tests {
             upstreams: vec![],
             build: None,
             artifact: None,
+            site: None,
             update: None,
             auth: None,
         }
@@ -588,6 +589,7 @@ mod tests {
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             build: None,
             artifact: None,
+            site: None,
             update: None,
             auth: None,
         }

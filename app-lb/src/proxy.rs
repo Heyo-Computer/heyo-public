@@ -182,6 +182,146 @@ async fn write_gate_response(session: &mut Session, r: crate::auth::Response) ->
         .await
 }
 
+/// Answer a request routed to a `site` deployment, out of its directory.
+///
+/// Everything about *which* file is `site::resolve`'s decision; this is the HTTP
+/// around it — status, headers, conditional requests, ranges, and getting the
+/// bytes onto the wire without reading a large file into memory.
+async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path: &str) -> Result<()> {
+    use crate::site::{self, Resolved};
+
+    let (file, status) = match site::resolve(spec, path) {
+        Resolved::File(f) => (f, 200),
+        Resolved::Redirect(to) => {
+            let mut header = ResponseHeader::build(301, Some(3))?;
+            header.insert_header(http::header::LOCATION, &to)?;
+            header.insert_header(http::header::CONTENT_LENGTH, "0")?;
+            session.write_response_header(Box::new(header), true).await?;
+            return Ok(());
+        }
+        Resolved::NotFound(Some(page)) => (page, 404),
+        Resolved::NotFound(None) => {
+            return write_plain(session, 404, "not found\n").await;
+        }
+    };
+
+    let mut handle = match tokio::fs::File::open(&file).await {
+        Ok(f) => f,
+        Err(e) => {
+            // Resolved a moment ago, so this is a deploy landing mid-request or
+            // a permissions problem — either way not the client's fault.
+            tracing::warn!(path = %file.display(), error = %e, "could not open a site file");
+            return write_plain(session, 404, "not found\n").await;
+        }
+    };
+    let Ok(meta) = handle.metadata().await else {
+        return write_plain(session, 404, "not found\n").await;
+    };
+    let len = meta.len();
+    let etag = site::etag(&meta);
+
+    // A cached client gets a 304 and no body. Only for a 200 — a 404 page is
+    // not a representation of the requested URL, so it must not be revalidated
+    // as one.
+    if status == 200
+        && session
+            .req_header()
+            .headers
+            .get(http::header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| site::etag_matches(v, &etag))
+    {
+        let mut header = ResponseHeader::build(304, Some(3))?;
+        header.insert_header(http::header::ETAG, &etag)?;
+        header.insert_header(http::header::CACHE_CONTROL, &spec.cache_control)?;
+        session.write_response_header(Box::new(header), true).await?;
+        return Ok(());
+    }
+
+    // Ranges, so a paused download or a seeking `<video>` works. Only on a 200:
+    // a range of an error page is meaningless.
+    let mut offset = 0u64;
+    let mut count = len;
+    let mut status = status;
+    if status == 200 {
+        let range = session
+            .req_header()
+            .headers
+            .get(http::header::RANGE)
+            .and_then(|v| v.to_str().ok());
+        if let Some(raw) = range {
+            match site::parse_range(raw, len) {
+                Ok(Some((first, last))) => {
+                    offset = first;
+                    count = last - first + 1;
+                    status = 206;
+                }
+                Ok(None) => {} // unsupported form; the whole file is a valid answer
+                Err(()) => {
+                    let mut header = ResponseHeader::build(416, Some(3))?;
+                    header.insert_header(http::header::CONTENT_RANGE, format!("bytes */{len}"))?;
+                    header.insert_header(http::header::CONTENT_LENGTH, "0")?;
+                    session.write_response_header(Box::new(header), true).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    let mut header = ResponseHeader::build(status, Some(6))?;
+    header.insert_header(http::header::CONTENT_TYPE, site::content_type(&file))?;
+    header.insert_header(http::header::CONTENT_LENGTH, count.to_string())?;
+    header.insert_header(http::header::ETAG, &etag)?;
+    header.insert_header(http::header::CACHE_CONTROL, &spec.cache_control)?;
+    // Advertised whether or not this request used one, so a client knows it can
+    // resume rather than restarting a large download.
+    header.insert_header(http::header::ACCEPT_RANGES, "bytes")?;
+    if status == 206 {
+        let last = offset + count - 1;
+        header.insert_header(
+            http::header::CONTENT_RANGE,
+            format!("bytes {offset}-{last}/{len}"),
+        )?;
+    }
+    let head_only = session.req_header().method == http::Method::HEAD;
+    session
+        .write_response_header(Box::new(header), head_only)
+        .await?;
+    if head_only {
+        return Ok(());
+    }
+
+    if offset > 0 {
+        use tokio::io::AsyncSeekExt;
+        if handle.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
+            return Ok(()); // header is already out; nothing better to say
+        }
+    }
+
+    // Streamed in chunks rather than read whole: a fleet of sites serving large
+    // assets would otherwise hold every concurrent response's full size in
+    // memory at once.
+    use tokio::io::AsyncReadExt;
+    let mut remaining = count;
+    let mut buf = vec![0u8; site::STREAM_CHUNK.min(count.max(1) as usize)];
+    while remaining > 0 {
+        let want = (buf.len() as u64).min(remaining) as usize;
+        let read = match handle.read(&mut buf[..want]).await {
+            Ok(0) => break, // truncated under us; stop rather than pad
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(path = %file.display(), error = %e, "site file read failed mid-response");
+                break;
+            }
+        };
+        remaining -= read as u64;
+        session
+            .write_response_body(Some(bytes::Bytes::copy_from_slice(&buf[..read])), remaining == 0)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Collect what the gate needs out of the live request.
 fn request_info<'a>(
     session: &'a Session,
@@ -309,6 +449,15 @@ impl ProxyHttp for LbProxy {
                     return Ok(true);
                 }
             }
+        }
+
+        // A site has no backend to pick: app-lb answers it here, off disk. This
+        // sits after the gate on purpose — a private site is private, and files
+        // must not be readable by anyone who skips sign-in.
+        if let Some(site) = deployment.spec.site.clone() {
+            ctx.deployment = Some(deployment);
+            serve_site(session, &site, &path).await?;
+            return Ok(true);
         }
 
         ctx.deployment = Some(deployment);
@@ -725,6 +874,7 @@ mod tests {
             upstreams: vec![],
             build: None,
             artifact: None,
+            site: None,
             update: None,
             auth: None,
         }))

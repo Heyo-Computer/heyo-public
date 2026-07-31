@@ -353,11 +353,12 @@ impl Deployment {
     /// Whether the autoscaler could still add capacity, i.e. whether a request
     /// arriving now is worth holding for a cold start.
     ///
-    /// Always false for a static (proxy_pass) deployment: its upstream set is
-    /// fixed, so a request that finds nothing available must fail fast rather
-    /// than hold for a VM boot that will never come.
+    /// Always false for anything without a VM pool: a static deployment's
+    /// upstream set is fixed and a site has no backends at all, so a request
+    /// that finds nothing available must fail fast rather than hold for a boot
+    /// that will never come.
     pub fn can_grow(&self) -> bool {
-        if self.spec.is_static() {
+        if !self.spec.is_managed() {
             return false;
         }
         let live = self.backends().len() + self.pending().len();
@@ -465,6 +466,7 @@ mod tests {
             upstreams: vec![],
             build: None,
             artifact: None,
+            site: None,
             update: None,
             auth: None,
         })
@@ -485,6 +487,7 @@ mod tests {
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             build: None,
             artifact: None,
+            site: None,
             update: None,
             auth: None,
         })

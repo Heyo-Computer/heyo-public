@@ -1211,6 +1211,11 @@ pub struct DeploymentSpec {
     /// finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactSpec>,
+    /// Serve files from a directory on this host, with no backend at all — the
+    /// third kind of deployment, alongside a managed VM pool and a `proxy_pass`
+    /// upstream list. See [`SiteSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<SiteSpec>,
     /// How a *static* deployment's backend is updated: a working directory on
     /// this host and commands to run in it. The static counterpart of `build`,
     /// and mutually exclusive with it for the same reason the backend kinds are.
@@ -1221,6 +1226,94 @@ pub struct DeploymentSpec {
     /// is chosen — so the application behind it needs to know nothing about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthGate>,
+}
+
+/// What answers a request routed to a deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// An autoscaled pool of microVMs.
+    Vm,
+    /// A fixed list of `proxy_pass` addresses.
+    Upstreams,
+    /// Files on this host, served by app-lb itself.
+    Site,
+}
+
+/// A static *site*: a directory on this host, served straight off disk.
+///
+/// The third backend kind, and the one with no backend — app-lb answers the
+/// request itself instead of proxying it. What nginx's `root` or a CloudFront
+/// origin bucket does: files, an index, a 404, and cache headers. There is no
+/// pool, nothing to scale, and nothing to health check.
+///
+/// Deliberately not configurable: rewrites, redirects, per-location blocks. A
+/// site that needs those wants a real server behind a `proxy_pass` deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SiteSpec {
+    /// Absolute path to the directory to serve. Nothing outside it is ever
+    /// served, symlinks included — see `site::resolve`.
+    pub root: String,
+    /// Served for a request that names a directory. Set to `""` to answer those
+    /// with a 404 instead of looking for an index.
+    #[serde(default = "default_site_index")]
+    pub index: String,
+    /// Body for a 404, relative to `root`. Absent means a plain-text 404.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_found: Option<String>,
+    /// Serve `index` (with a 200) for any path that matches no file, so a
+    /// client-side router owns the URL space. The single-page-app switch; off
+    /// by default because it turns every typo into a 200.
+    #[serde(default)]
+    pub spa: bool,
+    /// `Cache-Control` for served files. The default is deliberately short:
+    /// a wrong long max-age is not something you can take back, since the
+    /// client will not ask again until it expires.
+    #[serde(default = "default_site_cache_control")]
+    pub cache_control: String,
+}
+
+fn default_site_index() -> String {
+    "index.html".into()
+}
+
+/// Five minutes, and public. Long enough that a page's assets survive a reload,
+/// short enough that a bad deploy is not pinned in caches for a day. Sites that
+/// fingerprint their asset filenames should raise it.
+fn default_site_cache_control() -> String {
+    "public, max-age=300".into()
+}
+
+impl SiteSpec {
+    fn validate(&self) -> Result<(), SpecError> {
+        let root = self.root.trim();
+        if root.is_empty() {
+            return Err(SpecError::EmptySiteRoot);
+        }
+        // Absolute, because app-lb's working directory is not something a spec
+        // author can see — a relative root would resolve differently depending
+        // on how the process was started.
+        if !std::path::Path::new(root).is_absolute() {
+            return Err(SpecError::RelativeSiteRoot(root.to_string()));
+        }
+        for (field, value) in [("index", Some(&self.index)), ("not_found", self.not_found.as_ref())]
+        {
+            let Some(value) = value.map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            // These are joined onto the root, so a rooted or climbing path here
+            // would read a file the site was never meant to expose.
+            if value.starts_with('/') || value.split('/').any(|p| p == "..") {
+                return Err(SpecError::BadSitePath {
+                    field,
+                    value: value.to_string(),
+                });
+            }
+        }
+        if self.spa && self.index.trim().is_empty() {
+            return Err(SpecError::SpaWithoutIndex);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1237,6 +1330,22 @@ pub enum SpecError {
     BadReplicaRange { min: u32, max: u32 },
     ZeroTargetConcurrency,
     ZeroPort,
+    /// A `site` with no `root` to serve.
+    EmptySiteRoot,
+    /// A `site.root` that is not an absolute path.
+    RelativeSiteRoot(String),
+    /// `index` or `not_found` escapes the site root, or is rooted.
+    BadSitePath {
+        field: &'static str,
+        value: String,
+    },
+    /// `spa` needs an `index` to fall back *to*.
+    SpaWithoutIndex,
+    /// A `site` alongside a `vm` or `upstreams`: a deployment serves from one
+    /// place, and three ways to answer a request has no defined precedence.
+    SiteWithOtherBackend,
+    /// A `build`, `artifact` or `vm`-only block on a site.
+    NotForSites(&'static str),
     /// Both a `vm` template and a static `upstreams` list were set.
     BothBackendKinds,
     /// Neither a `vm` template nor a static `upstreams` list was set.
@@ -1292,10 +1401,34 @@ impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyId => write!(f, "deployment id must not be empty"),
+            Self::EmptySiteRoot => write!(f, "site.root must name a directory to serve"),
+            Self::RelativeSiteRoot(p) => write!(
+                f,
+                "site.root must be an absolute path, got {p:?} — app-lb's working \
+                 directory is not something a spec can rely on"
+            ),
+            Self::BadSitePath { field, value } => write!(
+                f,
+                "site.{field} must be a path inside the site root, got {value:?}"
+            ),
+            Self::SpaWithoutIndex => {
+                write!(f, "site.spa needs a site.index to fall back to")
+            }
+            Self::SiteWithOtherBackend => write!(
+                f,
+                "a deployment serves from exactly one place: `site` cannot be combined \
+                 with `vm` or `upstreams`"
+            ),
+            Self::NotForSites(what) => write!(
+                f,
+                "`{what}` does not apply to a site — it serves files off disk, with no \
+                 image and no pool"
+            ),
             Self::NoRoutes => write!(
                 f,
-                "a static deployment must declare at least one route; only a managed \
-                 (vm) deployment may have none, and is then reachable only by exec/shell"
+                "this deployment must declare at least one route; only a managed (vm) \
+                 deployment may have none, and is then reachable only by exec/shell — \
+                 a static deployment and a site are both reachable only through the proxy"
             ),
             Self::AuthWithoutRoutes => write!(
                 f,
@@ -1460,11 +1593,39 @@ impl std::fmt::Display for SpecError {
 impl std::error::Error for SpecError {}
 
 impl DeploymentSpec {
+    /// Which of the three backend kinds this deployment is.
+    ///
+    /// A valid spec sets exactly one of `vm`, `upstreams` and `site` (enforced
+    /// by [`validate`](Self::validate)). Prefer matching on this over asking
+    /// two questions: the code used to assume "static or managed" throughout,
+    /// and a third kind added to that shape is a bug in every place the
+    /// question was really "does this have a VM pool?".
+    pub fn backend(&self) -> Backend {
+        if self.site.is_some() {
+            Backend::Site
+        } else if !self.upstreams.is_empty() {
+            Backend::Upstreams
+        } else {
+            Backend::Vm
+        }
+    }
+
     /// A static (proxy_pass) deployment forwards to fixed upstreams instead of a
-    /// managed VM pool. Determined by which backend field is populated; a valid
-    /// spec sets exactly one (enforced by [`validate`](Self::validate)).
+    /// managed VM pool. **A site is not static in this sense** — it has no
+    /// upstreams either — so this is not the predicate for "has no VM pool".
     pub fn is_static(&self) -> bool {
-        !self.upstreams.is_empty()
+        self.backend() == Backend::Upstreams
+    }
+
+    /// Serves files off disk rather than proxying anywhere.
+    pub fn is_site(&self) -> bool {
+        self.backend() == Backend::Site
+    }
+
+    /// Owns an autoscaled VM pool — the only kind the autoscaler, the job
+    /// system and the eviction API have anything to do with.
+    pub fn is_managed(&self) -> bool {
+        self.backend() == Backend::Vm
     }
 
     /// The VM template of a *managed* deployment. Panics if called on a static
@@ -1494,9 +1655,10 @@ impl DeploymentSpec {
         // No routes means no ingress. For a *managed* deployment that is a
         // legitimate shape — an agent sandbox reached only through `exec` and
         // `shell`, never over HTTP — and it is the common one at fleet scale,
-        // where exposure is the exception. A *static* deployment has no such
-        // door: its backend is a fixed upstream list and the proxy is the only
-        // way to reach it, so an unrouted one is simply dead weight.
+        // where exposure is the exception. Neither other kind has such a door:
+        // a static deployment's backend is a fixed upstream list and a site is
+        // files on disk, and for both the proxy is the only way in, so an
+        // unrouted one is simply dead weight.
         if self.routes.is_empty() {
             if self.vm.is_none() {
                 return Err(SpecError::NoRoutes);
@@ -1517,6 +1679,30 @@ impl DeploymentSpec {
         }
 
         // Exactly one backend kind.
+        if let Some(site) = &self.site {
+            if self.vm.is_some() || !self.upstreams.is_empty() {
+                return Err(SpecError::SiteWithOtherBackend);
+            }
+            site.validate()?;
+            // A site has no image and no pool, so the blocks that produce or
+            // scale one are meaningless rather than merely unused. Rejected so
+            // a spec cannot claim something app-lb will silently ignore.
+            for (present, what) in [
+                (self.build.is_some(), "build"),
+                (self.artifact.is_some(), "artifact"),
+            ] {
+                if present {
+                    return Err(SpecError::NotForSites(what));
+                }
+            }
+            // `update` *is* allowed: running `git pull && npm run build` in a
+            // directory on this host is exactly how a site is redeployed.
+            if let Some(update) = &self.update {
+                update.validate()?;
+            }
+            return Ok(());
+        }
+
         match (&self.vm, self.upstreams.is_empty()) {
             (Some(_), false) => return Err(SpecError::BothBackendKinds),
             (None, true) => return Err(SpecError::NoBackendKind),
@@ -1634,6 +1820,7 @@ mod tests {
             upstreams: vec![],
             build: None,
             artifact: None,
+            site: None,
             update: None,
             auth: None,
         }
@@ -1666,6 +1853,7 @@ mod tests {
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             build: None,
             artifact: None,
+            site: None,
             update: None,
             auth: None,
         }
@@ -2449,6 +2637,133 @@ mod tests {
 
         let round = serde_json::to_string(&s).unwrap();
         assert!(round.contains(r#""idle_action":"retain""#), "got {round}");
+    }
+
+    mod sites {
+        use super::*;
+
+        fn site_spec() -> DeploymentSpec {
+            let mut s = static_spec(&["127.0.0.1:9000"]);
+            s.upstreams.clear();
+            s.site = Some(SiteSpec {
+                root: "/var/www/docs".into(),
+                index: "index.html".into(),
+                not_found: None,
+                spa: false,
+                cache_control: "public, max-age=300".into(),
+            });
+            s
+        }
+
+        #[test]
+        fn a_site_is_its_own_backend_kind() {
+            let s = site_spec();
+            assert_eq!(s.validate(), Ok(()));
+            assert_eq!(s.backend(), Backend::Site);
+            assert!(s.is_site());
+            // The distinction that matters everywhere else: a site is *not*
+            // static, and code asking "does this have a VM pool?" must not get
+            // its answer from `is_static`.
+            assert!(!s.is_static());
+            assert!(!s.is_managed());
+        }
+
+        #[test]
+        fn a_site_cannot_also_be_something_else() {
+            let mut s = site_spec();
+            s.upstreams = vec!["127.0.0.1:9000".into()];
+            assert_eq!(s.validate(), Err(SpecError::SiteWithOtherBackend));
+
+            let mut s = site_spec();
+            s.vm = spec().vm;
+            assert_eq!(s.validate(), Err(SpecError::SiteWithOtherBackend));
+        }
+
+        /// A site has no image and no pool, so a block that produces one is a
+        /// misunderstanding rather than a harmless extra.
+        #[test]
+        fn image_sources_are_refused_on_a_site() {
+            let mut s = site_spec();
+            s.build = Some(
+                serde_json::from_str(r#"{"repo":"https://github.com/acme/site.git"}"#).unwrap(),
+            );
+            assert_eq!(s.validate(), Err(SpecError::NotForSites("build")));
+        }
+
+        /// `update` *is* allowed: `git pull && npm run build` in a directory on
+        /// this host is exactly how a site is redeployed.
+        #[test]
+        fn an_update_block_is_how_a_site_is_deployed() {
+            let mut s = site_spec();
+            s.update = Some(
+                serde_json::from_str(
+                    r#"{"working_dir":"/srv/docs","commands":["git pull","npm run build"]}"#,
+                )
+                .unwrap(),
+            );
+            assert_eq!(s.validate(), Ok(()));
+        }
+
+        #[test]
+        fn the_root_must_be_absolute_and_present() {
+            let mut s = site_spec();
+            s.site.as_mut().unwrap().root = "  ".into();
+            assert_eq!(s.validate(), Err(SpecError::EmptySiteRoot));
+
+            let mut s = site_spec();
+            s.site.as_mut().unwrap().root = "www".into();
+            assert_eq!(
+                s.validate(),
+                Err(SpecError::RelativeSiteRoot("www".into())),
+                "a relative root would resolve against app-lb's working directory",
+            );
+        }
+
+        /// `index` and `not_found` are joined onto the root, so a climbing or
+        /// rooted value would read a file the site never meant to expose.
+        #[test]
+        fn the_index_and_404_page_cannot_escape_the_root() {
+            for (field, value) in [("index", "../../etc/passwd"), ("not_found", "/etc/passwd")] {
+                let mut s = site_spec();
+                match field {
+                    "index" => s.site.as_mut().unwrap().index = value.into(),
+                    _ => s.site.as_mut().unwrap().not_found = Some(value.into()),
+                }
+                assert_eq!(
+                    s.validate(),
+                    Err(SpecError::BadSitePath {
+                        field,
+                        value: value.into()
+                    }),
+                );
+            }
+        }
+
+        #[test]
+        fn spa_mode_needs_an_index_to_fall_back_to() {
+            let mut s = site_spec();
+            s.site.as_mut().unwrap().spa = true;
+            s.site.as_mut().unwrap().index = "".into();
+            assert_eq!(s.validate(), Err(SpecError::SpaWithoutIndex));
+        }
+
+        /// A site is only reachable through the proxy, so an unrouted one is
+        /// dead weight — the same reasoning as a static deployment.
+        #[test]
+        fn a_site_needs_a_route() {
+            let mut s = site_spec();
+            s.routes.clear();
+            assert_eq!(s.validate(), Err(SpecError::NoRoutes));
+        }
+
+        #[test]
+        fn the_defaults_are_what_a_build_output_wants() {
+            let s: SiteSpec = serde_json::from_str(r#"{"root":"/var/www"}"#).unwrap();
+            assert_eq!(s.index, "index.html");
+            assert_eq!(s.cache_control, "public, max-age=300");
+            assert!(!s.spa, "SPA mode turns every typo into a 200; opt in");
+            assert_eq!(s.not_found, None);
+        }
     }
 
     /// The agent-sandbox shape: a managed VM with no ingress at all, reached

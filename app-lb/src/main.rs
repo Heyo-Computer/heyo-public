@@ -19,6 +19,7 @@ mod obs;
 mod proxy;
 mod registry;
 mod secrets;
+mod site;
 mod tls;
 mod vm;
 

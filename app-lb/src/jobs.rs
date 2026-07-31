@@ -510,7 +510,7 @@ impl Jobs {
         let Some(deployment) = self.registry.get(deployment_id) else {
             return Err(StartError::NoDeployment(deployment_id.to_string()));
         };
-        if deployment.spec.is_static() == kind.is_managed() {
+        if deployment.spec.is_managed() != kind.is_managed() {
             return Err(StartError::WrongKind {
                 id: deployment_id.to_string(),
                 kind,
@@ -933,6 +933,28 @@ impl Jobs {
             return Ok(format!("{} command(s)", spec.commands.len()));
         }
 
+        // A site has no upstreams to probe, so "did it come back" is a different
+        // question: did the build leave something servable in the root. Without
+        // this the job would report failure after a perfectly good build, purely
+        // because there was nothing to send a request to.
+        if let Some(site) = self.registry.get(deployment_id).and_then(|d| d.spec.site.clone()) {
+            return match verify_site(&site) {
+                Ok(what) => {
+                    self.update_record(job_id, |r| {
+                        r.verified = Some(true);
+                        r.push_log(what.clone());
+                    });
+                    Ok(format!("{} command(s), {what}", spec.commands.len()))
+                }
+                Err(e) => {
+                    self.update_record(job_id, |r| r.verified = Some(false));
+                    Err(format!(
+                        "the commands succeeded but the site is not servable: {e}"
+                    ))
+                }
+            };
+        }
+
         self.log(
             job_id,
             format!(
@@ -1215,6 +1237,36 @@ fn trim_history(history: &mut VecDeque<JobRecord>, deployment: &str) {
     while history.len() > HISTORY_LIMIT {
         history.pop_front();
     }
+}
+
+/// Whether a site's root still holds something worth serving.
+///
+/// The counterpart to probing a static deployment's upstreams: a build that
+/// exits 0 but writes its output somewhere else leaves a directory that answers
+/// every request with a 404, and "the commands succeeded" would call that a
+/// successful deploy.
+fn verify_site(spec: &crate::config::SiteSpec) -> Result<String, String> {
+    let root = Path::new(&spec.root);
+    if !root.is_dir() {
+        return Err(format!(
+            "site.root {} is not a directory on this host (app-lb runs as {})",
+            spec.root,
+            whoami()
+        ));
+    }
+    let index = spec.index.trim();
+    if index.is_empty() {
+        // No index configured, so the site is a bag of files; the directory
+        // existing is all there is to check.
+        return Ok(format!("{} exists", spec.root));
+    }
+    if !root.join(index).is_file() {
+        return Err(format!(
+            "{index} is missing from {} — did the build write its output somewhere else?",
+            spec.root
+        ));
+    }
+    Ok(format!("{index} is in place"))
 }
 
 fn whoami() -> String {

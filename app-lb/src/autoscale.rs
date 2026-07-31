@@ -172,8 +172,13 @@ impl Autoscaler {
     /// simultaneous connections to the daemon.
     async fn reconcile(&self) {
         let deployments = self.registry.deployments();
+        // Sites are excluded outright rather than partitioned: they have no VMs
+        // to reconcile *and* no upstreams to probe, so there is nothing for this
+        // loop to do about one. Filtering here is what keeps a fleet of sites
+        // from costing a tick.
         let (statics, managed): (Vec<_>, Vec<_>) = deployments
             .values()
+            .filter(|d| !d.spec.is_site())
             .cloned()
             .partition(|d| d.spec.is_static());
 
@@ -276,7 +281,7 @@ impl Autoscaler {
     ) {
         // Managed-only: static deployments are reconciled separately in
         // `reconcile` (they own no VMs and need no daemon interaction).
-        debug_assert!(!d.spec.is_static(), "reconcile_one called on a static deployment");
+        debug_assert!(d.spec.is_managed(), "reconcile_one called on a deployment with no VM pool");
 
         // The tick's snapshot can already be stale: an admin request may have
         // deregistered or rebuilt this deployment while a *sibling* deployment
@@ -924,9 +929,9 @@ impl Autoscaler {
                 orphans.push(info.id.clone());
                 continue;
             };
-            if d.spec.is_static() {
-                // The deployment id was reused for a static one since this VM was
-                // created; it owns no VMs, so this sandbox is an orphan.
+            if !d.spec.is_managed() {
+                // The id was reused for a static deployment or a site since this
+                // VM was created; neither owns VMs, so this sandbox is an orphan.
                 orphans.push(info.id.clone());
                 continue;
             }
@@ -981,9 +986,10 @@ impl Autoscaler {
 
     /// Drain and kill every VM of a deployment, e.g. on DELETE.
     pub async fn teardown(&self, d: &Arc<Deployment>) {
-        // A static deployment's backends are not sandboxes — there is nothing to
-        // kill on the daemon. Just drop them from routing.
-        if d.spec.is_static() {
+        // Only a managed deployment's backends are sandboxes. A static one's are
+        // addresses and a site has none at all, so for both there is nothing to
+        // kill on the daemon — just drop them from routing.
+        if !d.spec.is_managed() {
             d.set_backends(Vec::new());
             return;
         }
@@ -1248,6 +1254,7 @@ mod tests {
             upstreams: vec![],
             build: None,
             artifact: None,
+            site: None,
             update: None,
             auth: None,
         }
@@ -1268,6 +1275,7 @@ mod tests {
             upstreams: vec!["127.0.0.1:9".into()],
             build: None,
             artifact: None,
+            site: None,
             update: None,
             auth: None,
         }

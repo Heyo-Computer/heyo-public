@@ -5,7 +5,7 @@ built on [Pingora](https://github.com/cloudflare/pingora).
 
 Register a *deployment* — routing rules plus a backend — and app-lb routes HTTP traffic to it.
 Deployments are registered at runtime over an admin API; multiple deployments coexist in one
-process. A deployment is one of two kinds:
+process. A deployment is one of three kinds:
 
 - **Managed** (`vm`): a VM template plus a scaling policy. app-lb boots and reaps a pool of
   microVMs to match load.
@@ -13,8 +13,10 @@ process. A deployment is one of two kinds:
   `ip:port`) to forward to — another app or service. No VM lifecycle and no autoscaling; the
   upstreams are load-balanced least-in-flight with failover, and health-re-probed so a
   recovered upstream rejoins. See [Static / proxy_pass deployments](#static--proxy_pass-deployments).
+- **Site** (`site`): a directory on the app-lb host, served straight off disk — no backend at
+  all. What nginx's `root` or a CloudFront origin does. See [Static sites](#static-sites).
 
-A deployment sets exactly one of `vm` or `upstreams`.
+A deployment sets exactly one of `vm`, `upstreams` or `site`.
 
 Only Firecracker and KVM are supported. This is not a limitation of taste: app-lb routes
 directly to `SandboxInfo.guest_ip`, which the daemon only populates for tap-networked
@@ -204,6 +206,76 @@ Each upstream is a `host:port` (or `ip:port`); a hostname is re-resolved per con
 change the targets, `PUT` the deployment with a new `upstreams` list (the backends are rebuilt).
 Scaling (`PATCH .../scaling`) and per-VM eviction (`DELETE .../vms/...`) do not apply to a
 static deployment and are rejected. Upstreams are proxied over **plaintext HTTP**.
+
+### Static sites
+
+A deployment with a `site` block has **no backend at all**: app-lb answers the
+request itself, out of a directory on its own host. What nginx's `root` or a
+CloudFront origin bucket does.
+
+```sh
+curl -XPOST localhost:9090/deployments -H 'content-type: application/json' -d '{
+  "id": "docs",
+  "routes": [{"host": "docs.example.com"}],
+  "site": {"root": "/srv/docs/dist", "not_found": "404.html"}
+}'
+```
+
+```sh
+serverctl create deployment docs --host docs.example.com \
+  --site-root /srv/docs/dist --site-404 404.html
+```
+
+| Field | Default | |
+| --- | --- | --- |
+| `root` | *(required)* | Absolute path to the directory to serve |
+| `index` | `index.html` | Served for a directory. `""` makes those a 404 |
+| `not_found` | *(none)* | Body for a 404, relative to `root`. Absent = plain text |
+| `spa` | `false` | Serve `index` for any unmatched path, with a 200 |
+| `cache_control` | `public, max-age=300` | `Cache-Control` on served files |
+
+What you get: an index, a custom 404, content types, `ETag` with `304` on
+`If-None-Match`, `Accept-Ranges` and byte ranges (so a paused download or a
+seeking `<video>` works), `HEAD`, and a `301` from `/docs` to `/docs/` so
+relative links resolve. Files are streamed in 64 KiB pieces rather than read
+whole, so a large asset does not pin its own size in memory per concurrent
+request.
+
+What you don't: rewrites, redirects, per-location blocks, directory listings,
+compression. A site that needs those wants a real web server behind a
+`proxy_pass` deployment.
+
+**Nothing outside `root` is ever served.** Every path component is checked before
+the filesystem is touched — which rejects `..`, an encoded `%2e%2e`, an absolute
+path and a NUL — and the resolved file is then confirmed to still be under the
+root *after* symlinks are followed, which is the only way to catch a symlink
+inside the root pointing out of it. A traversal is refused rather than
+sanitised: quietly dropping a `..` would turn an attack into a successful read
+of a different file.
+
+`spa: true` is for single-page apps: any path matching no file is served the
+index with a 200, so a client-side router owns the URL space. Off by default,
+because it turns every typo into a 200. It never rescues a traversal.
+
+**Deploying one.** A site takes an `update` block, the same as a static
+deployment — commands run in a directory on the app-lb host:
+
+```jsonc
+"update": {
+  "working_dir": "/srv/docs",
+  "commands": ["git pull --ff-only", "npm ci", "npm run build"]
+}
+```
+
+`serverctl update docs` runs them and then checks the site is still servable —
+that `index` is actually in `root`. A build that exits 0 but writes its output
+somewhere else fails the job, rather than leaving a deployment that 404s
+everything. (`build` and `artifact` are rejected on a site: there is no image and
+no pool.)
+
+Scaling, eviction, `exec` and `shell` all do not apply and are rejected with a
+message saying so. A site is only reachable through the proxy, so it needs at
+least one route.
 
 ### Editing & scaling a deployment
 

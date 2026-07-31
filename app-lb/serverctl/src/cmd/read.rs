@@ -119,9 +119,9 @@ fn get_deployments(ctx: &Ctx, names: &[String]) -> Result<()> {
             d.spec.id.clone(),
             d.kind.clone(),
             d.spec.routes_summary(),
-            // A static deployment has no autoscaler, so "desired" is a number
-            // nobody set — show its upstream count instead of a misleading 0.
-            if d.spec.is_static() {
+            // Neither a static deployment nor a site has an autoscaler, so
+            // "desired" is a number nobody set — a dash beats a misleading 0.
+            if d.spec.is_static() || d.spec.is_site() {
                 "—".to_string()
             } else {
                 d.desired_replicas.to_string()
@@ -132,7 +132,7 @@ fn get_deployments(ctx: &Ctx, names: &[String]) -> Result<()> {
         ];
         if ctx.out.is_wide() {
             let s = &d.spec.scaling;
-            if d.spec.is_static() {
+            if d.spec.is_static() || d.spec.is_site() {
                 row.extend(["—".to_string(), "—".to_string(), "—".to_string(), "—".to_string()]);
             } else {
                 row.extend([
@@ -519,7 +519,9 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
     output::top_field("Name", &d.spec.id);
     output::top_field(
         "Kind",
-        if d.spec.is_static() {
+        if d.spec.is_site() {
+            "site (files served off disk)".to_string()
+        } else if d.spec.is_static() {
             "static (proxy_pass to fixed upstreams)".to_string()
         } else {
             let driver = d.spec.vm.as_ref().map(|v| v.driver.clone()).unwrap_or_default();
@@ -533,6 +535,25 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
     }
     for r in &d.spec.routes {
         println!("  {}", r.render());
+    }
+
+    if let Some(site) = &d.spec.site {
+        output::section("Site");
+        output::field("Root", &site.root);
+        output::field(
+            "Index",
+            if site.index.is_empty() { "none (directories 404)" } else { &site.index },
+        );
+        output::field("404 page", site.not_found.as_deref().unwrap_or("none (plain text)"));
+        output::field(
+            "Unmatched paths",
+            if site.spa {
+                "served the index (SPA mode)"
+            } else {
+                "404"
+            },
+        );
+        output::field("Cache-Control", &site.cache_control);
     }
 
     if d.spec.is_static() {

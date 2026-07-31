@@ -453,11 +453,15 @@ function renderHist(el, snap, unitLabel) {
   }
 
   const max = Math.max(1, ...buckets.map(b => b.count));
-  if (el.dataset.bars !== String(buckets.length) || el.dataset.empty) {
+
+  // Rebuild the markup only when the shape changes: first paint, a different
+  // bucket count, or coming back from the empty state above.
+  const fresh = el.dataset.bars !== String(buckets.length) || !!el.dataset.empty;
+  if (fresh) {
     el.innerHTML = buckets.map((b, i) =>
       `<div class="hbar">
         <span class="k">${esc(bucketLabel(buckets, i))} ${esc(unitLabel)}</span>
-        <span class="track"><span class="fill"></span></span>
+        <span class="track"><span class="fill" style="width:0"></span></span>
         <span class="v"></span>
       </div>`).join("");
     el.dataset.bars = String(buckets.length);
@@ -466,10 +470,29 @@ function renderHist(el, snap, unitLabel) {
 
   const fills = el.querySelectorAll(".fill");
   const vals = el.querySelectorAll(".v");
-  buckets.forEach((b, i) => {
-    if (fills[i]) fills[i].style.width = ((b.count / max) * 100) + "%";
-    if (vals[i]) vals[i].textContent = fmt(b.count);
+  // Counts are text, not geometry — no reason to hold them back a frame.
+  buckets.forEach((b, i) => { if (vals[i]) vals[i].textContent = fmt(b.count); });
+
+  const setWidths = () => buckets.forEach((b, i) => {
+    const f = fills[i];
+    if (!f) return;
+    // Stagger the entrance so the distribution draws itself top to bottom;
+    // cleared on later updates, or a bar reacting to new data would sit still
+    // for a beat before moving.
+    f.style.transitionDelay = fresh ? Math.min(i * 18, 260) + "ms" : "";
+    f.style.width = ((b.count / max) * 100) + "%";
   });
+
+  // A just-created element has no committed width for a transition to start
+  // from, so setting the final width in the same task paints the bar at full
+  // size. Two frames lets the zero-width state land first; one is not reliably
+  // enough. This is most of the animation there is: a latency histogram is
+  // cumulative, so after a minute the bucket ratios barely move.
+  if (fresh && typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => requestAnimationFrame(setWidths));
+  } else {
+    setWidths();
+  }
 }
 
 // Minimal SVG line chart from an array of {t, v}. Recessive grid, single series.
@@ -703,7 +726,7 @@ function cardShell(id) {
 // The shell is created empty and filled by this, so a card created a moment ago
 // and one that has been on screen for an hour go through exactly the same code.
 // Splitting "create" and "update" markup is how those two drift apart.
-function updateCard(el, d) {
+function updateCard(el, d, fresh) {
   const p = d.pool, m = d.metrics;
   const util = p.utilization;
   const utilPct = util == null ? null : util * 100;
@@ -720,9 +743,18 @@ function updateCard(el, d) {
   // the VM-only columns (CPU/memory come from the daemon, which static
   // upstreams have no sample from).
   const isStatic = d.kind === "static";
+  // A site has no backends of any kind: app-lb serves its files itself. It
+  // shares the "nothing to scale" treatment with a static deployment, and adds
+  // "nothing to list" — there is no upstream or sandbox table to show.
+  const isSite = d.kind === "site";
 
   let vmRows;
-  if (isStatic) {
+  if (isSite) {
+    vmRows = `<tr>
+      <td class="mono">${esc(d.site_root || "—")}</td>
+      <td>${d.site_spa ? `<span class="tag boot">SPA fallback</span>` : `<span class="tag ok">static files</span>`}</td>
+    </tr>`;
+  } else if (isStatic) {
     vmRows = d.vms.length ? d.vms.map(v => {
       const load = Math.min(1, v.in_flight / Math.max(1, p.target_concurrency)) * 100;
       const st = !v.healthy ? `<span class="tag down">down</span>`
@@ -780,11 +812,16 @@ function updateCard(el, d) {
       || `<tr><td colspan="8" class="empty" style="padding:14px">No VMs — the pool wants ${fmt(p.desired_replicas)}.</td></tr>`;
   }
 
-  const vmHead = isStatic
+  const vmHead = isSite
+    ? `<tr><th>root</th><th>mode</th></tr>`
+    : isStatic
     ? `<tr><th>upstream</th><th>in-flight</th><th>uptime</th><th>state</th></tr>`
     : `<tr><th>sandbox</th><th>addr</th><th>in-flight</th><th>CPU</th><th>memory</th><th>uptime</th><th>state</th><th>actions</th></tr>`;
 
-  const headBadges = isStatic
+  const headBadges = isSite
+    ? `<span class="badge">static site</span>
+       <span class="badge">${d.site_spa ? "SPA" : "files"}</span>`
+    : isStatic
     ? `<span class="badge">static · proxy_pass</span>
        <span class="badge">${d.upstreams.length} upstream${d.upstreams.length === 1 ? "" : "s"}</span>`
     : `<span class="badge">${p.ready}/${p.max_replicas} replicas · want ${p.desired_replicas}</span>
@@ -800,17 +837,17 @@ function updateCard(el, d) {
     : "";
 
   // Static deployments can't be scaled; only Edit (to change the upstream list).
-  const headActions = (isStatic
+  const headActions = (isStatic || isSite
     ? `<button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`
     : `<button class="btn mini" data-act="scale" data-id="${esc(d.id)}">Scale</button>
        <button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`) + jobBtn;
 
   // Pool-only tiles (pending/draining/cold-start) are meaningless for a static
   // deployment; omit them.
-  const poolTiles = isStatic ? "" :
+  const poolTiles = (isStatic || isSite) ? "" :
       `<div><div class="label">Pending</div><div class="value">${fmt(p.pending)}</div></div>
        <div><div class="label">Draining</div><div class="value">${fmt(p.draining)}</div></div>`;
-  const coldTile = isStatic ? "" :
+  const coldTile = (isStatic || isSite) ? "" :
       `<div><div class="label">Cold p50</div><div class="value">${m.cold_start_s.count ? fmt(m.cold_start_s.p50,1)+"s" : "—"}</div></div>`;
 
   // Where this deployment is actually reachable. The server builds these —
@@ -835,9 +872,18 @@ function updateCard(el, d) {
   // The gauge is mutated in place rather than re-created. That is the whole
   // point of reusing the card: a transition animates from the element's
   // previous width, and a brand-new element has none.
+  //
+  // On a card that was just built, the same two-frame wait as the histograms —
+  // the shell is created at zero width, and that has to be painted before the
+  // real width is set or the gauge appears already full.
   const fill = el.querySelector(".gauge-fill");
   const width = Math.min(100, utilPct || 0) + "%";
-  if (fill.style.width !== width) fill.style.width = width;
+  const setWidth = () => { if (fill.style.width !== width) fill.style.width = width; };
+  if (fresh && typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => requestAnimationFrame(setWidth));
+  } else {
+    setWidth();
+  }
   const fillClass = "gauge-fill" + (cls ? " " + cls : "");
   if (fill.className !== fillClass) fill.className = fillClass;
   const val = el.querySelector(".gauge-val");
@@ -880,9 +926,10 @@ function renderDeployments(deps) {
 
   deps.forEach((d, i) => {
     let el = existing.get(d.id);
+    const fresh = !el;
     if (el) existing.delete(d.id);
     else el = cardShell(d.id);
-    updateCard(el, d);
+    updateCard(el, d, fresh);
     // Match the server's ordering by moving only the cards that are actually
     // out of place; a card already in the right slot is not touched at all.
     if (host.children[i] !== el) host.insertBefore(el, host.children[i] || null);
