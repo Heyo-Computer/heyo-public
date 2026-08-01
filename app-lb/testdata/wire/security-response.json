@@ -1,0 +1,77 @@
+{
+  "generated_at": 1722400000,
+  "enabled": true,
+  "window_secs": 60,
+  "alerts": [
+    {
+      "id": 41,
+      "ts": 1722399940000,
+      "last_ts": 1722399998000,
+      "rule": "traffic.scanner",
+      "severity": "medium",
+      "title": "203.0.113.9 is probing for unserved paths",
+      "client": "203.0.113.9",
+      "deployment": "demo",
+      "path": "/wp-login.php",
+      "technique": "T1595",
+      "count": 214,
+      "ecs": {
+        "event.action": "http-request",
+        "event.category": "web",
+        "event.outcome": "failure",
+        "http.request.method": "GET",
+        "http.response.status_code": 404,
+        "observer.name": "app-lb",
+        "source.ip": "203.0.113.9",
+        "tags": [
+          "access",
+          "external"
+        ],
+        "url.domain": "demo.example.com",
+        "url.extension": "php",
+        "url.path": "/wp-login.php"
+      }
+    },
+    {
+      "id": 42,
+      "ts": 1722399980000,
+      "last_ts": 1722399999000,
+      "rule": "auth.brute-force",
+      "severity": "high",
+      "title": "198.51.100.7 is failing authentication repeatedly",
+      "client": "198.51.100.7",
+      "path": "/metrics",
+      "technique": "T1110",
+      "count": 9,
+      "ecs": {
+        "event.action": "admin-rejected",
+        "event.category": "authentication",
+        "event.outcome": "failure",
+        "http.request.authorization.scheme": "basic",
+        "observer.name": "app-lb",
+        "source.ip": "198.51.100.7",
+        "tags": [
+          "auth-failure",
+          "external"
+        ],
+        "url.path": "/metrics"
+      }
+    }
+  ],
+  "totals": {
+    "info": 0,
+    "low": 0,
+    "medium": 11,
+    "high": 3,
+    "critical": 0
+  },
+  "stats": {
+    "observed": 918273,
+    "dropped": 0,
+    "analyzed": 918273,
+    "raised": 14,
+    "suppressed": 4118,
+    "tracked_clients": 118,
+    "clients_at_capacity": false
+  }
+}

@@ -557,6 +557,8 @@ pub struct MetricsResponse {
     pub global: DeploymentMetrics,
     /// Absent when the LB is not shipping logs to app-obs.
     pub obs: Option<ObsStats>,
+    /// Absent when the LB has security monitoring off (`APP_LB_SIEM=0`).
+    pub security: Option<SecuritySummary>,
     pub deployments: Vec<DeploymentView>,
     /// How many deployments matched before `limit`/`offset`, so a caller can
     /// page without guessing.
@@ -564,6 +566,27 @@ pub struct MetricsResponse {
     /// How many deployments hold their own counters. Climbing past the number
     /// registered means retirement is not keeping up.
     pub tracked_deployments: usize,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// Alert counts from the detection engine, carried on `/metrics` so a status
+/// display can show one without a second request. The alerts themselves are on
+/// `GET /security`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SecuritySummary {
+    /// Alerts currently held in the LB's in-memory ring.
+    pub open: usize,
+    /// How many of those are `high` or `critical`.
+    pub urgent: u64,
+    /// Observations dropped because the analysis queue was full. Non-zero means
+    /// detection is sampling rather than complete — the same failure mode, and
+    /// the same warning, as [`ObsStats::dropped`].
+    pub dropped: u64,
+    /// Whether the per-source table is full, which means the same for addresses
+    /// as `dropped` does for events.
+    pub clients_at_capacity: bool,
     #[serde(flatten)]
     pub extra: Extra,
 }

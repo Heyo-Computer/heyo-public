@@ -19,6 +19,7 @@ mod obs;
 mod proxy;
 mod registry;
 mod secrets;
+mod siem;
 mod site;
 mod tls;
 mod tokens;
@@ -371,11 +372,28 @@ fn main() {
     let auth_key_path = std::env::var("APP_LB_AUTH_KEY")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| auth::default_key_path());
+    // Attack detection over the same requests the access log describes. Built
+    // here because everything downstream takes a clone of its sink, and — like
+    // `obs::from_env` — it allocates a channel and nothing else, so it survives
+    // the fork `run_forever` may do to daemonize.
+    //
+    // Independent of `obs`: it needs no collector to be useful, and is on unless
+    // `APP_LB_SIEM=0`. The sink it is handed here is only for *shipping* alerts
+    // onward, which is why it is `None`-tolerant.
+    let siem = siem::from_env(
+        obs.as_ref().and_then(|o| o.events.clone()),
+        obs.as_ref()
+            .and_then(|o| o.events.as_ref().or(o.access.as_ref()))
+            .map(|s| s.deployment())
+            .unwrap_or_else(|| Arc::from(obs::LB_DEPLOYMENT)),
+    );
+
     let auth = Arc::new(Authenticator::new(
         Authenticator::load_key(&auth_key_path)
             .unwrap_or_else(|e| panic!("cannot read or create {}: {e}", auth_key_path.display())),
         secrets.clone(),
         Some(tokens.clone()),
+        siem.as_ref().map(|s| s.sink.clone()),
     ));
 
     let vms = VmManager::new(cfg.daemon_url.clone());
@@ -519,6 +537,7 @@ fn main() {
             tokens,
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),
+            siem.as_ref(),
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
         ),
     );
@@ -531,6 +550,7 @@ fn main() {
             challenges,
             auth,
             obs.as_ref().and_then(|o| o.access.clone()),
+            siem.as_ref().map(|s| s.sink.clone()),
         ),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);
@@ -555,6 +575,12 @@ fn main() {
     // answers it, must make no difference to serving traffic.
     if let Some(obs) = obs {
         server.add_service(background_service("obs", obs.shipper));
+    }
+    // Detection, on the same terms as log shipping: deliberately not a
+    // dependency of the proxy handle. A stalled or failed analyzer must degrade
+    // to losing findings, never to holding up traffic.
+    if let Some(siem) = siem {
+        server.add_service(background_service("siem", siem.engine));
     }
     if let Some(acme_svc) = acme_svc {
         server.add_service(acme_svc);

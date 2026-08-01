@@ -13,6 +13,7 @@ use crate::auth::{Authenticator, Decision, Identity, RequestInfo};
 use crate::deployment::{Deployment, VmBackend};
 use crate::metrics::Metrics;
 use crate::obs::{Access, LogSink};
+use crate::siem::SecuritySink;
 use crate::registry::Registry;
 use async_trait::async_trait;
 use pingora_core::prelude::HttpPeer;
@@ -72,6 +73,10 @@ pub struct LbProxy {
     /// Where the access log goes. `None` unless `APP_LB_OBS_URL` is configured,
     /// in which case `logging` does no extra work at all.
     access_log: Option<LogSink>,
+    /// Where the same requests go to be analysed for attacks. Independent of
+    /// `access_log` on purpose: the SIEM is on unless `APP_LB_SIEM=0`, and must
+    /// not inherit "off whenever no log collector is configured".
+    security: Option<SecuritySink>,
 }
 
 impl LbProxy {
@@ -81,6 +86,7 @@ impl LbProxy {
         challenges: Arc<ChallengeTable>,
         auth: Arc<Authenticator>,
         access_log: Option<LogSink>,
+        security: Option<SecuritySink>,
     ) -> Self {
         Self {
             registry,
@@ -88,6 +94,7 @@ impl LbProxy {
             challenges,
             auth,
             access_log,
+            security,
         }
     }
 }
@@ -364,6 +371,12 @@ fn request_info<'a>(
         secure,
         wants_html,
         bearer,
+        // The socket peer, for the SIEM's per-source sign-in rules. Never an
+        // `X-Forwarded-For`: keying a detector on a client-supplied header is an
+        // alert-spoofing primitive on an unauthenticated path.
+        client: session
+            .client_addr()
+            .and_then(|addr| addr.as_inet().map(|inet| inet.ip())),
     }
 }
 
@@ -628,9 +641,13 @@ impl ProxyHttp for LbProxy {
         // static upstream, which is exactly how app-obs keys a backend. Skipped
         // when nothing is shipping, so an app-lb without app-obs allocates
         // nothing extra per request.
-        let backend = match &self.access_log {
-            Some(_) => ctx.backend.as_ref().map(|b| b.sandbox_id.clone()),
-            None => None,
+        // Either consumer needs it: with `APP_LB_OBS_ACCESS_LOG=0` and the SIEM
+        // on, checking only `access_log` here would leave every alert without a
+        // backend, which reads as a bug in the SIEM rather than as this line.
+        let observing = self.access_log.is_some() || self.security.is_some();
+        let backend = match observing {
+            true => ctx.backend.as_ref().map(|b| b.sandbox_id.clone()),
+            false => None,
         };
         ctx.release();
 
@@ -652,15 +669,23 @@ impl ProxyHttp for LbProxy {
         // per-deployment view by construction. `started_at` is set first thing in
         // `request_filter`, so its absence means the request never got that far
         // and there is nothing to describe.
-        if let (Some(sink), Some(started)) = (&self.access_log, ctx.started_at) {
+        if let (true, Some(started)) = (observing, ctx.started_at) {
             let req = session.req_header();
             let method = req.method.as_str().to_string();
             // The path alone, never the query: a sign-in callback carries the
             // OAuth `code` there, and a shared log store is the last place a
             // credential should come to rest.
+            //
+            // The SIEM is the one exception, and a deliberately narrow one: it
+            // is handed the query as a *separate argument* below, matches attack
+            // signatures against the parameter values, and drops it. On a hit the
+            // alert records the parameter name only, never the value — so the
+            // `code` above still cannot reach a log store, while `?id=1' OR '1'='1`
+            // stops being invisible. `APP_LB_SIEM_SCAN_QUERY=0` turns it off.
             let path = req.uri.path().to_string();
+            let query = req.uri.query().map(str::to_string);
             let host = request_host(req);
-            sink.send_access(Access {
+            let access = Access {
                 deployment: ctx.deployment.as_ref().map(|d| d.spec.id.as_str()),
                 backend,
                 method: &method,
@@ -676,7 +701,17 @@ impl ProxyHttp for LbProxy {
                     None => addr.to_string(),
                 }),
                 error: e.map(|err| err.to_string()),
-            });
+            };
+
+            // SIEM first: it borrows, and `send_access` moves. `Access` is not
+            // `Clone`, so reordering these two stops compiling rather than
+            // silently dropping the analysis.
+            if let Some(siem) = &self.security {
+                siem.observe_access(&access, query.as_deref());
+            }
+            if let Some(sink) = &self.access_log {
+                sink.send_access(access);
+            }
         }
 
         if let Some(err) = e {

@@ -168,6 +168,12 @@
     "failed": 3,
     "healthy": true
   },
+  "security": {
+    "open": 12,
+    "urgent": 3,
+    "dropped": 0,
+    "clients_at_capacity": false
+  },
   "deployments": [
     {
       "id": "sandbox",

@@ -285,10 +285,93 @@ export interface MetricsResponse {
   fleet: FleetPool;
   global: DeploymentMetrics;
   obs?: ObsStats;
+  /** Absent when `APP_LB_SIEM=0`. */
+  security?: SecuritySummary;
   deployments: DeploymentView[];
   /** How many matched before `limit`/`offset`, so you can page. */
   matched: number;
   tracked_deployments: number;
+}
+
+// -- security --------------------------------------------------------------
+
+/** The alert counts carried on `/metrics`, for a status tile. */
+export interface SecuritySummary {
+  /** Alerts currently held in app-lb's in-memory ring. */
+  open: number;
+  /** How many of those are `high` or `critical`. */
+  urgent: number;
+  /**
+   * Observations dropped because the analysis queue was full. Non-zero means
+   * detection is sampling rather than complete — the figure to watch, since a
+   * SIEM that has stopped looking is indistinguishable from a quiet network.
+   */
+  dropped: number;
+  /** Whether the per-source table is full, which means the same for addresses. */
+  clients_at_capacity: boolean;
+}
+
+export type Severity = "info" | "low" | "medium" | "high" | "critical";
+
+export interface SecurityAlert {
+  id: number;
+  /** Epoch millis of the first occurrence folded into this alert. */
+  ts: number;
+  last_ts: number;
+  /** e.g. `auth.brute-force`, `web.sqli`, `traffic.scanner`. */
+  rule: string;
+  severity: Severity;
+  title: string;
+  client?: string;
+  /** Absent for admin-plane and unrouted findings. */
+  deployment?: string;
+  /** Never carries a query string. */
+  path?: string;
+  /** MITRE ATT&CK technique id, e.g. `T1110`. */
+  technique?: string;
+  /**
+   * Occurrences folded into this alert. A scanner produces one alert whose
+   * count climbs, not ten thousand alerts.
+   */
+  count: number;
+  /**
+   * The triggering event in ECS field names (`source.ip`, `url.path`, …). A
+   * free-form map: app-lb may add fields, and `url.query` is never among them.
+   */
+  ecs?: Record<string, unknown>;
+}
+
+export interface SeverityTotals {
+  info: number;
+  low: number;
+  medium: number;
+  high: number;
+  critical: number;
+}
+
+export interface SiemStats {
+  observed: number;
+  dropped: number;
+  analyzed: number;
+  raised: number;
+  suppressed: number;
+  tracked_clients: number;
+  clients_at_capacity: boolean;
+}
+
+/** `GET /security`. */
+export interface SecurityResponse {
+  generated_at: number;
+  /** `false` with an empty list when `APP_LB_SIEM=0` — not a 404. */
+  enabled: boolean;
+  /** Seconds each rate-based rule counts over. */
+  window_secs: number;
+  /** Newest first. */
+  alerts: SecurityAlert[];
+  totals: SeverityTotals;
+  /** Withheld from a deployment-scoped token, for whom it would describe
+   * traffic it cannot see. */
+  stats?: SiemStats;
 }
 
 // -- jobs, secrets, certs --------------------------------------------------

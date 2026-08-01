@@ -123,3 +123,26 @@ base64.workspace = true
 sha2.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The event model behind `src/siem.rs` — `SiemLog`, `SiemField`, the ECS field
+# dictionary, and the `LogParser`/`LogEnrichment` traits. The lib is `usiem`, not
+# `u_siem`.
+#
+# Core only, deliberately: `u-siem-kernel` would run components on its own
+# `std::thread` pool alongside tokio's, pulls `async-std` (RUSTSEC-2025-0052,
+# discontinued — a permanent cargo-audit allowlist entry), and its `run()`
+# panics with "No DatasetManager!" while core ships no `SiemDatasetManager` and
+# the only published one is pinned to the pre-0.1 API. None of that buys
+# anything here: `parse_log` is a synchronous call, so the pipeline runs on the
+# background service app-lb already has.
+#
+# Cheap in the graph — serde, serde_json, crossbeam-channel, chrono and regex
+# were all already resolved for something else, so this adds only `dyn-clone`.
+# `sled` stays out because `slow_geoip` is not default and we ship no GeoIP.
+#
+# Pinned exactly, not "0.7". The crate is dormant (last release 2024-01) with
+# 0.8.0 committed upstream but unpublished, and every other crate in its
+# ecosystem depends on `u-siem = "0"` — so a publish would move this silently.
+# It matters more than usual because the field-dictionary constants become the
+# field *names* in app-obs: a rename would reshape every security log stored.
+u-siem = "=0.7.0"

@@ -12,9 +12,10 @@ use crate::deployment::now_secs;
 use crate::metrics::{DeploymentMetricsSnapshot, HostUsageSnapshot, Metrics};
 use crate::registry::Registry;
 use crate::secrets::{SecretSpec, SecretStore};
+use crate::siem::AuthAction;
 use crate::tls::CertStore;
 use async_trait::async_trait;
-use axum::extract::{MatchedPath, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, MatchedPath, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -25,6 +26,7 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -164,6 +166,12 @@ struct AdminState {
     acme: Option<Arc<Notify>>,
     /// Counters for the app-obs log shipper. `None` when log shipping is off.
     obs: Option<Arc<crate::obs::Stats>>,
+    /// Queues rejected credentials for analysis. `None` when `APP_LB_SIEM=0`.
+    security: Option<crate::siem::SecuritySink>,
+    /// Findings, for `GET /security`. `None` when `APP_LB_SIEM=0`.
+    alerts: Option<Arc<crate::siem::AlertRing>>,
+    /// Counters for the detection engine, reported beside `obs` on `/metrics`.
+    siem: Option<Arc<crate::siem::SiemStats>>,
     /// How to turn a deployment's hostname into a link, given where the data
     /// plane actually listens.
     public_url: PublicUrl,
@@ -201,6 +209,7 @@ impl AdminApi {
         tokens: Arc<crate::tokens::TokenStore>,
         jobs: Arc<Jobs>,
         obs: Option<Arc<crate::obs::Stats>>,
+        siem: Option<&crate::siem::Siem>,
         public_url: PublicUrl,
     ) -> Self {
         // Render the display name into the page once; the placeholder appears in
@@ -239,6 +248,9 @@ impl AdminApi {
                 tokens,
                 jobs,
                 obs,
+                security: siem.map(|s| s.sink.clone()),
+                alerts: siem.map(|s| s.ring.clone()),
+                siem: siem.map(|s| s.stats.clone()),
                 public_url,
             },
         }
@@ -304,7 +316,7 @@ impl Caller {
 /// token may still reach, because the handler narrows the answer to that token's
 /// scope instead of refusing it.
 fn narrows_itself(matched: &str) -> bool {
-    matches!(matched, "/metrics" | "/dashboard")
+    matches!(matched, "/metrics" | "/dashboard" | "/security")
 }
 
 /// The deployment a matched route acts on, if it acts on one.
@@ -483,6 +495,12 @@ async fn authorize(
         .map(str::to_owned);
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_owned);
+    // Requires `into_make_service_with_connect_info` on the listener; without it
+    // this is always `None` and every alert raised here loses its source.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
 
     let verdict = decide_access(
         state.auth.as_deref(),
@@ -497,13 +515,63 @@ async fn authorize(
         now_secs(),
     );
 
+    // A rejected credential was invisible before this: the gate answered 401 or
+    // 403 and logged nothing, so a password spray against the dashboard left no
+    // trace anywhere. The `tracing::warn!` earns its place independently of the
+    // SIEM — it works with `APP_LB_SIEM=0`, and `obs::EventLayer` already ships
+    // it to app-obs.
+    let scheme = crate::siem::AuthScheme::of(header.as_deref());
     match verdict {
         Verdict::Allow(caller) => {
             req.extensions_mut().insert(caller);
             next.run(req).await
         }
-        Verdict::Unauthorized => unauthorized(),
-        Verdict::Forbidden(detail) => forbidden(detail),
+        Verdict::Unauthorized => {
+            tracing::warn!(
+                path = %path,
+                scheme = scheme.as_str(),
+                client = ?peer,
+                "admin API request rejected: no usable credential",
+            );
+            observe_auth_failure(&state, peer, &path, AuthAction::AdminRejected, scheme);
+            unauthorized()
+        }
+        Verdict::Forbidden(detail) => {
+            tracing::warn!(
+                path = %path,
+                scheme = scheme.as_str(),
+                client = ?peer,
+                detail = %detail,
+                "admin API request rejected: credential is out of scope",
+            );
+            observe_auth_failure(&state, peer, &path, AuthAction::AdminScope, scheme);
+            forbidden(detail)
+        }
+    }
+}
+
+/// Queue one rejected credential for analysis, if the SIEM is running.
+///
+/// Never carries the credential — not the password, not the token, not a prefix
+/// of either. Only the *scheme*, which is what separates token guessing from an
+/// unauthenticated probe.
+fn observe_auth_failure(
+    state: &AdminState,
+    peer: Option<std::net::IpAddr>,
+    path: &str,
+    action: AuthAction,
+    scheme: crate::siem::AuthScheme,
+) {
+    if let Some(siem) = &state.security {
+        siem.observe_auth(crate::siem::AuthObs {
+            ts: crate::obs::now_millis(),
+            client: peer,
+            deployment: None,
+            path: Box::from(path),
+            action,
+            scheme,
+            subject: None,
+        });
     }
 }
 
@@ -727,6 +795,12 @@ struct MetricsResponse {
     /// distinguish a quiet deployment from a full queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     obs: Option<crate::obs::ObsSnapshot>,
+    /// Detection-engine counters and a live alert tally, absent when
+    /// `APP_LB_SIEM=0`. On the *fast* poll rather than only on `/security` so an
+    /// alert reaches the dashboard's stat tiles within two seconds, and so a
+    /// dropping queue is visible next to `obs.dropped`, which fails the same way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    security: Option<SecuritySummary>,
     /// The slice of deployments this response carries. Scoped by the query
     /// parameters on `MetricsQuery` — at fleet scale the full list is megabytes,
     /// and the dashboard polls it every few seconds.
@@ -738,6 +812,55 @@ struct MetricsResponse {
     /// to the number registered; a number that climbs past it means retirement
     /// is not keeping up, which is the leak this used to have.
     tracked_deployments: usize,
+}
+
+/// The three numbers the dashboard's alert tile needs, without the alert list.
+///
+/// Separate from [`SecurityResponse`] so the two-second metrics poll does not
+/// carry a few hundred alerts it is not going to render.
+#[derive(Serialize)]
+struct SecuritySummary {
+    /// Alerts currently held in the ring.
+    open: usize,
+    /// How many of those are high or critical — what the tile colours on.
+    urgent: u64,
+    /// Observations refused because the queue was full. Non-zero means detection
+    /// is sampling rather than complete.
+    dropped: u64,
+    /// Whether the per-client table is full, which means the same thing for
+    /// sources rather than for events.
+    clients_at_capacity: bool,
+}
+
+/// `GET /security`.
+///
+/// Behind the same gate as `/metrics`, and deliberately: it enumerates attacker
+/// addresses and the exact probes that reached the fleet.
+#[derive(Serialize)]
+struct SecurityResponse {
+    generated_at: u64,
+    /// `false` with an empty list when `APP_LB_SIEM=0`, rather than a 404. The
+    /// dashboard has to be able to render "off"; a 404 is indistinguishable from
+    /// an app-lb too old to have this route.
+    enabled: bool,
+    window_secs: u64,
+    /// Newest first, which is the order the dashboard renders.
+    alerts: Vec<crate::siem::Alert>,
+    totals: crate::siem::SeverityTotals,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<crate::siem::SiemSnapshot>,
+}
+
+/// Query parameters for `GET /security`.
+#[derive(Debug, Default, Deserialize)]
+struct SecurityQuery {
+    /// Only alerts at or above this severity.
+    severity: Option<String>,
+    /// Only this rule, e.g. `auth.brute-force`.
+    rule: Option<String>,
+    /// Only alerts attributed to this deployment.
+    deployment: Option<String>,
+    limit: Option<usize>,
 }
 
 /// Query parameters for `GET /metrics`.
@@ -956,9 +1079,97 @@ async fn metrics_snapshot(
         fleet,
         global,
         obs: state.obs.as_ref().map(|o| o.snapshot()),
+        security: security_summary(&state),
         deployments: views,
         matched,
         tracked_deployments: tracked,
+    })
+}
+
+/// The alert tile's numbers. Fleet-wide regardless of any deployment filter, as
+/// `host`/`fleet`/`global` are — a filter narrows the table, not the system.
+fn security_summary(state: &AdminState) -> Option<SecuritySummary> {
+    let (ring, stats) = (state.alerts.as_ref()?, state.siem.as_ref()?);
+    let totals = ring.totals();
+    let s = stats.snapshot();
+    Some(SecuritySummary {
+        open: ring.len(),
+        urgent: totals.high + totals.critical,
+        dropped: s.dropped,
+        clients_at_capacity: s.clients_at_capacity,
+    })
+}
+
+/// `GET /security` — the findings, newest first.
+///
+/// Narrowed for a deployment-scoped token exactly as `/metrics` is, with one
+/// extra rule: alerts carrying no deployment are dropped for such a caller.
+/// Those are the admin-plane and unrouted-traffic findings, and the set of
+/// addresses attacking the LB itself is fleet information a sandbox-scoped token
+/// has no business reading.
+async fn security_snapshot(
+    State(state): State<AdminState>,
+    Query(q): Query<SecurityQuery>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let now = now_secs();
+    let scope = caller.as_ref().and_then(|c| c.0.visible());
+
+    let Some(ring) = state.alerts.as_ref() else {
+        // Enabled:false rather than 404 — see `SecurityResponse::enabled`.
+        return Json(SecurityResponse {
+            generated_at: now,
+            enabled: false,
+            window_secs: 0,
+            alerts: Vec::new(),
+            totals: crate::siem::SeverityTotals {
+                info: 0,
+                low: 0,
+                medium: 0,
+                high: 0,
+                critical: 0,
+            },
+            stats: None,
+        });
+    };
+
+    let min = q.severity.as_deref().and_then(crate::siem::Severity::parse);
+    let limit = q.limit.unwrap_or(200).min(1000);
+
+    // Read the whole ring and filter, rather than filtering inside it: the ring
+    // is a few hundred entries and this keeps the lock hold to one clone.
+    let alerts = ring
+        .recent(usize::MAX)
+        .into_iter()
+        .filter(|a| match scope {
+            None => true,
+            Some(ids) => a
+                .deployment
+                .as_deref()
+                .is_some_and(|d| ids.iter().any(|id| id == d)),
+        })
+        .filter(|a| min.is_none_or(|m| a.severity >= m))
+        .filter(|a| q.rule.as_deref().is_none_or(|r| a.rule == r))
+        .filter(|a| {
+            q.deployment
+                .as_deref()
+                .is_none_or(|d| a.deployment.as_deref() == Some(d))
+        })
+        .take(limit)
+        .collect();
+
+    Json(SecurityResponse {
+        generated_at: now,
+        enabled: true,
+        window_secs: ring.window_secs(),
+        alerts,
+        totals: ring.totals(),
+        // Fleet-wide counters: withheld from a scoped caller, for whom they
+        // would describe traffic they cannot see.
+        stats: scope
+            .is_none()
+            .then(|| state.siem.as_ref().map(|s| s.snapshot()))
+            .flatten(),
     })
 }
 
@@ -1854,7 +2065,12 @@ fn router(state: AdminState) -> Router {
     // The dashboard view + its data source are always behind the optional gate.
     let view = Router::new()
         .route("/metrics", get(metrics_snapshot))
-        .route("/dashboard", get(dashboard));
+        .route("/dashboard", get(dashboard))
+        // View tier, not CRUD: the dashboard is its consumer, so the browser's
+        // cached view credentials have to work. It must never be ungated — it
+        // enumerates attacker addresses and the probes that reached the fleet —
+        // and this group is the one that is gated whenever a password is set.
+        .route("/security", get(security_snapshot));
 
     // The deployment CRUD API — register/edit/scale/delete/evict, plus the reads
     // that expose the spec (env vars can hold secrets). Gated too iff
@@ -1943,7 +2159,20 @@ impl BackgroundService for AdminApi {
         };
         tracing::info!(addr = %self.addr, "admin API listening");
 
-        let served = axum::serve(listener, router(self.state.clone()))
+        // `into_make_service_with_connect_info` rather than the bare router:
+        // without it there is no `ConnectInfo` extension anywhere in the admin
+        // plane, so every rejected credential would be recorded with no source
+        // address and the brute-force rule could never fire. That failure is
+        // silent — the SIEM looks healthy and detects nothing — which is why it
+        // is worth a comment rather than just a call.
+        //
+        // The admin listener defaults to 127.0.0.1, so in the usual deployment
+        // this is a loopback address and the *count* is the useful part; the
+        // address only means something when the port is exposed directly.
+        let served = axum::serve(
+            listener,
+            router(self.state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+        )
             .with_graceful_shutdown(async move {
                 while shutdown.changed().await.is_ok() {
                     if *shutdown.borrow() {

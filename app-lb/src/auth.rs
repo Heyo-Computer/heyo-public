@@ -142,6 +142,10 @@ pub struct RequestInfo<'a> {
     /// The value of an `Authorization: Bearer …` header, if there was one. An
     /// app-token gate checks this; a Google gate ignores it.
     pub bearer: Option<String>,
+    /// The socket peer, for the SIEM's per-source rules. `None` in tests and for
+    /// a non-inet peer. Never derived from a forwarded header — see
+    /// `proxy::request_info`.
+    pub client: Option<std::net::IpAddr>,
 }
 
 pub struct Authenticator {
@@ -154,6 +158,39 @@ pub struct Authenticator {
     /// Overridable so the token exchange can be pointed at a stub in tests.
     token_endpoint: String,
     authorize_endpoint: String,
+    /// Queues rejected sign-ins for analysis. `None` when `APP_LB_SIEM=0`, and in
+    /// tests.
+    security: Option<crate::siem::SecuritySink>,
+}
+
+impl Authenticator {
+    /// Queue one refused sign-in for analysis.
+    ///
+    /// Never carries a token or a code — only which step refused, and for the
+    /// allow-list case the address that was refused, which is already in the
+    /// `tracing::info!` beside it and is what the enumeration rule counts.
+    fn observe_auth(
+        &self,
+        deployment: &str,
+        req: &RequestInfo<'_>,
+        action: crate::siem::AuthAction,
+        subject: Option<&str>,
+    ) {
+        if let Some(siem) = &self.security {
+            siem.observe_auth(crate::siem::AuthObs {
+                ts: crate::obs::now_millis(),
+                client: req.client,
+                deployment: Some(Box::from(deployment)),
+                path: Box::from(req.path),
+                action,
+                scheme: match req.bearer {
+                    Some(_) => crate::siem::AuthScheme::Bearer,
+                    None => crate::siem::AuthScheme::None,
+                },
+                subject: subject.map(Box::from),
+            });
+        }
+    }
 }
 
 impl std::fmt::Debug for Authenticator {
@@ -170,11 +207,13 @@ impl Authenticator {
         key: Vec<u8>,
         secrets: Arc<SecretStore>,
         tokens: Option<Arc<crate::tokens::TokenStore>>,
+        security: Option<crate::siem::SecuritySink>,
     ) -> Self {
         Self {
             key,
             secrets,
             tokens,
+            security,
             http: reqwest::Client::builder()
                 .timeout(TOKEN_TIMEOUT)
                 // A login is a person waiting; there is no retry that helps.
@@ -272,6 +311,17 @@ impl Authenticator {
                 "request admitted by app-token",
             );
             return Decision::Allow(Box::new(None));
+        }
+
+        // Reaching here with a bearer in hand means it was presented and did not
+        // admit — expired, revoked, forged, or scoped to another deployment.
+        //
+        // Gated on `bearer.is_some()` deliberately: a browser sends no
+        // `Authorization` header on any request to a gated deployment, so
+        // observing the no-credential case would flood the queue with the single
+        // most common non-event there is.
+        if gate.accepts_app_token() && req.bearer.is_some() {
+            self.observe_auth(deployment_id, req, crate::siem::AuthAction::GateToken, None);
         }
 
         match self.session(gate, deployment_id, req) {
@@ -407,6 +457,7 @@ impl Authenticator {
                 deployment = %deployment_id,
                 "sign-in state did not match the flow cookie; refusing",
             );
+            self.observe_auth(deployment_id, req, crate::siem::AuthAction::SigninState, None);
             return Response::text(400, "the sign-in state did not match\n");
         }
 
@@ -433,6 +484,12 @@ impl Authenticator {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(deployment = %deployment_id, error = %e, "token exchange failed");
+                self.observe_auth(
+                    deployment_id,
+                    req,
+                    crate::siem::AuthAction::SigninExchange,
+                    None,
+                );
                 return Response::text(502, "could not complete sign-in with the provider\n");
             }
         };
@@ -441,6 +498,7 @@ impl Authenticator {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!(deployment = %deployment_id, error = %e, "id token rejected");
+                self.observe_auth(deployment_id, req, crate::siem::AuthAction::SigninToken, None);
                 return Response::text(403, format!("sign-in was rejected: {e}\n"));
             }
         };
@@ -454,6 +512,12 @@ impl Authenticator {
                 deployment = %deployment_id,
                 email = %identity.email,
                 "sign-in refused by the allow-list",
+            );
+            self.observe_auth(
+                deployment_id,
+                req,
+                crate::siem::AuthAction::SigninRefused,
+                Some(&identity.email),
             );
             return Response::text(
                 403,
@@ -919,7 +983,7 @@ mod tests {
             data: BTreeMap::from([("client_secret".to_string(), "s3cret".to_string())]),
             updated_at: 0,
         });
-        Authenticator::new(vec![7u8; 32], store, None)
+        Authenticator::new(vec![7u8; 32], store, None, None)
     }
 
     fn req<'a>(path: &'a str, cookies: Vec<String>) -> RequestInfo<'a> {
@@ -931,6 +995,7 @@ mod tests {
             secure: true,
             wants_html: true,
             bearer: None,
+            client: None,
         }
     }
 
@@ -967,7 +1032,7 @@ mod tests {
             let tokens = Arc::new(TokenStore::new("/nonexistent/tokens.json"));
             let secrets = Arc::new(SecretStore::new("/nonexistent/secrets.json", None));
             (
-                Authenticator::new(vec![7u8; 32], secrets, Some(tokens.clone())),
+                Authenticator::new(vec![7u8; 32], secrets, Some(tokens.clone()), None),
                 tokens,
             )
         }
@@ -1216,7 +1281,7 @@ mod tests {
         ));
 
         // Signed with a different key.
-        let other = Authenticator::new(vec![9u8; 32], Arc::new(SecretStore::new("x.json", None)), None);
+        let other = Authenticator::new(vec![9u8; 32], Arc::new(SecretStore::new("x.json", None)), None, None);
         let forged = session_cookie(&other, &g, &id, now_secs() + 600);
         assert!(matches!(
             a.decide(&g, "web", &req("/", vec![forged])).await,
@@ -1416,7 +1481,7 @@ mod tests {
         assert_eq!(a.verify("garbage"), None);
         assert_eq!(a.verify(&format!("{token}x")), None);
 
-        let other = Authenticator::new(vec![1u8; 32], Arc::new(SecretStore::new("x.json", None)), None);
+        let other = Authenticator::new(vec![1u8; 32], Arc::new(SecretStore::new("x.json", None)), None, None);
         assert_eq!(other.verify(&token), None, "a different key must not verify");
     }
 

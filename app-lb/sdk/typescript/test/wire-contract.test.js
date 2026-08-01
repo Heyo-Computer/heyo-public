@@ -50,7 +50,14 @@ const KNOWN = {
     HostUsage: ["available", "cpu_count", "cpu_percent", "memory_total_bytes", "memory_used_bytes", "sampled_at_ms"],
     FleetPool: ["deployments", "ready", "draining", "pending", "total_in_flight"],
     ObsStats: ["queued", "dropped", "shipped", "failed", "healthy"],
-    MetricsResponse: ["generated_at", "uptime_secs", "host", "fleet", "global", "obs", "deployments", "matched", "tracked_deployments"],
+    MetricsResponse: ["generated_at", "uptime_secs", "host", "fleet", "global", "obs", "security", "deployments", "matched", "tracked_deployments"],
+    SecuritySummary: ["open", "urgent", "dropped", "clients_at_capacity"],
+    SecurityResponse: ["generated_at", "enabled", "window_secs", "alerts", "totals", "stats"],
+    // `ecs` is a free-form ECS map by design, so it has no declaration to check
+    // against — app-lb may add fields there without this being a contract change.
+    SecurityAlert: ["id", "ts", "last_ts", "rule", "severity", "title", "client", "deployment", "path", "technique", "count", "ecs"],
+    SeverityTotals: ["info", "low", "medium", "high", "critical"],
+    SiemStats: ["observed", "dropped", "analyzed", "raised", "suppressed", "tracked_clients", "clients_at_capacity"],
     JobRecord: ["id", "deployment", "kind", "status", "started_at", "finished_at", "error", "log", "repo", "ref", "commit", "dockerfile", "image", "rolled_out", "store", "artifact", "digest", "bytes", "reused", "working_dir", "commands_total", "commands_run", "verified"],
     SecretSummary: ["id", "description", "keys", "updated_at", "encrypted_at_rest"],
     CertStatus: ["host", "not_after", "issuer", "needs_renewal"],
@@ -70,6 +77,7 @@ const FIXTURES = {
   "deployment-status-artifact": "DeploymentStatus",
   "deployment-view-site": "DeploymentView",
   "metrics-response": "MetricsResponse",
+  "security-response": "SecurityResponse",
   "job-build": "JobRecord",
   "job-pull": "JobRecord",
   "job-update": "JobRecord",
@@ -90,13 +98,14 @@ const NESTED = {
   build: "BuildSpec", artifact: "ArtifactSpec", site: "SiteSpec", update: "UpdateSpec",
   auth: "AuthGate", client_secret: "SecretRef", pool: "PoolStatus", host: "HostUsage",
   fleet: "FleetPool", obs: "ObsStats", metrics: "DeploymentMetrics",
+  security: "SecuritySummary", totals: "SeverityTotals", stats: "SiemStats",
   global: "DeploymentMetrics", requests: "StatusCounts", latency_ms: "Histogram",
   cold_start_s: "Histogram", autoscale: "AutoscaleCounts",
 };
 
 /** Which declaration governs the *elements* of an array, by its key. */
 const ELEMENTS = {
-  routes: "RouteRule", vms: "VmStatus", deployments: "DeploymentView",
+  routes: "RouteRule", vms: "VmStatus", deployments: "DeploymentView", alerts: "SecurityAlert",
   pending_vms: "PendingVmView", buckets: "Bucket", env_from: "SecretEnv",
 };
 

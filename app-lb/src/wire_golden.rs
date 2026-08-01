@@ -345,6 +345,12 @@ fn metrics_response_is_stable() {
                 failed: 3,
                 healthy: true,
             }),
+            security: Some(SecuritySummary {
+                open: 12,
+                urgent: 3,
+                dropped: 0,
+                clients_at_capacity: false,
+            }),
             deployments: vec![DeploymentView {
                 id: spec.id.clone(),
                 kind: "vm",
@@ -595,6 +601,97 @@ fn the_small_responses_are_stable() {
         "api-error",
         &ApiError {
             error: "no deployment \"demo\"".into(),
+        },
+    );
+}
+
+/// `GET /security`, with one alert of each shape a client has to render: a
+/// signature hit against a deployment, and a control-plane finding that names
+/// none.
+///
+/// The `ecs` block is the point of normalizing through u-siem at all — the field
+/// *names* in this fixture are the crate's `field_dictionary` constants, so a
+/// version bump that renames one shows up as a diff here. There is deliberately
+/// no `url.query` key, and there never can be: no parser sets one.
+#[test]
+fn security_response_is_stable() {
+    use crate::siem::{Alert, Severity, SeverityTotals, SiemSnapshot};
+
+    golden(
+        "security-response",
+        &SecurityResponse {
+            generated_at: 1_722_400_000,
+            enabled: true,
+            window_secs: 60,
+            alerts: vec![
+                Alert {
+                    id: 41,
+                    ts: 1_722_399_940_000,
+                    last_ts: 1_722_399_998_000,
+                    rule: "traffic.scanner",
+                    severity: Severity::Medium,
+                    title: "203.0.113.9 is probing for unserved paths".into(),
+                    client: Some("203.0.113.9".into()),
+                    deployment: Some("demo".into()),
+                    path: Some("/wp-login.php".into()),
+                    technique: Some("T1595"),
+                    count: 214,
+                    ecs: Some(serde_json::json!({
+                        "event.action": "http-request",
+                        "event.category": "web",
+                        "event.outcome": "failure",
+                        "http.request.method": "GET",
+                        "http.response.status_code": 404,
+                        "observer.name": "app-lb",
+                        "source.ip": "203.0.113.9",
+                        "url.domain": "demo.example.com",
+                        "url.extension": "php",
+                        "url.path": "/wp-login.php",
+                        "tags": ["access", "external"],
+                    })),
+                },
+                Alert {
+                    id: 42,
+                    ts: 1_722_399_980_000,
+                    last_ts: 1_722_399_999_000,
+                    rule: "auth.brute-force",
+                    severity: Severity::High,
+                    title: "198.51.100.7 is failing authentication repeatedly".into(),
+                    client: Some("198.51.100.7".into()),
+                    // Admin-plane: no deployment of its own, so a
+                    // deployment-scoped token must not be shown this row.
+                    deployment: None,
+                    path: Some("/metrics".into()),
+                    technique: Some("T1110"),
+                    count: 9,
+                    ecs: Some(serde_json::json!({
+                        "event.action": "admin-rejected",
+                        "event.category": "authentication",
+                        "event.outcome": "failure",
+                        "http.request.authorization.scheme": "basic",
+                        "observer.name": "app-lb",
+                        "source.ip": "198.51.100.7",
+                        "url.path": "/metrics",
+                        "tags": ["auth-failure", "external"],
+                    })),
+                },
+            ],
+            totals: SeverityTotals {
+                info: 0,
+                low: 0,
+                medium: 11,
+                high: 3,
+                critical: 0,
+            },
+            stats: Some(SiemSnapshot {
+                observed: 918_273,
+                dropped: 0,
+                analyzed: 918_273,
+                raised: 14,
+                suppressed: 4_118,
+                tracked_clients: 118,
+                clients_at_capacity: false,
+            }),
         },
     );
 }

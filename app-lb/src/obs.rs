@@ -70,7 +70,7 @@ const SELF_TARGET: &str = module_path!();
 /// ingest has a body limit, and one pathological record must not cost the whole
 /// batch it travels in.
 const MAX_PATH: usize = 512;
-const MAX_MESSAGE: usize = 4096;
+pub(crate) const MAX_MESSAGE: usize = 4096;
 
 /// Ceiling on one POST. A collector that accepts the connection and then stalls
 /// would otherwise hold the only shipping task forever, which shows up as a full
@@ -83,7 +83,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// a delayed restart.
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn now_millis() -> i64 {
+/// Shared with [`crate::siem`], which stamps its alerts on the same clock so an
+/// alert and the access record that triggered it sort together in app-obs.
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -91,7 +93,7 @@ fn now_millis() -> i64 {
 }
 
 /// Truncate on a char boundary, marking that it happened.
-fn truncate(mut s: String, max: usize) -> String {
+pub(crate) fn truncate(mut s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
     }
@@ -141,7 +143,9 @@ pub struct Obs {
     pub stats: Arc<Stats>,
 }
 
-fn env_flag(name: &str, default: bool) -> bool {
+/// Shared with [`crate::siem`] rather than duplicated there, so the two cannot
+/// drift on what counts as true or on whether a malformed number is fatal.
+pub(crate) fn env_flag(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(v) => matches!(
             v.trim().to_ascii_lowercase().as_str(),
@@ -151,7 +155,7 @@ fn env_flag(name: &str, default: bool) -> bool {
     }
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
+pub(crate) fn env_usize(name: &str, default: usize) -> usize {
     match std::env::var(name) {
         Ok(v) => match v.trim().parse::<usize>() {
             Ok(n) if n > 0 => n,
@@ -416,6 +420,15 @@ impl LogSink {
     pub fn send_access(&self, access: Access<'_>) {
         self.send(access.into_record(&self.deployment));
     }
+
+    /// The id records that name no deployment are filed under.
+    ///
+    /// Shared with [`crate::siem`] so an alert raised against the LB itself lands
+    /// beside the events that explain it, rather than under a second id derived
+    /// by reading the environment twice.
+    pub fn deployment(&self) -> Arc<str> {
+        self.deployment.clone()
+    }
 }
 
 /// Log level for a proxied request.
@@ -557,8 +570,14 @@ impl EventLayer {
 }
 
 /// Whether an event came from app-lb itself, and not from this module.
+///
+/// [`crate::siem`] is excluded for a second-order version of the same reason:
+/// if app-obs is itself fronted by this app-lb, a shipped record becomes a
+/// proxied request, which becomes an observation, which can raise an alert, which
+/// ships another record. The SIEM's own alert-rate ceiling bounds that loop on
+/// the alert side; this closes it on the tracing side.
 fn ships_target(target: &str) -> bool {
-    if target.starts_with(SELF_TARGET) {
+    if target.starts_with(SELF_TARGET) || target.starts_with("app_lb::siem") {
         return false;
     }
     target == "app_lb" || target.starts_with("app_lb::")

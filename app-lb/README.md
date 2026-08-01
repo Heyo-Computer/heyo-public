@@ -78,6 +78,18 @@ Configuration is environment-only:
 | `APP_LB_OBS_DEPLOYMENT` | `_lb` | Deployment id in app-obs for app-lb's *own* records — name it per host (`lb-us2`) when several LBs ship to one collector |
 | `APP_LB_OBS_ACCESS_LOG` | `true` | `0` to stop shipping the per-request access log |
 | `APP_LB_OBS_EVENTS` | `true` | `0` to stop shipping app-lb's own log events (and deploy-job output) |
+| `APP_LB_SIEM` | `true` | `0` to turn [security monitoring](#security-monitoring) off entirely |
+| `APP_LB_SIEM_QUEUE_CAPACITY` | `4096` | Observations buffered for analysis before new ones are dropped |
+| `APP_LB_SIEM_ALERT_CAPACITY` | `512` | Alerts held in memory for `GET /security` |
+| `APP_LB_SIEM_WINDOW_SECS` | `60` | Window every rate-based rule counts over |
+| `APP_LB_SIEM_MAX_CLIENTS` | `16384` | Source addresses tracked at once (~2 MB at the default) |
+| `APP_LB_SIEM_AUTH_THRESHOLD` | `8` | Authentication failures per window from one source before an alert |
+| `APP_LB_SIEM_SCAN_THRESHOLD` | `30` | 4xx responses per window from one source before it reads as scanning |
+| `APP_LB_SIEM_RATE_THRESHOLD` | `600` | Requests per window from one source before it reads as a spike |
+| `APP_LB_SIEM_SUPPRESS_SECS` | `300` | Repeats inside this fold into the open alert instead of raising a new one |
+| `APP_LB_SIEM_MAX_ALERTS_PER_MIN` | `60` | Hard ceiling on *new* alerts, for a distributed attack that cannot fold |
+| `APP_LB_SIEM_SCAN_QUERY` | `true` | `0` to match signatures against the path only, never the query string |
+| `APP_LB_SIEM_SHIP` | `true` | `0` to keep alerts local instead of sending them to app-obs |
 | `APP_LB_OBS_QUEUE_CAPACITY` | `8192` | Records buffered before new ones are dropped |
 | `APP_LB_OBS_BATCH` | `500` | Records per POST |
 | `APP_LB_OBS_FLUSH_SECS` | `2` | How long a record may wait for a fuller batch |
@@ -991,13 +1003,14 @@ dashboard is a complete view of what app-lb holds rather than a metrics screen:
 
 | Section | Shows | Source |
 | --- | --- | --- |
+| Security | authentication abuse, attack signatures and traffic anomalies, newest first | `GET /security` |
 | Deployments | pool gauges, per-VM load, **booting VMs with their age and daemon status** | `GET /metrics` |
 | Certificates | issued hostnames, issuer, expiry, renewal state — plus routed hostnames that have *no* certificate yet | `GET /certs` |
 | Secrets | ids, descriptions, key *names*, last update, whether the store is sealed | `GET /secrets` |
 | Deploy jobs | recent builds and host updates, their result, and a live transcript | `GET /jobs` |
 
-Two polling loops: the metrics view refreshes every 2s, and certificates, secrets
-and jobs — which change on human timescales — every 10s. The slow loop tightens to
+Two polling loops: the metrics view refreshes every 2s, and certificates, secrets,
+jobs and security alerts — which change on human timescales — every 10s. The slow loop tightens to
 2s while a job is running, since its record is the only progress there is.
 
 The dashboard is also interactive:
@@ -1646,8 +1659,13 @@ configuration must not be able to take the data plane down.
   process restarts; this is the copy that survives, and the one to read when a
   build *hangs* rather than fails.
 
-Records carry a `source` — `access`, `app-lb` or `job` — so the three are
-separable inside one deployment's log.
+- **Security alerts** — one record per finding from
+  [security monitoring](#security-monitoring), tagged `source=security`, with the
+  triggering event's ECS fields flattened alongside. This is the durable copy;
+  app-lb's own `GET /security` ring is bounded and does not survive a restart.
+
+Records carry a `source` — `access`, `app-lb`, `job` or `security` — so the four
+are separable inside one deployment's log.
 
 ### Naming the LB itself
 
@@ -1743,6 +1761,185 @@ app-obs gets the part worth querying.
 it — DEBUG is where the per-request routing chatter lives, which is a worse copy
 of the access log. `RUST_LOG` still bounds what ships, since it decides what
 app-lb logs at all.
+
+## Security monitoring
+
+app-lb sits at the edge of every deployment it fronts, so it already sees the
+one stream a SIEM wants most: every request, with its source address, host,
+path, status and latency. What it had no notion of was *malice*. Three things
+follow, and this is what fixes them:
+
+- **Authentication failure was invisible.** The admin gate answered a bad
+  credential with a 401 and logged nothing, so a password spray against
+  `/dashboard` left no trace anywhere.
+- **Scanner traffic was noticed and thrown away.** `/wp-login.php` probes
+  accumulate in the unrouted access log; nothing read them.
+- **Anomalies were only visible to somebody watching** the right dashboard card
+  at the right moment.
+
+It is **on by default** — unlike log shipping, it needs no external service to
+be useful, and a security feature you have to remember to enable protects
+nobody. `APP_LB_SIEM=0` turns it off.
+
+Events are normalized through [`u-siem`](https://crates.io/crates/u-siem) into
+ECS field names (`source.ip`, `url.path`, `http.response.status_code`), so an
+alert stored in app-obs is queryable next to anything else ECS-shaped. Only the
+crate's event model is used; the detection is app-lb's own, because `SiemRule`
+matches one log at a time and two of the three rule families below need a
+window.
+
+### What it watches
+
+**Authentication abuse.** Rejected credentials from the admin gate, the
+data-plane app-token gate and the Google sign-in flow.
+
+| Rule | Fires when | Severity |
+| --- | --- | --- |
+| `auth.brute-force` | `APP_LB_SIEM_AUTH_THRESHOLD` failures from one source in a window | high |
+| `auth.spray` | the same, spread across four or more deployments | high |
+| `auth.enumeration` | the same, against four or more distinct sign-in identities | high |
+| `auth.scope-denied` | repeated 403s — a *valid* credential reaching past its scope | medium |
+| `auth.signin-state` | a sign-in state/nonce mismatch; CSRF-shaped, so unwindowed | medium |
+
+**Attack signatures**, matched in one pass over the request path and — see
+below — the query string.
+
+| Rule | Catches | Severity |
+| --- | --- | --- |
+| `web.rce` | `${jndi:`, `/bin/sh`, shell chaining | critical |
+| `web.traversal` | `../`, `%2e%2e`, encoded variants | high |
+| `web.sqli` | `union select`, `' or 1=1`, `sleep(` | high |
+| `web.xss` | `<script`, `javascript:`, `onerror=` | medium |
+| `web.secret-probe` | `/.env`, `/.git/`, `/wp-login.php`, `/phpmyadmin` | medium |
+
+**Traffic anomalies**, per source address.
+
+| Rule | Fires when | Severity |
+| --- | --- | --- |
+| `traffic.scanner` | `APP_LB_SIEM_SCAN_THRESHOLD` 4xx responses *across many distinct paths* | medium |
+| `traffic.rate-spike` | `APP_LB_SIEM_RATE_THRESHOLD` requests in a window | medium |
+
+The distinctness requirement on `traffic.scanner` is what separates enumeration
+from one broken client retrying a single dead URL.
+
+### Reading it
+
+The dashboard grows a **Security** card above the deployment table, and an
+**Alerts** tile beside the fleet totals so a critical finding is visible without
+scrolling. `GET /security` is the same data as JSON, behind the same gate as
+`/metrics` — it names attacker addresses and the exact probes that reached the
+fleet, so it is never open when `/metrics` is not.
+
+```sh
+curl -su admin:s3cret localhost:9090/security
+curl -su admin:s3cret 'localhost:9090/security?severity=high&limit=20'
+```
+
+```json
+{"enabled": true, "window_secs": 60,
+ "alerts": [{"id": 41, "rule": "traffic.scanner", "severity": "medium",
+             "title": "203.0.113.9 is probing for unserved paths",
+             "client": "203.0.113.9", "deployment": "demo", "count": 214,
+             "ecs": {"source.ip": "203.0.113.9", "url.path": "/wp-login.php",
+                     "http.response.status_code": 404}}],
+ "totals": {"medium": 11, "high": 3, "critical": 0},
+ "stats": {"observed": 918273, "dropped": 0, "raised": 14,
+           "suppressed": 4118, "tracked_clients": 118}}
+```
+
+Filter with `?severity=`, `?rule=`, `?deployment=` and `?limit=`. A
+deployment-scoped [app-token](#app-tokens) gets its own deployments' alerts and
+never the ones attributed to the LB itself — the set of addresses attacking the
+control plane is fleet information.
+
+**`count` is the occurrence tally, not an alert count.** Repeats with the same
+rule, source and deployment fold into the open alert for
+`APP_LB_SIEM_SUPPRESS_SECS`, so a scanner making ten thousand requests produces
+*one* alert whose count climbs. Without that the ring would hold nothing but
+that scanner, and app-obs would store ten thousand records saying the same
+thing.
+
+Every new alert also ships to app-obs under `source=security` when
+`APP_LB_OBS_URL` is set, with the ECS fields flattened alongside — so the
+in-memory ring is the live view and app-obs is the durable one. An alert about
+the LB itself lands under `APP_LB_OBS_DEPLOYMENT`, like every other record that
+names no deployment.
+
+### The query string
+
+app-lb otherwise **never logs the query string**, because a sign-in callback
+carries an OAuth `code` there. Most SQL injection and XSS payloads, though, live
+in a parameter *value* — so a path-only detector is blind to the attacks it most
+needs to see.
+
+The resolution is to **scan it and never store it**. The raw query reaches the
+matcher as its own argument, is read, and is dropped with the observation; it is
+not a field on the record type the access log is built from, so no code path
+exists that could carry it to app-obs. On a match the alert records the
+parameter *name* and nothing else:
+
+```
+web.sqli attempt in query parameter "id" from 203.0.113.9
+```
+
+The honest cost: the raw query now sits in a bounded in-process queue for a few
+milliseconds, which it did not before. It never crosses a process boundary and
+never reaches disk. `APP_LB_SIEM_SCAN_QUERY=0` removes even that, at the price
+of most of the signature coverage.
+
+### It is not a dependency of the data plane
+
+The same contract as [log shipping](#it-is-not-a-dependency-of-the-data-plane),
+enforced the same way: recording an observation is a `try_send` into a bounded
+queue and nothing else — no lock, no await, no I/O, and no normalization on the
+request path. Analysis happens on one background task, and every way it can fail
+resolves to losing findings rather than to holding up a request.
+
+Which makes the failure mode worth naming, because **a SIEM that has stopped
+looking is indistinguishable from a quiet network**. Two counters say so out
+loud, on `/metrics`, on `/security` and on the dashboard card:
+
+- `dropped` — observations refused because the queue was full. Non-zero means
+  detection is *sampling*; raise `APP_LB_SIEM_QUEUE_CAPACITY`.
+- `clients_at_capacity` — the per-source table is full, so new addresses are not
+  being tracked. Raise `APP_LB_SIEM_MAX_CLIENTS`.
+
+That table is capped because an unbounded one would let an attacker with a
+botnet choose how much memory app-lb allocates. At the cap it sweeps whatever
+has aged out and then **drops the new observation rather than evicting a live
+entry** — evicting the least-recently-seen is exactly what an attacker
+engineers, by flooding fresh addresses until the entry counting their real
+activity is the one that goes.
+
+### What it deliberately does not do
+
+**No `X-Forwarded-For` trust.** Detectors key on the socket peer only. Keying on
+a client-supplied header would be an alert-spoofing and alert-flooding primitive
+on an unauthenticated path. The consequence is that behind another proxy every
+request appears to come from that proxy, and the per-source rules are only as
+useful as that is.
+
+**No credentials, ever.** An auth alert records the *scheme* (`basic`, `bearer`,
+`none`) and never the password, the token, or a prefix of either — not even the
+Basic username, since decoding it would mean parsing unauthenticated attacker
+input on the failure path for no detection gain.
+
+**No configuration auditing.** Who changed which deployment is a different
+question with a different answer; the [deploy-job records](#shipping-logs-to-app-obs)
+and app-lb's own events already cover it.
+
+**No persistence.** The ring and the windows are in memory, so a restart resets
+both. That is the right trade for a load balancer, and the reason
+`APP_LB_SIEM_SHIP` defaults on: app-obs holds the copy that outlives the process.
+
+**No IPv6 escape by rotation.** Sources are keyed by /32 for IPv4 and by **/64**
+for IPv6, because a /64 is a standard end-site allocation and an attacker
+rotating within one would otherwise reset every counter for free.
+
+One caveat about addresses: the admin listener defaults to `127.0.0.1`, so
+control-plane alerts usually name a loopback address and it is the *count* that
+carries the information. The address only means something when that port is
+exposed directly.
 
 ## Design notes
 
