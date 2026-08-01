@@ -34,6 +34,10 @@ use tokio::sync::Notify;
 /// same-origin `/metrics` poll) so it works over an SSH tunnel with no assets.
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
+/// The server-rendered landing page at `/`. Self-contained for the same reason
+/// the dashboard is: it has to work over an SSH tunnel with no route out.
+const DIRECTORY_HTML: &str = include_str!("directory.html");
+
 /// How to turn a deployment's hostname into a URL somebody can click.
 ///
 /// The dashboard runs on the *admin* listener, so it cannot infer the data
@@ -145,6 +149,10 @@ struct AdminState {
     /// The dashboard page with the display name substituted in, rendered once at
     /// startup. `Arc<str>` so cloning `AdminState` per request is a refcount bump.
     dashboard_html: Arc<str>,
+    /// The directory shell, with the display name already substituted. Only
+    /// `{{LEDE}}` and `{{CARDS}}` are left, and those are filled per request
+    /// because the registry moves.
+    directory_html: Arc<str>,
     /// `None` disables the gate — the dashboard and `/metrics` are then open.
     auth: Option<Arc<DashboardAuth>>,
     /// When true, the gate also covers the deployment CRUD routes (reflected in
@@ -216,6 +224,8 @@ impl AdminApi {
         // both the <title> and the <h1>.
         let dashboard_html: Arc<str> =
             Arc::from(DASHBOARD_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let directory_html: Arc<str> =
+            Arc::from(DIRECTORY_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
 
         // The gate turns on as soon as a password is set; the username is
         // optional and defaults to "admin", so one env var is enough to secure
@@ -239,6 +249,7 @@ impl AdminApi {
                 autoscaler,
                 metrics,
                 dashboard_html,
+                directory_html,
                 auth,
                 gate_admin,
                 started_at: now_secs(),
@@ -316,7 +327,7 @@ impl Caller {
 /// token may still reach, because the handler narrows the answer to that token's
 /// scope instead of refusing it.
 fn narrows_itself(matched: &str) -> bool {
-    matches!(matched, "/metrics" | "/dashboard" | "/security")
+    matches!(matched, "/" | "/metrics" | "/dashboard" | "/security")
 }
 
 /// The deployment a matched route acts on, if it acts on one.
@@ -1171,6 +1182,258 @@ async fn security_snapshot(
             .then(|| state.siem.as_ref().map(|s| s.snapshot()))
             .flatten(),
     })
+}
+
+// ---- the directory page -------------------------------------------------
+
+/// One clickable destination.
+///
+/// A card per *URL* rather than per deployment: a deployment with three
+/// hostnames genuinely offers three places to go, and this page exists to be
+/// clicked.
+struct DirectoryEntry {
+    url: String,
+    deployment: String,
+    kind: &'static str,
+    state: EntryState,
+    /// What is behind it, in a few words — "2 of 3 VMs ready", "serving /srv/www".
+    detail: String,
+}
+
+/// Whether following the link right now would reach anything.
+#[derive(PartialEq)]
+enum EntryState {
+    Ready,
+    /// Nothing available yet, but a VM is booting — a cold start, not an outage.
+    Starting,
+    /// Registered and routable with nothing healthy behind it.
+    Down,
+    /// A site: files on this host, so there is no backend to be up or down.
+    Files,
+}
+
+impl EntryState {
+    fn dot(&self) -> &'static str {
+        match self {
+            Self::Ready | Self::Files => "ready",
+            Self::Starting => "starting",
+            Self::Down => "down",
+        }
+    }
+}
+
+/// Collect what the directory shows, narrowed to what this caller may see.
+///
+/// Returns the linkable entries and, separately, the ids of deployments that are
+/// registered but have no URL a browser could be sent to. Those are reported
+/// rather than silently omitted: a directory that quietly drops things is worse
+/// than one that explains the gap, and "why isn't my deployment listed" has
+/// exactly one cause here.
+fn directory_entries(
+    state: &AdminState,
+    scope: Option<&[String]>,
+) -> (Vec<DirectoryEntry>, Vec<String>) {
+    let deployments = state.registry.deployments();
+    let mut entries = Vec::new();
+    let mut unlinkable = Vec::new();
+
+    for d in deployments.values() {
+        // Both operands are pure reads, so collapsing these is safe.
+        if let Some(ids) = scope
+            && !ids.iter().any(|id| id.as_str() == d.spec.id.as_str())
+        {
+            continue;
+        }
+
+        let urls: Vec<String> = d
+            .spec
+            .routes
+            .iter()
+            .filter_map(|r| state.public_url.of(r))
+            .collect();
+        if urls.is_empty() {
+            unlinkable.push(d.spec.id.clone());
+            continue;
+        }
+
+        let kind = deployment_kind(d);
+        let (entry_state, detail) = match d.spec.backend() {
+            // No backend by construction — app-lb answers these itself, so there
+            // is nothing that can be down.
+            crate::config::Backend::Site => (
+                EntryState::Files,
+                match d.spec.site.as_ref() {
+                    Some(s) => format!("serving {}", s.root),
+                    None => "static files".to_string(),
+                },
+            ),
+            crate::config::Backend::Upstreams => {
+                let backends = d.backends();
+                let up = backends.iter().filter(|b| b.is_available()).count();
+                let total = backends.len().max(d.spec.upstreams.len());
+                (
+                    if up > 0 { EntryState::Ready } else { EntryState::Down },
+                    format!("{up} of {total} {} up", plural(total, "upstream")),
+                )
+            }
+            crate::config::Backend::Vm => {
+                let backends = d.backends();
+                let up = backends.iter().filter(|b| b.is_available()).count();
+                let pending = d.pending().len();
+                if up > 0 {
+                    (
+                        EntryState::Ready,
+                        format!("{up} {} ready", plural(up, "VM")),
+                    )
+                } else if pending > 0 {
+                    (
+                        EntryState::Starting,
+                        format!("{pending} {} booting", plural(pending, "VM")),
+                    )
+                } else if d.spec.scaling.min_replicas == 0 {
+                    // Scale-to-zero is the configured state, not a fault: the
+                    // first request boots a VM. Saying "down" here would send
+                    // somebody debugging a system that is working.
+                    (EntryState::Starting, "idle — starts on first request".into())
+                } else {
+                    (EntryState::Down, "no healthy VMs".into())
+                }
+            }
+        };
+
+        for url in urls {
+            entries.push(DirectoryEntry {
+                url,
+                deployment: d.spec.id.clone(),
+                kind,
+                state: match entry_state {
+                    EntryState::Ready => EntryState::Ready,
+                    EntryState::Starting => EntryState::Starting,
+                    EntryState::Down => EntryState::Down,
+                    EntryState::Files => EntryState::Files,
+                },
+                detail: detail.clone(),
+            });
+        }
+    }
+
+    // Stable order, so a reload does not reshuffle the page under a cursor.
+    entries.sort_by(|a, b| a.deployment.cmp(&b.deployment).then(a.url.cmp(&b.url)));
+    unlinkable.sort();
+    (entries, unlinkable)
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
+/// The cards, as HTML.
+///
+/// Pure, so the escaping and the empty states are testable without a listener.
+/// Every interpolation goes through [`html_escape`] — a deployment id and a
+/// hostname are operator-supplied rather than attacker-supplied, but they reach
+/// this page from a JSON body over the admin API, which is close enough to
+/// untrusted that the distinction is not worth relying on.
+fn render_directory_cards(entries: &[DirectoryEntry], unlinkable: &[String]) -> String {
+    let note = if unlinkable.is_empty() {
+        String::new()
+    } else {
+        let ids = unlinkable
+            .iter()
+            .map(|id| format!("<code>{}</code>", html_escape(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "<div class=\"note\">Not shown: {ids} — a route with only a \
+             <code>host_suffix</code> or a <code>path_prefix</code> names no single \
+             hostname to link to.</div>"
+        )
+    };
+
+    if entries.is_empty() {
+        let body = if unlinkable.is_empty() {
+            "Nothing is registered yet. <code>POST /deployments</code>, or \
+             <code>serverctl apply</code>, and it appears here."
+        } else {
+            "No deployment has a linkable hostname."
+        };
+        return format!("<div class=\"empty\">{body}</div>{note}");
+    }
+
+    let cards = entries
+        .iter()
+        .map(|e| {
+            format!(
+                "<a class=\"card\" href=\"{url}\">\
+                   <div class=\"card-head\">\
+                     <span class=\"id\">{id}</span>\
+                     <span class=\"tag {kind}\">{kind}</span>\
+                   </div>\
+                   <div class=\"url\">{url}</div>\
+                   <div class=\"meta\"><span class=\"dot {dot}\"></span>{detail}</div>\
+                 </a>",
+                url = html_escape(&e.url),
+                id = html_escape(&e.deployment),
+                kind = e.kind,
+                dot = e.state.dot(),
+                detail = html_escape(&e.detail),
+            )
+        })
+        .collect::<String>();
+
+    format!("<div class=\"grid\">{cards}</div>{note}")
+}
+
+/// One line under the title: what this page is showing.
+fn directory_lede(entries: &[DirectoryEntry]) -> String {
+    if entries.is_empty() {
+        return "No deployments are routable yet.".into();
+    }
+    // Only the deployments these URLs actually came from. Counting the
+    // unlinkable ones here would claim URLs across deployments that contributed
+    // none; they get their own line under the cards instead.
+    let deployments = {
+        let mut ids: Vec<&str> = entries.iter().map(|e| e.deployment.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    };
+    let down = entries.iter().filter(|e| e.state == EntryState::Down).count();
+    let mut s = format!(
+        "{} {} across {} {}.",
+        entries.len(),
+        plural(entries.len(), "URL"),
+        deployments,
+        plural(deployments, "deployment"),
+    );
+    if down > 0 {
+        s.push_str(&format!(" {down} with nothing healthy behind {}.",
+            if down == 1 { "it" } else { "them" }));
+    }
+    s
+}
+
+/// `GET /` — a directory of everything this app-lb routes.
+///
+/// Server-rendered, unlike `/dashboard`: it is a landing page that should be
+/// complete in its first response, work without JavaScript, and not hold a
+/// polling connection open. The cards are built per request because the
+/// underlying registry changes; the app name is substituted once at startup.
+async fn directory(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let scope = caller.as_ref().and_then(|c| c.0.visible());
+    let (entries, unlinkable) = directory_entries(&state, scope);
+    let html = state
+        .directory_html
+        .replace("{{LEDE}}", &html_escape(&directory_lede(&entries)))
+        .replace("{{CARDS}}", &render_directory_cards(&entries, &unlinkable));
+    Html(html)
 }
 
 async fn dashboard(State(state): State<AdminState>) -> impl IntoResponse {
@@ -2064,6 +2327,9 @@ async fn get_job(
 fn router(state: AdminState) -> Router {
     // The dashboard view + its data source are always behind the optional gate.
     let view = Router::new()
+        // The landing page. Same tier as the dashboard: it lists every hostname
+        // this app-lb routes, which is the same inventory `/metrics` exposes.
+        .route("/", get(directory))
         .route("/metrics", get(metrics_snapshot))
         .route("/dashboard", get(dashboard))
         // View tier, not CRUD: the dashboard is its consumer, so the browser's
@@ -2318,6 +2584,141 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The landing page at `/`. Rendering is a pure function of the collected
+    /// entries, so all of this runs without a listener or a registry.
+    mod directory {
+        use super::*;
+
+        fn entry(id: &str, url: &str, state: EntryState) -> DirectoryEntry {
+            DirectoryEntry {
+                url: url.into(),
+                deployment: id.into(),
+                kind: "vm",
+                state,
+                detail: "2 VMs ready".into(),
+            }
+        }
+
+        #[test]
+        fn a_card_links_to_the_data_plane_url() {
+            let html = render_directory_cards(
+                &[entry("demo", "https://demo.example.com", EntryState::Ready)],
+                &[],
+            );
+            assert!(html.contains(r#"href="https://demo.example.com""#));
+            assert!(html.contains(">demo<"));
+            assert!(html.contains("dot ready"));
+        }
+
+        /// A deployment with several hostnames offers several destinations, and
+        /// this page exists to be clicked — so each gets its own card.
+        #[test]
+        fn every_url_gets_its_own_card() {
+            let html = render_directory_cards(
+                &[
+                    entry("demo", "https://a.example.com", EntryState::Ready),
+                    entry("demo", "https://b.example.com", EntryState::Ready),
+                ],
+                &[],
+            );
+            assert_eq!(html.matches("class=\"card\"").count(), 2);
+        }
+
+        /// Silently omitting them would make "why isn't my deployment listed?"
+        /// unanswerable from the page.
+        #[test]
+        fn a_deployment_with_no_linkable_host_is_explained_not_dropped() {
+            let html = render_directory_cards(
+                &[entry("demo", "https://demo.example.com", EntryState::Ready)],
+                &["internal-only".into()],
+            );
+            assert!(html.contains("internal-only"));
+            assert!(html.contains("host_suffix"));
+        }
+
+        #[test]
+        fn an_empty_fleet_says_how_to_fill_it() {
+            let html = render_directory_cards(&[], &[]);
+            assert!(html.contains("Nothing is registered yet"));
+            assert!(html.contains("POST /deployments"));
+        }
+
+        /// Everything on this page arrives through the admin API's JSON, which
+        /// is close enough to untrusted that escaping is not optional.
+        #[test]
+        fn operator_supplied_text_is_escaped() {
+            let html = render_directory_cards(
+                &[entry(
+                    "<script>alert(1)</script>",
+                    "https://x/\"><img src=x onerror=alert(1)>",
+                    EntryState::Ready,
+                )],
+                &["<b>bad</b>".into()],
+            );
+            assert!(!html.contains("<script>alert"), "id must be escaped");
+            assert!(!html.contains("<img src=x"), "url must be escaped");
+            assert!(!html.contains("<b>bad"), "the note must be escaped too");
+            assert!(html.contains("&lt;script&gt;"));
+        }
+
+        #[test]
+        fn the_lede_counts_urls_deployments_and_outages() {
+            let entries = vec![
+                entry("a", "https://a1", EntryState::Ready),
+                entry("a", "https://a2", EntryState::Ready),
+                entry("b", "https://b1", EntryState::Down),
+            ];
+            let lede = directory_lede(&entries);
+            assert!(lede.contains("3 URLs"), "{lede}");
+            assert!(lede.contains("2 deployments"), "{lede}");
+            assert!(lede.contains("1 with nothing healthy behind it"), "{lede}");
+        }
+
+        /// A deployment that contributes no URL must not be counted in "across
+        /// N deployments" — it has its own line under the cards.
+        #[test]
+        fn the_lede_counts_only_deployments_that_contributed_a_url() {
+            // The unlinkable one is reported under the cards, not counted here.
+            let lede = directory_lede(&[entry("a", "https://a1", EntryState::Ready)]);
+            assert!(lede.contains("1 URL across 1 deployment."), "{lede}");
+        }
+
+        #[test]
+        fn the_lede_stays_grammatical_in_the_singular() {
+            let lede = directory_lede(&[entry("a", "https://a1", EntryState::Ready)]);
+            assert!(lede.contains("1 URL across 1 deployment."), "{lede}");
+        }
+
+        /// Scale-to-zero is the configured state, not a fault. Calling it "down"
+        /// would send somebody debugging a system that is working as asked.
+        #[test]
+        fn an_idle_scale_to_zero_deployment_is_not_reported_as_down() {
+            let html = render_directory_cards(
+                &[DirectoryEntry {
+                    detail: "idle — starts on first request".into(),
+                    ..entry("demo", "https://demo", EntryState::Starting)
+                }],
+                &[],
+            );
+            assert!(html.contains("dot starting"));
+            assert!(!html.contains("dot down"));
+        }
+
+        /// The shell must have no placeholder left in it after rendering, or the
+        /// page ships literal `{{CARDS}}` to a browser.
+        #[test]
+        fn the_template_has_exactly_the_placeholders_the_handler_fills() {
+            assert!(DIRECTORY_HTML.contains("{{APP_NAME}}"));
+            assert!(DIRECTORY_HTML.contains("{{LEDE}}"));
+            assert!(DIRECTORY_HTML.contains("{{CARDS}}"));
+            let rendered = DIRECTORY_HTML
+                .replace("{{APP_NAME}}", "app-lb")
+                .replace("{{LEDE}}", &directory_lede(&[]))
+                .replace("{{CARDS}}", &render_directory_cards(&[], &[]));
+            assert!(!rendered.contains("{{"), "an unfilled placeholder would ship to a browser");
+        }
+    }
 
     /// The link has to reach the *data plane*, which the dashboard cannot infer
     /// from its own location — it is served by the admin listener, on a

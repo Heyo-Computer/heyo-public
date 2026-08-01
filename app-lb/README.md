@@ -946,10 +946,59 @@ in, so an unrouted one would be unreachable by anything, and it is rejected at
 registration. A sign-in gate on an unrouted deployment is rejected too: `auth`
 runs on a proxied request, and there are none.
 
+## Directory
+
+`http://<admin-addr>/` (default `http://127.0.0.1:9090/`) is a landing page: one
+card per routable URL, linking to the deployment that serves it. It is the
+answer to "what is running on this box, and where do I click", which the
+dashboard answers only incidentally.
+
+```
+edge-1                                      Dashboard  Metrics  Theme
+4 URLs across 3 deployments. 1 with nothing healthy behind it.
+
+┌────────────────────────────┐ ┌────────────────────────────┐
+│ api                 static │ │ docs                  site │
+│ http://api.example.com     │ │ http://docs.example.com    │
+│ ● 2 of 2 upstreams up      │ │ ● serving /srv/docs        │
+└────────────────────────────┘ └────────────────────────────┘
+```
+
+**Server-rendered**, unlike the dashboard: the page is complete in its first
+response, works with JavaScript off, and holds no polling connection open. The
+only script on it is the theme toggle. Reload to refresh.
+
+A card per *URL* rather than per deployment, because a deployment with three
+hostnames genuinely offers three places to go. Links point at the **data plane** —
+scheme, port and `path_prefix` included — which the page cannot infer from its
+own address, since it is served by the admin listener on a different port. Same
+derivation as the dashboard's `urls`.
+
+The dot reports whether following the link right now would reach anything:
+
+| Dot | Means |
+| --- | --- |
+| green | healthy backends, or a site (files on this host, so nothing to be down) |
+| amber | a VM is booting, **or** the deployment is scale-to-zero and idle — the first request starts it |
+| red | routable with nothing healthy behind it |
+
+Scale-to-zero idling is deliberately not red. It is the configured state, and
+colouring it as a fault sends people debugging a system that is working.
+
+A deployment whose routes use only `host_suffix` or `path_prefix` names no single
+hostname to link to, so it gets no card — and is listed by id underneath, with
+that reason. Omitting it silently would make "why isn't mine here?" unanswerable
+from the page.
+
+Gated exactly like the dashboard: open by default, behind
+`APP_LB_DASHBOARD_PASSWORD` when one is set, since it lists every hostname this
+app-lb routes. A deployment-scoped [app-token](#app-tokens) sees only its own.
+
 ## Dashboard
 
 Open `http://<admin-addr>/dashboard` (default `http://127.0.0.1:9090/dashboard`)
-for a live view of the fleet: host and per-VM CPU/memory, per-deployment pool
+for a live view of the fleet — or [`/`](#directory) for a static index of what is
+running. The dashboard shows: host and per-VM CPU/memory, per-deployment pool
 utilisation and per-VM load, request latency (distribution + p50/p90/p99 and a
 client-derived requests/sec), cold-start times, and autoscaling activity. It is
 a single self-contained page — no external assets, so it works over an SSH tunnel
