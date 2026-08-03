@@ -705,6 +705,9 @@ fn security_response_is_stable() {
                     hits: 1_412,
                     last_hit: Some(1_722_399_990),
                     enforcing: true,
+                    // A rule that is doing something, and one that is not — the
+                    // distinction the console's per-rule chart exists to draw.
+                    hits_recent: vec![0, 0, 4, 61, 128, 44, 9, 0],
                 },
                 crate::guard::RuleView {
                     id: "b1d0c4470c3e".into(),
@@ -720,6 +723,10 @@ fn security_response_is_stable() {
                     hits: 0,
                     last_hit: None,
                     enforcing: true,
+                    // Deliberately all-zero: an exemption that has never fired
+                    // renders as an empty chart, and a client that treats a flat
+                    // series as "no data" rather than "no hits" would be wrong.
+                    hits_recent: vec![0, 0, 0, 0, 0, 0, 0, 0],
                 },
             ],
             guard: crate::guard::GuardStats {
@@ -727,6 +734,10 @@ fn security_response_is_stable() {
                 blocked: 1_412,
                 exempted: 87,
                 enforcing: true,
+                blocked_recent: vec![0, 0, 4, 61, 128, 44, 9, 0],
+                exempted_recent: vec![0, 1, 1, 0, 2, 1, 1, 0],
+                hits_bucket_secs: 60,
+                hits_window_secs: 3_600,
             },
             stats: Some(SiemSnapshot {
                 observed: 918_273,

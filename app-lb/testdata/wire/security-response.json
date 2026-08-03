@@ -135,7 +135,17 @@
       "expires_at": 1722485800,
       "hits": 1412,
       "last_hit": 1722399990,
-      "enforcing": true
+      "enforcing": true,
+      "hits_recent": [
+        0,
+        0,
+        4,
+        61,
+        128,
+        44,
+        9,
+        0
+      ]
     },
     {
       "id": "b1d0c4470c3e",
@@ -147,14 +157,46 @@
       "note": "internal monitoring",
       "created_at": 1722300000,
       "hits": 0,
-      "enforcing": true
+      "enforcing": true,
+      "hits_recent": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
     }
   ],
   "guard": {
     "rules": 2,
     "blocked": 1412,
     "exempted": 87,
-    "enforcing": true
+    "enforcing": true,
+    "blocked_recent": [
+      0,
+      0,
+      4,
+      61,
+      128,
+      44,
+      9,
+      0
+    ],
+    "exempted_recent": [
+      0,
+      1,
+      1,
+      0,
+      2,
+      1,
+      1,
+      0
+    ],
+    "hits_bucket_secs": 60,
+    "hits_window_secs": 3600
   },
   "stats": {
     "observed": 918273,

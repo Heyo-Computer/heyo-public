@@ -6,15 +6,18 @@
 //! Three separate leaks, all of them observed:
 //!
 //! - `<data>/run/<id>/` — the Firecracker `/workspace` data disk plus a
-//!   `snapshot/` directory. mvm-ctrl's `destroy()` removes this directory only
-//!   when the sandbox was created *with* `disk_size_gb`; a sandbox without one
-//!   still gets the directory (the snapshot dir and the tap allocation live
-//!   there) and it is never removed.
+//!   `snapshot/` directory. The one outright delete-path bug: mvm-ctrl's
+//!   `destroy()` unlinks this directory only inside its `data_disk_path
+//!   .is_some()` branch, so a sandbox created *without* `disk_size_gb` still
+//!   gets the directory (the snapshot dir and the tap allocation live there)
+//!   and nothing ever removes it.
 //! - `<data>/kvm/<id>/` — the KVM driver's per-VM `rootfs.ext4` and any
-//!   `mount*.ext4`. These are the big ones: a 20 GiB rootfs per sandbox.
-//! - `/tmp/firecracker-<id>-rootfs.ext4` — the per-boot rootfs copy. `stop_vm()`
-//!   removes it, so it only survives when the VM died without a clean stop —
-//!   which, for a hypervisor process, is routine.
+//!   `mount*.ext4`, ~1 GiB each. A clean delete *does* remove the whole state
+//!   dir; what accumulates is every sandbox that never got one — a crash, a lost
+//!   daemon record, a VM nobody ran `heyvm rm` on.
+//! - `/tmp/{firecracker,kvm}-<id>-*` — the per-boot scratch. `stop_vm()` removes
+//!   it, so it only survives when the VM died without a clean stop — which, for
+//!   a hypervisor process, is routine.
 //!
 //! app-lb is the right place to fix this despite not owning those paths: it is
 //! required to run beside a *local* daemon (`guest_ip` exists nowhere else), so

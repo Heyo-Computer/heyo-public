@@ -1052,6 +1052,14 @@ edge-1                                      Dashboard  Metrics  Theme
 response, works with JavaScript off, and holds no polling connection open. The
 only script on it is the theme toggle. Reload to refresh.
 
+The theme is stored in `localStorage` under one key shared by all four pages, so
+a choice survives a reload and follows you between `/`, `/dashboard`, `/siem` and
+`/storage` — a theme belongs to the operator, not to the page. It is re-applied
+by a small script in `<head>`, before the body exists, so a stored preference
+never costs a frame painted in the wrong theme. With storage unavailable (a
+private window, or a page opened over `file://`) the toggle still works for the
+session and falls back to `prefers-color-scheme`.
+
 A card per *URL* rather than per deployment, because a deployment with three
 hostnames genuinely offers three places to go. Links point at the **data plane** —
 scheme, port and `path_prefix` included — which the page cannot infer from its
@@ -1211,14 +1219,18 @@ the sandbox is deleted. On a host that has been booting VMs for a few months tha
 gigabytes nothing will ever reclaim. app-lb inventories it at `GET /disks`, shows it at
 `GET /storage`, and reclaims it on a timer.
 
-Three leaks, all of them real:
+Where it accumulates:
 
 | Path | What it is | When the daemon removes it |
 | --- | --- | --- |
-| `<data>/run/<id>/data.ext4` | The Firecracker `/workspace` data disk | Only on delete, and only if the sandbox was created with `disk_size_gb` |
-| `<data>/run/<id>/snapshot/` | Memory/state checkpoint | Never — the directory outlives the sandbox whenever there was no data disk |
-| `<data>/kvm/<id>/` | The KVM driver's per-VM `rootfs.ext4` and `mount*.ext4` | Never. These are the big ones: a 20 GiB rootfs per sandbox |
-| `/tmp/firecracker-<id>-rootfs.ext4` | The per-boot rootfs copy | On a clean `stop`. A hypervisor that dies leaves it behind |
+| `<data>/run/<id>/data.ext4` | The Firecracker `/workspace` data disk | On delete, but **only if** the sandbox was created with `disk_size_gb` |
+| `<data>/run/<id>/snapshot/` | Memory/state checkpoint | **Never** when there was no data disk — `destroy()` unlinks the directory only inside its `data_disk_path.is_some()` branch, so a sandbox without one leaves the dir behind for good |
+| `<data>/kvm/<id>/` | The KVM driver's per-VM `rootfs.ext4` and `mount*.ext4` | On a *clean* delete, which removes the whole state dir. But these are ~1 GiB each, so anything that never got one — a crash, a lost daemon record, a VM nobody ran `heyvm rm` on — is the bulk of what is sitting there |
+| `/tmp/{firecracker,kvm}-<id>-*` | The per-boot scratch | On a clean `stop`. A hypervisor that dies leaves it behind |
+
+So only the second row is a delete-path bug. The rest is what a host looks like
+after months of VMs that did not all exit cleanly — nothing was ever going to
+come back for it, which is what the sweep below is for.
 
 app-lb can do this despite not owning those paths because it is *required* to run beside a
 local daemon — `guest_ip` exists nowhere else — so it shares the filesystem. It already writes
@@ -2212,6 +2224,28 @@ high   SQL injection attempt in query parameter "id" from 203.0.113.9
       [ Block 203.0.113.9 on demo only ]  …
 ```
 
+Each action carries a lifetime picker, pre-set to what the runbook suggested and
+offering **Forever** as the last option. The confirmation states which one is
+about to apply, and only `forever` gets an extra prompt of its own.
+
+Below the findings, **Rules in force** answers the other question — whether any
+of this is working:
+
+```
+ENFORCEMENT     ╭──╮                     519
+   refused    ──╯  ╰──────                519 requests refused in the last 60 minutes
+   exempted   ─────────────
+
+Action  Matches                   Hits   Last 60m      Last     Expires
+block   from 203.0.113.9          1,412  ▁▃▅█▅▃▁       30s ago  in 22h    [Change to…] [Set] [Remove]
+block   path containing /wp-admin     0  no hits       —        never     [Change to…] [Set] [Remove]
+allow   from 10.0.0.0/8              87  ▁█▁▃▁█▃▁      1m ago   never     [Change to…] [Set] [Remove]
+```
+
+That middle row is the one to act on: a rule being checked on every request and
+refusing nothing. **Set** applies the chosen lifetime to an existing rule and
+keeps its hit history, which re-posting the rule would reset.
+
 Those buttons post the exact body shown, so what an operator reads and what the
 server applies cannot drift. The advice is derived server-side and served on
 `/security`, which means `serverctl`, a script or another client gets the same
@@ -2246,7 +2280,16 @@ curl -su admin:s3cret localhost:9090/security/rules -X POST \
 
 curl -su admin:s3cret localhost:9090/security | jq .rules
 curl -su admin:s3cret localhost:9090/security/rules/5f295e1a86f2 -X DELETE
+
+# Change when a rule expires. `null` keeps it indefinitely; the hit history
+# carries over, unlike re-posting the rule.
+curl -su admin:s3cret localhost:9090/security/rules/5f295e1a86f2 -X PATCH \
+  -H 'content-type: application/json' -d '{"expires_in_secs":null}'
 ```
+
+`expires_in_secs` is **required** on that `PATCH` — omitting it is a 400, not
+"forever". Making a block permanent by forgetting a field is exactly the
+accident the field exists to prevent.
 
 | `match` field | Matches |
 | --- | --- |
@@ -2270,12 +2313,15 @@ Four things keep this from becoming the outage it was meant to prevent:
 * **The admin API is never guarded.** However badly you block yourself out of
   the data plane, the page that deletes the rule is still reachable. Nothing
   should ever be added that changes this.
-* **Rules expire.** Every action the console suggests carries a lifetime,
-  because the realistic failure is not a missing block, it is a permanent one
-  that outlives the attack and quietly breaks a customer months later. Client
-  blocks are short — an address is a lease, and behind CGNAT it belongs to
-  somebody else by tomorrow — and path blocks are long, because a path pattern
-  never changes hands.
+* **Rules expire by default.** Every action the console suggests carries a
+  lifetime, because the realistic failure is not a missing block, it is a
+  permanent one that outlives the attack and quietly breaks a customer months
+  later. Client blocks are short — an address is a lease, and behind CGNAT it
+  belongs to somebody else by tomorrow — and path blocks are long, because a
+  path pattern never changes hands. A rule *can* be kept forever: the picker
+  beside each action offers it, and the rules table can change an existing
+  rule's lifetime. Both make you confirm, and only for `forever` — that is the
+  one choice with no natural end.
 * **`APP_LB_GUARD_ENFORCE=0` is a dry run.** Rules match, count hits and log
   `would have refused this request`, and nothing is turned away. That is how a
   broad rule gets deployed sanely: watch what it would have caught for an hour
@@ -2284,6 +2330,35 @@ Four things keep this from becoming the outage it was meant to prevent:
 Rules are **persisted** to `APP_LB_GUARD_PATH`, unlike alerts. A restart that
 silently readmits an attacker somebody blocked during an incident is a worse
 failure than losing the finding that prompted it.
+
+#### Are the rules doing anything?
+
+Every rule is scanned on every request that reaches the data plane, so a rule
+that stopped matching is pure cost. `GET /security` reports hits per minute over
+the last hour — per rule as `hits_recent`, and fleet-wide as `guard
+.blocked_recent` / `guard.exempted_recent`, with `hits_bucket_secs` and
+`hits_window_secs` saying how to read them. The console charts both: a headline
+line of refusals, and a sparkline per rule.
+
+An all-zero series is a **finding, not an absence** — the console says *no hits*
+rather than drawing a flat line, because a rule refusing nothing is the one worth
+removing. That is also the shape of a rule that never worked: a `client` block
+that silently matches nothing on a dual-stack listener looks identical to an
+attack that stopped.
+
+Three properties worth knowing:
+
+* **In-memory only.** The series describes this process, so it is absent from
+  the persisted rule file and starts empty after a restart. `hits` — cumulative
+  since the rule was created — is the number that survives, and the number to
+  trust.
+* **Approximate at bucket boundaries.** The ring is written from the request
+  path under exactly the conditions where a lock is worst: a rule matching every
+  request from an address currently flooding the LB. A hit landing while the ring
+  rolls is dropped rather than paid for. Use `hits` for anything that has to add
+  up.
+* **Counted in the dry run too.** `APP_LB_GUARD_ENFORCE=0` charts what *would*
+  have been refused, which is the point of the dry run.
 
 **No regular expressions**, deliberately. A rule is written under time pressure
 and evaluated on every request; a pathological pattern would turn the mitigation

@@ -53,7 +53,7 @@
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -430,6 +430,7 @@ impl RuleSpec {
             expires_at: self.expires_in_secs.map(|s| now.saturating_add(s)),
             hits: AtomicU64::new(0),
             last_hit: AtomicU64::new(0),
+            series: HitSeries::new(now),
         })
     }
 }
@@ -473,6 +474,119 @@ fn rule_id(action: RuleAction, m: &RuleMatch) -> String {
     })
 }
 
+/// Buckets in a [`HitSeries`], and how wide each one is.
+///
+/// An hour at one-minute resolution. The question this answers is "is this rule
+/// still earning the branch it costs on every request?", which is a
+/// tens-of-minutes question — a two-second sparkline cannot distinguish a rule
+/// that fired twice this morning from one that has never fired at all, and a
+/// week of history would need real storage. Sixty `u32`s is 240 bytes per rule.
+pub const HIT_BUCKETS: usize = 60;
+pub const HIT_BUCKET_SECS: u64 = 60;
+
+/// A rolling count of hits per minute over the last hour.
+///
+/// Atomics rather than a mutex because this is written from the request path,
+/// under exactly the conditions where a lock is worst: a rule matching every
+/// request from an address that is currently flooding the LB.
+struct HitSeries {
+    buckets: [AtomicU32; HIT_BUCKETS],
+    /// The absolute bucket index (`epoch_secs / HIT_BUCKET_SECS`) whose count is
+    /// currently at slot `head % HIT_BUCKETS`. Monotonic.
+    head: AtomicU64,
+}
+
+impl HitSeries {
+    fn new(now: u64) -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU32::new(0)),
+            head: AtomicU64::new(now / HIT_BUCKET_SECS),
+        }
+    }
+
+    fn record(&self, now: u64) {
+        let bucket = now / HIT_BUCKET_SECS;
+        self.roll_to(bucket);
+        self.buckets[(bucket % HIT_BUCKETS as u64) as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Advance the ring to `bucket`, zeroing whatever it laps.
+    ///
+    /// One writer wins the CAS and does the zeroing. A hit landing in the
+    /// window between that CAS and the store it clears is lost — which is
+    /// accepted, deliberately: this drives a chart, and paying for exactness
+    /// here would mean a lock on the request path. The cumulative `hits` counter
+    /// is the number to trust, and it is never touched by this.
+    fn roll_to(&self, bucket: u64) {
+        loop {
+            let head = self.head.load(Ordering::Acquire);
+            if bucket <= head {
+                return;
+            }
+            if self
+                .head
+                .compare_exchange(head, bucket, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // Capped at one lap: a rule idle for a day must not cost a
+                // 1,440-iteration loop on its next hit.
+                let lapped = (bucket - head).min(HIT_BUCKETS as u64);
+                for step in 1..=lapped {
+                    let slot = ((head + step) % HIT_BUCKETS as u64) as usize;
+                    self.buckets[slot].store(0, Ordering::Relaxed);
+                }
+                return;
+            }
+        }
+    }
+
+    /// Copy the ring, rolled to `now`.
+    ///
+    /// For [`Guard::set_expiry`], which rebuilds a rule rather than mutating one
+    /// behind an `ArcSwap`. Without this the chart would reset every time an
+    /// operator extended a block — losing exactly the evidence that justified
+    /// extending it.
+    fn clone_from_now(&self, now: u64) -> Self {
+        self.roll_to(now / HIT_BUCKET_SECS);
+        Self {
+            buckets: std::array::from_fn(|i| {
+                AtomicU32::new(self.buckets[i].load(Ordering::Relaxed))
+            }),
+            head: AtomicU64::new(self.head.load(Ordering::Acquire)),
+        }
+    }
+
+    /// The last [`HIT_BUCKETS`] buckets, oldest first, as of `now`.
+    ///
+    /// Rolls first, so a rule that stopped firing half an hour ago reports the
+    /// zeroes it has earned since rather than a frozen tail of old counts.
+    fn snapshot(&self, now: u64) -> Vec<u32> {
+        let bucket = now / HIT_BUCKET_SECS;
+        self.roll_to(bucket);
+        let head = self.head.load(Ordering::Acquire);
+        (0..HIT_BUCKETS)
+            .map(|i| {
+                // Oldest first: the slot holding bucket `head - (BUCKETS-1-i)`.
+                //
+                // `checked_sub`, not `wrapping_sub`: a bucket older than the
+                // series itself never existed, and wrapping would send the
+                // modulo to an arbitrary live slot and report that slot's count
+                // twice. Only reachable when `head < HIT_BUCKETS` — i.e. within
+                // the first hour of the epoch the ring was seeded from, which
+                // real clocks never are and tests always are.
+                let age = (HIT_BUCKETS - 1 - i) as u64;
+                match head.checked_sub(age) {
+                    Some(bucket) => {
+                        let idx = (bucket % HIT_BUCKETS as u64) as usize;
+                        self.buckets[idx].load(Ordering::Relaxed)
+                    }
+                    None => 0,
+                }
+            })
+            .collect()
+    }
+}
+
 /// One live rule.
 pub struct Rule {
     pub id: String,
@@ -484,6 +598,10 @@ pub struct Rule {
     hits: AtomicU64,
     /// Epoch seconds, `0` for never.
     last_hit: AtomicU64,
+    /// Hits per minute over the last hour, for the console's per-rule chart.
+    /// In-memory only: it is telemetry about the running process, and restoring
+    /// an hour of counts from a file written days ago would be a lie.
+    series: HitSeries,
 }
 
 impl Rule {
@@ -494,6 +612,7 @@ impl Rule {
     fn record_hit(&self, now: u64) {
         self.hits.fetch_add(1, Ordering::Relaxed);
         self.last_hit.store(now, Ordering::Relaxed);
+        self.series.record(now);
     }
 
     pub fn describe(&self) -> String {
@@ -516,6 +635,22 @@ impl Rule {
             // "would block" on the row itself instead of in a banner somewhere
             // else on the page.
             enforcing: enforcing || self.action == RuleAction::Allow,
+            // Left empty here on purpose — see `report`.
+            hits_recent: Vec::new(),
+        }
+    }
+
+    /// [`view`](Self::view) plus the rolling hit series.
+    ///
+    /// A second constructor rather than a flag on `view`, because `RuleView` is
+    /// *also* the persisted form: `Guard::persist` writes exactly what `view`
+    /// produces. An hour of per-minute counts has no business in that file — it
+    /// describes this process, not the rule — and this split is what keeps it
+    /// out without anyone having to remember to clear it before writing.
+    pub fn report(&self, enforcing: bool, now: u64) -> RuleView {
+        RuleView {
+            hits_recent: self.series.snapshot(now),
+            ..self.view(enforcing)
         }
     }
 
@@ -555,6 +690,12 @@ pub struct RuleView {
     pub last_hit: Option<u64>,
     #[serde(default = "yes")]
     pub enforcing: bool,
+    /// Hits per minute over the last hour, oldest first. Populated only by
+    /// [`Rule::report`], so it is present on `GET /security` and absent from the
+    /// persisted file — hence `skip_serializing_if`, which is what keeps a
+    /// restored rule from carrying a stale hour of somebody else's traffic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hits_recent: Vec<u32>,
 }
 
 fn yes() -> bool {
@@ -587,6 +728,17 @@ pub struct GuardStats {
     pub blocked: u64,
     pub exempted: u64,
     pub enforcing: bool,
+    /// Requests refused per minute over the last hour, oldest first. The
+    /// headline the console charts: a flat line at zero with rules in force is
+    /// the "paying for nothing" case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_recent: Vec<u32>,
+    /// The same for requests an `allow` rule exempted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempted_recent: Vec<u32>,
+    /// How to read the two series above, so a client does not hard-code it.
+    pub hits_bucket_secs: u64,
+    pub hits_window_secs: u64,
 }
 
 /// The rule set, and the file it survives a restart in.
@@ -600,6 +752,11 @@ pub struct Guard {
     enforce: bool,
     blocked: AtomicU64,
     exempted: AtomicU64,
+    /// Fleet-level counterparts to each rule's own series, so the console can
+    /// chart "requests refused" without summing every rule client-side — and so
+    /// the total survives the rule that produced it being removed.
+    blocked_series: HitSeries,
+    exempted_series: HitSeries,
 }
 
 impl Guard {
@@ -611,6 +768,11 @@ impl Guard {
             enforce,
             blocked: AtomicU64::new(0),
             exempted: AtomicU64::new(0),
+            // Zero rather than "now": `Guard::new` runs at startup, and seeding
+            // the ring from a clock read here vs. at the first hit makes no
+            // difference to a series that rolls on read.
+            blocked_series: HitSeries::new(0),
+            exempted_series: HitSeries::new(0),
         }
     }
 
@@ -648,6 +810,7 @@ impl Guard {
                 RuleAction::Allow => {
                     rule.record_hit(now);
                     self.exempted.fetch_add(1, Ordering::Relaxed);
+                    self.exempted_series.record(now);
                     return Decision::Pass;
                 }
                 RuleAction::Block if blocked.is_none() => blocked = Some(rule),
@@ -660,6 +823,10 @@ impl Guard {
             Some(rule) => {
                 rule.record_hit(now);
                 self.blocked.fetch_add(1, Ordering::Relaxed);
+                // Counted in the dry run too: the whole point of
+                // `APP_LB_GUARD_ENFORCE=0` is to see what a rule *would* refuse
+                // before arming it, and a flat chart would defeat that.
+                self.blocked_series.record(now);
                 if self.enforce {
                     Decision::Block(rule.clone())
                 } else {
@@ -673,12 +840,22 @@ impl Guard {
         self.rules.load().as_ref().clone()
     }
 
-    pub fn stats(&self) -> GuardStats {
+    /// Counters plus the rolling series, as of `now`.
+    ///
+    /// Takes the clock because the series must be *rolled* before it is read —
+    /// otherwise a guard that stopped refusing anything half an hour ago still
+    /// reports the counts it earned before that, and the chart says the rules
+    /// are working when they have not fired since.
+    pub fn stats(&self, now: u64) -> GuardStats {
         GuardStats {
             rules: self.rules.load().len(),
             blocked: self.blocked.load(Ordering::Relaxed),
             exempted: self.exempted.load(Ordering::Relaxed),
             enforcing: self.enforce,
+            blocked_recent: self.blocked_series.snapshot(now),
+            exempted_recent: self.exempted_series.snapshot(now),
+            hits_bucket_secs: HIT_BUCKET_SECS,
+            hits_window_secs: HIT_BUCKET_SECS * HIT_BUCKETS as u64,
         }
     }
 
@@ -720,6 +897,55 @@ impl Guard {
             .collect();
         self.rules.store(Arc::new(next));
         Ok(())
+    }
+
+    /// Change when a rule expires — including never.
+    ///
+    /// `expires_in_secs: None` makes it permanent, which is the point: a rule
+    /// authored during an incident carries a bounded lifetime by design (see the
+    /// module docs), and the operator who has since decided that address is
+    /// simply not welcome should be able to say so without re-authoring the
+    /// match and losing its hit history.
+    ///
+    /// A rebuild rather than a mutation, because `expires_at` is a plain field
+    /// on a rule behind an `ArcSwap` — the hot path reads it without a lock, so
+    /// it is not something to change in place. The counters and the hit series
+    /// are carried across: this is the same rule, with a new deadline.
+    pub fn set_expiry(
+        &self,
+        id: &str,
+        expires_in_secs: Option<u64>,
+        now: u64,
+    ) -> Result<RuleView, GuardError> {
+        let _w = self.write.lock().expect("guard write lock");
+        let current = self.rules.load();
+        let Some(existing) = current.iter().find(|r| r.id == id && !r.expired(now)) else {
+            return Err(GuardError::NoRule(id.to_string()));
+        };
+
+        let replacement = Arc::new(Rule {
+            id: existing.id.clone(),
+            action: existing.action,
+            match_: existing.match_.clone(),
+            note: existing.note.clone(),
+            created_at: existing.created_at,
+            expires_at: expires_in_secs.map(|s| now.saturating_add(s)),
+            // Carried over, so extending a rule does not reset the evidence that
+            // it is working.
+            hits: AtomicU64::new(existing.hits.load(Ordering::Relaxed)),
+            last_hit: AtomicU64::new(existing.last_hit.load(Ordering::Relaxed)),
+            series: existing.series.clone_from_now(now),
+        });
+
+        let view = replacement.report(self.enforce, now);
+        let next: Vec<Arc<Rule>> = current
+            .iter()
+            .filter(|r| r.id != id && !r.expired(now))
+            .cloned()
+            .chain(std::iter::once(replacement))
+            .collect();
+        self.rules.store(Arc::new(next));
+        Ok(view)
     }
 
     /// Drop expired rules. Returns how many went.
@@ -970,6 +1196,291 @@ mod tests {
         assert!(g.list().is_empty());
     }
 
+    /// What a rule set costs the request path.
+    ///
+    /// `#[ignore]`d: it is a measurement, not an assertion, and a timing check
+    /// in CI is a flake waiting to happen. Run it deliberately:
+    ///
+    /// ```sh
+    /// cargo test --release --bin app-lb guard_cost -- --ignored --nocapture
+    /// ```
+    ///
+    /// The number that matters is the *miss* path — normal traffic matching no
+    /// rule — because `decide` never exits early: an `allow` anywhere in the
+    /// list beats a `block` anywhere else, so every request scans every rule.
+    mod guard_cost {
+        use super::*;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERS: u32 = 200_000;
+
+        fn bench(label: &str, g: &Guard, f: &RequestFacts<'_>) {
+            // Warm the branch predictor and the cache lines the scan walks.
+            for _ in 0..10_000 {
+                black_box(g.decide(black_box(f), 1_000));
+            }
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                black_box(g.decide(black_box(f), 1_000));
+            }
+            let per = t0.elapsed().as_nanos() as f64 / ITERS as f64;
+            println!(
+                "  {label:<52} {per:>8.1} ns/request  ({:.2} µs per 1k req)",
+                per * 1000.0 / 1000.0,
+            );
+        }
+
+        fn ua() -> &'static str {
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        }
+
+        #[test]
+        #[ignore = "measurement, not an assertion"]
+        fn scan_cost_by_rule_count_and_shape() {
+            println!("\nmiss path — the cost every ordinary request pays:\n");
+
+            for n in [0usize, 16, 64, 256] {
+                // The common shape: blocking addresses. Each rule fails on the
+                // first check, an masked address compare.
+                let g = Guard::new("", true);
+                for i in 0..n {
+                    let _ = g.insert(
+                        spec(client(&format!("10.{}.{}.0/24", i / 256, i % 256))),
+                        0,
+                    );
+                }
+                let f = facts("203.0.113.9", "/api/v1/things");
+                bench(&format!("{n:>3} client rules, no match"), &g, &f);
+            }
+
+            println!();
+            for n in [16usize, 64, 256] {
+                // The expensive shape: two substring searches per rule against a
+                // realistic user-agent, none of which match.
+                let g = Guard::new("", true);
+                for i in 0..n {
+                    let _ = g.insert(
+                        spec(MatchSpec {
+                            path_contains: Some(format!("/probe-{i}")),
+                            user_agent_contains: Some(format!("scanner-{i}")),
+                            ..Default::default()
+                        }),
+                        0,
+                    );
+                }
+                let f = RequestFacts {
+                    user_agent: Some(ua()),
+                    ..facts("203.0.113.9", "/api/v1/things")
+                };
+                bench(&format!("{n:>3} path+user-agent substring rules"), &g, &f);
+            }
+
+            println!();
+            // The worst realistic case: a rule that matches, so the scan runs to
+            // completion *and* records a hit into the ring.
+            let g = Guard::new("", true);
+            for i in 0..255 {
+                let _ = g.insert(spec(client(&format!("10.{}.0.0/16", i % 256))), 0);
+            }
+            let _ = g.insert(spec(client("203.0.113.9")), 0);
+            let f = facts("203.0.113.9", "/api/v1/things");
+            bench("256 client rules, last one matches (blocked)", &g, &f);
+            println!();
+        }
+    }
+
+    /// The per-rule hit chart. Its whole job is to distinguish a rule that is
+    /// still catching traffic from one that is costing a comparison on every
+    /// request and refusing nothing.
+    mod hit_series {
+        use super::*;
+
+        fn hit_at(g: &Guard, t: u64) {
+            assert!(blocked(&g.decide(&facts("203.0.113.9", "/"), t)));
+        }
+
+        #[test]
+        fn hits_land_in_the_bucket_for_their_minute() {
+            let g = Guard::new("", true);
+            g.insert(spec(client("203.0.113.9")), 0).unwrap();
+
+            hit_at(&g, 0);
+            hit_at(&g, 30); // same minute
+            hit_at(&g, 60); // the next one
+
+            let s = g.list()[0].report(true, 60).hits_recent;
+            assert_eq!(s.len(), HIT_BUCKETS);
+            assert_eq!(s[HIT_BUCKETS - 1], 1, "newest bucket is `now`");
+            assert_eq!(s[HIT_BUCKETS - 2], 2, "the two from the minute before");
+            assert_eq!(s.iter().sum::<u32>(), 3);
+        }
+
+        /// The failure this replaces: reading a stale ring. A rule that stopped
+        /// firing must report zeroes, not the counts it earned an hour ago.
+        #[test]
+        fn a_rule_that_went_quiet_reports_zeroes() {
+            let g = Guard::new("", true);
+            g.insert(spec(client("203.0.113.9")), 0).unwrap();
+            hit_at(&g, 0);
+
+            let rule = &g.list()[0];
+            assert_eq!(rule.report(true, 0).hits_recent.iter().sum::<u32>(), 1);
+
+            // An hour later, with nothing in between.
+            let later = HIT_BUCKET_SECS * HIT_BUCKETS as u64;
+            assert_eq!(
+                rule.report(true, later).hits_recent.iter().sum::<u32>(),
+                0,
+                "the window rolled past that hit",
+            );
+            // The cumulative counter is the one that must not move.
+            assert_eq!(rule.report(true, later).hits, 1);
+        }
+
+        /// A rule idle for a week must not cost a bucket-per-minute loop, and
+        /// must not resurrect counts from whatever slot the modulo lands on.
+        #[test]
+        fn a_long_silence_clears_the_whole_ring_exactly_once() {
+            let g = Guard::new("", true);
+            g.insert(spec(client("203.0.113.9")), 0).unwrap();
+            for minute in 0..HIT_BUCKETS as u64 {
+                hit_at(&g, minute * HIT_BUCKET_SECS);
+            }
+            let rule = &g.list()[0];
+            assert_eq!(rule.report(true, 3599).hits_recent.iter().sum::<u32>(), 60);
+
+            let week = 7 * 24 * 3600;
+            let s = rule.report(true, week).hits_recent;
+            assert!(s.iter().all(|&v| v == 0), "stale counts survived a lap: {s:?}");
+        }
+
+        /// The guard-wide series is what answers "is enforcement doing anything
+        /// at all", so it has to count in the dry run too — that is the mode you
+        /// watch before arming a broad rule.
+        #[test]
+        fn the_fleet_series_counts_refusals_including_a_dry_run() {
+            for enforce in [true, false] {
+                let g = Guard::new("", enforce);
+                g.insert(spec(client("203.0.113.9")), 0).unwrap();
+                let _ = g.decide(&facts("203.0.113.9", "/"), 0);
+                let stats = g.stats(0);
+                assert_eq!(
+                    stats.blocked_recent.iter().sum::<u32>(),
+                    1,
+                    "enforce={enforce}",
+                );
+                assert_eq!(stats.hits_bucket_secs, HIT_BUCKET_SECS);
+                assert_eq!(stats.hits_window_secs, HIT_BUCKET_SECS * HIT_BUCKETS as u64);
+            }
+        }
+
+        #[test]
+        fn an_allow_feeds_the_exempted_series_not_the_blocked_one() {
+            let g = Guard::new("", true);
+            g.insert(spec(client("203.0.113.9")), 0).unwrap();
+            g.insert(
+                RuleSpec {
+                    action: RuleAction::Allow,
+                    match_: client("203.0.113.9"),
+                    expires_in_secs: None,
+                    note: None,
+                },
+                0,
+            )
+            .unwrap();
+
+            assert!(!blocked(&g.decide(&facts("203.0.113.9", "/"), 0)));
+            let stats = g.stats(0);
+            assert_eq!(stats.exempted_recent.iter().sum::<u32>(), 1);
+            assert_eq!(stats.blocked_recent.iter().sum::<u32>(), 0);
+        }
+
+        /// `RuleView` doubles as the persisted form. An hour of per-minute
+        /// counts describes this process, not the rule, and writing it would
+        /// mean a restored rule showing traffic it never saw.
+        #[test]
+        fn the_series_is_reported_but_never_persisted() {
+            let g = Guard::new("", true);
+            g.insert(spec(client("203.0.113.9")), 0).unwrap();
+            hit_at(&g, 0);
+
+            let rule = &g.list()[0];
+            assert!(!rule.report(true, 0).hits_recent.is_empty(), "the API sees it");
+            assert!(rule.view(true).hits_recent.is_empty(), "the file does not");
+
+            let stored = serde_json::to_string(&rule.view(true)).unwrap();
+            assert!(!stored.contains("hits_recent"), "{stored}");
+        }
+    }
+
+    /// Making a rule permanent, and the history that has to survive it.
+    mod set_expiry {
+        use super::*;
+
+        fn timed(secs: u64) -> RuleSpec {
+            RuleSpec {
+                expires_in_secs: Some(secs),
+                ..spec(client("203.0.113.9"))
+            }
+        }
+
+        #[test]
+        fn a_timed_rule_can_be_made_permanent() {
+            let g = Guard::new("", true);
+            let id = g.insert(timed(60), 100).unwrap().id.clone();
+            assert!(g.list()[0].expires_at.is_some());
+
+            let view = g.set_expiry(&id, None, 100).unwrap();
+            assert_eq!(view.expires_at, None);
+            assert_eq!(g.list().len(), 1, "replaced, not added");
+            assert!(g.list()[0].expires_at.is_none());
+            // And it is still enforced long past when it would have lapsed.
+            assert!(blocked(&g.decide(&facts("203.0.113.9", "/"), 10_000_000)));
+        }
+
+        /// Extending a rule must not reset the evidence that justified
+        /// extending it.
+        #[test]
+        fn the_hit_history_carries_across() {
+            let g = Guard::new("", true);
+            let id = g.insert(spec(client("203.0.113.9")), 0).unwrap().id.clone();
+            assert!(blocked(&g.decide(&facts("203.0.113.9", "/"), 0)));
+
+            let view = g.set_expiry(&id, None, 0).unwrap();
+            assert_eq!(view.hits, 1, "cumulative count survived");
+            assert_eq!(view.hits_recent.iter().sum::<u32>(), 1, "and so did the chart");
+        }
+
+        #[test]
+        fn a_permanent_rule_can_be_given_a_deadline_again() {
+            let g = Guard::new("", true);
+            let id = g.insert(spec(client("203.0.113.9")), 100).unwrap().id.clone();
+            assert!(g.list()[0].expires_at.is_none(), "starts permanent");
+
+            g.set_expiry(&id, Some(60), 100).unwrap();
+            assert_eq!(g.list()[0].expires_at, Some(160));
+            assert!(!blocked(&g.decide(&facts("203.0.113.9", "/"), 160)));
+        }
+
+        #[test]
+        fn an_unknown_or_expired_rule_is_not_found() {
+            let g = Guard::new("", true);
+            let id = g.insert(timed(60), 100).unwrap().id.clone();
+            assert!(matches!(
+                g.set_expiry("nope", None, 100),
+                Err(GuardError::NoRule(_))
+            ));
+            // Already lapsed: reviving it would resurrect a block the operator
+            // watched expire.
+            assert!(matches!(
+                g.set_expiry(&id, None, 10_000),
+                Err(GuardError::NoRule(_))
+            ));
+        }
+    }
+
     /// `APP_LB_GUARD_ENFORCE=0`: the rule matches and counts, and the request
     /// still goes through. Without the count the dry run tells you nothing.
     #[test]
@@ -980,8 +1491,8 @@ mod tests {
             g.decide(&facts("203.0.113.9", "/"), 100),
             Decision::WouldBlock(_)
         ));
-        assert_eq!(g.stats().blocked, 1);
-        assert!(!g.stats().enforcing);
+        assert_eq!(g.stats(100).blocked, 1);
+        assert!(!g.stats(100).enforcing);
         assert_eq!(g.list()[0].view(false).hits, 1);
     }
 
@@ -1073,7 +1584,7 @@ mod tests {
     fn nothing_is_scanned_when_no_rule_exists() {
         let g = Guard::new("", true);
         assert!(matches!(g.decide(&facts("203.0.113.9", "/"), 100), Decision::Pass));
-        assert_eq!(g.stats().rules, 0);
+        assert_eq!(g.stats(100).rules, 0);
     }
 
     #[test]

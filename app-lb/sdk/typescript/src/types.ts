@@ -410,10 +410,23 @@ export interface RuleView {
   note?: string;
   created_at: number;
   expires_at?: number;
+  /** Cumulative since this rule was created. The number to trust. */
   hits: number;
   last_hit?: number;
   /** `false` under `APP_LB_GUARD_ENFORCE=0`: matched and counted, not refused. */
   enforcing: boolean;
+  /**
+   * Hits per bucket over the last window, oldest first — see
+   * {@link GuardStats.hits_bucket_secs}. In-memory on the LB, so it is absent
+   * from the persisted rule file and starts empty after a restart. All-zero
+   * means "no hits", not "no data": a rule that has never fired is exactly what
+   * this is for spotting.
+   *
+   * Approximate at bucket boundaries by design — the LB will not take a lock on
+   * the request path to make a chart exact. Use `hits` for anything that has to
+   * add up.
+   */
+  hits_recent?: number[];
 }
 
 export interface GuardStats {
@@ -422,6 +435,14 @@ export interface GuardStats {
   /** Requests an `allow` rule exempted from a block. */
   exempted: number;
   enforcing: boolean;
+  /** Requests refused per bucket over the last window, oldest first. */
+  blocked_recent?: number[];
+  /** The same for requests an `allow` rule exempted. */
+  exempted_recent?: number[];
+  /** Seconds each entry of the `*_recent` series covers. */
+  hits_bucket_secs: number;
+  /** Total seconds the `*_recent` series spans. */
+  hits_window_secs: number;
 }
 
 export interface SeverityTotals {

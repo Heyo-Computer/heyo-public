@@ -154,6 +154,29 @@
   table.rules tr:last-child td { border-bottom: 0; }
   table.rules td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
   table.rules td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+  /* Hit sparklines. `preserveAspectRatio="none"` lets one viewBox stretch to
+     whatever the column is, so the bars stay aligned across rows. */
+  .spark { display: block; width: 108px; height: 22px; }
+  .spark rect { fill: var(--series-1); }
+  .spark.idle rect { fill: var(--muted); }
+  .spark-none {
+    font-size: 11px; color: var(--muted); font-style: italic; white-space: nowrap;
+  }
+  .headline { display: flex; gap: 18px; align-items: flex-end; flex-wrap: wrap; }
+  .headline .chart { flex: 1 1 320px; min-width: 240px; }
+  .headline svg { display: block; width: 100%; height: 56px; }
+  .headline .legend {
+    display: flex; gap: 14px; font-size: 11.5px; color: var(--text-2); margin-top: 6px;
+  }
+  .headline .swatch {
+    display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px;
+  }
+
+  select.ttl {
+    font: inherit; font-size: 12px; padding: 3px 6px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+
   .note { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
   .empty { color: var(--text-2); padding: 20px 0; text-align: center; }
   code {
@@ -171,6 +194,18 @@
   .flash.ok { background: color-mix(in srgb, var(--good) 14%, var(--surface)); color: var(--success-text); }
   .flash.bad { background: color-mix(in srgb, var(--critical) 14%, var(--surface)); color: var(--critical); }
 </style>
+<script>
+// Before the body exists, so a stored choice is on the root element ahead of the
+// first paint. Doing this with the rest of the page script would render one
+// frame in the wrong theme on every load.
+//
+// The key is shared by /, /dashboard, /siem and /storage: a theme is a property
+// of the operator, not of the page, so following a link must not re-ask.
+try {
+  var t = localStorage.getItem("app-lb-theme");
+  if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+} catch (e) { /* storage unavailable (private window, file://) — use the OS setting */ }
+</script>
 </head>
 <body>
 <div class="wrap">
@@ -210,6 +245,7 @@
   <div class="card" id="alerts"><div class="empty">Loading…</div></div>
 
   <div class="section-title">Rules in force</div>
+  <div class="card" id="enforcement"></div>
   <div class="card" id="rules"><div class="empty">Loading…</div></div>
 </div>
 
@@ -328,12 +364,19 @@ function renderAlert(a) {
     ? `<h4>Check first</h4><ul>${r.investigate.map(i => `<li>${esc(i)}</li>`).join("")}</ul>` : "";
   const caveat = r.caveat ? `<div class="caveat">${esc(r.caveat)}</div>` : "";
   const actions = (r.actions || []).length
-    ? `<h4>Act</h4>` + r.actions.map((act, i) =>
-        `<div class="action">
+    ? `<h4>Act</h4>` + r.actions.map((act, i) => {
+        // The runbook's suggested lifetime pre-selects, so the default stays
+        // what the server recommended; the picker is what makes any other
+        // choice — including forever — reachable without hand-writing a POST.
+        const suggested = act.rule && act.rule.expires_in_secs != null
+          ? act.rule.expires_in_secs : null;
+        return `<div class="action">
            <button class="act${act.kind === "exempt-client" ? "" : " danger"}"
                    type="button" data-alert="${esc(a.id)}" data-action="${i}">${esc(act.label)}</button>
+           ${ttlSelect(`data-for="${esc(a.id)}-${i}"`, suggested)}
            <span class="effect">${esc(act.effect)}</span>
-         </div>`).join("")
+         </div>`;
+      }).join("")
     : `<div class="effect">No rule app-lb can apply for this one — see the notes above.</div>`;
 
   const ecs = a.ecs
@@ -355,9 +398,125 @@ function renderAlert(a) {
   </div>`;
 }
 
+// How long a rule lasts. "Forever" is last and deliberately not the default:
+// the realistic failure here is not a missing block, it is a permanent one that
+// outlives the attack and quietly breaks a customer weeks later.
+const TTLS = [
+  ["1 hour", 3600],
+  ["24 hours", 86400],
+  ["7 days", 604800],
+  ["30 days", 2592000],
+  ["Forever", null],
+];
+
+// `selected` pre-picks an option; `placeholder` instead leads with a neutral
+// entry and selects nothing.
+//
+// The distinction matters. On an alert's action the value shown *is* the value
+// that will be applied, so it must default to what the runbook suggested. In the
+// rules table it is a change control sitting next to an "Expires" column that
+// already states the truth — pre-selecting an arbitrary option there would claim
+// a rule expiring in 22 hours is set to "1 hour".
+function ttlSelect(name, selected, placeholder) {
+  const head = placeholder ? `<option value="">${esc(placeholder)}</option>` : "";
+  const opts = TTLS.map(([label, secs]) =>
+    `<option value="${secs === null ? "never" : secs}"${
+      !placeholder && secs === selected ? " selected" : ""}>${esc(label)}</option>`).join("");
+  return `<select class="ttl" ${name}>${head}${opts}</select>`;
+}
+
+/// `null` = forever, `undefined` = nothing chosen.
+const ttlValue = el =>
+  el.value === "" ? undefined : el.value === "never" ? null : Number(el.value);
+
+// A bar per bucket, scaled to the row's own peak. Per-row rather than a shared
+// scale because the question each one answers is "is *this* rule still firing",
+// not "which rule fires most" — a busy rule would otherwise flatten every other
+// row to invisibility.
+function sparkline(series, bucketSecs) {
+  if (!Array.isArray(series) || !series.length) {
+    return `<span class="spark-none">no data yet</span>`;
+  }
+  const max = Math.max(...series);
+  const total = series.reduce((a, b) => a + b, 0);
+  if (!total) {
+    // An all-zero series is a finding, not an absence — say so rather than
+    // drawing a flat line somebody has to squint at.
+    return `<span class="spark-none">no hits</span>`;
+  }
+  const n = series.length;
+  const w = 100 / n;
+  const bars = series.map((v, i) => {
+    const h = (v / max) * 20;
+    return `<rect x="${(i * w).toFixed(2)}" y="${(21 - h).toFixed(2)}"
+      width="${(w * 0.8).toFixed(2)}" height="${Math.max(h, v ? 0.8 : 0).toFixed(2)}"/>`;
+  }).join("");
+  const mins = Math.round((n * bucketSecs) / 60);
+  return `<svg class="spark" viewBox="0 0 100 22" preserveAspectRatio="none"
+    role="img" aria-label="${fmt(total)} hits over the last ${mins} minutes">${bars}</svg>`;
+}
+
+// The headline: is enforcement doing anything at all? A flat line with rules in
+// force is the "paying for a branch on every request for nothing" case, which is
+// the whole reason this chart exists.
+function renderEnforcement(d) {
+  const g = d.guard || {};
+  const el = $("enforcement");
+  const blocked = g.blocked_recent || [];
+  const exempted = g.exempted_recent || [];
+  if (!blocked.length) {
+    el.style.display = "none";
+    return;
+  }
+  el.style.display = "";
+  const bucket = g.hits_bucket_secs || 60;
+  const mins = Math.round((g.hits_window_secs || blocked.length * bucket) / 60);
+  const max = Math.max(1, ...blocked, ...exempted);
+  const n = blocked.length;
+  const x = i => (i / Math.max(1, n - 1)) * 100;
+  const y = v => 22 - (v / max) * 20;
+  const poly = s => s.map((v, i) => `${x(i).toFixed(2)},${y(v).toFixed(2)}`).join(" ");
+  const totalBlocked = blocked.reduce((a, b) => a + b, 0);
+
+  const verdict = !g.rules
+    ? "No rules in force."
+    : totalBlocked
+      ? `${fmt(totalBlocked)} request${totalBlocked === 1 ? "" : "s"} refused in the last ${mins} minutes.`
+      : `Nothing refused in the last ${mins} minutes — ${fmt(g.rules)} rule${
+          g.rules === 1 ? " is" : "s are"} being checked on every request without matching anything.`;
+
+  el.innerHTML = `<div class="headline">
+    <div class="chart">
+      <svg viewBox="0 0 100 24" preserveAspectRatio="none" role="img"
+           aria-label="requests refused over the last ${mins} minutes">
+        <line x1="0" y1="22" x2="100" y2="22" stroke="var(--grid)" stroke-width="0.4"/>
+        <polyline points="${poly(blocked)}" fill="none" stroke="var(--critical)"
+                  stroke-width="1.1" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
+        ${exempted.some(v => v) ? `<polyline points="${poly(exempted)}" fill="none"
+                  stroke="var(--good)" stroke-width="1.1" stroke-linejoin="round"
+                  vector-effect="non-scaling-stroke"/>` : ""}
+      </svg>
+      <div class="legend">
+        <span><span class="swatch" style="background:var(--critical)"></span>refused</span>
+        ${exempted.some(v => v)
+          ? `<span><span class="swatch" style="background:var(--good)"></span>exempted</span>` : ""}
+        <span style="margin-left:auto">last ${mins}m · peak ${fmt(max)}/${bucket}s</span>
+      </div>
+    </div>
+    <div style="flex:1 1 240px">
+      <div class="tile" style="border:0;padding:0">
+        <div class="label">Enforcement</div>
+        <div class="value${g.rules && !totalBlocked ? " attn" : ""}">${fmt(totalBlocked)}</div>
+        <div class="sub">${esc(verdict)}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
 function renderRules(d) {
   const el = $("rules");
   const rules = d.rules || [];
+  const bucket = (d.guard || {}).hits_bucket_secs || 60;
   if (!rules.length) {
     el.innerHTML = `<div class="empty">No rules. Nothing is being refused.</div>
       <div class="note">Rules come from the <b>Respond</b> buttons above, or from
@@ -370,15 +529,25 @@ function renderRules(d) {
         r.enforcing === false ? ` <span class="tag dry">dry run</span>` : ""}</td>
     <td class="mono">${esc(r.summary)}${r.note ? `<div class="note" style="margin:2px 0 0">${esc(r.note)}</div>` : ""}</td>
     <td class="num">${fmt(r.hits)}</td>
+    <td>${sparkline(r.hits_recent, bucket)}</td>
     <td class="num">${esc(r.last_hit ? ago(r.last_hit) : "—")}</td>
     <td class="num">${esc(until(r.expires_at))}</td>
-    <td><button class="act" type="button" data-rule="${esc(r.id)}">Remove</button></td>
+    <td style="white-space:nowrap">
+      ${ttlSelect(`data-ttl="${esc(r.id)}"`, undefined, "Change to…")}
+      <button class="act" type="button" data-keep="${esc(r.id)}">Set</button>
+      <button class="act danger" type="button" data-rule="${esc(r.id)}">Remove</button>
+    </td>
   </tr>`).join("");
+  const mins = Math.round(((d.guard || {}).hits_window_secs || 3600) / 60);
   el.innerHTML = `<table class="rules">
-    <thead><tr><th>Action</th><th>Matches</th><th>Hits</th><th>Last</th><th>Expires</th><th></th></tr></thead>
+    <thead><tr><th>Action</th><th>Matches</th><th>Hits</th>
+      <th>Last ${mins}m</th><th>Last</th><th>Expires</th><th></th></tr></thead>
     <tbody>${rows}</tbody></table>
-    <div class="note">Rules are never applied to this admin API — that is what keeps a bad rule
-    from locking you out of the page that removes it.</div>`;
+    <div class="note">A rule reading <b>no hits</b> is costing a comparison on every request to
+    the data plane and refusing nothing — either the attack stopped, or the match never described
+    it. <b>Set</b> changes when a rule expires, including keeping it forever; the hit history
+    carries over. Rules are never applied to this admin API, which is what keeps a bad one from
+    locking you out of the page that removes it.</div>`;
 }
 
 function ruleOptions(alerts) {
@@ -418,6 +587,7 @@ async function load() {
   tiles(d);
   ruleOptions(d.alerts || []);
   renderAlerts(d);
+  renderEnforcement(d);
   renderRules(d);
 
   const g = d.guard || {};
@@ -468,6 +638,33 @@ document.addEventListener("click", async ev => {
     return;
   }
 
+  const keep = ev.target.closest("button[data-keep]");
+  if (keep) {
+    const id = keep.getAttribute("data-keep");
+    const sel = document.querySelector(`select[data-ttl="${CSS.escape(id)}"]`);
+    const secs = sel ? ttlValue(sel) : undefined;
+    if (secs === undefined) {
+      flash("bad", "Pick a new lifetime from the dropdown first.");
+      return;
+    }
+    const label = sel.options[sel.selectedIndex].text;
+    if (secs === null && !confirm(
+        `Keep rule ${id} forever?\n\nIt will outlive the incident that created it. ` +
+        `A permanent block that nobody revisits is the usual way a mitigation ` +
+        `turns into an outage months later.`)) return;
+    keep.disabled = true;
+    const r = await api("PATCH", "/security/rules/" + encodeURIComponent(id),
+      { expires_in_secs: secs });
+    if (r.ok) { flash("ok", `Rule ${id} now expires: ${label.toLowerCase()}.`); await load(); }
+    else {
+      keep.disabled = false;
+      flash("bad", r.status === 401 || r.status === 403
+        ? "Refused: changing a rule needs admin credentials."
+        : `Rule not changed (${r.status}). ${(r.data && (r.data.message || r.data.error)) || ""}`);
+    }
+    return;
+  }
+
   const btn = ev.target.closest("button[data-action]");
   if (!btn) return;
   const alertId = btn.getAttribute("data-alert");
@@ -475,9 +672,19 @@ document.addEventListener("click", async ev => {
   const alert = (latest && latest.alerts || []).find(a => String(a.id) === alertId);
   const action = alert && alert.response && alert.response.actions[idx];
   if (!action) return;
-  if (!confirm(action.effect + "\n\nApply this rule?")) return;
+
+  // The picker beside the button decides the lifetime, overriding whatever the
+  // runbook suggested. Copied rather than mutated, so a failed POST does not
+  // leave the cached alert carrying an edit that was never applied.
+  const sel = document.querySelector(`select[data-for="${CSS.escape(alertId + "-" + idx)}"]`);
+  const secs = sel ? ttlValue(sel) : (action.rule || {}).expires_in_secs;
+  const rule = Object.assign({}, action.rule, { expires_in_secs: secs });
+  const lifetime = secs === null || secs === undefined
+    ? "It will not expire on its own."
+    : `It expires in ${sel ? sel.options[sel.selectedIndex].text.toLowerCase() : secs + "s"}.`;
+  if (!confirm(action.effect + "\n\n" + lifetime + "\n\nApply this rule?")) return;
   btn.disabled = true;
-  await applyRule(action.rule, action.label);
+  await applyRule(rule, action.label);
   btn.disabled = false;
 });
 
@@ -512,7 +719,11 @@ $("themebtn").addEventListener("click", () => {
   const root = document.documentElement;
   const dark = root.getAttribute("data-theme") === "dark"
     || (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
-  root.setAttribute("data-theme", dark ? "light" : "dark");
+  const next = dark ? "light" : "dark";
+  root.setAttribute("data-theme", next);
+  // Persisted so a refresh, or a hop to another app-lb page, keeps it. A
+  // failure here costs the preference and nothing else.
+  try { localStorage.setItem("app-lb-theme", next); } catch (e) { /* ignore */ }
 });
 
 load();

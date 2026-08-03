@@ -855,7 +855,16 @@ impl Autoscaler {
         let inactive = match self.vms.list_inactive().await {
             Ok(list) => list,
             Err(e) => {
-                tracing::debug!(error = %e, "could not list inactive sandboxes; skipping sweep");
+                // `warn`, not `debug`: this is the only backstop for a stopped
+                // sandbox nothing claims, and it is invisible when it is not
+                // running. A daemon that answers this call with a payload the
+                // client cannot parse switches the backstop off silently, which
+                // is exactly how it went unnoticed before.
+                tracing::warn!(
+                    error = %e,
+                    "could not list inactive sandboxes; the suspended-VM sweep is not running, \
+                     so stopped VMs no deployment claims will not be reclaimed",
+                );
                 return;
             }
         };

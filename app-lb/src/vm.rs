@@ -381,7 +381,7 @@ impl VmManager {
                 )
                 .await?;
             let empty = page.sandboxes.is_empty();
-            out.extend(page.sandboxes);
+            out.extend(page.sandboxes.into_iter().map(InactiveSandbox::into_info));
             match page.next_cursor {
                 // A cursor that repeats itself would loop forever.
                 Some(next) if !empty && Some(&next) != cursor.as_ref() => cursor = Some(next),
@@ -400,9 +400,88 @@ impl VmManager {
 #[derive(Debug, Deserialize)]
 struct InactivePage {
     #[serde(default)]
-    sandboxes: Vec<SandboxInfo>,
+    sandboxes: Vec<InactiveSandbox>,
     #[serde(default)]
     next_cursor: Option<String>,
+}
+
+/// One sandbox as the *inactive* listing reports it.
+///
+/// Parsed here rather than straight into the SDK's [`SandboxInfo`], because the
+/// two are not the same wire format and never were. mvm-ctrl serves two families
+/// of route: the **compat** ones the SDK is built for (`/deployed-sandboxes`),
+/// which go through its `compat_sandbox_json` shim and synthesize the
+/// `status_changed_at` the SDK requires, and the **native** ones
+/// (`/sandboxes/inactive`), which serialize the daemon's own model — a model with
+/// no such field. `SandboxInfo` declares `status_changed_at` as the single field
+/// without `#[serde(default)]`, so pointing it at the native route fails the
+/// *entire page* on a string that was never promised.
+///
+/// That is app-lb's error and not the daemon's: the SDK has no `list_inactive`,
+/// so this call was written here against a route the SDK does not cover. It cost
+/// real damage before it was understood — a failed page takes down both callers
+/// (the suspended-VM backstop in `autoscale` and disk reclamation in `disks`),
+/// and both then decline to act, silently.
+///
+/// So: `id` is required, because a record without one is not addressable and
+/// acting on a page containing it would be guesswork. Everything else defaults.
+/// That keeps a genuinely malformed page an error — which is what makes the
+/// inventory report `complete: false` and hold every disk — while a merely
+/// *sparse* one, which is what the daemon actually sends, goes through.
+#[derive(Debug, Deserialize)]
+struct InactiveSandbox {
+    id: String,
+    #[serde(default)]
+    name: String,
+    /// `SandboxStatus` has a `#[serde(other)]` fallback, so an unrecognised
+    /// state degrades to `Unknown` rather than failing the page.
+    #[serde(default = "unknown_status")]
+    status: SandboxStatus,
+    #[serde(default)]
+    image: String,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+    #[serde(default)]
+    error_message: Option<String>,
+    #[serde(default)]
+    status_changed_at: String,
+    #[serde(default)]
+    guest_ip: Option<String>,
+}
+
+fn unknown_status() -> SandboxStatus {
+    SandboxStatus::Unknown
+}
+
+impl InactiveSandbox {
+    /// Widen to the shape the rest of app-lb reads.
+    ///
+    /// Only `id`, `name` and `status` are ever consulted for a sandbox from this
+    /// listing — it exists to answer "does the daemon still know about this?" —
+    /// so the remaining fields are filled with the same defaults `SandboxInfo`
+    /// would have used. Nothing routes to an inactive sandbox, by definition.
+    fn into_info(self) -> SandboxInfo {
+        SandboxInfo {
+            id: self.id,
+            name: self.name,
+            status: self.status,
+            image: self.image,
+            region: None,
+            start_command: None,
+            working_directory: None,
+            size_class: None,
+            env_vars: None,
+            setup_hooks: None,
+            uptime_secs: 0,
+            ttl_seconds: self.ttl_seconds,
+            is_deployed: false,
+            error_message: self.error_message,
+            status_changed_at: self.status_changed_at,
+            urls: vec![],
+            guest_ip: self.guest_ip,
+            metadata: None,
+        }
+    }
 }
 
 /// Extract the routable address, rejecting anything we could not proxy to.
@@ -561,6 +640,96 @@ mod tests {
         assert_eq!(owner_of("applb-"), None);
         // No nonce segment => not one of ours.
         assert_eq!(owner_of("applb-demo"), None);
+    }
+
+    /// The daemon's two listings do not agree on their own schema, and the
+    /// SDK's `SandboxInfo` cannot parse the inactive one.
+    ///
+    /// This payload is copied verbatim from a live `GET /sandboxes/inactive`:
+    /// note the complete absence of `status_changed_at`, plus an `uptime` object
+    /// where the SDK expects `uptime_secs`. Deserializing it as `SandboxInfo`
+    /// fails the whole page, which took disk reclamation and the suspended-VM
+    /// backstop down with it.
+    mod inactive_listing {
+        use super::*;
+
+        /// Verbatim from heyvmd 2026-08-03, trimmed to two records.
+        const LIVE: &str = r#"{"cursor":null,"next_cursor":"sb-067cf381","sandboxes":[
+            {"backend_type":"libvirt","cpu_usage":null,"id":"sb-000fcf7c",
+             "image":"/home/u/.heyo/images/todo-agent-base.qcow2","memory_usage":null,
+             "mounts":[{"host_path":"/home/u/.todo","read_only":false,"sandbox_path":"/data"}],
+             "name":"e2e-test","remotely_accessible":false,"sandbox_type":"shell",
+             "status":"stopped","ttl_seconds":3600,"uptime":{"nanos":8225,"secs":0}},
+            {"backend_type":"firecracker","cpu_usage":null,"guest_ip":"172.21.94.166",
+             "id":"sb-066157a9","image":"ubuntu","memory_usage":null,"name":"applb-demo-000000000001",
+             "remotely_accessible":false,"sandbox_type":"shell","status":"stopped",
+             "tap_device":"tap-fc-066157a9","ttl_seconds":900,"uptime":{"nanos":1379056,"secs":0}}]}"#;
+
+        /// Not a daemon bug: `/sandboxes/inactive` is a *native* route and
+        /// `SandboxInfo` is the *compat* shape. This pins the mismatch so that a
+        /// future SDK that does cover this route makes the local parser
+        /// obviously redundant rather than quietly redundant.
+        #[test]
+        fn the_sdk_type_cannot_parse_what_the_daemon_sends() {
+            #[derive(Debug, Deserialize)]
+            struct StrictPage {
+                #[allow(dead_code)]
+                sandboxes: Vec<SandboxInfo>,
+            }
+            let e = serde_json::from_str::<StrictPage>(LIVE).unwrap_err().to_string();
+            assert!(
+                e.contains("status_changed_at"),
+                "if the SDK ever defaults this field, our own parser can go: {e}",
+            );
+        }
+
+        #[test]
+        fn our_parser_reads_it() {
+            let page: InactivePage = serde_json::from_str(LIVE).unwrap();
+            assert_eq!(page.sandboxes.len(), 2);
+            assert_eq!(page.next_cursor.as_deref(), Some("sb-067cf381"));
+
+            let infos: Vec<SandboxInfo> = page
+                .sandboxes
+                .into_iter()
+                .map(InactiveSandbox::into_info)
+                .collect();
+            assert_eq!(infos[0].id, "sb-000fcf7c");
+            assert_eq!(infos[0].status, SandboxStatus::Stopped);
+            assert_eq!(infos[0].status_changed_at, "", "absent, and that is fine");
+            // The name is what maps a sandbox back to its deployment, so it is
+            // the one field besides the id that must survive.
+            assert_eq!(owner_of(&infos[1].name), Some("demo"));
+            assert_eq!(infos[1].guest_ip.as_deref(), Some("172.21.94.166"));
+        }
+
+        /// Only the id is load-bearing. A record without one cannot be acted on,
+        /// and failing the page is what makes the disk inventory report
+        /// `complete: false` and hold every disk rather than guess.
+        #[test]
+        fn a_record_with_no_id_still_fails_the_page() {
+            let bad = r#"{"sandboxes":[{"name":"nameless","status":"stopped"}]}"#;
+            assert!(serde_json::from_str::<InactivePage>(bad).is_err());
+        }
+
+        /// Everything else is optional, including the status.
+        #[test]
+        fn an_almost_empty_record_is_accepted() {
+            let sparse = r#"{"sandboxes":[{"id":"sb-1"}]}"#;
+            let page: InactivePage = serde_json::from_str(sparse).unwrap();
+            let info = page.sandboxes.into_iter().next().unwrap().into_info();
+            assert_eq!(info.id, "sb-1");
+            assert_eq!(info.status, SandboxStatus::Unknown);
+        }
+
+        /// An unrecognised status must not fail the page either — the SDK enum
+        /// has a `#[serde(other)]` arm and this pins that we rely on it.
+        #[test]
+        fn an_unknown_status_degrades_rather_than_failing() {
+            let odd = r#"{"sandboxes":[{"id":"sb-1","status":"hibernating"}]}"#;
+            let page: InactivePage = serde_json::from_str(odd).unwrap();
+            assert_eq!(page.sandboxes[0].status, SandboxStatus::Unknown);
+        }
     }
 
     #[test]

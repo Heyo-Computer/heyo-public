@@ -1148,7 +1148,7 @@ fn security_summary(state: &AdminState) -> Option<SecuritySummary> {
     let (ring, stats) = (state.alerts.as_ref()?, state.siem.as_ref()?);
     let totals = ring.totals();
     let s = stats.snapshot();
-    let g = state.guard.stats();
+    let g = state.guard.stats(now_secs());
     Some(SecuritySummary {
         open: ring.len(),
         urgent: totals.high + totals.critical,
@@ -1165,7 +1165,11 @@ fn security_summary(state: &AdminState) -> Option<SecuritySummary> {
 /// that name its own deployment and nothing else. A fleet-wide block is fleet
 /// information — it says which addresses are considered hostile, which is the
 /// same disclosure the alert list is gated for.
-fn visible_rules(state: &AdminState, scope: Option<&[String]>) -> Vec<crate::guard::RuleView> {
+fn visible_rules(
+    state: &AdminState,
+    scope: Option<&[String]>,
+    now: u64,
+) -> Vec<crate::guard::RuleView> {
     let enforcing = state.guard.enforcing();
     state
         .guard
@@ -1177,7 +1181,10 @@ fn visible_rules(state: &AdminState, scope: Option<&[String]>) -> Vec<crate::gua
                 .deployment()
                 .is_some_and(|d| ids.iter().any(|id| id == d)),
         })
-        .map(|r| r.view(enforcing))
+        // `report`, not `view`: the console charts each rule's recent hits, and
+        // that series is what answers "is this rule still doing anything, or am
+        // I paying for a branch on every request for nothing?".
+        .map(|r| r.report(enforcing, now))
         .collect()
 }
 
@@ -1220,8 +1227,8 @@ async fn security_snapshot(
                 high: 0,
                 critical: 0,
             },
-            rules: visible_rules(&state, scope),
-            guard: state.guard.stats(),
+            rules: visible_rules(&state, scope, now),
+            guard: state.guard.stats(now),
             stats: None,
         });
     };
@@ -1258,8 +1265,8 @@ async fn security_snapshot(
         window_secs: ring.window_secs(),
         alerts,
         totals: ring.totals(),
-        rules: visible_rules(&state, scope),
-        guard: state.guard.stats(),
+        rules: visible_rules(&state, scope, now),
+        guard: state.guard.stats(now),
         // Fleet-wide counters: withheld from a scoped caller, for whom they
         // would describe traffic they cannot see.
         stats: scope
@@ -1326,6 +1333,56 @@ async fn create_rule(
         "guard rule created",
     );
     (StatusCode::CREATED, Json(rule.view(state.guard.enforcing()))).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleExpiryBody {
+    /// Seconds from now, or `null` for a rule that never expires. Required —
+    /// absent is refused rather than read as "forever", because making a block
+    /// permanent by omission is exactly the accident this field exists to
+    /// prevent.
+    #[serde(default, deserialize_with = "double_option")]
+    expires_in_secs: Option<Option<u64>>,
+}
+
+/// `PATCH /security/rules/:id` — change when a rule expires, including never.
+///
+/// The counterpart to the bounded lifetime every suggested action carries. That
+/// default is right for a rule authored mid-incident, and wrong once an operator
+/// has decided an address is simply not welcome; re-posting the rule to make it
+/// permanent would work but would reset its hit history, which is the evidence
+/// the decision rests on.
+async fn patch_rule(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(body): Json<RuleExpiryBody>,
+) -> Response {
+    let Some(expires_in_secs) = body.expires_in_secs else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "expires_in_secs is required: a number of seconds, or null to keep the rule \
+             indefinitely",
+        )
+        .into_response();
+    };
+    let now = now_secs();
+    match state.guard.set_expiry(&id, expires_in_secs, now) {
+        Ok(view) => {
+            if let Err(e) = state.guard.persist() {
+                tracing::error!(error = %e, "guard rules not saved after expiry change");
+            }
+            match expires_in_secs {
+                None => tracing::warn!(
+                    rule = %id,
+                    summary = %view.summary,
+                    "guard rule made permanent; it will now outlive the incident that created it",
+                ),
+                Some(secs) => tracing::info!(rule = %id, secs, "guard rule expiry extended"),
+            }
+            Json(view).into_response()
+        }
+        Err(e) => guard_error(e),
+    }
 }
 
 /// `DELETE /security/rules/:id` — stop refusing it.
@@ -2708,7 +2765,7 @@ fn router(state: AdminState) -> Router {
         // ones above it, so it belongs on this side of the gate. Reads live on
         // `GET /security` with the alerts, which is why there is no `get` here.
         .route("/security/rules", post(create_rule))
-        .route("/security/rules/:id", delete(delete_rule))
+        .route("/security/rules/:id", patch(patch_rule).delete(delete_rule))
         // Disk mutations. `DELETE /disks/:id` deletes gigabytes with no undo,
         // which puts it firmly on this side of the gate — it is the single most
         // destructive route app-lb exposes. `/disks/sweep` is registered as a
@@ -3242,6 +3299,123 @@ mod tests {
                 DISKS_HTML.contains(r#"reason(r).includes("force=1")"#),
                 "the page must not offer force for a refusal that forbids it",
             );
+        }
+    }
+
+    mod security_console {
+        use super::*;
+
+        #[test]
+        fn the_page_calls_the_rule_routes_the_router_registers() {
+            for route in [
+                r#""POST", "/security/rules""#,
+                r#""PATCH", "/security/rules/""#,
+                r#""DELETE", "/security/rules/""#,
+            ] {
+                assert!(SIEM_HTML.contains(route), "page never calls {route}");
+            }
+        }
+
+        /// An all-zero series means "this rule refused nothing", which is the
+        /// finding — not "no data". A page that rendered the two the same way
+        /// would hide exactly the rule worth removing.
+        #[test]
+        fn a_rule_that_never_fires_is_called_out_rather_than_drawn_flat() {
+            assert!(SIEM_HTML.contains(r#">no hits<"#));
+            assert!(SIEM_HTML.contains(r#">no data yet<"#));
+        }
+
+        /// Making a block permanent is the one action here with no natural end,
+        /// so it must not be reachable without saying so.
+        #[test]
+        fn keeping_a_rule_forever_is_confirmed() {
+            assert!(SIEM_HTML.contains("Keep rule"));
+            assert!(
+                SIEM_HTML.contains("secs === null && !confirm("),
+                "a forever rule must be confirmed and a timed one must not be",
+            );
+        }
+
+        /// `expires_in_secs` is required on the PATCH: absent must not be read
+        /// as "forever", or a client that forgets the field silently makes a
+        /// block permanent.
+        #[test]
+        fn an_absent_expiry_is_refused_rather_than_read_as_forever() {
+            let absent: RuleExpiryBody = serde_json::from_str("{}").unwrap();
+            assert!(absent.expires_in_secs.is_none(), "absent");
+
+            let forever: RuleExpiryBody =
+                serde_json::from_str(r#"{"expires_in_secs":null}"#).unwrap();
+            assert_eq!(forever.expires_in_secs, Some(None), "explicitly forever");
+
+            let timed: RuleExpiryBody =
+                serde_json::from_str(r#"{"expires_in_secs":3600}"#).unwrap();
+            assert_eq!(timed.expires_in_secs, Some(Some(3600)));
+        }
+    }
+
+    /// The four pages are separate `include_str!`d files with no build step to
+    /// share anything through, so what makes them one product is only ever
+    /// convention. These pin the parts of that convention a user would notice.
+    mod page_consistency {
+        use super::*;
+
+        fn pages() -> [(&'static str, &'static str); 4] {
+            [
+                ("dashboard", DASHBOARD_HTML),
+                ("directory", DIRECTORY_HTML),
+                ("siem", SIEM_HTML),
+                ("disks", DISKS_HTML),
+            ]
+        }
+
+        /// One key, or the theme resets every time an operator follows a link
+        /// between the pages.
+        #[test]
+        fn every_page_persists_the_theme_under_the_same_key() {
+            for (name, html) in pages() {
+                assert!(
+                    html.contains(r#"localStorage.getItem("app-lb-theme")"#),
+                    "{name} does not restore the saved theme",
+                );
+                assert!(
+                    html.contains(r#"localStorage.setItem("app-lb-theme", next)"#),
+                    "{name} does not save the theme it just applied",
+                );
+            }
+        }
+
+        /// The restore has to run in `<head>`, before the body exists. Applied
+        /// alongside the rest of the page script it would paint one frame in the
+        /// wrong theme on every load.
+        #[test]
+        fn the_theme_is_restored_before_the_body_renders() {
+            for (name, html) in pages() {
+                let head = html
+                    .split_once("</head>")
+                    .unwrap_or_else(|| panic!("{name} has no </head>"))
+                    .0;
+                assert!(
+                    head.contains(r#"localStorage.getItem("app-lb-theme")"#),
+                    "{name} restores the theme after <head>, which flashes",
+                );
+            }
+        }
+
+        /// Storage throws rather than returning null in a private window and
+        /// under some `file://` policies. A theme preference must not be able to
+        /// take a page's whole script block down with it.
+        #[test]
+        fn theme_storage_failures_cannot_break_the_page() {
+            for (name, html) in pages() {
+                let uses = html.matches("localStorage").count();
+                let guards = html.matches("try {").count();
+                assert!(
+                    guards >= 2 && uses == 2,
+                    "{name}: every localStorage access must sit inside a try/catch \
+                     ({uses} accesses, {guards} guards)",
+                );
+            }
         }
     }
 

@@ -292,6 +292,18 @@
   #toast.show { opacity: 1; }
   #toast.err { background: var(--critical); color: #fff; }
 </style>
+<script>
+// Before the body exists, so a stored choice is on the root element ahead of the
+// first paint. Doing this with the rest of the page script would render one
+// frame in the wrong theme on every load.
+//
+// The key is shared by /, /dashboard, /siem and /storage: a theme is a property
+// of the operator, not of the page, so following a link must not re-ask.
+try {
+  var t = localStorage.getItem("app-lb-theme");
+  if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+} catch (e) { /* storage unavailable (private window, file://) — use the OS setting */ }
+</script>
 </head>
 <body>
 <div class="wrap">
@@ -1788,7 +1800,11 @@ $("themebtn").addEventListener("click", () => {
   const root = document.documentElement;
   const dark = root.getAttribute("data-theme") === "dark"
     || (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
-  root.setAttribute("data-theme", dark ? "light" : "dark");
+  const next = dark ? "light" : "dark";
+  root.setAttribute("data-theme", next);
+  // Persisted so a refresh, or a hop to another app-lb page, keeps it. A
+  // failure here costs the preference and nothing else.
+  try { localStorage.setItem("app-lb-theme", next); } catch (e) { /* ignore */ }
 });
 
 poll();
