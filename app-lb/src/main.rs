@@ -12,6 +12,7 @@ mod autoscale;
 mod config;
 mod deployment;
 mod dns;
+mod guard;
 mod health;
 mod jobs;
 mod metrics;
@@ -58,6 +59,9 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_TOKENS_PATH") {
         cfg.tokens_path = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_GUARD_PATH") {
+        cfg.guard_path = v;
     }
     if let Ok(v) = std::env::var("APP_LB_NAME") {
         cfg.name = v;
@@ -344,6 +348,23 @@ fn main() {
         let _ = tokens.persist();
     }
 
+    // Block rules, restored before the data plane accepts anything. Fatal on a
+    // corrupt file, for the same reason the token store is: coming up with an
+    // empty rule set would silently readmit whatever an operator blocked during
+    // an incident, and would look exactly like a healthy server while doing it.
+    let guard = Arc::new(guard::Guard::from_env(&cfg.guard_path));
+    match guard.load(deployment::now_secs()) {
+        Ok(0) => tracing::info!(path = %guard.path().display(), "no guard rules"),
+        Ok(n) => tracing::info!(count = n, enforcing = guard.enforcing(), "loaded guard rules"),
+        Err(e) => panic!("cannot read {}: {e}", guard.path().display()),
+    }
+    if !guard.enforcing() {
+        tracing::warn!(
+            "APP_LB_GUARD_ENFORCE=0: guard rules are matched and counted but nothing is \
+             refused — this is a dry run, not protection",
+        );
+    }
+
     if !secrets.is_encrypted() {
         tracing::info!(
             path = %secrets.path().display(),
@@ -538,6 +559,7 @@ fn main() {
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),
             siem.as_ref(),
+            guard.clone(),
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
         ),
     );
@@ -551,6 +573,7 @@ fn main() {
             auth,
             obs.as_ref().and_then(|o| o.access.clone()),
             siem.as_ref().map(|s| s.sink.clone()),
+            guard.clone(),
         ),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);

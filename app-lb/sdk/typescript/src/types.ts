@@ -309,6 +309,10 @@ export interface SecuritySummary {
   dropped: number;
   /** Whether the per-source table is full, which means the same for addresses. */
   clients_at_capacity: boolean;
+  /** Guard rules currently in force. */
+  rules: number;
+  /** Requests those rules have refused since app-lb started. */
+  blocked: number;
 }
 
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
@@ -339,6 +343,85 @@ export interface SecurityAlert {
    * free-form map: app-lb may add fields, and `url.query` is never among them.
    */
   ecs?: Record<string, unknown>;
+  /** What to do about it. Derived server-side, so a client renders rather than
+   * reasons. */
+  response: AlertResponse;
+}
+
+/** The runbook half of an alert: what to check, and what can be applied. */
+export interface AlertResponse {
+  /** Ordered, short. What to check before refusing anyone's traffic. */
+  investigate: string[];
+  /** Rules that would mitigate this, ready to `POST /security/rules`. */
+  actions: SuggestedAction[];
+  /** Present where the obvious action does not do what it looks like it does —
+   * notably that guard rules are never applied to app-lb's own admin API. */
+  caveat?: string;
+}
+
+export interface SuggestedAction {
+  /** `block-client`, `block-client-deployment`, `block-path`, `exempt-client`. */
+  kind: string;
+  label: string;
+  /** What it stops and what it leaves alone. Show this next to the button. */
+  effect: string;
+  /** Post verbatim to `/security/rules`. */
+  rule: RuleSpec;
+}
+
+// -- guard rules -----------------------------------------------------------
+
+export type RuleAction = "block" | "allow";
+
+/**
+ * Conditions on a request. Every field present must match; absent fields are
+ * not checked. All literal — app-lb runs no regular expressions on the request
+ * path.
+ */
+export interface RuleMatch {
+  /** An address or CIDR: `203.0.113.9`, `203.0.113.0/24`, `2001:db8::/32`. */
+  client?: string;
+  host?: string;
+  deployment?: string;
+  path_prefix?: string;
+  path_contains?: string;
+  method?: string;
+  user_agent_contains?: string;
+}
+
+/** The body of `POST /security/rules`. */
+export interface RuleSpec {
+  action: RuleAction;
+  /** At least one condition — an empty match is refused, since it would apply
+   * to every request to the data plane. */
+  match: RuleMatch;
+  /** Seconds from now. Omitted means permanent. */
+  expires_in_secs?: number;
+  note?: string;
+}
+
+/** One rule in force. */
+export interface RuleView {
+  id: string;
+  action: RuleAction;
+  match: RuleMatch;
+  /** The conditions as a phrase, so a client need not render them. */
+  summary: string;
+  note?: string;
+  created_at: number;
+  expires_at?: number;
+  hits: number;
+  last_hit?: number;
+  /** `false` under `APP_LB_GUARD_ENFORCE=0`: matched and counted, not refused. */
+  enforcing: boolean;
+}
+
+export interface GuardStats {
+  rules: number;
+  blocked: number;
+  /** Requests an `allow` rule exempted from a block. */
+  exempted: number;
+  enforcing: boolean;
 }
 
 export interface SeverityTotals {
@@ -369,6 +452,10 @@ export interface SecurityResponse {
   /** Newest first. */
   alerts: SecurityAlert[];
   totals: SeverityTotals;
+  /** The block rules in force. Served here so a console renders findings and
+   * interventions from one fetch. Narrowed for a deployment-scoped token. */
+  rules: RuleView[];
+  guard: GuardStats;
   /** Withheld from a deployment-scoped token, for whom it would describe
    * traffic it cannot see. */
   stats?: SiemStats;

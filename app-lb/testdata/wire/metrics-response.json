@@ -172,7 +172,9 @@
     "open": 12,
     "urgent": 3,
     "dropped": 0,
-    "clients_at_capacity": false
+    "clients_at_capacity": false,
+    "rules": 2,
+    "blocked": 1412
   },
   "deployments": [
     {

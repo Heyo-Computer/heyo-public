@@ -50,6 +50,7 @@ Configuration is environment-only:
 | `APP_LB_SECRET_KEY` | *(unset)* | 32-byte hex key (or any passphrase) that seals the secrets file with AES-256-GCM |
 | `APP_LB_TOKENS_PATH` | `app-lb-tokens.json` | Where minted [app-tokens](#app-tokens) persist (written `0600`; only hashes) |
 | `APP_LB_AUTH_KEY` | `app-lb-auth-key` | Signing key for sign-in sessions; generated `0600` on first use |
+| `APP_LB_GUARD_PATH` | `app-lb-guard.json` | Where [block rules](#response-actions) persist, so a restart does not unblock an attacker |
 | `APP_LB_NAME` | `app-lb` | Display name in the dashboard header and page title |
 | `APP_LB_DAEMON_URL` | `http://127.0.0.1:34099` | heyvm daemon |
 | `APP_LB_DASHBOARD_PASSWORD` | *(unset)* | Set to gate the dashboard behind HTTP Basic Auth |
@@ -90,6 +91,7 @@ Configuration is environment-only:
 | `APP_LB_SIEM_MAX_ALERTS_PER_MIN` | `60` | Hard ceiling on *new* alerts, for a distributed attack that cannot fold |
 | `APP_LB_SIEM_SCAN_QUERY` | `true` | `0` to match signatures against the path only, never the query string |
 | `APP_LB_SIEM_SHIP` | `true` | `0` to keep alerts local instead of sending them to app-obs |
+| `APP_LB_GUARD_ENFORCE` | `true` | `0` for a dry run: [rules](#response-actions) match and count, nothing is refused |
 | `APP_LB_OBS_QUEUE_CAPACITY` | `8192` | Records buffered before new ones are dropped |
 | `APP_LB_OBS_BATCH` | `500` | Records per POST |
 | `APP_LB_OBS_FLUSH_SECS` | `2` | How long a record may wait for a fuller batch |
@@ -179,6 +181,13 @@ curl -XDELETE localhost:9090/deployments/demo   # drain and reap every VM
 curl localhost:9090/healthz
 curl localhost:9090/metrics              # metrics snapshot (JSON)
 curl localhost:9090/certs                # issued TLS certificates and expiry
+curl localhost:9090/security             # security findings + the block rules in force
+
+# Refuse traffic. See "Response actions"; an empty match is rejected, and these
+# rules are never applied to this admin API.
+curl -XPOST localhost:9090/security/rules -H 'content-type: application/json' \
+  -d '{"action":"block","match":{"client":"203.0.113.9"},"expires_in_secs":3600}'
+curl -XDELETE localhost:9090/security/rules/5f295e1a86f2
 
 # Edit a deployment in place (full spec). The pool is preserved unless the `vm`
 # template changes, in which case the VMs are rebuilt.
@@ -509,6 +518,52 @@ first, so only a real change to *who* may enter invalidates anything.
 **The identity headers are stripped from every incoming request** to a gated
 deployment before app-lb sets them, so a client cannot present its own
 `x-auth-request-email`.
+
+### One sign-in across several deployments
+
+By default the session cookie is scoped to the hostname that set it. That is the
+safe default and it has an obvious cost: opening `docs.example.com` and then
+`api.example.com` — say from the [directory](#directory) — sends you back to
+Google in between, because the second host has nothing to present.
+
+Set `auth.cookie_domain` on both gates to make them one realm:
+
+```json
+"auth": {
+  "provider": "google",
+  "client_id": "…apps.googleusercontent.com",
+  "client_secret": {"secret": "google-oauth", "key": "client_secret"},
+  "allowed_domains": ["example.com"],
+  "cookie_domain": "example.com"
+}
+```
+
+One sign-in then covers every deployment under `example.com`, and the directory's
+cards open without a round trip.
+
+**A wider cookie is not a weaker check.** A session is still refused unless the
+gate presenting it has a byte-identical policy — provider, client id, both
+allow-lists, and this field. Two gates share a session only when either would
+have admitted the same person anyway; a neighbour with a narrower `allowed_emails`
+refuses the cookie and starts its own sign-in. Turning the realm on also changes
+the fingerprint, so a host-only session cannot be replayed at a realm gate or
+the other way round.
+
+**What you are accepting.** A cookie scoped to `example.com` is sent to *every*
+host under it, including ones app-lb does not serve. If anything else on that
+domain is untrusted — a customer subdomain, a legacy box — this hands it a live
+session cookie. `HttpOnly` keeps scripts off it; nothing keeps a server on that
+domain off it. That is why it is opt-in and per-gate rather than a global
+setting.
+
+The value must have at least two labels and must be a parent of the hostnames the
+deployment serves; registration refuses anything else, because a cookie the
+browser silently discards produces a sign-in that loops forever with nothing in
+any log to explain it. It is not checked against the public suffix list, so
+`co.uk` is accepted and would simply never be sent — don't.
+
+There is no way to widen a session across *different* registrable domains. That
+is a browser rule, not an app-lb one.
 
 ### Limits
 
@@ -958,9 +1013,9 @@ edge-1                                      Dashboard  Metrics  Theme
 4 URLs across 3 deployments. 1 with nothing healthy behind it.
 
 ┌────────────────────────────┐ ┌────────────────────────────┐
-│ api                 static │ │ docs                  site │
-│ http://api.example.com     │ │ http://docs.example.com    │
-│ ● 2 of 2 upstreams up      │ │ ● serving /srv/docs        │
+│ api                 static │ │ private     sign-in    vm  │
+│ http://api.example.com     │ │ http://private.example.com │
+│ ● 2 of 2 upstreams up      │ │ ● 2 VMs ready              │
 └────────────────────────────┘ └────────────────────────────┘
 ```
 
@@ -985,6 +1040,12 @@ The dot reports whether following the link right now would reach anything:
 Scale-to-zero idling is deliberately not red. It is the configured state, and
 colouring it as a fault sends people debugging a system that is working.
 
+A **sign-in** badge marks a card behind [Google sign-in](#google-sign-in), so
+following it may bounce through the provider. Said before the click rather than
+after: it is the difference between "slow" and "broken". Set
+[`auth.cookie_domain`](#one-sign-in-across-several-deployments) across the fleet
+and that bounce happens once for the whole realm instead of once per card.
+
 A deployment whose routes use only `host_suffix` or `path_prefix` names no single
 hostname to link to, so it gets no card — and is listed by id underneath, with
 that reason. Omitting it silently would make "why isn't mine here?" unanswerable
@@ -998,7 +1059,7 @@ app-lb routes. A deployment-scoped [app-token](#app-tokens) sees only its own.
 
 Open `http://<admin-addr>/dashboard` (default `http://127.0.0.1:9090/dashboard`)
 for a live view of the fleet — or [`/`](#directory) for a static index of what is
-running. The dashboard shows: host and per-VM CPU/memory, per-deployment pool
+running, or [`/siem`](#the-security-console) to work through security findings. The dashboard shows: host and per-VM CPU/memory, per-deployment pool
 utilisation and per-VM load, request latency (distribution + p50/p90/p99 and a
 client-derived requests/sec), cold-start times, and autoscaling activity. It is
 a single self-contained page — no external assets, so it works over an SSH tunnel
@@ -1052,7 +1113,7 @@ dashboard is a complete view of what app-lb holds rather than a metrics screen:
 
 | Section | Shows | Source |
 | --- | --- | --- |
-| Security | authentication abuse, attack signatures and traffic anomalies, newest first | `GET /security` |
+| Security | authentication abuse, attack signatures and traffic anomalies, newest first, plus any [block rules](#response-actions) in force — links to the [console](#the-security-console) at `/siem`, where they can be acted on | `GET /security` |
 | Deployments | pool gauges, per-VM load, **booting VMs with their age and daemon status** | `GET /metrics` |
 | Certificates | issued hostnames, issuer, expiry, renewal state — plus routed hostnames that have *no* certificate yet | `GET /certs` |
 | Secrets | ids, descriptions, key *names*, last update, whether the store is sealed | `GET /secrets` |
@@ -1826,9 +1887,17 @@ follow, and this is what fixes them:
 - **Anomalies were only visible to somebody watching** the right dashboard card
   at the right moment.
 
+A fourth followed once the first three were fixed: **a finding with no answer to
+"and now what?" is a notification, not a control.** So detection comes with
+[response actions](#response-actions) — block an address, block a pattern of
+traffic, take it back off — and a [console](#the-security-console) at `/siem`
+where each alert carries its runbook and a rule that is already filled in.
+
 It is **on by default** — unlike log shipping, it needs no external service to
 be useful, and a security feature you have to remember to enable protects
-nobody. `APP_LB_SIEM=0` turns it off.
+nobody. `APP_LB_SIEM=0` turns it off. Enforcement is separate and stays on
+regardless: a rule an operator created keeps working whether or not detection is
+running.
 
 Events are normalized through [`u-siem`](https://crates.io/crates/u-siem) into
 ECS field names (`source.ip`, `url.path`, `http.response.status_code`), so an
@@ -1875,7 +1944,8 @@ from one broken client retrying a single dead URL.
 
 The dashboard grows a **Security** card above the deployment table, and an
 **Alerts** tile beside the fleet totals so a critical finding is visible without
-scrolling. `GET /security` is the same data as JSON, behind the same gate as
+scrolling. The card links to the [console](#the-security-console) at `/siem`,
+which is where a finding can actually be acted on. `GET /security` is the same data as JSON, behind the same gate as
 `/metrics` — it names attacker addresses and the exact probes that reached the
 fleet, so it is never open when `/metrics` is not.
 
@@ -1913,6 +1983,119 @@ Every new alert also ships to app-obs under `source=security` when
 in-memory ring is the live view and app-obs is the durable one. An alert about
 the LB itself lands under `APP_LB_OBS_DEPLOYMENT`, like every other record that
 names no deployment.
+
+### The security console
+
+`GET /siem` is the page the Security card links to. The card summarises; the
+console is where a finding can be acted on, which is why they are two pages: the
+dashboard has to stay glanceable, and this needs the full alert list, the ECS
+fields behind each one, and buttons that change what the data plane does.
+
+Each finding carries a **runbook** and, where one exists, a rule that is already
+filled in:
+
+```
+high   SQL injection attempt in query parameter "id" from 203.0.113.9
+       203.0.113.9   demo   /search   ATT&CK T1190   web.sqli
+
+  ▾ Respond
+    CHECK FIRST
+      · Check the status this got: a 404 means it found nothing, a 200 means it
+        did and the block is the second thing to do.
+      · The alert names the parameter, never the value — app-lb does not store
+        query strings. The upstream's own log is where the payload is.
+    ACT
+      [ Block 203.0.113.9 for 24 hours ]  Every request from 203.0.113.9 to the
+                                          data plane is refused with a 403 for
+                                          24 hours, then the rule expires on its
+                                          own. The admin API is not affected.
+      [ Block 203.0.113.9 on demo only ]  …
+```
+
+Those buttons post the exact body shown, so what an operator reads and what the
+server applies cannot drift. The advice is derived server-side and served on
+`/security`, which means `serverctl`, a script or another client gets the same
+answers rather than reimplementing them.
+
+The console is **view tier**, like the dashboard — the browser's existing
+credentials work. The buttons post to the **CRUD tier**, so a view-only
+[app-token](#app-tokens) can read the console and cannot arm it. The page says so
+when that happens instead of failing silently.
+
+### Response actions
+
+Detection is advisory and runs off the request path. Enforcement is
+authoritative and runs *on* it. A rule is a conjunction of literal conditions —
+all present ones must match, absent ones are not checked:
+
+```sh
+# Block one address for an hour.
+curl -su admin:s3cret localhost:9090/security/rules -X POST \
+  -H 'content-type: application/json' \
+  -d '{"action":"block","match":{"client":"203.0.113.9"},"expires_in_secs":3600}'
+
+# Block a probe path across the fleet, for a week.
+curl -su admin:s3cret localhost:9090/security/rules -X POST \
+  -H 'content-type: application/json' \
+  -d '{"action":"block","match":{"path_prefix":"/wp-login.php"},"expires_in_secs":604800}'
+
+# Never block our own monitoring, whatever else gets created later.
+curl -su admin:s3cret localhost:9090/security/rules -X POST \
+  -H 'content-type: application/json' \
+  -d '{"action":"allow","match":{"client":"10.0.0.0/8"},"note":"internal monitoring"}'
+
+curl -su admin:s3cret localhost:9090/security | jq .rules
+curl -su admin:s3cret localhost:9090/security/rules/5f295e1a86f2 -X DELETE
+```
+
+| `match` field | Matches |
+| --- | --- |
+| `client` | An address or CIDR: `203.0.113.9`, `203.0.113.0/24`, `2001:db8::/32` |
+| `host` | The request's hostname, exactly |
+| `deployment` | The deployment it routed to |
+| `path_prefix` / `path_contains` | The path, literally |
+| `method` | `GET`, `POST`, … |
+| `user_agent_contains` | A substring of `User-Agent`, case-insensitively |
+
+An `allow` rule beats a `block` rule whichever was created first, so
+"block that /16 except our own health checker" needs no reasoning about
+precedence during an incident. Rules are content-addressed: re-posting the same
+conditions replaces the rule rather than stacking a second copy, which is how a
+block about to expire gets extended.
+
+Four things keep this from becoming the outage it was meant to prevent:
+
+* **An empty match is refused.** `{}` is a conjunction of nothing, true of every
+  request — one click would take the whole data plane down.
+* **The admin API is never guarded.** However badly you block yourself out of
+  the data plane, the page that deletes the rule is still reachable. Nothing
+  should ever be added that changes this.
+* **Rules expire.** Every action the console suggests carries a lifetime,
+  because the realistic failure is not a missing block, it is a permanent one
+  that outlives the attack and quietly breaks a customer months later. Client
+  blocks are short — an address is a lease, and behind CGNAT it belongs to
+  somebody else by tomorrow — and path blocks are long, because a path pattern
+  never changes hands.
+* **`APP_LB_GUARD_ENFORCE=0` is a dry run.** Rules match, count hits and log
+  `would have refused this request`, and nothing is turned away. That is how a
+  broad rule gets deployed sanely: watch what it would have caught for an hour
+  first.
+
+Rules are **persisted** to `APP_LB_GUARD_PATH`, unlike alerts. A restart that
+silently readmits an attacker somebody blocked during an incident is a worse
+failure than losing the finding that prompted it.
+
+**No regular expressions**, deliberately. A rule is written under time pressure
+and evaluated on every request; a pathological pattern would turn the mitigation
+into the incident. The regex-shaped matching lives in the detector, which runs
+off the hot path and can afford it. With no rules configured the whole thing is
+one `is_empty` check.
+
+Two limits worth knowing: certificate renewal cannot be broken by a rule,
+because an outstanding ACME `http-01` challenge is answered before the guard
+runs; and a rule cannot stop an attack on the admin API, since that plane is
+never guarded — the console says so on every auth finding rather than offering a
+button that appears to work.
 
 ### The query string
 
@@ -1977,9 +2160,12 @@ input on the failure path for no detection gain.
 question with a different answer; the [deploy-job records](#shipping-logs-to-app-obs)
 and app-lb's own events already cover it.
 
-**No persistence.** The ring and the windows are in memory, so a restart resets
-both. That is the right trade for a load balancer, and the reason
+**No persistence — for findings.** The ring and the windows are in memory, so a
+restart resets both. That is the right trade for a load balancer, and the reason
 `APP_LB_SIEM_SHIP` defaults on: app-obs holds the copy that outlives the process.
+[Block rules](#response-actions) are the deliberate exception and *are* written
+to disk: losing a finding costs you a record of something that already happened,
+while losing a rule readmits an attacker somebody blocked on purpose.
 
 **No IPv6 escape by rotation.** Sources are keyed by /32 for IPv4 and by **/64**
 for IPv6, because a /64 is a standard end-site allocation and an attacker

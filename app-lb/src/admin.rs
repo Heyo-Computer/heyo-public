@@ -38,6 +38,9 @@ const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 /// the dashboard is: it has to work over an SSH tunnel with no route out.
 const DIRECTORY_HTML: &str = include_str!("directory.html");
 
+/// The security console at `GET /siem`.
+const SIEM_HTML: &str = include_str!("siem.html");
+
 /// How to turn a deployment's hostname into a URL somebody can click.
 ///
 /// The dashboard runs on the *admin* listener, so it cannot infer the data
@@ -180,6 +183,12 @@ struct AdminState {
     alerts: Option<Arc<crate::siem::AlertRing>>,
     /// Counters for the detection engine, reported beside `obs` on `/metrics`.
     siem: Option<Arc<crate::siem::SiemStats>>,
+    /// The block rules the data plane enforces. Always present, unlike the SIEM:
+    /// a rule an operator created must keep working whether or not detection is
+    /// switched on.
+    guard: Arc<crate::guard::Guard>,
+    /// The SIEM console, with the display name already substituted.
+    siem_html: Arc<str>,
     /// How to turn a deployment's hostname into a link, given where the data
     /// plane actually listens.
     public_url: PublicUrl,
@@ -218,6 +227,7 @@ impl AdminApi {
         jobs: Arc<Jobs>,
         obs: Option<Arc<crate::obs::Stats>>,
         siem: Option<&crate::siem::Siem>,
+        guard: Arc<crate::guard::Guard>,
         public_url: PublicUrl,
     ) -> Self {
         // Render the display name into the page once; the placeholder appears in
@@ -226,6 +236,7 @@ impl AdminApi {
             Arc::from(DASHBOARD_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
         let directory_html: Arc<str> =
             Arc::from(DIRECTORY_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let siem_html: Arc<str> = Arc::from(SIEM_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
 
         // The gate turns on as soon as a password is set; the username is
         // optional and defaults to "admin", so one env var is enough to secure
@@ -262,6 +273,8 @@ impl AdminApi {
                 security: siem.map(|s| s.sink.clone()),
                 alerts: siem.map(|s| s.ring.clone()),
                 siem: siem.map(|s| s.stats.clone()),
+                guard,
+                siem_html,
                 public_url,
             },
         }
@@ -327,7 +340,14 @@ impl Caller {
 /// token may still reach, because the handler narrows the answer to that token's
 /// scope instead of refusing it.
 fn narrows_itself(matched: &str) -> bool {
-    matches!(matched, "/" | "/metrics" | "/dashboard" | "/security")
+    // `/siem` is here for the same reason `/dashboard` is: it is a static page
+    // that narrows itself from `/security`, so a deployment-scoped token should
+    // get the console rather than a 403. `/security/rules` is deliberately
+    // absent — a scoped token has no business arming a fleet-wide block.
+    matches!(
+        matched,
+        "/" | "/metrics" | "/dashboard" | "/security" | "/siem"
+    )
 }
 
 /// The deployment a matched route acts on, if it acts on one.
@@ -841,6 +861,11 @@ struct SecuritySummary {
     /// Whether the per-client table is full, which means the same thing for
     /// sources rather than for events.
     clients_at_capacity: bool,
+    /// Block rules in force, and how many requests they have refused. On the
+    /// summary because "we are blocking traffic" belongs next to "we are seeing
+    /// attacks" — an operator who forgot a rule exists should trip over it here.
+    rules: usize,
+    blocked: u64,
 }
 
 /// `GET /security`.
@@ -855,9 +880,16 @@ struct SecurityResponse {
     /// an app-lb too old to have this route.
     enabled: bool,
     window_secs: u64,
-    /// Newest first, which is the order the dashboard renders.
-    alerts: Vec<crate::siem::Alert>,
+    /// Newest first, which is the order the dashboard renders. Each carries its
+    /// own `response` — the runbook and the ready-to-post rules — so the console
+    /// never has to derive "and now what?" from the rule name in JavaScript.
+    alerts: Vec<crate::siem::AlertView>,
     totals: crate::siem::SeverityTotals,
+    /// The block rules in force. Served here rather than from a route of their
+    /// own so the console renders findings and interventions from one fetch, and
+    /// cannot show a stale rule list beside fresh alerts.
+    rules: Vec<crate::guard::RuleView>,
+    guard: crate::guard::GuardStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     stats: Option<crate::siem::SiemSnapshot>,
 }
@@ -1103,12 +1135,37 @@ fn security_summary(state: &AdminState) -> Option<SecuritySummary> {
     let (ring, stats) = (state.alerts.as_ref()?, state.siem.as_ref()?);
     let totals = ring.totals();
     let s = stats.snapshot();
+    let g = state.guard.stats();
     Some(SecuritySummary {
         open: ring.len(),
         urgent: totals.high + totals.critical,
         dropped: s.dropped,
         clients_at_capacity: s.clients_at_capacity,
+        rules: g.rules,
+        blocked: g.blocked,
     })
+}
+
+/// The rules a caller may see.
+///
+/// Narrowed the same way alerts are: a deployment-scoped token sees the rules
+/// that name its own deployment and nothing else. A fleet-wide block is fleet
+/// information — it says which addresses are considered hostile, which is the
+/// same disclosure the alert list is gated for.
+fn visible_rules(state: &AdminState, scope: Option<&[String]>) -> Vec<crate::guard::RuleView> {
+    let enforcing = state.guard.enforcing();
+    state
+        .guard
+        .list()
+        .into_iter()
+        .filter(|r| match scope {
+            None => true,
+            Some(ids) => r
+                .deployment()
+                .is_some_and(|d| ids.iter().any(|id| id == d)),
+        })
+        .map(|r| r.view(enforcing))
+        .collect()
 }
 
 /// `GET /security` — the findings, newest first.
@@ -1126,8 +1183,18 @@ async fn security_snapshot(
     let now = now_secs();
     let scope = caller.as_ref().and_then(|c| c.0.visible());
 
+    // Drop rules that have run out on the way past. Expiry is already enforced
+    // in `Guard::decide`, so this is tidying rather than correctness — but a
+    // console listing rules that stopped doing anything yesterday is a console
+    // nobody trusts. Not persisted here: a `GET` that writes to disk is a
+    // surprise, and the next mutation or restart rewrites the file anyway.
+    state.guard.sweep(now);
+
     let Some(ring) = state.alerts.as_ref() else {
-        // Enabled:false rather than 404 — see `SecurityResponse::enabled`.
+        // Enabled:false rather than 404 — see `SecurityResponse::enabled`. The
+        // rules still come back: enforcement does not depend on detection, and a
+        // console that hid the active blocks whenever `APP_LB_SIEM=0` would hide
+        // the one thing still affecting traffic.
         return Json(SecurityResponse {
             generated_at: now,
             enabled: false,
@@ -1140,6 +1207,8 @@ async fn security_snapshot(
                 high: 0,
                 critical: 0,
             },
+            rules: visible_rules(&state, scope),
+            guard: state.guard.stats(),
             stats: None,
         });
     };
@@ -1167,6 +1236,7 @@ async fn security_snapshot(
                 .is_none_or(|d| a.deployment.as_deref() == Some(d))
         })
         .take(limit)
+        .map(crate::siem::AlertView::from)
         .collect();
 
     Json(SecurityResponse {
@@ -1175,6 +1245,8 @@ async fn security_snapshot(
         window_secs: ring.window_secs(),
         alerts,
         totals: ring.totals(),
+        rules: visible_rules(&state, scope),
+        guard: state.guard.stats(),
         // Fleet-wide counters: withheld from a scoped caller, for whom they
         // would describe traffic they cannot see.
         stats: scope
@@ -1182,6 +1254,92 @@ async fn security_snapshot(
             .then(|| state.siem.as_ref().map(|s| s.snapshot()))
             .flatten(),
     })
+}
+
+// ---- guard rules ----------------------------------------------------------
+
+/// Map a guard rejection onto a status. Everything a caller can get wrong is a
+/// 400 except the cap, which is a 409 — that one is about the server's state
+/// rather than about the request, and retrying the identical body after
+/// deleting a rule is the correct next move.
+fn guard_error(e: crate::guard::GuardError) -> Response {
+    use crate::guard::GuardError as E;
+    let code = match &e {
+        E::EmptyMatch | E::BadClient(_) | E::TooLong(_) => StatusCode::BAD_REQUEST,
+        E::Full => StatusCode::CONFLICT,
+        E::NoRule(_) => StatusCode::NOT_FOUND,
+        E::Io(_) | E::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(code, e.to_string()).into_response()
+}
+
+/// `POST /security/rules` — start refusing something.
+///
+/// CRUD tier, not view. This is the only route on the admin API that can stop
+/// traffic reaching a deployment, so it sits behind the same credentials as
+/// editing the spec — a dashboard-only token may read the console and may not
+/// arm it.
+async fn create_rule(
+    State(state): State<AdminState>,
+    Json(spec): Json<crate::guard::RuleSpec>,
+) -> Response {
+    let now = now_secs();
+    let rule = match state.guard.insert(spec, now) {
+        Ok(r) => r,
+        Err(e) => return guard_error(e),
+    };
+    // Persist before answering. A 200 for a rule that a crash would lose is the
+    // wrong way round for a control somebody just used to stop an attack.
+    if let Err(e) = state.guard.persist() {
+        // The rule is live in memory either way, so undoing it here would be
+        // worse than saying what happened: report the failure and leave the
+        // block in force.
+        tracing::error!(error = %e, path = %state.guard.path().display(), "guard rules not saved");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "the rule is in force but could not be written to {}: {e} — it will not \
+                 survive a restart",
+                state.guard.path().display()
+            ),
+        )
+        .into_response();
+    }
+    tracing::warn!(
+        rule = %rule.id,
+        action = ?rule.action,
+        matched = %rule.describe(),
+        expires_at = ?rule.expires_at,
+        "guard rule created",
+    );
+    (StatusCode::CREATED, Json(rule.view(state.guard.enforcing()))).into_response()
+}
+
+/// `DELETE /security/rules/:id` — stop refusing it.
+async fn delete_rule(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    let now = now_secs();
+    if let Err(e) = state.guard.remove(&id, now) {
+        return guard_error(e);
+    }
+    if let Err(e) = state.guard.persist() {
+        tracing::error!(error = %e, "guard rules not saved after delete");
+    }
+    tracing::warn!(rule = %id, "guard rule removed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ---- the SIEM console -----------------------------------------------------
+
+/// `GET /siem` — the security console.
+///
+/// Its own page rather than a bigger card on `/dashboard`, because the two are
+/// read at different moments and at different depths. The dashboard answers "is
+/// the fleet healthy" in a glance and must stay glanceable; this answers "what
+/// is attacking us and what do I do about it", which needs the full alert list,
+/// the ECS fields behind each one, and the buttons that change what the data
+/// plane does. The dashboard card links here and keeps its summary.
+async fn siem_console(State(state): State<AdminState>) -> impl IntoResponse {
+    Html(state.siem_html.to_string())
 }
 
 // ---- the directory page -------------------------------------------------
@@ -1198,6 +1356,10 @@ struct DirectoryEntry {
     state: EntryState,
     /// What is behind it, in a few words — "2 of 3 VMs ready", "serving /srv/www".
     detail: String,
+    /// Behind a sign-in gate. Worth saying before the click rather than after:
+    /// following one of these can bounce through the provider, and knowing which
+    /// cards will do that is the difference between "slow" and "broken".
+    gated: bool,
 }
 
 /// Whether following the link right now would reach anything.
@@ -1301,6 +1463,7 @@ fn directory_entries(
             }
         };
 
+        let gated = d.spec.auth.is_some();
         for url in urls {
             entries.push(DirectoryEntry {
                 url,
@@ -1313,6 +1476,7 @@ fn directory_entries(
                     EntryState::Files => EntryState::Files,
                 },
                 detail: detail.clone(),
+                gated,
             });
         }
     }
@@ -1371,6 +1535,7 @@ fn render_directory_cards(entries: &[DirectoryEntry], unlinkable: &[String]) -> 
                 "<a class=\"card\" href=\"{url}\">\
                    <div class=\"card-head\">\
                      <span class=\"id\">{id}</span>\
+                     {gate}\
                      <span class=\"tag {kind}\">{kind}</span>\
                    </div>\
                    <div class=\"url\">{url}</div>\
@@ -1381,6 +1546,11 @@ fn render_directory_cards(entries: &[DirectoryEntry], unlinkable: &[String]) -> 
                 kind = e.kind,
                 dot = e.state.dot(),
                 detail = html_escape(&e.detail),
+                gate = if e.gated {
+                    "<span class=\"tag gated\" title=\"Google sign-in required\">sign-in</span>"
+                } else {
+                    ""
+                },
             )
         })
         .collect::<String>();
@@ -2336,7 +2506,13 @@ fn router(state: AdminState) -> Router {
         // cached view credentials have to work. It must never be ungated — it
         // enumerates attacker addresses and the probes that reached the fleet —
         // and this group is the one that is gated whenever a password is set.
-        .route("/security", get(security_snapshot));
+        .route("/security", get(security_snapshot))
+        // The console that reads it. View tier for the same reason the dashboard
+        // is: it renders `/security`, so it must work with whatever credentials
+        // the browser already has. The buttons on it post to the CRUD tier and
+        // will be refused for a view-only caller — which is the intended split,
+        // and the page says so rather than failing silently.
+        .route("/siem", get(siem_console));
 
     // The deployment CRUD API — register/edit/scale/delete/evict, plus the reads
     // that expose the spec (env vars can hold secrets). Gated too iff
@@ -2353,6 +2529,11 @@ fn router(state: AdminState) -> Router {
         // Grouped with the CRUD routes so it inherits the `APP_LB_ADMIN_AUTH`
         // gate: it reports which hostnames app-lb holds keys for.
         .route("/certs", get(certs))
+        // Blocking traffic is a mutation with more blast radius than most of the
+        // ones above it, so it belongs on this side of the gate. Reads live on
+        // `GET /security` with the alerts, which is why there is no `get` here.
+        .route("/security/rules", post(create_rule))
+        .route("/security/rules/:id", delete(delete_rule))
         // Secrets: write-only by design. `GET` returns key *names*, never values.
         .route("/secrets", post(put_secret).get(list_secrets))
         .route(
@@ -2585,6 +2766,34 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 mod tests {
     use super::*;
 
+    /// The two routing decisions behind the security console, both of which are
+    /// silent when wrong: one produces a 403 for a caller who should see the
+    /// page, the other hands a scoped token a fleet-wide control.
+    #[test]
+    fn the_console_narrows_itself_and_the_rule_api_does_not() {
+        for view in ["/", "/metrics", "/dashboard", "/security", "/siem"] {
+            assert!(narrows_itself(view), "{view} must narrow for a scoped token");
+        }
+        // A deployment-scoped token has no business arming a fleet-wide block,
+        // so these must fall through to the "does not cover the fleet" refusal.
+        for mutating in ["/security/rules", "/security/rules/:id"] {
+            assert!(!narrows_itself(mutating), "{mutating} must not narrow");
+        }
+    }
+
+    #[test]
+    fn a_guard_rejection_maps_onto_a_status_a_client_can_act_on() {
+        use crate::guard::GuardError as E;
+        let status = |e: E| guard_error(e).status();
+        assert_eq!(status(E::EmptyMatch), StatusCode::BAD_REQUEST);
+        assert_eq!(status(E::BadClient("x".into())), StatusCode::BAD_REQUEST);
+        assert_eq!(status(E::TooLong("match.host")), StatusCode::BAD_REQUEST);
+        // The cap is about the server's state, not the request: deleting a rule
+        // and retrying the identical body is the correct next move.
+        assert_eq!(status(E::Full), StatusCode::CONFLICT);
+        assert_eq!(status(E::NoRule("x".into())), StatusCode::NOT_FOUND);
+    }
+
     /// The landing page at `/`. Rendering is a pure function of the collected
     /// entries, so all of this runs without a listener or a registry.
     mod directory {
@@ -2597,7 +2806,23 @@ mod tests {
                 kind: "vm",
                 state,
                 detail: "2 VMs ready".into(),
+                gated: false,
             }
+        }
+
+        /// Following a gated card can bounce through Google, so the card says so
+        /// first. With `auth.cookie_domain` set across the fleet that bounce
+        /// happens once rather than once per card — see `AuthGate::cookie_domain`.
+        #[test]
+        fn a_gated_destination_is_labelled_before_it_is_clicked() {
+            let open = entry("api", "https://api.example.com", EntryState::Ready);
+            let gated = DirectoryEntry {
+                gated: true,
+                ..entry("private", "https://private.example.com", EntryState::Ready)
+            };
+            let html = render_directory_cards(&[open, gated], &[]);
+            assert_eq!(html.matches("tag gated").count(), 1, "{html}");
+            assert!(html.contains(">sign-in<"), "{html}");
         }
 
         #[test]

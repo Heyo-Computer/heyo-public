@@ -20,6 +20,9 @@ fn default_secrets_path() -> String {
 fn default_tokens_path() -> String {
     "app-lb-tokens.json".into()
 }
+fn default_guard_path() -> String {
+    "app-lb-guard.json".into()
+}
 fn default_name() -> String {
     "app-lb".into()
 }
@@ -43,6 +46,11 @@ pub struct LbConfig {
     /// unlike the secret store there is nothing here to encrypt.
     #[serde(default = "default_tokens_path")]
     pub tokens_path: String,
+    /// Where the guard's block rules live. Persisted for one reason: a restart
+    /// that silently unblocks an address somebody blocked during an incident is
+    /// a worse failure than any other this file can have.
+    #[serde(default = "default_guard_path")]
+    pub guard_path: String,
     /// Display name shown in the dashboard header and page title. Defaults to
     /// `app-lb`.
     #[serde(default = "default_name")]
@@ -199,6 +207,7 @@ impl Default for LbConfig {
             state_path: default_state_path(),
             secrets_path: default_secrets_path(),
             tokens_path: default_tokens_path(),
+            guard_path: default_guard_path(),
             name: default_name(),
             daemon_url: None,
             dashboard_user: None,
@@ -1020,6 +1029,35 @@ pub struct AuthGate {
     /// the application already sets.
     #[serde(default = "default_auth_cookie_name")]
     pub cookie_name: String,
+    /// Widen the session cookie to a parent domain, so one sign-in covers every
+    /// deployment under it. Unset means host-only: the default, and the safe one.
+    ///
+    /// This is the answer to "why does opening each service from the directory
+    /// send me back to Google?". Cookies are scoped to the host that set them, so
+    /// signing in at `docs.example.com` leaves `api.example.com` with nothing to
+    /// present. Setting `"cookie_domain": "example.com"` on both gates makes the
+    /// session one realm, and the second service admits the browser without a
+    /// round trip.
+    ///
+    /// Two properties make that safe, and both are load-bearing:
+    ///
+    /// * **The cookie is only wider; the check is not.** A session is still
+    ///   refused unless the gate presenting it has a byte-identical
+    ///   [`AuthGate::policy_fingerprint`], which covers the provider, client id,
+    ///   allowed domains, allowed emails *and* this field. Two gates share a
+    ///   session only when either would have admitted the same person anyway.
+    /// * **It is opt-in.** A cookie scoped to `example.com` is sent to every
+    ///   host under it, including ones app-lb does not serve. If anything else
+    ///   on that domain is untrusted — a customer subdomain, a legacy box — this
+    ///   hands it your session cookie. `HttpOnly` keeps scripts off it, nothing
+    ///   keeps a server on that domain off it.
+    ///
+    /// Must be the request host or a parent of it, at a label boundary. A value
+    /// the browser would reject is refused at registration, because the failure
+    /// it produces — the cookie silently dropped, sign-in looping forever — is
+    /// almost impossible to diagnose from the outside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie_domain: Option<String>,
     /// Redirect URI to send the provider, when app-lb cannot derive it from the
     /// request — something in front rewriting the host or terminating TLS
     /// elsewhere. Normally unset: `https://<request host><base_path>/callback`.
@@ -1110,6 +1148,37 @@ fn default_session_ttl_secs() -> u64 {
     43_200 // 12h — a working day plus slack, short enough that a revoked
            // account loses access the same day.
 }
+/// Canonicalize a `cookie_domain`, or reject it.
+///
+/// Lowercased and stripped of the legacy leading dot (RFC 6265 ignores it, and
+/// people write it out of habit). Refused when it is not a domain, or when it
+/// has fewer than two labels: `com` would be a cookie offered to every `.com`
+/// host, which browsers discard — the user would never sign in and nothing would
+/// say why.
+///
+/// It does **not** check the public suffix list, so `co.uk` passes here. Doing
+/// that properly means shipping and updating the PSL; the practical guard is
+/// that the realm must also cover the request host, so the worst a bad value
+/// does is fail to widen. The README says so where an operator will read it.
+fn normalize_cookie_domain(raw: &str) -> Option<String> {
+    let d = raw.trim().trim_start_matches('.').trim_end_matches('.');
+    if d.is_empty() || d.len() > 253 {
+        return None;
+    }
+    let labels: Vec<&str> = d.split('.').collect();
+    if labels.len() < 2 {
+        return None;
+    }
+    let ok = labels.iter().all(|l| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    });
+    ok.then(|| d.to_ascii_lowercase())
+}
+
 fn default_auth_cookie_name() -> String {
     "applb_session".into()
 }
@@ -1159,6 +1228,31 @@ impl AuthGate {
     /// each session, so tightening the allow-list or rotating the client id
     /// invalidates the sessions issued under the old policy instead of leaving
     /// a removed user signed in until their cookie expires.
+    /// The `Domain` attribute to set for a request arriving at `host`, if any.
+    ///
+    /// `None` — a host-only cookie — both when sharing is off and when the
+    /// configured realm does not cover this host. The second case is a
+    /// misconfiguration, and falling back to host-only is the recoverable
+    /// direction: sign-in still works for this hostname, it just is not shared.
+    /// Emitting the `Domain` anyway would have the browser discard the cookie
+    /// outright and loop the user through the provider forever.
+    pub fn cookie_domain_for(&self, host: &str) -> Option<String> {
+        let realm = normalize_cookie_domain(self.cookie_domain.as_deref()?)?;
+        // The realm must be the host or a parent of it, cut at a label boundary
+        // — `example.com` covers `api.example.com` but not `notexample.com`.
+        let host = host
+            .trim_end_matches('.')
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let covers = host == realm
+            || host
+                .strip_suffix(&realm)
+                .is_some_and(|head| head.ends_with('.'));
+        covers.then_some(realm)
+    }
+
     pub fn policy_fingerprint(&self) -> String {
         let mut domains: Vec<String> = self
             .allowed_domains
@@ -1183,13 +1277,25 @@ impl AuthGate {
             [one] => format!("{one:?}"),
             many => format!("{many:?}"),
         };
-        let material = format!(
+        let mut material = format!(
             "{}|{}|{}|{}",
             providers,
             self.client_id.as_deref().unwrap_or(""),
             domains.join(","),
             emails.join(",")
         );
+        // Appended only when set, so a gate that does not share sessions hashes
+        // exactly what it hashed before this field existed — see the note above
+        // about not signing everyone out on an upgrade.
+        //
+        // It has to be *in* the material, though, and this is the security
+        // property that makes sharing safe: a session issued by a host-only gate
+        // must not be accepted by a realm gate with otherwise identical policy,
+        // or widening the cookie on one deployment would retroactively widen
+        // what every neighbouring gate accepts.
+        if let Some(realm) = &self.cookie_domain {
+            material.push_str(&format!("|realm={}", realm.to_ascii_lowercase()));
+        }
         let digest = openssl::hash::hash(
             openssl::hash::MessageDigest::sha256(),
             material.as_bytes(),
@@ -1287,6 +1393,11 @@ impl AuthGate {
                 .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
         {
             return Err(SpecError::BadCookieName(self.cookie_name.clone()));
+        }
+        if let Some(d) = &self.cookie_domain
+            && normalize_cookie_domain(d).is_none()
+        {
+            return Err(SpecError::BadCookieDomain(d.clone()));
         }
 
         // The provider redirects the browser to `<host><callback>`, and that
@@ -1513,6 +1624,7 @@ pub enum SpecError {
     BadPublicPath(String),
     ZeroSessionTtl,
     BadCookieName(String),
+    BadCookieDomain(String),
     /// The provider's redirect would not route back to this deployment.
     AuthCallbackUnroutable(String),
     EmptyRepo,
@@ -1689,6 +1801,12 @@ impl std::fmt::Display for SpecError {
             Self::BadCookieName(c) => write!(
                 f,
                 "auth.cookie_name {c:?} is not a usable cookie name"
+            ),
+            Self::BadCookieDomain(d) => write!(
+                f,
+                "auth.cookie_domain {d:?} is not a domain a browser would accept: it needs at \
+                 least two labels (\"example.com\", not \"com\") and must be a parent of the \
+                 hostnames this deployment serves. Leave it unset for a per-host session"
             ),
             Self::AuthCallbackUnroutable(c) => write!(
                 f,
@@ -2456,6 +2574,7 @@ mod tests {
             base_path: default_auth_base_path(),
             session_ttl_secs: default_session_ttl_secs(),
             cookie_name: default_auth_cookie_name(),
+            cookie_domain: None,
             redirect_url: None,
             forward_identity: true,
         }
@@ -2591,6 +2710,17 @@ mod tests {
             (
                 AuthGate { cookie_name: "bad name".into(), ..auth_gate() },
                 SpecError::BadCookieName("bad name".into()),
+            ),
+            // A single label is a cookie every browser discards, and the
+            // symptom — sign-in looping forever with nothing logged — is close
+            // to undiagnosable from outside. Refuse it at registration.
+            (
+                AuthGate { cookie_domain: Some("com".into()), ..auth_gate() },
+                SpecError::BadCookieDomain("com".into()),
+            ),
+            (
+                AuthGate { cookie_domain: Some("not a domain".into()), ..auth_gate() },
+                SpecError::BadCookieDomain("not a domain".into()),
             ),
         ];
         for (gate, want) in cases {

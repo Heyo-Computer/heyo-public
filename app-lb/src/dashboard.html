@@ -95,6 +95,12 @@
   }
   .section-title .spacer { flex: 1 1 auto; }
   .section-title .count { text-transform: none; letter-spacing: 0; font-weight: 500; }
+  /* A way out of a summary and into the page that can act on it. */
+  .section-title a.out {
+    text-transform: none; letter-spacing: 0; font-weight: 500;
+    color: var(--series-1); text-decoration: none; margin-left: auto;
+  }
+  .section-title a.out:hover { text-decoration: underline; }
 
   .card {
     background: var(--surface);
@@ -123,7 +129,13 @@
   .hbar .track { height: 14px; background: var(--grid); border-radius: 4px; overflow: hidden; }
   /* Transitioned because `renderHist` updates these in place rather than
      rebuilding them — a rebuilt element has no previous width to animate from. */
+  /* `display: block` is load-bearing, not tidiness. The fill is a <span>, and
+     `width`/`height`/`min-width` do not apply to a non-replaced *inline* box —
+     so without this the element paints at zero width and the histogram shows
+     nothing but empty tracks. Every engine behaves this way; it is not a
+     browser quirk, which is why nothing about it is conditional. */
   .hbar .fill {
+    display: block;
     height: 100%; background: var(--series-1); border-radius: 4px; min-width: 2px;
     transition: width .45s cubic-bezier(.22,.61,.36,1);
   }
@@ -175,7 +187,9 @@
   table.vms td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-2); }
   .vm-load { display: inline-flex; align-items: center; gap: 6px; }
   .vm-load .track { width: 60px; height: 8px; background: var(--grid); border-radius: 4px; overflow: hidden; }
-  .vm-load .fill { height: 100%; background: var(--series-1); border-radius: 4px; }
+  /* Blockified for the same reason as `.hbar .fill` above: an inline span
+     ignores width, so the per-VM load and CPU bars painted nothing either. */
+  .vm-load .fill { display: block; height: 100%; background: var(--series-1); border-radius: 4px; }
   .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; }
   .tag.drain { background: color-mix(in srgb, var(--serious) 22%, transparent); color: var(--serious); }
   .tag.down { background: color-mix(in srgb, var(--critical) 22%, transparent); color: var(--critical); }
@@ -320,6 +334,10 @@
        right now. -->
   <div class="section-title">
     Security <span class="count" id="security-count"></span>
+    <!-- The card summarises; the console is where an alert can be acted on.
+         This link is the only route between the two, so it is part of the
+         heading rather than a footnote under the table. -->
+    <a class="out" href="/siem">Open the security console →</a>
   </div>
   <div class="card" id="security"></div>
 
@@ -1038,11 +1056,24 @@ function renderSecurity(data) {
   const el = $("security");
   const alerts = data.alerts || [];
 
+  // Rules refuse traffic whether or not anyone is looking at the console, and
+  // whether or not detection is even running, so their existence is reported
+  // here rather than only on the page that manages them — "why is this client
+  // getting a 403" should be answerable from the dashboard.
+  const g = data.guard;
+  const enforcing = g && g.rules
+    ? `<div class="note">${fmt(g.rules)} guard rule${g.rules === 1 ? " is" : "s are"}
+       ${g.enforcing === false ? "matching but <b>not</b> refusing anything (<code>APP_LB_GUARD_ENFORCE=0</code>)"
+         : `in force, and ${g.blocked ? `${fmt(g.blocked)} request${g.blocked === 1 ? " has" : "s have"} been refused`
+            : "nothing has matched them yet"}`} —
+       <a href="/siem">review them</a>.</div>`
+    : "";
+
   if (!data.enabled) {
     $("security-count").textContent = "off";
     setHTML(el, `<div class="empty">Security monitoring is off. Unset
       <code>APP_LB_SIEM=0</code> to watch authentication failures, attack
-      signatures and per-source traffic.</div>`);
+      signatures and per-source traffic.</div>` + enforcing);
     return;
   }
 
@@ -1062,7 +1093,7 @@ function renderSecurity(data) {
           <code>APP_LB_SIEM_MAX_CLIENTS</code>.` : ""}</div>`
     : "";
 
-  const footer = `<div class="note">Findings are held in memory, newest ${MAX_ALERT_ROWS} shown,
+  const footer = enforcing + `<div class="note">Findings are held in memory, newest ${MAX_ALERT_ROWS} shown,
      and are lost on restart. Repeats fold into an open alert rather than adding rows, so
      <code>count</code> is the occurrence tally${s && s.suppressed ? ` (${fmt(s.suppressed)} folded so far)` : ""}.
      With <code>APP_LB_OBS_URL</code> set, every alert also ships to app-obs under
@@ -1071,7 +1102,7 @@ function renderSecurity(data) {
   if (!alerts.length) {
     setHTML(el, `<div class="empty">No security alerts. app-lb is watching authentication
       failures, attack signatures and per-source request rates${data.window_secs
-        ? ` over a ${fmt(data.window_secs)}s window` : ""}.</div>` + blind);
+        ? ` over a ${fmt(data.window_secs)}s window` : ""}.</div>` + blind + enforcing);
     return;
   }
 

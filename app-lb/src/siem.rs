@@ -1033,6 +1033,338 @@ fn ecs_fields(log: &SiemLog) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+// -- response actions -------------------------------------------------------
+
+/// What an operator can do about one finding.
+///
+/// A finding with no answer to "and now what?" is a notification, not a
+/// security control. This is the runbook half of an alert: a couple of things
+/// worth checking before acting, and — where one exists — a [`RuleSpec`] that is
+/// already filled in, so the dashboard's button posts *exactly* the body it
+/// showed and what the operator read cannot drift from what the server applies.
+///
+/// Derived at read time from the alert rather than stored on it. The ring holds
+/// hundreds of alerts and app-obs holds them forever; neither should carry a
+/// paragraph of advice that is a pure function of three fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct AlertResponse {
+    /// What to check first. Ordered, and deliberately short — a list nobody
+    /// finishes reading is the same as no list.
+    pub investigate: Vec<&'static str>,
+    /// Rules that would mitigate this, ready to post.
+    pub actions: Vec<SuggestedAction>,
+    /// Where the obvious action does *not* do what it looks like it does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caveat: Option<&'static str>,
+}
+
+/// One ready-to-apply rule, with the sentence that explains what it will and
+/// will not stop.
+#[derive(Debug, Clone, Serialize)]
+pub struct SuggestedAction {
+    /// Stable identifier for the kind of action, so a client can style or
+    /// confirm on it without parsing the label.
+    pub kind: &'static str,
+    /// The button.
+    pub label: String,
+    /// What it does, and what it leaves alone. Shown next to the button, not
+    /// behind it: this is the last thing read before traffic is refused.
+    pub effect: String,
+    /// The exact body for `POST /security/rules`.
+    pub rule: crate::guard::RuleSpec,
+}
+
+/// Signatures reused for [`respond`], so "is this path itself the payload?" is
+/// answered by the same patterns that raised the alert instead of a second,
+/// drifting copy of them.
+fn path_signatures() -> &'static Signatures {
+    static S: OnceLock<Signatures> = OnceLock::new();
+    S.get_or_init(Signatures::new)
+}
+
+/// A client block lasts hours; a path block lasts a week.
+///
+/// Not symmetry for its own sake. An address is a lease — behind CGNAT or a
+/// mobile carrier it belongs to somebody else by tomorrow, so a long block
+/// punishes a stranger for what its previous holder did. A path pattern never
+/// changes hands: `/wp-login.php` is a probe today and a probe next month.
+const CLIENT_BLOCK_SECS: u64 = 3_600;
+const CLIENT_BLOCK_LONG_SECS: u64 = 86_400;
+const PATH_BLOCK_SECS: u64 = 604_800;
+
+fn secs_phrase(secs: u64) -> &'static str {
+    match secs {
+        3_600 => "1 hour",
+        86_400 => "24 hours",
+        604_800 => "7 days",
+        _ => "a while",
+    }
+}
+
+fn block_client(client: &str, secs: u64, note: String) -> SuggestedAction {
+    SuggestedAction {
+        kind: "block-client",
+        label: format!("Block {client} for {}", secs_phrase(secs)),
+        effect: format!(
+            "Every request from {client} to the data plane is refused with a 403 \
+             for {}, then the rule expires on its own. The admin API is not affected.",
+            secs_phrase(secs)
+        ),
+        rule: crate::guard::RuleSpec {
+            action: crate::guard::RuleAction::Block,
+            match_: crate::guard::MatchSpec {
+                client: Some(client.to_string()),
+                ..Default::default()
+            },
+            expires_in_secs: Some(secs),
+            note: Some(note),
+        },
+    }
+}
+
+/// The narrower sibling: block one address, but only against the deployment it
+/// was caught attacking. The right choice when the address is a shared egress
+/// and only one of the things behind it is misbehaving.
+fn block_client_on(client: &str, deployment: &str, secs: u64, note: String) -> SuggestedAction {
+    SuggestedAction {
+        kind: "block-client-deployment",
+        label: format!("Block {client} on {deployment} only"),
+        effect: format!(
+            "Refuses {client} for {} where it is routed to {deployment}, and leaves \
+             the rest of the fleet reachable from that address.",
+            secs_phrase(secs)
+        ),
+        rule: crate::guard::RuleSpec {
+            action: crate::guard::RuleAction::Block,
+            match_: crate::guard::MatchSpec {
+                client: Some(client.to_string()),
+                deployment: Some(deployment.to_string()),
+                ..Default::default()
+            },
+            expires_in_secs: Some(secs),
+            note: Some(note),
+        },
+    }
+}
+
+fn block_path(path: &str, deployment: Option<&str>, note: String) -> SuggestedAction {
+    let scope = match deployment {
+        Some(d) => format!(" on {d}"),
+        None => String::new(),
+    };
+    SuggestedAction {
+        kind: "block-path",
+        label: format!("Block {path}{scope} for 7 days"),
+        effect: format!(
+            "Refuses every request whose path starts with {path}{scope}, from any \
+             address — which stops the whole population probing it, not just this one. \
+             Check first that nothing legitimate lives under that prefix.",
+        ),
+        rule: crate::guard::RuleSpec {
+            action: crate::guard::RuleAction::Block,
+            match_: crate::guard::MatchSpec {
+                path_prefix: Some(path.to_string()),
+                deployment: deployment.map(str::to_string),
+                ..Default::default()
+            },
+            expires_in_secs: Some(PATH_BLOCK_SECS),
+            note: Some(note),
+        },
+    }
+}
+
+fn exempt_client(client: &str, note: String) -> SuggestedAction {
+    SuggestedAction {
+        kind: "exempt-client",
+        label: format!("Exempt {client}"),
+        effect: format!(
+            "Marks {client} as never-block, so no current or future rule refuses it. \
+             Does not stop it being alerted on — this is for a monitor or a load test \
+             you recognise, not for silencing the finding.",
+        ),
+        rule: crate::guard::RuleSpec {
+            action: crate::guard::RuleAction::Allow,
+            match_: crate::guard::MatchSpec {
+                client: Some(client.to_string()),
+                ..Default::default()
+            },
+            // Permanent on purpose, and the one action here that is: an
+            // exemption that quietly expires re-exposes the thing it protects,
+            // and the failure would show up as an outage in a monitor rather
+            // than as anything anyone connects back to this button.
+            expires_in_secs: None,
+            note: Some(note),
+        },
+    }
+}
+
+/// Turn a finding into a runbook.
+///
+/// Pure and total: every rule name gets an answer, including one it has never
+/// seen, so adding a detection can never produce an alert the console has
+/// nothing to say about.
+pub fn respond(alert: &Alert) -> AlertResponse {
+    // Only an address app-lb parsed itself is offered as a rule. Anything else
+    // would put a string the guard will reject into a button that looks like it
+    // works.
+    let client = alert
+        .client
+        .as_deref()
+        .filter(|c| c.parse::<IpAddr>().is_ok());
+    let note = format!("{} alert #{}", alert.rule, alert.id);
+    let mut actions = Vec::new();
+    let mut caveat = None;
+
+    let investigate: Vec<&'static str> = match alert.rule {
+        r if r.starts_with("auth.") => {
+            // The guard is not consulted on the admin listener — that is what
+            // keeps a bad rule from locking an operator out of the page that
+            // removes it. Which means for an admin-plane spray the honest answer
+            // is "not from here", and saying so beats a button that appears to
+            // work.
+            caveat = Some(
+                "app-lb never applies these rules to its own admin API, so that a bad rule \
+                 cannot lock you out of the page that deletes it. If this address is \
+                 probing the admin plane, block it at the firewall or bind \
+                 APP_LB_ADMIN_ADDR to loopback and reach it over SSH.",
+            );
+            if let Some(c) = client {
+                let secs = if r == "auth.brute-force" || r == "auth.scope-denied" {
+                    CLIENT_BLOCK_SECS
+                } else {
+                    CLIENT_BLOCK_LONG_SECS
+                };
+                actions.push(block_client(c, secs, note.clone()));
+            }
+            match alert.rule {
+                "auth.scope-denied" => vec![
+                    "This is a valid credential reaching past its scope — treat it as a \
+                     possibly-leaked app-token, not as guessing.",
+                    "Find it in GET /tokens by its scope and last-used time, and revoke it \
+                     with DELETE /tokens/:id.",
+                    "Rotate whatever held it before deciding the incident is over.",
+                ],
+                "auth.enumeration" | "auth.spray" => vec![
+                    "Many identities from one address is credential stuffing, so a single \
+                     account lockout will not touch it.",
+                    "Narrow the sign-in gate: allowed_domains to your Workspace domain, or \
+                     allowed_emails to the list that should actually get in.",
+                    "Check whether any attempt succeeded — a `security` record with \
+                     event.outcome=success from this address is the one that matters.",
+                ],
+                "auth.signin-state" => vec![
+                    "A mismatched sign-in state is usually a stale bookmark or a cookie \
+                     dropped by a SameSite policy, not an attack — check the volume before \
+                     acting.",
+                    "If it is one user in a loop, have them clear the app-lb cookie for \
+                     that hostname and try again.",
+                ],
+                _ => vec![
+                    "Confirm this is not your own automation retrying with a stale \
+                     credential — that is the common cause and blocking it makes an \
+                     outage.",
+                    "If it is genuine, blocking the address buys time; rotating the \
+                     credential it is guessing at is the fix.",
+                    "Check whether any attempt succeeded before treating the block as the \
+                     end of it.",
+                ],
+            }
+        }
+
+        r if r.starts_with("web.") => {
+            if let Some(c) = client {
+                actions.push(block_client(c, CLIENT_BLOCK_LONG_SECS, note.clone()));
+                if let Some(d) = alert.deployment.as_deref() {
+                    actions.push(block_client_on(c, d, CLIENT_BLOCK_LONG_SECS, note.clone()));
+                }
+            }
+            // Offer the path block only when the *path* is what tripped the
+            // signature. When the payload was in a query value the path is an
+            // ordinary endpoint — `/search`, `/api/items` — and blocking it
+            // would take a working feature offline to stop one probe.
+            if let Some(p) = alert.path.as_deref()
+                && path_signatures().scan(p, None).is_some()
+            {
+                actions.push(block_path(p, alert.deployment.as_deref(), note.clone()));
+            }
+            vec![
+                "Check the status this got: a 404 means it found nothing, a 200 means it \
+                 did and the block is the second thing to do.",
+                "The alert names the parameter, never the value — app-lb does not store \
+                 query strings. The upstream's own log is where the payload is.",
+                "One probe is a scanner and needs no response; a sequence of them from one \
+                 address is worth blocking.",
+            ]
+        }
+
+        "traffic.scanner" => {
+            if let Some(c) = client {
+                actions.push(block_client(c, CLIENT_BLOCK_LONG_SECS, note.clone()));
+                actions.push(exempt_client(c, format!("recognised source, {note}")));
+            }
+            vec![
+                "Distinct paths, not repeats — this is somebody mapping the surface rather \
+                 than a client retrying.",
+                "Check it against your own vulnerability scanner's source before blocking.",
+                "If the paths are all 404s it has found nothing yet, which makes this the \
+                 cheap moment to act.",
+            ]
+        }
+
+        "traffic.rate-spike" => {
+            if let Some(c) = client {
+                actions.push(block_client(c, CLIENT_BLOCK_SECS, note.clone()));
+                actions.push(exempt_client(c, format!("recognised source, {note}")));
+            }
+            caveat = Some(
+                "Rate alone does not distinguish an attack from a launch. Check the \
+                 deployment's error rate on the dashboard before refusing traffic — if it \
+                 is serving all of this successfully, the answer is more replicas, not a \
+                 block.",
+            );
+            vec![
+                "Identify the source first: a CDN or corporate NAT presents thousands of \
+                 users as one address, and blocking it takes all of them out.",
+                "Compare against the deployment's 5xx rate — a spike that is being served \
+                 fine is capacity, not abuse.",
+                "If it is abuse, an hour is usually enough; re-issue the rule if it comes \
+                 back.",
+            ]
+        }
+
+        _ => vec![
+            "No standing runbook for this rule — read the ECS fields on the alert for the \
+             request that raised it.",
+        ],
+    };
+
+    AlertResponse {
+        investigate,
+        actions,
+        caveat,
+    }
+}
+
+/// An alert as `GET /security` serves it: the finding plus what to do about it.
+///
+/// A separate type rather than fields on [`Alert`], so the record that goes to
+/// app-obs and the entries in the ring stay exactly what they were.
+#[derive(Debug, Clone, Serialize)]
+pub struct AlertView {
+    #[serde(flatten)]
+    pub alert: Alert,
+    pub response: AlertResponse,
+}
+
+impl From<Alert> for AlertView {
+    fn from(alert: Alert) -> Self {
+        Self {
+            response: respond(&alert),
+            alert,
+        }
+    }
+}
+
 /// The in-memory ring `GET /security` serves.
 ///
 /// A `Mutex`, not `ArcSwap` — worth saying, because `ArcSwap` is the house
@@ -2236,6 +2568,144 @@ mod tests {
                 "the query must not be captured when scanning is off"
             ),
             _ => panic!("expected an access observation"),
+        }
+    }
+
+    // -- response actions --------------------------------------------------
+
+    mod response {
+        use super::*;
+
+        /// Every rule the analyzer can raise, so a new detection cannot ship
+        /// without an answer to "and now what?".
+        const EVERY_RULE: &[&str] = &[
+            "web.traversal",
+            "web.sqli",
+            "web.xss",
+            "web.rce",
+            "web.secret-probe",
+            "traffic.scanner",
+            "traffic.rate-spike",
+            "auth.signin-state",
+            "auth.enumeration",
+            "auth.spray",
+            "auth.scope-denied",
+            "auth.brute-force",
+        ];
+
+        fn alert(rule: &'static str, client: Option<&str>, path: Option<&str>) -> Alert {
+            Alert {
+                id: 7,
+                ts: 1_700_000_000_000,
+                last_ts: 1_700_000_000_000,
+                rule,
+                severity: Severity::High,
+                title: "something happened".into(),
+                client: client.map(str::to_string),
+                deployment: Some("demo".into()),
+                path: path.map(str::to_string),
+                technique: None,
+                count: 1,
+                ecs: None,
+            }
+        }
+
+        /// The load-bearing one. A button that posts a body the server refuses
+        /// is worse than no button: it is discovered mid-incident, by someone
+        /// who believed they had just blocked an attacker.
+        #[test]
+        fn every_suggested_rule_is_one_the_guard_accepts() {
+            let g = crate::guard::Guard::new("", true);
+            for rule in EVERY_RULE {
+                let a = alert(rule, Some("203.0.113.9"), Some("/wp-login.php"));
+                let r = respond(&a);
+                for action in &r.actions {
+                    g.insert(action.rule.clone(), 1_000).unwrap_or_else(|e| {
+                        panic!("{rule} suggested a rule the guard refuses: {e}")
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn every_rule_has_something_to_say_including_one_that_does_not_exist_yet() {
+            for rule in EVERY_RULE.iter().chain(std::iter::once(&"future.rule")) {
+                let r = respond(&alert(rule, Some("203.0.113.9"), None));
+                assert!(!r.investigate.is_empty(), "{rule} has no runbook");
+            }
+        }
+
+        /// A block that never lifts is the failure this design expects: it
+        /// outlives the attack and breaks somebody months later. Only the
+        /// exemption is permanent, and deliberately.
+        #[test]
+        fn every_suggested_block_expires_and_only_the_exemption_does_not() {
+            for rule in EVERY_RULE {
+                for action in respond(&alert(rule, Some("203.0.113.9"), Some("/.env"))).actions {
+                    let permanent = action.rule.expires_in_secs.is_none();
+                    assert_eq!(
+                        permanent,
+                        action.kind == "exempt-client",
+                        "{rule}/{} has the wrong lifetime",
+                        action.kind
+                    );
+                }
+            }
+        }
+
+        /// Blocking `/search` because a payload arrived in `?q=` takes a working
+        /// feature offline to stop one probe. The path block is offered only
+        /// when the path is itself what tripped the signature.
+        #[test]
+        fn a_path_block_is_offered_for_a_probe_path_and_not_for_an_ordinary_one() {
+            let probe = respond(&alert("web.secret-probe", Some("203.0.113.9"), Some("/.env")));
+            assert!(probe.actions.iter().any(|a| a.kind == "block-path"), "{probe:?}");
+
+            let query_hit = respond(&alert("web.sqli", Some("203.0.113.9"), Some("/search")));
+            assert!(
+                !query_hit.actions.iter().any(|a| a.kind == "block-path"),
+                "an ordinary endpoint must not be offered up for blocking: {query_hit:?}"
+            );
+            // The client block is still there — there is always something to do.
+            assert!(query_hit.actions.iter().any(|a| a.kind == "block-client"));
+        }
+
+        /// The guard is not consulted on the admin listener, so an admin-plane
+        /// brute force cannot be stopped from here. Saying so beats a button
+        /// that looks like it worked.
+        #[test]
+        fn an_auth_finding_admits_that_a_rule_will_not_cover_the_admin_plane() {
+            let r = respond(&alert("auth.brute-force", Some("198.51.100.7"), None));
+            let caveat = r.caveat.expect("auth findings carry the admin-plane caveat");
+            assert!(caveat.contains("admin"), "{caveat}");
+        }
+
+        /// Anything that is not an address app-lb parsed itself would be
+        /// refused by the guard, so it is never offered as a rule.
+        #[test]
+        fn an_unattributed_finding_offers_no_client_rule() {
+            for client in [None, Some("not-an-address")] {
+                let r = respond(&alert("web.sqli", client, Some("/x")));
+                assert!(
+                    !r.actions.iter().any(|a| a.kind.contains("client")),
+                    "{client:?} must not become a rule: {r:?}"
+                );
+                assert!(!r.investigate.is_empty(), "there is still advice");
+            }
+        }
+
+        /// Serialized onto `/security`, so the console can post it back
+        /// verbatim. A field renamed here silently breaks the buttons.
+        #[test]
+        fn a_suggested_rule_serializes_as_the_post_body_the_api_takes() {
+            let r = respond(&alert("auth.brute-force", Some("203.0.113.9"), None));
+            let body = serde_json::to_value(&r.actions[0].rule).unwrap();
+            assert_eq!(body["action"], "block");
+            assert_eq!(body["match"]["client"], "203.0.113.9");
+            assert_eq!(body["expires_in_secs"], 3600);
+            // And it round-trips back into the type the handler deserializes.
+            let parsed: crate::guard::RuleSpec = serde_json::from_value(body).unwrap();
+            crate::guard::Guard::new("", true).insert(parsed, 1_000).unwrap();
         }
     }
 }

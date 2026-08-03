@@ -312,6 +312,9 @@ pub struct AuthGate {
     pub base_path: String,
     pub session_ttl_secs: u64,
     pub cookie_name: String,
+    /// Set to share one sign-in across every deployment under a parent domain;
+    /// `None` is a per-host session.
+    pub cookie_domain: Option<String>,
     pub redirect_url: Option<String>,
     pub forward_identity: bool,
 }
@@ -587,6 +590,11 @@ pub struct SecuritySummary {
     /// Whether the per-source table is full, which means the same for addresses
     /// as `dropped` does for events.
     pub clients_at_capacity: bool,
+    /// Guard rules the data plane is enforcing, and how many requests they have
+    /// refused. Reported beside the alert counts because "we are blocking
+    /// traffic" belongs next to "we are seeing attacks".
+    pub rules: usize,
+    pub blocked: u64,
     #[serde(flatten)]
     pub extra: Extra,
 }

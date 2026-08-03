@@ -30,6 +30,40 @@
         "url.domain": "demo.example.com",
         "url.extension": "php",
         "url.path": "/wp-login.php"
+      },
+      "response": {
+        "investigate": [
+          "Distinct paths, not repeats — this is somebody mapping the surface rather than a client retrying.",
+          "Check it against your own vulnerability scanner's source before blocking.",
+          "If the paths are all 404s it has found nothing yet, which makes this the cheap moment to act."
+        ],
+        "actions": [
+          {
+            "kind": "block-client",
+            "label": "Block 203.0.113.9 for 24 hours",
+            "effect": "Every request from 203.0.113.9 to the data plane is refused with a 403 for 24 hours, then the rule expires on its own. The admin API is not affected.",
+            "rule": {
+              "action": "block",
+              "match": {
+                "client": "203.0.113.9"
+              },
+              "expires_in_secs": 86400,
+              "note": "traffic.scanner alert #41"
+            }
+          },
+          {
+            "kind": "exempt-client",
+            "label": "Exempt 203.0.113.9",
+            "effect": "Marks 203.0.113.9 as never-block, so no current or future rule refuses it. Does not stop it being alerted on — this is for a monitor or a load test you recognise, not for silencing the finding.",
+            "rule": {
+              "action": "allow",
+              "match": {
+                "client": "203.0.113.9"
+              },
+              "note": "recognised source, traffic.scanner alert #41"
+            }
+          }
+        ]
       }
     },
     {
@@ -55,6 +89,29 @@
           "external"
         ],
         "url.path": "/metrics"
+      },
+      "response": {
+        "investigate": [
+          "Confirm this is not your own automation retrying with a stale credential — that is the common cause and blocking it makes an outage.",
+          "If it is genuine, blocking the address buys time; rotating the credential it is guessing at is the fix.",
+          "Check whether any attempt succeeded before treating the block as the end of it."
+        ],
+        "actions": [
+          {
+            "kind": "block-client",
+            "label": "Block 198.51.100.7 for 1 hour",
+            "effect": "Every request from 198.51.100.7 to the data plane is refused with a 403 for 1 hour, then the rule expires on its own. The admin API is not affected.",
+            "rule": {
+              "action": "block",
+              "match": {
+                "client": "198.51.100.7"
+              },
+              "expires_in_secs": 3600,
+              "note": "auth.brute-force alert #42"
+            }
+          }
+        ],
+        "caveat": "app-lb never applies these rules to its own admin API, so that a bad rule cannot lock you out of the page that deletes it. If this address is probing the admin plane, block it at the firewall or bind APP_LB_ADMIN_ADDR to loopback and reach it over SSH."
       }
     }
   ],
@@ -64,6 +121,40 @@
     "medium": 11,
     "high": 3,
     "critical": 0
+  },
+  "rules": [
+    {
+      "id": "5f295e1a86f2",
+      "action": "block",
+      "match": {
+        "client": "203.0.113.9"
+      },
+      "summary": "from 203.0.113.9",
+      "note": "traffic.scanner alert #41",
+      "created_at": 1722399400,
+      "expires_at": 1722485800,
+      "hits": 1412,
+      "last_hit": 1722399990,
+      "enforcing": true
+    },
+    {
+      "id": "b1d0c4470c3e",
+      "action": "allow",
+      "match": {
+        "client": "10.0.0.0/8"
+      },
+      "summary": "from 10.0.0.0/8",
+      "note": "internal monitoring",
+      "created_at": 1722300000,
+      "hits": 0,
+      "enforcing": true
+    }
+  ],
+  "guard": {
+    "rules": 2,
+    "blocked": 1412,
+    "exempted": 87,
+    "enforcing": true
   },
   "stats": {
     "observed": 918273,

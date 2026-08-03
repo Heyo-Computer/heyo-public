@@ -147,6 +147,7 @@ fn vm_spec() -> DeploymentSpec {
             base_path: "/__applb/auth".into(),
             session_ttl_secs: 43200,
             cookie_name: "applb_session".into(),
+            cookie_domain: None,
             redirect_url: Some("https://sandbox.example.com/__applb/auth/callback".into()),
             forward_identity: true,
         }),
@@ -350,6 +351,8 @@ fn metrics_response_is_stable() {
                 urgent: 3,
                 dropped: 0,
                 clients_at_capacity: false,
+                rules: 2,
+                blocked: 1_412,
             }),
             deployments: vec![DeploymentView {
                 id: spec.id.clone(),
@@ -649,7 +652,8 @@ fn security_response_is_stable() {
                         "url.path": "/wp-login.php",
                         "tags": ["access", "external"],
                     })),
-                },
+                }
+                .into(),
                 Alert {
                     id: 42,
                     ts: 1_722_399_980_000,
@@ -674,7 +678,8 @@ fn security_response_is_stable() {
                         "url.path": "/metrics",
                         "tags": ["auth-failure", "external"],
                     })),
-                },
+                }
+                .into(),
             ],
             totals: SeverityTotals {
                 info: 0,
@@ -682,6 +687,46 @@ fn security_response_is_stable() {
                 medium: 11,
                 high: 3,
                 critical: 0,
+            },
+            // One rule of each shape a client renders: a timed block created
+            // from an alert, and a permanent exemption.
+            rules: vec![
+                crate::guard::RuleView {
+                    id: "5f295e1a86f2".into(),
+                    action: crate::guard::RuleAction::Block,
+                    match_: crate::guard::MatchSpec {
+                        client: Some("203.0.113.9".into()),
+                        ..Default::default()
+                    },
+                    summary: "from 203.0.113.9".into(),
+                    note: Some("traffic.scanner alert #41".into()),
+                    created_at: 1_722_399_400,
+                    expires_at: Some(1_722_485_800),
+                    hits: 1_412,
+                    last_hit: Some(1_722_399_990),
+                    enforcing: true,
+                },
+                crate::guard::RuleView {
+                    id: "b1d0c4470c3e".into(),
+                    action: crate::guard::RuleAction::Allow,
+                    match_: crate::guard::MatchSpec {
+                        client: Some("10.0.0.0/8".into()),
+                        ..Default::default()
+                    },
+                    summary: "from 10.0.0.0/8".into(),
+                    note: Some("internal monitoring".into()),
+                    created_at: 1_722_300_000,
+                    expires_at: None,
+                    hits: 0,
+                    last_hit: None,
+                    enforcing: true,
+                },
+            ],
+            guard: crate::guard::GuardStats {
+                rules: 2,
+                blocked: 1_412,
+                exempted: 87,
+                enforcing: true,
             },
             stats: Some(SiemSnapshot {
                 observed: 918_273,

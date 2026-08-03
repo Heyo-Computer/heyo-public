@@ -11,6 +11,7 @@
 use crate::acme::ChallengeTable;
 use crate::auth::{Authenticator, Decision, Identity, RequestInfo};
 use crate::deployment::{Deployment, VmBackend};
+use crate::guard::{Decision as GuardVerdict, Guard, RequestFacts};
 use crate::metrics::Metrics;
 use crate::obs::{Access, LogSink};
 use crate::siem::SecuritySink;
@@ -77,6 +78,12 @@ pub struct LbProxy {
     /// `access_log` on purpose: the SIEM is on unless `APP_LB_SIEM=0`, and must
     /// not inherit "off whenever no log collector is configured".
     security: Option<SecuritySink>,
+    /// The other half of that pair: the SIEM decides something is an attack,
+    /// this refuses it. Not an `Option` — an empty rule set is one `is_empty`
+    /// check, and making enforcement conditional on the SIEM being on would
+    /// mean `APP_LB_SIEM=0` silently unblocked every address an operator had
+    /// blocked.
+    guard: Arc<Guard>,
 }
 
 impl LbProxy {
@@ -87,6 +94,7 @@ impl LbProxy {
         auth: Arc<Authenticator>,
         access_log: Option<LogSink>,
         security: Option<SecuritySink>,
+        guard: Arc<Guard>,
     ) -> Self {
         Self {
             registry,
@@ -95,9 +103,81 @@ impl LbProxy {
             auth,
             access_log,
             security,
+            guard,
+        }
+    }
+
+    /// Consult the guard. `Some(body)` means refuse the request with a 403.
+    ///
+    /// The body says nothing about *why*. A refusal that names the rule tells an
+    /// attacker which of their properties was matched and therefore which one to
+    /// change — the operator has the dashboard for that, and they are the only
+    /// party entitled to the answer.
+    fn enforce(
+        &self,
+        session: &Session,
+        host: &Option<String>,
+        path: &str,
+        routed: Option<&Arc<Deployment>>,
+    ) -> Option<String> {
+        let req = session.req_header();
+        // The socket peer, never `X-Forwarded-For`. Keying enforcement on a
+        // client-supplied header would let anyone get anyone else refused, and
+        // let the attacker exempt themselves by setting it.
+        let client = session
+            .client_addr()
+            .and_then(|a| a.as_inet().map(|inet| inet.ip()));
+        let facts = RequestFacts {
+            client,
+            host: host.as_deref(),
+            path,
+            method: req.method.as_str(),
+            deployment: routed.map(|d| d.spec.id.as_str()),
+            // Capped before it is scanned: the header is attacker-controlled and
+            // the substring search is O(header × pattern).
+            //
+            // `get(..n)`, not `&v[..n]`. Slicing would panic on a byte that is
+            // not a char boundary, and a panic here takes down a worker on
+            // attacker-supplied input. `to_str` only succeeds for visible ASCII
+            // today, so the fallback is unreachable — which is exactly the kind
+            // of reasoning that stops being true after somebody else's upgrade.
+            user_agent: req
+                .headers
+                .get(http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.get(..MAX_SCANNED_UA).unwrap_or(v)),
+        };
+
+        match self.guard.decide(&facts, crate::deployment::now_secs()) {
+            GuardVerdict::Pass => None,
+            GuardVerdict::Block(rule) => {
+                tracing::info!(
+                    rule = %rule.id,
+                    matched = %rule.describe(),
+                    client = ?client,
+                    %path,
+                    "refused by a guard rule",
+                );
+                Some("blocked\n".to_string())
+            }
+            // `APP_LB_GUARD_ENFORCE=0`. Warn rather than debug: the whole point
+            // of a dry run is that somebody is watching for exactly this line.
+            GuardVerdict::WouldBlock(rule) => {
+                tracing::warn!(
+                    rule = %rule.id,
+                    matched = %rule.describe(),
+                    client = ?client,
+                    %path,
+                    "would have refused this request (APP_LB_GUARD_ENFORCE=0)",
+                );
+                None
+            }
         }
     }
 }
+
+/// How much of `User-Agent` a rule may match against.
+const MAX_SCANNED_UA: usize = 512;
 
 /// The request's target host.
 ///
@@ -434,7 +514,25 @@ impl ProxyHttp for LbProxy {
             return Ok(true);
         }
 
-        let Some(deployment) = self.registry.route(host.as_deref(), &path) else {
+        // Routed before the guard runs, purely so a rule can name a deployment:
+        // `registry.route` is a lock-free read of an `ArcSwap`, so this costs a
+        // blocked request nothing worth measuring, and without it a
+        // deployment-scoped rule could never match.
+        let routed = self.registry.route(host.as_deref(), &path);
+
+        // Enforcement. Deliberately *after* the ACME block above: a rule must
+        // not be able to break certificate renewal, and answering the challenge
+        // first is a carve-out that needs no special case of its own. An unknown
+        // challenge token falls through to here like anything else.
+        if let Some(refusal) = self.enforce(session, &host, &path, routed.as_ref()) {
+            // Attributed to the deployment it was aimed at, so a wall of blocks
+            // shows up in that deployment's numbers rather than nowhere.
+            ctx.deployment = routed;
+            write_plain(session, 403, &refusal).await?;
+            return Ok(true);
+        }
+
+        let Some(deployment) = routed else {
             tracing::debug!(?host, %path, "no deployment matches request");
             write_plain(session, 404, "no deployment matches this request\n").await?;
             return Ok(true); // response already written; stop proxying

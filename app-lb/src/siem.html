@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{APP_NAME}} security</title>
+<style>
+  /* The dashboard's tokens. Copied rather than shared because both pages are
+     `include_str!`d into the binary and there is no build step to share
+     anything through. */
+  :root {
+    color-scheme: light;
+    --plane:        #f9f9f7;
+    --surface:      #fcfcfb;
+    --text:         #0b0b0b;
+    --text-2:       #52514e;
+    --muted:        #898781;
+    --grid:         #e1e0d9;
+    --border:       rgba(11,11,11,0.10);
+    --series-1:     #2a78d6;
+    --good:         #0ca30c;
+    --warning:      #fab219;
+    --serious:      #ec835a;
+    --critical:     #d03b3b;
+    --success-text: #006300;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
+    --muted:#898781; --grid:#2c2c2a; --border:rgba(255,255,255,0.10);
+    --series-1:#3987e5; --good:#0ca30c; --warning:#fab219; --serious:#ec835a;
+    --critical:#d03b3b; --success-text:#0ca30c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
+      --muted:#898781; --grid:#2c2c2a; --border:rgba(255,255,255,0.10);
+      --series-1:#3987e5; --success-text:#0ca30c;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 24px 72px;
+    background: var(--plane); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  .lede { color: var(--text-2); margin: 0 0 22px; }
+  .links { margin-left: auto; display: flex; gap: 14px; align-items: baseline; }
+  .links a, .themebtn {
+    color: var(--text-2); text-decoration: none; font-size: 13px;
+    border: 0; background: none; padding: 0; cursor: pointer; font-family: inherit;
+  }
+  .links a:hover, .themebtn:hover { color: var(--text); text-decoration: underline; }
+
+  .section-title {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); margin: 30px 0 10px; font-weight: 600;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px 18px; margin-bottom: 12px;
+  }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .tile .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .tile .value { font-size: 24px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .tile .value.attn { color: var(--critical); }
+  .tile .sub { font-size: 12px; color: var(--text-2); margin-top: 3px; }
+
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+  select, input[type=text] {
+    font: inherit; font-size: 13px; padding: 5px 8px; border-radius: 7px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  .filters .spacer { margin-left: auto; }
+
+  button.act {
+    font: inherit; font-size: 12.5px; padding: 5px 11px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  button.act:hover { border-color: var(--series-1); }
+  button.act.danger { color: var(--critical); }
+  button.act.danger:hover { border-color: var(--critical); }
+  button.act:disabled { opacity: .5; cursor: not-allowed; }
+
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; flex: none; }
+  .tag.critical { background: color-mix(in srgb, var(--critical) 26%, transparent); color: var(--critical); }
+  .tag.high     { background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
+  .tag.medium   { background: color-mix(in srgb, var(--warning) 28%, transparent); color: var(--serious); }
+  .tag.low      { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
+  .tag.info     { background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--text-2); }
+  .tag.block    { background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
+  .tag.allow    { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+  .tag.dry      { background: color-mix(in srgb, var(--warning) 26%, transparent); color: var(--serious); }
+
+  .alert { border-bottom: 1px solid var(--grid); padding: 13px 0; }
+  .alert:last-child { border-bottom: 0; padding-bottom: 0; }
+  .alert:first-child { padding-top: 0; }
+  .alert-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .alert-head .title { font-weight: 600; overflow-wrap: anywhere; }
+  .alert-head .when { margin-left: auto; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .facts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+  .fact {
+    font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 1px 6px; border-radius: 4px; background: color-mix(in srgb, var(--muted) 16%, transparent);
+    color: var(--text-2); overflow-wrap: anywhere;
+  }
+  details.respond { margin-top: 9px; }
+  details.respond > summary {
+    cursor: pointer; font-size: 12.5px; color: var(--series-1); list-style: none;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  details.respond > summary::-webkit-details-marker { display: none; }
+  details.respond > summary::before { content: "▸"; font-size: 10px; }
+  details.respond[open] > summary::before { content: "▾"; }
+  .respond-body {
+    margin-top: 9px; padding: 12px 14px; border-radius: 8px;
+    background: var(--plane); border: 1px solid var(--border);
+  }
+  .respond-body h4 {
+    margin: 0 0 6px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--muted); font-weight: 600;
+  }
+  .respond-body ul { margin: 0 0 14px; padding-left: 18px; color: var(--text-2); font-size: 13px; }
+  .respond-body li { margin-bottom: 4px; }
+  .caveat {
+    font-size: 12.5px; color: var(--text-2); margin-bottom: 14px; padding: 9px 11px;
+    border-left: 3px solid var(--warning); border-radius: 0 6px 6px 0;
+    background: color-mix(in srgb, var(--warning) 9%, transparent);
+  }
+  .action { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 9px; }
+  .action .effect { font-size: 12px; color: var(--text-2); flex: 1 1 260px; }
+  details.ecs > summary { cursor: pointer; font-size: 12px; color: var(--muted); margin-top: 9px; }
+  pre.ecs {
+    margin: 8px 0 0; padding: 10px 12px; border-radius: 8px; overflow: auto;
+    background: var(--plane); border: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+    color: var(--text-2); max-height: 320px;
+  }
+
+  table.rules { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.rules th {
+    text-align: left; color: var(--muted); font-weight: 500;
+    padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap;
+  }
+  table.rules td { padding: 7px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  table.rules tr:last-child td { border-bottom: 0; }
+  table.rules td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  table.rules td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+  .note { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
+  .empty { color: var(--text-2); padding: 20px 0; text-align: center; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    background: color-mix(in srgb, var(--muted) 16%, transparent);
+    padding: 1px 5px; border-radius: 4px;
+  }
+
+  /* One line above the fold that reports what the last button press did. */
+  .flash {
+    position: sticky; top: 0; z-index: 5; margin: 0 0 14px;
+    padding: 10px 14px; border-radius: 8px; font-size: 13px; display: none;
+  }
+  .flash.on { display: block; }
+  .flash.ok { background: color-mix(in srgb, var(--good) 14%, var(--surface)); color: var(--success-text); }
+  .flash.bad { background: color-mix(in srgb, var(--critical) 14%, var(--surface)); color: var(--critical); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>{{APP_NAME}} security</h1>
+    <div class="links">
+      <a href="/">Directory</a>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/metrics">Metrics</a>
+      <button class="themebtn" id="themebtn" type="button">Theme</button>
+    </div>
+  </header>
+  <p class="lede" id="lede">Loading…</p>
+
+  <div class="flash" id="flash"></div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="section-title">Findings</div>
+  <div class="filters">
+    <select id="f-severity">
+      <option value="">Any severity</option>
+      <option value="critical">Critical</option>
+      <option value="high">High and above</option>
+      <option value="medium">Medium and above</option>
+      <option value="low">Low and above</option>
+    </select>
+    <select id="f-rule"><option value="">Any rule</option></select>
+    <input type="text" id="f-deployment" placeholder="deployment" size="14">
+    <span class="spacer"></span>
+    <button class="act" id="refresh" type="button">Refresh</button>
+    <label style="font-size:12.5px;color:var(--text-2)">
+      <input type="checkbox" id="auto" checked> auto
+    </label>
+  </div>
+  <div class="card" id="alerts"><div class="empty">Loading…</div></div>
+
+  <div class="section-title">Rules in force</div>
+  <div class="card" id="rules"><div class="empty">Loading…</div></div>
+</div>
+
+<script>
+"use strict";
+
+// Every interpolation below goes through this. The strings on this page are
+// attacker-shaped by definition — a path, a user agent, a query parameter name —
+// and a missed escape here is a stored XSS in the security console itself.
+function esc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+const $ = id => document.getElementById(id);
+const fmt = n => (n == null ? "—" : Number(n).toLocaleString());
+
+function ago(secs) {
+  if (!secs) return "";
+  const d = Math.max(0, Math.floor(Date.now() / 1000) - secs);
+  if (d < 60) return d + "s ago";
+  if (d < 3600) return Math.floor(d / 60) + "m ago";
+  if (d < 86400) return Math.floor(d / 3600) + "h ago";
+  return Math.floor(d / 86400) + "d ago";
+}
+function until(secs) {
+  if (!secs) return "never";
+  const d = secs - Math.floor(Date.now() / 1000);
+  if (d <= 0) return "expired";
+  if (d < 3600) return "in " + Math.ceil(d / 60) + "m";
+  if (d < 86400) return "in " + Math.round(d / 3600) + "h";
+  return "in " + Math.round(d / 86400) + "d";
+}
+
+async function api(method, path, body) {
+  const opts = { method, headers: { accept: "application/json" } };
+  if (body !== undefined) {
+    opts.headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  try {
+    const r = await fetch(path, opts);
+    if (r.status === 204) return { ok: true, status: 204, data: null };
+    const text = await r.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = { message: text }; }
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+function flash(kind, message) {
+  const el = $("flash");
+  el.className = "flash on " + kind;
+  el.textContent = message;
+  if (flash.timer) clearTimeout(flash.timer);
+  // Long enough to read a sentence, and it stays put while the poll runs so a
+  // refresh landing underneath cannot wipe the only record of what happened.
+  flash.timer = setTimeout(() => { el.className = "flash"; }, 12000);
+}
+
+// Which alerts have their runbook open. Kept outside the markup because the
+// poll rebuilds the list, and a disclosure that closes itself every ten seconds
+// is unusable exactly when somebody is reading it.
+const expanded = new Set();
+let latest = null;
+
+function tiles(d) {
+  const s = d.stats || {};
+  const g = d.guard || {};
+  const urgent = (d.totals ? d.totals.high + d.totals.critical : 0);
+  const sampling = s.dropped
+    ? "queue dropping — detection is sampling"
+    : s.clients_at_capacity ? "source table full" : "";
+  const items = [
+    ["Findings", fmt(d.alerts ? d.alerts.length : 0), urgent ? `${fmt(urgent)} high or critical` : "held in memory", urgent > 0],
+    ["Sources tracked", fmt(s.tracked_clients), sampling, !!sampling],
+    ["Rules in force", fmt(g.rules), g.enforcing === false ? "not enforcing — dry run" : "enforcing", g.enforcing === false],
+    ["Requests refused", fmt(g.blocked), g.exempted ? `${fmt(g.exempted)} exempted` : "since start", false],
+  ];
+  $("tiles").innerHTML = items.map(([label, value, sub, attn]) =>
+    `<div class="tile"><div class="label">${esc(label)}</div>
+     <div class="value${attn ? " attn" : ""}">${esc(value)}</div>
+     <div class="sub">${esc(sub)}</div></div>`).join("");
+}
+
+function renderAlerts(d) {
+  const el = $("alerts");
+  if (!d.enabled) {
+    el.innerHTML = `<div class="empty">Detection is off (<code>APP_LB_SIEM=0</code>).
+      Rules below are still enforced — blocking does not depend on detecting.</div>`;
+    return;
+  }
+  const alerts = d.alerts || [];
+  if (!alerts.length) {
+    el.innerHTML = `<div class="empty">No findings. app-lb is watching authentication failures,
+      attack signatures and traffic anomalies over a ${esc(d.window_secs)}s window.</div>`;
+    return;
+  }
+  el.innerHTML = alerts.map(renderAlert).join("");
+}
+
+function renderAlert(a) {
+  const r = a.response || {};
+  const key = "alert-" + a.id;
+  const open = expanded.has(a.id) ? " open" : "";
+
+  const facts = [];
+  if (a.client) facts.push(a.client);
+  if (a.deployment) facts.push(a.deployment);
+  if (a.path) facts.push(a.path);
+  if (a.technique) facts.push("ATT&CK " + a.technique);
+  if (a.count > 1) facts.push("×" + fmt(a.count));
+
+  const investigate = (r.investigate || []).length
+    ? `<h4>Check first</h4><ul>${r.investigate.map(i => `<li>${esc(i)}</li>`).join("")}</ul>` : "";
+  const caveat = r.caveat ? `<div class="caveat">${esc(r.caveat)}</div>` : "";
+  const actions = (r.actions || []).length
+    ? `<h4>Act</h4>` + r.actions.map((act, i) =>
+        `<div class="action">
+           <button class="act${act.kind === "exempt-client" ? "" : " danger"}"
+                   type="button" data-alert="${esc(a.id)}" data-action="${i}">${esc(act.label)}</button>
+           <span class="effect">${esc(act.effect)}</span>
+         </div>`).join("")
+    : `<div class="effect">No rule app-lb can apply for this one — see the notes above.</div>`;
+
+  const ecs = a.ecs
+    ? `<details class="ecs"><summary>Event fields (ECS)</summary>
+       <pre class="ecs">${esc(JSON.stringify(a.ecs, null, 2))}</pre></details>` : "";
+
+  return `<div class="alert" id="${esc(key)}">
+    <div class="alert-head">
+      <span class="tag ${esc(a.severity)}">${esc(a.severity)}</span>
+      <span class="title">${esc(a.title)}</span>
+      <span class="when">${esc(ago(Math.floor(a.last_ts / 1000)))}</span>
+    </div>
+    <div class="facts">${facts.map(f => `<span class="fact">${esc(f)}</span>`).join("")}
+      <span class="fact">${esc(a.rule)}</span></div>
+    <details class="respond"${open} data-alert="${esc(a.id)}">
+      <summary>Respond</summary>
+      <div class="respond-body">${investigate}${caveat}${actions}${ecs}</div>
+    </details>
+  </div>`;
+}
+
+function renderRules(d) {
+  const el = $("rules");
+  const rules = d.rules || [];
+  if (!rules.length) {
+    el.innerHTML = `<div class="empty">No rules. Nothing is being refused.</div>
+      <div class="note">Rules come from the <b>Respond</b> buttons above, or from
+      <code>POST /security/rules</code>. They are written to disk, so they survive a restart —
+      and they are never applied to this admin API, so a rule cannot lock you out of this page.</div>`;
+    return;
+  }
+  const rows = rules.map(r => `<tr>
+    <td><span class="tag ${esc(r.action)}">${esc(r.action)}</span>${
+        r.enforcing === false ? ` <span class="tag dry">dry run</span>` : ""}</td>
+    <td class="mono">${esc(r.summary)}${r.note ? `<div class="note" style="margin:2px 0 0">${esc(r.note)}</div>` : ""}</td>
+    <td class="num">${fmt(r.hits)}</td>
+    <td class="num">${esc(r.last_hit ? ago(r.last_hit) : "—")}</td>
+    <td class="num">${esc(until(r.expires_at))}</td>
+    <td><button class="act" type="button" data-rule="${esc(r.id)}">Remove</button></td>
+  </tr>`).join("");
+  el.innerHTML = `<table class="rules">
+    <thead><tr><th>Action</th><th>Matches</th><th>Hits</th><th>Last</th><th>Expires</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <div class="note">Rules are never applied to this admin API — that is what keeps a bad rule
+    from locking you out of the page that removes it.</div>`;
+}
+
+function ruleOptions(alerts) {
+  const sel = $("f-rule");
+  const seen = [...new Set(alerts.map(a => a.rule))].sort();
+  const want = `<option value="">Any rule</option>` +
+    seen.map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join("");
+  // Rebuilding unconditionally would drop the operator's selection mid-poll.
+  if (sel.dataset.built !== seen.join(",")) {
+    const current = sel.value;
+    sel.innerHTML = want;
+    sel.value = current;
+    sel.dataset.built = seen.join(",");
+  }
+}
+
+function query() {
+  const p = new URLSearchParams();
+  if ($("f-severity").value) p.set("severity", $("f-severity").value);
+  if ($("f-rule").value) p.set("rule", $("f-rule").value);
+  if ($("f-deployment").value.trim()) p.set("deployment", $("f-deployment").value.trim());
+  const s = p.toString();
+  return "/security" + (s ? "?" + s : "");
+}
+
+async function load() {
+  const r = await api("GET", query());
+  if (!r.ok) {
+    const why = r.status === 401 ? "Not authenticated."
+      : r.status === 403 ? "This credential may not read the security console."
+      : `GET /security failed (${r.status}).`;
+    $("lede").textContent = why;
+    return;
+  }
+  const d = r.data || {};
+  latest = d;
+  tiles(d);
+  ruleOptions(d.alerts || []);
+  renderAlerts(d);
+  renderRules(d);
+
+  const g = d.guard || {};
+  const bits = [];
+  bits.push(d.enabled
+    ? `Watching authentication, attack signatures and traffic anomalies over a ${d.window_secs}s window.`
+    : `Detection is off; enforcement is not.`);
+  bits.push(`${fmt(g.rules)} rule${g.rules === 1 ? "" : "s"} in force.`);
+  if (g.enforcing === false) bits.push("Enforcement is disabled — rules match but nothing is refused.");
+  $("lede").textContent = bits.join(" ");
+}
+
+// --- acting ---------------------------------------------------------------
+
+async function applyRule(spec, label) {
+  // The last thing between a click and refused traffic. It shows the effect
+  // sentence rather than "Are you sure?", because the sentence is the part that
+  // decides whether this is the right button.
+  const r = await api("POST", "/security/rules", spec);
+  if (r.ok) {
+    flash("ok", `${label} — rule ${r.data && r.data.id ? r.data.id : ""} is in force.`);
+    await load();
+    return;
+  }
+  const msg = r.data && (r.data.message || r.data.error) ? (r.data.message || r.data.error) : "";
+  if (r.status === 401 || r.status === 403) {
+    flash("bad", "Refused: this credential can read the console but not change what the data " +
+      "plane does. Creating a rule needs admin credentials, not a view token.");
+  } else {
+    flash("bad", `Rule not created (${r.status}). ${msg}`);
+  }
+}
+
+document.addEventListener("click", async ev => {
+  const rm = ev.target.closest("button[data-rule]");
+  if (rm) {
+    const id = rm.getAttribute("data-rule");
+    if (!confirm(`Remove rule ${id}? Traffic it was refusing will be served again.`)) return;
+    rm.disabled = true;
+    const r = await api("DELETE", "/security/rules/" + encodeURIComponent(id));
+    if (r.ok) { flash("ok", `Rule ${id} removed.`); await load(); }
+    else {
+      rm.disabled = false;
+      flash("bad", r.status === 401 || r.status === 403
+        ? "Refused: removing a rule needs admin credentials."
+        : `Rule not removed (${r.status}).`);
+    }
+    return;
+  }
+
+  const btn = ev.target.closest("button[data-action]");
+  if (!btn) return;
+  const alertId = btn.getAttribute("data-alert");
+  const idx = Number(btn.getAttribute("data-action"));
+  const alert = (latest && latest.alerts || []).find(a => String(a.id) === alertId);
+  const action = alert && alert.response && alert.response.actions[idx];
+  if (!action) return;
+  if (!confirm(action.effect + "\n\nApply this rule?")) return;
+  btn.disabled = true;
+  await applyRule(action.rule, action.label);
+  btn.disabled = false;
+});
+
+// Remember which runbooks are open across a poll.
+document.addEventListener("toggle", ev => {
+  const d = ev.target.closest("details.respond");
+  if (!d) return;
+  const id = Number(d.getAttribute("data-alert"));
+  if (d.open) expanded.add(id); else expanded.delete(id);
+}, true);
+
+// --- polling --------------------------------------------------------------
+
+let timer = null;
+function schedule() {
+  if (timer) clearInterval(timer);
+  // Ten seconds, matching the dashboard's slow loop. Findings change on the
+  // order of minutes; polling faster would only cost the operator their
+  // scroll position more often.
+  if ($("auto").checked) timer = setInterval(load, 10000);
+}
+
+["f-severity", "f-rule", "f-deployment"].forEach(id =>
+  $(id).addEventListener("change", load));
+$("f-deployment").addEventListener("input", () => {
+  clearTimeout($("f-deployment").debounce);
+  $("f-deployment").debounce = setTimeout(load, 400);
+});
+$("refresh").addEventListener("click", load);
+$("auto").addEventListener("change", schedule);
+$("themebtn").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.getAttribute("data-theme") === "dark"
+    || (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
+  root.setAttribute("data-theme", dark ? "light" : "dark");
+});
+
+load();
+schedule();
+</script>
+</body>
+</html>

@@ -37,7 +37,7 @@ const KNOWN = {
     UpdateSpec: ["working_dir", "commands", "env", "env_from", "auth", "timeout_secs", "verify_timeout_secs"],
     SecretEnv: ["secret", "key", "as"],
     SecretRef: ["secret", "key", "username"],
-    AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "base_path", "session_ttl_secs", "cookie_name", "redirect_url", "forward_identity"],
+    AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity"],
     DeploymentView: ["id", "kind", "upstreams", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
     PoolStatus: ["desired_replicas", "ready", "draining", "pending", "total_in_flight", "target_concurrency", "min_replicas", "max_replicas", "warm_pool", "utilization", "cpu_percent", "memory_bytes", "boot_timeout_secs", "cold_start_timeout_secs"],
     VmView: ["sandbox_id", "addr", "in_flight", "healthy", "draining", "uptime_secs", "cpu_percent", "memory_bytes"],
@@ -51,11 +51,17 @@ const KNOWN = {
     FleetPool: ["deployments", "ready", "draining", "pending", "total_in_flight"],
     ObsStats: ["queued", "dropped", "shipped", "failed", "healthy"],
     MetricsResponse: ["generated_at", "uptime_secs", "host", "fleet", "global", "obs", "security", "deployments", "matched", "tracked_deployments"],
-    SecuritySummary: ["open", "urgent", "dropped", "clients_at_capacity"],
-    SecurityResponse: ["generated_at", "enabled", "window_secs", "alerts", "totals", "stats"],
+    SecuritySummary: ["open", "urgent", "dropped", "clients_at_capacity", "rules", "blocked"],
+    SecurityResponse: ["generated_at", "enabled", "window_secs", "alerts", "totals", "rules", "guard", "stats"],
     // `ecs` is a free-form ECS map by design, so it has no declaration to check
     // against — app-lb may add fields there without this being a contract change.
-    SecurityAlert: ["id", "ts", "last_ts", "rule", "severity", "title", "client", "deployment", "path", "technique", "count", "ecs"],
+    SecurityAlert: ["id", "ts", "last_ts", "rule", "severity", "title", "client", "deployment", "path", "technique", "count", "ecs", "response"],
+    AlertResponse: ["investigate", "actions", "caveat"],
+    SuggestedAction: ["kind", "label", "effect", "rule"],
+    RuleSpec: ["action", "match", "expires_in_secs", "note"],
+    RuleMatch: ["client", "host", "deployment", "path_prefix", "path_contains", "method", "user_agent_contains"],
+    RuleView: ["id", "action", "match", "summary", "note", "created_at", "expires_at", "hits", "last_hit", "enforcing"],
+    GuardStats: ["rules", "blocked", "exempted", "enforcing"],
     SeverityTotals: ["info", "low", "medium", "high", "critical"],
     SiemStats: ["observed", "dropped", "analyzed", "raised", "suppressed", "tracked_clients", "clients_at_capacity"],
     JobRecord: ["id", "deployment", "kind", "status", "started_at", "finished_at", "error", "log", "repo", "ref", "commit", "dockerfile", "image", "rolled_out", "store", "artifact", "digest", "bytes", "reused", "working_dir", "commands_total", "commands_run", "verified"],
@@ -99,6 +105,10 @@ const NESTED = {
   auth: "AuthGate", client_secret: "SecretRef", pool: "PoolStatus", host: "HostUsage",
   fleet: "FleetPool", obs: "ObsStats", metrics: "DeploymentMetrics",
   security: "SecuritySummary", totals: "SeverityTotals", stats: "SiemStats",
+  response: "AlertResponse", guard: "GuardStats",
+  // `rule` is a bare string on an alert and a whole RuleSpec on a suggested
+  // action; `check` only recurses into objects, so one entry serves both.
+  rule: "RuleSpec", match: "RuleMatch",
   global: "DeploymentMetrics", requests: "StatusCounts", latency_ms: "Histogram",
   cold_start_s: "Histogram", autoscale: "AutoscaleCounts",
 };
@@ -107,6 +117,7 @@ const NESTED = {
 const ELEMENTS = {
   routes: "RouteRule", vms: "VmStatus", deployments: "DeploymentView", alerts: "SecurityAlert",
   pending_vms: "PendingVmView", buckets: "Bucket", env_from: "SecretEnv",
+  actions: "SuggestedAction", rules: "RuleView",
 };
 
 const K = KNOWN.common;
