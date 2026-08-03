@@ -604,23 +604,33 @@ impl BuildSpec {
     }
 }
 
-/// Where a deployment's guest image comes from: a rootfs already in an artifact
-/// store, addressed by content.
+/// Where a deployment's content comes from: bytes already in an artifact store,
+/// addressed by content.
+///
+/// Two backends read this block, and what the same digest means differs:
+///
+/// * A **managed (`vm`) deployment** pulls a *guest rootfs*. The blob is
+///   materialized as an ext4 file heyvmd can boot and [`VmSpec::image`] is
+///   rewritten to it, so the spec still says which image is actually booting and
+///   this block says where the next one comes from.
+/// * A **site** pulls a *directory tree* — a `tar` or `tar.gz` of built files,
+///   unpacked into [`SiteSpec::root`]. This is the counterpart of
+///   [`UpdateSpec`] and the reason to prefer it: the host needs no toolchain at
+///   all, because the build already happened wherever the bundle was made.
 ///
 /// The counterpart of [`BuildSpec`], and the same shape of thing: the *source*
-/// of the next image, not the running one. A pull resolves `reference` to a
-/// blob digest, materializes that blob as an ext4 rootfs heyvmd can boot, and
-/// only then rewrites [`VmSpec::image`] — so the spec still says which image is
-/// actually booting and this block says where the next one comes from.
+/// of the next content, not the running one.
 ///
 /// What makes this different from a build is that nothing is *produced*. The
 /// digest names bytes that already exist, so the same `artifact` block resolves
-/// to the same rootfs on every host that can reach the store, which is the whole
-/// reason to prefer it over rebuilding a Dockerfile per machine.
+/// to the same content on every host that can reach the store, which is the
+/// whole reason to prefer it over rebuilding per machine. It is also what makes
+/// a rollback expressible: a tag moves, a digest cannot.
 ///
 /// See <https://github.com/sarocu/artifacts> — `art heyvm import` puts heyvm's
-/// base images in, `serverctl artifact push` puts a locally-built one in, and
-/// either is pullable here.
+/// base images in, `art put dist.tgz --tag <name>` puts a site bundle in,
+/// `serverctl artifact push` puts a locally-built rootfs in, and any of them is
+/// pullable here.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ArtifactSpec {
     /// The store to pull from, in one of two forms:
@@ -628,16 +638,17 @@ pub struct ArtifactSpec {
     /// * `http://host:port` — a remote `art serve`. app-lb resolves and streams
     ///   the blob itself, verifying the digest as the bytes land.
     /// * `/abs/path` — a store root (`ART_ROOT`) on this host. app-lb shells out
-    ///   to `art heyvm materialize`, which skips the blob's holes instead of
-    ///   copying its zeros.
+    ///   to the `art` CLI: `art heyvm materialize` for a rootfs, which skips the
+    ///   blob's holes instead of copying its zeros, and `art get` for a site
+    ///   bundle, which hardlinks it and copies nothing at all.
     ///
     /// A local store is by far the faster of the two and is what a host running
     /// its own store should use; the URL form is what makes one store serve a
     /// fleet.
     pub store: String,
-    /// A tag (`debian-hermes`) or a 64-hex digest. A tag is resolved at pull
-    /// time, so a deployment pinned to one follows whatever the tag moves to; a
-    /// digest is immutable and is what a rollback should name.
+    /// A tag (`debian-hermes`, `marketing-live`) or a 64-hex digest. A tag is
+    /// resolved at pull time, so a deployment pinned to one follows whatever the
+    /// tag moves to; a digest is immutable and is what a rollback should name.
     #[serde(rename = "ref")]
     pub artifact_ref: String,
     /// API key for a store started with `ART_API_KEY`, as a reference into the
@@ -649,13 +660,29 @@ pub struct ArtifactSpec {
     /// costs no disk until the guest writes; heyvm still runs the `resize2fs`
     /// that lets the guest filesystem use the room. Set it when the image was
     /// built small and the workload needs space on `/`.
+    ///
+    /// Guest images only — a site has no filesystem to grow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grow_gb: Option<u64>,
     /// Base name for the materialized image; the digest is appended, so one
     /// deployment's pulls are `<name>-<short digest>`. Defaults to the
     /// deployment id.
+    ///
+    /// Guest images only — a site's files land in `site.root` under their own
+    /// names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_name: Option<String>,
+    /// Leading path components to drop from every entry while unpacking, exactly
+    /// as `tar --strip-components` does.
+    ///
+    /// Sites only, and it exists because of how the bundle was almost certainly
+    /// made: `tar czf dist.tgz dist` writes every entry as `dist/…`, so
+    /// unpacking it straight into `site.root` puts the index at
+    /// `<root>/dist/index.html` and the deployment 404s everything. `1` drops
+    /// that wrapper. A bundle rolled with `tar czf dist.tgz -C dist .` needs
+    /// nothing here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_components: Option<usize>,
 }
 
 impl ArtifactSpec {
@@ -684,7 +711,19 @@ impl ArtifactSpec {
         s.starts_with("http://") || s.starts_with("https://")
     }
 
-    fn validate(&self) -> Result<(), SpecError> {
+    /// How many leading path components a site's unpack drops. Zero unless the
+    /// spec says otherwise, which is the right default for a bundle rolled with
+    /// `tar -C dist .`.
+    pub fn strip(&self) -> usize {
+        self.strip_components.unwrap_or(0)
+    }
+
+    /// `for_site` decides which half of this block is meaningful. Both halves
+    /// are rejected on the backend they do not describe rather than ignored: a
+    /// `grow_gb` on a site is somebody expecting room they will not get, and a
+    /// `strip_components` on a guest image is somebody expecting an unpack that
+    /// never happens.
+    fn validate(&self, for_site: bool) -> Result<(), SpecError> {
         let store = self.store.trim();
         if store.is_empty() {
             return Err(SpecError::EmptyArtifactStore);
@@ -710,6 +749,30 @@ impl ArtifactSpec {
         if !is_valid_artifact_ref(&self.artifact_ref) {
             return Err(SpecError::BadArtifactRef(self.artifact_ref.clone()));
         }
+        if let Some(auth) = &self.auth {
+            auth.validate().map_err(|e| SpecError::BadSecretRef {
+                field: "artifact.auth",
+                detail: e.to_string(),
+            })?;
+        }
+
+        if for_site {
+            // Both describe a guest rootfs: one grows its filesystem, the other
+            // names the `.ext4` it is written to. A site produces neither.
+            for (present, what) in [
+                (self.grow_gb.is_some(), "artifact.grow_gb"),
+                (self.image_name.is_some(), "artifact.image_name"),
+            ] {
+                if present {
+                    return Err(SpecError::NotForSites(what));
+                }
+            }
+            return Ok(());
+        }
+
+        if self.strip_components.is_some() {
+            return Err(SpecError::OnlyForSites("artifact.strip_components"));
+        }
         if let Some(name) = &self.image_name
             && sanitize_image_name(name).is_empty()
         {
@@ -717,12 +780,6 @@ impl ArtifactSpec {
         }
         if self.grow_gb == Some(0) {
             return Err(SpecError::ZeroGrow);
-        }
-        if let Some(auth) = &self.auth {
-            auth.validate().map_err(|e| SpecError::BadSecretRef {
-                field: "artifact.auth",
-                detail: e.to_string(),
-            })?;
         }
         Ok(())
     }
@@ -1587,8 +1644,13 @@ pub enum SpecError {
     /// A `site` alongside a `vm` or `upstreams`: a deployment serves from one
     /// place, and three ways to answer a request has no defined precedence.
     SiteWithOtherBackend,
-    /// A `build`, `artifact` or `vm`-only block on a site.
+    /// A `build` or other guest-image-only block on a site.
     NotForSites(&'static str),
+    /// A site-only field set on a deployment that is not a site.
+    OnlyForSites(&'static str),
+    /// A site set both `update` and `artifact`; both claim to produce the files
+    /// under `site.root`.
+    BothSiteSources,
     /// Both a `vm` template and a static `upstreams` list were set.
     BothBackendKinds,
     /// Neither a `vm` template nor a static `upstreams` list was set.
@@ -1671,6 +1733,19 @@ impl std::fmt::Display for SpecError {
                 f,
                 "`{what}` does not apply to a site — it serves files off disk, with no \
                  image and no pool"
+            ),
+            Self::OnlyForSites(what) => write!(
+                f,
+                "`{what}` only applies to a site, which unpacks its artifact into a \
+                 directory. A managed (vm) deployment's artifact is a single guest rootfs, \
+                 and nothing unpacks it"
+            ),
+            Self::BothSiteSources => write!(
+                f,
+                "a site sets both `update` and `artifact`: pick one — both write the files \
+                 under `site.root`, so with both there is no answer to where what is being \
+                 served came from. Run the build on this host (`update`), or unpack a bundle \
+                 somebody already built (`artifact`)"
             ),
             Self::NoRoutes => write!(
                 f,
@@ -1952,21 +2027,24 @@ impl DeploymentSpec {
                 return Err(SpecError::SiteWithOtherBackend);
             }
             site.validate()?;
-            // A site has no image and no pool, so the blocks that produce or
-            // scale one are meaningless rather than merely unused. Rejected so
-            // a spec cannot claim something app-lb will silently ignore.
-            for (present, what) in [
-                (self.build.is_some(), "build"),
-                (self.artifact.is_some(), "artifact"),
-            ] {
-                if present {
-                    return Err(SpecError::NotForSites(what));
-                }
+            // A site has no image and no pool, so a block that produces one is
+            // meaningless rather than merely unused. Rejected so a spec cannot
+            // claim something app-lb will silently ignore.
+            if self.build.is_some() {
+                return Err(SpecError::NotForSites("build"));
             }
-            // `update` *is* allowed: running `git pull && npm run build` in a
-            // directory on this host is exactly how a site is redeployed.
+            // Both of these *are* allowed, and they are the two ways a site's
+            // files get replaced: `update` runs `git pull && npm run build` in a
+            // directory on this host, `artifact` unpacks a bundle somebody else
+            // built. Never both — see [`SpecError::BothSiteSources`].
+            if self.update.is_some() && self.artifact.is_some() {
+                return Err(SpecError::BothSiteSources);
+            }
             if let Some(update) = &self.update {
                 update.validate()?;
+            }
+            if let Some(artifact) = &self.artifact {
+                artifact.validate(true)?;
             }
             return Ok(());
         }
@@ -2005,7 +2083,7 @@ impl DeploymentSpec {
                 build.validate()?;
             }
             if let Some(artifact) = &self.artifact {
-                artifact.validate()?;
+                artifact.validate(false)?;
             }
             // An `update` runs commands in a directory on this host; a managed
             // deployment's backend is a microVM, so there is nothing here for
@@ -2443,6 +2521,7 @@ mod tests {
             auth: None,
             grow_gb: None,
             image_name: None,
+            strip_components: None,
         }
     }
 
@@ -3089,10 +3168,11 @@ mod tests {
             assert_eq!(s.validate(), Err(SpecError::SiteWithOtherBackend));
         }
 
-        /// A site has no image and no pool, so a block that produces one is a
-        /// misunderstanding rather than a harmless extra.
+        /// A `build` produces a guest image, and a site has neither an image nor
+        /// a pool — so it is a misunderstanding rather than a harmless extra.
+        /// `artifact` is *not* in this company: see below.
         #[test]
-        fn image_sources_are_refused_on_a_site() {
+        fn a_build_block_is_refused_on_a_site() {
             let mut s = site_spec();
             s.build = Some(
                 serde_json::from_str(r#"{"repo":"https://github.com/acme/site.git"}"#).unwrap(),
@@ -3112,6 +3192,75 @@ mod tests {
                 .unwrap(),
             );
             assert_eq!(s.validate(), Ok(()));
+        }
+
+        /// And so is `artifact`: unpacking a bundle somebody else built is the
+        /// other way a site is redeployed, and the one that needs no toolchain on
+        /// this host at all.
+        #[test]
+        fn an_artifact_block_is_the_other_way_a_site_is_deployed() {
+            let mut s = site_spec();
+            s.artifact = Some(
+                serde_json::from_str(
+                    r#"{"store":"http://127.0.0.1:8080","ref":"marketing-live"}"#,
+                )
+                .unwrap(),
+            );
+            assert_eq!(s.validate(), Ok(()));
+
+            // The one field that only means something here.
+            s.artifact.as_mut().unwrap().strip_components = Some(1);
+            assert_eq!(s.validate(), Ok(()));
+            assert_eq!(s.artifact.as_ref().unwrap().strip(), 1);
+        }
+
+        /// The half of `artifact` that describes a guest rootfs. Refused rather
+        /// than ignored: somebody setting `grow_gb` on a site expects room they
+        /// are never going to get.
+        #[test]
+        fn the_guest_image_half_of_an_artifact_block_is_refused_on_a_site() {
+            let base: ArtifactSpec =
+                serde_json::from_str(r#"{"store":"/srv/artifacts","ref":"marketing-live"}"#)
+                    .unwrap();
+
+            let mut s = site_spec();
+            s.artifact = Some(ArtifactSpec { grow_gb: Some(8), ..base.clone() });
+            assert_eq!(s.validate(), Err(SpecError::NotForSites("artifact.grow_gb")));
+
+            let mut s = site_spec();
+            s.artifact = Some(ArtifactSpec { image_name: Some("web".into()), ..base });
+            assert_eq!(s.validate(), Err(SpecError::NotForSites("artifact.image_name")));
+        }
+
+        /// And the reverse: a guest rootfs is one file, so there is nothing for
+        /// `strip_components` to strip.
+        #[test]
+        fn strip_components_is_refused_off_a_site() {
+            let mut s = spec();
+            s.artifact = Some(ArtifactSpec {
+                strip_components: Some(1),
+                ..artifact_spec()
+            });
+            assert_eq!(
+                s.validate(),
+                Err(SpecError::OnlyForSites("artifact.strip_components"))
+            );
+        }
+
+        /// Both blocks write the files under `site.root`, so a site holding both
+        /// has no answer to where what it is serving came from — the same
+        /// reasoning that refuses `build` next to `artifact` on a VM.
+        #[test]
+        fn a_site_deploys_one_way_or_the_other_not_both() {
+            let mut s = site_spec();
+            s.update = Some(
+                serde_json::from_str(r#"{"working_dir":"/srv/docs","commands":["make"]}"#)
+                    .unwrap(),
+            );
+            s.artifact = Some(
+                serde_json::from_str(r#"{"store":"/srv/artifacts","ref":"docs-live"}"#).unwrap(),
+            );
+            assert_eq!(s.validate(), Err(SpecError::BothSiteSources));
         }
 
         #[test]

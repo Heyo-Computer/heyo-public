@@ -437,9 +437,16 @@ pub struct JobRecord {
     pub artifact_ref: Option<String>,
     /// What it resolved to — the pull's answer to "which bytes are live?".
     pub digest: Option<String>,
-    /// Bytes transferred. `0` with `reused` is a skipped fetch, not a no-op job.
+    /// Bytes transferred. `0` with `reused` is a skipped fetch, not a no-op job;
+    /// `0` without it is a local store hardlinking the blob rather than copying.
     pub bytes: Option<u64>,
     pub reused: bool,
+    /// Set only when the pull was a *site* pull — a bundle unpacked into this
+    /// directory rather than a rootfs written to an image.
+    pub site_root: Option<String>,
+    /// Regular files unpacked, for the same kind of pull. The answer `bytes`
+    /// cannot give when the blob was hardlinked and the transfer was free.
+    pub files: Option<usize>,
 
     // host-update
     pub working_dir: Option<String>,

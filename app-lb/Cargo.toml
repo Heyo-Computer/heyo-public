@@ -121,6 +121,21 @@ base64.workspace = true
 # be the one the artifact store computed, which is the one `sha256sum` reports.
 # Already in the tree via pingora and heyo-sdk.
 sha2.workspace = true
+
+# Unpacking a site's artifact bundle (`src/unpack.rs`). In-process rather than
+# shelling out to `tar`, for two reasons: a bundle is untrusted input, and this
+# way the containment rules are ours and testable rather than whichever `tar` is
+# on the host and whichever flags it defaults to. It also keeps the promise the
+# feature exists to make — that a host serving an artifact-backed site needs no
+# toolchain on it.
+#
+# `tar` brings only `filetime`/`libc`; `flate2` is already in the tree three
+# times over (pingora-core, heyo-sdk, ureq), so this is a dependency line rather
+# than a new build. Its backend is chosen workspace-wide by feature unification
+# — pingora's `zlib-ng` wins, which is what `cmake` in the requirements is for.
+tar = "0.4"
+flate2 = "1"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

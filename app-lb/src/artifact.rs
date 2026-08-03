@@ -1,10 +1,22 @@
-//! Pulling a guest rootfs out of an artifact store.
+//! Pulling a deployment's content out of an artifact store.
 //!
 //! The store is [`artifacts`](https://github.com/sarocu/artifacts) — content
-//! addressed, ext4-native, and already the thing that holds heyvm's base images
-//! (`art heyvm import`). A deployment's `artifact` block names a store and a
-//! reference; this module turns that pair into an `<name>.ext4` in heyvm's image
-//! directory that `heyvmd` can boot, and reports the digest it came from.
+//! addressed, and already the thing that holds heyvm's base images (`art heyvm
+//! import`). A deployment's `artifact` block names a store and a reference; this
+//! module turns that pair into bytes on this host, and reports the digest they
+//! came from.
+//!
+//! What those bytes become depends on the backend, and the two are different
+//! enough to be worth naming:
+//!
+//! * **A managed (`vm`) deployment** gets an `<name>.ext4` in heyvm's image
+//!   directory that `heyvmd` can boot. [`Puller::pull`].
+//! * **A site** gets a `tar`/`tar.gz` bundle unpacked into `site.root`.
+//!   [`Puller::pull_tree`], with the unpacking itself in [`crate::unpack`].
+//!
+//! Everything below the resolve step is shared, because the hard parts are the
+//! same either way: turning a tag into a digest, getting the bytes across, and
+//! proving they are the bytes that were asked for.
 //!
 //! Two transports, chosen by how `artifact.store` is spelled, because the two
 //! situations are genuinely different rather than one being a fallback:
@@ -20,12 +32,22 @@
 //!
 //! ## What this module insists on
 //!
-//! **The digest is verified on the way in.** A rootfs fetched over the wire is
-//! the thing the kernel boots. A truncated body, a proxy that helpfully
-//! transcoded something, a store that answered the wrong blob — all of those
-//! produce a file that `mke2fs` never made, and the only cheap way to notice is
-//! to hash what arrived and compare it with the name that was asked for. The
-//! local path gets this for free: `art` hashes on materialize.
+//! **The digest is verified before the bytes are used.** A rootfs is the thing
+//! the kernel boots and a bundle is the thing that gets written across a
+//! directory on this host. A truncated body, a proxy that helpfully transcoded
+//! something, a store that answered the wrong blob — all of those produce a file
+//! that is not what was asked for, and the only cheap way to notice is to hash
+//! it and compare.
+//!
+//! Where that check happens differs by path, and it is worth being precise
+//! because one of them is not free:
+//!
+//! * **Over the wire**, [`Puller::fetch_blob`] hashes the body as it lands, so
+//!   nothing is ever written under a final name unverified.
+//! * **From a local store**, `art heyvm materialize` hashes as it copies — but
+//!   only on the copying path. `art get` *hardlinks* when it can, which writes
+//!   no bytes and therefore hashes none, so [`verify_file`] does it here before
+//!   a bundle is unpacked.
 //!
 //! **The image is named after the digest, so a re-pull is free.** `<base>-<12
 //! hex>` is a pure function of the content, so the file being present is proof
@@ -64,8 +86,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// hung one.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// What a pull did. Every field is reported on the job record, because "which
-/// bytes are live" is the question a pull exists to answer.
+/// What a *rootfs* pull did. Every field is reported on the job record, because
+/// "which bytes are live" is the question a pull exists to answer.
 #[derive(Debug, Clone)]
 pub struct Pulled {
     /// The rootfs blob's digest — what `artifact.ref` resolved to.
@@ -82,7 +104,30 @@ pub struct Pulled {
     pub reused: bool,
 }
 
-/// Materializes rootfs images into one directory.
+/// What a *site* pull did. The tree counterpart of [`Pulled`], and deliberately
+/// not the same type: a site produces no image name and no file, so half of
+/// [`Pulled`] would be `None` here and the other half would need explaining.
+#[derive(Debug, Clone)]
+pub struct PulledTree {
+    /// The bundle blob's digest — what `artifact.ref` resolved to, and what the
+    /// marker beside the root now records.
+    pub digest: String,
+    /// The directory now serving it.
+    pub root: PathBuf,
+    /// Regular files unpacked.
+    pub files: usize,
+    /// Uncompressed bytes written into the tree.
+    pub unpacked: u64,
+    /// Bytes transferred from the store. Zero from a local store means the blob
+    /// was hardlinked rather than copied, which is the normal case.
+    pub bytes_written: u64,
+    /// Whether the whole pull was skipped because this digest is already the one
+    /// deployed at `root`.
+    pub reused: bool,
+}
+
+/// Materializes a store's blobs onto this host: rootfs images into one
+/// directory, site bundles into the directory each site is served from.
 pub struct Puller {
     /// The `art` CLI, for the local-store path.
     art_bin: String,
@@ -159,6 +204,150 @@ impl Puller {
         }
     }
 
+    // -- sites: a bundle unpacked into the served directory ------------------
+
+    /// Resolve `spec.artifact_ref`, unpack the bundle behind it into
+    /// `site.root`, and say what happened.
+    ///
+    /// The order is the point, and it is not the order the equivalent shell
+    /// commands run in. The bundle is fetched, verified, unpacked *beside* the
+    /// live tree and checked for the index the site will look for — and only
+    /// then swapped in. Every way this can fail therefore fails with the
+    /// previous site still serving, which is the one thing `git pull && npm run
+    /// build && mv -T dist public` cannot promise.
+    pub async fn pull_tree(
+        &self,
+        spec: &ArtifactSpec,
+        site: &crate::config::SiteSpec,
+        api_key: Option<&str>,
+        force: bool,
+        log: &mut (dyn FnMut(String) + Send),
+    ) -> Result<PulledTree, String> {
+        let root = PathBuf::from(site.root.trim());
+        let remote = spec.is_remote();
+        let base = spec.store.trim().trim_end_matches('/').to_string();
+
+        // Resolve first: it is one round trip, and it is what makes the reuse
+        // check below possible without moving any bytes.
+        let (digest, size) = if remote {
+            self.resolve_remote(&base, &spec.artifact_ref, api_key, None)
+                .await?
+        } else {
+            if api_key.is_some() {
+                log("artifact.auth is set on a local store; a store root is protected by \
+                     file permissions, not by an API key, and the secret is unused"
+                    .to_string());
+            }
+            self.stat_local(&base, &spec.artifact_ref).await?
+        };
+        log(format!(
+            "{} resolves to {digest} ({}) {} {base}",
+            spec.artifact_ref,
+            human(size),
+            if remote { "at" } else { "in" },
+        ));
+
+        // The site counterpart of "the image is already on disk". The digest is
+        // recorded beside the root rather than encoded in a filename, because a
+        // directory cannot be content-addressed by its name the way an image
+        // file is.
+        if !force && crate::unpack::deployed_digest(&root).as_deref() == Some(digest.as_str()) {
+            log(format!(
+                "{} is already serving this digest; nothing to unpack",
+                root.display()
+            ));
+            return Ok(PulledTree {
+                digest,
+                root,
+                files: 0,
+                unpacked: 0,
+                bytes_written: 0,
+                reused: true,
+            });
+        }
+
+        // Beside the root, so a bundle too large for `/tmp` is not a surprise
+        // and the local store's hardlink lands on the filesystem the files are
+        // going to anyway.
+        let bundle = Scratch::new(crate::unpack::scratch_path(&root, "bundle")?);
+        let bytes_written = if remote {
+            self.fetch_blob(&base, &digest, api_key, bundle.path(), size, log)
+                .await?
+        } else {
+            let written = self.get_local(&base, &digest, bundle.path()).await?;
+            // `art get` hardlinks when it can, and a hardlink hashes nothing.
+            verify_file(bundle.path(), &digest).await?;
+            log(format!(
+                "{} from {base} ({})",
+                human(size),
+                if written == 0 { "hardlinked" } else { "copied" }
+            ));
+            written
+        };
+
+        // Unpacking is synchronous, and a bundle can be hundreds of megabytes
+        // of gzip: on the job task directly it would stall every other future
+        // on this runtime thread for the duration.
+        let strip = spec.strip();
+        let index = site.index.trim().to_string();
+        let (root, unpacked) = {
+            let root = root.clone();
+            let bundle_path = bundle.path().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let (staged, unpacked) = crate::unpack::stage(&root, &bundle_path, strip)?;
+                crate::unpack::verify_index(staged.dir(), &index, strip)?;
+                staged.commit()?;
+                Ok::<_, String>((root, unpacked))
+            })
+            .await
+            .map_err(|e| format!("the unpack task did not finish: {e}"))??
+        };
+
+        log(format!(
+            "unpacked {} file{} ({}) into {}",
+            unpacked.files,
+            if unpacked.files == 1 { "" } else { "s" },
+            human(unpacked.bytes),
+            root.display(),
+        ));
+
+        // After the swap, so the marker can only ever describe a tree that is
+        // actually in place.
+        //
+        // If it cannot be written the *old* marker must go, and that matters
+        // more than it looks: a marker left claiming the digest this deploy
+        // replaced would make a later pull of that digest skip its work and
+        // report "already serving" over a tree holding something else. Losing
+        // the marker only costs the next pull its shortcut, so the failure is
+        // logged rather than raised — the deploy itself succeeded.
+        if let Err(e) = crate::unpack::record_digest(&root, &digest) {
+            crate::unpack::forget_digest(&root);
+            log(format!("{e}; the next pull will unpack again rather than skip"));
+        }
+
+        Ok(PulledTree {
+            digest,
+            root,
+            files: unpacked.files,
+            unpacked: unpacked.bytes,
+            bytes_written,
+            reused: false,
+        })
+    }
+
+    /// `art get` — the blob's bytes at a path, hardlinked if the filesystem
+    /// allows it. Returns what was actually written, which is `0` for a link.
+    async fn get_local(&self, root: &str, digest: &str, dest: &Path) -> Result<u64, String> {
+        // `art get` refuses to clobber, and a crashed run can leave one behind.
+        let _ = tokio::fs::remove_file(dest).await;
+        let mut cmd = self.art(root);
+        cmd.arg("get").arg(digest).arg("-o").arg(dest);
+        let out = self.run(cmd).await?;
+        let v: serde_json::Value = serde_json::from_str(&out)
+            .map_err(|e| format!("`art get` produced output that is not JSON: {e}"))?;
+        Ok(v.get("bytesWritten").and_then(|b| b.as_u64()).unwrap_or(0))
+    }
+
     // -- remote: art serve over HTTP ---------------------------------------
 
     async fn pull_remote(
@@ -171,7 +360,9 @@ impl Puller {
         log: &mut (dyn FnMut(String) + Send),
     ) -> Result<Pulled, String> {
         let base = spec.store.trim().trim_end_matches('/');
-        let (digest, expected_size) = self.resolve_remote(base, &spec.artifact_ref, api_key).await?;
+        let (digest, expected_size) = self
+            .resolve_remote(base, &spec.artifact_ref, api_key, Some(ROOTFS_FILENAME))
+            .await?;
         log(format!(
             "{} resolves to {digest} ({}) at {base}",
             spec.artifact_ref,
@@ -226,6 +417,7 @@ impl Puller {
         base: &str,
         reference: &str,
         api_key: Option<&str>,
+        expected: Option<&str>,
     ) -> Result<(String, u64), String> {
         let url = format!("{base}/manifests/{reference}");
         let manifest_err = match self.get(&url, api_key).await {
@@ -234,7 +426,7 @@ impl Puller {
                     .json()
                     .await
                     .map_err(|e| format!("the manifest at {url} was not readable: {e}"))?;
-                return rootfs_entry(&m, reference);
+                return blob_entry(&m, reference, expected);
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -647,18 +839,21 @@ struct ManifestEntry {
     size: u64,
 }
 
-/// The rootfs inside a manifest: the entry named `rootfs.ext4`, or the only one.
+/// The blob a manifest is standing in for: the entry with the expected name, or
+/// the only one.
 ///
 /// Both rules are needed. `art heyvm import` writes a single-entry manifest and
 /// names it `rootfs.ext4`, but a manifest holding one unrelated blob is still
 /// unambiguous, and `art put --tag` produces exactly that. Anything else is
 /// reported rather than guessed — picking an entry out of a bundle by position
-/// would boot whichever file happened to sort first.
-fn rootfs_entry(m: &Manifest, reference: &str) -> Result<(String, u64), String> {
-    let entry = m
-        .entries
-        .iter()
-        .find(|e| e.name == ROOTFS_FILENAME)
+/// would deploy whichever file happened to sort first.
+///
+/// `expected` is what the caller is looking for by name, and there is one only
+/// for a rootfs: a site bundle has no filename convention, so it relies on the
+/// single-entry rule alone.
+fn blob_entry(m: &Manifest, reference: &str, expected: Option<&str>) -> Result<(String, u64), String> {
+    let entry = expected
+        .and_then(|name| m.entries.iter().find(|e| e.name == name))
         .or(if m.entries.len() == 1 {
             m.entries.first()
         } else {
@@ -674,9 +869,14 @@ fn rootfs_entry(m: &Manifest, reference: &str) -> Result<(String, u64), String> 
             Err(format!("the manifest for {reference:?} is empty"))
         }
         None => Err(format!(
-            "the manifest for {reference:?} holds {} entries and none is called {ROOTFS_FILENAME}: {}. \
-             Tag the rootfs blob directly, or push it with `serverctl artifact push`",
+            "the manifest for {reference:?} holds {} entries{}: {}. Tag the blob you want \
+             directly — a manifest with several entries does not say which one this \
+             deployment is for",
             m.entries.len(),
+            match expected {
+                Some(name) => format!(" and none is called {name}"),
+                None => String::new(),
+            },
             m.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", "),
         )),
     }
@@ -748,6 +948,66 @@ impl Drop for TempImage {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+/// A file removed when it goes out of scope, however the scope ends.
+///
+/// Unlike [`TempImage`] there is no commit: a bundle is read and discarded, and
+/// what survives a site pull is the unpacked tree rather than the archive.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Hash a file already on disk and confirm it is the blob that was asked for.
+///
+/// The wire path does this as the bytes land ([`Puller::fetch_blob`]); this is
+/// for the local path, where `art get` hardlinks the blob and so writes — and
+/// hashes — nothing at all. Cheap next to the unpack it precedes, and it is the
+/// only thing standing between a store somebody has written to and a directory
+/// this host serves.
+async fn verify_file(path: &Path, digest: &str) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("could not read {} back to verify it: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut read: u64 = 0;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        read += n as u64;
+    }
+
+    let actual = hex(&hasher.finalize());
+    if actual != digest {
+        return Err(format!(
+            "the store produced {read} bytes that hash to {actual}, but {digest} was asked \
+             for — this is a corrupted or substituted bundle and it has not been unpacked"
+        ));
+    }
+    Ok(())
 }
 
 /// Where a pulled image is written, resolved the way mvm-ctrl resolves it.
@@ -856,6 +1116,11 @@ mod tests {
         s
     }
 
+    /// What a rootfs pull looks for.
+    fn rootfs_entry(m: &Manifest, reference: &str) -> Result<(String, u64), String> {
+        blob_entry(m, reference, Some(ROOTFS_FILENAME))
+    }
+
     #[test]
     fn a_heyvm_import_manifest_resolves_to_its_rootfs() {
         let m = manifest(&[("rootfs.ext4", &d("c74abee2"), 21_474_836_480)]);
@@ -882,23 +1147,62 @@ mod tests {
         assert_eq!(rootfs_entry(&m, "web").unwrap().0, d("3333"));
     }
 
+    /// A site bundle has no filename convention — `dist.tgz`, `site.tar`,
+    /// whatever the CI job called it — so it resolves on the single-entry rule
+    /// alone, and `rootfs.ext4` means nothing special to it.
+    #[test]
+    fn a_site_bundle_resolves_without_an_expected_name() {
+        let m = manifest(&[("dist.tgz", &d("6666"), 4_194_304)]);
+        assert_eq!(
+            blob_entry(&m, "marketing-live", None).unwrap(),
+            (d("6666"), 4_194_304)
+        );
+
+        // And with several entries it is ambiguous rather than guessed, even
+        // though one of them is a rootfs: nothing says a site wants that one.
+        let m = manifest(&[("rootfs.ext4", &d("7777"), 1), ("dist.tgz", &d("8888"), 2)]);
+        let err = blob_entry(&m, "mixed", None).unwrap_err();
+        assert!(err.contains("dist.tgz"), "{err}");
+        assert!(!err.contains("none is called"), "no name was expected: {err}");
+    }
+
     #[test]
     fn an_ambiguous_manifest_is_reported_with_what_it_holds() {
         let m = manifest(&[("a.img", &d("4444"), 1), ("b.img", &d("5555"), 2)]);
         let err = rootfs_entry(&m, "pair").unwrap_err();
         assert!(err.contains("a.img"), "{err}");
         assert!(err.contains("b.img"), "{err}");
+        assert!(err.contains(ROOTFS_FILENAME), "it should name what it looked for: {err}");
     }
 
     #[test]
     fn an_empty_manifest_says_so_rather_than_panicking() {
         assert!(rootfs_entry(&manifest(&[]), "empty").is_err());
+        assert!(blob_entry(&manifest(&[]), "empty", None).is_err());
     }
 
     #[test]
     fn a_manifest_entry_whose_digest_is_not_a_sha256_is_refused() {
         let m = manifest(&[("rootfs.ext4", "not-a-digest", 1)]);
         assert!(rootfs_entry(&m, "bad").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_bundle_that_is_not_the_blob_that_was_asked_for_is_refused() {
+        let dir = std::env::temp_dir().join(format!("applb-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bundle");
+        std::fs::write(&path, b"hello").unwrap();
+
+        // sha256("hello")
+        let real = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert!(verify_file(&path, real).await.is_ok());
+
+        let err = verify_file(&path, &d("dead")).await.unwrap_err();
+        assert!(err.contains("has not been unpacked"), "{err}");
+        assert!(err.contains(real), "it should report what it actually got: {err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

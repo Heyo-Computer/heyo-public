@@ -25,6 +25,7 @@ mod siem;
 mod site;
 mod tls;
 mod tokens;
+mod unpack;
 mod vm;
 
 use crate::acme::{AcmeConfig, AcmeManager, ChallengeTable};

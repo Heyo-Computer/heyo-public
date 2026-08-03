@@ -40,7 +40,7 @@
 
 use crate::artifact::{Puller, human as human_bytes};
 use crate::autoscale::Autoscaler;
-use crate::config::{ArtifactSpec, BuildSpec, UpdateSpec};
+use crate::config::{ArtifactSpec, Backend, BuildSpec, UpdateSpec};
 use crate::deployment::{Deployment, now_secs};
 use crate::health;
 use crate::registry::Registry;
@@ -85,9 +85,11 @@ const VERIFY_INTERVAL: Duration = Duration::from_secs(2);
 pub enum JobKind {
     /// Build a guest image from git + a Dockerfile (managed deployments).
     ImageBuild,
-    /// Materialize a guest image from an artifact store (managed deployments).
+    /// Materialize content from an artifact store: a guest rootfs for a managed
+    /// deployment, an unpacked bundle for a site.
     ArtifactPull,
-    /// Run commands in a working directory on this host (static deployments).
+    /// Run commands in a working directory on this host (static deployments and
+    /// sites).
     HostUpdate,
 }
 
@@ -100,10 +102,22 @@ impl JobKind {
         }
     }
 
-    /// Whether this kind acts on a managed deployment. Both image sources do;
-    /// only `host-update` does not.
-    fn is_managed(self) -> bool {
-        matches!(self, Self::ImageBuild | Self::ArtifactPull)
+    /// Whether this kind of job means anything for that kind of backend.
+    ///
+    /// Deliberately a table rather than a pair of `is_managed()` comparisons,
+    /// because the mapping stopped being one-to-one when sites learned to pull:
+    /// two kinds apply to a site, and `ArtifactPull` applies to two backends. A
+    /// predicate that answers "managed?" cannot express either.
+    fn applies_to(self, backend: Backend) -> bool {
+        match self {
+            // A guest image, from a Dockerfile. Only a VM has one.
+            Self::ImageBuild => backend == Backend::Vm,
+            // A rootfs for a VM, a directory tree for a site. What a static
+            // deployment proxies to is somebody else's process, with neither.
+            Self::ArtifactPull => matches!(backend, Backend::Vm | Backend::Site),
+            // Commands in a directory on this host. A VM's backend is not here.
+            Self::HostUpdate => matches!(backend, Backend::Upstreams | Backend::Site),
+        }
     }
 }
 
@@ -160,12 +174,21 @@ pub struct JobRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// Bytes transferred or copied. `0` with `reused` set means the
-    /// content-addressed image was already on disk and nothing moved.
+    /// content-addressed image was already on disk and nothing moved; `0`
+    /// without it means a local store hardlinked the blob instead of copying.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
-    /// Whether the fetch was skipped because the image was already present.
+    /// Whether the fetch was skipped because the content was already present.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub reused: bool,
+    /// The directory a site's bundle was unpacked into. Only a site pull sets
+    /// it — for a managed deployment the pull's destination is `image`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_root: Option<String>,
+    /// Regular files unpacked. The site pull's answer to "did this deploy what
+    /// I think it did?", which `bytes` cannot give when the blob was hardlinked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<usize>,
 
     // -- host-update ------------------------------------------------------
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,6 +229,8 @@ impl JobRecord {
             digest: None,
             bytes: None,
             reused: false,
+            site_root: None,
+            files: None,
             working_dir: None,
             commands_total: None,
             commands_run: None,
@@ -229,10 +254,14 @@ impl JobRecord {
 #[derive(Debug)]
 pub enum StartError {
     NoDeployment(String),
-    /// The deployment is the wrong kind for this job.
+    /// The deployment is the wrong kind for this job. Carries the backend it
+    /// actually has, because "wrong kind" is only useful with what it is
+    /// instead — and with three backends and three job kinds, the message
+    /// cannot be inferred from the job kind alone.
     WrongKind {
         id: String,
         kind: JobKind,
+        backend: Backend,
     },
     NoSpec {
         id: String,
@@ -249,27 +278,37 @@ impl std::fmt::Display for StartError {
             Self::WrongKind {
                 id,
                 kind: JobKind::ImageBuild,
+                backend,
             } => write!(
                 f,
-                "deployment {id:?} is static (proxy_pass); it has no guest image to build. \
-                 Use `update` to run commands on the host instead"
+                "deployment {id:?} {}, so it has no guest image to build. {}",
+                describe_backend(*backend),
+                match backend {
+                    Backend::Site => "Use `pull` to unpack a bundle from an artifact store, \
+                                      or `update` to build on this host",
+                    _ => "Use `update` to run commands on the host instead",
+                }
             ),
             Self::WrongKind {
                 id,
                 kind: JobKind::ArtifactPull,
+                backend,
             } => write!(
                 f,
-                "deployment {id:?} is static (proxy_pass); it has no guest image to pull a \
-                 rootfs into. Use `update` to run commands on the host instead"
+                "deployment {id:?} {}, so there is nothing for a pull to land in — it \
+                 forwards to upstreams somebody else runs. Use `update` to run commands on \
+                 the host instead",
+                describe_backend(*backend),
             ),
             Self::WrongKind {
                 id,
                 kind: JobKind::HostUpdate,
+                backend,
             } => write!(
                 f,
-                "deployment {id:?} is a managed VM pool, not a static (proxy_pass) one; its \
-                 backends are microVMs, not host processes. Use `build` or `pull` to change \
-                 its image"
+                "deployment {id:?} {}; its backends are microVMs, not processes on this \
+                 host. Use `build` or `pull` to change its image",
+                describe_backend(*backend),
             ),
             Self::NoSpec {
                 id,
@@ -302,6 +341,20 @@ impl std::fmt::Display for StartError {
             ),
             Self::BadRef(r) => write!(f, "{r}"),
         }
+    }
+}
+
+/// A digest, short enough for a one-line job outcome.
+fn short(digest: &str) -> String {
+    digest.chars().take(12).collect()
+}
+
+/// A backend as it appears mid-sentence in a "wrong kind of deployment" error.
+fn describe_backend(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Vm => "is a managed VM pool",
+        Backend::Upstreams => "is static (proxy_pass)",
+        Backend::Site => "is a site: it serves files off disk",
     }
 }
 
@@ -510,10 +563,12 @@ impl Jobs {
         let Some(deployment) = self.registry.get(deployment_id) else {
             return Err(StartError::NoDeployment(deployment_id.to_string()));
         };
-        if deployment.spec.is_managed() != kind.is_managed() {
+        let backend = deployment.spec.backend();
+        if !kind.applies_to(backend) {
             return Err(StartError::WrongKind {
                 id: deployment_id.to_string(),
                 kind,
+                backend,
             });
         }
         Ok(deployment)
@@ -842,6 +897,13 @@ impl Jobs {
             })?),
         };
 
+        // A site's artifact is a directory tree rather than a guest rootfs, and
+        // everything after the resolve differs: where the bytes land, what
+        // proves they landed, and whether there is a pool to roll afterwards.
+        if let Some(site) = self.registry.get(deployment_id).and_then(|d| d.spec.site.clone()) {
+            return self.run_site_pull(job_id, spec, &site, api_key.as_deref(), force).await;
+        }
+
         let mut log = |line: String| self.log(job_id, line);
         let pulled = self
             .puller
@@ -869,6 +931,59 @@ impl Jobs {
         // whatever rootfs they booted from, which is not necessarily this one.
         self.roll_out(job_id, deployment_id, &pulled.image).await?;
         Ok(pulled.image)
+    }
+
+    /// The site reading of a pull: a bundle unpacked into `site.root`.
+    ///
+    /// Where the managed path ends in a pool roll, this ends in nothing at all —
+    /// and that is the whole appeal. There is no image to name, no VM to
+    /// recycle, and no window in which capacity is short: the files are simply
+    /// the files, and the next request reads the new ones.
+    ///
+    /// It also ends without the verification step the *other* two deploy paths
+    /// need, because that step has already happened. `pull_tree` checks the
+    /// unpacked tree for the site's index before it swaps anything in, so by
+    /// the time this returns there is nothing left to confirm — unlike an
+    /// update, which can only look at the wreckage afterwards.
+    async fn run_site_pull(
+        &self,
+        job_id: &str,
+        spec: &ArtifactSpec,
+        site: &crate::config::SiteSpec,
+        api_key: Option<&str>,
+        force: bool,
+    ) -> Result<String, String> {
+        let mut log = |line: String| self.log(job_id, line);
+        let pulled = self
+            .puller
+            .pull_tree(spec, site, api_key, force, &mut log)
+            .await?;
+
+        let root = pulled.root.display().to_string();
+        self.update_record(job_id, |r| {
+            r.digest = Some(pulled.digest.clone());
+            r.bytes = Some(pulled.bytes_written);
+            r.reused = pulled.reused;
+            r.site_root = Some(root.clone());
+            // Both are about the tree that is now live, so a reused pull reports
+            // what is serving rather than the zero it did not write.
+            if !pulled.reused {
+                r.files = Some(pulled.files);
+            }
+            // The index was checked before the swap; saying so is what makes a
+            // succeeded site pull mean the same thing as a succeeded update.
+            r.verified = Some(true);
+        });
+
+        if pulled.reused {
+            return Ok(format!("{} already serving {}", root, short(&pulled.digest)));
+        }
+        Ok(format!(
+            "{} file{} ({}) in {root}",
+            pulled.files,
+            if pulled.files == 1 { "" } else { "s" },
+            crate::artifact::human(pulled.unpacked),
+        ))
     }
 
     // -- host updates ------------------------------------------------------
@@ -1269,7 +1384,9 @@ fn verify_site(spec: &crate::config::SiteSpec) -> Result<String, String> {
     Ok(format!("{index} is in place"))
 }
 
-fn whoami() -> String {
+/// The user app-lb is running as, for the errors that are almost always a
+/// permission problem wearing a different hat.
+pub fn whoami() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| format!("uid {}", unsafe { libc_getuid() }))
@@ -1759,12 +1876,13 @@ mod tests {
     }
 
     #[test]
-    fn each_job_kind_is_refused_on_the_other_kind_of_deployment() {
+    fn each_job_kind_is_refused_on_the_backends_it_does_not_describe() {
         // The message has to say what to use instead: somebody who ran `build`
         // on a static deployment wants `update`, and vice versa.
         let build_on_static = StartError::WrongKind {
             id: "obs".into(),
             kind: JobKind::ImageBuild,
+            backend: Backend::Upstreams,
         }
         .to_string();
         assert!(build_on_static.contains("static"), "{build_on_static}");
@@ -1773,6 +1891,7 @@ mod tests {
         let pull_on_static = StartError::WrongKind {
             id: "obs".into(),
             kind: JobKind::ArtifactPull,
+            backend: Backend::Upstreams,
         }
         .to_string();
         assert!(pull_on_static.contains("static"), "{pull_on_static}");
@@ -1781,9 +1900,64 @@ mod tests {
         let update_on_managed = StartError::WrongKind {
             id: "web".into(),
             kind: JobKind::HostUpdate,
+            backend: Backend::Vm,
         }
         .to_string();
         assert!(update_on_managed.contains("managed"), "{update_on_managed}");
         assert!(update_on_managed.contains("build"), "{update_on_managed}");
+
+        // A site is neither of the other two, and the message that used to be
+        // reached here called it "static (proxy_pass)" — which is wrong, and
+        // sends somebody looking for upstreams they do not have.
+        let build_on_site = StartError::WrongKind {
+            id: "docs".into(),
+            kind: JobKind::ImageBuild,
+            backend: Backend::Site,
+        }
+        .to_string();
+        assert!(build_on_site.contains("serves files off disk"), "{build_on_site}");
+        assert!(!build_on_site.contains("proxy_pass"), "{build_on_site}");
+        // Both of a site's deploy paths, since either could be what was meant.
+        assert!(build_on_site.contains("pull"), "{build_on_site}");
+        assert!(build_on_site.contains("update"), "{build_on_site}");
+    }
+
+    /// The table that replaced "is this deployment managed?", which could not
+    /// express a job kind applying to two backends or a backend accepting two
+    /// job kinds — and both are now true.
+    #[test]
+    fn a_pull_applies_to_a_vm_and_a_site_but_never_to_upstreams() {
+        for (kind, expected) in [
+            (JobKind::ImageBuild, [true, false, false]),
+            (JobKind::ArtifactPull, [true, false, true]),
+            (JobKind::HostUpdate, [false, true, true]),
+        ] {
+            for (backend, want) in
+                [Backend::Vm, Backend::Upstreams, Backend::Site].into_iter().zip(expected)
+            {
+                assert_eq!(
+                    kind.applies_to(backend),
+                    want,
+                    "{kind:?} on {backend:?}",
+                );
+            }
+        }
+    }
+
+    /// A site pull records what it unpacked; a rootfs pull has no such thing and
+    /// must not carry the fields as nulls.
+    #[test]
+    fn a_site_pull_reports_its_root_and_file_count() {
+        let mut pull = JobRecord::new("job-5".into(), "docs".into(), JobKind::ArtifactPull);
+        pull.site_root = Some("/srv/docs/public".into());
+        pull.files = Some(412);
+        let json = serde_json::to_string(&pull).unwrap();
+        assert!(json.contains(r#""site_root":"/srv/docs/public""#), "{json}");
+        assert!(json.contains(r#""files":412"#), "{json}");
+
+        let rootfs = JobRecord::new("job-6".into(), "web".into(), JobKind::ArtifactPull);
+        let json = serde_json::to_string(&rootfs).unwrap();
+        assert!(!json.contains("site_root"), "no site fields on a rootfs pull: {json}");
+        assert!(!json.contains("files"), "{json}");
     }
 }

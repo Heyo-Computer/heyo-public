@@ -238,6 +238,26 @@ fn artifact_spec() -> DeploymentSpec {
         }),
         grow_gb: Some(8),
         image_name: Some("agent-base".into()),
+        strip_components: None,
+    });
+    s
+}
+
+/// The *site* reading of the same block: a bundle unpacked into `site.root`
+/// rather than a rootfs written to `vm.image`. Separate from [`site_spec`]
+/// because a site deploys one way or the other — `update` or `artifact`, never
+/// both — so one fixture cannot show both halves.
+fn site_artifact_spec() -> DeploymentSpec {
+    let mut s = site_spec();
+    s.id = "docs-pull".into();
+    s.update = None;
+    s.artifact = Some(crate::config::ArtifactSpec {
+        store: "/srv/artifacts".into(),
+        artifact_ref: "docs-live".into(),
+        auth: None,
+        grow_gb: None,
+        image_name: None,
+        strip_components: Some(1),
     });
     s
 }
@@ -281,6 +301,7 @@ fn deployment_status_is_stable() {
         ("deployment-status-site", site_spec()),
         ("deployment-status-static", static_spec()),
         ("deployment-status-artifact", artifact_spec()),
+        ("deployment-status-site-artifact", site_artifact_spec()),
     ] {
         spec.validate().unwrap_or_else(|e| {
             panic!("fixture {name} describes a deployment the server would reject: {e}")
@@ -464,6 +485,8 @@ fn job_records_are_stable() {
         digest: None,
         bytes: None,
         reused: false,
+        site_root: None,
+        files: None,
         working_dir: None,
         commands_total: None,
         commands_run: None,
@@ -490,6 +513,23 @@ fn job_records_are_stable() {
         reused: true,
         rolled_out: true,
         ..base("job-002", JobKind::ArtifactPull)
+    });
+
+    // The other reading of `artifact-pull`, and the only fixture carrying
+    // `site_root`/`files`. A client that only ever saw `job-pull` would render a
+    // site's deploy history with an empty result column.
+    golden("job-site-pull", &JobRecord {
+        deployment: "docs".into(),
+        store: Some("/srv/artifacts".into()),
+        artifact_ref: Some("docs-live".into()),
+        digest: Some("0f1e2d3c4b5a".into()),
+        // Zero without `reused`: a local store hardlinks the blob rather than
+        // copying it, so the transfer really was free.
+        bytes: Some(0),
+        site_root: Some("/srv/docs/dist".into()),
+        files: Some(412),
+        verified: Some(true),
+        ..base("job-005", JobKind::ArtifactPull)
     });
 
     golden("job-update", &JobRecord {

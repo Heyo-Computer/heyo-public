@@ -507,6 +507,10 @@ export interface JobRecord {
   digest?: string;
   bytes?: number;
   reused?: boolean;
+  /** Site pulls only: the directory the bundle was unpacked into. */
+  site_root?: string;
+  /** Site pulls only: regular files unpacked. */
+  files?: number;
   working_dir?: string;
   commands_total?: number;
   commands_run?: number;

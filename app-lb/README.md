@@ -321,8 +321,12 @@ deployment — commands run in a directory on the app-lb host:
 `serverctl update docs` runs them and then checks the site is still servable —
 that `index` is actually in `root`. A build that exits 0 but writes its output
 somewhere else fails the job, rather than leaving a deployment that 404s
-everything. (`build` and `artifact` are rejected on a site: there is no image and
-no pool.)
+everything. (`build` is rejected on a site: there is no image and no pool.)
+
+This needs the toolchain on the app-lb host. The alternative is
+[`artifact`](#pulling-a-site-from-an-artifact-store), which unpacks a bundle
+somebody else built and needs nothing installed here — a site takes one or the
+other, never both.
 
 Scaling, eviction, `exec` and `shell` all do not apply and are rejected with a
 message saying so. A site is only reachable through the proxy, so it needs at
@@ -815,6 +819,73 @@ an `artifact` block either, for the same reason it cannot have a `build`.
 The CLI side is `serverctl pull` and `serverctl set artifact`, plus
 `serverctl artifact` for talking to the store itself — see
 [`serverctl/README.md`](serverctl/README.md#artifact-stores).
+
+### Pulling a site from an artifact store
+
+A [site](#static-sites) reads the same `artifact` block, and it is the one deploy
+path that needs **nothing installed on this host** — no git, no node, no bun, no
+Docker. The bundle is a `tar` (or `tar.gz`) of the built site; app-lb fetches it,
+verifies it, unpacks it and swaps it into `site.root`.
+
+```jsonc
+{
+  "id": "marketing",
+  "routes": [{"host": "example.com"}],
+  "site": {"root": "/srv/marketing/public", "index": "index.html"},
+  "artifact": {
+    "store": "/srv/artifacts",
+    "ref": "marketing-live",
+    "strip_components": 1    // drop the `dist/` the bundle wraps everything in
+  }
+}
+```
+
+Build wherever you like — CI, a laptop, a VM — and push the result:
+
+```sh
+tar czf dist.tgz -C dist .                       # no wrapper: strip_components 0
+art put dist.tgz --tag marketing-live            # or `art put -` from a pipe
+curl -XPOST localhost:9090/deployments/marketing/pull
+```
+
+Everything above about tags, digests, transports and `force` applies unchanged.
+What differs is the ending, and it is the better one: there is no image to name
+and no pool to recycle, so a site pull has no cold start and no capacity dip. The
+files are simply the files, and the next request reads the new ones.
+
+**Nothing goes live until it is known good.** The order is fetch → verify digest
+→ unpack *beside* the live tree → confirm the index is there → swap. Every way a
+deploy can fail therefore fails with the previous site still serving, which is
+the one thing `git pull && npm run build && mv -T dist public` cannot promise.
+The swap itself is two renames in one directory, and the tree it replaces is kept
+until the new one is in place.
+
+**`strip_components` is the field you will need.** `tar czf dist.tgz dist` writes
+every entry as `dist/…`, which would put the index at `<root>/dist/index.html`
+and 404 the whole site. Set `1` to drop the wrapper — and if you forget, the job
+fails *before* the swap with a message naming the directory it found and the
+number to set. A bundle rolled with `tar czf dist.tgz -C dist .` needs nothing.
+
+**A bundle may only contain files and directories.** Symlinks, hardlinks, devices
+and any path with a `..` or a leading `/` are refused rather than sanitized —
+whoever can write to the store decides what lands on this host. Permissions are
+not taken from the archive either, so a bundle cannot ship something setuid.
+
+**Re-pulls are free.** The deployed digest is recorded in `.<root>.artifact`
+*beside* the root (never inside it, where it would be servable), so pulling a
+digest already serving is a resolve and nothing else. `{"force": true}` unpacks
+anyway.
+
+**`update` and `artifact` are mutually exclusive on a site**, for the reason
+`build` and `artifact` are on a VM: both write the files under `site.root`, so a
+site with both has no answer to where what it serves came from. Build on this
+host, or unpack a bundle built elsewhere. `grow_gb` and `image_name` are rejected
+on a site (there is no rootfs to grow or name), and `strip_components` is
+rejected off one (a rootfs is one file, and nothing unpacks it).
+
+A site pull's job record carries `site_root` and `files` where a rootfs pull
+carries `image`. `bytes` is what crossed the wire, so `0` from a local store is
+normal — `art get` hardlinks the blob rather than copying it.
 
 ## Updating a static deployment
 
@@ -1338,6 +1409,20 @@ validated against `[A-Za-z0-9_-]+` and *refused* rather than sanitized. Every pa
 constructed from the configured roots and that validated id, never taken from the inventory —
 so no request, and no stale inventory, can direct a delete outside the two directories app-lb
 manages.
+
+**app-lb has to be able to write to the daemon's data directory.** Listing a disk needs only
+read and traverse; *deleting* one needs write on the directory holding it. A host where heyvmd
+runs as one user and app-lb as another (the supervisord unit runs it as `app-lb`) will happily
+show the whole inventory and then be unable to reclaim any of it — the common shape is a data
+directory at mode `755`/`775` owned by the daemon's user. Add app-lb's user to that group, or
+give it ownership of `run/` and `kvm/`.
+
+A purge that removes **nothing** while at least one path failed is a `500`, not a success with
+`0` bytes freed — the disks are still there and still counted, and reporting that as a completed
+purge is how a sweep comes to claim a thousand disks reclaimed on a host that never got emptier.
+A *partial* failure stays a success: the bytes that went are gone, `removed` and `failed` both
+come back on the response, and it logs at `warn` with the paths. A clean purge logs at `info`
+with the count it actually removed.
 
 ### Reusing VMs instead of recreating them
 

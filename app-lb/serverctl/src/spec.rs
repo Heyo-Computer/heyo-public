@@ -332,12 +332,20 @@ pub fn build_mut<'a>(spec: &'a mut Value, id: &str) -> Result<&'a mut Map<String
         .with_context(|| format!("deployment {id:?} has a non-object `build`"))
 }
 
-/// The `artifact` block of a managed deployment, created if it has none.
+/// The `artifact` block of a managed deployment *or a site*, created if it has
+/// none.
 ///
-/// The other image source, and refused on a static deployment for the same
-/// reason [`build_mut`] is. It also refuses to sit next to a `build`: app-lb
-/// rejects a spec holding both, and catching it here means the error names the
-/// flag that caused it instead of arriving as a validation failure on `PUT`.
+/// Refused only on a static (`upstreams`) deployment: a VM pulls a guest rootfs
+/// and a site pulls a bundle to unpack into `site.root`, but what a `proxy_pass`
+/// deployment forwards to is somebody else's process, with nowhere for either to
+/// land. It also refuses to sit next to a `build`: app-lb rejects a spec holding
+/// both, and catching it here means the error names the flag that caused it
+/// instead of arriving as a validation failure on `PUT`.
+///
+/// The narrower rules — `grow_gb`/`image_name` are VM-only, `strip_components`
+/// is site-only, and a site takes `update` or `artifact` but not both — are left
+/// to app-lb, which is the authority on them and answers with a message naming
+/// the field.
 pub fn artifact_mut<'a>(spec: &'a mut Value, id: &str) -> Result<&'a mut Map<String, Value>> {
     if is_static(spec) {
         bail!(

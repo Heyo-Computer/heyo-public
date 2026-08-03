@@ -507,6 +507,9 @@ pub struct PurgeOutcome {
     /// Whether the daemon was asked to delete the sandbox first.
     pub killed: bool,
     pub removed: Vec<String>,
+    /// What was actually reclaimed — the parts under a path that was removed,
+    /// not what the sandbox occupied before. The two agree unless some paths
+    /// failed, and that is the case where the difference matters.
     pub bytes: u64,
     /// Paths that could not be removed, with the reason. A partial purge is
     /// reported rather than rolled back: the bytes that did go are gone.
@@ -534,6 +537,19 @@ pub enum DiskError {
     /// There is nothing durable to archive — only scratch files in `/tmp`.
     NothingToArchive(String),
     AlreadyArchiving(String),
+    /// Every path a purge tried to remove failed, so nothing was reclaimed.
+    ///
+    /// Distinct from a *partial* failure, which stays a success: the bytes that
+    /// did go are gone and the caller needs the outcome, not an error. This is
+    /// the case where the operation did not happen at all, and reporting it as
+    /// a completed purge is what let a whole fleet's worth of residue look
+    /// reclaimed while nothing moved. In practice it is nearly always
+    /// permissions — heyvmd's data directory belongs to the user the daemon runs
+    /// as, and app-lb is usually somebody else.
+    PurgeFailed {
+        sandbox_id: String,
+        failed: Vec<String>,
+    },
     Io(String),
 }
 
@@ -566,6 +582,14 @@ impl std::fmt::Display for DiskError {
                  worth archiving"
             ),
             Self::AlreadyArchiving(id) => write!(f, "an archive of {id} is already running"),
+            Self::PurgeFailed { sandbox_id, failed } => write!(
+                f,
+                "nothing was reclaimed for {sandbox_id}: every path failed to delete. \
+                 app-lb runs as {}, and these are usually owned by whichever user heyvmd \
+                 runs as — check the ownership of the data directory. {}",
+                crate::jobs::whoami(),
+                failed.join("; "),
+            ),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -958,35 +982,81 @@ impl DiskStore {
             DiskState::Running => unreachable!("refused above"),
         };
 
-        // A forced purge of a claimed disk has to drop the claim too, or the
-        // next scale-up spends a resume attempt on a sandbox whose disks are
-        // gone and then boots a fresh VM anyway.
-        if disk.claimed {
-            self.drop_claim(&disk.sandbox_id);
-        }
-
         let cfg = self.cfg.clone();
         let id = disk.sandbox_id.clone();
         let (removed, failed) = tokio::task::spawn_blocking(move || remove_all(&cfg, &id))
             .await
             .unwrap_or_else(|e| (Vec::new(), vec![format!("purge task failed: {e}")]));
 
+        // Nothing went. Reported as an error rather than as a purge that freed
+        // zero bytes, because the two are not the same claim and only one of
+        // them is true: the disks are still there, still counted, and still
+        // taking the space this was called to reclaim. Returning `Ok` here is
+        // what let a sweep report a thousand disks purged while the host filled
+        // up — see [`DiskError::PurgeFailed`].
+        //
+        // Both empty is *not* this case: it means the paths were already gone,
+        // which is a purge that had nothing left to do and succeeded.
+        if removed.is_empty() && !failed.is_empty() {
+            tracing::error!(
+                sandbox = %disk.sandbox_id,
+                deployment = disk.deployment.as_deref().unwrap_or("-"),
+                state = disk.state.label(),
+                failed = failed.len(),
+                detail = %failed.join("; "),
+                "purge removed nothing: every path failed",
+            );
+            return Err(DiskError::PurgeFailed {
+                sandbox_id: disk.sandbox_id,
+                failed,
+            });
+        }
+
+        // Both of these describe a sandbox whose disks are gone, so neither may
+        // run until that is actually true. Dropping the claim first would tell
+        // the next scale-up not to resume a sandbox that is still perfectly
+        // resumable, and forgetting the policy first would lose a `retain` flag
+        // protecting a disk this call failed to delete.
+        if disk.claimed {
+            // Or the next scale-up spends a resume attempt on a sandbox whose
+            // disks are gone and then boots a fresh VM anyway.
+            self.drop_claim(&disk.sandbox_id);
+        }
         self.forget(&disk.sandbox_id);
 
-        tracing::info!(
-            sandbox = %disk.sandbox_id,
-            deployment = disk.deployment.as_deref().unwrap_or("-"),
-            bytes = disk.bytes,
-            state = disk.state.label(),
-            killed,
-            "purged sandbox disks",
-        );
+        // A partial failure stays a success — the bytes that went are gone — but
+        // it is not something to log at the same level as a clean one, and the
+        // counts are here either way so that "purged" in the log can be checked
+        // against what it actually removed.
+        if failed.is_empty() {
+            tracing::info!(
+                sandbox = %disk.sandbox_id,
+                deployment = disk.deployment.as_deref().unwrap_or("-"),
+                bytes = disk.bytes,
+                state = disk.state.label(),
+                killed,
+                removed = removed.len(),
+                "purged sandbox disks",
+            );
+        } else {
+            tracing::warn!(
+                sandbox = %disk.sandbox_id,
+                deployment = disk.deployment.as_deref().unwrap_or("-"),
+                bytes = disk.bytes,
+                state = disk.state.label(),
+                killed,
+                removed = removed.len(),
+                failed = failed.len(),
+                detail = %failed.join("; "),
+                "purged some of a sandbox's disks; the rest could not be removed",
+            );
+        }
 
         Ok(PurgeOutcome {
             sandbox_id: disk.sandbox_id,
             killed,
+            bytes: freed(&disk.parts, &removed),
             removed,
-            bytes: disk.bytes,
             failed,
         })
     }
@@ -1692,6 +1762,28 @@ fn tmp_belongs_to(file_name: &str, sandbox_id: &str) -> bool {
     })
 }
 
+/// What a purge actually freed: the parts that were under a path it removed.
+///
+/// Not simply `disk.bytes`, which is what the sandbox occupied *before* — the
+/// two agree on a clean purge and differ on a partial one, and it is exactly
+/// the partial one where an operator is trying to work out how much is left.
+/// Reporting the size of something still on disk as freed is the same mistake
+/// as reporting a failed purge as a success, one level down.
+fn freed(parts: &[DiskPart], removed: &[String]) -> u64 {
+    parts
+        .iter()
+        .filter(|p| {
+            removed.iter().any(|r| {
+                // A removed directory covers everything beneath it; a removed
+                // file is only itself. The separator check is what stops
+                // `run/sb-1` from claiming `run/sb-12`'s bytes.
+                p.path == *r || p.path.strip_prefix(r.as_str()).is_some_and(|t| t.starts_with('/'))
+            })
+        })
+        .map(|p| p.bytes)
+        .sum()
+}
+
 /// Remove every path this module associates with a sandbox.
 ///
 /// Every path is *constructed* from the validated id and the configured roots,
@@ -2052,6 +2144,48 @@ mod tests {
             assert!(failed.is_empty());
         }
 
+        /// The shape that made a fleet's worth of residue look reclaimed: the
+        /// disks are readable, so the inventory lists them and reports their
+        /// size, but the directory holding them is not writable, so nothing can
+        /// be unlinked. This is what a host where heyvmd runs as one user and
+        /// app-lb as another looks like from inside `remove_all`.
+        ///
+        /// Skipped under root, which ignores the permission bits entirely.
+        #[test]
+        fn an_undeletable_directory_is_a_failure_not_a_silent_no_op() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = scratch("denied");
+            let cfg = cfg_at(&root);
+            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
+
+            // Unlinking a file needs write on its *parent*, so this is the
+            // directory the purge cannot modify.
+            let dir = cfg.data_dir.join("run/sb-1");
+            let original = std::fs::metadata(&dir).unwrap().permissions();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let (removed, failed) = remove_all(&cfg, "sb-1");
+            std::fs::set_permissions(&dir, original).unwrap();
+
+            // Detected by outcome rather than by uid: if the unlink went through
+            // despite the bits, this is running as root and there is nothing
+            // here to assert.
+            if failed.is_empty() {
+                eprintln!("skipped: the removal succeeded, so this is running as root");
+                return;
+            }
+
+            assert!(removed.is_empty(), "nothing could be removed: {removed:?}");
+            assert_eq!(failed.len(), 1, "and that has to be reported: {failed:?}");
+            assert!(failed[0].contains("run/sb-1"), "{failed:?}");
+            // Still there, still counted, still taking the space — which is why
+            // `purge_resolved` turns exactly this pair into an error rather than
+            // a purge that happened to free nothing.
+            assert!(dir.join("data.ext4").exists());
+            assert!(scan(&cfg).contains_key("sb-1"));
+        }
+
         /// Every path is rebuilt from the roots and the validated id, so nothing
         /// a caller supplies can steer a delete. `remove_all` is only ever
         /// reached through `purge`, which validates first; this pins the
@@ -2111,6 +2245,102 @@ mod tests {
             let p = s.policies.lock().unwrap();
             assert_eq!(p["sb-1"].note.as_deref(), Some("why"));
             assert!(!p["sb-1"].retain);
+        }
+
+        /// A partial purge reports what it reclaimed, not what was there.
+        ///
+        /// The counterpart of the failed-purge case below, one level down: an
+        /// operator looking at a purge that could not remove everything is
+        /// trying to work out how much is left, and the pre-purge total is the
+        /// one number that cannot tell them.
+        #[test]
+        fn freed_bytes_count_only_what_was_removed() {
+            let parts = |paths: &[(&str, u64)]| -> Vec<DiskPart> {
+                paths
+                    .iter()
+                    .map(|(path, bytes)| DiskPart {
+                        kind: PartKind::Data,
+                        path: (*path).to_string(),
+                        bytes: *bytes,
+                        apparent_bytes: *bytes,
+                        modified_at: 0,
+                    })
+                    .collect()
+            };
+            let all = parts(&[
+                ("/d/run/sb-1/data.ext4", 100),
+                ("/d/kvm/sb-1/rootfs.ext4", 200),
+                ("/tmp/firecracker-sb-1-rootfs.ext4", 30),
+            ]);
+
+            // A clean purge: every root went, so this is the whole sandbox.
+            assert_eq!(
+                freed(&all, &["/d/run/sb-1".into(), "/d/kvm/sb-1".into(),
+                              "/tmp/firecracker-sb-1-rootfs.ext4".into()]),
+                330,
+            );
+            // A partial one: only the directory that could be removed counts.
+            assert_eq!(freed(&all, &["/d/run/sb-1".into()]), 100);
+            assert_eq!(freed(&all, &[]), 0);
+            // And a prefix must not claim a neighbour's bytes.
+            let neighbour = parts(&[("/d/run/sb-12/data.ext4", 999)]);
+            assert_eq!(freed(&neighbour, &["/d/run/sb-1".into()]), 0);
+        }
+
+        /// The whole failed-purge path, end to end.
+        ///
+        /// A purge that removed nothing must say so rather than returning an
+        /// outcome claiming the size it *would* have freed — that is what let a
+        /// sweep report a thousand disks reclaimed while the host filled up. It
+        /// must also leave the policy alone: forgetting a `retain` flag that is
+        /// still protecting a disk still on disk is the wrong half of the
+        /// operation to complete.
+        #[tokio::test]
+        async fn a_purge_that_removes_nothing_is_an_error_and_keeps_its_policy() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = scratch("purge-denied");
+            let s = store(&root);
+            let cfg = cfg_at(&root);
+            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
+            s.set_policy("sb-1", Some(true), Some(Some("still needed".into())))
+                .unwrap();
+
+            let dir = cfg.data_dir.join("run/sb-1");
+            let original = std::fs::metadata(&dir).unwrap().permissions();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            // Forced, because this harness points at a dead daemon port, which
+            // makes every disk `Unknown` and therefore held.
+            let outcome = s.purge("sb-1", true).await;
+            std::fs::set_permissions(&dir, original).unwrap();
+
+            match outcome {
+                Err(DiskError::PurgeFailed { sandbox_id, failed }) => {
+                    assert_eq!(sandbox_id, "sb-1");
+                    assert!(failed.iter().any(|f| f.contains("run/sb-1")), "{failed:?}");
+                    // The message has to point at the actual cause; an operator
+                    // reading "0 bytes freed" learns nothing.
+                    let shown = DiskError::PurgeFailed {
+                        sandbox_id: "sb-1".into(),
+                        failed,
+                    }
+                    .to_string();
+                    assert!(shown.contains("nothing was reclaimed"), "{shown}");
+                    assert!(shown.contains("ownership"), "{shown}");
+                }
+                Ok(_) => {
+                    eprintln!("skipped: the removal succeeded, so this is running as root");
+                    return;
+                }
+                Err(e) => panic!("wrong error: {e}"),
+            }
+
+            assert!(dir.join("data.ext4").exists(), "the disk is still there");
+            assert!(
+                s.policies.lock().unwrap()["sb-1"].retain,
+                "a retain flag must survive a purge that failed to delete anything",
+            );
         }
 
         /// An entry that says nothing is dropped, so the file tracks decisions

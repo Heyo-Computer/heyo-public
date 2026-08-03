@@ -657,14 +657,17 @@ fn deployment_kind(d: &crate::deployment::Deployment) -> &'static str {
     }
 }
 
-/// Which `POST` a deployment's code is redeployed with, if either.
+/// Which `POST` a deployment's code is redeployed with, if any.
 ///
-/// The two are mutually exclusive by validation — there is no image to build for a
-/// `proxy_pass` upstream, and no host directory behind a microVM — so this is one
-/// answer rather than two flags.
+/// At most one is ever configured, because validation refuses the combinations:
+/// a `proxy_pass` upstream has no image to build, a microVM has no host
+/// directory to run commands in, and a site takes `update` or `artifact` but
+/// never both. So this is one answer rather than three flags.
 fn job_kind_of(spec: &DeploymentSpec) -> Option<&'static str> {
     if spec.build.is_some() {
         Some("build")
+    } else if spec.artifact.is_some() {
+        Some("pull")
     } else if spec.update.is_some() {
         Some("update")
     } else {
@@ -1439,7 +1442,11 @@ fn disk_error(e: crate::disks::DiskError) -> Response {
         // and the caller can change that state.
         E::Held { .. } | E::AlreadyArchiving(_) | E::NothingToArchive(_) => StatusCode::CONFLICT,
         E::NoArchiveTarget => StatusCode::NOT_IMPLEMENTED,
-        E::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // 500, not 409: nothing about the disk's state refuses this and no
+        // `force=1` gets past it. Something on the host — almost always the
+        // ownership of the daemon's data directory — stopped app-lb deleting
+        // files it was told to delete, and that is the server's problem to fix.
+        E::PurgeFailed { .. } | E::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     err(code, e.to_string()).into_response()
 }
