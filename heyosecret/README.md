@@ -60,6 +60,36 @@ cargo run
 Migrations under `migrations/` are applied automatically on startup. Then open
 <http://localhost:4455/> and sign in with the admin password.
 
+## Deployment
+
+The repo-local `.heyo/workflows/deploy-heyo-services.yml` owns HeyoSecret's
+build, test, packaging, and orchestrator-managed deployment. A `git submit`
+validation builds and persists the service archive; after merge, the workflow
+deploys that validated archive through the configured Heyo orchestrator. The
+orchestrator creates the replacement VM, verifies `/health`, cuts over the
+stable `/heyosecret` route, and drains the previous VM.
+
+Normal updates do not expose the database URL or encryption master key to CICD.
+Before the first managed update, the active HeyoSecret installation must contain
+these deployment secrets so orchestrator can resolve them before replacing it:
+
+- `heyosecret/database-url` → `HEYOSECRET_DATABASE_URL`
+- `heyosecret/master-key` → `HEYOSECRET_MASTER_KEY`
+
+Keep an independently secured recovery copy of the master key for a complete
+HeyoSecret outage; the self-reference supports zero-downtime updates, not
+disaster bootstrap. The workflow uses `HEYOSECRET_INTERNAL_API_KEY` for the
+machine API. If it is unset, the workflow may retain the orchestrator internal
+key only after its preflight proves the active HeyoSecret already accepts that
+key; this prevents a missing setting from silently rotating the credential. Set
+`HEYOSECRET_ADMIN_PASSWORD` separately to enable dashboard login; the dashboard
+page remains deployed but login is disabled when the variable is absent.
+
+Required CICD/orchestrator configuration is `HEYO_ORCHESTRATOR_URL` (or the
+stable public `/orchestrator` route), `ORCHESTRATOR_INTERNAL_API_KEY`,
+and `HEYO_PUBLIC_HOST`. Set `HEYOSECRET_INTERNAL_API_KEY` when HeyoSecret uses a
+key distinct from the orchestrator internal key.
+
 ## Dashboard
 
 The dashboard (`src/assets/dashboard.html`, embedded at compile time) is a

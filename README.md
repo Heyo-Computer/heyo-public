@@ -14,6 +14,13 @@ skills.
 - `skills/` — reusable public agent skills. The top-level catalog is intentionally small: `heyvm` and `git-submit`.
 - `examples/` — example projects and specs.
 
+HeyoSecret is also deployed from this repository. Its repo-local Heyo workflow
+builds and validates the service, then uses the shared CICD and orchestrator
+APIs to update the stable `/heyosecret` service route. The deployment boundary
+is repository-independent so additional open-source platform services can move
+here without moving their build or release ownership back to the private
+monorepo.
+
 ## Printer
 
 In the "Bobiverse", the printer is the technology that enables the Bobs' self replicating journey across the stars. The printer works at the atomic level and can produce any good, including more printers and the equipment to replicate the Bobs themselves. In this future, humans trade time on the printers as currency. They are the foundation of the universe's economic and scientific ambitions.
