@@ -41,6 +41,9 @@ const DIRECTORY_HTML: &str = include_str!("directory.html");
 /// The security console at `GET /siem`.
 const SIEM_HTML: &str = include_str!("siem.html");
 
+/// The disk console at `GET /storage`.
+const DISKS_HTML: &str = include_str!("disks.html");
+
 /// How to turn a deployment's hostname into a URL somebody can click.
 ///
 /// The dashboard runs on the *admin* listener, so it cannot infer the data
@@ -189,6 +192,11 @@ struct AdminState {
     guard: Arc<crate::guard::Guard>,
     /// The SIEM console, with the display name already substituted.
     siem_html: Arc<str>,
+    /// Per-sandbox disk inventory and reclamation. `None` when the daemon's data
+    /// directory could not be resolved, which is the only way it is off.
+    disks: Option<Arc<crate::disks::DiskStore>>,
+    /// The disk console, with the display name already substituted.
+    disks_html: Arc<str>,
     /// How to turn a deployment's hostname into a link, given where the data
     /// plane actually listens.
     public_url: PublicUrl,
@@ -228,6 +236,7 @@ impl AdminApi {
         obs: Option<Arc<crate::obs::Stats>>,
         siem: Option<&crate::siem::Siem>,
         guard: Arc<crate::guard::Guard>,
+        disks: Option<Arc<crate::disks::DiskStore>>,
         public_url: PublicUrl,
     ) -> Self {
         // Render the display name into the page once; the placeholder appears in
@@ -237,6 +246,8 @@ impl AdminApi {
         let directory_html: Arc<str> =
             Arc::from(DIRECTORY_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
         let siem_html: Arc<str> = Arc::from(SIEM_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let disks_html: Arc<str> =
+            Arc::from(DISKS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
 
         // The gate turns on as soon as a password is set; the username is
         // optional and defaults to "admin", so one env var is enough to secure
@@ -275,6 +286,8 @@ impl AdminApi {
                 siem: siem.map(|s| s.stats.clone()),
                 guard,
                 siem_html,
+                disks,
+                disks_html,
                 public_url,
             },
         }
@@ -1340,6 +1353,163 @@ async fn delete_rule(State(state): State<AdminState>, Path(id): Path<String>) ->
 /// plane does. The dashboard card links here and keeps its summary.
 async fn siem_console(State(state): State<AdminState>) -> impl IntoResponse {
     Html(state.siem_html.to_string())
+}
+
+// ---- disks ----------------------------------------------------------------
+
+/// The store, or the 503 that explains why there isn't one.
+///
+/// Disk management is the one subsystem that can be *absent* rather than merely
+/// idle: without a resolvable daemon data directory there is nothing to
+/// inventory. Saying so with the fix in it beats a 404 on a route the page is
+/// hard-coded to call.
+fn disks_off() -> Response {
+    err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "disk management is off: app-lb could not work out where heyvmd keeps its \
+         per-sandbox disks. Set APP_LB_VM_DATA_DIR to the daemon's data directory \
+         (MVM_DATA_DIR, or ~/.heyo) and restart",
+    )
+    .into_response()
+}
+
+fn disk_error(e: crate::disks::DiskError) -> Response {
+    use crate::disks::DiskError as E;
+    let code = match &e {
+        E::BadId(_) => StatusCode::BAD_REQUEST,
+        E::NotFound(_) => StatusCode::NOT_FOUND,
+        // 409, not 403: the request was permitted, the disk's state refuses it,
+        // and the caller can change that state.
+        E::Held { .. } | E::AlreadyArchiving(_) | E::NothingToArchive(_) => StatusCode::CONFLICT,
+        E::NoArchiveTarget => StatusCode::NOT_IMPLEMENTED,
+        E::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(code, e.to_string()).into_response()
+}
+
+/// `GET /disks` — every per-sandbox disk on this host.
+///
+/// View tier, like `/metrics` and `/security`: the console renders it, so the
+/// browser's cached view credentials have to work. Fleet-wide, so a
+/// deployment-scoped token is refused — a disk inventory spans deployments and
+/// includes sandboxes no deployment owns any more.
+async fn disks(State(state): State<AdminState>) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    Json(store.inventory().await).into_response()
+}
+
+/// `GET /storage` — the disk console.
+async fn storage_console(State(state): State<AdminState>) -> impl IntoResponse {
+    Html(state.disks_html.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct DiskPolicyBody {
+    /// Absent leaves the flag alone, so a note can be edited without touching
+    /// retention and vice versa.
+    #[serde(default)]
+    retain: Option<bool>,
+    /// `null` clears the note; absent leaves it.
+    #[serde(default, deserialize_with = "double_option")]
+    note: Option<Option<String>>,
+}
+
+/// Distinguish "absent" from "present and null" in a JSON body.
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
+}
+
+/// `PATCH /disks/:id` — pin a disk against expiry, or annotate it.
+async fn patch_disk(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(body): Json<DiskPolicyBody>,
+) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    if let Err(e) = store.set_policy(&id, body.retain, body.note) {
+        return disk_error(e);
+    }
+    if let Some(retain) = body.retain {
+        tracing::info!(sandbox = %id, retain, "disk retention changed");
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ForceQuery {
+    #[serde(default)]
+    force: Option<String>,
+}
+
+impl ForceQuery {
+    fn on(&self) -> bool {
+        matches!(
+            self.force.as_deref().map(str::trim),
+            Some("1" | "true" | "yes" | "on")
+        )
+    }
+}
+
+/// `DELETE /disks/:id` — reclaim a sandbox's disks.
+///
+/// CRUD tier, and the most destructive route app-lb has: it deletes gigabytes
+/// with no undo. `?force=1` overrides the "a deployment expects to resume it"
+/// and "the daemon is unreachable" guards; it does *not* override the running
+/// check, which has no legitimate override.
+async fn purge_disk(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(q): Query<ForceQuery>,
+) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    match store.purge(&id, q.on()).await {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(e) => disk_error(e),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ArchiveBody {
+    /// Reclaim the disks once the upload succeeds. Never on failure.
+    #[serde(default)]
+    purge: bool,
+}
+
+/// `POST /disks/:id/archive` — stream a sandbox's disks to S3.
+///
+/// Answers as soon as the upload starts; progress arrives on `GET /disks`
+/// alongside the inventory, which is what the console polls anyway.
+async fn archive_disk(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<ArchiveBody>>,
+) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    let purge = body.map(|Json(b)| b.purge).unwrap_or(false);
+    match store.archive(&id, purge).await {
+        Ok(view) => (StatusCode::ACCEPTED, Json(view)).into_response(),
+        Err(e) => disk_error(e),
+    }
+}
+
+/// `POST /disks/sweep` — run the expiry sweep now instead of at the next tick.
+async fn sweep_disks(State(state): State<AdminState>) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    Json(store.sweep().await).into_response()
 }
 
 // ---- the directory page -------------------------------------------------
@@ -2512,7 +2682,12 @@ fn router(state: AdminState) -> Router {
         // the browser already has. The buttons on it post to the CRUD tier and
         // will be refused for a view-only caller — which is the intended split,
         // and the page says so rather than failing silently.
-        .route("/siem", get(siem_console));
+        .route("/siem", get(siem_console))
+        // The disk inventory and the console that renders it, on the same tier
+        // and for the same reason. Reading what is on the host is a view-tier
+        // question; every route that *changes* it is on the CRUD side below.
+        .route("/disks", get(disks))
+        .route("/storage", get(storage_console));
 
     // The deployment CRUD API — register/edit/scale/delete/evict, plus the reads
     // that expose the spec (env vars can hold secrets). Gated too iff
@@ -2534,6 +2709,14 @@ fn router(state: AdminState) -> Router {
         // `GET /security` with the alerts, which is why there is no `get` here.
         .route("/security/rules", post(create_rule))
         .route("/security/rules/:id", delete(delete_rule))
+        // Disk mutations. `DELETE /disks/:id` deletes gigabytes with no undo,
+        // which puts it firmly on this side of the gate — it is the single most
+        // destructive route app-lb exposes. `/disks/sweep` is registered as a
+        // static segment and so cannot be reached by naming a sandbox `sweep`;
+        // matchit prefers a literal over a parameter.
+        .route("/disks/sweep", post(sweep_disks))
+        .route("/disks/:id", patch(patch_disk).delete(purge_disk))
+        .route("/disks/:id/archive", post(archive_disk))
         // Secrets: write-only by design. `GET` returns key *names*, never values.
         .route("/secrets", post(put_secret).get(list_secrets))
         .route(
@@ -2942,6 +3125,123 @@ mod tests {
                 .replace("{{LEDE}}", &directory_lede(&[]))
                 .replace("{{CARDS}}", &render_directory_cards(&[], &[]));
             assert!(!rendered.contains("{{"), "an unfilled placeholder would ship to a browser");
+        }
+    }
+
+    /// The disk console. Unlike the directory it is client-rendered, so the
+    /// only server-side contract is the display name and the route it polls.
+    mod disk_console {
+        use super::*;
+
+        #[test]
+        fn the_page_has_only_the_placeholder_the_constructor_fills() {
+            assert!(DISKS_HTML.contains("{{APP_NAME}}"));
+            let rendered = DISKS_HTML.replace("{{APP_NAME}}", "app-lb");
+            assert!(
+                !rendered.contains("{{"),
+                "an unfilled placeholder would ship to a browser",
+            );
+        }
+
+        /// The page hard-codes the routes it calls, so a rename here has to
+        /// break a test rather than a browser.
+        #[test]
+        fn the_page_calls_the_routes_the_router_registers() {
+            for route in [
+                "\"GET\", \"/disks\"",
+                "\"PATCH\", \"/disks/\"",
+                "/archive`",
+                "\"POST\", \"/disks/sweep\"",
+                "\"DELETE\", \"/disks/\"",
+            ] {
+                assert!(DISKS_HTML.contains(route), "page never calls {route}");
+            }
+        }
+
+        /// Sandbox ids, paths and daemon error strings all reach this markup.
+        #[test]
+        fn the_page_escapes_what_it_interpolates() {
+            assert!(DISKS_HTML.contains("function esc(v)"));
+            assert!(DISKS_HTML.contains("encodeURIComponent(id)"));
+        }
+
+        /// The status code is the whole contract with the page: it offers the
+        /// force override on a 409 and nothing else, so a guard that answered
+        /// 403 would be unoverridable and one that answered 500 would look like
+        /// a bug.
+        #[test]
+        fn each_refusal_maps_to_the_code_the_page_acts_on() {
+            use crate::disks::DiskError as E;
+            let code = |e: E| disk_error(e).status();
+
+            assert_eq!(
+                code(E::Held {
+                    sandbox_id: "sb-1".into(),
+                    reason: "the sandbox is running",
+                    forceable: false,
+                }),
+                StatusCode::CONFLICT,
+                "the page offers ?force=1 on a 409 and only on a 409",
+            );
+            assert_eq!(
+                code(E::AlreadyArchiving("sb-1".into())),
+                StatusCode::CONFLICT
+            );
+            assert_eq!(
+                code(E::NothingToArchive("sb-1".into())),
+                StatusCode::CONFLICT
+            );
+            assert_eq!(code(E::BadId("../etc".into())), StatusCode::BAD_REQUEST);
+            assert_eq!(code(E::NotFound("sb-1".into())), StatusCode::NOT_FOUND);
+            // Not 500: nothing is broken, the feature is simply unconfigured.
+            assert_eq!(code(E::NoArchiveTarget), StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(
+                code(E::Io("disk full".into())),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+
+        /// Every refusal has to say what to do next — these messages are shown
+        /// verbatim in a `confirm()` dialog, and the page decides whether to
+        /// offer the force retry by looking for `force=1` in this very string.
+        /// A message that promises an override the server would refuse produces
+        /// a dialog whose "yes" fails a second time.
+        #[test]
+        fn only_a_forceable_refusal_advertises_the_override() {
+            use crate::disks::DiskError as E;
+
+            let forceable = E::Held {
+                sandbox_id: "sb-1".into(),
+                reason: "a deployment expects to resume it",
+                forceable: true,
+            }
+            .to_string();
+            assert!(forceable.contains("force=1"), "{forceable}");
+            assert!(forceable.contains("sb-1"), "{forceable}");
+
+            let never = E::Held {
+                sandbox_id: "sb-1".into(),
+                reason: "the sandbox is running; evict or stop it first",
+                forceable: false,
+            }
+            .to_string();
+            assert!(!never.contains("force"), "{never}");
+            // It still has to say what *would* work.
+            assert!(never.contains("stop it first"), "{never}");
+
+            let no_target = E::NoArchiveTarget.to_string();
+            assert!(no_target.contains("APP_LB_DISK_ARCHIVE_BUCKET"), "{no_target}");
+        }
+
+        /// The page's force-retry condition, pinned against the message it
+        /// reads. These two live in different languages and cannot share a
+        /// constant, so the coupling is asserted instead.
+        #[test]
+        fn the_page_gates_its_force_retry_on_that_same_string() {
+            assert!(
+                DISKS_HTML.contains(r#"reason(r).includes("force=1")"#),
+                "the page must not offer force for a refusal that forbids it",
+            );
         }
     }
 

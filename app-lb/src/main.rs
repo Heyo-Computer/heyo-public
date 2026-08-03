@@ -11,6 +11,7 @@ mod auth;
 mod autoscale;
 mod config;
 mod deployment;
+mod disks;
 mod dns;
 mod guard;
 mod health;
@@ -475,9 +476,70 @@ fn main() {
     // which is how the admin API reaches the autoscaler to tear deployments down.
     let autoscaler_svc = background_service(
         "autoscaler",
-        Autoscaler::new(registry.clone(), vms, metrics.clone()),
+        Autoscaler::new(registry.clone(), vms.clone(), metrics.clone()),
     );
     let autoscaler = autoscaler_svc.task();
+
+    // Disk inventory and reclamation. Optional in exactly one way: without a
+    // resolvable daemon data directory there is nothing to inventory, and an LB
+    // whose host keeps its VMs elsewhere should not refuse to start over it. The
+    // routes then answer 503 and say why.
+    let disks = match disks::DiskConfig::from_env(&cfg) {
+        Ok(disk_cfg) => {
+            let store = Arc::new(disks::DiskStore::new(
+                disk_cfg,
+                vms,
+                registry.clone(),
+            ));
+            match store.load() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(count = n, "loaded disk retention policies"),
+                // Not fatal, unlike the secret store: the worst case is that a
+                // `retain` flag is missed, and the sweep's other four guards
+                // (running, claimed, age, daemon reachable) still hold.
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "cannot read disk retention policies; every disk will be treated as \
+                     unretained until this is fixed",
+                ),
+            }
+            let c = store.config();
+            if c.ttl_secs == 0 {
+                tracing::info!(
+                    data_dir = %c.data_dir.display(),
+                    "disk expiry is off (APP_LB_DISK_TTL_SECS=0); disks are listed and can be \
+                     purged by hand, but nothing is reclaimed automatically",
+                );
+            } else {
+                // Counted here rather than left for the first sweep to
+                // discover, because on a host that has been booting VMs for
+                // months the honest answer is "most of them" — and an operator
+                // who never opens /storage should still learn that from the log
+                // before it happens rather than after. An upper bound: without
+                // the daemon this cannot tell a running sandbox from residue.
+                let (total, due, bytes) = store.expiry_preview();
+                tracing::warn!(
+                    data_dir = %c.data_dir.display(),
+                    ttl_secs = c.ttl_secs,
+                    sweep_secs = c.sweep_secs,
+                    archive = c.bucket.is_some(),
+                    disks = total,
+                    eligible = due,
+                    gib = bytes / (1 << 30),
+                    "disk expiry is ON: up to {due} of {total} sandbox disks on this host are \
+                     already older than the retention window and will be reclaimed by the \
+                     first sweep, in {}s. Open /storage to review them, mark the ones to keep \
+                     as retained, or set APP_LB_DISK_TTL_SECS=0 to turn expiry off",
+                    c.sweep_secs,
+                );
+            }
+            Some(store)
+        }
+        Err(e) => {
+            tracing::warn!("{e}. Disk management is disabled");
+            None
+        }
+    };
 
     // Where an artifact pull writes a rootfs. Resolved once, and kept as a
     // `Result` rather than unwrapped: without `HOME` or `MVM_DATA_DIR` there is
@@ -560,6 +622,7 @@ fn main() {
             obs.as_ref().map(|o| o.stats.clone()),
             siem.as_ref(),
             guard.clone(),
+            disks.clone(),
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
         ),
     );
@@ -607,6 +670,12 @@ fn main() {
     }
     if let Some(acme_svc) = acme_svc {
         server.add_service(acme_svc);
+    }
+    // Disk reclamation, on the same terms as the two above: never a dependency
+    // of the proxy handle. It walks directories and shells out to `aws`, and
+    // neither may hold up traffic.
+    if let Some(disks) = disks {
+        server.add_service(background_service("disks", disks::DiskSweeper::new(disks)));
     }
     let proxy_handle = server.add_service(proxy_svc);
     // Don't accept traffic until the autoscaler has adopted existing VMs and

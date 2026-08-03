@@ -87,6 +87,14 @@
     border-radius: 999px; padding: 4px 12px; cursor: pointer;
   }
   button.ghost:hover { color: var(--text); }
+  /* An anchor that sits in the button row. Same pill, but it navigates rather
+     than acting, so it stays an <a> for middle-click and keyboard focus. */
+  a.ghost {
+    font: inherit; font-size: 12px; color: var(--text-2); text-decoration: none;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 999px; padding: 4px 12px;
+  }
+  a.ghost:hover { color: var(--text); }
 
   .section-title {
     font-size: 12px; font-weight: 600; text-transform: uppercase;
@@ -292,6 +300,7 @@
     <span class="sub" id="uptime">—</span>
     <span class="spacer"></span>
     <span class="pill"><span class="dot" id="livedot"></span><span id="updated">connecting…</span></span>
+    <a class="ghost" href="/storage">Disks</a>
     <button class="ghost" id="pausebtn">Pause</button>
     <button class="ghost" id="themebtn">Theme</button>
   </header>

@@ -64,7 +64,7 @@ Configuration is environment-only:
 | `APP_LB_ACME_DIRECTORY` | LE production | ACME directory URL — point at staging for testing |
 | `APP_LB_ACME_WILDCARD` | *(unset)* | Comma-separated domains to cover with a **wildcard** cert (`sb.example.com` → also `*.sb.example.com`). Issued over DNS-01; needs the zone id below |
 | `APP_LB_ROUTE53_ZONE_ID` | *(unset)* | Route 53 hosted zone where DNS-01 challenge records are written |
-| `APP_LB_AWS_BIN` | `aws` | The AWS CLI used for DNS-01. Only reached when a wildcard is configured |
+| `APP_LB_AWS_BIN` | `aws` | The AWS CLI, used for the DNS-01 challenge and for [disk archives](#archiving-a-disk-to-s3) |
 | `APP_LB_BUILD_DIR` | `/var/lib/app-lb/builds` | Git checkouts for image builds (one per deployment, `0700`) |
 | `APP_LB_HEYVM_BIN` | `heyvm` | The heyvm CLI that builds guest images |
 | `APP_LB_ART_BIN` | `art` | The `art` CLI that materializes a rootfs from a **local** artifact store; unused when `artifact.store` is a URL |
@@ -73,6 +73,17 @@ Configuration is environment-only:
 | `APP_LB_UPDATE_SHELL` | `/bin/sh` | Shell a static deployment's `update.commands` run through |
 | `APP_LB_BUILD_TIMEOUT_SECS` | `1800` | Ceiling on one build step or update command, after which the child is killed |
 | `APP_LB_HEYVM_HOME` | *(unset)* | `HOME` for the heyvm child — set it when app-lb and heyvmd run as different users |
+| `APP_LB_VM_DATA_DIR` | `$MVM_DATA_DIR`, else `<home>/.heyo` | The daemon's data directory, where per-sandbox disks live. Disk management is disabled if this cannot be resolved |
+| `APP_LB_VM_TMP_DIR` | `/tmp` | Where the Firecracker driver writes its per-boot rootfs copy |
+| `APP_LB_DISKS_PATH` | `app-lb-disks.json` | Where retention decisions persist |
+| `APP_LB_DISK_TTL_SECS` | `604800` (7 days) | How long an unclaimed disk survives. **`0` turns expiry off** |
+| `APP_LB_DISK_SWEEP_SECS` | `3600` | Gap between expiry sweeps (floor 60) |
+| `APP_LB_DISK_ARCHIVE_BUCKET` | *(unset)* | S3 bucket for disk archives; **setting it enables archiving** |
+| `APP_LB_DISK_ARCHIVE_PREFIX` | `app-lb/disks` | Key prefix inside the bucket |
+| `APP_LB_DISK_ARCHIVE_ENDPOINT` | *(unset)* | `--endpoint-url` for an S3-compatible store |
+| `APP_LB_DISK_ARCHIVE_ON_EXPIRE` | `false` | `1` to archive an expiring disk before reclaiming it |
+| `APP_LB_DISK_ARCHIVE_TIMEOUT_SECS` | `7200` | Ceiling on one archive, after which `tar` and `aws` are killed |
+| `APP_LB_TAR_BIN` | `tar` | The `tar` used to stream a disk into the uploader. Needs GNU `--sparse` |
 | `APP_LB_OBS_URL` | *(unset)* | Where app-obs listens (e.g. `127.0.0.1:9500`); **setting it enables log shipping** |
 | `APP_LB_OBS_TOKEN` | *(unset)* | Bearer token for app-obs's `/ingest` — must match its `APP_OBS_INGEST_TOKEN` |
 | `APP_LB_OBS_HOST` | `/etc/hostname` | Machine name stamped on every batch |
@@ -120,6 +131,14 @@ A file whose spec no longer validates is skipped with a warning and **left
 alone**, because that file is the only copy of what somebody wrote. The startup
 sweep that removes files no deployment claims stands down entirely when that
 happens, for the same reason.
+
+[Disk retention decisions](#disk-management) live in their own file
+(`APP_LB_DISKS_PATH`, default `app-lb-disks.json`) and hold only what cannot be
+re-derived from the filesystem: which disks are pinned, any note, and where each
+one was archived. An entry back at its defaults is dropped rather than written,
+so the file tracks decisions rather than growing a line per sandbox that ever
+booted. A corrupt or unreadable file is logged and **not** fatal — the worst
+case is a missed `retain` flag, and the sweep's other four guards still hold.
 
 ## CLI
 
@@ -182,6 +201,16 @@ curl localhost:9090/healthz
 curl localhost:9090/metrics              # metrics snapshot (JSON)
 curl localhost:9090/certs                # issued TLS certificates and expiry
 curl localhost:9090/security             # security findings + the block rules in force
+curl localhost:9090/disks                # every per-sandbox disk on this host
+
+# Disk management. See "Disk management" — purging deletes gigabytes with no undo.
+curl -XPATCH localhost:9090/disks/sb-abc123 -H 'content-type: application/json' \
+  -d '{"retain": true, "note": "holds the demo database"}'   # pin against expiry
+curl -XPOST localhost:9090/disks/sb-abc123/archive -H 'content-type: application/json' \
+  -d '{"purge": true}'                                       # stream to S3, then reclaim
+curl -XDELETE localhost:9090/disks/sb-abc123                 # reclaim now
+curl -XDELETE 'localhost:9090/disks/sb-abc123?force=1'       # ...even if a deployment claims it
+curl -XPOST localhost:9090/disks/sweep                       # run the expiry sweep now
 
 # Refuse traffic. See "Response actions"; an empty match is rejected, and these
 # rules are never applied to this admin API.
@@ -1175,6 +1204,163 @@ keep working. The credentials are compared in constant time, but the admin
 listener is plain HTTP — terminate TLS in front of it, or reach it over an SSH
 tunnel, if it leaves localhost.
 
+## Disk management
+
+The daemon creates a directory of disk images per sandbox and only removes *some* of it when
+the sandbox is deleted. On a host that has been booting VMs for a few months that is tens of
+gigabytes nothing will ever reclaim. app-lb inventories it at `GET /disks`, shows it at
+`GET /storage`, and reclaims it on a timer.
+
+Three leaks, all of them real:
+
+| Path | What it is | When the daemon removes it |
+| --- | --- | --- |
+| `<data>/run/<id>/data.ext4` | The Firecracker `/workspace` data disk | Only on delete, and only if the sandbox was created with `disk_size_gb` |
+| `<data>/run/<id>/snapshot/` | Memory/state checkpoint | Never — the directory outlives the sandbox whenever there was no data disk |
+| `<data>/kvm/<id>/` | The KVM driver's per-VM `rootfs.ext4` and `mount*.ext4` | Never. These are the big ones: a 20 GiB rootfs per sandbox |
+| `/tmp/firecracker-<id>-rootfs.ext4` | The per-boot rootfs copy | On a clean `stop`. A hypervisor that dies leaves it behind |
+
+app-lb can do this despite not owning those paths because it is *required* to run beside a
+local daemon — `guest_ip` exists nowhere else — so it shares the filesystem. It already writes
+into the daemon's image directory for artifact pulls. What it adds is the one thing the daemon
+cannot know: which sandboxes a deployment still expects to resume.
+
+Sizes are **allocated blocks**, not nominal size. A data disk is created sparse at its full
+size, so 8 GiB of `data.ext4` is usually a few hundred MiB on the host; the page shows both.
+
+### Alongside `heyvm prune`
+
+`heyvm prune` is the daemon's own cleanup, and the two do not overlap — run both.
+
+| | `heyvm prune` | app-lb |
+| --- | --- | --- |
+| `/tmp/{firecracker,kvm}-<id>-*` | **yes**, unconditionally | yes, but only for a sandbox that is not running |
+| `/tmp/firecracker-configs/` | yes | no |
+| `<data>/run/<id>/`, `<data>/kvm/<id>/` | **no** | **yes** — this is where the tens of gigabytes are |
+| Base images in `<data>/images/` | with `--images` | no |
+| Runs | when you run it | on a timer |
+
+The `/tmp` overlap is the interesting one. `heyvm prune` deletes every matching file with no
+liveness check, so running it while a Firecracker VM is up removes the rootfs that VM is
+serving from. app-lb refuses to touch scratch belonging to a running sandbox, which is why it
+still does that half itself rather than deferring to prune.
+
+Note also that **`heyvm prune --images` can delete an image a deployment still needs.** It
+keeps images referenced by a live or persisted *sandbox*, and a deployment scaled to zero has
+neither — so its `vm.image` looks unreferenced. The next scale-up then fails to boot. Re-run
+[`POST /deployments/:id/pull`](#pulling-images-from-an-artifact-store) or `build` to put it
+back, or keep one replica warm on deployments whose images matter.
+
+### Expiry
+
+A disk that no deployment claims and nobody pinned is reclaimed once it has gone untouched for
+`APP_LB_DISK_TTL_SECS` — **seven days by default**. This is on out of the box, so the first
+thing app-lb logs at startup is how much it is about to delete:
+
+```
+WARN disk expiry is ON: up to 105 of 116 sandbox disks on this host are already older
+     than the retention window and will be reclaimed by the first sweep, in 3600s.
+     Open /storage to review them, mark the ones to keep as retained, or set
+     APP_LB_DISK_TTL_SECS=0 to turn expiry off
+     disks=116 eligible=105 gib=18
+```
+
+The first sweep is a full interval away, not immediate, so that warning arrives with time to
+act on it. Four things hold a disk against expiry, at any age:
+
+- **the sandbox is running** — never reclaimed, and `?force=1` does not override it
+- **a deployment expects to resume it** — it is in that deployment's suspended list, which is
+  what `scaling.idle_action: retain` means
+- **marked retained** — an operator pinned it on `/storage` or through `PATCH /disks/:id`
+- **the daemon could not be reached** — see below
+
+That last one is the most important line in the feature. A daemon that is restarting answers
+neither listing, every disk on the host then looks like residue, and one sweep would delete the
+whole fleet's state. So the inventory reports `complete: false`, classifies everything as
+`unknown`, and the sweep declines to run at all.
+
+### Archiving a disk to S3
+
+With `APP_LB_DISK_ARCHIVE_BUCKET` set, a disk can be uploaded before it is reclaimed:
+
+```sh
+curl -XPOST localhost:9090/disks/sb-abc123/archive -H 'content-type: application/json' \
+  -d '{"purge": true}'
+```
+
+The pipeline is `tar --create --sparse --gzip` → `aws s3 cp -`, with app-lb holding the pipe.
+Streaming end to end and never one PUT: `aws s3 cp -` does a multipart upload, and `--sparse`
+means `tar` skips the holes rather than compressing gigabytes of zeros. A 20 GiB sparse rootfs
+becomes an object of tens of megabytes without either process holding it in memory.
+
+app-lb sits in the middle of the pipe rather than letting a shell join the two, because there
+is no shell to quote into, the byte counter behind the progress bar has to come from somewhere,
+and a `tar` that outlives a failed upload has to be killed rather than left blocked on a pipe.
+
+`purge: true` reclaims the disk **only** if the upload succeeds. The archive returns as soon as
+it starts; progress arrives on `GET /disks` next to the inventory, which is what the page polls
+anyway. `APP_LB_DISK_ARCHIVE_ON_EXPIRE=1` applies the same thing to the sweep.
+
+The key is `<prefix>/<sandbox-id>/<unix-ts>.tar.gz`, timestamped so re-archiving never
+overwrites the copy already in the bucket. Paths inside are relative (`run/<id>`, `kvm/<id>`),
+so restoring is `tar -xzf` into a data directory. Credentials come from the `aws` CLI's own
+chain — env, `~/.aws/credentials`, or an instance role — exactly as they do for DNS-01.
+
+An archive killed by `APP_LB_DISK_ARCHIVE_TIMEOUT_SECS` abandons its multipart upload. A
+lifecycle rule on `AbortIncompleteMultipartUpload` is the usual way to clean those up.
+
+### Purging
+
+`DELETE /disks/:id` asks the daemon to delete the sandbox — so its own cleanup runs and its
+record goes away — and then removes whatever it left behind. A daemon that refuses, or that has
+already forgotten the sandbox, is not fatal: residue is exactly what the daemon cannot see.
+
+`?force=1` overrides the "a deployment expects to resume it" and "the daemon is unreachable"
+guards, and drops the claim so the next scale-up does not spend a resume on a sandbox whose
+disks are gone. It does **not** override the running check. Deleting disks out from under a
+live hypervisor corrupts the guest rather than freeing anything, and the actual intent — stop
+it, then reclaim it — is two clicks away on the dashboard.
+
+Sandbox ids arrive as URL path segments and end up joined to `remove_dir_all`, so they are
+validated against `[A-Za-z0-9_-]+` and *refused* rather than sanitized. Every path is then
+constructed from the configured roots and that validated id, never taken from the inventory —
+so no request, and no stale inventory, can direct a delete outside the two directories app-lb
+manages.
+
+### Reusing VMs instead of recreating them
+
+The other half of the same problem: every new sandbox is a new directory. app-lb already
+prefers resuming a suspended VM over booting a fresh one, but a VM it had *lost track of* — an
+LB restart, a crash between the stop and the state write — used to be destroyed, and the next
+scale-up would mint a new sandbox id while the old one's disks stayed on the host forever.
+
+A `retain` deployment now takes those back instead, up to `max_replicas`; only the surplus is
+destroyed. Reclaiming is deliberately limited to `idle_action: retain` — under `destroy` a
+stopped sandbox is one this LB already decided it did not want, and taking it back would
+quietly convert every deployment to `retain`.
+
+Note what a resume does and does not preserve, because the daemon decides this and not app-lb:
+a Firecracker sandbox keeps its `/workspace` data disk and **loses writes to its rootfs**,
+because mvm-ctrl recopies the rootfs from the base image on every cold boot. The KVM driver
+keeps a persistent per-VM `rootfs.ext4` and does not. Persistent state belongs under
+`/workspace` either way.
+
+### The console
+
+`GET /storage` renders the inventory: totals, what is reclaimable right now, and a row per
+sandbox with its state, size, age, when it expires or why it will not, and the files behind the
+number. The buttons pin, archive and purge. It polls `/disks` every five seconds so an archive
+in flight has a live progress bar.
+
+The inventory is view-tier — the same credentials as `/dashboard` and `/metrics` — and every
+route that *changes* something is CRUD-tier. Both are fleet-wide: a deployment-scoped app-token
+is refused, because a disk inventory spans deployments and includes sandboxes no deployment
+owns any more.
+
+`~/.heyo/sandboxes/<id>/` is deliberately **not** touched. It is the daemon's own metadata
+store, it is small (single-digit MB across a whole host), and deleting a daemon's persistence
+records to reclaim 23 KB is not a trade worth making.
+
 ## Clients
 
 | | |
@@ -1572,12 +1758,16 @@ it held. Retiring the single VM that is somebody's working directory should not.
 | Memory | gone | gone |
 | Next scale-up | boots a fresh VM | resumes this one |
 
-**Read the rootfs row again.** `retain` does not preserve the root filesystem,
-and cannot: mvm-ctrl gives each VM a private rootfs copy under `/tmp` and
-**recopies it from the base image on every cold boot**. The only thing that
-survives a stop is the persistent data disk at `~/.heyo/run/<id>/data.ext4`,
-attached as `/dev/vdb` and mounted at `/workspace` — and that disk only exists
-if `vm.disk_size_gb` is set.
+**Read the rootfs row again.** On Firecracker, `retain` does not preserve the
+root filesystem, and app-lb cannot make it: mvm-ctrl gives each VM a private
+rootfs copy under `/tmp`, removes it on `stop`, and **recopies it from the base
+image on every cold boot**. The only thing that survives a stop is the
+persistent data disk at `~/.heyo/run/<id>/data.ext4`, attached as `/dev/vdb` and
+mounted at `/workspace` — and that disk only exists if `vm.disk_size_gb` is set.
+
+(The KVM driver is the exception: it keeps a per-VM `~/.heyo/kvm/<id>/rootfs.ext4`
+across stop/start and reuses it. Fixing Firecracker to match is a daemon change,
+not one app-lb can make — every boot goes through mvm-ctrl's `start_vm`.)
 
 So a `retain` deployment is only meaningfully stateful when both hold:
 
@@ -1596,8 +1786,18 @@ a stopped sandbox from `GET /sandboxes`, so it is invisible to the fleet list th
 autoscaler reconciles against, and its TTL does not run while it is stopped. Its
 id is therefore written into the deployment's state file the moment it is
 stopped. Deregistering a deployment destroys its suspended VMs, and a slow sweep
-(every 5 minutes) destroys any stopped VM of ours that no deployment claims —
+(every 5 minutes) reconciles any stopped VM of ours that no deployment claims —
 the residue of a crash between stopping a VM and recording that we did.
+
+**That sweep reclaims before it destroys.** A `retain` deployment that finds one
+of its own stopped sandboxes unclaimed has, by definition, lost track of a VM it
+asked to keep, and destroying it means the next scale-up creates a new sandbox
+— new id, new directory under the daemon's data dir, fresh rootfs — while the
+old one's disks stay on the host forever. So it is taken back into the
+deployment's suspended list, up to `max_replicas`, and only the surplus is
+destroyed. A `destroy` deployment's stopped VMs are still destroyed: that one
+was already decided. Whatever *does* get destroyed leaves disks behind, which is
+what [disk management](#disk-management) is for.
 
 A scale-up prefers resuming a suspended VM over creating one, and not only to
 save time: creating a fresh VM while one sits stopped would strand that VM's

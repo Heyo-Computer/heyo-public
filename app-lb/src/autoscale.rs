@@ -809,7 +809,7 @@ impl Autoscaler {
         taken
     }
 
-    /// Destroy stopped sandboxes of ours that no deployment claims.
+    /// Reclaim or destroy stopped sandboxes of ours that no deployment claims.
     ///
     /// The backstop for `idle_action: retain`. A stopped sandbox is invisible to
     /// every other mechanism here — it is absent from the fleet list, so `prune`
@@ -817,6 +817,21 @@ impl Autoscaler {
     /// stopped. If the record of it is lost (a crash between the stop and the
     /// state write, a state file deleted by hand), it keeps its disk forever with
     /// nothing to reclaim it.
+    ///
+    /// Unclaimed does not mean unwanted. A `retain` deployment that finds one of
+    /// its own stopped sandboxes here has, by definition, lost track of a VM it
+    /// asked to keep — and destroying it means the next scale-up creates a *new*
+    /// sandbox, with a new id, a new directory under the daemon's data dir and a
+    /// fresh rootfs, while the old one's disks stay on the host forever. So it is
+    /// taken back into `state.suspended` instead, up to `max_replicas`, and only
+    /// the surplus is destroyed. Reclaiming is deliberately limited to `retain`:
+    /// under `destroy` a stopped sandbox is one this LB already decided it did
+    /// not want.
+    ///
+    /// A reclaimed sandbox is matched by *name*, exactly as `adopt_existing`
+    /// matches a running one, so it can predate an image change the same way an
+    /// adopted running VM can. The `update` path guards that case for both: a
+    /// changed `VmSpec` tears the pool down instead of preserving it.
     ///
     /// Only sandboxes named `applb-<deployment>-<nonce>` are touched, and only
     /// when their deployment either does not exist or does not list them. A
@@ -856,15 +871,59 @@ impl Autoscaler {
             .chain(fleet.iter().filter(|i| vm::is_terminal(&i.status)));
 
         let mut orphans: Vec<(String, String)> = Vec::new();
+        // Candidates for reclaim, grouped so each deployment's budget is applied
+        // once rather than per sandbox. Ordered, so which ones survive the cap is
+        // stable across ticks instead of depending on hash iteration order.
+        let mut reclaimable: Vec<(String, Vec<String>)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
         for info in stopped {
             let Some(owner) = vm::owner_of(&info.name) else {
                 continue; // not ours
             };
-            let claimed = deployments
-                .get(owner)
-                .is_some_and(|d| d.state().suspended.contains(&info.id));
-            if !claimed && !orphans.iter().any(|(id, _)| id == &info.id) {
+            // The two listings overlap for KVM; count each sandbox once.
+            if !seen.insert(info.id.clone()) {
+                continue;
+            }
+            let d = deployments.get(owner);
+            if d.is_some_and(|d| d.state().suspended.contains(&info.id)) {
+                continue; // claimed: nothing to decide
+            }
+            if d.is_some_and(|d| d.spec.is_managed() && d.spec.scaling.idle_action == IdleAction::Retain)
+            {
+                match reclaimable.iter_mut().find(|(o, _)| o == owner) {
+                    Some((_, ids)) => ids.push(info.id.clone()),
+                    None => reclaimable.push((owner.to_string(), vec![info.id.clone()])),
+                }
+            } else {
                 orphans.push((info.id.clone(), owner.to_string()));
+            }
+        }
+
+        for (owner, ids) in reclaimable {
+            let Some(d) = deployments.get(owner.as_str()) else {
+                continue;
+            };
+            let budget = reclaim_budget(d);
+            let take = ids.len().min(budget);
+            let (keep, surplus) = ids.split_at(take);
+            if !keep.is_empty() {
+                tracing::info!(
+                    deployment = %owner,
+                    count = keep.len(),
+                    "reclaiming stopped VMs this LB had lost track of; the next scale-up \
+                     resumes these instead of creating new sandboxes",
+                );
+                self.remember_suspended(d, keep.to_vec());
+            }
+            for id in surplus {
+                tracing::info!(
+                    deployment = %owner,
+                    sandbox = %id,
+                    max_replicas = d.spec.scaling.max_replicas,
+                    "more stopped VMs than this deployment may hold; destroying the surplus",
+                );
+                orphans.push((id.clone(), owner.clone()));
             }
         }
 
@@ -1184,6 +1243,21 @@ fn at_rest(d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) -> bool {
     })
 }
 
+/// How many stopped sandboxes a deployment may take back.
+///
+/// A reclaimed sandbox is one this deployment will hold and may resume, so it
+/// counts against `max_replicas` exactly as a running or booting one does.
+/// Without the cap, a host carrying a hundred stale sandboxes from before a
+/// restart would hand all hundred to one deployment, which would then never
+/// destroy any of them — the leak this is meant to close, wearing a different
+/// hat.
+///
+/// Pure, so the cap is testable without a daemon.
+fn reclaim_budget(d: &Arc<Deployment>) -> usize {
+    let held = d.backends().len() + d.pending().len() + d.state().suspended.len();
+    (d.spec.scaling.max_replicas as usize).saturating_sub(held)
+}
+
 fn boot_stall(info: &SandboxInfo, check: &crate::config::HealthCheck, vm_port: u16) -> String {
     if info.status != heyo_sdk::SandboxStatus::Running {
         return match info.error_message.as_deref() {
@@ -1399,6 +1473,87 @@ mod tests {
             // carries on, which is what must not leave the record behind.
             a.teardown(&d).await;
             assert!(d.state().suspended.is_empty());
+        }
+    }
+
+    /// A stopped VM this LB has lost track of is worth more than the disk it
+    /// holds: destroying it means the next scale-up mints a *new* sandbox id,
+    /// with a new directory under the daemon's data dir, while the old one's
+    /// disks stay on the host forever. See `sweep_suspended`.
+    mod reclaiming_stopped_vms {
+        use super::*;
+
+        fn deployment(reg: &Arc<Registry>, idle: IdleAction, max: u32) -> Arc<Deployment> {
+            let mut s = spec();
+            s.scaling.idle_action = idle;
+            s.scaling.max_replicas = max;
+            reg.upsert(s);
+            reg.get("demo").unwrap()
+        }
+
+        #[test]
+        fn the_budget_counts_every_vm_the_deployment_already_holds() {
+            let (a, reg) = autoscaler();
+            let d = deployment(&reg, IdleAction::Retain, 4);
+            assert_eq!(reclaim_budget(&d), 4, "an empty deployment may take its max");
+
+            d.set_backends(vec![Arc::new(VmBackend::new(
+                "sb-live".into(),
+                "10.0.0.1:80".parse().unwrap(),
+            ))]);
+            d.set_pending(vec![pending("sb-booting")]);
+            a.remember_suspended(&d, vec!["sb-kept".into()]);
+
+            assert_eq!(reclaim_budget(&d), 1, "running, booting and suspended all count");
+        }
+
+        /// The cap is what keeps this from becoming the leak it closes: a host
+        /// carrying a hundred stale sandboxes must not hand all hundred to one
+        /// deployment that would then never destroy any of them.
+        #[test]
+        fn a_deployment_at_its_ceiling_reclaims_nothing() {
+            let (_a, reg) = autoscaler();
+            let d = deployment(&reg, IdleAction::Retain, 1);
+            d.set_backends(vec![Arc::new(VmBackend::new(
+                "sb-live".into(),
+                "10.0.0.1:80".parse().unwrap(),
+            ))]);
+
+            assert_eq!(reclaim_budget(&d), 0);
+        }
+
+        #[test]
+        fn the_budget_never_goes_negative() {
+            let (a, reg) = autoscaler();
+            let d = deployment(&reg, IdleAction::Retain, 1);
+            a.remember_suspended(&d, vec!["a".into(), "b".into(), "c".into()]);
+            assert_eq!(reclaim_budget(&d), 0);
+        }
+
+        /// Reclaiming is limited to `retain` on purpose: under `destroy` a
+        /// stopped sandbox of ours is one this LB already decided it did not
+        /// want, and taking it back would quietly convert every deployment to
+        /// `retain`.
+        #[test]
+        fn only_retain_deployments_are_reclaim_candidates() {
+            let (_a, reg) = autoscaler();
+            let d = deployment(&reg, IdleAction::Destroy, 4);
+            assert!(d.spec.is_managed());
+            assert_ne!(d.spec.scaling.idle_action, IdleAction::Retain);
+
+            let d = deployment(&reg, IdleAction::Retain, 4);
+            assert_eq!(d.spec.scaling.idle_action, IdleAction::Retain);
+        }
+
+        /// A reclaimed sandbox has to land in the same record `scale_up` reads,
+        /// or the resume path never sees it and the churn continues.
+        #[test]
+        fn a_reclaimed_sandbox_is_what_the_next_scale_up_resumes() {
+            let (a, reg) = autoscaler();
+            let d = deployment(&reg, IdleAction::Retain, 4);
+
+            a.remember_suspended(&d, vec!["sb-recovered".into()]);
+            assert_eq!(a.take_suspended(&d).as_deref(), Some("sb-recovered"));
         }
     }
 

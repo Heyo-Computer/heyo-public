@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{APP_NAME}} disks</title>
+<style>
+  /* The dashboard's tokens. Copied rather than shared because every page is
+     `include_str!`d into the binary and there is no build step to share
+     anything through. */
+  :root {
+    color-scheme: light;
+    --plane:        #f9f9f7;
+    --surface:      #fcfcfb;
+    --text:         #0b0b0b;
+    --text-2:       #52514e;
+    --muted:        #898781;
+    --grid:         #e1e0d9;
+    --border:       rgba(11,11,11,0.10);
+    --series-1:     #2a78d6;
+    --good:         #0ca30c;
+    --warning:      #fab219;
+    --serious:      #ec835a;
+    --critical:     #d03b3b;
+    --success-text: #006300;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
+    --muted:#898781; --grid:#2c2c2a; --border:rgba(255,255,255,0.10);
+    --series-1:#3987e5; --good:#0ca30c; --warning:#fab219; --serious:#ec835a;
+    --critical:#d03b3b; --success-text:#0ca30c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
+      --muted:#898781; --grid:#2c2c2a; --border:rgba(255,255,255,0.10);
+      --series-1:#3987e5; --success-text:#0ca30c;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 24px 72px;
+    background: var(--plane); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  .lede { color: var(--text-2); margin: 0 0 22px; }
+  .links { margin-left: auto; display: flex; gap: 14px; align-items: baseline; }
+  .links a, .themebtn {
+    color: var(--text-2); text-decoration: none; font-size: 13px;
+    border: 0; background: none; padding: 0; cursor: pointer; font-family: inherit;
+  }
+  .links a:hover, .themebtn:hover { color: var(--text); text-decoration: underline; }
+
+  .section-title {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); margin: 30px 0 10px; font-weight: 600;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px 18px; margin-bottom: 12px;
+  }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .tile .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .tile .value { font-size: 24px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .tile .value.attn { color: var(--critical); }
+  .tile .sub { font-size: 12px; color: var(--text-2); margin-top: 3px; }
+
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+  select, input[type=text] {
+    font: inherit; font-size: 13px; padding: 5px 8px; border-radius: 7px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  .filters .spacer { margin-left: auto; }
+
+  button.act {
+    font: inherit; font-size: 12.5px; padding: 5px 11px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  button.act:hover { border-color: var(--series-1); }
+  button.act.danger { color: var(--critical); }
+  button.act.danger:hover { border-color: var(--critical); }
+  button.act:disabled { opacity: .5; cursor: not-allowed; }
+
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; flex: none; white-space: nowrap; }
+  .tag.running { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+  .tag.stopped { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
+  .tag.orphan  { background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
+  .tag.unknown { background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--text-2); }
+  .tag.retain  { background: color-mix(in srgb, var(--warning) 26%, transparent); color: var(--serious); }
+  .tag.archived{ background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--success-text); }
+  /* Archive outcomes. Their own classes rather than borrowing the disk-state
+     ones: the colours coincide today, and a later change to either must not
+     silently repaint the other. */
+  .tag.ok      { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+  .tag.busy    { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
+  .tag.fail    { background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
+
+  .scroll { overflow-x: auto; }
+  table.disks { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.disks th {
+    text-align: left; color: var(--muted); font-weight: 500;
+    padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap;
+  }
+  table.disks td { padding: 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  table.disks tr:last-child td { border-bottom: 0; }
+  table.disks td.num { font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+  table.disks td.mono, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere;
+  }
+  table.disks td.actions { white-space: nowrap; text-align: right; }
+  table.disks td.actions button { margin-left: 5px; }
+  .sub2 { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+
+  details.parts > summary {
+    cursor: pointer; font-size: 11.5px; color: var(--series-1); list-style: none;
+    display: inline-flex; align-items: center; gap: 5px; margin-top: 4px;
+  }
+  details.parts > summary::-webkit-details-marker { display: none; }
+  details.parts > summary::before { content: "▸"; font-size: 9px; }
+  details.parts[open] > summary::before { content: "▾"; }
+  pre.parts {
+    margin: 6px 0 0; padding: 9px 11px; border-radius: 8px; overflow: auto;
+    background: var(--plane); border: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+    color: var(--text-2); max-height: 260px;
+  }
+
+  .bar {
+    height: 5px; border-radius: 3px; background: color-mix(in srgb, var(--muted) 22%, transparent);
+    overflow: hidden; margin-top: 5px; min-width: 90px;
+  }
+  .bar > i { display: block; height: 100%; background: var(--series-1); }
+
+  .note { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
+  .empty { color: var(--text-2); padding: 20px 0; text-align: center; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    background: color-mix(in srgb, var(--muted) 16%, transparent);
+    padding: 1px 5px; border-radius: 4px;
+  }
+  .caveat {
+    font-size: 12.5px; color: var(--text-2); margin-bottom: 14px; padding: 9px 11px;
+    border-left: 3px solid var(--warning); border-radius: 0 6px 6px 0;
+    background: color-mix(in srgb, var(--warning) 9%, transparent);
+  }
+  .caveat.bad { border-left-color: var(--critical); background: color-mix(in srgb, var(--critical) 9%, transparent); }
+
+  .flash {
+    position: sticky; top: 0; z-index: 5; margin: 0 0 14px;
+    padding: 10px 14px; border-radius: 8px; font-size: 13px; display: none;
+  }
+  .flash.on { display: block; }
+  .flash.ok { background: color-mix(in srgb, var(--good) 14%, var(--surface)); color: var(--success-text); }
+  .flash.bad { background: color-mix(in srgb, var(--critical) 14%, var(--surface)); color: var(--critical); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>{{APP_NAME}} disks</h1>
+    <div class="links">
+      <a href="/">Directory</a>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/siem">Security</a>
+      <a href="/metrics">Metrics</a>
+      <button class="themebtn" id="themebtn" type="button">Theme</button>
+    </div>
+  </header>
+  <p class="lede" id="lede">Loading…</p>
+
+  <div class="flash" id="flash"></div>
+  <div id="warnings"></div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="section-title">Sandbox disks</div>
+  <div class="filters">
+    <select id="f-state">
+      <option value="">Any state</option>
+      <option value="orphan">Orphaned</option>
+      <option value="stopped">Stopped</option>
+      <option value="running">Running</option>
+      <option value="expiring">Expiring soon</option>
+      <option value="retain">Retained</option>
+    </select>
+    <input type="text" id="f-search" placeholder="sandbox or deployment" size="22">
+    <span class="spacer"></span>
+    <button class="act" id="sweep" type="button">Run sweep now</button>
+    <button class="act" id="refresh" type="button">Refresh</button>
+    <label style="font-size:12.5px;color:var(--text-2)">
+      <input type="checkbox" id="auto" checked> auto
+    </label>
+  </div>
+  <div class="card"><div class="scroll" id="disks"><div class="empty">Loading…</div></div></div>
+
+  <div class="section-title">Archives</div>
+  <div class="card" id="archives"><div class="empty">Loading…</div></div>
+</div>
+
+<script>
+"use strict";
+
+// Paths, sandbox names and daemon error strings all land in this markup, and
+// a deployment id is operator-supplied. Everything interpolated goes through
+// this.
+function esc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+const $ = id => document.getElementById(id);
+const fmt = n => (n == null ? "—" : Number(n).toLocaleString());
+
+// Binary units, because that is what `du` and the daemon's disk sizes are in.
+function bytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return n + " B";
+  const u = ["KiB", "MiB", "GiB", "TiB"];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + " " + u[i];
+}
+function ago(secs) {
+  if (!secs) return "never";
+  const d = Math.max(0, Math.floor(Date.now() / 1000) - secs);
+  if (d < 60) return d + "s ago";
+  if (d < 3600) return Math.floor(d / 60) + "m ago";
+  if (d < 86400) return Math.floor(d / 3600) + "h ago";
+  return Math.floor(d / 86400) + "d ago";
+}
+function until(secs) {
+  if (!secs) return "never";
+  const d = secs - Math.floor(Date.now() / 1000);
+  if (d <= 0) return "now";
+  if (d < 3600) return "in " + Math.ceil(d / 60) + "m";
+  if (d < 86400) return "in " + Math.round(d / 3600) + "h";
+  return "in " + Math.round(d / 86400) + "d";
+}
+function duration(secs) {
+  if (!secs) return "—";
+  const p = (n, unit) => n + " " + unit + (n === 1 ? "" : "s");
+  if (secs % 86400 === 0) return p(secs / 86400, "day");
+  if (secs % 3600 === 0) return p(secs / 3600, "hour");
+  if (secs % 60 === 0) return p(secs / 60, "minute");
+  return secs + "s";
+}
+
+async function api(method, path, body) {
+  const opts = { method, headers: { accept: "application/json" } };
+  if (body !== undefined) {
+    opts.headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  try {
+    const r = await fetch(path, opts);
+    if (r.status === 204) return { ok: true, status: 204, data: null };
+    const text = await r.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = { message: text }; }
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+function flash(kind, message) {
+  const el = $("flash");
+  el.className = "flash on " + kind;
+  el.textContent = message;
+  if (flash.timer) clearTimeout(flash.timer);
+  flash.timer = setTimeout(() => { el.className = "flash"; }, 12000);
+}
+
+function reason(r) {
+  const d = r.data || {};
+  return d.message || d.error || "";
+}
+
+// Which disks have their file list open. Kept outside the markup because the
+// poll rebuilds the table.
+const expanded = new Set();
+let latest = null;
+
+function tiles(d) {
+  const t = d.totals || {};
+  const items = [
+    ["On disk", bytes(t.bytes), `${fmt(t.disks)} sandbox${t.disks === 1 ? "" : "es"}`, false],
+    ["Orphaned", fmt(t.orphan), t.orphan ? "no daemon record at all" : "none", t.orphan > 0],
+    ["Reclaimable now", bytes(t.reclaimable_bytes),
+      d.ttl_secs ? `${fmt(t.expiring_now)} past ${duration(d.ttl_secs)}` : "expiry is off", t.expiring_now > 0],
+    ["Retained", fmt(t.retained), "pinned against expiry", false],
+    ["Running", fmt(t.running), `${fmt(t.stopped)} stopped`, false],
+  ];
+  $("tiles").innerHTML = items.map(([label, value, sub, attn]) =>
+    `<div class="tile"><div class="label">${esc(label)}</div>
+     <div class="value${attn ? " attn" : ""}">${esc(value)}</div>
+     <div class="sub">${esc(sub)}</div></div>`).join("");
+}
+
+function warnings(d) {
+  const out = [];
+  if (!d.complete) {
+    out.push(`<div class="caveat bad"><b>The daemon could not be reached.</b>
+      ${esc(d.incomplete_reason || "")} Nothing is classified as orphaned and the sweep will not
+      run — without those listings every disk on this host would look like residue.</div>`);
+  }
+  if (!d.ttl_secs) {
+    out.push(`<div class="caveat">Automatic expiry is off
+      (<code>APP_LB_DISK_TTL_SECS=0</code>). Disks are listed and can be reclaimed by hand,
+      but nothing is deleted on its own.</div>`);
+  }
+  $("warnings").innerHTML = out.join("");
+}
+
+function partsBlock(disk) {
+  const rows = (disk.parts || []).map(p =>
+    `${String(p.kind).padEnd(9)} ${bytes(p.bytes).padStart(9)}  ${p.path}`).join("\n");
+  const roots = (disk.roots || []).length
+    ? `\n\nremoved by a purge:\n` + disk.roots.map(r => "  " + r).join("\n")
+    : "";
+  return `<details class="parts"${expanded.has(disk.sandbox_id) ? " open" : ""}
+    data-parts="${esc(disk.sandbox_id)}">
+    <summary>${esc((disk.parts || []).length)} file${(disk.parts || []).length === 1 ? "" : "s"}</summary>
+    <pre class="parts">${esc(rows + roots)}</pre></details>`;
+}
+
+function row(d, inv) {
+  const id = esc(d.sandbox_id);
+  const tags = [`<span class="tag ${esc(d.state)}">${esc(d.state)}</span>`];
+  if (d.retain) tags.push(`<span class="tag retain">retained</span>`);
+  if (d.archived) tags.push(`<span class="tag archived">archived</span>`);
+
+  // The single most useful cell on the page: why this disk is or is not going
+  // to be deleted, in the server's own words.
+  const fate = d.held_by
+    ? `<span title="${esc(d.held_by)}">held</span><div class="sub2">${esc(d.held_by)}</div>`
+    : d.expires_at
+      ? `${esc(until(d.expires_at))}<div class="sub2">${esc(new Date(d.expires_at * 1000).toLocaleDateString())}</div>`
+      : `never<div class="sub2">expiry is off</div>`;
+
+  const sparse = d.apparent_bytes > d.bytes * 1.5
+    ? `<div class="sub2">${esc(bytes(d.apparent_bytes))} apparent</div>` : "";
+
+  // The daemon's name for the sandbox, when it still has one. Omitted rather
+  // than dashed for an orphan: the whole point of an orphan is that there is no
+  // record, and a column of em-dashes says that less clearly than nothing does.
+  const name = d.name ? `<div class="sub2">${esc(d.name)}</div>` : "";
+
+  return `<tr>
+    <td class="mono">${id}${name}${partsBlock(d)}</td>
+    <td>${esc(d.deployment || "—")}</td>
+    <td>${tags.join(" ")}</td>
+    <td class="num">${esc(bytes(d.bytes))}${sparse}</td>
+    <td class="num">${esc(ago(d.modified_at))}</td>
+    <td class="num">${fate}</td>
+    <td class="actions">
+      <button class="act" type="button" data-retain="${id}" data-to="${d.retain ? "0" : "1"}"
+        >${d.retain ? "Unpin" : "Retain"}</button>
+      ${inv.archive_enabled
+        ? `<button class="act" type="button" data-archive="${id}">Archive</button>` : ""}
+      <button class="act danger" type="button" data-purge="${id}">Purge</button>
+    </td>
+  </tr>`;
+}
+
+function matches(d, state, search) {
+  if (state === "expiring" && !d.expires_at) return false;
+  if (state === "retain" && !d.retain) return false;
+  if (state && state !== "expiring" && state !== "retain" && d.state !== state) return false;
+  if (search) {
+    const hay = (d.sandbox_id + " " + (d.deployment || "") + " " + (d.name || "")).toLowerCase();
+    if (!hay.includes(search)) return false;
+  }
+  return true;
+}
+
+function renderDisks(inv) {
+  const el = $("disks");
+  const state = $("f-state").value;
+  const search = $("f-search").value.trim().toLowerCase();
+  const rows = (inv.disks || []).filter(d => matches(d, state, search));
+
+  if (!rows.length) {
+    el.innerHTML = (inv.disks || []).length
+      ? `<div class="empty">No disk matches that filter.</div>`
+      : `<div class="empty">No sandbox disks under <code>${esc(inv.data_dir)}</code>.</div>`;
+    return;
+  }
+  el.innerHTML = `<table class="disks">
+    <thead><tr>
+      <th>Sandbox</th><th>Deployment</th><th>State</th>
+      <th style="text-align:right">On disk</th>
+      <th style="text-align:right">Touched</th>
+      <th style="text-align:right">Expires</th><th></th>
+    </tr></thead>
+    <tbody>${rows.map(d => row(d, inv)).join("")}</tbody></table>
+    <div class="note">Sizes are blocks actually allocated, not nominal size — a data disk is
+    created sparse, so 8 GiB of <code>data.ext4</code> is usually a few hundred MiB on the host.
+    Purging removes the sandbox from the daemon and then deletes its directories under
+    <code>${esc(inv.data_dir)}</code>; there is no undo. This covers what
+    <code>heyvm prune</code> does not: prune clears <code>${esc(inv.tmp_dir)}</code> scratch and,
+    with <code>--images</code>, unreferenced base images — it never touches the per-sandbox
+    directories above.</div>`;
+}
+
+function renderArchives(inv) {
+  const el = $("archives");
+  if (!inv.archive_enabled) {
+    el.innerHTML = `<div class="empty">No archive destination configured. Set
+      <code>APP_LB_DISK_ARCHIVE_BUCKET</code> to stream a disk to S3 before reclaiming it —
+      it is piped through <code>tar --sparse --gzip</code> into a multipart upload, so a
+      20 GiB rootfs never lands in memory or in one PUT.</div>`;
+    return;
+  }
+  const jobs = inv.archives || [];
+  if (!jobs.length) {
+    el.innerHTML = `<div class="empty">No archives yet. Uploads go to
+      <code>${esc(inv.archive_target)}</code>.${
+      inv.archive_on_expire ? " Expiring disks are archived before they are reclaimed." : ""}</div>`;
+    return;
+  }
+  const rows = jobs.map(j => {
+    const pct = j.expected_bytes ? Math.min(100, Math.round(j.bytes * 100 / j.expected_bytes)) : 0;
+    const progress = j.status === "running"
+      ? `<div class="bar"><i style="width:${pct}%"></i></div>` : "";
+    return `<tr>
+      <td class="mono">${esc(j.sandbox_id)}<div class="sub2">${esc(j.uri)}</div></td>
+      <td><span class="tag ${j.status === "succeeded" ? "ok"
+        : j.status === "failed" ? "fail" : "busy"}">${esc(j.status)}</span>${
+        j.purged ? ` <span class="tag archived">purged</span>` : ""}</td>
+      <td class="num">${esc(bytes(j.bytes))}${progress}</td>
+      <td class="num">${esc(ago(j.started_at))}</td>
+      <td>${j.error ? `<span style="color:var(--critical)">${esc(j.error)}</span>` : ""}</td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `<div class="scroll"><table class="disks">
+    <thead><tr><th>Sandbox</th><th>Status</th>
+      <th style="text-align:right">Uploaded</th>
+      <th style="text-align:right">Started</th><th>Error</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+async function load() {
+  const r = await api("GET", "/disks");
+  if (!r.ok) {
+    const why = r.status === 401 ? "Not authenticated."
+      : r.status === 403 ? "This credential may not read the disk inventory — it is fleet-wide, "
+          + "so a deployment-scoped token is refused."
+      : r.status === 503 ? reason(r)
+      : `GET /disks failed (${r.status}). ${reason(r)}`;
+    $("lede").textContent = why;
+    $("disks").innerHTML = `<div class="empty">${esc(why)}</div>`;
+    return;
+  }
+  const d = r.data || {};
+  latest = d;
+  warnings(d);
+  tiles(d);
+  renderDisks(d);
+  renderArchives(d);
+
+  const t = d.totals || {};
+  const bits = [`${bytes(t.bytes)} across ${fmt(t.disks)} sandbox${t.disks === 1 ? "" : "es"} under ${d.data_dir}.`];
+  if (d.ttl_secs) {
+    bits.push(`Unclaimed disks are reclaimed after ${duration(d.ttl_secs)}; the sweep runs every ${duration(d.sweep_secs)}.`);
+  } else {
+    bits.push("Automatic expiry is off.");
+  }
+  if (t.reclaimable_bytes) bits.push(`${bytes(t.reclaimable_bytes)} is reclaimable right now.`);
+  $("lede").textContent = bits.join(" ");
+}
+
+// --- acting ---------------------------------------------------------------
+
+document.addEventListener("click", async ev => {
+  const pin = ev.target.closest("button[data-retain]");
+  if (pin) {
+    const id = pin.getAttribute("data-retain");
+    const to = pin.getAttribute("data-to") === "1";
+    pin.disabled = true;
+    const r = await api("PATCH", "/disks/" + encodeURIComponent(id), { retain: to });
+    if (r.ok) { flash("ok", `${id} is ${to ? "retained — expiry will skip it" : "no longer pinned"}.`); await load(); }
+    else { pin.disabled = false; flash("bad", denied(r, "Changing retention")); }
+    return;
+  }
+
+  const arch = ev.target.closest("button[data-archive]");
+  if (arch) {
+    const id = arch.getAttribute("data-archive");
+    const disk = (latest && latest.disks || []).find(d => d.sandbox_id === id);
+    const size = disk ? bytes(disk.bytes) : "";
+    const purge = confirm(`Archive ${id} (${size}) to ${latest.archive_target}, then purge it?\n\n` +
+      `OK archives and purges on success. Cancel archives only — nothing is deleted.`);
+    arch.disabled = true;
+    const r = await api("POST", `/disks/${encodeURIComponent(id)}/archive`, { purge });
+    if (r.ok) flash("ok", `Archiving ${id}${purge ? "; it will be purged if the upload succeeds" : ""}.`);
+    else flash("bad", denied(r, "Archiving"));
+    arch.disabled = false;
+    await load();
+    return;
+  }
+
+  const purge = ev.target.closest("button[data-purge]");
+  if (purge) {
+    const id = purge.getAttribute("data-purge");
+    const disk = (latest && latest.disks || []).find(d => d.sandbox_id === id);
+    if (!disk) return;
+    const paths = (disk.roots || []).join("\n") || "(only scratch files in /tmp)";
+    if (!confirm(`Delete every disk belonging to ${id}?\n\n${paths}\n\n` +
+      `${bytes(disk.bytes)} will be freed. This cannot be undone.`)) return;
+    purge.disabled = true;
+    let r = await api("DELETE", "/disks/" + encodeURIComponent(id));
+    // A 409 is the server's guards refusing, and each one names itself. Offer
+    // the override rather than making the operator find the query parameter —
+    // but only when the server said force would work. A running sandbox has no
+    // legitimate override, and offering one there would produce a confirm
+    // dialog whose "yes" is refused a second time.
+    if (r.status === 409 && reason(r).includes("force=1")
+        && confirm(`${reason(r)}\n\nForce the purge anyway?`)) {
+      r = await api("DELETE", `/disks/${encodeURIComponent(id)}?force=1`);
+    }
+    if (r.ok) {
+      const d = r.data || {};
+      flash("ok", `Purged ${id} — ${bytes(d.bytes)} freed from ${fmt((d.removed || []).length)} path(s).` +
+        ((d.failed || []).length ? ` ${d.failed.length} path(s) could not be removed: ${d.failed.join("; ")}` : ""));
+    } else {
+      flash("bad", denied(r, "Purging"));
+    }
+    purge.disabled = false;
+    await load();
+  }
+});
+
+function denied(r, what) {
+  if (r.status === 401 || r.status === 403) {
+    return `Refused: ${what.toLowerCase()} a disk needs admin credentials, not a view token.`;
+  }
+  return `${what} failed (${r.status}). ${reason(r)}`;
+}
+
+$("sweep").addEventListener("click", async () => {
+  if (!latest) return;
+  const t = latest.totals || {};
+  if (!latest.ttl_secs) { flash("bad", "Expiry is off (APP_LB_DISK_TTL_SECS=0); the sweep would do nothing."); return; }
+  if (!confirm(`Run the expiry sweep now?\n\n${t.expiring_now || 0} disk(s) are past ` +
+    `${duration(latest.ttl_secs)} and would be ${latest.archive_on_expire ? "archived, then " : ""}deleted, ` +
+    `freeing ${bytes(t.reclaimable_bytes || 0)}.`)) return;
+  $("sweep").disabled = true;
+  const r = await api("POST", "/disks/sweep");
+  $("sweep").disabled = false;
+  if (!r.ok) { flash("bad", denied(r, "Sweeping")); return; }
+  const d = r.data || {};
+  flash(d.failed ? "bad" : "ok", d.skipped
+    ? "Sweep skipped: the daemon was unreachable, so nothing was classified as residue."
+    : `Sweep done — ${d.purged} purged, ${d.archived} archived, ${d.failed} failed, ${bytes(d.bytes)} freed.`);
+  await load();
+});
+
+// Remember which file lists are open across a poll.
+document.addEventListener("toggle", ev => {
+  const el = ev.target.closest("details.parts");
+  if (!el) return;
+  const id = el.getAttribute("data-parts");
+  if (el.open) expanded.add(id); else expanded.delete(id);
+}, true);
+
+// --- polling --------------------------------------------------------------
+
+let timer = null;
+function schedule() {
+  if (timer) clearInterval(timer);
+  // Five seconds rather than the SIEM's ten: an archive in flight has a
+  // progress bar on this page, and a bar that moves twice a minute is worse
+  // than no bar.
+  if ($("auto").checked) timer = setInterval(load, 5000);
+}
+
+$("f-state").addEventListener("change", () => latest && renderDisks(latest));
+$("f-search").addEventListener("input", () => latest && renderDisks(latest));
+$("refresh").addEventListener("click", load);
+$("auto").addEventListener("change", schedule);
+$("themebtn").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.getAttribute("data-theme") === "dark"
+    || (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
+  root.setAttribute("data-theme", dark ? "light" : "dark");
+});
+
+load();
+schedule();
+</script>
+</body>
+</html>
