@@ -1,0 +1,410 @@
+name: Deploy Heyo public services
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'heyosecret/**'
+      - '.heyo/workflows/deploy-heyo-services.yml'
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Service to deploy"
+        required: true
+        type: choice
+        options:
+          - all
+          - heyosecret
+      forceStaleDeploy:
+        description: "Allow deploying a commit that is no longer current on main"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-heyo-public-services
+  cancel-in-progress: false
+
+jobs:
+  deploy-platform-service:
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - target: heyosecret
+    runs-on: namespace-profile-default
+    env:
+      ORCHESTRATOR_URL: ${{ secrets.HEYO_ORCHESTRATOR_URL }}
+      ORCHESTRATOR_INTERNAL_API_KEY: ${{ secrets.ORCHESTRATOR_INTERNAL_API_KEY }}
+      HEYOSECRET_INTERNAL_API_KEY: ${{ secrets.HEYOSECRET_INTERNAL_API_KEY }}
+      HEYO_PUBLIC_HOST: ${{ secrets.HEYO_PUBLIC_HOST || 'stage.heyo.computer' }}
+      HEYO_TRAEFIK_CERT_RESOLVER: ${{ secrets.HEYO_TRAEFIK_CERT_RESOLVER || 'letsencrypt-http' }}
+      HEYO_SERVICE_REGION: ${{ secrets.HEYO_SERVICE_REGION }}
+      CI_GIT_AUTH_TOKEN: ${{ secrets.CI_GIT_AUTH_TOKEN || secrets.GITHUB_TOKEN }}
+      TARGET_HEYO_SERVICE: ${{ matrix.target }}
+      FORCE_STALE_SERVICE_DEPLOY: ${{ inputs.forceStaleDeploy }}
+      VALIDATED_SERVICE_ARTIFACTS_AVAILABLE: ${{ inputs.validatedServiceArtifactsAvailable }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify HeyoSecret deployment secret references
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          public_host = os.environ.get("HEYO_PUBLIC_HOST", "").strip()
+          token = (
+              os.environ.get("HEYOSECRET_INTERNAL_API_KEY", "").strip()
+              or os.environ.get("ORCHESTRATOR_INTERNAL_API_KEY", "").strip()
+          )
+          if not public_host:
+              raise SystemExit("missing required configuration: HEYO_PUBLIC_HOST")
+          if not token:
+              raise SystemExit(
+                  "missing required configuration: HEYOSECRET_INTERNAL_API_KEY or ORCHESTRATOR_INTERNAL_API_KEY"
+              )
+          base_url = f"https://{public_host}/heyosecret"
+          for secret_path in ("heyosecret/database-url", "heyosecret/master-key"):
+              url = f"{base_url}/v1/secrets/metadata?{urllib.parse.urlencode({'path': secret_path})}"
+              request = urllib.request.Request(
+                  url,
+                  headers={"Authorization": f"Bearer {token}"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      metadata = json.load(response)
+              except urllib.error.HTTPError as error:
+                  raise SystemExit(
+                      f"required deployment secret {secret_path} is unavailable: HTTP {error.code}"
+                  ) from error
+              except (OSError, ValueError) as error:
+                  raise SystemExit(
+                      f"failed to verify required deployment secret {secret_path}: {error}"
+                  ) from error
+              if metadata.get("path") != secret_path:
+                  raise SystemExit(f"unexpected metadata response for deployment secret {secret_path}")
+              print(f"Verified deployment secret metadata: {secret_path}")
+          PY
+
+      - name: Plan public service deployment
+        run: |
+          set -eu
+          if [ "${TARGET_HEYO_SERVICE:?}" != "heyosecret" ]; then
+            echo "Unsupported public service target: ${TARGET_HEYO_SERVICE}" >&2
+            exit 1
+          fi
+          requested_service="${REQUESTED_HEYO_SERVICE:-${{ inputs.service }}}"
+          case "$requested_service" in
+            ""|all|heyosecret) ;;
+            *) echo "Unsupported requested public service: $requested_service" >&2; exit 1 ;;
+          esac
+          if [ "${CI_SOURCE:-}" = "git-submit-post-merge" ] && [ "${VALIDATED_SERVICE_ARTIFACTS_AVAILABLE:-0}" = "1" ]; then
+            printf 'USE_VALIDATED_SERVICE_ARTIFACTS=1\n' >> "$GITHUB_ENV"
+          else
+            printf 'USE_VALIDATED_SERVICE_ARTIFACTS=0\n' >> "$GITHUB_ENV"
+          fi
+
+      - name: Download validated service artifact
+        if: ${{ inputs.validatedServiceArtifactsAvailable == '1' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: selected-service-artifacts-${{ matrix.target }}
+          path: validated-selected-service-artifacts
+
+      - name: Restore validated HeyoSecret artifact
+        run: |
+          set -eu
+          if [ "${USE_VALIDATED_SERVICE_ARTIFACTS:-0}" != "1" ]; then
+            echo "Building HeyoSecret from this checkout."
+            exit 0
+          fi
+          manifest="$(find validated-selected-service-artifacts -path '*/manifest.json' -type f | head -1 || true)"
+          if [ -z "$manifest" ]; then
+            echo "Validated HeyoSecret artifact is missing manifest.json" >&2
+            exit 1
+          fi
+          bundle_dir="$(dirname "$manifest")"
+          archive_name="$(python3 - "$manifest" <<'PY'
+          import json
+          import sys
+
+          manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+          for artifact in manifest.get("artifacts", []):
+              if artifact.get("service") == "heyosecret":
+                  print(artifact.get("archiveName", ""))
+                  break
+          PY
+          )"
+          if [ -z "$archive_name" ] || [ ! -s "$bundle_dir/files/$archive_name" ]; then
+            echo "Validated artifact bundle does not contain the HeyoSecret service archive" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$bundle_dir/files/$archive_name" "dist/$archive_name"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test HeyoSecret
+        run: |
+          set -eu
+          if [ "${USE_VALIDATED_SERVICE_ARTIFACTS:-0}" = "1" ]; then
+            echo "Using the HeyoSecret artifact tested before merge."
+            exit 0
+          fi
+          cargo test --locked --manifest-path heyosecret/Cargo.toml
+
+      - name: Build HeyoSecret release binary
+        run: |
+          set -eu
+          if [ "${USE_VALIDATED_SERVICE_ARTIFACTS:-0}" = "1" ]; then
+            echo "Using the HeyoSecret artifact built before merge."
+            exit 0
+          fi
+          cargo build --locked --release --manifest-path heyosecret/Cargo.toml --bin heyosecret
+
+      - name: Package HeyoSecret service archive
+        run: |
+          set -eu
+          if [ "${USE_VALIDATED_SERVICE_ARTIFACTS:-0}" = "1" ]; then
+            echo "Using the restored HeyoSecret service archive."
+            exit 0
+          fi
+          rm -rf dist/heyo-heyosecret
+          mkdir -p dist/heyo-heyosecret/migrations
+          cp heyosecret/target/release/heyosecret dist/heyo-heyosecret/heyosecret
+          cp -R heyosecret/migrations/. dist/heyo-heyosecret/migrations/
+          cat > dist/heyo-heyosecret/start.sh <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+          export HEYOSECRET_SERVER_PORT="${HEYOSECRET_SERVER_PORT:-8080}"
+          export HEYOSECRET_MIGRATIONS_DIR="${HEYOSECRET_MIGRATIONS_DIR:-/workspace/migrations}"
+          : "${HEYO_SERVICE_LOG:=/workspace/service.log}"
+          touch "$HEYO_SERVICE_LOG" 2>/dev/null || true
+          exec >>"$HEYO_SERVICE_LOG" 2>&1
+          exec ./heyosecret
+          EOF
+          chmod +x dist/heyo-heyosecret/heyosecret dist/heyo-heyosecret/start.sh
+          tar -C dist/heyo-heyosecret -czf dist/heyo-heyosecret-linux.tar.gz .
+
+      - name: Prepare selected HeyoSecret artifact
+        run: |
+          set -eu
+          if [ "${USE_VALIDATED_SERVICE_ARTIFACTS:-0}" = "1" ]; then
+            echo "The validation artifact is already persisted."
+            exit 0
+          fi
+          archive="dist/heyo-heyosecret-linux.tar.gz"
+          test -s "$archive"
+          rm -rf dist/selected-service-artifacts
+          mkdir -p dist/selected-service-artifacts/files
+          cp "$archive" dist/selected-service-artifacts/files/heyo-heyosecret-linux.tar.gz
+          bytes="$(wc -c < "$archive" | tr -d ' ')"
+          python3 - "$bytes" <<'PY' > dist/selected-service-artifacts/manifest.json
+          import json
+          import os
+          import sys
+
+          print(json.dumps({
+              "schemaVersion": 1,
+              "gitSha": os.environ.get("GITHUB_SHA", ""),
+              "source": os.environ.get("CI_SOURCE", ""),
+              "artifacts": [{
+                  "service": "heyosecret",
+                  "archiveName": "heyo-heyosecret-linux.tar.gz",
+                  "sizeBytes": int(sys.argv[1]),
+              }],
+          }, separators=(",", ":")))
+          PY
+
+      - name: Upload selected HeyoSecret artifact
+        if: ${{ inputs.validatedServiceArtifactsAvailable != '1' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-service-artifacts-${{ matrix.target }}
+          path: dist/selected-service-artifacts
+
+      - name: Deploy HeyoSecret through Heyo orchestrator
+        run: |
+          set -eu
+          if [ "${CI_SOURCE:-}" = "git-submit" ]; then
+            echo "HeyoSecret was built and tested for git submit; cutover waits for the merged revision."
+            exit 0
+          fi
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+          import urllib.request
+          import uuid
+
+          def required_env(name):
+              value = os.environ.get(name, "").strip()
+              if not value:
+                  raise SystemExit(f"missing required configuration: {name}")
+              return value
+
+          def canonical_repository_url(value):
+              if value.startswith("git@github.com:"):
+                  return "https://github.com/" + value.removeprefix("git@github.com:")
+              if value.startswith("ssh://git@github.com/"):
+                  return "https://github.com/" + value.removeprefix("ssh://git@github.com/")
+              return value
+
+          def run_async_service_deploy(endpoint, internal_api_key, payload):
+              payload["async"] = True
+              accepted = subprocess.run([
+                  "curl", "--connect-timeout", "15", "--max-time", "420",
+                  "--fail-with-body", "--show-error", "--silent", "--request", "POST",
+                  "--header", f"Authorization: Bearer {internal_api_key}",
+                  "--header", "Content-Type: application/json", "--data-binary", "@-",
+                  f"{endpoint}/orchestration/services/deployments",
+              ], input=json.dumps(payload), text=True, capture_output=True)
+              if accepted.returncode != 0:
+                  print(accepted.stdout, end="")
+                  print(accepted.stderr, end="", file=sys.stderr)
+                  sys.exit(accepted.returncode)
+              response = json.loads(accepted.stdout or "{}")
+              deployment_id = response.get("deploymentId") or payload["deploymentId"]
+              status_url = response.get("statusUrl") or f"/orchestration/services/deployments/{deployment_id}"
+              if status_url.startswith("/"):
+                  status_url = endpoint + status_url
+              print(f"Accepted HeyoSecret deployment {deployment_id}; polling {status_url}", flush=True)
+              seen_event_ids = set()
+              deadline = time.monotonic() + 1200
+              last_progress = time.monotonic()
+              while time.monotonic() < deadline:
+                  poll = subprocess.run([
+                      "curl", "--connect-timeout", "15", "--max-time", "30",
+                      "--fail-with-body", "--show-error", "--silent",
+                      "--header", f"Authorization: Bearer {internal_api_key}", status_url,
+                  ], text=True, capture_output=True)
+                  if poll.returncode != 0:
+                      if time.monotonic() - last_progress > 180:
+                          print(poll.stderr, end="", file=sys.stderr)
+                          raise SystemExit(f"HeyoSecret deployment {deployment_id} status polling stalled")
+                      time.sleep(5)
+                      continue
+                  status = json.loads(poll.stdout or "{}")
+                  for event in status.get("events") or []:
+                      event_id = event.get("id")
+                      if event_id in seen_event_ids:
+                          continue
+                      seen_event_ids.add(event_id)
+                      last_progress = time.monotonic()
+                      print(f"[{event.get('status')}] {event.get('phase')}: {event.get('message')}", flush=True)
+                      if event.get("errorMessage"):
+                          print(event["errorMessage"], flush=True)
+                  if status.get("status") in {"passed", "completed", "succeeded"}:
+                      return
+                  if status.get("status") in {"failed", "error"}:
+                      raise SystemExit(json.dumps(status, indent=2)[-4000:])
+                  if time.monotonic() - last_progress > 180:
+                      raise SystemExit(f"HeyoSecret deployment {deployment_id} made no durable progress")
+                  time.sleep(5)
+              raise SystemExit(f"HeyoSecret deployment {deployment_id} exceeded the workflow deadline")
+
+          public_host = required_env("HEYO_PUBLIC_HOST")
+          endpoint = (os.environ.get("ORCHESTRATOR_URL") or f"https://{public_host}/orchestrator").rstrip("/")
+          orchestrator_key = required_env("ORCHESTRATOR_INTERNAL_API_KEY")
+          heyosecret_key = os.environ.get("HEYOSECRET_INTERNAL_API_KEY") or orchestrator_key
+          repository_url = canonical_repository_url(required_env("CI_REPO_URL"))
+          archive_path = "dist/heyo-heyosecret-linux.tar.gz"
+          archive = base64.b64encode(open(archive_path, "rb").read()).decode()
+          git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          deployment_id = f"svc-secret-{uuid.uuid4().hex[:12]}"
+          route = {
+              "host": public_host,
+              "pathPrefix": "/heyosecret",
+              "entryPoints": ["websecure"],
+              "stripPrefix": True,
+              "passHostHeader": False,
+              "priority": 10010,
+          }
+          if os.environ.get("HEYO_TRAEFIK_CERT_RESOLVER"):
+              route["certResolver"] = os.environ["HEYO_TRAEFIK_CERT_RESOLVER"]
+          payload = {
+              "serviceId": "heyosecret",
+              "deploymentId": deployment_id,
+              "userId": os.environ.get("HEYO_SERVICE_USER_ID", "heyo-system"),
+              "accountId": os.environ.get("HEYO_SERVICE_ACCOUNT_ID", "heyo-system"),
+              "name": "heyo-heyosecret",
+              "archiveName": "heyo-heyosecret-linux.tar.gz",
+              "archiveBytesBase64": archive,
+              "region": os.environ.get("HEYO_SERVICE_REGION") or "EU",
+              "driver": os.environ.get("HEYO_SERVICE_DRIVER", "libvirt"),
+              "image": os.environ.get("HEYO_SERVICE_IMAGE", "ubuntu:24.04"),
+              "ports": [8080],
+              "workingDirectory": "/workspace",
+              "startCommand": "./start.sh",
+              "sizeClass": os.environ.get("HEYO_SERVICE_SIZE_CLASS", "small"),
+              "ttlSeconds": 0,
+              "healthPath": "/health",
+              "healthTimeoutSeconds": 900,
+              "drainSeconds": 30,
+              "retirePrevious": True,
+              "retirePreviousAsync": True,
+              "deletePrevious": True,
+              "metadata": {
+                  "gitSha": git_sha,
+                  "gitRef": os.environ.get("GITHUB_REF", ""),
+                  "repositoryUrl": repository_url,
+                  "workflow": "Deploy Heyo public services",
+              },
+              "revisionGuard": {
+                  "repositoryUrl": repository_url,
+                  "ref": required_env("CI_REF"),
+                  "expectedSha": required_env("CI_AFTER"),
+                  "force": os.environ.get("FORCE_STALE_SERVICE_DEPLOY", "").lower() in {"1", "true"},
+              },
+              "env": {
+                  "HEYOSECRET_SERVER_PORT": "8080",
+                  "HEYOSECRET_INTERNAL_API_KEY": heyosecret_key,
+                  "HEYOSECRET_MIGRATIONS_DIR": "/workspace/migrations",
+                  "HEYOSECRET_COOKIE_SECURE": "true",
+              },
+              "envRefs": [
+                  "HEYOSECRET_DATABASE_URL=heyosecret://heyosecret/database-url@active",
+                  "HEYOSECRET_MASTER_KEY=heyosecret://heyosecret/master-key@active",
+              ],
+              "route": route,
+          }
+          print("::heyo-cleanup-target::" + json.dumps({
+              "deploymentId": deployment_id,
+              "serviceId": "heyosecret",
+              "name": "heyo-heyosecret",
+              "resourceType": "service-candidate",
+              "reason": "HeyoSecret deploy failed before the candidate became active",
+          }), flush=True)
+          run_async_service_deploy(endpoint, orchestrator_key, payload)
+
+          checks = [
+              (f"https://{public_host}/heyosecret/health", lambda body: json.loads(body).get("status") == "ok"),
+              (f"https://{public_host}/heyosecret/dashboard/api/session", lambda body: "dashboardEnabled" in json.loads(body)),
+          ]
+          for url, valid in checks:
+              deadline = time.monotonic() + 180
+              last_error = "not checked"
+              while time.monotonic() < deadline:
+                  try:
+                      with urllib.request.urlopen(url, timeout=10) as response:
+                          body = response.read().decode()
+                      if valid(body):
+                          break
+                      last_error = f"unexpected response: {body[:300]}"
+                  except Exception as error:
+                      last_error = str(error)
+                  time.sleep(5)
+              else:
+                  raise SystemExit(f"public HeyoSecret verification failed for {url}: {last_error}")
+          print(f"HeyoSecret {git_sha} is healthy at https://{public_host}/heyosecret/health")
+          PY
