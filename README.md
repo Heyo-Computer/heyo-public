@@ -1,25 +1,45 @@
 # Heyo Public
 
-This is the public Heyo monorepo. It contains the open-source `printer` code
-factory CLI, supporting CLIs, plugins, examples, docs, and reusable agent
-skills.
+This is the public Heyo monorepo. It contains Heyo's open-source orchestrator,
+secrets service, `printer` code factory CLI, supporting CLIs, plugins, examples,
+docs, and reusable agent skills.
 
 ## Repository layout
 
 - `printer/` — core CLI that manages agent sessions against a spec file.
 - `computer/` — CLI for programmatic desktop interactions on Linux/Wayland.
 - `codegraph/` — tree-sitter based code graph, search, and patch tooling.
+- `orchestrator/` — control plane for sandboxes, service deployments, and agent-driven workflows.
 - `heyosecret/` — single-tenant encrypted secrets store with a machine API and a web dashboard for inspecting/managing secrets.
+- `heyosecret-client/` — Rust client used by the orchestrator to resolve service secret references.
 - `plugins/` — printer plugins for agent integrations, codegraph, heyvm, and related tooling.
 - `skills/` — reusable public agent skills. The top-level catalog is intentionally small: `heyvm` and `git-submit`.
 - `examples/` — example projects and specs.
 
-HeyoSecret is also deployed from this repository. Its repo-local Heyo workflow
-builds and validates the service, then uses the shared CICD and orchestrator
-APIs to update the stable `/heyosecret` service route. The deployment boundary
-is repository-independent so additional open-source platform services can move
-here without moving their build or release ownership back to the private
-monorepo.
+HeyoSecret and orchestrator are built, validated, and deployed from this
+repository. The repo-local Heyo workflow uses the external Heyo CICD service
+and the orchestrator API to update their stable service routes. CICD remains a
+private consumer of orchestrator and is not published from this repository.
+
+## Platform services
+
+Each Rust service has its own lockfile and can be checked independently:
+
+```sh
+cargo test --locked --manifest-path heyosecret/Cargo.toml
+cargo test --locked --manifest-path heyosecret-client/Cargo.toml
+cargo test --locked --manifest-path orchestrator/Cargo.toml
+```
+
+See [`orchestrator/README.md`](orchestrator/README.md) for configuration, local
+run instructions, and service relationships. Public design references include:
+
+- [`docs/ORCHESTRATOR_DESIGN.md`](docs/ORCHESTRATOR_DESIGN.md)
+- [`docs/HEYO_AI_ORCHESTRATION_SERVICE_SPEC.md`](docs/HEYO_AI_ORCHESTRATION_SERVICE_SPEC.md)
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
 
 ## Printer
 

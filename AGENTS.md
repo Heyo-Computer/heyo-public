@@ -21,3 +21,10 @@
 - lint: `cargo clippy`
 - format: `cargo fmt`
 - test: `cargo test`
+
+## Platform services
+- paths: `heyosecret/`, `heyosecret-client/`, `orchestrator/`
+- build: `cargo build --locked --manifest-path <path>/Cargo.toml`
+- check: `cargo check --locked --manifest-path <path>/Cargo.toml`
+- test: `cargo test --locked --manifest-path <path>/Cargo.toml`
+- format check: `cargo fmt --manifest-path <path>/Cargo.toml -- --check`
