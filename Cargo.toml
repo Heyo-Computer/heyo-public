@@ -59,6 +59,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # (heyo/mvm-ctrl/src/bundles.rs:93-106), so the flock semantics match.
 fs2 = "0.4"
 
+# Packing a Docker build context into the `context.tar.gz` of a Dockerfile
+# manifest. `tar` brings only `filetime`/`libc`, both already here; `flate2`
+# defaults to the pure-Rust backend and pulls no C. Used by `art dockerfile
+# put --context <dir>` and nothing else — the store itself never looks inside
+# a blob.
+tar = "0.4"
+flate2 = "1"
+
 # -- daemon feature ---------------------------------------------------------
 # axum 0.8, matching vault (path params are `{name}`, not `:name`). This is a
 # separate process from app-lb, so its axum 0.7 is not a conflict.

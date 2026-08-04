@@ -137,7 +137,7 @@ pub fn router(state: ServeState) -> Router {
         .route("/manifests/{reference}", get(get_manifest))
         .route("/manifests", put(put_manifest))
         .route("/tags", get(list_tags))
-        .route("/tags/{name}", put(put_tag).delete(delete_tag))
+        .route("/tags/{name}", get(get_tag).put(put_tag).delete(delete_tag))
         .route("/usage", get(get_usage))
         .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT))
         .with_state(state.clone());
@@ -375,6 +375,22 @@ async fn list_tags(State(st): State<ServeState>) -> Result<Response, ApiError> {
         .map(|(t, d)| serde_json::json!({"tag": t.as_str(), "digest": d.as_str()}))
         .collect();
     Ok(Json(body).into_response())
+}
+
+/// What one tag points at.
+///
+/// A client that only wants a single tag had to `GET /tags` and filter, which
+/// grows with the store rather than with the question. It matters because a tag
+/// may name a *blob* rather than a manifest — `art put --tag` does exactly that
+/// — so "resolve this reference" cannot always be answered by
+/// `GET /manifests/{ref}`, and the fallback should not be a full listing.
+async fn get_tag(
+    State(st): State<ServeState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let t = TagName::parse(&name).map_err(Error::from)?;
+    let d = st.store.get_tag(&t).await?;
+    Ok(Json(serde_json::json!({"tag": t.as_str(), "digest": d.as_str()})).into_response())
 }
 
 async fn put_tag(
@@ -768,6 +784,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn one_tag_can_be_read_without_listing_them_all() {
+        let d = tmpdir();
+        let (app, store) = app(&d, None, false);
+        let info = store.insert_bytes(b"tagged".to_vec()).await.unwrap();
+        store
+            .set_tag(&TagName::parse("web").unwrap(), &info.digest)
+            .await
+            .unwrap();
+
+        let r = app
+            .clone()
+            .oneshot(HttpRequest::get("/tags/web").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["tag"], "web");
+        assert_eq!(v["digest"], info.digest.as_str());
+
+        let r = app
+            .clone()
+            .oneshot(HttpRequest::get("/tags/absent").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        // A name the store would never write is a bad request, not a 404.
+        let r = app
+            .oneshot(HttpRequest::get("/tags/.hidden").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_dockerfile_manifest_round_trips_over_http() {
+        // The push path serverctl uses: PUT the blobs, PUT the manifest, move a
+        // tag onto it, and read the whole thing back by tag.
+        let d = tmpdir();
+        let (app, store) = app(&d, None, false);
+        let recipe = store
+            .insert_bytes(b"FROM debian\nRUN true\n".to_vec())
+            .await
+            .unwrap();
+        let m = crate::dockerfile::manifest_for(
+            &recipe,
+            None,
+            &crate::dockerfile::Options {
+                image_name: Some("web".into()),
+                size_mb: Some(2048),
+                source: None,
+            },
+        );
+
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::put("/manifests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(m.to_canonical_json()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let digest = serde_json::from_str::<serde_json::Value>(&body_string(r).await).unwrap()
+            ["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        app.clone()
+            .oneshot(
+                HttpRequest::put("/tags/web-recipe")
+                    .body(Body::from(digest))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let r = app
+            .oneshot(
+                HttpRequest::get("/manifests/web-recipe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let back: Manifest = serde_json::from_str(&body_string(r).await).unwrap();
+        assert!(crate::dockerfile::is_dockerfile(&back));
+        assert_eq!(
+            crate::dockerfile::dockerfile_entry(&back).unwrap().digest,
+            recipe.digest
+        );
+        assert_eq!(crate::dockerfile::size_mb(&back), Some(2048));
     }
 
     #[tokio::test]

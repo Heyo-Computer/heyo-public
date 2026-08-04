@@ -114,8 +114,12 @@ art put <file|-> [--squash] [--tag NAME]    art get <ref> -o FILE [--writable]
 art cat <ref>                               art stat <ref>
 art ls [--blobs|--tags|--manifests]         art usage
 art tag <name> <ref>                        art untag <name>
-art rm <ref> [--force]                      art verify [<ref>|--all]
-art gc [--dry-run] [--min-age 1h]
+art manifest <ref>                          art rm <ref> [--force]
+art verify [<ref>|--all]                    art gc [--dry-run] [--min-age 1h]
+
+art dockerfile put <path> [--context DIR|ARCHIVE] [--tag NAME]
+                          [--image-name NAME] [--size-mb N] [--source TEXT]
+art dockerfile show <ref>                   art dockerfile export <ref> <dir>
 
 art heyvm sparsify [names...] [--dry-run] [--no-verify]
 art heyvm import [names...|--all]
@@ -126,6 +130,54 @@ art serve [--listen ADDR] [--api-key KEY] [--read-only]
 ```
 
 `--json` on any command. Exit codes: `1` failure, `2` bad usage, `3` out of space.
+
+## Dockerfiles
+
+Every other manifest kind here describes a build **output**. `heyvm.dockerfile.v1`
+describes a build **input** — the recipe that defines a rootfs, plus the files it
+copies from:
+
+```
+art dockerfile put ./Dockerfile --context ./app --tag web-rootfs \
+    --image-name web --size-mb 4096
+```
+
+```
+kind: heyvm.dockerfile.v1
+entries:
+  Dockerfile        required
+  context.tar.gz    optional; omit for a recipe that copies nothing in
+annotations:
+  heyvm.image       default name for the image this builds
+  heyvm.size_mb     default `heyvm mvm build --size-mb`
+  dockerfile.source provenance, free-form
+```
+
+The tag lands on the manifest, not on either blob — the manifest is what carries
+the annotations, and a tag on the recipe alone would resolve to a Dockerfile with
+no context and no image name.
+
+The store does not build it. It has no Docker, no heyvm and no opinion about what
+a `RUN` line means; app-lb's `image-build` job fetches this manifest, unpacks it
+and drives `heyvm mvm build`. What the store contributes is the address: a
+manifest digest covers the recipe, the context *and* the annotations, so "which
+inputs produced this image" has an answer that a moving tag cannot change
+underneath.
+
+Two consequences worth stating plainly:
+
+- **The context is one blob, not one blob per file.** A build context is consumed
+  whole and exactly once, so per-file addressing buys nothing at read time and
+  costs an inode and a `link` per file at write time. The price is that changing
+  one byte re-uploads all of it.
+- **Nothing is excluded.** No `.dockerignore` handling, no built-in skip list. A
+  packer that silently dropped files would produce a build that fails on a host
+  nobody is watching, with an error pointing at the Dockerfile rather than at the
+  packer. Point `--context` at a clean directory, or pack it yourself and pass the
+  archive.
+
+Packing is deterministic (`tar::HeaderMode::Deterministic`), so re-pushing an
+unchanged tree lands on the same digest and uploads nothing.
 
 ## Serving
 

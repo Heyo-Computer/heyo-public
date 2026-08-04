@@ -28,6 +28,12 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const KIND_ROOTFS: &str = "heyvm.rootfs.v1";
 /// Kind string for an imported heyvm sync bundle.
 pub const KIND_BUNDLE: &str = "heyvm.bundle.v1";
+/// Kind string for a Dockerfile that *defines* a rootfs, rather than a rootfs.
+///
+/// The one manifest kind whose entries are a build input instead of a build
+/// output: nothing here is bootable, and a consumer is expected to run a build
+/// over it. See [`crate::dockerfile`].
+pub const KIND_DOCKERFILE: &str = "heyvm.dockerfile.v1";
 /// Kind string for a plain collection of files.
 pub const KIND_GENERIC: &str = "generic";
 

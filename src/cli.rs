@@ -16,7 +16,7 @@ use crate::store::{BlobInfo, Materialize, Store};
 use crate::sys::sparse::Shape;
 use crate::tags::{Ref, TagName};
 use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
@@ -80,6 +80,13 @@ pub enum Command {
     },
     /// Show one blob's size, allocation and link count.
     Stat { reference: String },
+    /// Print a manifest as JSON.
+    ///
+    /// The read half of `put-manifest`, and the only way to see what a tag
+    /// points *at* rather than what it resolves *to*. A consumer driving `art`
+    /// as a subprocess uses this to find a manifest's entries without needing
+    /// the store's HTTP daemon.
+    Manifest { reference: String },
     /// Point a tag at a digest.
     Tag { name: String, reference: String },
     /// Remove a tag. The blob it named becomes collectable.
@@ -144,6 +151,9 @@ pub enum Command {
         )]
         dashboard_open: bool,
     },
+    /// Dockerfiles that define a rootfs.
+    #[command(subcommand)]
+    Dockerfile(DockerfileCommand),
     /// heyvm integration.
     #[command(subcommand)]
     Heyvm(HeyvmCommand),
@@ -158,6 +168,45 @@ pub struct LsWhat {
     pub tags: bool,
     #[arg(long)]
     pub manifests: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DockerfileCommand {
+    /// Store a Dockerfile (and optionally its build context) as a manifest, and
+    /// tag it.
+    ///
+    /// The manifest is a build *input*, not an image: nothing here is bootable.
+    /// app-lb's `build.store` points at one of these and runs
+    /// `heyvm mvm build` over it.
+    Put {
+        /// Path to the Dockerfile.
+        path: PathBuf,
+        /// Build context: a directory to pack, or an existing `.tar`/`.tar.gz`.
+        /// Omit for a recipe that copies nothing in.
+        #[arg(long)]
+        context: Option<PathBuf>,
+        /// Tag to point at the manifest.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Default name for the image this builds.
+        #[arg(long)]
+        image_name: Option<String>,
+        /// Default rootfs size in megabytes, for `heyvm mvm build --size-mb`.
+        #[arg(long)]
+        size_mb: Option<u64>,
+        /// Provenance note. Part of the manifest's address, so two pushes that
+        /// differ only here are two manifests.
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Show what a Dockerfile manifest holds.
+    Show { reference: String },
+    /// Write a Dockerfile manifest's entries into a directory.
+    ///
+    /// Produces `<dir>/Dockerfile` and, when the manifest has one,
+    /// `<dir>/context.tar.gz`. Unpacking the archive is left to the caller —
+    /// the rules for what an archive may contain belong to whoever runs it.
+    Export { reference: String, dir: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -303,6 +352,26 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        Command::Manifest { reference } => {
+            let d = store.resolve(&parse_ref(&reference)?).await?;
+            let m = store.get_manifest(&d).await?;
+            if json {
+                // The manifest itself, not a wrapper: a caller parsing this
+                // wants the same shape `GET /manifests/{ref}` answers with, so
+                // one consumer can be written against both transports.
+                print_json(&serde_json::to_value(&m).expect("a Manifest is always serializable"));
+            } else {
+                println!("digest     {d}");
+                println!("kind       {}", m.kind);
+                for e in &m.entries {
+                    println!("entry      {}  {}  {}", e.name, e.digest, human(e.size));
+                }
+                for (k, v) in &m.annotations {
+                    println!("annotation {k}={v}");
+                }
+            }
+        }
+
         Command::Tag { name, reference } => {
             let t = TagName::parse(&name)?;
             let d = store.resolve(&parse_ref(&reference)?).await?;
@@ -433,9 +502,191 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await?;
         }
 
+        Command::Dockerfile(cmd) => run_dockerfile(&store, cmd, json).await?,
+
         Command::Heyvm(cmd) => run_heyvm(&store, &config, cmd, json).await?,
     }
     Ok(())
+}
+
+async fn run_dockerfile(store: &Store, cmd: DockerfileCommand, json: bool) -> Result<()> {
+    use crate::dockerfile;
+
+    match cmd {
+        DockerfileCommand::Put {
+            path,
+            context,
+            tag,
+            image_name,
+            size_mb,
+            source,
+        } => {
+            // Resolved before anything is packed or stored: a tag the store
+            // would refuse should not cost a full context pack first.
+            let tag = tag.map(|t| TagName::parse(&t)).transpose()?;
+
+            // A directory is packed into the store's own scratch, not `/tmp`:
+            // a context can be gigabytes and `/tmp` is often a small tmpfs, and
+            // packing beside the store keeps the insert on one filesystem.
+            let packed = match &context {
+                Some(c) if c.is_dir() => {
+                    let dest = Scratch::new(
+                        store
+                            .tmp_dir()
+                            .join(format!(".context.{}.tar.gz", std::process::id())),
+                    );
+                    let size = dockerfile::pack_context(c, dest.path())?;
+                    if !json {
+                        eprintln!("packed {} into {}", c.display(), human(size));
+                    }
+                    Some(dest)
+                }
+                _ => None,
+            };
+            let archive = match (&packed, &context) {
+                (Some(p), _) => Some(p.path()),
+                (None, Some(c)) => Some(c.as_path()),
+                (None, None) => None,
+            };
+
+            let stored = dockerfile::put(
+                store,
+                &path,
+                archive,
+                tag,
+                // `source` is left unset unless asked for. Defaulting it to the
+                // Dockerfile's path would put the pushing machine's directory
+                // layout into the manifest's address, so the same recipe pushed
+                // from two checkouts would be two manifests that dedupe to one
+                // blob and no further.
+                &dockerfile::Options {
+                    image_name,
+                    size_mb,
+                    source,
+                },
+            )
+            .await?;
+
+            if json {
+                print_json(&serde_json::json!({
+                    "manifest": stored.manifest.as_str(),
+                    "dockerfile": blob_json(&stored.dockerfile),
+                    "context": stored.context.as_ref().map(blob_json),
+                    "tag": stored.tag.as_ref().map(TagName::as_str),
+                }));
+            } else {
+                println!("manifest   {}", stored.manifest);
+                println!(
+                    "Dockerfile {}  {}",
+                    stored.dockerfile.digest,
+                    human(stored.dockerfile.size)
+                );
+                match &stored.context {
+                    Some(c) => println!("context    {}  {}", c.digest, human(c.size)),
+                    None => println!("context    (none)"),
+                }
+                if let Some(t) = &stored.tag {
+                    println!("tag        {t}");
+                }
+            }
+        }
+
+        DockerfileCommand::Show { reference } => {
+            let d = store.resolve(&parse_ref(&reference)?).await?;
+            let m = store.get_manifest(&d).await?;
+            if !dockerfile::is_dockerfile(&m) {
+                return Err(Error::Io {
+                    context: format!(
+                        "{reference} is a {:?} manifest, not {:?}",
+                        m.kind,
+                        crate::manifest::KIND_DOCKERFILE
+                    ),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "wrong manifest kind",
+                    ),
+                });
+            }
+            let df = dockerfile::dockerfile_entry(&m)?;
+            let ctx = dockerfile::context_entry(&m);
+
+            if json {
+                print_json(&serde_json::json!({
+                    "manifest": d.as_str(),
+                    "kind": m.kind,
+                    "dockerfile": {"digest": df.digest.as_str(), "size": df.size},
+                    "context": ctx.map(|c| serde_json::json!({
+                        "digest": c.digest.as_str(),
+                        "size": c.size,
+                    })),
+                    "imageName": dockerfile::image_name(&m),
+                    "sizeMb": dockerfile::size_mb(&m),
+                    "annotations": m.annotations,
+                }));
+            } else {
+                println!("manifest   {d}");
+                println!("Dockerfile {}  {}", df.digest, human(df.size));
+                match ctx {
+                    Some(c) => println!("context    {}  {}", c.digest, human(c.size)),
+                    None => println!("context    (none — this recipe copies nothing in)"),
+                }
+                if let Some(n) = dockerfile::image_name(&m) {
+                    println!("image name {n}");
+                }
+                if let Some(mb) = dockerfile::size_mb(&m) {
+                    println!("size       {mb} MB");
+                }
+            }
+        }
+
+        DockerfileCommand::Export { reference, dir } => {
+            let e = dockerfile::export(store, &parse_ref(&reference)?, &dir).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "manifest": e.manifest.as_str(),
+                    "dockerfile": {
+                        "path": e.dockerfile.path,
+                        "digest": e.dockerfile.digest.as_str(),
+                        "method": e.dockerfile.method.to_string(),
+                        "bytesWritten": e.dockerfile.bytes_written,
+                    },
+                    "context": e.context.as_ref().map(|c| serde_json::json!({
+                        "path": c.path,
+                        "digest": c.digest.as_str(),
+                        "method": c.method.to_string(),
+                        "bytesWritten": c.bytes_written,
+                    })),
+                }));
+            } else {
+                println!("{}  ({})", e.dockerfile.path.display(), e.dockerfile.method);
+                if let Some(c) = &e.context {
+                    println!("{}  ({})", c.path.display(), c.method);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A file removed on drop. For something staged on the way into the store,
+/// where every early return between "packed" and "inserted" would otherwise
+/// leave it behind in the store's scratch directory.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(path: PathBuf) -> Self {
+        Scratch(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 async fn list(store: &Store, what: &LsWhat, json: bool) -> Result<()> {
@@ -825,6 +1076,45 @@ mod tests {
             }
             other => panic!("expected Materialize, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dockerfile_subcommands_parse() {
+        let cli = Cli::try_parse_from([
+            "art",
+            "dockerfile",
+            "put",
+            "./Dockerfile",
+            "--context",
+            "./app",
+            "--tag",
+            "web-rootfs",
+            "--size-mb",
+            "4096",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Dockerfile(DockerfileCommand::Put {
+                path,
+                context,
+                tag,
+                size_mb,
+                ..
+            }) => {
+                assert_eq!(path, PathBuf::from("./Dockerfile"));
+                assert_eq!(context, Some(PathBuf::from("./app")));
+                assert_eq!(tag.as_deref(), Some("web-rootfs"));
+                assert_eq!(size_mb, Some(4096));
+            }
+            other => panic!("expected Dockerfile Put, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["art", "dockerfile", "export", "web-rootfs", "/tmp/b"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Dockerfile(DockerfileCommand::Export { .. })
+        ));
     }
 
     #[test]

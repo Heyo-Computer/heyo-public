@@ -162,6 +162,17 @@ impl Store {
         self.inner.blob_path(d)
     }
 
+    /// The store's scratch directory.
+    ///
+    /// Exposed so a caller staging something it is about to insert — a packed
+    /// build context, say — can put it on the store's own filesystem. Writing it
+    /// to `/tmp` instead risks a `tmpfs` far smaller than the thing being
+    /// packed, and makes the subsequent insert a cross-filesystem copy. Anything
+    /// left here is the caller's to remove.
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.inner.tmp_dir()
+    }
+
     // -- blobs -------------------------------------------------------------
 
     /// Insert a file, hashing its full logical content and storing it as
