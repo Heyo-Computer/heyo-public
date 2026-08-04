@@ -195,11 +195,18 @@ pub struct VmSpec {
     pub ttl_seconds: u64,
 }
 
-/// Where a managed deployment's image is built from.
+/// Where a managed deployment's image is built from: a git checkout, or a
+/// Dockerfile manifest in an artifact store. Exactly one of `repo` and `store`
+/// is set.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct BuildSpec {
+    /// Empty when the recipe comes from `store`. A `String` rather than an
+    /// `Option` because `#[serde(default)]` already renders an absent field
+    /// empty, and every read of it on this side is a display.
     pub repo: String,
+    /// Empty when the recipe comes from `repo`.
+    pub store: String,
     #[serde(rename = "ref")]
     pub git_ref: Option<String>,
     pub dockerfile: Option<String>,
@@ -210,8 +217,28 @@ pub struct BuildSpec {
 }
 
 impl BuildSpec {
-    /// One column: `github.com/acme/web@main`.
+    /// One column: `github.com/acme/web@main`, or `art:8080/web-rootfs` when the
+    /// recipe comes out of a store.
+    ///
+    /// The store form deliberately reads like [`ArtifactSpec::summary`] rather
+    /// than like the git form: the two share the SOURCE column, and what a
+    /// reader scanning a fleet wants from it is *where this came from*. Which
+    /// column it appears in already says whether it is built or pulled.
     pub fn summary(&self) -> String {
+        if !self.store.is_empty() {
+            let store = self
+                .store
+                .trim_end_matches('/')
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            return match &self.git_ref {
+                Some(r) => format!("{store}/{r}"),
+                // Refused by the server, so only reachable from a hand-edited
+                // state file. Rendered rather than panicked on: a listing is how
+                // somebody would find that out.
+                None => format!("{store}/(no ref)"),
+            };
+        }
         let repo = self
             .repo
             .trim_end_matches(".git")
@@ -399,6 +426,43 @@ pub struct SecretSummary {
     pub keys: Vec<String>,
     pub updated_at: u64,
     pub encrypted_at_rest: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// -- GET /workflows, GET /workflows/:id ------------------------------------
+
+/// A CI workflow object.
+///
+/// Lenient like every other read type here: unknown fields land in `extra`, and
+/// `tests/wire_contract.rs` asserts `extra` is empty against app-lb's own
+/// fixture. That assertion is the only thing that catches a field this struct
+/// stopped understanding — to a defaulting deserializer, an unknown field and an
+/// absent one are the same thing.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct WorkflowView {
+    pub id: String,
+    pub repo: String,
+    /// `ref` on the wire; a Rust keyword here.
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    pub path: String,
+    pub network: String,
+    /// A reference to a stored secret, never a value.
+    pub auth: Option<Value>,
+    pub secrets_prefix: Option<String>,
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /workflows` is enveloped so it can grow a cursor later without that
+/// being a breaking change.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct WorkflowList {
+    pub workflows: Vec<WorkflowView>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -879,6 +943,23 @@ mod tests {
             default_branch.summary(),
             "git@github.com:acme/web@(default branch)"
         );
+
+        // A recipe out of a store reads like the store column, not like a repo:
+        // both share SOURCE, and which column it lands in already says whether
+        // this is built or pulled.
+        let from_store = BuildSpec {
+            store: "http://art.internal:8080".into(),
+            git_ref: Some("web-rootfs".into()),
+            ..Default::default()
+        };
+        assert_eq!(from_store.summary(), "art.internal:8080/web-rootfs");
+
+        // `store` wins over an empty `repo` without either being an Option: an
+        // absent field is empty under #[serde(default)], and that is the whole
+        // signal.
+        let parsed: BuildSpec =
+            serde_json::from_str(r#"{"store":"/srv/artifacts","ref":"web"}"#).unwrap();
+        assert_eq!(parsed.summary(), "/srv/artifacts/web");
     }
 
     #[test]

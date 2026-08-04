@@ -29,7 +29,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +45,21 @@ const ANN_PRIMITIVE: &str = "heyvm.primitive";
 const ANN_IMAGE: &str = "heyvm.image";
 const ANN_NOMINAL_SIZE: &str = "heyvm.nominal_size";
 const PRIMITIVE_EXT4_RAW: &str = "ext4_raw";
+
+/// The Dockerfile manifest, from the same source. A recipe rather than an
+/// image: app-lb's `build.store` names one of these and builds it, where
+/// `artifact.ref` names a rootfs and boots it.
+const KIND_DOCKERFILE: &str = "heyvm.dockerfile.v1";
+const DOCKERFILE_ENTRY: &str = "Dockerfile";
+const CONTEXT_ENTRY: &str = "context.tar.gz";
+const ANN_SIZE_MB: &str = "heyvm.size_mb";
+const ANN_SOURCE: &str = "dockerfile.source";
+
+/// Ceiling on the Dockerfile itself, matching the store's own. A recipe is
+/// kilobytes; something claiming otherwise is most often a whole build context
+/// passed where the Dockerfile was meant, and catching it here beats uploading
+/// it and being refused.
+const MAX_DOCKERFILE_BYTES: u64 = 1 << 20;
 
 /// Read size for the hashing pass. Large enough that the syscall overhead
 /// disappears against a multi-gigabyte file.
@@ -302,6 +317,103 @@ pub fn rootfs_manifest(digest: &str, size: u64, image: &str) -> Value {
     })
 }
 
+/// The manifest `art dockerfile put` writes, byte for byte.
+///
+/// Matching it matters for the same reason [`rootfs_manifest`] does, one layer
+/// up: app-lb finds the recipe by looking for the entry called `Dockerfile` and
+/// the context by looking for `context.tar.gz`, and reads `heyvm.size_mb` as a
+/// build default. A manifest that merely *contained* the two blobs would push
+/// fine and then be unbuildable.
+///
+/// Annotations are omitted when unset rather than emitted empty: the manifest is
+/// content-addressed, so an empty string is a different address from an absent
+/// key, and re-pushing an unchanged recipe must land on the manifest already
+/// there.
+pub fn dockerfile_manifest(
+    dockerfile: (&str, u64),
+    context: Option<(&str, u64)>,
+    image_name: Option<&str>,
+    size_mb: Option<u64>,
+    source: Option<&str>,
+) -> Value {
+    let mut entries = vec![json!({
+        "name": DOCKERFILE_ENTRY,
+        "digest": dockerfile.0,
+        "size": dockerfile.1,
+    })];
+    if let Some((digest, size)) = context {
+        entries.push(json!({ "name": CONTEXT_ENTRY, "digest": digest, "size": size }));
+    }
+
+    let mut annotations = serde_json::Map::new();
+    if let Some(n) = image_name {
+        annotations.insert(ANN_IMAGE.into(), Value::String(n.to_string()));
+    }
+    if let Some(mb) = size_mb {
+        // A string, like every annotation: the store's annotations are a map of
+        // strings and a number here would not round-trip.
+        annotations.insert(ANN_SIZE_MB.into(), Value::String(mb.to_string()));
+    }
+    if let Some(s) = source {
+        annotations.insert(ANN_SOURCE.into(), Value::String(s.to_string()));
+    }
+
+    json!({
+        "schema": SCHEMA_VERSION,
+        "kind": KIND_DOCKERFILE,
+        "entries": entries,
+        "annotations": annotations,
+    })
+}
+
+/// Pack `dir` into a gzipped tar at `dest`, and report its size.
+///
+/// Deterministic headers, so the same tree packs to the same bytes and a
+/// re-push of an unchanged context is a `HEAD` and nothing else. Every file is
+/// included — no `.dockerignore` handling and no built-in exclusions — because a
+/// packer that silently dropped files would produce a build that fails on
+/// somebody else's host with an error pointing at the Dockerfile. Point
+/// `--context` at a clean directory, or pack it yourself and pass the archive.
+///
+/// Symlinks are followed and stored as their content, which is what keeps the
+/// archive unpackable under app-lb's "no links" rule at the other end.
+pub fn pack_context(dir: &Path, dest: &Path) -> Result<u64> {
+    if !dir.is_dir() {
+        bail!("build context {} is not a directory", dir.display());
+    }
+    let out = std::fs::File::create(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let gz = flate2::write::GzEncoder::new(out, flate2::Compression::default());
+    let mut builder = tar::Builder::new(gz);
+    builder.mode(tar::HeaderMode::Deterministic);
+    builder
+        .append_dir_all(".", dir)
+        .with_context(|| format!("packing {}", dir.display()))?;
+    let gz = builder.into_inner().context("finishing the context archive")?;
+    let mut out = gz.finish().context("compressing the context archive")?;
+    // The digest is taken from this file immediately afterwards, so a buffered
+    // tail that never reached the kernel would be a manifest naming bytes that
+    // are not the ones on disk.
+    out.flush().context("flushing the context archive")?;
+    out.sync_all().context("syncing the context archive")?;
+    Ok(std::fs::metadata(dest)
+        .with_context(|| format!("reading {}", dest.display()))?
+        .len())
+}
+
+/// Refuse a Dockerfile that is obviously not one, before anything is uploaded.
+pub fn check_dockerfile_size(path: &Path, size: u64) -> Result<()> {
+    if size > MAX_DOCKERFILE_BYTES {
+        bail!(
+            "{} is {}; a Dockerfile is expected to be under {}. Did you mean --context?",
+            path.display(),
+            crate::output::bytes(size),
+            crate::output::bytes(MAX_DOCKERFILE_BYTES),
+        );
+    }
+    Ok(())
+}
+
 /// sha256 a file, reporting progress. Returns the digest and the size.
 ///
 /// Streamed rather than read whole for the obvious reason, and the size comes
@@ -439,6 +551,81 @@ mod tests {
         // A string, not a number: it is an annotation, and annotations are a
         // map of strings on the store's side.
         assert_eq!(m["annotations"][ANN_NOMINAL_SIZE], "4096");
+    }
+
+    #[test]
+    fn a_dockerfile_manifest_matches_what_art_dockerfile_put_writes() {
+        let m = dockerfile_manifest(
+            ("a1b2", 812),
+            Some(("c3d4", 40213)),
+            Some("web"),
+            Some(4096),
+            None,
+        );
+        assert_eq!(m["kind"], KIND_DOCKERFILE);
+        assert_eq!(m["schema"], 1);
+        // Order is fixed and significant: the store addresses entries as a
+        // sequence, so emitting them the other way round would give the same
+        // recipe a second manifest.
+        assert_eq!(m["entries"][0]["name"], DOCKERFILE_ENTRY);
+        assert_eq!(m["entries"][0]["digest"], "a1b2");
+        assert_eq!(m["entries"][1]["name"], CONTEXT_ENTRY);
+        assert_eq!(m["entries"][1]["size"], 40213);
+        assert_eq!(m["annotations"][ANN_IMAGE], "web");
+        // A string, not a number: annotations are a map of strings on the
+        // store's side and a number would not round-trip.
+        assert_eq!(m["annotations"][ANN_SIZE_MB], "4096");
+    }
+
+    #[test]
+    fn an_unset_annotation_is_absent_rather_than_empty() {
+        // The manifest is content-addressed, so `""` is a different address from
+        // an absent key — and re-pushing an unchanged recipe has to land on the
+        // manifest already there.
+        let m = dockerfile_manifest(("a1b2", 812), None, None, None, None);
+        assert_eq!(m["annotations"].as_object().unwrap().len(), 0);
+        assert_eq!(m["entries"].as_array().unwrap().len(), 1);
+        assert!(m["annotations"].get(ANN_IMAGE).is_none());
+    }
+
+    #[test]
+    fn packing_the_same_tree_twice_gives_the_same_bytes() {
+        // Deterministic headers are what make a re-push of an unchanged context
+        // a HEAD and nothing else.
+        let dir = std::env::temp_dir().join(format!("serverctl-pack-{}", std::process::id()));
+        let ctx = dir.join("ctx");
+        std::fs::create_dir_all(ctx.join("app")).unwrap();
+        std::fs::write(ctx.join("app/main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(ctx.join("README"), b"hi").unwrap();
+
+        let first = dir.join("1.tar.gz");
+        let second = dir.join("2.tar.gz");
+        assert!(pack_context(&ctx, &first).unwrap() > 0);
+        pack_context(&ctx, &second).unwrap();
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&second).unwrap()
+        );
+
+        // And it is a real gzipped tar with the files in it.
+        let gz = flate2::read::GzDecoder::new(std::fs::File::open(&first).unwrap());
+        let names: Vec<String> = tar::Archive::new(gz)
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n.ends_with("app/main.rs")), "{names:?}");
+        assert!(names.iter().any(|n| n.ends_with("README")), "{names:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_context_passed_as_the_dockerfile_is_caught_before_the_upload() {
+        let p = Path::new("Dockerfile");
+        assert!(check_dockerfile_size(p, 4096).is_ok());
+        let e = check_dockerfile_size(p, MAX_DOCKERFILE_BYTES + 1).unwrap_err();
+        assert!(e.to_string().contains("--context"), "{e}");
     }
 
     #[test]

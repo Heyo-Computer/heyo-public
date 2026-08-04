@@ -3,16 +3,28 @@
 //! Both kinds run as an async task on the app-lb host, one at a time per
 //! deployment, and are polled through the same records:
 //!
-//! * **`image-build`** (managed deployments) — `git fetch` a repo, hand its
-//!   Dockerfile to `heyvm mvm build`, then rewrite `vm.image` to the image that
+//! * **`image-build`** (managed deployments) — get a Dockerfile onto this host,
+//!   hand it to `heyvm mvm build`, then rewrite `vm.image` to the image that
 //!   produced, which recycles the pool onto it. heyvm has no build API, so this
 //!   is app-lb driving child processes.
+//!
+//!   Two ways in, and only the first few steps differ: `git fetch` a repo and
+//!   find a Dockerfile inside it, or fetch a Dockerfile manifest from an
+//!   artifact store and unpack its context. Both converge on one `Prepared` —
+//!   a Dockerfile, a context directory, and a version string to name the image
+//!   after — which is why there is one job kind and not two.
 //! * **`artifact-pull`** (managed deployments) — resolve a reference in an
 //!   artifact store to a rootfs blob, materialize it as an `.ext4` heyvmd can
 //!   boot, and rewrite `vm.image` the same way. The difference from a build is
 //!   that nothing is produced: the digest names bytes that already exist, so the
 //!   same reference gives the same rootfs on every host that can reach the
 //!   store. See [`crate::artifact`].
+//!
+//!   Worth being precise about, now that a build can also name a store: what
+//!   separates the two is not *where the bytes live* but *whether an image is
+//!   made*. A `build.store` holds a recipe and every host that uses it runs its
+//!   own `docker build`; an `artifact.store` holds the finished rootfs and no
+//!   host builds anything.
 //! * **`host-update`** (static/`proxy_pass` deployments) — run a list of
 //!   commands in a working directory on this host, then re-probe the upstreams
 //!   to prove the service came back. A static deployment's backend is a process
@@ -40,7 +52,7 @@
 
 use crate::artifact::{Puller, human as human_bytes};
 use crate::autoscale::Autoscaler;
-use crate::config::{ArtifactSpec, Backend, BuildSpec, UpdateSpec};
+use crate::config::{ArtifactSpec, Backend, BuildSource, BuildSpec, UpdateSpec};
 use crate::deployment::{Deployment, now_secs};
 use crate::health;
 use crate::registry::Registry;
@@ -316,7 +328,8 @@ impl std::fmt::Display for StartError {
             } => write!(
                 f,
                 "deployment {id:?} has no `build` block — set `build.repo` (and optionally \
-                 `build.dockerfile`) on the spec first"
+                 `build.dockerfile`) to build from a git checkout, or `build.store` and \
+                 `build.ref` to build a Dockerfile manifest out of an artifact store"
             ),
             Self::NoSpec {
                 id,
@@ -347,6 +360,23 @@ impl std::fmt::Display for StartError {
 /// A digest, short enough for a one-line job outcome.
 fn short(digest: &str) -> String {
     digest.chars().take(12).collect()
+}
+
+/// What a build source produced, which is all `heyvm mvm build` needs.
+///
+/// The narrow waist between the two sources: whatever a git checkout and an
+/// artifact store had to do to get here, from this point on a build is the same
+/// build. Adding a field is the test of whether a difference between the sources
+/// is real — `size_mb` is, because only a manifest can carry a default; a
+/// `commit` field would not be, because the image name is all it was ever for.
+struct Prepared {
+    dockerfile: PathBuf,
+    context: PathBuf,
+    /// What the image is named after: a commit, or a manifest digest.
+    version: String,
+    /// A `--size-mb` default carried by the source itself. Overridden by
+    /// `build.image_size_mb` when the spec sets one.
+    size_mb: Option<u64>,
 }
 
 /// A backend as it appears mid-sentence in a "wrong kind of deployment" error.
@@ -460,8 +490,10 @@ impl Jobs {
         if let Some(r) = ref_override {
             // A one-off ref does not touch the stored spec — `POST …/build
             // {"ref": "v2.1"}` builds that tag without making it the default.
-            spec.git_ref = Some(r);
+            spec.source_ref = Some(r);
             // The stored spec was validated on registration; an override was not.
+            // This is also what refuses a git ref on a store source and vice
+            // versa: the two have different rules and the same field.
             let probe = crate::config::DeploymentSpec {
                 build: Some(spec.clone()),
                 ..deployment.spec.clone()
@@ -469,11 +501,22 @@ impl Jobs {
             probe.validate().map_err(|e| StartError::BadRef(e.to_string()))?;
         }
 
-        let git_ref = spec.git_ref.clone();
+        // The record says up front which source this build is using, so a job
+        // list distinguishes the two without waiting for the first log line.
+        let source_ref = spec.source_ref.clone();
         let repo = spec.repo.clone();
+        let store = spec.store.clone();
         self.spawn(deployment_id, JobKind::ImageBuild, move |r| {
-            r.repo = Some(repo);
-            r.git_ref = git_ref;
+            match (repo, store) {
+                (Some(repo), _) => {
+                    r.repo = Some(repo);
+                    r.git_ref = source_ref;
+                }
+                (None, store) => {
+                    r.store = store;
+                    r.artifact_ref = source_ref;
+                }
+            }
         }, move |jobs, job_id, deployment_id| async move {
             jobs.run_build(&job_id, &deployment_id, &spec).await
         })
@@ -682,59 +725,54 @@ impl Jobs {
 
     /// The build itself. Every error is a string because it goes straight into
     /// the record for a human to read.
+    ///
+    /// Two sources produce the same three things — a Dockerfile path, a context
+    /// directory, and a version string to name the image after — and everything
+    /// downstream of that is identical. So the sources diverge only for as long
+    /// as they must, and `heyvm mvm build` is driven from one place: a second
+    /// copy of the invocation is a second place for `--local-only` to be
+    /// forgotten.
     async fn run_build(
         &self,
         job_id: &str,
         deployment_id: &str,
         spec: &BuildSpec,
     ) -> Result<String, String> {
-        let checkout = self.cfg.work_dir.join(sanitize_dir(deployment_id));
-        crate::tls::create_dir_private(&checkout)
-            .map_err(|e| format!("could not create {}: {e}", checkout.display()))?;
+        let prepared = match spec.source().ok_or_else(|| {
+            // Unreachable through the admin API, which validates on registration
+            // and on a ref override. Reachable by hand-editing the state file.
+            format!(
+                "deployment {deployment_id:?} has a `build` block with neither `repo` nor \
+                 `store` set, so there is no Dockerfile to build"
+            )
+        })? {
+            BuildSource::Git { .. } => self.prepare_git_build(job_id, deployment_id, spec).await?,
+            BuildSource::Dockerfile { store, reference } => {
+                self.prepare_store_build(job_id, deployment_id, spec, store, reference)
+                    .await?
+            }
+        };
 
-        // -- checkout ------------------------------------------------------
-        let token = self.git_token(spec.auth.as_ref())?;
-        // Said once per build rather than once per git command: an ssh remote
-        // authenticates with the host's key material, so a secret here is a
-        // credential somebody thinks is in use and isn't.
-        if token.is_some() && is_ssh_remote(&spec.repo) {
-            let note = "build.auth is set on an ssh remote; git authenticates with the host's \
-                        key material and the secret is ignored";
-            tracing::warn!(repo = %spec.repo, "{note}");
-            self.log(job_id, note);
-        }
-
-        let commit = self.checkout(job_id, &checkout, spec, token.as_ref()).await?;
-        self.update_record(job_id, |r| r.commit = Some(commit.clone()));
-
-        // -- locate the Dockerfile -----------------------------------------
-        let (dockerfile, context) = locate_dockerfile(&checkout, spec)?;
-        let shown = dockerfile
-            .strip_prefix(&checkout)
-            .unwrap_or(&dockerfile)
-            .display()
-            .to_string();
-        self.update_record(job_id, |r| r.dockerfile = Some(shown.clone()));
-        self.log(job_id, format!("using {shown} (context {})", context.display()));
-
-        // -- build ----------------------------------------------------------
-        let image = spec.image_for(deployment_id, &commit);
+        let image = spec.image_for(deployment_id, &prepared.version);
         self.update_record(job_id, |r| r.image = Some(image.clone()));
 
         let mut cmd = tokio::process::Command::new(&self.cfg.heyvm_bin);
         cmd.arg("mvm")
             .arg("build")
             .arg("-f")
-            .arg(&dockerfile)
+            .arg(&prepared.dockerfile)
             .arg("-c")
-            .arg(&context)
+            .arg(&prepared.context)
             .arg("-n")
             .arg(&image)
             // Never upload: the image is consumed by the daemon on this host,
             // and a cloud push would need credentials app-lb does not have.
             .arg("--local-only")
-            .current_dir(&context);
-        if let Some(mb) = spec.image_size_mb {
+            .current_dir(&prepared.context);
+        // The spec wins over the manifest's annotation, which is only a default
+        // recorded by whoever pushed the recipe; `build.image_size_mb` is the
+        // operator of *this* deployment saying what its guest needs.
+        if let Some(mb) = spec.image_size_mb.or(prepared.size_mb) {
             cmd.arg("--size-mb").arg(mb.to_string());
         }
         if let Some(home) = &self.cfg.home {
@@ -747,6 +785,114 @@ impl Jobs {
         Ok(image)
     }
 
+    /// Fetch a git checkout and find the Dockerfile in it.
+    async fn prepare_git_build(
+        &self,
+        job_id: &str,
+        deployment_id: &str,
+        spec: &BuildSpec,
+    ) -> Result<Prepared, String> {
+        let repo = spec.repo.as_deref().expect("a git source has a repo");
+        let checkout = self.cfg.work_dir.join(sanitize_dir(deployment_id));
+        crate::tls::create_dir_private(&checkout)
+            .map_err(|e| format!("could not create {}: {e}", checkout.display()))?;
+
+        let token = self.git_token(spec.auth.as_ref())?;
+        // Said once per build rather than once per git command: an ssh remote
+        // authenticates with the host's key material, so a secret here is a
+        // credential somebody thinks is in use and isn't.
+        if token.is_some() && is_ssh_remote(repo) {
+            let note = "build.auth is set on an ssh remote; git authenticates with the host's \
+                        key material and the secret is ignored";
+            tracing::warn!(repo = %repo, "{note}");
+            self.log(job_id, note);
+        }
+
+        let commit = self.checkout(job_id, &checkout, spec, token.as_ref()).await?;
+        self.update_record(job_id, |r| r.commit = Some(commit.clone()));
+
+        let (dockerfile, context) = locate_dockerfile(&checkout, spec)?;
+        let shown = dockerfile
+            .strip_prefix(&checkout)
+            .unwrap_or(&dockerfile)
+            .display()
+            .to_string();
+        self.update_record(job_id, |r| r.dockerfile = Some(shown.clone()));
+        self.log(job_id, format!("using {shown} (context {})", context.display()));
+
+        Ok(Prepared {
+            dockerfile,
+            context,
+            version: commit,
+            size_mb: None,
+        })
+    }
+
+    /// Fetch a Dockerfile manifest from an artifact store and lay it out on disk.
+    ///
+    /// The image is named after the *manifest* digest rather than the recipe's,
+    /// because the manifest is what covers the whole build input — the recipe,
+    /// the context and the annotations together. Naming it after the Dockerfile
+    /// alone would give two builds with different contexts the same image name.
+    async fn prepare_store_build(
+        &self,
+        job_id: &str,
+        deployment_id: &str,
+        spec: &BuildSpec,
+        store: &str,
+        reference: &str,
+    ) -> Result<Prepared, String> {
+        // Inside the deployment's own work directory, not beside it: a sibling
+        // called `<id>-recipe` would collide with a deployment actually named
+        // that, and nesting cannot, because the parent is already unique per
+        // deployment.
+        //
+        // A subdirectory of the checkout rather than the checkout itself, so a
+        // deployment that switches sources never unpacks a context over a git
+        // tree — a `COPY` satisfied by a file the current recipe never shipped
+        // is exactly what `git clean -xffdq` exists to prevent on the other
+        // path. Switching the other way needs nothing: `git clean` removes this
+        // directory along with everything else it did not put there.
+        let deployment_dir = self.cfg.work_dir.join(sanitize_dir(deployment_id));
+        // `0700` here rather than in the puller: a build context holds whatever
+        // the person who pushed it put in it, and the mode is a property of
+        // where app-lb stages work, not of how the bytes were fetched.
+        crate::tls::create_dir_private(&deployment_dir)
+            .map_err(|e| format!("could not create {}: {e}", deployment_dir.display()))?;
+        let dir = deployment_dir.join(".recipe");
+
+        let api_key = self.store_key(spec.auth.as_ref())?;
+        if api_key.is_some() && !spec.store_is_remote() {
+            let note = "build.auth is set on a local store; a store root is protected by file \
+                        permissions, not by an API key, and the secret is unused";
+            tracing::warn!(store = %store, "{note}");
+            self.log(job_id, note);
+        }
+
+        let mut log = |line: String| self.log(job_id, line);
+        let fetched = self
+            .puller
+            .fetch_dockerfile(store, reference, api_key.as_deref(), &dir, &mut log)
+            .await?;
+
+        self.update_record(job_id, |r| {
+            r.digest = Some(fetched.manifest.clone());
+            r.dockerfile = Some(crate::artifact::DOCKERFILE_ENTRY.to_string());
+            r.bytes = Some(fetched.bytes_written);
+            // The same question a site pull's `files` answers — "did this deploy
+            // what I think it did?" — asked of the build's inputs. `bytes` cannot
+            // answer it, because a local store hardlinks and transfers nothing.
+            r.files = fetched.context_files;
+        });
+
+        Ok(Prepared {
+            dockerfile: fetched.dockerfile,
+            context: fetched.context,
+            version: fetched.manifest,
+            size_mb: fetched.size_mb,
+        })
+    }
+
     /// Fetch and check out, returning the resolved commit.
     async fn checkout(
         &self,
@@ -755,6 +901,11 @@ impl Jobs {
         spec: &BuildSpec,
         token: Option<&(String, String)>,
     ) -> Result<String, String> {
+        let repo = spec
+            .repo
+            .as_deref()
+            .ok_or("this build has no `repo`; a git checkout was asked for anyway")?;
+
         // `git init` on an existing repo just reinitializes it, so the checkout
         // directory survives between builds and a rebuild is a shallow fetch
         // rather than a fresh clone.
@@ -762,14 +913,14 @@ impl Jobs {
         init.arg("init").arg("-q").arg(dir);
         self.step(job_id, "git", init, self.cfg.timeout).await?;
 
-        let refspec = spec.git_ref.clone().unwrap_or_else(|| "HEAD".into());
+        let refspec = spec.source_ref.clone().unwrap_or_else(|| "HEAD".into());
         let fetch = |depth: Option<&str>| {
             let mut cmd = self.git(token);
             cmd.arg("-C").arg(dir).arg("fetch").arg("--no-tags").arg("--force");
             if let Some(d) = depth {
                 cmd.arg("--depth").arg(d);
             }
-            cmd.arg(&spec.repo).arg(&refspec);
+            cmd.arg(repo).arg(&refspec);
             cmd
         };
 
@@ -787,7 +938,7 @@ impl Jobs {
                 format!("shallow fetch of {refspec} was refused; retrying with full history"),
             );
             let mut full = self.git(token);
-            full.arg("-C").arg(dir).arg("fetch").arg("--no-tags").arg("--force").arg(&spec.repo);
+            full.arg("-C").arg(dir).arg("fetch").arg("--no-tags").arg("--force").arg(repo);
             self.step(job_id, "git", full, self.cfg.timeout).await?;
         }
 
@@ -799,7 +950,7 @@ impl Jobs {
             .arg("-q")
             .arg("--detach")
             .arg("--force")
-            .arg(if spec.git_ref.is_some() && looks_like_sha(&refspec) {
+            .arg(if spec.source_ref.is_some() && looks_like_sha(&refspec) {
                 refspec.clone()
             } else {
                 "FETCH_HEAD".into()
@@ -890,12 +1041,7 @@ impl Jobs {
     ) -> Result<String, String> {
         // Resolved here rather than inside the puller, so the one place that
         // reads secrets is the one place that already does for a build.
-        let api_key = match &spec.auth {
-            None => None,
-            Some(r) => Some(self.secrets.resolve(r).map_err(|e| {
-                format!("{e} — `serverctl get secrets` lists what this LB holds")
-            })?),
-        };
+        let api_key = self.store_key(spec.auth.as_ref())?;
 
         // A site's artifact is a directory tree rather than a guest rootfs, and
         // everything after the resolve differs: where the bytes land, what
@@ -1157,6 +1303,23 @@ impl Jobs {
     // -- shared child-process plumbing -------------------------------------
 
     /// Resolve a git credential reference into `(value, username)`.
+    /// An artifact store's API key, out of the secret store.
+    ///
+    /// The counterpart of [`git_token`](Self::git_token), and the only other
+    /// thing `build.auth` / `artifact.auth` can mean. Kept beside it so the
+    /// places that read secrets stay countable.
+    fn store_key(
+        &self,
+        auth: Option<&crate::secrets::SecretRef>,
+    ) -> Result<Option<String>, String> {
+        match auth {
+            None => Ok(None),
+            Some(r) => Ok(Some(self.secrets.resolve(r).map_err(|e| {
+                format!("{e} — `serverctl get secrets` lists what this LB holds")
+            })?)),
+        }
+    }
+
     fn git_token(
         &self,
         auth: Option<&crate::secrets::SecretRef>,
@@ -1652,8 +1815,9 @@ mod tests {
 
     fn build_spec() -> BuildSpec {
         BuildSpec {
-            repo: "https://example.com/acme/web.git".into(),
-            git_ref: None,
+            repo: Some("https://example.com/acme/web.git".into()),
+            store: None,
+            source_ref: None,
             dockerfile: None,
             context: None,
             image_name: None,

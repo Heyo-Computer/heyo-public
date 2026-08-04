@@ -18,7 +18,12 @@ use std::time::{Duration, Instant};
 
 // -- create ----------------------------------------------------------------
 
+/// The `build_source` group exists so the flags that merely *describe* a build
+/// can require "one of the two sources", rather than naming `--repo`
+/// specifically — which was true while a repo was the only source and silently
+/// wrong the moment a second one existed.
 #[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("build_source").args(["repo", "build_store"])))]
 pub struct CreateDeploymentArgs {
     /// The deployment id, unique across the load balancer.
     #[arg(value_name = "NAME")]
@@ -116,10 +121,22 @@ pub struct CreateDeploymentArgs {
     // build <name>` does that — so a deployment can be created against an
     // existing image and switched to built images later.
     /// Git remote the guest image is built from.
-    #[arg(long, value_name = "URL", help_heading = "Build source")]
+    #[arg(long, value_name = "URL", help_heading = "Build source", conflicts_with = "build_store")]
     pub repo: Option<String>,
-    /// Branch, tag or commit to build. Unset follows the remote's default branch.
-    #[arg(long = "ref", value_name = "REF", help_heading = "Build source", requires = "repo")]
+    /// Artifact store holding a Dockerfile manifest to build, instead of a git
+    /// remote: an `art serve` URL or an absolute store root on the app-lb host.
+    /// Pair it with --ref.
+    #[arg(
+        long = "build-store",
+        value_name = "URL|PATH",
+        help_heading = "Build source",
+        conflicts_with = "repo",
+        requires = "git_ref"
+    )]
+    pub build_store: Option<String>,
+    /// Which version of the source to build: a branch, tag or commit for --repo,
+    /// or a Dockerfile manifest's tag or digest for --build-store.
+    #[arg(long = "ref", value_name = "REF", help_heading = "Build source", requires = "build_source")]
     pub git_ref: Option<String>,
     /// Dockerfile path within the repo. Unset lets app-lb look for one.
     #[arg(long, value_name = "PATH", help_heading = "Build source", requires = "repo")]
@@ -127,14 +144,15 @@ pub struct CreateDeploymentArgs {
     /// Build context within the repo. Defaults to the Dockerfile's directory.
     #[arg(long = "build-context", value_name = "PATH", help_heading = "Build source", requires = "repo")]
     pub build_context: Option<String>,
-    /// Base name for built images; the commit is appended.
-    #[arg(long, value_name = "NAME", help_heading = "Build source", requires = "repo")]
+    /// Base name for built images; the source version is appended.
+    #[arg(long, value_name = "NAME", help_heading = "Build source", requires = "build_source")]
     pub image_name: Option<String>,
     /// Rootfs size for the built image.
-    #[arg(long = "size-mb", value_name = "MB", help_heading = "Build source", requires = "repo")]
+    #[arg(long = "size-mb", value_name = "MB", help_heading = "Build source", requires = "build_source")]
     pub image_size_mb: Option<u64>,
-    /// Stored secret holding the git credential, as `NAME` or `NAME/KEY`.
-    #[arg(long = "secret", value_name = "NAME[/KEY]", help_heading = "Build source", requires = "repo")]
+    /// Stored secret holding the credential, as `NAME` or `NAME/KEY`: a git
+    /// token for --repo, or the store's API key for --build-store.
+    #[arg(long = "secret", value_name = "NAME[/KEY]", help_heading = "Build source", requires = "build_source")]
     pub secret: Option<String>,
 
     #[command(flatten)]
@@ -368,15 +386,16 @@ fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
         spec.insert("vm".into(), Value::Object(vm));
     }
 
-    if let Some(repo) = &args.repo {
+    if args.repo.is_some() || args.build_store.is_some() {
         if !args.upstreams.is_empty() {
             bail!(
-                "--repo builds a guest image, which a static (proxy_pass) deployment does \
-                 not have — drop --upstream, or drop the build flags"
+                "--repo and --build-store build a guest image, which a static (proxy_pass) \
+                 deployment does not have — drop --upstream, or drop the build flags"
             );
         }
         let mut build = Map::new();
-        build.insert("repo".into(), Value::String(repo.clone()));
+        insert_opt_str(&mut build, "repo", args.repo.as_deref());
+        insert_opt_str(&mut build, "store", args.build_store.as_deref());
         insert_opt_str(&mut build, "ref", args.git_ref.as_deref());
         insert_opt_str(&mut build, "dockerfile", args.dockerfile.as_deref());
         insert_opt_str(&mut build, "context", args.build_context.as_deref());
@@ -673,17 +692,28 @@ pub struct SetBuildArgs {
     pub resource: String,
 
     /// Git remote to build from: `https://…`, `git@host:path`, or a path on the
-    /// app-lb host. Required the first time.
-    #[arg(long, value_name = "URL")]
+    /// app-lb host. Required the first time, unless --store is given.
+    #[arg(long, value_name = "URL", conflicts_with = "store")]
     pub repo: Option<String>,
-    /// Branch, tag or commit to build. Unset follows the remote's default branch.
+    /// Build from a Dockerfile manifest in an artifact store instead of a git
+    /// checkout: an `art serve` URL (`http://host:8080`) or an absolute path to
+    /// a store root on the app-lb host. Pair it with --ref.
+    ///
+    /// `serverctl artifact push-dockerfile` is what puts one there.
+    #[arg(long, value_name = "URL|PATH", conflicts_with = "repo")]
+    pub store: Option<String>,
+    /// Which version of the source to build: a branch, tag or commit for --repo
+    /// (unset follows the remote's default branch), or the tag or digest of a
+    /// Dockerfile manifest for --store, where it is required.
     #[arg(long = "ref", value_name = "REF")]
     pub git_ref: Option<String>,
-    /// Dockerfile path within the repo. Unset lets app-lb look for one.
-    #[arg(long, value_name = "PATH")]
+    /// Dockerfile path within the repo. Unset lets app-lb look for one. Git
+    /// source only — a Dockerfile manifest already names its own recipe.
+    #[arg(long, value_name = "PATH", conflicts_with = "store")]
     pub dockerfile: Option<String>,
     /// Build context within the repo. Defaults to the Dockerfile's directory.
-    #[arg(long = "build-context", value_name = "PATH")]
+    /// Git source only.
+    #[arg(long = "build-context", value_name = "PATH", conflicts_with = "store")]
     pub build_context: Option<String>,
     /// Base name for built images; the commit is appended. Defaults to the
     /// deployment id.
@@ -693,8 +723,8 @@ pub struct SetBuildArgs {
     /// contents.
     #[arg(long = "size-mb", value_name = "MB")]
     pub image_size_mb: Option<u64>,
-    /// Credential for a private repo: a stored secret, as `NAME` or `NAME/KEY`
-    /// (default key `token`).
+    /// Credential: a stored secret, as `NAME` or `NAME/KEY` (default key
+    /// `token`). A git token for --repo, or the store's ART_API_KEY for --store.
     #[arg(long = "secret", value_name = "NAME[/KEY]")]
     pub secret: Option<String>,
     /// Username to pair with the token. Only needed by forges that reject a
@@ -706,7 +736,7 @@ pub struct SetBuildArgs {
     pub no_auth: bool,
     /// Remove the build source entirely; the deployment keeps its current image.
     #[arg(long, conflicts_with_all = [
-        "repo", "git_ref", "dockerfile", "build_context", "image_name",
+        "repo", "store", "git_ref", "dockerfile", "build_context", "image_name",
         "image_size_mb", "secret", "username", "no_auth",
     ])]
     pub clear: bool,
@@ -728,6 +758,7 @@ pub fn set_build(ctx: &Ctx, args: &SetBuildArgs) -> Result<()> {
     }
 
     let touched = args.repo.is_some()
+        || args.store.is_some()
         || args.git_ref.is_some()
         || args.dockerfile.is_some()
         || args.build_context.is_some()
@@ -737,8 +768,9 @@ pub fn set_build(ctx: &Ctx, args: &SetBuildArgs) -> Result<()> {
         || args.no_auth;
     if !touched {
         bail!(
-            "nothing to set — pass --repo, --ref, --dockerfile, --context, --image-name, \
-             --size-mb, --secret or --no-auth (or --clear to remove the build source)"
+            "nothing to set — pass --repo or --store, --ref, --dockerfile, --context, \
+             --image-name, --size-mb, --secret or --no-auth (or --clear to remove the \
+             build source)"
         );
     }
 
@@ -755,14 +787,29 @@ pub fn set_build(ctx: &Ctx, args: &SetBuildArgs) -> Result<()> {
 
     edit_spec(ctx, &id, args.dry_run, "build source updated", |spec| {
         let build = spec::build_mut(spec, &id)?;
-        if build.get("repo").and_then(Value::as_str).is_none() && args.repo.is_none() {
+        let had = |key: &str| build.get(key).and_then(Value::as_str).is_some();
+        if !had("repo") && !had("store") && args.repo.is_none() && args.store.is_none() {
             bail!(
-                "deployment {id:?} has no build source yet, so --repo is required \
-                 (e.g. --repo https://github.com/acme/web.git)"
+                "deployment {id:?} has no build source yet, so --repo or --store is required \
+                 (e.g. --repo https://github.com/acme/web.git, or --store \
+                 http://art:8080 --ref web-rootfs)"
             );
+        }
+        // Switching sources drops the other one and the fields that only meant
+        // something to it. Leaving them would produce a spec the server rejects
+        // as having two sources, which is a confusing way to report a switch
+        // that was expressed unambiguously.
+        if args.repo.is_some() {
+            build.remove("store");
+        }
+        if args.store.is_some() {
+            for stale in ["repo", "dockerfile", "context"] {
+                build.remove(stale);
+            }
         }
         for (key, value) in [
             ("repo", args.repo.as_deref()),
+            ("store", args.store.as_deref()),
             ("ref", args.git_ref.as_deref()),
             ("dockerfile", args.dockerfile.as_deref()),
             ("context", args.build_context.as_deref()),
@@ -1978,6 +2025,7 @@ pub fn delete(ctx: &Ctx, args: &DeleteArgs) -> Result<()> {
         Resource::Deployment => delete_deployments(ctx, &names, args),
         Resource::Vm => delete_vms(ctx, &names, args),
         Resource::Secret => delete_secrets(ctx, &names, args),
+        Resource::Workflow => delete_workflows(ctx, &names, args),
         Resource::Cert => bail!(
             "certificates are managed by app-lb's ACME loop and cannot be deleted through \
              the API; remove them from APP_LB_ACME_DIR on the host instead"
@@ -1988,6 +2036,95 @@ pub fn delete(ctx: &Ctx, args: &DeleteArgs) -> Result<()> {
         ),
         Resource::All => bail!("`delete all` is not supported — name the deployments, or use --all"),
     }
+}
+
+#[derive(Args, Debug)]
+pub struct CreateWorkflowArgs {
+    /// Workflow id. Becomes a NATS subject token and part of a VM name, so it
+    /// is restricted to letters, digits, `-` and `_`.
+    pub id: String,
+
+    /// Clone URL of the repository this workflow builds.
+    #[arg(long)]
+    pub repo: String,
+
+    /// The heyvm network whose hosts may run it.
+    #[arg(long)]
+    pub network: String,
+
+    /// Branch or ref.
+    #[arg(long = "ref", default_value = "main")]
+    pub git_ref: String,
+
+    /// Glob for workflow files inside the repository.
+    #[arg(long, default_value = ".ci/workflows/*.yml")]
+    pub path: String,
+
+    /// heyosecret prefix override. Defaults to `ci/<id>` in the orchestrator.
+    #[arg(long)]
+    pub secrets_prefix: Option<String>,
+
+    /// Register it but do not run it yet.
+    #[arg(long)]
+    pub disabled: bool,
+}
+
+pub fn create_workflow(ctx: &Ctx, args: &CreateWorkflowArgs) -> Result<()> {
+    let mut spec = serde_json::json!({
+        "id": args.id,
+        "repo": args.repo,
+        "ref": args.git_ref,
+        "path": args.path,
+        "network": args.network,
+        "enabled": !args.disabled,
+    });
+    // Only sent when given, so the server's own default is what fills it in —
+    // one place decides the default rather than two that can disagree.
+    if let Some(prefix) = &args.secrets_prefix {
+        spec["secrets_prefix"] = Value::String(prefix.clone());
+    }
+
+    let created = ctx
+        .client
+        .create_workflow(&spec)
+        .with_context(|| format!("creating workflow {:?}", args.id))?;
+
+    println!(
+        "workflow/{} created ({} on {}, {} → {})",
+        created.id, created.git_ref, created.repo, created.path, created.network
+    );
+    if !created.enabled {
+        println!("It is disabled; `serverctl set workflow {} --enabled` turns it on.", created.id);
+    }
+    Ok(())
+}
+
+fn delete_workflows(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {
+    let targets: Vec<String> = if args.all {
+        ctx.client.workflows()?.into_iter().map(|w| w.id).collect()
+    } else {
+        if names.is_empty() {
+            bail!("delete workflow needs a name, or --all");
+        }
+        names.to_vec()
+    };
+    if targets.is_empty() {
+        println!("No CI workflows to delete.");
+        return Ok(());
+    }
+    // Deleting a workflow stops a repository being built, which is the kind of
+    // change somebody notices a week later. Same confirmation the other bulk
+    // deletes use.
+    if args.all && !args.yes {
+        confirm(&format!("Delete {} workflow(s)?", targets.len()))?;
+    }
+    for id in &targets {
+        ctx.client
+            .delete_workflow(id)
+            .with_context(|| format!("deleting workflow {id:?}"))?;
+        println!("workflow/{id} deleted");
+    }
+    Ok(())
 }
 
 fn delete_secrets(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {

@@ -512,59 +512,131 @@ fn default_vm_ttl_secs() -> u64 {
     3600
 }
 
-/// Where a deployment's guest image comes from: a git checkout plus a Dockerfile.
+/// Where a deployment's guest image is *built* from — a Dockerfile, and the
+/// files it copies in.
 ///
-/// This is the *source*, not the running image. A build clones (or fetches)
-/// `repo` at `ref`, hands the Dockerfile to `heyvm mvm build`, and only then
+/// This is the *source*, not the running image. A build assembles the recipe and
+/// its context on this host, hands them to `heyvm mvm build`, and only then
 /// writes the resulting image name into [`VmSpec::image`] — so the spec always
 /// says which image is actually booting, and this block says where the next one
 /// will come from. Editing it never disturbs running VMs; running a build does.
 ///
-/// Note what is deliberately absent: build arguments and a registry. The image
-/// is an ext4 rootfs on this host, built from a Dockerfile the daemon never
-/// sees, and `heyvm mvm build` exposes neither `--build-arg` nor a push target
-/// for the local-only path.
+/// Two ways to get the recipe here, and exactly one of them must be set:
+///
+/// * **`repo`** — a git checkout. app-lb fetches `repo` at `ref` and looks for a
+///   Dockerfile inside it. The original form, and the right one when the recipe
+///   lives with the code it builds.
+/// * **`store`** — a Dockerfile manifest in an artifact store, named by `ref`.
+///   app-lb fetches the manifest, writes out its `Dockerfile` and unpacks its
+///   `context.tar.gz`. See [`ArtifactSpec`] for the two spellings of `store`, and
+///   `art dockerfile put` in the artifacts crate for how one gets there.
+///
+/// The difference that matters is *what the ref pins*. A git ref pins a commit,
+/// and the Dockerfile is whatever that commit happens to hold; a store ref
+/// resolves to a manifest digest covering the recipe, the context and the
+/// annotations together. So a store build can say "these exact inputs" in a way a
+/// branch name cannot, and a rollback is expressible: a tag moves, a digest does
+/// not.
+///
+/// It remains a *build* either way, which is why this is one block and not two.
+/// Both run `heyvm mvm build` and produce an image that did not exist before,
+/// which is the whole distinction from [`ArtifactSpec`] — there, the digest names
+/// bytes that already exist and nothing is produced at all.
+///
+/// Note what is deliberately absent: build arguments and a registry. The image is
+/// an ext4 rootfs on this host, built from a Dockerfile the daemon never sees, and
+/// `heyvm mvm build` exposes neither `--build-arg` nor a push target for the
+/// local-only path.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct BuildSpec {
     /// Git remote: `https://…`, `ssh://…`, `git@host:path`, or a local path.
-    pub repo: String,
-    /// Branch, tag or commit to build. `None` follows the remote's default
+    /// Mutually exclusive with `store`; exactly one must be set.
+    ///
+    /// `Option` rather than required because `store` is the alternative, not
+    /// because a build can have no source — a spec with neither is refused. Every
+    /// spec written before `store` existed has it, so nothing on disk needs
+    /// migrating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// An artifact store holding a Dockerfile manifest: an `http(s)://` URL of an
+    /// `art serve`, or an absolute store root on this host. Mutually exclusive
+    /// with `repo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
+    /// Which version of the source to build.
+    ///
+    /// For a `repo`: a branch, tag or commit. `None` follows the remote's default
     /// branch, which is what makes `POST …/build` mean "ship what is on main".
+    ///
+    /// For a `store`: the tag or digest of a Dockerfile manifest, and **required**
+    /// — a store has no default, and guessing one would be picking somebody's
+    /// image out of a shared namespace.
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
-    pub git_ref: Option<String>,
+    pub source_ref: Option<String>,
     /// Dockerfile path *within the checkout*. `None` looks for one: `Dockerfile`
     /// at the context root, else a unique `Dockerfile` within three directories
     /// of it. Ambiguity is an error, never a guess.
+    ///
+    /// Git source only: a Dockerfile manifest names its own recipe, so a path
+    /// here would be pointing into an archive this deployment does not choose the
+    /// layout of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<String>,
     /// Build context within the checkout. Defaults to the Dockerfile's directory,
-    /// matching `heyvm mvm build`'s own default.
+    /// matching `heyvm mvm build`'s own default. Git source only, for the same
+    /// reason as `dockerfile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    /// Base name for built images; the commit is appended, so one deployment's
-    /// builds are `<name>-<short sha>`. Defaults to the deployment id.
+    /// Base name for built images; the source version is appended, so one
+    /// deployment's builds are `<name>-<short sha>` from git and
+    /// `<name>-<short manifest digest>` from a store. Defaults to the deployment
+    /// id, and overrides the manifest's own `heyvm.image` annotation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_name: Option<String>,
     /// Rootfs size passed to `heyvm mvm build --size-mb`. Unset lets heyvm size
     /// it from the exported tar (×1.2 + 64 MB), which is right until the guest
-    /// writes to its own rootfs at runtime.
+    /// writes to its own rootfs at runtime. On a store source, unset falls back
+    /// to the manifest's `heyvm.size_mb` annotation before heyvm's own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_size_mb: Option<u64>,
-    /// Credential for a private repo, as a reference into the secret store. Only
-    /// meaningful for HTTP(S) remotes — an `ssh://` or `git@` remote authenticates
-    /// with the host's own key material and should leave this unset.
+    /// Credential, as a reference into the secret store. What it *is* depends on
+    /// the source, which is why it is one field: a git token for a private `repo`,
+    /// or the `ART_API_KEY` of a gated `store`.
+    ///
+    /// Unused by an `ssh://` or `git@` remote, which authenticates with the host's
+    /// own key material, and by a local store root, which is protected by file
+    /// permissions. Both cases are warned about at build time rather than
+    /// rejected here — a spec may legitimately carry one while its `repo` is
+    /// being switched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<SecretRef>,
 }
 
+/// Which of [`BuildSpec`]'s two sources a build will actually use.
+///
+/// Returned rather than re-derived at each use, so the "exactly one is set"
+/// invariant is checked once — in `validate` — and every consumer afterwards has
+/// a value that cannot represent both or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildSource<'a> {
+    /// A git checkout. `git_ref` unset follows the remote's default branch.
+    Git {
+        repo: &'a str,
+        git_ref: Option<&'a str>,
+    },
+    /// A Dockerfile manifest in an artifact store.
+    Dockerfile { store: &'a str, reference: &'a str },
+}
+
 impl BuildSpec {
-    /// The image name for a given commit. Lowercased and stripped to what both
-    /// `docker build -t` and heyvm's `<name>.ext4` filename accept, because the
-    /// deployment id it defaults to is only constrained by the route table.
-    pub fn image_for(&self, deployment_id: &str, commit: &str) -> String {
+    /// The image name for a given source version — a commit for git, a manifest
+    /// digest for a store. Lowercased and stripped to what both `docker build -t`
+    /// and heyvm's `<name>.ext4` filename accept, because the deployment id it
+    /// defaults to is only constrained by the route table.
+    pub fn image_for(&self, deployment_id: &str, version: &str) -> String {
         let base = self.image_name.as_deref().unwrap_or(deployment_id);
         let base = sanitize_image_name(base);
-        let short: String = commit.chars().take(12).collect();
+        let short: String = version.chars().take(12).collect();
         if short.is_empty() {
             base
         } else {
@@ -572,23 +644,85 @@ impl BuildSpec {
         }
     }
 
+    /// Which source this build uses. `None` only for a spec that never passed
+    /// [`BuildSpec::validate`], which is why callers may treat it as unreachable
+    /// rather than as a case to handle.
+    pub fn source(&self) -> Option<BuildSource<'_>> {
+        match (self.repo.as_deref(), self.store.as_deref()) {
+            (Some(repo), None) => Some(BuildSource::Git {
+                repo,
+                git_ref: self.source_ref.as_deref(),
+            }),
+            (None, Some(store)) => Some(BuildSource::Dockerfile {
+                store,
+                reference: self.source_ref.as_deref()?,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether `store` names a remote `art serve` rather than a path on this
+    /// host. Same rule [`ArtifactSpec::is_remote`] applies, and for the same
+    /// reason: the scheme is what decides whether `auth` means anything.
+    pub fn store_is_remote(&self) -> bool {
+        self.store.as_deref().is_some_and(is_remote_store)
+    }
+
     fn validate(&self) -> Result<(), SpecError> {
-        if self.repo.trim().is_empty() {
-            return Err(SpecError::EmptyRepo);
+        match (&self.repo, &self.store) {
+            (Some(_), Some(_)) => return Err(SpecError::BothBuildSources),
+            (None, None) => return Err(SpecError::NoBuildSource),
+            _ => {}
         }
-        if !is_supported_repo_url(&self.repo) {
-            return Err(SpecError::UnsupportedRepoUrl(self.repo.clone()));
-        }
-        if let Some(r) = &self.git_ref
-            && !is_safe_git_ref(r)
-        {
-            return Err(SpecError::BadBuildRef(r.clone()));
-        }
-        for path in [&self.dockerfile, &self.context].into_iter().flatten() {
-            if !is_safe_relative_path(path) {
-                return Err(SpecError::BadBuildPath(path.clone()));
+
+        if let Some(repo) = &self.repo {
+            if repo.trim().is_empty() {
+                return Err(SpecError::EmptyRepo);
+            }
+            if !is_supported_repo_url(repo) {
+                return Err(SpecError::UnsupportedRepoUrl(repo.clone()));
+            }
+            if let Some(r) = &self.source_ref
+                && !is_safe_git_ref(r)
+            {
+                return Err(SpecError::BadBuildRef(r.clone()));
+            }
+            for path in [&self.dockerfile, &self.context].into_iter().flatten() {
+                if !is_safe_relative_path(path) {
+                    return Err(SpecError::BadBuildPath(path.clone()));
+                }
             }
         }
+
+        if let Some(store) = &self.store {
+            if store.trim().is_empty() {
+                return Err(SpecError::EmptyBuildStore);
+            }
+            if !is_supported_store(store) {
+                return Err(SpecError::UnsupportedBuildStore(store.clone()));
+            }
+            // Required, unlike a git ref: a store has no default branch to fall
+            // back to, and a build with no reference has nothing to fetch.
+            let Some(r) = &self.source_ref else {
+                return Err(SpecError::MissingBuildRef);
+            };
+            if !is_valid_artifact_ref(r) {
+                return Err(SpecError::BadBuildArtifactRef(r.clone()));
+            }
+            // Rejected rather than ignored, because both would be somebody
+            // expecting a file to be chosen that the manifest already chose. A
+            // Dockerfile manifest names its recipe `Dockerfile` and its context
+            // `context.tar.gz`; there is nothing left to point at.
+            for (present, what) in [
+                (self.dockerfile.is_some(), "build.dockerfile"),
+                (self.context.is_some(), "build.context"),
+            ] {
+                if present {
+                    return Err(SpecError::OnlyForGitBuilds(what));
+                }
+            }
+        }
+
         if let Some(name) = &self.image_name
             && sanitize_image_name(name).is_empty()
         {
@@ -602,6 +736,33 @@ impl BuildSpec {
         }
         Ok(())
     }
+}
+
+/// Whether a store reference names a remote `art serve` rather than a path.
+pub fn is_remote_store(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// Whether a string names an artifact store this host could reach: an
+/// `http(s)://` URL, or an absolute store root.
+///
+/// Shared by `artifact.store` and `build.store` so the two cannot drift. Only an
+/// *absolute* path is accepted, because app-lb's working directory is not
+/// something a spec author can see — a relative path would name a different store
+/// depending on how the LB was started.
+fn is_supported_store(store: &str) -> bool {
+    let store = store.trim();
+    if store.is_empty() {
+        return false;
+    }
+    if let Some(rest) = store
+        .strip_prefix("http://")
+        .or_else(|| store.strip_prefix("https://"))
+    {
+        return !rest.is_empty() && !rest.contains(char::is_whitespace);
+    }
+    std::path::Path::new(store).is_absolute() && !store.contains("..") && !store.contains('\0')
 }
 
 /// Where a deployment's content comes from: bytes already in an artifact store,
@@ -707,8 +868,7 @@ impl ArtifactSpec {
     /// host. The two are told apart by the scheme, which is also what decides
     /// whether `auth` means anything.
     pub fn is_remote(&self) -> bool {
-        let s = self.store.trim();
-        s.starts_with("http://") || s.starts_with("https://")
+        is_remote_store(&self.store)
     }
 
     /// How many leading path components a site's unpack drops. Zero unless the
@@ -724,25 +884,10 @@ impl ArtifactSpec {
     /// `strip_components` on a guest image is somebody expecting an unpack that
     /// never happens.
     fn validate(&self, for_site: bool) -> Result<(), SpecError> {
-        let store = self.store.trim();
-        if store.is_empty() {
+        if self.store.trim().is_empty() {
             return Err(SpecError::EmptyArtifactStore);
         }
-        let store_ok = if let Some(rest) = store
-            .strip_prefix("http://")
-            .or_else(|| store.strip_prefix("https://"))
-        {
-            !rest.is_empty() && !rest.contains(char::is_whitespace)
-        } else {
-            // A store root, and only an absolute one: app-lb's working
-            // directory is not something a spec author can see, so a relative
-            // path would name a different store depending on how the LB was
-            // started.
-            std::path::Path::new(store).is_absolute()
-                && !store.contains("..")
-                && !store.contains('\0')
-        };
-        if !store_ok {
+        if !is_supported_store(&self.store) {
             return Err(SpecError::UnsupportedArtifactStore(self.store.clone()));
         }
 
@@ -1619,6 +1764,12 @@ impl SiteSpec {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpecError {
     EmptyId,
+    /// Workflow ids are interpolated into NATS subjects and VM names unescaped.
+    BadWorkflowId(String),
+    EmptyWorkflowRepo,
+    EmptyWorkflowRef,
+    EmptyWorkflowNetwork,
+    BadWorkflowPath(String),
     /// A *static* deployment declared no routes. Managed deployments may:
     /// see [`DeploymentSpec::validate`].
     NoRoutes,
@@ -1694,6 +1845,21 @@ pub enum SpecError {
     BadBuildRef(String),
     BadBuildPath(String),
     BadImageName(String),
+    /// A `build` block set both `repo` and `store`; both name the recipe.
+    BothBuildSources,
+    /// A `build` block set neither `repo` nor `store`, so there is nothing to
+    /// build from.
+    NoBuildSource,
+    EmptyBuildStore,
+    UnsupportedBuildStore(String),
+    /// `build.store` was set without a `build.ref`. A store has no default
+    /// branch to fall back to.
+    MissingBuildRef,
+    /// `build.ref` on a store source is neither a tag nor a digest.
+    BadBuildArtifactRef(String),
+    /// A field that only means something for a git checkout, set on a build
+    /// whose recipe comes from a store.
+    OnlyForGitBuilds(&'static str),
     EmptyArtifactStore,
     UnsupportedArtifactStore(String),
     BadArtifactRef(String),
@@ -1711,6 +1877,23 @@ impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyId => write!(f, "deployment id must not be empty"),
+            Self::BadWorkflowId(id) => write!(
+                f,
+                "workflow id {id:?} must contain only letters, digits, '-' and '_'; \
+                 it is interpolated into a NATS subject and a VM name unescaped"
+            ),
+            Self::EmptyWorkflowRepo => write!(f, "workflow.repo must name a repository"),
+            Self::EmptyWorkflowRef => write!(f, "workflow.ref must name a branch or ref"),
+            Self::EmptyWorkflowNetwork => write!(
+                f,
+                "workflow.network must name the heyvm network whose hosts run this \
+                 workflow"
+            ),
+            Self::BadWorkflowPath(p) => write!(
+                f,
+                "workflow.path {p:?} must be a relative path inside the repository, \
+                 with no leading '/' and no '..' segments"
+            ),
             Self::EmptySiteRoot => write!(f, "site.root must name a directory to serve"),
             Self::RelativeSiteRoot(p) => write!(
                 f,
@@ -1909,6 +2092,45 @@ impl std::fmt::Display for SpecError {
                 f,
                 "build.image_name {n:?} has no usable characters: image names are \
                  [a-z0-9._-] and must start with a letter or digit"
+            ),
+            Self::BothBuildSources => write!(
+                f,
+                "a build sets both `build.repo` and `build.store`: pick one — both name the \
+                 Dockerfile to build, and a build with two recipes has no answer to which one \
+                 produced the image. Check the recipe into the repo, or `art dockerfile put` \
+                 it into the store"
+            ),
+            Self::NoBuildSource => write!(
+                f,
+                "a build sets neither `build.repo` nor `build.store`, so there is no \
+                 Dockerfile to build. Set `build.repo` for a git checkout, or `build.store` \
+                 and `build.ref` for a Dockerfile manifest in an artifact store"
+            ),
+            Self::EmptyBuildStore => write!(f, "build.store must not be empty"),
+            Self::UnsupportedBuildStore(s) => write!(
+                f,
+                "build.store {s:?} is not a usable store: give either an `art serve` URL \
+                 (http://host:port) or an absolute path to a store root on this host"
+            ),
+            Self::MissingBuildRef => write!(
+                f,
+                "build.store is set but build.ref is not: name the Dockerfile manifest to \
+                 build, as a tag or a digest. Unlike a git remote, a store has no default \
+                 branch to fall back to"
+            ),
+            Self::BadBuildArtifactRef(r) => write!(
+                f,
+                "build.ref {r:?} is neither a tag nor a digest: a tag is [A-Za-z0-9._-] and \
+                 may not start with `-` or `.`, and a digest is 64 lowercase hex characters. \
+                 (A git ref would be valid here only if `build.repo` were set instead of \
+                 `build.store`)"
+            ),
+            Self::OnlyForGitBuilds(what) => write!(
+                f,
+                "`{what}` only applies to a build from a git checkout, where it selects a \
+                 file within the repo. A Dockerfile manifest already names its recipe \
+                 (`Dockerfile`) and its context (`context.tar.gz`), so there is nothing left \
+                 to point at"
             ),
             Self::EmptyArtifactStore => write!(f, "artifact.store must not be empty"),
             Self::UnsupportedArtifactStore(s) => write!(
@@ -2136,6 +2358,87 @@ fn is_valid_host_port(s: &str) -> bool {
     matches!(port.parse::<u16>(), Ok(p) if p > 0)
 }
 
+// ---- workflow objects ---------------------------------------------------
+
+/// A CI workflow: which repository to build, and on which heyvm network.
+///
+/// app-lb stores and serves these; it never runs them. The `ci` orchestrator
+/// polls `GET /workflows` and does the work. Keeping the object here rather than
+/// in `ci` means one place holds "what this fleet knows about" — the same
+/// argument that puts deployments and secrets here.
+///
+/// The object names a repository and a path *glob*, not a workflow body. A
+/// workflow lives in the repository it builds, versioned with the code, so the
+/// object is a pointer rather than a copy that can drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSpec {
+    pub id: String,
+    /// Clone URL. Only ever compared and displayed by app-lb; the orchestrator
+    /// never clones it either — a submit carries its own source.
+    pub repo: String,
+    /// Branch or ref this workflow is for. `ref` is a Rust keyword.
+    #[serde(rename = "ref", default = "default_workflow_ref")]
+    pub git_ref: String,
+    /// Where workflow files live inside the repository.
+    #[serde(default = "default_workflow_path")]
+    pub path: String,
+    /// The heyvm network whose hosts may run it.
+    pub network: String,
+    /// Credential for the repository, if the orchestrator is ever made to fetch
+    /// one. A reference, never a value — the admin API echoes specs back and the
+    /// state file holds them in the clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<SecretRef>,
+    /// heyosecret prefix override. Defaults to `ci/<id>` in the orchestrator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets_prefix: Option<String>,
+    /// Disabled workflows stay listed but are not run, so turning one off does
+    /// not lose its configuration.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_workflow_ref() -> String {
+    "main".to_string()
+}
+
+fn default_workflow_path() -> String {
+    ".ci/workflows/*.yml".to_string()
+}
+
+impl WorkflowSpec {
+    pub fn validate(&self) -> Result<(), SpecError> {
+        // The id reaches a NATS subject token, a durable consumer name and a VM
+        // name in the orchestrator, all unescaped. Restricting the alphabet is
+        // cheaper than escaping it in four places.
+        if self.id.is_empty() {
+            return Err(SpecError::EmptyId);
+        }
+        if !self
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err(SpecError::BadWorkflowId(self.id.clone()));
+        }
+        if self.repo.trim().is_empty() {
+            return Err(SpecError::EmptyWorkflowRepo);
+        }
+        if self.git_ref.trim().is_empty() {
+            return Err(SpecError::EmptyWorkflowRef);
+        }
+        if self.network.trim().is_empty() {
+            return Err(SpecError::EmptyWorkflowNetwork);
+        }
+        // The path is joined onto an extracted tree, so it must not escape it.
+        let path = self.path.trim();
+        if path.is_empty() || path.starts_with('/') || path.split('/').any(|s| s == "..") {
+            return Err(SpecError::BadWorkflowPath(self.path.clone()));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2174,8 +2477,23 @@ mod tests {
 
     fn build_spec() -> BuildSpec {
         BuildSpec {
-            repo: "https://github.com/acme/web.git".into(),
-            git_ref: Some("main".into()),
+            repo: Some("https://github.com/acme/web.git".into()),
+            store: None,
+            source_ref: Some("main".into()),
+            dockerfile: None,
+            context: None,
+            image_name: None,
+            image_size_mb: None,
+            auth: None,
+        }
+    }
+
+    /// The other source: a Dockerfile manifest in an artifact store.
+    fn store_build_spec() -> BuildSpec {
+        BuildSpec {
+            repo: None,
+            store: Some("http://art.internal:8080".into()),
+            source_ref: Some("web-rootfs".into()),
             dockerfile: None,
             context: None,
             image_name: None,
@@ -2219,7 +2537,7 @@ mod tests {
         ] {
             let mut s = spec();
             s.build = Some(BuildSpec {
-                repo: repo.into(),
+                repo: Some(repo.into()),
                 ..build_spec()
             });
             assert_eq!(s.validate(), Ok(()), "{repo} should be accepted");
@@ -2237,7 +2555,7 @@ mod tests {
         ] {
             let mut s = spec();
             s.build = Some(BuildSpec {
-                repo: repo.into(),
+                repo: Some(repo.into()),
                 ..build_spec()
             });
             assert!(s.validate().is_err(), "{repo:?} should be rejected");
@@ -2246,7 +2564,7 @@ mod tests {
         for git_ref in ["--upload-pack=x", "a b", "a..b", "/refs/heads/main", "v1^"] {
             let mut s = spec();
             s.build = Some(BuildSpec {
-                git_ref: Some(git_ref.into()),
+                source_ref: Some(git_ref.into()),
                 ..build_spec()
             });
             assert_eq!(
@@ -2279,6 +2597,191 @@ mod tests {
             ..build_spec()
         });
         assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn accepts_a_dockerfile_manifest_build_source() {
+        let mut s = spec();
+        s.build = Some(store_build_spec());
+        assert_eq!(s.validate(), Ok(()));
+
+        // Both spellings of a store, and a digest as well as a tag.
+        for store in ["https://art.example.com", "/srv/artifacts"] {
+            let mut s = spec();
+            s.build = Some(BuildSpec {
+                store: Some(store.into()),
+                source_ref: Some("a".repeat(64)),
+                ..store_build_spec()
+            });
+            assert_eq!(s.validate(), Ok(()), "{store} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_build_needs_exactly_one_source() {
+        // Both: two recipes, and no answer to which produced the image.
+        let mut s = spec();
+        s.build = Some(BuildSpec {
+            store: Some("http://art:8080".into()),
+            ..build_spec()
+        });
+        assert_eq!(s.validate(), Err(SpecError::BothBuildSources));
+
+        // Neither: nothing to build.
+        let mut s = spec();
+        s.build = Some(BuildSpec {
+            repo: None,
+            ..build_spec()
+        });
+        assert_eq!(s.validate(), Err(SpecError::NoBuildSource));
+    }
+
+    #[test]
+    fn a_store_build_requires_a_ref_and_a_reachable_store() {
+        // A git remote has a default branch to fall back to. A store does not,
+        // and guessing one would pick somebody's image out of a shared namespace.
+        let mut s = spec();
+        s.build = Some(BuildSpec {
+            source_ref: None,
+            ..store_build_spec()
+        });
+        assert_eq!(s.validate(), Err(SpecError::MissingBuildRef));
+
+        // Same store rule as `artifact.store`, because it is the same function:
+        // a relative path names a different store depending on how the LB was
+        // started.
+        for store in ["srv/artifacts", "ftp://art", "/srv/../etc", ""] {
+            let mut s = spec();
+            s.build = Some(BuildSpec {
+                store: Some(store.into()),
+                ..store_build_spec()
+            });
+            assert!(s.validate().is_err(), "{store:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn a_git_ref_is_not_accepted_on_a_store_build() {
+        // The two sources share the `ref` field and read it by different rules.
+        // A branch name with a slash is a perfectly good git ref and not a tag,
+        // so which rule applies has to follow from which source is set.
+        for r in ["release/2.1", "a b", "-flag"] {
+            let mut s = spec();
+            s.build = Some(BuildSpec {
+                source_ref: Some(r.into()),
+                ..store_build_spec()
+            });
+            assert_eq!(
+                s.validate(),
+                Err(SpecError::BadBuildArtifactRef(r.to_string())),
+                "{r:?} should be rejected on a store source",
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_relative_paths_are_refused_on_a_store_build() {
+        // A Dockerfile manifest names its own recipe and context. A path here is
+        // somebody expecting a file to be chosen that was already chosen.
+        for (field, with) in [
+            (
+                "build.dockerfile",
+                BuildSpec {
+                    dockerfile: Some("deploy/Dockerfile".into()),
+                    ..store_build_spec()
+                },
+            ),
+            (
+                "build.context",
+                BuildSpec {
+                    context: Some(".".into()),
+                    ..store_build_spec()
+                },
+            ),
+        ] {
+            let mut s = spec();
+            s.build = Some(with);
+            assert_eq!(s.validate(), Err(SpecError::OnlyForGitBuilds(field)));
+        }
+    }
+
+    #[test]
+    fn a_store_build_still_cannot_coexist_with_an_artifact_block() {
+        // Both rewrite `vm.image`. That one of them now also *builds* changes
+        // nothing about why a deployment cannot have two.
+        let mut s = spec();
+        s.build = Some(store_build_spec());
+        s.artifact = Some(ArtifactSpec {
+            store: "http://art:8080".into(),
+            artifact_ref: "web".into(),
+            auth: None,
+            grow_gb: None,
+            image_name: None,
+            strip_components: None,
+        });
+        assert_eq!(s.validate(), Err(SpecError::BothImageSources));
+    }
+
+    #[test]
+    fn a_build_source_is_a_repo_or_a_store_and_never_both() {
+        match store_build_spec().source() {
+            Some(BuildSource::Dockerfile { store, reference }) => {
+                assert_eq!(store, "http://art.internal:8080");
+                assert_eq!(reference, "web-rootfs");
+            }
+            other => panic!("expected a Dockerfile source, got {other:?}"),
+        }
+        match build_spec().source() {
+            Some(BuildSource::Git { repo, git_ref }) => {
+                assert_eq!(repo, "https://github.com/acme/web.git");
+                assert_eq!(git_ref, Some("main"));
+            }
+            other => panic!("expected a Git source, got {other:?}"),
+        }
+        // A spec that never passed validate() has no source at all, rather than
+        // a half-formed one a consumer would have to defend against.
+        assert!(
+            BuildSpec {
+                repo: None,
+                ..build_spec()
+            }
+            .source()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_store_built_image_is_named_after_its_manifest() {
+        let digest = "c74abee2f1a0".to_string() + &"0".repeat(52);
+        assert_eq!(store_build_spec().image_for("web", &digest), "web-c74abee2f1a0");
+        // The same shape a commit gets, so one deployment's images sort together
+        // whichever source made them.
+        assert_eq!(
+            build_spec().image_for("web", "abcdef0123456789"),
+            "web-abcdef012345"
+        );
+    }
+
+    #[test]
+    fn a_build_spec_round_trips_through_json_under_both_sources() {
+        for original in [build_spec(), store_build_spec()] {
+            let json = serde_json::to_string(&original).unwrap();
+            let back: BuildSpec = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, original, "{json}");
+            // One wire name for the version, whichever source it selects.
+            assert!(json.contains("\"ref\""), "{json}");
+            assert!(!json.contains("source_ref"), "{json}");
+        }
+
+        // A spec written before `store` existed still loads: `repo` became
+        // optional by type but is still required in practice, so nothing on disk
+        // needs migrating.
+        let old: BuildSpec =
+            serde_json::from_str(r#"{"repo":"https://x/y.git","ref":"main"}"#).unwrap();
+        assert_eq!(old.repo.as_deref(), Some("https://x/y.git"));
+        assert_eq!(old.store, None);
+        // And still serializes without mentioning a store it does not have.
+        assert!(!serde_json::to_string(&old).unwrap().contains("store"));
     }
 
     #[test]

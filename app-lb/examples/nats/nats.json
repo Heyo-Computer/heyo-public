@@ -1,0 +1,28 @@
+{
+  "id": "nats",
+  "routes": [],
+  "vm": {
+    "driver": "firecracker",
+    "image": "nats",
+    "port": 8222,
+    "open_ports": [4222],
+    "size_class": "medium",
+    "disk_size_gb": 20,
+    "ttl_seconds": 86400
+  },
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 1,
+    "warm_pool": 0,
+    "target_concurrency": 64,
+    "scale_to_zero_after_secs": 0,
+    "cold_start_timeout_secs": 180,
+    "boot_timeout_secs": 180,
+    "drain_timeout_secs": 60,
+    "idle_action": "retain"
+  },
+  "health": {
+    "path": "/healthz",
+    "timeout_secs": 2
+  }
+}

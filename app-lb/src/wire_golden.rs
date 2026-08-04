@@ -118,8 +118,9 @@ fn vm_spec() -> DeploymentSpec {
         },
         upstreams: vec![],
         build: Some(crate::config::BuildSpec {
-            repo: "https://github.com/example/agent".into(),
-            git_ref: Some("main".into()),
+            repo: Some("https://github.com/example/agent".into()),
+            store: None,
+            source_ref: Some("main".into()),
             dockerfile: Some("Dockerfile".into()),
             context: Some(".".into()),
             image_name: Some("agent-base".into()),
@@ -790,4 +791,55 @@ fn security_response_is_stable() {
             }),
         },
     );
+}
+
+/// A workflow object with every optional field populated.
+///
+/// Maximal on purpose: the fixture's job is to catch a field that stops being
+/// serialized, and an absent field cannot go missing.
+fn workflow_spec() -> crate::config::WorkflowSpec {
+    crate::config::WorkflowSpec {
+        id: "build".into(),
+        repo: "https://github.com/Heyo-Computer/app.git".into(),
+        git_ref: "main".into(),
+        path: ".ci/workflows/*.yml".into(),
+        network: "prod-runners".into(),
+        auth: Some(crate::secrets::SecretRef {
+            secret: "github".into(),
+            key: "token".into(),
+            username: None,
+        }),
+        secrets_prefix: Some("ci/app".into()),
+        enabled: true,
+    }
+}
+
+#[test]
+fn workflow_spec_is_stable() {
+    let spec = workflow_spec();
+    spec.validate()
+        .unwrap_or_else(|e| panic!("the fixture describes a workflow the server would reject: {e}"));
+    golden("workflow", &spec);
+
+    // The list shape the `ci` orchestrator polls. Enveloped rather than a bare
+    // array so the response can grow a cursor without becoming a breaking
+    // change.
+    golden(
+        "workflow-list",
+        &serde_json::json!({ "workflows": [workflow_spec()] }),
+    );
+}
+
+/// A minimal object must round-trip through its defaults, or `serverctl create
+/// workflow` would have to send every field.
+#[test]
+fn a_minimal_workflow_fills_its_defaults() {
+    let minimal: crate::config::WorkflowSpec = serde_json::from_str(
+        r#"{"id":"build","repo":"https://example.com/a.git","network":"prod"}"#,
+    )
+    .expect("a minimal object parses");
+    assert_eq!(minimal.git_ref, "main");
+    assert_eq!(minimal.path, ".ci/workflows/*.yml");
+    assert!(minimal.enabled);
+    golden("workflow-minimal", &minimal);
 }

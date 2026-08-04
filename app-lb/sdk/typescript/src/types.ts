@@ -59,13 +59,32 @@ export interface SecretRef {
   username?: string;
 }
 
+/**
+ * Where a managed deployment's guest image is built from. Exactly one of `repo`
+ * and `store` is set — both name the Dockerfile, and a build with two recipes
+ * has no answer to which one produced the image.
+ */
 export interface BuildSpec {
-  repo: string;
+  /** Git remote. Absent when the recipe comes from `store`. */
+  repo?: string;
+  /**
+   * An artifact store holding a Dockerfile manifest (`heyvm.dockerfile.v1`):
+   * an `art serve` URL, or an absolute store root on the app-lb host.
+   */
+  store?: string;
+  /**
+   * Which version of the source to build: a branch, tag or commit for `repo`
+   * (absent follows the remote's default branch), or the tag or digest of a
+   * Dockerfile manifest for `store`, where it is required.
+   */
   ref?: string;
+  /** Git source only — a Dockerfile manifest already names its own recipe. */
   dockerfile?: string;
+  /** Git source only. */
   context?: string;
   image_name?: string;
   image_size_mb?: number;
+  /** A git token for `repo`, or the store's API key for `store`. */
   auth?: SecretRef;
 }
 

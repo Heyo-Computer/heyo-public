@@ -116,6 +116,9 @@ pub enum Resource {
     Vm,
     Cert,
     Secret,
+    /// A CI workflow object: which repository the `ci` orchestrator builds, and
+    /// on which heyvm network.
+    Workflow,
     /// A deploy job: an image build, an artifact pull, or a host update.
     Job,
     /// `get all` — every kind that has a listing.
@@ -129,6 +132,7 @@ impl Resource {
             "vm" | "instance" | "backend" | "replica" => Some(Self::Vm),
             "cert" | "certificate" | "tl" => Some(Self::Cert),
             "secret" | "sec" => Some(Self::Secret),
+            "workflow" | "wf" | "flow" | "ci" => Some(Self::Workflow),
             // `build`, `pull` and `update` name the three verbs; all list the
             // same jobs, so `get builds` and `get pulls` are the same listing
             // filtered by eye. One resource kind, several spellings people will
@@ -145,6 +149,7 @@ impl Resource {
             Self::Vm => "vm",
             Self::Cert => "cert",
             Self::Secret => "secret",
+            Self::Workflow => "workflow",
             Self::Job => "job",
             Self::All => "all",
         }

@@ -27,6 +27,7 @@ mod tls;
 mod tokens;
 mod unpack;
 mod vm;
+mod workflows;
 
 use crate::acme::{AcmeConfig, AcmeManager, ChallengeTable};
 use crate::admin::AdminApi;
@@ -301,6 +302,23 @@ fn main() {
         }
         Ok(n) => tracing::info!(count = n, "restored deployments"),
         Err(e) => tracing::error!(error = %e, "failed to load persisted state; starting empty"),
+    }
+
+    // Beside the deployment state, derived the same way: `app-lb-state.json`
+    // gives `app-lb-workflows.d/`. One directory per object kind keeps a
+    // listing readable and a delete unambiguous.
+    let workflows = Arc::new(crate::workflows::WorkflowStore::new(
+        crate::workflows::workflow_dir(&cfg.state_path),
+    ));
+    match workflows.load() {
+        (0, 0) => tracing::info!(dir = %workflows.dir().display(), "no CI workflows"),
+        (n, 0) => tracing::info!(count = n, "restored CI workflows"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %workflows.dir().display(),
+            "restored CI workflows; some objects were unreadable and were left on disk"
+        ),
     }
     // A deregistration whose file removal failed would otherwise resurrect the
     // deployment on this start. Declines to run if the load above skipped
@@ -618,6 +636,7 @@ fn main() {
             certs.clone(),
             acme_signal,
             secrets,
+            workflows,
             tokens,
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),

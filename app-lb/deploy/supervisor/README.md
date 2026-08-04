@@ -20,9 +20,18 @@ cargo build --release
 sudo install -m0755 target/release/app-lb /usr/local/bin/app-lb
 
 # Dedicated non-root service user. app-lb talks to heyvmd over HTTP and never
-# touches /dev/kvm itself, so this user does NOT need the kvm group — it only
-# needs to write its data/log dirs and reach the daemon URL.
+# touches /dev/kvm itself, so this user does NOT need the kvm group — on a host
+# that does not build images it only needs to write its data/log dirs and reach
+# the daemon URL.
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin app-lb
+
+# ONLY on a host that runs image builds (a deployment with a `build` block).
+# `heyvm mvm build` shells out to docker, whose socket is root:docker 0660, so
+# without this the first build fails with "permission denied while trying to
+# connect to the Docker daemon socket". The group is root-equivalent — that
+# socket starts containers as root on request — so skip it on hosts that only
+# pull artifacts or serve static deployments.
+sudo usermod -aG docker app-lb
 
 # Data dir (persisted deployment state) and log dir.
 sudo install -d -o app-lb -g app-lb /var/lib/app-lb /var/log/app-lb
@@ -61,6 +70,11 @@ sudo supervisorctl tail -f app-lb stderr
 
 ## Notes
 
+- **A new group needs a program restart, not a config reload.** supervisord
+  resolves the service user's group list when it forks the child, so after
+  `usermod -aG docker app-lb` run `supervisorctl restart app-lb`. `reread` and
+  `update` alone leave the already-running process without the group, and builds
+  keep failing on the docker socket with nothing in the config to explain it.
 - A startup misconfiguration causes an immediate panic-exit: setting only one of
   `APP_LB_TLS_CERT` / `APP_LB_TLS_KEY`, `APP_LB_ADMIN_AUTH=1` without
   `APP_LB_DASHBOARD_PASSWORD`, or a listen address that cannot be bound.

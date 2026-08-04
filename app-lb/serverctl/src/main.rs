@@ -81,8 +81,8 @@ enum Command {
         cmd: CreateCmd,
     },
 
-    /// Build a managed deployment's guest image from its git repo and
-    /// Dockerfile, and roll the pool onto the result.
+    /// Build a managed deployment's guest image from its Dockerfile — out of a
+    /// git checkout or an artifact store — and roll the pool onto the result.
     Build(cmd::write::BuildArgs),
 
     /// Pull a managed deployment's guest rootfs from an artifact store, and
@@ -174,6 +174,11 @@ enum CreateCmd {
     /// never readable back out; deployments refer to them by name.
     #[command(visible_alias = "sec")]
     Secret(cmd::write::CreateSecretArgs),
+
+    /// Register a CI workflow: which repository the `ci` orchestrator builds,
+    /// and on which heyvm network.
+    #[command(visible_aliases = ["wf", "flow"])]
+    Workflow(cmd::write::CreateWorkflowArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -193,9 +198,9 @@ enum SetCmd {
     #[command(visible_alias = "routes")]
     Route(cmd::write::SetRouteArgs),
 
-    /// Set where a managed deployment's image is built from: git repo, ref,
-    /// Dockerfile. Recording it changes nothing on its own — `serverctl build`
-    /// runs it.
+    /// Set where a managed deployment's image is built from: a git repo and
+    /// Dockerfile, or a Dockerfile manifest in an artifact store. Recording it
+    /// changes nothing on its own — `serverctl build` runs it.
     Build(cmd::write::SetBuildArgs),
 
     /// Set where a managed deployment's image is *pulled* from: an artifact
@@ -269,6 +274,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Create { cmd } => match cmd {
             CreateCmd::Deployment(args) => cmd::write::create(&Ctx::new(g)?, args),
             CreateCmd::Secret(args) => cmd::write::create_secret(&Ctx::new(g)?, args),
+            CreateCmd::Workflow(args) => cmd::write::create_workflow(&Ctx::new(g)?, args),
         },
         Command::Build(args) => cmd::write::build(&Ctx::new(g)?, args),
         Command::Pull(args) => cmd::write::pull(&Ctx::new(g)?, args),
@@ -674,6 +680,115 @@ mod tests {
             Cli::try_parse_from([
                 "serverctl", "artifact", "login", "http://art:8080", "--api-key", "k",
                 "--api-key-stdin",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_build_source_is_a_repo_or_a_store_and_never_both() {
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "set", "build", "web", "--store", "http://art:8080", "--ref",
+                "web-rootfs",
+            ])
+            .is_ok()
+        );
+        // The flags that only describe a checkout do not apply to a manifest,
+        // which already names its recipe and its context.
+        for conflicting in [
+            vec!["--store", "http://art:8080", "--repo", "https://x/y.git"],
+            vec!["--store", "http://art:8080", "--dockerfile", "deploy/Dockerfile"],
+            vec!["--store", "http://art:8080", "--build-context", "."],
+        ] {
+            let mut argv = vec!["serverctl", "set", "build", "web"];
+            argv.extend(conflicting.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{conflicting:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn create_takes_a_dockerfile_manifest_build_source() {
+        let cli = Cli::try_parse_from([
+            "serverctl",
+            "create",
+            "deployment",
+            "web",
+            "--host",
+            "web.local",
+            "--port",
+            "8080",
+            "--build-store",
+            "http://art:8080",
+            "--ref",
+            "web-rootfs",
+        ])
+        .unwrap();
+        let Command::Create {
+            cmd: CreateCmd::Deployment(args),
+        } = &cli.command
+        else {
+            panic!("expected create deployment");
+        };
+        assert_eq!(args.build_store.as_deref(), Some("http://art:8080"));
+        assert_eq!(args.git_ref.as_deref(), Some("web-rootfs"));
+        assert_eq!(args.repo, None);
+
+        // A store has no default branch, so its ref is not optional.
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "create", "deployment", "web", "--host", "w.local", "--port", "80",
+                "--build-store", "http://art:8080",
+            ])
+            .is_err(),
+            "--build-store without --ref should be refused"
+        );
+        // And the two sources stay alternatives.
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "create", "deployment", "web", "--host", "w.local", "--port", "80",
+                "--build-store", "http://art:8080", "--repo", "https://x/y.git", "--ref", "main",
+            ])
+            .is_err(),
+            "--build-store and --repo say opposite things"
+        );
+    }
+
+    #[test]
+    fn pushing_a_dockerfile_takes_a_context_and_a_tag() {
+        let cli = Cli::try_parse_from([
+            "serverctl",
+            "artifact",
+            "push-dockerfile",
+            "./Dockerfile",
+            "--build-context",
+            "./app",
+            "--tag",
+            "web-rootfs",
+            "--size-mb",
+            "4096",
+        ])
+        .unwrap();
+        let Command::Artifact {
+            cmd: cmd::artifact::ArtifactCmd::PushDockerfile(args),
+            ..
+        } = &cli.command
+        else {
+            panic!("expected artifact push-dockerfile");
+        };
+        assert_eq!(args.file, std::path::PathBuf::from("./Dockerfile"));
+        assert_eq!(args.build_context.as_deref(), Some(std::path::Path::new("./app")));
+        assert_eq!(args.tag.as_deref(), Some("web-rootfs"));
+        assert_eq!(args.image_size_mb, Some(4096));
+
+        // A tag and no-tag say opposite things.
+        assert!(
+            Cli::try_parse_from([
+                "serverctl", "artifact", "push-dockerfile", "./Dockerfile", "--tag", "x",
+                "--no-tag",
             ])
             .is_err()
         );

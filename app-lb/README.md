@@ -640,14 +640,27 @@ is a browser rule, not an app-lb one.
   — gets a `401` and no numbers ever appear. See
   [Putting the dashboard behind Google](#putting-the-dashboard-behind-google).
 
-## Building images from git
+## Building images from a Dockerfile
 
 A managed deployment can say where its guest image *comes from*, not just what it
-is called. Add a `build` block naming a git repo and a Dockerfile, and
-`POST /deployments/:id/build` will check the repo out on the app-lb host, hand
-the Dockerfile to `heyvm mvm build`, and — when that succeeds — rewrite the
-deployment's `vm.image` to the image it produced, which recycles the pool onto
-it.
+is called. Add a `build` block, and `POST /deployments/:id/build` will get a
+Dockerfile onto the app-lb host, hand it to `heyvm mvm build`, and — when that
+succeeds — rewrite the deployment's `vm.image` to the image it produced, which
+recycles the pool onto it.
+
+Two places the Dockerfile can come from, and exactly one of them may be set:
+
+| | `build.repo` | `build.store` |
+|---|---|---|
+| the recipe is | in a git checkout | a manifest in an artifact store |
+| `build.ref` pins | a commit | a manifest digest — recipe *and* context |
+| `build.ref` unset | follows the default branch | rejected; a store has no default |
+| `build.auth` is | a git token | the store's `ART_API_KEY` |
+| needs on this host | `git` | nothing extra |
+
+Both run `heyvm mvm build` and both produce an image that did not exist before,
+which is what separates either from [`artifact`](#pulling-images-from-an-artifact-store)
+— there the digest names a finished rootfs and nothing is built at all.
 
 ```jsonc
 {
@@ -702,6 +715,19 @@ the daemon only looks under *its own* home — so app-lb should run as the same
 user as `heyvmd`, or be given `APP_LB_HEYVM_HOME`. Otherwise the build succeeds
 and then nothing boots.
 
+**Builds need the `docker` group.** `heyvm mvm build` shells out to `docker`,
+whose socket is `root:docker` at `0660`, and the
+[supervisord unit](deploy/supervisor/README.md) runs app-lb as a non-root user
+that is not in that group — so the first build on a fresh host dies with
+`permission denied while trying to connect to the Docker daemon socket`. Add it
+(`usermod -aG docker app-lb`) and then **restart the program**, not just the
+config: supervisord resolves the group list when it forks the child, so a
+`reread`/`update` leaves the running process without it. Grant it only where
+builds actually run — the socket starts containers as root on request, so the
+group is root-equivalent and hands back most of what the non-root user was for.
+A host that only [pulls images](#pulling-images-from-an-artifact-store) needs
+none of this.
+
 **Image names carry the commit.** Each build produces `<name>-<short sha>`
 (`<name>` defaults to the deployment id, override with `build.image_name`), so
 the running spec answers "what is deployed?" with something you can look up in
@@ -723,6 +749,63 @@ A static (`upstreams`) deployment cannot have a `build` block: it has no guest
 image, it forwards to something somebody else runs. Its update path is
 [`update`](#updating-a-static-deployment) instead, and declaring the wrong one is
 rejected at registration.
+
+### Building a Dockerfile out of the artifact store
+
+The recipe does not have to live in a repo. `art dockerfile put` stores a
+Dockerfile — and, optionally, the build context it copies from — as a
+`heyvm.dockerfile.v1` manifest, and `build.store` points a deployment at it:
+
+```jsonc
+{
+  "id": "web",
+  "vm": {"driver": "firecracker", "image": "web-30fea8aa436f", "port": 8080},
+  "build": {
+    "store": "http://art.internal:8080",   // an `art serve` URL, or an absolute store root
+    "ref": "web-rootfs",                   // a tag, or a manifest digest
+    "image_size_mb": 4096,                 // omit to use the manifest's own default
+    "auth": {"secret": "art", "key": "key"}  // the store's ART_API_KEY; omit if it is open
+  }
+}
+```
+
+Push one from a workstation and point a deployment at it:
+
+```sh
+serverctl artifact push-dockerfile ./Dockerfile --build-context . --tag web-rootfs
+serverctl set build web --store http://art.internal:8080 --ref web-rootfs
+serverctl build web --wait
+```
+
+**What this buys over a repo.** A git ref pins a commit and the Dockerfile is
+whatever that commit happens to hold; a store ref resolves to a manifest digest
+covering the recipe, the context *and* the build defaults together. So a build
+can name its exact inputs, and a rollback is expressible — a tag moves, a digest
+does not. It also builds a deployment whose source is not in a repo app-lb can
+reach, without giving the LB a git credential.
+
+**What it does not buy.** The build still runs here, and still takes as long as
+`docker build` does. If the point is to stop building on every host, push the
+*image* instead — that is [`artifact`](#pulling-images-from-an-artifact-store).
+
+**The layout on disk.** The recipe lands in
+`<work_dir>/<deployment>/.recipe/Dockerfile` and the context is unpacked into
+`<work_dir>/<deployment>/.recipe/context/`, which is what `-c` is pointed at. The
+directory is **emptied first**, and the archive is deleted after unpacking:
+otherwise a file from a previous build could satisfy a `COPY` the current recipe
+no longer ships — the same failure `git clean -xffdq` prevents on the repo path,
+arriving by a different route. For the same reason the `Dockerfile` sits *beside*
+the context rather than in it, so a `COPY` cannot reach it.
+
+**Image names carry the manifest digest**, the way a repo build's carry the
+commit: `<name>-<12 hex>`. Both are the input's identity, not the output's — a
+`docker build` is not reproducible, so the image is named after what it was made
+*from*.
+
+**Context contents are refused, not sanitized.** The archive is unpacked under
+the same rules as a site bundle: no absolute paths, no `..`, and no symlinks,
+hardlinks or devices. `docker build` itself would allow a symlink; a build
+context arriving over a wire is exactly the untrusted input that rule exists for.
 
 ## Pulling images from an artifact store
 

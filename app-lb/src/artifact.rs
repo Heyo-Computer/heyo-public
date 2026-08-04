@@ -61,7 +61,7 @@
 //! `<name>.ext4` and does not care how long it has been there, so a partial file
 //! under the final name is a VM that boots halfway.
 
-use crate::config::ArtifactSpec;
+use crate::config::{ArtifactSpec, is_remote_store};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -73,6 +73,22 @@ use tokio::io::AsyncWriteExt;
 /// `driver/sync.rs`. A manifest with several entries — a sync bundle — is
 /// resolved by finding this one.
 const ROOTFS_FILENAME: &str = "rootfs.ext4";
+
+/// Entry names and kind of a Dockerfile manifest, matching `src/dockerfile.rs`
+/// in the artifacts crate. Copied rather than depended on, for the same reason
+/// [`Manifest`] below is: this side only ever reads these, and the dependency
+/// would pull an axum tree and a syscall layer in to spell three constants.
+pub const KIND_DOCKERFILE: &str = "heyvm.dockerfile.v1";
+pub const DOCKERFILE_ENTRY: &str = "Dockerfile";
+const CONTEXT_ENTRY: &str = "context.tar.gz";
+/// The manifest's own `--size-mb` default.
+const ANN_SIZE_MB: &str = "heyvm.size_mb";
+
+/// Directory the build context is unpacked into, beneath the recipe directory.
+/// `heyvm mvm build -c` is pointed here, so a Dockerfile sitting beside it is
+/// deliberately *outside* the context — it is not a file the build should be
+/// able to `COPY`.
+const CONTEXT_DIR: &str = "context";
 
 /// A sha256 in the only spelling the store accepts.
 const DIGEST_HEX_LEN: usize = 64;
@@ -124,6 +140,28 @@ pub struct PulledTree {
     /// Whether the whole pull was skipped because this digest is already the one
     /// deployed at `root`.
     pub reused: bool,
+}
+
+/// What a Dockerfile-manifest fetch produced: a build, laid out and ready to
+/// run.
+#[derive(Debug, Clone)]
+pub struct FetchedDockerfile {
+    /// The manifest digest the reference resolved to. This is what the built
+    /// image is named after, because it is the only thing that covers the whole
+    /// build input — recipe, context and annotations together.
+    pub manifest: String,
+    /// The recipe on disk.
+    pub dockerfile: PathBuf,
+    /// The `docker build` context. An empty directory when the manifest had no
+    /// context entry, which is correct rather than a special case: a recipe that
+    /// copies nothing in needs a context that contains nothing.
+    pub context: PathBuf,
+    /// Regular files unpacked from the context, or `None` when there was none.
+    pub context_files: Option<usize>,
+    /// The manifest's `heyvm.size_mb` annotation, if it recorded a usable one.
+    pub size_mb: Option<u64>,
+    /// Bytes transferred from the store.
+    pub bytes_written: u64,
 }
 
 /// Materializes a store's blobs onto this host: rootfs images into one
@@ -202,6 +240,212 @@ impl Puller {
             }
             self.pull_local(dir, deployment_id, spec, force, log).await
         }
+    }
+
+    // -- builds: a Dockerfile manifest laid out on disk ----------------------
+
+    /// Resolve a Dockerfile manifest and write it into `dir` as a buildable
+    /// tree: `<dir>/Dockerfile` and `<dir>/context/`.
+    ///
+    /// `dir` is **wiped first**, and that is the point rather than tidiness. A
+    /// context left over from the previous build could satisfy a `COPY` the
+    /// current recipe no longer ships, producing an image that builds here and
+    /// nowhere else — the same failure `git clean -xffdq` prevents on the git
+    /// path, arriving by a different route.
+    ///
+    /// Both transports end in the same place, but only one of them is free:
+    ///
+    /// * **A URL** — `GET /manifests/{ref}`, then the blobs, hashed as they land.
+    /// * **A path** — `art dockerfile export`, which hardlinks. A hardlink writes
+    ///   no bytes and therefore hashes none, so the digests are checked here
+    ///   afterwards. It is worth doing: a context is untrusted input that is
+    ///   about to be unpacked across a directory on this host.
+    pub async fn fetch_dockerfile(
+        &self,
+        store: &str,
+        reference: &str,
+        api_key: Option<&str>,
+        dir: &Path,
+        log: &mut (dyn FnMut(String) + Send),
+    ) -> Result<FetchedDockerfile, String> {
+        let base = store.trim().trim_end_matches('/');
+        let remote = is_remote_store(base);
+
+        // Removed and recreated, never merged into.
+        let _ = tokio::fs::remove_dir_all(dir).await;
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+
+        let recipe = dir.join(DOCKERFILE_ENTRY);
+        let archive = dir.join(CONTEXT_ENTRY);
+        let context = dir.join(CONTEXT_DIR);
+
+        let (manifest, size_mb, bytes_written) = if remote {
+            self.fetch_dockerfile_remote(base, reference, api_key, &recipe, &archive, log)
+                .await?
+        } else {
+            if api_key.is_some() {
+                log("build.auth is set on a local store; a store root is protected by file \
+                     permissions, not by an API key, and the secret is unused"
+                    .to_string());
+            }
+            self.export_dockerfile_local(base, reference, dir, log).await?
+        };
+
+        tokio::fs::create_dir_all(&context)
+            .await
+            .map_err(|e| format!("could not create {}: {e}", context.display()))?;
+
+        let context_files = if tokio::fs::metadata(&archive).await.is_ok() {
+            // Untarring is synchronous and a context can be hundreds of
+            // megabytes of gzip: on the job task directly it would stall every
+            // other future on this runtime thread for the duration.
+            let (from, into) = (archive.clone(), context.clone());
+            let unpacked = tokio::task::spawn_blocking(move || {
+                crate::unpack::extract_into(&from, &into, 0)
+            })
+            .await
+            .map_err(|e| format!("the context unpack task did not finish: {e}"))??;
+            log(format!(
+                "unpacked {} file{} ({}) of build context",
+                unpacked.files,
+                if unpacked.files == 1 { "" } else { "s" },
+                human(unpacked.bytes),
+            ));
+            // The archive is not part of the context and must not be visible to
+            // a `COPY`. It is also the whole context a second time on disk.
+            let _ = tokio::fs::remove_file(&archive).await;
+            Some(unpacked.files)
+        } else {
+            log("this recipe has no build context".to_string());
+            None
+        };
+
+        Ok(FetchedDockerfile {
+            manifest,
+            dockerfile: recipe,
+            context,
+            context_files,
+            size_mb,
+            bytes_written,
+        })
+    }
+
+    /// `GET /manifests/{ref}` and then the blobs it names.
+    async fn fetch_dockerfile_remote(
+        &self,
+        base: &str,
+        reference: &str,
+        api_key: Option<&str>,
+        recipe: &Path,
+        archive: &Path,
+        log: &mut (dyn FnMut(String) + Send),
+    ) -> Result<(String, Option<u64>, u64), String> {
+        let url = format!("{base}/manifests/{reference}");
+        let resp = self
+            .get(&url, api_key)
+            .await
+            .map_err(|e| format!("GET {url} failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "GET {url} answered {status}{} — `build.ref` must name a Dockerfile manifest \
+                 in this store. Push one with `serverctl artifact push-dockerfile --tag \
+                 {reference}`",
+                detail(&body)
+            ));
+        }
+        let m: Manifest = resp
+            .json()
+            .await
+            .map_err(|e| format!("the manifest at {url} was not readable: {e}"))?;
+        check_dockerfile_kind(&m, reference)?;
+
+        // The digest the reference resolved to. Asked for separately because
+        // `GET /manifests/{tag}` answers with the manifest, not with its address,
+        // and the address is what the image gets named after. A reference that is
+        // already a digest is its own answer and costs no round trip.
+        let manifest_digest = if is_digest(reference) {
+            reference.to_string()
+        } else {
+            match self.tag_digest(base, reference, api_key).await? {
+                Some(d) => d,
+                None => {
+                    return Err(format!(
+                        "{base} served a manifest for {reference:?} but has no tag by that name"
+                    ));
+                }
+            }
+        };
+
+        let df = named_entry(&m, DOCKERFILE_ENTRY, reference)?;
+        log(format!(
+            "{reference} resolves to {manifest_digest} at {base} (Dockerfile {}, {})",
+            short(&df.digest),
+            human(df.size),
+        ));
+        let mut written = self
+            .fetch_blob(base, &df.digest, api_key, recipe, df.size, log)
+            .await?;
+
+        if let Some(ctx) = m.entries.iter().find(|e| e.name == CONTEXT_ENTRY) {
+            written += self
+                .fetch_blob(base, &ctx.digest, api_key, archive, ctx.size, log)
+                .await?;
+        }
+        Ok((manifest_digest, m.size_mb(), written))
+    }
+
+    /// `art dockerfile export` — the local-store path, which hardlinks.
+    async fn export_dockerfile_local(
+        &self,
+        root: &str,
+        reference: &str,
+        dir: &Path,
+        log: &mut (dyn FnMut(String) + Send),
+    ) -> Result<(String, Option<u64>, u64), String> {
+        // Asked for first: it is one cheap invocation, and it is the only place
+        // the annotations and the entry digests are visible on this path.
+        let mut cmd = self.art(root);
+        cmd.arg("manifest").arg(reference);
+        let out = self.run(cmd).await?;
+        let m: Manifest = serde_json::from_str(&out)
+            .map_err(|e| format!("`art manifest` produced output that is not a manifest: {e}"))?;
+        check_dockerfile_kind(&m, reference)?;
+        let df = named_entry(&m, DOCKERFILE_ENTRY, reference)?;
+
+        let mut cmd = self.art(root);
+        cmd.arg("dockerfile").arg("export").arg(reference).arg(dir);
+        let out = self.run(cmd).await?;
+        let v: serde_json::Value = serde_json::from_str(&out).map_err(|e| {
+            format!("`art dockerfile export` produced output that is not JSON: {e}")
+        })?;
+        let manifest_digest = v
+            .get("manifest")
+            .and_then(|d| d.as_str())
+            .ok_or("`art dockerfile export` reported no manifest digest")?
+            .to_string();
+        let written = ["dockerfile", "context"]
+            .iter()
+            .filter_map(|k| v.get(*k)?.get("bytesWritten")?.as_u64())
+            .sum();
+
+        log(format!(
+            "{reference} resolves to {manifest_digest} in {root} ({})",
+            if written == 0 { "hardlinked" } else { "copied" }
+        ));
+
+        // `art dockerfile export` hardlinks when it can, and a hardlink hashes
+        // nothing. The context is about to be unpacked across a directory on
+        // this host, so it is verified before that happens rather than after.
+        verify_file(&dir.join(DOCKERFILE_ENTRY), &df.digest).await?;
+        if let Some(ctx) = m.entries.iter().find(|e| e.name == CONTEXT_ENTRY) {
+            verify_file(&dir.join(CONTEXT_ENTRY), &ctx.digest).await?;
+        }
+
+        Ok((manifest_digest, m.size_mb(), written))
     }
 
     // -- sites: a bundle unpacked into the served directory ------------------
@@ -476,18 +720,37 @@ impl Puller {
         Ok((digest, size))
     }
 
-    /// What a tag points at, via the tag listing.
+    /// What one tag points at.
     ///
-    /// The store has `GET /tags` but no `GET /tags/{name}`, so this reads the
-    /// whole list and filters. That is fine at the sizes involved — a store
-    /// holds tens of images — and it is only reached when the tag turned out
-    /// not to name a manifest.
+    /// `GET /tags/{name}` first, falling back to filtering `GET /tags` — not for
+    /// robustness's sake, but because the single-tag route is newer than the
+    /// listing and a fleet is not upgraded all at once. A store that predates it
+    /// answers `405`, and re-asking is one round trip against a list of tens.
+    ///
+    /// The fallback is scoped to that: a `404` from the single-tag route is a
+    /// real answer — this store has no such tag — and re-reading the whole
+    /// listing to confirm it would only make the same reply cost twice.
     async fn tag_digest(
         &self,
         base: &str,
         tag: &str,
         api_key: Option<&str>,
     ) -> Result<Option<String>, String> {
+        let url = format!("{base}/tags/{tag}");
+        match self.get(&url, api_key).await {
+            Ok(resp) if resp.status().is_success() => {
+                let entry: TagEntry = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("the tag at {url} was not readable: {e}"))?;
+                return Ok(Some(entry.digest).filter(|d| is_digest(d)));
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => return Ok(None),
+            // Anything else — a 405 from an older store, a proxy in the way —
+            // falls through to the listing.
+            Ok(_) | Err(_) => {}
+        }
+
         let url = format!("{base}/tags");
         let resp = self
             .get(&url, api_key)
@@ -820,7 +1083,71 @@ struct Materialized {
 #[derive(serde::Deserialize)]
 struct Manifest {
     #[serde(default)]
+    kind: String,
+    #[serde(default)]
     entries: Vec<ManifestEntry>,
+    /// Free-form, and read only for defaults a caller may override. A value that
+    /// does not parse is treated as absent — a build that refused to start over
+    /// a malformed *default* would be worse than one that lets heyvm size the
+    /// image itself.
+    #[serde(default)]
+    annotations: std::collections::BTreeMap<String, String>,
+}
+
+impl Manifest {
+    fn size_mb(&self) -> Option<u64> {
+        self.annotations.get(ANN_SIZE_MB)?.trim().parse().ok()
+    }
+}
+
+/// Refuse a manifest that is not a recipe, by name and before anything is
+/// fetched.
+///
+/// Worth its own check rather than letting the missing `Dockerfile` entry speak:
+/// pointing `build.ref` at a rootfs tag is the obvious mistake, and "that is an
+/// image, use `artifact` to pull it" is a different instruction from "that
+/// manifest is malformed".
+fn check_dockerfile_kind(m: &Manifest, reference: &str) -> Result<(), String> {
+    if m.kind == KIND_DOCKERFILE {
+        return Ok(());
+    }
+    Err(format!(
+        "{reference:?} is a {:?} manifest, not {KIND_DOCKERFILE:?}. `build.store` names a \
+         Dockerfile to build; a manifest holding an image that is already built is pulled \
+         with an `artifact` block instead",
+        m.kind
+    ))
+}
+
+/// One entry of a manifest, by name.
+fn named_entry<'a>(m: &'a Manifest, name: &str, reference: &str) -> Result<&'a ManifestEntry, String> {
+    let e = m.entries.iter().find(|e| e.name == name).ok_or_else(|| {
+        format!(
+            "the manifest for {reference:?} has no {name:?} entry (it holds: {})",
+            match m.entries.len() {
+                0 => "nothing".to_string(),
+                _ => m
+                    .entries
+                    .iter()
+                    .map(|e| e.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }
+        )
+    })?;
+    if !is_digest(&e.digest) {
+        return Err(format!(
+            "the manifest for {reference:?} names {name:?} with digest {:?}, which is not a \
+             sha256",
+            e.digest
+        ));
+    }
+    Ok(e)
+}
+
+/// A digest, short enough to read in a log line.
+fn short(digest: &str) -> String {
+    digest.chars().take(12).collect()
 }
 
 /// One row of `GET /tags`.
@@ -830,7 +1157,7 @@ struct TagEntry {
     digest: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct ManifestEntry {
     #[serde(default)]
     name: String,
@@ -1096,7 +1423,12 @@ mod tests {
     use super::*;
 
     fn manifest(entries: &[(&str, &str, u64)]) -> Manifest {
+        manifest_of("heyvm.rootfs.v1", entries)
+    }
+
+    fn manifest_of(kind: &str, entries: &[(&str, &str, u64)]) -> Manifest {
         Manifest {
+            kind: kind.to_string(),
             entries: entries
                 .iter()
                 .map(|(name, digest, size)| ManifestEntry {
@@ -1105,6 +1437,7 @@ mod tests {
                     size: *size,
                 })
                 .collect(),
+            annotations: Default::default(),
         }
     }
 
@@ -1119,6 +1452,71 @@ mod tests {
     /// What a rootfs pull looks for.
     fn rootfs_entry(m: &Manifest, reference: &str) -> Result<(String, u64), String> {
         blob_entry(m, reference, Some(ROOTFS_FILENAME))
+    }
+
+    #[test]
+    fn a_dockerfile_manifest_yields_its_recipe_and_its_context() {
+        let m = manifest_of(
+            KIND_DOCKERFILE,
+            &[
+                (DOCKERFILE_ENTRY, &d("1111"), 812),
+                (CONTEXT_ENTRY, &d("2222"), 40_213),
+            ],
+        );
+        assert!(check_dockerfile_kind(&m, "web-rootfs").is_ok());
+        assert_eq!(named_entry(&m, DOCKERFILE_ENTRY, "web").unwrap().digest, d("1111"));
+        assert_eq!(named_entry(&m, CONTEXT_ENTRY, "web").unwrap().size, 40_213);
+    }
+
+    #[test]
+    fn a_recipe_is_found_by_name_not_by_position() {
+        // `context.tar.gz` sorts first. Picking entry zero would hand a gzip
+        // file to `heyvm mvm build -f`.
+        let m = manifest_of(
+            KIND_DOCKERFILE,
+            &[(CONTEXT_ENTRY, &d("2222"), 40), (DOCKERFILE_ENTRY, &d("1111"), 8)],
+        );
+        assert_eq!(named_entry(&m, DOCKERFILE_ENTRY, "web").unwrap().digest, d("1111"));
+    }
+
+    #[test]
+    fn pointing_a_build_at_a_rootfs_manifest_says_to_pull_it_instead() {
+        // The obvious mistake: `build.ref` given an image tag. "That is an image,
+        // pull it" is a different instruction from "that manifest is malformed",
+        // so the kind is checked before the entries are.
+        let m = manifest(&[("rootfs.ext4", &d("c74abee2"), 4096)]);
+        let e = check_dockerfile_kind(&m, "debian-hermes").unwrap_err();
+        assert!(e.contains("heyvm.rootfs.v1"), "{e}");
+        assert!(e.contains("artifact"), "{e}");
+    }
+
+    #[test]
+    fn a_dockerfile_manifest_with_no_recipe_names_what_it_does_hold() {
+        let m = manifest_of(KIND_DOCKERFILE, &[(CONTEXT_ENTRY, &d("2222"), 40)]);
+        let e = named_entry(&m, DOCKERFILE_ENTRY, "web").unwrap_err();
+        assert!(e.contains(CONTEXT_ENTRY), "{e}");
+
+        let empty = manifest_of(KIND_DOCKERFILE, &[]);
+        assert!(
+            named_entry(&empty, DOCKERFILE_ENTRY, "web")
+                .unwrap_err()
+                .contains("nothing")
+        );
+    }
+
+    #[test]
+    fn a_size_annotation_is_a_default_and_never_a_failure() {
+        let mut m = manifest_of(KIND_DOCKERFILE, &[(DOCKERFILE_ENTRY, &d("1111"), 8)]);
+        assert_eq!(m.size_mb(), None);
+
+        m.annotations.insert(ANN_SIZE_MB.into(), "4096".into());
+        assert_eq!(m.size_mb(), Some(4096));
+
+        // Annotations are free text on the store's side. A build that refused to
+        // start over a malformed *default* would be worse than one that lets
+        // heyvm size the image itself.
+        m.annotations.insert(ANN_SIZE_MB.into(), "quite big".into());
+        assert_eq!(m.size_mb(), None);
     }
 
     #[test]
@@ -1298,5 +1696,78 @@ mod tests {
         assert_eq!(human(512), "512 B");
         assert_eq!(human(1024), "1.0 KiB");
         assert_eq!(human(21_474_836_480), "20.0 GiB");
+    }
+
+    /// Both transports, against a real store, laying out a real recipe.
+    ///
+    /// Opt-in because it needs something this repository does not ship: a store
+    /// with a Dockerfile manifest in it, and — for the local half — the `art`
+    /// binary on `PATH`. The unit tests above pin the *shapes* app-lb parses;
+    /// this is the one that proves those shapes are what `art` and `art serve`
+    /// actually emit, which is the part no amount of hand-written JSON can
+    /// establish.
+    ///
+    /// ```text
+    /// export ART_ROOT=/tmp/store
+    /// art dockerfile put ./Dockerfile --context ./app --tag proj
+    /// ART_API_KEY=k art serve --listen 127.0.0.1:38099 &
+    /// APP_LB_TEST_ART_ROOT=$ART_ROOT \
+    /// APP_LB_TEST_ART_URL=http://127.0.0.1:38099 \
+    /// APP_LB_TEST_ART_KEY=k APP_LB_TEST_ART_REF=proj \
+    ///   cargo test --bin app-lb fetches_a_dockerfile -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a live artifact store; see the doc comment"]
+    async fn fetches_a_dockerfile_manifest_from_a_real_store() {
+        let Ok(reference) = std::env::var("APP_LB_TEST_ART_REF") else {
+            eprintln!("set APP_LB_TEST_ART_REF to run this");
+            return;
+        };
+        let key = std::env::var("APP_LB_TEST_ART_KEY").ok();
+        let puller = Puller::new(
+            std::env::var("APP_LB_TEST_ART_BIN").unwrap_or_else(|_| "art".into()),
+            Err("not needed for a recipe fetch".into()),
+            None,
+        );
+
+        let scratch = std::env::temp_dir().join(format!("applb-df-test-{}", std::process::id()));
+        for (label, store) in [
+            ("url", std::env::var("APP_LB_TEST_ART_URL").ok()),
+            ("root", std::env::var("APP_LB_TEST_ART_ROOT").ok()),
+        ] {
+            let Some(store) = store else { continue };
+            let dir = scratch.join(label);
+            let mut lines = Vec::new();
+            let fetched = puller
+                .fetch_dockerfile(&store, &reference, key.as_deref(), &dir, &mut |l| {
+                    lines.push(l)
+                })
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            eprintln!("[{label}] {}\n  {}", fetched.manifest, lines.join("\n  "));
+
+            assert!(is_digest(&fetched.manifest), "{label}");
+            let recipe = std::fs::read_to_string(&fetched.dockerfile)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(recipe.contains("FROM"), "{label}: {recipe:?}");
+            // The context is a directory `heyvm mvm build -c` can be pointed at,
+            // never the archive it arrived as.
+            assert!(fetched.context.is_dir(), "{label}");
+            assert!(
+                !fetched.context.join(CONTEXT_ENTRY).exists()
+                    && !fetched.dockerfile.with_file_name(CONTEXT_ENTRY).exists(),
+                "{label}: the archive was left where a COPY could reach it",
+            );
+        }
+
+        // The same reference through two transports must produce the same
+        // manifest digest, or the image name would depend on how it was fetched.
+        if scratch.join("url").is_dir() && scratch.join("root").is_dir() {
+            assert_eq!(
+                std::fs::read(scratch.join("url").join(DOCKERFILE_ENTRY)).unwrap(),
+                std::fs::read(scratch.join("root").join(DOCKERFILE_ENTRY)).unwrap(),
+            );
+        }
+        std::fs::remove_dir_all(&scratch).ok();
     }
 }

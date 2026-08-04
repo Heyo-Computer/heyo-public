@@ -330,6 +330,26 @@ pub fn forget_digest(root: &Path) {
     }
 }
 
+/// Unpack `archive` straight into `dest`, which must already exist.
+///
+/// The staging-and-swap dance in [`stage`] exists because a site's directory is
+/// *being served* while it is replaced. A Docker build context is not: it is
+/// written into a scratch directory that the caller just emptied, and nothing
+/// reads it until the build starts. So this is the same extractor under the same
+/// rules — no `..`, no absolute paths, no symlinks, hardlinks or devices — with
+/// none of the swap.
+///
+/// The symlink rule is worth flagging, because `docker build` itself would allow
+/// one: a context that needs a symlink is refused here rather than unpacked. A
+/// link is how a tar reaches outside the directory it was told to fill, and a
+/// build context arriving from a store is exactly the untrusted input that rule
+/// was written for.
+///
+/// **Blocking.** Call it from `spawn_blocking`.
+pub fn extract_into(archive: &Path, dest: &Path, strip: usize) -> Result<Unpacked, String> {
+    extract(archive, dest, strip)
+}
+
 fn extract(archive: &Path, dest: &Path, strip: usize) -> Result<Unpacked, String> {
     let file = std::fs::File::open(archive)
         .map_err(|e| format!("could not open the bundle at {}: {e}", archive.display()))?;

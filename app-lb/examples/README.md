@@ -334,9 +334,11 @@ which recycles the pool onto it.
 
 The build runs on the app-lb host, so that host needs `docker`, `mke2fs`
 (e2fsprogs), `fakeroot` and the `heyvm` CLI — the same tools you would need to
-run `heyvm mvm build` by hand, because that is exactly what app-lb runs. It also
-needs to write into the *daemon's* image directory: run app-lb as the same user
-as `heyvmd`, or set `APP_LB_HEYVM_HOME` to that user's home.
+run `heyvm mvm build` by hand, because that is exactly what app-lb runs. The
+user app-lb runs as has to be in the `docker` group — the supervisord unit's
+`app-lb` user is not, by default — and to be able to write into the *daemon's*
+image directory: run app-lb as the same user as `heyvmd`, or set
+`APP_LB_HEYVM_HOME` to that user's home.
 
 Store the git credential first (a private repo needs one; drop `build.auth` for
 a public one):
@@ -714,3 +716,38 @@ curl -H 'Host: secrets.local' localhost:6188/health
   browser sees HTTPS and the `Secure` attribute is correct, but it has to be set
   explicitly. Leave it `false` while testing over plaintext `:6188`, or the
   dashboard login cookie is dropped and sign-in silently loops.
+
+## `nats/` — a NATS server with JetStream, image and all
+
+The only example that is a directory rather than a single spec, because the
+deployment is half of it: `nats/image/` is the Firecracker rootfs, and
+`nats/nats.json` is the deployment that owns its lifecycle. See
+[`nats/README.md`](nats/README.md).
+
+```sh
+cd examples/nats && ./build-image.sh
+serverctl apply -f examples/nats/nats.json
+serverctl exec nats -- /opt/nats/preflight.sh
+```
+
+It is worth reading for two things that generalize past NATS:
+
+- **A stateful service has to put its state on `/workspace`.** mvm-ctrl recopies
+  the rootfs from the base image on every cold boot, so JetStream's store lives
+  on the `disk_size_gb` data disk, which `init.sh` formats and mounts. Getting
+  this wrong is invisible: the server is healthy, streams work, and the queue is
+  gone the next time app-lb recreates the VM. `init.sh` refuses to start the
+  server rather than run non-durably, and `preflight.sh` proves durability by
+  writing to the mounted store.
+
+- **app-lb fronts the part of a service that speaks HTTP, and says so about the
+  rest.** NATS's client protocol is raw TCP in which the server speaks first, so
+  it can never traverse an HTTP proxy. `vm.port` is the 8222 monitoring endpoint —
+  proxied and health-checked on NATS's own `/healthz` — while `vm.open_ports`
+  carries 4222 for clients that connect directly to the guest IP. What the
+  deployment buys is the VM lifecycle, health, disk retention and TTL renewal;
+  it does not pretend to proxy the bus.
+
+`min_replicas: max_replicas: 1` is deliberate and not a placeholder: this is a
+single JetStream server with a file store, so a second replica would be a second
+independent broker with its own store. Clustering is a different manifest.

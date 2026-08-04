@@ -294,11 +294,12 @@ Every `set` command and `edit` is a read-modify-write against `PUT /deployments/
 replaces the whole spec. serverctl edits the server's JSON rather than a struct of its own, so
 fields it has never heard of survive the round trip.
 
-### Building an image from git
+### Building an image from a Dockerfile
 
-A managed deployment can carry a *build source* — a git repo and a Dockerfile — instead of only
-an image name. `serverctl build` checks the repo out on the app-lb host, builds the image with
-`heyvm mvm build`, and rolls the pool onto the result.
+A managed deployment can carry a *build source* — where its Dockerfile comes from — instead of
+only an image name. `serverctl build` gets that Dockerfile onto the app-lb host, builds the image
+with `heyvm mvm build`, and rolls the pool onto the result. The recipe comes from a git checkout
+(`--repo`) or from a Dockerfile manifest in an artifact store (`--store`); exactly one of the two.
 
 ```sh
 # Store the credential first, if the repo is private. The value is never readable back.
@@ -320,6 +321,21 @@ serverctl build web                        # fire and forget; poll with `get job
 
 serverctl set build web --clear             # stop tracking a source; keep the current image
 ```
+
+The recipe can live in the artifact store instead of a repo, which is what
+[`artifact push-dockerfile`](#pushing-a-dockerfile-to-an-artifact-store) puts there:
+
+```sh
+serverctl set build web --store http://10.0.0.4:8080 --ref web-rootfs
+serverctl create deployment web --host web.example.com --port 8080 \
+  --build-store http://10.0.0.4:8080 --ref web-rootfs
+serverctl build web --wait
+```
+
+`--repo` and `--store` are alternatives, and switching drops the other along with the flags that
+only meant something to it (`--dockerfile`, `--build-context`). `--ref` is read by whichever
+source is set — a branch or commit for a repo, a manifest tag or digest for a store, where it is
+required because a store has no default branch to fall back on.
 
 A build is asynchronous server-side, so plain `serverctl build` returns as soon as it is
 scheduled and prints the id to follow. `--wait` polls to completion, `--logs` also streams the
@@ -420,6 +436,31 @@ A push hashes the file, asks the store whether it already holds those bytes, upl
 then writes a manifest and moves the tag onto it. The manifest matters: it is what makes a pushed
 image indistinguishable from one `art heyvm import` put in, and therefore pullable. Re-pushing
 unchanged bytes is two round trips and reports `uploaded: false`.
+
+### Pushing a Dockerfile to an artifact store
+
+The counterpart of `push`, one step earlier: `push` ships an image somebody already built,
+`push-dockerfile` ships the recipe and lets app-lb build it on the host that will run it.
+
+```sh
+serverctl artifact push-dockerfile ./Dockerfile --build-context . --tag web-rootfs
+serverctl artifact push-dockerfile ./Dockerfile --image-name web --size-mb 4096
+serverctl artifact push-dockerfile ./Dockerfile --no-tag       # name the manifest digest instead
+```
+
+The context may be a directory (packed here, deterministically, so an unchanged tree re-pushes as
+one `HEAD`) or an archive you rolled yourself. Nothing is excluded — no `.dockerignore` handling —
+because a packer that silently dropped files produces a build that fails on somebody else's host
+with an error pointing at the Dockerfile. Point `--build-context` at a clean directory.
+
+It is spelled `--build-context` rather than `--context` because `--context` is a global flag that
+selects the saved app-lb context. The tag defaults to the Dockerfile's *directory* name, not its
+filename — every project's recipe is called `Dockerfile`, so a filename default would have every
+push in a shared store fighting over one tag.
+
+The manifest is `heyvm.dockerfile.v1`: entries `Dockerfile` and `context.tar.gz`, annotated with
+the image name and size defaults. Its digest covers all of that together, so
+`serverctl set build web --store … --ref <digest>` pins a build to exact inputs.
 
 ```sh
 serverctl artifact ls                                  # the store's tags

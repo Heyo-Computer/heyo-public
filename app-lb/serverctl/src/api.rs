@@ -319,6 +319,61 @@ impl Client {
 
     // -- secrets ------------------------------------------------------------
 
+    /// `GET /workflows` — every CI workflow object.
+    pub async fn workflows(&self) -> Result<Vec<WorkflowView>> {
+        let list: WorkflowList = self
+            .read(Request::new(Method::Get, "/workflows"), "workflow", "")
+            .await?;
+        Ok(list.workflows)
+    }
+
+    pub async fn workflow(&self, id: &str) -> Result<WorkflowView> {
+        self.read(
+            Request::new(Method::Get, format!("/workflows/{}", seg(id))),
+            "workflow",
+            id,
+        )
+        .await
+    }
+
+    /// `POST /workflows` — create or replace.
+    ///
+    /// Takes a `Value` rather than a typed spec for the same reason the
+    /// deployment writes do: the CLI round-trips whatever the user wrote,
+    /// including fields this build does not know about, so an older `serverctl`
+    /// cannot silently drop a newer field on an edit.
+    pub async fn create_workflow(&self, spec: &Value) -> Result<WorkflowView> {
+        let id = spec
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        self.read(
+            Request::new(Method::Post, "/workflows").json(spec.clone()),
+            "workflow",
+            &id,
+        )
+        .await
+    }
+
+    pub async fn replace_workflow(&self, id: &str, spec: &Value) -> Result<WorkflowView> {
+        self.read(
+            Request::new(Method::Put, format!("/workflows/{}", seg(id))).json(spec.clone()),
+            "workflow",
+            id,
+        )
+        .await
+    }
+
+    pub async fn delete_workflow(&self, id: &str) -> Result<()> {
+        self.unit(
+            Request::new(Method::Delete, format!("/workflows/{}", seg(id))),
+            "workflow",
+            id,
+        )
+        .await
+    }
+
     pub async fn secrets(&self) -> Result<Vec<SecretSummary>> {
         self.read(Request::new(Method::Get, "/secrets"), "secret", "")
             .await
@@ -608,6 +663,7 @@ impl Raw<'_> {
         tokens      => "token",      "/tokens";
         jobs        => "job",        "/jobs";
         certs       => "certificate", "/certs";
+        workflows   => "workflow",   "/workflows";
     }
 
     raw_item! {
@@ -616,6 +672,7 @@ impl Raw<'_> {
         token           => "token",      "/tokens/{}";
         job             => "job",        "/jobs/{}";
         deployment_jobs => "deployment", "/deployments/{}/jobs";
+        workflow        => "workflow",   "/workflows/{}";
     }
 
     pub async fn metrics(&self, query: &MetricsQuery) -> Result<Value> {

@@ -171,6 +171,9 @@ struct AdminState {
     certs: Arc<CertStore>,
     /// Stored secrets. Values enter through this API and never leave it.
     secrets: Arc<SecretStore>,
+    /// CI workflow objects. app-lb stores and serves them; the `ci`
+    /// orchestrator polls them and does the building.
+    workflows: Arc<crate::workflows::WorkflowStore>,
     /// App-tokens. Verified on every gated request, so reads are lock-free.
     tokens: Arc<crate::tokens::TokenStore>,
     /// Runs image builds and host updates, and remembers what they did.
@@ -231,6 +234,7 @@ impl AdminApi {
         certs: Arc<CertStore>,
         acme: Option<Arc<Notify>>,
         secrets: Arc<SecretStore>,
+        workflows: Arc<crate::workflows::WorkflowStore>,
         tokens: Arc<crate::tokens::TokenStore>,
         jobs: Arc<Jobs>,
         obs: Option<Arc<crate::obs::Stats>>,
@@ -278,6 +282,7 @@ impl AdminApi {
                 certs,
                 acme,
                 secrets,
+                workflows,
                 tokens,
                 jobs,
                 obs,
@@ -2549,6 +2554,94 @@ async fn patch_secret(
     Json(state.secrets.summary(&id).expect("just stored")).into_response()
 }
 
+/// `GET /workflows` — every workflow object.
+///
+/// The orchestrator polls this, so it is the hot path of the whole feature.
+/// Lock-free: the store is an `ArcSwap`, and listing clones `Arc`s.
+async fn list_workflows(State(state): State<AdminState>) -> impl IntoResponse {
+    let items: Vec<_> = state
+        .workflows
+        .list()
+        .into_iter()
+        .map(|w| (*w).clone())
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({ "workflows": items }))).into_response()
+}
+
+async fn get_workflow(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.workflows.get(&id) {
+        Some(w) => (StatusCode::OK, Json((*w).clone())).into_response(),
+        None => err(StatusCode::NOT_FOUND, format!("no workflow {id}")).into_response(),
+    }
+}
+
+/// `POST /workflows` — create or replace.
+///
+/// Validated before anything is stored, so an invalid object is a 400 rather
+/// than a file on disk that the next load skips with a warning nobody reads.
+async fn put_workflow(
+    State(state): State<AdminState>,
+    Json(spec): Json<crate::config::WorkflowSpec>,
+) -> impl IntoResponse {
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let id = spec.id.clone();
+    match state.workflows.upsert(spec) {
+        Ok(stored) => (StatusCode::CREATED, Json((*stored).clone())).into_response(),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not persist workflow {id}: {e}"),
+        )
+        .into_response(),
+    }
+}
+
+/// `PUT /workflows/{id}` — replace, with the path id winning.
+///
+/// A body whose `id` disagrees with the path is a mistake worth naming rather
+/// than silently resolving: the two readings (rename, or write to the wrong
+/// object) have very different consequences.
+async fn replace_workflow(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(mut spec): Json<crate::config::WorkflowSpec>,
+) -> impl IntoResponse {
+    if !spec.id.is_empty() && spec.id != id {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the body's id {:?} does not match the path id {id:?}; \
+                 renaming is a delete and a create",
+                spec.id
+            ),
+        )
+        .into_response();
+    }
+    spec.id = id;
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    match state.workflows.upsert(spec) {
+        Ok(stored) => (StatusCode::OK, Json((*stored).clone())).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn delete_workflow(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.workflows.remove(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, format!("no workflow {id}")).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn list_secrets(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.secrets.list())
 }
@@ -2637,7 +2730,16 @@ fn job_start_error(e: StartError) -> Response {
     }
 }
 
-/// `POST /deployments/:id/build` — clone, build the image, roll the pool.
+/// `POST /deployments/:id/build` — fetch the recipe, build the image, roll the
+/// pool.
+///
+/// Where the recipe comes from is the deployment's `build` block, not this
+/// request: a git checkout, or a Dockerfile manifest in an artifact store. An
+/// optional `{"ref": "…"}` overrides the version for this build only, and is
+/// read by whichever source the spec selects — a branch or commit for a repo, a
+/// tag or digest for a store. It is validated against that source's rules before
+/// the job starts, so a git ref handed to a store-backed deployment is a `400`
+/// here rather than a build that fails minutes later.
 ///
 /// Returns `202` with a job record as soon as the work is scheduled. A build
 /// takes minutes; poll `GET /jobs/:job_id` for the outcome.
@@ -2782,6 +2884,13 @@ fn router(state: AdminState) -> Router {
         .route("/disks/:id", patch(patch_disk).delete(purge_disk))
         .route("/disks/:id/archive", post(archive_disk))
         // Secrets: write-only by design. `GET` returns key *names*, never values.
+        // CRUD-tier: a workflow object decides what gets built and on whose
+        // hardware, which is at least as consequential as a deployment spec.
+        .route("/workflows", post(put_workflow).get(list_workflows))
+        .route(
+            "/workflows/:id",
+            get(get_workflow).put(replace_workflow).delete(delete_workflow),
+        )
         .route("/secrets", post(put_secret).get(list_secrets))
         .route(
             "/secrets/:id",
