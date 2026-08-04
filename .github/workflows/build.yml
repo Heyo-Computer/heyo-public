@@ -93,3 +93,25 @@ jobs:
             "dist/$TARBALL" \
             "dist/$TARBALL.sha256" \
             --clobber
+
+  platform-services:
+    name: test platform services
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            heyosecret
+            heyosecret-client
+            orchestrator
+
+      - name: Test platform services
+        run: |
+          cargo test --locked --manifest-path heyosecret/Cargo.toml
+          cargo test --locked --manifest-path heyosecret-client/Cargo.toml
+          cargo test --locked --manifest-path orchestrator/Cargo.toml

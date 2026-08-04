@@ -2,6 +2,10 @@
 target/
 **/target/
 
+# Local service configuration and secrets
+.env
+**/.env
+
 # Atomic-write temp files left behind by `printer task` if a write was
 # interrupted mid-rename
 **/*.md.tmp
