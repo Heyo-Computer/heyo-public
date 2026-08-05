@@ -1,0 +1,177 @@
+{
+  "id": "docs",
+  "kind": "site",
+  "upstreams": [],
+  "hosts": [
+    "docs.example.com"
+  ],
+  "urls": [
+    "https://docs.example.com"
+  ],
+  "site_root": "/srv/docs/dist",
+  "site_spa": true,
+  "job_kind": "update",
+  "pool": {
+    "desired_replicas": 0,
+    "ready": 0,
+    "draining": 0,
+    "pending": 0,
+    "total_in_flight": 0,
+    "target_concurrency": 10,
+    "min_replicas": 0,
+    "max_replicas": 5,
+    "warm_pool": 0,
+    "utilization": null,
+    "cpu_percent": null,
+    "memory_bytes": null,
+    "boot_timeout_secs": 300,
+    "cold_start_timeout_secs": 120
+  },
+  "vms": [],
+  "pending_vms": [],
+  "metrics": {
+    "requests": {
+      "total": 0,
+      "c2xx": 0,
+      "c3xx": 0,
+      "c4xx": 0,
+      "c5xx": 0,
+      "errors": 0
+    },
+    "latency_ms": {
+      "count": 0,
+      "sum": 0,
+      "mean": 0.0,
+      "p50": 0.0,
+      "p90": 0.0,
+      "p99": 0.0,
+      "buckets": [
+        {
+          "le": 1,
+          "count": 0
+        },
+        {
+          "le": 2,
+          "count": 0
+        },
+        {
+          "le": 5,
+          "count": 0
+        },
+        {
+          "le": 10,
+          "count": 0
+        },
+        {
+          "le": 25,
+          "count": 0
+        },
+        {
+          "le": 50,
+          "count": 0
+        },
+        {
+          "le": 100,
+          "count": 0
+        },
+        {
+          "le": 250,
+          "count": 0
+        },
+        {
+          "le": 500,
+          "count": 0
+        },
+        {
+          "le": 1000,
+          "count": 0
+        },
+        {
+          "le": 2500,
+          "count": 0
+        },
+        {
+          "le": 5000,
+          "count": 0
+        },
+        {
+          "le": 10000,
+          "count": 0
+        },
+        {
+          "le": null,
+          "count": 0
+        }
+      ]
+    },
+    "cold_start_s": {
+      "count": 0,
+      "sum": 0,
+      "mean": 0.0,
+      "p50": 0.0,
+      "p90": 0.0,
+      "p99": 0.0,
+      "buckets": [
+        {
+          "le": 1,
+          "count": 0
+        },
+        {
+          "le": 2,
+          "count": 0
+        },
+        {
+          "le": 3,
+          "count": 0
+        },
+        {
+          "le": 5,
+          "count": 0
+        },
+        {
+          "le": 8,
+          "count": 0
+        },
+        {
+          "le": 13,
+          "count": 0
+        },
+        {
+          "le": 21,
+          "count": 0
+        },
+        {
+          "le": 34,
+          "count": 0
+        },
+        {
+          "le": 55,
+          "count": 0
+        },
+        {
+          "le": 89,
+          "count": 0
+        },
+        {
+          "le": 120,
+          "count": 0
+        },
+        {
+          "le": null,
+          "count": 0
+        }
+      ]
+    },
+    "autoscale": {
+      "vms_created": 0,
+      "vms_drained": 0,
+      "vms_reaped": 0,
+      "scale_up_events": 0,
+      "scale_down_events": 0,
+      "cold_start_waits": 0,
+      "cold_start_hits": 0,
+      "cold_start_timeouts": 0,
+      "boot_timeouts": 0
+    }
+  }
+}

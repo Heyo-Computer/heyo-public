@@ -1,0 +1,34 @@
+{
+  "id": "artifacts",
+  "routes": [
+    { "host": "artifacts.local" }
+  ],
+  "vm": {
+    "driver": "firecracker",
+    "image": "artifacts",
+    "port": 8080,
+    "start_command": "setsid nohup /usr/local/bin/art serve </dev/null >/var/log/art.log 2>&1 &",
+    "size_class": "small",
+    "disk_size_gb": 4,
+    "env_vars": {
+      "ART_ROOT": "/workspace/store",
+      "ART_LISTEN": "0.0.0.0:8080",
+      "ART_API_KEY": "change-me",
+      "ART_ADMIN_USER": "admin",
+      "ART_ADMIN_PASSWORD": "change-me-too",
+      "ART_MIN_FREE_BYTES": "536870912",
+      "RUST_LOG": "art=info,artifacts=info"
+    },
+    "ttl_seconds": 3600
+  },
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 1,
+    "warm_pool": 0,
+    "target_concurrency": 64,
+    "scale_to_zero_after_secs": 0,
+    "cold_start_timeout_secs": 120,
+    "drain_timeout_secs": 30
+  },
+  "health": { "path": "/healthz", "timeout_secs": 2 }
+}

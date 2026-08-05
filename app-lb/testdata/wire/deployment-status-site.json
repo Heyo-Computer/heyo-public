@@ -1,0 +1,62 @@
+{
+  "spec": {
+    "id": "docs",
+    "routes": [
+      {
+        "host": "docs.example.com"
+      }
+    ],
+    "scaling": {
+      "min_replicas": 0,
+      "max_replicas": 5,
+      "warm_pool": 0,
+      "target_concurrency": 10,
+      "scale_to_zero_after_secs": 300,
+      "cold_start_timeout_secs": 120,
+      "drain_timeout_secs": 30,
+      "boot_timeout_secs": 300,
+      "idle_action": "destroy"
+    },
+    "health": {
+      "path": "/",
+      "timeout_secs": 2
+    },
+    "site": {
+      "root": "/srv/docs/dist",
+      "index": "index.html",
+      "not_found": "404.html",
+      "spa": true,
+      "cache_control": "public, max-age=300"
+    },
+    "update": {
+      "working_dir": "/srv/docs",
+      "commands": [
+        "git pull --ff-only",
+        "npm run build"
+      ],
+      "env": {
+        "NODE_ENV": "production"
+      },
+      "env_from": [
+        {
+          "secret": "npm",
+          "key": "token",
+          "as": "NPM_TOKEN"
+        }
+      ],
+      "auth": {
+        "secret": "github",
+        "key": "token",
+        "username": "git"
+      },
+      "timeout_secs": 600,
+      "verify_timeout_secs": 60
+    }
+  },
+  "kind": "site",
+  "desired_replicas": 0,
+  "ready": 0,
+  "pending": 0,
+  "total_in_flight": 0,
+  "vms": []
+}

@@ -1,0 +1,8 @@
+{
+  "id": "app-lb-admin",
+  "routes": [
+    { "host": "lb-admin.example.com" }
+  ],
+  "upstreams": ["127.0.0.1:9090"],
+  "health": { "path": "/healthz", "timeout_secs": 2 }
+}

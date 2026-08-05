@@ -1,0 +1,32 @@
+{
+  "id": "web",
+  "routes": [
+    { "host": "web.example.com" }
+  ],
+  "vm": {
+    "driver": "firecracker",
+    "port": 8080,
+    "start_command": "setsid nohup /usr/local/bin/web </dev/null >/var/log/web.log 2>&1 &",
+    "size_class": "small",
+    "env_vars": {
+      "RUST_LOG": "info"
+    },
+    "ttl_seconds": 3600
+  },
+  "artifact": {
+    "store": "http://127.0.0.1:8080",
+    "ref": "web-v2",
+    "grow_gb": 4,
+    "auth": { "secret": "art", "key": "api_key" }
+  },
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 4,
+    "warm_pool": 0,
+    "target_concurrency": 20,
+    "scale_to_zero_after_secs": 300,
+    "cold_start_timeout_secs": 120,
+    "drain_timeout_secs": 30
+  },
+  "health": { "path": "/healthz", "timeout_secs": 2 }
+}

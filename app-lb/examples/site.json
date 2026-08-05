@@ -1,0 +1,22 @@
+{
+  "id": "docs",
+  "routes": [
+    { "host": "docs.example.com" }
+  ],
+  "site": {
+    "root": "/srv/docs/dist",
+    "index": "index.html",
+    "not_found": "404.html",
+    "spa": false,
+    "cache_control": "public, max-age=300"
+  },
+  "update": {
+    "working_dir": "/srv/docs",
+    "commands": [
+      "git pull --ff-only",
+      "npm ci",
+      "npm run build"
+    ],
+    "verify_timeout_secs": 60
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": "7f3a9c2b1e4d",
+  "name": "ci",
+  "admin": "admin",
+  "deployments": [
+    "*"
+  ],
+  "created_at": 1722400000,
+  "last_used_at": 1722403600,
+  "token": "applb_7f3a9c2b1e4d_EXAMPLEONLY0000000000000000000000000000000"
+}

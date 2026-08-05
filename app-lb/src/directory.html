@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{APP_NAME}}</title>
+<style>
+  /* The same tokens as the dashboard, so the two read as one system. Kept as a
+     copy rather than a shared file because both pages are `include_str!`d into
+     the binary and there is no build step to share anything through. */
+  :root {
+    color-scheme: light;
+    --plane:        #f9f9f7;
+    --surface:      #fcfcfb;
+    --text:         #0b0b0b;
+    --text-2:       #52514e;
+    --muted:        #898781;
+    --grid:         #e1e0d9;
+    --border:       rgba(11,11,11,0.10);
+    --series-1:     #2a78d6;
+    --good:         #0ca30c;
+    --warning:      #fab219;
+    --critical:     #d03b3b;
+    --success-text: #006300;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --plane:        #0d0d0d;
+    --surface:      #1a1a19;
+    --text:         #ffffff;
+    --text-2:       #c3c2b7;
+    --muted:        #898781;
+    --grid:         #2c2c2a;
+    --border:       rgba(255,255,255,0.10);
+    --series-1:     #3987e5;
+    --good:         #0ca30c;
+    --success-text: #0ca30c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
+      --muted:#898781; --grid:#2c2c2a; --border:rgba(255,255,255,0.10);
+      --series-1:#3987e5; --success-text:#0ca30c;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 64px;
+    background: var(--plane); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  .lede { color: var(--text-2); margin: 0 0 28px; }
+  .links { margin-left: auto; display: flex; gap: 14px; align-items: baseline; }
+  .links a, .themebtn {
+    color: var(--text-2); text-decoration: none; font-size: 13px;
+    border: 0; background: none; padding: 0; cursor: pointer; font-family: inherit;
+  }
+  .links a:hover, .themebtn:hover { color: var(--text); text-decoration: underline; }
+
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+
+  /* The whole card is the link: this page exists to be clicked. */
+  a.card {
+    display: block; text-decoration: none; color: inherit;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px 18px;
+    transition: border-color .12s ease, transform .12s ease, box-shadow .12s ease;
+  }
+  a.card:hover {
+    border-color: var(--series-1);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px rgba(0,0,0,0.07);
+  }
+  a.card:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+
+  .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .id { font-weight: 600; font-size: 15px; overflow-wrap: anywhere; }
+  .url {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+    color: var(--series-1); overflow-wrap: anywhere; margin-bottom: 10px;
+  }
+  .meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); }
+
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; margin-left: auto; flex: none; }
+  .tag.vm     { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
+  .tag.static { background: color-mix(in srgb, var(--muted) 22%, transparent); color: var(--text-2); }
+  .tag.site   { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--muted); }
+  .dot.ready { background: var(--good); }
+  .dot.starting { background: var(--warning); }
+  .dot.down { background: var(--critical); }
+
+  .empty {
+    border: 1px dashed var(--grid); border-radius: 10px;
+    padding: 28px; text-align: center; color: var(--text-2);
+  }
+  .note { margin-top: 26px; color: var(--muted); font-size: 12.5px; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    background: color-mix(in srgb, var(--muted) 16%, transparent);
+    padding: 1px 5px; border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>{{APP_NAME}}</h1>
+    <div class="links">
+      <a href="/dashboard">Dashboard</a>
+      <a href="/metrics">Metrics</a>
+      <button class="themebtn" id="themebtn" type="button">Theme</button>
+    </div>
+  </header>
+  <p class="lede">{{LEDE}}</p>
+  {{CARDS}}
+</div>
+<script>
+// The only script on the page: everything above is rendered by the server. The
+// toggle matches the dashboard's, including using `data-theme` on the root, so
+// the two agree on what a theme is.
+document.getElementById("themebtn").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.getAttribute("data-theme") === "dark"
+    || (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
+  root.setAttribute("data-theme", dark ? "light" : "dark");
+});
+</script>
+</body>
+</html>

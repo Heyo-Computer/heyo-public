@@ -1,0 +1,2241 @@
+//! Detecting attacks in what app-lb already sees.
+//!
+//! [`crate::obs`] records *what happened*. Nothing there decides whether what
+//! happened was an attack, and three things follow from that which this module
+//! exists to fix:
+//!
+//! * **Authentication failure was invisible.** The admin gate answered a bad
+//!   credential with a 401 and logged nothing at all, so a password spray against
+//!   `/dashboard` left no trace anywhere.
+//! * **Scanner traffic was noticed and thrown away.** `/wp-login.php` probes
+//!   already accumulate in the unrouted access log; nothing read them.
+//! * **Anomalies were only visible to somebody watching.** `crate::metrics`
+//!   would show a 5xx surge on the dashboard, to whoever happened to be looking.
+//!
+//! # Shape
+//!
+//! A second, independent pipeline beside [`crate::obs`] — not a tee inside
+//! [`crate::obs::LogSink`]. That is deliberate: `obs::from_env` returns `None`
+//! whenever `APP_LB_OBS_URL` is unset, so a SIEM living inside it would silently
+//! not exist on every host without a log collector, which is the opposite of what
+//! a security control should do. This one is on unless `APP_LB_SIEM=0`.
+//!
+//! ```text
+//! proxy::logging ─┐
+//! admin::authorize├─→ SecuritySink ──try_send──→ Engine ──→ AlertRing ──→ GET /security
+//! auth sign-in   ─┘   (bounded queue)            │          (in memory)
+//!                                                └────────→ obs::LogSink → app-obs
+//!                                                           source="security"
+//! ```
+//!
+//! # This must never become a dependency of the data plane
+//!
+//! The same invariant [`crate::obs`] holds, for the same reason and by the same
+//! means: recording is a `try_send` into a bounded queue and nothing else. No
+//! lock, no await, no I/O, no `SiemLog` construction on the request path. A SIEM
+//! that can add latency to a request is a SIEM that gets switched off. When the
+//! queue is full, observations are dropped and counted — and because *that*
+//! failure mode makes a busy network look quiet, [`SiemSnapshot::dropped`] and
+//! [`SiemSnapshot::clients_at_capacity`] are reported on `/metrics`, on
+//! `/security` and on the dashboard rather than hidden in a counter.
+//!
+//! # What is borrowed from `u-siem`, and what is not
+//!
+//! The crate supplies the *vocabulary*: [`SiemLog`] as an ECS-shaped field bag,
+//! [`SiemField`], the field-name constants, and the [`LogParser`] /
+//! [`LogEnrichment`] traits. Normalizing through them is what makes an app-lb
+//! security log indexable next to anything else ECS-shaped, and it keeps these
+//! parsers liftable into a real u-siem kernel later without a rewrite.
+//!
+//! It does **not** supply windowing. `SiemRule::matches` sees one log and no
+//! history, so "5 auth failures from one address in 60 seconds" — two of the
+//! three detection categories here — is not expressible in it. Those are plain
+//! Rust in [`Windows`]. Rule state in u-siem is fed by kernel-side machinery
+//! behind `SiemDatasetManager`, which app-lb deliberately does not run. Signature
+//! matching also uses one [`RegexSet`] pass rather than `RuleOperator::Matches`
+//! per subrule, because it sits on a per-request path.
+//!
+//! # Bounded by construction
+//!
+//! Unbounded per-client state is how a detector becomes the vulnerability. Two
+//! rules, both load-bearing, both tested:
+//!
+//! * Every window is a fixed ring of time buckets and distinct-path counting is
+//!   a 64-bit sketch — never a `Vec` of timestamps or a set of strings. Cost per
+//!   tracked client is constant, and no attacker-controlled string is retained.
+//! * At [`SiemConfig::max_clients`] the table sweeps expired entries and then
+//!   *drops the new observation* rather than evicting a live one. Evicting the
+//!   least-recently-seen is precisely what an attacker engineers, by flooding
+//!   fresh addresses to push their own activity out of the table.
+
+use async_trait::async_trait;
+use pingora_core::server::ShutdownWatch;
+use pingora_core::services::background::BackgroundService;
+use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+use usiem::components::dataset::holder::DatasetHolder;
+use usiem::components::enrichment::LogEnrichment;
+use usiem::components::parsing::{GeneratorConfig, LogGenerator, LogParser, LogParsingError};
+use usiem::events::field::SiemField;
+use usiem::events::field_dictionary as fd;
+use usiem::events::ip::SiemIp;
+use usiem::events::schema::{FieldSchema, FieldType};
+use usiem::events::SiemLog;
+
+use crate::obs::{self, Access, LogSink, Record};
+
+/// The `source` every alert record carries into app-obs, beside the existing
+/// `access`, `app-lb` and `job`.
+pub const SECURITY_SOURCE: &str = "security";
+
+/// The origin every [`SiemLog`] this module builds is stamped with.
+const ORIGIN: &str = "app-lb";
+
+/// Ceiling on the path handed to the signature matcher. Deliberately four times
+/// [`crate::obs`]'s `MAX_PATH`: truncating at 512 would cut the tail off a long
+/// injection payload and blind the matcher to exactly the requests worth
+/// catching. What reaches an *alert* is re-truncated to [`MAX_ALERT_PATH`].
+const MAX_SCAN_PATH: usize = 2048;
+const MAX_ALERT_PATH: usize = 512;
+
+/// Ceiling on a query-parameter *name* recorded in an alert. Names are short;
+/// anything longer is someone probing the alert store itself.
+const MAX_PARAM_NAME: usize = 64;
+
+/// Buckets per detection window. Twelve is a five-second resolution on the
+/// default sixty-second window — fine enough that a burst is not smeared across
+/// the whole window, coarse enough to stay in 48 bytes.
+const BUCKETS: usize = 12;
+
+// -- configuration ---------------------------------------------------------
+
+/// Thresholds and caps, all environment-only like the rest of app-lb's
+/// process-level configuration.
+///
+/// Defaults are **on**. app-lb's other optional subsystems (`APP_LB_OBS_URL`,
+/// `APP_LB_ACME_EMAIL`) are opt-in because they need external configuration — an
+/// endpoint, a contact address. This needs none, and a security feature somebody
+/// has to remember to enable protects nobody. `APP_LB_SIEM=0` is the escape
+/// hatch rather than `=1` being the entry.
+#[derive(Debug, Clone)]
+pub struct SiemConfig {
+    pub queue_capacity: usize,
+    pub alert_capacity: usize,
+    /// Seconds. Every rate-based rule counts within this.
+    pub window: i64,
+    pub max_clients: usize,
+    pub auth_threshold: u32,
+    pub scan_threshold: u32,
+    pub rate_threshold: u32,
+    /// Seconds. A repeat inside this folds into the open alert.
+    pub suppress: i64,
+    /// Ceiling on *new* (unfolded) alerts per minute.
+    pub max_alerts_per_min: u32,
+    /// Match signatures against the query string as well as the path. See
+    /// [`AccessObs::scan_query`] for why this is safe and what it costs.
+    pub scan_query: bool,
+    /// Ship alerts to app-obs as `source="security"` records.
+    pub ship: bool,
+}
+
+impl SiemConfig {
+    fn from_env() -> Self {
+        Self {
+            queue_capacity: obs::env_usize("APP_LB_SIEM_QUEUE_CAPACITY", 4096),
+            alert_capacity: obs::env_usize("APP_LB_SIEM_ALERT_CAPACITY", 512),
+            window: obs::env_usize("APP_LB_SIEM_WINDOW_SECS", 60) as i64,
+            max_clients: obs::env_usize("APP_LB_SIEM_MAX_CLIENTS", 16384),
+            auth_threshold: obs::env_usize("APP_LB_SIEM_AUTH_THRESHOLD", 8) as u32,
+            scan_threshold: obs::env_usize("APP_LB_SIEM_SCAN_THRESHOLD", 30) as u32,
+            rate_threshold: obs::env_usize("APP_LB_SIEM_RATE_THRESHOLD", 600) as u32,
+            suppress: obs::env_usize("APP_LB_SIEM_SUPPRESS_SECS", 300) as i64,
+            max_alerts_per_min: obs::env_usize("APP_LB_SIEM_MAX_ALERTS_PER_MIN", 60) as u32,
+            scan_query: obs::env_flag("APP_LB_SIEM_SCAN_QUERY", true),
+            ship: obs::env_flag("APP_LB_SIEM_SHIP", true),
+        }
+    }
+}
+
+// -- what the sources hand over --------------------------------------------
+
+/// One thing worth analysing.
+///
+/// Flat, owned, `Copy`-where-it-matters data — never a [`SiemLog`]. Building one
+/// of those is a dozen allocations and two tree inserts, which is fine in the
+/// background task and not fine on a request path.
+#[derive(Debug)]
+pub enum Observation {
+    Access(Box<AccessObs>),
+    Auth(Box<AuthObs>),
+}
+
+/// One proxied request, as [`crate::proxy`] saw it.
+#[derive(Debug)]
+pub struct AccessObs {
+    pub ts: i64,
+    /// Parsed once, here, so every downstream map keys on 17 bytes of `Copy`
+    /// data instead of a `String`. A pingora unix-socket peer stringifies to a
+    /// path and fails to parse, which correctly excludes it from IP-keyed
+    /// detection rather than inventing a key for it.
+    pub client: Option<IpAddr>,
+    pub deployment: Option<Box<str>>,
+    pub method: Box<str>,
+    pub path: Box<str>,
+    pub host: Option<Box<str>>,
+    /// Present only under `APP_LB_SIEM_SCAN_QUERY`, and **consumed by the
+    /// matcher, never stored**.
+    ///
+    /// This is the one place app-lb's "the query string is never logged" rule is
+    /// bent, and the bend is structural rather than promised: the raw query
+    /// arrives here as its own field, is read by [`Signatures::scan`], and dies
+    /// with the observation. It is not on [`Access`], so no code path exists that
+    /// could carry it into a [`Record`] and out to app-obs. On a match the alert
+    /// records the parameter *name* only — `web.sqli in query parameter "id"` —
+    /// never the value. Most SQLi and XSS payloads live in a parameter value; a
+    /// path-only detector is blind to them, and this is the narrowest way to see
+    /// them that keeps the credential in an OAuth callback out of the log store.
+    pub scan_query: Option<Box<str>>,
+    pub status: Option<u16>,
+    pub duration_nanos: u64,
+    pub bytes: u64,
+}
+
+/// One rejected credential.
+#[derive(Debug)]
+pub struct AuthObs {
+    pub ts: i64,
+    pub client: Option<IpAddr>,
+    pub deployment: Option<Box<str>>,
+    pub path: Box<str>,
+    pub action: AuthAction,
+    /// The credential *scheme* only — never the credential.
+    pub scheme: AuthScheme,
+    /// Set only for [`AuthAction::SigninRefused`], where the address is already
+    /// in a `tracing::info!` and the rule that needs it counts *distinct*
+    /// addresses from one source to spot enumeration.
+    pub subject: Option<Box<str>>,
+}
+
+/// Which gate said no. Becomes `event.action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthAction {
+    /// Admin API: no usable credential.
+    AdminRejected,
+    /// Admin API: the credential was good and the scope was not.
+    AdminScope,
+    /// Data-plane app-token gate: a bearer was presented and rejected.
+    GateToken,
+    /// Sign-in: the state/nonce did not match the flow cookie. CSRF-shaped.
+    SigninState,
+    /// Sign-in: the OAuth token exchange failed.
+    SigninExchange,
+    /// Sign-in: the id token was rejected.
+    SigninToken,
+    /// Sign-in: a valid identity the allow-list refused.
+    SigninRefused,
+}
+
+impl AuthAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AdminRejected => "admin-rejected",
+            Self::AdminScope => "admin-scope",
+            Self::GateToken => "gate-token",
+            Self::SigninState => "signin-state",
+            Self::SigninExchange => "signin-exchange",
+            Self::SigninToken => "signin-token",
+            Self::SigninRefused => "signin-refused",
+        }
+    }
+
+    /// Whether this counts toward the brute-force window. A provider-side token
+    /// exchange failure is usually a hiccup rather than an attempt, and counting
+    /// it would let a flaky IdP raise a brute-force alert.
+    fn counts_as_attempt(self) -> bool {
+        !matches!(self, Self::SigninExchange)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthScheme {
+    None,
+    Basic,
+    Bearer,
+}
+
+impl AuthScheme {
+    /// Read the scheme off an `Authorization` header without decoding it.
+    ///
+    /// Deliberately not parsing the credential: `DashboardAuth::accepts` is one
+    /// constant-time compare against a precomputed header precisely so no base64
+    /// decode happens per request, and decoding on the *failure* path would
+    /// reintroduce parsing of unauthenticated attacker input for no detection
+    /// gain — the detector keys on address, not on username.
+    pub fn of(header: Option<&str>) -> Self {
+        match header {
+            Some(h) if h.len() >= 6 && h[..6].eq_ignore_ascii_case("basic ") => Self::Basic,
+            Some(h) if h.len() >= 7 && h[..7].eq_ignore_ascii_case("bearer ") => Self::Bearer,
+            _ => Self::None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Basic => "basic",
+            Self::Bearer => "bearer",
+        }
+    }
+}
+
+// -- the write end ---------------------------------------------------------
+
+/// Cloned to every source. Cheap to clone and safe to hold anywhere.
+#[derive(Clone)]
+pub struct SecuritySink {
+    tx: mpsc::Sender<Observation>,
+    stats: Arc<SiemStats>,
+    scan_query: bool,
+}
+
+impl SecuritySink {
+    /// Queue one proxied request.
+    ///
+    /// Borrows rather than consuming, because [`crate::obs::LogSink::send_access`]
+    /// still needs to move the same [`Access`] afterwards. `Access` is not
+    /// `Clone`, so if anyone ever reorders those two calls it stops compiling —
+    /// which is the good outcome.
+    pub fn observe_access(&self, access: &Access<'_>, query: Option<&str>) {
+        let obs = AccessObs {
+            ts: obs::now_millis(),
+            client: access.client.as_deref().and_then(|c| c.parse().ok()),
+            deployment: access.deployment.map(Box::from),
+            method: Box::from(access.method),
+            path: Box::from(clip(access.path, MAX_SCAN_PATH)),
+            host: access.host.map(Box::from),
+            scan_query: match (self.scan_query, query) {
+                (true, Some(q)) if !q.is_empty() => Some(Box::from(clip(q, MAX_SCAN_PATH))),
+                _ => None,
+            },
+            status: access.status,
+            duration_nanos: access.duration.as_nanos().min(u64::MAX as u128) as u64,
+            bytes: access.bytes as u64,
+        };
+        self.offer(Observation::Access(Box::new(obs)));
+    }
+
+    /// Queue one rejected credential.
+    pub fn observe_auth(&self, auth: AuthObs) {
+        self.offer(Observation::Auth(Box::new(auth)));
+    }
+
+    /// The only `try_send`. Never blocks, never awaits, never does I/O — see the
+    /// module header, and [`crate::obs::LogSink::send`], whose discipline this
+    /// copies exactly.
+    fn offer(&self, o: Observation) {
+        let counter = match self.tx.try_send(o) {
+            Ok(()) => &self.stats.observed,
+            Err(_) => &self.stats.dropped,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Truncate on a char boundary without allocating when it is not needed.
+fn clip(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+// -- counters --------------------------------------------------------------
+
+/// Counters for the pipeline itself.
+#[derive(Debug, Default)]
+pub struct SiemStats {
+    observed: AtomicU64,
+    dropped: AtomicU64,
+    analyzed: AtomicU64,
+    raised: AtomicU64,
+    suppressed: AtomicU64,
+    tracked_clients: AtomicU64,
+    clients_at_capacity: AtomicBool,
+}
+
+impl SiemStats {
+    pub fn snapshot(&self) -> SiemSnapshot {
+        SiemSnapshot {
+            observed: self.observed.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            analyzed: self.analyzed.load(Ordering::Relaxed),
+            raised: self.raised.load(Ordering::Relaxed),
+            suppressed: self.suppressed.load(Ordering::Relaxed),
+            tracked_clients: self.tracked_clients.load(Ordering::Relaxed),
+            clients_at_capacity: self.clients_at_capacity.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// What `/metrics` and `/security` report about the engine.
+///
+/// `dropped` and `clients_at_capacity` are the two worth watching: both mean the
+/// SIEM has stopped seeing part of the traffic, and a SIEM that has quietly
+/// stopped looking is indistinguishable from a quiet network.
+#[derive(Debug, Clone, Serialize)]
+pub struct SiemSnapshot {
+    pub observed: u64,
+    pub dropped: u64,
+    pub analyzed: u64,
+    pub raised: u64,
+    pub suppressed: u64,
+    pub tracked_clients: u64,
+    pub clients_at_capacity: bool,
+}
+
+// -- client identity -------------------------------------------------------
+
+/// A source address, normalized to the unit worth counting: IPv4 to /32, IPv6 to
+/// /64.
+///
+/// Keying on the full IPv6 address would be free to defeat — a /64 is the
+/// standard end-site allocation, so an attacker rotates the low 64 bits at no
+/// cost and every per-source rule counts one attempt per address forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ClientKey(u128);
+
+impl ClientKey {
+    fn of(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Self(u32::from(v4) as u128),
+            // Mark the v6 side so a v4 address can never collide with a v6 /64.
+            IpAddr::V6(v6) => Self((u128::from(v6) >> 64) | (1 << 127)),
+        }
+    }
+}
+
+// -- bounded windows -------------------------------------------------------
+
+/// A sliding count with no allocation and no timestamp list.
+///
+/// `BUCKETS` fixed slots advanced by zeroing whatever was skipped past. A
+/// `VecDeque<Instant>` per client would be an allocation per request and an
+/// unbounded one under exactly the load where it matters.
+#[derive(Debug, Default, Clone)]
+struct RingCounter {
+    slots: [u32; BUCKETS],
+    /// Epoch millis at which the current head bucket started.
+    head_start: i64,
+    head: u8,
+}
+
+impl RingCounter {
+    fn advance(&mut self, now: i64, window: i64) {
+        let bucket = (window * 1000 / BUCKETS as i64).max(1);
+        if self.head_start == 0 {
+            self.head_start = now;
+            return;
+        }
+        let steps = (now - self.head_start) / bucket;
+        if steps <= 0 {
+            return;
+        }
+        if steps >= BUCKETS as i64 {
+            self.slots = [0; BUCKETS];
+        } else {
+            for i in 1..=steps {
+                let idx = (self.head as i64 + i) as usize % BUCKETS;
+                self.slots[idx] = 0;
+            }
+        }
+        self.head = ((self.head as i64 + steps) % BUCKETS as i64) as u8;
+        self.head_start += steps * bucket;
+    }
+
+    fn record(&mut self, now: i64, window: i64) {
+        self.advance(now, window);
+        self.slots[self.head as usize] = self.slots[self.head as usize].saturating_add(1);
+    }
+
+    fn total(&self) -> u32 {
+        self.slots.iter().copied().fold(0u32, u32::saturating_add)
+    }
+}
+
+/// Everything tracked about one source address. Fixed size, ~120 bytes.
+#[derive(Debug, Default, Clone)]
+struct ClientWindow {
+    requests: RingCounter,
+    auth_failures: RingCounter,
+    /// 401/403/404 — the responses a scanner collects.
+    client_errors: RingCounter,
+    /// Distinctness sketch over paths: set bit `hash(path) % 64`. A scanner
+    /// walking a wordlist lights many bits; a client retrying one broken URL
+    /// lights one. `count_ones()` separates them without storing a single
+    /// attacker-controlled string.
+    path_sketch: u64,
+    /// The same trick over deployment ids, for a credential spray across the
+    /// fleet rather than against one host.
+    deployment_sketch: u64,
+    /// And over sign-in subjects, for account enumeration.
+    subject_sketch: u64,
+    last_seen: i64,
+}
+
+fn sketch_bit(s: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    1u64 << (h.finish() % 64)
+}
+
+/// The per-client table, with the cap policy that keeps it from becoming the
+/// vulnerability.
+struct Windows {
+    clients: HashMap<ClientKey, ClientWindow>,
+    window: i64,
+    max_clients: usize,
+    at_capacity: bool,
+}
+
+impl Windows {
+    fn new(window: i64, max_clients: usize) -> Self {
+        Self {
+            clients: HashMap::new(),
+            window,
+            max_clients,
+            at_capacity: false,
+        }
+    }
+
+    /// Borrow the window for `key`, or `None` when the table is full.
+    ///
+    /// At capacity: sweep whatever has aged out, and if that frees nothing,
+    /// refuse the *new* entry. Evicting the least-recently-seen instead would
+    /// hand an attacker a way to erase their own history — flood fresh addresses
+    /// and the entry counting your attempts is the one that goes.
+    fn entry(&mut self, key: ClientKey, now: i64) -> Option<&mut ClientWindow> {
+        if !self.clients.contains_key(&key) && self.clients.len() >= self.max_clients {
+            self.prune(now);
+            if self.clients.len() >= self.max_clients {
+                self.at_capacity = true;
+                return None;
+            }
+        }
+        let w = self.clients.entry(key).or_default();
+        w.last_seen = now;
+        Some(w)
+    }
+
+    /// Drop entries with nothing left inside the window. Also runs on a timer, so
+    /// an idle LB releases its table instead of holding the last burst forever.
+    fn prune(&mut self, now: i64) {
+        let horizon = self.window * 1000;
+        self.clients
+            .retain(|_, w| w.last_seen != 0 && now - w.last_seen < horizon);
+        if self.clients.len() < self.max_clients {
+            self.at_capacity = false;
+        }
+    }
+}
+
+// -- normalization ---------------------------------------------------------
+
+/// Field names we add that `u-siem`'s dictionary has no constant for.
+///
+/// `event.duration` is written as a literal deliberately: the dictionary has
+/// `NETWORK_DURATION` (`network.duration`) and no `EVENT_DURATION`, and the
+/// former is *not* a substitute — in ECS it means flow duration at the network
+/// layer, not request handling time. `FieldSchema::allow_unknown_fields` carries
+/// these, and the golden-field test pins them.
+const F_DURATION: &str = "event.duration";
+const F_BYTES: &str = "http.response.body.bytes";
+const F_SERVICE: &str = "service.name";
+const F_SCHEME: &str = "http.request.authorization.scheme";
+const F_EXTENSION: &str = "url.extension";
+
+/// `url.query` is in the dictionary and we never set it. See
+/// [`AccessObs::scan_query`].
+fn access_schema() -> &'static FieldSchema {
+    static SCHEMA: OnceLock<FieldSchema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let mut s = FieldSchema::new();
+        s.allow_unknown_fields = true;
+        s.fields
+            .insert(fd::SOURCE_IP, FieldType::Ip("Client address as seen on the socket"));
+        s.fields.insert(
+            fd::HTTP_REQUEST_METHOD,
+            FieldType::Text("HTTP method"),
+        );
+        s.fields.insert(fd::URL_PATH, FieldType::Text("Request path, never the query"));
+        s.fields.insert(fd::URL_DOMAIN, FieldType::Text("Host header"));
+        s.fields.insert(
+            fd::HTTP_RESPONSE_STATUS_CODE,
+            FieldType::Numeric("Response status, absent when nothing was written"),
+        );
+        s.fields
+            .insert(F_DURATION, FieldType::Numeric("Request handling time, nanoseconds"));
+        s.fields.insert(F_BYTES, FieldType::Numeric("Response body bytes"));
+        s.fields
+            .insert(F_SERVICE, FieldType::Text("Deployment that served the request"));
+        s.fields
+            .insert(F_EXTENSION, FieldType::Text("Lowercased path extension"));
+        s
+    })
+}
+
+fn control_schema() -> &'static FieldSchema {
+    static SCHEMA: OnceLock<FieldSchema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let mut s = FieldSchema::new();
+        s.allow_unknown_fields = true;
+        s.fields
+            .insert(fd::SOURCE_IP, FieldType::Ip("Client address as seen on the socket"));
+        s.fields.insert(fd::URL_PATH, FieldType::Text("Request path"));
+        s.fields
+            .insert(fd::USER_NAME, FieldType::Text("Refused sign-in subject"));
+        s.fields
+            .insert(F_SCHEME, FieldType::Text("Credential scheme, never the credential"));
+        s.fields
+            .insert(F_SERVICE, FieldType::Text("Deployment the credential was for"));
+        s
+    })
+}
+
+/// `LogParser::generator` exists for synthetic-log testing we do not do.
+///
+/// A local type rather than `usiem::testing::parsers::DummyLogGenerator`: naming
+/// a `testing` module from production code is a smell, and its shape is not a
+/// stability promise.
+#[derive(Clone)]
+struct NoGenerator;
+
+impl LogGenerator for NoGenerator {
+    fn configure(&mut self, _config: GeneratorConfig) {}
+    fn log(&self) -> String {
+        String::new()
+    }
+    fn weight(&self) -> u8 {
+        0
+    }
+}
+
+/// Whether a source address is inside the network.
+///
+/// `SiemIp::is_local` covers RFC1918 and the RFC6598 CGN range but **not
+/// loopback** — 127.0.0.1 comes back `false`. That is a real problem here rather
+/// than a nitpick: the admin listener defaults to `127.0.0.1`, so every alert
+/// raised against the control plane would be tagged `external`, which is exactly
+/// backwards and is the kind of thing an operator reasonably acts on.
+fn is_internal(ip: &SiemIp) -> bool {
+    if ip.is_local() {
+        return true;
+    }
+    match ip {
+        SiemIp::V4(v4) => std::net::Ipv4Addr::from(*v4).is_loopback(),
+        SiemIp::V6(v6) => std::net::Ipv6Addr::from(*v6).is_loopback(),
+    }
+}
+
+fn siem_ip(ip: IpAddr) -> SiemIp {
+    match ip {
+        IpAddr::V4(v4) => SiemIp::V4(u32::from(v4)),
+        IpAddr::V6(v6) => SiemIp::V6(u128::from(v6)),
+    }
+}
+
+/// Borrow the eight standard methods instead of allocating for them.
+fn method_field(m: &str) -> SiemField {
+    match m {
+        "GET" => SiemField::from_str_slice("GET"),
+        "POST" => SiemField::from_str_slice("POST"),
+        "PUT" => SiemField::from_str_slice("PUT"),
+        "DELETE" => SiemField::from_str_slice("DELETE"),
+        "HEAD" => SiemField::from_str_slice("HEAD"),
+        "PATCH" => SiemField::from_str_slice("PATCH"),
+        "OPTIONS" => SiemField::from_str_slice("OPTIONS"),
+        "CONNECT" => SiemField::from_str_slice("CONNECT"),
+        other => SiemField::Text(other.to_string().into()),
+    }
+}
+
+/// Normalizes a proxied request into ECS.
+#[derive(Clone)]
+struct AccessParser;
+
+impl LogParser for AccessParser {
+    fn parse_log(
+        &self,
+        mut log: SiemLog,
+        _datasets: &DatasetHolder,
+    ) -> Result<SiemLog, LogParsingError> {
+        // The dispatch idiom: hand the log back untouched so the next parser can
+        // try it, rather than cloning it per candidate.
+        if !log.has_tag("access") {
+            return Err(LogParsingError::NoValidParser(log));
+        }
+        log.set_product(ORIGIN);
+        log.set_vendor(ORIGIN);
+        log.set_service("proxy");
+        log.set_category("webserver");
+        log.add_field(fd::EVENT_CATEGORY, SiemField::from_str_slice("web"));
+        log.add_field(fd::EVENT_ACTION, SiemField::from_str_slice("http-request"));
+        log.add_field(fd::OBSERVER_NAME, SiemField::from_str_slice(ORIGIN));
+        Ok(log)
+    }
+    fn name(&self) -> &'static str {
+        "app-lb-access"
+    }
+    fn description(&self) -> &'static str {
+        "app-lb proxy access records"
+    }
+    fn schema(&self) -> &FieldSchema {
+        access_schema()
+    }
+    fn generator(&self) -> Box<dyn LogGenerator> {
+        Box::new(NoGenerator)
+    }
+}
+
+/// Normalizes a rejected credential into ECS.
+#[derive(Clone)]
+struct ControlPlaneParser;
+
+impl LogParser for ControlPlaneParser {
+    fn parse_log(
+        &self,
+        mut log: SiemLog,
+        _datasets: &DatasetHolder,
+    ) -> Result<SiemLog, LogParsingError> {
+        if !log.has_tag("auth-failure") {
+            return Err(LogParsingError::NoValidParser(log));
+        }
+        log.set_product(ORIGIN);
+        log.set_vendor(ORIGIN);
+        log.set_category("authentication");
+        log.add_field(fd::EVENT_CATEGORY, SiemField::from_str_slice("authentication"));
+        log.add_field(fd::EVENT_OUTCOME, SiemField::from_str_slice("failure"));
+        log.add_field(fd::OBSERVER_NAME, SiemField::from_str_slice(ORIGIN));
+        Ok(log)
+    }
+    fn name(&self) -> &'static str {
+        "app-lb-control-plane"
+    }
+    fn description(&self) -> &'static str {
+        "app-lb admin, app-token and sign-in gate rejections"
+    }
+    fn schema(&self) -> &FieldSchema {
+        control_schema()
+    }
+    fn generator(&self) -> Box<dyn LogGenerator> {
+        Box::new(NoGenerator)
+    }
+}
+
+/// Three dataset-free enrichments, so the impl is honest rather than a stub.
+///
+/// app-lb ships no GeoIP or IOC feed — populating [`DatasetHolder`] would mean
+/// the `slow_geoip` feature and a `sled` dependency for a lookup nothing here
+/// needs — so this does what can be derived from the log itself.
+#[derive(Clone)]
+struct LbEnrichment;
+
+impl LogEnrichment for LbEnrichment {
+    fn enrich(&self, mut log: SiemLog, _datasets: &DatasetHolder) -> SiemLog {
+        // 1. Is the source inside the network? "600 requests a minute" from a
+        //    private address is a health check; from a public one it may not be.
+        if let Some(SiemField::IP(ip)) = log.field(fd::SOURCE_IP) {
+            let tag = if is_internal(ip) { "internal" } else { "external" };
+            log.add_tag(tag);
+        }
+        // 2. Extension, which is a scanner tell and lets signatures match one
+        //    short field instead of rescanning the whole path.
+        if let Some(SiemField::Text(path)) = log.field(fd::URL_PATH)
+            && let Some(ext) = path
+                .rsplit('/')
+                .next()
+                .and_then(|seg| seg.rsplit_once('.'))
+                .map(|(_, e)| e.to_ascii_lowercase())
+                .filter(|e| !e.is_empty() && e.len() <= 8)
+        {
+            log.add_field(F_EXTENSION, SiemField::Text(ext.into()));
+        }
+        // 3. Outcome, when the access parser had a status and left it unset.
+        if !log.has_field(fd::EVENT_OUTCOME)
+            && let Some(SiemField::U64(status)) = log.field(fd::HTTP_RESPONSE_STATUS_CODE)
+        {
+            let outcome = if *status < 400 { "success" } else { "failure" };
+            log.add_field(fd::EVENT_OUTCOME, SiemField::from_str_slice(outcome));
+        }
+        log
+    }
+    fn name(&self) -> &'static str {
+        "app-lb-enrichment"
+    }
+    fn description(&self) -> &'static str {
+        "locality tag, url extension and outcome, without datasets"
+    }
+}
+
+// -- signatures ------------------------------------------------------------
+
+/// One stateless signature.
+struct Signature {
+    rule: &'static str,
+    severity: Severity,
+    technique: &'static str,
+    what: &'static str,
+}
+
+/// Index-aligned with the patterns handed to [`RegexSet::new`].
+const SIGNATURES: &[Signature] = &[
+    Signature {
+        rule: "web.traversal",
+        severity: Severity::High,
+        technique: "T1083",
+        what: "path traversal",
+    },
+    Signature {
+        rule: "web.sqli",
+        severity: Severity::High,
+        technique: "T1190",
+        what: "SQL injection",
+    },
+    Signature {
+        rule: "web.xss",
+        severity: Severity::Medium,
+        technique: "T1190",
+        what: "cross-site scripting",
+    },
+    Signature {
+        rule: "web.rce",
+        severity: Severity::Critical,
+        technique: "T1190",
+        what: "remote code execution",
+    },
+    Signature {
+        rule: "web.secret-probe",
+        severity: Severity::Medium,
+        technique: "T1595_002",
+        what: "sensitive-file probe",
+    },
+];
+
+const PATTERNS: &[&str] = &[
+    r"(?i)(\.\./|\.\.%2f|%2e%2e[/\\]|\.\.\\)",
+    r"(?i)(union\s+select|'\s*or\s*'?1'?\s*=\s*'?1|;\s*drop\s+table|\bsleep\(\s*\d|\bbenchmark\()",
+    r"(?i)(<script|%3cscript|javascript:|\bon(error|load)\s*=)",
+    r"(?i)(\$\{jndi:|/bin/(ba)?sh\b|;\s*(cat|curl|wget)\s|\bexec\()",
+    r"(?i)^/(\.env|\.git/|\.aws/|\.ssh/|wp-login\.php|wp-admin|phpmyadmin|xmlrpc\.php|server-status|config\.json)",
+];
+
+/// Matches the stateless rules in one pass.
+///
+/// One [`RegexSet`] rather than a regex per rule: this runs per request, and the
+/// set evaluates every pattern in a single scan of the input.
+struct Signatures {
+    set: usiem::regex::RegexSet,
+}
+
+impl Signatures {
+    fn new() -> Self {
+        Self {
+            set: usiem::regex::RegexSet::new(PATTERNS).expect("signature patterns must compile"),
+        }
+    }
+
+    /// Highest-severity match against the path, then the query if scanning it.
+    ///
+    /// Returns the parameter name on a query hit so the alert can say *where*
+    /// without ever recording *what*.
+    fn scan(&self, path: &str, query: Option<&str>) -> Option<(&'static Signature, Option<String>)> {
+        if allowlisted(path) {
+            return None;
+        }
+        let best = |hay: &str| {
+            self.set
+                .matches(hay)
+                .into_iter()
+                .map(|i| &SIGNATURES[i])
+                .max_by_key(|s| s.severity)
+        };
+        if let Some(sig) = best(path) {
+            return Some((sig, None));
+        }
+        let query = query?;
+        // Match per parameter value, so the alert can name the parameter. The
+        // value itself is read here and goes no further.
+        for (name, value) in form_urlencoded::parse(query.as_bytes()) {
+            if let Some(sig) = best(&value) {
+                let name = obs::truncate(name.into_owned(), MAX_PARAM_NAME);
+                return Some((sig, Some(name)));
+            }
+        }
+        None
+    }
+}
+
+/// Paths app-lb legitimately serves that would otherwise trip a signature.
+///
+/// This is where the false positives come from, and every entry is a real path
+/// this process answers:
+///
+/// * `/.well-known/acme-challenge/<token>` is answered before routing by
+///   [`crate::proxy`], with an opaque CA-supplied token, and matches
+///   `web.secret-probe`'s dotted-directory pattern.
+/// * A static site serves whatever is on disk, so minified JS containing
+///   `javascript:` in a string literal matches `web.xss`.
+/// * The sign-in callback carries provider state that has matched `web.sqli`'s
+///   quote patterns in the wild.
+fn allowlisted(path: &str) -> bool {
+    path.starts_with("/.well-known/acme-challenge/")
+        || path.starts_with("/.well-known/")
+        || path.starts_with("/__applb/auth/")
+}
+
+// -- alerts ----------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl Severity {
+    /// Parse the `?severity=` filter. Unknown values are `None`, which reads as
+    /// "no floor" rather than "match nothing" — a typo should not silently blank
+    /// a security console.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "info" => Some(Self::Info),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+
+    fn level(self) -> &'static str {
+        match self {
+            Self::Critical | Self::High => "error",
+            Self::Medium => "warn",
+            _ => "info",
+        }
+    }
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// One finding.
+///
+/// app-lb's own type rather than `usiem::prelude::SiemAlert`, for three reasons
+/// worth stating: `SiemAlert` embeds the whole triggering [`SiemLog`], which is
+/// the *log* and not the alert and would republish the raw message through
+/// `/security`; it has no id, so the dashboard could not key rows across polls;
+/// and it has no occurrence count, so folding would be invisible. Owning the
+/// wire type is also what keeps `testdata/wire/security-response.json` stable
+/// across a u-siem version bump.
+#[derive(Debug, Clone, Serialize)]
+pub struct Alert {
+    pub id: u64,
+    /// Epoch millis of the first occurrence folded into this alert.
+    pub ts: i64,
+    pub last_ts: i64,
+    pub rule: &'static str,
+    pub severity: Severity,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<String>,
+    /// Truncated, and never carrying a query string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// MITRE ATT&CK technique id, as a plain string: it is part of app-lb's wire
+    /// contract, so it must not move when u-siem's `MitreTechniques` enum does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub technique: Option<&'static str>,
+    /// Occurrences folded in. A scanner produces one alert whose count climbs,
+    /// not ten thousand alerts.
+    pub count: u64,
+    /// The triggering event, normalized to ECS field names.
+    ///
+    /// This is what the `u-siem` dependency is *for*: an alert stored in app-obs
+    /// carries `source.ip` and `url.path` under the names any ECS-shaped store
+    /// already indexes, so a security query spans app-lb's alerts and anything
+    /// else without a translation layer. Built from the enriched [`SiemLog`], so
+    /// it can only contain fields a parser set — and no parser sets `url.query`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ecs: Option<serde_json::Value>,
+}
+
+/// Project an enriched [`SiemLog`] onto JSON for storage.
+///
+/// Only the field bag and tags: the message duplicates [`Alert::title`], and the
+/// envelope (product, vendor) is constant for everything app-lb emits.
+fn ecs_fields(log: &SiemLog) -> serde_json::Value {
+    // `SiemLog::fields` includes the envelope `SiemLog::new` sets — the message,
+    // origin, product, vendor and the two received/created stamps. Every one of
+    // those is either constant for anything app-lb emits or already a field on
+    // the alert, and repeating them on every record is bytes app-obs stores
+    // forever for no query anyone will run.
+    const ENVELOPE: &[&str] = &[
+        "message",
+        "origin",
+        "product",
+        "vendor",
+        "service",
+        "category",
+        "tenant",
+        "event.type",
+        "event.created",
+        "event.received",
+    ];
+
+    let mut out = serde_json::Map::new();
+    for (name, field) in log.fields() {
+        if ENVELOPE.contains(&name.as_ref()) {
+            continue;
+        }
+        let value = match field {
+            SiemField::Text(t) => serde_json::Value::from(t.to_string()),
+            SiemField::IP(ip) => serde_json::Value::from(ip.to_string()),
+            SiemField::U64(n) => serde_json::Value::from(*n),
+            SiemField::I64(n) => serde_json::Value::from(*n),
+            SiemField::F64(n) => serde_json::Value::from(*n),
+            SiemField::Date(n) => serde_json::Value::from(*n),
+            SiemField::User(u) => serde_json::Value::from(u.clone()),
+            SiemField::Domain(d) => serde_json::Value::from(d.clone()),
+            _ => continue,
+        };
+        out.insert(name.to_string(), value);
+    }
+    let tags: Vec<String> = log.tags().iter().map(|t| t.to_string()).collect();
+    if !tags.is_empty() {
+        out.insert("tags".into(), serde_json::Value::from(tags));
+    }
+    serde_json::Value::Object(out)
+}
+
+/// The in-memory ring `GET /security` serves.
+///
+/// A `Mutex`, not `ArcSwap` — worth saying, because `ArcSwap` is the house
+/// pattern elsewhere ([`crate::acme::ChallengeTable`], `Deployment::backends`).
+/// It is the wrong tool here: `ArcSwap` suits read-mostly values replaced
+/// *wholesale*, and this ring is mutated in place when a repeat folds into an
+/// existing entry, so every push would clone the whole deque. A lock held for
+/// microseconds, taken only when an alert fires (rare by construction) and once
+/// per ten-second dashboard poll, is correct and simpler. The counters stay
+/// atomics so `/metrics` never takes the lock at all.
+pub struct AlertRing {
+    alerts: Mutex<VecDeque<Alert>>,
+    capacity: usize,
+    window: i64,
+    suppress: i64,
+    max_per_min: u32,
+    next_id: AtomicU64,
+    stats: Arc<SiemStats>,
+    by_severity: [AtomicU64; 5],
+    /// Ceiling state: new alerts in the current minute.
+    minute: Mutex<(i64, u32)>,
+}
+
+impl AlertRing {
+    fn new(cfg: &SiemConfig, stats: Arc<SiemStats>) -> Self {
+        Self {
+            alerts: Mutex::new(VecDeque::with_capacity(cfg.alert_capacity.min(1024))),
+            capacity: cfg.alert_capacity,
+            window: cfg.window,
+            suppress: cfg.suppress,
+            max_per_min: cfg.max_alerts_per_min,
+            next_id: AtomicU64::new(1),
+            stats,
+            by_severity: Default::default(),
+            minute: Mutex::new((0, 0)),
+        }
+    }
+
+    /// Fold or raise. Returns the alert only when it is genuinely new, which is
+    /// what decides whether a [`Record`] goes to app-obs.
+    fn raise(&self, mut alert: Alert, now: i64) -> Option<Alert> {
+        let mut alerts = self.alerts.lock().expect("alert ring lock");
+
+        // Layer 1: fold a repeat into the open alert. Scanning the deque is
+        // cheaper than a side index that can fall out of sync with eviction, and
+        // this path is rare by construction.
+        for existing in alerts.iter_mut().rev() {
+            if existing.rule == alert.rule
+                && existing.client == alert.client
+                && existing.deployment == alert.deployment
+                && now - existing.last_ts <= self.suppress * 1000
+            {
+                existing.count += 1;
+                existing.last_ts = now;
+                self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+
+        // Layer 2: a hard ceiling on *new* alerts. Layer 1 cannot fold a
+        // distributed attack, where every source has a distinct key — this is
+        // what bounds the record rate app-obs sees in that case.
+        {
+            let mut minute = self.minute.lock().expect("alert minute lock");
+            let this_minute = now / 60_000;
+            if minute.0 != this_minute {
+                *minute = (this_minute, 0);
+            }
+            if minute.1 >= self.max_per_min {
+                self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            minute.1 += 1;
+        }
+
+        alert.id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.by_severity[alert.severity.index()].fetch_add(1, Ordering::Relaxed);
+        self.stats.raised.fetch_add(1, Ordering::Relaxed);
+        while alerts.len() >= self.capacity {
+            alerts.pop_front();
+        }
+        alerts.push_back(alert.clone());
+        Some(alert)
+    }
+
+    /// Newest first, which is the order the dashboard renders.
+    pub fn recent(&self, limit: usize) -> Vec<Alert> {
+        let alerts = self.alerts.lock().expect("alert ring lock");
+        alerts.iter().rev().take(limit).cloned().collect()
+    }
+
+    pub fn totals(&self) -> SeverityTotals {
+        SeverityTotals {
+            info: self.by_severity[0].load(Ordering::Relaxed),
+            low: self.by_severity[1].load(Ordering::Relaxed),
+            medium: self.by_severity[2].load(Ordering::Relaxed),
+            high: self.by_severity[3].load(Ordering::Relaxed),
+            critical: self.by_severity[4].load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.alerts.lock().expect("alert ring lock").len()
+    }
+
+    /// Reported on `/security` so a reader knows what "8 failures" is counted
+    /// over without having to know the server's environment.
+    pub fn window_secs(&self) -> u64 {
+        self.window as u64
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SeverityTotals {
+    pub info: u64,
+    pub low: u64,
+    pub medium: u64,
+    pub high: u64,
+    pub critical: u64,
+}
+
+/// One alert, as app-obs stores it.
+///
+/// The deployment falls back the same way [`Access::into_record`] does: app-obs
+/// rejects a record naming no deployment, so an admin-plane alert has to land
+/// under the LB's own id.
+fn alert_record(a: &Alert, lb_deployment: &str) -> Record {
+    let mut fields = serde_json::Map::new();
+    fields.insert("rule".into(), a.rule.into());
+    fields.insert(
+        "severity".into(),
+        serde_json::to_value(a.severity).unwrap_or(serde_json::Value::Null),
+    );
+    fields.insert("count".into(), a.count.into());
+    if let Some(client) = &a.client {
+        fields.insert("client".into(), client.clone().into());
+    }
+    if let Some(path) = &a.path {
+        fields.insert("path".into(), path.clone().into());
+    }
+    if let Some(t) = a.technique {
+        fields.insert("technique".into(), t.into());
+    }
+    // The normalized event, flattened alongside the alert's own fields so a
+    // query in app-obs can filter on `source.ip` or `url.path` directly. Our
+    // keys win a collision — `rule`/`severity`/`count` describe the alert, not
+    // the event.
+    if let Some(serde_json::Value::Object(ecs)) = &a.ecs {
+        for (k, v) in ecs {
+            fields.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    Record {
+        ts: a.ts,
+        deployment: a
+            .deployment
+            .clone()
+            .unwrap_or_else(|| lb_deployment.to_string()),
+        backend: None,
+        source: SECURITY_SOURCE,
+        level: a.severity.level(),
+        message: obs::truncate(a.title.clone(), obs::MAX_MESSAGE),
+        fields: Some(serde_json::Value::Object(fields)),
+    }
+}
+
+// -- the analyzer ----------------------------------------------------------
+
+/// Owns every piece of mutable detection state. Separated from [`Engine`] so the
+/// tests can drive it with an injected clock instead of sleeping.
+struct Analyzer {
+    cfg: SiemConfig,
+    windows: Windows,
+    signatures: Signatures,
+    access_parser: AccessParser,
+    control_parser: ControlPlaneParser,
+    enrichment: LbEnrichment,
+    /// Required by the trait signatures. Every lookup returns `None`, which is
+    /// correct: app-lb ships no GeoIP or IOC feed.
+    datasets: DatasetHolder,
+}
+
+impl Analyzer {
+    fn new(cfg: SiemConfig) -> Self {
+        Self {
+            windows: Windows::new(cfg.window, cfg.max_clients),
+            signatures: Signatures::new(),
+            access_parser: AccessParser,
+            control_parser: ControlPlaneParser,
+            enrichment: LbEnrichment,
+            datasets: DatasetHolder::default(),
+            cfg,
+        }
+    }
+
+    /// Normalize, enrich, then detect. `now` is a parameter rather than read from
+    /// the clock so every window test is deterministic.
+    fn analyze(&mut self, o: Observation, now: i64) -> Vec<Alert> {
+        let (mut alerts, log) = match o {
+            Observation::Access(a) => self.access(*a, now),
+            Observation::Auth(a) => self.auth(*a, now),
+        };
+        // Attached once and shared: every alert from one observation describes
+        // the same event.
+        if !alerts.is_empty() {
+            let ecs = ecs_fields(&log);
+            for a in &mut alerts {
+                a.ecs = Some(ecs.clone());
+            }
+        }
+        alerts
+    }
+
+    fn normalize(&self, mut log: SiemLog, parser: Which) -> SiemLog {
+        let parsed = match parser {
+            Which::Access => self.access_parser.parse_log(log, &self.datasets),
+            Which::Control => self.control_parser.parse_log(log, &self.datasets),
+        };
+        log = match parsed {
+            Ok(l) => l,
+            // The parser hands the log back rather than cloning it. Nothing here
+            // dispatches across candidates — the source told us which shape it
+            // is — so an unparsed log still gets enriched and analyzed.
+            Err(LogParsingError::NoValidParser(l))
+            | Err(LogParsingError::ParserError(l, _))
+            | Err(LogParsingError::NotImplemented(l))
+            | Err(LogParsingError::FormatError(l, _)) => l,
+            Err(LogParsingError::Discard) => return SiemLog::new("", 0, ORIGIN),
+        };
+        self.enrichment.enrich(log, &self.datasets)
+    }
+
+    fn access(&mut self, o: AccessObs, now: i64) -> (Vec<Alert>, SiemLog) {
+        let mut log = SiemLog::new(
+            format!("{} {} {}", o.method, o.path, status_text(o.status)),
+            o.ts,
+            ORIGIN,
+        );
+        log.add_tag("access");
+        if o.deployment.is_none() {
+            log.add_tag("unrouted");
+        }
+        if let Some(ip) = o.client {
+            log.add_field(fd::SOURCE_IP, SiemField::IP(siem_ip(ip)));
+        }
+        log.add_field(fd::HTTP_REQUEST_METHOD, method_field(&o.method));
+        log.add_field(fd::URL_PATH, SiemField::Text(o.path.to_string().into()));
+        if let Some(host) = &o.host {
+            log.add_field(fd::URL_DOMAIN, SiemField::Text(host.to_string().into()));
+        }
+        if let Some(s) = o.status {
+            log.add_field(fd::HTTP_RESPONSE_STATUS_CODE, SiemField::U64(s as u64));
+        }
+        log.add_field(F_DURATION, SiemField::U64(o.duration_nanos));
+        log.add_field(F_BYTES, SiemField::U64(o.bytes));
+        if let Some(d) = &o.deployment {
+            log.set_service(d.to_string());
+            log.add_field(F_SERVICE, SiemField::Text(d.to_string().into()));
+        }
+        let log = self.normalize(log, Which::Access);
+
+        let mut out = Vec::new();
+
+        // Stateless: signatures over the path, then the query values.
+        if let Some((sig, param)) = self.signatures.scan(&o.path, o.scan_query.as_deref()) {
+            let where_ = match &param {
+                Some(p) => format!("query parameter {p:?}"),
+                None => "path".to_string(),
+            };
+            out.push(Alert {
+                id: 0,
+                ts: o.ts,
+                last_ts: o.ts,
+                rule: sig.rule,
+                severity: sig.severity,
+                title: format!(
+                    "{} attempt in {} from {}",
+                    sig.what,
+                    where_,
+                    o.client.map(|c| c.to_string()).unwrap_or("an unknown source".into())
+                ),
+                client: o.client.map(|c| c.to_string()),
+                deployment: o.deployment.as_ref().map(|d| d.to_string()),
+                path: Some(obs::truncate(o.path.to_string(), MAX_ALERT_PATH)),
+                technique: Some(sig.technique),
+                count: 1,
+                ecs: None,
+            });
+        }
+
+        // Stateful: per-source rates.
+        let Some(ip) = o.client else {
+            return (out, log);
+        };
+        let key = ClientKey::of(ip);
+        let (rate, scan) = {
+            let window = self.cfg.window;
+            let scan_threshold = self.cfg.scan_threshold;
+            let rate_threshold = self.cfg.rate_threshold;
+            let Some(w) = self.windows.entry(key, now) else {
+                return (out, log);
+            };
+            w.requests.record(now, window);
+            if let Some(d) = &o.deployment {
+                w.deployment_sketch |= sketch_bit(d);
+            }
+            let mut scan = false;
+            if matches!(o.status, Some(401) | Some(403) | Some(404)) {
+                w.client_errors.record(now, window);
+                w.path_sketch |= sketch_bit(&o.path);
+                // The distinctness gate is what separates enumeration from one
+                // broken client retrying a single dead URL.
+                scan = w.client_errors.total() >= scan_threshold
+                    && w.path_sketch.count_ones() >= 8;
+            }
+            (w.requests.total() >= rate_threshold, scan)
+        };
+
+        if scan {
+            out.push(Alert {
+                id: 0,
+                ts: o.ts,
+                last_ts: o.ts,
+                rule: "traffic.scanner",
+                severity: Severity::Medium,
+                title: format!("{ip} is probing for unserved paths"),
+                client: Some(ip.to_string()),
+                deployment: o.deployment.as_ref().map(|d| d.to_string()),
+                path: Some(obs::truncate(o.path.to_string(), MAX_ALERT_PATH)),
+                technique: Some("T1595"),
+                count: 1,
+                ecs: None,
+            });
+        }
+        if rate {
+            out.push(Alert {
+                id: 0,
+                ts: o.ts,
+                last_ts: o.ts,
+                rule: "traffic.rate-spike",
+                severity: Severity::Medium,
+                title: format!("{ip} is sending an unusual volume of requests"),
+                client: Some(ip.to_string()),
+                deployment: o.deployment.as_ref().map(|d| d.to_string()),
+                path: None,
+                technique: Some("T1498"),
+                count: 1,
+                ecs: None,
+            });
+        }
+        (out, log)
+    }
+
+    fn auth(&mut self, o: AuthObs, now: i64) -> (Vec<Alert>, SiemLog) {
+        let mut log = SiemLog::new(
+            format!("{} rejected at {}", o.action.as_str(), o.path),
+            o.ts,
+            ORIGIN,
+        );
+        log.add_tag("auth-failure");
+        log.set_service(match o.action {
+            AuthAction::AdminRejected | AuthAction::AdminScope => "admin",
+            _ => "auth-gate",
+        });
+        if let Some(ip) = o.client {
+            log.add_field(fd::SOURCE_IP, SiemField::IP(siem_ip(ip)));
+        }
+        log.add_field(fd::URL_PATH, SiemField::Text(o.path.to_string().into()));
+        log.add_field(fd::EVENT_ACTION, SiemField::from_str_slice(o.action.as_str()));
+        log.add_field(F_SCHEME, SiemField::from_str_slice(o.scheme.as_str()));
+        if let Some(d) = &o.deployment {
+            log.add_field(F_SERVICE, SiemField::Text(d.to_string().into()));
+        }
+        if let Some(s) = &o.subject {
+            log.add_field(fd::USER_NAME, SiemField::User(s.to_string()));
+        }
+        let log = self.normalize(log, Which::Control);
+
+        let mut out = Vec::new();
+
+        // A state/nonce mismatch is CSRF-shaped and never benign, so it is worth
+        // an alert on its own rather than after a threshold.
+        if o.action == AuthAction::SigninState {
+            out.push(Alert {
+                id: 0,
+                ts: o.ts,
+                last_ts: o.ts,
+                rule: "auth.signin-state",
+                severity: Severity::Medium,
+                title: "sign-in state did not match the flow cookie".into(),
+                client: o.client.map(|c| c.to_string()),
+                deployment: o.deployment.as_ref().map(|d| d.to_string()),
+                path: Some(obs::truncate(o.path.to_string(), MAX_ALERT_PATH)),
+                technique: Some("T1190"),
+                count: 1,
+                ecs: None,
+            });
+        }
+
+        let Some(ip) = o.client else {
+            return (out, log);
+        };
+        if !o.action.counts_as_attempt() {
+            return (out, log);
+        }
+        let key = ClientKey::of(ip);
+        let (brute, spray, enumerating) = {
+            let window = self.cfg.window;
+            let threshold = self.cfg.auth_threshold;
+            let Some(w) = self.windows.entry(key, now) else {
+                return (out, log);
+            };
+            w.auth_failures.record(now, window);
+            if let Some(d) = &o.deployment {
+                w.deployment_sketch |= sketch_bit(d);
+            }
+            if let Some(s) = &o.subject {
+                w.subject_sketch |= sketch_bit(s);
+            }
+            let over = w.auth_failures.total() >= threshold;
+            (
+                over,
+                over && w.deployment_sketch.count_ones() >= 4,
+                over && w.subject_sketch.count_ones() >= 4,
+            )
+        };
+
+        if enumerating {
+            out.push(Alert {
+                id: 0,
+                ts: o.ts,
+                last_ts: o.ts,
+                rule: "auth.enumeration",
+                severity: Severity::High,
+                title: format!("{ip} is trying many identities against the sign-in gate"),
+                client: Some(ip.to_string()),
+                deployment: o.deployment.as_ref().map(|d| d.to_string()),
+                path: None,
+                technique: Some("T1110_003"),
+                count: 1,
+                ecs: None,
+            });
+        } else if spray {
+            out.push(Alert {
+                id: 0,
+                ts: o.ts,
+                last_ts: o.ts,
+                rule: "auth.spray",
+                severity: Severity::High,
+                title: format!("{ip} is spraying credentials across several deployments"),
+                client: Some(ip.to_string()),
+                deployment: None,
+                path: None,
+                technique: Some("T1110_003"),
+                count: 1,
+                ecs: None,
+            });
+        } else if brute {
+            let (rule, severity, what) = match o.action {
+                // A *valid* credential reaching past its scope is a
+                // compromised-token signal, not a guessing attack.
+                AuthAction::AdminScope => (
+                    "auth.scope-denied",
+                    Severity::Medium,
+                    "is using a credential beyond its scope",
+                ),
+                _ => (
+                    "auth.brute-force",
+                    Severity::High,
+                    "is failing authentication repeatedly",
+                ),
+            };
+            out.push(Alert {
+                id: 0,
+                ts: o.ts,
+                last_ts: o.ts,
+                rule,
+                severity,
+                title: format!("{ip} {what}"),
+                client: Some(ip.to_string()),
+                deployment: o.deployment.as_ref().map(|d| d.to_string()),
+                path: Some(obs::truncate(o.path.to_string(), MAX_ALERT_PATH)),
+                technique: Some("T1110"),
+                count: 1,
+                ecs: None,
+            });
+        }
+        (out, log)
+    }
+}
+
+enum Which {
+    Access,
+    Control,
+}
+
+fn status_text(s: Option<u16>) -> String {
+    match s {
+        Some(s) => s.to_string(),
+        None => "-".into(),
+    }
+}
+
+// -- the background service ------------------------------------------------
+
+/// Drains the queue, analyses, and publishes.
+pub struct Engine {
+    rx: Mutex<Option<mpsc::Receiver<Observation>>>,
+    cfg: SiemConfig,
+    ring: Arc<AlertRing>,
+    stats: Arc<SiemStats>,
+    /// `None` when app-obs is not configured. Alerts still reach `/security`.
+    obs: Option<LogSink>,
+    lb_deployment: Arc<str>,
+}
+
+#[async_trait]
+impl BackgroundService for Engine {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        let Some(mut rx) = self.rx.lock().expect("siem receiver lock").take() else {
+            tracing::error!("siem engine started twice");
+            return;
+        };
+        let mut analyzer = Analyzer::new(self.cfg.clone());
+        // Releases per-client state on an LB that has gone quiet, so an idle
+        // process does not hold the last burst forever.
+        let mut prune = tokio::time::interval(Duration::from_secs(
+            (self.cfg.window as u64 / 2).max(5),
+        ));
+        prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut warned_dropped = false;
+
+        tracing::info!(
+            window_secs = self.cfg.window,
+            max_clients = self.cfg.max_clients,
+            scan_query = self.cfg.scan_query,
+            "security monitoring active",
+        );
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = prune.tick() => {
+                    let now = obs::now_millis();
+                    analyzer.windows.prune(now);
+                    self.stats
+                        .tracked_clients
+                        .store(analyzer.windows.clients.len() as u64, Ordering::Relaxed);
+                    self.stats
+                        .clients_at_capacity
+                        .store(analyzer.windows.at_capacity, Ordering::Relaxed);
+
+                    // A SIEM that has silently stopped seeing traffic looks
+                    // exactly like a quiet network, so say so once.
+                    if !warned_dropped && self.stats.dropped.load(Ordering::Relaxed) > 0 {
+                        warned_dropped = true;
+                        tracing::warn!(
+                            "the security queue is dropping observations, so detection is \
+                             now sampling rather than complete; raise \
+                             APP_LB_SIEM_QUEUE_CAPACITY",
+                        );
+                    }
+                }
+                got = rx.recv() => {
+                    let Some(o) = got else { break };
+                    let now = obs::now_millis();
+                    self.stats.analyzed.fetch_add(1, Ordering::Relaxed);
+                    for alert in analyzer.analyze(o, now) {
+                        // `raise` must run unconditionally — it is what puts the
+                        // alert in the ring `GET /security` serves. Only the
+                        // shipping is optional; folding these into one `&&`
+                        // chain would empty the dashboard whenever
+                        // `APP_LB_SIEM_SHIP=0`.
+                        if let Some(raised) = self.ring.raise(alert, now)
+                            && self.cfg.ship
+                            && let Some(sink) = &self.obs
+                        {
+                            sink.send(alert_record(&raised, &self.lb_deployment));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// -- wiring ----------------------------------------------------------------
+
+/// The pieces `main` wires up. Mirrors [`crate::obs::Obs`].
+pub struct Siem {
+    /// Cloned into the proxy, the admin API and the sign-in gate.
+    pub sink: SecuritySink,
+    /// Shared with the admin API for `GET /security`.
+    pub ring: Arc<AlertRing>,
+    /// Registered as a pingora background service.
+    pub engine: Engine,
+    /// Read by `/metrics`.
+    pub stats: Arc<SiemStats>,
+}
+
+/// Build the pipeline, unless `APP_LB_SIEM=0`.
+///
+/// Allocates a channel and nothing else — `main` calls this before
+/// `run_forever`, which may fork to daemonize, so nothing here may own a thread
+/// or a connection.
+///
+/// `obs` is the *events* sink, used only to ship alerts; the SIEM is fully
+/// functional without it.
+pub fn from_env(obs_sink: Option<LogSink>, lb_deployment: Arc<str>) -> Option<Siem> {
+    if !obs::env_flag("APP_LB_SIEM", true) {
+        return None;
+    }
+    let cfg = SiemConfig::from_env();
+    let stats = Arc::new(SiemStats::default());
+    let ring = Arc::new(AlertRing::new(&cfg, stats.clone()));
+    let (tx, rx) = mpsc::channel(cfg.queue_capacity.max(1));
+
+    Some(Siem {
+        sink: SecuritySink {
+            tx,
+            stats: stats.clone(),
+            scan_query: cfg.scan_query,
+        },
+        ring: ring.clone(),
+        engine: Engine {
+            rx: Mutex::new(Some(rx)),
+            cfg,
+            ring,
+            stats: stats.clone(),
+            obs: obs_sink,
+            lb_deployment,
+        },
+        stats,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration as StdDuration;
+
+    fn cfg() -> SiemConfig {
+        SiemConfig {
+            queue_capacity: 64,
+            alert_capacity: 16,
+            window: 60,
+            max_clients: 8,
+            auth_threshold: 5,
+            scan_threshold: 10,
+            rate_threshold: 100,
+            suppress: 300,
+            max_alerts_per_min: 1000,
+            scan_query: true,
+            ship: true,
+        }
+    }
+
+    fn access(path: &str, status: Option<u16>, client: &str) -> AccessObs {
+        AccessObs {
+            ts: 1_700_000_000_000,
+            client: client.parse().ok(),
+            deployment: Some(Box::from("demo")),
+            method: Box::from("GET"),
+            path: Box::from(path),
+            host: Some(Box::from("demo.local")),
+            scan_query: None,
+            status,
+            duration_nanos: 1_400_000,
+            bytes: 254,
+        }
+    }
+
+    fn auth(client: &str, action: AuthAction) -> AuthObs {
+        AuthObs {
+            ts: 1_700_000_000_000,
+            client: client.parse().ok(),
+            deployment: None,
+            path: Box::from("/metrics"),
+            action,
+            scheme: AuthScheme::Basic,
+            subject: None,
+        }
+    }
+
+    /// The invariant the whole module is built around, mirroring obs.rs.
+    #[tokio::test]
+    async fn a_full_queue_drops_instead_of_blocking() {
+        let stats = Arc::new(SiemStats::default());
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = SecuritySink {
+            tx,
+            stats: stats.clone(),
+            scan_query: false,
+        };
+        for _ in 0..2 {
+            sink.observe_auth(auth("1.2.3.4", AuthAction::AdminRejected));
+        }
+        let s = stats.snapshot();
+        assert_eq!((s.observed, s.dropped), (1, 1));
+    }
+
+    /// The most important test here: the query string is matched and never kept.
+    #[test]
+    fn the_query_string_never_reaches_a_field_an_alert_or_a_record() {
+        let mut a = Analyzer::new(cfg());
+        let mut o = access("/items", Some(200), "203.0.113.9");
+        o.scan_query = Some(Box::from("code=SUPERSECRET&id=1' or '1'='1"));
+
+        let alerts = a.analyze(Observation::Access(Box::new(o)), 1_700_000_000_000);
+        let alert = alerts
+            .iter()
+            .find(|x| x.rule == "web.sqli")
+            .expect("sqli must be detected in a parameter value");
+
+        // It names where, not what.
+        assert!(
+            alert.title.contains("query parameter \"id\""),
+            "alert should name the parameter: {}",
+            alert.title
+        );
+
+        let as_alert = serde_json::to_string(alert).unwrap();
+        let as_record = serde_json::to_string(&alert_record(alert, "_lb")).unwrap();
+        for rendered in [&as_alert, &as_record] {
+            assert!(
+                !rendered.contains("SUPERSECRET"),
+                "a credential from the query reached the log store: {rendered}"
+            );
+            assert!(
+                !rendered.contains("'1'='1"),
+                "a parameter *value* reached the log store: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_access_log_parses_into_the_ecs_field_names_app_obs_expects() {
+        let a = Analyzer::new(cfg());
+        let mut log = SiemLog::new("GET /x 200", 1, ORIGIN);
+        log.add_tag("access");
+        log.add_field(fd::SOURCE_IP, SiemField::IP(SiemIp::V4(0x0100_0001)));
+        log.add_field(fd::URL_PATH, SiemField::Text("/a/b.php".into()));
+        log.add_field(fd::HTTP_RESPONSE_STATUS_CODE, SiemField::U64(404));
+        let log = a.normalize(log, Which::Access);
+
+        // Assert against the dictionary constants, so a u-siem bump that renames
+        // one fails here instead of silently reshaping every stored log.
+        assert_eq!(log.field(fd::EVENT_CATEGORY).is_some(), true);
+        assert!(matches!(
+            log.field(fd::EVENT_OUTCOME),
+            Some(SiemField::Text(o)) if o == "failure"
+        ));
+        assert!(matches!(
+            log.field(F_EXTENSION),
+            Some(SiemField::Text(e)) if e == "php"
+        ));
+        assert_eq!(log.product(), ORIGIN);
+        // Never set, by construction.
+        assert!(log.field(fd::URL_QUERY).is_none());
+    }
+
+    /// `SiemIp::is_local` returns false for 127.0.0.1, and the admin listener
+    /// binds loopback by default — so without the override every control-plane
+    /// alert would claim an external attacker.
+    #[test]
+    fn loopback_is_internal_even_though_the_crate_says_otherwise() {
+        assert!(
+            !SiemIp::V4(u32::from(std::net::Ipv4Addr::LOCALHOST)).is_local(),
+            "upstream behaviour changed; the override in `is_internal` may be redundant now",
+        );
+        for ip in ["127.0.0.1", "::1", "10.1.2.3", "192.168.0.9"] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(is_internal(&siem_ip(parsed)), "{ip} must be internal");
+        }
+        for ip in ["203.0.113.9", "2001:db8::1"] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(!is_internal(&siem_ip(parsed)), "{ip} must be external");
+        }
+    }
+
+    /// The envelope is constant or already on the alert; repeating it on every
+    /// record is storage app-obs keeps forever for no query.
+    #[test]
+    fn the_ecs_block_carries_the_event_and_not_the_envelope() {
+        let mut a = Analyzer::new(cfg());
+        let alerts = a.analyze(
+            Observation::Access(Box::new(access("/wp-login.php", Some(404), "203.0.113.9"))),
+            1_700_000_000_000,
+        );
+        let ecs = alerts[0].ecs.as_ref().expect("an alert carries its event");
+        let obj = ecs.as_object().unwrap();
+        for gone in ["message", "product", "vendor", "origin", "event.received"] {
+            assert!(!obj.contains_key(gone), "{gone} is envelope, not event");
+        }
+        for kept in [fd::SOURCE_IP, fd::URL_PATH, fd::HTTP_RESPONSE_STATUS_CODE] {
+            assert!(obj.contains_key(kept), "{kept} is the event itself");
+        }
+    }
+
+    #[test]
+    fn the_wrong_parser_hands_the_log_back_intact() {
+        let a = Analyzer::new(cfg());
+        let mut log = SiemLog::new("something", 1, ORIGIN);
+        log.add_tag("auth-failure");
+        match a.access_parser.parse_log(log, &a.datasets) {
+            Err(LogParsingError::NoValidParser(back)) => {
+                assert_eq!(back.message(), "something");
+            }
+            _ => panic!("access parser must decline an auth-failure log"),
+        }
+    }
+
+    #[test]
+    fn brute_force_fires_at_the_threshold_and_not_before() {
+        let c = cfg();
+        let mut a = Analyzer::new(c.clone());
+        let now = 1_700_000_000_000;
+        for _ in 0..c.auth_threshold - 1 {
+            let out = a.analyze(
+                Observation::Auth(Box::new(auth("198.51.100.7", AuthAction::AdminRejected))),
+                now,
+            );
+            assert!(out.is_empty(), "must not alert below the threshold");
+        }
+        let out = a.analyze(
+            Observation::Auth(Box::new(auth("198.51.100.7", AuthAction::AdminRejected))),
+            now,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rule, "auth.brute-force");
+    }
+
+    #[test]
+    fn a_window_that_has_slid_past_forgets() {
+        let c = cfg();
+        let mut a = Analyzer::new(c.clone());
+        let now = 1_700_000_000_000;
+        for _ in 0..c.auth_threshold - 1 {
+            a.analyze(
+                Observation::Auth(Box::new(auth("198.51.100.8", AuthAction::AdminRejected))),
+                now,
+            );
+        }
+        // Past the whole window, so every bucket is stale.
+        let later = now + (c.window + 1) * 1000;
+        for _ in 0..c.auth_threshold - 1 {
+            let out = a.analyze(
+                Observation::Auth(Box::new(auth("198.51.100.8", AuthAction::AdminRejected))),
+                later,
+            );
+            assert!(out.is_empty(), "attempts from a lapsed window must not count");
+        }
+    }
+
+    /// The highest-value line in the detector: a /64 is one attacker.
+    #[test]
+    fn an_ipv6_attacker_cannot_rotate_within_a_64_to_escape() {
+        let c = cfg();
+        let mut a = Analyzer::new(c.clone());
+        let now = 1_700_000_000_000;
+        let mut fired = None;
+        for i in 0..c.auth_threshold {
+            let addr = format!("2001:db8:1:2::{:x}", i + 1);
+            let out = a.analyze(
+                Observation::Auth(Box::new(auth(&addr, AuthAction::AdminRejected))),
+                now,
+            );
+            if let Some(alert) = out.into_iter().next() {
+                fired = Some(alert);
+            }
+        }
+        assert!(
+            fired.is_some(),
+            "rotating the low 64 bits must not reset the counter"
+        );
+    }
+
+    /// The bound that keeps this from being the vulnerability.
+    #[test]
+    fn the_client_table_is_capped_and_prefers_dropping_new_over_evicting_live() {
+        let c = cfg();
+        let mut w = Windows::new(c.window, c.max_clients);
+        let now = 1_700_000_000_000;
+
+        // A source with live, in-window activity.
+        let live = ClientKey::of("203.0.113.1".parse().unwrap());
+        w.entry(live, now).unwrap().requests.record(now, c.window);
+
+        // Flood with fresh sources, all inside the window.
+        for i in 0..1000u32 {
+            let ip: IpAddr = format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256)
+                .parse()
+                .unwrap();
+            w.entry(ClientKey::of(ip), now);
+        }
+
+        assert!(
+            w.clients.len() <= c.max_clients,
+            "the table must stay bounded, got {}",
+            w.clients.len()
+        );
+        assert!(w.at_capacity, "saturation must be reported");
+        assert!(
+            w.clients.contains_key(&live),
+            "a live entry must not be evicted to make room for a flood",
+        );
+    }
+
+    #[test]
+    fn a_scanner_produces_one_alert_not_ten_thousand() {
+        let stats = Arc::new(SiemStats::default());
+        let ring = AlertRing::new(&cfg(), stats.clone());
+        let now = 1_700_000_000_000;
+        let mut shipped = 0;
+        for _ in 0..5000 {
+            let a = Alert {
+                id: 0,
+                ts: now,
+                last_ts: now,
+                rule: "traffic.scanner",
+                severity: Severity::Medium,
+                title: "probing".into(),
+                client: Some("203.0.113.9".into()),
+                deployment: Some("demo".into()),
+                path: None,
+                technique: Some("T1595"),
+                count: 1,
+                ecs: None,
+            };
+            if ring.raise(a, now).is_some() {
+                shipped += 1;
+            }
+        }
+        assert_eq!(shipped, 1, "only the first occurrence ships to app-obs");
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.recent(10)[0].count, 5000);
+        assert_eq!(stats.snapshot().suppressed, 4999);
+    }
+
+    /// `APP_LB_SIEM_SHIP=0` must stop records reaching app-obs and nothing else.
+    /// Collapsing the ship check into the same condition as `raise` would empty
+    /// `GET /security`, which is a silent way to lose the whole feature.
+    #[test]
+    fn not_shipping_still_records_the_alert_locally() {
+        let mut c = cfg();
+        c.ship = false;
+        let stats = Arc::new(SiemStats::default());
+        let ring = AlertRing::new(&c, stats.clone());
+        let now = 1_700_000_000_000;
+
+        // What the engine loop does: raise first, ship second.
+        let raised = ring.raise(
+            Alert {
+                id: 0,
+                ts: now,
+                last_ts: now,
+                rule: "auth.brute-force",
+                severity: Severity::High,
+                title: "x".into(),
+                client: Some("203.0.113.9".into()),
+                deployment: None,
+                path: None,
+                technique: None,
+                count: 1,
+                ecs: None,
+            },
+            now,
+        );
+        assert!(raised.is_some(), "a new alert is always raised");
+        assert_eq!(ring.len(), 1, "and is held for GET /security regardless of shipping");
+        assert_eq!(stats.snapshot().raised, 1);
+    }
+
+    #[test]
+    fn the_ring_never_exceeds_its_capacity() {
+        let c = cfg();
+        let stats = Arc::new(SiemStats::default());
+        let ring = AlertRing::new(&c, stats);
+        let now = 1_700_000_000_000;
+        for i in 0..c.alert_capacity * 3 {
+            ring.raise(
+                Alert {
+                    id: 0,
+                    ts: now,
+                    last_ts: now,
+                    rule: "web.sqli",
+                    // A distinct key each time, so nothing folds.
+                    client: Some(format!("203.0.113.{}", i % 250)),
+                    severity: Severity::High,
+                    title: "x".into(),
+                    deployment: Some(format!("d{i}")),
+                    path: None,
+                    technique: None,
+                    count: 1,
+                    ecs: None,
+                },
+                now,
+            );
+        }
+        assert_eq!(ring.len(), c.alert_capacity);
+    }
+
+    /// app-lb serves these itself; matching them would make the feature unusable.
+    #[test]
+    fn app_lbs_own_paths_are_not_attacks() {
+        let s = Signatures::new();
+        for path in [
+            "/.well-known/acme-challenge/tok3n-with-.-dots",
+            "/.well-known/openid-configuration",
+        ] {
+            assert!(
+                s.scan(path, None).is_none(),
+                "{path} must not be reported as an attack"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_traffic_raises_nothing() {
+        let s = Signatures::new();
+        for path in [
+            "/",
+            "/health",
+            "/api/v1/users",
+            "/static/app.1f2e3d.js",
+            "/assets/logo.svg",
+            "/images/photo.jpeg",
+            "/docs/getting-started",
+            "/v2/items/42",
+            "/favicon.ico",
+        ] {
+            assert!(s.scan(path, None).is_none(), "{path} must be clean");
+        }
+        // A benign query, including a base64 value with padding.
+        assert!(
+            s.scan("/api/v1/users", Some("limit=50&cursor=YWJjZGVm==")).is_none(),
+            "an ordinary query must be clean"
+        );
+    }
+
+    #[test]
+    fn the_signatures_catch_what_they_are_for() {
+        let s = Signatures::new();
+        for (path, rule) in [
+            ("/files/../../etc/passwd", "web.traversal"),
+            ("/wp-login.php", "web.secret-probe"),
+            ("/.env", "web.secret-probe"),
+            ("/search/<script>alert(1)</script>", "web.xss"),
+        ] {
+            let hit = s.scan(path, None);
+            assert_eq!(
+                hit.map(|(sig, _)| sig.rule),
+                Some(rule),
+                "{path} should match {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alert_becomes_a_record_app_obs_can_store() {
+        let a = Alert {
+            id: 7,
+            ts: 1_700_000_000_000,
+            last_ts: 1_700_000_000_000,
+            rule: "auth.brute-force",
+            severity: Severity::High,
+            title: "1.2.3.4 is failing authentication repeatedly".into(),
+            client: Some("1.2.3.4".into()),
+            // Admin-plane: no deployment of its own.
+            deployment: None,
+            path: Some("/metrics".into()),
+            technique: Some("T1110"),
+            count: 9,
+            ecs: None,
+        };
+        let r = alert_record(&a, "_lb");
+        assert_eq!(r.source, SECURITY_SOURCE);
+        assert_eq!(r.level, "error");
+        // app-obs rejects a record naming no deployment, taking the whole batch
+        // with it, so the fallback is load-bearing.
+        assert_eq!(r.deployment, "_lb");
+    }
+
+    /// The dashboard switches on these strings.
+    #[test]
+    fn severity_serializes_as_the_string_the_dashboard_switches_on() {
+        for (sev, want) in [
+            (Severity::Critical, "\"critical\""),
+            (Severity::High, "\"high\""),
+            (Severity::Medium, "\"medium\""),
+            (Severity::Low, "\"low\""),
+            (Severity::Info, "\"info\""),
+        ] {
+            assert_eq!(serde_json::to_string(&sev).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn a_ring_counter_slides_without_allocating() {
+        let mut c = RingCounter::default();
+        let now = 1_700_000_000_000;
+        for i in 0..5 {
+            c.record(now + i * 100, 60);
+        }
+        assert_eq!(c.total(), 5);
+        // A full window later, everything has aged out.
+        c.advance(now + 61_000, 60);
+        assert_eq!(c.total(), 0);
+    }
+
+    #[test]
+    fn the_path_sketch_separates_a_wordlist_from_a_retry_loop() {
+        let mut retry = 0u64;
+        for _ in 0..500 {
+            retry |= sketch_bit("/missing");
+        }
+        assert_eq!(retry.count_ones(), 1, "one path lights one bit");
+
+        let mut walk = 0u64;
+        for i in 0..500 {
+            walk |= sketch_bit(&format!("/admin{i}"));
+        }
+        assert!(
+            walk.count_ones() >= 8,
+            "a wordlist must light many bits, got {}",
+            walk.count_ones()
+        );
+    }
+
+    #[test]
+    fn a_scheme_is_read_without_decoding_the_credential() {
+        assert_eq!(AuthScheme::of(Some("Basic aGk6dGhlcmU=")), AuthScheme::Basic);
+        assert_eq!(AuthScheme::of(Some("bearer applb_x")), AuthScheme::Bearer);
+        assert_eq!(AuthScheme::of(Some("weird")), AuthScheme::None);
+        assert_eq!(AuthScheme::of(None), AuthScheme::None);
+    }
+
+    #[test]
+    fn an_unparseable_peer_is_excluded_rather_than_given_a_key() {
+        let stats = Arc::new(SiemStats::default());
+        let (tx, mut rx) = mpsc::channel(4);
+        let sink = SecuritySink {
+            tx,
+            stats,
+            scan_query: false,
+        };
+        sink.observe_access(
+            &Access {
+                deployment: Some("demo"),
+                backend: None,
+                method: "GET",
+                path: "/",
+                host: None,
+                status: Some(200),
+                duration: StdDuration::from_millis(1),
+                bytes: 0,
+                // A unix-socket peer stringifies to a path.
+                client: Some("/var/run/app.sock".into()),
+                error: None,
+            },
+            None,
+        );
+        match rx.try_recv() {
+            Ok(Observation::Access(a)) => assert!(a.client.is_none()),
+            _ => panic!("expected an access observation"),
+        }
+    }
+
+    #[test]
+    fn scanning_the_query_is_off_when_configured_off() {
+        let stats = Arc::new(SiemStats::default());
+        let (tx, mut rx) = mpsc::channel(4);
+        let sink = SecuritySink {
+            tx,
+            stats,
+            scan_query: false,
+        };
+        sink.observe_access(
+            &Access {
+                deployment: Some("demo"),
+                backend: None,
+                method: "GET",
+                path: "/",
+                host: None,
+                status: Some(200),
+                duration: StdDuration::from_millis(1),
+                bytes: 0,
+                client: Some("1.2.3.4".into()),
+                error: None,
+            },
+            Some("id=1' or '1'='1"),
+        );
+        match rx.try_recv() {
+            Ok(Observation::Access(a)) => assert!(
+                a.scan_query.is_none(),
+                "the query must not be captured when scanning is off"
+            ),
+            _ => panic!("expected an access observation"),
+        }
+    }
+}
