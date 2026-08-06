@@ -2186,6 +2186,30 @@ struct ShellQuery {
     wake: bool,
 }
 
+/// The VM an `exec` or `shell` session runs in.
+///
+/// Two cases, because the pool cannot offer the second one. A ready backend
+/// comes with a [`BackendSlot`](crate::deployment::BackendSlot) that holds an
+/// in-flight slot for the life of the session, which is what stops the
+/// autoscaler scaling the VM away underneath it. A *booting* VM has no slot to
+/// take — it is not in the pool — and needs none: nothing scales away a VM that
+/// was never promoted. What can still kill it is `boot_timeout_secs`, and that
+/// is the autoscaler's call, not something a session should be able to veto.
+enum VmTarget {
+    Ready(crate::deployment::BackendSlot),
+    /// A VM the daemon reports `Running` that has not passed its health check.
+    Booting(String),
+}
+
+impl VmTarget {
+    fn sandbox_id(&self) -> &str {
+        match self {
+            Self::Ready(slot) => slot.sandbox_id(),
+            Self::Booting(id) => id,
+        }
+    }
+}
+
 /// Resolve a deployment to a VM that can run something, waking one if asked.
 ///
 /// The waiting half is the proxy's cold-start path (`proxy::wait_for_capacity`)
@@ -2193,13 +2217,16 @@ struct ShellQuery {
 /// autoscaler and waits exactly as a request would — including the autoscaler's
 /// preference for resuming a suspended VM over booting a fresh one.
 ///
-/// The returned guard holds an in-flight slot for as long as the caller keeps
-/// it, which is what stops the VM being scaled out from under a live session.
-async fn hold_a_vm(
-    state: &AdminState,
-    id: &str,
-    wake: bool,
-) -> Result<crate::deployment::BackendSlot, Response> {
+/// **A booting VM counts.** A guest that is up but whose server never answers
+/// the health check is never promoted, so the pool cannot hand it over — and it
+/// is the single case where getting inside the VM matters most. Resolving only
+/// against ready backends meant `exec` sat out `cold_start_timeout_secs` and
+/// answered 503 on exactly the deployment somebody was trying to debug, while
+/// the VM they wanted sat there `Running` with a `guest_ip`. So a still-booting
+/// VM is used when the pool has nothing, and it is tried *before* waking one:
+/// a VM that already exists is the one to look at, and booting another would
+/// add a sandbox — and its disks — to a deployment that is already churning.
+async fn hold_a_vm(state: &AdminState, id: &str, wake: bool) -> Result<VmTarget, Response> {
     let Some(d) = state.registry.get(id) else {
         return Err(err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response());
     };
@@ -2217,7 +2244,15 @@ async fn hold_a_vm(
     }
 
     if let Some(b) = d.select(&[]) {
-        return Ok(b.hold());
+        return Ok(VmTarget::Ready(b.hold()));
+    }
+    if let Some(sandbox_id) = booting_vm(&d) {
+        tracing::info!(
+            deployment = %id,
+            sandbox = %sandbox_id,
+            "no VM has passed its health check; running in one that is still booting",
+        );
+        return Ok(VmTarget::Booting(sandbox_id));
     }
     if !wake {
         return Err(err(
@@ -2227,16 +2262,41 @@ async fn hold_a_vm(
         .into_response());
     }
     match crate::proxy::wait_for_capacity(&d, &[], &state.metrics).await {
-        Some(b) => Ok(b.hold()),
-        None => Err(err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "deployment {id:?} has no VM and none became available within \
-                 cold_start_timeout_secs"
-            ),
-        )
-        .into_response()),
+        Some(b) => Ok(VmTarget::Ready(b.hold())),
+        // The wait itself is what created a VM, so ask again before giving up:
+        // a boot that got as far as `Running` and stalled on the health check is
+        // still something to run a command in, and answering 503 here would send
+        // the caller away from the VM their own request had just started.
+        None => match booting_vm(&d) {
+            Some(sandbox_id) => Ok(VmTarget::Booting(sandbox_id)),
+            None => Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "deployment {id:?} has no VM and none became available within \
+                     cold_start_timeout_secs"
+                ),
+            )
+            .into_response()),
+        },
     }
+}
+
+/// The oldest pending VM the daemon reports `Running`, if there is one.
+///
+/// Oldest first: with a pool of stalled boots, the one that has been up longest
+/// is the one whose logs cover the most, and picking it keeps repeated `exec`s
+/// landing on the same guest instead of scattering across a churning pool.
+///
+/// `Running` and not merely pending, because a VM the daemon has not started
+/// yet has no guest to talk to — the daemon would refuse the exec, and doing so
+/// slowly. This is the same distinction `promote_pending` draws, minus the
+/// health probe that is the whole reason the caller is here.
+fn booting_vm(d: &std::sync::Arc<crate::deployment::Deployment>) -> Option<String> {
+    d.pending()
+        .iter()
+        .filter(|p| p.status == Some(heyo_sdk::SandboxStatus::Running))
+        .min_by_key(|p| p.created_at)
+        .map(|p| p.sandbox_id.clone())
 }
 
 /// `POST /deployments/:id/exec` — run one command in the deployment's VM.
@@ -2350,7 +2410,7 @@ async fn pump_shell(
     socket: axum::extract::ws::WebSocket,
     session: heyo_sdk::ShellSession,
     sandbox_id: String,
-    _slot: crate::deployment::BackendSlot,
+    _target: VmTarget,
 ) {
     use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
@@ -3134,6 +3194,73 @@ mod tests {
         // so these must fall through to the "does not cover the fleet" refusal.
         for mutating in ["/security/rules", "/security/rules/:id"] {
             assert!(!narrows_itself(mutating), "{mutating} must not narrow");
+        }
+    }
+
+    /// `exec` and `shell` against a deployment whose VMs boot but never pass
+    /// their health check — the case they are needed for, and the one the pool
+    /// cannot serve, because such a VM is never promoted out of `pending`.
+    mod booting_targets {
+        use super::*;
+        use crate::deployment::{Deployment, PendingVm};
+        use heyo_sdk::SandboxStatus;
+
+        fn deployment() -> std::sync::Arc<Deployment> {
+            let spec = serde_json::from_str(
+                r#"{"id":"demo","routes":[],"vm":{"driver":"firecracker","port":8080}}"#,
+            )
+            .expect("the fixture spec parses");
+            std::sync::Arc::new(Deployment::new(spec))
+        }
+
+        fn pending(id: &str, created_at: u64, status: Option<SandboxStatus>) -> PendingVm {
+            PendingVm {
+                sandbox_id: id.into(),
+                created_at,
+                status,
+                reported_at_secs: 0,
+            }
+        }
+
+        #[test]
+        fn nothing_pending_offers_nothing() {
+            assert_eq!(booting_vm(&deployment()), None);
+        }
+
+        /// A VM the daemon has not started has no guest to talk to. Offering it
+        /// would trade a fast 503 for a slow one at the daemon.
+        #[test]
+        fn a_vm_the_daemon_has_not_started_is_not_a_target() {
+            let d = deployment();
+            d.set_pending(vec![
+                pending("sb-1", 100, None),
+                pending("sb-2", 200, Some(SandboxStatus::Provisioning)),
+            ]);
+            assert_eq!(booting_vm(&d), None);
+        }
+
+        #[test]
+        fn a_running_vm_that_never_passed_its_health_check_is() {
+            let d = deployment();
+            d.set_pending(vec![
+                pending("sb-1", 100, Some(SandboxStatus::Provisioning)),
+                pending("sb-2", 200, Some(SandboxStatus::Running)),
+            ]);
+            assert_eq!(booting_vm(&d).as_deref(), Some("sb-2"));
+        }
+
+        /// Oldest first, so a pool of stalled boots sends every `exec` to the
+        /// same guest — the one whose logs cover the most — instead of
+        /// scattering them across VMs that are each about to be killed.
+        #[test]
+        fn the_oldest_running_one_wins() {
+            let d = deployment();
+            d.set_pending(vec![
+                pending("sb-new", 300, Some(SandboxStatus::Running)),
+                pending("sb-old", 100, Some(SandboxStatus::Running)),
+                pending("sb-mid", 200, Some(SandboxStatus::Running)),
+            ]);
+            assert_eq!(booting_vm(&d).as_deref(), Some("sb-old"));
         }
     }
 

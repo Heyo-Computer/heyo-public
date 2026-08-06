@@ -728,6 +728,32 @@ group is root-equivalent and hands back most of what the non-root user was for.
 A host that only [pulls images](#pulling-images-from-an-artifact-store) needs
 none of this.
 
+**Builds need a home directory, before they need anything else** — and the
+service user does not have to have `HOME` set to end up with one. `docker` keeps
+its client state in `$HOME/.docker`, but when `HOME` is unset it resolves the
+home directory by reading `/etc/passwd` for its own uid instead of giving up. So
+the home *string* comes from the passwd entry that `useradd` writes from
+`/etc/default/useradd` (`HOME=/home` + the username), and `--no-create-home` —
+what the [supervisord setup](deploy/supervisor/README.md) does — suppresses only
+the `mkdir`, not the field. The result is a build that dies before reading a
+single Dockerfile instruction with `Docker build failed: ERROR: mkdir
+/home/app-lb: permission denied`: `/home` is root-owned, so the user cannot
+create the home its own passwd entry names.
+
+This bites under supervisord in particular because supervisord never sets
+`HOME`. It copies its own environment to the child verbatim and reads the passwd
+record only for uid/gid, so a supervisord started by systemd without `User=`
+hands the child no `HOME` at all. The corroborating symptom is in app-lb's own
+startup log — with `HOME` unset it cannot resolve the images directory either,
+and warns `neither MVM_DATA_DIR nor HOME is set`.
+
+Either give the user a real home
+(`install -d -o app-lb -g app-lb /home/app-lb`) or set `APP_LB_HEYVM_HOME`,
+which app-lb passes to the heyvm child as an explicit `HOME` and docker prefers
+over the passwd lookup. Prefer the latter where possible: it is the same
+variable the image-placement problem above wants set, and pointing it at
+heyvmd's home settles both at once.
+
 **Image names carry the commit.** Each build produces `<name>-<short sha>`
 (`<name>` defaults to the deployment id, override with `build.image_name`), so
 the running spec answers "what is deployed?" with something you can look up in

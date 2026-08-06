@@ -1784,6 +1784,56 @@ fn freed(parts: &[DiskPart], removed: &[String]) -> u64 {
         .sum()
 }
 
+/// Remove a directory tree, naming the path that actually stopped it.
+///
+/// `std::fs::remove_dir_all` returns a bare `io::Error` with no path attached,
+/// so every failure anywhere under a sandbox directory was reported against the
+/// sandbox directory itself. That is the wrong path on the host this feature
+/// exists for: heyvmd creates the files, app-lb usually owns only the directory
+/// above them, so the denial is a level or two down and the message named a
+/// directory app-lb could already write. An operator following it `chown`s that
+/// directory, sweeps again, gets the identical line, and reasonably concludes
+/// the sweep is broken rather than the permissions.
+///
+/// `Ok(true)` if something was there and is now gone, `Ok(false)` if there was
+/// nothing to remove, `Err` with the first path that could not be — first, and
+/// not all of them, because this stops where `remove_dir_all` stops and one
+/// accurate path is the whole diagnosis. Every file under a directory nobody
+/// can write into is the same fact repeated.
+fn remove_tree(path: &Path) -> Result<bool, String> {
+    // `symlink_metadata`, so a symlink is unlinked as itself and never
+    // followed: nothing under these roots is supposed to be one, and a purge
+    // that walked through one would delete outside the two directories this
+    // module manages.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+
+    if !meta.is_dir() {
+        return unlinked(std::fs::remove_file(path), path);
+    }
+
+    // Read errors name this directory, which is correct: not being able to list
+    // it is what stopped the removal.
+    let entries = std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", path.display()))?;
+        remove_tree(&entry.path())?;
+    }
+    unlinked(std::fs::remove_dir(path), path)
+}
+
+/// One unlink, with the path attached to whatever it returns.
+fn unlinked(result: std::io::Result<()>, path: &Path) -> Result<bool, String> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 /// Remove every path this module associates with a sandbox.
 ///
 /// Every path is *constructed* from the validated id and the configured roots,
@@ -1796,10 +1846,12 @@ fn remove_all(cfg: &DiskConfig, sandbox_id: &str) -> (Vec<String>, Vec<String>) 
 
     for root in DISK_ROOTS {
         let dir = cfg.data_dir.join(root).join(sandbox_id);
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => removed.push(dir.display().to_string()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => failed.push(format!("{}: {e}", dir.display())),
+        match remove_tree(&dir) {
+            Ok(true) => removed.push(dir.display().to_string()),
+            // Already gone: a purge racing the daemon's own cleanup is a purge
+            // with nothing left to do, not a failure.
+            Ok(false) => {}
+            Err(e) => failed.push(e),
         }
     }
 
@@ -2178,12 +2230,53 @@ mod tests {
 
             assert!(removed.is_empty(), "nothing could be removed: {removed:?}");
             assert_eq!(failed.len(), 1, "and that has to be reported: {failed:?}");
-            assert!(failed[0].contains("run/sb-1"), "{failed:?}");
+            // The *file*, not the directory holding it. Unlinking needs write on
+            // the parent, so the parent is what has to change — but an operator
+            // reading this needs to be told which path the kernel refused, and
+            // `remove_dir_all` would have named `run/sb-1` here whatever went
+            // wrong inside it. See `remove_tree`.
+            assert!(failed[0].contains("run/sb-1/data.ext4"), "{failed:?}");
             // Still there, still counted, still taking the space — which is why
             // `purge_resolved` turns exactly this pair into an error rather than
             // a purge that happened to free nothing.
             assert!(dir.join("data.ext4").exists());
             assert!(scan(&cfg).contains_key("sb-1"));
+        }
+
+        /// The us2 shape, and the reason `remove_tree` exists: the sandbox
+        /// directory is app-lb's and perfectly writable, and the denial is a
+        /// level down in the directory heyvmd made inside it. `remove_dir_all`
+        /// reported this as a failure on `run/sb-1` — a directory the operator
+        /// then owns, chowns, and watches fail again identically.
+        ///
+        /// Skipped under root, which ignores the permission bits entirely.
+        #[test]
+        fn a_failure_inside_the_sandbox_directory_names_the_path_inside() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = scratch("denied-nested");
+            let cfg = cfg_at(&root);
+            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
+            write(&cfg.data_dir.join("run/sb-1/snapshot/mem"), 32);
+
+            let inner = cfg.data_dir.join("run/sb-1/snapshot");
+            let original = std::fs::metadata(&inner).unwrap().permissions();
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let (removed, failed) = remove_all(&cfg, "sb-1");
+            std::fs::set_permissions(&inner, original).unwrap();
+
+            if failed.is_empty() {
+                eprintln!("skipped: the removal succeeded, so this is running as root");
+                return;
+            }
+
+            assert!(removed.is_empty(), "the sandbox dir survives: {removed:?}");
+            assert_eq!(failed.len(), 1, "{failed:?}");
+            assert!(
+                failed[0].contains("run/sb-1/snapshot/mem"),
+                "the path that was actually refused, not the one two levels up: {failed:?}",
+            );
         }
 
         /// Every path is rebuilt from the roots and the validated id, so nothing
