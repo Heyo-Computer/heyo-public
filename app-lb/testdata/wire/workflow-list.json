@@ -1,0 +1,17 @@
+{
+  "workflows": [
+    {
+      "auth": {
+        "key": "token",
+        "secret": "github"
+      },
+      "enabled": true,
+      "id": "build",
+      "network": "prod-runners",
+      "path": ".ci/workflows/*.yml",
+      "ref": "main",
+      "repo": "https://github.com/Heyo-Computer/app.git",
+      "secrets_prefix": "ci/app"
+    }
+  ]
+}

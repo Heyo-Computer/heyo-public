@@ -1,0 +1,13 @@
+{
+  "id": "build",
+  "repo": "https://github.com/Heyo-Computer/app.git",
+  "ref": "main",
+  "path": ".ci/workflows/*.yml",
+  "network": "prod-runners",
+  "auth": {
+    "secret": "github",
+    "key": "token"
+  },
+  "secrets_prefix": "ci/app",
+  "enabled": true
+}

@@ -2,7 +2,10 @@
 
 use super::{Ctx, Resource, parse_ref};
 use crate::output::{self, OutputFormat, Table};
-use crate::types::{CertStatus, DeploymentStatus, JobRecord, MetricsResponse, SecretSummary};
+use crate::types::{
+    CertStatus, DeploymentStatus, JobRecord, MetricsResponse, SecretSummary, WorkflowList,
+    WorkflowView,
+};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde_json::Value;
@@ -46,6 +49,7 @@ fn get_once(ctx: &Ctx, kind: Resource, names: &[String], args: &GetArgs) -> Resu
         Resource::Vm => get_vms(ctx, names, args.deployment.as_deref()),
         Resource::Cert => get_certs(ctx),
         Resource::Secret => get_secrets(ctx, names),
+        Resource::Workflow => get_workflows(ctx, names),
         Resource::Job => get_jobs(ctx, names, args.deployment.as_deref()),
         Resource::All => {
             get_deployments(ctx, &[])?;
@@ -246,6 +250,75 @@ fn get_certs(ctx: &Ctx) -> Result<()> {
 
 /// `get secrets` — names and key names. There is no flag that prints a value:
 /// app-lb has no endpoint that returns one.
+fn get_workflows(ctx: &Ctx, names: &[String]) -> Result<()> {
+    let raw = if names.is_empty() {
+        ctx.client.raw().workflows()?
+    } else {
+        let mut out = Vec::new();
+        for name in names {
+            out.push(
+                ctx.client
+                    .raw()
+                    .workflow(name)
+                    .with_context(|| format!("getting workflow {name:?}"))?,
+            );
+        }
+        Value::Array(out)
+    };
+
+    // `GET /workflows` is enveloped; a by-name fetch is a bare array. Both
+    // shapes reach this function, so both are unwrapped here rather than at two
+    // call sites.
+    let workflows: Vec<WorkflowView> = match &raw {
+        Value::Array(items) => items
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()))
+            .collect::<Result<_, _>>()
+            .context("parsing the workflow list")?,
+        Value::Object(map) if map.contains_key("workflows") => {
+            serde_json::from_value::<WorkflowList>(raw.clone())
+                .context("parsing the workflow list")?
+                .workflows
+        }
+        other => vec![serde_json::from_value(other.clone()).context("parsing the workflow")?],
+    };
+
+    if ctx.out.is_machine() {
+        let refs: Vec<String> = workflows
+            .iter()
+            .map(|w| format!("workflow/{}", w.id))
+            .collect();
+        return output::emit(&raw, ctx.out, &refs);
+    }
+
+    if workflows.is_empty() {
+        println!(
+            "No CI workflows. (`serverctl create workflow build --repo <url> \
+             --network <net>` registers one.)"
+        );
+        return Ok(());
+    }
+
+    let mut table = if ctx.out.is_wide() {
+        Table::new(["NAME", "REPO", "REF", "PATH", "NETWORK", "ENABLED"])
+    } else {
+        Table::new(["NAME", "REPO", "REF", "NETWORK"])
+    };
+    for w in &workflows {
+        let mut row = vec![w.id.clone(), w.repo.clone(), w.git_ref.clone()];
+        if ctx.out.is_wide() {
+            row.push(w.path.clone());
+        }
+        row.push(w.network.clone());
+        if ctx.out.is_wide() {
+            row.push(if w.enabled { "yes" } else { "no" }.to_string());
+        }
+        table.row(row);
+    }
+    table.print();
+    Ok(())
+}
+
 fn get_secrets(ctx: &Ctx, names: &[String]) -> Result<()> {
     let raw = if names.is_empty() {
         ctx.client.raw().secrets()?

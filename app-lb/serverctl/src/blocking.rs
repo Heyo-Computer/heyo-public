@@ -227,6 +227,28 @@ impl Client {
         })
     }
 
+    // -- workflows ----------------------------------------------------------
+
+    pub fn workflows(&self) -> Result<Vec<WorkflowView>> {
+        run!(self, self.inner.workflows())
+    }
+
+    pub fn workflow(&self, id: &str) -> Result<WorkflowView> {
+        run!(self, self.inner.workflow(id))
+    }
+
+    pub fn create_workflow(&self, spec: &Value) -> Result<WorkflowView> {
+        run!(self, self.inner.create_workflow(spec))
+    }
+
+    pub fn replace_workflow(&self, id: &str, spec: &Value) -> Result<WorkflowView> {
+        run!(self, self.inner.replace_workflow(id, spec))
+    }
+
+    pub fn delete_workflow(&self, id: &str) -> Result<()> {
+        run!(self, self.inner.delete_workflow(id))
+    }
+
     // -- secrets ------------------------------------------------------------
 
     pub fn secrets(&self) -> Result<Vec<SecretSummary>> {
@@ -521,8 +543,8 @@ macro_rules! raw_blocking_id {
 }
 
 impl Raw<'_> {
-    raw_blocking!(deployments, secrets, tokens, jobs, certs);
-    raw_blocking_id!(deployment, secret, token, job, deployment_jobs, spec);
+    raw_blocking!(deployments, secrets, tokens, jobs, certs, workflows);
+    raw_blocking_id!(deployment, secret, token, job, deployment_jobs, spec, workflow);
 
     pub fn metrics(&self, query: &MetricsQuery) -> Result<Value> {
         block_on(&self.client.rt, self.client.inner.raw().metrics(query))?

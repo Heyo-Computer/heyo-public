@@ -10,7 +10,7 @@
   ],
   "site_root": "/srv/docs/dist",
   "site_spa": true,
-  "job_kind": "update",
+  "job_kind": "pull",
   "pool": {
     "desired_replicas": 0,
     "ready": 0,

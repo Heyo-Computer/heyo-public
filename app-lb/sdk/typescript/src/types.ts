@@ -59,13 +59,32 @@ export interface SecretRef {
   username?: string;
 }
 
+/**
+ * Where a managed deployment's guest image is built from. Exactly one of `repo`
+ * and `store` is set — both name the Dockerfile, and a build with two recipes
+ * has no answer to which one produced the image.
+ */
 export interface BuildSpec {
-  repo: string;
+  /** Git remote. Absent when the recipe comes from `store`. */
+  repo?: string;
+  /**
+   * An artifact store holding a Dockerfile manifest (`heyvm.dockerfile.v1`):
+   * an `art serve` URL, or an absolute store root on the app-lb host.
+   */
+  store?: string;
+  /**
+   * Which version of the source to build: a branch, tag or commit for `repo`
+   * (absent follows the remote's default branch), or the tag or digest of a
+   * Dockerfile manifest for `store`, where it is required.
+   */
   ref?: string;
+  /** Git source only — a Dockerfile manifest already names its own recipe. */
   dockerfile?: string;
+  /** Git source only. */
   context?: string;
   image_name?: string;
   image_size_mb?: number;
+  /** A git token for `repo`, or the store's API key for `store`. */
   auth?: SecretRef;
 }
 
@@ -75,6 +94,8 @@ export interface ArtifactSpec {
   auth?: SecretRef;
   grow_gb?: number;
   image_name?: string;
+  /** Site bundles only: leading path components to drop while unpacking. */
+  strip_components?: number;
 }
 
 export interface SiteSpec {
@@ -117,6 +138,7 @@ export interface AuthGate {
   base_path?: string;
   session_ttl_secs?: number;
   cookie_name?: string;
+  cookie_domain?: string;
   redirect_url?: string;
   forward_identity?: boolean;
 }
@@ -263,7 +285,7 @@ export interface DeploymentView {
   urls?: string[];
   site_root?: string;
   site_spa?: boolean;
-  job_kind?: "build" | "update";
+  job_kind?: "build" | "pull" | "update";
   pool: PoolStatus;
   vms: VmView[];
   pending_vms: PendingVmView[];
@@ -309,6 +331,10 @@ export interface SecuritySummary {
   dropped: number;
   /** Whether the per-source table is full, which means the same for addresses. */
   clients_at_capacity: boolean;
+  /** Guard rules currently in force. */
+  rules: number;
+  /** Requests those rules have refused since app-lb started. */
+  blocked: number;
 }
 
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
@@ -339,6 +365,106 @@ export interface SecurityAlert {
    * free-form map: app-lb may add fields, and `url.query` is never among them.
    */
   ecs?: Record<string, unknown>;
+  /** What to do about it. Derived server-side, so a client renders rather than
+   * reasons. */
+  response: AlertResponse;
+}
+
+/** The runbook half of an alert: what to check, and what can be applied. */
+export interface AlertResponse {
+  /** Ordered, short. What to check before refusing anyone's traffic. */
+  investigate: string[];
+  /** Rules that would mitigate this, ready to `POST /security/rules`. */
+  actions: SuggestedAction[];
+  /** Present where the obvious action does not do what it looks like it does —
+   * notably that guard rules are never applied to app-lb's own admin API. */
+  caveat?: string;
+}
+
+export interface SuggestedAction {
+  /** `block-client`, `block-client-deployment`, `block-path`, `exempt-client`. */
+  kind: string;
+  label: string;
+  /** What it stops and what it leaves alone. Show this next to the button. */
+  effect: string;
+  /** Post verbatim to `/security/rules`. */
+  rule: RuleSpec;
+}
+
+// -- guard rules -----------------------------------------------------------
+
+export type RuleAction = "block" | "allow";
+
+/**
+ * Conditions on a request. Every field present must match; absent fields are
+ * not checked. All literal — app-lb runs no regular expressions on the request
+ * path.
+ */
+export interface RuleMatch {
+  /** An address or CIDR: `203.0.113.9`, `203.0.113.0/24`, `2001:db8::/32`. */
+  client?: string;
+  host?: string;
+  deployment?: string;
+  path_prefix?: string;
+  path_contains?: string;
+  method?: string;
+  user_agent_contains?: string;
+}
+
+/** The body of `POST /security/rules`. */
+export interface RuleSpec {
+  action: RuleAction;
+  /** At least one condition — an empty match is refused, since it would apply
+   * to every request to the data plane. */
+  match: RuleMatch;
+  /** Seconds from now. Omitted means permanent. */
+  expires_in_secs?: number;
+  note?: string;
+}
+
+/** One rule in force. */
+export interface RuleView {
+  id: string;
+  action: RuleAction;
+  match: RuleMatch;
+  /** The conditions as a phrase, so a client need not render them. */
+  summary: string;
+  note?: string;
+  created_at: number;
+  expires_at?: number;
+  /** Cumulative since this rule was created. The number to trust. */
+  hits: number;
+  last_hit?: number;
+  /** `false` under `APP_LB_GUARD_ENFORCE=0`: matched and counted, not refused. */
+  enforcing: boolean;
+  /**
+   * Hits per bucket over the last window, oldest first — see
+   * {@link GuardStats.hits_bucket_secs}. In-memory on the LB, so it is absent
+   * from the persisted rule file and starts empty after a restart. All-zero
+   * means "no hits", not "no data": a rule that has never fired is exactly what
+   * this is for spotting.
+   *
+   * Approximate at bucket boundaries by design — the LB will not take a lock on
+   * the request path to make a chart exact. Use `hits` for anything that has to
+   * add up.
+   */
+  hits_recent?: number[];
+}
+
+export interface GuardStats {
+  rules: number;
+  blocked: number;
+  /** Requests an `allow` rule exempted from a block. */
+  exempted: number;
+  enforcing: boolean;
+  /** Requests refused per bucket over the last window, oldest first. */
+  blocked_recent?: number[];
+  /** The same for requests an `allow` rule exempted. */
+  exempted_recent?: number[];
+  /** Seconds each entry of the `*_recent` series covers. */
+  hits_bucket_secs: number;
+  /** Total seconds the `*_recent` series spans. */
+  hits_window_secs: number;
 }
 
 export interface SeverityTotals {
@@ -369,12 +495,33 @@ export interface SecurityResponse {
   /** Newest first. */
   alerts: SecurityAlert[];
   totals: SeverityTotals;
+  /** The block rules in force. Served here so a console renders findings and
+   * interventions from one fetch. Narrowed for a deployment-scoped token. */
+  rules: RuleView[];
+  guard: GuardStats;
   /** Withheld from a deployment-scoped token, for whom it would describe
    * traffic it cannot see. */
   stats?: SiemStats;
 }
 
-// -- jobs, secrets, certs --------------------------------------------------
+// -- workflows, jobs, secrets, certs --------------------------------------
+
+/** A repository workflow registered with app-lb. */
+export interface WorkflowSpec {
+  id: string;
+  repo: string;
+  ref: string;
+  path: string;
+  network: string;
+  /** A stored credential reference, never the credential value. */
+  auth?: SecretRef;
+  secrets_prefix?: string;
+  enabled: boolean;
+}
+
+export interface WorkflowList {
+  workflows: WorkflowSpec[];
+}
 
 export type JobKind = "image-build" | "artifact-pull" | "host-update";
 export type JobStatus = "running" | "succeeded" | "failed";
@@ -399,6 +546,10 @@ export interface JobRecord {
   digest?: string;
   bytes?: number;
   reused?: boolean;
+  /** Site pulls only: the directory the bundle was unpacked into. */
+  site_root?: string;
+  /** Site pulls only: regular files unpacked. */
+  files?: number;
   working_dir?: string;
   commands_total?: number;
   commands_run?: number;

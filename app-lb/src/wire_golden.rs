@@ -118,8 +118,9 @@ fn vm_spec() -> DeploymentSpec {
         },
         upstreams: vec![],
         build: Some(crate::config::BuildSpec {
-            repo: "https://github.com/example/agent".into(),
-            git_ref: Some("main".into()),
+            repo: Some("https://github.com/example/agent".into()),
+            store: None,
+            source_ref: Some("main".into()),
             dockerfile: Some("Dockerfile".into()),
             context: Some(".".into()),
             image_name: Some("agent-base".into()),
@@ -147,6 +148,7 @@ fn vm_spec() -> DeploymentSpec {
             base_path: "/__applb/auth".into(),
             session_ttl_secs: 43200,
             cookie_name: "applb_session".into(),
+            cookie_domain: Some(".example.com".into()),
             redirect_url: Some("https://sandbox.example.com/__applb/auth/callback".into()),
             forward_identity: true,
         }),
@@ -237,6 +239,26 @@ fn artifact_spec() -> DeploymentSpec {
         }),
         grow_gb: Some(8),
         image_name: Some("agent-base".into()),
+        strip_components: None,
+    });
+    s
+}
+
+/// The *site* reading of the same block: a bundle unpacked into `site.root`
+/// rather than a rootfs written to `vm.image`. Separate from [`site_spec`]
+/// because a site deploys one way or the other — `update` or `artifact`, never
+/// both — so one fixture cannot show both halves.
+fn site_artifact_spec() -> DeploymentSpec {
+    let mut s = site_spec();
+    s.id = "docs-pull".into();
+    s.update = None;
+    s.artifact = Some(crate::config::ArtifactSpec {
+        store: "/srv/artifacts".into(),
+        artifact_ref: "docs-live".into(),
+        auth: None,
+        grow_gb: None,
+        image_name: None,
+        strip_components: Some(1),
     });
     s
 }
@@ -280,6 +302,7 @@ fn deployment_status_is_stable() {
         ("deployment-status-site", site_spec()),
         ("deployment-status-static", static_spec()),
         ("deployment-status-artifact", artifact_spec()),
+        ("deployment-status-site-artifact", site_artifact_spec()),
     ] {
         spec.validate().unwrap_or_else(|e| {
             panic!("fixture {name} describes a deployment the server would reject: {e}")
@@ -350,6 +373,8 @@ fn metrics_response_is_stable() {
                 urgent: 3,
                 dropped: 0,
                 clients_at_capacity: false,
+                rules: 2,
+                blocked: 1_412,
             }),
             deployments: vec![DeploymentView {
                 id: spec.id.clone(),
@@ -415,7 +440,7 @@ fn a_site_view_carries_its_root_and_spa_flag() {
             urls: vec!["https://docs.example.com".into()],
             site_root: Some("/srv/docs/dist".into()),
             site_spa: true,
-            job_kind: Some("update"),
+            job_kind: Some("pull"),
             pool: PoolStatus {
                 desired_replicas: 0,
                 ready: 0,
@@ -461,6 +486,8 @@ fn job_records_are_stable() {
         digest: None,
         bytes: None,
         reused: false,
+        site_root: None,
+        files: None,
         working_dir: None,
         commands_total: None,
         commands_run: None,
@@ -487,6 +514,23 @@ fn job_records_are_stable() {
         reused: true,
         rolled_out: true,
         ..base("job-002", JobKind::ArtifactPull)
+    });
+
+    // The other reading of `artifact-pull`, and the only fixture carrying
+    // `site_root`/`files`. A client that only ever saw `job-pull` would render a
+    // site's deploy history with an empty result column.
+    golden("job-site-pull", &JobRecord {
+        deployment: "docs".into(),
+        store: Some("/srv/artifacts".into()),
+        artifact_ref: Some("docs-live".into()),
+        digest: Some("0f1e2d3c4b5a".into()),
+        // Zero without `reused`: a local store hardlinks the blob rather than
+        // copying it, so the transfer really was free.
+        bytes: Some(0),
+        site_root: Some("/srv/docs/dist".into()),
+        files: Some(412),
+        verified: Some(true),
+        ..base("job-005", JobKind::ArtifactPull)
     });
 
     golden("job-update", &JobRecord {
@@ -649,7 +693,8 @@ fn security_response_is_stable() {
                         "url.path": "/wp-login.php",
                         "tags": ["access", "external"],
                     })),
-                },
+                }
+                .into(),
                 Alert {
                     id: 42,
                     ts: 1_722_399_980_000,
@@ -674,7 +719,8 @@ fn security_response_is_stable() {
                         "url.path": "/metrics",
                         "tags": ["auth-failure", "external"],
                     })),
-                },
+                }
+                .into(),
             ],
             totals: SeverityTotals {
                 info: 0,
@@ -682,6 +728,57 @@ fn security_response_is_stable() {
                 medium: 11,
                 high: 3,
                 critical: 0,
+            },
+            // One rule of each shape a client renders: a timed block created
+            // from an alert, and a permanent exemption.
+            rules: vec![
+                crate::guard::RuleView {
+                    id: "5f295e1a86f2".into(),
+                    action: crate::guard::RuleAction::Block,
+                    match_: crate::guard::MatchSpec {
+                        client: Some("203.0.113.9".into()),
+                        ..Default::default()
+                    },
+                    summary: "from 203.0.113.9".into(),
+                    note: Some("traffic.scanner alert #41".into()),
+                    created_at: 1_722_399_400,
+                    expires_at: Some(1_722_485_800),
+                    hits: 1_412,
+                    last_hit: Some(1_722_399_990),
+                    enforcing: true,
+                    // A rule that is doing something, and one that is not — the
+                    // distinction the console's per-rule chart exists to draw.
+                    hits_recent: vec![0, 0, 4, 61, 128, 44, 9, 0],
+                },
+                crate::guard::RuleView {
+                    id: "b1d0c4470c3e".into(),
+                    action: crate::guard::RuleAction::Allow,
+                    match_: crate::guard::MatchSpec {
+                        client: Some("10.0.0.0/8".into()),
+                        ..Default::default()
+                    },
+                    summary: "from 10.0.0.0/8".into(),
+                    note: Some("internal monitoring".into()),
+                    created_at: 1_722_300_000,
+                    expires_at: None,
+                    hits: 0,
+                    last_hit: None,
+                    enforcing: true,
+                    // Deliberately all-zero: an exemption that has never fired
+                    // renders as an empty chart, and a client that treats a flat
+                    // series as "no data" rather than "no hits" would be wrong.
+                    hits_recent: vec![0, 0, 0, 0, 0, 0, 0, 0],
+                },
+            ],
+            guard: crate::guard::GuardStats {
+                rules: 2,
+                blocked: 1_412,
+                exempted: 87,
+                enforcing: true,
+                blocked_recent: vec![0, 0, 4, 61, 128, 44, 9, 0],
+                exempted_recent: vec![0, 1, 1, 0, 2, 1, 1, 0],
+                hits_bucket_secs: 60,
+                hits_window_secs: 3_600,
             },
             stats: Some(SiemSnapshot {
                 observed: 918_273,
@@ -694,4 +791,55 @@ fn security_response_is_stable() {
             }),
         },
     );
+}
+
+/// A workflow object with every optional field populated.
+///
+/// Maximal on purpose: the fixture's job is to catch a field that stops being
+/// serialized, and an absent field cannot go missing.
+fn workflow_spec() -> crate::config::WorkflowSpec {
+    crate::config::WorkflowSpec {
+        id: "build".into(),
+        repo: "https://github.com/Heyo-Computer/app.git".into(),
+        git_ref: "main".into(),
+        path: ".ci/workflows/*.yml".into(),
+        network: "prod-runners".into(),
+        auth: Some(crate::secrets::SecretRef {
+            secret: "github".into(),
+            key: "token".into(),
+            username: None,
+        }),
+        secrets_prefix: Some("ci/app".into()),
+        enabled: true,
+    }
+}
+
+#[test]
+fn workflow_spec_is_stable() {
+    let spec = workflow_spec();
+    spec.validate()
+        .unwrap_or_else(|e| panic!("the fixture describes a workflow the server would reject: {e}"));
+    golden("workflow", &spec);
+
+    // The list shape the `ci` orchestrator polls. Enveloped rather than a bare
+    // array so the response can grow a cursor without becoming a breaking
+    // change.
+    golden(
+        "workflow-list",
+        &serde_json::json!({ "workflows": [workflow_spec()] }),
+    );
+}
+
+/// A minimal object must round-trip through its defaults, or `serverctl create
+/// workflow` would have to send every field.
+#[test]
+fn a_minimal_workflow_fills_its_defaults() {
+    let minimal: crate::config::WorkflowSpec = serde_json::from_str(
+        r#"{"id":"build","repo":"https://example.com/a.git","network":"prod"}"#,
+    )
+    .expect("a minimal object parses");
+    assert_eq!(minimal.git_ref, "main");
+    assert_eq!(minimal.path, ".ci/workflows/*.yml");
+    assert!(minimal.enabled);
+    golden("workflow-minimal", &minimal);
 }

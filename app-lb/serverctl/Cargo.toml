@@ -38,7 +38,7 @@ blocking = ["tokio/rt"]
 config-file = ["dep:dirs"]
 # The artifact-store client, which talks to `art serve` rather than to app-lb —
 # a different service with a different auth model (API key, not Basic).
-artifact = ["dep:sha2", "dep:ureq"]
+artifact = ["dep:sha2", "dep:ureq", "dep:tar", "dep:flate2"]
 # Exposes the scripted `Transport` the tests use. Worth shipping: the thing most
 # worth testing in a program that drives app-lb is what it does when app-lb says
 # no, and that is hard to arrange against a real server.
@@ -95,6 +95,13 @@ sha2 = { workspace = true, optional = true }
 # folded into the async one: a blob upload is a long streaming PUT with a
 # progress callback, and nothing about it wants a runtime.
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"], optional = true }
+# Packing a Docker build context for `artifact push-dockerfile`. `tar` brings
+# only `filetime`/`libc`; `flate2` is already in the tree behind ureq's `gzip`.
+# Not shared with app-lb's copy of the same job: serverctl deliberately does not
+# depend on the artifacts crate (see src/artifact.rs), and the two ends of the
+# wire are pinned by the round-trip test rather than by a shared type.
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1", optional = true }
 thiserror = "2"
 
 [dev-dependencies]

@@ -38,6 +38,12 @@ const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 /// the dashboard is: it has to work over an SSH tunnel with no route out.
 const DIRECTORY_HTML: &str = include_str!("directory.html");
 
+/// The security console at `GET /siem`.
+const SIEM_HTML: &str = include_str!("siem.html");
+
+/// The disk console at `GET /storage`.
+const DISKS_HTML: &str = include_str!("disks.html");
+
 /// How to turn a deployment's hostname into a URL somebody can click.
 ///
 /// The dashboard runs on the *admin* listener, so it cannot infer the data
@@ -165,6 +171,9 @@ struct AdminState {
     certs: Arc<CertStore>,
     /// Stored secrets. Values enter through this API and never leave it.
     secrets: Arc<SecretStore>,
+    /// CI workflow objects. app-lb stores and serves them; the `ci`
+    /// orchestrator polls them and does the building.
+    workflows: Arc<crate::workflows::WorkflowStore>,
     /// App-tokens. Verified on every gated request, so reads are lock-free.
     tokens: Arc<crate::tokens::TokenStore>,
     /// Runs image builds and host updates, and remembers what they did.
@@ -180,6 +189,17 @@ struct AdminState {
     alerts: Option<Arc<crate::siem::AlertRing>>,
     /// Counters for the detection engine, reported beside `obs` on `/metrics`.
     siem: Option<Arc<crate::siem::SiemStats>>,
+    /// The block rules the data plane enforces. Always present, unlike the SIEM:
+    /// a rule an operator created must keep working whether or not detection is
+    /// switched on.
+    guard: Arc<crate::guard::Guard>,
+    /// The SIEM console, with the display name already substituted.
+    siem_html: Arc<str>,
+    /// Per-sandbox disk inventory and reclamation. `None` when the daemon's data
+    /// directory could not be resolved, which is the only way it is off.
+    disks: Option<Arc<crate::disks::DiskStore>>,
+    /// The disk console, with the display name already substituted.
+    disks_html: Arc<str>,
     /// How to turn a deployment's hostname into a link, given where the data
     /// plane actually listens.
     public_url: PublicUrl,
@@ -214,10 +234,13 @@ impl AdminApi {
         certs: Arc<CertStore>,
         acme: Option<Arc<Notify>>,
         secrets: Arc<SecretStore>,
+        workflows: Arc<crate::workflows::WorkflowStore>,
         tokens: Arc<crate::tokens::TokenStore>,
         jobs: Arc<Jobs>,
         obs: Option<Arc<crate::obs::Stats>>,
         siem: Option<&crate::siem::Siem>,
+        guard: Arc<crate::guard::Guard>,
+        disks: Option<Arc<crate::disks::DiskStore>>,
         public_url: PublicUrl,
     ) -> Self {
         // Render the display name into the page once; the placeholder appears in
@@ -226,6 +249,9 @@ impl AdminApi {
             Arc::from(DASHBOARD_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
         let directory_html: Arc<str> =
             Arc::from(DIRECTORY_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let siem_html: Arc<str> = Arc::from(SIEM_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let disks_html: Arc<str> =
+            Arc::from(DISKS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
 
         // The gate turns on as soon as a password is set; the username is
         // optional and defaults to "admin", so one env var is enough to secure
@@ -256,12 +282,17 @@ impl AdminApi {
                 certs,
                 acme,
                 secrets,
+                workflows,
                 tokens,
                 jobs,
                 obs,
                 security: siem.map(|s| s.sink.clone()),
                 alerts: siem.map(|s| s.ring.clone()),
                 siem: siem.map(|s| s.stats.clone()),
+                guard,
+                siem_html,
+                disks,
+                disks_html,
                 public_url,
             },
         }
@@ -327,7 +358,14 @@ impl Caller {
 /// token may still reach, because the handler narrows the answer to that token's
 /// scope instead of refusing it.
 fn narrows_itself(matched: &str) -> bool {
-    matches!(matched, "/" | "/metrics" | "/dashboard" | "/security")
+    // `/siem` is here for the same reason `/dashboard` is: it is a static page
+    // that narrows itself from `/security`, so a deployment-scoped token should
+    // get the console rather than a 403. `/security/rules` is deliberately
+    // absent — a scoped token has no business arming a fleet-wide block.
+    matches!(
+        matched,
+        "/" | "/metrics" | "/dashboard" | "/security" | "/siem"
+    )
 }
 
 /// The deployment a matched route acts on, if it acts on one.
@@ -624,14 +662,17 @@ fn deployment_kind(d: &crate::deployment::Deployment) -> &'static str {
     }
 }
 
-/// Which `POST` a deployment's code is redeployed with, if either.
+/// Which `POST` a deployment's code is redeployed with, if any.
 ///
-/// The two are mutually exclusive by validation — there is no image to build for a
-/// `proxy_pass` upstream, and no host directory behind a microVM — so this is one
-/// answer rather than two flags.
+/// At most one is ever configured, because validation refuses the combinations:
+/// a `proxy_pass` upstream has no image to build, a microVM has no host
+/// directory to run commands in, and a site takes `update` or `artifact` but
+/// never both. So this is one answer rather than three flags.
 fn job_kind_of(spec: &DeploymentSpec) -> Option<&'static str> {
     if spec.build.is_some() {
         Some("build")
+    } else if spec.artifact.is_some() {
+        Some("pull")
     } else if spec.update.is_some() {
         Some("update")
     } else {
@@ -841,6 +882,11 @@ struct SecuritySummary {
     /// Whether the per-client table is full, which means the same thing for
     /// sources rather than for events.
     clients_at_capacity: bool,
+    /// Block rules in force, and how many requests they have refused. On the
+    /// summary because "we are blocking traffic" belongs next to "we are seeing
+    /// attacks" — an operator who forgot a rule exists should trip over it here.
+    rules: usize,
+    blocked: u64,
 }
 
 /// `GET /security`.
@@ -855,9 +901,16 @@ struct SecurityResponse {
     /// an app-lb too old to have this route.
     enabled: bool,
     window_secs: u64,
-    /// Newest first, which is the order the dashboard renders.
-    alerts: Vec<crate::siem::Alert>,
+    /// Newest first, which is the order the dashboard renders. Each carries its
+    /// own `response` — the runbook and the ready-to-post rules — so the console
+    /// never has to derive "and now what?" from the rule name in JavaScript.
+    alerts: Vec<crate::siem::AlertView>,
     totals: crate::siem::SeverityTotals,
+    /// The block rules in force. Served here rather than from a route of their
+    /// own so the console renders findings and interventions from one fetch, and
+    /// cannot show a stale rule list beside fresh alerts.
+    rules: Vec<crate::guard::RuleView>,
+    guard: crate::guard::GuardStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     stats: Option<crate::siem::SiemSnapshot>,
 }
@@ -1103,12 +1156,44 @@ fn security_summary(state: &AdminState) -> Option<SecuritySummary> {
     let (ring, stats) = (state.alerts.as_ref()?, state.siem.as_ref()?);
     let totals = ring.totals();
     let s = stats.snapshot();
+    let g = state.guard.stats(now_secs());
     Some(SecuritySummary {
         open: ring.len(),
         urgent: totals.high + totals.critical,
         dropped: s.dropped,
         clients_at_capacity: s.clients_at_capacity,
+        rules: g.rules,
+        blocked: g.blocked,
     })
+}
+
+/// The rules a caller may see.
+///
+/// Narrowed the same way alerts are: a deployment-scoped token sees the rules
+/// that name its own deployment and nothing else. A fleet-wide block is fleet
+/// information — it says which addresses are considered hostile, which is the
+/// same disclosure the alert list is gated for.
+fn visible_rules(
+    state: &AdminState,
+    scope: Option<&[String]>,
+    now: u64,
+) -> Vec<crate::guard::RuleView> {
+    let enforcing = state.guard.enforcing();
+    state
+        .guard
+        .list()
+        .into_iter()
+        .filter(|r| match scope {
+            None => true,
+            Some(ids) => r
+                .deployment()
+                .is_some_and(|d| ids.iter().any(|id| id == d)),
+        })
+        // `report`, not `view`: the console charts each rule's recent hits, and
+        // that series is what answers "is this rule still doing anything, or am
+        // I paying for a branch on every request for nothing?".
+        .map(|r| r.report(enforcing, now))
+        .collect()
 }
 
 /// `GET /security` — the findings, newest first.
@@ -1126,8 +1211,18 @@ async fn security_snapshot(
     let now = now_secs();
     let scope = caller.as_ref().and_then(|c| c.0.visible());
 
+    // Drop rules that have run out on the way past. Expiry is already enforced
+    // in `Guard::decide`, so this is tidying rather than correctness — but a
+    // console listing rules that stopped doing anything yesterday is a console
+    // nobody trusts. Not persisted here: a `GET` that writes to disk is a
+    // surprise, and the next mutation or restart rewrites the file anyway.
+    state.guard.sweep(now);
+
     let Some(ring) = state.alerts.as_ref() else {
-        // Enabled:false rather than 404 — see `SecurityResponse::enabled`.
+        // Enabled:false rather than 404 — see `SecurityResponse::enabled`. The
+        // rules still come back: enforcement does not depend on detection, and a
+        // console that hid the active blocks whenever `APP_LB_SIEM=0` would hide
+        // the one thing still affecting traffic.
         return Json(SecurityResponse {
             generated_at: now,
             enabled: false,
@@ -1140,6 +1235,8 @@ async fn security_snapshot(
                 high: 0,
                 critical: 0,
             },
+            rules: visible_rules(&state, scope, now),
+            guard: state.guard.stats(now),
             stats: None,
         });
     };
@@ -1167,6 +1264,7 @@ async fn security_snapshot(
                 .is_none_or(|d| a.deployment.as_deref() == Some(d))
         })
         .take(limit)
+        .map(crate::siem::AlertView::from)
         .collect();
 
     Json(SecurityResponse {
@@ -1175,6 +1273,8 @@ async fn security_snapshot(
         window_secs: ring.window_secs(),
         alerts,
         totals: ring.totals(),
+        rules: visible_rules(&state, scope, now),
+        guard: state.guard.stats(now),
         // Fleet-wide counters: withheld from a scoped caller, for whom they
         // would describe traffic they cannot see.
         stats: scope
@@ -1182,6 +1282,303 @@ async fn security_snapshot(
             .then(|| state.siem.as_ref().map(|s| s.snapshot()))
             .flatten(),
     })
+}
+
+// ---- guard rules ----------------------------------------------------------
+
+/// Map a guard rejection onto a status. Everything a caller can get wrong is a
+/// 400 except the cap, which is a 409 — that one is about the server's state
+/// rather than about the request, and retrying the identical body after
+/// deleting a rule is the correct next move.
+fn guard_error(e: crate::guard::GuardError) -> Response {
+    use crate::guard::GuardError as E;
+    let code = match &e {
+        E::EmptyMatch | E::BadClient(_) | E::TooLong(_) => StatusCode::BAD_REQUEST,
+        E::Full => StatusCode::CONFLICT,
+        E::NoRule(_) => StatusCode::NOT_FOUND,
+        E::Io(_) | E::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(code, e.to_string()).into_response()
+}
+
+/// `POST /security/rules` — start refusing something.
+///
+/// CRUD tier, not view. This is the only route on the admin API that can stop
+/// traffic reaching a deployment, so it sits behind the same credentials as
+/// editing the spec — a dashboard-only token may read the console and may not
+/// arm it.
+async fn create_rule(
+    State(state): State<AdminState>,
+    Json(spec): Json<crate::guard::RuleSpec>,
+) -> Response {
+    let now = now_secs();
+    let rule = match state.guard.insert(spec, now) {
+        Ok(r) => r,
+        Err(e) => return guard_error(e),
+    };
+    // Persist before answering. A 200 for a rule that a crash would lose is the
+    // wrong way round for a control somebody just used to stop an attack.
+    if let Err(e) = state.guard.persist() {
+        // The rule is live in memory either way, so undoing it here would be
+        // worse than saying what happened: report the failure and leave the
+        // block in force.
+        tracing::error!(error = %e, path = %state.guard.path().display(), "guard rules not saved");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "the rule is in force but could not be written to {}: {e} — it will not \
+                 survive a restart",
+                state.guard.path().display()
+            ),
+        )
+        .into_response();
+    }
+    tracing::warn!(
+        rule = %rule.id,
+        action = ?rule.action,
+        matched = %rule.describe(),
+        expires_at = ?rule.expires_at,
+        "guard rule created",
+    );
+    (StatusCode::CREATED, Json(rule.view(state.guard.enforcing()))).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleExpiryBody {
+    /// Seconds from now, or `null` for a rule that never expires. Required —
+    /// absent is refused rather than read as "forever", because making a block
+    /// permanent by omission is exactly the accident this field exists to
+    /// prevent.
+    #[serde(default, deserialize_with = "double_option")]
+    expires_in_secs: Option<Option<u64>>,
+}
+
+/// `PATCH /security/rules/:id` — change when a rule expires, including never.
+///
+/// The counterpart to the bounded lifetime every suggested action carries. That
+/// default is right for a rule authored mid-incident, and wrong once an operator
+/// has decided an address is simply not welcome; re-posting the rule to make it
+/// permanent would work but would reset its hit history, which is the evidence
+/// the decision rests on.
+async fn patch_rule(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(body): Json<RuleExpiryBody>,
+) -> Response {
+    let Some(expires_in_secs) = body.expires_in_secs else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "expires_in_secs is required: a number of seconds, or null to keep the rule \
+             indefinitely",
+        )
+        .into_response();
+    };
+    let now = now_secs();
+    match state.guard.set_expiry(&id, expires_in_secs, now) {
+        Ok(view) => {
+            if let Err(e) = state.guard.persist() {
+                tracing::error!(error = %e, "guard rules not saved after expiry change");
+            }
+            match expires_in_secs {
+                None => tracing::warn!(
+                    rule = %id,
+                    summary = %view.summary,
+                    "guard rule made permanent; it will now outlive the incident that created it",
+                ),
+                Some(secs) => tracing::info!(rule = %id, secs, "guard rule expiry extended"),
+            }
+            Json(view).into_response()
+        }
+        Err(e) => guard_error(e),
+    }
+}
+
+/// `DELETE /security/rules/:id` — stop refusing it.
+async fn delete_rule(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    let now = now_secs();
+    if let Err(e) = state.guard.remove(&id, now) {
+        return guard_error(e);
+    }
+    if let Err(e) = state.guard.persist() {
+        tracing::error!(error = %e, "guard rules not saved after delete");
+    }
+    tracing::warn!(rule = %id, "guard rule removed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ---- the SIEM console -----------------------------------------------------
+
+/// `GET /siem` — the security console.
+///
+/// Its own page rather than a bigger card on `/dashboard`, because the two are
+/// read at different moments and at different depths. The dashboard answers "is
+/// the fleet healthy" in a glance and must stay glanceable; this answers "what
+/// is attacking us and what do I do about it", which needs the full alert list,
+/// the ECS fields behind each one, and the buttons that change what the data
+/// plane does. The dashboard card links here and keeps its summary.
+async fn siem_console(State(state): State<AdminState>) -> impl IntoResponse {
+    Html(state.siem_html.to_string())
+}
+
+// ---- disks ----------------------------------------------------------------
+
+/// The store, or the 503 that explains why there isn't one.
+///
+/// Disk management is the one subsystem that can be *absent* rather than merely
+/// idle: without a resolvable daemon data directory there is nothing to
+/// inventory. Saying so with the fix in it beats a 404 on a route the page is
+/// hard-coded to call.
+fn disks_off() -> Response {
+    err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "disk management is off: app-lb could not work out where heyvmd keeps its \
+         per-sandbox disks. Set APP_LB_VM_DATA_DIR to the daemon's data directory \
+         (MVM_DATA_DIR, or ~/.heyo) and restart",
+    )
+    .into_response()
+}
+
+fn disk_error(e: crate::disks::DiskError) -> Response {
+    use crate::disks::DiskError as E;
+    let code = match &e {
+        E::BadId(_) => StatusCode::BAD_REQUEST,
+        E::NotFound(_) => StatusCode::NOT_FOUND,
+        // 409, not 403: the request was permitted, the disk's state refuses it,
+        // and the caller can change that state.
+        E::Held { .. } | E::AlreadyArchiving(_) | E::NothingToArchive(_) => StatusCode::CONFLICT,
+        E::NoArchiveTarget => StatusCode::NOT_IMPLEMENTED,
+        // 500, not 409: nothing about the disk's state refuses this and no
+        // `force=1` gets past it. Something on the host — almost always the
+        // ownership of the daemon's data directory — stopped app-lb deleting
+        // files it was told to delete, and that is the server's problem to fix.
+        E::PurgeFailed { .. } | E::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(code, e.to_string()).into_response()
+}
+
+/// `GET /disks` — every per-sandbox disk on this host.
+///
+/// View tier, like `/metrics` and `/security`: the console renders it, so the
+/// browser's cached view credentials have to work. Fleet-wide, so a
+/// deployment-scoped token is refused — a disk inventory spans deployments and
+/// includes sandboxes no deployment owns any more.
+async fn disks(State(state): State<AdminState>) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    Json(store.inventory().await).into_response()
+}
+
+/// `GET /storage` — the disk console.
+async fn storage_console(State(state): State<AdminState>) -> impl IntoResponse {
+    Html(state.disks_html.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct DiskPolicyBody {
+    /// Absent leaves the flag alone, so a note can be edited without touching
+    /// retention and vice versa.
+    #[serde(default)]
+    retain: Option<bool>,
+    /// `null` clears the note; absent leaves it.
+    #[serde(default, deserialize_with = "double_option")]
+    note: Option<Option<String>>,
+}
+
+/// Distinguish "absent" from "present and null" in a JSON body.
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
+}
+
+/// `PATCH /disks/:id` — pin a disk against expiry, or annotate it.
+async fn patch_disk(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(body): Json<DiskPolicyBody>,
+) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    if let Err(e) = store.set_policy(&id, body.retain, body.note) {
+        return disk_error(e);
+    }
+    if let Some(retain) = body.retain {
+        tracing::info!(sandbox = %id, retain, "disk retention changed");
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ForceQuery {
+    #[serde(default)]
+    force: Option<String>,
+}
+
+impl ForceQuery {
+    fn on(&self) -> bool {
+        matches!(
+            self.force.as_deref().map(str::trim),
+            Some("1" | "true" | "yes" | "on")
+        )
+    }
+}
+
+/// `DELETE /disks/:id` — reclaim a sandbox's disks.
+///
+/// CRUD tier, and the most destructive route app-lb has: it deletes gigabytes
+/// with no undo. `?force=1` overrides the "a deployment expects to resume it"
+/// and "the daemon is unreachable" guards; it does *not* override the running
+/// check, which has no legitimate override.
+async fn purge_disk(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(q): Query<ForceQuery>,
+) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    match store.purge(&id, q.on()).await {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(e) => disk_error(e),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ArchiveBody {
+    /// Reclaim the disks once the upload succeeds. Never on failure.
+    #[serde(default)]
+    purge: bool,
+}
+
+/// `POST /disks/:id/archive` — stream a sandbox's disks to S3.
+///
+/// Answers as soon as the upload starts; progress arrives on `GET /disks`
+/// alongside the inventory, which is what the console polls anyway.
+async fn archive_disk(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<ArchiveBody>>,
+) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    let purge = body.map(|Json(b)| b.purge).unwrap_or(false);
+    match store.archive(&id, purge).await {
+        Ok(view) => (StatusCode::ACCEPTED, Json(view)).into_response(),
+        Err(e) => disk_error(e),
+    }
+}
+
+/// `POST /disks/sweep` — run the expiry sweep now instead of at the next tick.
+async fn sweep_disks(State(state): State<AdminState>) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    Json(store.sweep().await).into_response()
 }
 
 // ---- the directory page -------------------------------------------------
@@ -1198,6 +1595,10 @@ struct DirectoryEntry {
     state: EntryState,
     /// What is behind it, in a few words — "2 of 3 VMs ready", "serving /srv/www".
     detail: String,
+    /// Behind a sign-in gate. Worth saying before the click rather than after:
+    /// following one of these can bounce through the provider, and knowing which
+    /// cards will do that is the difference between "slow" and "broken".
+    gated: bool,
 }
 
 /// Whether following the link right now would reach anything.
@@ -1301,6 +1702,7 @@ fn directory_entries(
             }
         };
 
+        let gated = d.spec.auth.is_some();
         for url in urls {
             entries.push(DirectoryEntry {
                 url,
@@ -1313,6 +1715,7 @@ fn directory_entries(
                     EntryState::Files => EntryState::Files,
                 },
                 detail: detail.clone(),
+                gated,
             });
         }
     }
@@ -1371,6 +1774,7 @@ fn render_directory_cards(entries: &[DirectoryEntry], unlinkable: &[String]) -> 
                 "<a class=\"card\" href=\"{url}\">\
                    <div class=\"card-head\">\
                      <span class=\"id\">{id}</span>\
+                     {gate}\
                      <span class=\"tag {kind}\">{kind}</span>\
                    </div>\
                    <div class=\"url\">{url}</div>\
@@ -1381,6 +1785,11 @@ fn render_directory_cards(entries: &[DirectoryEntry], unlinkable: &[String]) -> 
                 kind = e.kind,
                 dot = e.state.dot(),
                 detail = html_escape(&e.detail),
+                gate = if e.gated {
+                    "<span class=\"tag gated\" title=\"Google sign-in required\">sign-in</span>"
+                } else {
+                    ""
+                },
             )
         })
         .collect::<String>();
@@ -1777,6 +2186,30 @@ struct ShellQuery {
     wake: bool,
 }
 
+/// The VM an `exec` or `shell` session runs in.
+///
+/// Two cases, because the pool cannot offer the second one. A ready backend
+/// comes with a [`BackendSlot`](crate::deployment::BackendSlot) that holds an
+/// in-flight slot for the life of the session, which is what stops the
+/// autoscaler scaling the VM away underneath it. A *booting* VM has no slot to
+/// take — it is not in the pool — and needs none: nothing scales away a VM that
+/// was never promoted. What can still kill it is `boot_timeout_secs`, and that
+/// is the autoscaler's call, not something a session should be able to veto.
+enum VmTarget {
+    Ready(crate::deployment::BackendSlot),
+    /// A VM the daemon reports `Running` that has not passed its health check.
+    Booting(String),
+}
+
+impl VmTarget {
+    fn sandbox_id(&self) -> &str {
+        match self {
+            Self::Ready(slot) => slot.sandbox_id(),
+            Self::Booting(id) => id,
+        }
+    }
+}
+
 /// Resolve a deployment to a VM that can run something, waking one if asked.
 ///
 /// The waiting half is the proxy's cold-start path (`proxy::wait_for_capacity`)
@@ -1784,13 +2217,16 @@ struct ShellQuery {
 /// autoscaler and waits exactly as a request would — including the autoscaler's
 /// preference for resuming a suspended VM over booting a fresh one.
 ///
-/// The returned guard holds an in-flight slot for as long as the caller keeps
-/// it, which is what stops the VM being scaled out from under a live session.
-async fn hold_a_vm(
-    state: &AdminState,
-    id: &str,
-    wake: bool,
-) -> Result<crate::deployment::BackendSlot, Response> {
+/// **A booting VM counts.** A guest that is up but whose server never answers
+/// the health check is never promoted, so the pool cannot hand it over — and it
+/// is the single case where getting inside the VM matters most. Resolving only
+/// against ready backends meant `exec` sat out `cold_start_timeout_secs` and
+/// answered 503 on exactly the deployment somebody was trying to debug, while
+/// the VM they wanted sat there `Running` with a `guest_ip`. So a still-booting
+/// VM is used when the pool has nothing, and it is tried *before* waking one:
+/// a VM that already exists is the one to look at, and booting another would
+/// add a sandbox — and its disks — to a deployment that is already churning.
+async fn hold_a_vm(state: &AdminState, id: &str, wake: bool) -> Result<VmTarget, Response> {
     let Some(d) = state.registry.get(id) else {
         return Err(err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response());
     };
@@ -1808,7 +2244,15 @@ async fn hold_a_vm(
     }
 
     if let Some(b) = d.select(&[]) {
-        return Ok(b.hold());
+        return Ok(VmTarget::Ready(b.hold()));
+    }
+    if let Some(sandbox_id) = booting_vm(&d) {
+        tracing::info!(
+            deployment = %id,
+            sandbox = %sandbox_id,
+            "no VM has passed its health check; running in one that is still booting",
+        );
+        return Ok(VmTarget::Booting(sandbox_id));
     }
     if !wake {
         return Err(err(
@@ -1818,16 +2262,41 @@ async fn hold_a_vm(
         .into_response());
     }
     match crate::proxy::wait_for_capacity(&d, &[], &state.metrics).await {
-        Some(b) => Ok(b.hold()),
-        None => Err(err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "deployment {id:?} has no VM and none became available within \
-                 cold_start_timeout_secs"
-            ),
-        )
-        .into_response()),
+        Some(b) => Ok(VmTarget::Ready(b.hold())),
+        // The wait itself is what created a VM, so ask again before giving up:
+        // a boot that got as far as `Running` and stalled on the health check is
+        // still something to run a command in, and answering 503 here would send
+        // the caller away from the VM their own request had just started.
+        None => match booting_vm(&d) {
+            Some(sandbox_id) => Ok(VmTarget::Booting(sandbox_id)),
+            None => Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "deployment {id:?} has no VM and none became available within \
+                     cold_start_timeout_secs"
+                ),
+            )
+            .into_response()),
+        },
     }
+}
+
+/// The oldest pending VM the daemon reports `Running`, if there is one.
+///
+/// Oldest first: with a pool of stalled boots, the one that has been up longest
+/// is the one whose logs cover the most, and picking it keeps repeated `exec`s
+/// landing on the same guest instead of scattering across a churning pool.
+///
+/// `Running` and not merely pending, because a VM the daemon has not started
+/// yet has no guest to talk to — the daemon would refuse the exec, and doing so
+/// slowly. This is the same distinction `promote_pending` draws, minus the
+/// health probe that is the whole reason the caller is here.
+fn booting_vm(d: &std::sync::Arc<crate::deployment::Deployment>) -> Option<String> {
+    d.pending()
+        .iter()
+        .filter(|p| p.status == Some(heyo_sdk::SandboxStatus::Running))
+        .min_by_key(|p| p.created_at)
+        .map(|p| p.sandbox_id.clone())
 }
 
 /// `POST /deployments/:id/exec` — run one command in the deployment's VM.
@@ -1941,7 +2410,7 @@ async fn pump_shell(
     socket: axum::extract::ws::WebSocket,
     session: heyo_sdk::ShellSession,
     sandbox_id: String,
-    _slot: crate::deployment::BackendSlot,
+    _target: VmTarget,
 ) {
     use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
@@ -2145,6 +2614,94 @@ async fn patch_secret(
     Json(state.secrets.summary(&id).expect("just stored")).into_response()
 }
 
+/// `GET /workflows` — every workflow object.
+///
+/// The orchestrator polls this, so it is the hot path of the whole feature.
+/// Lock-free: the store is an `ArcSwap`, and listing clones `Arc`s.
+async fn list_workflows(State(state): State<AdminState>) -> impl IntoResponse {
+    let items: Vec<_> = state
+        .workflows
+        .list()
+        .into_iter()
+        .map(|w| (*w).clone())
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({ "workflows": items }))).into_response()
+}
+
+async fn get_workflow(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.workflows.get(&id) {
+        Some(w) => (StatusCode::OK, Json((*w).clone())).into_response(),
+        None => err(StatusCode::NOT_FOUND, format!("no workflow {id}")).into_response(),
+    }
+}
+
+/// `POST /workflows` — create or replace.
+///
+/// Validated before anything is stored, so an invalid object is a 400 rather
+/// than a file on disk that the next load skips with a warning nobody reads.
+async fn put_workflow(
+    State(state): State<AdminState>,
+    Json(spec): Json<crate::config::WorkflowSpec>,
+) -> impl IntoResponse {
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let id = spec.id.clone();
+    match state.workflows.upsert(spec) {
+        Ok(stored) => (StatusCode::CREATED, Json((*stored).clone())).into_response(),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not persist workflow {id}: {e}"),
+        )
+        .into_response(),
+    }
+}
+
+/// `PUT /workflows/{id}` — replace, with the path id winning.
+///
+/// A body whose `id` disagrees with the path is a mistake worth naming rather
+/// than silently resolving: the two readings (rename, or write to the wrong
+/// object) have very different consequences.
+async fn replace_workflow(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(mut spec): Json<crate::config::WorkflowSpec>,
+) -> impl IntoResponse {
+    if !spec.id.is_empty() && spec.id != id {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the body's id {:?} does not match the path id {id:?}; \
+                 renaming is a delete and a create",
+                spec.id
+            ),
+        )
+        .into_response();
+    }
+    spec.id = id;
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    match state.workflows.upsert(spec) {
+        Ok(stored) => (StatusCode::OK, Json((*stored).clone())).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn delete_workflow(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.workflows.remove(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, format!("no workflow {id}")).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn list_secrets(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.secrets.list())
 }
@@ -2233,7 +2790,16 @@ fn job_start_error(e: StartError) -> Response {
     }
 }
 
-/// `POST /deployments/:id/build` — clone, build the image, roll the pool.
+/// `POST /deployments/:id/build` — fetch the recipe, build the image, roll the
+/// pool.
+///
+/// Where the recipe comes from is the deployment's `build` block, not this
+/// request: a git checkout, or a Dockerfile manifest in an artifact store. An
+/// optional `{"ref": "…"}` overrides the version for this build only, and is
+/// read by whichever source the spec selects — a branch or commit for a repo, a
+/// tag or digest for a store. It is validated against that source's rules before
+/// the job starts, so a git ref handed to a store-backed deployment is a `400`
+/// here rather than a build that fails minutes later.
 ///
 /// Returns `202` with a job record as soon as the work is scheduled. A build
 /// takes minutes; poll `GET /jobs/:job_id` for the outcome.
@@ -2336,7 +2902,18 @@ fn router(state: AdminState) -> Router {
         // cached view credentials have to work. It must never be ungated — it
         // enumerates attacker addresses and the probes that reached the fleet —
         // and this group is the one that is gated whenever a password is set.
-        .route("/security", get(security_snapshot));
+        .route("/security", get(security_snapshot))
+        // The console that reads it. View tier for the same reason the dashboard
+        // is: it renders `/security`, so it must work with whatever credentials
+        // the browser already has. The buttons on it post to the CRUD tier and
+        // will be refused for a view-only caller — which is the intended split,
+        // and the page says so rather than failing silently.
+        .route("/siem", get(siem_console))
+        // The disk inventory and the console that renders it, on the same tier
+        // and for the same reason. Reading what is on the host is a view-tier
+        // question; every route that *changes* it is on the CRUD side below.
+        .route("/disks", get(disks))
+        .route("/storage", get(storage_console));
 
     // The deployment CRUD API — register/edit/scale/delete/evict, plus the reads
     // that expose the spec (env vars can hold secrets). Gated too iff
@@ -2353,7 +2930,27 @@ fn router(state: AdminState) -> Router {
         // Grouped with the CRUD routes so it inherits the `APP_LB_ADMIN_AUTH`
         // gate: it reports which hostnames app-lb holds keys for.
         .route("/certs", get(certs))
+        // Blocking traffic is a mutation with more blast radius than most of the
+        // ones above it, so it belongs on this side of the gate. Reads live on
+        // `GET /security` with the alerts, which is why there is no `get` here.
+        .route("/security/rules", post(create_rule))
+        .route("/security/rules/:id", patch(patch_rule).delete(delete_rule))
+        // Disk mutations. `DELETE /disks/:id` deletes gigabytes with no undo,
+        // which puts it firmly on this side of the gate — it is the single most
+        // destructive route app-lb exposes. `/disks/sweep` is registered as a
+        // static segment and so cannot be reached by naming a sandbox `sweep`;
+        // matchit prefers a literal over a parameter.
+        .route("/disks/sweep", post(sweep_disks))
+        .route("/disks/:id", patch(patch_disk).delete(purge_disk))
+        .route("/disks/:id/archive", post(archive_disk))
         // Secrets: write-only by design. `GET` returns key *names*, never values.
+        // CRUD-tier: a workflow object decides what gets built and on whose
+        // hardware, which is at least as consequential as a deployment spec.
+        .route("/workflows", post(put_workflow).get(list_workflows))
+        .route(
+            "/workflows/:id",
+            get(get_workflow).put(replace_workflow).delete(delete_workflow),
+        )
         .route("/secrets", post(put_secret).get(list_secrets))
         .route(
             "/secrets/:id",
@@ -2585,6 +3182,101 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 mod tests {
     use super::*;
 
+    /// The two routing decisions behind the security console, both of which are
+    /// silent when wrong: one produces a 403 for a caller who should see the
+    /// page, the other hands a scoped token a fleet-wide control.
+    #[test]
+    fn the_console_narrows_itself_and_the_rule_api_does_not() {
+        for view in ["/", "/metrics", "/dashboard", "/security", "/siem"] {
+            assert!(narrows_itself(view), "{view} must narrow for a scoped token");
+        }
+        // A deployment-scoped token has no business arming a fleet-wide block,
+        // so these must fall through to the "does not cover the fleet" refusal.
+        for mutating in ["/security/rules", "/security/rules/:id"] {
+            assert!(!narrows_itself(mutating), "{mutating} must not narrow");
+        }
+    }
+
+    /// `exec` and `shell` against a deployment whose VMs boot but never pass
+    /// their health check — the case they are needed for, and the one the pool
+    /// cannot serve, because such a VM is never promoted out of `pending`.
+    mod booting_targets {
+        use super::*;
+        use crate::deployment::{Deployment, PendingVm};
+        use heyo_sdk::SandboxStatus;
+
+        fn deployment() -> std::sync::Arc<Deployment> {
+            let spec = serde_json::from_str(
+                r#"{"id":"demo","routes":[],"vm":{"driver":"firecracker","port":8080}}"#,
+            )
+            .expect("the fixture spec parses");
+            std::sync::Arc::new(Deployment::new(spec))
+        }
+
+        fn pending(id: &str, created_at: u64, status: Option<SandboxStatus>) -> PendingVm {
+            PendingVm {
+                sandbox_id: id.into(),
+                created_at,
+                status,
+                reported_at_secs: 0,
+            }
+        }
+
+        #[test]
+        fn nothing_pending_offers_nothing() {
+            assert_eq!(booting_vm(&deployment()), None);
+        }
+
+        /// A VM the daemon has not started has no guest to talk to. Offering it
+        /// would trade a fast 503 for a slow one at the daemon.
+        #[test]
+        fn a_vm_the_daemon_has_not_started_is_not_a_target() {
+            let d = deployment();
+            d.set_pending(vec![
+                pending("sb-1", 100, None),
+                pending("sb-2", 200, Some(SandboxStatus::Provisioning)),
+            ]);
+            assert_eq!(booting_vm(&d), None);
+        }
+
+        #[test]
+        fn a_running_vm_that_never_passed_its_health_check_is() {
+            let d = deployment();
+            d.set_pending(vec![
+                pending("sb-1", 100, Some(SandboxStatus::Provisioning)),
+                pending("sb-2", 200, Some(SandboxStatus::Running)),
+            ]);
+            assert_eq!(booting_vm(&d).as_deref(), Some("sb-2"));
+        }
+
+        /// Oldest first, so a pool of stalled boots sends every `exec` to the
+        /// same guest — the one whose logs cover the most — instead of
+        /// scattering them across VMs that are each about to be killed.
+        #[test]
+        fn the_oldest_running_one_wins() {
+            let d = deployment();
+            d.set_pending(vec![
+                pending("sb-new", 300, Some(SandboxStatus::Running)),
+                pending("sb-old", 100, Some(SandboxStatus::Running)),
+                pending("sb-mid", 200, Some(SandboxStatus::Running)),
+            ]);
+            assert_eq!(booting_vm(&d).as_deref(), Some("sb-old"));
+        }
+    }
+
+    #[test]
+    fn a_guard_rejection_maps_onto_a_status_a_client_can_act_on() {
+        use crate::guard::GuardError as E;
+        let status = |e: E| guard_error(e).status();
+        assert_eq!(status(E::EmptyMatch), StatusCode::BAD_REQUEST);
+        assert_eq!(status(E::BadClient("x".into())), StatusCode::BAD_REQUEST);
+        assert_eq!(status(E::TooLong("match.host")), StatusCode::BAD_REQUEST);
+        // The cap is about the server's state, not the request: deleting a rule
+        // and retrying the identical body is the correct next move.
+        assert_eq!(status(E::Full), StatusCode::CONFLICT);
+        assert_eq!(status(E::NoRule("x".into())), StatusCode::NOT_FOUND);
+    }
+
     /// The landing page at `/`. Rendering is a pure function of the collected
     /// entries, so all of this runs without a listener or a registry.
     mod directory {
@@ -2597,7 +3289,23 @@ mod tests {
                 kind: "vm",
                 state,
                 detail: "2 VMs ready".into(),
+                gated: false,
             }
+        }
+
+        /// Following a gated card can bounce through Google, so the card says so
+        /// first. With `auth.cookie_domain` set across the fleet that bounce
+        /// happens once rather than once per card — see `AuthGate::cookie_domain`.
+        #[test]
+        fn a_gated_destination_is_labelled_before_it_is_clicked() {
+            let open = entry("api", "https://api.example.com", EntryState::Ready);
+            let gated = DirectoryEntry {
+                gated: true,
+                ..entry("private", "https://private.example.com", EntryState::Ready)
+            };
+            let html = render_directory_cards(&[open, gated], &[]);
+            assert_eq!(html.matches("tag gated").count(), 1, "{html}");
+            assert!(html.contains(">sign-in<"), "{html}");
         }
 
         #[test]
@@ -2717,6 +3425,240 @@ mod tests {
                 .replace("{{LEDE}}", &directory_lede(&[]))
                 .replace("{{CARDS}}", &render_directory_cards(&[], &[]));
             assert!(!rendered.contains("{{"), "an unfilled placeholder would ship to a browser");
+        }
+    }
+
+    /// The disk console. Unlike the directory it is client-rendered, so the
+    /// only server-side contract is the display name and the route it polls.
+    mod disk_console {
+        use super::*;
+
+        #[test]
+        fn the_page_has_only_the_placeholder_the_constructor_fills() {
+            assert!(DISKS_HTML.contains("{{APP_NAME}}"));
+            let rendered = DISKS_HTML.replace("{{APP_NAME}}", "app-lb");
+            assert!(
+                !rendered.contains("{{"),
+                "an unfilled placeholder would ship to a browser",
+            );
+        }
+
+        /// The page hard-codes the routes it calls, so a rename here has to
+        /// break a test rather than a browser.
+        #[test]
+        fn the_page_calls_the_routes_the_router_registers() {
+            for route in [
+                "\"GET\", \"/disks\"",
+                "\"PATCH\", \"/disks/\"",
+                "/archive`",
+                "\"POST\", \"/disks/sweep\"",
+                "\"DELETE\", \"/disks/\"",
+            ] {
+                assert!(DISKS_HTML.contains(route), "page never calls {route}");
+            }
+        }
+
+        /// Sandbox ids, paths and daemon error strings all reach this markup.
+        #[test]
+        fn the_page_escapes_what_it_interpolates() {
+            assert!(DISKS_HTML.contains("function esc(v)"));
+            assert!(DISKS_HTML.contains("encodeURIComponent(id)"));
+        }
+
+        /// The status code is the whole contract with the page: it offers the
+        /// force override on a 409 and nothing else, so a guard that answered
+        /// 403 would be unoverridable and one that answered 500 would look like
+        /// a bug.
+        #[test]
+        fn each_refusal_maps_to_the_code_the_page_acts_on() {
+            use crate::disks::DiskError as E;
+            let code = |e: E| disk_error(e).status();
+
+            assert_eq!(
+                code(E::Held {
+                    sandbox_id: "sb-1".into(),
+                    reason: "the sandbox is running",
+                    forceable: false,
+                }),
+                StatusCode::CONFLICT,
+                "the page offers ?force=1 on a 409 and only on a 409",
+            );
+            assert_eq!(
+                code(E::AlreadyArchiving("sb-1".into())),
+                StatusCode::CONFLICT
+            );
+            assert_eq!(
+                code(E::NothingToArchive("sb-1".into())),
+                StatusCode::CONFLICT
+            );
+            assert_eq!(code(E::BadId("../etc".into())), StatusCode::BAD_REQUEST);
+            assert_eq!(code(E::NotFound("sb-1".into())), StatusCode::NOT_FOUND);
+            // Not 500: nothing is broken, the feature is simply unconfigured.
+            assert_eq!(code(E::NoArchiveTarget), StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(
+                code(E::Io("disk full".into())),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+
+        /// Every refusal has to say what to do next — these messages are shown
+        /// verbatim in a `confirm()` dialog, and the page decides whether to
+        /// offer the force retry by looking for `force=1` in this very string.
+        /// A message that promises an override the server would refuse produces
+        /// a dialog whose "yes" fails a second time.
+        #[test]
+        fn only_a_forceable_refusal_advertises_the_override() {
+            use crate::disks::DiskError as E;
+
+            let forceable = E::Held {
+                sandbox_id: "sb-1".into(),
+                reason: "a deployment expects to resume it",
+                forceable: true,
+            }
+            .to_string();
+            assert!(forceable.contains("force=1"), "{forceable}");
+            assert!(forceable.contains("sb-1"), "{forceable}");
+
+            let never = E::Held {
+                sandbox_id: "sb-1".into(),
+                reason: "the sandbox is running; evict or stop it first",
+                forceable: false,
+            }
+            .to_string();
+            assert!(!never.contains("force"), "{never}");
+            // It still has to say what *would* work.
+            assert!(never.contains("stop it first"), "{never}");
+
+            let no_target = E::NoArchiveTarget.to_string();
+            assert!(no_target.contains("APP_LB_DISK_ARCHIVE_BUCKET"), "{no_target}");
+        }
+
+        /// The page's force-retry condition, pinned against the message it
+        /// reads. These two live in different languages and cannot share a
+        /// constant, so the coupling is asserted instead.
+        #[test]
+        fn the_page_gates_its_force_retry_on_that_same_string() {
+            assert!(
+                DISKS_HTML.contains(r#"reason(r).includes("force=1")"#),
+                "the page must not offer force for a refusal that forbids it",
+            );
+        }
+    }
+
+    mod security_console {
+        use super::*;
+
+        #[test]
+        fn the_page_calls_the_rule_routes_the_router_registers() {
+            for route in [
+                r#""POST", "/security/rules""#,
+                r#""PATCH", "/security/rules/""#,
+                r#""DELETE", "/security/rules/""#,
+            ] {
+                assert!(SIEM_HTML.contains(route), "page never calls {route}");
+            }
+        }
+
+        /// An all-zero series means "this rule refused nothing", which is the
+        /// finding — not "no data". A page that rendered the two the same way
+        /// would hide exactly the rule worth removing.
+        #[test]
+        fn a_rule_that_never_fires_is_called_out_rather_than_drawn_flat() {
+            assert!(SIEM_HTML.contains(r#">no hits<"#));
+            assert!(SIEM_HTML.contains(r#">no data yet<"#));
+        }
+
+        /// Making a block permanent is the one action here with no natural end,
+        /// so it must not be reachable without saying so.
+        #[test]
+        fn keeping_a_rule_forever_is_confirmed() {
+            assert!(SIEM_HTML.contains("Keep rule"));
+            assert!(
+                SIEM_HTML.contains("secs === null && !confirm("),
+                "a forever rule must be confirmed and a timed one must not be",
+            );
+        }
+
+        /// `expires_in_secs` is required on the PATCH: absent must not be read
+        /// as "forever", or a client that forgets the field silently makes a
+        /// block permanent.
+        #[test]
+        fn an_absent_expiry_is_refused_rather_than_read_as_forever() {
+            let absent: RuleExpiryBody = serde_json::from_str("{}").unwrap();
+            assert!(absent.expires_in_secs.is_none(), "absent");
+
+            let forever: RuleExpiryBody =
+                serde_json::from_str(r#"{"expires_in_secs":null}"#).unwrap();
+            assert_eq!(forever.expires_in_secs, Some(None), "explicitly forever");
+
+            let timed: RuleExpiryBody =
+                serde_json::from_str(r#"{"expires_in_secs":3600}"#).unwrap();
+            assert_eq!(timed.expires_in_secs, Some(Some(3600)));
+        }
+    }
+
+    /// The four pages are separate `include_str!`d files with no build step to
+    /// share anything through, so what makes them one product is only ever
+    /// convention. These pin the parts of that convention a user would notice.
+    mod page_consistency {
+        use super::*;
+
+        fn pages() -> [(&'static str, &'static str); 4] {
+            [
+                ("dashboard", DASHBOARD_HTML),
+                ("directory", DIRECTORY_HTML),
+                ("siem", SIEM_HTML),
+                ("disks", DISKS_HTML),
+            ]
+        }
+
+        /// One key, or the theme resets every time an operator follows a link
+        /// between the pages.
+        #[test]
+        fn every_page_persists_the_theme_under_the_same_key() {
+            for (name, html) in pages() {
+                assert!(
+                    html.contains(r#"localStorage.getItem("app-lb-theme")"#),
+                    "{name} does not restore the saved theme",
+                );
+                assert!(
+                    html.contains(r#"localStorage.setItem("app-lb-theme", next)"#),
+                    "{name} does not save the theme it just applied",
+                );
+            }
+        }
+
+        /// The restore has to run in `<head>`, before the body exists. Applied
+        /// alongside the rest of the page script it would paint one frame in the
+        /// wrong theme on every load.
+        #[test]
+        fn the_theme_is_restored_before_the_body_renders() {
+            for (name, html) in pages() {
+                let head = html
+                    .split_once("</head>")
+                    .unwrap_or_else(|| panic!("{name} has no </head>"))
+                    .0;
+                assert!(
+                    head.contains(r#"localStorage.getItem("app-lb-theme")"#),
+                    "{name} restores the theme after <head>, which flashes",
+                );
+            }
+        }
+
+        /// Storage throws rather than returning null in a private window and
+        /// under some `file://` policies. A theme preference must not be able to
+        /// take a page's whole script block down with it.
+        #[test]
+        fn theme_storage_failures_cannot_break_the_page() {
+            for (name, html) in pages() {
+                let uses = html.matches("localStorage").count();
+                let guards = html.matches("try {").count();
+                assert!(
+                    guards >= 2 && uses == 2,
+                    "{name}: every localStorage access must sit inside a try/catch \
+                     ({uses} accesses, {guards} guards)",
+                );
+            }
         }
     }
 

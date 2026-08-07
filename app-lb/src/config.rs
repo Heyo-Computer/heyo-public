@@ -20,6 +20,9 @@ fn default_secrets_path() -> String {
 fn default_tokens_path() -> String {
     "app-lb-tokens.json".into()
 }
+fn default_guard_path() -> String {
+    "app-lb-guard.json".into()
+}
 fn default_name() -> String {
     "app-lb".into()
 }
@@ -43,6 +46,11 @@ pub struct LbConfig {
     /// unlike the secret store there is nothing here to encrypt.
     #[serde(default = "default_tokens_path")]
     pub tokens_path: String,
+    /// Where the guard's block rules live. Persisted for one reason: a restart
+    /// that silently unblocks an address somebody blocked during an incident is
+    /// a worse failure than any other this file can have.
+    #[serde(default = "default_guard_path")]
+    pub guard_path: String,
     /// Display name shown in the dashboard header and page title. Defaults to
     /// `app-lb`.
     #[serde(default = "default_name")]
@@ -199,6 +207,7 @@ impl Default for LbConfig {
             state_path: default_state_path(),
             secrets_path: default_secrets_path(),
             tokens_path: default_tokens_path(),
+            guard_path: default_guard_path(),
             name: default_name(),
             daemon_url: None,
             dashboard_user: None,
@@ -503,59 +512,131 @@ fn default_vm_ttl_secs() -> u64 {
     3600
 }
 
-/// Where a deployment's guest image comes from: a git checkout plus a Dockerfile.
+/// Where a deployment's guest image is *built* from — a Dockerfile, and the
+/// files it copies in.
 ///
-/// This is the *source*, not the running image. A build clones (or fetches)
-/// `repo` at `ref`, hands the Dockerfile to `heyvm mvm build`, and only then
+/// This is the *source*, not the running image. A build assembles the recipe and
+/// its context on this host, hands them to `heyvm mvm build`, and only then
 /// writes the resulting image name into [`VmSpec::image`] — so the spec always
 /// says which image is actually booting, and this block says where the next one
 /// will come from. Editing it never disturbs running VMs; running a build does.
 ///
-/// Note what is deliberately absent: build arguments and a registry. The image
-/// is an ext4 rootfs on this host, built from a Dockerfile the daemon never
-/// sees, and `heyvm mvm build` exposes neither `--build-arg` nor a push target
-/// for the local-only path.
+/// Two ways to get the recipe here, and exactly one of them must be set:
+///
+/// * **`repo`** — a git checkout. app-lb fetches `repo` at `ref` and looks for a
+///   Dockerfile inside it. The original form, and the right one when the recipe
+///   lives with the code it builds.
+/// * **`store`** — a Dockerfile manifest in an artifact store, named by `ref`.
+///   app-lb fetches the manifest, writes out its `Dockerfile` and unpacks its
+///   `context.tar.gz`. See [`ArtifactSpec`] for the two spellings of `store`, and
+///   `art dockerfile put` in the artifacts crate for how one gets there.
+///
+/// The difference that matters is *what the ref pins*. A git ref pins a commit,
+/// and the Dockerfile is whatever that commit happens to hold; a store ref
+/// resolves to a manifest digest covering the recipe, the context and the
+/// annotations together. So a store build can say "these exact inputs" in a way a
+/// branch name cannot, and a rollback is expressible: a tag moves, a digest does
+/// not.
+///
+/// It remains a *build* either way, which is why this is one block and not two.
+/// Both run `heyvm mvm build` and produce an image that did not exist before,
+/// which is the whole distinction from [`ArtifactSpec`] — there, the digest names
+/// bytes that already exist and nothing is produced at all.
+///
+/// Note what is deliberately absent: build arguments and a registry. The image is
+/// an ext4 rootfs on this host, built from a Dockerfile the daemon never sees, and
+/// `heyvm mvm build` exposes neither `--build-arg` nor a push target for the
+/// local-only path.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct BuildSpec {
     /// Git remote: `https://…`, `ssh://…`, `git@host:path`, or a local path.
-    pub repo: String,
-    /// Branch, tag or commit to build. `None` follows the remote's default
+    /// Mutually exclusive with `store`; exactly one must be set.
+    ///
+    /// `Option` rather than required because `store` is the alternative, not
+    /// because a build can have no source — a spec with neither is refused. Every
+    /// spec written before `store` existed has it, so nothing on disk needs
+    /// migrating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// An artifact store holding a Dockerfile manifest: an `http(s)://` URL of an
+    /// `art serve`, or an absolute store root on this host. Mutually exclusive
+    /// with `repo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
+    /// Which version of the source to build.
+    ///
+    /// For a `repo`: a branch, tag or commit. `None` follows the remote's default
     /// branch, which is what makes `POST …/build` mean "ship what is on main".
+    ///
+    /// For a `store`: the tag or digest of a Dockerfile manifest, and **required**
+    /// — a store has no default, and guessing one would be picking somebody's
+    /// image out of a shared namespace.
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
-    pub git_ref: Option<String>,
+    pub source_ref: Option<String>,
     /// Dockerfile path *within the checkout*. `None` looks for one: `Dockerfile`
     /// at the context root, else a unique `Dockerfile` within three directories
     /// of it. Ambiguity is an error, never a guess.
+    ///
+    /// Git source only: a Dockerfile manifest names its own recipe, so a path
+    /// here would be pointing into an archive this deployment does not choose the
+    /// layout of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<String>,
     /// Build context within the checkout. Defaults to the Dockerfile's directory,
-    /// matching `heyvm mvm build`'s own default.
+    /// matching `heyvm mvm build`'s own default. Git source only, for the same
+    /// reason as `dockerfile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    /// Base name for built images; the commit is appended, so one deployment's
-    /// builds are `<name>-<short sha>`. Defaults to the deployment id.
+    /// Base name for built images; the source version is appended, so one
+    /// deployment's builds are `<name>-<short sha>` from git and
+    /// `<name>-<short manifest digest>` from a store. Defaults to the deployment
+    /// id, and overrides the manifest's own `heyvm.image` annotation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_name: Option<String>,
     /// Rootfs size passed to `heyvm mvm build --size-mb`. Unset lets heyvm size
     /// it from the exported tar (×1.2 + 64 MB), which is right until the guest
-    /// writes to its own rootfs at runtime.
+    /// writes to its own rootfs at runtime. On a store source, unset falls back
+    /// to the manifest's `heyvm.size_mb` annotation before heyvm's own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_size_mb: Option<u64>,
-    /// Credential for a private repo, as a reference into the secret store. Only
-    /// meaningful for HTTP(S) remotes — an `ssh://` or `git@` remote authenticates
-    /// with the host's own key material and should leave this unset.
+    /// Credential, as a reference into the secret store. What it *is* depends on
+    /// the source, which is why it is one field: a git token for a private `repo`,
+    /// or the `ART_API_KEY` of a gated `store`.
+    ///
+    /// Unused by an `ssh://` or `git@` remote, which authenticates with the host's
+    /// own key material, and by a local store root, which is protected by file
+    /// permissions. Both cases are warned about at build time rather than
+    /// rejected here — a spec may legitimately carry one while its `repo` is
+    /// being switched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<SecretRef>,
 }
 
+/// Which of [`BuildSpec`]'s two sources a build will actually use.
+///
+/// Returned rather than re-derived at each use, so the "exactly one is set"
+/// invariant is checked once — in `validate` — and every consumer afterwards has
+/// a value that cannot represent both or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildSource<'a> {
+    /// A git checkout. `git_ref` unset follows the remote's default branch.
+    Git {
+        repo: &'a str,
+        git_ref: Option<&'a str>,
+    },
+    /// A Dockerfile manifest in an artifact store.
+    Dockerfile { store: &'a str, reference: &'a str },
+}
+
 impl BuildSpec {
-    /// The image name for a given commit. Lowercased and stripped to what both
-    /// `docker build -t` and heyvm's `<name>.ext4` filename accept, because the
-    /// deployment id it defaults to is only constrained by the route table.
-    pub fn image_for(&self, deployment_id: &str, commit: &str) -> String {
+    /// The image name for a given source version — a commit for git, a manifest
+    /// digest for a store. Lowercased and stripped to what both `docker build -t`
+    /// and heyvm's `<name>.ext4` filename accept, because the deployment id it
+    /// defaults to is only constrained by the route table.
+    pub fn image_for(&self, deployment_id: &str, version: &str) -> String {
         let base = self.image_name.as_deref().unwrap_or(deployment_id);
         let base = sanitize_image_name(base);
-        let short: String = commit.chars().take(12).collect();
+        let short: String = version.chars().take(12).collect();
         if short.is_empty() {
             base
         } else {
@@ -563,23 +644,85 @@ impl BuildSpec {
         }
     }
 
+    /// Which source this build uses. `None` only for a spec that never passed
+    /// [`BuildSpec::validate`], which is why callers may treat it as unreachable
+    /// rather than as a case to handle.
+    pub fn source(&self) -> Option<BuildSource<'_>> {
+        match (self.repo.as_deref(), self.store.as_deref()) {
+            (Some(repo), None) => Some(BuildSource::Git {
+                repo,
+                git_ref: self.source_ref.as_deref(),
+            }),
+            (None, Some(store)) => Some(BuildSource::Dockerfile {
+                store,
+                reference: self.source_ref.as_deref()?,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether `store` names a remote `art serve` rather than a path on this
+    /// host. Same rule [`ArtifactSpec::is_remote`] applies, and for the same
+    /// reason: the scheme is what decides whether `auth` means anything.
+    pub fn store_is_remote(&self) -> bool {
+        self.store.as_deref().is_some_and(is_remote_store)
+    }
+
     fn validate(&self) -> Result<(), SpecError> {
-        if self.repo.trim().is_empty() {
-            return Err(SpecError::EmptyRepo);
+        match (&self.repo, &self.store) {
+            (Some(_), Some(_)) => return Err(SpecError::BothBuildSources),
+            (None, None) => return Err(SpecError::NoBuildSource),
+            _ => {}
         }
-        if !is_supported_repo_url(&self.repo) {
-            return Err(SpecError::UnsupportedRepoUrl(self.repo.clone()));
-        }
-        if let Some(r) = &self.git_ref
-            && !is_safe_git_ref(r)
-        {
-            return Err(SpecError::BadBuildRef(r.clone()));
-        }
-        for path in [&self.dockerfile, &self.context].into_iter().flatten() {
-            if !is_safe_relative_path(path) {
-                return Err(SpecError::BadBuildPath(path.clone()));
+
+        if let Some(repo) = &self.repo {
+            if repo.trim().is_empty() {
+                return Err(SpecError::EmptyRepo);
+            }
+            if !is_supported_repo_url(repo) {
+                return Err(SpecError::UnsupportedRepoUrl(repo.clone()));
+            }
+            if let Some(r) = &self.source_ref
+                && !is_safe_git_ref(r)
+            {
+                return Err(SpecError::BadBuildRef(r.clone()));
+            }
+            for path in [&self.dockerfile, &self.context].into_iter().flatten() {
+                if !is_safe_relative_path(path) {
+                    return Err(SpecError::BadBuildPath(path.clone()));
+                }
             }
         }
+
+        if let Some(store) = &self.store {
+            if store.trim().is_empty() {
+                return Err(SpecError::EmptyBuildStore);
+            }
+            if !is_supported_store(store) {
+                return Err(SpecError::UnsupportedBuildStore(store.clone()));
+            }
+            // Required, unlike a git ref: a store has no default branch to fall
+            // back to, and a build with no reference has nothing to fetch.
+            let Some(r) = &self.source_ref else {
+                return Err(SpecError::MissingBuildRef);
+            };
+            if !is_valid_artifact_ref(r) {
+                return Err(SpecError::BadBuildArtifactRef(r.clone()));
+            }
+            // Rejected rather than ignored, because both would be somebody
+            // expecting a file to be chosen that the manifest already chose. A
+            // Dockerfile manifest names its recipe `Dockerfile` and its context
+            // `context.tar.gz`; there is nothing left to point at.
+            for (present, what) in [
+                (self.dockerfile.is_some(), "build.dockerfile"),
+                (self.context.is_some(), "build.context"),
+            ] {
+                if present {
+                    return Err(SpecError::OnlyForGitBuilds(what));
+                }
+            }
+        }
+
         if let Some(name) = &self.image_name
             && sanitize_image_name(name).is_empty()
         {
@@ -595,23 +738,60 @@ impl BuildSpec {
     }
 }
 
-/// Where a deployment's guest image comes from: a rootfs already in an artifact
-/// store, addressed by content.
+/// Whether a store reference names a remote `art serve` rather than a path.
+pub fn is_remote_store(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// Whether a string names an artifact store this host could reach: an
+/// `http(s)://` URL, or an absolute store root.
+///
+/// Shared by `artifact.store` and `build.store` so the two cannot drift. Only an
+/// *absolute* path is accepted, because app-lb's working directory is not
+/// something a spec author can see — a relative path would name a different store
+/// depending on how the LB was started.
+fn is_supported_store(store: &str) -> bool {
+    let store = store.trim();
+    if store.is_empty() {
+        return false;
+    }
+    if let Some(rest) = store
+        .strip_prefix("http://")
+        .or_else(|| store.strip_prefix("https://"))
+    {
+        return !rest.is_empty() && !rest.contains(char::is_whitespace);
+    }
+    std::path::Path::new(store).is_absolute() && !store.contains("..") && !store.contains('\0')
+}
+
+/// Where a deployment's content comes from: bytes already in an artifact store,
+/// addressed by content.
+///
+/// Two backends read this block, and what the same digest means differs:
+///
+/// * A **managed (`vm`) deployment** pulls a *guest rootfs*. The blob is
+///   materialized as an ext4 file heyvmd can boot and [`VmSpec::image`] is
+///   rewritten to it, so the spec still says which image is actually booting and
+///   this block says where the next one comes from.
+/// * A **site** pulls a *directory tree* — a `tar` or `tar.gz` of built files,
+///   unpacked into [`SiteSpec::root`]. This is the counterpart of
+///   [`UpdateSpec`] and the reason to prefer it: the host needs no toolchain at
+///   all, because the build already happened wherever the bundle was made.
 ///
 /// The counterpart of [`BuildSpec`], and the same shape of thing: the *source*
-/// of the next image, not the running one. A pull resolves `reference` to a
-/// blob digest, materializes that blob as an ext4 rootfs heyvmd can boot, and
-/// only then rewrites [`VmSpec::image`] — so the spec still says which image is
-/// actually booting and this block says where the next one comes from.
+/// of the next content, not the running one.
 ///
 /// What makes this different from a build is that nothing is *produced*. The
 /// digest names bytes that already exist, so the same `artifact` block resolves
-/// to the same rootfs on every host that can reach the store, which is the whole
-/// reason to prefer it over rebuilding a Dockerfile per machine.
+/// to the same content on every host that can reach the store, which is the
+/// whole reason to prefer it over rebuilding per machine. It is also what makes
+/// a rollback expressible: a tag moves, a digest cannot.
 ///
 /// See <https://github.com/sarocu/artifacts> — `art heyvm import` puts heyvm's
-/// base images in, `serverctl artifact push` puts a locally-built one in, and
-/// either is pullable here.
+/// base images in, `art put dist.tgz --tag <name>` puts a site bundle in,
+/// `serverctl artifact push` puts a locally-built rootfs in, and any of them is
+/// pullable here.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ArtifactSpec {
     /// The store to pull from, in one of two forms:
@@ -619,16 +799,17 @@ pub struct ArtifactSpec {
     /// * `http://host:port` — a remote `art serve`. app-lb resolves and streams
     ///   the blob itself, verifying the digest as the bytes land.
     /// * `/abs/path` — a store root (`ART_ROOT`) on this host. app-lb shells out
-    ///   to `art heyvm materialize`, which skips the blob's holes instead of
-    ///   copying its zeros.
+    ///   to the `art` CLI: `art heyvm materialize` for a rootfs, which skips the
+    ///   blob's holes instead of copying its zeros, and `art get` for a site
+    ///   bundle, which hardlinks it and copies nothing at all.
     ///
     /// A local store is by far the faster of the two and is what a host running
     /// its own store should use; the URL form is what makes one store serve a
     /// fleet.
     pub store: String,
-    /// A tag (`debian-hermes`) or a 64-hex digest. A tag is resolved at pull
-    /// time, so a deployment pinned to one follows whatever the tag moves to; a
-    /// digest is immutable and is what a rollback should name.
+    /// A tag (`debian-hermes`, `marketing-live`) or a 64-hex digest. A tag is
+    /// resolved at pull time, so a deployment pinned to one follows whatever the
+    /// tag moves to; a digest is immutable and is what a rollback should name.
     #[serde(rename = "ref")]
     pub artifact_ref: String,
     /// API key for a store started with `ART_API_KEY`, as a reference into the
@@ -640,13 +821,29 @@ pub struct ArtifactSpec {
     /// costs no disk until the guest writes; heyvm still runs the `resize2fs`
     /// that lets the guest filesystem use the room. Set it when the image was
     /// built small and the workload needs space on `/`.
+    ///
+    /// Guest images only — a site has no filesystem to grow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grow_gb: Option<u64>,
     /// Base name for the materialized image; the digest is appended, so one
     /// deployment's pulls are `<name>-<short digest>`. Defaults to the
     /// deployment id.
+    ///
+    /// Guest images only — a site's files land in `site.root` under their own
+    /// names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_name: Option<String>,
+    /// Leading path components to drop from every entry while unpacking, exactly
+    /// as `tar --strip-components` does.
+    ///
+    /// Sites only, and it exists because of how the bundle was almost certainly
+    /// made: `tar czf dist.tgz dist` writes every entry as `dist/…`, so
+    /// unpacking it straight into `site.root` puts the index at
+    /// `<root>/dist/index.html` and the deployment 404s everything. `1` drops
+    /// that wrapper. A bundle rolled with `tar czf dist.tgz -C dist .` needs
+    /// nothing here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_components: Option<usize>,
 }
 
 impl ArtifactSpec {
@@ -671,35 +868,55 @@ impl ArtifactSpec {
     /// host. The two are told apart by the scheme, which is also what decides
     /// whether `auth` means anything.
     pub fn is_remote(&self) -> bool {
-        let s = self.store.trim();
-        s.starts_with("http://") || s.starts_with("https://")
+        is_remote_store(&self.store)
     }
 
-    fn validate(&self) -> Result<(), SpecError> {
-        let store = self.store.trim();
-        if store.is_empty() {
+    /// How many leading path components a site's unpack drops. Zero unless the
+    /// spec says otherwise, which is the right default for a bundle rolled with
+    /// `tar -C dist .`.
+    pub fn strip(&self) -> usize {
+        self.strip_components.unwrap_or(0)
+    }
+
+    /// `for_site` decides which half of this block is meaningful. Both halves
+    /// are rejected on the backend they do not describe rather than ignored: a
+    /// `grow_gb` on a site is somebody expecting room they will not get, and a
+    /// `strip_components` on a guest image is somebody expecting an unpack that
+    /// never happens.
+    fn validate(&self, for_site: bool) -> Result<(), SpecError> {
+        if self.store.trim().is_empty() {
             return Err(SpecError::EmptyArtifactStore);
         }
-        let store_ok = if let Some(rest) = store
-            .strip_prefix("http://")
-            .or_else(|| store.strip_prefix("https://"))
-        {
-            !rest.is_empty() && !rest.contains(char::is_whitespace)
-        } else {
-            // A store root, and only an absolute one: app-lb's working
-            // directory is not something a spec author can see, so a relative
-            // path would name a different store depending on how the LB was
-            // started.
-            std::path::Path::new(store).is_absolute()
-                && !store.contains("..")
-                && !store.contains('\0')
-        };
-        if !store_ok {
+        if !is_supported_store(&self.store) {
             return Err(SpecError::UnsupportedArtifactStore(self.store.clone()));
         }
 
         if !is_valid_artifact_ref(&self.artifact_ref) {
             return Err(SpecError::BadArtifactRef(self.artifact_ref.clone()));
+        }
+        if let Some(auth) = &self.auth {
+            auth.validate().map_err(|e| SpecError::BadSecretRef {
+                field: "artifact.auth",
+                detail: e.to_string(),
+            })?;
+        }
+
+        if for_site {
+            // Both describe a guest rootfs: one grows its filesystem, the other
+            // names the `.ext4` it is written to. A site produces neither.
+            for (present, what) in [
+                (self.grow_gb.is_some(), "artifact.grow_gb"),
+                (self.image_name.is_some(), "artifact.image_name"),
+            ] {
+                if present {
+                    return Err(SpecError::NotForSites(what));
+                }
+            }
+            return Ok(());
+        }
+
+        if self.strip_components.is_some() {
+            return Err(SpecError::OnlyForSites("artifact.strip_components"));
         }
         if let Some(name) = &self.image_name
             && sanitize_image_name(name).is_empty()
@@ -708,12 +925,6 @@ impl ArtifactSpec {
         }
         if self.grow_gb == Some(0) {
             return Err(SpecError::ZeroGrow);
-        }
-        if let Some(auth) = &self.auth {
-            auth.validate().map_err(|e| SpecError::BadSecretRef {
-                field: "artifact.auth",
-                detail: e.to_string(),
-            })?;
         }
         Ok(())
     }
@@ -1020,6 +1231,35 @@ pub struct AuthGate {
     /// the application already sets.
     #[serde(default = "default_auth_cookie_name")]
     pub cookie_name: String,
+    /// Widen the session cookie to a parent domain, so one sign-in covers every
+    /// deployment under it. Unset means host-only: the default, and the safe one.
+    ///
+    /// This is the answer to "why does opening each service from the directory
+    /// send me back to Google?". Cookies are scoped to the host that set them, so
+    /// signing in at `docs.example.com` leaves `api.example.com` with nothing to
+    /// present. Setting `"cookie_domain": "example.com"` on both gates makes the
+    /// session one realm, and the second service admits the browser without a
+    /// round trip.
+    ///
+    /// Two properties make that safe, and both are load-bearing:
+    ///
+    /// * **The cookie is only wider; the check is not.** A session is still
+    ///   refused unless the gate presenting it has a byte-identical
+    ///   [`AuthGate::policy_fingerprint`], which covers the provider, client id,
+    ///   allowed domains, allowed emails *and* this field. Two gates share a
+    ///   session only when either would have admitted the same person anyway.
+    /// * **It is opt-in.** A cookie scoped to `example.com` is sent to every
+    ///   host under it, including ones app-lb does not serve. If anything else
+    ///   on that domain is untrusted — a customer subdomain, a legacy box — this
+    ///   hands it your session cookie. `HttpOnly` keeps scripts off it, nothing
+    ///   keeps a server on that domain off it.
+    ///
+    /// Must be the request host or a parent of it, at a label boundary. A value
+    /// the browser would reject is refused at registration, because the failure
+    /// it produces — the cookie silently dropped, sign-in looping forever — is
+    /// almost impossible to diagnose from the outside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie_domain: Option<String>,
     /// Redirect URI to send the provider, when app-lb cannot derive it from the
     /// request — something in front rewriting the host or terminating TLS
     /// elsewhere. Normally unset: `https://<request host><base_path>/callback`.
@@ -1110,6 +1350,37 @@ fn default_session_ttl_secs() -> u64 {
     43_200 // 12h — a working day plus slack, short enough that a revoked
            // account loses access the same day.
 }
+/// Canonicalize a `cookie_domain`, or reject it.
+///
+/// Lowercased and stripped of the legacy leading dot (RFC 6265 ignores it, and
+/// people write it out of habit). Refused when it is not a domain, or when it
+/// has fewer than two labels: `com` would be a cookie offered to every `.com`
+/// host, which browsers discard — the user would never sign in and nothing would
+/// say why.
+///
+/// It does **not** check the public suffix list, so `co.uk` passes here. Doing
+/// that properly means shipping and updating the PSL; the practical guard is
+/// that the realm must also cover the request host, so the worst a bad value
+/// does is fail to widen. The README says so where an operator will read it.
+fn normalize_cookie_domain(raw: &str) -> Option<String> {
+    let d = raw.trim().trim_start_matches('.').trim_end_matches('.');
+    if d.is_empty() || d.len() > 253 {
+        return None;
+    }
+    let labels: Vec<&str> = d.split('.').collect();
+    if labels.len() < 2 {
+        return None;
+    }
+    let ok = labels.iter().all(|l| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    });
+    ok.then(|| d.to_ascii_lowercase())
+}
+
 fn default_auth_cookie_name() -> String {
     "applb_session".into()
 }
@@ -1159,6 +1430,31 @@ impl AuthGate {
     /// each session, so tightening the allow-list or rotating the client id
     /// invalidates the sessions issued under the old policy instead of leaving
     /// a removed user signed in until their cookie expires.
+    /// The `Domain` attribute to set for a request arriving at `host`, if any.
+    ///
+    /// `None` — a host-only cookie — both when sharing is off and when the
+    /// configured realm does not cover this host. The second case is a
+    /// misconfiguration, and falling back to host-only is the recoverable
+    /// direction: sign-in still works for this hostname, it just is not shared.
+    /// Emitting the `Domain` anyway would have the browser discard the cookie
+    /// outright and loop the user through the provider forever.
+    pub fn cookie_domain_for(&self, host: &str) -> Option<String> {
+        let realm = normalize_cookie_domain(self.cookie_domain.as_deref()?)?;
+        // The realm must be the host or a parent of it, cut at a label boundary
+        // — `example.com` covers `api.example.com` but not `notexample.com`.
+        let host = host
+            .trim_end_matches('.')
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let covers = host == realm
+            || host
+                .strip_suffix(&realm)
+                .is_some_and(|head| head.ends_with('.'));
+        covers.then_some(realm)
+    }
+
     pub fn policy_fingerprint(&self) -> String {
         let mut domains: Vec<String> = self
             .allowed_domains
@@ -1183,13 +1479,25 @@ impl AuthGate {
             [one] => format!("{one:?}"),
             many => format!("{many:?}"),
         };
-        let material = format!(
+        let mut material = format!(
             "{}|{}|{}|{}",
             providers,
             self.client_id.as_deref().unwrap_or(""),
             domains.join(","),
             emails.join(",")
         );
+        // Appended only when set, so a gate that does not share sessions hashes
+        // exactly what it hashed before this field existed — see the note above
+        // about not signing everyone out on an upgrade.
+        //
+        // It has to be *in* the material, though, and this is the security
+        // property that makes sharing safe: a session issued by a host-only gate
+        // must not be accepted by a realm gate with otherwise identical policy,
+        // or widening the cookie on one deployment would retroactively widen
+        // what every neighbouring gate accepts.
+        if let Some(realm) = &self.cookie_domain {
+            material.push_str(&format!("|realm={}", realm.to_ascii_lowercase()));
+        }
         let digest = openssl::hash::hash(
             openssl::hash::MessageDigest::sha256(),
             material.as_bytes(),
@@ -1287,6 +1595,11 @@ impl AuthGate {
                 .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
         {
             return Err(SpecError::BadCookieName(self.cookie_name.clone()));
+        }
+        if let Some(d) = &self.cookie_domain
+            && normalize_cookie_domain(d).is_none()
+        {
+            return Err(SpecError::BadCookieDomain(d.clone()));
         }
 
         // The provider redirects the browser to `<host><callback>`, and that
@@ -1451,6 +1764,12 @@ impl SiteSpec {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpecError {
     EmptyId,
+    /// Workflow ids are interpolated into NATS subjects and VM names unescaped.
+    BadWorkflowId(String),
+    EmptyWorkflowRepo,
+    EmptyWorkflowRef,
+    EmptyWorkflowNetwork,
+    BadWorkflowPath(String),
     /// A *static* deployment declared no routes. Managed deployments may:
     /// see [`DeploymentSpec::validate`].
     NoRoutes,
@@ -1476,8 +1795,13 @@ pub enum SpecError {
     /// A `site` alongside a `vm` or `upstreams`: a deployment serves from one
     /// place, and three ways to answer a request has no defined precedence.
     SiteWithOtherBackend,
-    /// A `build`, `artifact` or `vm`-only block on a site.
+    /// A `build` or other guest-image-only block on a site.
     NotForSites(&'static str),
+    /// A site-only field set on a deployment that is not a site.
+    OnlyForSites(&'static str),
+    /// A site set both `update` and `artifact`; both claim to produce the files
+    /// under `site.root`.
+    BothSiteSources,
     /// Both a `vm` template and a static `upstreams` list were set.
     BothBackendKinds,
     /// Neither a `vm` template nor a static `upstreams` list was set.
@@ -1513,6 +1837,7 @@ pub enum SpecError {
     BadPublicPath(String),
     ZeroSessionTtl,
     BadCookieName(String),
+    BadCookieDomain(String),
     /// The provider's redirect would not route back to this deployment.
     AuthCallbackUnroutable(String),
     EmptyRepo,
@@ -1520,6 +1845,21 @@ pub enum SpecError {
     BadBuildRef(String),
     BadBuildPath(String),
     BadImageName(String),
+    /// A `build` block set both `repo` and `store`; both name the recipe.
+    BothBuildSources,
+    /// A `build` block set neither `repo` nor `store`, so there is nothing to
+    /// build from.
+    NoBuildSource,
+    EmptyBuildStore,
+    UnsupportedBuildStore(String),
+    /// `build.store` was set without a `build.ref`. A store has no default
+    /// branch to fall back to.
+    MissingBuildRef,
+    /// `build.ref` on a store source is neither a tag nor a digest.
+    BadBuildArtifactRef(String),
+    /// A field that only means something for a git checkout, set on a build
+    /// whose recipe comes from a store.
+    OnlyForGitBuilds(&'static str),
     EmptyArtifactStore,
     UnsupportedArtifactStore(String),
     BadArtifactRef(String),
@@ -1537,6 +1877,23 @@ impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyId => write!(f, "deployment id must not be empty"),
+            Self::BadWorkflowId(id) => write!(
+                f,
+                "workflow id {id:?} must contain only letters, digits, '-' and '_'; \
+                 it is interpolated into a NATS subject and a VM name unescaped"
+            ),
+            Self::EmptyWorkflowRepo => write!(f, "workflow.repo must name a repository"),
+            Self::EmptyWorkflowRef => write!(f, "workflow.ref must name a branch or ref"),
+            Self::EmptyWorkflowNetwork => write!(
+                f,
+                "workflow.network must name the heyvm network whose hosts run this \
+                 workflow"
+            ),
+            Self::BadWorkflowPath(p) => write!(
+                f,
+                "workflow.path {p:?} must be a relative path inside the repository, \
+                 with no leading '/' and no '..' segments"
+            ),
             Self::EmptySiteRoot => write!(f, "site.root must name a directory to serve"),
             Self::RelativeSiteRoot(p) => write!(
                 f,
@@ -1559,6 +1916,19 @@ impl std::fmt::Display for SpecError {
                 f,
                 "`{what}` does not apply to a site — it serves files off disk, with no \
                  image and no pool"
+            ),
+            Self::OnlyForSites(what) => write!(
+                f,
+                "`{what}` only applies to a site, which unpacks its artifact into a \
+                 directory. A managed (vm) deployment's artifact is a single guest rootfs, \
+                 and nothing unpacks it"
+            ),
+            Self::BothSiteSources => write!(
+                f,
+                "a site sets both `update` and `artifact`: pick one — both write the files \
+                 under `site.root`, so with both there is no answer to where what is being \
+                 served came from. Run the build on this host (`update`), or unpack a bundle \
+                 somebody already built (`artifact`)"
             ),
             Self::NoRoutes => write!(
                 f,
@@ -1690,6 +2060,12 @@ impl std::fmt::Display for SpecError {
                 f,
                 "auth.cookie_name {c:?} is not a usable cookie name"
             ),
+            Self::BadCookieDomain(d) => write!(
+                f,
+                "auth.cookie_domain {d:?} is not a domain a browser would accept: it needs at \
+                 least two labels (\"example.com\", not \"com\") and must be a parent of the \
+                 hostnames this deployment serves. Leave it unset for a per-host session"
+            ),
             Self::AuthCallbackUnroutable(c) => write!(
                 f,
                 "no route would match the sign-in callback {c:?}, so the provider's redirect \
@@ -1716,6 +2092,45 @@ impl std::fmt::Display for SpecError {
                 f,
                 "build.image_name {n:?} has no usable characters: image names are \
                  [a-z0-9._-] and must start with a letter or digit"
+            ),
+            Self::BothBuildSources => write!(
+                f,
+                "a build sets both `build.repo` and `build.store`: pick one — both name the \
+                 Dockerfile to build, and a build with two recipes has no answer to which one \
+                 produced the image. Check the recipe into the repo, or `art dockerfile put` \
+                 it into the store"
+            ),
+            Self::NoBuildSource => write!(
+                f,
+                "a build sets neither `build.repo` nor `build.store`, so there is no \
+                 Dockerfile to build. Set `build.repo` for a git checkout, or `build.store` \
+                 and `build.ref` for a Dockerfile manifest in an artifact store"
+            ),
+            Self::EmptyBuildStore => write!(f, "build.store must not be empty"),
+            Self::UnsupportedBuildStore(s) => write!(
+                f,
+                "build.store {s:?} is not a usable store: give either an `art serve` URL \
+                 (http://host:port) or an absolute path to a store root on this host"
+            ),
+            Self::MissingBuildRef => write!(
+                f,
+                "build.store is set but build.ref is not: name the Dockerfile manifest to \
+                 build, as a tag or a digest. Unlike a git remote, a store has no default \
+                 branch to fall back to"
+            ),
+            Self::BadBuildArtifactRef(r) => write!(
+                f,
+                "build.ref {r:?} is neither a tag nor a digest: a tag is [A-Za-z0-9._-] and \
+                 may not start with `-` or `.`, and a digest is 64 lowercase hex characters. \
+                 (A git ref would be valid here only if `build.repo` were set instead of \
+                 `build.store`)"
+            ),
+            Self::OnlyForGitBuilds(what) => write!(
+                f,
+                "`{what}` only applies to a build from a git checkout, where it selects a \
+                 file within the repo. A Dockerfile manifest already names its recipe \
+                 (`Dockerfile`) and its context (`context.tar.gz`), so there is nothing left \
+                 to point at"
             ),
             Self::EmptyArtifactStore => write!(f, "artifact.store must not be empty"),
             Self::UnsupportedArtifactStore(s) => write!(
@@ -1834,21 +2249,24 @@ impl DeploymentSpec {
                 return Err(SpecError::SiteWithOtherBackend);
             }
             site.validate()?;
-            // A site has no image and no pool, so the blocks that produce or
-            // scale one are meaningless rather than merely unused. Rejected so
-            // a spec cannot claim something app-lb will silently ignore.
-            for (present, what) in [
-                (self.build.is_some(), "build"),
-                (self.artifact.is_some(), "artifact"),
-            ] {
-                if present {
-                    return Err(SpecError::NotForSites(what));
-                }
+            // A site has no image and no pool, so a block that produces one is
+            // meaningless rather than merely unused. Rejected so a spec cannot
+            // claim something app-lb will silently ignore.
+            if self.build.is_some() {
+                return Err(SpecError::NotForSites("build"));
             }
-            // `update` *is* allowed: running `git pull && npm run build` in a
-            // directory on this host is exactly how a site is redeployed.
+            // Both of these *are* allowed, and they are the two ways a site's
+            // files get replaced: `update` runs `git pull && npm run build` in a
+            // directory on this host, `artifact` unpacks a bundle somebody else
+            // built. Never both — see [`SpecError::BothSiteSources`].
+            if self.update.is_some() && self.artifact.is_some() {
+                return Err(SpecError::BothSiteSources);
+            }
             if let Some(update) = &self.update {
                 update.validate()?;
+            }
+            if let Some(artifact) = &self.artifact {
+                artifact.validate(true)?;
             }
             return Ok(());
         }
@@ -1887,7 +2305,7 @@ impl DeploymentSpec {
                 build.validate()?;
             }
             if let Some(artifact) = &self.artifact {
-                artifact.validate()?;
+                artifact.validate(false)?;
             }
             // An `update` runs commands in a directory on this host; a managed
             // deployment's backend is a microVM, so there is nothing here for
@@ -1940,6 +2358,87 @@ fn is_valid_host_port(s: &str) -> bool {
     matches!(port.parse::<u16>(), Ok(p) if p > 0)
 }
 
+// ---- workflow objects ---------------------------------------------------
+
+/// A CI workflow: which repository to build, and on which heyvm network.
+///
+/// app-lb stores and serves these; it never runs them. The `ci` orchestrator
+/// polls `GET /workflows` and does the work. Keeping the object here rather than
+/// in `ci` means one place holds "what this fleet knows about" — the same
+/// argument that puts deployments and secrets here.
+///
+/// The object names a repository and a path *glob*, not a workflow body. A
+/// workflow lives in the repository it builds, versioned with the code, so the
+/// object is a pointer rather than a copy that can drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSpec {
+    pub id: String,
+    /// Clone URL. Only ever compared and displayed by app-lb; the orchestrator
+    /// never clones it either — a submit carries its own source.
+    pub repo: String,
+    /// Branch or ref this workflow is for. `ref` is a Rust keyword.
+    #[serde(rename = "ref", default = "default_workflow_ref")]
+    pub git_ref: String,
+    /// Where workflow files live inside the repository.
+    #[serde(default = "default_workflow_path")]
+    pub path: String,
+    /// The heyvm network whose hosts may run it.
+    pub network: String,
+    /// Credential for the repository, if the orchestrator is ever made to fetch
+    /// one. A reference, never a value — the admin API echoes specs back and the
+    /// state file holds them in the clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<SecretRef>,
+    /// heyosecret prefix override. Defaults to `ci/<id>` in the orchestrator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets_prefix: Option<String>,
+    /// Disabled workflows stay listed but are not run, so turning one off does
+    /// not lose its configuration.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_workflow_ref() -> String {
+    "main".to_string()
+}
+
+fn default_workflow_path() -> String {
+    ".ci/workflows/*.yml".to_string()
+}
+
+impl WorkflowSpec {
+    pub fn validate(&self) -> Result<(), SpecError> {
+        // The id reaches a NATS subject token, a durable consumer name and a VM
+        // name in the orchestrator, all unescaped. Restricting the alphabet is
+        // cheaper than escaping it in four places.
+        if self.id.is_empty() {
+            return Err(SpecError::EmptyId);
+        }
+        if !self
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err(SpecError::BadWorkflowId(self.id.clone()));
+        }
+        if self.repo.trim().is_empty() {
+            return Err(SpecError::EmptyWorkflowRepo);
+        }
+        if self.git_ref.trim().is_empty() {
+            return Err(SpecError::EmptyWorkflowRef);
+        }
+        if self.network.trim().is_empty() {
+            return Err(SpecError::EmptyWorkflowNetwork);
+        }
+        // The path is joined onto an extracted tree, so it must not escape it.
+        let path = self.path.trim();
+        if path.is_empty() || path.starts_with('/') || path.split('/').any(|s| s == "..") {
+            return Err(SpecError::BadWorkflowPath(self.path.clone()));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1978,8 +2477,23 @@ mod tests {
 
     fn build_spec() -> BuildSpec {
         BuildSpec {
-            repo: "https://github.com/acme/web.git".into(),
-            git_ref: Some("main".into()),
+            repo: Some("https://github.com/acme/web.git".into()),
+            store: None,
+            source_ref: Some("main".into()),
+            dockerfile: None,
+            context: None,
+            image_name: None,
+            image_size_mb: None,
+            auth: None,
+        }
+    }
+
+    /// The other source: a Dockerfile manifest in an artifact store.
+    fn store_build_spec() -> BuildSpec {
+        BuildSpec {
+            repo: None,
+            store: Some("http://art.internal:8080".into()),
+            source_ref: Some("web-rootfs".into()),
             dockerfile: None,
             context: None,
             image_name: None,
@@ -2023,7 +2537,7 @@ mod tests {
         ] {
             let mut s = spec();
             s.build = Some(BuildSpec {
-                repo: repo.into(),
+                repo: Some(repo.into()),
                 ..build_spec()
             });
             assert_eq!(s.validate(), Ok(()), "{repo} should be accepted");
@@ -2041,7 +2555,7 @@ mod tests {
         ] {
             let mut s = spec();
             s.build = Some(BuildSpec {
-                repo: repo.into(),
+                repo: Some(repo.into()),
                 ..build_spec()
             });
             assert!(s.validate().is_err(), "{repo:?} should be rejected");
@@ -2050,7 +2564,7 @@ mod tests {
         for git_ref in ["--upload-pack=x", "a b", "a..b", "/refs/heads/main", "v1^"] {
             let mut s = spec();
             s.build = Some(BuildSpec {
-                git_ref: Some(git_ref.into()),
+                source_ref: Some(git_ref.into()),
                 ..build_spec()
             });
             assert_eq!(
@@ -2083,6 +2597,191 @@ mod tests {
             ..build_spec()
         });
         assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn accepts_a_dockerfile_manifest_build_source() {
+        let mut s = spec();
+        s.build = Some(store_build_spec());
+        assert_eq!(s.validate(), Ok(()));
+
+        // Both spellings of a store, and a digest as well as a tag.
+        for store in ["https://art.example.com", "/srv/artifacts"] {
+            let mut s = spec();
+            s.build = Some(BuildSpec {
+                store: Some(store.into()),
+                source_ref: Some("a".repeat(64)),
+                ..store_build_spec()
+            });
+            assert_eq!(s.validate(), Ok(()), "{store} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_build_needs_exactly_one_source() {
+        // Both: two recipes, and no answer to which produced the image.
+        let mut s = spec();
+        s.build = Some(BuildSpec {
+            store: Some("http://art:8080".into()),
+            ..build_spec()
+        });
+        assert_eq!(s.validate(), Err(SpecError::BothBuildSources));
+
+        // Neither: nothing to build.
+        let mut s = spec();
+        s.build = Some(BuildSpec {
+            repo: None,
+            ..build_spec()
+        });
+        assert_eq!(s.validate(), Err(SpecError::NoBuildSource));
+    }
+
+    #[test]
+    fn a_store_build_requires_a_ref_and_a_reachable_store() {
+        // A git remote has a default branch to fall back to. A store does not,
+        // and guessing one would pick somebody's image out of a shared namespace.
+        let mut s = spec();
+        s.build = Some(BuildSpec {
+            source_ref: None,
+            ..store_build_spec()
+        });
+        assert_eq!(s.validate(), Err(SpecError::MissingBuildRef));
+
+        // Same store rule as `artifact.store`, because it is the same function:
+        // a relative path names a different store depending on how the LB was
+        // started.
+        for store in ["srv/artifacts", "ftp://art", "/srv/../etc", ""] {
+            let mut s = spec();
+            s.build = Some(BuildSpec {
+                store: Some(store.into()),
+                ..store_build_spec()
+            });
+            assert!(s.validate().is_err(), "{store:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn a_git_ref_is_not_accepted_on_a_store_build() {
+        // The two sources share the `ref` field and read it by different rules.
+        // A branch name with a slash is a perfectly good git ref and not a tag,
+        // so which rule applies has to follow from which source is set.
+        for r in ["release/2.1", "a b", "-flag"] {
+            let mut s = spec();
+            s.build = Some(BuildSpec {
+                source_ref: Some(r.into()),
+                ..store_build_spec()
+            });
+            assert_eq!(
+                s.validate(),
+                Err(SpecError::BadBuildArtifactRef(r.to_string())),
+                "{r:?} should be rejected on a store source",
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_relative_paths_are_refused_on_a_store_build() {
+        // A Dockerfile manifest names its own recipe and context. A path here is
+        // somebody expecting a file to be chosen that was already chosen.
+        for (field, with) in [
+            (
+                "build.dockerfile",
+                BuildSpec {
+                    dockerfile: Some("deploy/Dockerfile".into()),
+                    ..store_build_spec()
+                },
+            ),
+            (
+                "build.context",
+                BuildSpec {
+                    context: Some(".".into()),
+                    ..store_build_spec()
+                },
+            ),
+        ] {
+            let mut s = spec();
+            s.build = Some(with);
+            assert_eq!(s.validate(), Err(SpecError::OnlyForGitBuilds(field)));
+        }
+    }
+
+    #[test]
+    fn a_store_build_still_cannot_coexist_with_an_artifact_block() {
+        // Both rewrite `vm.image`. That one of them now also *builds* changes
+        // nothing about why a deployment cannot have two.
+        let mut s = spec();
+        s.build = Some(store_build_spec());
+        s.artifact = Some(ArtifactSpec {
+            store: "http://art:8080".into(),
+            artifact_ref: "web".into(),
+            auth: None,
+            grow_gb: None,
+            image_name: None,
+            strip_components: None,
+        });
+        assert_eq!(s.validate(), Err(SpecError::BothImageSources));
+    }
+
+    #[test]
+    fn a_build_source_is_a_repo_or_a_store_and_never_both() {
+        match store_build_spec().source() {
+            Some(BuildSource::Dockerfile { store, reference }) => {
+                assert_eq!(store, "http://art.internal:8080");
+                assert_eq!(reference, "web-rootfs");
+            }
+            other => panic!("expected a Dockerfile source, got {other:?}"),
+        }
+        match build_spec().source() {
+            Some(BuildSource::Git { repo, git_ref }) => {
+                assert_eq!(repo, "https://github.com/acme/web.git");
+                assert_eq!(git_ref, Some("main"));
+            }
+            other => panic!("expected a Git source, got {other:?}"),
+        }
+        // A spec that never passed validate() has no source at all, rather than
+        // a half-formed one a consumer would have to defend against.
+        assert!(
+            BuildSpec {
+                repo: None,
+                ..build_spec()
+            }
+            .source()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_store_built_image_is_named_after_its_manifest() {
+        let digest = "c74abee2f1a0".to_string() + &"0".repeat(52);
+        assert_eq!(store_build_spec().image_for("web", &digest), "web-c74abee2f1a0");
+        // The same shape a commit gets, so one deployment's images sort together
+        // whichever source made them.
+        assert_eq!(
+            build_spec().image_for("web", "abcdef0123456789"),
+            "web-abcdef012345"
+        );
+    }
+
+    #[test]
+    fn a_build_spec_round_trips_through_json_under_both_sources() {
+        for original in [build_spec(), store_build_spec()] {
+            let json = serde_json::to_string(&original).unwrap();
+            let back: BuildSpec = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, original, "{json}");
+            // One wire name for the version, whichever source it selects.
+            assert!(json.contains("\"ref\""), "{json}");
+            assert!(!json.contains("source_ref"), "{json}");
+        }
+
+        // A spec written before `store` existed still loads: `repo` became
+        // optional by type but is still required in practice, so nothing on disk
+        // needs migrating.
+        let old: BuildSpec =
+            serde_json::from_str(r#"{"repo":"https://x/y.git","ref":"main"}"#).unwrap();
+        assert_eq!(old.repo.as_deref(), Some("https://x/y.git"));
+        assert_eq!(old.store, None);
+        // And still serializes without mentioning a store it does not have.
+        assert!(!serde_json::to_string(&old).unwrap().contains("store"));
     }
 
     #[test]
@@ -2325,6 +3024,7 @@ mod tests {
             auth: None,
             grow_gb: None,
             image_name: None,
+            strip_components: None,
         }
     }
 
@@ -2456,6 +3156,7 @@ mod tests {
             base_path: default_auth_base_path(),
             session_ttl_secs: default_session_ttl_secs(),
             cookie_name: default_auth_cookie_name(),
+            cookie_domain: None,
             redirect_url: None,
             forward_identity: true,
         }
@@ -2591,6 +3292,17 @@ mod tests {
             (
                 AuthGate { cookie_name: "bad name".into(), ..auth_gate() },
                 SpecError::BadCookieName("bad name".into()),
+            ),
+            // A single label is a cookie every browser discards, and the
+            // symptom — sign-in looping forever with nothing logged — is close
+            // to undiagnosable from outside. Refuse it at registration.
+            (
+                AuthGate { cookie_domain: Some("com".into()), ..auth_gate() },
+                SpecError::BadCookieDomain("com".into()),
+            ),
+            (
+                AuthGate { cookie_domain: Some("not a domain".into()), ..auth_gate() },
+                SpecError::BadCookieDomain("not a domain".into()),
             ),
         ];
         for (gate, want) in cases {
@@ -2959,10 +3671,11 @@ mod tests {
             assert_eq!(s.validate(), Err(SpecError::SiteWithOtherBackend));
         }
 
-        /// A site has no image and no pool, so a block that produces one is a
-        /// misunderstanding rather than a harmless extra.
+        /// A `build` produces a guest image, and a site has neither an image nor
+        /// a pool — so it is a misunderstanding rather than a harmless extra.
+        /// `artifact` is *not* in this company: see below.
         #[test]
-        fn image_sources_are_refused_on_a_site() {
+        fn a_build_block_is_refused_on_a_site() {
             let mut s = site_spec();
             s.build = Some(
                 serde_json::from_str(r#"{"repo":"https://github.com/acme/site.git"}"#).unwrap(),
@@ -2982,6 +3695,75 @@ mod tests {
                 .unwrap(),
             );
             assert_eq!(s.validate(), Ok(()));
+        }
+
+        /// And so is `artifact`: unpacking a bundle somebody else built is the
+        /// other way a site is redeployed, and the one that needs no toolchain on
+        /// this host at all.
+        #[test]
+        fn an_artifact_block_is_the_other_way_a_site_is_deployed() {
+            let mut s = site_spec();
+            s.artifact = Some(
+                serde_json::from_str(
+                    r#"{"store":"http://127.0.0.1:8080","ref":"marketing-live"}"#,
+                )
+                .unwrap(),
+            );
+            assert_eq!(s.validate(), Ok(()));
+
+            // The one field that only means something here.
+            s.artifact.as_mut().unwrap().strip_components = Some(1);
+            assert_eq!(s.validate(), Ok(()));
+            assert_eq!(s.artifact.as_ref().unwrap().strip(), 1);
+        }
+
+        /// The half of `artifact` that describes a guest rootfs. Refused rather
+        /// than ignored: somebody setting `grow_gb` on a site expects room they
+        /// are never going to get.
+        #[test]
+        fn the_guest_image_half_of_an_artifact_block_is_refused_on_a_site() {
+            let base: ArtifactSpec =
+                serde_json::from_str(r#"{"store":"/srv/artifacts","ref":"marketing-live"}"#)
+                    .unwrap();
+
+            let mut s = site_spec();
+            s.artifact = Some(ArtifactSpec { grow_gb: Some(8), ..base.clone() });
+            assert_eq!(s.validate(), Err(SpecError::NotForSites("artifact.grow_gb")));
+
+            let mut s = site_spec();
+            s.artifact = Some(ArtifactSpec { image_name: Some("web".into()), ..base });
+            assert_eq!(s.validate(), Err(SpecError::NotForSites("artifact.image_name")));
+        }
+
+        /// And the reverse: a guest rootfs is one file, so there is nothing for
+        /// `strip_components` to strip.
+        #[test]
+        fn strip_components_is_refused_off_a_site() {
+            let mut s = spec();
+            s.artifact = Some(ArtifactSpec {
+                strip_components: Some(1),
+                ..artifact_spec()
+            });
+            assert_eq!(
+                s.validate(),
+                Err(SpecError::OnlyForSites("artifact.strip_components"))
+            );
+        }
+
+        /// Both blocks write the files under `site.root`, so a site holding both
+        /// has no answer to where what it is serving came from — the same
+        /// reasoning that refuses `build` next to `artifact` on a VM.
+        #[test]
+        fn a_site_deploys_one_way_or_the_other_not_both() {
+            let mut s = site_spec();
+            s.update = Some(
+                serde_json::from_str(r#"{"working_dir":"/srv/docs","commands":["make"]}"#)
+                    .unwrap(),
+            );
+            s.artifact = Some(
+                serde_json::from_str(r#"{"store":"/srv/artifacts","ref":"docs-live"}"#).unwrap(),
+            );
+            assert_eq!(s.validate(), Err(SpecError::BothSiteSources));
         }
 
         #[test]

@@ -20,9 +20,27 @@ cargo build --release
 sudo install -m0755 target/release/app-lb /usr/local/bin/app-lb
 
 # Dedicated non-root service user. app-lb talks to heyvmd over HTTP and never
-# touches /dev/kvm itself, so this user does NOT need the kvm group — it only
-# needs to write its data/log dirs and reach the daemon URL.
+# touches /dev/kvm itself, so this user does NOT need the kvm group — on a host
+# that does not build images it only needs to write its data/log dirs and reach
+# the daemon URL.
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin app-lb
+
+# ONLY on a host that runs image builds (a deployment with a `build` block).
+# `heyvm mvm build` shells out to docker, whose socket is root:docker 0660, so
+# without this the first build fails with "permission denied while trying to
+# connect to the Docker daemon socket". The group is root-equivalent — that
+# socket starts containers as root on request — so skip it on hosts that only
+# pull artifacts or serve static deployments.
+sudo usermod -aG docker app-lb
+
+# ALSO only on a build host. `--no-create-home` above suppresses the mkdir but
+# NOT the passwd field, which useradd still fills in from /etc/default/useradd
+# (HOME=/home) as /home/app-lb. supervisord never sets HOME, and the docker CLI
+# falls back to reading /etc/passwd when it is unset — so docker finds that
+# never-created path, tries to make its state dir under it, and dies before
+# reading a line of the Dockerfile: "Docker build failed: ERROR: mkdir
+# /home/app-lb: permission denied" (/home is root-owned). Give it a real home.
+sudo install -d -o app-lb -g app-lb -m0755 /home/app-lb
 
 # Data dir (persisted deployment state) and log dir.
 sudo install -d -o app-lb -g app-lb /var/lib/app-lb /var/log/app-lb
@@ -61,6 +79,25 @@ sudo supervisorctl tail -f app-lb stderr
 
 ## Notes
 
+- **`HOME` does double duty on a build host, and both users have a claim on
+  it.** `docker` keeps its client state in `$HOME/.docker`, so `HOME` has to be
+  a directory app-lb can write or no build starts at all. `heyvm mvm build` then
+  saves the finished rootfs to `$HOME/.heyo/images/firecracker/<name>.ext4`, and
+  heyvmd only resolves image names under *its own* home — so a `HOME` that
+  satisfies only docker gives you the second failure instead of the first: the
+  build succeeds and nothing boots. Settle it one of two ways:
+  - `APP_LB_HEYVM_HOME=<heyvmd's home>` — one variable covers both, but only
+    when app-lb can write that directory. Check with
+    `getent passwd $(ps -o user= -C heyvmd | head -1)`.
+  - `MVM_DATA_DIR=<shared dir>` set on **both** app-lb and heyvmd, which takes
+    image placement out of `HOME` entirely and leaves `/home/app-lb` doing
+    nothing but holding `.docker`. Point `APP_LB_IMAGES_DIR` at
+    `<shared dir>/images/firecracker` so artifact pulls land there too.
+- **A new group needs a program restart, not a config reload.** supervisord
+  resolves the service user's group list when it forks the child, so after
+  `usermod -aG docker app-lb` run `supervisorctl restart app-lb`. `reread` and
+  `update` alone leave the already-running process without the group, and builds
+  keep failing on the docker socket with nothing in the config to explain it.
 - A startup misconfiguration causes an immediate panic-exit: setting only one of
   `APP_LB_TLS_CERT` / `APP_LB_TLS_KEY`, `APP_LB_ADMIN_AUTH=1` without
   `APP_LB_DASHBOARD_PASSWORD`, or a listen address that cannot be bound.

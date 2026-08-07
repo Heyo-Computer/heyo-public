@@ -11,7 +11,9 @@ mod auth;
 mod autoscale;
 mod config;
 mod deployment;
+mod disks;
 mod dns;
+mod guard;
 mod health;
 mod jobs;
 mod metrics;
@@ -23,7 +25,9 @@ mod siem;
 mod site;
 mod tls;
 mod tokens;
+mod unpack;
 mod vm;
+mod workflows;
 
 use crate::acme::{AcmeConfig, AcmeManager, ChallengeTable};
 use crate::admin::AdminApi;
@@ -58,6 +62,9 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_TOKENS_PATH") {
         cfg.tokens_path = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_GUARD_PATH") {
+        cfg.guard_path = v;
     }
     if let Ok(v) = std::env::var("APP_LB_NAME") {
         cfg.name = v;
@@ -296,6 +303,23 @@ fn main() {
         Ok(n) => tracing::info!(count = n, "restored deployments"),
         Err(e) => tracing::error!(error = %e, "failed to load persisted state; starting empty"),
     }
+
+    // Beside the deployment state, derived the same way: `app-lb-state.json`
+    // gives `app-lb-workflows.d/`. One directory per object kind keeps a
+    // listing readable and a delete unambiguous.
+    let workflows = Arc::new(crate::workflows::WorkflowStore::new(
+        crate::workflows::workflow_dir(&cfg.state_path),
+    ));
+    match workflows.load() {
+        (0, 0) => tracing::info!(dir = %workflows.dir().display(), "no CI workflows"),
+        (n, 0) => tracing::info!(count = n, "restored CI workflows"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %workflows.dir().display(),
+            "restored CI workflows; some objects were unreadable and were left on disk"
+        ),
+    }
     // A deregistration whose file removal failed would otherwise resurrect the
     // deployment on this start. Declines to run if the load above skipped
     // anything, so it can never delete a spec it merely failed to understand.
@@ -342,6 +366,23 @@ fn main() {
     }
     if tokens.sweep_expired(deployment::now_secs()) > 0 {
         let _ = tokens.persist();
+    }
+
+    // Block rules, restored before the data plane accepts anything. Fatal on a
+    // corrupt file, for the same reason the token store is: coming up with an
+    // empty rule set would silently readmit whatever an operator blocked during
+    // an incident, and would look exactly like a healthy server while doing it.
+    let guard = Arc::new(guard::Guard::from_env(&cfg.guard_path));
+    match guard.load(deployment::now_secs()) {
+        Ok(0) => tracing::info!(path = %guard.path().display(), "no guard rules"),
+        Ok(n) => tracing::info!(count = n, enforcing = guard.enforcing(), "loaded guard rules"),
+        Err(e) => panic!("cannot read {}: {e}", guard.path().display()),
+    }
+    if !guard.enforcing() {
+        tracing::warn!(
+            "APP_LB_GUARD_ENFORCE=0: guard rules are matched and counted but nothing is \
+             refused — this is a dry run, not protection",
+        );
     }
 
     if !secrets.is_encrypted() {
@@ -454,9 +495,70 @@ fn main() {
     // which is how the admin API reaches the autoscaler to tear deployments down.
     let autoscaler_svc = background_service(
         "autoscaler",
-        Autoscaler::new(registry.clone(), vms, metrics.clone()),
+        Autoscaler::new(registry.clone(), vms.clone(), metrics.clone()),
     );
     let autoscaler = autoscaler_svc.task();
+
+    // Disk inventory and reclamation. Optional in exactly one way: without a
+    // resolvable daemon data directory there is nothing to inventory, and an LB
+    // whose host keeps its VMs elsewhere should not refuse to start over it. The
+    // routes then answer 503 and say why.
+    let disks = match disks::DiskConfig::from_env(&cfg) {
+        Ok(disk_cfg) => {
+            let store = Arc::new(disks::DiskStore::new(
+                disk_cfg,
+                vms,
+                registry.clone(),
+            ));
+            match store.load() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(count = n, "loaded disk retention policies"),
+                // Not fatal, unlike the secret store: the worst case is that a
+                // `retain` flag is missed, and the sweep's other four guards
+                // (running, claimed, age, daemon reachable) still hold.
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "cannot read disk retention policies; every disk will be treated as \
+                     unretained until this is fixed",
+                ),
+            }
+            let c = store.config();
+            if c.ttl_secs == 0 {
+                tracing::info!(
+                    data_dir = %c.data_dir.display(),
+                    "disk expiry is off (APP_LB_DISK_TTL_SECS=0); disks are listed and can be \
+                     purged by hand, but nothing is reclaimed automatically",
+                );
+            } else {
+                // Counted here rather than left for the first sweep to
+                // discover, because on a host that has been booting VMs for
+                // months the honest answer is "most of them" — and an operator
+                // who never opens /storage should still learn that from the log
+                // before it happens rather than after. An upper bound: without
+                // the daemon this cannot tell a running sandbox from residue.
+                let (total, due, bytes) = store.expiry_preview();
+                tracing::warn!(
+                    data_dir = %c.data_dir.display(),
+                    ttl_secs = c.ttl_secs,
+                    sweep_secs = c.sweep_secs,
+                    archive = c.bucket.is_some(),
+                    disks = total,
+                    eligible = due,
+                    gib = bytes / (1 << 30),
+                    "disk expiry is ON: up to {due} of {total} sandbox disks on this host are \
+                     already older than the retention window and will be reclaimed by the \
+                     first sweep, in {}s. Open /storage to review them, mark the ones to keep \
+                     as retained, or set APP_LB_DISK_TTL_SECS=0 to turn expiry off",
+                    c.sweep_secs,
+                );
+            }
+            Some(store)
+        }
+        Err(e) => {
+            tracing::warn!("{e}. Disk management is disabled");
+            None
+        }
+    };
 
     // Where an artifact pull writes a rootfs. Resolved once, and kept as a
     // `Result` rather than unwrapped: without `HOME` or `MVM_DATA_DIR` there is
@@ -534,10 +636,13 @@ fn main() {
             certs.clone(),
             acme_signal,
             secrets,
+            workflows,
             tokens,
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),
             siem.as_ref(),
+            guard.clone(),
+            disks.clone(),
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
         ),
     );
@@ -551,6 +656,7 @@ fn main() {
             auth,
             obs.as_ref().and_then(|o| o.access.clone()),
             siem.as_ref().map(|s| s.sink.clone()),
+            guard.clone(),
         ),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);
@@ -584,6 +690,12 @@ fn main() {
     }
     if let Some(acme_svc) = acme_svc {
         server.add_service(acme_svc);
+    }
+    // Disk reclamation, on the same terms as the two above: never a dependency
+    // of the proxy handle. It walks directories and shells out to `aws`, and
+    // neither may hold up traffic.
+    if let Some(disks) = disks {
+        server.add_service(background_service("disks", disks::DiskSweeper::new(disks)));
     }
     let proxy_handle = server.add_service(proxy_svc);
     // Don't accept traffic until the autoscaler has adopted existing VMs and

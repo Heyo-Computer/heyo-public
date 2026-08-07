@@ -5,7 +5,7 @@ built on [Pingora](https://github.com/cloudflare/pingora).
 
 This directory was imported from the standalone
 [`Heyo-Computer/app-lb`](https://github.com/Heyo-Computer/app-lb) repository
-with its 22-commit author, timestamp, message, and ancestry history rewritten
+with its 28-commit author, timestamp, message, and ancestry history rewritten
 under `app-lb/`. Generated runtime state and credential files
 (`app-lb-auth-key` and `app-lb-state.json`) were removed from every imported
 revision and are ignored here. Rewriting the paths and sanitizing those files
@@ -59,6 +59,7 @@ Configuration is environment-only:
 | `APP_LB_SECRET_KEY` | *(unset)* | 32-byte hex key (or any passphrase) that seals the secrets file with AES-256-GCM |
 | `APP_LB_TOKENS_PATH` | `app-lb-tokens.json` | Where minted [app-tokens](#app-tokens) persist (written `0600`; only hashes) |
 | `APP_LB_AUTH_KEY` | `app-lb-auth-key` | Signing key for sign-in sessions; generated `0600` on first use |
+| `APP_LB_GUARD_PATH` | `app-lb-guard.json` | Where [block rules](#response-actions) persist, so a restart does not unblock an attacker |
 | `APP_LB_NAME` | `app-lb` | Display name in the dashboard header and page title |
 | `APP_LB_DAEMON_URL` | `http://127.0.0.1:34099` | heyvm daemon |
 | `APP_LB_DASHBOARD_PASSWORD` | *(unset)* | Set to gate the dashboard behind HTTP Basic Auth |
@@ -72,7 +73,7 @@ Configuration is environment-only:
 | `APP_LB_ACME_DIRECTORY` | LE production | ACME directory URL — point at staging for testing |
 | `APP_LB_ACME_WILDCARD` | *(unset)* | Comma-separated domains to cover with a **wildcard** cert (`sb.example.com` → also `*.sb.example.com`). Issued over DNS-01; needs the zone id below |
 | `APP_LB_ROUTE53_ZONE_ID` | *(unset)* | Route 53 hosted zone where DNS-01 challenge records are written |
-| `APP_LB_AWS_BIN` | `aws` | The AWS CLI used for DNS-01. Only reached when a wildcard is configured |
+| `APP_LB_AWS_BIN` | `aws` | The AWS CLI, used for the DNS-01 challenge and for [disk archives](#archiving-a-disk-to-s3) |
 | `APP_LB_BUILD_DIR` | `/var/lib/app-lb/builds` | Git checkouts for image builds (one per deployment, `0700`) |
 | `APP_LB_HEYVM_BIN` | `heyvm` | The heyvm CLI that builds guest images |
 | `APP_LB_ART_BIN` | `art` | The `art` CLI that materializes a rootfs from a **local** artifact store; unused when `artifact.store` is a URL |
@@ -81,6 +82,17 @@ Configuration is environment-only:
 | `APP_LB_UPDATE_SHELL` | `/bin/sh` | Shell a static deployment's `update.commands` run through |
 | `APP_LB_BUILD_TIMEOUT_SECS` | `1800` | Ceiling on one build step or update command, after which the child is killed |
 | `APP_LB_HEYVM_HOME` | *(unset)* | `HOME` for the heyvm child — set it when app-lb and heyvmd run as different users |
+| `APP_LB_VM_DATA_DIR` | `$MVM_DATA_DIR`, else `<home>/.heyo` | The daemon's data directory, where per-sandbox disks live. Disk management is disabled if this cannot be resolved |
+| `APP_LB_VM_TMP_DIR` | `/tmp` | Where the Firecracker driver writes its per-boot rootfs copy |
+| `APP_LB_DISKS_PATH` | `app-lb-disks.json` | Where retention decisions persist |
+| `APP_LB_DISK_TTL_SECS` | `604800` (7 days) | How long an unclaimed disk survives. **`0` turns expiry off** |
+| `APP_LB_DISK_SWEEP_SECS` | `3600` | Gap between expiry sweeps (floor 60) |
+| `APP_LB_DISK_ARCHIVE_BUCKET` | *(unset)* | S3 bucket for disk archives; **setting it enables archiving** |
+| `APP_LB_DISK_ARCHIVE_PREFIX` | `app-lb/disks` | Key prefix inside the bucket |
+| `APP_LB_DISK_ARCHIVE_ENDPOINT` | *(unset)* | `--endpoint-url` for an S3-compatible store |
+| `APP_LB_DISK_ARCHIVE_ON_EXPIRE` | `false` | `1` to archive an expiring disk before reclaiming it |
+| `APP_LB_DISK_ARCHIVE_TIMEOUT_SECS` | `7200` | Ceiling on one archive, after which `tar` and `aws` are killed |
+| `APP_LB_TAR_BIN` | `tar` | The `tar` used to stream a disk into the uploader. Needs GNU `--sparse` |
 | `APP_LB_OBS_URL` | *(unset)* | Where app-obs listens (e.g. `127.0.0.1:9500`); **setting it enables log shipping** |
 | `APP_LB_OBS_TOKEN` | *(unset)* | Bearer token for app-obs's `/ingest` — must match its `APP_OBS_INGEST_TOKEN` |
 | `APP_LB_OBS_HOST` | `/etc/hostname` | Machine name stamped on every batch |
@@ -99,6 +111,7 @@ Configuration is environment-only:
 | `APP_LB_SIEM_MAX_ALERTS_PER_MIN` | `60` | Hard ceiling on *new* alerts, for a distributed attack that cannot fold |
 | `APP_LB_SIEM_SCAN_QUERY` | `true` | `0` to match signatures against the path only, never the query string |
 | `APP_LB_SIEM_SHIP` | `true` | `0` to keep alerts local instead of sending them to app-obs |
+| `APP_LB_GUARD_ENFORCE` | `true` | `0` for a dry run: [rules](#response-actions) match and count, nothing is refused |
 | `APP_LB_OBS_QUEUE_CAPACITY` | `8192` | Records buffered before new ones are dropped |
 | `APP_LB_OBS_BATCH` | `500` | Records per POST |
 | `APP_LB_OBS_FLUSH_SECS` | `2` | How long a record may wait for a fuller batch |
@@ -127,6 +140,14 @@ A file whose spec no longer validates is skipped with a warning and **left
 alone**, because that file is the only copy of what somebody wrote. The startup
 sweep that removes files no deployment claims stands down entirely when that
 happens, for the same reason.
+
+[Disk retention decisions](#disk-management) live in their own file
+(`APP_LB_DISKS_PATH`, default `app-lb-disks.json`) and hold only what cannot be
+re-derived from the filesystem: which disks are pinned, any note, and where each
+one was archived. An entry back at its defaults is dropped rather than written,
+so the file tracks decisions rather than growing a line per sandbox that ever
+booted. A corrupt or unreadable file is logged and **not** fatal — the worst
+case is a missed `retain` flag, and the sweep's other four guards still hold.
 
 ## CLI
 
@@ -188,6 +209,23 @@ curl -XDELETE localhost:9090/deployments/demo   # drain and reap every VM
 curl localhost:9090/healthz
 curl localhost:9090/metrics              # metrics snapshot (JSON)
 curl localhost:9090/certs                # issued TLS certificates and expiry
+curl localhost:9090/security             # security findings + the block rules in force
+curl localhost:9090/disks                # every per-sandbox disk on this host
+
+# Disk management. See "Disk management" — purging deletes gigabytes with no undo.
+curl -XPATCH localhost:9090/disks/sb-abc123 -H 'content-type: application/json' \
+  -d '{"retain": true, "note": "holds the demo database"}'   # pin against expiry
+curl -XPOST localhost:9090/disks/sb-abc123/archive -H 'content-type: application/json' \
+  -d '{"purge": true}'                                       # stream to S3, then reclaim
+curl -XDELETE localhost:9090/disks/sb-abc123                 # reclaim now
+curl -XDELETE 'localhost:9090/disks/sb-abc123?force=1'       # ...even if a deployment claims it
+curl -XPOST localhost:9090/disks/sweep                       # run the expiry sweep now
+
+# Refuse traffic. See "Response actions"; an empty match is rejected, and these
+# rules are never applied to this admin API.
+curl -XPOST localhost:9090/security/rules -H 'content-type: application/json' \
+  -d '{"action":"block","match":{"client":"203.0.113.9"},"expires_in_secs":3600}'
+curl -XDELETE localhost:9090/security/rules/5f295e1a86f2
 
 # Edit a deployment in place (full spec). The pool is preserved unless the `vm`
 # template changes, in which case the VMs are rebuilt.
@@ -292,8 +330,12 @@ deployment — commands run in a directory on the app-lb host:
 `serverctl update docs` runs them and then checks the site is still servable —
 that `index` is actually in `root`. A build that exits 0 but writes its output
 somewhere else fails the job, rather than leaving a deployment that 404s
-everything. (`build` and `artifact` are rejected on a site: there is no image and
-no pool.)
+everything. (`build` is rejected on a site: there is no image and no pool.)
+
+This needs the toolchain on the app-lb host. The alternative is
+[`artifact`](#pulling-a-site-from-an-artifact-store), which unpacks a bundle
+somebody else built and needs nothing installed here — a site takes one or the
+other, never both.
 
 Scaling, eviction, `exec` and `shell` all do not apply and are rejected with a
 message saying so. A site is only reachable through the proxy, so it needs at
@@ -519,6 +561,52 @@ first, so only a real change to *who* may enter invalidates anything.
 deployment before app-lb sets them, so a client cannot present its own
 `x-auth-request-email`.
 
+### One sign-in across several deployments
+
+By default the session cookie is scoped to the hostname that set it. That is the
+safe default and it has an obvious cost: opening `docs.example.com` and then
+`api.example.com` — say from the [directory](#directory) — sends you back to
+Google in between, because the second host has nothing to present.
+
+Set `auth.cookie_domain` on both gates to make them one realm:
+
+```json
+"auth": {
+  "provider": "google",
+  "client_id": "…apps.googleusercontent.com",
+  "client_secret": {"secret": "google-oauth", "key": "client_secret"},
+  "allowed_domains": ["example.com"],
+  "cookie_domain": "example.com"
+}
+```
+
+One sign-in then covers every deployment under `example.com`, and the directory's
+cards open without a round trip.
+
+**A wider cookie is not a weaker check.** A session is still refused unless the
+gate presenting it has a byte-identical policy — provider, client id, both
+allow-lists, and this field. Two gates share a session only when either would
+have admitted the same person anyway; a neighbour with a narrower `allowed_emails`
+refuses the cookie and starts its own sign-in. Turning the realm on also changes
+the fingerprint, so a host-only session cannot be replayed at a realm gate or
+the other way round.
+
+**What you are accepting.** A cookie scoped to `example.com` is sent to *every*
+host under it, including ones app-lb does not serve. If anything else on that
+domain is untrusted — a customer subdomain, a legacy box — this hands it a live
+session cookie. `HttpOnly` keeps scripts off it; nothing keeps a server on that
+domain off it. That is why it is opt-in and per-gate rather than a global
+setting.
+
+The value must have at least two labels and must be a parent of the hostnames the
+deployment serves; registration refuses anything else, because a cookie the
+browser silently discards produces a sign-in that loops forever with nothing in
+any log to explain it. It is not checked against the public suffix list, so
+`co.uk` is accepted and would simply never be sent — don't.
+
+There is no way to widen a session across *different* registrable domains. That
+is a browser rule, not an app-lb one.
+
 ### Limits
 
 - **One provider.** Google only; `provider` exists so a spec written today still
@@ -561,14 +649,27 @@ deployment before app-lb sets them, so a client cannot present its own
   — gets a `401` and no numbers ever appear. See
   [Putting the dashboard behind Google](#putting-the-dashboard-behind-google).
 
-## Building images from git
+## Building images from a Dockerfile
 
 A managed deployment can say where its guest image *comes from*, not just what it
-is called. Add a `build` block naming a git repo and a Dockerfile, and
-`POST /deployments/:id/build` will check the repo out on the app-lb host, hand
-the Dockerfile to `heyvm mvm build`, and — when that succeeds — rewrite the
-deployment's `vm.image` to the image it produced, which recycles the pool onto
-it.
+is called. Add a `build` block, and `POST /deployments/:id/build` will get a
+Dockerfile onto the app-lb host, hand it to `heyvm mvm build`, and — when that
+succeeds — rewrite the deployment's `vm.image` to the image it produced, which
+recycles the pool onto it.
+
+Two places the Dockerfile can come from, and exactly one of them may be set:
+
+| | `build.repo` | `build.store` |
+|---|---|---|
+| the recipe is | in a git checkout | a manifest in an artifact store |
+| `build.ref` pins | a commit | a manifest digest — recipe *and* context |
+| `build.ref` unset | follows the default branch | rejected; a store has no default |
+| `build.auth` is | a git token | the store's `ART_API_KEY` |
+| needs on this host | `git` | nothing extra |
+
+Both run `heyvm mvm build` and both produce an image that did not exist before,
+which is what separates either from [`artifact`](#pulling-images-from-an-artifact-store)
+— there the digest names a finished rootfs and nothing is built at all.
 
 ```jsonc
 {
@@ -623,6 +724,45 @@ the daemon only looks under *its own* home — so app-lb should run as the same
 user as `heyvmd`, or be given `APP_LB_HEYVM_HOME`. Otherwise the build succeeds
 and then nothing boots.
 
+**Builds need the `docker` group.** `heyvm mvm build` shells out to `docker`,
+whose socket is `root:docker` at `0660`, and the
+[supervisord unit](deploy/supervisor/README.md) runs app-lb as a non-root user
+that is not in that group — so the first build on a fresh host dies with
+`permission denied while trying to connect to the Docker daemon socket`. Add it
+(`usermod -aG docker app-lb`) and then **restart the program**, not just the
+config: supervisord resolves the group list when it forks the child, so a
+`reread`/`update` leaves the running process without it. Grant it only where
+builds actually run — the socket starts containers as root on request, so the
+group is root-equivalent and hands back most of what the non-root user was for.
+A host that only [pulls images](#pulling-images-from-an-artifact-store) needs
+none of this.
+
+**Builds need a home directory, before they need anything else** — and the
+service user does not have to have `HOME` set to end up with one. `docker` keeps
+its client state in `$HOME/.docker`, but when `HOME` is unset it resolves the
+home directory by reading `/etc/passwd` for its own uid instead of giving up. So
+the home *string* comes from the passwd entry that `useradd` writes from
+`/etc/default/useradd` (`HOME=/home` + the username), and `--no-create-home` —
+what the [supervisord setup](deploy/supervisor/README.md) does — suppresses only
+the `mkdir`, not the field. The result is a build that dies before reading a
+single Dockerfile instruction with `Docker build failed: ERROR: mkdir
+/home/app-lb: permission denied`: `/home` is root-owned, so the user cannot
+create the home its own passwd entry names.
+
+This bites under supervisord in particular because supervisord never sets
+`HOME`. It copies its own environment to the child verbatim and reads the passwd
+record only for uid/gid, so a supervisord started by systemd without `User=`
+hands the child no `HOME` at all. The corroborating symptom is in app-lb's own
+startup log — with `HOME` unset it cannot resolve the images directory either,
+and warns `neither MVM_DATA_DIR nor HOME is set`.
+
+Either give the user a real home
+(`install -d -o app-lb -g app-lb /home/app-lb`) or set `APP_LB_HEYVM_HOME`,
+which app-lb passes to the heyvm child as an explicit `HOME` and docker prefers
+over the passwd lookup. Prefer the latter where possible: it is the same
+variable the image-placement problem above wants set, and pointing it at
+heyvmd's home settles both at once.
+
 **Image names carry the commit.** Each build produces `<name>-<short sha>`
 (`<name>` defaults to the deployment id, override with `build.image_name`), so
 the running spec answers "what is deployed?" with something you can look up in
@@ -644,6 +784,63 @@ A static (`upstreams`) deployment cannot have a `build` block: it has no guest
 image, it forwards to something somebody else runs. Its update path is
 [`update`](#updating-a-static-deployment) instead, and declaring the wrong one is
 rejected at registration.
+
+### Building a Dockerfile out of the artifact store
+
+The recipe does not have to live in a repo. `art dockerfile put` stores a
+Dockerfile — and, optionally, the build context it copies from — as a
+`heyvm.dockerfile.v1` manifest, and `build.store` points a deployment at it:
+
+```jsonc
+{
+  "id": "web",
+  "vm": {"driver": "firecracker", "image": "web-30fea8aa436f", "port": 8080},
+  "build": {
+    "store": "http://art.internal:8080",   // an `art serve` URL, or an absolute store root
+    "ref": "web-rootfs",                   // a tag, or a manifest digest
+    "image_size_mb": 4096,                 // omit to use the manifest's own default
+    "auth": {"secret": "art", "key": "key"}  // the store's ART_API_KEY; omit if it is open
+  }
+}
+```
+
+Push one from a workstation and point a deployment at it:
+
+```sh
+serverctl artifact push-dockerfile ./Dockerfile --build-context . --tag web-rootfs
+serverctl set build web --store http://art.internal:8080 --ref web-rootfs
+serverctl build web --wait
+```
+
+**What this buys over a repo.** A git ref pins a commit and the Dockerfile is
+whatever that commit happens to hold; a store ref resolves to a manifest digest
+covering the recipe, the context *and* the build defaults together. So a build
+can name its exact inputs, and a rollback is expressible — a tag moves, a digest
+does not. It also builds a deployment whose source is not in a repo app-lb can
+reach, without giving the LB a git credential.
+
+**What it does not buy.** The build still runs here, and still takes as long as
+`docker build` does. If the point is to stop building on every host, push the
+*image* instead — that is [`artifact`](#pulling-images-from-an-artifact-store).
+
+**The layout on disk.** The recipe lands in
+`<work_dir>/<deployment>/.recipe/Dockerfile` and the context is unpacked into
+`<work_dir>/<deployment>/.recipe/context/`, which is what `-c` is pointed at. The
+directory is **emptied first**, and the archive is deleted after unpacking:
+otherwise a file from a previous build could satisfy a `COPY` the current recipe
+no longer ships — the same failure `git clean -xffdq` prevents on the repo path,
+arriving by a different route. For the same reason the `Dockerfile` sits *beside*
+the context rather than in it, so a `COPY` cannot reach it.
+
+**Image names carry the manifest digest**, the way a repo build's carry the
+commit: `<name>-<12 hex>`. Both are the input's identity, not the output's — a
+`docker build` is not reproducible, so the image is named after what it was made
+*from*.
+
+**Context contents are refused, not sanitized.** The archive is unpacked under
+the same rules as a site bundle: no absolute paths, no `..`, and no symlinks,
+hardlinks or devices. `docker build` itself would allow a symlink; a build
+context arriving over a wire is exactly the untrusted input that rule exists for.
 
 ## Pulling images from an artifact store
 
@@ -740,6 +937,73 @@ an `artifact` block either, for the same reason it cannot have a `build`.
 The CLI side is `serverctl pull` and `serverctl set artifact`, plus
 `serverctl artifact` for talking to the store itself — see
 [`serverctl/README.md`](serverctl/README.md#artifact-stores).
+
+### Pulling a site from an artifact store
+
+A [site](#static-sites) reads the same `artifact` block, and it is the one deploy
+path that needs **nothing installed on this host** — no git, no node, no bun, no
+Docker. The bundle is a `tar` (or `tar.gz`) of the built site; app-lb fetches it,
+verifies it, unpacks it and swaps it into `site.root`.
+
+```jsonc
+{
+  "id": "marketing",
+  "routes": [{"host": "example.com"}],
+  "site": {"root": "/srv/marketing/public", "index": "index.html"},
+  "artifact": {
+    "store": "/srv/artifacts",
+    "ref": "marketing-live",
+    "strip_components": 1    // drop the `dist/` the bundle wraps everything in
+  }
+}
+```
+
+Build wherever you like — CI, a laptop, a VM — and push the result:
+
+```sh
+tar czf dist.tgz -C dist .                       # no wrapper: strip_components 0
+art put dist.tgz --tag marketing-live            # or `art put -` from a pipe
+curl -XPOST localhost:9090/deployments/marketing/pull
+```
+
+Everything above about tags, digests, transports and `force` applies unchanged.
+What differs is the ending, and it is the better one: there is no image to name
+and no pool to recycle, so a site pull has no cold start and no capacity dip. The
+files are simply the files, and the next request reads the new ones.
+
+**Nothing goes live until it is known good.** The order is fetch → verify digest
+→ unpack *beside* the live tree → confirm the index is there → swap. Every way a
+deploy can fail therefore fails with the previous site still serving, which is
+the one thing `git pull && npm run build && mv -T dist public` cannot promise.
+The swap itself is two renames in one directory, and the tree it replaces is kept
+until the new one is in place.
+
+**`strip_components` is the field you will need.** `tar czf dist.tgz dist` writes
+every entry as `dist/…`, which would put the index at `<root>/dist/index.html`
+and 404 the whole site. Set `1` to drop the wrapper — and if you forget, the job
+fails *before* the swap with a message naming the directory it found and the
+number to set. A bundle rolled with `tar czf dist.tgz -C dist .` needs nothing.
+
+**A bundle may only contain files and directories.** Symlinks, hardlinks, devices
+and any path with a `..` or a leading `/` are refused rather than sanitized —
+whoever can write to the store decides what lands on this host. Permissions are
+not taken from the archive either, so a bundle cannot ship something setuid.
+
+**Re-pulls are free.** The deployed digest is recorded in `.<root>.artifact`
+*beside* the root (never inside it, where it would be servable), so pulling a
+digest already serving is a resolve and nothing else. `{"force": true}` unpacks
+anyway.
+
+**`update` and `artifact` are mutually exclusive on a site**, for the reason
+`build` and `artifact` are on a VM: both write the files under `site.root`, so a
+site with both has no answer to where what it serves came from. Build on this
+host, or unpack a bundle built elsewhere. `grow_gb` and `image_name` are rejected
+on a site (there is no rootfs to grow or name), and `strip_components` is
+rejected off one (a rootfs is one file, and nothing unpacks it).
+
+A site pull's job record carries `site_root` and `files` where a rootfs pull
+carries `image`. `bytes` is what crossed the wire, so `0` from a local store is
+normal — `art get` hardlinks the blob rather than copying it.
 
 ## Updating a static deployment
 
@@ -967,15 +1231,23 @@ edge-1                                      Dashboard  Metrics  Theme
 4 URLs across 3 deployments. 1 with nothing healthy behind it.
 
 ┌────────────────────────────┐ ┌────────────────────────────┐
-│ api                 static │ │ docs                  site │
-│ http://api.example.com     │ │ http://docs.example.com    │
-│ ● 2 of 2 upstreams up      │ │ ● serving /srv/docs        │
+│ api                 static │ │ private     sign-in    vm  │
+│ http://api.example.com     │ │ http://private.example.com │
+│ ● 2 of 2 upstreams up      │ │ ● 2 VMs ready              │
 └────────────────────────────┘ └────────────────────────────┘
 ```
 
 **Server-rendered**, unlike the dashboard: the page is complete in its first
 response, works with JavaScript off, and holds no polling connection open. The
 only script on it is the theme toggle. Reload to refresh.
+
+The theme is stored in `localStorage` under one key shared by all four pages, so
+a choice survives a reload and follows you between `/`, `/dashboard`, `/siem` and
+`/storage` — a theme belongs to the operator, not to the page. It is re-applied
+by a small script in `<head>`, before the body exists, so a stored preference
+never costs a frame painted in the wrong theme. With storage unavailable (a
+private window, or a page opened over `file://`) the toggle still works for the
+session and falls back to `prefers-color-scheme`.
 
 A card per *URL* rather than per deployment, because a deployment with three
 hostnames genuinely offers three places to go. Links point at the **data plane** —
@@ -994,6 +1266,12 @@ The dot reports whether following the link right now would reach anything:
 Scale-to-zero idling is deliberately not red. It is the configured state, and
 colouring it as a fault sends people debugging a system that is working.
 
+A **sign-in** badge marks a card behind [Google sign-in](#google-sign-in), so
+following it may bounce through the provider. Said before the click rather than
+after: it is the difference between "slow" and "broken". Set
+[`auth.cookie_domain`](#one-sign-in-across-several-deployments) across the fleet
+and that bounce happens once for the whole realm instead of once per card.
+
 A deployment whose routes use only `host_suffix` or `path_prefix` names no single
 hostname to link to, so it gets no card — and is listed by id underneath, with
 that reason. Omitting it silently would make "why isn't mine here?" unanswerable
@@ -1007,7 +1285,7 @@ app-lb routes. A deployment-scoped [app-token](#app-tokens) sees only its own.
 
 Open `http://<admin-addr>/dashboard` (default `http://127.0.0.1:9090/dashboard`)
 for a live view of the fleet — or [`/`](#directory) for a static index of what is
-running. The dashboard shows: host and per-VM CPU/memory, per-deployment pool
+running, or [`/siem`](#the-security-console) to work through security findings. The dashboard shows: host and per-VM CPU/memory, per-deployment pool
 utilisation and per-VM load, request latency (distribution + p50/p90/p99 and a
 client-derived requests/sec), cold-start times, and autoscaling activity. It is
 a single self-contained page — no external assets, so it works over an SSH tunnel
@@ -1061,7 +1339,7 @@ dashboard is a complete view of what app-lb holds rather than a metrics screen:
 
 | Section | Shows | Source |
 | --- | --- | --- |
-| Security | authentication abuse, attack signatures and traffic anomalies, newest first | `GET /security` |
+| Security | authentication abuse, attack signatures and traffic anomalies, newest first, plus any [block rules](#response-actions) in force — links to the [console](#the-security-console) at `/siem`, where they can be acted on | `GET /security` |
 | Deployments | pool gauges, per-VM load, **booting VMs with their age and daemon status** | `GET /metrics` |
 | Certificates | issued hostnames, issuer, expiry, renewal state — plus routed hostnames that have *no* certificate yet | `GET /certs` |
 | Secrets | ids, descriptions, key *names*, last update, whether the store is sealed | `GET /secrets` |
@@ -1122,6 +1400,181 @@ startup error, never a silently-open gate. `/healthz` is always open so probes
 keep working. The credentials are compared in constant time, but the admin
 listener is plain HTTP — terminate TLS in front of it, or reach it over an SSH
 tunnel, if it leaves localhost.
+
+## Disk management
+
+The daemon creates a directory of disk images per sandbox and only removes *some* of it when
+the sandbox is deleted. On a host that has been booting VMs for a few months that is tens of
+gigabytes nothing will ever reclaim. app-lb inventories it at `GET /disks`, shows it at
+`GET /storage`, and reclaims it on a timer.
+
+Where it accumulates:
+
+| Path | What it is | When the daemon removes it |
+| --- | --- | --- |
+| `<data>/run/<id>/data.ext4` | The Firecracker `/workspace` data disk | On delete, but **only if** the sandbox was created with `disk_size_gb` |
+| `<data>/run/<id>/snapshot/` | Memory/state checkpoint | **Never** when there was no data disk — `destroy()` unlinks the directory only inside its `data_disk_path.is_some()` branch, so a sandbox without one leaves the dir behind for good |
+| `<data>/kvm/<id>/` | The KVM driver's per-VM `rootfs.ext4` and `mount*.ext4` | On a *clean* delete, which removes the whole state dir. But these are ~1 GiB each, so anything that never got one — a crash, a lost daemon record, a VM nobody ran `heyvm rm` on — is the bulk of what is sitting there |
+| `/tmp/{firecracker,kvm}-<id>-*` | The per-boot scratch | On a clean `stop`. A hypervisor that dies leaves it behind |
+
+So only the second row is a delete-path bug. The rest is what a host looks like
+after months of VMs that did not all exit cleanly — nothing was ever going to
+come back for it, which is what the sweep below is for.
+
+app-lb can do this despite not owning those paths because it is *required* to run beside a
+local daemon — `guest_ip` exists nowhere else — so it shares the filesystem. It already writes
+into the daemon's image directory for artifact pulls. What it adds is the one thing the daemon
+cannot know: which sandboxes a deployment still expects to resume.
+
+Sizes are **allocated blocks**, not nominal size. A data disk is created sparse at its full
+size, so 8 GiB of `data.ext4` is usually a few hundred MiB on the host; the page shows both.
+
+### Alongside `heyvm prune`
+
+`heyvm prune` is the daemon's own cleanup, and the two do not overlap — run both.
+
+| | `heyvm prune` | app-lb |
+| --- | --- | --- |
+| `/tmp/{firecracker,kvm}-<id>-*` | **yes**, unconditionally | yes, but only for a sandbox that is not running |
+| `/tmp/firecracker-configs/` | yes | no |
+| `<data>/run/<id>/`, `<data>/kvm/<id>/` | **no** | **yes** — this is where the tens of gigabytes are |
+| Base images in `<data>/images/` | with `--images` | no |
+| Runs | when you run it | on a timer |
+
+The `/tmp` overlap is the interesting one. `heyvm prune` deletes every matching file with no
+liveness check, so running it while a Firecracker VM is up removes the rootfs that VM is
+serving from. app-lb refuses to touch scratch belonging to a running sandbox, which is why it
+still does that half itself rather than deferring to prune.
+
+Note also that **`heyvm prune --images` can delete an image a deployment still needs.** It
+keeps images referenced by a live or persisted *sandbox*, and a deployment scaled to zero has
+neither — so its `vm.image` looks unreferenced. The next scale-up then fails to boot. Re-run
+[`POST /deployments/:id/pull`](#pulling-images-from-an-artifact-store) or `build` to put it
+back, or keep one replica warm on deployments whose images matter.
+
+### Expiry
+
+A disk that no deployment claims and nobody pinned is reclaimed once it has gone untouched for
+`APP_LB_DISK_TTL_SECS` — **seven days by default**. This is on out of the box, so the first
+thing app-lb logs at startup is how much it is about to delete:
+
+```
+WARN disk expiry is ON: up to 105 of 116 sandbox disks on this host are already older
+     than the retention window and will be reclaimed by the first sweep, in 3600s.
+     Open /storage to review them, mark the ones to keep as retained, or set
+     APP_LB_DISK_TTL_SECS=0 to turn expiry off
+     disks=116 eligible=105 gib=18
+```
+
+The first sweep is a full interval away, not immediate, so that warning arrives with time to
+act on it. Four things hold a disk against expiry, at any age:
+
+- **the sandbox is running** — never reclaimed, and `?force=1` does not override it
+- **a deployment expects to resume it** — it is in that deployment's suspended list, which is
+  what `scaling.idle_action: retain` means
+- **marked retained** — an operator pinned it on `/storage` or through `PATCH /disks/:id`
+- **the daemon could not be reached** — see below
+
+That last one is the most important line in the feature. A daemon that is restarting answers
+neither listing, every disk on the host then looks like residue, and one sweep would delete the
+whole fleet's state. So the inventory reports `complete: false`, classifies everything as
+`unknown`, and the sweep declines to run at all.
+
+### Archiving a disk to S3
+
+With `APP_LB_DISK_ARCHIVE_BUCKET` set, a disk can be uploaded before it is reclaimed:
+
+```sh
+curl -XPOST localhost:9090/disks/sb-abc123/archive -H 'content-type: application/json' \
+  -d '{"purge": true}'
+```
+
+The pipeline is `tar --create --sparse --gzip` → `aws s3 cp -`, with app-lb holding the pipe.
+Streaming end to end and never one PUT: `aws s3 cp -` does a multipart upload, and `--sparse`
+means `tar` skips the holes rather than compressing gigabytes of zeros. A 20 GiB sparse rootfs
+becomes an object of tens of megabytes without either process holding it in memory.
+
+app-lb sits in the middle of the pipe rather than letting a shell join the two, because there
+is no shell to quote into, the byte counter behind the progress bar has to come from somewhere,
+and a `tar` that outlives a failed upload has to be killed rather than left blocked on a pipe.
+
+`purge: true` reclaims the disk **only** if the upload succeeds. The archive returns as soon as
+it starts; progress arrives on `GET /disks` next to the inventory, which is what the page polls
+anyway. `APP_LB_DISK_ARCHIVE_ON_EXPIRE=1` applies the same thing to the sweep.
+
+The key is `<prefix>/<sandbox-id>/<unix-ts>.tar.gz`, timestamped so re-archiving never
+overwrites the copy already in the bucket. Paths inside are relative (`run/<id>`, `kvm/<id>`),
+so restoring is `tar -xzf` into a data directory. Credentials come from the `aws` CLI's own
+chain — env, `~/.aws/credentials`, or an instance role — exactly as they do for DNS-01.
+
+An archive killed by `APP_LB_DISK_ARCHIVE_TIMEOUT_SECS` abandons its multipart upload. A
+lifecycle rule on `AbortIncompleteMultipartUpload` is the usual way to clean those up.
+
+### Purging
+
+`DELETE /disks/:id` asks the daemon to delete the sandbox — so its own cleanup runs and its
+record goes away — and then removes whatever it left behind. A daemon that refuses, or that has
+already forgotten the sandbox, is not fatal: residue is exactly what the daemon cannot see.
+
+`?force=1` overrides the "a deployment expects to resume it" and "the daemon is unreachable"
+guards, and drops the claim so the next scale-up does not spend a resume on a sandbox whose
+disks are gone. It does **not** override the running check. Deleting disks out from under a
+live hypervisor corrupts the guest rather than freeing anything, and the actual intent — stop
+it, then reclaim it — is two clicks away on the dashboard.
+
+Sandbox ids arrive as URL path segments and end up joined to `remove_dir_all`, so they are
+validated against `[A-Za-z0-9_-]+` and *refused* rather than sanitized. Every path is then
+constructed from the configured roots and that validated id, never taken from the inventory —
+so no request, and no stale inventory, can direct a delete outside the two directories app-lb
+manages.
+
+**app-lb has to be able to write to the daemon's data directory.** Listing a disk needs only
+read and traverse; *deleting* one needs write on the directory holding it. A host where heyvmd
+runs as one user and app-lb as another (the supervisord unit runs it as `app-lb`) will happily
+show the whole inventory and then be unable to reclaim any of it — the common shape is a data
+directory at mode `755`/`775` owned by the daemon's user. Add app-lb's user to that group, or
+give it ownership of `run/` and `kvm/`.
+
+A purge that removes **nothing** while at least one path failed is a `500`, not a success with
+`0` bytes freed — the disks are still there and still counted, and reporting that as a completed
+purge is how a sweep comes to claim a thousand disks reclaimed on a host that never got emptier.
+A *partial* failure stays a success: the bytes that went are gone, `removed` and `failed` both
+come back on the response, and it logs at `warn` with the paths. A clean purge logs at `info`
+with the count it actually removed.
+
+### Reusing VMs instead of recreating them
+
+The other half of the same problem: every new sandbox is a new directory. app-lb already
+prefers resuming a suspended VM over booting a fresh one, but a VM it had *lost track of* — an
+LB restart, a crash between the stop and the state write — used to be destroyed, and the next
+scale-up would mint a new sandbox id while the old one's disks stayed on the host forever.
+
+A `retain` deployment now takes those back instead, up to `max_replicas`; only the surplus is
+destroyed. Reclaiming is deliberately limited to `idle_action: retain` — under `destroy` a
+stopped sandbox is one this LB already decided it did not want, and taking it back would
+quietly convert every deployment to `retain`.
+
+Note what a resume does and does not preserve, because the daemon decides this and not app-lb:
+a Firecracker sandbox keeps its `/workspace` data disk and **loses writes to its rootfs**,
+because mvm-ctrl recopies the rootfs from the base image on every cold boot. The KVM driver
+keeps a persistent per-VM `rootfs.ext4` and does not. Persistent state belongs under
+`/workspace` either way.
+
+### The console
+
+`GET /storage` renders the inventory: totals, what is reclaimable right now, and a row per
+sandbox with its state, size, age, when it expires or why it will not, and the files behind the
+number. The buttons pin, archive and purge. It polls `/disks` every five seconds so an archive
+in flight has a live progress bar.
+
+The inventory is view-tier — the same credentials as `/dashboard` and `/metrics` — and every
+route that *changes* something is CRUD-tier. Both are fleet-wide: a deployment-scoped app-token
+is refused, because a disk inventory spans deployments and includes sandboxes no deployment
+owns any more.
+
+`~/.heyo/sandboxes/<id>/` is deliberately **not** touched. It is the daemon's own metadata
+store, it is small (single-digit MB across a whole host), and deleting a daemon's persistence
+records to reclaim 23 KB is not a trade worth making.
 
 ## Clients
 
@@ -1520,12 +1973,16 @@ it held. Retiring the single VM that is somebody's working directory should not.
 | Memory | gone | gone |
 | Next scale-up | boots a fresh VM | resumes this one |
 
-**Read the rootfs row again.** `retain` does not preserve the root filesystem,
-and cannot: mvm-ctrl gives each VM a private rootfs copy under `/tmp` and
-**recopies it from the base image on every cold boot**. The only thing that
-survives a stop is the persistent data disk at `~/.heyo/run/<id>/data.ext4`,
-attached as `/dev/vdb` and mounted at `/workspace` — and that disk only exists
-if `vm.disk_size_gb` is set.
+**Read the rootfs row again.** On Firecracker, `retain` does not preserve the
+root filesystem, and app-lb cannot make it: mvm-ctrl gives each VM a private
+rootfs copy under `/tmp`, removes it on `stop`, and **recopies it from the base
+image on every cold boot**. The only thing that survives a stop is the
+persistent data disk at `~/.heyo/run/<id>/data.ext4`, attached as `/dev/vdb` and
+mounted at `/workspace` — and that disk only exists if `vm.disk_size_gb` is set.
+
+(The KVM driver is the exception: it keeps a per-VM `~/.heyo/kvm/<id>/rootfs.ext4`
+across stop/start and reuses it. Fixing Firecracker to match is a daemon change,
+not one app-lb can make — every boot goes through mvm-ctrl's `start_vm`.)
 
 So a `retain` deployment is only meaningfully stateful when both hold:
 
@@ -1544,8 +2001,18 @@ a stopped sandbox from `GET /sandboxes`, so it is invisible to the fleet list th
 autoscaler reconciles against, and its TTL does not run while it is stopped. Its
 id is therefore written into the deployment's state file the moment it is
 stopped. Deregistering a deployment destroys its suspended VMs, and a slow sweep
-(every 5 minutes) destroys any stopped VM of ours that no deployment claims —
+(every 5 minutes) reconciles any stopped VM of ours that no deployment claims —
 the residue of a crash between stopping a VM and recording that we did.
+
+**That sweep reclaims before it destroys.** A `retain` deployment that finds one
+of its own stopped sandboxes unclaimed has, by definition, lost track of a VM it
+asked to keep, and destroying it means the next scale-up creates a new sandbox
+— new id, new directory under the daemon's data dir, fresh rootfs — while the
+old one's disks stay on the host forever. So it is taken back into the
+deployment's suspended list, up to `max_replicas`, and only the surplus is
+destroyed. A `destroy` deployment's stopped VMs are still destroyed: that one
+was already decided. Whatever *does* get destroyed leaves disks behind, which is
+what [disk management](#disk-management) is for.
 
 A scale-up prefers resuming a suspended VM over creating one, and not only to
 save time: creating a fresh VM while one sits stopped would strand that VM's
@@ -1835,9 +2302,17 @@ follow, and this is what fixes them:
 - **Anomalies were only visible to somebody watching** the right dashboard card
   at the right moment.
 
+A fourth followed once the first three were fixed: **a finding with no answer to
+"and now what?" is a notification, not a control.** So detection comes with
+[response actions](#response-actions) — block an address, block a pattern of
+traffic, take it back off — and a [console](#the-security-console) at `/siem`
+where each alert carries its runbook and a rule that is already filled in.
+
 It is **on by default** — unlike log shipping, it needs no external service to
 be useful, and a security feature you have to remember to enable protects
-nobody. `APP_LB_SIEM=0` turns it off.
+nobody. `APP_LB_SIEM=0` turns it off. Enforcement is separate and stays on
+regardless: a rule an operator created keeps working whether or not detection is
+running.
 
 Events are normalized through [`u-siem`](https://crates.io/crates/u-siem) into
 ECS field names (`source.ip`, `url.path`, `http.response.status_code`), so an
@@ -1884,7 +2359,8 @@ from one broken client retrying a single dead URL.
 
 The dashboard grows a **Security** card above the deployment table, and an
 **Alerts** tile beside the fleet totals so a critical finding is visible without
-scrolling. `GET /security` is the same data as JSON, behind the same gate as
+scrolling. The card links to the [console](#the-security-console) at `/siem`,
+which is where a finding can actually be acted on. `GET /security` is the same data as JSON, behind the same gate as
 `/metrics` — it names attacker addresses and the exact probes that reached the
 fleet, so it is never open when `/metrics` is not.
 
@@ -1922,6 +2398,182 @@ Every new alert also ships to app-obs under `source=security` when
 in-memory ring is the live view and app-obs is the durable one. An alert about
 the LB itself lands under `APP_LB_OBS_DEPLOYMENT`, like every other record that
 names no deployment.
+
+### The security console
+
+`GET /siem` is the page the Security card links to. The card summarises; the
+console is where a finding can be acted on, which is why they are two pages: the
+dashboard has to stay glanceable, and this needs the full alert list, the ECS
+fields behind each one, and buttons that change what the data plane does.
+
+Each finding carries a **runbook** and, where one exists, a rule that is already
+filled in:
+
+```
+high   SQL injection attempt in query parameter "id" from 203.0.113.9
+       203.0.113.9   demo   /search   ATT&CK T1190   web.sqli
+
+  ▾ Respond
+    CHECK FIRST
+      · Check the status this got: a 404 means it found nothing, a 200 means it
+        did and the block is the second thing to do.
+      · The alert names the parameter, never the value — app-lb does not store
+        query strings. The upstream's own log is where the payload is.
+    ACT
+      [ Block 203.0.113.9 for 24 hours ]  Every request from 203.0.113.9 to the
+                                          data plane is refused with a 403 for
+                                          24 hours, then the rule expires on its
+                                          own. The admin API is not affected.
+      [ Block 203.0.113.9 on demo only ]  …
+```
+
+Each action carries a lifetime picker, pre-set to what the runbook suggested and
+offering **Forever** as the last option. The confirmation states which one is
+about to apply, and only `forever` gets an extra prompt of its own.
+
+Below the findings, **Rules in force** answers the other question — whether any
+of this is working:
+
+```
+ENFORCEMENT     ╭──╮                     519
+   refused    ──╯  ╰──────                519 requests refused in the last 60 minutes
+   exempted   ─────────────
+
+Action  Matches                   Hits   Last 60m      Last     Expires
+block   from 203.0.113.9          1,412  ▁▃▅█▅▃▁       30s ago  in 22h    [Change to…] [Set] [Remove]
+block   path containing /wp-admin     0  no hits       —        never     [Change to…] [Set] [Remove]
+allow   from 10.0.0.0/8              87  ▁█▁▃▁█▃▁      1m ago   never     [Change to…] [Set] [Remove]
+```
+
+That middle row is the one to act on: a rule being checked on every request and
+refusing nothing. **Set** applies the chosen lifetime to an existing rule and
+keeps its hit history, which re-posting the rule would reset.
+
+Those buttons post the exact body shown, so what an operator reads and what the
+server applies cannot drift. The advice is derived server-side and served on
+`/security`, which means `serverctl`, a script or another client gets the same
+answers rather than reimplementing them.
+
+The console is **view tier**, like the dashboard — the browser's existing
+credentials work. The buttons post to the **CRUD tier**, so a view-only
+[app-token](#app-tokens) can read the console and cannot arm it. The page says so
+when that happens instead of failing silently.
+
+### Response actions
+
+Detection is advisory and runs off the request path. Enforcement is
+authoritative and runs *on* it. A rule is a conjunction of literal conditions —
+all present ones must match, absent ones are not checked:
+
+```sh
+# Block one address for an hour.
+curl -su admin:s3cret localhost:9090/security/rules -X POST \
+  -H 'content-type: application/json' \
+  -d '{"action":"block","match":{"client":"203.0.113.9"},"expires_in_secs":3600}'
+
+# Block a probe path across the fleet, for a week.
+curl -su admin:s3cret localhost:9090/security/rules -X POST \
+  -H 'content-type: application/json' \
+  -d '{"action":"block","match":{"path_prefix":"/wp-login.php"},"expires_in_secs":604800}'
+
+# Never block our own monitoring, whatever else gets created later.
+curl -su admin:s3cret localhost:9090/security/rules -X POST \
+  -H 'content-type: application/json' \
+  -d '{"action":"allow","match":{"client":"10.0.0.0/8"},"note":"internal monitoring"}'
+
+curl -su admin:s3cret localhost:9090/security | jq .rules
+curl -su admin:s3cret localhost:9090/security/rules/5f295e1a86f2 -X DELETE
+
+# Change when a rule expires. `null` keeps it indefinitely; the hit history
+# carries over, unlike re-posting the rule.
+curl -su admin:s3cret localhost:9090/security/rules/5f295e1a86f2 -X PATCH \
+  -H 'content-type: application/json' -d '{"expires_in_secs":null}'
+```
+
+`expires_in_secs` is **required** on that `PATCH` — omitting it is a 400, not
+"forever". Making a block permanent by forgetting a field is exactly the
+accident the field exists to prevent.
+
+| `match` field | Matches |
+| --- | --- |
+| `client` | An address or CIDR: `203.0.113.9`, `203.0.113.0/24`, `2001:db8::/32` |
+| `host` | The request's hostname, exactly |
+| `deployment` | The deployment it routed to |
+| `path_prefix` / `path_contains` | The path, literally |
+| `method` | `GET`, `POST`, … |
+| `user_agent_contains` | A substring of `User-Agent`, case-insensitively |
+
+An `allow` rule beats a `block` rule whichever was created first, so
+"block that /16 except our own health checker" needs no reasoning about
+precedence during an incident. Rules are content-addressed: re-posting the same
+conditions replaces the rule rather than stacking a second copy, which is how a
+block about to expire gets extended.
+
+Four things keep this from becoming the outage it was meant to prevent:
+
+* **An empty match is refused.** `{}` is a conjunction of nothing, true of every
+  request — one click would take the whole data plane down.
+* **The admin API is never guarded.** However badly you block yourself out of
+  the data plane, the page that deletes the rule is still reachable. Nothing
+  should ever be added that changes this.
+* **Rules expire by default.** Every action the console suggests carries a
+  lifetime, because the realistic failure is not a missing block, it is a
+  permanent one that outlives the attack and quietly breaks a customer months
+  later. Client blocks are short — an address is a lease, and behind CGNAT it
+  belongs to somebody else by tomorrow — and path blocks are long, because a
+  path pattern never changes hands. A rule *can* be kept forever: the picker
+  beside each action offers it, and the rules table can change an existing
+  rule's lifetime. Both make you confirm, and only for `forever` — that is the
+  one choice with no natural end.
+* **`APP_LB_GUARD_ENFORCE=0` is a dry run.** Rules match, count hits and log
+  `would have refused this request`, and nothing is turned away. That is how a
+  broad rule gets deployed sanely: watch what it would have caught for an hour
+  first.
+
+Rules are **persisted** to `APP_LB_GUARD_PATH`, unlike alerts. A restart that
+silently readmits an attacker somebody blocked during an incident is a worse
+failure than losing the finding that prompted it.
+
+#### Are the rules doing anything?
+
+Every rule is scanned on every request that reaches the data plane, so a rule
+that stopped matching is pure cost. `GET /security` reports hits per minute over
+the last hour — per rule as `hits_recent`, and fleet-wide as `guard
+.blocked_recent` / `guard.exempted_recent`, with `hits_bucket_secs` and
+`hits_window_secs` saying how to read them. The console charts both: a headline
+line of refusals, and a sparkline per rule.
+
+An all-zero series is a **finding, not an absence** — the console says *no hits*
+rather than drawing a flat line, because a rule refusing nothing is the one worth
+removing. That is also the shape of a rule that never worked: a `client` block
+that silently matches nothing on a dual-stack listener looks identical to an
+attack that stopped.
+
+Three properties worth knowing:
+
+* **In-memory only.** The series describes this process, so it is absent from
+  the persisted rule file and starts empty after a restart. `hits` — cumulative
+  since the rule was created — is the number that survives, and the number to
+  trust.
+* **Approximate at bucket boundaries.** The ring is written from the request
+  path under exactly the conditions where a lock is worst: a rule matching every
+  request from an address currently flooding the LB. A hit landing while the ring
+  rolls is dropped rather than paid for. Use `hits` for anything that has to add
+  up.
+* **Counted in the dry run too.** `APP_LB_GUARD_ENFORCE=0` charts what *would*
+  have been refused, which is the point of the dry run.
+
+**No regular expressions**, deliberately. A rule is written under time pressure
+and evaluated on every request; a pathological pattern would turn the mitigation
+into the incident. The regex-shaped matching lives in the detector, which runs
+off the hot path and can afford it. With no rules configured the whole thing is
+one `is_empty` check.
+
+Two limits worth knowing: certificate renewal cannot be broken by a rule,
+because an outstanding ACME `http-01` challenge is answered before the guard
+runs; and a rule cannot stop an attack on the admin API, since that plane is
+never guarded — the console says so on every auth finding rather than offering a
+button that appears to work.
 
 ### The query string
 
@@ -1986,9 +2638,12 @@ input on the failure path for no detection gain.
 question with a different answer; the [deploy-job records](#shipping-logs-to-app-obs)
 and app-lb's own events already cover it.
 
-**No persistence.** The ring and the windows are in memory, so a restart resets
-both. That is the right trade for a load balancer, and the reason
+**No persistence — for findings.** The ring and the windows are in memory, so a
+restart resets both. That is the right trade for a load balancer, and the reason
 `APP_LB_SIEM_SHIP` defaults on: app-obs holds the copy that outlives the process.
+[Block rules](#response-actions) are the deliberate exception and *are* written
+to disk: losing a finding costs you a record of something that already happened,
+while losing a rule readmits an attacker somebody blocked on purpose.
 
 **No IPv6 escape by rotation.** Sources are keyed by /32 for IPv4 and by **/64**
 for IPv6, because a /64 is a standard end-site allocation and an attacker

@@ -44,6 +44,16 @@ pub enum ArtifactCmd {
     /// Upload an ext4 rootfs and tag it, so deployments can pull it.
     Push(PushArgs),
 
+    /// Upload a Dockerfile (and its build context) and tag it, so deployments
+    /// can *build* it.
+    ///
+    /// The counterpart of `push`, one step earlier: `push` ships an image
+    /// somebody already built, this ships the recipe and lets app-lb build it on
+    /// the host that will run it. Point a deployment at it with
+    /// `serverctl set build --store <url> --ref <tag>`.
+    #[command(visible_alias = "push-df")]
+    PushDockerfile(PushDockerfileArgs),
+
     /// List the store's tags — the images a deployment can name.
     #[command(visible_alias = "tags")]
     Ls,
@@ -166,6 +176,53 @@ pub struct PushArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct PushDockerfileArgs {
+    /// Path to the Dockerfile.
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Build context: a directory to pack, or an existing `.tar`/`.tar.gz`.
+    /// Omit for a recipe that copies nothing in.
+    ///
+    /// Spelled `--build-context` rather than `--context` because `--context` is
+    /// a global flag that selects the saved app-lb context. Same name `set
+    /// build` uses, for the same collision. (`art dockerfile put` has no such
+    /// clash and spells it `--context`.)
+    #[arg(long = "build-context", value_name = "PATH")]
+    pub build_context: Option<PathBuf>,
+
+    /// Tag to point at the manifest. Defaults to the Dockerfile's directory
+    /// name, which is usually the project.
+    #[arg(long, value_name = "NAME")]
+    pub tag: Option<String>,
+
+    /// Upload and write a manifest, but move no tag. The manifest digest is
+    /// printed, and a deployment can name it directly — which is what pinning a
+    /// build to exact inputs looks like.
+    #[arg(long, conflicts_with = "tag")]
+    pub no_tag: bool,
+
+    /// Default name for the image this builds. `build.image_name` on the
+    /// deployment overrides it.
+    #[arg(long, value_name = "NAME")]
+    pub image_name: Option<String>,
+
+    /// Default rootfs size in megabytes. `build.image_size_mb` on the deployment
+    /// overrides it.
+    #[arg(long = "size-mb", value_name = "MB")]
+    pub image_size_mb: Option<u64>,
+
+    /// Provenance note recorded on the manifest. Part of its address, so two
+    /// pushes differing only here are two manifests.
+    #[arg(long, value_name = "TEXT")]
+    pub source: Option<String>,
+
+    /// Upload even if the store already reports holding these bytes.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct DescribeArgs {
     /// A tag or a digest.
     #[arg(value_name = "REF")]
@@ -188,6 +245,7 @@ pub fn run(globals: &GlobalOpts, opts: &RegistryOpts, cmd: &ArtifactCmd) -> Resu
 
         ArtifactCmd::Login(args) => login(globals, args),
         ArtifactCmd::Push(args) => push(globals, opts, args),
+        ArtifactCmd::PushDockerfile(args) => push_dockerfile(globals, opts, args),
         ArtifactCmd::Ls => ls(globals, opts),
         ArtifactCmd::Describe(args) => describe(globals, opts, args),
         ArtifactCmd::Usage => usage(globals, opts),
@@ -538,6 +596,221 @@ fn push(globals: &GlobalOpts, opts: &RegistryOpts, args: &PushArgs) -> Result<()
     Ok(())
 }
 
+// -- push-dockerfile -------------------------------------------------------
+
+fn push_dockerfile(
+    globals: &GlobalOpts,
+    opts: &RegistryOpts,
+    args: &PushDockerfileArgs,
+) -> Result<()> {
+    let meta = std::fs::metadata(&args.file)
+        .with_context(|| format!("reading {}", args.file.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a file", args.file.display());
+    }
+    artifact::check_dockerfile_size(&args.file, meta.len())?;
+
+    // Resolved before anything is packed or uploaded. A name the store would
+    // refuse should not cost a context pack first.
+    let tag = if args.no_tag {
+        None
+    } else {
+        let t = match &args.tag {
+            Some(t) => t.clone(),
+            None => default_recipe_tag(&args.file).with_context(|| {
+                format!(
+                    "cannot derive a tag from {} — pass --tag, or --no-tag to push without one",
+                    args.file.display()
+                )
+            })?,
+        };
+        if !artifact::is_valid_tag(&t) {
+            bail!(
+                "{t:?} is not a usable tag: tags are [A-Za-z0-9._-] and may not start with \
+                 `-` or `.`"
+            );
+        }
+        Some(t)
+    };
+
+    let quiet = globals.output.is_machine();
+
+    // A directory is packed into a temp file first; an archive is used as it is.
+    // The `Scratch` is what removes the packed copy however this returns.
+    let packed = match &args.build_context {
+        Some(c) if c.is_dir() => {
+            if !quiet {
+                eprintln!("Packing {}...", c.display());
+            }
+            let dest = Scratch::new(std::env::temp_dir().join(format!(
+                "serverctl-context-{}.tar.gz",
+                std::process::id()
+            )));
+            let size = artifact::pack_context(c, dest.path())?;
+            if !quiet {
+                println!("packed {} into {}", c.display(), output::bytes(size));
+            }
+            Some(dest)
+        }
+        _ => None,
+    };
+    let archive: Option<&std::path::Path> = match (&packed, &args.build_context) {
+        (Some(p), _) => Some(p.path()),
+        (None, Some(c)) => Some(c.as_path()),
+        (None, None) => None,
+    };
+
+    let (c, registry, _) = client(globals, opts)?;
+
+    // Both blobs go up the same way `push` sends a rootfs: hash, ask, upload.
+    // The recipe is kilobytes and the context is usually not, so the "ask" is
+    // worth it for exactly one of them and costs one round trip for the other.
+    let recipe = upload(&c, &args.file, args.force, quiet, "Dockerfile")?;
+    let context = match archive {
+        Some(p) => Some(upload(&c, p, args.force, quiet, "context")?),
+        None => None,
+    };
+
+    let manifest = artifact::dockerfile_manifest(
+        (&recipe.digest, recipe.size),
+        context.as_ref().map(|c| (c.digest.as_str(), c.size)),
+        args.image_name.as_deref(),
+        args.image_size_mb,
+        args.source.as_deref(),
+    );
+    let manifest_digest = c.put_manifest(&manifest)?;
+
+    // The tag lands on the manifest, never on the recipe blob: the manifest is
+    // what carries the context and the annotations, and a tag on the Dockerfile
+    // alone would resolve to a recipe with neither.
+    if let Some(t) = &tag {
+        c.put_tag(t, &manifest_digest)?;
+    }
+
+    let result = json!({
+        "registry": registry,
+        "store": c.url(),
+        "path": args.file.display().to_string(),
+        "manifest": manifest_digest,
+        "dockerfile": { "digest": recipe.digest, "size": recipe.size, "uploaded": recipe.uploaded },
+        "context": context.as_ref().map(|c| json!({
+            "digest": c.digest, "size": c.size, "uploaded": c.uploaded,
+        })),
+        "tag": tag,
+    });
+    if globals.output.is_machine() {
+        return output::emit(&result, globals.output, &[]);
+    }
+
+    output::section("Pushed");
+    output::field("store", c.url());
+    output::field("manifest", &manifest_digest);
+    output::field(
+        "Dockerfile",
+        format!("{} ({})", recipe.digest, output::bytes(recipe.size)),
+    );
+    match &context {
+        Some(c) => output::field(
+            "context",
+            format!("{} ({})", c.digest, output::bytes(c.size)),
+        ),
+        None => output::field("context", "(none — this recipe copies nothing in)"),
+    }
+    match &tag {
+        Some(t) => output::field("tag", t),
+        None => output::field("tag", "(none — name the manifest digest to build it)"),
+    }
+    println!();
+    let reference = tag.as_deref().unwrap_or(&manifest_digest);
+    println!("Build it with:");
+    println!(
+        "  serverctl set build <deployment> --store {} --ref {reference}",
+        c.url()
+    );
+    println!("  serverctl build <deployment> --wait");
+    Ok(())
+}
+
+/// One blob's trip into the store: hash it, ask whether it is already there,
+/// upload it if not.
+struct Uploaded {
+    digest: String,
+    size: u64,
+    uploaded: bool,
+}
+
+fn upload(
+    c: &RegistryClient,
+    path: &std::path::Path,
+    force: bool,
+    quiet: bool,
+    what: &str,
+) -> Result<Uploaded> {
+    let (digest, size) = artifact::hash_file(path, |done, total| {
+        if !quiet {
+            progress(&format!("hashing {what}"), done, total);
+        }
+    })?;
+    if !quiet {
+        clear_progress();
+    }
+
+    let already = if force { None } else { c.blob_exists(&digest)? };
+    let uploaded = match already {
+        Some(_) => {
+            if !quiet {
+                println!("{what} {digest} is already in the store; skipping the upload");
+            }
+            false
+        }
+        None => {
+            if !quiet {
+                eprintln!("Uploading {what} ({})...", output::bytes(size));
+            }
+            c.put_blob(&digest, path, size)?
+        }
+    };
+    Ok(Uploaded {
+        digest,
+        size,
+        uploaded,
+    })
+}
+
+/// The tag a Dockerfile gets when none is given: the name of the directory
+/// holding it.
+///
+/// Not the filename, which is `Dockerfile` for almost every recipe there has
+/// ever been and would collide across every project in a shared store. The
+/// directory name is the closest thing to "which project is this".
+fn default_recipe_tag(path: &std::path::Path) -> Option<String> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let name = match dir {
+        Some(d) => d.canonicalize().ok()?.file_name()?.to_str()?.to_string(),
+        None => return None,
+    };
+    artifact::is_valid_tag(&name).then_some(name)
+}
+
+/// A file removed on drop, for a context packed on the way to the store.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(path: PathBuf) -> Self {
+        Scratch(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// A one-line progress meter on stderr, so `-o json` on stdout stays clean.
 fn progress(what: &str, done: u64, total: u64) {
     if total == 0 {
@@ -695,6 +968,28 @@ fn run_command(cmd: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recipe_is_tagged_after_its_directory_not_its_filename() {
+        // Every project's recipe is called `Dockerfile`, so a filename default
+        // would have every push in a shared store fighting over one tag.
+        let dir = std::env::temp_dir().join(format!("serverctl-tag-{}", std::process::id()));
+        let project = dir.join("web-frontend");
+        std::fs::create_dir_all(&project).unwrap();
+        let df = project.join("Dockerfile");
+        std::fs::write(&df, b"FROM debian\n").unwrap();
+        assert_eq!(default_recipe_tag(&df).as_deref(), Some("web-frontend"));
+
+        // A directory the store would refuse gets no default, so the push asks
+        // for --tag rather than inventing something.
+        let odd = dir.join(".hidden");
+        std::fs::create_dir_all(&odd).unwrap();
+        let df = odd.join("Dockerfile");
+        std::fs::write(&df, b"FROM debian\n").unwrap();
+        assert_eq!(default_recipe_tag(&df), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn a_registry_is_named_after_its_host() {

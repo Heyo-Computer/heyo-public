@@ -404,11 +404,16 @@ impl Authenticator {
 
         Response::redirect(
             url,
+            // The flow cookie stays host-only even in a shared realm: it is a
+            // single round trip that starts and ends on this hostname, and
+            // widening it would put a live PKCE verifier on every sibling host
+            // for no gain.
             vec![set_cookie(
                 FLOW_COOKIE,
                 &self.sign(&flow.encode()),
                 req.secure,
                 Some(FLOW_TTL.as_secs()),
+                None,
             )],
         )
     }
@@ -531,6 +536,20 @@ impl Authenticator {
             );
         }
 
+        // Computed from the host that actually served the callback, not from the
+        // spec alone: a realm that does not cover this hostname must fall back
+        // to a host-only cookie, or the browser drops it and the user loops.
+        let realm = gate.cookie_domain_for(req.host);
+        if gate.cookie_domain.is_some() && realm.is_none() {
+            tracing::warn!(
+                deployment = %deployment_id,
+                host = %req.host,
+                cookie_domain = ?gate.cookie_domain,
+                "auth.cookie_domain does not cover this hostname; issuing a host-only \
+                 session cookie, so sign-in will not be shared with sibling deployments",
+            );
+        }
+
         let session = Session {
             subject: identity.subject.clone(),
             email: identity.email.clone(),
@@ -554,8 +573,9 @@ impl Authenticator {
                     &self.sign(&session.encode()),
                     req.secure,
                     Some(gate.session_ttl_secs),
+                    realm.as_deref(),
                 ),
-                clear_cookie(FLOW_COOKIE, req.secure),
+                clear_cookie(FLOW_COOKIE, req.secure, None),
             ],
         )
     }
@@ -567,8 +587,8 @@ impl Authenticator {
         Response::redirect(
             format!("{}{}", origin(req), gate.login_path()),
             vec![
-                clear_cookie(&gate.cookie_name, req.secure),
-                clear_cookie(FLOW_COOKIE, req.secure),
+                clear_cookie(&gate.cookie_name, req.secure, gate.cookie_domain_for(req.host).as_deref()),
+                clear_cookie(FLOW_COOKIE, req.secure, None),
             ],
         )
     }
@@ -585,10 +605,23 @@ impl Authenticator {
         if session.exp <= now_secs() {
             return None;
         }
-        // A session is scoped to one deployment and to the policy it was issued
-        // under, so it cannot be replayed at a differently-gated deployment and
-        // does not outlive a tightened allow-list.
-        if session.deployment != deployment_id || session.policy != gate.policy_fingerprint() {
+        // A session does not outlive a tightened allow-list: the fingerprint
+        // covers the provider, the client id, both allow-lists, and whether the
+        // gate shares sessions at all.
+        if session.policy != gate.policy_fingerprint() {
+            return None;
+        }
+        // And it is scoped to the deployment that issued it — unless this gate
+        // opted into a shared realm, which is what makes one sign-in cover every
+        // deployment under a parent domain instead of one per hostname.
+        //
+        // Relaxing this is safe *because* of the check above, not in spite of
+        // it. Reaching here means the two gates have byte-identical policy, so
+        // whoever holds this session is somebody this gate would have admitted
+        // anyway; the round trip it skips would have ended in exactly this
+        // identity. A gate with a different allow-list has a different
+        // fingerprint and refuses the cookie, shared realm or not.
+        if session.deployment != deployment_id && gate.cookie_domain.is_none() {
             return None;
         }
         Some(Identity {
@@ -895,12 +928,26 @@ fn cookie_value(headers: &[String], name: &str) -> Option<String> {
     None
 }
 
-fn set_cookie(name: &str, value: &str, secure: bool, max_age: Option<u64>) -> String {
+fn set_cookie(
+    name: &str,
+    value: &str,
+    secure: bool,
+    max_age: Option<u64>,
+    domain: Option<&str>,
+) -> String {
     let mut c = format!("{name}={value}; Path=/; HttpOnly");
     // Lax, not Strict: the provider's redirect back is a cross-site top-level
     // navigation, and Strict would withhold the flow cookie on exactly that
-    // request — the sign-in would loop forever.
+    // request — the sign-in would loop forever. It is also what lets a link from
+    // the admin directory into a gated deployment carry the session, since that
+    // navigation is cross-site too.
     c.push_str("; SameSite=Lax");
+    // Present only for a realm session. A `Domain` widens the cookie to every
+    // host under it, so it is never added by default and never guessed at — see
+    // `AuthGate::cookie_domain`.
+    if let Some(d) = domain {
+        c.push_str(&format!("; Domain={d}"));
+    }
     if secure {
         c.push_str("; Secure");
     }
@@ -910,8 +957,15 @@ fn set_cookie(name: &str, value: &str, secure: bool, max_age: Option<u64>) -> St
     c
 }
 
-fn clear_cookie(name: &str, secure: bool) -> String {
+/// The `Domain` matters here too, and getting it wrong is a silent failure: a
+/// cookie set with `Domain=example.com` and one set host-only are two different
+/// cookies, and clearing the wrong one leaves the user signed in with a logout
+/// that reported success.
+fn clear_cookie(name: &str, secure: bool, domain: Option<&str>) -> String {
     let mut c = format!("{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    if let Some(d) = domain {
+        c.push_str(&format!("; Domain={d}"));
+    }
     if secure {
         c.push_str("; Secure");
     }
@@ -970,6 +1024,7 @@ mod tests {
             base_path: "/__applb/auth".into(),
             session_ttl_secs: 3600,
             cookie_name: "applb_session".into(),
+            cookie_domain: None,
             redirect_url: None,
             forward_identity: true,
         }
@@ -1019,6 +1074,137 @@ mod tests {
             exp,
         };
         format!("{}={}", g.cookie_name, a.sign(&s.encode()))
+    }
+
+    // -- shared sign-in across sibling hostnames ---------------------------
+
+    /// One sign-in covering every deployment under a parent domain is the whole
+    /// point of `cookie_domain`; without this the session is refused at the
+    /// second hostname and the user goes back to the provider for each card they
+    /// open from the directory.
+    mod realm {
+        use super::*;
+
+        fn realm_gate() -> AuthGate {
+            AuthGate {
+                cookie_domain: Some("example.com".into()),
+                ..gate()
+            }
+        }
+
+        fn at<'a>(host: &'a str, cookies: Vec<String>) -> RequestInfo<'a> {
+            RequestInfo {
+                host,
+                ..req("/private", cookies)
+            }
+        }
+
+        #[tokio::test]
+        async fn a_session_from_one_deployment_is_accepted_at_a_sibling() {
+            let (a, g) = (auth(), realm_gate());
+            let id = identity("someone@example.com", Some("example.com"));
+            // Issued by `web`, presented at `api`.
+            let cookie = session_cookie(&a, &g, &id, now_secs() + 3600);
+            let Decision::Allow(who) = a
+                .decide(&g, "api", &at("api.example.com", vec![cookie]))
+                .await
+            else {
+                panic!("a realm session must be accepted at a sibling deployment");
+            };
+            assert_eq!(who.unwrap().email, "someone@example.com");
+        }
+
+        /// The default. A host-only gate must keep refusing a session another
+        /// deployment issued, or adding this feature would have quietly widened
+        /// every existing gate.
+        #[tokio::test]
+        async fn without_a_realm_a_foreign_session_is_still_refused() {
+            let (a, g) = (auth(), gate());
+            let id = identity("someone@example.com", Some("example.com"));
+            let cookie = session_cookie(&a, &g, &id, now_secs() + 3600);
+            let Decision::Answered(r) = a
+                .decide(&g, "api", &at("api.example.com", vec![cookie]))
+                .await
+            else {
+                panic!("a host-only gate must not accept another deployment's session");
+            };
+            assert_eq!(r.status, 302, "and it starts a fresh sign-in");
+        }
+
+        /// The security property that makes sharing safe: sibling gates share a
+        /// session only when either would have admitted the same person. A gate
+        /// with a narrower allow-list has a different fingerprint and refuses.
+        #[tokio::test]
+        async fn a_sibling_with_a_different_allow_list_refuses_the_session() {
+            let a = auth();
+            let issuer = realm_gate();
+            let id = identity("someone@example.com", Some("example.com"));
+            let cookie = session_cookie(&a, &issuer, &id, now_secs() + 3600);
+
+            let stricter = AuthGate {
+                allowed_domains: vec![],
+                allowed_emails: vec!["only-me@example.com".into()],
+                ..realm_gate()
+            };
+            let Decision::Answered(r) = a
+                .decide(&stricter, "api", &at("api.example.com", vec![cookie]))
+                .await
+            else {
+                panic!("a differently-scoped gate must not honour the shared session");
+            };
+            assert_eq!(r.status, 302);
+        }
+
+        /// Turning sharing on changes the fingerprint, so a session minted by
+        /// the host-only version of the same gate cannot be replayed once the
+        /// realm is switched on — and vice versa.
+        #[test]
+        fn the_realm_is_part_of_the_policy_fingerprint() {
+            assert_ne!(gate().policy_fingerprint(), realm_gate().policy_fingerprint());
+            // And an unshared gate hashes exactly what it did before the field
+            // existed, so upgrading does not sign everybody out.
+            let other = AuthGate {
+                cookie_domain: None,
+                ..gate()
+            };
+            assert_eq!(gate().policy_fingerprint(), other.policy_fingerprint());
+        }
+
+        #[test]
+        fn the_cookie_carries_the_domain_only_when_the_realm_covers_the_host() {
+            let g = realm_gate();
+            assert_eq!(g.cookie_domain_for("api.example.com").as_deref(), Some("example.com"));
+            assert_eq!(g.cookie_domain_for("example.com").as_deref(), Some("example.com"));
+            assert_eq!(g.cookie_domain_for("EXAMPLE.COM").as_deref(), Some("example.com"));
+            // Suffix, but not at a label boundary — the classic way to write a
+            // rule that looks right and matches the wrong domain.
+            assert_eq!(g.cookie_domain_for("notexample.com"), None);
+            assert_eq!(g.cookie_domain_for("example.com.evil.test"), None);
+            assert_eq!(gate().cookie_domain_for("api.example.com"), None);
+        }
+
+        /// A logout must clear the cookie it actually set. A `Domain` cookie and
+        /// a host-only one are two different cookies, so clearing the wrong one
+        /// reports success and leaves the user signed in.
+        #[test]
+        fn logout_clears_the_realm_cookie_not_a_host_only_one() {
+            let (a, g) = (auth(), realm_gate());
+            let r = a.logout(&g, &at("api.example.com", vec![]));
+            let session = r
+                .cookies
+                .iter()
+                .find(|c| c.starts_with(&g.cookie_name))
+                .expect("the session cookie is cleared");
+            assert!(session.contains("Domain=example.com"), "{session}");
+            assert!(session.contains("Max-Age=0"), "{session}");
+            // The flow cookie was never widened, so clearing it must not be.
+            let flow = r
+                .cookies
+                .iter()
+                .find(|c| c.starts_with(FLOW_COOKIE))
+                .expect("the flow cookie is cleared");
+            assert!(!flow.contains("Domain="), "{flow}");
+        }
     }
 
     // -- app-tokens at the data plane --------------------------------------
@@ -1588,8 +1774,8 @@ mod tests {
     fn a_plaintext_connection_gets_a_cookie_it_can_actually_send() {
         // `Secure` on a cookie set over http is dropped by the browser, which
         // would make the session invisible and loop the sign-in.
-        assert!(!set_cookie("n", "v", false, None).contains("Secure"));
-        assert!(set_cookie("n", "v", true, None).contains("Secure"));
+        assert!(!set_cookie("n", "v", false, None, None).contains("Secure"));
+        assert!(set_cookie("n", "v", true, None, None).contains("Secure"));
     }
 
     #[test]

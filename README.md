@@ -30,7 +30,7 @@ Each Rust service has its own lockfile and can be checked independently:
 cargo test --locked --manifest-path heyosecret/Cargo.toml
 cargo test --locked --manifest-path heyosecret-client/Cargo.toml
 cargo test --locked --manifest-path orchestrator/Cargo.toml
-cargo test --locked --manifest-path app-lb/Cargo.toml
+cargo test --locked --manifest-path app-lb/Cargo.toml -p app-lb
 cargo test --locked --manifest-path app-lb/serverctl/Cargo.toml
 ```
 

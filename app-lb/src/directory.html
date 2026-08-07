@@ -88,10 +88,16 @@
   }
   .meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); }
 
-  .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; margin-left: auto; flex: none; }
-  .tag.vm     { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
-  .tag.static { background: color-mix(in srgb, var(--muted) 22%, transparent); color: var(--text-2); }
-  .tag.site   { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; flex: none; }
+  /* The kind badge is the last chip on the row, so it takes the slack. A
+     `sign-in` badge sits between it and the id. */
+  .tag.vm     { margin-left: auto; background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
+  .tag.static { margin-left: auto; background: color-mix(in srgb, var(--muted) 22%, transparent); color: var(--text-2); }
+  .tag.site   { margin-left: auto; background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+  .tag.gated  { margin-left: auto; background: color-mix(in srgb, var(--warning) 26%, transparent); color: var(--text-2); }
+  /* When both are present the kind badge must not also claim the slack, or the
+     two chips separate and the row reads as two groups. */
+  .tag.gated + .tag { margin-left: 0; }
 
   .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--muted); }
   .dot.ready { background: var(--good); }
@@ -109,6 +115,18 @@
     padding: 1px 5px; border-radius: 4px;
   }
 </style>
+<script>
+// Before the body exists, so a stored choice is on the root element ahead of the
+// first paint. Doing this with the rest of the page script would render one
+// frame in the wrong theme on every load.
+//
+// The key is shared by /, /dashboard, /siem and /storage: a theme is a property
+// of the operator, not of the page, so following a link must not re-ask.
+try {
+  var t = localStorage.getItem("app-lb-theme");
+  if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+} catch (e) { /* storage unavailable (private window, file://) — use the OS setting */ }
+</script>
 </head>
 <body>
 <div class="wrap">
@@ -116,6 +134,7 @@
     <h1>{{APP_NAME}}</h1>
     <div class="links">
       <a href="/dashboard">Dashboard</a>
+      <a href="/storage">Disks</a>
       <a href="/metrics">Metrics</a>
       <button class="themebtn" id="themebtn" type="button">Theme</button>
     </div>
@@ -131,7 +150,11 @@ document.getElementById("themebtn").addEventListener("click", () => {
   const root = document.documentElement;
   const dark = root.getAttribute("data-theme") === "dark"
     || (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
-  root.setAttribute("data-theme", dark ? "light" : "dark");
+  const next = dark ? "light" : "dark";
+  root.setAttribute("data-theme", next);
+  // Persisted so a refresh, or a hop to another app-lb page, keeps it. A
+  // failure here costs the preference and nothing else.
+  try { localStorage.setItem("app-lb-theme", next); } catch (e) { /* ignore */ }
 });
 </script>
 </body>
