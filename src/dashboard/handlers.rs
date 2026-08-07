@@ -245,7 +245,12 @@ async fn run_lifecycle(id: &str, act: Lifecycle) -> anyhow::Result<()> {
             Lifecycle::Stop => sb.stop().await,
             Lifecycle::Reboot => {
                 let _permit = crate::reclaim::boot_permit().await;
-                sb.restart().await
+                // Not sb.restart(): the SDK builds that as the cloud-dialect
+                // path /deployed-sandboxes/{id}/restart, which the local
+                // heyvmd doesn't route (bare 404). Stop→start under one boot
+                // permit, same as vm::power_cycle.
+                sb.stop().await?;
+                sb.start().await
             }
         }
     };
