@@ -1,0 +1,39 @@
+name: app-lb CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app-lb/**'
+      - '.heyo/workflows/app-lb.yml'
+
+jobs:
+  app-lb:
+    name: Test app-lb
+    runs-on: namespace-profile-default
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev pkg-config
+
+      - name: Test app-lb
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path app-lb/Cargo.toml -p app-lb
+          cargo test --locked --manifest-path app-lb/serverctl/Cargo.toml
+
+      - name: Test TypeScript SDK
+        working-directory: app-lb/sdk/typescript
+        run: |
+          set -euo pipefail
+          npm ci
+          npm test
