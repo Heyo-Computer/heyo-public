@@ -115,3 +115,30 @@ jobs:
           cargo test --locked --manifest-path heyosecret/Cargo.toml
           cargo test --locked --manifest-path heyosecret-client/Cargo.toml
           cargo test --locked --manifest-path orchestrator/Cargo.toml
+
+  app-lb:
+    name: test app-lb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-lb
+
+      - name: Test app-lb
+        run: |
+          cargo test --locked --manifest-path app-lb/Cargo.toml -p app-lb
+          cargo test --locked --manifest-path app-lb/serverctl/Cargo.toml
+
+      - name: Test TypeScript SDK
+        working-directory: app-lb/sdk/typescript
+        run: npm ci && npm test

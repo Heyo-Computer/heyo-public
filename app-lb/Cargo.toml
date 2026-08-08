@@ -1,0 +1,163 @@
+[package]
+name = "app-lb"
+version.workspace = true
+edition.workspace = true
+
+# `serverctl` — the CLI *and the client SDK* for the admin API — is a separate
+# crate rather than a second binary here, so installing it doesn't drag in
+# pingora, openssl and the ACME stack. It shares nothing with the LB but the wire
+# format, and deliberately: a `path` dependency would make the client's leniency
+# (unknown fields ignored, missing ones defaulted) impossible to test, because
+# the two would always be the same build. `testdata/wire/` is the contract
+# instead — this crate writes those fixtures, serverctl reads them.
+[workspace]
+members = ["serverctl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# Hoisted so the two crates cannot drift onto different major versions of a
+# shared dependency. Features stay per-crate — a member adds what it needs with
+# `features = [...]` alongside `workspace = true`, and cargo unifies them across
+# the workspace build anyway.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+futures = "0.3"
+tokio = "1"
+# `default-features = false` here rather than per-crate, because reqwest's
+# defaults include native-tls: with both TLS backends in one workspace build
+# reqwest silently prefers native-tls, which would move app-lb's outbound TLS off
+# rustls without anything in this file saying so. Both crates opt into
+# rustls-tls explicitly.
+reqwest = { version = "0.12", default-features = false }
+
+[dependencies]
+# Proxy data plane. The `openssl` feature enables the client-facing HTTPS
+# listener (see `APP_LB_TLS_*` / `APP_LB_ACME_*`); upstreams stay plaintext
+# guest_ip on the tap network regardless.
+#
+# openssl — not rustls — because per-deployment ACME certificates need a cert
+# chosen per handshake from the SNI. That is `TlsSettings::with_callbacks`, and
+# pingora supports it only under openssl/boringssl: the rustls build returns a
+# hard "Certificate callbacks are not supported" error and exposes no
+# `ResolvesServerCert` hook. The cost is a second TLS stack in the link, since
+# heyo-sdk still pulls rustls through reqwest, plus a libssl-dev build
+# dependency. See `src/tls.rs`.
+pingora-core = { version = "0.8.1", features = ["openssl"] }
+pingora-proxy = "0.8.1"
+pingora-http = "0.8.1"
+# Shared with pingora's own public API (RequestHeader/ResponseHeader are built
+# on `http`, and response bodies are `bytes::Bytes`), so these must stay on the
+# same major versions pingora resolves.
+http = "1"
+bytes = "1"
+
+heyo-sdk = "0.1.6"
+
+# ACME (Let's Encrypt) client for per-deployment certificates. In-process rather
+# than shelling out to certbot: no external binary, and no root — the account key
+# and issued certs live under `APP_LB_ACME_DIR`, owned by the non-root `app-lb`
+# user. The `rcgen` feature is what makes `Order::finalize()` available, which
+# generates each certificate's keypair and CSR for us, so rcgen needs no direct
+# dependency here.
+instant-acme = { version = "0.8", features = ["rcgen"] }
+# Certificate parsing and expiry arithmetic. pingora-openssl re-exports `x509`
+# and `pkey` but not `asn1`, and comparing a cert's notAfter against a renewal
+# threshold needs `Asn1Time`. Must resolve to the same 0.10.x that
+# pingora-openssl picks, or the `X509`/`PKey` types won't unify across crates.
+openssl = "0.10"
+# Not used directly for anything but installing the process-level
+# `CryptoProvider`. rustls is still in the tree under instant-acme's HTTP client
+# (and reqwest), and 0.23 refuses to pick a provider automatically when both
+# `ring` and `aws-lc-rs` are present — which they are, via iroh/hickory and
+# instant-acme respectively. pingora's *rustls* build used to install one for us
+# inside `TlsSettings::build()`; the openssl build never calls that, so app-lb
+# has to do it. Must match the version the rest of the graph resolves to, or the
+# provider gets installed into a different crate's static and the panic remains.
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+
+# The OAuth token exchange for the Google sign-in gate (`src/auth.rs`) — one
+# HTTPS POST per login. Already compiled in the graph via heyo-sdk, so this is a
+# dependency line rather than a new build; the features match heyo-sdk's so the
+# two resolve to one copy.
+#
+# `stream` is for the artifact puller (`src/artifact.rs`), which reads a rootfs
+# blob off the wire chunk by chunk. A rootfs is gigabytes; `bytes()` would hold
+# the whole thing in memory before the first byte reached disk.
+reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
+# Query-string building (the authorize URL) and parsing (the callback). Small,
+# already present under reqwest/url, and hand-rolling percent-encoding is a
+# classic source of bugs.
+form_urlencoded = "1"
+
+async-trait = "0.1"
+futures.workspace = true
+# `process` is for the image builder (`src/build.rs`), which shells out to `git`
+# and `heyvm mvm build`: heyvm exposes no build API, so this is the only way to
+# turn a Dockerfile into a guest rootfs. It buys `kill_on_drop`, which is what
+# lets a timed-out `docker build` actually die instead of outliving its future.
+#
+# `fs` and `io-util` are the artifact puller's write side: a streamed blob lands
+# in a file, and the copy must not block the runtime for the minutes a
+# multi-gigabyte rootfs takes.
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "net", "process", "fs", "io-util"] }
+arc-swap = "1"
+# `ws` is for `GET /deployments/:id/shell`, where app-lb terminates the client's
+# WebSocket and pipes it to the sandbox's PTY. Proxying rather than handing the
+# client a daemon address is what lets the gate, the deployment→sandbox lookup
+# and the wake-a-suspended-VM step happen at all.
+axum = { version = "0.7", features = ["ws"] }
+serde.workspace = true
+serde_json.workspace = true
+# Encoding the configured dashboard credentials into the expected Basic-auth
+# header once at startup. Already in the tree transitively (reqwest/pingora).
+base64.workspace = true
+# Verifying a rootfs pulled over the wire against the digest that named it
+# (`src/artifact.rs`). sha256 and not something faster because the digest has to
+# be the one the artifact store computed, which is the one `sha256sum` reports.
+# Already in the tree via pingora and heyo-sdk.
+sha2.workspace = true
+
+# Unpacking a site's artifact bundle (`src/unpack.rs`). In-process rather than
+# shelling out to `tar`, for two reasons: a bundle is untrusted input, and this
+# way the containment rules are ours and testable rather than whichever `tar` is
+# on the host and whichever flags it defaults to. It also keeps the promise the
+# feature exists to make — that a host serving an artifact-backed site needs no
+# toolchain on it.
+#
+# `tar` brings only `filetime`/`libc`; `flate2` is already in the tree three
+# times over (pingora-core, heyo-sdk, ureq), so this is a dependency line rather
+# than a new build. Its backend is chosen workspace-wide by feature unification
+# — pingora's `zlib-ng` wins, which is what `cmake` in the requirements is for.
+tar = "0.4"
+flate2 = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The event model behind `src/siem.rs` — `SiemLog`, `SiemField`, the ECS field
+# dictionary, and the `LogParser`/`LogEnrichment` traits. The lib is `usiem`, not
+# `u_siem`.
+#
+# Core only, deliberately: `u-siem-kernel` would run components on its own
+# `std::thread` pool alongside tokio's, pulls `async-std` (RUSTSEC-2025-0052,
+# discontinued — a permanent cargo-audit allowlist entry), and its `run()`
+# panics with "No DatasetManager!" while core ships no `SiemDatasetManager` and
+# the only published one is pinned to the pre-0.1 API. None of that buys
+# anything here: `parse_log` is a synchronous call, so the pipeline runs on the
+# background service app-lb already has.
+#
+# Cheap in the graph — serde, serde_json, crossbeam-channel, chrono and regex
+# were all already resolved for something else, so this adds only `dyn-clone`.
+# `sled` stays out because `slow_geoip` is not default and we ship no GeoIP.
+#
+# Pinned exactly, not "0.7". The crate is dormant (last release 2024-01) with
+# 0.8.0 committed upstream but unpublished, and every other crate in its
+# ecosystem depends on `u-siem = "0"` — so a publish would move this silently.
+# It matters more than usual because the field-dictionary constants become the
+# field *names* in app-obs: a rename would reshape every security log stored.
+u-siem = "=0.7.0"

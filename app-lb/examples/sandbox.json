@@ -1,0 +1,32 @@
+{
+  "id": "sb-7f3a9c",
+  "routes": [],
+  "vm": {
+    "driver": "firecracker",
+    "port": 8080,
+    "size_class": "medium",
+    "disk_size_gb": 20,
+    "working_directory": "/workspace",
+    "env_vars": {
+      "HOME": "/workspace"
+    },
+    "ttl_seconds": 86400
+  },
+  "artifact": {
+    "store": "http://127.0.0.1:8080",
+    "ref": "agent-base",
+    "grow_gb": 8,
+    "auth": { "secret": "art", "key": "api_key" }
+  },
+  "scaling": {
+    "min_replicas": 0,
+    "max_replicas": 1,
+    "warm_pool": 0,
+    "target_concurrency": 1,
+    "scale_to_zero_after_secs": 900,
+    "cold_start_timeout_secs": 180,
+    "drain_timeout_secs": 30,
+    "idle_action": "retain"
+  },
+  "health": { "path": "/", "timeout_secs": 2 }
+}

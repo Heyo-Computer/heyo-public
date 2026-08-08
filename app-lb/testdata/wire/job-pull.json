@@ -1,0 +1,19 @@
+{
+  "id": "job-002",
+  "deployment": "sandbox",
+  "kind": "artifact-pull",
+  "status": "succeeded",
+  "started_at": 1722400000,
+  "finished_at": 1722400123,
+  "rolled_out": true,
+  "store": "http://127.0.0.1:8080",
+  "artifact": "agent-base",
+  "digest": "sha256:0f1e2d3c",
+  "bytes": 2147483648,
+  "reused": true,
+  "error": null,
+  "log": [
+    "cloning …",
+    "done"
+  ]
+}

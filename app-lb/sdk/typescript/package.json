@@ -1,0 +1,44 @@
+{
+  "name": "serverctl",
+  "version": "0.1.0",
+  "description": "Client for the app-lb admin API \u2014 deployments, autoscaling, exec and interactive shells for heyvm microVMs",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.6.0"
+  },
+  "peerDependenciesMeta": {},
+  "keywords": [
+    "app-lb",
+    "heyvm",
+    "firecracker",
+    "microvm",
+    "sandbox",
+    "load-balancer"
+  ],
+  "license": "MIT"
+}

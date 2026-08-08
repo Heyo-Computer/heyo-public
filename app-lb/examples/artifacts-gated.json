@@ -1,0 +1,50 @@
+{
+  "id": "artifacts",
+  "routes": [
+    { "host": "art.us2.heyo.work" }
+  ],
+  "vm": {
+    "driver": "firecracker",
+    "image": "artifacts",
+    "port": 8080,
+    "start_command": "setsid nohup /usr/local/bin/art serve </dev/null >/var/log/art.log 2>&1 &",
+    "size_class": "small",
+    "disk_size_gb": 4,
+    "env_vars": {
+      "ART_ROOT": "/workspace/store",
+      "ART_LISTEN": "0.0.0.0:8080",
+      "ART_API_KEY": "change-me",
+      "ART_ADMIN_USER": "admin",
+      "ART_ADMIN_PASSWORD": "change-me-too",
+      "ART_MIN_FREE_BYTES": "536870912",
+      "RUST_LOG": "art=info,artifacts=info"
+    },
+    "ttl_seconds": 3600
+  },
+  "build": {
+    "repo": "https://github.com/Heyo-Computer/artifacts.git",
+    "ref": "main",
+    "dockerfile": "Dockerfile",
+    "image_size_mb": 768,
+    "auth": { "secret": "github", "key": "token" }
+  },
+  "auth": {
+    "client_id": "REPLACE-WITH-YOUR-CLIENT-ID.apps.googleusercontent.com",
+    "client_secret": { "secret": "google", "key": "client_secret" },
+    "allowed_domains": ["heyo.computer"],
+    "allowed_emails": [],
+    "public_paths": ["/healthz", "/blobs/", "/manifests", "/tags", "/usage"],
+    "session_ttl_secs": 43200,
+    "forward_identity": false
+  },
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 1,
+    "warm_pool": 0,
+    "target_concurrency": 64,
+    "scale_to_zero_after_secs": 0,
+    "cold_start_timeout_secs": 120,
+    "drain_timeout_secs": 30
+  },
+  "health": { "path": "/healthz", "timeout_secs": 2 }
+}

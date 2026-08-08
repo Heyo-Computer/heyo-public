@@ -1,0 +1,17 @@
+{
+  "id": "job-004",
+  "deployment": "sandbox",
+  "kind": "host-update",
+  "status": "failed",
+  "started_at": 1722400000,
+  "finished_at": 1722400123,
+  "working_dir": "/srv/docs",
+  "commands_total": 2,
+  "commands_run": 1,
+  "verified": false,
+  "error": "command 2 exited 1",
+  "log": [
+    "cloning …",
+    "done"
+  ]
+}

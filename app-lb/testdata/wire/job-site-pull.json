@@ -1,0 +1,20 @@
+{
+  "id": "job-005",
+  "deployment": "docs",
+  "kind": "artifact-pull",
+  "status": "succeeded",
+  "started_at": 1722400000,
+  "finished_at": 1722400123,
+  "store": "/srv/artifacts",
+  "artifact": "docs-live",
+  "digest": "0f1e2d3c4b5a",
+  "bytes": 0,
+  "site_root": "/srv/docs/dist",
+  "files": 412,
+  "verified": true,
+  "error": null,
+  "log": [
+    "cloning …",
+    "done"
+  ]
+}

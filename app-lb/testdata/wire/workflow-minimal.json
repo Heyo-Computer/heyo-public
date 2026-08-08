@@ -1,0 +1,8 @@
+{
+  "id": "build",
+  "repo": "https://example.com/a.git",
+  "ref": "main",
+  "path": ".ci/workflows/*.yml",
+  "network": "prod",
+  "enabled": true
+}

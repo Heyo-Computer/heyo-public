@@ -1,0 +1,749 @@
+//! Live deployment state: the VM pool, in-flight accounting, and selection.
+
+use crate::config::DeploymentSpec;
+use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
+
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// A single routable backend — a ready VM, or a static proxy_pass upstream.
+///
+/// `in_flight` is the one number that matters: it picks the upstream *and*
+/// drives the autoscaler, which is why we track it ourselves instead of using
+/// pingora-load-balancing (whose selection algorithms cannot see it).
+///
+/// `peer` is the address handed to pingora (`HttpPeer`) and the identity used
+/// for retry-exclusion and display. It is a `host:port` *string* rather than a
+/// resolved `SocketAddr` so a static upstream can be a hostname that pingora
+/// re-resolves per connection.
+#[derive(Debug)]
+pub struct VmBackend {
+    pub sandbox_id: String,
+    pub peer: String,
+    in_flight: AtomicUsize,
+    draining: AtomicBool,
+    healthy: AtomicBool,
+    last_active: AtomicU64,
+    /// When this VM joined the pool (LB clock). Serving uptime, as opposed to
+    /// the daemon's `uptime_secs` which counts provisioning too; this is what
+    /// the LB actually watched the VM serve for.
+    ready_at: u64,
+    /// Latest CPU/memory sample from the daemon's `/system/usage`, refreshed by
+    /// the autoscaler each tick. CPU is stored as f64 bits (percent of a core);
+    /// `has_usage` distinguishes "no sample yet" from a genuine zero.
+    cpu_percent_bits: AtomicU64,
+    mem_bytes: AtomicU64,
+    has_usage: AtomicBool,
+}
+
+impl VmBackend {
+    /// A backend for a managed VM, addressed by its resolved guest `SocketAddr`.
+    pub fn new(sandbox_id: String, addr: SocketAddr) -> Self {
+        Self::with_peer(sandbox_id, addr.to_string())
+    }
+
+    /// A backend for a static proxy_pass upstream, addressed by a `host:port`
+    /// string (which pingora resolves per connection). The address doubles as the
+    /// backend's display id, since there is no sandbox.
+    pub fn for_upstream(address: String) -> Self {
+        Self::with_peer(address.clone(), address)
+    }
+
+    fn with_peer(sandbox_id: String, peer: String) -> Self {
+        Self {
+            sandbox_id,
+            peer,
+            in_flight: AtomicUsize::new(0),
+            draining: AtomicBool::new(false),
+            healthy: AtomicBool::new(true),
+            last_active: AtomicU64::new(now_secs()),
+            ready_at: now_secs(),
+            cpu_percent_bits: AtomicU64::new(0),
+            mem_bytes: AtomicU64::new(0),
+            has_usage: AtomicBool::new(false),
+        }
+    }
+
+    /// Seconds this VM has been in the pool.
+    pub fn uptime_secs(&self) -> u64 {
+        now_secs().saturating_sub(self.ready_at)
+    }
+
+    /// Record the latest resource sample for this VM.
+    pub fn set_usage(&self, cpu_percent: f64, mem_bytes: u64) {
+        self.cpu_percent_bits
+            .store(cpu_percent.to_bits(), Ordering::Relaxed);
+        self.mem_bytes.store(mem_bytes, Ordering::Relaxed);
+        self.has_usage.store(true, Ordering::Relaxed);
+    }
+
+    /// Latest `(cpu_percent, mem_bytes)`, or `None` if the daemon has not yet
+    /// reported usage for this VM (freshly promoted, or usage unavailable).
+    pub fn usage(&self) -> Option<(f64, u64)> {
+        self.has_usage.load(Ordering::Relaxed).then(|| {
+            (
+                f64::from_bits(self.cpu_percent_bits.load(Ordering::Relaxed)),
+                self.mem_bytes.load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Relaxed)
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed)
+    }
+
+    /// Eligible to receive a *new* request. A draining VM keeps serving what it
+    /// already has, but takes nothing new.
+    pub fn is_available(&self) -> bool {
+        self.is_healthy() && !self.is_draining()
+    }
+
+    pub fn set_draining(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+    }
+
+    pub fn set_healthy(&self, healthy: bool) {
+        self.healthy.store(healthy, Ordering::Relaxed);
+    }
+
+    pub fn last_active(&self) -> u64 {
+        self.last_active.load(Ordering::Relaxed)
+    }
+
+    pub fn acquire(&self) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.last_active.store(now_secs(), Ordering::Relaxed);
+    }
+
+    /// Saturating so a double-release can never wrap to `usize::MAX` and pin the
+    /// deployment at max replicas forever.
+    pub fn release(&self) {
+        let _ = self
+            .in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+        self.last_active.store(now_secs(), Ordering::Relaxed);
+    }
+}
+
+/// Holds an in-flight slot on a backend for as long as it lives.
+///
+/// The proxy releases its slot by hand (`Ctx::release`, which has to be
+/// idempotent across several exit paths). A shell session cannot: it lives for
+/// minutes or hours across an arbitrary number of failure modes, and a leaked
+/// slot pins the deployment at max replicas forever.
+///
+/// Holding a slot is also what keeps a session's VM alive. An unrouted sandbox
+/// serves no requests, so nothing else moves `last_active` — without this, a
+/// deployment with `scale_to_zero_after_secs` set would reap the VM out from
+/// under an open shell.
+pub struct BackendSlot {
+    backend: Arc<VmBackend>,
+}
+
+impl BackendSlot {
+    pub fn sandbox_id(&self) -> &str {
+        &self.backend.sandbox_id
+    }
+}
+
+impl Drop for BackendSlot {
+    fn drop(&mut self) {
+        self.backend.release();
+    }
+}
+
+impl VmBackend {
+    /// Take an in-flight slot, released when the returned guard drops.
+    pub fn hold(self: &Arc<Self>) -> BackendSlot {
+        self.acquire();
+        BackendSlot {
+            backend: self.clone(),
+        }
+    }
+}
+
+/// A VM that has been created but is not yet serving.
+///
+/// The two progress fields exist because a boot that never finishes is otherwise
+/// completely silent: the autoscaler simply re-queues the VM every tick, forever,
+/// with nothing logged and nothing on the dashboard but a `pending` count. They
+/// are plain values rather than atomics because `promote_pending` rebuilds this
+/// vec on every tick and is the only writer — it carries the previous tick's
+/// values forward, so there is nothing to share.
+#[derive(Debug, Clone)]
+pub struct PendingVm {
+    pub sandbox_id: String,
+    pub created_at: u64,
+    /// The daemon's last reported status, `None` before the first observation.
+    /// Kept so a *transition* (Provisioning → Running, or → Stopped) can be
+    /// logged the moment it happens instead of at the next heartbeat.
+    pub status: Option<heyo_sdk::SandboxStatus>,
+    /// Age in seconds at which this VM's progress was last logged. Bounds the
+    /// heartbeat: a pool of stuck VMs must not write a line per VM per 2s tick.
+    pub reported_at_secs: u64,
+}
+
+impl PendingVm {
+    pub fn new(sandbox_id: String) -> Self {
+        Self {
+            sandbox_id,
+            created_at: now_secs(),
+            status: None,
+            reported_at_secs: 0,
+        }
+    }
+
+    /// How long this VM has been booting.
+    pub fn age_secs(&self) -> u64 {
+        now_secs().saturating_sub(self.created_at)
+    }
+}
+
+/// Per-deployment runtime state that has to outlive a restart.
+///
+/// Distinct from the spec: the spec is what the operator wrote, this is what the
+/// LB learned. It is persisted alongside the spec because losing it leaks real
+/// resources — a suspended sandbox that app-lb forgets is invisible to the
+/// daemon's running-VM list and so is never reaped by anything.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct DeploymentState {
+    /// Sandboxes this deployment stopped rather than destroyed, under
+    /// `scaling.idle_action: retain`. They hold their `/workspace` data disk and
+    /// are candidates for resume in preference to a cold create.
+    ///
+    /// Tracked here because a stopped sandbox is **absent** from the daemon's
+    /// `GET /sandboxes` (mvm-ctrl drops it from the in-memory map on stop), so
+    /// the fleet list cannot be asked what we suspended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspended: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct Deployment {
+    pub spec: DeploymentSpec,
+    /// Runtime state, persisted with the spec. Copy-on-write like the pools.
+    state: ArcSwap<DeploymentState>,
+    /// Ready, routable VMs. Copy-on-write: the autoscaler is the only writer.
+    backends: ArcSwap<Vec<Arc<VmBackend>>>,
+    /// Booting VMs, not yet routable.
+    pending: ArcSwap<Vec<PendingVm>>,
+    /// Requests blocked waiting for a VM to boot.
+    ///
+    /// This is real demand that `in_flight` cannot see: a waiting request has no
+    /// backend to hold a slot on. Without counting it, a scaled-to-zero
+    /// deployment looks idle *while a request is waiting on it*, so the
+    /// autoscaler leaves it at zero and the request blocks until it times out.
+    waiters: AtomicUsize,
+    /// Wakes cold-start waiters when a VM becomes ready, and nudges the
+    /// autoscaler when a request arrives with nowhere to go.
+    pub ready_signal: Notify,
+    pub scale_signal: Notify,
+}
+
+impl Deployment {
+    pub fn new(spec: DeploymentSpec) -> Self {
+        // A static (proxy_pass) deployment has a fixed set of backends known at
+        // registration; populate them now so it is routable immediately and the
+        // autoscaler never has to (indeed, it skips static deployments entirely).
+        let backends: Vec<Arc<VmBackend>> = spec
+            .upstreams
+            .iter()
+            .map(|addr| Arc::new(VmBackend::for_upstream(addr.clone())))
+            .collect();
+        Self {
+            spec,
+            state: ArcSwap::from_pointee(DeploymentState::default()),
+            backends: ArcSwap::from_pointee(backends),
+            pending: ArcSwap::from_pointee(Vec::new()),
+            waiters: AtomicUsize::new(0),
+            ready_signal: Notify::new(),
+            scale_signal: Notify::new(),
+        }
+    }
+
+    pub fn state(&self) -> Arc<DeploymentState> {
+        self.state.load_full()
+    }
+
+    pub fn set_state(&self, state: DeploymentState) {
+        self.state.store(Arc::new(state));
+    }
+
+    /// Read-modify-write the runtime state, returning whether it changed.
+    ///
+    /// The return value is what tells a caller whether the change is worth a
+    /// disk write; these paths run every tick and usually change nothing.
+    pub fn mutate_state(&self, f: impl FnOnce(&mut DeploymentState)) -> bool {
+        let before = self.state();
+        let mut next = (*before).clone();
+        f(&mut next);
+        if next == *before {
+            return false;
+        }
+        self.state.store(Arc::new(next));
+        true
+    }
+
+    pub fn waiters(&self) -> usize {
+        self.waiters.load(Ordering::Relaxed)
+    }
+
+    /// Register a cold-start waiter for as long as the guard lives.
+    pub fn track_waiter(self: &Arc<Self>) -> WaiterGuard {
+        self.waiters.fetch_add(1, Ordering::Relaxed);
+        WaiterGuard {
+            deployment: self.clone(),
+        }
+    }
+
+    pub fn backends(&self) -> Arc<Vec<Arc<VmBackend>>> {
+        self.backends.load_full()
+    }
+
+    pub fn set_backends(&self, backends: Vec<Arc<VmBackend>>) {
+        self.backends.store(Arc::new(backends));
+    }
+
+    pub fn pending(&self) -> Arc<Vec<PendingVm>> {
+        self.pending.load_full()
+    }
+
+    pub fn set_pending(&self, pending: Vec<PendingVm>) {
+        self.pending.store(Arc::new(pending));
+    }
+
+    /// Total in-flight across the pool, including draining VMs — they still
+    /// represent real load.
+    pub fn total_in_flight(&self) -> usize {
+        self.backends().iter().map(|b| b.in_flight()).sum()
+    }
+
+    /// Least-in-flight pick, skipping backends already tried on this request.
+    ///
+    /// `exclude` is what makes retry work: on `fail_to_connect` we re-enter
+    /// `upstream_peer` and must not hand back the backend that just failed. The
+    /// exclusion key is the peer address string (see [`VmBackend::peer`]).
+    pub fn select(&self, exclude: &[String]) -> Option<Arc<VmBackend>> {
+        self.backends()
+            .iter()
+            .filter(|b| b.is_available() && !exclude.contains(&b.peer))
+            .min_by_key(|b| b.in_flight())
+            .cloned()
+    }
+
+    /// Whether the autoscaler could still add capacity, i.e. whether a request
+    /// arriving now is worth holding for a cold start.
+    ///
+    /// Always false for anything without a VM pool: a static deployment's
+    /// upstream set is fixed and a site has no backends at all, so a request
+    /// that finds nothing available must fail fast rather than hold for a boot
+    /// that will never come.
+    pub fn can_grow(&self) -> bool {
+        if !self.spec.is_managed() {
+            return false;
+        }
+        let live = self.backends().len() + self.pending().len();
+        (live as u32) < self.spec.scaling.max_replicas
+    }
+
+    /// Total demand: requests being served plus requests waiting for a VM.
+    ///
+    /// Waiters must be included or a scaled-to-zero deployment can never wake
+    /// up: the request that would justify a VM is precisely the one with no VM
+    /// to be counted against.
+    pub fn demand(&self) -> usize {
+        self.total_in_flight() + self.waiters()
+    }
+
+    /// Desired ready-replica count.
+    ///
+    /// Load term: enough VMs to keep each at `target_concurrency`. The warm pool
+    /// is *additive* — spare capacity above current load — then the whole thing
+    /// is clamped to [min, max].
+    ///
+    /// Scale-to-zero requires `warm_pool == 0`: a warm pool exists precisely to
+    /// absorb cold starts, so honouring both would be contradictory. It would
+    /// also be unreachable in practice — an empty pool reports maximal idleness,
+    /// so a warm pool that ever emptied could never refill itself.
+    pub fn desired_replicas(&self) -> u32 {
+        let policy = &self.spec.scaling;
+        let demand = self.demand();
+
+        let needed = demand.div_ceil(policy.target_concurrency.max(1) as usize) as u32;
+        let mut desired = needed.saturating_add(policy.warm_pool);
+
+        let may_scale_to_zero = policy.min_replicas == 0 && policy.warm_pool == 0;
+        if may_scale_to_zero && demand == 0 && self.idle_for() >= policy.scale_to_zero_after_secs {
+            desired = 0;
+        }
+
+        desired.clamp(policy.min_replicas, policy.max_replicas)
+    }
+
+    /// Seconds since the pool last saw activity. An empty pool is treated as
+    /// maximally idle so a scaled-to-zero deployment stays there.
+    pub fn idle_for(&self) -> u64 {
+        let backends = self.backends();
+        if backends.is_empty() {
+            return u64::MAX;
+        }
+        let last = backends.iter().map(|b| b.last_active()).max().unwrap_or(0);
+        now_secs().saturating_sub(last)
+    }
+}
+
+/// Keeps a deployment's waiter count accurate for the life of a cold-start wait.
+///
+/// RAII because the wait has several exits (VM arrives, timeout, request
+/// cancelled); a leaked waiter would keep the deployment scaled up forever.
+pub struct WaiterGuard {
+    deployment: Arc<Deployment>,
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .deployment
+            .waiters
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{HealthCheck, RouteRule, ScalingPolicy, VmSpec};
+    use heyo_sdk::SandboxDriver;
+
+    fn backend(addr: &str) -> Arc<VmBackend> {
+        Arc::new(VmBackend::new(format!("sb-{addr}"), addr.parse().unwrap()))
+    }
+
+    fn deployment(scaling: ScalingPolicy) -> Deployment {
+        Deployment::new(DeploymentSpec {
+            id: "demo".into(),
+            routes: vec![RouteRule {
+                host: Some("demo.local".into()),
+                host_suffix: None,
+                path_prefix: None,
+            }],
+            vm: Some(VmSpec {
+                driver: SandboxDriver::Firecracker,
+                image: None,
+                port: 8080,
+                start_command: None,
+                size_class: None,
+                disk_size_gb: None,
+                working_directory: None,
+                env_vars: None,
+                setup_hooks: None,
+                open_ports: vec![],
+                ttl_seconds: 3600,
+            }),
+            scaling,
+            health: HealthCheck::default(),
+            upstreams: vec![],
+            build: None,
+            artifact: None,
+            site: None,
+            update: None,
+            auth: None,
+        })
+    }
+
+    /// A static (proxy_pass) deployment with the given upstreams.
+    fn static_deployment(upstreams: &[&str]) -> Deployment {
+        Deployment::new(DeploymentSpec {
+            id: "proxy".into(),
+            routes: vec![RouteRule {
+                host: None,
+                host_suffix: None,
+                path_prefix: Some("/legacy".into()),
+            }],
+            vm: None,
+            scaling: ScalingPolicy::default(),
+            health: HealthCheck::default(),
+            upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
+            build: None,
+            artifact: None,
+            site: None,
+            update: None,
+            auth: None,
+        })
+    }
+
+    #[test]
+    fn selects_least_in_flight() {
+        let d = deployment(ScalingPolicy::default());
+        let a = backend("10.0.0.1:80");
+        let b = backend("10.0.0.2:80");
+        a.acquire();
+        a.acquire();
+        b.acquire();
+        d.set_backends(vec![a, b.clone()]);
+        assert_eq!(d.select(&[]).unwrap().peer, b.peer);
+    }
+
+    #[test]
+    fn select_skips_excluded_draining_and_unhealthy() {
+        let d = deployment(ScalingPolicy::default());
+        let a = backend("10.0.0.1:80");
+        let b = backend("10.0.0.2:80");
+        let c = backend("10.0.0.3:80");
+        d.set_backends(vec![a.clone(), b.clone(), c.clone()]);
+
+        // Excluding the first (e.g. it just failed to connect) moves on.
+        assert_eq!(d.select(std::slice::from_ref(&a.peer)).unwrap().peer, b.peer);
+
+        b.set_draining();
+        c.set_healthy(false);
+        assert!(d.select(std::slice::from_ref(&a.peer)).is_none());
+        assert_eq!(d.select(&[]).unwrap().peer, a.peer);
+    }
+
+    #[test]
+    fn static_deployment_is_routable_immediately_and_cannot_grow() {
+        let d = static_deployment(&["10.0.0.9:8080", "backend.internal:8080"]);
+        // Backends are populated from the spec at construction, no autoscaler.
+        assert_eq!(d.backends().len(), 2);
+        assert!(d.spec.is_static());
+        // Never holds a request for a cold start.
+        assert!(!d.can_grow());
+        // Load-balances least-in-flight across the fixed upstreams.
+        let first = d.select(&[]).unwrap();
+        first.acquire();
+        let second = d.select(&[]).unwrap();
+        assert_ne!(first.peer, second.peer, "second request picks the idle upstream");
+    }
+
+    #[test]
+    fn select_on_empty_pool_is_none_not_panic() {
+        let d = deployment(ScalingPolicy::default());
+        assert!(d.select(&[]).is_none());
+    }
+
+    #[test]
+    fn release_saturates_at_zero() {
+        let b = backend("10.0.0.1:80");
+        b.release();
+        b.release();
+        assert_eq!(b.in_flight(), 0);
+        b.acquire();
+        assert_eq!(b.in_flight(), 1);
+    }
+
+    #[test]
+    fn acquire_release_round_trips() {
+        let b = backend("10.0.0.1:80");
+        for _ in 0..5 {
+            b.acquire();
+        }
+        assert_eq!(b.in_flight(), 5);
+        for _ in 0..5 {
+            b.release();
+        }
+        assert_eq!(b.in_flight(), 0);
+    }
+
+    #[test]
+    fn desired_scales_with_load() {
+        let d = deployment(ScalingPolicy {
+            min_replicas: 1,
+            max_replicas: 10,
+            target_concurrency: 10,
+            ..Default::default()
+        });
+        let a = backend("10.0.0.1:80");
+        d.set_backends(vec![a.clone()]);
+
+        // 25 in-flight / target 10 -> ceil = 3.
+        for _ in 0..25 {
+            a.acquire();
+        }
+        assert_eq!(d.desired_replicas(), 3);
+    }
+
+    #[test]
+    fn desired_is_clamped_to_min_and_max() {
+        let d = deployment(ScalingPolicy {
+            min_replicas: 2,
+            max_replicas: 4,
+            target_concurrency: 1,
+            ..Default::default()
+        });
+        let a = backend("10.0.0.1:80");
+        d.set_backends(vec![a.clone()]);
+        // Idle, but min_replicas holds the floor.
+        assert_eq!(d.desired_replicas(), 2);
+
+        // Far past max, but the ceiling holds.
+        for _ in 0..100 {
+            a.acquire();
+        }
+        assert_eq!(d.desired_replicas(), 4);
+    }
+
+    #[test]
+    fn warm_pool_adds_headroom_above_load() {
+        let d = deployment(ScalingPolicy {
+            min_replicas: 0,
+            max_replicas: 10,
+            warm_pool: 2,
+            target_concurrency: 10,
+            scale_to_zero_after_secs: 0,
+            ..Default::default()
+        });
+        let a = backend("10.0.0.1:80");
+        d.set_backends(vec![a.clone()]);
+
+        // Idle: just the warm pool. Scale-to-zero must not eat it, even though
+        // min_replicas is 0 and the pool is idle.
+        assert_eq!(d.desired_replicas(), 2);
+
+        // 10 in-flight needs 1, plus 2 warm spares.
+        for _ in 0..10 {
+            a.acquire();
+        }
+        assert_eq!(d.desired_replicas(), 3);
+    }
+
+    /// Regression: an empty pool reports `idle_for() == u64::MAX`, so a warm
+    /// pool starting from zero used to be zeroed out by scale-to-zero and could
+    /// never boot its first VM.
+    #[test]
+    fn warm_pool_bootstraps_from_an_empty_pool() {
+        let d = deployment(ScalingPolicy {
+            min_replicas: 0,
+            max_replicas: 3,
+            warm_pool: 1,
+            target_concurrency: 2,
+            scale_to_zero_after_secs: 300,
+            ..Default::default()
+        });
+        assert_eq!(d.desired_replicas(), 1);
+    }
+
+    #[test]
+    fn scales_to_zero_only_when_idle_and_min_is_zero() {
+        let d = deployment(ScalingPolicy {
+            min_replicas: 0,
+            max_replicas: 4,
+            warm_pool: 0,
+            target_concurrency: 10,
+            scale_to_zero_after_secs: 0, // idle immediately
+            ..Default::default()
+        });
+        let a = backend("10.0.0.1:80");
+        d.set_backends(vec![a.clone()]);
+        assert_eq!(d.desired_replicas(), 0);
+
+        // In-flight work blocks scale-to-zero even when "idle" by time.
+        a.acquire();
+        assert_eq!(d.desired_replicas(), 1);
+    }
+
+    #[test]
+    fn empty_pool_stays_at_zero_when_allowed() {
+        let d = deployment(ScalingPolicy {
+            min_replicas: 0,
+            max_replicas: 4,
+            scale_to_zero_after_secs: 300,
+            ..Default::default()
+        });
+        // No backends => idle_for is MAX => desired 0, and no panic on max().
+        assert_eq!(d.desired_replicas(), 0);
+    }
+
+    /// Regression: a request waiting on a scaled-to-zero deployment holds no
+    /// in-flight slot, so the pool looked idle and stayed at zero — the waiting
+    /// request then blocked until its cold-start timeout and 500'd.
+    #[test]
+    fn a_cold_start_waiter_is_demand_and_forces_scale_up() {
+        let d = Arc::new(deployment(ScalingPolicy {
+            min_replicas: 0,
+            max_replicas: 3,
+            warm_pool: 0,
+            target_concurrency: 2,
+            scale_to_zero_after_secs: 0, // maximally eager to scale to zero
+            ..Default::default()
+        }));
+        assert_eq!(d.desired_replicas(), 0);
+
+        let guard = d.track_waiter();
+        assert_eq!(d.demand(), 1);
+        assert_eq!(
+            d.desired_replicas(),
+            1,
+            "a waiting request must justify booting a VM",
+        );
+
+        drop(guard);
+        assert_eq!(d.demand(), 0);
+        assert_eq!(d.desired_replicas(), 0, "waiter must not leak after drop");
+    }
+
+    #[test]
+    fn waiters_and_in_flight_both_count_toward_demand() {
+        let d = Arc::new(deployment(ScalingPolicy {
+            min_replicas: 0,
+            max_replicas: 10,
+            target_concurrency: 2,
+            scale_to_zero_after_secs: 0,
+            ..Default::default()
+        }));
+        let a = backend("10.0.0.1:80");
+        d.set_backends(vec![a.clone()]);
+        for _ in 0..4 {
+            a.acquire();
+        }
+        let _g1 = d.track_waiter();
+        let _g2 = d.track_waiter();
+        // 4 in-flight + 2 waiting = 6, over target 2 => 3 replicas.
+        assert_eq!(d.demand(), 6);
+        assert_eq!(d.desired_replicas(), 3);
+    }
+
+    #[test]
+    fn concurrent_waiters_are_tracked_independently() {
+        let d = Arc::new(deployment(ScalingPolicy::default()));
+        let guards: Vec<_> = (0..5).map(|_| d.track_waiter()).collect();
+        assert_eq!(d.waiters(), 5);
+        drop(guards);
+        assert_eq!(d.waiters(), 0);
+    }
+
+    #[test]
+    fn can_grow_counts_pending_against_max() {
+        let d = deployment(ScalingPolicy {
+            max_replicas: 2,
+            ..Default::default()
+        });
+        assert!(d.can_grow());
+        d.set_backends(vec![backend("10.0.0.1:80")]);
+        assert!(d.can_grow());
+        // A booting VM already counts, so we don't over-provision.
+        d.set_pending(vec![PendingVm::new("sb-2".into())]);
+        assert!(!d.can_grow());
+    }
+}
