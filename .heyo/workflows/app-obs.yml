@@ -1,0 +1,25 @@
+name: app-obs CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app-obs/**'
+      - '.heyo/workflows/app-obs.yml'
+
+jobs:
+  app-obs:
+    name: Test app-obs
+    runs-on: namespace-profile-default
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test app-obs
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path app-obs/Cargo.toml

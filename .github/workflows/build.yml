@@ -109,12 +109,14 @@ jobs:
             heyosecret
             heyosecret-client
             orchestrator
+            app-obs
 
       - name: Test platform services
         run: |
           cargo test --locked --manifest-path heyosecret/Cargo.toml
           cargo test --locked --manifest-path heyosecret-client/Cargo.toml
           cargo test --locked --manifest-path orchestrator/Cargo.toml
+          cargo test --locked --manifest-path app-obs/Cargo.toml
 
   app-lb:
     name: test app-lb
