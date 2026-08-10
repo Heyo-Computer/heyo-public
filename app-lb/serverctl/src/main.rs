@@ -125,6 +125,15 @@ enum Command {
     /// Recycle a deployment's VMs, one eviction at a time.
     Restart(cmd::write::RestartArgs),
 
+    /// Stop new requests to one static upstream and return immediately.
+    Cordon(cmd::write::CordonArgs),
+
+    /// Cordon one static upstream and wait for its in-flight requests to finish.
+    Drain(cmd::write::DrainArgs),
+
+    /// Return a cordoned static upstream to traffic when it is healthy.
+    Uncordon(cmd::write::UncordonArgs),
+
     /// Watch a pool converge on its desired size.
     Rollout {
         #[command(subcommand)]
@@ -297,6 +306,9 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::Scale(args) => cmd::write::scale(&Ctx::new(g)?, args),
         Command::Restart(args) => cmd::write::restart(&Ctx::new(g)?, args),
+        Command::Cordon(args) => cmd::write::cordon(&Ctx::new(g)?, args),
+        Command::Drain(args) => cmd::write::drain(&Ctx::new(g)?, args),
+        Command::Uncordon(args) => cmd::write::uncordon(&Ctx::new(g)?, args),
         Command::Rollout { cmd } => {
             let ctx = Ctx::new(g)?;
             match cmd {

@@ -277,6 +277,11 @@ serverctl set upstreams legacy 10.0.0.9:8080 10.0.0.10:8080
 serverctl set route web --host web.example.com --path-prefix /api
 serverctl set route web --route '*.apps.example.com' --add
 serverctl set route sb-7f3a9c --none                  # withdraw from the proxy
+
+# Static upstream maintenance: durable and independent from probe health.
+serverctl cordon stage us1.internal:8080 --reason 'regional maintenance'
+serverctl drain stage us1.internal:8080 --timeout 300
+serverctl uncordon stage us1.internal:8080
 ```
 
 Routing flags: `--host`, `--host-suffix` and `--path-prefix` describe **one** rule together, so
@@ -578,6 +583,25 @@ daemon recopies from the base image on every boot. Pair it with
 or it only saves boot time; `serverctl describe` reports which mode a deployment
 is in under "When idle".
 
+### Cordoning and draining static upstreams
+
+`cordon` stops assigning new requests to one address in a static (`upstreams`)
+deployment and returns immediately. `drain` performs the same state change and
+then polls until that address has no requests in flight. Neither removes the
+address from the spec, kills a process, nor changes probe health.
+
+```sh
+serverctl cordon stage us1.internal:8080 --reason 'kernel upgrade'
+serverctl drain stage us1.internal:8080 --timeout 300
+serverctl uncordon stage us1.internal:8080
+```
+
+The state persists across app-lb restarts and deployment replay. A drain is
+refused while there is no other healthy, accepting upstream; `--force` opts into
+taking the deployment fully offline. If waiting times out, the upstream remains
+cordoned and the error names the `uncordon` command that restores it. `get vms
+-d stage` shows `Draining` separately from health throughout the operation.
+
 ### Static sites
 
 ```sh
@@ -655,6 +679,7 @@ The distinction runs through every command, because app-lb enforces it:
 | backends | an autoscaled pool of microVMs | fixed `host:port` addresses | none — files off disk |
 | `scale` | yes | rejected — the policy is inert | rejected — nothing to scale |
 | `restart` / `delete vm` | yes | rejected — nothing to evict | rejected — nothing to evict |
+| `cordon` / `drain` / `uncordon` | rejected — use VM eviction | yes | rejected — no upstream |
 | `exec` / `shell` | yes | rejected — upstreams are addresses | rejected — a site is files |
 | `set image` / `set env` | yes | rejected — no VM template | rejected — no VM template |
 | `set build` / `build` | yes | rejected — no guest image to build | rejected — no guest image |

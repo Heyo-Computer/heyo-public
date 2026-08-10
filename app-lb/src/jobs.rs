@@ -987,6 +987,7 @@ impl Jobs {
         deployment_id: &str,
         image: &str,
     ) -> Result<(), String> {
+        let change = self.registry.change_guard().await;
         let Some(old) = self.registry.get(deployment_id) else {
             return Err(format!(
                 "deployment {deployment_id:?} was removed while its image was building; \
@@ -1003,10 +1004,11 @@ impl Jobs {
         vm.image = Some(image.to_string());
 
         let deployment = self.registry.upsert(spec);
-        self.autoscaler.teardown(&old).await;
         if let Err(e) = self.registry.persist_one(&deployment.spec.id) {
             tracing::error!(error = %e, "failed to persist state after a build");
         }
+        drop(change);
+        self.autoscaler.teardown(&old).await;
         deployment.scale_signal.notify_one();
 
         self.update_record(job_id, |r| {

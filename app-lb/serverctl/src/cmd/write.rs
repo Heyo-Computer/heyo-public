@@ -8,7 +8,7 @@
 use super::{Ctx, Resource, deployment_name, parse_ref};
 use crate::output::{self, Table};
 use crate::spec::{self, EnvChange};
-use crate::types::{DeploymentStatus, JobRecord, SecretSummary};
+use crate::types::{DeploymentStatus, JobRecord, SecretSummary, UpstreamTrafficStatus};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde_json::{Map, Value};
@@ -1866,6 +1866,178 @@ pub fn scale(ctx: &Ctx, args: &ScaleArgs) -> Result<()> {
         status.spec.scaling.target_concurrency,
         status.ready,
         status.pending,
+    );
+    Ok(())
+}
+
+// -- static-upstream traffic control --------------------------------------
+
+#[derive(Args, Debug)]
+pub struct CordonArgs {
+    /// The static deployment, e.g. `stage` or `deployment/stage`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+    /// The exact `host:port` entry to stop sending new requests to.
+    #[arg(value_name = "UPSTREAM")]
+    pub upstream: String,
+    /// Allow cordoning when no other healthy, accepting upstream remains.
+    #[arg(long)]
+    pub force: bool,
+    /// Why this upstream is being withdrawn. Stored with the durable drain.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct DrainArgs {
+    #[command(flatten)]
+    pub cordon: CordonArgs,
+    /// Give up waiting after this long. The upstream remains cordoned on timeout.
+    #[arg(long, value_name = "SECS", default_value_t = 300)]
+    pub timeout: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct UncordonArgs {
+    /// The static deployment, e.g. `stage` or `deployment/stage`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+    /// The exact `host:port` entry to return to traffic when healthy.
+    #[arg(value_name = "UPSTREAM")]
+    pub upstream: String,
+}
+
+fn emit_upstream_status(ctx: &Ctx, status: &UpstreamTrafficStatus) -> Result<()> {
+    output::emit(
+        &serde_json::to_value(status)?,
+        ctx.out,
+        &[format!("upstream/{}", status.upstream)],
+    )
+}
+
+pub fn cordon(ctx: &Ctx, args: &CordonArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+    let status = ctx.client.cordon_upstream(
+        &id,
+        &args.upstream,
+        args.force,
+        args.reason.as_deref(),
+    )?;
+    if ctx.out.is_machine() {
+        return emit_upstream_status(ctx, &status);
+    }
+    println!(
+        "upstream/{} cordoned in deployment/{id} — {} request(s) still in flight{}",
+        status.upstream,
+        status.in_flight,
+        status
+            .reason
+            .as_deref()
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default(),
+    );
+    if status.in_flight > 0 {
+        println!(
+            "Wait for completion with `serverctl drain {id} {}`.",
+            status.upstream
+        );
+    }
+    Ok(())
+}
+
+pub fn drain(ctx: &Ctx, args: &DrainArgs) -> Result<()> {
+    let id = deployment_name(&args.cordon.resource)?;
+    let mut outcome = ctx.client.cordon_upstream(
+        &id,
+        &args.cordon.upstream,
+        args.cordon.force,
+        args.cordon.reason.as_deref(),
+    )?;
+    if !ctx.out.is_machine() {
+        println!(
+            "upstream/{} cordoned in deployment/{id}; waiting for {} in-flight request(s).",
+            outcome.upstream, outcome.in_flight
+        );
+    }
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(args.timeout);
+    let mut last = outcome.in_flight;
+    loop {
+        if outcome.in_flight == 0 {
+            outcome.state = "drained".into();
+            if ctx.out.is_machine() {
+                return emit_upstream_status(ctx, &outcome);
+            }
+            println!(
+                "upstream/{} drained — no requests remain in flight.",
+                outcome.upstream
+            );
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "timed out after {}s waiting for upstream {:?} to drain; it remains cordoned. \
+                 Inspect it with `serverctl get vms -d {id}` or restore it with \
+                 `serverctl uncordon {id} {}`",
+                timeout.as_secs(),
+                args.cordon.upstream,
+                args.cordon.upstream,
+            );
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        std::thread::sleep(Duration::from_secs(1).min(remaining));
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            bail!(
+                "timed out after {}s waiting for upstream {:?} to drain; it remains cordoned. \
+                 Restore it with `serverctl uncordon {id} {}`",
+                timeout.as_secs(),
+                args.cordon.upstream,
+                args.cordon.upstream,
+            );
+        }
+
+        let deployment = ctx.client.deployment_with_timeout(&id, remaining)?;
+        let upstreams: Vec<_> = deployment
+            .vms
+            .iter()
+            .filter(|backend| backend.addr == args.cordon.upstream)
+            .collect();
+        if upstreams.is_empty() {
+            bail!(
+                "upstream {:?} disappeared from deployment/{id} while draining",
+                args.cordon.upstream,
+            );
+        }
+        if upstreams.iter().any(|upstream| !upstream.draining) {
+            bail!(
+                "upstream {:?} became uncordoned before its drain completed",
+                args.cordon.upstream,
+            );
+        }
+        outcome.in_flight = upstreams.iter().map(|upstream| upstream.in_flight).sum();
+        if !ctx.out.is_machine() && outcome.in_flight != last {
+            println!("{} request(s) still in flight.", outcome.in_flight);
+            last = outcome.in_flight;
+        }
+    }
+}
+
+pub fn uncordon(ctx: &Ctx, args: &UncordonArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+    let status = ctx.client.uncordon_upstream(&id, &args.upstream)?;
+    if ctx.out.is_machine() {
+        return emit_upstream_status(ctx, &status);
+    }
+    println!(
+        "upstream/{} uncordoned in deployment/{id} — {}",
+        status.upstream,
+        if status.healthy {
+            "accepting traffic"
+        } else {
+            "administratively accepting, but still excluded by its health probe"
+        },
     );
     Ok(())
 }

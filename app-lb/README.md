@@ -165,6 +165,8 @@ serverctl rollout status demo
 serverctl get deployments -o wide
 serverctl scale demo --min 2 --max 8
 serverctl restart demo                    # drain every VM; the autoscaler replaces them
+serverctl drain stage us1.internal:8080   # stop new traffic, wait for in-flight to reach zero
+serverctl uncordon stage us1.internal:8080
 serverctl top                             # per-deployment CPU, memory, latency, 5xx
 
 # Ship a rootfs through an artifact store, and boot it somewhere else.
@@ -238,6 +240,11 @@ curl -XPATCH localhost:9090/deployments/demo/scaling -H 'content-type: applicati
 # Evict (delete) a single VM. The x-vm-id header / metrics give the sandbox id.
 curl -XDELETE localhost:9090/deployments/demo/vms/sb-abc123            # graceful drain
 curl -XDELETE 'localhost:9090/deployments/demo/vms/sb-abc123?force=true'  # kill now
+
+# Drain a fixed regional/static upstream. The address is one encoded path segment.
+curl -XPUT localhost:9090/deployments/stage/upstreams/us1.internal%3A8080/drain \
+  -H 'content-type: application/json' -d '{"reason":"regional maintenance"}'
+curl -XDELETE localhost:9090/deployments/stage/upstreams/us1.internal%3A8080/drain
 ```
 
 Then: `curl -H 'Host: demo.local' localhost:6188/`
@@ -266,6 +273,35 @@ Each upstream is a `host:port` (or `ip:port`); a hostname is re-resolved per con
 change the targets, `PUT` the deployment with a new `upstreams` list (the backends are rebuilt).
 Scaling (`PATCH .../scaling`) and per-VM eviction (`DELETE .../vms/...`) do not apply to a
 static deployment and are rejected. Upstreams are proxied over **plaintext HTTP**.
+
+#### Cordoning and draining a static upstream
+
+Health and operator intent are deliberately separate. A failed probe excludes an upstream until
+it recovers. An operator drain excludes it until an operator removes that drain, even if every
+probe succeeds in the meantime. Drain intent is stored in the deployment's runtime state, survives
+an app-lb restart and a replay of the deployment spec, and is visible beside `healthy`, `draining`
+and `in_flight` in the deployment and metrics responses.
+
+```sh
+# Stop new traffic and return immediately. Existing requests continue.
+serverctl cordon stage us1.internal:8080 --reason 'regional maintenance'
+
+# Do the same, but wait until in_flight reaches zero.
+serverctl drain stage us1.internal:8080 --timeout 300
+
+# A healthy upstream becomes selectable immediately. An unhealthy one waits for its probe.
+serverctl uncordon stage us1.internal:8080
+```
+
+The safety rule is fail-closed: a first-time drain is rejected with `409 Conflict` unless another
+upstream is both healthy and accepting. This prevents two simultaneous maintenance operations
+from withdrawing all capacity; drain mutations are serialized per deployment so both requests
+cannot race through the check. `--force` (API body `{"force":true}`) is the explicit escape hatch
+for an intentional outage. Retrying an already-active drain is idempotent and does not need force.
+
+`cordon` and `drain` both stop new selection at the same instant. The difference is only whether
+the client waits for old requests to finish. A drain timeout does **not** reopen the upstream; the
+safe failure mode is to leave it cordoned until `uncordon` is called.
 
 ### Static sites
 

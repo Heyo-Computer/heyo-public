@@ -203,6 +203,22 @@ impl Client {
         .await
     }
 
+    /// Read one deployment with a caller-supplied deadline. Drain polling uses
+    /// this so its `--timeout` remains a wall-clock bound rather than inheriting
+    /// the ordinary 30-second request timeout on every iteration.
+    pub async fn deployment_with_timeout(
+        &self,
+        id: &str,
+        timeout: Duration,
+    ) -> Result<DeploymentStatus> {
+        self.read(
+            Request::new(Method::Get, format!("/deployments/{}", seg(id))).timeout(timeout),
+            "deployment",
+            id,
+        )
+        .await
+    }
+
     /// Whether a deployment exists, without treating absence as an error.
     pub async fn deployment_exists(&self, id: &str) -> Result<bool> {
         match self.deployment(id).await {
@@ -278,6 +294,57 @@ impl Client {
         );
         self.read(Request::new(Method::Delete, path), "vm", sandbox)
             .await
+    }
+
+    /// Stop new requests to one static upstream. Existing requests remain until
+    /// they finish; use the returned `in_flight` count to observe the drain.
+    pub async fn cordon_upstream(
+        &self,
+        id: &str,
+        upstream: &str,
+        force: bool,
+        reason: Option<&str>,
+    ) -> Result<UpstreamTrafficStatus> {
+        let mut body = json!({ "force": force });
+        if let Some(reason) = reason {
+            body["reason"] = json!(reason);
+        }
+        self.read(
+            Request::new(
+                Method::Put,
+                format!(
+                    "/deployments/{}/upstreams/{}/drain",
+                    seg(id),
+                    seg(upstream),
+                ),
+            )
+            .json(body),
+            "upstream",
+            upstream,
+        )
+        .await
+    }
+
+    /// Remove an administrative drain. Health remains independent: an
+    /// unhealthy upstream is still excluded until its probe recovers.
+    pub async fn uncordon_upstream(
+        &self,
+        id: &str,
+        upstream: &str,
+    ) -> Result<UpstreamTrafficStatus> {
+        self.read(
+            Request::new(
+                Method::Delete,
+                format!(
+                    "/deployments/{}/upstreams/{}/drain",
+                    seg(id),
+                    seg(upstream),
+                ),
+            ),
+            "upstream",
+            upstream,
+        )
+        .await
     }
 
     // -- running things inside a VM ----------------------------------------
@@ -782,6 +849,51 @@ impl Raw<'_> {
                 ),
                 "vm",
                 sandbox,
+            )
+            .await
+    }
+
+    pub async fn cordon_upstream(
+        &self,
+        id: &str,
+        upstream: &str,
+        force: bool,
+        reason: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = json!({ "force": force });
+        if let Some(reason) = reason {
+            body["reason"] = json!(reason);
+        }
+        self.0
+            .read(
+                Request::new(
+                    Method::Put,
+                    format!(
+                        "/deployments/{}/upstreams/{}/drain",
+                        seg(id),
+                        seg(upstream),
+                    ),
+                )
+                .json(body),
+                "upstream",
+                upstream,
+            )
+            .await
+    }
+
+    pub async fn uncordon_upstream(&self, id: &str, upstream: &str) -> Result<Value> {
+        self.0
+            .read(
+                Request::new(
+                    Method::Delete,
+                    format!(
+                        "/deployments/{}/upstreams/{}/drain",
+                        seg(id),
+                        seg(upstream),
+                    ),
+                ),
+                "upstream",
+                upstream,
             )
             .await
     }

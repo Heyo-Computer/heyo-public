@@ -15,7 +15,7 @@
 //! Regenerate the fixtures with:
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
-use serverctl::types::{WorkflowList, WorkflowView};
+use serverctl::types::{UpstreamTrafficStatus, WorkflowList, WorkflowView};
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> String {
@@ -99,4 +99,22 @@ fn an_unknown_field_parses_and_is_reachable() {
         Some("prod"),
         "an unknown field must be reachable, not dropped"
     );
+}
+
+#[test]
+fn upstream_traffic_status_understands_every_field() {
+    let status: UpstreamTrafficStatus =
+        serde_json::from_str(&fixture("upstream-traffic-status")).expect("fixture parses");
+    assert!(
+        status.extra.is_empty(),
+        "unknown upstream traffic fields: {:?}",
+        status.extra.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(status.deployment_id, "stage");
+    assert_eq!(status.upstream, "us1.example.com:443");
+    assert_eq!(status.state, "draining");
+    assert!(status.healthy);
+    assert_eq!(status.in_flight, 3);
+    assert_eq!(status.reason.as_deref(), Some("regional maintenance"));
+    assert_eq!(status.started_at, Some(1_722_400_000));
 }

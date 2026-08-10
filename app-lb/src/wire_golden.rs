@@ -638,6 +638,19 @@ fn the_small_responses_are_stable() {
         },
     );
 
+    golden(
+        "upstream-traffic-status",
+        &UpstreamTrafficResponse {
+            deployment_id: "stage".into(),
+            upstream: "us1.example.com:443".into(),
+            state: "draining",
+            healthy: true,
+            in_flight: 3,
+            reason: Some("regional maintenance".into()),
+            started_at: Some(1_722_400_000),
+        },
+    );
+
     // The one error shape clients can parse. Every *other* error app-lb produces
     // — the 401, and every axum extractor rejection — is plain text with no JSON
     // at all, which is why a client's error path cannot assume this envelope.

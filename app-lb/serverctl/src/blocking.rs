@@ -184,6 +184,14 @@ impl Client {
         run!(self, self.inner.deployment(id))
     }
 
+    pub fn deployment_with_timeout(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<DeploymentStatus> {
+        run!(self, self.inner.deployment_with_timeout(id, timeout))
+    }
+
     pub fn deployment_exists(&self, id: &str) -> Result<bool> {
         run!(self, self.inner.deployment_exists(id))
     }
@@ -206,6 +214,23 @@ impl Client {
 
     pub fn evict_vm(&self, id: &str, sandbox: &str, force: bool) -> Result<EvictOutcome> {
         run!(self, self.inner.evict_vm(id, sandbox, force))
+    }
+
+    pub fn cordon_upstream(
+        &self,
+        id: &str,
+        upstream: &str,
+        force: bool,
+        reason: Option<&str>,
+    ) -> Result<UpstreamTrafficStatus> {
+        run!(
+            self,
+            self.inner.cordon_upstream(id, upstream, force, reason)
+        )
+    }
+
+    pub fn uncordon_upstream(&self, id: &str, upstream: &str) -> Result<UpstreamTrafficStatus> {
+        run!(self, self.inner.uncordon_upstream(id, upstream))
     }
 
     pub fn deployment_ids(&self, page: usize) -> Result<Vec<String>> {
@@ -580,6 +605,29 @@ impl Raw<'_> {
 
     pub fn evict_vm(&self, id: &str, sandbox: &str, force: bool) -> Result<Value> {
         block_on(&self.client.rt, self.client.inner.raw().evict_vm(id, sandbox, force))?
+    }
+
+    pub fn cordon_upstream(
+        &self,
+        id: &str,
+        upstream: &str,
+        force: bool,
+        reason: Option<&str>,
+    ) -> Result<Value> {
+        block_on(
+            &self.client.rt,
+            self.client
+                .inner
+                .raw()
+                .cordon_upstream(id, upstream, force, reason),
+        )?
+    }
+
+    pub fn uncordon_upstream(&self, id: &str, upstream: &str) -> Result<Value> {
+        block_on(
+            &self.client.rt,
+            self.client.inner.raw().uncordon_upstream(id, upstream),
+        )?
     }
 
     pub fn start_build(&self, id: &str, git_ref: Option<&str>) -> Result<Value> {
