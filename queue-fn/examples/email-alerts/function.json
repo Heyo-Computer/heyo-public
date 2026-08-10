@@ -1,0 +1,35 @@
+{
+  "id": "email-alerts",
+  "vm": {
+    "driver": "firecracker",
+    "image": "ubuntu-alerts",
+    "size_class": "small",
+    "ttl_seconds": 3600
+  },
+  "exec": {
+    "command": "python3 /opt/email-alerts/fanout.py",
+    "timeout_secs": 25,
+    "max_payload_bytes": 4096,
+    "payload_mode": "env",
+    "env": {
+      "ALERT_SECRETS_TOKEN": "__HEYOSECRET_TOKEN__",
+      "ALERT_SECRETS_PORT": "4455",
+      "ALERT_SMTP_SECRET": "alerts/smtp/relay",
+      "ALERT_ROUTING_SECRET": "alerts/routing/email-alerts",
+      "ALERT_DEADLINE_SECS": "20",
+      "ALERT_CACHE_TTL_SECS": "60"
+    }
+  },
+  "scaling": {
+    "min_replicas": 0,
+    "max_replicas": 6,
+    "warm_pool": 1,
+    "target_concurrency": 2,
+    "scale_to_zero_after_secs": 600,
+    "cold_start_timeout_secs": 180,
+    "drain_timeout_secs": 60
+  },
+  "retry": {
+    "max_attempts": 3
+  }
+}
