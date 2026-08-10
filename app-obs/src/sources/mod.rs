@@ -2,6 +2,7 @@
 
 pub mod applb;
 pub mod heyvm;
+pub mod nats;
 
 /// One live VM backend and the deployment it serves, as reported by app-lb's
 /// metrics snapshot. The poller publishes the current set after every

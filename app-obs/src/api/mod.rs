@@ -15,6 +15,8 @@ use crate::ingest::Sink;
 use crate::query::{
     Engine, HOST_DEPLOYMENT, LogBucket, LogFilter, MAX_LOG_LIMIT, MetricBucket, QueryError, Window,
 };
+use crate::sources::applb::LiveStatus;
+use crate::sources::nats;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect};
@@ -57,6 +59,11 @@ pub struct ApiState {
     pub buffered: Arc<AtomicUsize>,
     pub flush_secs: u64,
     pub retain_days: u32,
+    /// Last successful app-lb poll. A failed poll leaves the snapshot in place;
+    /// the endpoint marks it stale instead of replacing evidence with emptiness.
+    pub live: tokio::sync::watch::Receiver<Option<LiveStatus>>,
+    pub stale_after_secs: u64,
+    pub telemetry: Option<Arc<nats::Stats>>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -66,6 +73,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/", get(|| async { Redirect::temporary("/dashboard") }))
         .route("/dashboard", get(dashboard))
         .route("/api/fleet", get(fleet))
+        .route("/api/platform-status", get(platform_status))
         .route("/api/deployments/{id}", get(detail))
         .route("/api/deployments/{id}/logs", get(logs))
         // Always open, and deliberately not behind a query slot: app-lb health
@@ -89,6 +97,116 @@ async fn stats(State(state): State<ApiState>) -> impl IntoResponse {
         "flush_secs": state.flush_secs,
         "retain_days": state.retain_days,
     }))
+}
+
+#[derive(Debug, Serialize)]
+struct PlatformStatusResponse {
+    generated_at_ms: i64,
+    status: &'static str,
+    stale: bool,
+    stale_after_secs: u64,
+    telemetry: serde_json::Value,
+    snapshot: Option<LiveStatus>,
+}
+
+/// Current routing topology and observation health. Unlike `/api/fleet`, this
+/// never scans parquet: a status page must still answer while historical query
+/// capacity is exhausted.
+async fn platform_status(State(state): State<ApiState>) -> Json<PlatformStatusResponse> {
+    let now = Utc::now().timestamp_millis();
+    let snapshot = state.live.borrow().clone();
+    let stale = observation_is_stale(now, snapshot.as_ref(), state.stale_after_secs);
+    let mut status = overall_status(snapshot.as_ref(), stale);
+    let telemetry = state.telemetry.as_ref().map_or_else(
+        || serde_json::json!({ "configured": false }),
+        |stats| {
+            let snapshot = stats.snapshot();
+            if status == "healthy" && !snapshot.connected {
+                status = "degraded";
+            }
+            serde_json::to_value(snapshot).unwrap_or_default()
+        },
+    );
+    Json(PlatformStatusResponse {
+        generated_at_ms: now,
+        status,
+        stale,
+        stale_after_secs: state.stale_after_secs,
+        telemetry,
+        snapshot,
+    })
+}
+
+fn observation_is_stale(now_ms: i64, snapshot: Option<&LiveStatus>, stale_after_secs: u64) -> bool {
+    snapshot.is_none_or(|snapshot| {
+        now_ms.saturating_sub(snapshot.observed_at_ms)
+            > (stale_after_secs as i64).saturating_mul(1000)
+    })
+}
+
+fn overall_status(snapshot: Option<&LiveStatus>, stale: bool) -> &'static str {
+    let Some(snapshot) = snapshot else {
+        return "unavailable";
+    };
+    if stale {
+        return "unavailable";
+    }
+
+    let mut degraded = false;
+    let mut routed_deployments = 0;
+    let mut routing_unknown = false;
+    for deployment in &snapshot.deployments {
+        let kind = deployment.kind.as_deref().unwrap_or("vm");
+        match deployment.routed {
+            Some(false) => continue,
+            None => {
+                routing_unknown = true;
+                continue;
+            }
+            Some(true) => {}
+        }
+        routed_deployments += 1;
+        if kind == "site" {
+            continue;
+        }
+        let accepting = deployment
+            .vms
+            .iter()
+            .filter(|backend| backend.healthy && !backend.draining)
+            .count();
+        if accepting == 0 {
+            let intentionally_idle = kind == "vm"
+                && deployment.vms.is_empty()
+                && deployment.pool.pending == 0
+                && deployment.pool.min_replicas == Some(0)
+                && deployment.pool.desired_replicas == Some(0);
+            if intentionally_idle {
+                continue;
+            }
+            if deployment.pool.min_replicas.is_none()
+                || deployment.pool.desired_replicas.is_none()
+            {
+                degraded = true;
+                continue;
+            }
+            return "unavailable";
+        }
+        if accepting < deployment.vms.len() {
+            degraded = true;
+        }
+    }
+    if routed_deployments == 0 {
+        return if routing_unknown {
+            "degraded"
+        } else {
+            "unavailable"
+        };
+    }
+    if degraded || routing_unknown {
+        "degraded"
+    } else {
+        "healthy"
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +556,9 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::applb::{
+        DeploymentMetrics, DeploymentView, Histogram, HostUsage, PoolStatus, StatusCounts, VmView,
+    };
 
     fn bucket(t: i64, cpu: Option<f64>, latency: Option<f64>) -> MetricBucket {
         MetricBucket {
@@ -446,6 +567,185 @@ mod tests {
             mean_latency_ms: latency,
             ..Default::default()
         }
+    }
+
+    fn backend(name: &str, healthy: bool, draining: bool) -> VmView {
+        VmView {
+            backend: name.into(),
+            in_flight: 0,
+            healthy,
+            draining,
+            uptime_secs: 60,
+            cpu_percent: None,
+            memory_bytes: None,
+        }
+    }
+
+    fn static_status(backends: Vec<VmView>) -> LiveStatus {
+        LiveStatus {
+            schema_version: 1,
+            source: "stage-edge".into(),
+            observed_at_ms: 1_000,
+            app_lb_generated_at_ms: 1_000,
+            host: HostUsage {
+                available: true,
+                cpu_percent: 10.0,
+                memory_used_bytes: 1024,
+            },
+            deployments: vec![DeploymentView {
+                id: "stage".into(),
+                kind: Some("static".into()),
+                upstreams: vec!["eu1:80".into(), "us1:80".into()],
+                routed: Some(true),
+                pool: PoolStatus {
+                    desired_replicas: Some(0),
+                    ready: backends.len() as u32,
+                    draining: backends.iter().filter(|backend| backend.draining).count() as u32,
+                    pending: 0,
+                    min_replicas: Some(0),
+                    total_in_flight: 0,
+                    cpu_percent: None,
+                    memory_bytes: None,
+                },
+                vms: backends,
+                metrics: DeploymentMetrics {
+                    requests: StatusCounts {
+                        total: 0,
+                        errors: 0,
+                    },
+                    latency_ms: Histogram {
+                        count: 0,
+                        sum: 0,
+                        p50: 0.0,
+                        p90: 0.0,
+                        p99: 0.0,
+                    },
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn platform_status_distinguishes_partial_and_total_withdrawal() {
+        let healthy = static_status(vec![
+            backend("eu1:80", true, false),
+            backend("us1:80", true, false),
+        ]);
+        assert_eq!(overall_status(Some(&healthy), false), "healthy");
+
+        let partial = static_status(vec![
+            backend("eu1:80", true, false),
+            backend("us1:80", true, true),
+        ]);
+        assert_eq!(overall_status(Some(&partial), false), "degraded");
+
+        let offline = static_status(vec![
+            backend("eu1:80", false, false),
+            backend("us1:80", true, true),
+        ]);
+        assert_eq!(overall_status(Some(&offline), false), "unavailable");
+        assert_eq!(overall_status(Some(&healthy), true), "unavailable");
+        assert_eq!(overall_status(None, false), "unavailable");
+    }
+
+    #[test]
+    fn platform_status_staleness_tolerates_clock_correction() {
+        let status = static_status(vec![backend("eu1:80", true, false)]);
+        assert!(observation_is_stale(20_001, Some(&status), 19));
+        assert!(!observation_is_stale(20_000, Some(&status), 19));
+        assert!(observation_is_stale(20_000, None, 19));
+
+        let future = LiveStatus {
+            observed_at_ms: 30_000,
+            ..status
+        };
+        assert!(
+            !observation_is_stale(20_000, Some(&future), 19),
+            "a wall clock correction must not underflow into a stale snapshot",
+        );
+    }
+
+    #[test]
+    fn platform_status_requires_capacity_or_intentional_scale_to_zero() {
+        let no_deployments = LiveStatus {
+            deployments: Vec::new(),
+            ..static_status(Vec::new())
+        };
+        assert_eq!(overall_status(Some(&no_deployments), false), "unavailable");
+
+        let empty_pool = static_status(Vec::new());
+        assert_eq!(overall_status(Some(&empty_pool), false), "unavailable");
+
+        let managed_pool = LiveStatus {
+            deployments: vec![DeploymentView {
+                kind: Some("vm".into()),
+                ..empty_pool.deployments[0].clone()
+            }],
+            ..empty_pool
+        };
+        assert_eq!(
+            overall_status(Some(&managed_pool), false),
+            "healthy",
+            "an intentionally idle scale-to-zero deployment is not an outage",
+        );
+    }
+
+    #[test]
+    fn unrouted_sandboxes_do_not_degrade_routed_capacity() {
+        let mut status = static_status(vec![backend("eu1:80", true, false)]);
+        status.deployments.push(DeploymentView {
+            id: "agent-sandbox".into(),
+            kind: Some("vm".into()),
+            upstreams: Vec::new(),
+            routed: Some(false),
+            pool: PoolStatus {
+                desired_replicas: Some(0),
+                ready: 0,
+                draining: 0,
+                pending: 0,
+                min_replicas: Some(0),
+                total_in_flight: 0,
+                cpu_percent: None,
+                memory_bytes: None,
+            },
+            vms: Vec::new(),
+            metrics: DeploymentMetrics {
+                requests: StatusCounts {
+                    total: 0,
+                    errors: 0,
+                },
+                latency_ms: Histogram {
+                    count: 0,
+                    sum: 0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p99: 0.0,
+                },
+            },
+        });
+
+        assert_eq!(overall_status(Some(&status), false), "healthy");
+    }
+
+    #[test]
+    fn scale_to_zero_and_sites_are_serving_states() {
+        let mut idle = static_status(Vec::new());
+        idle.deployments[0].kind = Some("vm".into());
+        assert_eq!(overall_status(Some(&idle), false), "healthy");
+
+        idle.deployments[0].pool.desired_replicas = Some(1);
+        assert_eq!(overall_status(Some(&idle), false), "unavailable");
+
+        let mut site = static_status(Vec::new());
+        site.deployments[0].kind = Some("site".into());
+        assert_eq!(overall_status(Some(&site), false), "healthy");
+    }
+
+    #[test]
+    fn an_old_app_lb_is_unknown_instead_of_inventing_routes() {
+        let mut status = static_status(Vec::new());
+        status.deployments[0].routed = None;
+        assert_eq!(overall_status(Some(&status), false), "degraded");
     }
 
     #[test]

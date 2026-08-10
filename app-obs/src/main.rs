@@ -21,9 +21,10 @@ use ingest::http::IngestState;
 use query::Engine;
 use retention::Retention;
 use sources::applb::Poller;
+use sources::nats::{Config as NatsConfig, Publisher as NatsPublisher, Stats as NatsStats};
+use std::sync::Arc;
 use store::schema::Record;
 use store::writer::Writer;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// How many records to take off the queue per blocking excursion.
@@ -118,6 +119,27 @@ async fn run(cfg: Config) {
     // deployment each serves; the channel starts empty so the tailer idles
     // until the first successful poll.
     let (targets_tx, targets_rx) = tokio::sync::watch::channel(Vec::new());
+    let (live_tx, live_rx) = tokio::sync::watch::channel(None);
+    let telemetry_stats = cfg
+        .nats_url
+        .as_ref()
+        .map(|_| Arc::new(NatsStats::new(cfg.nats_subject.clone())));
+    let telemetry = cfg.nats_url.as_ref().map(|url| {
+        NatsPublisher::new(
+            NatsConfig {
+                url: url.clone(),
+                user: cfg.nats_user.clone(),
+                password: cfg.nats_password.clone(),
+                token: cfg.nats_token.clone(),
+                subject: cfg.nats_subject.clone(),
+            },
+            telemetry_stats
+                .as_ref()
+                .expect("stats exist whenever NATS is configured")
+                .clone(),
+        )
+        .spawn()
+    });
     tokio::spawn(
         Poller::new(
             &cfg.applb_url,
@@ -125,6 +147,9 @@ async fn run(cfg: Config) {
             cfg.applb_password.clone(),
             cfg.poll_interval,
             sink.clone(),
+            cfg.source.clone(),
+            live_tx,
+            telemetry,
             Some(targets_tx),
         )
         .run(),
@@ -166,6 +191,9 @@ async fn run(cfg: Config) {
         buffered,
         flush_secs: cfg.flush_interval.as_secs(),
         retain_days: cfg.retain_days,
+        live: live_rx,
+        stale_after_secs: cfg.poll_interval.as_secs().saturating_mul(3).max(15),
+        telemetry: telemetry_stats,
     };
     let api_addr = cfg.api_addr.clone();
     tokio::spawn(async move {
