@@ -48,6 +48,14 @@ const RECONCILE_CONCURRENCY: usize = 32;
 /// operation rather than on the loop that reaches it.
 const CREATE_CONCURRENCY: usize = 8;
 
+/// How many lines of the guest's own output to attach to a boot timeout.
+///
+/// The tail, because a boot that fails says so at the end: the last thing a
+/// dying server printed is the reason, and everything before it is the startup
+/// it got through. Twenty is enough for a stack trace or a connection refusal
+/// with the lines around it, and short enough to stay one log record.
+const GUEST_LOG_LINES: usize = 20;
+
 /// How often to look for suspended VMs no deployment claims.
 ///
 /// Slow on purpose. The daemon answers `GET /sandboxes/inactive` by walking its
@@ -498,6 +506,17 @@ impl Autoscaler {
             // Still booting. Either it gets a deadline or it gets a heartbeat,
             // but it does not get silence.
             if boot_timeout > 0 && age >= boot_timeout {
+                // Fetched *before* the kill below, because the daemon's capture
+                // buffer belongs to the sandbox and goes when it does. This is
+                // the last moment the guest can say why it never came up, and
+                // for a long time this line reported the whole failure without
+                // it: `waiting_on` says the server never answered, and the
+                // reason the server never answered was sitting in a ring buffer
+                // that app-lb then threw away with the VM.
+                let guest_log = self
+                    .vms
+                    .guest_log_tail(&p.sandbox_id, GUEST_LOG_LINES)
+                    .await;
                 tracing::error!(
                     deployment = %d.spec.id,
                     sandbox = %p.sandbox_id,
@@ -505,6 +524,12 @@ impl Autoscaler {
                     boot_timeout_secs = boot_timeout,
                     status = ?info.status,
                     waiting_on = %boot_stall(info, &d.spec.health, d.spec.vm_spec().port),
+                    guest_log = guest_log.as_deref().unwrap_or(
+                        "unavailable — the daemon captured no output for this sandbox. A guest \
+                         with no socat or /dev/vsock never starts the forwarders heyvmd \
+                         collects it through, and its output stays in the guest's own \
+                         /var/log/heyvm-start.err.log",
+                    ),
                     "VM never became ready inside its boot timeout; killing it so the pool \
                      can try again",
                 );
