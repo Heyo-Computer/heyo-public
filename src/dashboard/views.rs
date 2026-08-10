@@ -147,6 +147,7 @@ pub fn monitoring_page(
     let guest_cpu: f32 = running.iter().filter_map(|r| r.cpu_percent).sum();
     let archived = rows.iter().filter(|r| r.offload == Some("archived")).count();
     let frozen = rows.iter().filter(|r| r.offload == Some("frozen")).count();
+    let compacted = rows.iter().filter(|r| r.offload == Some("compacted")).count();
 
     shell(
         "Monitoring",
@@ -222,6 +223,7 @@ pub fn monitoring_page(
                 (stat("allocated RAM", &human_bytes(alloc_mem), Some("across running VMs")))
                 (stat("guest CPU", &format!("{guest_cpu:.0}%"), Some("cores busy, top-convention")))
                 @if st.registry.archive_enabled() {
+                    (stat("compacted (local)", &compacted.to_string(), None))
                     (stat("frozen (local)", &frozen.to_string(), None))
                     (stat("archived (S3)", &archived.to_string(), None))
                 }
@@ -1222,6 +1224,7 @@ fn sessions_cell(r: &VmRow) -> Markup {
 fn status_badge_row(r: &VmRow) -> Markup {
     match r.offload {
         Some("frozen") => html! { span.badge class="s-archived" { "frozen (local)" } },
+        Some("compacted") => html! { span.badge class="s-archived" { "compacted (local)" } },
         Some(_) => html! { span.badge class="s-archived" { "archived (S3)" } },
         None => status_badge(&r.status),
     }

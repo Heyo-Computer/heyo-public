@@ -90,6 +90,11 @@ async fn main() -> Result<()> {
     // PG_VM_POOL_FREEZE_AFTER_SECS is configured.
     registry.spawn_dump_server();
     registry.spawn_freezer();
+    // Compacted tier: image stopped, long-idle schemas' disks into local zstd
+    // files (~5-25x smaller than the ext4) and delete their VMs — no boot, no
+    // pg_dump; thaw is a decompress + boot. No-op unless
+    // PG_VM_POOL_COMPACT_AFTER_SECS (and PG_VM_POOL_RUN_DIR) are set.
+    registry.spawn_compactor();
     // Offline-trim stopped VMs' data disks so freed guest blocks return to the
     // host (Firecracker has no discard passthrough). No-op unless
     // PG_VM_POOL_RECLAIM_CMD is configured.
@@ -98,6 +103,13 @@ async fn main() -> Result<()> {
     // kill it acked but didn't act on), reclaiming the stranded disk. No-op
     // unless PG_VM_POOL_ORPHAN_SWEEP_SECS (and PG_VM_POOL_RUN_DIR) are set.
     registry.spawn_orphan_reaper();
+    // A pooler that died mid-image-restore left up to a full raw image in the
+    // run dir's dot-named scratch (invisible to the sb-* sweep). Clean that
+    // up-front — this startup is the first moment we know no restore is
+    // running — and let the sweep keep it clean from here.
+    if let Some(run_dir) = registry.run_dir() {
+        crate::imgarchive::gc_restore_scratch(&run_dir);
+    }
 
     // Optional admin dashboard: enabled only when PG_VM_POOL_DASHBOARD_LISTEN is
     // set. Runs in its own task sharing the registry, so it never blocks the PG

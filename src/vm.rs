@@ -59,6 +59,10 @@ pub enum RestoreSource {
     /// spare claim, no guest job. Chosen when the schema's S3 archive is an
     /// image rather than a dump (see `imgarchive::pick_restore`).
     S3Image(S3Config),
+    /// Locally compacted image (the `Compacted` tier): same materialize
+    /// maneuver as `S3Image` minus the download — the compressed image is
+    /// already on this host at the given path.
+    LocalImage(std::path::PathBuf),
     Local {
         srv: std::sync::Arc<crate::dumpsrv::DumpServer>,
         port: u16,
@@ -81,54 +85,85 @@ pub async fn ensure_vm(
     // restore, whose database is partially loaded — which is why the restore
     // job runs `pg_restore --clean --if-exists` (idempotent over that débris).
     let known_id = if restore.is_some() { None } else { known_id };
-    let sandbox = match restore {
+    let (sandbox, claimed_spare) = match restore {
         // An image restore builds its own VM (download, disk swap, boot on the
         // real data) — the database is complete before Postgres first starts,
         // so there is nothing to restore into and no spare worth claiming.
-        Some(RestoreSource::S3Image(s3)) => crate::imgarchive::materialize_from_image(cfg, schema, s3)
-            .await
-            .with_context(|| format!("restoring schema {schema} from its S3 disk image"))?,
+        Some(RestoreSource::S3Image(s3)) => (
+            crate::imgarchive::materialize_from_image(cfg, schema, s3)
+                .await
+                .with_context(|| format!("restoring schema {schema} from its S3 disk image"))?,
+            false,
+        ),
+        Some(RestoreSource::LocalImage(path)) => (
+            crate::imgarchive::materialize_from_local_image(cfg, schema, path)
+                .await
+                .with_context(|| format!("thawing schema {schema} from its compacted image"))?,
+            false,
+        ),
         _ => resolve_sandbox(cfg, &name, keepalive, known_id, spares).await?,
     };
+    let sandbox_id = sandbox.sandbox_id().to_string();
 
-    // Pin keep-alive schemas idempotently: TTL 0 = never auto-stopped. This
-    // covers a VM created before its schema was pinned (or created with a
-    // non-zero TTL) — a freshly-created keep-alive VM is already TTL 0, so this
-    // is a harmless no-op there. Best-effort: a failure here shouldn't block
-    // serving the connection, so we warn rather than bail.
-    if keepalive {
-        if let Err(e) = sandbox.set_ttl(0).await {
-            warn!("failed to pin keep-alive VM {name} (set_ttl 0): {e:#}");
+    // The rest of the bring-up can still fail (ready-timeout, restore error).
+    // When the sandbox is a freshly claimed spare, that failure must release
+    // the claim — otherwise the id stays in the pool's `claimed` set for the
+    // life of the process: a running VM + disk nothing can reclaim, invisible
+    // to replenish inventory (which then builds a replacement on top).
+    let result = async {
+        // Pin keep-alive schemas idempotently: TTL 0 = never auto-stopped. This
+        // covers a VM created before its schema was pinned (or created with a
+        // non-zero TTL) — a freshly-created keep-alive VM is already TTL 0, so this
+        // is a harmless no-op there. Best-effort: a failure here shouldn't block
+        // serving the connection, so we warn rather than bail.
+        if keepalive {
+            if let Err(e) = sandbox.set_ttl(0).await {
+                warn!("failed to pin keep-alive VM {name} (set_ttl 0): {e:#}");
+            }
         }
-    }
 
-    let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
-    ensure_database(&pool, schema).await?;
+        let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
+        ensure_database(&pool, schema).await?;
 
-    // Restore into the freshly-created, empty database before the entry is
-    // handed to any client. A failure here must abort the bring-up: serving
-    // an empty DB in place of a restored one would look like silent data loss.
-    match restore {
-        Some(RestoreSource::S3(s3)) => restore_from_s3(cfg, &sandbox, schema, s3)
-            .await
-            .with_context(|| format!("restoring schema {schema} from S3"))?,
-        Some(RestoreSource::Local { srv, port }) => {
-            restore_from_local(cfg, &sandbox, schema, srv, *port)
+        // Restore into the freshly-created, empty database before the entry is
+        // handed to any client. A failure here must abort the bring-up: serving
+        // an empty DB in place of a restored one would look like silent data loss.
+        match restore {
+            Some(RestoreSource::S3(s3)) => restore_from_s3(cfg, &sandbox, schema, s3)
                 .await
-                .with_context(|| format!("restoring schema {schema} from the local dump"))?
+                .with_context(|| format!("restoring schema {schema} from S3"))?,
+            Some(RestoreSource::Local { srv, port }) => {
+                restore_from_local(cfg, &sandbox, schema, srv, *port)
+                    .await
+                    .with_context(|| format!("restoring schema {schema} from the local dump"))?
+            }
+            // Already restored above — the VM booted on the adopted disk. Counted
+            // with the S3 restores on the monitoring charts: same tier, same cost
+            // profile, and a fourth chart wouldn't earn its space.
+            Some(RestoreSource::S3Image(_)) => crate::events::record(crate::events::Event::RestoreS3),
+            // Ditto, but local (a compacted-image thaw): counted with the
+            // local-dump restores.
+            Some(RestoreSource::LocalImage(_)) => {
+                crate::events::record(crate::events::Event::RestoreLocal)
+            }
+            None => {}
         }
-        // Already restored above — the VM booted on the adopted disk. Counted
-        // with the S3 restores on the monitoring charts: same tier, same cost
-        // profile, and a fourth chart wouldn't earn its space.
-        Some(RestoreSource::S3Image(_)) => crate::events::record(crate::events::Event::RestoreS3),
-        None => {}
+
+        let slots = client_slot_budget(&pool, &name).await;
+
+        Ok(Arc::new(SchemaEntry::new(
+            sandbox, target, tunnel, pool, keepalive, slots,
+        )))
     }
+    .await;
 
-    let slots = client_slot_budget(&pool, &name).await;
-
-    Ok(Arc::new(SchemaEntry::new(
-        sandbox, target, tunnel, pool, keepalive, slots,
-    )))
+    if result.is_err()
+        && claimed_spare
+        && let Some((pool, _)) = spares
+    {
+        pool.release_failed(&sandbox_id).await;
+    }
+    result
 }
 
 /// Validity window for a presigned S3 URL handed to the guest. Generous enough
@@ -353,12 +388,33 @@ pub async fn kill_and_reclaim(
     Ok(())
 }
 
+/// Archive `schema`'s database to S3. Two routes:
+///
+/// * **Via the dump server** (default whenever one is running): the guest
+///   *streams* `pg_dump` to the host — zero guest-disk writes — and the
+///   pooler uploads the landed file to S3 (multipart above 100MB) and deletes
+///   it. The file-based route inflated the very disk being archived: the
+///   guest's `-f /workspace/_archive.dump` permanently converted sparse holes
+///   into allocated host blocks (no discard passthrough), on failures too.
+/// * **Legacy, direct from the guest** (`PG_VM_POOL_ARCHIVE_VIA_GUEST=1`, or
+///   no dump server running): dump to a guest file, `curl -T` it to a
+///   presigned PUT. Kept one release as an escape hatch.
 pub async fn dump_to_s3(
     cfg: &Config,
     sandbox: &Sandbox,
     schema: &str,
     s3: &S3Config,
+    dumps: Option<(&crate::dumpsrv::DumpServer, u16)>,
 ) -> Result<()> {
+    let via_guest = std::env::var("PG_VM_POOL_ARCHIVE_VIA_GUEST")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if let Some((srv, port)) = dumps
+        && !via_guest
+    {
+        return dump_to_s3_via_server(cfg, sandbox, schema, s3, srv, port).await;
+    }
+
     let key = s3.object_key(schema);
     let db = shell_squote(schema);
     let user = shell_squote(&cfg.pg_user);
@@ -392,6 +448,72 @@ pub async fn dump_to_s3(
         .await?;
 
     await_archive(cfg, sandbox, schema, s3, &http, &key, baseline.as_ref()).await
+}
+
+/// The streaming S3 archive: guest dump → host dump server (committed, so the
+/// bytes are a verified-complete archive) → pooler upload to S3 → HEAD-verify
+/// against a pre-upload baseline → local file removed. The guest's data disk
+/// is never written.
+async fn dump_to_s3_via_server(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    s3: &S3Config,
+    srv: &crate::dumpsrv::DumpServer,
+    port: u16,
+) -> Result<()> {
+    let db = shell_squote(schema);
+    let user = shell_squote(&cfg.pg_user);
+    let token = srv.issue(schema, crate::dumpsrv::Mode::Put)?;
+    let url = format!("http://$GW:{port}/d/{token}");
+    let body = format!(
+        "{}{}",
+        gw_prelude(ARCHIVE_JOB.done),
+        streaming_dump_job_body(&user, &db, &url)
+    );
+    ARCHIVE_JOB.launch(cfg, sandbox, &body, STREAM_FAIL_MARK).await?;
+    let bytes = await_server_upload(cfg, sandbox, schema, srv, &token).await?;
+
+    // The landed file is this tier's scratch: uploaded then removed on every
+    // exit path. (On failure it must not linger either — a later *freeze*
+    // would trust a file at this exact path as that schema's frozen dump.)
+    let path = srv.dump_path(schema);
+    let res = upload_dump_to_s3(s3, schema, &path, bytes).await;
+    let _ = tokio::fs::remove_file(&path).await;
+    res
+}
+
+/// Pooler-side upload of a landed dump file to the schema's S3 dump key, with
+/// the same baseline-HEAD verification discipline as the guest path: the
+/// caller reclaims the source disk on success, so presence-at-key alone is
+/// never trusted.
+async fn upload_dump_to_s3(s3: &S3Config, schema: &str, path: &std::path::Path, len: u64) -> Result<()> {
+    let http = reqwest::Client::builder()
+        .build()
+        .context("building HTTP client for the S3 upload")?;
+    let key = s3.object_key(schema);
+    let baseline = baseline_head(&http, s3, &key, schema).await?;
+    crate::imgarchive::upload_path(s3, &http, &key, path, len)
+        .await
+        .with_context(|| format!("uploading {} to s3://{}/{key}", path.display(), s3.bucket))?;
+    match s3.head_object(&http, &key, ARCHIVE_HEAD_TIMEOUT).await {
+        Ok(Some(id)) if id.content_length == len && Some(&id) != baseline.as_ref() => {
+            info!(
+                "schema {schema}: archive uploaded to s3://{}/{key} ({len} bytes)",
+                s3.bucket
+            );
+            Ok(())
+        }
+        Ok(Some(id)) => bail!(
+            "uploaded s3://{}/{key} but the HEAD reports {} bytes against a {len}-byte \
+             dump (baseline unchanged: {}) — refusing to trust it",
+            s3.bucket,
+            id.content_length,
+            Some(&id) == baseline.as_ref(),
+        ),
+        Ok(None) => bail!("uploaded s3://{}/{key} but a HEAD finds nothing", s3.bucket),
+        Err(e) => Err(e.context("verifying the uploaded archive")),
+    }
 }
 
 /// Read what is at the archive key before dumping, retrying a few times.
@@ -434,11 +556,59 @@ async fn baseline_head(
     })
 }
 
+/// tmpfs marker recording that `pg_dump` itself failed inside the streaming
+/// pipeline (POSIX sh has no pipefail). `/tmp` is RAM in the guest image, so
+/// touching it never allocates data-disk blocks.
+const STREAM_FAIL_MARK: &str = "/tmp/_dump_stream.failed";
+
+/// The *streaming* dump job body: `pg_dump` pipes straight into `curl -T -`
+/// against the host dump server — no `/workspace/_archive.dump`, so the dump
+/// payload allocates zero blocks on the guest's data disk (the few-KB job
+/// sentinel/log still land there). That matters because the virtio-blk has no
+/// discard passthrough: any block a dump file ever touched stays allocated in
+/// the host's sparse `data.ext4` after `rm`, permanently — the file-based job
+/// inflated every disk it tried to archive, failed attempts included (the
+/// snowball emergency-drain.sh documents).
+///
+/// A chunked upload whose producer dies just *ends* — the server can't tell
+/// torn from complete — so the upload is two-phase: the streamed bytes are
+/// held pending, and only this job, which alone knows pg_dump's exit code,
+/// commits them (or aborts on failure). The pooler's wait loop trusts nothing
+/// before the server records the commit.
+fn streaming_dump_job_body(user: &str, db: &str, url: &str) -> String {
+    let done = ARCHIVE_JOB.done;
+    format!(
+        "ec=0\n\
+         rm -f {STREAM_FAIL_MARK}\n\
+         code=$({{ pg_dump -h 127.0.0.1 -U {user} -Fc -d {db} || echo 1 > {STREAM_FAIL_MARK}; }} \
+         | curl -sS -T - -o /dev/null -w '%{{http_code}}' \"{url}\") || ec=$?\n\
+         if [ -f {STREAM_FAIL_MARK} ]; then\n\
+         \techo 'pg_dump failed before the stream ended' >&2\n\
+         \tec=1\n\
+         fi\n\
+         {}\
+         if [ \"$ec\" = 0 ]; then\n\
+         \tcode=$(curl -sS -X POST -o /dev/null -w '%{{http_code}}' \"{url}/commit\") || ec=$?\n\
+         {}\
+         else\n\
+         \tcurl -sS -X POST -o /dev/null \"{url}/abort\" >/dev/null 2>&1 || true\n\
+         fi\n\
+         printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n",
+        require_2xx("upload"),
+        require_2xx("commit"),
+    )
+}
+
 /// The dump job body, planted as a *file* rather than run as `sh -c '…'`, so
 /// the presigned URL — full of `&`/`=` query params — never has to survive a
 /// layer of shell quoting. `ec` captures the first failing step so a failed
 /// pg_dump never uploads a truncated object, and the sentinel records it.
 /// `user`/`db` arrive already shell-quoted.
+///
+/// Only used against *S3* today (presigned PUTs need a Content-Length, so the
+/// guest must dump to a file first) — and only as the legacy fallback when no
+/// dump server is running (see [`dump_to_s3`]): the `-f {DUMP_PATH}` write is
+/// exactly the disk-inflating behavior the streaming body exists to avoid.
 fn archive_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
     let done = ARCHIVE_JOB.done;
     format!(
@@ -807,10 +977,24 @@ pub async fn dump_to_local(
     let body = format!(
         "{}{}",
         gw_prelude(ARCHIVE_JOB.done),
-        archive_job_body(&user, &db, "", &url)
+        streaming_dump_job_body(&user, &db, &url)
     );
-    ARCHIVE_JOB.launch(cfg, sandbox, &body, DUMP_PATH).await?;
+    ARCHIVE_JOB.launch(cfg, sandbox, &body, STREAM_FAIL_MARK).await?;
+    await_server_upload(cfg, sandbox, schema, srv, &token).await
+}
 
+/// Wait out a detached dump against *our* dump server, on two signals — the
+/// server's own completion record (authoritative: bytes fully written,
+/// fsync'd, renamed after the guest's commit) and the guest sentinel
+/// (best-effort, for prompt explained failures). Mirrors [`await_archive`]'s
+/// trust posture: an unconfirmed dump is a failed dump.
+async fn await_server_upload(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    srv: &crate::dumpsrv::DumpServer,
+    token: &str,
+) -> Result<u64> {
     let deadline = Instant::now() + ARCHIVE_DEADLINE;
     let mut probe_failures: u32 = 0;
     let mut probes_muted = false;
@@ -818,12 +1002,12 @@ pub async fn dump_to_local(
     loop {
         sleep(ARCHIVE_POLL_INTERVAL).await;
         // Authoritative: our own server fully wrote and renamed the upload.
-        if let Some(bytes) = srv.upload_completed(&token) {
+        if let Some(bytes) = srv.upload_completed(token) {
             if bytes < MIN_ARCHIVE_BYTES {
                 bail!(
                     "schema {schema}: local dump is only {bytes} bytes — no pg_dump \
                      archive is that small, so the dump itself produced no data; \
-                     refusing to freeze. Guest log: {}",
+                     refusing to trust it. Guest log: {}",
                     truncate(ARCHIVE_JOB.log_tail(cfg, sandbox).await.trim(), 800)
                 );
             }
@@ -858,14 +1042,14 @@ pub async fn dump_to_local(
                 }
             }
         }
-        // The guest claims success but our server never saw a complete upload
+        // The guest claims success but our server never saw a committed upload
         // land — same trust posture as the S3 path: unconfirmed means failed.
         if let Some(at) = claimed_done
             && at.elapsed() >= ARCHIVE_CONFIRM_GRACE
         {
             bail!(
                 "local-dump job for schema {schema} reported success but the dump \
-                 server never received a complete upload — refusing to freeze"
+                 server never received a committed upload — refusing to trust it"
             );
         }
         if Instant::now() >= deadline {
@@ -1559,11 +1743,11 @@ async fn resolve_sandbox(
     keepalive: bool,
     known_id: Option<&str>,
     spares: Option<(&crate::spares::SparePool, &std::collections::HashSet<String>)>,
-) -> Result<Sandbox> {
+) -> Result<(Sandbox, bool)> {
     // 1. Reattach to the VM we last used for this schema, by id.
     if let Some(id) = known_id {
         match bring_up_existing(cfg, name, id).await {
-            Ok(Some(sb)) => return Ok(sb),
+            Ok(Some(sb)) => return Ok((sb, false)),
             Ok(None) => info!("known VM {name} ({id}) is gone; find-or-create by name"),
             Err(e) => warn!("reattaching {name} ({id}) failed ({e:#}); find-or-create by name"),
         }
@@ -1578,23 +1762,25 @@ async fn resolve_sandbox(
         .find(|s| s.name == name)
     {
         if let Some(sb) = bring_up_existing(cfg, name, &info.id).await? {
-            return Ok(sb);
+            return Ok((sb, false));
         }
     }
 
     // 3. Genuinely new VM needed. Claim a warm spare if one is available —
     //    already booted with initdb done, so the whole create+boot+init cost
     //    is skipped. It keeps its spare name; the registry's id mapping (put
-    //    on successful bring-up) is what binds it to the schema.
+    //    on successful bring-up) is what binds it to the schema. The `true`
+    //    tells `ensure_vm` this sandbox is a claim it must release (kill)
+    //    if the rest of the bring-up fails.
     if let Some((pool, bound)) = spares
         && let Some(sb) = pool.take(bound).await
     {
         info!("claiming warm spare {} for {name}", sb.sandbox_id());
-        return Ok(sb);
+        return Ok((sb, true));
     }
 
     // 4. No spare: create from scratch.
-    create_vm(cfg, name, keepalive).await
+    create_vm(cfg, name, keepalive).await.map(|sb| (sb, false))
 }
 
 /// Grow a sandbox's persistent data device to `target_gb` through the
@@ -1923,6 +2109,48 @@ mod tests {
         ] {
             plants_verbatim(job_desc, &body, scratch, planted_as, url);
         }
+    }
+
+    /// The streaming body must be real `sh`, never touch the data disk, and
+    /// keep commit strictly on the success path (a commit reachable after a
+    /// failed pg_dump would finalize torn bytes as a durable archive).
+    #[test]
+    fn streaming_dump_job_is_valid_sh_and_commits_only_on_success() {
+        let user = shell_squote("postgres");
+        let db = shell_squote("Kb0s7KwS");
+        let body = streaming_dump_job_body(&user, &db, "http://$GW:6433/d/tok0123");
+
+        // Syntax-check the exact bytes with a real shell.
+        let f = std::env::temp_dir().join(format!("pgfc-streamjob-{}.sh", std::process::id()));
+        std::fs::write(&f, &body).unwrap();
+        let ok = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&f)
+            .status()
+            .unwrap()
+            .success();
+        let _ = std::fs::remove_file(&f);
+        assert!(ok, "streaming job body must parse as sh:\n{body}");
+
+        // No payload writes to the data disk: the whole point of the streaming
+        // route. (The job's sentinel/log still land there — a few KB, versus
+        // the full dump the file-based route wrote.)
+        assert!(!body.contains(DUMP_PATH), "streaming job must not write the dump to the data disk");
+        assert!(body.contains(STREAM_FAIL_MARK), "pipefail surrogate present");
+
+        // Commit only inside the ec=0 branch; abort on the other side. The
+        // anchor is the branch on its own line — require_2xx's inline
+        // `; if [ "$ec" = 0 ]; then ec=22` must not match.
+        let branch = "\nif [ \"$ec\" = 0 ]; then\n";
+        let success_branch = body.split(branch).nth(1).unwrap();
+        let (commit_side, abort_side) = success_branch.split_once("\nelse\n").unwrap();
+        assert!(commit_side.contains("/commit"));
+        assert!(!commit_side.contains("/abort"));
+        assert!(abort_side.contains("/abort"));
+        assert!(!abort_side.contains("/commit"));
+        // And nothing commits before the branch.
+        let preamble = body.split(branch).next().unwrap();
+        assert!(!preamble.contains("/commit"));
     }
 
     /// Run one job's real launch script through a real `sh` — with every command

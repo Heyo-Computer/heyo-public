@@ -134,7 +134,7 @@ Config via env (all optional):
 | `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
 | `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables |
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
-| `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (4GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
+| `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
 | `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
 | `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
@@ -224,6 +224,31 @@ dump is **promoted to S3 by the pooler itself** — a file upload, no VM bring-u
 at all — and the local file is deleted. `frozen` schemas appear in the
 dashboard with a "frozen (local)" badge and a `frozen` state filter.
 
+### Local compacted tier
+
+The **compacted** tier solves the same problem as freezing — a stopped
+schema's full ext4 image squatting on host disk — without ever booting the
+VM: a schema whose VM has sat stopped for `PG_VM_POOL_COMPACT_AFTER_SECS` has
+its data disk trimmed (`e2fsck -fp -E discard`, the reclaim pipeline) and
+zstd-compressed into `PG_VM_POOL_COMPACT_DIR/<schema>.img.zst`, verified
+(`zstd -t` + the ext4 magic, atomic rename), and its **VM + disk deleted**.
+Measured on a real pool disk: a 183MB-allocated idle disk became a 7MB image
+(~26x) in under 3 seconds. Thawing decompresses the image onto a fresh VM's
+disk (sparse) and boots on the real data — no `pg_restore`, no index
+rebuilds; the crash-recovery path a normal VM restart takes.
+
+Freeze vs. compact: a dump is smaller than an image and version-independent,
+but freezing must boot each candidate to `pg_dump` it, and thawing pays a
+full restore. Compacting is a few seconds of host CPU each way. With both
+enabled, whichever threshold fires first wins (the config warns if freeze
+would always beat compact); the shipped supervisor conf prefers compact and
+leaves freeze off. Needs `PG_VM_POOL_RUN_DIR` and `zstd`.
+
+Same ladder as frozen: past `PG_VM_POOL_ARCHIVE_AFTER_SECS` a compacted
+schema's image is promoted to S3 as `{schema}.img.zst` — the image-archive
+format, uploaded as-is with no recompression, any stale dump object deleted so
+it can't shadow the newer image — and the local file is removed.
+
 ### S3 eviction tier
 
 The idle reaper (`PG_VM_POOL_IDLE_TIMEOUT_SECS`) only **stops** an idle VM — its
@@ -288,7 +313,7 @@ provisioned size and never shrinks, even when the live database is tiny (a 1 GB
 database routinely pins tens of GB on disk after a transient bulk load).
 
 **Thin provisioning (first line of defense):** the image formats only a small
-(4GB, `pgdata_init_mb` cmdline override) filesystem inside the provisioned
+(2GB, `pgdata_init_mb` cmdline override) filesystem inside the provisioned
 device on first boot, and a watcher in the guest grows it online with
 `resize2fs` — doubling up to the device cap — whenever free space drops below
 1GB (or ⅛ of the fs). Since ext4 never touches blocks past its own end, the
@@ -319,7 +344,7 @@ before thin provisioning have a full-device filesystem, so even after a trim
 their next growth ratchets straight back toward the provisioned max, and ~1GB
 of full-device ext4 metadata stays allocated forever. With `SHRINK=1` the
 script also *shrinks* each stopped VM's filesystem to `used × 1.25` (floored at
-`MIN_FS_MB`, default 4096 to match the image's initial size) and hole-punches
+`MIN_FS_MB`, default 2048 to match the image's initial size) and hole-punches
 the backing file past the new end. The guest's grow watcher re-extends the
 filesystem online if the database later needs the space. Shrinking relocates
 blocks, so it's slower than a plain trim and the script re-fscks each shrunk
@@ -430,6 +455,18 @@ then `supervisorctl reread && supervisorctl update pg-vm-pool` — note a plain
 `restart` does **not** reload `environment=`; `update` does. Comma-containing
 values (like `KEEPALIVE_SCHEMAS`) must be double-quoted. Logs land in
 `/var/log/pg-vm-pool/pg-vm-pool.log`.
+
+The shipped `environment=` block enables the full density stack — orphan
+sweep, periodic reclaim (`--shrink --prune-swap`), the compacted tier (1h
+idle → the stopped disk is trimmed + zstd'd into a local image ~5-25x
+smaller, VM deleted; thaw is a decompress + boot), the S3 archive tier (24h
+idle, plus the image-level fallback), and pressure eviction — so idle schemas
+progressively leave the host instead of pinning ext4 images forever. It requires one-time host setup (deploy
+`reclaim-disks.sh` to a stable path + a pinned sudoers entry, migrate any
+repo-relative `registry.tsv`, fill in the `S3_*` placeholders); the checklist
+lives in the header comment of `deploy/supervisor/pg-vm-pool.conf`. On a host
+with a large stopped-VM backlog, enable reclaim first and the freeze/archive
+timers second (sequencing notes ibid.).
 
 ### Client auth
 

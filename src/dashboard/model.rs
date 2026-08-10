@@ -42,7 +42,7 @@ pub const MAX_PER: usize = 200;
 /// sentinel [`STATE_ALL`] disables the filter. The view defaults to showing
 /// only running sandboxes — on a busy host the stopped tail dwarfs the live
 /// set.
-pub const STATE_FILTERS: [&str; 9] = [
+pub const STATE_FILTERS: [&str; 10] = [
     "running",
     "provisioning",
     "stopped",
@@ -50,6 +50,7 @@ pub const STATE_FILTERS: [&str; 9] = [
     "cold-stored",
     "failed",
     "unknown",
+    "compacted",
     "frozen",
     "archived",
 ];
@@ -140,10 +141,7 @@ fn append_offloaded(list: &mut Vec<RawSandbox>, records: &[(String, StoreRecord)
         .iter()
         .filter(|(_, r)| r.offloaded() && !existing.contains(r.sandbox_id.as_str()))
         .map(|(schema, r)| {
-            let label = match r.tier {
-                crate::store::Tier::Frozen => "frozen",
-                _ => "archived",
-            };
+            let label = r.tier.as_str();
             RawSandbox::offloaded(schema, &r.sandbox_id, label)
         })
         .collect();

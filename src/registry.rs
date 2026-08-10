@@ -339,10 +339,11 @@ impl SchemaRegistry {
             .as_ref()
             .map(|r| Arc::new(Reclaimer::new(r.cmd.clone())));
         let spares = (cfg.warm_spares > 0).then(|| Arc::new(SparePool::new(cfg.warm_spares)));
-        let dumps = cfg
-            .freeze
-            .as_ref()
-            .map(|f| Arc::new(DumpServer::new(f.dump_dir.clone())));
+        // The dump server has two consumers: the frozen tier (freeze + thaw)
+        // and the S3 archive tier, whose dumps *stream* through it so they
+        // never touch the guest's data disk. Either one enables it.
+        let dumps = (cfg.freeze.is_some() || cfg.archive.is_some())
+            .then(|| Arc::new(DumpServer::new(cfg.dump_net.dump_dir.clone())));
         Self {
             cfg,
             entries: Mutex::new(HashMap::new()),
@@ -397,6 +398,11 @@ impl SchemaRegistry {
     /// manual "reclaim disk slack" control.
     pub fn reclaim_enabled(&self) -> bool {
         self.reclaimer.is_some()
+    }
+
+    /// The configured heyvmd run dir, if any (`PG_VM_POOL_RUN_DIR`).
+    pub fn run_dir(&self) -> Option<PathBuf> {
+        self.cfg.run_dir.clone()
     }
 
     /// Point-in-time view of every *warm* schema entry (VMs the pooler currently
@@ -597,6 +603,14 @@ impl SchemaRegistry {
                          not configured (set PG_VM_POOL_FREEZE_AFTER_SECS) — cannot restore it"
                     ),
                 },
+                Some(Tier::Compacted) => match &self.cfg.compact {
+                    Some(c) => Some(RestoreSource::LocalImage(c.compact_path(schema))),
+                    None => bail!(
+                        "schema {schema} is compacted to a local image, but the compacted \
+                         tier is not configured (set PG_VM_POOL_COMPACT_AFTER_SECS + \
+                         PG_VM_POOL_RUN_DIR) — cannot thaw it"
+                    ),
+                },
                 _ => None,
             };
             let bound = self.spares.as_ref().map(|_| self.bound_ids()).unwrap_or_default();
@@ -618,6 +632,31 @@ impl SchemaRegistry {
                     // also clears any `archived` flag (this is a fresh VM id), so
                     // a just-restored schema is durably marked live again.
                     self.store.put(schema, entry.sandbox.sandbox_id());
+                    // A thawed schema's local offload artifact is now dead
+                    // weight: the row is durably live, the data lives on the
+                    // VM's disk, and the next freeze/compact rewrites the file
+                    // from scratch. Left in place it pins those bytes per
+                    // thawed schema forever (they are only otherwise deleted
+                    // on S3 promotion).
+                    let thawed_file = match &restore {
+                        Some(RestoreSource::Local { .. }) => {
+                            self.dumps.as_ref().map(|srv| srv.dump_path(schema))
+                        }
+                        Some(RestoreSource::LocalImage(path)) => Some(path.clone()),
+                        _ => None,
+                    };
+                    if let Some(file) = thawed_file {
+                        match tokio::fs::remove_file(&file).await {
+                            Ok(()) => {
+                                info!("schema {schema}: thawed; removed {}", file.display());
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => warn!(
+                                "schema {schema}: thawed but removing {} failed: {e}",
+                                file.display()
+                            ),
+                        }
+                    }
                     info!("schema {schema}: VM ready in {:?}", started.elapsed());
                     let Some(guard) =
                         ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await
@@ -642,6 +681,13 @@ impl SchemaRegistry {
                             started.elapsed()
                         ),
                     );
+                    // Same leak guard as the archive/freeze bring-ups: a
+                    // ready-timeout leaves a running VM `ensure_vm` never
+                    // returned a handle to. Without this it has no owner —
+                    // no registry row, not spare-named, daemon still knows
+                    // it — so no reaper, purge, or sweep ever reclaims its
+                    // RAM or disk.
+                    vm::stop_after_failed_bringup(schema, known_id.as_deref()).await;
                     return Err(e);
                 }
             }
@@ -1099,18 +1145,23 @@ impl SchemaRegistry {
             .collect();
 
         let mut candidates: Vec<String> = Vec::new();
-        // Frozen schemas past the archive threshold get promoted local-file →
-        // S3 without any VM (the dump already exists on the host).
+        // Frozen/compacted schemas past the archive threshold get promoted
+        // local-file → S3 without any VM (the file already exists on the host).
         let mut frozen_candidates: Vec<String> = Vec::new();
+        let mut compact_candidates: Vec<String> = Vec::new();
         let mut total = 0usize;
         let mut backing_off = 0usize;
         let (mut refreshed, mut keepalive, mut already, mut not_idle) = (0usize, 0usize, 0usize, 0usize);
         for (schema, rec) in self.store_records() {
             total += 1;
             let ka = self.cfg.is_keepalive(&schema);
-            if rec.tier == Tier::Frozen {
+            if rec.tier == Tier::Frozen || rec.tier == Tier::Compacted {
                 if !ka && now.saturating_sub(rec.last_active) >= threshold_secs {
-                    frozen_candidates.push(schema);
+                    if rec.tier == Tier::Frozen {
+                        frozen_candidates.push(schema);
+                    } else {
+                        compact_candidates.push(schema);
+                    }
                 } else {
                     not_idle += 1;
                 }
@@ -1152,17 +1203,18 @@ impl SchemaRegistry {
         // "sweep now" button and the periodic pass both surface here.
         info!(
             "S3 eviction sweep: evaluated {total} schema(s) — {} live candidate(s) + \
-             {} frozen promotion(s), {refreshed} refreshed (warm), {backing_off} in \
-             failure backoff, skipped {} ({keepalive} keepalive, {already} already \
-             archived, {not_idle} idle < {threshold_secs}s)",
+             {} frozen + {} compacted promotion(s), {refreshed} refreshed (warm), \
+             {backing_off} in failure backoff, skipped {} ({keepalive} keepalive, \
+             {already} already archived, {not_idle} idle < {threshold_secs}s)",
             candidates.len(),
             frozen_candidates.len(),
+            compact_candidates.len(),
             keepalive + already + not_idle,
         );
 
-        // Promote frozen dumps first: cheap (a file upload, no VM), and every
+        // Promote local files first: cheap (a file upload, no VM), and every
         // success frees local disk.
-        let n_frozen = frozen_candidates.len();
+        let n_frozen = frozen_candidates.len() + compact_candidates.len();
         let mut archived_frozen = 0usize;
         for schema in frozen_candidates {
             match self.archive_frozen_schema(&schema).await {
@@ -1178,6 +1230,21 @@ impl SchemaRegistry {
                 }
             }
         }
+        for schema in compact_candidates {
+            match self.archive_compacted_schema(&schema).await {
+                Ok(()) => archived_frozen += 1,
+                Err(e) => {
+                    warn!(
+                        "promoting compacted schema {schema} to S3 failed (will retry next \
+                         sweep): {e:#}"
+                    );
+                    crate::events::journal_error(
+                        "archive",
+                        format!("promoting compacted schema {schema} to S3 failed: {e:#}"),
+                    );
+                }
+            }
+        }
 
         if candidates.is_empty() {
             // Journal only sweeps that had work; a quiet fleet's no-op passes
@@ -1185,7 +1252,7 @@ impl SchemaRegistry {
             if n_frozen > 0 {
                 crate::events::journal_info(
                     "sweep.archive",
-                    format!("promoted {archived_frozen}/{n_frozen} frozen dump(s) to S3"),
+                    format!("promoted {archived_frozen}/{n_frozen} local file(s) to S3"),
                 );
             }
             return archived_frozen;
@@ -1268,6 +1335,8 @@ impl SchemaRegistry {
             Some(Tier::Archived) => bail!("schema {schema} is already archived to S3"),
             // Frozen: no VM to dump — promote the existing local dump file.
             Some(Tier::Frozen) => return self.archive_frozen_schema(schema).await,
+            // Compacted: likewise — promote the existing local image file.
+            Some(Tier::Compacted) => return self.archive_compacted_schema(schema).await,
             _ => {}
         }
 
@@ -1327,7 +1396,11 @@ impl SchemaRegistry {
         // sees it), it burns RAM, and it pins its disk open against reclaim.
         // A whole sweep of failures leaks a fleet of them at once. Stop, not
         // kill: the data on its disk is still the only copy.
-        if let Err(e) = vm::dump_to_s3(&self.cfg, &entry.sandbox, schema, &archive.s3).await {
+        let dumps = self
+            .dumps
+            .as_deref()
+            .map(|srv| (srv, self.cfg.dump_net.listen.port()));
+        if let Err(e) = vm::dump_to_s3(&self.cfg, &entry.sandbox, schema, &archive.s3, dumps).await {
             warn!("schema {schema}: dump failed; stopping the VM booted for this attempt");
             checkpoint_and_stop(&entry, schema).await;
             // The VM this attempt used is the one whose disk holds the data —
@@ -1384,31 +1457,20 @@ impl SchemaRegistry {
             "local dump {} is only {len} bytes — refusing to promote a failed dump",
             path.display()
         );
-        // The whole object rides through memory (the SDK's reqwest has no
-        // streaming-body feature enabled). Bound it; an oversized dump simply
-        // stays frozen locally, which is safe.
-        const MAX_POOLER_UPLOAD: u64 = 512 * 1024 * 1024;
-        anyhow::ensure!(
-            len <= MAX_POOLER_UPLOAD,
-            "local dump {} is {len} bytes (> {MAX_POOLER_UPLOAD}); leaving it frozen \
-             locally rather than buffering it through the pooler",
-            path.display()
-        );
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("reading {}", path.display()))?;
-
         let key = archive.s3.object_key(schema);
         let http = reqwest::Client::builder()
             .build()
             .context("building HTTP client for S3 upload")?;
         // HEAD first so a wrong-region bucket is discovered (and latched)
-        // before the PUT is presigned.
+        // before anything is presigned.
         let _ = archive.s3.head_object(&http, &key, Duration::from_secs(10)).await;
-        archive
-            .s3
-            .put_object(&http, &key, bytes, Duration::from_secs(600))
-            .await?;
+        // Single PUT for small dumps, 64MB multipart above 100MB — memory is
+        // bounded by the part size, so there is no pooler-side cap on how
+        // large a frozen dump can be promoted (there used to be a 512MB one,
+        // which silently pinned oversized dumps to the local disk forever).
+        crate::imgarchive::upload_path(&archive.s3, &http, &key, &path, len)
+            .await
+            .with_context(|| format!("uploading {} to s3://{}/{key}", path.display(), archive.s3.bucket))?;
         // Verify: the object must exist with exactly the file's size.
         match archive.s3.head_object(&http, &key, Duration::from_secs(10)).await {
             Ok(Some(id)) if id.content_length == len => {}
@@ -1429,6 +1491,39 @@ impl SchemaRegistry {
         info!(
             "schema {schema}: frozen dump promoted to s3://{}/{key} ({len} bytes), local file removed",
             archive.s3.bucket
+        );
+        Ok(())
+    }
+
+    /// Promote a compacted schema's local image file to S3 — no VM, no
+    /// recompression: the file already IS the archive format the image tier
+    /// stores (`{schema}.img.zst`), so this is an upload + verify + tier
+    /// flip + local-file cleanup. The compacted twin of the frozen-dump
+    /// promotion ([`Self::archive_frozen_schema`]).
+    async fn archive_compacted_schema(&self, schema: &str) -> Result<()> {
+        let Some(archive) = self.cfg.archive.clone() else {
+            bail!("S3 eviction tier is not configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*)");
+        };
+        let Some(compact) = self.cfg.compact.clone() else {
+            bail!("schema {schema} is compacted but the compacted tier is not configured");
+        };
+        let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
+            Some(g) => g,
+            None => bail!("schema {schema} is already being archived"),
+        };
+        let path = compact.compact_path(schema);
+        let len = crate::imgarchive::promote_compact(&archive.s3, schema, &path)
+            .await
+            .with_context(|| format!("promoting compacted schema {schema} to S3"))?;
+        self.store.set_tier(schema, Tier::Archived).await;
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            warn!("schema {schema}: promoted to S3 but deleting {} failed: {e}", path.display());
+        }
+        info!(
+            "schema {schema}: compacted image promoted to s3://{}/{} ({len} bytes), local \
+             file removed",
+            archive.s3.bucket,
+            archive.s3.image_object_key(schema),
         );
         Ok(())
     }
@@ -1561,6 +1656,10 @@ impl SchemaRegistry {
             Some(Tier::Frozen) => bail!(
                 "schema {schema} is frozen to a local dump — the archive sweep promotes that \
                  to S3; there is no VM disk to image"
+            ),
+            Some(Tier::Compacted) => bail!(
+                "schema {schema} is already compacted to a local image — the archive sweep \
+                 promotes that to S3; there is no VM disk to image"
             ),
             _ => {}
         }
@@ -1706,15 +1805,20 @@ impl SchemaRegistry {
 
     // ---- local frozen tier --------------------------------------------------
 
-    /// Start the local dump HTTP server (frozen tier). Serves guest uploads
-    /// and downloads; without it, freezing and thawing are inert.
+    /// Start the local dump HTTP server. Serves guest uploads and downloads
+    /// for the frozen tier AND the S3 archive tier's streamed dumps; without
+    /// it, freezing, thawing, and streamed archiving are inert.
     pub fn spawn_dump_server(self: &Arc<Self>) {
-        let (Some(srv), Some(freeze)) = (self.dumps.clone(), self.cfg.freeze.clone()) else {
+        let Some(srv) = self.dumps.clone() else {
             return;
         };
+        let listen = self.cfg.dump_net.listen;
         tokio::spawn(async move {
-            if let Err(e) = srv.serve(freeze.listen).await {
-                error!("local dump server exited: {e:#} — freezing and thawing are down");
+            if let Err(e) = srv.serve(listen).await {
+                error!(
+                    "local dump server exited: {e:#} — freezing, thawing, and streamed \
+                     archive dumps are down"
+                );
             }
         });
     }
@@ -1931,6 +2035,222 @@ impl SchemaRegistry {
         Ok(())
     }
 
+    // ---- compacted tier -----------------------------------------------------
+
+    /// Spawn the compact sweep if `PG_VM_POOL_COMPACT_AFTER_SECS` (and the run
+    /// dir) are configured: image stopped, long-idle schemas' disks into local
+    /// zstd files and delete their VMs. Unlike freezing this never boots a VM
+    /// — the disk is compacted offline exactly as the reclaim/image-archive
+    /// paths do — so a compact costs seconds of CPU, not a boot + pg_dump.
+    pub fn spawn_compactor(self: &Arc<Self>) {
+        let Some(compact) = self.cfg.compact.clone() else {
+            info!("compacted tier disabled (PG_VM_POOL_COMPACT_AFTER_SECS unset/0)");
+            return;
+        };
+        info!(
+            "compacted tier: imaging schemas idle >= {:?} into {} and deleting their \
+             VMs (sweep every {:?})",
+            compact.compact_after,
+            compact.compact_dir.display(),
+            compact.sweep_interval
+        );
+        let registry = self.clone();
+        let interval = compact.sweep_interval;
+        let after = compact.compact_after;
+        let first = ARCHIVE_FIRST_SWEEP_DELAY.min(interval);
+        tokio::spawn(supervise("compactor", first, interval, move || {
+            let registry = registry.clone();
+            async move { registry.sweep_compact(after).await }
+        }));
+    }
+
+    /// One compact pass: compact every live, non-keepalive, *stopped* schema
+    /// untouched for at least `threshold`. Shares the sweep single-flight
+    /// with the freeze/S3/pressure passes.
+    async fn sweep_compact(&self, threshold: Duration) -> usize {
+        if self.sweeping.swap(true, Ordering::SeqCst) {
+            info!("compact: another sweep is running; skipping this pass");
+            return 0;
+        }
+        let _sweeping = SweepGuard(&self.sweeping);
+
+        let now = now_unix();
+        let threshold_secs = threshold.as_secs();
+        let live: HashMap<String, (usize, u64)> = self
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|e| (e.schema, (e.active, e.idle_secs)))
+            .collect();
+
+        let mut candidates: Vec<String> = Vec::new();
+        let mut backing_off = 0usize;
+        for (schema, rec) in self.store_records() {
+            let ka = self.cfg.is_keepalive(&schema);
+            // The extra gate vs. the freeze sweep: only schemas with NO warm
+            // entry. A warm entry means a VM process may hold the disk open;
+            // the idle reaper stops those first (its timeout is far shorter
+            // than any sensible compact_after), so waiting a sweep is cheaper
+            // than stalling 60s in the disk-release wait.
+            if live.contains_key(&schema) {
+                continue;
+            }
+            if classify_candidate(&rec, ka, now, threshold_secs, None) == SweepAction::Archive {
+                if self.offload_backoff.active(&schema, Instant::now()).is_some() {
+                    backing_off += 1;
+                } else {
+                    candidates.push(schema);
+                }
+            }
+        }
+        if backing_off > 0 {
+            info!("compact sweep: {backing_off} candidate(s) skipped in failure backoff");
+        }
+        if candidates.is_empty() {
+            return 0;
+        }
+        let backlog = candidates.len().saturating_sub(FREEZE_MAX_PER_SWEEP);
+        candidates.truncate(FREEZE_MAX_PER_SWEEP);
+        info!(
+            "compact sweep: {} candidate(s) this pass{}",
+            candidates.len(),
+            if backlog > 0 {
+                format!(" ({backlog} more deferred to later sweeps)")
+            } else {
+                String::new()
+            }
+        );
+        let n = candidates.len();
+        let mut compacted = 0usize;
+        let mut consecutive_failures = 0usize;
+        let mut aborted = false;
+        for schema in candidates {
+            match self.compact_schema(&schema).await {
+                Ok(()) => {
+                    compacted += 1;
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    warn!("compacting schema {schema} failed (will retry next sweep): {e:#}");
+                    consecutive_failures += 1;
+                    if consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES {
+                        error!(
+                            "compact sweep: aborting after {consecutive_failures} consecutive \
+                             failures — environment looks unhealthy; remaining candidates \
+                             will be retried next sweep"
+                        );
+                        aborted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        crate::events::journal_info(
+            "sweep.compact",
+            format!(
+                "compacted {compacted}/{n} candidate(s){}{}",
+                if backlog > 0 {
+                    format!(" ({backlog} deferred)")
+                } else {
+                    String::new()
+                },
+                if aborted {
+                    " — ABORTED after 3 consecutive failures"
+                } else {
+                    ""
+                }
+            ),
+        );
+        compacted
+    }
+
+    /// Compact one schema's stopped disk to a local image and delete its VM —
+    /// the compacted twin of [`Self::freeze_schema`], with the same guards:
+    /// `archiving` claim (checkouts wait), live-session refusal, image
+    /// verified complete (zstd -t + ext4 magic, atomic rename) *before* the
+    /// durable tier flip, and the tier flip durable *before* the kill.
+    pub async fn compact_schema(&self, schema: &str) -> Result<()> {
+        let res = self.compact_schema_inner(schema).await;
+        match &res {
+            Ok(()) => {
+                self.offload_backoff.clear(schema);
+                crate::events::journal_info(
+                    "compact",
+                    format!("schema {schema} → compacted (local image)"),
+                );
+            }
+            Err(e) => {
+                let (n, delay) = self.offload_backoff.record_failure(schema, Instant::now());
+                crate::events::journal_error(
+                    "compact",
+                    format!(
+                        "schema {schema}: {e:#} (failure {n}; sweeps skip this schema for {})",
+                        fmt_backoff(delay)
+                    ),
+                );
+            }
+        }
+        res
+    }
+
+    async fn compact_schema_inner(&self, schema: &str) -> Result<()> {
+        let Some(compact) = self.cfg.compact.clone() else {
+            bail!("compacted tier is not configured (set PG_VM_POOL_COMPACT_AFTER_SECS)");
+        };
+        if self.store.record(schema).map(|r| r.offloaded()).unwrap_or(false) {
+            bail!("schema {schema} is already compacted, frozen, or archived");
+        }
+        let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
+            Some(g) => g,
+            None => bail!("schema {schema} is already being offloaded"),
+        };
+        {
+            let mut map = self.entries.lock().await;
+            if let Some(entry) = map.get(schema).and_then(|c| c.get()) {
+                // A warm entry appeared since candidate selection: the VM may
+                // be running (disk open). Leave it to the idle reaper.
+                let active = entry.active_count();
+                bail!(
+                    "schema {schema} has a warm VM ({active} session(s)); refusing to compact"
+                );
+            }
+            map.remove(schema);
+        }
+        let Some(rec) = self.store.record(schema) else {
+            bail!("schema {schema} has no registry row — nothing to compact");
+        };
+
+        // Image the stopped disk. compact_disk's fd-scan wait refuses a disk
+        // anything still holds open, so a VM started out-of-band fails this
+        // rather than being imaged mid-write.
+        let bytes =
+            crate::imgarchive::compact_disk(&self.cfg, &compact, schema, &rec.sandbox_id)
+                .await
+                .with_context(|| format!("compacting schema {schema}'s data disk"))?;
+
+        // Tier flip durable before the kill (crash between them = data safely
+        // in the compact file, row says compacted, next connect thaws it —
+        // the VM/disk becomes purge/orphan fodder, not data loss).
+        self.store.set_tier(schema, Tier::Compacted).await;
+        let accomplished = format!(
+            "compacted to a {}-byte local image",
+            bytes
+        );
+        match Sandbox::connect(rec.sandbox_id.clone(), vm::local_opts()) {
+            Ok(sb) => {
+                if let Err(e) = vm::kill_and_reclaim(&self.cfg, &sb, schema, &accomplished).await {
+                    warn!("schema {schema}: compacted but killing the VM failed (orphaned): {e:#}");
+                }
+            }
+            Err(e) => warn!(
+                "schema {schema}: compacted but connecting to VM {} to kill it failed \
+                 (orphaned): {e:#}",
+                rec.sandbox_id
+            ),
+        }
+        Ok(())
+    }
+
     // ---- orphan-disk reclamation --------------------------------------------
 
     /// Spawn the orphan-disk sweep if `PG_VM_POOL_ORPHAN_SWEEP_SECS` (and a run
@@ -1987,6 +2307,10 @@ impl SchemaRegistry {
             return 0;
         }
         let _guard = SweepGuard(&self.orphan_sweeping);
+
+        // The restore scratch dir is dot-named, so the sb-* scan below never
+        // sees it — GC its crash leftovers here, on the sweep's cadence.
+        crate::imgarchive::gc_restore_scratch(&run_dir);
 
         // Registry view: sandbox-id → (schema, tier). The authoritative map of
         // which disks a schema still depends on.

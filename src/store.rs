@@ -47,6 +47,12 @@ const FLUSH_DEBOUNCE_SECS: u64 = 60;
 pub enum Tier {
     /// A VM (running or merely stopped) holds the data on its disk.
     Live,
+    /// The VM (and its disk) was deleted; the data lives as a trimmed,
+    /// zstd-compressed raw disk image under the pooler's compact dir — a
+    /// stopped schema at a fraction of its ext4 footprint (~5-25x smaller),
+    /// thawed by decompressing onto a fresh VM's disk: no boot at compact
+    /// time, no pg_restore at thaw time. The next checkout materializes it.
+    Compacted,
     /// The VM was killed; the data lives in a local dump file under the
     /// pooler's dump dir. The next checkout restores from it.
     Frozen,
@@ -58,15 +64,22 @@ impl Tier {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Tier::Live => "live",
+            Tier::Compacted => "compacted",
             Tier::Frozen => "frozen",
             Tier::Archived => "archived",
         }
     }
 
+    // NOTE: an older binary reading a registry with "compacted" rows parses
+    // them as Live (the historical default) — the schema then looks live with
+    // no VM, and the next connect builds a fresh empty one while the compact
+    // file still holds the data. Don't roll back across this without first
+    // thawing (or manually decompressing) compacted schemas.
     fn parse(s: &str) -> Tier {
         match s {
             "archived" => Tier::Archived,
             "frozen" => Tier::Frozen,
+            "compacted" => Tier::Compacted,
             _ => Tier::Live,
         }
     }
@@ -374,7 +387,7 @@ mod tests {
     fn parses_new_four_column_format() {
         let map = parse(
             "wb1\tsb-1\t1700000000\tlive\nwb2\tsb-2\t1700000500\tarchived\n\
-             wb3\tsb-3\t1700000900\tfrozen\n",
+             wb3\tsb-3\t1700000900\tfrozen\nwb4\tsb-4\t1700001000\tcompacted\n",
             999,
         );
         let wb1 = map.get("wb1").unwrap();
@@ -385,6 +398,8 @@ mod tests {
         assert_eq!(wb2.tier, Tier::Archived);
         assert_eq!(wb2.last_active, 1_700_000_500);
         assert_eq!(map.get("wb3").unwrap().tier, Tier::Frozen);
+        assert_eq!(map.get("wb4").unwrap().tier, Tier::Compacted);
+        assert_eq!(Tier::parse(Tier::Compacted.as_str()), Tier::Compacted);
     }
 
     #[test]

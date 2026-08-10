@@ -202,6 +202,152 @@ pub async fn archive_disk(
     res.map(|bytes| ImageArchived { bytes, pg_version })
 }
 
+/// Compact a stopped schema's data disk into a local compressed image:
+/// trim → zstd → verify → atomic rename to `<compact_dir>/<schema>.img.zst`.
+/// The local twin of [`archive_disk`] — same pipeline, no S3 — backing the
+/// `Compacted` tier: after this the caller deletes the VM and the schema
+/// costs image-file bytes instead of an ext4 disk (measured ~26x smaller on
+/// real pool disks). Returns the image's byte count.
+pub async fn compact_disk(
+    cfg: &Config,
+    compact: &crate::config::CompactConfig,
+    schema: &str,
+    sandbox_id: &str,
+) -> Result<u64> {
+    let run_dir = cfg
+        .run_dir
+        .as_ref()
+        .context("compacting needs the run dir (set PG_VM_POOL_RUN_DIR)")?;
+    let disk = run_dir.join(sandbox_id).join("data.ext4");
+    let md = tokio::fs::metadata(&disk)
+        .await
+        .with_context(|| format!("schema {schema}: no data disk at {}", disk.display()))?;
+
+    wait_disk_released(&disk).await?;
+
+    // Trim first: the compact file IS the tier, so shrinking it matters even
+    // more than for an upload. Same best-effort posture as the archive path —
+    // a disk that fails preen is imaged exactly as it is.
+    trim_disk(schema, &disk).await;
+
+    let allocated = {
+        use std::os::unix::fs::MetadataExt;
+        tokio::fs::metadata(&disk).await.map(|m| m.blocks() * 512).unwrap_or(md.len())
+    };
+    tokio::fs::create_dir_all(&compact.compact_dir)
+        .await
+        .with_context(|| format!("creating compact dir {}", compact.compact_dir.display()))?;
+    if let Some(free) = free_bytes(&compact.compact_dir).await
+        && free < allocated + allocated / 10
+    {
+        bail!(
+            "schema {schema}: compact dir {} has {} free but the disk has {} allocated — \
+             not enough room to compact (point PG_VM_POOL_COMPACT_DIR at a roomier \
+             filesystem)",
+            compact.compact_dir.display(),
+            crate::orphans::human_iec(free),
+            crate::orphans::human_iec(allocated),
+        );
+    }
+
+    let dest = compact.compact_path(schema);
+    let tmp = compact.compact_dir.join(format!("{schema}.img.zst.tmp"));
+    let res = compact_via_tmp(schema, &disk, &tmp, &dest).await;
+    if res.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    res
+}
+
+/// compress → verify → rename. Split out so `compact_disk` can clean the tmp
+/// file on every failure path; the rename is what makes a compact file at its
+/// final path always a verified-complete image.
+async fn compact_via_tmp(schema: &str, disk: &Path, tmp: &Path, dest: &Path) -> Result<u64> {
+    run_ok(
+        Command::new("zstd").args(["-q", "-f", "-3", "-T0", "-o"]).arg(tmp).arg(disk),
+        "compressing the disk image (is zstd installed?)",
+        ZSTD_TIMEOUT,
+    )
+    .await?;
+    let len = tokio::fs::metadata(tmp)
+        .await
+        .with_context(|| format!("statting compact tmp {}", tmp.display()))?
+        .len();
+    anyhow::ensure!(
+        len >= MIN_IMAGE_BYTES,
+        "schema {schema}: compacted image is only {len} bytes — not a filesystem image; \
+         refusing to keep it"
+    );
+    run_ok(
+        Command::new("zstd").args(["-q", "-t"]).arg(tmp),
+        "verifying the compacted image (zstd -t)",
+        ZSTD_TIMEOUT,
+    )
+    .await?;
+    check_compressed_ext4_magic(tmp).await.with_context(|| {
+        format!("schema {schema}: compacted image does not decompress to an ext4 filesystem")
+    })?;
+    tokio::fs::rename(tmp, dest)
+        .await
+        .with_context(|| format!("renaming compact image into {}", dest.display()))?;
+    info!(
+        "schema {schema}: disk compacted to {} ({})",
+        dest.display(),
+        crate::orphans::human_iec(len)
+    );
+    Ok(len)
+}
+
+/// Promote a compacted schema's local image file to S3 (`{schema}.img.zst`
+/// key) — no VM, no recompression: upload, HEAD-verify against a baseline,
+/// then delete any stale dump object that would shadow the image at restore
+/// time (restores prefer dumps — see [`choose_restore`]). The caller flips
+/// the tier and removes the local file on `Ok`.
+pub async fn promote_compact(s3: &S3Config, schema: &str, path: &Path) -> Result<u64> {
+    let len = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("statting compact image {}", path.display()))?
+        .len();
+    anyhow::ensure!(
+        len >= MIN_IMAGE_BYTES,
+        "compact image {} is only {len} bytes — refusing to promote it",
+        path.display()
+    );
+    let http = reqwest::Client::builder()
+        .build()
+        .context("building HTTP client for the image upload")?;
+    let key = s3.image_object_key(schema);
+    let baseline = s3.head_object(&http, &key, HEAD_TIMEOUT).await.with_context(|| {
+        format!("pre-upload HEAD of s3://{}/{key} — refusing to upload unverifiably", s3.bucket)
+    })?;
+    upload_file(s3, &http, &key, path, len, PART_SIZE, SINGLE_PUT_MAX).await?;
+    match s3.head_object(&http, &key, HEAD_TIMEOUT).await {
+        Ok(Some(id)) if id.content_length == len && Some(&id) != baseline.as_ref() => {}
+        Ok(Some(id)) => bail!(
+            "uploaded s3://{}/{key} but the HEAD reports {} bytes against a {len}-byte \
+             compact image (baseline unchanged: {}) — refusing to trust it",
+            s3.bucket,
+            id.content_length,
+            Some(&id) == baseline.as_ref(),
+        ),
+        Ok(None) => bail!("uploaded s3://{}/{key} but a HEAD finds nothing", s3.bucket),
+        Err(e) => return Err(e.context("verifying the uploaded image")),
+    }
+    // Same shadow-guard as archive_via_spool: an older dump object at the
+    // schema's dump key must not outlive this newer image.
+    let dump_key = s3.object_key(schema);
+    s3.delete_object(&http, &dump_key, HEAD_TIMEOUT)
+        .await
+        .with_context(|| {
+            format!(
+                "image uploaded, but deleting the stale dump at s3://{}/{dump_key} failed — \
+                 not flipping the tier while an older dump could shadow the image",
+                s3.bucket
+            )
+        })?;
+    Ok(len)
+}
+
 /// compress → verify → upload → verify → delete stale dump. Split out so the
 /// caller can clean the spool file on every exit path.
 async fn archive_via_spool(
@@ -322,6 +468,20 @@ async fn upload_file(
     res
 }
 
+/// Upload any file to `key` with the module's standard sizing (single PUT to
+/// 100MB, 64MB multipart parts above). The crate-wide file→S3 primitive — the
+/// streamed dump archive and the frozen-dump promotion use it too, so nothing
+/// outside a test needs to pick part sizes.
+pub(crate) async fn upload_path(
+    s3: &S3Config,
+    http: &reqwest::Client,
+    key: &str,
+    path: &Path,
+    len: u64,
+) -> Result<()> {
+    upload_file(s3, http, key, path, len, PART_SIZE, SINGLE_PUT_MAX).await
+}
+
 async fn upload_parts(
     s3: &S3Config,
     http: &reqwest::Client,
@@ -403,8 +563,81 @@ pub async fn materialize_from_image(
     let zst = scratch.join(format!("{schema}.img.zst"));
     let raw = scratch.join(format!("{schema}.ext4"));
 
+    // Mirror of the archive side's spool precheck: a restore transiently
+    // holds the compressed download, the decompressed raw image, AND the
+    // in-place copy onto the new VM's disk — all on the run-dir filesystem.
+    // The raw/copy sizes aren't knowable before the decompress (sparse), so
+    // this gates only the download; `swap_and_boot`'s copy is gated exactly,
+    // below. Refusing here beats driving the VM filesystem to 0% mid-restore,
+    // which is precisely the incident emergency-drain.sh exists for.
+    if let Some(free) = free_bytes(&scratch).await
+        && free < expect_len * 2
+    {
+        bail!(
+            "schema {schema}: {} free on {} but the compressed image alone is {} — \
+             not enough room to even download it; reclaim disk first",
+            crate::orphans::human_iec(free),
+            run_dir.display(),
+            crate::orphans::human_iec(expect_len),
+        );
+    }
+
     let res = materialize_inner(cfg, schema, s3, &key, &http, expect_len, &zst, &raw).await;
     let _ = tokio::fs::remove_file(&zst).await;
+    let _ = tokio::fs::remove_file(&raw).await;
+    res
+}
+
+/// Materialize the VM for a locally *compacted* schema — the same maneuver as
+/// [`materialize_from_image`] minus the download: the compressed image is
+/// already on this host (`<compact_dir>/<schema>.img.zst`). The source file is
+/// never deleted here — that's the caller's move once the thaw is confirmed
+/// (registry row flipped live), so a failed boot always leaves the data where
+/// it was.
+pub async fn materialize_from_local_image(
+    cfg: &Config,
+    schema: &str,
+    src: &Path,
+) -> Result<heyo_sdk::Sandbox> {
+    let run_dir = cfg
+        .run_dir
+        .as_ref()
+        .context("restoring a compacted image needs the run dir (set PG_VM_POOL_RUN_DIR)")?;
+    let len = tokio::fs::metadata(src)
+        .await
+        .with_context(|| {
+            format!(
+                "schema {schema} is marked compacted but its image {} is unreadable — \
+                 nothing to thaw (was PG_VM_POOL_COMPACT_DIR changed or the file removed?)",
+                src.display()
+            )
+        })?
+        .len();
+    anyhow::ensure!(
+        len >= MIN_IMAGE_BYTES,
+        "schema {schema}: compact image {} is only {len} bytes — not a filesystem image",
+        src.display()
+    );
+
+    let scratch = run_dir.join(".pg-vm-pool-restore");
+    tokio::fs::create_dir_all(&scratch)
+        .await
+        .with_context(|| format!("creating restore scratch dir {}", scratch.display()))?;
+    let raw = scratch.join(format!("{schema}.ext4"));
+    // Sanity gate only (the compression ratio is unknowable here); the exact
+    // allocated-bytes gate before the copy lives in swap_and_boot.
+    if let Some(free) = free_bytes(&scratch).await
+        && free < len * 2
+    {
+        bail!(
+            "schema {schema}: {} free on {} but the compact image alone is {} — \
+             not enough room to thaw; reclaim disk first",
+            crate::orphans::human_iec(free),
+            run_dir.display(),
+            crate::orphans::human_iec(len),
+        );
+    }
+    let res = adopt_zst_image(cfg, schema, src, &raw).await;
     let _ = tokio::fs::remove_file(&raw).await;
     res
 }
@@ -421,6 +654,19 @@ async fn materialize_inner(
     raw: &Path,
 ) -> Result<heyo_sdk::Sandbox> {
     download(s3, http, key, expect_len, zst).await?;
+    adopt_zst_image(cfg, schema, zst, raw).await
+}
+
+/// The shared tail of every image restore: decompress `zst` into `raw`,
+/// verify it is ext4, then run the readopt maneuver (fresh VM, disk swap,
+/// boot on the real data). Deletes nothing — each caller owns its files'
+/// lifecycles.
+async fn adopt_zst_image(
+    cfg: &Config,
+    schema: &str,
+    zst: &Path,
+    raw: &Path,
+) -> Result<heyo_sdk::Sandbox> {
     run_ok(
         Command::new("zstd").args(["-q", "-d", "-f", "--sparse", "-o"]).arg(raw).arg(zst),
         "decompressing the disk image (is zstd installed?)",
@@ -451,10 +697,29 @@ async fn materialize_inner(
     let name = format!("pg-{schema}");
     let sandbox = crate::vm::create_vm(cfg, &name, cfg.is_keepalive(schema)).await?;
     if let Err(e) = swap_and_boot(cfg, &sandbox, schema, raw).await {
-        // The half-adopted VM must not be left running an empty (or torn)
-        // database that a later find-by-name could serve as the schema.
-        warn!("schema {schema}: image restore failed after VM create; stopping {}", sandbox.sandbox_id());
-        let _ = tokio::time::timeout(Duration::from_secs(30), sandbox.stop()).await;
+        // The half-adopted VM must not survive at all: merely *stopping* it
+        // leaves a `pg-<schema>` sandbox holding an empty-or-torn database
+        // that a later find-by-name would happily serve as the schema, and a
+        // stopped daemon-known sandbox is invisible to every reclaimer (not
+        // an orphan, not spare-named, no registry row). Kill it — sandbox,
+        // disk and all; the durable copy is still the S3 image. Best-effort:
+        // on a kill failure the loud warn is all we can do, and the next
+        // restore attempt's create will conflict on the name and surface it.
+        warn!(
+            "schema {schema}: image restore failed after VM create; killing {}",
+            sandbox.sandbox_id()
+        );
+        match tokio::time::timeout(Duration::from_secs(30), sandbox.kill()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(kill_err)) => warn!(
+                "schema {schema}: killing half-adopted VM {} failed: {kill_err:#}",
+                sandbox.sandbox_id()
+            ),
+            Err(_) => warn!(
+                "schema {schema}: killing half-adopted VM {} timed out",
+                sandbox.sandbox_id()
+            ),
+        }
         return Err(e);
     }
     Ok(sandbox)
@@ -474,6 +739,25 @@ async fn swap_and_boot(
         .context("stopping the fresh VM for the disk swap timed out")?
         .context("stopping the fresh VM for the disk swap")?;
     wait_disk_released(&disk).await?;
+
+    // Exact-size gate on the copy: at this point the raw image exists, so its
+    // *allocated* bytes (not the sparse apparent size) are exactly what the
+    // sparse copy below will add to the filesystem. ENOSPC mid-copy would
+    // leave a torn disk under a VM about to boot.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let need = tokio::fs::metadata(raw).await.map(|m| m.blocks() * 512).unwrap_or(0);
+        if let Some(free) = free_bytes(disk.parent().unwrap_or(raw)).await
+            && free < need + need / 10
+        {
+            bail!(
+                "schema {schema}: adopting the restored image needs {} but only {} is free \
+                 on the VM filesystem — reclaim disk first",
+                crate::orphans::human_iec(need),
+                crate::orphans::human_iec(free),
+            );
+        }
+    }
 
     // In place (`cp`, not rename): the write goes through the existing inode,
     // so a jailer hard-link to data.ext4 keeps pointing at the adopted bytes.
@@ -678,6 +962,58 @@ async fn check_compressed_ext4_magic(spool: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Age past which a file in the restore scratch dir is presumed abandoned.
+/// An in-flight restore keeps its files' mtimes fresh (the download and the
+/// decompress both write continuously); anything untouched this long belongs
+/// to a pooler that died mid-restore. Nothing else can clean these up: the
+/// scratch dir is dot-named precisely so the `sb-*` orphan scan never
+/// considers it, so without this GC a crash pins up to a full raw image
+/// (compressed + decompressed) on the VM filesystem forever.
+const SCRATCH_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// Delete abandoned restore-scratch files under `<run_dir>/.pg-vm-pool-restore`.
+/// Called at pooler startup and from each orphan-sweep pass. Best-effort —
+/// a GC miss costs disk, never correctness. Returns bytes freed.
+pub fn gc_restore_scratch(run_dir: &Path) -> u64 {
+    let scratch = run_dir.join(".pg-vm-pool-restore");
+    let entries = match std::fs::read_dir(&scratch) {
+        Ok(e) => e,
+        // Most commonly NotFound (no restore has ever run) — nothing to do.
+        Err(_) => return 0,
+    };
+    let now = std::time::SystemTime::now();
+    let mut freed = 0u64;
+    for ent in entries.flatten() {
+        let path = ent.path();
+        let Ok(md) = ent.metadata() else { continue };
+        let stale = md
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .map(|age| age >= SCRATCH_MAX_AGE)
+            .unwrap_or(false);
+        if !stale {
+            continue;
+        }
+        let allocated = {
+            use std::os::unix::fs::MetadataExt;
+            md.blocks() * 512
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                freed += allocated;
+                info!(
+                    "restore-scratch GC: removed abandoned {} ({})",
+                    path.display(),
+                    crate::orphans::human_iec(allocated),
+                );
+            }
+            Err(e) => warn!("restore-scratch GC: removing {} failed: {e}", path.display()),
+        }
+    }
+    freed
+}
+
 /// Free bytes on `dir`'s filesystem, via `df -Pk` (std has no statvfs).
 /// `None` when df is missing/unparseable — the caller then skips the check
 /// rather than failing an archive on a metrics gap.
@@ -737,6 +1073,36 @@ mod tests {
         assert_eq!(choose_restore(Some(100), Some(10)), RestoreKind::Dump);
     }
 
+    #[test]
+    fn scratch_gc_removes_stale_and_keeps_fresh() {
+        let run_dir =
+            std::env::temp_dir().join(format!("imgarchive-scratch-gc-{}", std::process::id()));
+        let scratch = run_dir.join(".pg-vm-pool-restore");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let stale = scratch.join("old.img.zst");
+        let fresh = scratch.join("new.ext4");
+        std::fs::write(&stale, vec![7u8; 8192]).unwrap();
+        std::fs::write(&fresh, vec![7u8; 8192]).unwrap();
+        // Age the stale file past SCRATCH_MAX_AGE (mtime only; no crate dep).
+        let ok = std::process::Command::new("touch")
+            .arg("-d")
+            .arg("2 hours ago")
+            .arg(&stale)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "touch -d must work to set up the stale mtime");
+
+        let freed = gc_restore_scratch(&run_dir);
+        assert!(freed > 0, "the stale file's blocks count as freed");
+        assert!(!stale.exists(), "stale scratch is deleted");
+        assert!(fresh.exists(), "an in-flight restore's fresh file survives");
+
+        // A run dir with no scratch dir is a quiet no-op.
+        assert_eq!(gc_restore_scratch(&run_dir.join("nonexistent")), 0);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
     #[tokio::test]
     async fn ext4_magic_check_accepts_and_rejects() {
         let dir = std::env::temp_dir().join(format!("imgarchive-magic-{}", std::process::id()));
@@ -762,6 +1128,46 @@ mod tests {
     /// sparse pseudo-image, verify it, magic-check it compressed, decompress
     /// it back, and confirm holes survived the round trip (a restore that
     /// re-inflates disks would undo the whole thin-provisioning effort).
+    #[tokio::test]
+    async fn compact_via_tmp_verifies_and_lands_atomically() {
+        if run(Command::new("zstd").arg("--version"), Duration::from_secs(10)).await.is_err() {
+            eprintln!("skipping: zstd not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("imgarchive-compact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A plausible mini "disk": ext4 magic in place, incompressible body
+        // (an all-zero disk zstd's below the MIN_IMAGE_BYTES floor).
+        let disk = dir.join("data.ext4");
+        let mut bytes = vec![0u8; 64 * 1024];
+        let mut x: u32 = 0x9e37_79b9;
+        for b in bytes.iter_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (x >> 24) as u8;
+        }
+        bytes[EXT4_MAGIC_OFFSET as usize] = EXT4_MAGIC[0];
+        bytes[EXT4_MAGIC_OFFSET as usize + 1] = EXT4_MAGIC[1];
+        std::fs::write(&disk, &bytes).unwrap();
+
+        let tmp = dir.join("s.img.zst.tmp");
+        let dest = dir.join("s.img.zst");
+        let len = compact_via_tmp("s", &disk, &tmp, &dest).await.unwrap();
+        assert!(dest.exists(), "verified image landed at its final path");
+        assert!(!tmp.exists(), "tmp renamed away");
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), len);
+
+        // A non-ext4 disk must never land at the final path.
+        let bogus = dir.join("bogus.bin");
+        std::fs::write(&bogus, vec![1u8; 64 * 1024]).unwrap();
+        let tmp2 = dir.join("b.img.zst.tmp");
+        let dest2 = dir.join("b.img.zst");
+        assert!(compact_via_tmp("b", &bogus, &tmp2, &dest2).await.is_err());
+        assert!(!dest2.exists(), "unverified image must not land");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn zstd_round_trip_preserves_magic_and_holes() {
         if run(Command::new("zstd").arg("--version"), Duration::from_secs(10)).await.is_err() {

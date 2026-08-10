@@ -115,6 +115,14 @@ pub struct Config {
     /// by `PG_VM_POOL_FREEZE_AFTER_SECS`. Sits between the idle reaper (stops
     /// the VM, keeps the disk) and the S3 tier (offloads off-host).
     pub freeze: Option<FreezeConfig>,
+    /// Local dump store location + server bind, shared by the frozen tier and
+    /// the S3 archive tier's streamed dumps. Always parsed (cheap, pure
+    /// defaults); the server only runs when freeze or archive is enabled.
+    pub dump_net: DumpNetConfig,
+    /// Local compacted tier: stopped schemas kept as trimmed zstd images
+    /// instead of full ext4 disks. `None` (default) disables it — enabled by
+    /// `PG_VM_POOL_COMPACT_AFTER_SECS`; needs the run dir.
+    pub compact: Option<CompactConfig>,
     /// How many warm-spare VMs (pre-booted, initdb done, parked empty) to keep
     /// ready for claiming, so a cold bring-up — notably a restore from S3 —
     /// skips create + boot + initdb. `0` (default) disables the pool. Each
@@ -239,6 +247,33 @@ impl FreezeConfig {
             .filter(|s| *s > 0)
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(900));
+        let net = DumpNetConfig::from_env()?;
+        Ok(Some(Self {
+            freeze_after,
+            sweep_interval,
+            dump_dir: net.dump_dir,
+            listen: net.listen,
+        }))
+    }
+}
+
+/// Where the local dump store lives and where its HTTP server listens. Parsed
+/// independently of the frozen tier because two consumers share the server:
+/// freeze/thaw, and the S3 archive tier's *streamed* dumps (the guest pipes
+/// `pg_dump` to this server so the archive never touches its own data disk;
+/// the pooler then uploads the landed file to S3). Always present on `Config`;
+/// the server itself runs only when a consumer is enabled.
+#[derive(Clone)]
+pub struct DumpNetConfig {
+    /// Env `PG_VM_POOL_DUMP_DIR` (default `~/.heyo/pg-vm-pool/dumps`).
+    pub dump_dir: PathBuf,
+    /// Env `PG_VM_POOL_DUMP_LISTEN` (default `0.0.0.0:6433`) — must be
+    /// reachable from the VM bridge (guests dial it at their gateway).
+    pub listen: SocketAddr,
+}
+
+impl DumpNetConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
         let dump_dir = std::env::var("PG_VM_POOL_DUMP_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
@@ -250,12 +285,64 @@ impl FreezeConfig {
         let listen: SocketAddr = listen
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid PG_VM_POOL_DUMP_LISTEN {listen:?}: {e}"))?;
+        Ok(Self { dump_dir, listen })
+    }
+}
+
+/// Settings for the local *compacted* tier: a schema whose VM has sat stopped
+/// past `compact_after` has its data disk trimmed, zstd-compressed into
+/// `compact_dir`, and the VM + disk deleted. Unlike the frozen tier this
+/// never boots the VM (no pg_dump — the disk is imaged as-is, the same
+/// pipeline as the S3 image archive but kept local), and thawing is a
+/// decompress + boot rather than a pg_restore. Measured on real pool disks:
+/// ~26x smaller than the untrimmed ext4, seconds each way.
+#[derive(Clone)]
+pub struct CompactConfig {
+    /// Idle time after which a stopped schema is compacted. Env
+    /// `PG_VM_POOL_COMPACT_AFTER_SECS` — setting it (> 0) is the switch.
+    pub compact_after: Duration,
+    /// Sweep cadence. Env `PG_VM_POOL_COMPACT_SWEEP_SECS` (default 900).
+    pub sweep_interval: Duration,
+    /// Where `<schema>.img.zst` files live. Env `PG_VM_POOL_COMPACT_DIR`
+    /// (default `compact/` next to the state file).
+    pub compact_dir: PathBuf,
+}
+
+impl CompactConfig {
+    fn from_env(state_file: &std::path::Path) -> anyhow::Result<Option<Self>> {
+        let compact_after = match std::env::var("PG_VM_POOL_COMPACT_AFTER_SECS") {
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) | Err(_) => return Ok(None),
+                Ok(secs) => Duration::from_secs(secs),
+            },
+            Err(_) => return Ok(None),
+        };
+        let sweep_interval = std::env::var("PG_VM_POOL_COMPACT_SWEEP_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(900));
+        let compact_dir = std::env::var("PG_VM_POOL_COMPACT_DIR")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                state_file
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("compact")
+            });
         Ok(Some(Self {
-            freeze_after,
+            compact_after,
             sweep_interval,
-            dump_dir,
-            listen,
+            compact_dir,
         }))
+    }
+
+    /// A schema's compact-file path (mirrors `DumpServer::dump_path`).
+    pub fn compact_path(&self, schema: &str) -> PathBuf {
+        self.compact_dir.join(format!("{schema}.img.zst"))
     }
 }
 
@@ -672,6 +759,27 @@ impl Config {
                 a.archive_after.as_secs()
             );
         }
+        // Compacting images a stopped VM's disk in place from the run dir, so
+        // like the image archive it is inert without one.
+        let mut compact = CompactConfig::from_env(&state_file)?;
+        if compact.is_some() && run_dir.is_none() {
+            tracing::warn!(
+                "PG_VM_POOL_COMPACT_AFTER_SECS is set but no run dir is known \
+                 (set PG_VM_POOL_RUN_DIR) — the compacted tier is disabled"
+            );
+            compact = None;
+        }
+        if let (Some(c), Some(f)) = (&compact, &freeze)
+            && f.freeze_after <= c.compact_after
+        {
+            tracing::warn!(
+                "PG_VM_POOL_FREEZE_AFTER_SECS ({}s) <= PG_VM_POOL_COMPACT_AFTER_SECS ({}s): \
+                 the freeze sweep (which boots each VM to pg_dump it) will win the race and \
+                 the cheaper compacted tier will rarely fire — prefer compacting first",
+                f.freeze_after.as_secs(),
+                c.compact_after.as_secs()
+            );
+        }
 
         Ok(Self {
             listen_addr,
@@ -695,6 +803,8 @@ impl Config {
             archive,
             image_archive,
             freeze,
+            dump_net: DumpNetConfig::from_env()?,
+            compact,
             warm_spares,
             reclaim,
             run_dir,

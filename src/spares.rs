@@ -47,8 +47,10 @@ pub struct SparePool {
     target: usize,
     /// Sandbox ids claimed by this process (bound to a schema, or mid-claim).
     /// In-memory only: after a restart the registry's id bindings provide the
-    /// same exclusion for successful claims, and an id claimed by a bring-up
-    /// that then *failed* simply returns to the pool.
+    /// same exclusion for successful claims. A claim whose bring-up *failed*
+    /// downstream is released via [`Self::release_failed`], which kills the
+    /// spare — its state is ambiguous after a partial claim, so it must never
+    /// return to the pool.
     claimed: StdMutex<HashSet<String>>,
 }
 
@@ -100,6 +102,37 @@ impl SparePool {
                 self.claimed.lock().unwrap().remove(&id);
                 None
             }
+        }
+    }
+
+    /// Release a claim whose bring-up failed *after* [`Self::take`] succeeded
+    /// (restore error, ready-timeout, …). The spare's state is ambiguous —
+    /// the failed attempt may have created the schema's database or partially
+    /// restored into it — so it is never returned to the pool: it is killed
+    /// (disk and all) and the replenisher builds a fresh, clean one. The id
+    /// leaves `claimed` only on a confirmed kill; a spare we couldn't kill
+    /// stays claimed forever, which keeps it out of inventory and out of
+    /// purge's reach — a dirty spare must never be handed to another schema.
+    /// Without this release, every failed claim leaked a running VM plus its
+    /// data disk for the life of the process, and the replenisher — which
+    /// also can't see claimed ids as inventory — booted a replacement on top.
+    pub async fn release_failed(&self, id: &str) {
+        match Sandbox::connect(id.to_string(), vm::local_opts()) {
+            Ok(sb) => match sb.kill().await {
+                Ok(()) => {
+                    self.claimed.lock().unwrap().remove(id);
+                    info!("warm-spares: killed spare {id} after a failed bring-up (claim released)");
+                }
+                Err(e) => warn!(
+                    "warm-spares: killing spare {id} after a failed bring-up failed: {e:#}; \
+                     leaving it claimed so it can never serve another schema — needs manual \
+                     cleanup (heyvm delete {id})"
+                ),
+            },
+            Err(e) => warn!(
+                "warm-spares: cannot connect to spare {id} to release its failed claim: {e:#}; \
+                 leaving it claimed — needs manual cleanup (heyvm delete {id})"
+            ),
         }
     }
 

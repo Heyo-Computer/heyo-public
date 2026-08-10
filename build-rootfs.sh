@@ -42,9 +42,9 @@ sudo mount -o loop "$OUTPUT" "$MNT"
 CID="$(docker create "$IMAGE")"
 docker export "$CID" | sudo tar -x -C "$MNT"
 
-# Firecracker's default kernel cmdline runs `init=/sbin/init.sh`; the Dockerfile
-# already placed it there. Make sure the mount points the init script needs
-# exist in the rootfs.
+# The kernel cmdline runs `init=/init.sh`; the Dockerfile already placed it
+# there (COPY init.sh /init.sh — a mismatch panics the kernel). Make sure the
+# mount points the init script needs exist in the rootfs.
 sudo mkdir -p "$MNT/proc" "$MNT/sys" "$MNT/dev" "$MNT/run" "$MNT/tmp" "$MNT/workspace"
 
 sync
