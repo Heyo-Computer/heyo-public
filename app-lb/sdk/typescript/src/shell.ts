@@ -36,7 +36,7 @@
  */
 
 import { ShellError, fromResponse } from "./errors.js";
-import type { Serverctl } from "./client.js";
+import type { Heyctl } from "./client.js";
 
 const STDIN = 0x01;
 const STDOUT = 0x02;
@@ -173,7 +173,7 @@ export class Shell {
   }
 
   /** @internal */
-  static async open(client: Serverctl, id: string, opts: ShellOptions): Promise<Shell> {
+  static async open(client: Heyctl, id: string, opts: ShellOptions): Promise<Shell> {
     const header = client.authHeader();
     let query = shellQuery(opts);
 
@@ -357,7 +357,7 @@ async function connect(
   url: string,
   header: string | undefined,
   id: string,
-  client: Serverctl,
+  client: Heyctl,
 ): Promise<SocketLike> {
   let socket: SocketLike;
 

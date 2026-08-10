@@ -263,9 +263,9 @@ one, `obs.<host>` hands every customer's logs to anyone who asks for them. So
 }
 ```
 
-Fill in the client id, store the secret (`serverctl create secret google
+Fill in the client id, store the secret (`heyctl create secret google
 --from-stdin client_secret`), and register the redirect URI Google needs —
-`serverctl describe deployment app-obs` prints the exact string. See
+`heyctl describe deployment app-obs` prints the exact string. See
 [app-lb's Google sign-in](../app-lb/README.md#google-sign-in) for the full set of
 options; `/healthz` stays public so the health probe still passes.
 

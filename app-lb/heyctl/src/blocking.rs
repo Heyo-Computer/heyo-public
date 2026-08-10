@@ -4,9 +4,9 @@
 //! forwards to the async client on a private current-thread runtime.
 //!
 //! ```no_run
-//! # fn f() -> serverctl::Result<()> {
-//! use serverctl::blocking::Client;
-//! use serverctl::ExecRequest;
+//! # fn f() -> heyctl::Result<()> {
+//! use heyctl::blocking::Client;
+//! use heyctl::ExecRequest;
 //!
 //! let lb = Client::builder("127.0.0.1:9090").token("applb_…").build()?;
 //! let out = lb.exec("sb-7f3a9c", &ExecRequest::new("uname -a"))?;
@@ -57,8 +57,8 @@ impl std::ops::Deref for Rt {
 fn block_on<F: std::future::Future>(rt: &Rt, f: F) -> Result<F::Output> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(Error::Invalid(
-            "serverctl::blocking cannot be used inside an async runtime — use \
-             serverctl::Client instead"
+            "heyctl::blocking cannot be used inside an async runtime — use \
+             heyctl::Client instead"
                 .into(),
         ));
     }
@@ -479,8 +479,8 @@ impl Shell {
 /// A session *is* a sequence of events that ends, so it iterates.
 ///
 /// ```no_run
-/// # fn f(shell: &mut serverctl::blocking::Shell) {
-/// use serverctl::ShellEvent;
+/// # fn f(shell: &mut heyctl::blocking::Shell) {
+/// use heyctl::ShellEvent;
 /// for event in shell.by_ref() {
 ///     if let ShellEvent::Output(bytes) = event {
 ///         // …
@@ -529,7 +529,7 @@ mod tests {
 
         let e = c.healthz().unwrap_err();
         assert!(matches!(&e, Error::Invalid(m) if m.contains("async runtime")), "{e:?}");
-        assert!(e.to_string().contains("serverctl::Client"), "it should name the fix: {e}");
+        assert!(e.to_string().contains("heyctl::Client"), "it should name the fix: {e}");
     }
 }
 

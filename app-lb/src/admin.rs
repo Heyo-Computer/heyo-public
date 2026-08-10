@@ -1765,7 +1765,7 @@ fn render_directory_cards(entries: &[DirectoryEntry], unlinkable: &[String]) -> 
     if entries.is_empty() {
         let body = if unlinkable.is_empty() {
             "Nothing is registered yet. <code>POST /deployments</code>, or \
-             <code>serverctl apply</code>, and it appears here."
+             <code>heyctl apply</code>, and it appears here."
         } else {
             "No deployment has a linkable hostname."
         };

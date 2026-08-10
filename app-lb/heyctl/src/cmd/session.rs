@@ -1,4 +1,4 @@
-//! `serverctl exec` and `serverctl shell` — the two ways into a VM that are not
+//! `heyctl exec` and `heyctl shell` — the two ways into a VM that are not
 //! HTTP, and the only ways into a sandbox with no routes.
 //!
 //! Both go through app-lb's admin API rather than the heyvm daemon, so they work
@@ -79,7 +79,7 @@ pub fn exec(ctx: &Ctx, args: &ExecArgs) -> Result<()> {
     }
 
     // Human mode is a pass-through: stdout to stdout, stderr to stderr, and the
-    // guest's exit code as our own. That is what makes `serverctl exec` usable
+    // guest's exit code as our own. That is what makes `heyctl exec` usable
     // in a pipeline instead of only at a prompt.
     print!("{}", result.stdout);
     eprint!("{}", result.stderr);

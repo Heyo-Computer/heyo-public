@@ -1295,7 +1295,7 @@ impl Jobs {
             spec.env.clone().unwrap_or_default().into_iter().collect();
         for from in &spec.env_from {
             let value = self.secrets.resolve(&from.secret_ref()).map_err(|e| {
-                format!("{e} — `serverctl get secrets` lists what this LB holds")
+                format!("{e} — `heyctl get secrets` lists what this LB holds")
             })?;
             env.insert(from.env_name(), value);
         }
@@ -1317,7 +1317,7 @@ impl Jobs {
         match auth {
             None => Ok(None),
             Some(r) => Ok(Some(self.secrets.resolve(r).map_err(|e| {
-                format!("{e} — `serverctl get secrets` lists what this LB holds")
+                format!("{e} — `heyctl get secrets` lists what this LB holds")
             })?)),
         }
     }
@@ -1330,7 +1330,7 @@ impl Jobs {
             None => Ok(None),
             Some(r) => Ok(Some((
                 self.secrets.resolve(r).map_err(|e| {
-                    format!("{e} — `serverctl get secrets` lists what this LB holds")
+                    format!("{e} — `heyctl get secrets` lists what this LB holds")
                 })?,
                 r.username.clone().unwrap_or_else(|| "x-access-token".into()),
             ))),

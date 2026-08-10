@@ -1,4 +1,4 @@
-//! `serverctl token` — minting, listing and revoking app-tokens.
+//! `heyctl token` — minting, listing and revoking app-tokens.
 //!
 //! An app-token is what a program authenticates with: scoped to particular
 //! deployments, revocable without restarting app-lb, optionally expiring. Basic
@@ -9,7 +9,7 @@
 //! everything else to stderr, which makes the useful thing pipeable:
 //!
 //! ```text
-//! APP_LB_TOKEN=$(serverctl token mint agent --admin admin --deployment sb-1 -q)
+//! APP_LB_TOKEN=$(heyctl token mint agent --admin admin --deployment sb-1 -q)
 //! ```
 
 use anyhow::{Result, bail};
@@ -166,7 +166,7 @@ fn mint(ctx: &Ctx, args: &MintArgs) -> Result<()> {
         return output::emit(&minted, ctx.out, &[]);
     }
 
-    // The secret on stdout, the commentary on stderr: `$(serverctl token mint …)`
+    // The secret on stdout, the commentary on stderr: `$(heyctl token mint …)`
     // then captures the credential and nothing else, even without `-q`.
     eprintln!("Minted {:?}.", args.name);
     eprintln!("This is the only time the token is shown — app-lb stores only its hash.\n");

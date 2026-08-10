@@ -1,19 +1,19 @@
-# serverctl (TypeScript)
+# heyctl (TypeScript)
 
 A client for the [app-lb](../../README.md) admin API: register deployments,
 scale pools, run commands inside a microVM, and attach an interactive shell.
 
-Same name and same wire contract as the [Rust crate](../../serverctl) and the
-`serverctl` CLI.
+Same name and same wire contract as the [Rust crate](../../heyctl) and the
+`heyctl` CLI.
 
 ```sh
-npm install serverctl
+npm install heyctl
 ```
 
 ```ts
-import { Serverctl } from "serverctl";
+import { Heyctl } from "heyctl";
 
-const lb = new Serverctl({
+const lb = new Heyctl({
   server: "127.0.0.1:9090",
   token: process.env.APP_LB_TOKEN,
 });
@@ -32,7 +32,7 @@ restarting app-lb, optionally expiring. Basic auth also works and is unscoped â€
 it is the operator credential, and the one that mints tokens.
 
 ```ts
-const admin = new Serverctl({ server, user: "admin", password: process.env.PW! });
+const admin = new Heyctl({ server, user: "admin", password: process.env.PW! });
 
 const minted = await admin.mintToken({
   name: "agent-runner",
@@ -115,7 +115,7 @@ throws rather than silently failing the upgrade.
 
 ## Errors
 
-Every failure is a subclass of `ServerctlError` carrying `status`, `retryable`
+Every failure is a subclass of `HeyctlError` carrying `status`, `retryable`
 and `isAuth`:
 
 | | |

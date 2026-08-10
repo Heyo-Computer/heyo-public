@@ -34,7 +34,7 @@ cargo test --locked --manifest-path heyosecret/Cargo.toml
 cargo test --locked --manifest-path heyosecret-client/Cargo.toml
 cargo test --locked --manifest-path orchestrator/Cargo.toml
 cargo test --locked --manifest-path app-lb/Cargo.toml -p app-lb
-cargo test --locked --manifest-path app-lb/serverctl/Cargo.toml
+cargo test --locked --manifest-path app-lb/heyctl/Cargo.toml
 cargo test --locked --manifest-path app-obs/Cargo.toml
 cargo test --locked --manifest-path artifacts/Cargo.toml
 cargo test --locked --manifest-path queue-fn/Cargo.toml

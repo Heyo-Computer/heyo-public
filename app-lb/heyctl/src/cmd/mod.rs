@@ -40,27 +40,27 @@ pub struct GlobalOpts {
     pub output: OutputFormat,
 
     /// Config file holding the saved contexts.
-    #[arg(long, global = true, env = "SERVERCTL_CONFIG", value_name = "PATH", help_heading = "Global options")]
+    #[arg(long, global = true, env = "HEYCTL_CONFIG", value_name = "PATH", help_heading = "Global options")]
     pub config: Option<PathBuf>,
 
     /// Which stored context to use.
-    #[arg(long, global = true, env = "SERVERCTL_CONTEXT", value_name = "NAME", help_heading = "Global options")]
+    #[arg(long, global = true, env = "HEYCTL_CONTEXT", value_name = "NAME", help_heading = "Global options")]
     pub context: Option<String>,
 
     /// Admin API URL, overriding the context.
-    #[arg(long, global = true, env = "SERVERCTL_SERVER", value_name = "URL", help_heading = "Global options")]
+    #[arg(long, global = true, env = "HEYCTL_SERVER", value_name = "URL", help_heading = "Global options")]
     pub server: Option<String>,
 
     /// Basic-auth user, overriding the context.
-    #[arg(long, global = true, env = "SERVERCTL_USER", value_name = "NAME", help_heading = "Global options")]
+    #[arg(long, global = true, env = "HEYCTL_USER", value_name = "NAME", help_heading = "Global options")]
     pub user: Option<String>,
 
-    /// Basic-auth password, overriding the context. Prefer SERVERCTL_PASSWORD
-    /// or `serverctl login` — an argument is visible in `ps`.
+    /// Basic-auth password, overriding the context. Prefer HEYCTL_PASSWORD
+    /// or `heyctl login` — an argument is visible in `ps`.
     #[arg(
         long,
         global = true,
-        env = "SERVERCTL_PASSWORD",
+        env = "HEYCTL_PASSWORD",
         value_name = "PASSWORD",
         hide_env_values = true,
         help_heading = "Global options"
@@ -109,7 +109,7 @@ impl Ctx {
     }
 }
 
-/// The resource kinds serverctl addresses, with kubectl-style aliases.
+/// The resource kinds heyctl addresses, with kubectl-style aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resource {
     Deployment,

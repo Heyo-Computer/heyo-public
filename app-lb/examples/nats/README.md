@@ -6,9 +6,9 @@ the app-lb deployment that owns its lifecycle. This is the bus
 
 ```sh
 ./build-image.sh                              # -> ~/.heyo/images/firecracker/nats.ext4
-serverctl apply -f nats.json
-serverctl rollout status nats
-serverctl exec nats -- /opt/nats/preflight.sh # checks what a health check cannot
+heyctl apply -f nats.json
+heyctl rollout status nats
+heyctl exec nats -- /opt/nats/preflight.sh # checks what a health check cannot
 ```
 
 | File | What it is |
@@ -16,7 +16,7 @@ serverctl exec nats -- /opt/nats/preflight.sh # checks what a health check canno
 | `image/Dockerfile` | The rootfs. Official `nats-server` binary on an Ubuntu userland |
 | `image/init.sh` | PID 1: mounts the data disk, then starts sshd and nats-server |
 | `image/nats-server.conf` | Listeners, JetStream store, logging |
-| `image/preflight.sh` | In-guest check, run over `serverctl exec` |
+| `image/preflight.sh` | In-guest check, run over `heyctl exec` |
 | `build-image.sh` | `heyvm mvm build` wrapper (the context has to be this directory) |
 | `nats.json` | The deployment |
 
@@ -50,7 +50,7 @@ concrete: everything queue-fn published and has not yet acked, and every cloud
 sandbox create still sitting in `HEYO_SANDBOX`.
 
 `init.sh` therefore **refuses to start nats-server at all** if `/workspace` is
-not a mount. A VM that fails its health check shows up in `serverctl get
+not a mount. A VM that fails its health check shows up in `heyctl get
 deployments` within a minute; silent non-durability shows up the day you need the
 queue to have survived something.
 
@@ -143,10 +143,10 @@ credentials without rebuilding the image by dropping a config fragment on the
 data disk — `init.sh` includes it when it exists:
 
 ```sh
-serverctl exec nats -- sh -c 'mkdir -p /workspace/nats && cat > /workspace/nats/auth.conf <<EOF
+heyctl exec nats -- sh -c 'mkdir -p /workspace/nats && cat > /workspace/nats/auth.conf <<EOF
 authorization { token: "s3cret" }
 EOF'
-serverctl restart nats
+heyctl restart nats
 ```
 
 Then `QFN_NATS_TOKEN=s3cret` for queue-fn, or userinfo in cloud's
@@ -161,8 +161,8 @@ monitoring API on a hostname — behind app-lb's TLS, sign-in gate and access lo
 it is a reversible step:
 
 ```sh
-serverctl set routes nats --host nats.internal.example.com
-serverctl set routes nats --none    # withdraw again
+heyctl set routes nats --host nats.internal.example.com
+heyctl set routes nats --none    # withdraw again
 ```
 
 Consider an `auth` block or an app-token gate at the same time; there is no
@@ -171,10 +171,10 @@ authentication on NATS's monitoring port itself.
 ## Operating it
 
 ```sh
-serverctl get deployments                     # ready/desired, in-flight
-serverctl exec nats -- /opt/nats/preflight.sh # durability + listeners
-serverctl shell nats                          # a PTY in the guest
-serverctl exec nats -- tail -50 /workspace/log/nats-server.log
+heyctl get deployments                     # ready/desired, in-flight
+heyctl exec nats -- /opt/nats/preflight.sh # durability + listeners
+heyctl shell nats                          # a PTY in the guest
+heyctl exec nats -- tail -50 /workspace/log/nats-server.log
 curl -s localhost:9090/deployments/nats | jq '.vms'
 ```
 

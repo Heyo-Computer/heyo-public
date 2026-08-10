@@ -823,7 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dockerfile_manifest_round_trips_over_http() {
-        // The push path serverctl uses: PUT the blobs, PUT the manifest, move a
+        // The push path heyctl uses: PUT the blobs, PUT the manifest, move a
         // tag onto it, and read the whole thing back by tag.
         let d = tmpdir();
         let (app, store) = app(&d, None, false);

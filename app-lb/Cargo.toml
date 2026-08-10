@@ -3,15 +3,15 @@ name = "app-lb"
 version.workspace = true
 edition.workspace = true
 
-# `serverctl` — the CLI *and the client SDK* for the admin API — is a separate
+# `heyctl` — the CLI *and the client SDK* for the admin API — is a separate
 # crate rather than a second binary here, so installing it doesn't drag in
 # pingora, openssl and the ACME stack. It shares nothing with the LB but the wire
 # format, and deliberately: a `path` dependency would make the client's leniency
 # (unknown fields ignored, missing ones defaulted) impossible to test, because
 # the two would always be the same build. `testdata/wire/` is the contract
-# instead — this crate writes those fixtures, serverctl reads them.
+# instead — this crate writes those fixtures, heyctl reads them.
 [workspace]
-members = ["serverctl"]
+members = ["heyctl"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,4 +1,4 @@
-//! `serverctl artifact` — authenticate against an artifact store and push guest
+//! `heyctl artifact` — authenticate against an artifact store and push guest
 //! images to it.
 //!
 //! The store is a separate service from app-lb (`art serve`), so these commands
@@ -9,8 +9,8 @@
 //! retargeted a push.
 //!
 //! The point of a push is the pull on the other end: an image in a store is what
-//! a deployment's `artifact` block names, so `serverctl artifact push` and
-//! `serverctl pull` are the two halves of shipping a rootfs to a fleet. That is
+//! a deployment's `artifact` block names, so `heyctl artifact push` and
+//! `heyctl pull` are the two halves of shipping a rootfs to a fleet. That is
 //! why a push writes a manifest and moves a tag rather than just uploading
 //! bytes — see [`crate::artifact`].
 
@@ -50,7 +50,7 @@ pub enum ArtifactCmd {
     /// The counterpart of `push`, one step earlier: `push` ships an image
     /// somebody already built, this ships the recipe and lets app-lb build it on
     /// the host that will run it. Point a deployment at it with
-    /// `serverctl set build --store <url> --ref <tag>`.
+    /// `heyctl set build --store <url> --ref <tag>`.
     #[command(visible_alias = "push-df")]
     PushDockerfile(PushDockerfileArgs),
 
@@ -73,20 +73,20 @@ pub enum ArtifactCmd {
 #[derive(Args, Debug, Clone)]
 pub struct RegistryOpts {
     /// Which stored registry to use.
-    #[arg(long, global = true, env = "SERVERCTL_REGISTRY", value_name = "NAME")]
+    #[arg(long, global = true, env = "HEYCTL_REGISTRY", value_name = "NAME")]
     pub registry: Option<String>,
 
     /// Store URL, overriding the stored registry. `host:port` is accepted and
     /// assumed to be http.
-    #[arg(long, global = true, env = "SERVERCTL_ART_URL", value_name = "URL")]
+    #[arg(long, global = true, env = "HEYCTL_ART_URL", value_name = "URL")]
     pub registry_url: Option<String>,
 
-    /// API key, overriding the stored one. Prefer `serverctl artifact login` —
+    /// API key, overriding the stored one. Prefer `heyctl artifact login` —
     /// an argument is visible in `ps`.
     #[arg(
         long,
         global = true,
-        env = "SERVERCTL_ART_API_KEY",
+        env = "HEYCTL_ART_API_KEY",
         value_name = "KEY",
         hide_env_values = true
     )]
@@ -114,7 +114,7 @@ pub struct LoginArgs {
     pub api_key_command: Option<String>,
 
     /// Verify the key but don't write it to disk — supply it per invocation via
-    /// SERVERCTL_ART_API_KEY.
+    /// HEYCTL_ART_API_KEY.
     #[arg(long)]
     pub no_store_key: bool,
 
@@ -333,7 +333,7 @@ fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
 
     println!("Logged in to {}.", c.url());
     if args.no_store_key {
-        println!("  key not stored — set SERVERCTL_ART_API_KEY for later commands");
+        println!("  key not stored — set HEYCTL_ART_API_KEY for later commands");
     }
 
     save_registry(
@@ -443,7 +443,7 @@ fn registries(globals: &GlobalOpts) -> Result<()> {
     }
 
     if config.registries.is_empty() {
-        println!("No artifact stores configured. `serverctl artifact login <url>` adds one.");
+        println!("No artifact stores configured. `heyctl artifact login <url>` adds one.");
         return Ok(());
     }
 
@@ -470,7 +470,7 @@ fn use_registry(globals: &GlobalOpts, args: &UseArgs) -> Result<()> {
     let mut config = Config::load(&path)?;
     if !config.registries.contains_key(&args.name) {
         bail!(
-            "no registry named {:?} — `serverctl artifact registries` lists them",
+            "no registry named {:?} — `heyctl artifact registries` lists them",
             args.name
         );
     }
@@ -591,8 +591,8 @@ fn push(globals: &GlobalOpts, opts: &RegistryOpts, args: &PushArgs) -> Result<()
     println!();
     let reference = tag.as_deref().unwrap_or(&manifest_digest);
     println!("Pull it with:");
-    println!("  serverctl set artifact <deployment> --store {} --ref {reference}", c.url());
-    println!("  serverctl pull <deployment> --wait");
+    println!("  heyctl set artifact <deployment> --store {} --ref {reference}", c.url());
+    println!("  heyctl pull <deployment> --wait");
     Ok(())
 }
 
@@ -643,7 +643,7 @@ fn push_dockerfile(
                 eprintln!("Packing {}...", c.display());
             }
             let dest = Scratch::new(std::env::temp_dir().join(format!(
-                "serverctl-context-{}.tar.gz",
+                "heyctl-context-{}.tar.gz",
                 std::process::id()
             )));
             let size = artifact::pack_context(c, dest.path())?;
@@ -724,10 +724,10 @@ fn push_dockerfile(
     let reference = tag.as_deref().unwrap_or(&manifest_digest);
     println!("Build it with:");
     println!(
-        "  serverctl set build <deployment> --store {} --ref {reference}",
+        "  heyctl set build <deployment> --store {} --ref {reference}",
         c.url()
     );
-    println!("  serverctl build <deployment> --wait");
+    println!("  heyctl build <deployment> --wait");
     Ok(())
 }
 
@@ -973,7 +973,7 @@ mod tests {
     fn a_recipe_is_tagged_after_its_directory_not_its_filename() {
         // Every project's recipe is called `Dockerfile`, so a filename default
         // would have every push in a shared store fighting over one tag.
-        let dir = std::env::temp_dir().join(format!("serverctl-tag-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("heyctl-tag-{}", std::process::id()));
         let project = dir.join("web-frontend");
         std::fs::create_dir_all(&project).unwrap();
         let df = project.join("Dockerfile");

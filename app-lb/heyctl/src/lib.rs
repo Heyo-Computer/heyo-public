@@ -4,14 +4,14 @@
 //! drives it: register deployments, scale pools, run commands inside a VM, and
 //! attach an interactive shell.
 //!
-//! It is also the library behind the `serverctl` CLI, which is the point — the
+//! It is also the library behind the `heyctl` CLI, which is the point — the
 //! CLI is this crate's first consumer, so a field the client stops understanding
 //! becomes a compile error rather than a silently blank column at somebody's
 //! terminal.
 //!
 //! ```no_run
-//! # async fn f() -> serverctl::Result<()> {
-//! use serverctl::{Client, ExecRequest};
+//! # async fn f() -> heyctl::Result<()> {
+//! use heyctl::{Client, ExecRequest};
 //!
 //! let lb = Client::builder("127.0.0.1:9090")
 //!     .token(std::env::var("APP_LB_TOKEN").unwrap())
@@ -29,8 +29,8 @@
 //! it is the operator credential, and the one that mints tokens.
 //!
 //! ```no_run
-//! # async fn f() -> serverctl::Result<()> {
-//! use serverctl::{AdminScope, Client, NewToken};
+//! # async fn f() -> heyctl::Result<()> {
+//! use heyctl::{AdminScope, Client, NewToken};
 //!
 //! let admin = Client::builder("127.0.0.1:9090").basic("admin", "s3cret").build()?;
 //! let minted = admin.mint_token(

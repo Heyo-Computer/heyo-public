@@ -9,7 +9,7 @@
 # The one hard contract with the host: print `HEYVM_READY` on the serial console
 # when the VM is up, then leave a shell reading from it. heyvmd drives commands
 # by writing `echo <START>; (cmd) 2>&1; echo <END> $?` into that shell and
-# reading back the lines between the markers — that is how `serverctl exec` and
+# reading back the lines between the markers — that is how `heyctl exec` and
 # app-lb's own exec path work.
 #
 # Anything printed to the serial console after HEYVM_READY that is not part of a
@@ -101,7 +101,7 @@ fi
 
 # --- sshd -----------------------------------------------------------------
 #
-# What `serverctl shell` and `serverctl exec` use. /run does not survive the
+# What `heyctl shell` and `heyctl exec` use. /run does not survive the
 # export→ext4 conversion as a populated directory, so the privilege-separation
 # dir is recreated here even though the Dockerfile also makes it.
 mkdir -p /run/sshd
@@ -120,7 +120,7 @@ chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null
 # point: a NATS that comes up with its store on the rootfs passes every health
 # check, serves traffic correctly for as long as the VM lives, and loses the
 # entire stream the first time app-lb recreates it. A VM that fails its health
-# check is visible in `serverctl get deployments` within a minute; silent
+# check is visible in `heyctl get deployments` within a minute; silent
 # non-durability is discovered when something needs the queue to have survived.
 if [ "$DATA_READY" = "1" ]; then
     mkdir -p /workspace/jetstream /workspace/log

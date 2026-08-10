@@ -1,4 +1,4 @@
-//! serverctl — a kubectl-shaped CLI for the app-lb admin API.
+//! heyctl — a kubectl-shaped CLI for the app-lb admin API.
 //!
 //! The verbs mirror kubectl because the mental model is the same: declarative
 //! specs you `apply`, imperative helpers (`create`, `scale`, `set`) that write
@@ -15,8 +15,8 @@
 // dispatch. That is the point of the split — every command below runs through
 // the same client an SDK caller gets, so a field the client stops understanding
 // breaks the build here rather than blanking a column at somebody's terminal.
-use serverctl::cmd;
-use serverctl::cmd::GlobalOpts;
+use heyctl::cmd;
+use heyctl::cmd::GlobalOpts;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -25,14 +25,14 @@ use cmd::Ctx;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "serverctl",
+    name = "heyctl",
     version,
     about = "Control an app-lb load balancer: deployments, scaling, VM pools and certificates",
-    long_about = "serverctl drives app-lb's admin API.\n\n\
+    long_about = "heyctl drives app-lb's admin API.\n\n\
                   By default it talks to http://127.0.0.1:9090 — app-lb's admin listener binds \
                   loopback and speaks plaintext HTTP, so reach a remote one over an SSH tunnel \
                   (ssh -L 9090:127.0.0.1:9090 host) or through app-lb's own TLS listener, and \
-                  save it with `serverctl login`.",
+                  save it with `heyctl login`.",
     propagate_version = true,
     max_term_width = 100
 )]
@@ -144,7 +144,7 @@ enum Command {
     ///
     /// Goes through app-lb, not the heyvm daemon, so it works wherever the admin
     /// API does and starts a VM for a deployment that has none running. The
-    /// guest's exit code becomes serverctl's.
+    /// guest's exit code becomes heyctl's.
     Exec(cmd::session::ExecArgs),
 
     /// Open an interactive shell in a deployment's VM.
@@ -209,17 +209,17 @@ enum SetCmd {
 
     /// Set where a managed deployment's image is built from: a git repo and
     /// Dockerfile, or a Dockerfile manifest in an artifact store. Recording it
-    /// changes nothing on its own — `serverctl build` runs it.
+    /// changes nothing on its own — `heyctl build` runs it.
     Build(cmd::write::SetBuildArgs),
 
     /// Set where a managed deployment's image is *pulled* from: an artifact
     /// store and a reference. Recording it changes nothing on its own —
-    /// `serverctl pull` runs it. Mutually exclusive with `set build`.
+    /// `heyctl pull` runs it. Mutually exclusive with `set build`.
     #[command(visible_alias = "art")]
     Artifact(cmd::write::SetArtifactArgs),
 
     /// Set how a static deployment is updated: a working directory on the app-lb
-    /// host and the commands to run in it. `serverctl update` runs them.
+    /// host and the commands to run in it. `heyctl update` runs them.
     Update(cmd::write::SetUpdateArgs),
 
     /// Put a deployment behind Google sign-in, or change who may enter. Applies
@@ -237,12 +237,12 @@ enum RolloutCmd {
     /// Wait until a deployment's pool is at its desired size and healthy.
     Status(cmd::write::RolloutStatusArgs),
 
-    /// Recycle a deployment's VMs (the same thing as `serverctl restart`).
+    /// Recycle a deployment's VMs (the same thing as `heyctl restart`).
     Restart(cmd::write::RestartArgs),
 }
 
 fn main() {
-    // Rust ignores SIGPIPE, which turns `serverctl get deployments | head` into
+    // Rust ignores SIGPIPE, which turns `heyctl get deployments | head` into
     // a panic on the first write past the closed pipe. Restore the default
     // disposition so the process just ends, like every other CLI in a pipeline.
     #[cfg(unix)]
@@ -326,7 +326,7 @@ fn run(cli: &Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use serverctl::output::OutputFormat;
+    use heyctl::output::OutputFormat;
     use super::*;
 
     #[test]
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn global_flags_are_accepted_after_the_subcommand() {
         let cli = Cli::try_parse_from([
-            "serverctl",
+            "heyctl",
             "get",
             "deployments",
             "-o",
@@ -355,16 +355,16 @@ mod tests {
     #[test]
     fn scale_rejects_replicas_together_with_a_band() {
         assert!(
-            Cli::try_parse_from(["serverctl", "scale", "web", "--replicas", "2", "--min", "1"])
+            Cli::try_parse_from(["heyctl", "scale", "web", "--replicas", "2", "--min", "1"])
                 .is_err()
         );
-        assert!(Cli::try_parse_from(["serverctl", "scale", "web", "--replicas", "2"]).is_ok());
+        assert!(Cli::try_parse_from(["heyctl", "scale", "web", "--replicas", "2"]).is_ok());
     }
 
     #[test]
     fn create_takes_the_shorthand_and_long_route_forms() {
         let cli = Cli::try_parse_from([
-            "serverctl",
+            "heyctl",
             "create",
             "deployment",
             "web",
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn create_takes_a_build_source() {
         let cli = Cli::try_parse_from([
-            "serverctl",
+            "heyctl",
             "create",
             "deployment",
             "web",
@@ -422,7 +422,7 @@ mod tests {
         // The build knobs describe a repo, so they need one.
         assert!(
             Cli::try_parse_from([
-                "serverctl", "create", "deployment", "web", "--host", "w.local", "--port", "80",
+                "heyctl", "create", "deployment", "web", "--host", "w.local", "--port", "80",
                 "--ref", "main",
             ])
             .is_err(),
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn a_secret_can_be_created_without_putting_the_value_on_the_command_line() {
         let cli = Cli::try_parse_from([
-            "serverctl",
+            "heyctl",
             "create",
             "secret",
             "github",
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn build_takes_a_one_off_ref_and_can_wait() {
         let cli =
-            Cli::try_parse_from(["serverctl", "build", "web", "--ref", "v2.1", "--wait"]).unwrap();
+            Cli::try_parse_from(["heyctl", "build", "web", "--ref", "v2.1", "--wait"]).unwrap();
         let Command::Build(args) = &cli.command else {
             panic!("expected build");
         };
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn update_takes_a_working_directory_and_commands() {
         let cli = Cli::try_parse_from([
-            "serverctl",
+            "heyctl",
             "set",
             "update",
             "app-obs",
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn running_an_update_can_wait_and_stream() {
-        let cli = Cli::try_parse_from(["serverctl", "update", "app-obs", "--logs"]).unwrap();
+        let cli = Cli::try_parse_from(["heyctl", "update", "app-obs", "--logs"]).unwrap();
         let Command::Update(args) = &cli.command else {
             panic!("expected update");
         };
@@ -515,7 +515,7 @@ mod tests {
     #[test]
     fn a_gate_takes_a_client_id_a_secret_and_an_allow_list() {
         let cli = Cli::try_parse_from([
-            "serverctl",
+            "heyctl",
             "set",
             "auth",
             "web",
@@ -547,10 +547,10 @@ mod tests {
 
     #[test]
     fn clearing_a_gate_excludes_editing_it() {
-        assert!(Cli::try_parse_from(["serverctl", "set", "auth", "web", "--clear"]).is_ok());
+        assert!(Cli::try_parse_from(["heyctl", "set", "auth", "web", "--clear"]).is_ok());
         assert!(
             Cli::try_parse_from([
-                "serverctl", "set", "auth", "web", "--clear", "--allow-domain", "example.com",
+                "heyctl", "set", "auth", "web", "--clear", "--allow-domain", "example.com",
             ])
             .is_err(),
             "--clear and --allow-domain say opposite things"
@@ -559,10 +559,10 @@ mod tests {
 
     #[test]
     fn clearing_an_update_excludes_editing_it() {
-        assert!(Cli::try_parse_from(["serverctl", "set", "update", "obs", "--clear"]).is_ok());
+        assert!(Cli::try_parse_from(["heyctl", "set", "update", "obs", "--clear"]).is_ok());
         assert!(
             Cli::try_parse_from([
-                "serverctl", "set", "update", "obs", "--clear", "-c", "make deploy",
+                "heyctl", "set", "update", "obs", "--clear", "-c", "make deploy",
             ])
             .is_err(),
             "--clear and --command say opposite things"
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn a_pull_takes_a_one_off_ref_and_can_wait() {
         let cli = Cli::try_parse_from([
-            "serverctl", "pull", "web", "--ref", "debian-hermes", "--wait",
+            "heyctl", "pull", "web", "--ref", "debian-hermes", "--wait",
         ])
         .unwrap();
         let Command::Pull(args) = &cli.command else {
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn an_artifact_source_takes_a_store_and_a_ref() {
         let cli = Cli::try_parse_from([
-            "serverctl",
+            "heyctl",
             "set",
             "artifact",
             "web",
@@ -615,10 +615,10 @@ mod tests {
 
     #[test]
     fn clearing_an_artifact_source_excludes_editing_it() {
-        assert!(Cli::try_parse_from(["serverctl", "set", "artifact", "web", "--clear"]).is_ok());
+        assert!(Cli::try_parse_from(["heyctl", "set", "artifact", "web", "--clear"]).is_ok());
         assert!(
             Cli::try_parse_from([
-                "serverctl", "set", "artifact", "web", "--clear", "--ref", "debian-hermes",
+                "heyctl", "set", "artifact", "web", "--clear", "--ref", "debian-hermes",
             ])
             .is_err(),
             "--clear and --ref say opposite things"
@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn a_push_takes_a_file_or_an_image_but_not_both() {
         let cli = Cli::try_parse_from([
-            "serverctl", "artifact", "push", "/tmp/rootfs.ext4", "--tag", "web-v2",
+            "heyctl", "artifact", "push", "/tmp/rootfs.ext4", "--tag", "web-v2",
         ])
         .unwrap();
         let Command::Artifact {
@@ -642,22 +642,22 @@ mod tests {
         assert_eq!(args.tag.as_deref(), Some("web-v2"));
 
         assert!(
-            Cli::try_parse_from(["serverctl", "artifact", "push", "--image", "artifacts"]).is_ok(),
+            Cli::try_parse_from(["heyctl", "artifact", "push", "--image", "artifacts"]).is_ok(),
             "--image is the other way to name the source"
         );
         assert!(
             Cli::try_parse_from([
-                "serverctl", "artifact", "push", "/tmp/a.ext4", "--image", "artifacts",
+                "heyctl", "artifact", "push", "/tmp/a.ext4", "--image", "artifacts",
             ])
             .is_err(),
             "a path and an image name are two answers to one question"
         );
         // Something has to be pushed.
-        assert!(Cli::try_parse_from(["serverctl", "artifact", "push"]).is_err());
+        assert!(Cli::try_parse_from(["heyctl", "artifact", "push"]).is_err());
         // And a tag cannot be both given and refused.
         assert!(
             Cli::try_parse_from([
-                "serverctl", "artifact", "push", "/tmp/a.ext4", "--tag", "x", "--no-tag",
+                "heyctl", "artifact", "push", "/tmp/a.ext4", "--tag", "x", "--no-tag",
             ])
             .is_err()
         );
@@ -666,7 +666,7 @@ mod tests {
     #[test]
     fn artifact_login_takes_a_url_and_a_key_out_of_band() {
         let cli = Cli::try_parse_from([
-            "serverctl",
+            "heyctl",
             "artifact",
             "login",
             "http://art.example.com:8080",
@@ -690,7 +690,7 @@ mod tests {
         // chain: two of them set would leave half the command a lie.
         assert!(
             Cli::try_parse_from([
-                "serverctl", "artifact", "login", "http://art:8080", "--api-key", "k",
+                "heyctl", "artifact", "login", "http://art:8080", "--api-key", "k",
                 "--api-key-stdin",
             ])
             .is_err()
@@ -701,7 +701,7 @@ mod tests {
     fn a_build_source_is_a_repo_or_a_store_and_never_both() {
         assert!(
             Cli::try_parse_from([
-                "serverctl", "set", "build", "web", "--store", "http://art:8080", "--ref",
+                "heyctl", "set", "build", "web", "--store", "http://art:8080", "--ref",
                 "web-rootfs",
             ])
             .is_ok()
@@ -713,7 +713,7 @@ mod tests {
             vec!["--store", "http://art:8080", "--dockerfile", "deploy/Dockerfile"],
             vec!["--store", "http://art:8080", "--build-context", "."],
         ] {
-            let mut argv = vec!["serverctl", "set", "build", "web"];
+            let mut argv = vec!["heyctl", "set", "build", "web"];
             argv.extend(conflicting.iter().copied());
             assert!(
                 Cli::try_parse_from(&argv).is_err(),
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn create_takes_a_dockerfile_manifest_build_source() {
         let cli = Cli::try_parse_from([
-            "serverctl",
+            "heyctl",
             "create",
             "deployment",
             "web",
@@ -752,7 +752,7 @@ mod tests {
         // A store has no default branch, so its ref is not optional.
         assert!(
             Cli::try_parse_from([
-                "serverctl", "create", "deployment", "web", "--host", "w.local", "--port", "80",
+                "heyctl", "create", "deployment", "web", "--host", "w.local", "--port", "80",
                 "--build-store", "http://art:8080",
             ])
             .is_err(),
@@ -761,7 +761,7 @@ mod tests {
         // And the two sources stay alternatives.
         assert!(
             Cli::try_parse_from([
-                "serverctl", "create", "deployment", "web", "--host", "w.local", "--port", "80",
+                "heyctl", "create", "deployment", "web", "--host", "w.local", "--port", "80",
                 "--build-store", "http://art:8080", "--repo", "https://x/y.git", "--ref", "main",
             ])
             .is_err(),
@@ -772,7 +772,7 @@ mod tests {
     #[test]
     fn pushing_a_dockerfile_takes_a_context_and_a_tag() {
         let cli = Cli::try_parse_from([
-            "serverctl",
+            "heyctl",
             "artifact",
             "push-dockerfile",
             "./Dockerfile",
@@ -799,7 +799,7 @@ mod tests {
         // A tag and no-tag say opposite things.
         assert!(
             Cli::try_parse_from([
-                "serverctl", "artifact", "push-dockerfile", "./Dockerfile", "--tag", "x",
+                "heyctl", "artifact", "push-dockerfile", "./Dockerfile", "--tag", "x",
                 "--no-tag",
             ])
             .is_err()
@@ -808,17 +808,17 @@ mod tests {
 
     #[test]
     fn clearing_a_build_source_excludes_editing_it() {
-        assert!(Cli::try_parse_from(["serverctl", "set", "build", "web", "--clear"]).is_ok());
+        assert!(Cli::try_parse_from(["heyctl", "set", "build", "web", "--clear"]).is_ok());
         assert!(
             Cli::try_parse_from([
-                "serverctl", "set", "build", "web", "--clear", "--repo", "https://x/y.git",
+                "heyctl", "set", "build", "web", "--clear", "--repo", "https://x/y.git",
             ])
             .is_err(),
             "--clear and --repo say opposite things"
         );
         // --username is only meaningful next to the secret it belongs to.
         assert!(
-            Cli::try_parse_from(["serverctl", "set", "build", "web", "--username", "bot"]).is_err()
+            Cli::try_parse_from(["heyctl", "set", "build", "web", "--username", "bot"]).is_err()
         );
     }
 }

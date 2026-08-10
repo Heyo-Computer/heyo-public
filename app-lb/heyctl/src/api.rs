@@ -407,7 +407,7 @@ impl Client {
     ///
     /// Takes a `Value` rather than a typed spec for the same reason the
     /// deployment writes do: the CLI round-trips whatever the user wrote,
-    /// including fields this build does not know about, so an older `serverctl`
+    /// including fields this build does not know about, so an older `heyctl`
     /// cannot silently drop a newer field on an edit.
     pub async fn create_workflow(&self, spec: &Value) -> Result<WorkflowView> {
         let id = spec
@@ -685,7 +685,7 @@ impl Client {
     ///
     /// - anything that **prints** a response. Re-serializing one of the typed
     ///   views would drop whatever this build does not name, so
-    ///   `serverctl get … -o json` would quietly print less than the server
+    ///   `heyctl get … -o json` would quietly print less than the server
     ///   sent.
     /// - the read half of a read-modify-write. `PUT /deployments/:id` replaces
     ///   the whole spec, so the thing you edit has to be the thing that came

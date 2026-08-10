@@ -15,13 +15,13 @@
 //! Regenerate the fixtures with:
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
-use serverctl::types::{UpstreamTrafficStatus, WorkflowList, WorkflowView};
+use heyctl::types::{UpstreamTrafficStatus, WorkflowList, WorkflowView};
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("serverctl lives inside the app-lb workspace")
+        .expect("heyctl lives inside the app-lb workspace")
         .join("testdata")
         .join("wire")
         .join(format!("{name}.json"));
@@ -40,7 +40,7 @@ fn workflow_view_understands_every_field() {
 
     assert!(
         w.extra.is_empty(),
-        "serverctl does not understand these fields app-lb sends: {:?}\n\
+        "heyctl does not understand these fields app-lb sends: {:?}\n\
          Add them to WorkflowView in src/types.rs.",
         w.extra.keys().collect::<Vec<_>>()
     );

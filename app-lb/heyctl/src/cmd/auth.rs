@@ -41,7 +41,7 @@ pub struct LoginArgs {
     pub password_command: Option<String>,
 
     /// Verify the credentials but don't write the password to disk — supply it
-    /// per invocation via SERVERCTL_PASSWORD.
+    /// per invocation via HEYCTL_PASSWORD.
     #[arg(long)]
     pub no_store_password: bool,
 
@@ -139,7 +139,7 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
         gate_summary(gates.view, gates.crud)
     );
     if args.no_store_password {
-        println!("  password not stored — set SERVERCTL_PASSWORD for later commands");
+        println!("  password not stored — set HEYCTL_PASSWORD for later commands");
     }
 
     save_context(
@@ -287,7 +287,7 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
     // `403` on a push has nothing to do with the credentials above. Reported
     // only when one is configured — most LBs have no store.
     // `None` for the name: whoami reports what the *next* command would reach
-    // for by default, and `--registry` is scoped to `serverctl artifact`.
+    // for by default, and `--registry` is scoped to `heyctl artifact`.
     if let Ok(reg) = crate::config::resolve_registry_endpoint(
         &config,
         None,
@@ -434,7 +434,7 @@ pub fn config(globals: &GlobalOpts, cmd: &ConfigCmd) -> Result<()> {
         ConfigCmd::GetContexts => {
             if config.contexts.is_empty() {
                 println!(
-                    "No contexts. `serverctl login` creates one; without it, commands go to {}.",
+                    "No contexts. `heyctl login` creates one; without it, commands go to {}.",
                     crate::cmd::DEFAULT_SERVER
                 );
                 return Ok(());
@@ -467,7 +467,7 @@ pub fn config(globals: &GlobalOpts, cmd: &ConfigCmd) -> Result<()> {
 
         ConfigCmd::UseContext { name } => {
             if !config.contexts.contains_key(name) {
-                bail!("no context named {name:?} — `serverctl config get-contexts` lists them");
+                bail!("no context named {name:?} — `heyctl config get-contexts` lists them");
             }
             config.current_context = Some(name.clone());
             config.save(&path)?;

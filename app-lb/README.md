@@ -151,31 +151,31 @@ case is a missed `retain` flag, and the sweep's other four guards still hold.
 
 ## CLI
 
-[`serverctl`](serverctl/README.md) is a kubectl-shaped CLI over the admin API below — the same
+[`heyctl`](heyctl/README.md) is a kubectl-shaped CLI over the admin API below — the same
 operations without hand-written `curl`, plus saved server/credential contexts, tables, `$EDITOR`
 round-trips and rollout waiting. It is a separate crate, so installing it doesn't pull in pingora
 or the ACME stack.
 
 ```sh
-cargo build --release -p serverctl
+cargo build --release -p heyctl
 
-serverctl login --server 127.0.0.1:9090   # saves a context; prompts if the server is gated
-serverctl create deployment demo --host demo.local --image nginx --port 80 --min 0 --max 4
-serverctl rollout status demo
-serverctl get deployments -o wide
-serverctl scale demo --min 2 --max 8
-serverctl restart demo                    # drain every VM; the autoscaler replaces them
-serverctl drain stage us1.internal:8080   # stop new traffic, wait for in-flight to reach zero
-serverctl uncordon stage us1.internal:8080
-serverctl top                             # per-deployment CPU, memory, latency, 5xx
+heyctl login --server 127.0.0.1:9090   # saves a context; prompts if the server is gated
+heyctl create deployment demo --host demo.local --image nginx --port 80 --min 0 --max 4
+heyctl rollout status demo
+heyctl get deployments -o wide
+heyctl scale demo --min 2 --max 8
+heyctl restart demo                    # drain every VM; the autoscaler replaces them
+heyctl drain stage us1.internal:8080   # stop new traffic, wait for in-flight to reach zero
+heyctl uncordon stage us1.internal:8080
+heyctl top                             # per-deployment CPU, memory, latency, 5xx
 
 # Ship a rootfs through an artifact store, and boot it somewhere else.
-serverctl artifact login http://10.0.0.4:8080   # saves a registry; prompts for the API key
-serverctl artifact push --image web-v2          # a heyvm image, or a path to an .ext4
-serverctl pull demo --wait                      # materialize it here and roll the pool
+heyctl artifact login http://10.0.0.4:8080   # saves a registry; prompts for the API key
+heyctl artifact push --image web-v2          # a heyvm image, or a path to an .ext4
+heyctl pull demo --wait                      # materialize it here and roll the pool
 ```
 
-See [`serverctl/README.md`](serverctl/README.md) for the full command set, the context/credential
+See [`heyctl/README.md`](heyctl/README.md) for the full command set, the context/credential
 model, and which commands apply to managed versus static deployments.
 
 ## Admin API
@@ -284,13 +284,13 @@ and `in_flight` in the deployment and metrics responses.
 
 ```sh
 # Stop new traffic and return immediately. Existing requests continue.
-serverctl cordon stage us1.internal:8080 --reason 'regional maintenance'
+heyctl cordon stage us1.internal:8080 --reason 'regional maintenance'
 
 # Do the same, but wait until in_flight reaches zero.
-serverctl drain stage us1.internal:8080 --timeout 300
+heyctl drain stage us1.internal:8080 --timeout 300
 
 # A healthy upstream becomes selectable immediately. An unhealthy one waits for its probe.
-serverctl uncordon stage us1.internal:8080
+heyctl uncordon stage us1.internal:8080
 ```
 
 The safety rule is fail-closed: a first-time drain is rejected with `409 Conflict` unless another
@@ -318,7 +318,7 @@ curl -XPOST localhost:9090/deployments -H 'content-type: application/json' -d '{
 ```
 
 ```sh
-serverctl create deployment docs --host docs.example.com \
+heyctl create deployment docs --host docs.example.com \
   --site-root /srv/docs/dist --site-404 404.html
 ```
 
@@ -363,7 +363,7 @@ deployment — commands run in a directory on the app-lb host:
 }
 ```
 
-`serverctl update docs` runs them and then checks the site is still servable —
+`heyctl update docs` runs them and then checks the site is still servable —
 that `index` is actually in `root`. A build that exits 0 but writes its output
 somewhere else fails the job, rather than leaving a deployment that 404s
 everything. (`build` is rejected on a site: there is no image and no pool.)
@@ -425,7 +425,7 @@ curl -XPOST localhost:9090/deployments/sb-7f3a9c/exec \
   -d '{"command":"ls -la /workspace","cwd":"/workspace"}'
 
 # An interactive PTY, over a WebSocket.
-serverctl shell sb-7f3a9c
+heyctl shell sb-7f3a9c
 ```
 
 | | |
@@ -492,16 +492,16 @@ needs to know nothing about OAuth. It sees only requests that got through.
 1. In the Google Cloud console, create an **OAuth 2.0 Client ID** of type *Web
    application*, and register the redirect URI — `https://<hostname><base_path>/callback`,
    so with the defaults above: `https://web.example.com/__applb/auth/callback`.
-   `serverctl describe deployment web` prints the exact string to paste.
+   `heyctl describe deployment web` prints the exact string to paste.
 2. Store the client secret. It is a [secret](#secrets), not a spec field:
 
    ```sh
-   serverctl create secret google --from-stdin client_secret < ~/.google-oauth-secret
+   heyctl create secret google --from-stdin client_secret < ~/.google-oauth-secret
    ```
 3. Add the gate:
 
    ```sh
-   serverctl set auth web \
+   heyctl set auth web \
      --client-id 1234-abc.apps.googleusercontent.com \
      --secret google/client_secret \
      --allow-domain example.com \
@@ -553,7 +553,7 @@ caller:
 ```
 
 ```sh
-serverctl set auth web \
+heyctl set auth web \
   --allow-domain sarocu.com --allow-domain heyo.computer \
   --allow-email contractor@gmail.com --allow-email auditor@example.org
 ```
@@ -584,7 +584,7 @@ most of the internet, which is a real thing to want and has to be said out loud:
 
 **Editing a list replaces it.** Every `--allow-domain`/`--allow-email` you pass
 replaces that whole list rather than adding to it, so growing the list means
-resending all of it. `serverctl edit deployment <id>` is the incremental
+resending all of it. `heyctl edit deployment <id>` is the incremental
 alternative — it opens the spec in `$EDITOR` and changes only what you change.
 
 **Adding or removing an entry signs everyone out once.** The allow-list is part
@@ -669,7 +669,7 @@ is a browser rule, not an app-lb one.
   | Client | Unauthenticated request gets |
   | --- | --- |
   | a browser navigating (`Accept: text/html`) | `302` to Google |
-  | anything else — curl, CI, serverctl, **and a page's own `fetch()`** | `401` + `{"error":"authentication required","login_url":"…"}` |
+  | anything else — curl, CI, heyctl, **and a page's own `fetch()`** | `401` + `{"error":"authentication required","login_url":"…"}` |
 
   The `login_url` is only useful to something that can open a browser. Put every
   path a machine calls in `public_paths` and protect those with a credential the
@@ -843,9 +843,9 @@ Dockerfile — and, optionally, the build context it copies from — as a
 Push one from a workstation and point a deployment at it:
 
 ```sh
-serverctl artifact push-dockerfile ./Dockerfile --build-context . --tag web-rootfs
-serverctl set build web --store http://art.internal:8080 --ref web-rootfs
-serverctl build web --wait
+heyctl artifact push-dockerfile ./Dockerfile --build-context . --tag web-rootfs
+heyctl set build web --store http://art.internal:8080 --ref web-rootfs
+heyctl build web --wait
 ```
 
 **What this buys over a repo.** A git ref pins a commit and the Dockerfile is
@@ -948,7 +948,7 @@ costs one round trip. The job still rolls the pool, because running VMs hold a
 copy of whatever rootfs *they* booted from.
 
 **A tag is resolved at pull time; a digest is not.** A deployment pinned to a tag
-follows wherever that tag is moved, which is what makes `serverctl artifact push
+follows wherever that tag is moved, which is what makes `heyctl artifact push
 --tag web-v2` a deploy. Naming a digest pins the bytes forever, which is what a
 rollback should do.
 
@@ -966,13 +966,13 @@ worked out, app-lb still starts and warns; only pulls fail.
 **`build` and `artifact` are mutually exclusive.** Both rewrite `vm.image` when
 they run, so a deployment holding both would have no answer to where the running
 image came from. To do both, build on one host and
-[`serverctl artifact push`](serverctl/README.md#pushing-an-image-to-an-artifact-store)
+[`heyctl artifact push`](heyctl/README.md#pushing-an-image-to-an-artifact-store)
 the result for the others to pull. A static (`upstreams`) deployment cannot have
 an `artifact` block either, for the same reason it cannot have a `build`.
 
-The CLI side is `serverctl pull` and `serverctl set artifact`, plus
-`serverctl artifact` for talking to the store itself — see
-[`serverctl/README.md`](serverctl/README.md#artifact-stores).
+The CLI side is `heyctl pull` and `heyctl set artifact`, plus
+`heyctl artifact` for talking to the store itself — see
+[`heyctl/README.md`](heyctl/README.md#artifact-stores).
 
 ### Pulling a site from an artifact store
 
@@ -1237,14 +1237,14 @@ says: nothing reaches it through the proxy. It is still registered, still
 autoscaled, and still reachable by id through the admin API.
 
 That is the normal shape for an agent sandbox. A sandbox is worked on by
-`serverctl exec` and `serverctl shell`, not by HTTP, and putting it on a
+`heyctl exec` and `heyctl shell`, not by HTTP, and putting it on a
 hostname it doesn't need means putting it on the internet. Exposure becomes an
 explicit, reversible step:
 
 ```sh
-serverctl create deployment sb-7f3a9c --no-route --port 8080 --size medium
-serverctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com   # expose
-serverctl set routes sb-7f3a9c --none                            # withdraw again
+heyctl create deployment sb-7f3a9c --no-route --port 8080 --size medium
+heyctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com   # expose
+heyctl set routes sb-7f3a9c --none                            # withdraw again
 ```
 
 Withdrawing a route does not disturb the VM — the deployment keeps running and
@@ -1619,8 +1619,8 @@ records to reclaim 23 KB is not a trade worth making.
 
 | | |
 |---|---|
-| [`serverctl`](serverctl/README.md) | Rust — a client library *and* the kubectl-shaped CLI. `cargo install serverctl` for the CLI, `default-features = false` for the library. |
-| [`serverctl` (npm)](sdk/typescript/README.md) | TypeScript — Node, Bun, Deno and browsers. |
+| [`heyctl`](heyctl/README.md) | Rust — a client library *and* the kubectl-shaped CLI. `cargo install heyctl` for the CLI, `default-features = false` for the library. |
+| [`heyctl` (npm)](sdk/typescript/README.md) | TypeScript — Node, Bun, Deno and browsers. |
 
 Both speak the same wire contract, and both are checked against it: the fixtures
 in `testdata/wire/` are written by app-lb's own response types, and each client
@@ -1628,12 +1628,12 @@ has a test asserting it understands every field in them. A field app-lb starts
 sending fails a test in each client rather than going silently unread.
 
 ```rust
-let lb = serverctl::Client::builder("127.0.0.1:9090").token(token).build()?;
+let lb = heyctl::Client::builder("127.0.0.1:9090").token(token).build()?;
 let out = lb.exec("sb-7f3a9c", &ExecRequest::new("uname -a")).await?;
 ```
 
 ```ts
-const lb = new Serverctl({ server: "127.0.0.1:9090", token });
+const lb = new Heyctl({ server: "127.0.0.1:9090", token });
 const { stdout } = await lb.exec("sb-7f3a9c", "uname -a");
 ```
 
@@ -1779,14 +1779,14 @@ The recipe is a static deployment fronting the admin listener
 block. Measured against exactly that, through the gated hostname:
 
 ```
-                                          browser      fetch()/curl/serverctl
+                                          browser      fetch()/curl/heyctl
 GET /dashboard   (Accept: text/html)       302 → Google
 GET /metrics     (accept: application/json)                          401
 GET /deployments (no Accept)                                         401
 ```
 
 So a gate alone gives you a dashboard that loads, signs you in, and then shows
-nothing — its `/metrics` poll is refused — while `serverctl` is locked out
+nothing — its `/metrics` poll is refused — while `heyctl` is locked out
 entirely, since it cannot complete an OAuth flow and the `login_url` in the 401
 body means nothing to it.
 
@@ -1811,7 +1811,7 @@ API, `/secrets` included, is on the internet with nothing in front of it.
 If you would rather not make that trade, don't: leave the hostname
 browser-only and reach the API over an SSH tunnel
 (`ssh -L 9090:127.0.0.1:9090 host`), which is what
-[`serverctl`](serverctl/README.md#connecting) expects.
+[`heyctl`](heyctl/README.md#connecting) expects.
 
 Two data sources feed it:
 
@@ -1936,7 +1936,7 @@ That issues **one** certificate covering `sb.example.com` and
 free of certificate work entirely — add the route and it is already covered:
 
 ```sh
-serverctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com
+heyctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com
 ```
 
 Pair it with a single wildcard `A` record (`*.sb.example.com → <lb-ip>`) and
@@ -2121,13 +2121,13 @@ One deployment per sandbox — see [`examples/sandbox.json`](examples/sandbox.js
 ```
 
 ```sh
-serverctl create deployment sb-7f3a9c --no-route --port 8080 --disk-gb 20 \
+heyctl create deployment sb-7f3a9c --no-route --port 8080 --disk-gb 20 \
   --idle-action retain --max 1 --target-concurrency 1
-serverctl exec sb-7f3a9c -- ls /workspace
-serverctl shell sb-7f3a9c
+heyctl exec sb-7f3a9c -- ls /workspace
+heyctl shell sb-7f3a9c
 
-serverctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com   # expose it
-serverctl set routes sb-7f3a9c --none                             # take it back
+heyctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com   # expose it
+heyctl set routes sb-7f3a9c --none                             # take it back
 ```
 
 | Need | What does it | Why not the obvious thing |
@@ -2490,7 +2490,7 @@ keeps its hit history, which re-posting the rule would reset.
 
 Those buttons post the exact body shown, so what an operator reads and what the
 server applies cannot drift. The advice is derived server-side and served on
-`/security`, which means `serverctl`, a script or another client gets the same
+`/security`, which means `heyctl`, a script or another client gets the same
 answers rather than reimplementing them.
 
 The console is **view tier**, like the dashboard — the browser's existing

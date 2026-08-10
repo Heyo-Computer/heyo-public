@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   ColdStartTimeoutError, ConflictError, ForbiddenError, InvalidRequestError,
-  MalformedResponseError, NoRunningVmError, NotFoundError, Serverctl,
+  MalformedResponseError, NoRunningVmError, NotFoundError, Heyctl,
   UnauthorizedError, UpstreamError, normalizeServer,
 } from "../dist/index.js";
 
@@ -25,7 +25,7 @@ function stub(...replies) {
   return { fetch, seen };
 }
 
-const lb = (s, opts = {}) => new Serverctl({ server: "http://x:1", fetch: s.fetch, ...opts });
+const lb = (s, opts = {}) => new Heyctl({ server: "http://x:1", fetch: s.fetch, ...opts });
 
 test("a bare host and port becomes a URL", () => {
   assert.equal(normalizeServer("127.0.0.1:9090"), "http://127.0.0.1:9090");
@@ -38,12 +38,12 @@ test("a bare host and port becomes a URL", () => {
 // precomputed at startup. A test that derives it independently is the only thing
 // that would catch a change here.
 test("the Basic header is byte-exact", () => {
-  const c = new Serverctl({ server: "x:1", user: "admin", password: "hunter2", fetch: async () => new Response("") });
+  const c = new Heyctl({ server: "x:1", user: "admin", password: "hunter2", fetch: async () => new Response("") });
   assert.equal(c.authHeader(), "Basic YWRtaW46aHVudGVyMg==");
 });
 
 test("a token rides as a Bearer", () => {
-  const c = new Serverctl({ server: "x:1", token: "applb_abc_s", fetch: async () => new Response("") });
+  const c = new Heyctl({ server: "x:1", token: "applb_abc_s", fetch: async () => new Response("") });
   assert.equal(c.authHeader(), "Bearer applb_abc_s");
   assert.equal(c.credential(), "token");
 });
@@ -196,7 +196,7 @@ test("the exec deadline outlasts the server's worst case", async () => {
     sawSignal = init.signal;
     return new Response(JSON.stringify({ sandbox_id: "s", exit_code: 0, stdout: "", stderr: "", output: "" }));
   };
-  const c = new Serverctl({ server: "x:1", fetch });
+  const c = new Heyctl({ server: "x:1", fetch });
   await c.exec("d", "sleep 1", { timeoutSecs: 60 });
   assert.ok(sawSignal, "a deadline is always attached");
   // Measured by behaviour rather than by reading a private field: a client

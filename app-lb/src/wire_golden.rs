@@ -1,12 +1,12 @@
 //! Golden wire fixtures — the contract between this crate and its clients.
 //!
-//! `serverctl` deliberately depends on nothing from app-lb: it re-declares the
+//! `heyctl` deliberately depends on nothing from app-lb: it re-declares the
 //! wire types so that a client one version behind still renders what it
 //! understands. The cost of that independence is that nothing catches a field
 //! this crate starts emitting and the client silently ignores — an unknown field
 //! and an absent one look identical to a lenient deserializer, which is exactly
 //! how `DeploymentView::urls`, `PoolStatus::boot_timeout_secs` and three others
-//! went missing from `serverctl/src/types.rs` without a single test failing.
+//! went missing from `heyctl/src/types.rs` without a single test failing.
 //!
 //! So: this module writes `testdata/wire/*.json` from the *real* response types,
 //! and each client asserts it understood every key in them. Two properties make
@@ -57,7 +57,7 @@ fn golden(name: &str, value: &impl Serialize) {
          Every client re-declares these types, so this is an API change even if \
          no Rust caller broke.\n\
          Regenerate with `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden` and \
-         update serverctl/src/types.rs and sdk/typescript/src/types.ts to match.",
+         update heyctl/src/types.rs and sdk/typescript/src/types.ts to match.",
         path.display()
     );
 }
@@ -845,7 +845,7 @@ fn workflow_spec_is_stable() {
     );
 }
 
-/// A minimal object must round-trip through its defaults, or `serverctl create
+/// A minimal object must round-trip through its defaults, or `heyctl create
 /// workflow` would have to send every field.
 #[test]
 fn a_minimal_workflow_fills_its_defaults() {
