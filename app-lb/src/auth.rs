@@ -442,13 +442,27 @@ impl Authenticator {
             return Response::text(400, "the sign-in callback is missing `code` or `state`\n");
         };
 
-        let Some(raw) = cookie_value(&req.cookies, FLOW_COOKIE) else {
+        let presented = cookie_values(&req.cookies, FLOW_COOKIE);
+        if presented.is_empty() {
             // Usually a bookmarked callback URL or a cookie dropped by a
             // `SameSite` policy, not an attack. Start over rather than dead-end.
             tracing::debug!(deployment = %deployment_id, "sign-in callback with no flow cookie");
             return self.start(gate, deployment_id, req, "/");
-        };
-        let Some(flow) = self.verify(&raw).and_then(|b| Flow::decode(&b)) else {
+        }
+        let verified: Vec<Flow> = presented
+            .iter()
+            .filter_map(|raw| self.verify(raw))
+            .filter_map(|bytes| Flow::decode(&bytes))
+            .collect();
+        // More than one means a sibling host's flow cookie is in the jar too.
+        // The live one is whichever nonce the provider just echoed back; falling
+        // back to the first keeps the mismatch below reporting a real failure
+        // rather than a missing cookie.
+        let Some(flow) = verified
+            .iter()
+            .find(|f| ct_eq(state.as_bytes(), f.nonce.as_bytes()))
+            .or_else(|| verified.first())
+        else {
             return Response::text(400, "the sign-in state could not be verified\n");
         };
         if flow.exp <= now_secs() {
@@ -594,14 +608,61 @@ impl Authenticator {
     }
 
     /// The identity in the request's session cookie, if it has a valid one.
+    ///
+    /// "The" cookie is a simplification the browser does not share — see
+    /// [`cookie_values`]. A request can carry several under this name and only
+    /// one of them be this gate's, so every candidate is tried and the first
+    /// that stands up wins. Refusing on the first one that does not is what
+    /// turned a stale neighbouring cookie into a permanent sign-in loop.
     fn session(
         &self,
         gate: &AuthGate,
         deployment_id: &str,
         req: &RequestInfo<'_>,
     ) -> Option<Identity> {
-        let raw = cookie_value(&req.cookies, &gate.cookie_name)?;
-        let session = Session::decode(&self.verify(&raw)?)?;
+        let presented = cookie_values(&req.cookies, &gate.cookie_name);
+        let found = presented
+            .iter()
+            .enumerate()
+            .find_map(|(i, raw)| Some((i, self.session_from(gate, deployment_id, raw)?)));
+
+        // Several cookies under one name means some other gate's realm covers
+        // this hostname. Benign once it is handled, and worth saying out loud
+        // when none of them is a session: that is the shape of the loop this
+        // used to cause, and previously it produced a wall of redirects with
+        // nothing anywhere to say why.
+        if presented.len() > 1 {
+            match &found {
+                Some((i, _)) => tracing::debug!(
+                    deployment = %deployment_id,
+                    host = %req.host,
+                    cookie = %gate.cookie_name,
+                    presented = presented.len(),
+                    accepted = i,
+                    "several cookies share this gate's session cookie name",
+                ),
+                None => tracing::warn!(
+                    deployment = %deployment_id,
+                    host = %req.host,
+                    cookie = %gate.cookie_name,
+                    presented = presented.len(),
+                    "{presented} cookies named {name:?} reached this hostname and none is a \
+                     session for it; a sibling gate's `auth.cookie_domain` almost certainly \
+                     covers this host. Give one of the two gates a distinct `auth.cookie_name`, \
+                     or drop the realm",
+                    presented = presented.len(),
+                    name = gate.cookie_name,
+                ),
+            }
+        }
+        found.map(|(_, identity)| identity)
+    }
+
+    /// One candidate cookie, checked end to end. `None` for anything that is not
+    /// a live session *this* gate would honour — which is the same standard as
+    /// before, applied to each cookie rather than only to the first.
+    fn session_from(&self, gate: &AuthGate, deployment_id: &str, raw: &str) -> Option<Identity> {
+        let session = Session::decode(&self.verify(raw)?)?;
         if session.exp <= now_secs() {
             return None;
         }
@@ -913,19 +974,32 @@ fn safe_return_path(path: &str) -> String {
     if ok { path.to_string() } else { "/".to_string() }
 }
 
-/// Find one cookie by name across every `Cookie` header on the request.
-fn cookie_value(headers: &[String], name: &str) -> Option<String> {
+/// Every cookie with this name, across every `Cookie` header on the request.
+///
+/// Plural on purpose, and the plural case is not exotic. A cookie jar keys an
+/// entry on name *and* domain *and* path (RFC 6265 §5.3), so a browser can hold
+/// a host-only `applb_session` for `admin.example.com` and a realm-scoped one
+/// for `example.com` at the same time, and it sends **both** — ordered by path
+/// length, then by which was created first (§5.4). Nothing about that order
+/// favours the one this gate issued.
+///
+/// Reading only the first is therefore a sign-in loop waiting to happen: a
+/// foreign cookie shadows the real session, the gate refuses it, redirects to
+/// the provider, sets a fresh cookie that still sorts second, and the round trip
+/// repeats forever with nothing in any log to explain it. Callers try every
+/// candidate and take the first that actually verifies.
+fn cookie_values(headers: &[String], name: &str) -> Vec<String> {
+    let mut found = Vec::new();
     for header in headers {
         for pair in header.split(';') {
-            let pair = pair.trim();
-            if let Some((k, v)) = pair.split_once('=')
+            if let Some((k, v)) = pair.trim().split_once('=')
                 && k.trim() == name
             {
-                return Some(v.trim().to_string());
+                found.push(v.trim().to_string());
             }
         }
     }
-    None
+    found
 }
 
 fn set_cookie(
@@ -1181,6 +1255,58 @@ mod tests {
             assert_eq!(g.cookie_domain_for("notexample.com"), None);
             assert_eq!(g.cookie_domain_for("example.com.evil.test"), None);
             assert_eq!(gate().cookie_domain_for("api.example.com"), None);
+        }
+
+        /// Regression, and the reason [`cookie_values`] is plural.
+        ///
+        /// The moment one gate in a fleet opts into a realm, every sibling host
+        /// under it receives that cookie *in addition to* its own host-only one
+        /// — same name, two jar entries, order decided by which was created
+        /// first. A gate that read only the first refused its own live session,
+        /// redirected to the provider, set a fresh cookie that still sorted
+        /// second, and looped forever. It showed up on exactly one host: the one
+        /// whose policy differed from the realm's.
+        #[tokio::test]
+        async fn a_foreign_cookie_of_the_same_name_does_not_shadow_the_session() {
+            let a = auth();
+            let id = identity("someone@example.com", Some("example.com"));
+
+            // A neighbour's realm covers this hostname, so its session arrives
+            // here too — under the same name, with a policy of its own.
+            let neighbour = AuthGate {
+                cookie_domain: Some("example.com".into()),
+                allowed_emails: vec!["someone-else@example.com".into()],
+                ..gate()
+            };
+            let foreign = session_cookie(&a, &neighbour, &id, now_secs() + 3600);
+
+            // This gate's own, host-only, entirely valid session.
+            let g = gate();
+            let mine = session_cookie(&a, &g, &id, now_secs() + 3600);
+
+            for cookies in [
+                vec![foreign.clone(), mine.clone()],
+                vec![mine.clone(), foreign.clone()],
+                // Both in one header, which is how a browser actually sends
+                // them, with the shadowing one first.
+                vec![format!("{foreign}; {mine}")],
+            ] {
+                let Decision::Allow(who) = a.decide(&g, "web", &req("/dashboard", cookies)).await
+                else {
+                    panic!("a live session must be honoured whatever order the jar sends it in");
+                };
+                assert_eq!(who.unwrap().email, "someone@example.com");
+            }
+
+            // And the foreign cookie on its own is still refused — the fix
+            // widens which cookies are *looked at*, never which are accepted.
+            assert!(
+                matches!(
+                    a.decide(&g, "web", &req("/dashboard", vec![foreign])).await,
+                    Decision::Answered(_)
+                ),
+                "a session issued under another policy must not be honoured",
+            );
         }
 
         /// A logout must clear the cookie it actually set. A `Domain` cookie and
@@ -1651,12 +1777,27 @@ mod tests {
             "other=1; applb_session=abc.def".to_string(),
             "unrelated=2".to_string(),
         ];
-        assert_eq!(cookie_value(&headers, "applb_session").as_deref(), Some("abc.def"));
-        assert_eq!(cookie_value(&headers, "unrelated").as_deref(), Some("2"));
-        assert_eq!(cookie_value(&headers, "missing"), None);
+        assert_eq!(cookie_values(&headers, "applb_session"), ["abc.def"]);
+        assert_eq!(cookie_values(&headers, "unrelated"), ["2"]);
+        assert!(cookie_values(&headers, "missing").is_empty());
         // A cookie whose *name* merely ends with the one we want must not match.
         let confusable = vec!["not_applb_session=nope".to_string()];
-        assert_eq!(cookie_value(&confusable, "applb_session"), None);
+        assert!(cookie_values(&confusable, "applb_session").is_empty());
+    }
+
+    /// Same name, two entries — a host-only cookie and a realm one from a
+    /// sibling gate. The browser sends both and nothing says which comes first,
+    /// so both have to be visible to the caller.
+    #[test]
+    fn every_cookie_sharing_a_name_is_returned_in_order() {
+        let headers = vec![
+            "applb_session=from-the-realm; other=1".to_string(),
+            "applb_session=host-only".to_string(),
+        ];
+        assert_eq!(
+            cookie_values(&headers, "applb_session"),
+            ["from-the-realm", "host-only"]
+        );
     }
 
     #[test]
@@ -1738,6 +1879,40 @@ mod tests {
         };
         assert_eq!(response.status, 403);
         assert!(response.body.contains("access_denied"));
+    }
+
+    /// The same shadowing one step earlier: a leftover flow cookie ahead of the
+    /// live one must not turn the provider's redirect back into "the sign-in
+    /// state did not match", which would strand the browser on a 400 with a
+    /// spent authorization code.
+    #[tokio::test]
+    async fn a_stale_flow_cookie_does_not_shadow_the_live_one() {
+        let mut a = auth();
+        // Nothing listening, so the exchange fails fast on connect. Reaching it
+        // at all is the property under test.
+        a.token_endpoint = "http://127.0.0.1:1/token".into();
+        let g = gate();
+
+        let flow = |nonce: &str, verifier: &str| Flow {
+            nonce: nonce.into(),
+            return_to: "/dashboard".into(),
+            verifier: verifier.into(),
+            deployment: "web".into(),
+            exp: now_secs() + 300,
+        };
+        let stale = format!("{FLOW_COOKIE}={}", a.sign(&flow("an-older-nonce", "v0").encode()));
+        let live = format!("{FLOW_COOKIE}={}", a.sign(&flow("the-live-nonce", "v1").encode()));
+
+        let mut r = req("/__applb/auth/callback", vec![stale, live]);
+        r.query = Some("code=abc&state=the-live-nonce");
+        let Decision::Answered(response) = a.decide(&g, "web", &r).await else {
+            panic!("the callback always answers");
+        };
+        assert_eq!(
+            response.status, 502,
+            "the callback must get as far as the token exchange: {}",
+            response.body,
+        );
     }
 
     /// A bookmarked callback URL has no flow cookie; starting over beats a

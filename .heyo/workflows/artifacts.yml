@@ -1,0 +1,25 @@
+name: artifacts CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'artifacts/**'
+      - '.heyo/workflows/artifacts.yml'
+
+jobs:
+  artifacts:
+    name: Test artifacts
+    runs-on: namespace-profile-default
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test artifacts
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path artifacts/Cargo.toml
