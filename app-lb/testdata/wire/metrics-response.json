@@ -181,6 +181,7 @@
       "id": "sandbox",
       "kind": "vm",
       "upstreams": [],
+      "routed": true,
       "hosts": [
         "sandbox.example.com"
       ],

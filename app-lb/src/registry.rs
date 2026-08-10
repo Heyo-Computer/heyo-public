@@ -436,7 +436,26 @@ impl Registry {
         state: &DeploymentState,
     ) -> std::io::Result<()> {
         let dir = self.state_dir();
+        let mut missing_dirs = Vec::new();
+        let mut ancestor = dir.as_path();
+        while !ancestor.as_os_str().is_empty() && !ancestor.exists() {
+            missing_dirs.push(ancestor.to_path_buf());
+            let Some(parent) = ancestor.parent() else {
+                break;
+            };
+            ancestor = parent;
+        }
         std::fs::create_dir_all(&dir)?;
+        // create_dir_all makes each directory visible, but those entries are
+        // not crash-durable until their parents are synced. Work from the
+        // highest newly-created directory down toward the state directory.
+        for created in missing_dirs.iter().rev() {
+            let parent = created
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         let record = StoredDeployment {
             spec: deployment.spec.clone(),
             state: state.clone(),
@@ -445,8 +464,15 @@ impl Registry {
         // Write-then-rename so a crash mid-write can't truncate existing state.
         let path = dir.join(state_file_name(&deployment.spec.id));
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, &json)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &path)?;
+        // The rename is not durable until the directory entry is synced. A
+        // successful drain must not disappear after a host crash and silently
+        // reopen traffic on restart.
+        std::fs::File::open(dir)?.sync_all()
     }
 
     /// Drop one deployment's file. A missing file is success — deregistering

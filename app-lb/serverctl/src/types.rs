@@ -719,6 +719,8 @@ pub struct DeploymentView {
     /// `"vm"`, `"static"` or `"site"`.
     pub kind: String,
     pub upstreams: Vec<String>,
+    /// Whether at least one data-plane route points at this deployment.
+    pub routed: bool,
     /// Exact hostnames this deployment is routed on — `host` rules only, since
     /// a `host_suffix` names no single certificate subject.
     pub hosts: Vec<String>,

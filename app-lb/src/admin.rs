@@ -788,6 +788,10 @@ struct DeploymentView {
     /// For a static deployment, the configured upstream addresses; empty for a
     /// managed one.
     upstreams: Vec<String>,
+    /// Whether any data-plane route points at this deployment. Agent sandboxes
+    /// may be intentionally registered without a route and must not count as
+    /// unavailable serving capacity in fleet status.
+    routed: bool,
     /// Exact hostnames this deployment is routed on — `host` rules only, since a
     /// `host_suffix` names no single certificate subject and a `path_prefix` names
     /// no hostname at all. Reported so the dashboard can say which routed names
@@ -1070,6 +1074,7 @@ async fn metrics_snapshot(
                 id: d.spec.id.clone(),
                 kind: deployment_kind(d),
                 upstreams: d.spec.upstreams.clone(),
+                routed: !d.spec.routes.is_empty(),
                 hosts: d
                     .spec
                     .routes
@@ -2136,6 +2141,40 @@ fn normalized_drain_reason(reason: Option<String>) -> Result<Option<String>, Res
     Ok(reason)
 }
 
+/// Publish the cordon before attempting persistence. If any durability step
+/// fails, the caller reports the error but the live backend remains closed to
+/// new traffic; reverting it could disagree with a rename that already landed.
+fn apply_upstream_drain(
+    registry: &Registry,
+    deployment: &crate::deployment::Deployment,
+    id: &str,
+    upstream: &str,
+    reason_was_supplied: bool,
+    reason: Option<String>,
+) -> std::io::Result<()> {
+    deployment.mutate_state(|runtime| {
+        if let Some(drain) = runtime
+            .upstream_drains
+            .iter_mut()
+            .find(|drain| drain.upstream == upstream)
+        {
+            if reason_was_supplied {
+                drain.reason = reason.clone();
+            }
+        } else {
+            runtime.upstream_drains.push(UpstreamDrain {
+                upstream: upstream.to_string(),
+                reason,
+                started_at: now_secs(),
+            });
+            runtime
+                .upstream_drains
+                .sort_by(|left, right| left.upstream.cmp(&right.upstream));
+        }
+    });
+    registry.persist_one(id)
+}
+
 /// Stop assigning new requests to a static upstream while existing requests
 /// finish. The intent is persisted before the request succeeds.
 async fn drain_upstream(
@@ -2189,35 +2228,24 @@ async fn drain_upstream(
         .into_response();
     }
 
-    let before = (*deployment.state()).clone();
-    deployment.mutate_state(|runtime| {
-        if let Some(drain) = runtime
-            .upstream_drains
-            .iter_mut()
-            .find(|drain| drain.upstream == upstream)
-        {
-            if reason_was_supplied {
-                drain.reason = reason.clone();
-            }
-        } else {
-            runtime.upstream_drains.push(UpstreamDrain {
-                upstream: upstream.clone(),
-                reason: reason.clone(),
-                started_at: now_secs(),
-            });
-            runtime
-                .upstream_drains
-                .sort_by(|left, right| left.upstream.cmp(&right.upstream));
-        }
-    });
-    if let Err(error) = state.registry.persist_one(&id) {
-        // A drain that only survives until process restart is not a successful
-        // control-plane operation. Put both runtime selection and state back.
-        deployment.set_state(before);
+    if let Err(error) = apply_upstream_drain(
+        &state.registry,
+        &deployment,
+        &id,
+        &upstream,
+        reason_was_supplied,
+        reason,
+    ) {
+        // Fail closed. The rename may already have committed before a later
+        // fsync reported an error, so restoring the accepting state could
+        // disagree with disk and would reopen traffic during a storage fault.
+        // A retry is idempotent and can confirm durability later.
         tracing::error!(deployment = %id, %upstream, %error, "failed to persist upstream drain");
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("upstream drain was not saved: {error}"),
+            format!(
+                "upstream is cordoned, but drain durability could not be confirmed: {error}"
+            ),
         )
         .into_response();
     }
@@ -3483,6 +3511,43 @@ mod tests {
             assert!(
                 normalized_drain_reason(Some("x".repeat(MAX_DRAIN_REASON_LEN + 1))).is_err()
             );
+        }
+
+        #[test]
+        fn a_persistence_failure_leaves_the_upstream_cordoned() {
+            let blocked_parent = std::env::temp_dir().join(format!(
+                "app-lb-drain-failure-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::write(&blocked_parent, b"not a directory").unwrap();
+            let registry = Registry::new(blocked_parent.join("drain-state.json"));
+            let deployment = registry.upsert((*deployment()).spec.clone());
+
+            let result = apply_upstream_drain(
+                &registry,
+                &deployment,
+                "stage",
+                "eu1.example:443",
+                true,
+                Some("maintenance".into()),
+            );
+
+            assert!(result.is_err(), "the fixture must fail before durability is confirmed");
+            assert!(
+                deployment.backends()[0].is_draining(),
+                "a storage error must fail closed rather than reopen traffic",
+            );
+            assert_eq!(
+                deployment
+                    .upstream_drain("eu1.example:443")
+                    .and_then(|drain| drain.reason),
+                Some("maintenance".into()),
+            );
+            std::fs::remove_file(blocked_parent).unwrap();
         }
     }
 

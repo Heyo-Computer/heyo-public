@@ -1329,6 +1329,9 @@ to the admin port.
 
 `GET /metrics` returns the same data as JSON (host usage, a global rollup, and a
 per-deployment breakdown), suitable for scraping into your own tooling.
+Each deployment includes `routed`, which is false for registered agent
+sandboxes with no data-plane route; fleet status consumers should not treat an
+idle unrouted sandbox as withdrawn serving capacity.
 
 The per-deployment breakdown can be scoped, which matters once the fleet is
 large — the unfiltered response carries a row per VM and a full set of histograms

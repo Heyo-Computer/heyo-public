@@ -38,7 +38,8 @@ const KNOWN = {
     SecretEnv: ["secret", "key", "as"],
     SecretRef: ["secret", "key", "username"],
     AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity"],
-    DeploymentView: ["id", "kind", "upstreams", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
+    DeploymentView: ["id", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
+    UpstreamTrafficStatus: ["deployment_id", "upstream", "state", "healthy", "in_flight", "reason", "started_at"],
     PoolStatus: ["desired_replicas", "ready", "draining", "pending", "total_in_flight", "target_concurrency", "min_replicas", "max_replicas", "warm_pool", "utilization", "cpu_percent", "memory_bytes", "boot_timeout_secs", "cold_start_timeout_secs"],
     VmView: ["sandbox_id", "addr", "in_flight", "healthy", "draining", "uptime_secs", "cpu_percent", "memory_bytes"],
     PendingVmView: ["sandbox_id", "age_secs", "status"],
@@ -103,6 +104,7 @@ const FIXTURES = {
   "token-summary": "TokenSummary",
   "token-summary-scoped": "TokenSummary",
   "minted-token": "MintedToken",
+  "upstream-traffic-status": "UpstreamTrafficStatus",
 };
 
 /** Which declaration governs a nested object, by the key that holds it. */
