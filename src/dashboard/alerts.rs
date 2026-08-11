@@ -1,7 +1,8 @@
 //! Webhook alerts for the basic host metrics the monitoring page shows.
 //!
 //! An operator configures rules on the monitoring page — one metric (host CPU %,
-//! host memory %, or disk saturation %), a threshold, and a webhook URL. A
+//! host memory %, disk saturation %, or the local daemon's health check), a
+//! threshold, and a webhook URL. A
 //! background task ([`spawn_evaluator`]) samples the same host metrics the page
 //! renders every [`DashboardConfig::alert_interval`] and POSTs a small JSON body
 //! to the URL when a rule *crosses* its threshold — once on the rising edge
@@ -9,10 +10,20 @@
 //! while it stays over. Delivery shells out to `curl` (already relied on for the
 //! healthcheck and guest S3 streaming), so no HTTP-client dependency is added.
 //!
+//! The daemon-health metric is the odd one out: its "value" is not a percentage
+//! but the count of *consecutive* failed `GET /health` probes against the local
+//! heyvmd (the same signal its watchdog keys on), so a rule with threshold 3
+//! means "alert once the daemon has been silent for 3 straight intervals". The
+//! webhook payload keeps the `threshold_pct`/`value_pct` keys for wire
+//! compatibility; consumers should interpret them by `metric`.
+//!
 //! Rules persist to a tiny TSV next to the pooler's schema registry, using the
 //! same atomic temp-file+rename write as [`crate::store`]. The firing state is
 //! runtime-only (starts clear on load), so a pooler restart re-evaluates from
-//! scratch and won't replay a stale edge.
+//! scratch and won't replay a stale edge. The paused flag *is* persisted (a
+//! pause should survive a redeploy); a paused rule keeps its config but is
+//! skipped by the evaluator, and pausing clears any firing state so resuming
+//! re-triggers on the next tick if the metric is still over.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -33,6 +44,10 @@ pub enum Metric {
     HostCpu,
     HostMemory,
     Disk,
+    /// Consecutive failed `GET /health` probes against the local heyvmd — the
+    /// same signal the supervisor watchdog keys on, so a rule here can warn
+    /// (webhook) well before the watchdog escalates to a VM-killing restart.
+    HeyvmdHealth,
 }
 
 impl Metric {
@@ -42,6 +57,7 @@ impl Metric {
             Metric::HostCpu => "host-cpu",
             Metric::HostMemory => "host-memory",
             Metric::Disk => "disk",
+            Metric::HeyvmdHealth => "heyvmd-health",
         }
     }
 
@@ -51,6 +67,15 @@ impl Metric {
             Metric::HostCpu => "host CPU",
             Metric::HostMemory => "host memory",
             Metric::Disk => "disk saturation",
+            Metric::HeyvmdHealth => "daemon health check",
+        }
+    }
+
+    /// Unit suffix for rendering a threshold ("≥ 90%" vs "≥ 3 failed checks").
+    pub fn unit(self) -> &'static str {
+        match self {
+            Metric::HeyvmdHealth => " failed checks",
+            _ => "%",
         }
     }
 
@@ -59,13 +84,19 @@ impl Metric {
             "host-cpu" => Some(Metric::HostCpu),
             "host-memory" => Some(Metric::HostMemory),
             "disk" => Some(Metric::Disk),
+            "heyvmd-health" => Some(Metric::HeyvmdHealth),
             _ => None,
         }
     }
 
     /// Every metric, for populating the add-rule dropdown.
-    pub fn all() -> [Metric; 3] {
-        [Metric::HostCpu, Metric::HostMemory, Metric::Disk]
+    pub fn all() -> [Metric; 4] {
+        [
+            Metric::HostCpu,
+            Metric::HostMemory,
+            Metric::Disk,
+            Metric::HeyvmdHealth,
+        ]
     }
 }
 
@@ -73,12 +104,16 @@ impl Metric {
 struct Rule {
     id: String,
     metric: Metric,
-    /// Fire when the metric's percentage is `>=` this (0–100).
+    /// Fire when the metric's value is `>=` this — a percentage (0–100) for the
+    /// host metrics, a consecutive-failure count for [`Metric::HeyvmdHealth`].
     threshold_pct: f64,
     webhook_url: String,
     /// True while the metric is currently over the threshold — the edge-detector
     /// that stops us re-POSTing every interval. Not persisted.
     firing: bool,
+    /// A paused rule keeps its config but is skipped by the evaluator.
+    /// Persisted (a pause should survive a redeploy).
+    paused: bool,
 }
 
 /// A read-only view of a rule for rendering.
@@ -88,6 +123,7 @@ pub struct RuleView {
     pub threshold_pct: f64,
     pub webhook_url: String,
     pub firing: bool,
+    pub paused: bool,
 }
 
 /// A webhook to send: the URL and a pre-rendered JSON body. Produced by
@@ -108,6 +144,11 @@ pub struct Sample {
     pub max_disk_pct: Option<f64>,
     /// Mount point of the fullest filesystem, for the disk payload's `detail`.
     pub worst_mount: Option<String>,
+    /// Consecutive failed heyvmd `/health` probes; 0 while healthy. The counter
+    /// lives in the evaluator loop (it must survive across ticks).
+    pub heyvmd_fail_count: Option<f64>,
+    /// The latest probe's error, for the health payload's `detail`.
+    pub heyvmd_error: Option<String>,
 }
 
 /// Max rules — a sanity cap so a runaway form can't grow the file unboundedly.
@@ -147,6 +188,7 @@ impl AlertStore {
                 threshold_pct: r.threshold_pct,
                 webhook_url: r.webhook_url.clone(),
                 firing: r.firing,
+                paused: r.paused,
             })
             .collect()
     }
@@ -155,19 +197,7 @@ impl AlertStore {
     /// the URL is a plausible http(s) webhook; returns a user-facing error string
     /// on rejection (surfaced in the redirect banner).
     pub fn add(&self, metric: &str, threshold_pct: f64, webhook_url: &str) -> Result<()> {
-        let metric = Metric::parse(metric).context("unknown metric")?;
-        if !(0.0..=100.0).contains(&threshold_pct) {
-            bail!("threshold must be between 0 and 100");
-        }
-        let url = webhook_url.trim();
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            bail!("webhook URL must start with http:// or https://");
-        }
-        // URLs are single-line by nature; refuse control chars so a value can't
-        // break the TSV or smuggle headers into the curl invocation.
-        if url.chars().any(|c| c.is_control()) {
-            bail!("webhook URL must not contain control characters");
-        }
+        let (metric, url) = validate(metric, threshold_pct, webhook_url)?;
         let snapshot = {
             let mut rules = self.rules.lock().unwrap();
             if rules.len() >= MAX_RULES {
@@ -177,14 +207,58 @@ impl AlertStore {
                 id: new_id(),
                 metric,
                 threshold_pct,
-                webhook_url: url.to_string(),
+                webhook_url: url,
                 firing: false,
+                paused: false,
             });
             serialize(&rules)
         };
         write_atomic(&self.path, &snapshot)
             .with_context(|| format!("persisting alerts to {}", self.path.display()))?;
         Ok(())
+    }
+
+    /// Replace the rule `id`'s metric/threshold/URL and persist. Same validation
+    /// as [`Self::add`]. Firing state resets (the rule's meaning changed, so the
+    /// next tick re-evaluates from a clean edge); the paused flag is kept.
+    pub fn update(&self, id: &str, metric: &str, threshold_pct: f64, webhook_url: &str) -> Result<()> {
+        let (metric, url) = validate(metric, threshold_pct, webhook_url)?;
+        let snapshot = {
+            let mut rules = self.rules.lock().unwrap();
+            let Some(r) = rules.iter_mut().find(|r| r.id == id) else {
+                bail!("no such alert rule");
+            };
+            r.metric = metric;
+            r.threshold_pct = threshold_pct;
+            r.webhook_url = url;
+            r.firing = false;
+            serialize(&rules)
+        };
+        write_atomic(&self.path, &snapshot)
+            .with_context(|| format!("persisting alerts to {}", self.path.display()))?;
+        Ok(())
+    }
+
+    /// Pause or resume the rule `id`, persisting the flag. Pausing clears any
+    /// firing state — no "resolved" webhook will be sent for a fire that was
+    /// alive at pause time, and resuming re-triggers on the next tick if the
+    /// metric is still over. Returns whether the rule exists.
+    pub fn set_paused(&self, id: &str, paused: bool) -> bool {
+        let snapshot = {
+            let mut rules = self.rules.lock().unwrap();
+            let Some(r) = rules.iter_mut().find(|r| r.id == id) else {
+                return false;
+            };
+            r.paused = paused;
+            if paused {
+                r.firing = false;
+            }
+            serialize(&rules)
+        };
+        if let Err(e) = write_atomic(&self.path, &snapshot) {
+            warn!("failed to persist alerts to {}: {e:#}", self.path.display());
+        }
+        true
     }
 
     /// Remove the rule with `id`, persisting if it existed. Returns whether a rule
@@ -212,10 +286,16 @@ impl AlertStore {
         let mut out = Vec::new();
         let mut rules = self.rules.lock().unwrap();
         for r in rules.iter_mut() {
+            if r.paused {
+                continue;
+            }
             let (value, detail) = match r.metric {
                 Metric::HostCpu => (sample.host_cpu_pct, None),
                 Metric::HostMemory => (sample.host_mem_pct, None),
                 Metric::Disk => (sample.max_disk_pct, sample.worst_mount.as_deref()),
+                Metric::HeyvmdHealth => {
+                    (sample.heyvmd_fail_count, sample.heyvmd_error.as_deref())
+                }
             };
             let Some(value) = value else { continue };
             let over = value >= r.threshold_pct;
@@ -268,12 +348,36 @@ async fn sample(st: &DashState) -> Sample {
         host_mem_pct,
         max_disk_pct,
         worst_mount,
+        // Filled in by the evaluator loop, which owns the cross-tick counter.
+        heyvmd_fail_count: None,
+        heyvmd_error: None,
+    }
+}
+
+/// Probe the local daemon's `/health` — the same lock-free endpoint the
+/// supervisor watchdog polls, with a similar per-probe bound so a wedged daemon
+/// costs one timeout per tick, not a hang. `Err` carries a short reason for the
+/// webhook payload's `detail`.
+async fn probe_heyvmd() -> std::result::Result<(), String> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    let url = format!("{}/health", heyo_sdk::DEFAULT_LOCAL_BASE_URL);
+    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => return Err(format!("building probe client: {e}")),
+    };
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => Ok(()),
+        Ok(resp) => Err(format!("HTTP {}", resp.status())),
+        Err(e) => Err(e.to_string()),
     }
 }
 
 /// Spawn the background evaluator: every `interval`, sample host metrics, flip
 /// rule edges, and deliver any resulting webhooks. Cheap and self-healing — a
-/// failed sample or delivery is logged and the loop continues.
+/// failed sample or delivery is logged and the loop continues. The
+/// consecutive-failure counter for the daemon-health metric lives here: it must
+/// survive across ticks, and counting even while no rule watches it means a
+/// rule added mid-outage fires on the very next tick.
 pub fn spawn_evaluator(st: DashState, interval: Duration) {
     tokio::spawn(async move {
         info!(
@@ -281,9 +385,19 @@ pub fn spawn_evaluator(st: DashState, interval: Duration) {
             interval.as_secs(),
             st.alerts.list().len()
         );
+        let mut heyvmd_fails: u64 = 0;
         loop {
             tokio::time::sleep(interval).await;
-            let sample = sample(&st).await;
+            let mut sample = sample(&st).await;
+            match probe_heyvmd().await {
+                Ok(()) => heyvmd_fails = 0,
+                Err(e) => {
+                    heyvmd_fails += 1;
+                    warn!("alert evaluator: heyvmd /health probe failed ({heyvmd_fails} consecutive): {e}");
+                    sample.heyvmd_error = Some(e);
+                }
+            }
+            sample.heyvmd_fail_count = Some(heyvmd_fails as f64);
             for d in st.alerts.evaluate(&sample) {
                 deliver(&d).await;
             }
@@ -407,7 +521,29 @@ fn to_base36(mut n: u128) -> String {
     String::from_utf8(buf).unwrap()
 }
 
-/// Parse the alert TSV: one `id\tmetric\tthreshold\turl` line per rule. Unknown
+/// Shared add/update validation: the metric must be known, the threshold in
+/// range, and the URL a plausible single-line http(s) webhook. Returns the
+/// parsed metric and trimmed URL.
+fn validate(metric: &str, threshold_pct: f64, webhook_url: &str) -> Result<(Metric, String)> {
+    let metric = Metric::parse(metric).context("unknown metric")?;
+    if !(0.0..=100.0).contains(&threshold_pct) {
+        bail!("threshold must be between 0 and 100");
+    }
+    let url = webhook_url.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        bail!("webhook URL must start with http:// or https://");
+    }
+    // URLs are single-line by nature; refuse control chars so a value can't
+    // break the TSV or smuggle headers into the curl invocation.
+    if url.chars().any(|c| c.is_control()) {
+        bail!("webhook URL must not contain control characters");
+    }
+    Ok((metric, url.to_string()))
+}
+
+/// Parse the alert TSV: one `id\tmetric\tthreshold\turl[\tstatus]` line per
+/// rule, where the optional fifth column is `paused` (anything else — including
+/// its absence in files written by older builds — means active). Unknown
 /// metrics, bad thresholds, or short lines are skipped (a corrupt line only
 /// drops that rule).
 fn parse(s: &str) -> Vec<Rule> {
@@ -418,6 +554,7 @@ fn parse(s: &str) -> Vec<Rule> {
             let metric = Metric::parse(f.next()?)?;
             let threshold_pct: f64 = f.next()?.parse().ok()?;
             let url = f.next()?;
+            let paused = f.next() == Some("paused");
             if id.is_empty() || url.is_empty() {
                 return None;
             }
@@ -427,6 +564,7 @@ fn parse(s: &str) -> Vec<Rule> {
                 threshold_pct,
                 webhook_url: url.to_string(),
                 firing: false,
+                paused,
             })
         })
         .collect()
@@ -442,6 +580,10 @@ fn serialize(rules: &[Rule]) -> String {
         out.push_str(&num(r.threshold_pct));
         out.push('\t');
         out.push_str(&r.webhook_url);
+        out.push('\t');
+        // A word, not a bool, so the column is self-describing in the file —
+        // and an older build's parser (4 columns) simply ignores it.
+        out.push_str(if r.paused { "paused" } else { "active" });
         out.push('\n');
     }
     out
@@ -476,6 +618,7 @@ mod tests {
             threshold_pct: threshold,
             webhook_url: "https://example.com/hook".into(),
             firing: false,
+            paused: false,
         }
     }
 
@@ -489,16 +632,28 @@ mod tests {
                 threshold_pct: 85.5,
                 webhook_url: "http://localhost:9000/a".into(),
                 firing: true, // not persisted
+                paused: true, // persisted
             },
         ];
         let reparsed = parse(&serialize(&rules));
         assert_eq!(reparsed.len(), 2);
         assert_eq!(reparsed[0].metric, Metric::HostCpu);
         assert_eq!(reparsed[0].threshold_pct, 90.0);
+        assert!(!reparsed[0].paused);
         assert_eq!(reparsed[1].metric, Metric::Disk);
         assert_eq!(reparsed[1].webhook_url, "http://localhost:9000/a");
-        // Firing state is runtime-only; a reloaded rule starts clear.
+        // Firing state is runtime-only; a reloaded rule starts clear. The
+        // paused flag survives the round trip.
         assert!(!reparsed[1].firing);
+        assert!(reparsed[1].paused);
+    }
+
+    #[test]
+    fn parse_accepts_legacy_four_column_lines() {
+        // A file written before the paused column existed: rule loads, active.
+        let rules = parse("r1\thost-cpu\t90\thttps://ok\n");
+        assert_eq!(rules.len(), 1);
+        assert!(!rules[0].paused);
     }
 
     #[test]
@@ -567,6 +722,75 @@ mod tests {
     fn json_str_escapes() {
         assert_eq!(json_str(r#"a"b\c"#), r#""a\"b\\c""#);
         assert_eq!(json_str("tab\there"), r#""tab\there""#);
+    }
+
+    #[test]
+    fn paused_rule_is_skipped_and_resume_refires() {
+        let store = AlertStore {
+            path: PathBuf::from("/nonexistent/should-not-write"),
+            rules: Mutex::new(vec![rule(Metric::HostCpu, 90.0)]),
+        };
+        let over = Sample {
+            host_cpu_pct: Some(95.0),
+            ..Default::default()
+        };
+        // Fire it, then pause mid-fire: firing state clears, nothing delivers.
+        assert_eq!(store.evaluate(&over).len(), 1);
+        assert!(store.set_paused("r1", true));
+        assert!(store.evaluate(&over).is_empty());
+        assert!(!store.list()[0].firing, "pausing clears firing state");
+        // Resume while still over: a fresh rising edge, one "triggered".
+        assert!(store.set_paused("r1", false));
+        let ev = store.evaluate(&over);
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].body.contains(r#""state":"triggered""#));
+        // Unknown id: reported, not invented.
+        assert!(!store.set_paused("nope", true));
+    }
+
+    #[test]
+    fn update_replaces_fields_and_validates() {
+        let store = AlertStore {
+            path: PathBuf::from("/nonexistent/should-not-write"),
+            rules: Mutex::new(vec![rule(Metric::HostCpu, 90.0)]),
+        };
+        assert!(store.update("nope", "host-cpu", 50.0, "https://ok").is_err());
+        assert!(store.update("r1", "bogus", 50.0, "https://ok").is_err());
+        assert!(store.update("r1", "host-cpu", 150.0, "https://ok").is_err());
+        // A write to /nonexistent fails at persist — but only after the
+        // in-memory rule is updated, which is what we assert on here.
+        let _ = store.update("r1", "disk", 80.0, "https://new.example/hook");
+        let v = &store.list()[0];
+        assert_eq!(v.metric, Metric::Disk);
+        assert_eq!(v.threshold_pct, 80.0);
+        assert_eq!(v.webhook_url, "https://new.example/hook");
+    }
+
+    #[test]
+    fn heyvmd_health_fires_on_consecutive_failures() {
+        let store = AlertStore {
+            path: PathBuf::from("/nonexistent"),
+            rules: Mutex::new(vec![rule(Metric::HeyvmdHealth, 3.0)]),
+        };
+        let fails = |n: f64, err: Option<&str>| Sample {
+            heyvmd_fail_count: Some(n),
+            heyvmd_error: err.map(str::to_string),
+            ..Default::default()
+        };
+        // 1–2 consecutive failures: under threshold, quiet.
+        assert!(store.evaluate(&fails(1.0, Some("timeout"))).is_empty());
+        assert!(store.evaluate(&fails(2.0, Some("timeout"))).is_empty());
+        // Third: fires once, carrying the probe error as detail.
+        let ev = store.evaluate(&fails(3.0, Some("connection refused")));
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].body.contains(r#""metric":"heyvmd-health""#));
+        assert!(ev[0].body.contains(r#""detail":"connection refused""#));
+        // Still failing: no repeat.
+        assert!(store.evaluate(&fails(4.0, Some("connection refused"))).is_empty());
+        // Recovery: one "resolved".
+        let ev = store.evaluate(&fails(0.0, None));
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].body.contains(r#""state":"resolved""#));
     }
 
     #[test]

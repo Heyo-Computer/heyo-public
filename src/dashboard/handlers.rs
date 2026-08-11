@@ -166,6 +166,39 @@ pub async fn alert_delete(State(st): State<DashState>, Path(id): Path<String>) -
     Redirect::to(&format!("/monitoring{msg}"))
 }
 
+/// Save an edited rule (same fields as the add form, targeted by id).
+pub async fn alert_update(
+    State(st): State<DashState>,
+    Path(id): Path<String>,
+    Form(form): Form<AlertForm>,
+) -> Redirect {
+    match st
+        .alerts
+        .update(&id, &form.metric, form.threshold_pct, &form.webhook_url)
+    {
+        Ok(()) => Redirect::to(&format!("/monitoring?msg={}", qenc("alert rule updated"))),
+        Err(e) => Redirect::to(&format!("/monitoring?err={}", qenc(&e.to_string()))),
+    }
+}
+
+pub async fn alert_pause(State(st): State<DashState>, Path(id): Path<String>) -> Redirect {
+    let msg = if st.alerts.set_paused(&id, true) {
+        format!("?msg={}", qenc("alert rule paused"))
+    } else {
+        format!("?err={}", qenc("no such alert rule"))
+    };
+    Redirect::to(&format!("/monitoring{msg}"))
+}
+
+pub async fn alert_resume(State(st): State<DashState>, Path(id): Path<String>) -> Redirect {
+    let msg = if st.alerts.set_paused(&id, false) {
+        format!("?msg={}", qenc("alert rule resumed"))
+    } else {
+        format!("?err={}", qenc("no such alert rule"))
+    };
+    Redirect::to(&format!("/monitoring{msg}"))
+}
+
 pub async fn vm_detail(
     State(st): State<DashState>,
     Path(id): Path<String>,
@@ -237,13 +270,16 @@ async fn run_lifecycle(id: &str, act: Lifecycle) -> anyhow::Result<()> {
     let fut = async move {
         match act {
             // Start/reboot open a stopped disk — mutually exclusive with
-            // reclaim passes (see reclaim::boot_permit).
+            // reclaim passes (see reclaim::boot_permit) and bounded by the
+            // bring-up gate so a manual action can't pile onto a busy daemon.
             Lifecycle::Start => {
+                let _slot = vm::bringup_slot("dashboard-start").await;
                 let _permit = crate::reclaim::boot_permit().await;
                 sb.start().await
             }
             Lifecycle::Stop => sb.stop().await,
             Lifecycle::Reboot => {
+                let _slot = vm::bringup_slot("dashboard-reboot").await;
                 let _permit = crate::reclaim::boot_permit().await;
                 // Not sb.restart(): the SDK builds that as the cloud-dialect
                 // path /deployed-sandboxes/{id}/restart, which the local

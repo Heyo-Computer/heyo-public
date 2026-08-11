@@ -521,8 +521,11 @@ fn fmt_span(secs: u64) -> String {
     }
 }
 
-/// The webhook-alerts panel: existing rules with their live firing state and a
-/// delete control, plus a form to add a new rule.
+/// The webhook-alerts panel: existing rules — editable in place, with live
+/// firing state and pause/delete controls — plus a form to add a new rule.
+/// Each row's inputs bind to a per-rule edit form in its actions cell via the
+/// HTML5 `form` attribute (forms can't nest, and pause/delete are their own
+/// one-button forms in the same cell).
 fn alerts_section(st: &DashState) -> Markup {
     let rules = st.alerts.list();
     let interval = st.cfg.alert_interval.as_secs();
@@ -544,12 +547,45 @@ fn alerts_section(st: &DashState) -> Markup {
                     }
                     tbody {
                         @for r in &rules {
+                            @let edit_id = format!("alert-edit-{}", r.id);
                             tr {
-                                td { (r.metric.label()) }
-                                td { "≥ " (fmt_pct(r.threshold_pct)) "%" }
-                                td.dim { code { (r.webhook_url) } }
+                                td {
+                                    select name="metric" form=(edit_id) {
+                                        @for m in Metric::all() {
+                                            option value=(m.slug()) selected[m == r.metric] {
+                                                (m.label())
+                                            }
+                                        }
+                                    }
+                                }
+                                td {
+                                    "≥ "
+                                    input.threshold type="number" name="threshold_pct"
+                                        form=(edit_id) min="0" max="100" step="0.1"
+                                        value=(fmt_pct(r.threshold_pct)) required;
+                                    span.dim { (r.metric.unit()) }
+                                }
+                                td {
+                                    input.webhook type="url" name="webhook_url" form=(edit_id)
+                                        value=(r.webhook_url) required;
+                                }
                                 td { (alert_state_badge(r)) }
                                 td.actions {
+                                    form id=(edit_id) method="post"
+                                        action={ "/monitoring/alerts/" (r.id) "/update" } {
+                                        button { "save" }
+                                    }
+                                    @if r.paused {
+                                        form method="post"
+                                            action={ "/monitoring/alerts/" (r.id) "/resume" } {
+                                            button { "resume" }
+                                        }
+                                    } @else {
+                                        form method="post"
+                                            action={ "/monitoring/alerts/" (r.id) "/pause" } {
+                                            button { "pause" }
+                                        }
+                                    }
                                     form method="post"
                                         action={ "/monitoring/alerts/" (r.id) "/delete" } {
                                         button.stop
@@ -574,7 +610,7 @@ fn alerts_section(st: &DashState) -> Markup {
                     }
                 }
                 label {
-                    span { "fire at ≥ (%)" }
+                    span { "fire at ≥ (% — or failed checks for daemon health)" }
                     input type="number" name="threshold_pct" min="0" max="100" step="1"
                         value="90" required;
                 }
@@ -586,11 +622,17 @@ fn alerts_section(st: &DashState) -> Markup {
                 button type="submit" { "add alert" }
             }
             p.note {
-                "The evaluator samples host CPU, memory, and the fullest disk every "
+                "The evaluator samples host CPU, memory, the fullest disk, and the "
+                "daemon's health endpoint every "
                 (interval) "s and POSTs a JSON body (" code { "state" } " of "
                 code { "triggered" } "/" code { "resolved" }
                 ") to the URL when a rule crosses its threshold — once per crossing, "
-                "not every interval. The disk rule watches the fullest host filesystem."
+                "not every interval. The disk rule watches the fullest host filesystem. "
+                "For the daemon health check the threshold counts CONSECUTIVE failed "
+                code { "GET /health" } " probes (e.g. 3 = silent for 3 straight "
+                "intervals) — set it below the watchdog's restart threshold to get "
+                "warned before a restart. A paused rule keeps its config but is "
+                "skipped until resumed."
             }
         }
     }
@@ -598,7 +640,9 @@ fn alerts_section(st: &DashState) -> Markup {
 
 fn alert_state_badge(r: &RuleView) -> Markup {
     html! {
-        @if r.firing {
+        @if r.paused {
+            span.badge.s-stopped { "paused" }
+        } @else if r.firing {
             span.badge.s-failed { "firing" }
         } @else {
             span.badge.s-running { "ok" }
@@ -1553,6 +1597,9 @@ h3.sub-head { font-size:.82rem; text-transform:uppercase; letter-spacing:.04em; 
 .stat-sub { color:var(--muted); font-size:.75rem; margin-top:.2rem; }
 table.alerts { margin:.4rem 0 .8rem; }
 table.alerts td code { white-space:normal; word-break:break-all; }
+table.alerts input.threshold { width:4.5rem; }
+table.alerts input.webhook { width:100%; min-width:16rem; box-sizing:border-box; }
+table.alerts td:nth-child(3) { width:40%; }
 form.alert-add { display:flex; flex-wrap:wrap; align-items:end; gap:.6rem 1rem; margin:.5rem 0; }
 form.alert-add label { display:flex; flex-direction:column; gap:.2rem; font-size:.82rem; color:var(--dim); }
 form.alert-add label.grow { flex:1; min-width:220px; }

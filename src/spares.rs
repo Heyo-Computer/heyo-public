@@ -177,7 +177,9 @@ impl SparePool {
         for id in &plan.start {
             match Sandbox::connect(id.clone(), vm::local_opts()) {
                 Ok(sb) => {
-                    // Opening a stopped disk — exclusive with reclaim passes.
+                    // Opening a stopped disk — exclusive with reclaim passes,
+                    // and bounded by the bring-up gate like every other boot.
+                    let _slot = crate::vm::bringup_slot("warm-spares").await;
                     let _permit = crate::reclaim::boot_permit().await;
                     match sb.start().await {
                         Ok(()) => {

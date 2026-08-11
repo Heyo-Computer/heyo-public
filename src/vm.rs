@@ -2,7 +2,7 @@
 //! microVM, open a raw-TCP tunnel to its Postgres, and bootstrap the database.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
@@ -13,6 +13,7 @@ use heyo_sdk::{
     CommandResult, CommandRunOptions, DEFAULT_LOCAL_BASE_URL, HeyoClientOptions, HeyoError,
     P2pTunnel, Sandbox, SandboxCreateOptions, SandboxDriver,
 };
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -42,6 +43,65 @@ pub(crate) fn local_opts() -> HeyoClientOptions {
         base_url: Some(DEFAULT_LOCAL_BASE_URL.to_string()),
         ..Default::default()
     }
+}
+
+/// HTTP timeout for the deploy POST specifically. `/sandbox-deploy` blocks
+/// server-side until the VM has fully booted, so tens of seconds is *normal*
+/// under load — the SDK's 60s default fires exactly when the daemon is
+/// busiest, and a client-side timeout doesn't cancel the server-side build:
+/// the "failed" deploy still finishes and leaves an orphan VM behind.
+const DEPLOY_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How many VM bring-ups (deploys of new VMs, boots of stopped ones) may hit
+/// the daemon at once. Overridden by `PG_VM_POOL_MAX_CONCURRENT_BRINGUPS`;
+/// `0` disables the gate entirely.
+///
+/// Why a gate: heyvmd runs blocking work on its async worker threads during
+/// every VM start (`debugfs` key injection, `mke2fs` for mounts, full rootfs
+/// copies on non-CoW filesystems). Enough simultaneous bring-ups park every
+/// worker, at which point the daemon stops answering *anything* — including
+/// its own health endpoint, whose watchdog then restarts it. Because the
+/// Firecracker VMM processes are the daemon's children (their stdio is the
+/// guest serial console), that restart kills every running VM, so every
+/// active schema cold-starts at once against the fresh daemon and wedges it
+/// again. Queueing the excess here (FIFO, in the pooler) breaks that cycle:
+/// the daemon only ever sees a herd it can survive.
+const DEFAULT_BRINGUP_SLOTS: usize = 3;
+
+/// The gate itself. `None` inside means the operator disabled it (`0`).
+static BRINGUP_GATE: OnceLock<Option<Semaphore>> = OnceLock::new();
+
+fn bringup_gate() -> Option<&'static Semaphore> {
+    BRINGUP_GATE
+        .get_or_init(|| {
+            let slots = std::env::var("PG_VM_POOL_MAX_CONCURRENT_BRINGUPS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_BRINGUP_SLOTS);
+            if slots == 0 {
+                warn!("PG_VM_POOL_MAX_CONCURRENT_BRINGUPS=0: bring-up gate disabled");
+            }
+            (slots > 0).then(|| Semaphore::new(slots))
+        })
+        .as_ref()
+}
+
+/// Take a bring-up slot before any daemon call that builds or boots a VM.
+/// Hold the returned permit only across the daemon-heavy call itself (deploy
+/// POST, `start()`) — readiness polling is cheap for the daemon and must not
+/// pin a slot. Waiting is logged so a queued bring-up is visible in the log
+/// instead of reading as a hang.
+pub(crate) async fn bringup_slot(what: &str) -> Option<SemaphorePermit<'static>> {
+    let gate = bringup_gate()?;
+    if let Ok(permit) = gate.try_acquire() {
+        return Some(permit);
+    }
+    let queued = Instant::now();
+    info!("{what}: all VM bring-up slots busy; queueing");
+    // The gate is never closed, so acquire() cannot fail.
+    let permit = gate.acquire().await.expect("bring-up gate is never closed");
+    info!("{what}: bring-up slot acquired after {:?} queued", queued.elapsed());
+    Some(permit)
 }
 
 /// Bring up (or reattach to) the VM for `schema` and return a ready entry.
@@ -1573,7 +1633,9 @@ async fn power_cycle(
     drop(tunnel);
     // The stop→start gap makes the disk look reclaimable; hold the boot permit
     // across both so a reclaim pass can't start working on it in between.
+    // The bring-up slot bounds how many such boots hit the daemon at once.
     {
+        let _slot = bringup_slot(name).await;
         let _permit = crate::reclaim::boot_permit().await;
         sandbox
             .stop()
@@ -1894,8 +1956,10 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
     // A stopped VM's disk may be mid-fsck/shrink under a reclaim pass; booting
     // over that destroys the filesystem. Hold the permit only across start():
     // once the VM process has the disk open, the next pass's in-use scan
-    // protects it.
+    // protects it. The bring-up slot comes first (same order everywhere) and
+    // covers the boot only — the ready wait below is cheap polling.
     let started = {
+        let _slot = bringup_slot(name).await;
         let _permit = crate::reclaim::boot_permit().await;
         sb.start().await
     };
@@ -1918,27 +1982,40 @@ pub(crate) async fn create_vm(cfg: &Config, name: &str, keepalive: bool) -> Resu
         "creating VM {name}{}",
         if keepalive { " (keep-alive)" } else { "" }
     );
-    let sandbox = Sandbox::create(
-        SandboxCreateOptions {
-            name: Some(name.to_string()),
-            image: Some(cfg.image.clone()),
-            driver: Some(SandboxDriver::Firecracker),
-            open_ports: vec![VM_PG_PORT],
-            size_class: Some(cfg.size_class),
-            // Persistent data disk → /dev/vdb → /workspace → PGDATA, so the
-            // schema's data survives VM stop/start/restart.
-            disk_size_gb: Some(cfg.data_disk_gb),
-            // Always 0: the pooler owns VM lifecycle. Keep-alive schemas stay up;
-            // others are stopped by the pooler's idle reaper, which tracks
-            // connections — something the daemon's absolute TTL can't do.
-            ttl_seconds: Some(0),
-            wait_for_ready: Some(cfg.ready_timeout),
-            ..Default::default()
-        },
-        local_opts(),
-    )
-    .await
-    .with_context(|| format!("creating VM {name}"))?;
+    let sandbox = {
+        let _slot = bringup_slot(name).await;
+        Sandbox::create(
+            SandboxCreateOptions {
+                name: Some(name.to_string()),
+                image: Some(cfg.image.clone()),
+                driver: Some(SandboxDriver::Firecracker),
+                open_ports: vec![VM_PG_PORT],
+                size_class: Some(cfg.size_class),
+                // Persistent data disk → /dev/vdb → /workspace → PGDATA, so the
+                // schema's data survives VM stop/start/restart.
+                disk_size_gb: Some(cfg.data_disk_gb),
+                // Always 0: the pooler owns VM lifecycle. Keep-alive schemas stay up;
+                // others are stopped by the pooler's idle reaper, which tracks
+                // connections — something the daemon's absolute TTL can't do.
+                ttl_seconds: Some(0),
+                // ZERO = return as soon as the deploy POST answers; the ready
+                // poll runs below, outside the bring-up gate, so a slot is held
+                // only while the daemon is actually building and booting.
+                wait_for_ready: Some(Duration::ZERO),
+                ..Default::default()
+            },
+            HeyoClientOptions {
+                timeout: Some(DEPLOY_HTTP_TIMEOUT),
+                ..local_opts()
+            },
+        )
+        .await
+        .with_context(|| format!("creating VM {name}"))?
+    };
+    sandbox
+        .wait_for_ready(cfg.ready_timeout)
+        .await
+        .with_context(|| format!("waiting for created VM {name}"))?;
     crate::events::record(crate::events::Event::VmCreated);
     Ok(sandbox)
 }
@@ -2075,6 +2152,28 @@ mod tests {
 
     fn pool_at(port: u16) -> Pool {
         build_pool("127.0.0.1", port, "postgres", "postgres", None).unwrap()
+    }
+
+    /// Exhaust the gate, confirm nothing is left, and confirm dropped permits
+    /// return to the pool — a leaked permit here would silently serialize all
+    /// production bring-ups down to N-1 slots forever. Capacity-agnostic so an
+    /// inherited PG_VM_POOL_MAX_CONCURRENT_BRINGUPS doesn't break the test.
+    #[tokio::test]
+    async fn bringup_gate_bounds_and_recycles_slots() {
+        let Some(gate) = bringup_gate() else {
+            return; // gate disabled via env — nothing to check
+        };
+        let cap = gate.available_permits();
+        assert!(cap > 0, "an enabled gate must have at least one slot");
+        let mut held = Vec::new();
+        for i in 0..cap {
+            held.push(bringup_slot(&format!("test-{i}")).await);
+        }
+        assert_eq!(gate.available_permits(), 0, "gate must be exhaustible");
+        held.pop();
+        assert_eq!(gate.available_permits(), 1, "dropped permits must recycle");
+        drop(held);
+        assert_eq!(gate.available_permits(), cap);
     }
 
 

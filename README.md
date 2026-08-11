@@ -136,6 +136,7 @@ Config via env (all optional):
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
 | `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
+| `PG_VM_POOL_MAX_CONCURRENT_BRINGUPS` | `3` | max VM deploys/boots in flight against heyvmd; the excess queues FIFO in the pooler (an unbounded burst can wedge the daemon, whose watchdog restart then kills every running VM); `0` disables |
 | `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
 | `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
 | `PG_VM_POOL_STATE_FILE` | `~/.heyo/pg-vm-pool/registry.tsv` | persisted schema→VM map |
@@ -583,9 +584,12 @@ paths default to the supervisord locations above and are overridable with
 #### Webhook alerts
 
 The monitoring page can watch the basic host metrics and POST a webhook when one
-crosses a threshold. Add a rule (metric = host CPU %, host memory %, or disk
-saturation %; a threshold; and a URL) from the page's **alerts** panel. A
-background task samples the same host metrics every
+crosses a threshold. Add a rule (metric = host CPU %, host memory %, disk
+saturation %, or the daemon health check; a threshold; and a URL) from the
+page's **alerts** panel. Rules are edited in place (change the metric,
+threshold, or URL and save) and can be **paused** — a paused rule keeps its
+config but is skipped by the evaluator until resumed (resuming re-triggers if
+the metric is still over). A background task samples the same host metrics every
 `PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS` (default 60) and, on a crossing,
 `POST`s a small JSON body to the URL — **once** on the rising edge
 (`"state":"triggered"`) and once when it falls back (`"state":"resolved"`), not
@@ -597,11 +601,21 @@ filesystem. Example body:
  "state":"triggered","threshold_pct":90.0,"value_pct":93.4,"detail":"/"}
 ```
 
+The **daemon health check** metric is the odd one out: each tick the evaluator
+probes heyvmd's `GET /health` (5s bound), and the rule's threshold counts
+**consecutive failed probes** rather than a percentage — a threshold of 3 means
+"webhook me once the daemon has been silent for 3 straight intervals". That's
+the same signal the supervisor watchdog keys on, so set the alert threshold
+below the watchdog's restart threshold to get warned before a (VM-killing)
+daemon restart; `detail` carries the probe error and the payload keeps the
+`_pct` keys for wire compatibility.
+
 Delivery shells out to `curl` (no extra HTTP dependency); a failed or slow
 endpoint is logged and never blocks the pooler. Rules persist to
 `PG_VM_POOL_DASHBOARD_ALERTS_FILE` (default `~/.heyo/pg-vm-pool/alerts.tsv`, a
-sibling of the schema registry) and survive restarts; the firing state is
-in-memory, so a restart re-evaluates cleanly rather than replaying a stale edge.
+sibling of the schema registry) and survive restarts — including the paused
+flag; the firing state is in-memory, so a restart re-evaluates cleanly rather
+than replaying a stale edge.
 
 ### Testing
 
