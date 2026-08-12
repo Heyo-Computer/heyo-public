@@ -38,7 +38,7 @@ const KNOWN = {
     SecretEnv: ["secret", "key", "as"],
     SecretRef: ["secret", "key", "username"],
     AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity"],
-    DeploymentView: ["id", "kind", "upstreams", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
+    DeploymentView: ["id", "namespace", "kind", "upstreams", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
     PoolStatus: ["desired_replicas", "ready", "draining", "pending", "total_in_flight", "target_concurrency", "min_replicas", "max_replicas", "warm_pool", "utilization", "cpu_percent", "memory_bytes", "boot_timeout_secs", "cold_start_timeout_secs"],
     VmView: ["sandbox_id", "addr", "in_flight", "healthy", "draining", "uptime_secs", "cpu_percent", "memory_bytes"],
     PendingVmView: ["sandbox_id", "age_secs", "status"],
@@ -74,6 +74,9 @@ const KNOWN = {
     TokenSummary: ["id", "name", "admin", "namespace", "deployments", "created_at", "expires_at", "last_used_at"],
     MintedToken: ["id", "name", "admin", "namespace", "deployments", "created_at", "expires_at", "last_used_at", "token"],
     ApiError: ["error"],
+    FeedSpec: ["announce", "issues", "expose"],
+    FeedIndexEntry: ["namespace", "events"],
+    FeedEvent: ["id", "ts", "last_ts", "count", "namespace", "deployment", "kind", "title", "detail"],
   },
 };
 
@@ -104,6 +107,8 @@ const FIXTURES = {
   "token-summary-scoped": "TokenSummary",
   "token-summary-namespaced": "TokenSummary",
   "minted-token": "MintedToken",
+  "feed-event": "FeedEvent",
+  "feed-index": "FeedIndexEntry",
 };
 
 /** Which declaration governs a nested object, by the key that holds it. */
@@ -111,6 +116,7 @@ const NESTED = {
   spec: "DeploymentSpec", vm: "VmSpec", scaling: "ScalingPolicy", health: "HealthCheck",
   build: "BuildSpec", artifact: "ArtifactSpec", site: "SiteSpec", update: "UpdateSpec",
   auth: "AuthGate", client_secret: "SecretRef", pool: "PoolStatus", host: "HostUsage",
+  feed: "FeedSpec",
   fleet: "FleetPool", obs: "ObsStats", metrics: "DeploymentMetrics",
   security: "SecuritySummary", totals: "SeverityTotals", stats: "SiemStats",
   response: "AlertResponse", guard: "GuardStats",
@@ -175,7 +181,13 @@ for (const file of files) {
   test(`${name} has no fields this package would silently drop`, () => {
     const value = JSON.parse(readFileSync(join(WIRE, file), "utf8"));
     const unknown = [];
-    check(value, FIXTURES[name], name, unknown);
+    // A collection route's fixture is a bare array; its declaration names the
+    // element type.
+    if (Array.isArray(value)) {
+      value.forEach((item, i) => check(item, FIXTURES[name], `${name}[${i}]`, unknown));
+    } else {
+      check(value, FIXTURES[name], name, unknown);
+    }
     assert.deepEqual(
       unknown,
       [],

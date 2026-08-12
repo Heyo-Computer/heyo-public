@@ -17,6 +17,8 @@ import type {
   MintedToken,
   SecretSummary,
   TokenSummary,
+  FeedEvent,
+  FeedIndexEntry,
 } from "./types.js";
 import type { Shell, ShellOptions } from "./shell.js";
 import type { WaitForJobOptions, WaitForReadyOptions } from "./wait.js";
@@ -487,6 +489,8 @@ export class Serverctl {
     patch: {
       name?: string;
       admin?: AdminScope;
+      /** `null` lifts the namespace wall; a string moves it. */
+      namespace?: string | null;
       deployments?: string[];
       expires_at?: number | null;
     },
@@ -507,6 +511,22 @@ export class Serverctl {
       name: id,
       signal,
       expect: "nothing",
+    });
+  }
+
+  // -- the event feed --------------------------------------------------------
+
+  /** The namespaces that have feed events, narrowed to this credential. */
+  feeds(signal?: AbortSignal): Promise<FeedIndexEntry[]> {
+    return this.request("GET", "/feeds", { signal });
+  }
+
+  /** A namespace's feed events as structured data, newest first. */
+  feedEvents(namespace: string, signal?: AbortSignal): Promise<FeedEvent[]> {
+    return this.request("GET", `/feeds/${seg(namespace)}?format=json`, {
+      kind: "feed",
+      name: namespace,
+      signal,
     });
   }
 

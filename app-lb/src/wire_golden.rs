@@ -623,6 +623,30 @@ fn token_responses_are_stable() {
     );
 }
 
+/// The event feed. `feed-event` pins the JSON shape `?format=json` returns —
+/// the same entries the RSS carries — and `feed-index` pins `GET /feeds`.
+#[test]
+fn feed_responses_are_stable() {
+    golden(
+        "feed-index",
+        &vec![crate::admin::FeedIndexEntry { namespace: "team-a".into(), events: 12 }],
+    );
+    golden(
+        "feed-event",
+        &crate::feed::FeedEvent {
+            id: 7,
+            ts: 1_722_400_000,
+            last_ts: 1_722_400_120,
+            count: 3,
+            namespace: "team-a".into(),
+            deployment: "web".into(),
+            kind: crate::feed::FeedEventKind::Issue,
+            title: "web: cold start timed out".into(),
+            detail: "a request waited 120s and no VM became available".into(),
+        },
+    );
+}
+
 #[test]
 fn the_small_responses_are_stable() {
     golden(

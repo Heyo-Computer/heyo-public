@@ -62,6 +62,9 @@ enum Command {
     #[command(subcommand)]
     Token(cmd::token::TokenCmd),
 
+    /// Read a namespace's event feed — the RSS of deployments that opted in.
+    Feed(cmd::feed::FeedArgs),
+
     /// Manage stored contexts.
     Config {
         #[command(subcommand)]
@@ -258,6 +261,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Config { cmd } => cmd::auth::config(g, cmd),
         Command::Whoami => cmd::auth::whoami(g),
         Command::Token(cmd) => cmd::token::run(&Ctx::new(g)?, cmd),
+        Command::Feed(args) => cmd::feed::run(&Ctx::new(g)?, args),
         Command::Completion { shell } => {
             let mut command = Cli::command();
             let name = command.get_name().to_string();

@@ -1236,6 +1236,40 @@ impl TokenSummary {
     }
 }
 
+// -- the event feed ---------------------------------------------------------
+
+/// One namespace that has feed events, from `GET /feeds`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct FeedIndexEntry {
+    pub namespace: String,
+    pub events: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One event from a namespace's feed, from `GET /feeds/:ns?format=json`.
+///
+/// The same entries the RSS document carries; `id` is the RSS `<guid>`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct FeedEvent {
+    pub id: u64,
+    /// When the event first happened.
+    pub ts: u64,
+    /// When it last happened — repeats of the same issue fold into one entry.
+    pub last_ts: u64,
+    pub count: u64,
+    pub namespace: String,
+    pub deployment: String,
+    /// `deployed`, `updated`, `removed` or `issue`.
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 /// The reply to a mint. **`token` is the only time the secret is ever
 /// returned** — app-lb stores only its hash, and there is no endpoint that
 /// reads it back. Store it here or mint another one.

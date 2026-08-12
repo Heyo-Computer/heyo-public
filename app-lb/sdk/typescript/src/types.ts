@@ -637,6 +637,32 @@ export interface TokenSummary {
   last_used_at?: number;
 }
 
+// -- the event feed --------------------------------------------------------
+
+/** One namespace that has feed events, from `GET /feeds`. */
+export interface FeedIndexEntry {
+  namespace: string;
+  events: number;
+}
+
+/**
+ * One event from a namespace's feed (`GET /feeds/:ns?format=json`) — the same
+ * entries the RSS document carries; `id` is the RSS `<guid>`.
+ */
+export interface FeedEvent {
+  id: number;
+  /** When the event first happened (unix seconds). */
+  ts: number;
+  /** When it last happened — repeats of the same issue fold into one entry. */
+  last_ts: number;
+  count: number;
+  namespace: string;
+  deployment: string;
+  kind: "deployed" | "updated" | "removed" | "issue";
+  title: string;
+  detail: string;
+}
+
 /**
  * The reply to a mint. **`token` is the only time the secret is returned** —
  * app-lb stores only its hash and no endpoint reads it back.

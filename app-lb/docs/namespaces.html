@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Namespaces — app-lb</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="side">
+  <a class="brand" href="index.html">app-lb</a>
+  <p class="tagline">load balancer &amp; microVM autoscaler</p>
+  <ul>
+    <li><a href="index.html">Overview</a></li>
+    <li class="group">app-lb</li>
+    <li><a href="deployments.html">Deployments &amp; scaling</a></li>
+    <li><a href="security.html">Auth, tokens &amp; the admin API</a></li>
+    <li><a href="namespaces.html" aria-current="page">Namespaces</a></li>
+    <li><a href="feed.html">The event feed</a></li>
+    <li class="group">clients</li>
+    <li><a href="serverctl.html">serverctl</a></li>
+  </ul>
+</nav>
+<main>
+<h1>Namespaces</h1>
+<p class="lede">A namespace groups deployments, and a token minted for a namespace reaches
+only the deployments in it — a key to one room, not a list of ids that goes stale.</p>
+
+<h2>On a deployment</h2>
+<p>One field. Absent means <code>"default"</code>, so a fleet that never says the word
+keeps behaving as one namespace and nothing changes on the wire or on disk:</p>
+<pre><code>{ "id": "web", "namespace": "team-a", "routes": [ … ], … }</code></pre>
+<p>Namespace names share the deployment-id alphabet (letters, digits, <code>-</code>
+<code>_</code> <code>.</code>) because they appear in URLs and filenames unescaped.</p>
+
+<h2>On a token</h2>
+<pre><code>serverctl token mint team-a-operator --admin admin --namespace team-a</code></pre>
+<p>A namespace-confined token behaves differently from a plain deployment-scoped one, and
+the differences are the point:</p>
+<ul>
+  <li><strong>An empty <code>deployments</code> list means the whole namespace</strong> —
+  every deployment there, now and in the future. (Outside a namespace, an empty list means
+  nothing; inside one, listing ids <em>narrows</em> within the namespace.)</li>
+  <li><strong>The wall is absolute.</strong> Whatever the <code>deployments</code> list
+  says — even <code>["*"]</code> — the token never touches a deployment in another
+  namespace, on the data plane or the admin API.</li>
+  <li><strong>It never covers the fleet.</strong> Fleet-wide admin routes — minting tokens,
+  the secret store, the all-jobs listing — are exactly the routes that see past a namespace
+  wall, so a namespace token is refused them. A token cannot widen itself.</li>
+</ul>
+
+<h2>What a namespace admin token can do</h2>
+<p>A token minted with <code>--admin admin --namespace team-a</code> is a self-service
+operator for that namespace:</p>
+<ul>
+  <li><code>GET /deployments</code> — the listing, narrowed to the namespace.</li>
+  <li><code>POST /deployments</code> — register deployments, provided the spec says
+  <code>"namespace": "team-a"</code>. It cannot capture a deployment id that exists in
+  another namespace, and an update cannot move a deployment <em>out</em> of the
+  namespace.</li>
+  <li>Everything per-deployment — describe, scale, evict, <code>exec</code>,
+  <code>shell</code>, build/pull — for deployments in the namespace.</li>
+  <li>The directory, <code>/metrics</code> and <code>/security</code>, narrowed to the
+  namespace's deployments; <code>GET /feeds/team-a</code>, and no other namespace's
+  feed.</li>
+</ul>
+
+<h2>Filtering</h2>
+<pre><code># everyone can filter listings by namespace
+GET /deployments?namespace=team-a
+
+serverctl get deployments        # serverctl passes your token's view through</code></pre>
+
+<div class="note">Data-plane gates compose with namespaces: a deployment's
+<code>auth</code> gate with the <code>app-token</code> provider admits a namespace token
+only if the deployment is inside that token's namespace. The same 401 covers "wrong
+secret", "expired", and "wrong namespace" — probing the gate teaches nothing about which
+it was.</div>
+
+<footer><a href="security.html">← Auth &amp; tokens</a> · next:
+<a href="feed.html">The event feed</a></footer>
+</main>
+</div>
+</body>
+</html>

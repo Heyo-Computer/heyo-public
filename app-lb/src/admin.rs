@@ -1610,6 +1610,15 @@ async fn feeds_index(
     Json(out)
 }
 
+#[derive(Deserialize)]
+struct FeedQuery {
+    /// `json` returns the events as structured data instead of RSS — what
+    /// `serverctl feed` and the dashboard read; a feed reader takes the
+    /// default.
+    #[serde(default)]
+    format: Option<String>,
+}
+
 /// `GET /feeds/:namespace` — the namespace's feed as RSS. `:namespace` may
 /// carry a `.xml` suffix, because half the feed readers ever written assume
 /// one. Access was already decided by the gate (see `decide_access`), which
@@ -1617,14 +1626,19 @@ async fn feeds_index(
 async fn feed_rss(
     State(state): State<AdminState>,
     Path(namespace): Path<String>,
-) -> impl IntoResponse {
+    Query(q): Query<FeedQuery>,
+) -> Response {
     let ns = namespace.strip_suffix(".xml").unwrap_or(&namespace);
     let events = state.feed.recent(ns, crate::proxy::FEED_PAGE);
+    if q.format.as_deref() == Some("json") {
+        return Json(events).into_response();
+    }
     let doc = crate::feed::rss(ns, &format!("/feeds/{ns}"), &events);
     (
         [(header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")],
         doc,
     )
+        .into_response()
 }
 
 /// What a lifecycle feed entry says about the deployment: where it serves, so

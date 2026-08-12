@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>app-lb — documentation</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="side">
+  <a class="brand" href="index.html">app-lb</a>
+  <p class="tagline">load balancer &amp; microVM autoscaler</p>
+  <ul>
+    <li><a href="index.html" aria-current="page">Overview</a></li>
+    <li class="group">app-lb</li>
+    <li><a href="deployments.html">Deployments &amp; scaling</a></li>
+    <li><a href="security.html">Auth, tokens &amp; the admin API</a></li>
+    <li><a href="namespaces.html">Namespaces</a></li>
+    <li><a href="feed.html">The event feed</a></li>
+    <li class="group">clients</li>
+    <li><a href="serverctl.html">serverctl</a></li>
+  </ul>
+</nav>
+<main>
+<h1>app-lb</h1>
+<p class="lede">A Pingora-based load balancer that boots Firecracker microVMs on demand:
+requests route by hostname and path, cold starts hold the request while a VM boots, and
+idle pools scale to zero.</p>
+
+<p>app-lb is one binary with two listeners:</p>
+<ul>
+  <li>The <strong>proxy</strong> (<code>0.0.0.0:6188</code>, TLS on <code>:6189</code>) — the data
+  plane. Every request is routed to a <em>deployment</em>: a pool of managed microVMs, a fixed
+  set of upstream addresses, or a directory of files served straight off disk.</li>
+  <li>The <strong>admin API</strong> (<code>127.0.0.1:9090</code>) — the control plane: register
+  deployments, watch the dashboard, mint tokens, run <code>exec</code> and <code>shell</code>
+  inside VMs. Loopback and plaintext by design; reach a remote one over an SSH tunnel or
+  through the proxy itself.</li>
+</ul>
+
+<div class="cards">
+  <a href="deployments.html"><strong>Deployments</strong><span>The spec, the three backend
+  kinds, routing rules, and how autoscaling and cold starts work.</span></a>
+  <a href="security.html"><strong>Auth &amp; tokens</strong><span>Sign-in gates in front of
+  deployments, app-tokens for programs, and the admin API's two tiers.</span></a>
+  <a href="namespaces.html"><strong>Namespaces</strong><span>Segregate deployments and walk
+  tokens into exactly one room.</span></a>
+  <a href="feed.html"><strong>Event feed</strong><span>Per-namespace RSS of deploys and
+  operational trouble — strictly opt-in.</span></a>
+  <a href="serverctl.html"><strong>serverctl</strong><span>The CLI: contexts, specs, scaling,
+  exec/shell, tokens and feeds.</span></a>
+</div>
+
+<h2>Quick start</h2>
+<pre><code># start app-lb (it finds the heyvm daemon on the host)
+app-lb
+
+# register a deployment from a spec file
+serverctl apply -f web.json
+
+# watch it
+serverctl get deployments
+serverctl describe web</code></pre>
+
+<p>A minimal managed deployment:</p>
+<pre><code>{
+  "id": "web",
+  "routes": [ { "host": "web.example.com" } ],
+  "vm": { "driver": "firecracker", "image": "web-rootfs", "port": 8080 },
+  "scaling": { "min_replicas": 0, "max_replicas": 3 }
+}</code></pre>
+
+<p>With <code>min_replicas: 0</code> the pool sits empty until a request arrives; the proxy
+holds the request (up to <code>cold_start_timeout_secs</code>, default 120) while the
+autoscaler boots a VM, then completes it. After
+<code>scale_to_zero_after_secs</code> (default 300) of idleness the pool drains back to
+zero.</p>
+
+<div class="note">
+<strong>One thing to internalise early:</strong> if a deployment declares an
+<code>auth</code> gate, the gate runs <em>before</em> the cold-start wait. An
+unauthenticated request never boots a VM — a browser that completes sign-in wakes the
+deployment, an API client with no accepted credential gets an immediate 401 and wakes
+nothing. See <a href="security.html">Auth &amp; tokens</a>.
+</div>
+
+<h2>Configuration</h2>
+<p>Everything is environment variables; nothing is required to start.</p>
+<table>
+  <tr><th>Variable</th><th>Default</th><th>What it does</th></tr>
+  <tr><td><code>APP_LB_PROXY_ADDR</code></td><td><code>0.0.0.0:6188</code></td><td>Data-plane listener.</td></tr>
+  <tr><td><code>APP_LB_PROXY_TLS_ADDR</code></td><td><code>0.0.0.0:6189</code></td><td>TLS listener (with certs or ACME).</td></tr>
+  <tr><td><code>APP_LB_ADMIN_ADDR</code></td><td><code>127.0.0.1:9090</code></td><td>Admin API and dashboard.</td></tr>
+  <tr><td><code>APP_LB_STATE_PATH</code></td><td><code>app-lb-state.json</code></td><td>Where deployment specs persist (a <code>.d/</code> directory beside it, one JSON file per deployment).</td></tr>
+  <tr><td><code>APP_LB_TOKENS_PATH</code></td><td><code>app-lb-tokens.json</code></td><td>The app-token store, written 0600. Only secret hashes are kept.</td></tr>
+  <tr><td><code>APP_LB_DASHBOARD_PASSWORD</code></td><td>unset</td><td>Setting it turns the admin gate on (user defaults to <code>admin</code>).</td></tr>
+  <tr><td><code>APP_LB_ADMIN_AUTH</code></td><td><code>0</code></td><td><code>1</code> extends the gate to the CRUD routes, not just the dashboard.</td></tr>
+  <tr><td><code>APP_LB_ACME_EMAIL</code></td><td>unset</td><td>Setting it turns on automatic certificates for routed hostnames.</td></tr>
+  <tr><td><code>APP_LB_OBS_URL</code></td><td>unset</td><td>Ship logs, access records and stats to an app-obs instance.</td></tr>
+  <tr><td><code>APP_LB_SIEM</code></td><td><code>1</code></td><td>The built-in security analyzer; <code>0</code> disables detection (block rules keep working).</td></tr>
+</table>
+
+<footer>app-lb &amp; serverctl · static documentation, served happily by a
+<code>site</code> deployment.</footer>
+</main>
+</div>
+</body>
+</html>

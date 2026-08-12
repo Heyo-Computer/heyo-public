@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deployments &amp; scaling — app-lb</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="side">
+  <a class="brand" href="index.html">app-lb</a>
+  <p class="tagline">load balancer &amp; microVM autoscaler</p>
+  <ul>
+    <li><a href="index.html">Overview</a></li>
+    <li class="group">app-lb</li>
+    <li><a href="deployments.html" aria-current="page">Deployments &amp; scaling</a></li>
+    <li><a href="security.html">Auth, tokens &amp; the admin API</a></li>
+    <li><a href="namespaces.html">Namespaces</a></li>
+    <li><a href="feed.html">The event feed</a></li>
+    <li class="group">clients</li>
+    <li><a href="serverctl.html">serverctl</a></li>
+  </ul>
+</nav>
+<main>
+<h1>Deployments &amp; scaling</h1>
+<p class="lede">A deployment is one JSON spec: where requests for it come from
+(<code>routes</code>), what answers them (exactly one backend kind), and how the pool
+behaves (<code>scaling</code>, <code>health</code>).</p>
+
+<h2>The three backend kinds</h2>
+<p>A valid spec sets exactly one of these; app-lb refuses a spec with two.</p>
+<table>
+  <tr><th>Kind</th><th>Spec field</th><th>What answers the request</th><th>Can scale?</th></tr>
+  <tr><td>managed</td><td><code>vm</code></td><td>An autoscaled pool of Firecracker/KVM
+  microVMs, booted and health-checked by app-lb.</td><td>yes — this is the whole point</td></tr>
+  <tr><td>static</td><td><code>upstreams</code></td><td>A fixed list of
+  <code>host:port</code> addresses, least-in-flight with failover and periodic
+  health re-probing.</td><td>no — the addresses are yours</td></tr>
+  <tr><td>site</td><td><code>site</code></td><td>Files in a directory on the app-lb host,
+  served by app-lb itself: index, 404 page, SPA fallback, ETags and range requests.</td>
+  <td>nothing to scale</td></tr>
+</table>
+
+<h2>Routing</h2>
+<p>Each route rule may set <code>host</code> (exact, case-insensitive),
+<code>host_suffix</code> (label-boundary suffix, so <code>sb.example.com</code> matches
+<code>a.sb.example.com</code> but not <code>notsb.example.com</code>), and
+<code>path_prefix</code>. The most specific matching rule wins; an exact host always
+outranks a suffix. A managed deployment may declare <em>no</em> routes at all — an agent
+sandbox reached only through <code>exec</code>/<code>shell</code>.</p>
+
+<pre><code>"routes": [
+  { "host": "web.example.com" },
+  { "host_suffix": "preview.example.com", "path_prefix": "/api" }
+]</code></pre>
+
+<h2>The scaling policy</h2>
+<table>
+  <tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+  <tr><td><code>min_replicas</code></td><td>0</td><td>Never fewer ready VMs than this. 0 enables scale-to-zero.</td></tr>
+  <tr><td><code>max_replicas</code></td><td>5</td><td>Hard ceiling, boots included.</td></tr>
+  <tr><td><code>warm_pool</code></td><td>0</td><td>VMs kept ready regardless of traffic.</td></tr>
+  <tr><td><code>target_concurrency</code></td><td>10</td><td>In-flight requests per VM the autoscaler aims for.</td></tr>
+  <tr><td><code>scale_to_zero_after_secs</code></td><td>300</td><td>Idle time before the pool drains to zero. Only applies when <code>min_replicas</code> and <code>warm_pool</code> are both 0.</td></tr>
+  <tr><td><code>cold_start_timeout_secs</code></td><td>120</td><td>How long a request is held waiting for a VM before a 503.</td></tr>
+  <tr><td><code>boot_timeout_secs</code></td><td>300</td><td>How long a booting VM gets before it is killed and retried.</td></tr>
+  <tr><td><code>drain_timeout_secs</code></td><td>30</td><td>How long a draining VM may finish its in-flight requests.</td></tr>
+  <tr><td><code>idle_action</code></td><td><code>destroy</code></td><td><code>retain</code> stops idle VMs instead of destroying them; the next scale-up <em>resumes</em> the stopped VM, keeping its <code>/workspace</code> disk.</td></tr>
+</table>
+
+<h3>What a cold start looks like</h3>
+<ol>
+  <li>A request routes to a deployment whose pool has no available backend.</li>
+  <li>The proxy registers the request as demand and nudges the autoscaler.</li>
+  <li>The autoscaler resumes a suspended VM if one exists (its disk <em>is</em> the
+  deployment's state), otherwise creates a fresh one.</li>
+  <li>The VM passes its health check, is promoted, and the held request completes.</li>
+</ol>
+<p>The dashboard's <code>cold_start_waits</code> / <code>hits</code> /
+<code>timeouts</code> counters trace this pipeline — if <code>waits</code> is not moving,
+requests are being answered before the wait (a 404 route miss, a 401 from the auth gate, a
+403 from a block rule).</p>
+
+<h2>Health checks</h2>
+<pre><code>"health": { "path": "/healthz", "timeout_secs": 2 }</code></pre>
+<p>Managed VMs are probed before promotion and while serving; static upstreams are
+re-probed every tick so a recovered upstream rejoins on its own. No <code>path</code>
+means a TCP connect check.</p>
+
+<h2>Getting an image into a managed deployment</h2>
+<p>Two mutually exclusive spec blocks, each with its own trigger; neither disturbs the
+pool until a job finishes and rewrites <code>vm.image</code>:</p>
+<ul>
+  <li><code>build</code> — a git repository and Dockerfile, built on the app-lb host.
+  Run with <code>serverctl build &lt;id&gt;</code>.</li>
+  <li><code>artifact</code> — a rootfs somebody already built, in an artifact store.
+  Run with <code>serverctl pull &lt;id&gt;</code>.</li>
+</ul>
+<p>Static deployments use <code>update</code> instead: commands run in a working
+directory on the host (<code>git pull &amp;&amp; cargo build</code>…), then app-lb verifies
+the upstreams came back. Sites accept <code>update</code> <em>or</em> <code>artifact</code>
+— the two ways their files get replaced.</p>
+
+<h2>A fuller example</h2>
+<pre><code>{
+  "id": "agent",
+  "namespace": "team-a",
+  "routes": [ { "host": "agent.example.com" } ],
+  "vm": {
+    "driver": "firecracker",
+    "image": "agent-base",
+    "port": 8080,
+    "size_class": "medium",
+    "disk_size_gb": 20,
+    "env_vars": { "RUST_LOG": "info" },
+    "ttl_seconds": 86400
+  },
+  "scaling": {
+    "min_replicas": 0,
+    "max_replicas": 2,
+    "target_concurrency": 8,
+    "idle_action": "retain"
+  },
+  "health": { "path": "/healthz", "timeout_secs": 2 },
+  "build": { "repo": "https://github.com/example/agent", "ref": "main" },
+  "feed": { "announce": true, "issues": true }
+}</code></pre>
+
+<div class="note">Registration order is deliberate: the routing table is swapped before the
+old pool is torn down, and specs persist one file per deployment under the state
+directory, so a restart reloads the fleet exactly as registered.</div>
+
+<footer><a href="index.html">← Overview</a> · next: <a href="security.html">Auth, tokens
+&amp; the admin API</a></footer>
+</main>
+</div>
+</body>
+</html>

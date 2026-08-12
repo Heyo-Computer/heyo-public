@@ -471,6 +471,36 @@ impl Client {
             .await
     }
 
+    // -- the event feed ------------------------------------------------------
+
+    /// The namespaces that have feed events, narrowed to what this credential
+    /// may read.
+    pub async fn feeds(&self) -> Result<Vec<FeedIndexEntry>> {
+        self.read(Request::new(Method::Get, "/feeds"), "feed", "")
+            .await
+    }
+
+    /// A namespace's feed events as structured data, newest first.
+    pub async fn feed_events(&self, namespace: &str) -> Result<Vec<FeedEvent>> {
+        self.read(
+            Request::new(Method::Get, format!("/feeds/{}?format=json", seg(namespace))),
+            "feed",
+            namespace,
+        )
+        .await
+    }
+
+    /// A namespace's feed as the RSS document a reader would fetch, verbatim.
+    pub async fn feed_rss(&self, namespace: &str) -> Result<String> {
+        self.send(
+            Request::new(Method::Get, format!("/feeds/{}", seg(namespace))),
+            "feed",
+            namespace,
+        )
+        .await
+        .map(|r| r.body)
+    }
+
     pub async fn token(&self, id: &str) -> Result<TokenSummary> {
         self.read(
             Request::new(Method::Get, format!("/tokens/{}", seg(id))),
@@ -667,6 +697,18 @@ impl Raw<'_> {
         jobs        => "job",        "/jobs";
         certs       => "certificate", "/certs";
         workflows   => "workflow",   "/workflows";
+        feeds       => "feed",       "/feeds";
+    }
+
+    /// A namespace's feed events as app-lb sent them.
+    pub async fn feed_events(&self, namespace: &str) -> Result<Value> {
+        self.0
+            .read(
+                Request::new(Method::Get, format!("/feeds/{}?format=json", seg(namespace))),
+                "feed",
+                namespace,
+            )
+            .await
     }
 
     raw_item! {
@@ -749,6 +791,7 @@ impl Raw<'_> {
         let body = json!({
             "name": req.name,
             "admin": req.admin,
+            "namespace": req.namespace,
             "deployments": req.deployments,
             "expires_in_secs": req.expires_in_secs,
         });
