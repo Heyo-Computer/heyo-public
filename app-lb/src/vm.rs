@@ -158,10 +158,79 @@ pub struct SandboxUsage {
     pub memory_bytes: u64,
 }
 
+/// How long to wait on the daemon for a guest's captured output.
+///
+/// Short, and much shorter than the SDK's 30s: this runs inside a reconcile
+/// tick, and a diagnostic is not worth stalling the autoscaler for. Missing the
+/// log costs one field on one error line; blocking the tick costs every
+/// deployment on the host.
+const GUEST_LOG_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Cap on the rendered tail. A boot-timeout line becomes one record at the log
+/// shipper, and a guest that spent five minutes printing a stack trace a second
+/// must not turn one diagnostic into a megabyte.
+const GUEST_LOG_MAX_CHARS: usize = 2000;
+
+/// `GET /sandboxes/:id/logs`, as much of it as this needs.
+///
+/// Deliberately loose: `source` is read as a string rather than the daemon's
+/// `LogSource` enum, and every field is optional. This is a diagnostic on a
+/// failure path, so a daemon that adds a variant or renames a field must
+/// degrade to a thinner message, never to no message.
+#[derive(Deserialize)]
+struct GuestLogs {
+    #[serde(default)]
+    logs: Vec<GuestLogLine>,
+}
+
+#[derive(Deserialize)]
+struct GuestLogLine {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    message: String,
+}
+
+/// The last `lines` of guest output on one line, bounded.
+///
+/// One line because this becomes a tracing *field*, and a field that spans
+/// twenty lines breaks every consumer that reads a record per line. The stream
+/// is kept because which one a message came out of is most of the diagnosis: a
+/// server announcing its port on stdout and a stack trace on stderr mean
+/// opposite things about the same boot.
+fn render_guest_log(logs: &[GuestLogLine], lines: usize) -> String {
+    let start = logs.len().saturating_sub(lines);
+    let mut out = String::new();
+    for entry in &logs[start..] {
+        let text = entry.message.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(" | ");
+        }
+        if let Some(source) = entry.source.as_deref() {
+            out.push_str(source);
+            out.push_str(": ");
+        }
+        out.push_str(text);
+        // Checked as it grows rather than truncated at the end, so the cap
+        // cannot be overshot by one enormous final line.
+        if out.chars().count() >= GUEST_LOG_MAX_CHARS {
+            let kept: String = out.chars().take(GUEST_LOG_MAX_CHARS).collect();
+            return format!("{kept}… (truncated)");
+        }
+    }
+    out
+}
+
 /// Talks to the heyvm daemon.
 #[derive(Debug, Clone)]
 pub struct VmManager {
     opts: HeyoClientOptions,
+    /// For the daemon routes the SDK does not wrap. Cloning a `reqwest::Client`
+    /// clones a handle, so this rides along with `VmManager` for free.
+    http: reqwest::Client,
 }
 
 impl VmManager {
@@ -177,7 +246,56 @@ impl VmManager {
                 api_key: None,
                 timeout: Some(Duration::from_secs(30)),
             },
+            http: reqwest::Client::builder()
+                .timeout(GUEST_LOG_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
         }
+    }
+
+    /// The tail of what a guest itself printed, as the daemon captured it.
+    ///
+    /// heyvmd starts vsock forwarders inside the guest before it runs the start
+    /// command, piping the workload's `/var/log/heyvm-start.log` and
+    /// `heyvm-start.err.log` into a per-sandbox ring buffer it serves at
+    /// `GET /sandboxes/:id/logs`. `heyo_sdk` wraps exec, shell and the lifecycle
+    /// but not that route, so this is a direct call at the daemon.
+    ///
+    /// **Best-effort by construction**: an unreachable daemon, a guest with no
+    /// `socat` or `/dev/vsock` to run the forwarders, a response shape we do not
+    /// recognise — all return `None`. Every caller is already reporting a
+    /// failure, and a diagnostic that can turn into a second failure is worse
+    /// than no diagnostic at all.
+    ///
+    /// Call it while the sandbox still exists: the ring buffer belongs to the
+    /// sandbox and goes when it does.
+    pub async fn guest_log_tail(&self, sandbox_id: &str, lines: usize) -> Option<String> {
+        // The id reaches the daemon inside a URL path. It comes from the daemon
+        // in the first place, but it is validated rather than escaped here for
+        // the same reason the disk routes validate it: refusing an id that
+        // cannot be one is a smaller surface than getting the escaping right.
+        if !crate::disks::valid_sandbox_id(sandbox_id) {
+            return None;
+        }
+        let base = self.opts.base_url.as_deref()?.trim_end_matches('/');
+        let url = format!("{base}/sandboxes/{sandbox_id}/logs?limit={lines}");
+
+        let body: GuestLogs = match self.http.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r.json().await.ok()?,
+            // Both are ordinary here — an older daemon has no such route, and a
+            // sandbox killed between the decision and this call is gone. Debug,
+            // not warn: the caller's own error line is the event.
+            Ok(r) => {
+                tracing::debug!(sandbox = %sandbox_id, status = %r.status(), "no guest logs");
+                return None;
+            }
+            Err(e) => {
+                tracing::debug!(sandbox = %sandbox_id, error = %e, "could not fetch guest logs");
+                return None;
+            }
+        };
+
+        Some(render_guest_log(&body.logs, lines)).filter(|s| !s.is_empty())
     }
 
     /// Every sandbox the daemon knows about.
@@ -526,6 +644,90 @@ pub fn is_terminal(status: &SandboxStatus) -> bool {
 /// Index a sandbox list by id for O(1) lookup during reconcile.
 pub fn index_by_id(infos: Vec<SandboxInfo>) -> HashMap<String, SandboxInfo> {
     infos.into_iter().map(|i| (i.id.clone(), i)).collect()
+}
+
+#[cfg(test)]
+mod guest_log_tests {
+    use super::*;
+
+    fn line(source: Option<&str>, message: &str) -> GuestLogLine {
+        GuestLogLine {
+            source: source.map(str::to_string),
+            message: message.into(),
+        }
+    }
+
+    /// The tail, and the stream each line came from — a server announcing its
+    /// port and a stack trace mean opposite things about the same boot.
+    #[test]
+    fn keeps_the_last_lines_and_says_which_stream_they_came_from() {
+        let logs = vec![
+            line(Some("stdout"), "starting"),
+            line(Some("stdout"), "migrations ok"),
+            line(Some("stderr"), "connection refused"),
+        ];
+        assert_eq!(
+            render_guest_log(&logs, 2),
+            "stdout: migrations ok | stderr: connection refused",
+        );
+    }
+
+    /// A daemon that stops sending `source` still has to produce a message.
+    #[test]
+    fn a_line_with_no_stream_still_renders() {
+        assert_eq!(render_guest_log(&[line(None, "boom")], 5), "boom");
+    }
+
+    /// Fewer lines than asked for is the normal case for a guest that died early.
+    #[test]
+    fn asking_for_more_than_there_is_returns_what_there_is() {
+        assert_eq!(
+            render_guest_log(&[line(Some("stderr"), "boom")], 20),
+            "stderr: boom"
+        );
+    }
+
+    /// Blank lines are padding in a terminal and noise in a log field.
+    #[test]
+    fn empty_lines_are_dropped_rather_than_joined_as_gaps() {
+        let logs = vec![
+            line(Some("stdout"), "a"),
+            line(Some("stdout"), "   "),
+            line(Some("stdout"), "b"),
+        ];
+        assert_eq!(render_guest_log(&logs, 10), "stdout: a | stdout: b");
+    }
+
+    /// Nothing captured is not an empty string dressed up as output —
+    /// `guest_log_tail` turns this into `None` and the caller says why.
+    #[test]
+    fn nothing_captured_renders_to_nothing() {
+        assert!(render_guest_log(&[], 20).is_empty());
+        assert!(render_guest_log(&[line(Some("stdout"), "")], 20).is_empty());
+    }
+
+    /// One enormous final line must not overshoot the cap — the check runs as
+    /// the string grows, not once at the end.
+    #[test]
+    fn a_single_huge_line_is_still_bounded() {
+        let huge = "x".repeat(GUEST_LOG_MAX_CHARS * 3);
+        let out = render_guest_log(&[line(Some("stderr"), &huge)], 20);
+        assert!(out.ends_with("… (truncated)"), "{}", &out[out.len() - 40..]);
+        assert!(
+            out.chars().count() <= GUEST_LOG_MAX_CHARS + "… (truncated)".chars().count(),
+            "{} chars",
+            out.chars().count(),
+        );
+    }
+
+    /// Truncation counts characters, not bytes: slicing a multi-byte guest
+    /// message on a byte boundary would panic on the failure path.
+    #[test]
+    fn truncation_does_not_split_a_multibyte_character() {
+        let huge = "é".repeat(GUEST_LOG_MAX_CHARS * 2);
+        let out = render_guest_log(&[line(Some("stderr"), &huge)], 20);
+        assert!(out.ends_with("… (truncated)"));
+    }
 }
 
 #[cfg(test)]

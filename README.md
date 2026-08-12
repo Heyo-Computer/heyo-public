@@ -14,6 +14,7 @@ supporting CLIs, plugins, examples, docs, and reusable agent skills.
 - `heyosecret-client/` — Rust client used by the orchestrator to resolve service secret references.
 - `app-lb/` — Pingora-based application load balancer and autoscaler for heyvm Firecracker/KVM microVMs.
 - `app-obs/` — logs, metrics, retention, query API, and dashboard for deployments managed by app-lb.
+- `artifacts/` — content-addressed artifact store for ext4, wired into heyvm. Ships as a library, the `art` CLI, and a daemon.
 - `plugins/` — printer plugins for agent integrations, codegraph, heyvm, and related tooling.
 - `skills/` — reusable public agent skills. The top-level catalog is intentionally small: `heyvm` and `git-submit`.
 - `examples/` — example projects and specs.
@@ -34,6 +35,7 @@ cargo test --locked --manifest-path orchestrator/Cargo.toml
 cargo test --locked --manifest-path app-lb/Cargo.toml -p app-lb
 cargo test --locked --manifest-path app-lb/serverctl/Cargo.toml
 cargo test --locked --manifest-path app-obs/Cargo.toml
+cargo test --locked --manifest-path artifacts/Cargo.toml
 ```
 
 See [`orchestrator/README.md`](orchestrator/README.md) for configuration, local
