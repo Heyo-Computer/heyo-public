@@ -26,7 +26,7 @@ const KNOWN = {
   common: {
     DeploymentStatus: ["spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
-    DeploymentSpec: ["id", "routes", "vm", "scaling", "health", "upstreams", "build", "artifact", "site", "update", "auth"],
+    DeploymentSpec: ["id", "namespace", "routes", "vm", "scaling", "health", "upstreams", "build", "artifact", "site", "update", "auth", "feed"],
     RouteRule: ["host", "host_suffix", "path_prefix"],
     VmSpec: ["driver", "image", "port", "start_command", "size_class", "disk_size_gb", "working_directory", "env_vars", "setup_hooks", "open_ports", "ttl_seconds"],
     ScalingPolicy: ["min_replicas", "max_replicas", "warm_pool", "target_concurrency", "scale_to_zero_after_secs", "cold_start_timeout_secs", "drain_timeout_secs", "boot_timeout_secs", "idle_action"],
@@ -71,8 +71,8 @@ const KNOWN = {
     CertStatus: ["host", "not_after", "issuer", "needs_renewal"],
     ExecOutput: ["sandbox_id", "exit_code", "stdout", "stderr", "output"],
     EvictOutcome: ["sandbox_id", "outcome"],
-    TokenSummary: ["id", "name", "admin", "deployments", "created_at", "expires_at", "last_used_at"],
-    MintedToken: ["id", "name", "admin", "deployments", "created_at", "expires_at", "last_used_at", "token"],
+    TokenSummary: ["id", "name", "admin", "namespace", "deployments", "created_at", "expires_at", "last_used_at"],
+    MintedToken: ["id", "name", "admin", "namespace", "deployments", "created_at", "expires_at", "last_used_at", "token"],
     ApiError: ["error"],
   },
 };
@@ -102,6 +102,7 @@ const FIXTURES = {
   "api-error": "ApiError",
   "token-summary": "TokenSummary",
   "token-summary-scoped": "TokenSummary",
+  "token-summary-namespaced": "TokenSummary",
   "minted-token": "MintedToken",
 };
 

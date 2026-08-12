@@ -147,6 +147,12 @@ export type AuthProvider = "google" | "app-token";
 
 export interface DeploymentSpec {
   id: string;
+  /**
+   * The namespace this deployment belongs to. Absent means `"default"`.
+   * Namespaces segregate use: a namespace-confined token reaches only the
+   * deployments in it, and the event feed is kept per namespace.
+   */
+  namespace?: string;
   routes: RouteRule[];
   vm?: VmSpec;
   scaling?: ScalingPolicy;
@@ -157,8 +163,26 @@ export interface DeploymentSpec {
   site?: SiteSpec;
   update?: UpdateSpec;
   auth?: AuthGate;
+  feed?: FeedSpec;
   /** Anything app-lb sent that this build has no name for. */
   [extra: string]: unknown;
+}
+
+/**
+ * A deployment's opt-in hooks into its namespace's event feed. Everything
+ * defaults to off — a deployment publishes nothing its spec did not ask for.
+ */
+export interface FeedSpec {
+  /** Publish lifecycle events (registered, updated, removed). */
+  announce?: boolean;
+  /** Publish operational issues (boot failures, cold-start timeouts, …). */
+  issues?: boolean;
+  /**
+   * Serve the namespace's feed as RSS at this path on this deployment's own
+   * routes — the only way a feed becomes reachable outside the admin listener.
+   * Runs behind the deployment's `auth` gate, if it has one.
+   */
+  expose?: string;
 }
 
 export interface VmStatus {
@@ -596,6 +620,12 @@ export interface TokenSummary {
   id: string;
   name: string;
   admin: AdminScope;
+  /**
+   * The namespace this token is confined to, if any. Inside it, an empty
+   * `deployments` list means every deployment there; outside it the token
+   * reaches nothing.
+   */
+  namespace?: string;
   /** Deployment ids, or `["*"]` for all of them. */
   deployments: string[];
   created_at: number;

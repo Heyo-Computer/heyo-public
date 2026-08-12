@@ -13,6 +13,7 @@ mod config;
 mod deployment;
 mod disks;
 mod dns;
+mod feed;
 mod guard;
 mod health;
 mod jobs;
@@ -491,11 +492,16 @@ fn main() {
     let mut server = Server::new(None).expect("failed to create server");
     server.bootstrap();
 
+    // One event feed, shared by the admin API (lifecycle events), the
+    // autoscaler (issues) and the proxy (cold-start timeouts, and serving any
+    // feed a deployment exposes). In-memory; a restart starts it empty.
+    let event_feed = std::sync::Arc::new(feed::Feed::new());
+
     // `background_service` hands back an Arc to the same task the service runs,
     // which is how the admin API reaches the autoscaler to tear deployments down.
     let autoscaler_svc = background_service(
         "autoscaler",
-        Autoscaler::new(registry.clone(), vms.clone(), metrics.clone()),
+        Autoscaler::new(registry.clone(), vms.clone(), metrics.clone(), event_feed.clone()),
     );
     let autoscaler = autoscaler_svc.task();
 
@@ -644,6 +650,7 @@ fn main() {
             guard.clone(),
             disks.clone(),
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
+            event_feed.clone(),
         ),
     );
 
@@ -657,6 +664,7 @@ fn main() {
             obs.as_ref().and_then(|o| o.access.clone()),
             siem.as_ref().map(|s| s.sink.clone()),
             guard.clone(),
+            event_feed,
         ),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);

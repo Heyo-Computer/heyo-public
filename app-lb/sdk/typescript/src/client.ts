@@ -79,6 +79,11 @@ export interface MetricsQuery {
 export interface NewToken {
   name: string;
   admin?: AdminScope;
+  /**
+   * Confine the token to one namespace. With no `deployments` it reaches
+   * every deployment in the namespace — and nothing outside it, ever.
+   */
+  namespace?: string;
   /** Deployment ids, or `["*"]`. Defaults to none, which can reach nothing. */
   deployments?: string[];
   expiresInSecs?: number;
@@ -455,6 +460,7 @@ export class Serverctl {
       admin: req.admin ?? "none",
       deployments: req.deployments ?? [],
     };
+    if (req.namespace !== undefined) body.namespace = req.namespace;
     if (req.expiresInSecs !== undefined) body.expires_in_secs = req.expiresInSecs;
     return this.request("POST", "/tokens", {
       body,

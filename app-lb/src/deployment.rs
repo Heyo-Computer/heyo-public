@@ -442,6 +442,8 @@ mod tests {
 
     fn deployment(scaling: ScalingPolicy) -> Deployment {
         Deployment::new(DeploymentSpec {
+            namespace: "default".into(),
+            feed: None,
             id: "demo".into(),
             routes: vec![RouteRule {
                 host: Some("demo.local".into()),
@@ -475,6 +477,8 @@ mod tests {
     /// A static (proxy_pass) deployment with the given upstreams.
     fn static_deployment(upstreams: &[&str]) -> Deployment {
         Deployment::new(DeploymentSpec {
+            namespace: "default".into(),
+            feed: None,
             id: "proxy".into(),
             routes: vec![RouteRule {
                 host: None,

@@ -70,6 +70,8 @@ fn golden(name: &str, value: &impl Serialize) {
 /// deployment that cannot exist.
 fn vm_spec() -> DeploymentSpec {
     DeploymentSpec {
+        namespace: "default".into(),
+        feed: None,
         id: "sandbox".into(),
         routes: vec![
             crate::config::RouteRule {
@@ -157,6 +159,8 @@ fn vm_spec() -> DeploymentSpec {
 
 fn site_spec() -> DeploymentSpec {
     DeploymentSpec {
+        namespace: "default".into(),
+        feed: None,
         id: "docs".into(),
         routes: vec![crate::config::RouteRule {
             host: Some("docs.example.com".into()),
@@ -203,6 +207,8 @@ fn site_spec() -> DeploymentSpec {
 
 fn static_spec() -> DeploymentSpec {
     DeploymentSpec {
+        namespace: "default".into(),
+        feed: None,
         id: "legacy".into(),
         routes: vec![crate::config::RouteRule {
             host: None,
@@ -378,6 +384,7 @@ fn metrics_response_is_stable() {
             }),
             deployments: vec![DeploymentView {
                 id: spec.id.clone(),
+                namespace: "default".into(),
                 kind: "vm",
                 upstreams: vec![],
                 hosts: vec!["sandbox.example.com".into()],
@@ -434,6 +441,7 @@ fn a_site_view_carries_its_root_and_spa_flag() {
         "deployment-view-site",
         &DeploymentView {
             id: "docs".into(),
+            namespace: "default".into(),
             kind: "site",
             upstreams: vec![],
             hosts: vec!["docs.example.com".into()],
@@ -566,6 +574,7 @@ fn token_responses_are_stable() {
         id: "7f3a9c2b1e4d".into(),
         name: "ci".into(),
         admin: AdminScope::Admin,
+        namespace: None,
         deployments: vec!["*".into()],
         created_at: 1_722_400_000,
         expires_at: None,
@@ -580,9 +589,27 @@ fn token_responses_are_stable() {
             id: "a1b2c3d4e5f6".into(),
             name: "sandbox sb-7f3a9c".into(),
             admin: AdminScope::None,
+            namespace: None,
             deployments: vec!["sb-7f3a9c".into()],
             created_at: 1_722_400_000,
             expires_at: Some(1_722_486_400),
+            last_used_at: None,
+        },
+    );
+
+    // The namespaced shape: confined to one namespace, reaching all of it.
+    // Pins the `namespace` key's spelling and its absence elsewhere — a client
+    // that misreads this walls a token into the wrong rooms.
+    golden(
+        "token-summary-namespaced",
+        &TokenSummary {
+            id: "b2c3d4e5f6a1".into(),
+            name: "team-a operator".into(),
+            admin: AdminScope::Admin,
+            namespace: Some("team-a".into()),
+            deployments: vec![],
+            created_at: 1_722_400_000,
+            expires_at: None,
             last_used_at: None,
         },
     );

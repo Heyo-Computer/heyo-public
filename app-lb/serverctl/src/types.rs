@@ -1208,6 +1208,10 @@ pub struct TokenSummary {
     pub id: String,
     pub name: String,
     pub admin: AdminScope,
+    /// The namespace this token is confined to, if any. Inside it, an empty
+    /// `deployments` list means every deployment there; outside it the token
+    /// reaches nothing.
+    pub namespace: Option<String>,
     /// Deployment ids, or `["*"]` for all of them.
     pub deployments: Vec<String>,
     pub created_at: u64,
@@ -1221,9 +1225,10 @@ pub struct TokenSummary {
 }
 
 impl TokenSummary {
-    /// Whether this token's scope covers the whole fleet.
+    /// Whether this token's scope covers the whole fleet. A namespace token
+    /// never does — `["*"]` inside a namespace means everything *there*.
     pub fn covers_fleet(&self) -> bool {
-        self.deployments.iter().any(|d| d == "*")
+        self.namespace.is_none() && self.deployments.iter().any(|d| d == "*")
     }
 
     pub fn allows(&self, deployment: &str) -> bool {

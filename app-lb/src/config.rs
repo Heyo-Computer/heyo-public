@@ -1621,6 +1621,12 @@ impl AuthGate {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeploymentSpec {
     pub id: String,
+    /// The namespace this deployment belongs to. Namespaces segregate use: a
+    /// token minted for a namespace reaches only the deployments in it, and the
+    /// event feed is kept per namespace. Absent means `"default"`, so a fleet
+    /// that never says the word keeps behaving as one namespace.
+    #[serde(default = "default_namespace", skip_serializing_if = "is_default_namespace")]
+    pub namespace: String,
     pub routes: Vec<RouteRule>,
     /// The VM template for a *managed* deployment: app-lb boots and autoscales a
     /// pool of microVMs. Mutually exclusive with `upstreams`; exactly one of the
@@ -1671,6 +1677,77 @@ pub struct DeploymentSpec {
     /// is chosen — so the application behind it needs to know nothing about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthGate>,
+    /// Opt-in hooks into the namespace's event feed. Absent means this
+    /// deployment publishes nothing and exposes nothing — the feed only ever
+    /// carries what a spec explicitly asked it to. See [`FeedSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<FeedSpec>,
+}
+
+/// The namespace a spec gets when it names none. One word, so an installation
+/// that never uses namespaces is a single namespace rather than a special case.
+pub const DEFAULT_NAMESPACE: &str = "default";
+
+fn default_namespace() -> String {
+    DEFAULT_NAMESPACE.to_string()
+}
+
+fn is_default_namespace(ns: &String) -> bool {
+    ns == DEFAULT_NAMESPACE
+}
+
+/// A namespace name a spec or a token may carry: the same alphabet as a
+/// deployment id, so it can appear in a URL path and a filename unescaped.
+pub fn is_valid_namespace(ns: &str) -> bool {
+    !ns.is_empty()
+        && ns
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// A deployment's opt-in hooks into its namespace's event feed.
+///
+/// Everything here defaults to *off*: the feed is a megaphone, and a
+/// deployment should end up on it only because its spec said so, never because
+/// a default did. The three switches are independent — a deployment can
+/// announce itself without reporting issues, report issues without announcing,
+/// or neither and only `expose` the feed for the rest of its namespace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FeedSpec {
+    /// Publish this deployment's lifecycle — registered, updated, removed — to
+    /// the namespace feed.
+    #[serde(default)]
+    pub announce: bool,
+    /// Publish this deployment's operational issues — a VM that never boots, a
+    /// failed scale-up, a cold start that timed out, an upstream going
+    /// unhealthy — to the namespace feed.
+    #[serde(default)]
+    pub issues: bool,
+    /// Serve the namespace's feed as RSS at this path on this deployment's own
+    /// routes. This is the only way a feed becomes reachable from outside the
+    /// admin listener: without an `expose` somewhere in the namespace, the feed
+    /// stays private. Runs after the deployment's `auth` gate, so a gated
+    /// deployment exposes its feed only to whoever the gate admits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expose: Option<String>,
+}
+
+impl FeedSpec {
+    fn validate(&self, routes: &[RouteRule]) -> Result<(), SpecError> {
+        let Some(expose) = &self.expose else {
+            return Ok(());
+        };
+        // The same shape a route's `path_prefix` must have: rooted, and unable
+        // to climb. The feed is served by matching this against request paths,
+        // so a relative or traversing value could never match anything sane.
+        if !expose.starts_with('/') || expose.split('/').any(|seg| seg == "..") {
+            return Err(SpecError::BadFeedExpose(expose.clone()));
+        }
+        if routes.is_empty() {
+            return Err(SpecError::FeedExposeWithoutRoutes);
+        }
+        Ok(())
+    }
 }
 
 /// What answers a request routed to a deployment.
@@ -1764,6 +1841,12 @@ impl SiteSpec {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpecError {
     EmptyId,
+    /// A namespace outside the id alphabet; it appears in URLs and filenames.
+    BadNamespace(String),
+    /// A `feed.expose` path that is not an absolute, traversal-free path.
+    BadFeedExpose(String),
+    /// A `feed.expose` on a deployment with no routes to serve it from.
+    FeedExposeWithoutRoutes,
     /// Workflow ids are interpolated into NATS subjects and VM names unescaped.
     BadWorkflowId(String),
     EmptyWorkflowRepo,
@@ -1877,6 +1960,21 @@ impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyId => write!(f, "deployment id must not be empty"),
+            Self::BadNamespace(ns) => write!(
+                f,
+                "namespace {ns:?} must contain only letters, digits, '-', '_' and '.' — \
+                 it is used in URLs and filenames unescaped"
+            ),
+            Self::BadFeedExpose(p) => write!(
+                f,
+                "feed.expose {p:?} must be an absolute path with no '..' segments, \
+                 like \"/feed.xml\""
+            ),
+            Self::FeedExposeWithoutRoutes => write!(
+                f,
+                "feed.expose serves the feed on this deployment's routes, and this \
+                 deployment has none"
+            ),
             Self::BadWorkflowId(id) => write!(
                 f,
                 "workflow id {id:?} must contain only letters, digits, '-' and '_'; \
@@ -2214,6 +2312,12 @@ impl DeploymentSpec {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
         }
+        if !is_valid_namespace(&self.namespace) {
+            return Err(SpecError::BadNamespace(self.namespace.clone()));
+        }
+        if let Some(feed) = &self.feed {
+            feed.validate(&self.routes)?;
+        }
         if self.routes.iter().any(RouteRule::is_empty) {
             return Err(SpecError::EmptyRoute);
         }
@@ -2445,6 +2549,8 @@ mod tests {
 
     fn spec() -> DeploymentSpec {
         DeploymentSpec {
+            namespace: "default".into(),
+            feed: None,
             id: "demo".into(),
             routes: vec![RouteRule {
                 host: Some("demo.local".into()),
@@ -2505,6 +2611,8 @@ mod tests {
     /// A static (proxy_pass) deployment: `upstreams` set, no `vm`.
     fn static_spec(upstreams: &[&str]) -> DeploymentSpec {
         DeploymentSpec {
+            namespace: "default".into(),
+            feed: None,
             id: "proxy".into(),
             routes: vec![RouteRule {
                 host: None,

@@ -452,6 +452,9 @@ impl Client {
             "admin": req.admin,
             "deployments": req.deployments,
         });
+        if let Some(ns) = &req.namespace {
+            body["namespace"] = json!(ns);
+        }
         if let Some(s) = req.expires_in_secs {
             body["expires_in_secs"] = json!(s);
         }
@@ -1041,6 +1044,7 @@ impl MetricsQuery {
 pub struct NewToken {
     pub name: String,
     pub admin: AdminScope,
+    pub namespace: Option<String>,
     pub deployments: Vec<String>,
     pub expires_in_secs: Option<u64>,
 }
@@ -1072,6 +1076,14 @@ impl NewToken {
     /// Scope to every deployment.
     pub fn fleet_wide(mut self) -> Self {
         self.deployments = vec!["*".into()];
+        self
+    }
+
+    /// Confine the token to one namespace. With no `deployments` list this
+    /// reaches every deployment in the namespace, now and in the future — and
+    /// nothing outside it, ever.
+    pub fn in_namespace(mut self, ns: impl Into<String>) -> Self {
+        self.namespace = Some(ns.into());
         self
     }
 
