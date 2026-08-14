@@ -1,8 +1,8 @@
 # `nats` — a NATS server with JetStream, in a microVM
 
 A Firecracker rootfs carrying [NATS](https://nats.io) with JetStream enabled, and
-the app-lb deployment that owns its lifecycle. This is the bus
-[queue-fn](../../../queue-fn) and heyo's cloud service both run on.
+the app-lb deployment that owns its lifecycle. This is suitable for heyo's cloud
+service and other JetStream clients that can reach the VM's guest network.
 
 ```sh
 ./build-image.sh                              # -> ~/.heyo/images/firecracker/nats.ext4
@@ -46,8 +46,8 @@ A default `store_dir` on the rootfs would pass every test you could think to
 run. JetStream would come up, streams would work, `/healthz` would return 200 —
 and the first time app-lb recreated the VM, every stream would be gone, silently,
 because JetStream recreates an empty store without complaint. What that costs is
-concrete: everything queue-fn published and has not yet acked, and every cloud
-sandbox create still sitting in `HEYO_SANDBOX`.
+concrete: every unacknowledged JetStream message, including every cloud sandbox
+create still sitting in `HEYO_SANDBOX`.
 
 `init.sh` therefore **refuses to start nats-server at all** if `/workspace` is
 not a mount. A VM that fails its health check shows up in `heyctl get
@@ -71,7 +71,7 @@ So the deployment splits the two ports deliberately:
 | Port | Who reaches it | How |
 | --- | --- | --- |
 | `8222` — HTTP monitoring | app-lb | `vm.port`, so it is what the proxy forwards to and what `health.path: /healthz` probes |
-| `4222` — client protocol | queue-fn, cloud | `vm.open_ports`, reached **directly** at the VM's `guest_ip` |
+| `4222` — client protocol | cloud and other NATS clients | `vm.open_ports`, reached **directly** at the VM's `guest_ip` |
 
 This is not a workaround; it is app-lb doing the part it is good at. What you get
 from the deployment is the VM's lifecycle — boot, health, restart, disk
@@ -87,9 +87,6 @@ built from `vm.port`), so take the host and use 4222:
 
 ```sh
 NATS_IP=$(curl -s localhost:9090/deployments/nats | jq -r '.vms[0].addr' | cut -d: -f1)
-
-# queue-fn
-QFN_NATS_URL="nats://$NATS_IP:4222" ./queue-fn
 
 # heyo cloud
 CLOUD_NATS_URL="nats://$NATS_IP:4222"
@@ -109,9 +106,7 @@ same address — so this changes far less often than it might.
 JetStream is stateful, and this is a single server with a file store — not a
 cluster. Two replicas behind one address would be two independent brokers with
 two independent stores: a message published to one would be invisible to the
-other, and a consumer would see roughly half its work. queue-fn is explicitly
-single-instance for the related reason that `WorkQueue` retention permits one
-consumer per subject.
+other, and a consumer would see roughly half its work.
 
 `min_replicas: 1` also makes scale-to-zero structurally impossible —
 `desired_replicas()` only considers it when `min_replicas == 0`
@@ -149,9 +144,10 @@ EOF'
 heyctl restart nats
 ```
 
-Then `QFN_NATS_TOKEN=s3cret` for queue-fn, or userinfo in cloud's
-`CLOUD_NATS_URL`. It lives on the data disk rather than in the image so a
-credential is never baked into a rootfs that gets copied between hosts.
+Then include the credential in each client's connection settings, such as
+userinfo in cloud's `CLOUD_NATS_URL`. It lives on the data disk rather than in
+the image so a credential is never baked into a rootfs that gets copied between
+hosts.
 
 ## Exposing the monitoring endpoint
 
@@ -185,10 +181,6 @@ NATS_IP=$(curl -s localhost:9090/deployments/nats | jq -r '.vms[0].addr' | cut -
 curl -s "http://$NATS_IP:8222/jsz?streams=1" | jq .
 curl -s "http://$NATS_IP:8222/varz" | jq '{uptime, connections, in_msgs, out_msgs}'
 ```
-
-queue-fn's dashboard renders the same stream and consumer state in context, with
-the enqueued/processing/succeeded/failed view over what is actually flowing
-through it.
 
 ## A note on rebuilding
 
