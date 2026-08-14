@@ -38,6 +38,9 @@ pub struct Config {
     pub ingest_addr: String,
     pub syslog_addr: String,
     pub api_addr: String,
+    /// Shared secret required on the dashboard/query API when set. The health
+    /// endpoint remains open for service readiness checks.
+    pub api_token: Option<String>,
     /// Shared secret required on `POST /ingest`. Unset leaves ingest open,
     /// which is only reasonable when the listener is unreachable from outside
     /// the tap networks.
@@ -89,6 +92,7 @@ impl Default for Config {
             ingest_addr: default_ingest_addr(),
             syslog_addr: default_syslog_addr(),
             api_addr: default_api_addr(),
+            api_token: None,
             ingest_token: None,
             applb_url: default_applb_url(),
             applb_user: None,
@@ -122,6 +126,11 @@ impl Config {
         }
         if let Ok(v) = std::env::var("APP_OBS_API_ADDR") {
             cfg.api_addr = v;
+        }
+        if let Ok(v) = std::env::var("APP_OBS_API_TOKEN")
+            && !v.is_empty()
+        {
+            cfg.api_token = Some(v);
         }
         if let Ok(v) = std::env::var("APP_OBS_INGEST_TOKEN") {
             cfg.ingest_token = Some(v);
