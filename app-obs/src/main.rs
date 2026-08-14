@@ -76,6 +76,12 @@ async fn run(cfg: Config) {
              reach the ingest port can write records",
         );
     }
+    if cfg.api_token.is_none() {
+        tracing::warn!(
+            "dashboard/query API is unauthenticated (set APP_OBS_API_TOKEN before \
+             exposing APP_OBS_API_ADDR outside a trusted host)",
+        );
+    }
 
     let (sink, rx) = Sink::new(cfg.queue_capacity);
 
@@ -173,6 +179,7 @@ async fn run(cfg: Config) {
     let api_state = ApiState {
         engine,
         sink: sink.clone(),
+        api_token: cfg.api_token.clone().map(Arc::new),
         buffered,
         flush_secs: cfg.flush_interval.as_secs(),
         retain_days: cfg.retain_days,

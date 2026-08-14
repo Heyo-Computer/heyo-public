@@ -42,8 +42,8 @@ sudo supervisorctl update
 ```
 
 Adjust the `environment=` block for your host — at minimum decide about
-`APP_OBS_INGEST_TOKEN`, and set `APP_LB_PASSWORD` if app-lb runs with
-`APP_LB_ADMIN_AUTH=1`.
+`APP_OBS_INGEST_TOKEN`, set `APP_OBS_API_TOKEN` before exposing the API listener
+directly, and set `APP_LB_PASSWORD` if app-lb runs with `APP_LB_ADMIN_AUTH=1`.
 
 ## Operate
 

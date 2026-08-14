@@ -1,24 +1,24 @@
 //! The dashboard and the JSON it runs on.
 //!
-//! Bound to loopback and reached through app-lb, which terminates TLS and — with
-//! an `auth` block on the deployment spec — puts sign-in in front of it. Nothing
-//! here authenticates, because a second gate on the same door only adds a second
-//! thing to get wrong. What *is* here is the refusal to be a load problem: every
-//! query takes a slot from a bounded pool and a deadline, so a month-wide
-//! refresh degrades into a 503 rather than competing with ingest for the machine.
+//! Bound to loopback by default and reached through app-lb, which terminates TLS
+//! and can put interactive sign-in in front of it. An optional bearer token also
+//! protects direct service routes used by Cloud. Every query takes a slot from a
+//! bounded pool and a deadline, so a month-wide refresh degrades into a 503
+//! rather than competing with ingest for the machine.
 //!
 //! The endpoints are typed rather than a SQL passthrough. Each one is a query
 //! this module built, so partition pruning and a row cap are always applied —
 //! neither is something a caller can forget.
 
-use crate::ingest::Sink;
+use crate::ingest::{Sink, token_matches};
 use crate::query::{
     Engine, HOST_DEPLOYMENT, LogBucket, LogFilter, MAX_LOG_LIMIT, MetricBucket, QueryError, Window,
 };
 use crate::sources::applb::LiveStatus;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Redirect};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, TimeZone, Utc};
@@ -56,6 +56,9 @@ const DETAIL_POINTS: u32 = 140;
 pub struct ApiState {
     pub engine: Arc<Engine>,
     pub sink: Sink,
+    /// Bearer token for every dashboard/query route. `None` preserves the
+    /// loopback-only default; `/healthz` is always open.
+    pub api_token: Option<Arc<String>>,
     /// Rows buffered in the writer, published by the drain task.
     pub buffered: Arc<AtomicUsize>,
     pub flush_secs: u64,
@@ -67,7 +70,7 @@ pub struct ApiState {
 }
 
 pub fn router(state: ApiState) -> Router {
-    Router::new()
+    let protected = Router::new()
         // The bare hostname should land somewhere useful; app-lb routes a whole
         // host here, so `/` is what someone actually types.
         .route("/", get(|| async { Redirect::temporary("/dashboard") }))
@@ -76,12 +79,43 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/platform-status", get(platform_status))
         .route("/api/deployments/{id}", get(detail))
         .route("/api/deployments/{id}/logs", get(logs))
+        .route("/stats", get(stats))
+        .route_layer(middleware::from_fn_with_state(
+            state.api_token.clone(),
+            require_api_token,
+        ));
+
+    Router::new()
         // Always open, and deliberately not behind a query slot: app-lb health
         // checks this, and a probe that fails because a dashboard is busy would
         // take the deployment out of rotation for no reason.
         .route("/healthz", get(|| async { "ok\n" }))
-        .route("/stats", get(stats))
+        .merge(protected)
         .with_state(state)
+}
+
+async fn require_api_token(
+    State(expected): State<Option<Arc<String>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if !api_request_authorized(expected.as_deref().map(String::as_str), presented) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "invalid api token\n",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn api_request_authorized(expected: Option<&str>, presented: Option<&str>) -> bool {
+    expected.is_none_or(|expected| token_matches(expected, presented))
 }
 
 async fn dashboard() -> impl IntoResponse {
@@ -666,6 +700,20 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    fn api_auth_is_optional_but_exact_when_configured() {
+        assert!(api_request_authorized(None, None));
+        assert!(api_request_authorized(
+            Some("status-secret"),
+            Some("Bearer status-secret")
+        ));
+        assert!(!api_request_authorized(Some("status-secret"), None));
+        assert!(!api_request_authorized(
+            Some("status-secret"),
+            Some("Bearer wrong")
+        ));
     }
 
     #[test]
