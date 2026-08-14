@@ -202,8 +202,11 @@
   .scroll-x { overflow-x: auto; }
 
   .logs td.ts { white-space: nowrap; color: var(--text-2); font-variant-numeric: tabular-nums; }
-  .logs td.msg { width: 100%; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
-  .logs td.who { white-space: nowrap; color: var(--muted); font-size: 12px; }
+  /* max-width: 0 keeps this column out of the table's intrinsic width, so a
+     long token or a wide fields block can never push the other columns (and
+     the copy button) past the card edge — text wraps, the pre scrolls. */
+  .logs td.msg { width: 100%; max-width: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .logs td.who { white-space: nowrap; color: var(--muted); font-size: 12px; max-width: 18ch; overflow: hidden; text-overflow: ellipsis; }
   .logs tr.has-fields { cursor: pointer; }
   .logs pre.fields {
     margin: 6px 0 2px; padding: 8px 10px; background: var(--plane);
@@ -1067,7 +1070,7 @@ function renderLogs(exhausted) {
         <td class="ts" title="${esc(new Date(r.ts).toISOString())}">${esc(fmtLogStamp(r.ts))}</td>
         <td><span class="lvl ${cls}">${esc(r.level || r.source)}</span></td>
         <td class="msg">${esc(r.message)}${r.fields ? `<pre class="fields" hidden>${esc(pretty(r.fields))}</pre>` : ""}</td>
-        <td class="who">${esc(who)}</td>
+        <td class="who" title="${esc(who)}">${esc(who)}</td>
         <td class="act"><button type="button" class="copy" data-i="${i}"
           title="Copy this line — timestamp in UTC, fields included">copy</button></td>
       </tr>`;
