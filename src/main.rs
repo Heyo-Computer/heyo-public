@@ -145,6 +145,12 @@ async fn main() -> Result<()> {
         if let Err(e) = sock.set_nodelay(true) {
             warn!("could not set TCP_NODELAY on client connection {peer}: {e}");
         }
+        // Arm keepalive on the same raw socket, for the same reason it has to
+        // happen here: the option rides the fd, so it survives the TLS wrap.
+        // Without it a client that vanishes without a FIN parks this task —
+        // and the connection slot it is about to take — forever. See
+        // `proxy::arm_keepalive`.
+        proxy::arm_keepalive(&sock, "client->pooler");
         let registry = registry.clone();
         let tls = tls.clone();
         tokio::spawn(async move {

@@ -408,6 +408,23 @@ jit = off
 # a session that is idle *inside* a transaction, never on a running query.
 idle_in_transaction_session_timeout = 5min
 
+# Reclaim sessions whose peer died without a FIN. The timeout above only fires
+# on a session idle *inside* a transaction; a backend parked at "idle" between
+# statements sits on its connection slot indefinitely, because the kernel never
+# times out an idle established socket on its own. The pooler splices 1:1 and
+# arms keepalive on its own legs, which covers a vanished client — but not the
+# case where the *pooler side* is the half that disappears (host crash, network
+# partition, a dropped iroh tunnel), where its FIN never arrives either. Then
+# every one of those backends holds a max_connections slot and its per-backend
+# memory budget until this VM is stopped.
+#
+# Probing from the server closes that: ~60s idle, then 3 probes 10s apart, so a
+# dead peer is reaped in ~90s. Costs one packet a minute on a genuinely idle
+# session and never touches a live one — the peer just ACKs.
+tcp_keepalives_idle = 60
+tcp_keepalives_interval = 10
+tcp_keepalives_count = 3
+
 # Lock waits and deadlocks here are almost always two client-side operations
 # racing on the same table, and the deadlock report alone names only the two
 # statements at the moment of detection. Logging the waits gives the blocked/

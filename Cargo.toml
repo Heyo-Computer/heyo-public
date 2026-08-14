@@ -8,6 +8,11 @@ deadpool-postgres = "0.14.1"
 tokio-postgres = "0.7"
 heyo-sdk = "0.1.5"
 tokio = { version = "1", features = ["full"] }
+# TCP keepalive (and TCP_USER_TIMEOUT on Linux) on both legs of a splice —
+# tokio's TcpStream exposes only TCP_NODELAY. Already resolved in Cargo.lock
+# via the hyper/reqwest stack, so this adds no new compilation; the `all`
+# feature only unlocks API surface (TCP_KEEPCNT, TCP_USER_TIMEOUT).
+socket2 = { version = "0.6", features = ["all"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

@@ -112,6 +112,19 @@ skips WAL replay entirely. The schema→VM binding is persisted in
 `PG_VM_POOL_STATE_FILE` (default `~/.heyo/pg-vm-pool/registry.tsv`) so it also
 survives pooler restarts.
 
+The pooler splices 1:1, so it admits at most `max_connections` minus the
+guest's reserved superuser slots and its own housekeeping pool; past that,
+clients queue at the pooler for `PG_VM_POOL_ADMIT_TIMEOUT_SECS` rather than
+being refused by Postgres with `FATAL: too many clients already`. Because a
+slot is held for the life of the splice, both legs run TCP keepalive (~60s
+idle, then 3 probes 10s apart) and, on Linux, `TCP_USER_TIMEOUT`; the guest
+probes back with `tcp_keepalives_*`. Without that, a client that vanishes
+without a FIN — a SIGKILLed pod, a preempted node, a NAT or load balancer
+dropping an idle flow — leaves a socket the kernel never times out, so its slot
+is never released. That leak is permanent on a keep-alive schema, whose entry
+(and its slot semaphore) no eviction tier ever rebuilds. The dashboard's
+per-VM `client slots` reads `0 / N — clients queueing` when a VM is saturated.
+
 Connect as `user=postgres`; the VM image's `trust` host auth needs no password
 (see the auth note in `init.sh`). `PG_VM_POOL_PASSWORD` does double duty:
 
@@ -136,6 +149,7 @@ Config via env (all optional):
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
 | `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
+| `PG_VM_POOL_ADMIT_TIMEOUT_SECS` | `30` | how long a client waits for a free connection slot on its schema's VM before the pooler errors it; `0` fails immediately when full |
 | `PG_VM_POOL_MAX_CONCURRENT_BRINGUPS` | `3` | max VM deploys/boots in flight against heyvmd; the excess queues FIFO in the pooler (an unbounded burst can wedge the daemon, whose watchdog restart then kills every running VM); `0` disables |
 | `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
 | `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
