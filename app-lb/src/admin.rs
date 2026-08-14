@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use axum::extract::{ConnectInfo, MatchedPath, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{AppendHeaders, Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use base64::Engine;
@@ -203,6 +203,9 @@ struct AdminState {
     /// How to turn a deployment's hostname into a link, given where the data
     /// plane actually listens.
     public_url: PublicUrl,
+    /// The per-namespace event feed, read by `GET /feeds/:namespace` and
+    /// written by the deployment lifecycle handlers.
+    feed: Arc<crate::feed::Feed>,
 }
 
 impl AdminState {
@@ -242,6 +245,7 @@ impl AdminApi {
         guard: Arc<crate::guard::Guard>,
         disks: Option<Arc<crate::disks::DiskStore>>,
         public_url: PublicUrl,
+        feed: Arc<crate::feed::Feed>,
     ) -> Self {
         // Render the display name into the page once; the placeholder appears in
         // both the <title> and the <h1>.
@@ -294,6 +298,7 @@ impl AdminApi {
                 disks,
                 disks_html,
                 public_url,
+                feed,
             },
         }
     }
@@ -326,10 +331,50 @@ impl Caller {
         }
     }
 
-    fn may_touch(&self, deployment: &str) -> bool {
+    /// Whether this caller may act on a deployment, given the namespace the
+    /// registry says it lives in — `None` when the deployment does not exist.
+    fn may_touch(&self, deployment: &str, namespace: Option<&str>) -> bool {
         match self {
             Self::Ungated | Self::Operator => true,
-            Self::Token(t) => t.allows(deployment),
+            Self::Token(t) => match (&t.namespace, namespace) {
+                (None, _) => t.allows(deployment),
+                (Some(_), Some(ns)) => t.admits(deployment, ns),
+                // No such deployment, so no namespace to check against. A
+                // namespace token cannot be shown to own it, so it does not —
+                // the 403 costs nothing (the handler would 404) and never
+                // confirms or denies that the id exists.
+                (Some(_), None) => false,
+            },
+        }
+    }
+
+    /// The namespace wall this caller is behind, if any.
+    fn namespace(&self) -> Option<&str> {
+        match self {
+            Self::Ungated | Self::Operator => None,
+            Self::Token(t) => t.namespace.as_deref(),
+        }
+    }
+
+    /// Whether this caller may read a namespace-wide surface — the event feed.
+    /// An unconfined token needs fleet scope: "which namespaces exist and what
+    /// happens in them" is fleet information.
+    fn reaches_namespace(&self, ns: &str) -> bool {
+        match self {
+            Self::Ungated | Self::Operator => true,
+            Self::Token(t) => match &t.namespace {
+                Some(own) => own == ns,
+                None => t.covers_fleet(),
+            },
+        }
+    }
+
+    /// Whether this caller may *see* a deployment on the views that narrow
+    /// themselves (the directory, `/metrics`, `/security`) rather than refuse.
+    fn may_view(&self, deployment: &str, namespace: &str) -> bool {
+        match self {
+            Self::Ungated | Self::Operator => true,
+            Self::Token(t) => t.admits(deployment, namespace),
         }
     }
 
@@ -352,6 +397,28 @@ impl Caller {
             Self::Token(t) => Some(&t.deployments),
         }
     }
+}
+
+/// The deployment ids `caller` may see, or `None` for all of them.
+///
+/// [`Caller::visible`] resolved against the registry: a namespace wall names no
+/// ids of its own, so the ids behind it have to be looked up at the moment of
+/// asking. Every self-narrowing view goes through here so a namespace token and
+/// a deployment-list token narrow the same way.
+fn visible_ids(state: &AdminState, caller: Option<&Caller>) -> Option<Vec<String>> {
+    let caller = caller?;
+    if caller.namespace().is_some() {
+        return Some(
+            state
+                .registry
+                .deployments()
+                .values()
+                .filter(|d| caller.may_view(&d.spec.id, &d.spec.namespace))
+                .map(|d| d.spec.id.clone())
+                .collect(),
+        );
+    }
+    caller.visible().map(<[String]>::to_vec)
 }
 
 /// Routes that are not about a single deployment but that a deployment-scoped
@@ -407,13 +474,25 @@ fn ws_query_token(matched: &str, query: Option<&str>) -> Option<String> {
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [(
-            header::WWW_AUTHENTICATE,
-            // Both schemes are advertised, in the order a browser should try
-            // them: a browser can only do Basic, and offering Bearer first would
-            // suppress its native login prompt on some clients.
-            "Basic realm=\"app-lb dashboard\", charset=\"UTF-8\", Bearer",
-        )],
+        // Two schemes, one header line each. Both are advertised, but they must
+        // be separate `WWW-Authenticate` lines rather than one comma-joined
+        // value: the combined form (`Basic …, Bearer`) is legal per RFC 7235 but
+        // ambiguous to parse, and Chrome chokes on the trailing bare `Bearer`
+        // token and suppresses its native Basic login prompt entirely — the user
+        // lands on the raw 401 body instead of a sign-in dialog. Firefox parses
+        // the combined line leniently, which is why it only broke on Chrome.
+        //
+        // `AppendHeaders` is load-bearing: a plain array of tuples *inserts*
+        // into the header map, so the second `WWW-Authenticate` would replace
+        // the first and the response would advertise only `Bearer` — no Basic
+        // challenge, no browser prompt, same raw-401 symptom as the bug above.
+        AppendHeaders([
+            (
+                header::WWW_AUTHENTICATE,
+                "Basic realm=\"app-lb dashboard\", charset=\"UTF-8\"",
+            ),
+            (header::WWW_AUTHENTICATE, "Bearer"),
+        ]),
         "authentication required\n",
     )
         .into_response()
@@ -451,6 +530,10 @@ struct Presented<'a> {
     /// The concrete request path.
     path: &'a str,
     query: Option<&'a str>,
+    /// The namespace of the deployment the path names, when it names one that
+    /// exists. Resolved by [`authorize`] from the registry, so the decision
+    /// itself stays a pure function.
+    target_namespace: Option<&'a str>,
 }
 
 /// Decide whether a request gets through, and as whom.
@@ -499,15 +582,31 @@ fn decide_access(
         );
     }
 
-    // Deployment scope. Every route is one of three things: about a named
-    // deployment, able to narrow itself, or fleet-wide.
+    // Deployment scope. Every route is one of four things: about a named
+    // deployment, about a namespace, able to narrow itself, or fleet-wide.
     if let Some(matched) = req.matched {
         match deployment_of(matched, req.path) {
-            Some(id) if !caller.may_touch(id) => {
+            Some(id) if !caller.may_touch(id, req.target_namespace) => {
                 return Verdict::Forbidden(format!(
                     "this token is not scoped to deployment \"{id}\""
                 ));
             }
+            None if matched == "/feeds/:namespace" => {
+                // Namespace-scoped rather than fleet-scoped: the handler knows
+                // which namespace from the path, and the check lives here so a
+                // feed can never be read past a token's namespace wall.
+                let ns = req.path.split('/').nth(2).unwrap_or_default();
+                let ns = ns.strip_suffix(".xml").unwrap_or(ns);
+                if !caller.reaches_namespace(ns) {
+                    return Verdict::Forbidden(format!(
+                        "this token cannot read the \"{ns}\" namespace feed"
+                    ));
+                }
+            }
+            // A namespace token may list and create deployments; the handlers
+            // narrow the answer to its namespace (list) or refuse a spec that
+            // names another one (create).
+            None if matched == "/deployments" && caller.namespace().is_some() => {}
             None if !narrows_itself(matched) && !caller.covers_fleet() => {
                 return Verdict::Forbidden(
                     "this token is scoped to specific deployments, so it cannot use a \
@@ -551,6 +650,15 @@ async fn authorize(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip());
 
+    // Resolved here rather than in `decide_access` so the decision stays pure.
+    // Only consulted for a namespace-confined token, but cheap enough (one
+    // lock-free registry read) to do unconditionally.
+    let target_namespace = matched
+        .as_deref()
+        .and_then(|m| deployment_of(m, &path))
+        .and_then(|id| state.registry.get(id))
+        .map(|d| d.spec.namespace.clone());
+
     let verdict = decide_access(
         state.auth.as_deref(),
         &state.tokens,
@@ -559,6 +667,7 @@ async fn authorize(
             matched: matched.as_deref(),
             path: &path,
             query: query.as_deref(),
+            target_namespace: target_namespace.as_deref(),
         },
         want,
         now_secs(),
@@ -651,6 +760,10 @@ struct DeploymentStatus {
     pending: usize,
     total_in_flight: usize,
     vms: Vec<VmStatus>,
+}
+
+fn is_default_namespace_str(ns: &String) -> bool {
+    ns == crate::config::DEFAULT_NAMESPACE
 }
 
 /// The backend kind of a deployment, as a stable string for the API/dashboard.
@@ -782,6 +895,10 @@ struct VmView {
 #[derive(Serialize)]
 struct DeploymentView {
     id: String,
+    /// The namespace the deployment belongs to. Omitted for `"default"`, so
+    /// the payload is unchanged for a fleet that never uses namespaces.
+    #[serde(skip_serializing_if = "is_default_namespace_str")]
+    namespace: String,
     /// `"vm"` (managed pool) or `"static"` (proxy_pass). The dashboard renders
     /// the two differently — a static deployment hides scaling controls.
     kind: &'static str,
@@ -1024,7 +1141,8 @@ async fn metrics_snapshot(
     // token minted to drive one sandbox should be able to watch that sandbox.
     // `None` means unscoped, which is the operator credential and the ungated
     // case both.
-    let scope = caller.as_ref().and_then(|c| c.visible());
+    let scope = visible_ids(&state, caller.as_ref().map(|c| &c.0));
+    let scope = scope.as_deref();
     let in_scope = |id: &str| scope.is_none_or(|s| s.iter().any(|d| d == id));
 
     // The fleet rollup covers the whole registry, never the filter or the page.
@@ -1072,6 +1190,7 @@ async fn metrics_snapshot(
             let backends = d.backends();
             DeploymentView {
                 id: d.spec.id.clone(),
+                namespace: d.spec.namespace.clone(),
                 kind: deployment_kind(d),
                 upstreams: d.spec.upstreams.clone(),
                 routed: !d.spec.routes.is_empty(),
@@ -1214,7 +1333,8 @@ async fn security_snapshot(
     caller: Option<axum::Extension<Caller>>,
 ) -> impl IntoResponse {
     let now = now_secs();
-    let scope = caller.as_ref().and_then(|c| c.0.visible());
+    let scope = visible_ids(&state, caller.as_ref().map(|c| &c.0));
+    let scope = scope.as_deref();
 
     // Drop rules that have run out on the way past. Expiry is already enforced
     // in `Guard::decide`, so this is tidying rather than correctness — but a
@@ -1477,6 +1597,82 @@ async fn disks(State(state): State<AdminState>) -> Response {
 /// `GET /storage` — the disk console.
 async fn storage_console(State(state): State<AdminState>) -> impl IntoResponse {
     Html(state.disks_html.to_string())
+}
+
+// ---- the event feed -------------------------------------------------------
+
+#[derive(Serialize)]
+struct FeedIndexEntry {
+    namespace: String,
+    events: usize,
+}
+
+/// `GET /feeds` — the namespaces that have events, narrowed to what the caller
+/// may read. A discovery aid for the dashboard and `heyctl`, not the feed
+/// itself.
+async fn feeds_index(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let out: Vec<FeedIndexEntry> = state
+        .feed
+        .namespaces()
+        .into_iter()
+        .filter(|ns| caller.as_ref().is_none_or(|c| c.0.reaches_namespace(ns)))
+        .map(|ns| {
+            let events = state.feed.recent(&ns, usize::MAX).len();
+            FeedIndexEntry { namespace: ns, events }
+        })
+        .collect();
+    Json(out)
+}
+
+#[derive(Deserialize)]
+struct FeedQuery {
+    /// `json` returns the events as structured data instead of RSS — what
+    /// `heyctl feed` and the dashboard read; a feed reader takes the
+    /// default.
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// `GET /feeds/:namespace` — the namespace's feed as RSS. `:namespace` may
+/// carry a `.xml` suffix, because half the feed readers ever written assume
+/// one. Access was already decided by the gate (see `decide_access`), which
+/// checks the same spelling.
+async fn feed_rss(
+    State(state): State<AdminState>,
+    Path(namespace): Path<String>,
+    Query(q): Query<FeedQuery>,
+) -> Response {
+    let ns = namespace.strip_suffix(".xml").unwrap_or(&namespace);
+    let events = state.feed.recent(ns, crate::proxy::FEED_PAGE);
+    if q.format.as_deref() == Some("json") {
+        return Json(events).into_response();
+    }
+    let doc = crate::feed::rss(ns, &format!("/feeds/{ns}"), &events);
+    (
+        [(header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")],
+        doc,
+    )
+        .into_response()
+}
+
+/// What a lifecycle feed entry says about the deployment: where it serves, so
+/// a subscriber can go look at it. Falls back to the backend kind for the
+/// unrouted (exec-only) shape.
+fn lifecycle_detail(state: &AdminState, spec: &DeploymentSpec) -> String {
+    let urls: Vec<String> = spec.routes.iter().filter_map(|r| state.public_url.of(r)).collect();
+    if urls.is_empty() {
+        let kind = match spec.backend() {
+            crate::config::Backend::Vm => "vm",
+            crate::config::Backend::Upstreams => "static",
+            crate::config::Backend::Site => "site",
+        };
+        format!("a {kind} deployment with no public routes")
+    } else {
+        format!("serving at {}", urls.join(", "))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1841,8 +2037,8 @@ async fn directory(
     State(state): State<AdminState>,
     caller: Option<axum::Extension<Caller>>,
 ) -> impl IntoResponse {
-    let scope = caller.as_ref().and_then(|c| c.0.visible());
-    let (entries, unlinkable) = directory_entries(&state, scope);
+    let scope = visible_ids(&state, caller.as_ref().map(|c| &c.0));
+    let (entries, unlinkable) = directory_entries(&state, scope.as_deref());
     let html = state
         .directory_html
         .replace("{{LEDE}}", &html_escape(&directory_lede(&entries)))
@@ -1876,6 +2072,7 @@ fn warn_about(spec: &DeploymentSpec) {
 
 async fn register(
     State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
     Json(spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
     // Validation is the gate that keeps unroutable VMs (e.g. libvirt, which has
@@ -1886,6 +2083,25 @@ async fn register(
     warn_about(&spec);
 
     let id = spec.id.clone();
+
+    // A namespace token creates inside its own wall or not at all. Checked
+    // against the *replaced* deployment too: `POST` with an existing id is a
+    // replace, and without that check a namespace token could capture another
+    // namespace's deployment by re-registering its id. One message for both
+    // refusals, so probing them apart teaches nothing about which ids exist.
+    if let Some(ns) = caller.as_ref().and_then(|c| c.0.namespace()) {
+        let taken_elsewhere = state
+            .registry
+            .get(&id)
+            .is_some_and(|old| old.spec.namespace != ns);
+        if spec.namespace != ns || taken_elsewhere {
+            return err(
+                StatusCode::FORBIDDEN,
+                format!("this token is confined to namespace \"{ns}\" and cannot register this deployment"),
+            )
+            .into_response();
+        }
+    }
     // Replacing a deployment abandons its old pool; tear it down explicitly so
     // the VMs don't linger until their TTL.
     //
@@ -1897,6 +2113,7 @@ async fn register(
     // `Autoscaler::unclaimed`).
     let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
+    let replaced = old.is_some();
     let deployment = state.registry.upsert(spec);
     if let Err(e) = state.registry.persist_one(&id) {
         tracing::error!(deployment = %id, error = %e, "failed to persist state");
@@ -1906,6 +2123,12 @@ async fn register(
         state.autoscaler.teardown(&old).await;
     }
     tracing::info!(deployment = %id, "registered");
+    state.feed.announce(
+        &deployment.spec,
+        if replaced { crate::feed::FeedEventKind::Updated } else { crate::feed::FeedEventKind::Deployed },
+        lifecycle_detail(&state, &deployment.spec),
+        now_secs(),
+    );
 
     // Let the autoscaler build the warm pool without waiting for the next tick.
     deployment.scale_signal.notify_one();
@@ -1926,6 +2149,7 @@ async fn register(
 async fn update(
     State(state): State<AdminState>,
     Path(id): Path<String>,
+    caller: Option<axum::Extension<Caller>>,
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
     spec.id = id.clone();
@@ -1933,6 +2157,24 @@ async fn update(
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     warn_about(&spec);
+
+    // The gate already established the caller may touch this deployment; what
+    // it cannot see is the body. A namespace token must not *move* a
+    // deployment: writing another namespace into the spec would walk it out
+    // through the wall the token is behind.
+    if let Some(ns) = caller.as_ref().and_then(|c| c.0.namespace())
+        && spec.namespace != ns
+    {
+        return err(
+            StatusCode::FORBIDDEN,
+            format!(
+                "this token is confined to namespace \"{ns}\" and cannot move a deployment to \
+                 \"{}\"",
+                spec.namespace
+            ),
+        )
+        .into_response();
+    }
 
     let change = state.registry.change_guard().await;
     let Some(old) = state.registry.get(&id) else {
@@ -1970,6 +2212,12 @@ async fn update(
     // An edit can introduce a hostname, so this needs the same nudge as
     // registration.
     state.nudge_acme();
+    state.feed.announce(
+        &deployment.spec,
+        crate::feed::FeedEventKind::Updated,
+        lifecycle_detail(&state, &deployment.spec),
+        now_secs(),
+    );
 
     Json(status_of(&deployment)).into_response()
 }
@@ -2043,9 +2291,33 @@ async fn scale(
     Json(status_of(&deployment)).into_response()
 }
 
-async fn list(State(state): State<AdminState>) -> impl IntoResponse {
+#[derive(Deserialize)]
+struct ListQuery {
+    /// Keep only deployments in this namespace. A filter, not authorization —
+    /// the caller's own narrowing has already happened by the time it applies.
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+async fn list(
+    State(state): State<AdminState>,
+    Query(q): Query<ListQuery>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    // Only a namespace token reaches here scoped (the gate refuses
+    // deployment-list tokens on this route), and it gets the narrowed answer.
+    let scope = visible_ids(&state, caller.as_ref().map(|c| &c.0));
     let deployments = state.registry.deployments();
-    let mut out: Vec<_> = deployments.values().map(status_of).collect();
+    let mut out: Vec<_> = deployments
+        .values()
+        .filter(|d| {
+            scope
+                .as_deref()
+                .is_none_or(|s| s.iter().any(|id| id == &d.spec.id))
+        })
+        .filter(|d| q.namespace.as_ref().is_none_or(|ns| &d.spec.namespace == ns))
+        .map(status_of)
+        .collect();
     out.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
     Json(out)
 }
@@ -2331,6 +2603,12 @@ async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> 
     // ids churn would otherwise accumulate one per sandbox that ever existed.
     state.metrics.retire(&id);
     tracing::info!(deployment = %id, "deregistered");
+    state.feed.announce(
+        &d.spec,
+        crate::feed::FeedEventKind::Removed,
+        "the deployment was deregistered and its routes released".to_string(),
+        now_secs(),
+    );
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2534,7 +2812,7 @@ async fn hold_a_vm(state: &AdminState, id: &str, wake: bool) -> Result<VmTarget,
         )
         .into_response());
     }
-    match crate::proxy::wait_for_capacity(&d, &[], &state.metrics).await {
+    match crate::proxy::wait_for_capacity(&d, &[], &state.metrics, &state.feed).await {
         Some(b) => match b.try_hold() {
             Some(slot) => Ok(VmTarget::Ready(slot)),
             None => Err(err(
@@ -3193,6 +3471,8 @@ fn router(state: AdminState) -> Router {
         // and for the same reason. Reading what is on the host is a view-tier
         // question; every route that *changes* it is on the CRUD side below.
         .route("/disks", get(disks))
+        .route("/feeds", get(feeds_index))
+        .route("/feeds/:namespace", get(feed_rss))
         .route("/storage", get(storage_console));
 
     // The deployment CRUD API — register/edit/scale/delete/evict, plus the reads
@@ -3549,6 +3829,33 @@ mod tests {
             );
             std::fs::remove_file(blocked_parent).unwrap();
         }
+    }
+
+    /// Both auth schemes must survive into the response as *separate*
+    /// `WWW-Authenticate` lines. This has now broken twice, silently, in
+    /// opposite directions: comma-joining them suppressed Chrome's Basic
+    /// prompt, and the fix's plain tuple-array *inserted* the second line over
+    /// the first, so the response advertised only `Bearer` — no Basic
+    /// challenge, no prompt in any browser without cached credentials.
+    #[test]
+    fn a_401_advertises_basic_and_bearer_on_separate_lines() {
+        let response = unauthorized();
+        let challenges: Vec<&str> = response
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|v| v.to_str().expect("ascii header"))
+            .collect();
+        assert_eq!(challenges.len(), 2, "both schemes must be present: {challenges:?}");
+        assert!(
+            challenges[0].starts_with("Basic "),
+            "Basic first, so a browser tries it before the Bearer it cannot do: {challenges:?}",
+        );
+        assert!(
+            !challenges[0].contains("Bearer"),
+            "one scheme per line — no comma-joined challenge: {challenges:?}",
+        );
+        assert_eq!(challenges[1], "Bearer");
     }
 
     /// The two routing decisions behind the security console, both of which are
@@ -4161,6 +4468,7 @@ mod tests {
                 NewToken {
                     name: "test".into(),
                     admin,
+                    namespace: None,
                     deployments: deployments.iter().map(|d| d.to_string()).collect(),
                     expires_in_secs: None,
                 },
@@ -4191,6 +4499,7 @@ mod tests {
                     matched: Some(matched),
                     path,
                     query: None,
+                    target_namespace: None,
                 },
                 want,
                 NOW,
@@ -4209,6 +4518,117 @@ mod tests {
                 Verdict::Forbidden(d) => d,
                 other => panic!("expected Forbidden, got {other:?}"),
             }
+        }
+
+        fn mint_in_namespace(s: &TokenStore, admin: AdminScope, ns: &str) -> String {
+            s.mint(
+                NewToken {
+                    name: "ns test".into(),
+                    admin,
+                    namespace: Some(ns.into()),
+                    deployments: vec![],
+                    expires_in_secs: None,
+                },
+                NOW,
+            )
+            .unwrap()
+            .1
+        }
+
+        /// `decide_access` for a route naming a deployment whose namespace the
+        /// registry resolved to `target_ns`.
+        fn on_deployment(
+            tokens: &TokenStore,
+            header: &str,
+            target_ns: Option<&str>,
+        ) -> Verdict {
+            decide_access(
+                Some(&basic()),
+                tokens,
+                &Presented {
+                    header: Some(header),
+                    matched: Some("/deployments/:id/exec"),
+                    path: "/deployments/web/exec",
+                    query: None,
+                    target_namespace: target_ns,
+                },
+                AdminScope::Admin,
+                NOW,
+            )
+        }
+
+        #[test]
+        fn a_namespace_token_reaches_its_namespace_and_nothing_else() {
+            let t = store();
+            let hdr = format!("Bearer {}", mint_in_namespace(&t, AdminScope::Admin, "team-a"));
+
+            assert!(matches!(on_deployment(&t, &hdr, Some("team-a")), Verdict::Allow(_)));
+            assert!(matches!(on_deployment(&t, &hdr, Some("team-b")), Verdict::Forbidden(_)));
+            // The deployment does not exist: refused, and indistinguishably
+            // from the out-of-namespace case, so probing can't map the fleet.
+            assert!(matches!(on_deployment(&t, &hdr, None), Verdict::Forbidden(_)));
+        }
+
+        #[test]
+        fn a_namespace_token_may_list_and_create_but_not_roam_the_fleet() {
+            let t = store();
+            let hdr = format!("Bearer {}", mint_in_namespace(&t, AdminScope::Admin, "team-a"));
+            let at = |matched: &str, path: &str| {
+                decide_access(
+                    Some(&basic()),
+                    &t,
+                    &Presented {
+                        header: Some(&hdr),
+                        matched: Some(matched),
+                        path,
+                        query: None,
+                        target_namespace: None,
+                    },
+                    AdminScope::Admin,
+                    NOW,
+                )
+            };
+
+            // `/deployments` narrows (list) or is checked in the handler
+            // (create), so the gate lets it through.
+            assert!(matches!(at("/deployments", "/deployments"), Verdict::Allow(_)));
+            // The routes that see past a namespace stay closed: minting tokens
+            // would be an escalation, the secret store is fleet state.
+            assert!(matches!(at("/tokens", "/tokens"), Verdict::Forbidden(_)));
+            assert!(matches!(at("/secrets", "/secrets"), Verdict::Forbidden(_)));
+            assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));
+        }
+
+        #[test]
+        fn the_feed_route_is_walled_by_namespace() {
+            let t = store();
+            let ns_hdr = format!("Bearer {}", mint_in_namespace(&t, AdminScope::View, "team-a"));
+            let fleet_hdr = format!("Bearer {}", mint(&t, AdminScope::View, &["*"]));
+            let scoped_hdr = format!("Bearer {}", mint(&t, AdminScope::View, &["web"]));
+            let at = |hdr: &str, path: &str| {
+                decide_access(
+                    Some(&basic()),
+                    &t,
+                    &Presented {
+                        header: Some(hdr),
+                        matched: Some("/feeds/:namespace"),
+                        path,
+                        query: None,
+                        target_namespace: None,
+                    },
+                    AdminScope::View,
+                    NOW,
+                )
+            };
+
+            assert!(matches!(at(&ns_hdr, "/feeds/team-a"), Verdict::Allow(_)));
+            // The `.xml` spelling is the same feed.
+            assert!(matches!(at(&ns_hdr, "/feeds/team-a.xml"), Verdict::Allow(_)));
+            assert!(matches!(at(&ns_hdr, "/feeds/team-b"), Verdict::Forbidden(_)));
+            // Fleet scope reads any feed; a deployment-list token reads none —
+            // which namespaces exist is fleet information.
+            assert!(matches!(at(&fleet_hdr, "/feeds/team-a"), Verdict::Allow(_)));
+            assert!(matches!(at(&scoped_hdr, "/feeds/team-a"), Verdict::Forbidden(_)));
         }
 
         #[test]
@@ -4233,7 +4653,7 @@ mod tests {
                 AdminScope::Admin,
             ));
             assert!(matches!(caller, Caller::Operator));
-            assert!(caller.may_touch("anything"));
+            assert!(caller.may_touch("anything", None));
             assert!(caller.covers_fleet());
             assert!(
                 caller.visible().is_none(),
@@ -4458,6 +4878,7 @@ mod tests {
                     matched: Some("/deployments/:id/shell"),
                     path: "/deployments/sb-1/shell",
                     query: Some(&query),
+                    target_namespace: None,
                 },
                 AdminScope::Admin,
                 NOW,
@@ -4481,6 +4902,7 @@ mod tests {
                                 matched: Some(matched),
                                 path,
                                 query: Some(&query),
+                                target_namespace: None,
                             },
                             AdminScope::Admin,
                             NOW,
@@ -4506,6 +4928,7 @@ mod tests {
                         matched: Some("/deployments/:id/shell"),
                         path: "/deployments/sb-2/shell",
                         query: Some(&query),
+                        target_namespace: None,
                     },
                     AdminScope::Admin,
                     NOW,
@@ -4522,6 +4945,7 @@ mod tests {
                     NewToken {
                         name: "short".into(),
                         admin: AdminScope::Admin,
+                        namespace: None,
                         deployments: vec!["*".into()],
                         expires_in_secs: Some(60),
                     },
@@ -4540,6 +4964,7 @@ mod tests {
                         matched: Some("/deployments"),
                         path: "/deployments",
                         query: None,
+                        target_namespace: None,
                     },
                     AdminScope::Admin,
                     now,

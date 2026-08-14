@@ -1,0 +1,11 @@
+{
+  "id": 7,
+  "ts": 1722400000,
+  "last_ts": 1722400120,
+  "count": 3,
+  "namespace": "team-a",
+  "deployment": "web",
+  "kind": "issue",
+  "title": "web: cold start timed out",
+  "detail": "a request waited 120s and no VM became available"
+}

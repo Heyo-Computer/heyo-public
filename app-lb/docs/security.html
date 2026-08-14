@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auth, tokens &amp; the admin API — app-lb</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="side">
+  <a class="brand" href="index.html">app-lb</a>
+  <p class="tagline">load balancer &amp; microVM autoscaler</p>
+  <ul>
+    <li><a href="index.html">Overview</a></li>
+    <li class="group">app-lb</li>
+    <li><a href="deployments.html">Deployments &amp; scaling</a></li>
+    <li><a href="security.html" aria-current="page">Auth, tokens &amp; the admin API</a></li>
+    <li><a href="namespaces.html">Namespaces</a></li>
+    <li><a href="feed.html">The event feed</a></li>
+    <li class="group">clients</li>
+    <li><a href="heyctl.html">heyctl</a></li>
+  </ul>
+</nav>
+<main>
+<h1>Auth, tokens &amp; the admin API</h1>
+<p class="lede">Two separate doors: a per-deployment sign-in gate on the data plane, and a
+two-tier gate on the admin API. App-tokens open both, each within their scope.</p>
+
+<h2>The sign-in gate</h2>
+<p>Any deployment can put a gate in front of everything it serves. It runs in the proxy,
+before a backend is chosen, so the application behind it needs to know nothing about
+it:</p>
+<pre><code>"auth": {
+  "provider": ["google", "app-token"],
+  "client_id": "…apps.googleusercontent.com",
+  "client_secret": { "secret": "google", "key": "client_secret" },
+  "allowed_domains": ["example.com"],
+  "public_paths": ["/healthz", "/api/webhook"],
+  "forward_identity": true
+}</code></pre>
+<ul>
+  <li><strong>Providers are alternatives.</strong> <code>google</code> admits a person with
+  a session (domain matching uses Google's <code>hd</code> claim, so a personal Gmail with a
+  lookalike address does not pass); <code>app-token</code> admits a program presenting
+  <code>Authorization: Bearer applb_…</code>. A gate listing both admits either. The default
+  is Google-only — a gate that should accept programs must say
+  <code>"app-token"</code> explicitly.</li>
+  <li><strong><code>public_paths</code></strong> are prefix-matched and skip the gate
+  entirely — health checks and webhooks.</li>
+  <li><strong><code>forward_identity</code></strong> adds
+  <code>x-auth-request-email</code>/<code>-user</code> upstream for signed-in people, and
+  app-lb strips those header names from inbound requests so nobody can forge them. A token
+  is not a person: token-admitted requests carry no identity headers.</li>
+</ul>
+
+<div class="warn"><strong>The gate runs before the cold-start wait.</strong> An
+unauthenticated request never boots a VM. An API client hitting a Google-only gate gets an
+immediate <code>401 {"error":"authentication required"}</code> from app-lb itself — the
+request never reaches the deployment and never wakes it. If a scale-from-zero deployment
+is "not waking up" for programmatic callers, check the gate's <code>provider</code> list
+and <code>public_paths</code> first.</div>
+
+<h2>App-tokens</h2>
+<p>The credential a program carries. Minted through the admin API (or
+<code>heyctl token mint</code>), scoped, optionally expiring, revocable instantly.
+The shape is <code>applb_&lt;id&gt;_&lt;secret&gt;</code> — greppable on purpose, and only
+the secret's SHA-256 is stored, so the token file is not a fleet compromise and there is
+no "reveal" endpoint.</p>
+<table>
+  <tr><th>Scope axis</th><th>Values</th><th>Governs</th></tr>
+  <tr><td><code>admin</code></td><td><code>none</code> / <code>view</code> / <code>admin</code></td>
+  <td>What the token may do on the admin API. <code>none</code> still passes data-plane
+  gates — the shape for a token handed to an application.</td></tr>
+  <tr><td><code>deployments</code></td><td>ids, or <code>["*"]</code></td>
+  <td>Which deployments it may touch — both the per-deployment admin routes
+  (<code>exec</code>, <code>shell</code>, scale, delete) and data-plane gates.</td></tr>
+  <tr><td><code>namespace</code></td><td>one namespace</td>
+  <td>A wall around everything: see <a href="namespaces.html">Namespaces</a>.</td></tr>
+</table>
+<pre><code># a token for CI to reach one deployment's data plane, expiring in a week
+heyctl token mint ci-secrets -d secret-service --expires-in 168 -q
+
+# a fleet-wide operator token
+heyctl token mint ops --admin admin --all-deployments</code></pre>
+<p><code>heyctl token set</code> re-scopes a token without changing its secret;
+<code>heyctl token revoke</code> takes effect on the next request.</p>
+
+<h2>The admin API's two tiers</h2>
+<p>Unset, the admin listener is open (it binds loopback). Setting
+<code>APP_LB_DASHBOARD_PASSWORD</code> gates the <em>view</em> tier — the directory,
+<code>/metrics</code>, the dashboard, <code>/security</code>, <code>/feeds</code>. Setting
+<code>APP_LB_ADMIN_AUTH=1</code> extends the gate to the <em>CRUD</em> tier — everything
+that changes state or reads specs.</p>
+<p>Scoped tokens are narrowed rather than refused where that makes sense: a token scoped
+to one deployment sees a directory, <code>/metrics</code> and <code>/security</code>
+filtered to that deployment, and is refused fleet-wide routes (creating deployments,
+reading secrets, minting tokens) outright — a token cannot widen itself.</p>
+
+<h2>Block rules and detection</h2>
+<p>Operators can arm block rules (by client IP, host, path, method, user-agent) that the
+proxy enforces with an anonymous 403 — the refusal deliberately does not say which
+property matched. A built-in analyzer (on unless <code>APP_LB_SIEM=0</code>) watches
+access and auth failures, folds repeats, and raises findings on
+<code>GET /security</code> with suggested rules.</p>
+
+<footer><a href="deployments.html">← Deployments</a> · next:
+<a href="namespaces.html">Namespaces</a></footer>
+</main>
+</div>
+</body>
+</html>

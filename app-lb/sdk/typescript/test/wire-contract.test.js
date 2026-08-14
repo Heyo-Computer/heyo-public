@@ -26,7 +26,7 @@ const KNOWN = {
   common: {
     DeploymentStatus: ["spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
-    DeploymentSpec: ["id", "routes", "vm", "scaling", "health", "upstreams", "build", "artifact", "site", "update", "auth"],
+    DeploymentSpec: ["id", "namespace", "routes", "vm", "scaling", "health", "upstreams", "build", "artifact", "site", "update", "auth", "feed"],
     RouteRule: ["host", "host_suffix", "path_prefix"],
     VmSpec: ["driver", "image", "port", "start_command", "size_class", "disk_size_gb", "working_directory", "env_vars", "setup_hooks", "open_ports", "ttl_seconds"],
     ScalingPolicy: ["min_replicas", "max_replicas", "warm_pool", "target_concurrency", "scale_to_zero_after_secs", "cold_start_timeout_secs", "drain_timeout_secs", "boot_timeout_secs", "idle_action"],
@@ -38,7 +38,7 @@ const KNOWN = {
     SecretEnv: ["secret", "key", "as"],
     SecretRef: ["secret", "key", "username"],
     AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity"],
-    DeploymentView: ["id", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
+    DeploymentView: ["id", "namespace", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
     UpstreamTrafficStatus: ["deployment_id", "upstream", "state", "healthy", "in_flight", "reason", "started_at"],
     PoolStatus: ["desired_replicas", "ready", "draining", "pending", "total_in_flight", "target_concurrency", "min_replicas", "max_replicas", "warm_pool", "utilization", "cpu_percent", "memory_bytes", "boot_timeout_secs", "cold_start_timeout_secs"],
     VmView: ["sandbox_id", "addr", "in_flight", "healthy", "draining", "uptime_secs", "cpu_percent", "memory_bytes"],
@@ -72,9 +72,12 @@ const KNOWN = {
     CertStatus: ["host", "not_after", "issuer", "needs_renewal"],
     ExecOutput: ["sandbox_id", "exit_code", "stdout", "stderr", "output"],
     EvictOutcome: ["sandbox_id", "outcome"],
-    TokenSummary: ["id", "name", "admin", "deployments", "created_at", "expires_at", "last_used_at"],
-    MintedToken: ["id", "name", "admin", "deployments", "created_at", "expires_at", "last_used_at", "token"],
+    TokenSummary: ["id", "name", "admin", "namespace", "deployments", "created_at", "expires_at", "last_used_at"],
+    MintedToken: ["id", "name", "admin", "namespace", "deployments", "created_at", "expires_at", "last_used_at", "token"],
     ApiError: ["error"],
+    FeedSpec: ["announce", "issues", "expose"],
+    FeedIndexEntry: ["namespace", "events"],
+    FeedEvent: ["id", "ts", "last_ts", "count", "namespace", "deployment", "kind", "title", "detail"],
   },
 };
 
@@ -103,8 +106,11 @@ const FIXTURES = {
   "api-error": "ApiError",
   "token-summary": "TokenSummary",
   "token-summary-scoped": "TokenSummary",
+  "token-summary-namespaced": "TokenSummary",
   "minted-token": "MintedToken",
   "upstream-traffic-status": "UpstreamTrafficStatus",
+  "feed-event": "FeedEvent",
+  "feed-index": "FeedIndexEntry",
 };
 
 /** Which declaration governs a nested object, by the key that holds it. */
@@ -112,6 +118,7 @@ const NESTED = {
   spec: "DeploymentSpec", vm: "VmSpec", scaling: "ScalingPolicy", health: "HealthCheck",
   build: "BuildSpec", artifact: "ArtifactSpec", site: "SiteSpec", update: "UpdateSpec",
   auth: "AuthGate", client_secret: "SecretRef", pool: "PoolStatus", host: "HostUsage",
+  feed: "FeedSpec",
   fleet: "FleetPool", obs: "ObsStats", metrics: "DeploymentMetrics",
   security: "SecuritySummary", totals: "SeverityTotals", stats: "SiemStats",
   response: "AlertResponse", guard: "GuardStats",
@@ -176,7 +183,13 @@ for (const file of files) {
   test(`${name} has no fields this package would silently drop`, () => {
     const value = JSON.parse(readFileSync(join(WIRE, file), "utf8"));
     const unknown = [];
-    check(value, FIXTURES[name], name, unknown);
+    // A collection route's fixture is a bare array; its declaration names the
+    // element type.
+    if (Array.isArray(value)) {
+      value.forEach((item, i) => check(item, FIXTURES[name], `${name}[${i}]`, unknown));
+    } else {
+      check(value, FIXTURES[name], name, unknown);
+    }
     assert.deepEqual(
       unknown,
       [],

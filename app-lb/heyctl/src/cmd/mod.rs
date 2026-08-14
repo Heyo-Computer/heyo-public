@@ -2,6 +2,7 @@
 
 pub mod artifact;
 pub mod auth;
+pub mod feed;
 pub mod observe;
 pub mod read;
 pub mod session;

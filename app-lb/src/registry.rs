@@ -665,6 +665,8 @@ mod tests {
 
     fn spec(id: &str, routes: Vec<RouteRule>) -> DeploymentSpec {
         DeploymentSpec {
+            namespace: "default".into(),
+            feed: None,
             id: id.into(),
             routes,
             vm: Some(VmSpec {
@@ -693,6 +695,8 @@ mod tests {
 
     fn static_spec(id: &str, routes: Vec<RouteRule>, upstreams: &[&str]) -> DeploymentSpec {
         DeploymentSpec {
+            namespace: "default".into(),
+            feed: None,
             id: id.into(),
             routes,
             vm: None,

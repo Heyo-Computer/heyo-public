@@ -358,7 +358,6 @@ fn with_utc(
 /// List the parquet files in a directory, ignoring in-progress temporaries.
 // The filtering here is what keeps a half-written file from reaching a reader,
 // so the query layer and the compaction step both go through it.
-#[allow(dead_code)]
 pub fn parquet_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();

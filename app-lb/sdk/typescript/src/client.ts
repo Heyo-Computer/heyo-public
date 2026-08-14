@@ -17,6 +17,8 @@ import type {
   MintedToken,
   SecretSummary,
   TokenSummary,
+  FeedEvent,
+  FeedIndexEntry,
 } from "./types.js";
 import type { Shell, ShellOptions } from "./shell.js";
 import type { WaitForJobOptions, WaitForReadyOptions } from "./wait.js";
@@ -79,6 +81,11 @@ export interface MetricsQuery {
 export interface NewToken {
   name: string;
   admin?: AdminScope;
+  /**
+   * Confine the token to one namespace. With no `deployments` it reaches
+   * every deployment in the namespace — and nothing outside it, ever.
+   */
+  namespace?: string;
   /** Deployment ids, or `["*"]`. Defaults to none, which can reach nothing. */
   deployments?: string[];
   expiresInSecs?: number;
@@ -455,6 +462,7 @@ export class Heyctl {
       admin: req.admin ?? "none",
       deployments: req.deployments ?? [],
     };
+    if (req.namespace !== undefined) body.namespace = req.namespace;
     if (req.expiresInSecs !== undefined) body.expires_in_secs = req.expiresInSecs;
     return this.request("POST", "/tokens", {
       body,
@@ -481,6 +489,8 @@ export class Heyctl {
     patch: {
       name?: string;
       admin?: AdminScope;
+      /** `null` lifts the namespace wall; a string moves it. */
+      namespace?: string | null;
       deployments?: string[];
       expires_at?: number | null;
     },
@@ -501,6 +511,22 @@ export class Heyctl {
       name: id,
       signal,
       expect: "nothing",
+    });
+  }
+
+  // -- the event feed --------------------------------------------------------
+
+  /** The namespaces that have feed events, narrowed to this credential. */
+  feeds(signal?: AbortSignal): Promise<FeedIndexEntry[]> {
+    return this.request("GET", "/feeds", { signal });
+  }
+
+  /** A namespace's feed events as structured data, newest first. */
+  feedEvents(namespace: string, signal?: AbortSignal): Promise<FeedEvent[]> {
+    return this.request("GET", `/feeds/${seg(namespace)}?format=json`, {
+      kind: "feed",
+      name: namespace,
+      signal,
     });
   }
 

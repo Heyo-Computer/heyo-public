@@ -84,6 +84,9 @@ pub struct LbProxy {
     /// mean `APP_LB_SIEM=0` silently unblocked every address an operator had
     /// blocked.
     guard: Arc<Guard>,
+    /// The per-namespace event feed, for the deployments that `expose` it on
+    /// their own routes, and for the cold-start-timeout issue hook.
+    feed: Arc<crate::feed::Feed>,
 }
 
 impl LbProxy {
@@ -95,6 +98,7 @@ impl LbProxy {
         access_log: Option<LogSink>,
         security: Option<SecuritySink>,
         guard: Arc<Guard>,
+        feed: Arc<crate::feed::Feed>,
     ) -> Self {
         Self {
             registry,
@@ -104,6 +108,7 @@ impl LbProxy {
             access_log,
             security,
             guard,
+            feed,
         }
     }
 
@@ -237,6 +242,26 @@ async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<
             Some(bytes::Bytes::copy_from_slice(message.as_bytes())),
             true,
         )
+        .await
+}
+
+/// The newest events an exposed or admin-served feed returns. Half the ring:
+/// a reader wants "recent", and the full ring is the debugging view.
+pub const FEED_PAGE: usize = 100;
+
+/// Write an RSS document. The one non-plain response the proxy authors itself.
+pub async fn write_rss(session: &mut Session, doc: &str) -> Result<()> {
+    let mut header = ResponseHeader::build(200, Some(3))?;
+    header.insert_header(http::header::CONTENT_LENGTH, doc.len().to_string())?;
+    header.insert_header(http::header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")?;
+    // Feed readers poll on their own schedule; a shared cache re-serving a
+    // stale feed for a few minutes is fine and keeps a popular feed cheap.
+    header.insert_header(http::header::CACHE_CONTROL, "public, max-age=300")?;
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::copy_from_slice(doc.as_bytes())), true)
         .await
 }
 
@@ -560,7 +585,7 @@ impl ProxyHttp for LbProxy {
 
             let secure = is_secure_request(session);
             let info = request_info(session, host, &path, secure);
-            match self.auth.decide(&gate, &deployment.spec.id, &info).await {
+            match self.auth.decide(&gate, &deployment.spec.id, &deployment.spec.namespace, &info).await {
                 Decision::Allow(identity) => ctx.identity = *identity,
                 Decision::Answered(response) => {
                     write_gate_response(session, response).await?;
@@ -571,6 +596,26 @@ impl ProxyHttp for LbProxy {
                     return Ok(true);
                 }
             }
+        }
+
+        // A deployment that carries `feed.expose` serves its namespace's feed
+        // at that path — the only door from the data plane to a feed. After the
+        // gate on purpose, like the site branch below: a gated deployment
+        // exposes its feed exactly as far as its gate admits, and an ungated
+        // one has decided the feed is public.
+        if let Some(expose) = deployment.spec.feed.as_ref().and_then(|f| f.expose.as_deref())
+            && path == expose
+        {
+            let link = match &host {
+                Some(h) if is_secure_request(session) => format!("https://{h}{path}"),
+                Some(h) => format!("http://{h}{path}"),
+                None => path.clone(),
+            };
+            let events = self.feed.recent(&deployment.spec.namespace, FEED_PAGE);
+            let doc = crate::feed::rss(&deployment.spec.namespace, &link, &events);
+            ctx.deployment = Some(deployment);
+            write_rss(session, &doc).await?;
+            return Ok(true);
         }
 
         // A site has no backend to pick: app-lb answers it here, off disk. This
@@ -657,7 +702,7 @@ impl ProxyHttp for LbProxy {
                     // Nothing ready. If the deployment can still grow, hold the
                     // request while a VM boots rather than failing the caller.
                     // (A static deployment never grows, so this returns at once.)
-                    match wait_for_capacity(&deployment, &ctx.failed, &self.metrics).await {
+                    match wait_for_capacity(&deployment, &ctx.failed, &self.metrics, &self.feed).await {
                         Some(b) => b,
                         None => {
                             return Err(Error::explain(
@@ -844,6 +889,7 @@ pub async fn wait_for_capacity(
     deployment: &Arc<Deployment>,
     exclude: &[String],
     metrics: &Metrics,
+    feed: &crate::feed::Feed,
 ) -> Option<Arc<VmBackend>> {
     if !deployment.can_grow() {
         // Not a cold-start wait — the pool is at max with nothing healthy, so
@@ -883,6 +929,15 @@ pub async fn wait_for_capacity(
                 "cold start timed out with no VM available",
             );
             metrics.record_cold_start_timeout(&deployment.spec.id);
+            feed.issue(
+                &deployment.spec,
+                format!("{}: cold start timed out", deployment.spec.id),
+                format!(
+                    "a request waited {}s and no VM became available",
+                    deployment.spec.scaling.cold_start_timeout_secs
+                ),
+                crate::deployment::now_secs(),
+            );
             return None;
         }
     }
@@ -1006,6 +1061,8 @@ mod tests {
 
     fn deployment(scaling: ScalingPolicy) -> Arc<Deployment> {
         Arc::new(Deployment::new(DeploymentSpec {
+            namespace: "default".into(),
+            feed: None,
             id: "demo".into(),
             routes: vec![RouteRule {
                 host: Some("demo.local".into()),
@@ -1072,7 +1129,7 @@ mod tests {
         d.set_backends(vec![b]);
 
         let started = std::time::Instant::now();
-        assert!(wait_for_capacity(&d, &[], &Metrics::new()).await.is_none());
+        assert!(wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -1083,7 +1140,7 @@ mod tests {
             cold_start_timeout_secs: 1,
             ..Default::default()
         });
-        assert!(wait_for_capacity(&d, &[], &Metrics::new()).await.is_none());
+        assert!(wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_none());
     }
 
     #[tokio::test]
@@ -1102,7 +1159,7 @@ mod tests {
             d2.ready_signal.notify_waiters();
         });
 
-        let got = wait_for_capacity(&d, &[], &Metrics::new()).await;
+        let got = wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await;
         assert_eq!(got.unwrap().peer, "10.0.0.1:80");
     }
 
@@ -1116,6 +1173,6 @@ mod tests {
             ..Default::default()
         });
         d.set_backends(vec![backend("10.0.0.1:80")]);
-        assert!(wait_for_capacity(&d, &[], &Metrics::new()).await.is_some());
+        assert!(wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_some());
     }
 }

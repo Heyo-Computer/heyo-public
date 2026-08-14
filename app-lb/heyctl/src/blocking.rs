@@ -323,6 +323,20 @@ impl Client {
         run!(self, self.inner.revoke_token(id))
     }
 
+    // -- the event feed ------------------------------------------------------
+
+    pub fn feeds(&self) -> Result<Vec<FeedIndexEntry>> {
+        run!(self, self.inner.feeds())
+    }
+
+    pub fn feed_events(&self, namespace: &str) -> Result<Vec<FeedEvent>> {
+        run!(self, self.inner.feed_events(namespace))
+    }
+
+    pub fn feed_rss(&self, namespace: &str) -> Result<String> {
+        run!(self, self.inner.feed_rss(namespace))
+    }
+
     // -- jobs ---------------------------------------------------------------
 
     pub fn start_build(&self, id: &str, git_ref: Option<&str>) -> Result<JobRecord> {
@@ -568,7 +582,7 @@ macro_rules! raw_blocking_id {
 }
 
 impl Raw<'_> {
-    raw_blocking!(deployments, secrets, tokens, jobs, certs, workflows);
+    raw_blocking!(deployments, secrets, tokens, jobs, certs, workflows, feeds);
     raw_blocking_id!(deployment, secret, token, job, deployment_jobs, spec, workflow);
 
     pub fn metrics(&self, query: &MetricsQuery) -> Result<Value> {
@@ -593,6 +607,10 @@ impl Raw<'_> {
 
     pub fn patch_secret(&self, id: &str, patch: &Value) -> Result<Value> {
         block_on(&self.client.rt, self.client.inner.raw().patch_secret(id, patch))?
+    }
+
+    pub fn feed_events(&self, namespace: &str) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().feed_events(namespace))?
     }
 
     pub fn mint_token(&self, req: &NewToken) -> Result<Value> {

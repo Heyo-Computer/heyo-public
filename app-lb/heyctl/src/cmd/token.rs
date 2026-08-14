@@ -56,6 +56,11 @@ pub struct MintArgs {
     #[arg(long, conflicts_with = "deployments")]
     pub all_deployments: bool,
 
+    /// Confine the token to one namespace. With no --deployment it reaches
+    /// every deployment in the namespace, and nothing outside it, ever.
+    #[arg(long, value_name = "NAMESPACE")]
+    pub namespace: Option<String>,
+
     /// Expire after this many hours.
     #[arg(long, value_name = "HOURS")]
     pub expires_in: Option<u64>,
@@ -138,16 +143,24 @@ fn mint(ctx: &Ctx, args: &MintArgs) -> Result<()> {
     // A token with neither an admin scope nor a deployment can do nothing at
     // all. That is a safe default for a *forgotten* field and a mistake when
     // it is the whole request, so say so rather than mint a useless credential.
-    if matches!(args.admin, AdminScopeArg::None) && deployments.is_empty() {
+    // A namespace changes the reading: inside one, an empty deployment list
+    // means the whole namespace.
+    if matches!(args.admin, AdminScopeArg::None)
+        && deployments.is_empty()
+        && args.namespace.is_none()
+    {
         bail!(
             "this token would have no access to anything — give it --admin, \
-             or --deployment/-d, or --all-deployments"
+             or --deployment/-d, or --all-deployments, or --namespace"
         );
     }
 
     let mut req = NewToken::new(&args.name)
         .admin(args.admin.into())
         .for_deployments(deployments);
+    if let Some(ns) = &args.namespace {
+        req = req.in_namespace(ns);
+    }
     if let Some(hours) = args.expires_in {
         req = req.expires_in(std::time::Duration::from_secs(hours * 3600));
     }
@@ -176,12 +189,17 @@ fn mint(ctx: &Ctx, args: &MintArgs) -> Result<()> {
 }
 
 fn scope_cell(t: &TokenSummary) -> String {
-    if t.covers_fleet() {
+    let deployments = if t.covers_fleet() {
         "*".to_string()
     } else if t.deployments.is_empty() {
-        "—".to_string()
+        // Inside a namespace an empty list is the whole namespace, not nothing.
+        if t.namespace.is_some() { "*".to_string() } else { "—".to_string() }
     } else {
         t.deployments.join(",")
+    };
+    match &t.namespace {
+        Some(ns) => format!("{ns}:{deployments}"),
+        None => deployments,
     }
 }
 
@@ -243,6 +261,9 @@ fn describe(ctx: &Ctx, id: &str) -> Result<()> {
     output::field("ID", &t.id);
     output::field("Name", &t.name);
     output::field("Admin API", t.admin.to_string());
+    if let Some(ns) = &t.namespace {
+        output::field("Namespace", ns);
+    }
     output::field(
         "Deployments",
         if t.covers_fleet() {
@@ -336,6 +357,7 @@ mod tests {
             id: "abc".into(),
             name: "t".into(),
             admin: AdminScope::Admin,
+            namespace: None,
             deployments: deployments.iter().map(|s| s.to_string()).collect(),
             created_at: 0,
             expires_at,
@@ -349,6 +371,20 @@ mod tests {
         assert_eq!(scope_cell(&token(&["*"], None)), "*");
         assert_eq!(scope_cell(&token(&[], None)), "—");
         assert_eq!(scope_cell(&token(&["a", "b"], None)), "a,b");
+    }
+
+    #[test]
+    fn the_scope_cell_shows_the_namespace_wall() {
+        let ns = |deployments: &[&str]| TokenSummary {
+            namespace: Some("team-a".into()),
+            ..token(deployments, None)
+        };
+        // An empty list inside a namespace is the whole namespace, so it must
+        // not render as the "reaches nothing" dash.
+        assert_eq!(scope_cell(&ns(&[])), "team-a:*");
+        assert_eq!(scope_cell(&ns(&["web"])), "team-a:web");
+        // And `*` inside a namespace is the namespace, not the fleet.
+        assert_eq!(scope_cell(&ns(&["*"])), "team-a:*");
     }
 
     #[test]

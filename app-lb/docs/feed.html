@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The event feed — app-lb</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="side">
+  <a class="brand" href="index.html">app-lb</a>
+  <p class="tagline">load balancer &amp; microVM autoscaler</p>
+  <ul>
+    <li><a href="index.html">Overview</a></li>
+    <li class="group">app-lb</li>
+    <li><a href="deployments.html">Deployments &amp; scaling</a></li>
+    <li><a href="security.html">Auth, tokens &amp; the admin API</a></li>
+    <li><a href="namespaces.html">Namespaces</a></li>
+    <li><a href="feed.html" aria-current="page">The event feed</a></li>
+    <li class="group">clients</li>
+    <li><a href="heyctl.html">heyctl</a></li>
+  </ul>
+</nav>
+<main>
+<h1>The event feed</h1>
+<p class="lede">Per-namespace RSS of what happened to your deployments: deploys, updates,
+removals, and operational trouble. Strictly opt-in — a spec that says nothing publishes
+nothing.</p>
+
+<h2>Opting in</h2>
+<p>Three independent switches on the deployment spec, all off by default:</p>
+<pre><code>"feed": {
+  "announce": true,          // publish registered / updated / removed
+  "issues": true,            // publish operational trouble
+  "expose": "/feed.xml"      // serve the namespace's feed on this deployment's routes
+}</code></pre>
+<table>
+  <tr><th>Switch</th><th>Publishes</th></tr>
+  <tr><td><code>announce</code></td><td>The deployment was registered, its spec was
+  replaced or edited, or it was deregistered — with its public URLs in the entry, so a
+  subscriber can go look.</td></tr>
+  <tr><td><code>issues</code></td><td>A VM that never became ready inside its boot
+  timeout, a VM create the daemon refused, a static upstream going unhealthy (and
+  recovering), and a cold start that timed out with a request waiting.</td></tr>
+  <tr><td><code>expose</code></td><td>Nothing — it makes the feed <em>reachable</em>; see
+  below.</td></tr>
+</table>
+<p>Repeats fold: the same issue recurring within five minutes becomes one entry with a
+count and a fresh timestamp, so a crash-looping VM is one story, not two hundred items
+pushing everything else off the feed.</p>
+
+<h2>Reading a feed</h2>
+<pre><code># which namespaces have events
+heyctl feed
+
+# the events, newest first
+heyctl feed team-a
+
+# the RSS document itself
+heyctl feed team-a --xml &gt; feed.xml</code></pre>
+<p>On the admin API: <code>GET /feeds</code> lists namespaces with events;
+<code>GET /feeds/team-a</code> (or <code>team-a.xml</code>) is RSS 2.0, and
+<code>?format=json</code> returns the same entries as structured data. Both sit on the
+view tier and behind the token namespace wall — a namespace token reads its own feed and
+no other, and a plain deployment-scoped token reads none (which namespaces exist is fleet
+information).</p>
+
+<h2>Making a feed public</h2>
+<p>The admin listener is loopback; the only door from the outside is <code>expose</code>.
+A deployment that carries <code>"expose": "/feed.xml"</code> serves its namespace's feed
+at that path on its own routes, through the proxy — <em>after</em> its own
+<code>auth</code> gate:</p>
+<ul>
+  <li>No gate → the feed is public at
+  <code>https://web.example.com/feed.xml</code>, cacheable, ready for any reader.</li>
+  <li>A gate → the feed is exactly as private as the deployment: whoever the gate admits
+  (a signed-in person, a program with an accepted token) can read it.</li>
+</ul>
+<p>Any deployment in the namespace can be the avenue — a team might give its status page
+deployment the <code>expose</code> and leave every other spec silent.</p>
+
+<div class="note">The feed is a ring in memory — 200 events per namespace, and a restart
+starts it empty. Feed readers handle that shape gracefully (an empty feed reads as
+"nothing new"). The durable record is the job history and app-obs; the feed is the
+subscription view.</div>
+
+<h2>Entry anatomy</h2>
+<pre><code>{
+  "id": 7,                          // monotonic; the RSS &lt;guid&gt;
+  "ts": 1722400000,                 // first occurrence
+  "last_ts": 1722400120,            // latest, when folded
+  "count": 3,
+  "namespace": "team-a",
+  "deployment": "web",
+  "kind": "issue",                  // deployed | updated | removed | issue
+  "title": "web: cold start timed out",
+  "detail": "a request waited 120s and no VM became available"
+}</code></pre>
+
+<footer><a href="namespaces.html">← Namespaces</a> · next:
+<a href="heyctl.html">heyctl</a></footer>
+</main>
+</div>
+</body>
+</html>

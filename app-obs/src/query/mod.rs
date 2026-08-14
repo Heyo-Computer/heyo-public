@@ -268,6 +268,8 @@ pub struct Engine {
     /// data plane, and a month-wide query is CPU-bound parquet work on the same
     /// runtime that is accepting ingest.
     permits: Arc<Semaphore>,
+    /// Every slot in `permits`, so `quiesce` knows what "all of them" means.
+    permit_count: u32,
     timeout: Duration,
 }
 
@@ -347,12 +349,30 @@ impl Engine {
                 .await?;
         }
 
+        let permit_count = u32::try_from(concurrency.max(1)).unwrap_or(u32::MAX);
         Ok(Self {
             data_dir,
             ctx,
-            permits: Arc::new(Semaphore::new(concurrency.max(1))),
+            permits: Arc::new(Semaphore::new(permit_count as usize)),
+            permit_count,
             timeout,
         })
+    }
+
+    /// Hold every query slot until the returned permit drops.
+    ///
+    /// For the compactor, which swaps a partition's files and must not do so
+    /// under a scan that has already listed the directory: with all slots held,
+    /// no query is in flight, and one arriving meanwhile gets the same `Busy` a
+    /// full pool produces. Waits for in-flight queries to finish rather than
+    /// interrupting them, so hold this only across cheap work — renames, not
+    /// reads.
+    pub async fn quiesce(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.permits
+            .clone()
+            .acquire_many_owned(self.permit_count)
+            .await
+            .expect("the query semaphore is never closed")
     }
 
     /// Every deployment with data on disk, `_host` excluded, sorted.

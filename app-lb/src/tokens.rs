@@ -99,6 +99,16 @@ pub struct AppToken {
     pub name: String,
     #[serde(default)]
     pub admin: AdminScope,
+    /// The namespace this token is confined to. `None` — the shape every token
+    /// had before namespaces existed — means unconfined: reach is governed by
+    /// `deployments` alone. `Some(ns)` walls the token into that namespace: it
+    /// can never touch a deployment outside it, no matter what `deployments`
+    /// says, and an empty `deployments` list means *everything in the
+    /// namespace* rather than nothing. That inversion is the point of the
+    /// field: a namespace token is "a key to this room", not a list of ids
+    /// that goes stale as the room's contents change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Deployment ids this token may touch, or `["*"]` for all of them.
     #[serde(default)]
     pub deployments: Vec<String>,
@@ -134,10 +144,32 @@ impl AppToken {
             .any(|d| d == "*" || d == deployment)
     }
 
+    /// Whether this token may act on a deployment, given the namespace that
+    /// deployment lives in. This is the check every enforcement point should
+    /// use; bare [`allows`](Self::allows) predates namespaces and ignores them.
+    ///
+    /// For an unconfined token this is exactly `allows`. For a namespace token
+    /// the namespace must match, and within it the `deployments` list narrows
+    /// only when non-empty — see the field doc on
+    /// [`namespace`](Self::namespace) for why empty means everything there.
+    pub fn admits(&self, deployment: &str, deployment_namespace: &str) -> bool {
+        match &self.namespace {
+            None => self.allows(deployment),
+            Some(ns) => {
+                ns == deployment_namespace
+                    && (self.deployments.is_empty() || self.allows(deployment))
+            }
+        }
+    }
+
     /// Whether this token's scope covers the whole fleet, which the routes that
     /// aren't about any one deployment require.
+    ///
+    /// A namespace token never does, whatever its `deployments` say: `["*"]`
+    /// inside a namespace means every deployment *there*, and the fleet-wide
+    /// routes are precisely the ones that see past a namespace wall.
     pub fn covers_fleet(&self) -> bool {
-        self.deployments.iter().any(|d| d == "*")
+        self.namespace.is_none() && self.deployments.iter().any(|d| d == "*")
     }
 
     pub fn expired_at(&self, now: u64) -> bool {
@@ -160,6 +192,7 @@ impl AppToken {
             id: self.id.clone(),
             name: self.name.clone(),
             admin: self.admin,
+            namespace: self.namespace.clone(),
             deployments: self.deployments.clone(),
             created_at: self.created_at,
             expires_at: self.expires_at,
@@ -178,6 +211,8 @@ pub struct TokenSummary {
     pub id: String,
     pub name: String,
     pub admin: AdminScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     pub deployments: Vec<String>,
     pub created_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +233,11 @@ pub struct NewToken {
     pub name: String,
     #[serde(default)]
     pub admin: AdminScope,
+    /// Confine the token to one namespace. See [`AppToken::namespace`] for the
+    /// semantics — note that with this set, an empty `deployments` list means
+    /// the whole namespace, not nothing.
+    #[serde(default)]
+    pub namespace: Option<String>,
     #[serde(default)]
     pub deployments: Vec<String>,
     /// Lifetime from now. Absent means it never expires, which is a real choice
@@ -215,6 +255,10 @@ pub struct TokenPatch {
     pub name: Option<String>,
     #[serde(default)]
     pub admin: Option<AdminScope>,
+    /// `Some(None)` (JSON `null`) lifts the namespace wall, `Some(Some(ns))`
+    /// moves it. Absent leaves it — the same shape as `expires_at`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub namespace: Option<Option<String>>,
     #[serde(default)]
     pub deployments: Option<Vec<String>>,
     /// `Some(None)` clears the expiry, `Some(Some(t))` sets it. Absent leaves it.
@@ -222,9 +266,10 @@ pub struct TokenPatch {
     pub expires_at: Option<Option<u64>>,
 }
 
-/// Distinguish `"expires_at": null` (clear it) from an absent key (leave it).
-fn double_option<'de, D>(d: D) -> Result<Option<Option<u64>>, D::Error>
+/// Distinguish an explicit `null` (clear it) from an absent key (leave it).
+fn double_option<'de, T, D>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
+    T: Deserialize<'de>,
     D: serde::Deserializer<'de>,
 {
     Deserialize::deserialize(d).map(Some)
@@ -238,6 +283,8 @@ pub enum TokenError {
     NoToken(String),
     /// A `deployments` entry that isn't a plausible id.
     BadScope(String),
+    /// A namespace outside the id alphabet.
+    BadNamespace(String),
     Io(std::io::Error),
     Json(serde_json::Error),
     UnknownFormat(String),
@@ -252,6 +299,10 @@ impl std::fmt::Display for TokenError {
             Self::BadScope(s) => write!(
                 f,
                 "\"{s}\" is not a deployment id — scope entries are ids, or \"*\" for all"
+            ),
+            Self::BadNamespace(s) => write!(
+                f,
+                "\"{s}\" is not a namespace — letters, digits, '-', '_' and '.' only"
             ),
             Self::Io(e) => write!(f, "{e}"),
             Self::Json(e) => write!(f, "{e}"),
@@ -308,6 +359,7 @@ impl TokenStore {
             return Err(TokenError::NameTooLong);
         }
         validate_scope(&req.deployments)?;
+        validate_namespace(req.namespace.as_deref())?;
 
         let id = random_hex(ID_LEN / 2);
         let secret = random_b64(SECRET_BYTES);
@@ -315,6 +367,7 @@ impl TokenStore {
             id: id.clone(),
             name,
             admin: req.admin,
+            namespace: req.namespace,
             deployments: req.deployments,
             created_at: now,
             expires_at: req.expires_in_secs.map(|s| now.saturating_add(s)),
@@ -367,6 +420,9 @@ impl TokenStore {
         if let Some(scope) = &patch.deployments {
             validate_scope(scope)?;
         }
+        if let Some(namespace) = &patch.namespace {
+            validate_namespace(namespace.as_deref())?;
+        }
         if let Some(name) = &patch.name {
             let n = name.trim();
             if n.is_empty() {
@@ -387,6 +443,9 @@ impl TokenStore {
         }
         if let Some(admin) = patch.admin {
             next.admin = admin;
+        }
+        if let Some(namespace) = patch.namespace {
+            next.namespace = namespace;
         }
         if let Some(deployments) = patch.deployments {
             next.deployments = deployments;
@@ -562,6 +621,18 @@ fn validate_scope(scope: &[String]) -> Result<(), TokenError> {
     Ok(())
 }
 
+/// A namespace, if one was given. Same reasoning as [`validate_scope`]: a
+/// typo'd namespace would mint a token that authenticates and then reaches
+/// nothing, silently.
+fn validate_namespace(ns: Option<&str>) -> Result<(), TokenError> {
+    match ns {
+        Some(ns) if !crate::config::is_valid_namespace(ns) => {
+            Err(TokenError::BadNamespace(ns.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     openssl::rand::rand_bytes(&mut buf).expect("entropy for a token id");
@@ -635,6 +706,7 @@ mod tests {
         NewToken {
             name: name.into(),
             admin,
+            namespace: None,
             deployments: deployments.iter().map(|s| s.to_string()).collect(),
             expires_in_secs: None,
         }
@@ -725,6 +797,107 @@ mod tests {
         let wide = s.get(&wide.id).unwrap();
         assert!(wide.allows("anything"));
         assert!(wide.covers_fleet());
+    }
+
+    #[test]
+    fn a_namespace_token_is_walled_into_its_namespace() {
+        let (s, _g) = store();
+        let (summary, _) = s
+            .mint(
+                NewToken {
+                    namespace: Some("team-a".into()),
+                    ..new("team-a agent", AdminScope::Admin, &[])
+                },
+                100,
+            )
+            .unwrap();
+        let t = s.get(&summary.id).unwrap();
+
+        // Empty `deployments` inside a namespace means the whole namespace —
+        // the inversion that makes the token a key to the room rather than a
+        // stale list of ids.
+        assert!(t.admits("web", "team-a"));
+        assert!(t.admits("anything-registered-there", "team-a"));
+        assert!(!t.admits("web", "team-b"), "the wall holds across namespaces");
+        assert!(!t.admits("web", "default"));
+
+        // `["*"]` inside a namespace is the namespace, not the fleet.
+        let (wide, _) = s
+            .mint(
+                NewToken {
+                    namespace: Some("team-a".into()),
+                    ..new("team-a wide", AdminScope::Admin, &["*"])
+                },
+                100,
+            )
+            .unwrap();
+        let wide = s.get(&wide.id).unwrap();
+        assert!(wide.admits("web", "team-a"));
+        assert!(!wide.admits("web", "team-b"));
+        assert!(
+            !wide.covers_fleet(),
+            "a namespace token must never satisfy a fleet-wide route"
+        );
+
+        // An explicit list narrows *within* the namespace.
+        let (narrow, _) = s
+            .mint(
+                NewToken {
+                    namespace: Some("team-a".into()),
+                    ..new("team-a one app", AdminScope::None, &["web"])
+                },
+                100,
+            )
+            .unwrap();
+        let narrow = s.get(&narrow.id).unwrap();
+        assert!(narrow.admits("web", "team-a"));
+        assert!(!narrow.admits("api", "team-a"));
+    }
+
+    #[test]
+    fn an_unconfined_token_ignores_namespaces_entirely() {
+        let (s, _g) = store();
+        let (summary, _) = s.mint(new("ci", AdminScope::Admin, &["web"]), 100).unwrap();
+        let t = s.get(&summary.id).unwrap();
+        // Pre-namespace behavior, unchanged: the list is the scope, wherever
+        // the deployment lives.
+        assert!(t.admits("web", "default"));
+        assert!(t.admits("web", "team-b"));
+        assert!(!t.admits("api", "default"));
+    }
+
+    #[test]
+    fn a_namespace_must_be_plausible_and_can_be_patched_away() {
+        let (s, _g) = store();
+        assert!(matches!(
+            s.mint(
+                NewToken {
+                    namespace: Some("team a".into()),
+                    ..new("bad", AdminScope::None, &[])
+                },
+                100,
+            ),
+            Err(TokenError::BadNamespace(_))
+        ));
+
+        let (summary, _) = s
+            .mint(
+                NewToken {
+                    namespace: Some("team-a".into()),
+                    ..new("movable", AdminScope::None, &["*"])
+                },
+                100,
+            )
+            .unwrap();
+        // `null` lifts the wall; the `deployments` list is the scope again.
+        let patched = s
+            .patch(&summary.id, TokenPatch { namespace: Some(None), ..Default::default() })
+            .unwrap();
+        assert_eq!(patched.namespace, None);
+        assert!(s.get(&summary.id).unwrap().covers_fleet());
+
+        // And it survives a restart in either shape.
+        s.persist().unwrap();
     }
 
     #[test]

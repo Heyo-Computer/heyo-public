@@ -268,6 +268,7 @@ impl Authenticator {
         &self,
         gate: &AuthGate,
         deployment_id: &str,
+        deployment_namespace: &str,
         req: &RequestInfo<'_>,
     ) -> Decision {
         // app-lb's own endpoints first — they live under the deployment's
@@ -300,7 +301,7 @@ impl Authenticator {
             && let Some(presented) = &req.bearer
             && let Some(tokens) = &self.tokens
             && let Some(token) = tokens.verify(presented, now_secs())
-            && token.allows(deployment_id)
+            && token.admits(deployment_id, deployment_namespace)
         {
             // No `Identity`: a token is not a person, and forwarding
             // `x-auth-request-email` for one would put a name upstream that
@@ -1180,7 +1181,7 @@ mod tests {
             // Issued by `web`, presented at `api`.
             let cookie = session_cookie(&a, &g, &id, now_secs() + 3600);
             let Decision::Allow(who) = a
-                .decide(&g, "api", &at("api.example.com", vec![cookie]))
+                .decide(&g, "api", "default", &at("api.example.com", vec![cookie]))
                 .await
             else {
                 panic!("a realm session must be accepted at a sibling deployment");
@@ -1197,7 +1198,7 @@ mod tests {
             let id = identity("someone@example.com", Some("example.com"));
             let cookie = session_cookie(&a, &g, &id, now_secs() + 3600);
             let Decision::Answered(r) = a
-                .decide(&g, "api", &at("api.example.com", vec![cookie]))
+                .decide(&g, "api", "default", &at("api.example.com", vec![cookie]))
                 .await
             else {
                 panic!("a host-only gate must not accept another deployment's session");
@@ -1221,7 +1222,7 @@ mod tests {
                 ..realm_gate()
             };
             let Decision::Answered(r) = a
-                .decide(&stricter, "api", &at("api.example.com", vec![cookie]))
+                .decide(&stricter, "api", "default", &at("api.example.com", vec![cookie]))
                 .await
             else {
                 panic!("a differently-scoped gate must not honour the shared session");
@@ -1291,7 +1292,7 @@ mod tests {
                 // them, with the shadowing one first.
                 vec![format!("{foreign}; {mine}")],
             ] {
-                let Decision::Allow(who) = a.decide(&g, "web", &req("/dashboard", cookies)).await
+                let Decision::Allow(who) = a.decide(&g, "web", "default", &req("/dashboard", cookies)).await
                 else {
                     panic!("a live session must be honoured whatever order the jar sends it in");
                 };
@@ -1302,7 +1303,7 @@ mod tests {
             // widens which cookies are *looked at*, never which are accepted.
             assert!(
                 matches!(
-                    a.decide(&g, "web", &req("/dashboard", vec![foreign])).await,
+                    a.decide(&g, "web", "default", &req("/dashboard", vec![foreign])).await,
                     Decision::Answered(_)
                 ),
                 "a session issued under another policy must not be honoured",
@@ -1353,6 +1354,7 @@ mod tests {
             t.mint(
                 NewToken {
                     name: "agent".into(),
+                    namespace: None,
                     // No admin API access at all — the point of this credential is
                     // to reach the application, not the LB.
                     admin: AdminScope::None,
@@ -1386,7 +1388,7 @@ mod tests {
             let g = token_gate(r#""app-token""#);
             let secret = mint(&t, &["web"]);
 
-            let Decision::Allow(identity) = a.decide(&g, "web", &bearing("/private", &secret)).await
+            let Decision::Allow(identity) = a.decide(&g, "web", "default", &bearing("/private", &secret)).await
             else {
                 panic!("a scoped token should have been admitted");
             };
@@ -1404,9 +1406,41 @@ mod tests {
 
             // Refused as if no credential were presented — the deployment it *is*
             // scoped to is none of this deployment's business.
-            let Decision::Answered(r) = a.decide(&g, "web", &bearing("/private", &secret)).await
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &bearing("/private", &secret)).await
             else {
                 panic!("expected a refusal");
+            };
+            assert_eq!(r.status, 401);
+        }
+
+        #[tokio::test]
+        async fn a_namespace_token_stops_at_its_namespace_wall() {
+            let (a, t) = with_tokens();
+            let g = token_gate(r#""app-token""#);
+            let secret = t
+                .mint(
+                    NewToken {
+                        name: "team-a agent".into(),
+                        namespace: Some("team-a".into()),
+                        admin: AdminScope::None,
+                        // Empty on purpose: inside a namespace this means every
+                        // deployment there.
+                        deployments: vec![],
+                        expires_in_secs: None,
+                    },
+                    now_secs(),
+                )
+                .unwrap()
+                .1;
+
+            let Decision::Allow(_) = a.decide(&g, "web", "team-a", &bearing("/private", &secret)).await
+            else {
+                panic!("a namespace token should reach a deployment in its namespace");
+            };
+            // The same deployment id elsewhere is a different deployment.
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &bearing("/private", &secret)).await
+            else {
+                panic!("expected a refusal outside the namespace");
             };
             assert_eq!(r.status, 401);
         }
@@ -1419,7 +1453,7 @@ mod tests {
 
             // A perfectly good token, on a gate that was never told to accept
             // one. Opting in is the spec's job, not the token's.
-            let Decision::Answered(r) = a.decide(&g, "web", &bearing("/private", &secret)).await
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &bearing("/private", &secret)).await
             else {
                 panic!("expected a redirect to the provider");
             };
@@ -1436,14 +1470,14 @@ mod tests {
 
             // Program.
             assert!(matches!(
-                a.decide(&g, "web", &bearing("/private", &secret)).await,
+                a.decide(&g, "web", "default", &bearing("/private", &secret)).await,
                 Decision::Allow(_)
             ));
 
             // Person.
             let id = identity("someone@example.com", Some("example.com"));
             let cookie = session_cookie(&a, &g, &id, now_secs() + 3600);
-            let Decision::Allow(who) = a.decide(&g, "web", &req("/private", vec![cookie])).await
+            let Decision::Allow(who) = a.decide(&g, "web", "default", &req("/private", vec![cookie])).await
             else {
                 panic!("a signed-in person should still get through");
             };
@@ -1451,7 +1485,7 @@ mod tests {
 
             // Neither.
             assert!(matches!(
-                a.decide(&g, "web", &req("/private", vec![])).await,
+                a.decide(&g, "web", "default", &req("/private", vec![])).await,
                 Decision::Answered(_)
             ));
         }
@@ -1462,13 +1496,13 @@ mod tests {
             let g = token_gate(r#""app-token""#);
             let secret = mint(&t, &["web"]);
             assert!(matches!(
-                a.decide(&g, "web", &bearing("/private", &secret)).await,
+                a.decide(&g, "web", "default", &bearing("/private", &secret)).await,
                 Decision::Allow(_)
             ));
 
             t.revoke(&t.list()[0].id);
             assert!(matches!(
-                a.decide(&g, "web", &bearing("/private", &secret)).await,
+                a.decide(&g, "web", "default", &bearing("/private", &secret)).await,
                 Decision::Answered(_)
             ));
         }
@@ -1481,7 +1515,7 @@ mod tests {
             let (a, _) = with_tokens();
             let g: AuthGate = serde_json::from_str(r#"{"provider":"app-token"}"#).unwrap();
 
-            let Decision::Answered(r) = a.decide(&g, "web", &req("/private", vec![])).await else {
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &req("/private", vec![])).await else {
                 panic!("expected a refusal");
             };
             assert_eq!(r.status, 401);
@@ -1496,7 +1530,7 @@ mod tests {
                 serde_json::from_str(r#"{"provider":"app-token","public_paths":["/healthz"]}"#)
                     .unwrap();
             assert!(matches!(
-                a.decide(&g, "web", &req("/healthz", vec![])).await,
+                a.decide(&g, "web", "default", &req("/healthz", vec![])).await,
                 Decision::Allow(_)
             ));
         }
@@ -1505,7 +1539,7 @@ mod tests {
     #[tokio::test]
     async fn an_unauthenticated_browser_is_sent_to_the_provider() {
         let (a, g) = (auth(), gate());
-        let Decision::Answered(r) = a.decide(&g, "web", &req("/dashboard", vec![])).await else {
+        let Decision::Answered(r) = a.decide(&g, "web", "default", &req("/dashboard", vec![])).await else {
             panic!("expected a redirect");
         };
         assert_eq!(r.status, 302);
@@ -1529,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn the_flow_cookie_is_lax_so_the_callback_can_read_it() {
         let (a, g) = (auth(), gate());
-        let Decision::Answered(r) = a.decide(&g, "web", &req("/", vec![])).await else {
+        let Decision::Answered(r) = a.decide(&g, "web", "default", &req("/", vec![])).await else {
             panic!("expected a redirect");
         };
         let flow = r.cookies.iter().find(|c| c.starts_with(FLOW_COOKIE)).unwrap();
@@ -1541,7 +1575,7 @@ mod tests {
         let (a, g) = (auth(), gate());
         let mut r = req("/api/things", vec![]);
         r.wants_html = false;
-        let Decision::Answered(response) = a.decide(&g, "web", &r).await else {
+        let Decision::Answered(response) = a.decide(&g, "web", "default", &r).await else {
             panic!("expected a 401");
         };
         assert_eq!(response.status, 401);
@@ -1555,7 +1589,7 @@ mod tests {
         let id = identity("someone@example.com", Some("example.com"));
         let cookie = session_cookie(&a, &g, &id, now_secs() + 600);
 
-        let Decision::Allow(got) = a.decide(&g, "web", &req("/dashboard", vec![cookie])).await
+        let Decision::Allow(got) = a.decide(&g, "web", "default", &req("/dashboard", vec![cookie])).await
         else {
             panic!("expected the request to pass");
         };
@@ -1568,14 +1602,14 @@ mod tests {
         g.public_paths = vec!["/healthz".into(), "/hooks/".into()];
 
         for path in ["/healthz", "/hooks/github"] {
-            let Decision::Allow(id) = a.decide(&g, "web", &req(path, vec![])).await else {
+            let Decision::Allow(id) = a.decide(&g, "web", "default", &req(path, vec![])).await else {
                 panic!("{path} should be public");
             };
             assert_eq!(*id, None, "a public path has no identity to forward");
         }
         // ...and only those.
         assert!(matches!(
-            a.decide(&g, "web", &req("/health", vec![])).await,
+            a.decide(&g, "web", "default", &req("/health", vec![])).await,
             Decision::Answered(_)
         ));
     }
@@ -1588,7 +1622,7 @@ mod tests {
         // Expired.
         let stale = session_cookie(&a, &g, &id, now_secs() - 1);
         assert!(matches!(
-            a.decide(&g, "web", &req("/", vec![stale])).await,
+            a.decide(&g, "web", "default", &req("/", vec![stale])).await,
             Decision::Answered(_)
         ));
 
@@ -1596,7 +1630,7 @@ mod tests {
         let other = Authenticator::new(vec![9u8; 32], Arc::new(SecretStore::new("x.json", None)), None, None);
         let forged = session_cookie(&other, &g, &id, now_secs() + 600);
         assert!(matches!(
-            a.decide(&g, "web", &req("/", vec![forged])).await,
+            a.decide(&g, "web", "default", &req("/", vec![forged])).await,
             Decision::Answered(_)
         ));
 
@@ -1608,7 +1642,7 @@ mod tests {
         edited[0] ^= 0x20;
         let tampered = format!("{name}={}.{mac}", b64().encode(edited));
         assert!(matches!(
-            a.decide(&g, "web", &req("/", vec![tampered])).await,
+            a.decide(&g, "web", "default", &req("/", vec![tampered])).await,
             Decision::Answered(_)
         ));
     }
@@ -1620,7 +1654,7 @@ mod tests {
         let (a, g) = (auth(), gate());
         let cookie = session_cookie(&a, &g, &identity("someone@example.com", Some("example.com")), now_secs() + 600);
         assert!(matches!(
-            a.decide(&g, "other", &req("/", vec![cookie])).await,
+            a.decide(&g, "other", "default", &req("/", vec![cookie])).await,
             Decision::Answered(_)
         ));
     }
@@ -1633,14 +1667,14 @@ mod tests {
         let id = identity("someone@example.com", Some("example.com"));
         let cookie = session_cookie(&a, &g, &id, now_secs() + 600);
         assert!(matches!(
-            a.decide(&g, "web", &req("/", vec![cookie.clone()])).await,
+            a.decide(&g, "web", "default", &req("/", vec![cookie.clone()])).await,
             Decision::Allow(_)
         ));
 
         let mut tightened = gate();
         tightened.allowed_domains = vec!["other.example".into()];
         assert!(matches!(
-            a.decide(&tightened, "web", &req("/", vec![cookie])).await,
+            a.decide(&tightened, "web", "default", &req("/", vec![cookie])).await,
             Decision::Answered(_)
         ));
     }
@@ -1862,7 +1896,7 @@ mod tests {
 
         let mut r = req("/__applb/auth/callback", vec![cookie]);
         r.query = Some("code=abc&state=a-different-nonce");
-        let Decision::Answered(response) = a.decide(&g, "web", &r).await else {
+        let Decision::Answered(response) = a.decide(&g, "web", "default", &r).await else {
             panic!("the callback always answers");
         };
         assert_eq!(response.status, 400);
@@ -1874,7 +1908,7 @@ mod tests {
         let (a, g) = (auth(), gate());
         let mut r = req("/__applb/auth/callback", vec![]);
         r.query = Some("error=access_denied");
-        let Decision::Answered(response) = a.decide(&g, "web", &r).await else {
+        let Decision::Answered(response) = a.decide(&g, "web", "default", &r).await else {
             panic!("the callback always answers");
         };
         assert_eq!(response.status, 403);
@@ -1905,7 +1939,7 @@ mod tests {
 
         let mut r = req("/__applb/auth/callback", vec![stale, live]);
         r.query = Some("code=abc&state=the-live-nonce");
-        let Decision::Answered(response) = a.decide(&g, "web", &r).await else {
+        let Decision::Answered(response) = a.decide(&g, "web", "default", &r).await else {
             panic!("the callback always answers");
         };
         assert_eq!(
@@ -1922,7 +1956,7 @@ mod tests {
         let (a, g) = (auth(), gate());
         let mut r = req("/__applb/auth/callback", vec![]);
         r.query = Some("code=abc&state=xyz");
-        let Decision::Answered(response) = a.decide(&g, "web", &r).await else {
+        let Decision::Answered(response) = a.decide(&g, "web", "default", &r).await else {
             panic!("the callback always answers");
         };
         assert_eq!(response.status, 302);
@@ -1935,7 +1969,7 @@ mod tests {
         let id = identity("someone@example.com", Some("example.com"));
         let cookie = session_cookie(&a, &g, &id, now_secs() + 600);
         let Decision::Answered(r) = a
-            .decide(&g, "web", &req("/__applb/auth/logout", vec![cookie]))
+            .decide(&g, "web", "default", &req("/__applb/auth/logout", vec![cookie]))
             .await
         else {
             panic!("logout always answers");

@@ -716,6 +716,8 @@ pub struct FleetPool {
 #[serde(default)]
 pub struct DeploymentView {
     pub id: String,
+    /// Empty when the server omitted the default namespace.
+    pub namespace: String,
     /// `"vm"`, `"static"` or `"site"`.
     pub kind: String,
     pub upstreams: Vec<String>,
@@ -1238,6 +1240,10 @@ pub struct TokenSummary {
     pub id: String,
     pub name: String,
     pub admin: AdminScope,
+    /// The namespace this token is confined to, if any. Inside it, an empty
+    /// `deployments` list means every deployment there; outside it the token
+    /// reaches nothing.
+    pub namespace: Option<String>,
     /// Deployment ids, or `["*"]` for all of them.
     pub deployments: Vec<String>,
     pub created_at: u64,
@@ -1251,14 +1257,49 @@ pub struct TokenSummary {
 }
 
 impl TokenSummary {
-    /// Whether this token's scope covers the whole fleet.
+    /// Whether this token's scope covers the whole fleet. A namespace token
+    /// never does — `["*"]` inside a namespace means everything *there*.
     pub fn covers_fleet(&self) -> bool {
-        self.deployments.iter().any(|d| d == "*")
+        self.namespace.is_none() && self.deployments.iter().any(|d| d == "*")
     }
 
     pub fn allows(&self, deployment: &str) -> bool {
         self.deployments.iter().any(|d| d == "*" || d == deployment)
     }
+}
+
+// -- the event feed ---------------------------------------------------------
+
+/// One namespace that has feed events, from `GET /feeds`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct FeedIndexEntry {
+    pub namespace: String,
+    pub events: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One event from a namespace's feed, from `GET /feeds/:ns?format=json`.
+///
+/// The same entries the RSS document carries; `id` is the RSS `<guid>`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct FeedEvent {
+    pub id: u64,
+    /// When the event first happened.
+    pub ts: u64,
+    /// When it last happened — repeats of the same issue fold into one entry.
+    pub last_ts: u64,
+    pub count: u64,
+    pub namespace: String,
+    pub deployment: String,
+    /// `deployed`, `updated`, `removed` or `issue`.
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// The reply to a mint. **`token` is the only time the secret is ever

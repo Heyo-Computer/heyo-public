@@ -7,6 +7,7 @@
 //! dashboard is.
 
 mod api;
+mod compaction;
 mod config;
 mod ingest;
 mod query;
@@ -15,6 +16,7 @@ mod sources;
 mod store;
 
 use api::ApiState;
+use compaction::Compaction;
 use config::Config;
 use ingest::Sink;
 use ingest::http::IngestState;
@@ -184,6 +186,11 @@ async fn run(cfg: Config) {
         Ok(engine) => Arc::new(engine),
         Err(e) => panic!("cannot open the query layer over {}: {e}", cfg.data_dir),
     };
+
+    // Merges the small files the flush interval produces, so a day-wide query
+    // opens a handful of parquet files rather than one per flush. Needs the
+    // engine to quiesce queries around each swap.
+    tokio::spawn(Compaction::new(&cfg.data_dir, cfg.compact_interval, engine.clone()).run());
 
     let api_state = ApiState {
         engine,

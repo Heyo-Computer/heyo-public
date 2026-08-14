@@ -1,0 +1,212 @@
+/* app-lb & heyctl documentation. Static, no JavaScript.
+   One stylesheet for every page; pages differ only in their <main>. */
+
+:root {
+  --bg: #ffffff;
+  --bg-raised: #f6f7f8;
+  --text: #1c2024;
+  --text-soft: #5b6570;
+  --accent: #0b6bcb;
+  --accent-soft: #e3effb;
+  --border: #dde2e7;
+  --code-bg: #f2f4f6;
+  --warn-bg: #fff7e6;
+  --warn-border: #e6c07a;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171a;
+    --bg-raised: #1b1f24;
+    --text: #e6e9ec;
+    --text-soft: #9aa4ae;
+    --accent: #66b2ff;
+    --accent-soft: #103050;
+    --border: #2b3239;
+    --code-bg: #1f242a;
+    --warn-bg: #2b2517;
+    --warn-border: #7a6534;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 16px/1.65 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+/* -- layout: fixed-ish sidebar, readable main column ---------------------- */
+
+.wrap {
+  display: flex;
+  min-height: 100vh;
+  max-width: 72rem;
+  margin: 0 auto;
+}
+
+nav.side {
+  flex: 0 0 15rem;
+  padding: 2rem 1.5rem;
+  border-right: 1px solid var(--border);
+}
+
+nav.side .brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+  display: block;
+  margin-bottom: 0.25rem;
+  color: var(--text);
+  text-decoration: none;
+}
+
+nav.side .tagline {
+  color: var(--text-soft);
+  font-size: 0.85rem;
+  margin: 0 0 1.5rem;
+}
+
+nav.side ul { list-style: none; margin: 0; padding: 0; }
+nav.side li { margin: 0; }
+
+nav.side a {
+  display: block;
+  padding: 0.35rem 0.6rem;
+  border-radius: 6px;
+  color: var(--text-soft);
+  text-decoration: none;
+}
+
+nav.side a:hover { color: var(--text); background: var(--bg-raised); }
+nav.side a[aria-current="page"] {
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+nav.side .group {
+  margin: 1.25rem 0 0.35rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+}
+
+main {
+  flex: 1;
+  min-width: 0;
+  padding: 2.5rem 3rem 5rem;
+  max-width: 50rem;
+}
+
+@media (max-width: 52rem) {
+  .wrap { flex-direction: column; }
+  nav.side { border-right: none; border-bottom: 1px solid var(--border); padding-bottom: 1rem; }
+  main { padding: 1.5rem 1.25rem 4rem; }
+}
+
+/* -- typography ----------------------------------------------------------- */
+
+h1 { font-size: 1.9rem; line-height: 1.25; margin: 0 0 0.5rem; }
+h1 + .lede { color: var(--text-soft); font-size: 1.05rem; margin-top: 0; }
+h2 { font-size: 1.35rem; margin: 2.5rem 0 0.75rem; padding-top: 0.5rem; }
+h3 { font-size: 1.05rem; margin: 1.75rem 0 0.5rem; }
+p, ul, ol { margin: 0.75rem 0; }
+li { margin: 0.3rem 0; }
+a { color: var(--accent); }
+hr { border: none; border-top: 1px solid var(--border); margin: 2.5rem 0; }
+
+/* -- code ----------------------------------------------------------------- */
+
+code, pre {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  font-size: 0.86em;
+}
+
+code {
+  background: var(--code-bg);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.9rem 1.1rem;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+
+pre code { background: none; padding: 0; }
+
+/* -- tables --------------------------------------------------------------- */
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1rem 0;
+  font-size: 0.92rem;
+}
+
+th, td {
+  text-align: left;
+  padding: 0.45rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+th {
+  font-size: 0.78rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+}
+
+td code { white-space: nowrap; }
+
+/* -- callouts -------------------------------------------------------------- */
+
+.note, .warn {
+  border-left: 3px solid var(--accent);
+  background: var(--bg-raised);
+  padding: 0.75rem 1rem;
+  border-radius: 0 8px 8px 0;
+  margin: 1.25rem 0;
+}
+
+.warn { border-left-color: var(--warn-border); background: var(--warn-bg); }
+
+/* -- cards on the index ---------------------------------------------------- */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.cards a {
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.15rem;
+  text-decoration: none;
+  color: var(--text);
+  background: var(--bg-raised);
+}
+
+.cards a:hover { border-color: var(--accent); }
+.cards strong { display: block; margin-bottom: 0.3rem; color: var(--accent); }
+.cards span { color: var(--text-soft); font-size: 0.9rem; }
+
+footer {
+  margin-top: 4rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-soft);
+  font-size: 0.85rem;
+}

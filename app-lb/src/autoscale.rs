@@ -75,16 +75,26 @@ pub struct Autoscaler {
     /// Fleet-wide budget for simultaneous VM creates. See
     /// [`CREATE_CONCURRENCY`].
     creates: tokio::sync::Semaphore,
+    /// The per-namespace event feed. Publishing is opt-in per spec — see
+    /// [`Feed::issue`](crate::feed::Feed::issue) — so calls are unconditional
+    /// here and the feed itself decides whether anyone hears about it.
+    feed: Arc<crate::feed::Feed>,
 }
 
 impl Autoscaler {
-    pub fn new(registry: Arc<Registry>, vms: VmManager, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        registry: Arc<Registry>,
+        vms: VmManager,
+        metrics: Arc<Metrics>,
+        feed: Arc<crate::feed::Feed>,
+    ) -> Self {
         Self {
             registry,
             vms,
             metrics,
             nonce: AtomicU64::new(now_secs()),
             creates: tokio::sync::Semaphore::new(CREATE_CONCURRENCY),
+            feed,
         }
     }
 
@@ -354,6 +364,18 @@ impl Autoscaler {
                     healthy,
                     "static upstream health changed",
                 );
+                let (title, detail) = if healthy {
+                    (
+                        format!("{}: upstream recovered", d.spec.id),
+                        format!("upstream {} is answering health checks again", b.peer),
+                    )
+                } else {
+                    (
+                        format!("{}: upstream unhealthy", d.spec.id),
+                        format!("upstream {} stopped answering health checks", b.peer),
+                    )
+                };
+                self.feed.issue(&d.spec, title, detail, now_secs());
             }
         }
     }
@@ -484,6 +506,12 @@ impl Autoscaler {
                         error = %e,
                         "giving up on VM",
                     );
+                    self.feed.issue(
+                        &d.spec,
+                        format!("{}: VM failed to boot", d.spec.id),
+                        format!("gave up on VM {} after {age}s: {e}", p.sandbox_id),
+                        now_secs(),
+                    );
                     doomed.push(p.sandbox_id.clone());
                     continue;
                 }
@@ -534,6 +562,15 @@ impl Autoscaler {
                      can try again",
                 );
                 self.metrics.record_boot_timeout(&d.spec.id);
+                self.feed.issue(
+                    &d.spec,
+                    format!("{}: VM failed to boot", d.spec.id),
+                    format!(
+                        "VM {} never became ready inside its {boot_timeout}s boot timeout",
+                        p.sandbox_id
+                    ),
+                    now_secs(),
+                );
                 doomed.push(p.sandbox_id.clone());
                 continue;
             }
@@ -676,6 +713,12 @@ impl Autoscaler {
                 }
                 Err(e) => {
                     tracing::error!(deployment = %d.spec.id, error = %e, "failed to create VM");
+                    self.feed.issue(
+                        &d.spec,
+                        format!("{}: VM create failed", d.spec.id),
+                        format!("the VM daemon refused to create a VM: {e}"),
+                        now_secs(),
+                    );
                     break; // daemon is unhappy; don't hammer it this tick
                 }
             }
@@ -1338,6 +1381,8 @@ mod tests {
 
     fn spec() -> DeploymentSpec {
         DeploymentSpec {
+            namespace: "default".into(),
+            feed: None,
             id: "demo".into(),
             routes: vec![RouteRule {
                 host: Some("demo.local".into()),
@@ -1371,6 +1416,8 @@ mod tests {
     /// A static (proxy_pass) deployment with fixed upstreams.
     fn static_spec() -> DeploymentSpec {
         DeploymentSpec {
+            namespace: "default".into(),
+            feed: None,
             id: "proxy".into(),
             routes: vec![RouteRule {
                 host: None,
@@ -1405,7 +1452,12 @@ mod tests {
         // not-found paths never call it.
         let vms = VmManager::new(Some("http://127.0.0.1:1".into()));
         (
-            Autoscaler::new(registry.clone(), vms, Arc::new(Metrics::new())),
+            Autoscaler::new(
+                registry.clone(),
+                vms,
+                Arc::new(Metrics::new()),
+                Arc::new(crate::feed::Feed::new()),
+            ),
             registry,
         )
     }
