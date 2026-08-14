@@ -365,12 +365,14 @@ fn default_boot_timeout_secs() -> u64 {
 /// one of four interchangeable web VMs should reclaim everything it held;
 /// retiring the single VM that is somebody's working directory should not.
 ///
-/// Note what `Retain` can and cannot keep, because the daemon decides this and
-/// not app-lb: a stopped sandbox keeps its record and its **`/workspace` data
-/// disk** (`vm.disk_size_gb`), and loses its memory and any writes to the
-/// rootfs — mvm-ctrl recopies the rootfs from the base image on every cold boot.
-/// A `Retain` deployment with no data disk therefore saves boot time and nothing
-/// else. Persistent state has to live under `/workspace`.
+/// Note what `Retain` can and cannot keep: a stopped sandbox keeps its record
+/// and its **`/workspace` data disk** (`vm.disk_size_gb`), and loses its memory
+/// and any writes to the rootfs. For Firecracker the daemon enforces that —
+/// the rootfs is recopied from the base image on every cold boot — and for KVM
+/// the autoscaler does, by discarding the persisted rootfs copy right after a
+/// suspend rather than parking a gigabyte per idle replica. A `Retain`
+/// deployment with no data disk therefore saves boot time and nothing else.
+/// Persistent state has to live under `/workspace`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IdleAction {
@@ -413,6 +415,13 @@ pub struct ScalingPolicy {
     /// anywhere. The pool's own `min_replicas` can never be met and nothing says
     /// why. `0` restores that unbounded wait for a deployment whose boots are
     /// genuinely open-ended.
+    ///
+    /// Replacements back off. Consecutive failed boots — timeouts and terminal
+    /// statuses alike — delay the next create, doubling from thirty seconds to
+    /// an hour and resetting on the first healthy boot (see
+    /// [`crate::deployment::boot_backoff_secs`]). Without that, a guest that
+    /// can never become ready churns a fresh sandbox — and, historically, a
+    /// fresh set of leaked disk directories — per cycle, forever.
     #[serde(default = "default_boot_timeout_secs")]
     pub boot_timeout_secs: u64,
     /// Whether a VM the autoscaler retires is destroyed or merely stopped. See

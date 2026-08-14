@@ -540,20 +540,36 @@ fn main() {
     // feed a deployment exposes). In-memory; a restart starts it empty.
     let event_feed = std::sync::Arc::new(feed::Feed::new());
 
+    // Resolved before the autoscaler because both want it: the disk console
+    // inventories these paths, and the autoscaler discards a suspended
+    // replica's rootfs copy under them. Optional in exactly one way: without a
+    // resolvable daemon data directory there is nothing to inventory, and an LB
+    // whose host keeps its VMs elsewhere should not refuse to start over it.
+    // The disk routes then answer 503 and say why.
+    let disk_cfg = match disks::DiskConfig::from_env(&cfg) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!("{e}. Disk management is disabled");
+            None
+        }
+    };
+
     // `background_service` hands back an Arc to the same task the service runs,
     // which is how the admin API reaches the autoscaler to tear deployments down.
     let autoscaler_svc = background_service(
         "autoscaler",
-        Autoscaler::new(registry.clone(), vms.clone(), metrics.clone(), event_feed.clone()),
+        Autoscaler::new(
+            registry.clone(),
+            vms.clone(),
+            metrics.clone(),
+            event_feed.clone(),
+            disk_cfg.clone(),
+        ),
     );
     let autoscaler = autoscaler_svc.task();
 
-    // Disk inventory and reclamation. Optional in exactly one way: without a
-    // resolvable daemon data directory there is nothing to inventory, and an LB
-    // whose host keeps its VMs elsewhere should not refuse to start over it. The
-    // routes then answer 503 and say why.
-    let disks = match disks::DiskConfig::from_env(&cfg) {
-        Ok(disk_cfg) => {
+    let disks = match disk_cfg {
+        Some(disk_cfg) => {
             let store = Arc::new(disks::DiskStore::new(
                 disk_cfg,
                 vms,
@@ -603,10 +619,7 @@ fn main() {
             }
             Some(store)
         }
-        Err(e) => {
-            tracing::warn!("{e}. Disk management is disabled");
-            None
-        }
+        None => None,
     };
 
     // Where an artifact pull writes a rootfs. Resolved once, and kept as a

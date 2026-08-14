@@ -6,11 +6,15 @@
 //! Three separate leaks, all of them observed:
 //!
 //! - `<data>/run/<id>/` — the Firecracker `/workspace` data disk plus a
-//!   `snapshot/` directory. The one outright delete-path bug: mvm-ctrl's
-//!   `destroy()` unlinks this directory only inside its `data_disk_path
-//!   .is_some()` branch, so a sandbox created *without* `disk_size_gb` still
-//!   gets the directory (the snapshot dir and the tap allocation live there)
-//!   and nothing ever removes it.
+//!   `snapshot/` directory. On daemons **before heyvm 0.42.5** this was an
+//!   outright delete-path bug: mvm-ctrl's `destroy()` unlinked this directory
+//!   only inside its `data_disk_path.is_some()` branch, so a sandbox created
+//!   *without* `disk_size_gb` still got the directory (the snapshot dir and the
+//!   tap allocation live there) and nothing ever removed it. Fixed upstream on
+//!   2026-08-03 — `destroy()` now removes both per-sandbox directories derived
+//!   from the id — but the fix only runs on delete, so whatever an older daemon
+//!   already leaked stays leaked until this module reclaims it, and any host
+//!   still running a pre-0.42.5 daemon keeps producing more.
 //! - `<data>/kvm/<id>/` — the KVM driver's per-VM `rootfs.ext4` and any
 //!   `mount*.ext4`, ~1 GiB each. A clean delete *does* remove the whole state
 //!   dir; what accumulates is every sandbox that never got one — a crash, a lost
@@ -1501,6 +1505,91 @@ impl DiskStore {
         }
         outcome
     }
+
+    /// Reclaim every orphaned disk on the host, at any age.
+    ///
+    /// The expiry sweep only takes what has sat unclaimed past the TTL; this is
+    /// the operator saying "the daemon has no record of these, take them all
+    /// now". Age is deliberately not consulted — an orphan is pure residue on
+    /// the day it is made, and waiting a week only means a week of paying for
+    /// it. What *is* consulted is everything else: the same holds as any other
+    /// purge, so a claimed or retained orphan is counted, reported, and left
+    /// alone rather than force-flagged through.
+    ///
+    /// Declines entirely when the inventory is incomplete, for the sweep's
+    /// reason: without both daemon listings nothing is classified as an orphan
+    /// in the first place, and saying "skipped" beats reporting an empty purge
+    /// as if the host were clean.
+    pub async fn purge_orphans(self: &Arc<Self>) -> PurgeOrphansOutcome {
+        let mut outcome = PurgeOrphansOutcome::default();
+
+        let inv = self.inventory().await;
+        if !inv.complete {
+            tracing::warn!(
+                reason = inv.incomplete_reason.as_deref().unwrap_or("unknown"),
+                "refusing to purge orphans: without the daemon's listings nothing can be \
+                 classified as one",
+            );
+            outcome.skipped = true;
+            return outcome;
+        }
+
+        let mut due = Vec::new();
+        for disk in inv.disks {
+            if disk.state != DiskState::Orphan {
+                continue;
+            }
+            // An orphan can still be held — a deployment claiming it for a
+            // resume, or an operator's retain pin. Those are decisions this
+            // bulk path must not override; the row's own Purge button offers
+            // force for the operator who means it.
+            if disk.held_by.is_some() {
+                outcome.held += 1;
+                continue;
+            }
+            due.push(disk);
+        }
+
+        if due.is_empty() {
+            return outcome;
+        }
+        tracing::info!(
+            count = due.len(),
+            held = outcome.held,
+            bytes = due.iter().map(|d| d.bytes).sum::<u64>(),
+            "purging every orphaned disk on the host",
+        );
+
+        for disk in due {
+            // `complete` is true — checked above — and `force` stays false, so
+            // each disk's guards are still consulted individually against the
+            // inventory this loop was built from.
+            match self.purge_resolved(disk, true, false).await {
+                Ok(o) => {
+                    outcome.purged += 1;
+                    outcome.bytes += o.bytes;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not purge an orphaned disk");
+                    outcome.failed += 1;
+                }
+            }
+        }
+        outcome
+    }
+}
+
+/// What one purge-all-orphans pass did.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PurgeOrphansOutcome {
+    /// True when nothing was attempted because the daemon was unreachable.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
+    pub purged: usize,
+    /// Orphans left alone because a claim or a retain pin holds them.
+    pub held: usize,
+    pub failed: usize,
+    pub bytes: u64,
 }
 
 /// What one expiry sweep did.
@@ -1884,6 +1973,46 @@ fn remove_all(cfg: &DiskConfig, sandbox_id: &str) -> (Vec<String>, Vec<String>) 
     (removed, failed)
 }
 
+/// Remove only the rootfs copies of one sandbox, leaving everything else.
+///
+/// The suspend-path counterpart of [`remove_all`], for the autoscaler: a
+/// replica spun to zero keeps its record and its `/workspace` data disk, but
+/// its rootfs copy is rebuilt from the base image on the next boot — the KVM
+/// driver reuses a persisted `kvm/<id>/rootfs.ext4` *only if it still exists*,
+/// and recopies from the base image when it does not, so removing it here is a
+/// space decision, not a correctness one. The Firecracker per-boot copy in
+/// `tmp_dir` is normally gone after a clean stop; it is matched anyway for the
+/// stop that was not clean.
+///
+/// Deliberately untouched: `data.ext4` (the state being retained), `mount*.ext4`
+/// (archive mounts the daemon re-attaches by path), snapshots, and the sandbox
+/// directories themselves. Paths are constructed from the validated id and the
+/// configured roots, exactly as `remove_all`'s are.
+pub fn discard_rootfs(cfg: &DiskConfig, sandbox_id: &str) -> (Vec<String>, Vec<String>) {
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    if !valid_sandbox_id(sandbox_id) {
+        failed.push(format!("{sandbox_id:?} is not a sandbox id"));
+        return (removed, failed);
+    }
+
+    let mut candidates = vec![cfg.data_dir.join("kvm").join(sandbox_id).join("rootfs.ext4")];
+    for prefix in TMP_PREFIXES {
+        candidates.push(cfg.tmp_dir.join(format!("{prefix}{sandbox_id}-rootfs.ext4")));
+    }
+
+    for path in candidates {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path.display().to_string()),
+            // The usual case for most of the list: a Firecracker sandbox has no
+            // kvm/ dir, a cleanly-stopped one has no /tmp copy.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failed.push(format!("{}: {e}", path.display())),
+        }
+    }
+    (removed, failed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2181,6 +2310,47 @@ mod tests {
                 "purging sb-1 must not take sb-12's scratch",
             );
             assert!(scan(&cfg).contains_key("sb-2"));
+        }
+
+        /// The suspend path takes only what the next boot rebuilds. Everything
+        /// that *is* the sandbox's state — the data disk, the mounts, the
+        /// snapshots, the directories themselves — has to survive, or a
+        /// scale-to-zero would quietly become the data loss `retain` exists to
+        /// prevent.
+        #[test]
+        fn discard_rootfs_takes_the_copies_and_nothing_else() {
+            let root = scratch("discard");
+            let cfg = cfg_at(&root);
+            std::fs::create_dir_all(&cfg.tmp_dir).unwrap();
+            write(&cfg.data_dir.join("kvm/sb-1/rootfs.ext4"), 64);
+            write(&cfg.data_dir.join("kvm/sb-1/mount0.ext4"), 32);
+            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
+            write(&cfg.data_dir.join("run/sb-1/snapshot/mem"), 32);
+            // A dirty stop's leftover, and a neighbour that must not be matched.
+            write(&cfg.tmp_dir.join("firecracker-sb-1-rootfs.ext4"), 32);
+            write(&cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4"), 32);
+
+            let (removed, failed) = discard_rootfs(&cfg, "sb-1");
+            assert!(failed.is_empty(), "{failed:?}");
+            assert_eq!(removed.len(), 2, "{removed:?}");
+            assert!(!cfg.data_dir.join("kvm/sb-1/rootfs.ext4").exists());
+            assert!(!cfg.tmp_dir.join("firecracker-sb-1-rootfs.ext4").exists());
+
+            assert!(cfg.data_dir.join("kvm/sb-1/mount0.ext4").exists());
+            assert!(cfg.data_dir.join("run/sb-1/data.ext4").exists(), "the retained state");
+            assert!(cfg.data_dir.join("run/sb-1/snapshot/mem").exists());
+            assert!(cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4").exists());
+
+            // Nothing left to discard is a no-op, not an error — the common
+            // case for a cleanly-stopped Firecracker sandbox.
+            let (removed, failed) = discard_rootfs(&cfg, "sb-1");
+            assert!(removed.is_empty() && failed.is_empty());
+
+            // The id joins paths, so the same charset rule as every other entry
+            // point; refused ids remove nothing.
+            let (removed, failed) = discard_rootfs(&cfg, "../etc");
+            assert!(removed.is_empty());
+            assert_eq!(failed.len(), 1);
         }
 
         /// A sandbox that only ever existed in one of the two directories is the

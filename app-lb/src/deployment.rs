@@ -299,6 +299,15 @@ pub struct Deployment {
     /// Keeps independent runtime-state writers from losing each other's fields.
     /// In particular, suspended-VM bookkeeping must not erase an upstream drain.
     state_change_lock: Mutex<()>,
+    /// Consecutive VM boot failures — timeouts and terminal statuses alike.
+    ///
+    /// Runtime-only, like the pools: a restart (or a spec update, which builds a
+    /// new `Deployment`) starts the count over, which is right — both are
+    /// exactly the moments a broken image may have been fixed.
+    boot_failures: AtomicU64,
+    /// Epoch seconds before which the autoscaler must not create VMs for this
+    /// deployment. See [`boot_backoff_secs`].
+    boot_backoff_until: AtomicU64,
 }
 
 impl Deployment {
@@ -320,6 +329,8 @@ impl Deployment {
             ready_signal: Notify::new(),
             scale_signal: Notify::new(),
             state_change_lock: Mutex::new(()),
+            boot_failures: AtomicU64::new(0),
+            boot_backoff_until: AtomicU64::new(0),
         }
     }
 
@@ -498,6 +509,60 @@ impl Deployment {
         let last = backends.iter().map(|b| b.last_active()).max().unwrap_or(0);
         now_secs().saturating_sub(last)
     }
+
+    // -- boot-failure backoff ------------------------------------------------
+
+    /// Record one failed boot and push the create embargo out.
+    ///
+    /// Returns the streak length and the delay it produced, so the caller can
+    /// log one line that says both.
+    pub fn note_boot_failure(&self, now: u64) -> (u64, u64) {
+        let failures = self.boot_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let delay = boot_backoff_secs(failures);
+        self.boot_backoff_until
+            .store(now.saturating_add(delay), Ordering::Relaxed);
+        (failures, delay)
+    }
+
+    /// A VM booted and passed its health check: the image works, so the streak
+    /// and any embargo end. Returns whether there was a streak to clear, so the
+    /// recovery is logged once rather than on every routine promotion.
+    pub fn note_boot_success(&self) -> bool {
+        self.boot_backoff_until.store(0, Ordering::Relaxed);
+        self.boot_failures.swap(0, Ordering::Relaxed) != 0
+    }
+
+    /// Seconds until the autoscaler may create VMs again, or `None` when it may
+    /// do so now.
+    pub fn boot_backoff_remaining(&self, now: u64) -> Option<u64> {
+        let until = self.boot_backoff_until.load(Ordering::Relaxed);
+        (until > now).then(|| until - now)
+    }
+}
+
+/// First backoff after a failed boot. Small on purpose: one flaky boot must not
+/// add real latency to a request already waiting on a cold start.
+const BOOT_BACKOFF_BASE_SECS: u64 = 30;
+
+/// The ceiling. A deployment that has failed this many times in a row is down
+/// either way; retrying hourly keeps it visible without feeding the churn.
+const BOOT_BACKOFF_MAX_SECS: u64 = 3600;
+
+/// How long to wait before replacing a failed boot, by streak length.
+///
+/// Doubles from thirty seconds to an hour. This exists because the reconcile
+/// loop otherwise replaces a doomed VM on its next 2-second tick, forever: a
+/// deployment whose guest exits immediately used to churn a sandbox every few
+/// seconds — and one whose guest merely never answered health checks, one every
+/// `boot_timeout_secs` — each cycle a fresh sandbox id and a fresh set of disk
+/// directories, with no error state anywhere that stopped it.
+pub fn boot_backoff_secs(failures: u64) -> u64 {
+    if failures == 0 {
+        return 0;
+    }
+    BOOT_BACKOFF_BASE_SECS
+        .saturating_mul(1 << (failures - 1).min(63))
+        .min(BOOT_BACKOFF_MAX_SECS)
 }
 
 /// Keeps a deployment's waiter count accurate for the life of a cold-start wait.
@@ -899,5 +964,42 @@ mod tests {
         // A booting VM already counts, so we don't over-provision.
         d.set_pending(vec![PendingVm::new("sb-2".into())]);
         assert!(!d.can_grow());
+    }
+
+    /// The schedule that keeps a deployment whose guest never boots from
+    /// churning a fresh sandbox every reconcile tick.
+    #[test]
+    fn boot_backoff_doubles_from_thirty_seconds_to_an_hour() {
+        assert_eq!(boot_backoff_secs(0), 0, "no failures, no embargo");
+        assert_eq!(boot_backoff_secs(1), 30);
+        assert_eq!(boot_backoff_secs(2), 60);
+        assert_eq!(boot_backoff_secs(3), 120);
+        assert_eq!(boot_backoff_secs(7), 1920);
+        assert_eq!(boot_backoff_secs(8), 3600, "capped, not 3840");
+        // A streak long enough to overflow the shift must still cap cleanly.
+        assert_eq!(boot_backoff_secs(1000), 3600);
+    }
+
+    #[test]
+    fn boot_failures_embargo_creates_and_a_success_clears_it() {
+        let d = deployment(ScalingPolicy::default());
+        let now = 1000;
+        assert_eq!(d.boot_backoff_remaining(now), None, "starts clear");
+
+        let (streak, delay) = d.note_boot_failure(now);
+        assert_eq!((streak, delay), (1, 30));
+        assert_eq!(d.boot_backoff_remaining(now), Some(30));
+        assert_eq!(d.boot_backoff_remaining(now + 30), None, "expires on time");
+
+        // A second failure doubles the wait and restarts it from *its* now.
+        let (streak, delay) = d.note_boot_failure(now + 30);
+        assert_eq!((streak, delay), (2, 60));
+        assert_eq!(d.boot_backoff_remaining(now + 31), Some(59));
+
+        // One good boot ends the streak — and says so exactly once.
+        assert!(d.note_boot_success(), "there was a streak to clear");
+        assert_eq!(d.boot_backoff_remaining(now + 31), None);
+        assert!(!d.note_boot_success(), "routine promotions stay quiet");
+        assert_eq!(d.note_boot_failure(now).0, 1, "the count restarted");
     }
 }

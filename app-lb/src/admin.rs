@@ -1782,6 +1782,17 @@ async fn sweep_disks(State(state): State<AdminState>) -> Response {
     Json(store.sweep().await).into_response()
 }
 
+/// `POST /disks/purge-orphans` — reclaim every orphaned disk, at any age.
+///
+/// The sweep's TTL does not apply here; the holds do. A claimed or retained
+/// orphan is skipped and counted, and the outcome says so.
+async fn purge_orphan_disks(State(state): State<AdminState>) -> Response {
+    let Some(store) = state.disks.as_ref() else {
+        return disks_off();
+    };
+    Json(store.purge_orphans().await).into_response()
+}
+
 // ---- the directory page -------------------------------------------------
 
 /// One clickable destination.
@@ -3505,6 +3516,9 @@ fn router(state: AdminState) -> Router {
         // static segment and so cannot be reached by naming a sandbox `sweep`;
         // matchit prefers a literal over a parameter.
         .route("/disks/sweep", post(sweep_disks))
+        // Also a static segment, shadowing any sandbox literally named
+        // `purge-orphans` — the same trade `/disks/sweep` already makes.
+        .route("/disks/purge-orphans", post(purge_orphan_disks))
         .route("/disks/:id", patch(patch_disk).delete(purge_disk))
         .route("/disks/:id/archive", post(archive_disk))
         // Secrets: write-only by design. `GET` returns key *names*, never values.
@@ -4128,6 +4142,7 @@ mod tests {
                 "\"PATCH\", \"/disks/\"",
                 "/archive`",
                 "\"POST\", \"/disks/sweep\"",
+                "\"POST\", \"/disks/purge-orphans\"",
                 "\"DELETE\", \"/disks/\"",
             ] {
                 assert!(DISKS_HTML.contains(route), "page never calls {route}");

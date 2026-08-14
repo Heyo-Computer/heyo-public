@@ -222,6 +222,7 @@ curl -XPOST localhost:9090/disks/sb-abc123/archive -H 'content-type: application
 curl -XDELETE localhost:9090/disks/sb-abc123                 # reclaim now
 curl -XDELETE 'localhost:9090/disks/sb-abc123?force=1'       # ...even if a deployment claims it
 curl -XPOST localhost:9090/disks/sweep                       # run the expiry sweep now
+curl -XPOST localhost:9090/disks/purge-orphans               # reclaim every orphan, at any age
 
 # Refuse traffic. See "Response actions"; an empty match is rejected, and these
 # rules are never applied to this admin API.
@@ -1452,13 +1453,15 @@ Where it accumulates:
 | Path | What it is | When the daemon removes it |
 | --- | --- | --- |
 | `<data>/run/<id>/data.ext4` | The Firecracker `/workspace` data disk | On delete, but **only if** the sandbox was created with `disk_size_gb` |
-| `<data>/run/<id>/snapshot/` | Memory/state checkpoint | **Never** when there was no data disk — `destroy()` unlinks the directory only inside its `data_disk_path.is_some()` branch, so a sandbox without one leaves the dir behind for good |
+| `<data>/run/<id>/snapshot/` | Memory/state checkpoint | On daemons **before heyvm 0.42.5**: never when there was no data disk — `destroy()` unlinked the directory only inside its `data_disk_path.is_some()` branch, so a sandbox without one left the dir behind for good. Fixed upstream (2026-08-03): the removal is derived from the id now |
 | `<data>/kvm/<id>/` | The KVM driver's per-VM `rootfs.ext4` and `mount*.ext4` | On a *clean* delete, which removes the whole state dir. But these are ~1 GiB each, so anything that never got one — a crash, a lost daemon record, a VM nobody ran `heyvm rm` on — is the bulk of what is sitting there |
 | `/tmp/{firecracker,kvm}-<id>-*` | The per-boot scratch | On a clean `stop`. A hypervisor that dies leaves it behind |
 
-So only the second row is a delete-path bug. The rest is what a host looks like
-after months of VMs that did not all exit cleanly — nothing was ever going to
-come back for it, which is what the sweep below is for.
+So the second row was a delete-path bug, fixed in heyvm 0.42.5 — but a fixed
+daemon only cleans on delete, so directories leaked before the upgrade are never
+revisited, and a host still running an older daemon keeps making more. The rest
+is what a host looks like after months of VMs that did not all exit cleanly —
+nothing was ever going to come back for it, which is what the sweep below is for.
 
 app-lb can do this despite not owning those paths because it is *required* to run beside a
 local daemon — `guest_ip` exists nowhere else — so it shares the filesystem. It already writes
@@ -1518,6 +1521,14 @@ That last one is the most important line in the feature. A daemon that is restar
 neither listing, every disk on the host then looks like residue, and one sweep would delete the
 whole fleet's state. So the inventory reports `complete: false`, classifies everything as
 `unknown`, and the sweep declines to run at all.
+
+### Purging every orphan at once
+
+Expiry waits out the TTL; orphans need not. `POST /disks/purge-orphans` — the **Purge
+orphans** button on `/storage` — reclaims every disk the daemon has no record of, at any
+age. The holds above still apply: a claimed or retained orphan is skipped and counted in
+the response rather than forced through, and the whole operation declines when the daemon
+is unreachable, for the same reason the sweep does.
 
 ### Archiving a disk to S3
 
@@ -2019,9 +2030,13 @@ image on every cold boot**. The only thing that survives a stop is the
 persistent data disk at `~/.heyo/run/<id>/data.ext4`, attached as `/dev/vdb` and
 mounted at `/workspace` — and that disk only exists if `vm.disk_size_gb` is set.
 
-(The KVM driver is the exception: it keeps a per-VM `~/.heyo/kvm/<id>/rootfs.ext4`
-across stop/start and reuses it. Fixing Firecracker to match is a daemon change,
-not one app-lb can make — every boot goes through mvm-ctrl's `start_vm`.)
+(The KVM driver would behave differently — it keeps a per-VM
+`~/.heyo/kvm/<id>/rootfs.ext4` across stop/start and reuses it if present — but
+the autoscaler discards that copy right after suspending a replica, so both
+drivers honour the same contract and a scaled-to-zero pool is not parking ~1 GiB
+per idle VM. The daemon rebuilds the copy from the base image on resume. Making
+Firecracker *preserve* a rootfs instead would be a daemon change, not one app-lb
+can make — every boot goes through mvm-ctrl's `start_vm`.)
 
 So a `retain` deployment is only meaningfully stateful when both hold:
 
@@ -2075,11 +2090,19 @@ Two things bound and expose that:
   outlasts `cold_start_timeout_secs` — the point at which it has already cost a
   request a 503 — the line becomes a `WARN`.
 - **`boot_timeout_secs`** (default `300`). Past this the autoscaler logs an `ERROR`,
-  kills the VM and lets the next tick create a replacement, so a deployment retries
-  visibly instead of sitting at zero replicas forever. It is deliberately much
-  larger than `cold_start_timeout_secs`: a request gives up long before the VM does,
-  because a boot that overran one caller's patience may still be the boot that
-  serves the next one. Set it to `0` to wait indefinitely.
+  kills the VM and creates a replacement, so a deployment retries visibly instead
+  of sitting at zero replicas forever. It is deliberately much larger than
+  `cold_start_timeout_secs`: a request gives up long before the VM does, because a
+  boot that overran one caller's patience may still be the boot that serves the
+  next one. Set it to `0` to wait indefinitely.
+- **Failed boots back off.** Consecutive boot failures — timeouts and terminal
+  statuses alike — delay the replacement, doubling from 30s to a 1h ceiling and
+  resetting the moment any VM boots to healthy. Without this the reconcile loop
+  replaced a doomed VM on its next 2-second tick forever, so a guest that could
+  never become ready churned a fresh sandbox (and its disk directories) per
+  cycle with no error state anywhere. The embargo is logged once when it is set
+  (`backing off VM creation after failed boots`), and suppressed ticks log at
+  `DEBUG`.
 
 The count of abandoned boots is in `/metrics`
 (`autoscale.boot_timeouts`) and on the dashboard's cold-start card, and booting VMs

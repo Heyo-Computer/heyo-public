@@ -206,6 +206,7 @@ try {
     </select>
     <input type="text" id="f-search" placeholder="sandbox or deployment" size="22">
     <span class="spacer"></span>
+    <button class="act danger" id="purge-orphans" type="button">Purge orphans</button>
     <button class="act" id="sweep" type="button">Run sweep now</button>
     <button class="act" id="refresh" type="button">Refresh</button>
     <label style="font-size:12.5px;color:var(--text-2)">
@@ -573,6 +574,40 @@ $("sweep").addEventListener("click", async () => {
   flash(d.failed ? "bad" : "ok", d.skipped
     ? "Sweep skipped: the daemon was unreachable, so nothing was classified as residue."
     : `Sweep done — ${d.purged} purged, ${d.archived} archived, ${d.failed} failed, ${bytes(d.bytes)} freed.`);
+  await load();
+});
+
+// Unlike the sweep, this ignores the TTL entirely: an orphan is residue on the
+// day it is made. The holds still apply — a claimed or retained orphan is
+// skipped server-side, and the confirm says how many will be.
+$("purge-orphans").addEventListener("click", async () => {
+  if (!latest) return;
+  if (!latest.complete) {
+    flash("bad", "The daemon could not be reached, so nothing is classified as orphaned right now.");
+    return;
+  }
+  const orphans = (latest.disks || []).filter(d => d.state === "orphan");
+  if (!orphans.length) { flash("ok", "No orphaned disks on this host."); return; }
+  const free = orphans.filter(d => !d.held_by);
+  const held = orphans.length - free.length;
+  if (!free.length) {
+    flash("bad", `Every orphan (${orphans.length}) is held — claimed by a deployment or retained. ` +
+      `Use a row's own Purge button to force one.`);
+    return;
+  }
+  const total = free.reduce((n, d) => n + (d.bytes || 0), 0);
+  if (!confirm(`Purge every orphaned disk now, regardless of age?\n\n` +
+    `${free.length} orphan(s) will be deleted, freeing ${bytes(total)}.` +
+    (held ? `\n${held} held orphan(s) (claimed or retained) will be skipped.` : "") +
+    `\n\nThis cannot be undone.`)) return;
+  $("purge-orphans").disabled = true;
+  const r = await api("POST", "/disks/purge-orphans");
+  $("purge-orphans").disabled = false;
+  if (!r.ok) { flash("bad", denied(r, "Purging orphans")); return; }
+  const d = r.data || {};
+  flash(d.failed ? "bad" : "ok", d.skipped
+    ? "Nothing was purged: the daemon was unreachable, so nothing was classified as an orphan."
+    : `Orphans purged — ${fmt(d.purged)} deleted, ${fmt(d.held)} held, ${fmt(d.failed)} failed, ${bytes(d.bytes)} freed.`);
   await load();
 });
 
