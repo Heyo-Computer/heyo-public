@@ -79,6 +79,11 @@ pub struct Autoscaler {
     /// [`Feed::issue`](crate::feed::Feed::issue) — so calls are unconditional
     /// here and the feed itself decides whether anyone hears about it.
     feed: Arc<crate::feed::Feed>,
+    /// Where the daemon keeps per-sandbox disks, when that could be resolved.
+    /// Only used to discard a suspended replica's rootfs copy — see
+    /// [`discard_rootfs_of`](Self::discard_rootfs_of); `None` degrades to
+    /// leaving the copy in place, exactly the pre-existing behaviour.
+    disk_cfg: Option<crate::disks::DiskConfig>,
 }
 
 impl Autoscaler {
@@ -87,6 +92,7 @@ impl Autoscaler {
         vms: VmManager,
         metrics: Arc<Metrics>,
         feed: Arc<crate::feed::Feed>,
+        disk_cfg: Option<crate::disks::DiskConfig>,
     ) -> Self {
         Self {
             registry,
@@ -95,6 +101,7 @@ impl Autoscaler {
             nonce: AtomicU64::new(now_secs()),
             creates: tokio::sync::Semaphore::new(CREATE_CONCURRENCY),
             feed,
+            disk_cfg,
         }
     }
 
@@ -321,7 +328,16 @@ impl Autoscaler {
         let live = ready + pending;
 
         if live < desired as usize {
-            self.scale_up(d, desired as usize - live).await;
+            // `debug`, not a per-tick warning: the embargo was announced once,
+            // loudly, when it was set.
+            match d.boot_backoff_remaining(now_secs()) {
+                Some(wait) => tracing::debug!(
+                    deployment = %d.spec.id,
+                    resume_in_secs = wait,
+                    "scale-up suppressed by the boot-failure backoff",
+                ),
+                None => self.scale_up(d, desired as usize - live).await,
+            }
         } else if ready > desired as usize {
             self.scale_down(d, ready - desired as usize).await;
         }
@@ -585,6 +601,33 @@ impl Autoscaler {
             d.set_backends(backends);
             // Release anything blocked on a cold start.
             d.ready_signal.notify_waiters();
+            // A boot made it all the way to healthy, so the image works; any
+            // failure streak ends here rather than being aged out.
+            if d.note_boot_success() {
+                tracing::info!(
+                    deployment = %d.spec.id,
+                    "a VM became ready; clearing the boot-failure backoff",
+                );
+            }
+        } else if !doomed.is_empty() {
+            // Only when *nothing* was promoted this tick: a doomed sibling next
+            // to a successful boot is capacity noise, not a broken image, and
+            // must not delay its replacement. Counted per VM, so a warm pool
+            // failing wholesale backs off faster than one flaky boot.
+            let now = now_secs();
+            let (mut failures, mut delay) = (0, 0);
+            for _ in &doomed {
+                (failures, delay) = d.note_boot_failure(now);
+            }
+            tracing::warn!(
+                deployment = %d.spec.id,
+                doomed = doomed.len(),
+                consecutive_failures = failures,
+                backoff_secs = delay,
+                "backing off VM creation after failed boots; without this the next tick \
+                 replaces the VM immediately, and a guest that can never become ready \
+                 churns a fresh sandbox per cycle forever",
+            );
         }
 
         for id in doomed {
@@ -801,7 +844,16 @@ impl Autoscaler {
                     // Recorded only on success. A sandbox we failed to stop is
                     // still running and still in the fleet list, so recording it
                     // as suspended would make the next tick skip a live VM.
-                    Ok(()) => suspended.push(b.sandbox_id.clone()),
+                    Ok(()) => {
+                        // The rootfs copy is dead weight while the VM sleeps:
+                        // a replica's real state lives on its /workspace data
+                        // disk, and the daemon recreates a missing rootfs from
+                        // the base image on resume. Discarded now rather than
+                        // parked — a KVM replica's copy is ~1 GiB, held for
+                        // however long the deployment stays scaled to zero.
+                        self.discard_rootfs_of(d, &b.sandbox_id).await;
+                        suspended.push(b.sandbox_id.clone());
+                    }
                     Err(e) => {
                         tracing::warn!(
                             deployment = %d.spec.id,
@@ -822,6 +874,48 @@ impl Autoscaler {
             }
         }
         self.remember_suspended(d, suspended);
+    }
+
+    /// Drop the rootfs copy of a replica the autoscaler just suspended.
+    ///
+    /// Autoscale replicas only: this runs on `applb-*` sandboxes retired by
+    /// `reap_drained`, never on a sandbox somebody made by hand — a person's
+    /// stopped VM may well be *about* its rootfs, and the daemon deliberately
+    /// preserves it for them. A pool replica's contract is the opposite
+    /// (persistent state lives under `/workspace`, the rootfs is rebuilt from
+    /// the image), so keeping its copy through a suspend buys nothing but the
+    /// gigabyte it occupies.
+    ///
+    /// Best-effort: a failure leaves the copy where it was, which is exactly
+    /// what happened before this existed, and the resume path does not care
+    /// either way.
+    async fn discard_rootfs_of(&self, d: &Arc<Deployment>, sandbox_id: &str) {
+        let Some(cfg) = self.disk_cfg.clone() else {
+            return;
+        };
+        let id = sandbox_id.to_string();
+        let (removed, failed) =
+            tokio::task::spawn_blocking(move || crate::disks::discard_rootfs(&cfg, &id))
+                .await
+                .unwrap_or_else(|e| (Vec::new(), vec![format!("discard task failed: {e}")]));
+        if !removed.is_empty() {
+            tracing::info!(
+                deployment = %d.spec.id,
+                sandbox = %sandbox_id,
+                removed = removed.len(),
+                "discarded the suspended VM's rootfs copy; the daemon rebuilds it from \
+                 the base image on resume",
+            );
+        }
+        if !failed.is_empty() {
+            tracing::warn!(
+                deployment = %d.spec.id,
+                sandbox = %sandbox_id,
+                detail = %failed.join("; "),
+                "could not discard a suspended VM's rootfs copy; it stays until the \
+                 sandbox is resumed or purged",
+            );
+        }
     }
 
     /// Record sandboxes we stopped, and persist that immediately.
@@ -992,6 +1086,12 @@ impl Autoscaler {
                      resumes these instead of creating new sandboxes",
                 );
                 self.remember_suspended(d, keep.to_vec());
+                // The same trim a fresh suspend gets: these were spun down by a
+                // previous run (or out of band), so their rootfs copies are
+                // sitting exactly as unused as a just-suspended replica's.
+                for id in keep {
+                    self.discard_rootfs_of(d, id).await;
+                }
             }
             for id in surplus {
                 tracing::info!(
@@ -1457,6 +1557,9 @@ mod tests {
                 vms,
                 Arc::new(Metrics::new()),
                 Arc::new(crate::feed::Feed::new()),
+                // No disk config: rootfs discarding quietly stands down, which
+                // is also the production behaviour when the data dir is unknown.
+                None,
             ),
             registry,
         )

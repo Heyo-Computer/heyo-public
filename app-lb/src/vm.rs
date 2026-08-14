@@ -422,9 +422,14 @@ impl VmManager {
 
     /// Stop a VM without destroying it — `scaling.idle_action: retain`.
     ///
-    /// The sandbox record and its `/workspace` data disk survive; memory and any
-    /// rootfs writes do not, because mvm-ctrl recopies the rootfs from the base
-    /// image on the next boot.
+    /// The sandbox record and its `/workspace` data disk survive; memory does
+    /// not. Rootfs writes do not survive either, but the two drivers get there
+    /// differently: Firecracker's per-boot copy lives in `/tmp` and is recopied
+    /// from the base image on every boot, while the KVM driver *would* reuse a
+    /// persisted `kvm/<id>/rootfs.ext4` if one still existed — which is why the
+    /// autoscaler discards that copy right after a successful suspend (see
+    /// [`crate::disks::discard_rootfs`]), so a replica behaves the same on both
+    /// drivers and a scaled-to-zero pool is not parking a gigabyte per VM.
     ///
     /// **A stopped sandbox disappears from [`list`](Self::list).** mvm-ctrl's
     /// `stop` removes it from the in-memory map that backs `GET /sandboxes`, so

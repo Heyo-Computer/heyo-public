@@ -29,11 +29,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// host with no route to the internet, which is most of them.
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
-/// Ranges the dashboard offers, longest label first for the picker.
+/// Ranges the dashboard offers as one-click presets, longest label first for
+/// the picker.
 ///
-/// A closed set rather than a free-form duration: each of these has a rung on
-/// the bucket ladder that yields a sensible number of points, and an arbitrary
-/// window does not.
+/// Presets, not the whole vocabulary: `resolve_window` also accepts any
+/// relative duration ("1d", "36h", "45m"), and the bucket ladder picks a
+/// workable step for whatever span comes out. These are the rungs worth a
+/// permanent button.
 const WINDOWS: &[(&str, i64)] = &[
     ("15m", 900),
     ("1h", 3_600),
@@ -218,7 +220,7 @@ async fn fleet(
         from_ms: window.start_ms(),
         to_ms: window.end_ms(),
         step_secs: step,
-        window: label.to_string(),
+        window: label,
         windows: window_labels(),
         retain_days: state.retain_days,
         freshness: freshness(&state),
@@ -253,7 +255,7 @@ async fn detail(
         from_ms: window.start_ms(),
         to_ms: window.end_ms(),
         step_secs: step,
-        window: label.to_string(),
+        window: label,
         windows: window_labels(),
         retain_days: state.retain_days,
         freshness: freshness(&state),
@@ -319,16 +321,73 @@ fn window_labels() -> Vec<String> {
 
 /// Resolve a window label, falling back to a day.
 ///
-/// An unrecognised label gets the default rather than a 400: this arrives from a
-/// URL someone may have bookmarked or hand-edited, and showing them a day of
-/// data is more use than an error about a query parameter.
-fn resolve_window(label: Option<&str>) -> (&'static str, Window) {
+/// A preset label takes its listed span; anything else is tried as a relative
+/// duration — "1d", "90m", "2 days" — so the picker's closed set bounds the
+/// buttons, not the vocabulary. An unrecognised label gets the default rather
+/// than a 400: this arrives from a URL someone may have bookmarked or
+/// hand-edited, and showing them a day of data is more use than an error about
+/// a query parameter.
+fn resolve_window(label: Option<&str>) -> (String, Window) {
     let now = Utc::now();
     let (label, seconds) = label
-        .and_then(|want| WINDOWS.iter().find(|(l, _)| *l == want))
-        .copied()
-        .unwrap_or(("24h", 86_400));
+        .and_then(|want| {
+            let want = want.trim();
+            WINDOWS
+                .iter()
+                .find(|(l, _)| *l == want)
+                .map(|(l, s)| ((*l).to_string(), *s))
+                .or_else(|| parse_relative(want).map(|s| (relative_label(s), s)))
+        })
+        .unwrap_or_else(|| ("24h".to_string(), 86_400));
     (label, Window::trailing(now, seconds))
+}
+
+/// The narrowest window a caller can name. One minute: below that the 10s
+/// bucket floor leaves too few points to draw, and "the last 20 seconds" is a
+/// question for the log view's range, not for a chart.
+const MIN_WINDOW_SECS: i64 = 60;
+
+/// The widest. Ninety days — comfortably past the longest retention anyone
+/// configures, so the clamp never hides data, only caps how much nothing a
+/// typo like "1000d" asks the engine to scan for.
+const MAX_WINDOW_SECS: i64 = 90 * 86_400;
+
+/// A relative duration — `<count><unit>`, unit spelled as a letter or a word,
+/// with or without a space — as clamped seconds, or `None` for anything else.
+fn parse_relative(s: &str) -> Option<i64> {
+    let t = s.trim().to_ascii_lowercase();
+    let split = t.find(|c: char| !c.is_ascii_digit())?;
+    let (count, unit) = t.split_at(split);
+    let count: i64 = count.parse().ok()?;
+    if count == 0 {
+        return None;
+    }
+    let unit_secs = match unit.trim_start() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+        "d" | "day" | "days" => 86_400,
+        "w" | "wk" | "wks" | "week" | "weeks" => 604_800,
+        _ => return None,
+    };
+    Some(
+        count
+            .saturating_mul(unit_secs)
+            .clamp(MIN_WINDOW_SECS, MAX_WINDOW_SECS),
+    )
+}
+
+/// The label echoed back for a free-form window.
+///
+/// Derived from the *clamped* seconds rather than the caller's spelling, so the
+/// page never claims a span ("1000d") that the query did not run.
+fn relative_label(seconds: i64) -> String {
+    match seconds {
+        s if s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s % 3_600 == 0 => format!("{}h", s / 3_600),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
 }
 
 /// Narrow a window to the range a caller named, in epoch milliseconds.
@@ -479,6 +538,57 @@ mod tests {
         // A hand-edited or stale URL should still show something.
         assert_eq!(resolve_window(Some("99y")).0, "24h");
         assert_eq!(resolve_window(Some("")).0, "24h");
+        assert_eq!(resolve_window(Some("d")).0, "24h");
+        assert_eq!(resolve_window(Some("-1d")).0, "24h");
+        assert_eq!(resolve_window(Some("0d")).0, "24h");
+    }
+
+    #[test]
+    fn a_relative_duration_is_a_window_too() {
+        // The example that motivated this: "the last day", spelled how people
+        // spell it rather than how the preset happens to.
+        let (label, window) = resolve_window(Some("1d"));
+        assert_eq!(label, "1d");
+        assert_eq!(window.seconds(), 86_400);
+
+        // Unit words, spaces and case all mean the same thing.
+        for spelling in ["1 day", "24 hours", "24H", " 1440 minutes "] {
+            assert_eq!(resolve_window(Some(spelling)).1.seconds(), 86_400, "{spelling}");
+        }
+        assert_eq!(resolve_window(Some("45m")).1.seconds(), 2_700);
+        assert_eq!(resolve_window(Some("2w")).1.seconds(), 1_209_600);
+        // A preset spelling stays the preset, not a re-derived label.
+        assert_eq!(resolve_window(Some("7d")).0, "7d");
+    }
+
+    #[test]
+    fn a_free_form_window_is_clamped_and_labelled_honestly() {
+        // Too narrow to chart, too wide to ever hold data — both clamp, and the
+        // label reports the span that actually ran, not the one typed.
+        let (label, window) = resolve_window(Some("5s"));
+        assert_eq!(window.seconds(), MIN_WINDOW_SECS);
+        assert_eq!(label, "1m");
+
+        let (label, window) = resolve_window(Some("1000d"));
+        assert_eq!(window.seconds(), MAX_WINDOW_SECS);
+        assert_eq!(label, "90d");
+    }
+
+    #[test]
+    fn free_form_extremes_still_have_a_workable_bucket_width() {
+        // The preset test above pins the closed set; the clamp bounds are what
+        // guard every window in between.
+        for seconds in [MIN_WINDOW_SECS, MAX_WINDOW_SECS] {
+            let window = Window::trailing(Utc::now(), seconds);
+            for target in [FLEET_POINTS, DETAIL_POINTS] {
+                let step = window.step_secs(target);
+                let points = seconds / i64::from(step);
+                assert!(
+                    (2..=600).contains(&points),
+                    "{seconds}s at {target} points gives {points} buckets of {step}s",
+                );
+            }
+        }
     }
 
     #[test]

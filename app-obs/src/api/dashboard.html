@@ -271,6 +271,9 @@
 <!-- One control row, scoping every chart and table below it. -->
 <div class="controls">
   <div class="segmented" id="windows" role="group" aria-label="Time range"></div>
+  <!-- The presets are rungs, not the vocabulary: any relative span works. -->
+  <input class="text" id="w-custom" type="text" placeholder="custom · 1d"
+    aria-label="Custom time range, e.g. 1d or 45m" style="min-width:0;flex:0 0 96px">
   <span class="spacer"></span>
   <button class="ghost" id="tables" aria-pressed="false">table view</button>
 </div>
@@ -1232,13 +1235,40 @@ function buildWindows(labels) {
     `<button data-w="${esc(l)}" aria-pressed="${l === state.window}">${esc(l)}</button>`).join("");
 }
 
+function setWindow(label) {
+  state.window = label;
+  for (const b of $("windows").children) {
+    b.setAttribute("aria-pressed", String(b.dataset.w === label));
+  }
+  refresh();
+  if (state.route.view === "detail") loadLogs(false);
+}
+
 $("windows").addEventListener("click", (e) => {
   const button = e.target.closest("button[data-w]");
   if (!button) return;
-  state.window = button.dataset.w;
-  for (const b of $("windows").children) b.setAttribute("aria-pressed", String(b === button));
-  refresh();
-  if (state.route.view === "detail") loadLogs(false);
+  // A preset click ends a custom window; leaving the text in the field would
+  // make two controls both look in charge of the range.
+  $("w-custom").value = "";
+  setWindow(button.dataset.w);
+});
+
+/* A free-form relative window — "1d", "45m", "2 weeks" — sent as-is; the server
+   parses the same vocabulary, clamps, and echoes back the span it actually ran.
+   Validated here only so a typo gets a hint instead of silently showing the
+   24h fallback as if it were what was asked for. */
+const RELATIVE_WINDOW =
+  /^\s*[1-9]\d*\s*(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?|w|wks?|weeks?)\s*$/i;
+
+$("w-custom").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  const value = $("w-custom").value.trim();
+  if (!value) { setWindow("24h"); return; }
+  if (!RELATIVE_WINDOW.test(value)) {
+    banner(`"${value}" is not a window — use a count and a unit, like 45m, 6h or 1d`, false);
+    return;
+  }
+  setWindow(value);
 });
 
 $("pause").addEventListener("click", () => {

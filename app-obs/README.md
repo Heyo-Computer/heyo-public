@@ -155,9 +155,12 @@ The JSON behind it:
 | `GET /stats` | Ingest counters, and rows still buffered in memory |
 | `GET /healthz` | Always open, never queued behind a query |
 
-`window` is one of `15m`, `1h`, `6h`, `24h`, `7d`, `30d`; anything else falls back
-to `24h` rather than erroring, since these arrive from bookmarked URLs. Bucket
-width is derived from the window, not accepted from the caller. `q` is a
+`window` is a preset (`15m`, `1h`, `6h`, `24h`, `7d`, `30d`) or any relative
+duration — `1d`, `45m`, `2 weeks` — clamped to between a minute and ninety days,
+with the label echoed back derived from the clamped span rather than the
+spelling. Anything else falls back to `24h` rather than erroring, since these
+arrive from bookmarked URLs. Bucket width is derived from the window, not
+accepted from the caller. `q` is a
 case-insensitive substring — `%` and `_` are literal, not wildcards. `before` is
 an **inclusive** page boundary: log timestamps collide freely, and an exclusive
 one would silently drop lines from a burst that straddles a page edge, so the
