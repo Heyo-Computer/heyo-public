@@ -1292,7 +1292,7 @@ mod tests {
                 // them, with the shadowing one first.
                 vec![format!("{foreign}; {mine}")],
             ] {
-                let Decision::Allow(who) = a.decide(&g, "web", &req("/dashboard", cookies)).await
+                let Decision::Allow(who) = a.decide(&g, "web", "default", &req("/dashboard", cookies)).await
                 else {
                     panic!("a live session must be honoured whatever order the jar sends it in");
                 };
@@ -1303,7 +1303,7 @@ mod tests {
             // widens which cookies are *looked at*, never which are accepted.
             assert!(
                 matches!(
-                    a.decide(&g, "web", &req("/dashboard", vec![foreign])).await,
+                    a.decide(&g, "web", "default", &req("/dashboard", vec![foreign])).await,
                     Decision::Answered(_)
                 ),
                 "a session issued under another policy must not be honoured",
@@ -1939,7 +1939,7 @@ mod tests {
 
         let mut r = req("/__applb/auth/callback", vec![stale, live]);
         r.query = Some("code=abc&state=the-live-nonce");
-        let Decision::Answered(response) = a.decide(&g, "web", &r).await else {
+        let Decision::Answered(response) = a.decide(&g, "web", "default", &r).await else {
             panic!("the callback always answers");
         };
         assert_eq!(

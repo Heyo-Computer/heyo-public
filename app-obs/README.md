@@ -102,6 +102,17 @@ would just multiply tiny files. `deployment`, `date`, and `hour` live in the
 path, not inside the files. Files are written under a temporary name and renamed
 into place, so a reader never sees a partial parquet.
 
+The flush interval trades file count for freshness: rows become queryable within
+a minute, at the cost of one small file per partition per flush — which, left
+alone, is over a thousand files under a day-wide query, most of whose budget
+would go to parquet footers rather than rows. A background compactor pays that
+debt back, periodically merging each partition's files into one; the steady state
+per partition is one compacted file plus whatever has been flushed since the last
+pass. Swaps happen with the query pool quiesced, so a scan never sees a partition
+half-swapped, and the rename protocol is crash-recoverable from file names alone
+— an interrupted merge is either rolled back or its leftovers swept on the next
+pass, never duplicated.
+
 Whole-host CPU and memory land under the reserved deployment id `_host`, since
 they belong to no deployment.
 
@@ -204,6 +215,7 @@ Configuration is environment-only:
 | `APP_OBS_RETAIN_DAYS` | `30` | Partitions older than this are deleted |
 | `APP_OBS_FLUSH_ROWS` | `10000` | Flush a partition at this many buffered rows... |
 | `APP_OBS_FLUSH_SECS` | `60` | ...or this long after its first row |
+| `APP_OBS_COMPACT_SECS` | `600` | Merge each partition's small parquet files into one this often; `0` disables |
 | `APP_OBS_QUEUE_CAPACITY` | `65536` | Ingest queue depth before records are dropped |
 | `APP_OBS_QUERY_CONCURRENCY` | `4` | Dashboard queries in flight before a `503` |
 | `APP_OBS_QUERY_TIMEOUT_SECS` | `30` | Ceiling on one query |

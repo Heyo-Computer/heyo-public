@@ -474,13 +474,20 @@ fn ws_query_token(matched: &str, query: Option<&str>) -> Option<String> {
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [(
-            header::WWW_AUTHENTICATE,
-            // Both schemes are advertised, in the order a browser should try
-            // them: a browser can only do Basic, and offering Bearer first would
-            // suppress its native login prompt on some clients.
-            "Basic realm=\"app-lb dashboard\", charset=\"UTF-8\", Bearer",
-        )],
+        // Two schemes, one header line each. Both are advertised, but they must
+        // be separate `WWW-Authenticate` lines rather than one comma-joined
+        // value: the combined form (`Basic …, Bearer`) is legal per RFC 7235 but
+        // ambiguous to parse, and Chrome chokes on the trailing bare `Bearer`
+        // token and suppresses its native Basic login prompt entirely — the user
+        // lands on the raw 401 body instead of a sign-in dialog. Firefox parses
+        // the combined line leniently, which is why it only broke on Chrome.
+        [
+            (
+                header::WWW_AUTHENTICATE,
+                "Basic realm=\"app-lb dashboard\", charset=\"UTF-8\"",
+            ),
+            (header::WWW_AUTHENTICATE, "Bearer"),
+        ],
         "authentication required\n",
     )
         .into_response()

@@ -405,6 +405,49 @@ fn main() {
              docker on this host, and POST /deployments/:id/update runs that deployment's \
              own commands",
         );
+
+        // The blanket warning above assumes the admin listener is only on
+        // loopback. This one fires when a registered deployment actually fronts
+        // it through a sign-in gate: then the CRUD API is not merely open on
+        // 127.0.0.1, it is reachable from wherever that deployment's hostname
+        // resolves, with no credential at all. A gate's `public_paths` bypass
+        // *sign-in* only — the admin listener's own CRUD gate is what
+        // `admin_auth` turns on, and with it off nothing is left in front. And
+        // because `is_public` matches by prefix (see `AuthGate::is_public`), a
+        // single `/deployments` entry also exposes `POST /deployments/:id/build`
+        // and `/update`: unauthenticated remote code execution on this host.
+        // Best-effort — the upstream is matched to `admin_addr` as a string, so
+        // an alias (`localhost` vs `127.0.0.1`) slips past, and the blanket
+        // warning above still covers that. See the README, "Putting the
+        // dashboard behind Google".
+        for dep in registry.deployments().values() {
+            let spec = &dep.spec;
+            if !spec.upstreams.iter().any(|u| u == &cfg.admin_addr) {
+                continue;
+            }
+            let Some(gate) = &spec.auth else { continue };
+            let health = spec.health.path.as_deref();
+            let exposed: Vec<&str> = gate
+                .public_paths
+                .iter()
+                .map(String::as_str)
+                .filter(|p| *p != "/healthz" && Some(*p) != health)
+                .collect();
+            if !exposed.is_empty() {
+                tracing::error!(
+                    deployment = %spec.id,
+                    admin = %cfg.admin_addr,
+                    public_paths = ?exposed,
+                    "deployment {:?} fronts the admin listener through a sign-in gate while \
+                     APP_LB_ADMIN_AUTH is off: these public_paths bypass sign-in and reach the \
+                     unauthenticated CRUD API. Paths match by prefix, so \"/deployments\" also \
+                     exposes POST /deployments/:id/build and /update — remote code execution on \
+                     this host. Set APP_LB_ADMIN_AUTH=1 (with APP_LB_DASHBOARD_PASSWORD) and \
+                     restart.",
+                    spec.id,
+                );
+            }
+        }
     }
 
     // The key that signs sign-in sessions. Generated on first use and kept, so
