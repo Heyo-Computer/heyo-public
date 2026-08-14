@@ -65,6 +65,17 @@ pub struct LbConfig {
     pub dashboard_user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dashboard_password: Option<String>,
+    /// Whether a configured password actually gates the dashboard view tier
+    /// (`/`, `/dashboard`, `/metrics`, `/security`, …). Defaults to true — a
+    /// password alone turns the gate on, as ever. Setting it to false keeps
+    /// the password for the CRUD gate (`admin_auth`) and token minting while
+    /// leaving the browser-facing pages open, which is the shape a deployment
+    /// with its own sign-in (e.g. Google auth) in front of the dashboard
+    /// needs: humans authenticate at that layer, machines still meet Basic on
+    /// the API. With nothing in front, false exposes the view tier —
+    /// `/security` included — to whoever can reach `admin_addr`.
+    #[serde(default = "default_true")]
+    pub dashboard_auth: bool,
     /// When true, the Basic-auth gate also covers the deployment CRUD API
     /// (register/edit/scale/delete/evict and the spec-revealing reads), not just
     /// the dashboard view. It reuses the dashboard credentials, so this requires
@@ -212,6 +223,7 @@ impl Default for LbConfig {
             daemon_url: None,
             dashboard_user: None,
             dashboard_password: None,
+            dashboard_auth: true,
             admin_auth: false,
             tls_addr: default_tls_addr(),
             tls_addr_explicit: false,

@@ -161,6 +161,11 @@ struct AdminState {
     directory_html: Arc<str>,
     /// `None` disables the gate — the dashboard and `/metrics` are then open.
     auth: Option<Arc<DashboardAuth>>,
+    /// Whether `auth` actually gates the view tier. False when the operator
+    /// runs their own sign-in (e.g. Google auth) in front of the dashboard:
+    /// the browser-facing pages open up while the credential keeps guarding
+    /// the CRUD tier and minting tokens. Meaningless when `auth` is `None`.
+    gate_view: bool,
     /// When true, the gate also covers the deployment CRUD routes (reflected in
     /// `router`), so mutations and spec reads require the same credentials.
     gate_admin: bool,
@@ -233,6 +238,7 @@ impl AdminApi {
         name: String,
         dashboard_user: Option<String>,
         dashboard_password: Option<String>,
+        gate_view: bool,
         gate_admin: bool,
         certs: Arc<CertStore>,
         acme: Option<Arc<Notify>>,
@@ -262,7 +268,12 @@ impl AdminApi {
         // it and there is no "half-configured, silently open" state.
         let auth = dashboard_password.map(|password| {
             let user = dashboard_user.unwrap_or_else(|| "admin".to_string());
-            tracing::info!(user = %user, admin_api = gate_admin, "dashboard auth enabled");
+            tracing::info!(
+                user = %user,
+                dashboard = gate_view,
+                admin_api = gate_admin,
+                "dashboard credentials configured"
+            );
             Arc::new(DashboardAuth::new(&user, &password))
         });
         if auth.is_none() {
@@ -281,6 +292,7 @@ impl AdminApi {
                 dashboard_html,
                 directory_html,
                 auth,
+                gate_view,
                 gate_admin,
                 started_at: now_secs(),
                 certs,
@@ -734,6 +746,15 @@ fn observe_auth_failure(
 }
 
 async fn require_view_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
+    // `gate_view` off means the view tier behaves exactly as if no password
+    // were set: the layer still runs (handlers keep their `Caller` extension,
+    // now `Ungated`), the challenge never fires. Done by dropping `auth` here
+    // rather than by skipping the layer so the two paths cannot drift.
+    let state = if state.gate_view {
+        state
+    } else {
+        AdminState { auth: None, ..state }
+    };
     authorize(state, req, next, crate::tokens::AdminScope::View).await
 }
 

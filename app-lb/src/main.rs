@@ -85,6 +85,12 @@ fn config_from_env() -> LbConfig {
             "1" | "true" | "yes" | "on"
         );
     }
+    if let Ok(v) = std::env::var("APP_LB_DASHBOARD_AUTH") {
+        cfg.dashboard_auth = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
     if let Ok(v) = std::env::var("APP_LB_PROXY_TLS_ADDR") {
         cfg.tls_addr = v;
         cfg.tls_addr_explicit = true;
@@ -217,6 +223,26 @@ fn main() {
             "APP_LB_ADMIN_AUTH is set but APP_LB_DASHBOARD_PASSWORD is not; the admin \
              gate reuses the dashboard credentials, so set a password or unset APP_LB_ADMIN_AUTH"
         );
+    }
+
+    // A password with both gates off protects nothing — likely someone turned
+    // off the dashboard prompt (for an SSO proxy in front) and forgot that the
+    // CRUD gate is a separate switch. Loud, not fatal: the state is identical
+    // to running with no password at all, which is allowed.
+    if cfg.dashboard_password.is_some() && !cfg.dashboard_auth {
+        if cfg.admin_auth {
+            tracing::info!(
+                "APP_LB_DASHBOARD_AUTH=0: the dashboard view tier (/, /dashboard, /metrics, \
+                 /security…) is open — keep your own sign-in in front of it — while the \
+                 deployment CRUD API still requires the dashboard credentials"
+            );
+        } else {
+            tracing::warn!(
+                "APP_LB_DASHBOARD_PASSWORD is set but APP_LB_DASHBOARD_AUTH=0 and \
+                 APP_LB_ADMIN_AUTH is off: the password gates nothing — every admin route, \
+                 /security included, is open to whoever reaches the admin listener"
+            );
+        }
     }
 
     // Pre-flight the listener addresses.
@@ -694,6 +720,7 @@ fn main() {
             cfg.name.clone(),
             cfg.dashboard_user.clone(),
             cfg.dashboard_password.clone(),
+            cfg.dashboard_auth,
             cfg.admin_auth,
             certs.clone(),
             acme_signal,

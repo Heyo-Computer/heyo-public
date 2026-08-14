@@ -64,6 +64,7 @@ Configuration is environment-only:
 | `APP_LB_DAEMON_URL` | `http://127.0.0.1:34099` | heyvm daemon |
 | `APP_LB_DASHBOARD_PASSWORD` | *(unset)* | Set to gate the dashboard behind HTTP Basic Auth |
 | `APP_LB_DASHBOARD_USER` | `admin` | Basic Auth username (only used when a password is set) |
+| `APP_LB_DASHBOARD_AUTH` | `true` | `0`/`false` to leave the dashboard view tier open while the password keeps gating the CRUD API — for when your own sign-in (e.g. Google) fronts the pages |
 | `APP_LB_ADMIN_AUTH` | `false` | `1`/`true` to extend the gate to the deployment CRUD API (needs a password) |
 | `APP_LB_TLS_CERT` | *(unset)* | PEM cert path; set with `APP_LB_TLS_KEY`. The fallback cert when ACME is on |
 | `APP_LB_TLS_KEY` | *(unset)* | PEM private-key path |
@@ -1398,7 +1399,17 @@ curl -u admin:s3cret -XDELETE localhost:9090/deployments/demo/vms/sb-abc123
 
 `APP_LB_ADMIN_AUTH` requires a password — enabling it without one is a hard
 startup error, never a silently-open gate. `/healthz` is always open so probes
-keep working. The credentials are compared in constant time, but the admin
+keep working.
+
+The inverse split also exists: `APP_LB_DASHBOARD_AUTH=0` leaves the view tier
+(`/`, `/dashboard`, `/metrics`, `/security`, …) open **while the password keeps
+gating the CRUD API** (with `APP_LB_ADMIN_AUTH=1`) and minting app-tokens. This
+is the setting for a dashboard fronted by its own sign-in — see
+[Putting the dashboard behind Google](#putting-the-dashboard-behind-google) —
+where a Basic prompt after the Google redirect is a second login for the same
+door. With nothing in front, turning it off exposes the view tier, `/security`
+included, to whoever can reach the admin listener; app-lb warns at startup when
+the flag leaves a configured password gating nothing at all. The credentials are compared in constant time, but the admin
 listener is plain HTTP — terminate TLS in front of it, or reach it over an SSH
 tunnel, if it leaves localhost.
 
@@ -1772,13 +1783,19 @@ credential the machine *can* present behind them.
 
 ```sh
 # and on app-lb itself, so those paths are not simply open
-APP_LB_DASHBOARD_PASSWORD=s3cret APP_LB_ADMIN_AUTH=1
+APP_LB_DASHBOARD_PASSWORD=s3cret APP_LB_ADMIN_AUTH=1 APP_LB_DASHBOARD_AUTH=0
 ```
 
 `/` and `/dashboard` stay behind Google; everything a machine calls passes the
-gate and meets Basic auth instead. **Set `APP_LB_ADMIN_AUTH=1` first and restart,
+gate and meets Basic auth instead. `APP_LB_DASHBOARD_AUTH=0` is what stops the
+*second* sign-in: without it the page and its `/metrics` poll still answer 401
+after the Google redirect, so every session starts with Google **and** a Basic
+prompt for the same door. Google is the humans' credential here; Basic is the
+machines'. **Set `APP_LB_ADMIN_AUTH=1` first and restart,
 then add `public_paths`** — the other order leaves a window where a full CRUD
-API, `/secrets` included, is on the internet with nothing in front of it.
+API, `/secrets` included, is on the internet with nothing in front of it. And
+only turn `APP_LB_DASHBOARD_AUTH` off *after* the Google-fronted deployment is
+live: the flag opens the view tier to whatever can reach the admin listener.
 
 If you would rather not make that trade, don't: leave the hostname
 browser-only and reach the API over an SSH tunnel
