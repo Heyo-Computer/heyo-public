@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use axum::extract::{ConnectInfo, MatchedPath, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{AppendHeaders, Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use base64::Engine;
@@ -481,13 +481,18 @@ fn unauthorized() -> Response {
         // token and suppresses its native Basic login prompt entirely — the user
         // lands on the raw 401 body instead of a sign-in dialog. Firefox parses
         // the combined line leniently, which is why it only broke on Chrome.
-        [
+        //
+        // `AppendHeaders` is load-bearing: a plain array of tuples *inserts*
+        // into the header map, so the second `WWW-Authenticate` would replace
+        // the first and the response would advertise only `Bearer` — no Basic
+        // challenge, no browser prompt, same raw-401 symptom as the bug above.
+        AppendHeaders([
             (
                 header::WWW_AUTHENTICATE,
                 "Basic realm=\"app-lb dashboard\", charset=\"UTF-8\"",
             ),
             (header::WWW_AUTHENTICATE, "Bearer"),
-        ],
+        ]),
         "authentication required\n",
     )
         .into_response()
@@ -3456,6 +3461,33 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both auth schemes must survive into the response as *separate*
+    /// `WWW-Authenticate` lines. This has now broken twice, silently, in
+    /// opposite directions: comma-joining them suppressed Chrome's Basic
+    /// prompt, and the fix's plain tuple-array *inserted* the second line over
+    /// the first, so the response advertised only `Bearer` — no Basic
+    /// challenge, no prompt in any browser without cached credentials.
+    #[test]
+    fn a_401_advertises_basic_and_bearer_on_separate_lines() {
+        let response = unauthorized();
+        let challenges: Vec<&str> = response
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|v| v.to_str().expect("ascii header"))
+            .collect();
+        assert_eq!(challenges.len(), 2, "both schemes must be present: {challenges:?}");
+        assert!(
+            challenges[0].starts_with("Basic "),
+            "Basic first, so a browser tries it before the Bearer it cannot do: {challenges:?}",
+        );
+        assert!(
+            !challenges[0].contains("Bearer"),
+            "one scheme per line — no comma-joined challenge: {challenges:?}",
+        );
+        assert_eq!(challenges[1], "Bearer");
+    }
 
     /// The two routing decisions behind the security console, both of which are
     /// silent when wrong: one produces a 403 for a caller who should see the
