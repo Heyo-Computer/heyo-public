@@ -8,7 +8,7 @@
 use super::{Ctx, Resource, deployment_name, parse_ref};
 use crate::output::{self, Table};
 use crate::spec::{self, EnvChange};
-use crate::types::{DeploymentStatus, JobRecord, SecretSummary};
+use crate::types::{DeploymentStatus, JobRecord, SecretSummary, UpstreamTrafficStatus};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde_json::{Map, Value};
@@ -46,9 +46,9 @@ pub struct CreateDeploymentArgs {
     #[arg(long = "route", value_name = "RULE", help_heading = "Routing")]
     pub routes: Vec<String>,
     /// Create with no ingress at all. The deployment takes no HTTP traffic and
-    /// is reached only by `serverctl exec` and `serverctl shell` — the usual
+    /// is reached only by `heyctl exec` and `heyctl shell` — the usual
     /// shape for an agent sandbox. Managed (VM) deployments only; add a route
-    /// later with `serverctl set routes` to expose it.
+    /// later with `heyctl set routes` to expose it.
     #[arg(
         long,
         conflicts_with_all = ["host", "host_suffix", "path_prefix", "routes"],
@@ -117,7 +117,7 @@ pub struct CreateDeploymentArgs {
     #[arg(long = "upstream", value_name = "ADDR", help_heading = "Static upstreams")]
     pub upstreams: Vec<String>,
 
-    // Build source. Recording it here does not build anything — `serverctl
+    // Build source. Recording it here does not build anything — `heyctl
     // build <name>` does that — so a deployment can be created against an
     // existing image and switched to built images later.
     /// Git remote the guest image is built from.
@@ -247,7 +247,7 @@ pub fn create(ctx: &Ctx, args: &CreateDeploymentArgs) -> Result<()> {
     // deployment is otherwise sitting on whatever --image named.
     if args.repo.is_some() && !ctx.out.is_machine() {
         println!(
-            "\nIts image is not built yet — run `serverctl build {}` to check out the repo, \
+            "\nIts image is not built yet — run `heyctl build {}` to check out the repo, \
              build the Dockerfile and roll the pool onto the result.",
             args.name
         );
@@ -529,7 +529,7 @@ pub struct CreateSecretArgs {
     #[command(flatten)]
     pub sources: SecretSourceFlags,
 
-    /// What this secret is for. Shown by `serverctl get secrets`.
+    /// What this secret is for. Shown by `heyctl get secrets`.
     #[arg(long, value_name = "TEXT")]
     pub description: Option<String>,
 
@@ -699,7 +699,7 @@ pub struct SetBuildArgs {
     /// checkout: an `art serve` URL (`http://host:8080`) or an absolute path to
     /// a store root on the app-lb host. Pair it with --ref.
     ///
-    /// `serverctl artifact push-dockerfile` is what puts one there.
+    /// `heyctl artifact push-dockerfile` is what puts one there.
     #[arg(long, value_name = "URL|PATH", conflicts_with = "repo")]
     pub store: Option<String>,
     /// Which version of the source to build: a branch, tag or commit for --repo
@@ -919,7 +919,7 @@ pub fn set_artifact(ctx: &Ctx, args: &SetArtifactArgs) -> Result<()> {
             bail!(
                 "deployment {id:?} has no artifact ref yet, so --ref is required \
                  (a tag like `debian-hermes`, or a digest). \
-                 `serverctl artifact ls` lists a store's tags"
+                 `heyctl artifact ls` lists a store's tags"
             );
         }
         for (key, value) in [
@@ -1009,7 +1009,7 @@ pub fn pull(ctx: &Ctx, args: &PullArgs) -> Result<()> {
         println!(
             "\nIt runs on the app-lb host, and takes as long as the transfer does — or no \
              time at all if the image is already there. Follow it with \
-             `serverctl get job {}`.",
+             `heyctl get job {}`.",
             record.id
         );
         return Ok(());
@@ -1277,7 +1277,7 @@ pub fn set_auth(ctx: &Ctx, args: &SetAuthArgs) -> Result<()> {
         if fresh && (args.client_id.is_none() || secret.is_none()) {
             bail!(
                 "deployment {id:?} has no sign-in gate yet, so --client-id and --secret are \
-                 both required (store the client secret first: `serverctl create secret \
+                 both required (store the client secret first: `heyctl create secret \
                  google --from-stdin client_secret`)"
             );
         }
@@ -1360,7 +1360,7 @@ pub fn update(ctx: &Ctx, args: &UpdateArgs) -> Result<()> {
 
     if !(args.wait || args.logs) {
         println!(
-            "\nIt runs on the app-lb host. Follow it with `serverctl get job {}`.",
+            "\nIt runs on the app-lb host. Follow it with `heyctl get job {}`.",
             record.id
         );
         return Ok(());
@@ -1416,7 +1416,7 @@ pub fn build(ctx: &Ctx, args: &BuildArgs) -> Result<()> {
     if !(args.wait || args.logs) {
         println!(
             "\nIt runs on the app-lb host and takes as long as `docker build` does. \
-             Follow it with `serverctl get job {}`.",
+             Follow it with `heyctl get job {}`.",
             record.id
         );
         return Ok(());
@@ -1453,7 +1453,7 @@ fn wait_job(ctx: &Ctx, job_id: &str, timeout: Duration, show_logs: bool) -> Resu
         if started.elapsed() >= timeout {
             bail!(
                 "timed out after {}s waiting for job/{job_id}; it is still running on the \
-                 server — check it with `serverctl get job {job_id}`",
+                 server — check it with `heyctl get job {job_id}`",
                 timeout.as_secs()
             );
         }
@@ -1506,7 +1506,7 @@ fn report_job(record: &JobRecord, show_tail: bool) -> Result<()> {
             );
         }
         println!(
-            "\nWatch the replacements with `serverctl rollout status {}`.",
+            "\nWatch the replacements with `heyctl rollout status {}`.",
             record.deployment
         );
         return Ok(());
@@ -1596,7 +1596,7 @@ pub fn edit(ctx: &Ctx, args: &EditArgs) -> Result<()> {
     let original = format!("{header}{}", serde_yaml::to_string(&current)?);
 
     let path = std::env::temp_dir().join(format!(
-        "serverctl-{}-{}.yaml",
+        "heyctl-{}-{}.yaml",
         sanitize(id),
         std::process::id()
     ));
@@ -1870,6 +1870,178 @@ pub fn scale(ctx: &Ctx, args: &ScaleArgs) -> Result<()> {
     Ok(())
 }
 
+// -- static-upstream traffic control --------------------------------------
+
+#[derive(Args, Debug)]
+pub struct CordonArgs {
+    /// The static deployment, e.g. `stage` or `deployment/stage`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+    /// The exact `host:port` entry to stop sending new requests to.
+    #[arg(value_name = "UPSTREAM")]
+    pub upstream: String,
+    /// Allow cordoning when no other healthy, accepting upstream remains.
+    #[arg(long)]
+    pub force: bool,
+    /// Why this upstream is being withdrawn. Stored with the durable drain.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct DrainArgs {
+    #[command(flatten)]
+    pub cordon: CordonArgs,
+    /// Give up waiting after this long. The upstream remains cordoned on timeout.
+    #[arg(long, value_name = "SECS", default_value_t = 300)]
+    pub timeout: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct UncordonArgs {
+    /// The static deployment, e.g. `stage` or `deployment/stage`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+    /// The exact `host:port` entry to return to traffic when healthy.
+    #[arg(value_name = "UPSTREAM")]
+    pub upstream: String,
+}
+
+fn emit_upstream_status(ctx: &Ctx, status: &UpstreamTrafficStatus) -> Result<()> {
+    output::emit(
+        &serde_json::to_value(status)?,
+        ctx.out,
+        &[format!("upstream/{}", status.upstream)],
+    )
+}
+
+pub fn cordon(ctx: &Ctx, args: &CordonArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+    let status = ctx.client.cordon_upstream(
+        &id,
+        &args.upstream,
+        args.force,
+        args.reason.as_deref(),
+    )?;
+    if ctx.out.is_machine() {
+        return emit_upstream_status(ctx, &status);
+    }
+    println!(
+        "upstream/{} cordoned in deployment/{id} — {} request(s) still in flight{}",
+        status.upstream,
+        status.in_flight,
+        status
+            .reason
+            .as_deref()
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default(),
+    );
+    if status.in_flight > 0 {
+        println!(
+            "Wait for completion with `heyctl drain {id} {}`.",
+            status.upstream
+        );
+    }
+    Ok(())
+}
+
+pub fn drain(ctx: &Ctx, args: &DrainArgs) -> Result<()> {
+    let id = deployment_name(&args.cordon.resource)?;
+    let mut outcome = ctx.client.cordon_upstream(
+        &id,
+        &args.cordon.upstream,
+        args.cordon.force,
+        args.cordon.reason.as_deref(),
+    )?;
+    if !ctx.out.is_machine() {
+        println!(
+            "upstream/{} cordoned in deployment/{id}; waiting for {} in-flight request(s).",
+            outcome.upstream, outcome.in_flight
+        );
+    }
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(args.timeout);
+    let mut last = outcome.in_flight;
+    loop {
+        if outcome.in_flight == 0 {
+            outcome.state = "drained".into();
+            if ctx.out.is_machine() {
+                return emit_upstream_status(ctx, &outcome);
+            }
+            println!(
+                "upstream/{} drained — no requests remain in flight.",
+                outcome.upstream
+            );
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "timed out after {}s waiting for upstream {:?} to drain; it remains cordoned. \
+                 Inspect it with `heyctl get vms -d {id}` or restore it with \
+                 `heyctl uncordon {id} {}`",
+                timeout.as_secs(),
+                args.cordon.upstream,
+                args.cordon.upstream,
+            );
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        std::thread::sleep(Duration::from_secs(1).min(remaining));
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            bail!(
+                "timed out after {}s waiting for upstream {:?} to drain; it remains cordoned. \
+                 Restore it with `heyctl uncordon {id} {}`",
+                timeout.as_secs(),
+                args.cordon.upstream,
+                args.cordon.upstream,
+            );
+        }
+
+        let deployment = ctx.client.deployment_with_timeout(&id, remaining)?;
+        let upstreams: Vec<_> = deployment
+            .vms
+            .iter()
+            .filter(|backend| backend.addr == args.cordon.upstream)
+            .collect();
+        if upstreams.is_empty() {
+            bail!(
+                "upstream {:?} disappeared from deployment/{id} while draining",
+                args.cordon.upstream,
+            );
+        }
+        if upstreams.iter().any(|upstream| !upstream.draining) {
+            bail!(
+                "upstream {:?} became uncordoned before its drain completed",
+                args.cordon.upstream,
+            );
+        }
+        outcome.in_flight = upstreams.iter().map(|upstream| upstream.in_flight).sum();
+        if !ctx.out.is_machine() && outcome.in_flight != last {
+            println!("{} request(s) still in flight.", outcome.in_flight);
+            last = outcome.in_flight;
+        }
+    }
+}
+
+pub fn uncordon(ctx: &Ctx, args: &UncordonArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+    let status = ctx.client.uncordon_upstream(&id, &args.upstream)?;
+    if ctx.out.is_machine() {
+        return emit_upstream_status(ctx, &status);
+    }
+    println!(
+        "upstream/{} uncordoned in deployment/{id} — {}",
+        status.upstream,
+        if status.healthy {
+            "accepting traffic"
+        } else {
+            "administratively accepting, but still excluded by its health probe"
+        },
+    );
+    Ok(())
+}
+
 // -- restart / rollout status ---------------------------------------------
 
 #[derive(Args, Debug)]
@@ -1925,7 +2097,7 @@ pub fn restart(ctx: &Ctx, args: &RestartArgs) -> Result<()> {
         println!();
         return wait_ready(ctx, &id, Duration::from_secs(args.timeout));
     }
-    println!("\nWatch the replacements with `serverctl rollout status {id}`.");
+    println!("\nWatch the replacements with `heyctl rollout status {id}`.");
     Ok(())
 }
 
@@ -1975,7 +2147,7 @@ fn wait_ready(ctx: &Ctx, id: &str, timeout: Duration) -> Result<()> {
         if started.elapsed() >= timeout {
             bail!(
                 "timed out after {}s waiting for deployment/{id} — \
-                 `serverctl describe deployment {id}` shows where it is stuck",
+                 `heyctl describe deployment {id}` shows where it is stuck",
                 timeout.as_secs()
             );
         }
@@ -2094,7 +2266,7 @@ pub fn create_workflow(ctx: &Ctx, args: &CreateWorkflowArgs) -> Result<()> {
         created.id, created.git_ref, created.repo, created.path, created.network
     );
     if !created.enabled {
-        println!("It is disabled; `serverctl set workflow {} --enabled` turns it on.", created.id);
+        println!("It is disabled; `heyctl set workflow {} --enabled` turns it on.", created.id);
     }
     Ok(())
 }
@@ -2222,7 +2394,7 @@ fn delete_vms(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {
     // Worth saying, because it is the difference between this and `scale`.
     println!(
         "\nThe autoscaler boots replacements on its next tick if the scaling policy still \
-         wants the capacity. To shrink the pool, use `serverctl scale`."
+         wants the capacity. To shrink the pool, use `heyctl scale`."
     );
     Ok(())
 }

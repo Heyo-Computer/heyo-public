@@ -1,7 +1,7 @@
 import {
   type Credential,
   InvalidRequestError,
-  ServerctlError,
+  HeyctlError,
   TransportError,
   fromResponse,
 } from "./errors.js";
@@ -37,7 +37,7 @@ export type Auth =
   /** An app-token. Scoped, revocable — the normal choice for a program. */
   | { kind: "token"; token: string };
 
-export interface ServerctlOptions {
+export interface HeyctlOptions {
   /** A URL, or a bare `host:port`. */
   server: string;
   /** Shorthand for `auth: { kind: "token", token }`. */
@@ -106,17 +106,17 @@ export function normalizeServer(server: string): string {
  * A client for one app-lb.
  *
  * ```ts
- * const lb = new Serverctl({ server: "127.0.0.1:9090", token: process.env.APP_LB_TOKEN });
+ * const lb = new Heyctl({ server: "127.0.0.1:9090", token: process.env.APP_LB_TOKEN });
  * const { stdout } = await lb.exec("sb-7f3a9c", "uname -a");
  * ```
  */
-export class Serverctl {
+export class Heyctl {
   readonly server: string;
   /** @internal */ readonly auth: Auth;
   private readonly timeoutMs: number;
   private readonly doFetch: typeof globalThis.fetch;
 
-  constructor(opts: ServerctlOptions) {
+  constructor(opts: HeyctlOptions) {
     this.server = normalizeServer(opts.server);
     this.auth =
       opts.auth ??
@@ -230,7 +230,7 @@ export class Serverctl {
     try {
       return JSON.parse(text) as T;
     } catch (cause) {
-      throw new ServerctlError(`could not read the response from ${path}: ${String(cause)}`);
+      throw new HeyctlError(`could not read the response from ${path}: ${String(cause)}`);
     }
   }
 
@@ -247,7 +247,7 @@ export class Serverctl {
    * gate is on at all.
    */
   async gates(): Promise<Gates> {
-    const anon = new Serverctl({ server: this.server, fetch: this.doFetch });
+    const anon = new Heyctl({ server: this.server, fetch: this.doFetch });
     const refused = async (path: string) => (await anon.send("GET", path)).status === 401;
     return { view: await refused("/metrics"), crud: await refused("/deployments") };
   }
@@ -272,7 +272,7 @@ export class Serverctl {
       await this.deployment(id);
       return true;
     } catch (e) {
-      if (e instanceof ServerctlError && e.status === 404) return false;
+      if (e instanceof HeyctlError && e.status === 404) return false;
       throw e;
     }
   }

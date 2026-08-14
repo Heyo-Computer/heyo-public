@@ -203,6 +203,16 @@ export interface DeploymentStatus {
   vms: VmStatus[];
 }
 
+export interface UpstreamTrafficStatus {
+  deployment_id: string;
+  upstream: string;
+  state: "accepting" | "draining" | "drained";
+  healthy: boolean;
+  in_flight: number;
+  reason: string | null;
+  started_at: number | null;
+}
+
 // -- metrics ---------------------------------------------------------------
 
 export interface StatusCounts {
@@ -303,8 +313,12 @@ export interface PendingVmView {
 
 export interface DeploymentView {
   id: string;
+  /** Absent for the default namespace. */
+  namespace?: string;
   kind: DeploymentKind;
   upstreams: string[];
+  /** Whether at least one data-plane route points at this deployment. */
+  routed: boolean;
   hosts: string[];
   urls?: string[];
   site_root?: string;

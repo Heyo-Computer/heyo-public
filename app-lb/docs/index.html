@@ -19,7 +19,7 @@
     <li><a href="namespaces.html">Namespaces</a></li>
     <li><a href="feed.html">The event feed</a></li>
     <li class="group">clients</li>
-    <li><a href="serverctl.html">serverctl</a></li>
+    <li><a href="heyctl.html">heyctl</a></li>
   </ul>
 </nav>
 <main>
@@ -48,7 +48,7 @@ idle pools scale to zero.</p>
   tokens into exactly one room.</span></a>
   <a href="feed.html"><strong>Event feed</strong><span>Per-namespace RSS of deploys and
   operational trouble — strictly opt-in.</span></a>
-  <a href="serverctl.html"><strong>serverctl</strong><span>The CLI: contexts, specs, scaling,
+  <a href="heyctl.html"><strong>heyctl</strong><span>The CLI: contexts, specs, scaling,
   exec/shell, tokens and feeds.</span></a>
 </div>
 
@@ -57,11 +57,11 @@ idle pools scale to zero.</p>
 app-lb
 
 # register a deployment from a spec file
-serverctl apply -f web.json
+heyctl apply -f web.json
 
 # watch it
-serverctl get deployments
-serverctl describe web</code></pre>
+heyctl get deployments
+heyctl describe web</code></pre>
 
 <p>A minimal managed deployment:</p>
 <pre><code>{
@@ -101,7 +101,7 @@ nothing. See <a href="security.html">Auth &amp; tokens</a>.
   <tr><td><code>APP_LB_SIEM</code></td><td><code>1</code></td><td>The built-in security analyzer; <code>0</code> disables detection (block rules keep working).</td></tr>
 </table>
 
-<footer>app-lb &amp; serverctl · static documentation, served happily by a
+<footer>app-lb &amp; heyctl · static documentation, served happily by a
 <code>site</code> deployment.</footer>
 </main>
 </div>

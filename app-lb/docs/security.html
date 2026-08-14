@@ -19,7 +19,7 @@
     <li><a href="namespaces.html">Namespaces</a></li>
     <li><a href="feed.html">The event feed</a></li>
     <li class="group">clients</li>
-    <li><a href="serverctl.html">serverctl</a></li>
+    <li><a href="heyctl.html">heyctl</a></li>
   </ul>
 </nav>
 <main>
@@ -63,7 +63,7 @@ and <code>public_paths</code> first.</div>
 
 <h2>App-tokens</h2>
 <p>The credential a program carries. Minted through the admin API (or
-<code>serverctl token mint</code>), scoped, optionally expiring, revocable instantly.
+<code>heyctl token mint</code>), scoped, optionally expiring, revocable instantly.
 The shape is <code>applb_&lt;id&gt;_&lt;secret&gt;</code> — greppable on purpose, and only
 the secret's SHA-256 is stored, so the token file is not a fleet compromise and there is
 no "reveal" endpoint.</p>
@@ -79,12 +79,12 @@ no "reveal" endpoint.</p>
   <td>A wall around everything: see <a href="namespaces.html">Namespaces</a>.</td></tr>
 </table>
 <pre><code># a token for CI to reach one deployment's data plane, expiring in a week
-serverctl token mint ci-secrets -d secret-service --expires-in 168 -q
+heyctl token mint ci-secrets -d secret-service --expires-in 168 -q
 
 # a fleet-wide operator token
-serverctl token mint ops --admin admin --all-deployments</code></pre>
-<p><code>serverctl token set</code> re-scopes a token without changing its secret;
-<code>serverctl token revoke</code> takes effect on the next request.</p>
+heyctl token mint ops --admin admin --all-deployments</code></pre>
+<p><code>heyctl token set</code> re-scopes a token without changing its secret;
+<code>heyctl token revoke</code> takes effect on the next request.</p>
 
 <h2>The admin API's two tiers</h2>
 <p>Unset, the admin listener is open (it binds loopback). Setting

@@ -47,6 +47,9 @@ pub struct Config {
     /// Credentials for app-lb when `APP_LB_ADMIN_AUTH` is on there.
     pub applb_user: Option<String>,
     pub applb_password: Option<String>,
+    /// Stable name carried in live status, e.g. `stage-edge`. This identifies
+    /// the collector, never an individual VM.
+    pub source: String,
     /// The sandbox daemon (`heyvmd`) whose native per-sandbox log streams are
     /// tailed. Unset disables the tailer — the safe default, since a daemon
     /// predating the stream endpoint would fail every attach.
@@ -90,6 +93,7 @@ impl Default for Config {
             applb_url: default_applb_url(),
             applb_user: None,
             applb_password: None,
+            source: "app-lb".into(),
             heyvm_url: None,
             heyvm_token: None,
             poll_interval: Duration::from_secs(10),
@@ -130,6 +134,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("APP_LB_PASSWORD") {
             cfg.applb_password = Some(v);
+        }
+        if let Ok(v) = std::env::var("APP_OBS_SOURCE") {
+            cfg.source = v;
         }
         if let Ok(v) = std::env::var("HEYVM_URL") {
             cfg.heyvm_url = Some(v);

@@ -6,9 +6,9 @@
  * attach an interactive shell.
  *
  * ```ts
- * import { Serverctl } from "serverctl";
+ * import { Heyctl } from "heyctl";
  *
- * const lb = new Serverctl({ server: "127.0.0.1:9090", token: process.env.APP_LB_TOKEN });
+ * const lb = new Heyctl({ server: "127.0.0.1:9090", token: process.env.APP_LB_TOKEN });
  * const { stdout } = await lb.exec("sb-7f3a9c", "uname -a");
  * ```
  *
@@ -27,7 +27,7 @@
  *
  * # What this package does not smooth over
  *
- * - A non-zero exit code from {@link Serverctl.exec} resolves, it does not
+ * - A non-zero exit code from {@link Heyctl.exec} resolves, it does not
  *   reject. The command ran; it failed.
  * - `exec`'s timeout does not kill anything. It bounds app-lb's call to the
  *   daemon — on expiry you get an `UpstreamError` and the command **keeps
@@ -36,14 +36,14 @@
  *   gives a *new* shell.
  */
 
-export { Serverctl, normalizeServer, ASSUMED_COLD_START_MS } from "./client.js";
+export { Heyctl, normalizeServer, ASSUMED_COLD_START_MS } from "./client.js";
 export type {
   Auth,
   ExecOptions,
   Gates,
   MetricsQuery,
   NewToken,
-  ServerctlOptions,
+  HeyctlOptions,
 } from "./client.js";
 
 export { Shell, PING_INTERVAL_MS } from "./shell.js";
@@ -66,7 +66,7 @@ export {
   MalformedResponseError,
   NoRunningVmError,
   NotFoundError,
-  ServerctlError,
+  HeyctlError,
   ShellError,
   TimeoutError,
   TransportError,

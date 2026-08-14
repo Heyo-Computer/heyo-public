@@ -8,7 +8,7 @@
 use crate::autoscale::{Autoscaler, EvictOutcome};
 use crate::config::DeploymentSpec;
 use crate::jobs::{Jobs, StartError};
-use crate::deployment::now_secs;
+use crate::deployment::{UpstreamDrain, now_secs};
 use crate::metrics::{DeploymentMetricsSnapshot, HostUsageSnapshot, Metrics};
 use crate::registry::Registry;
 use crate::secrets::{SecretSpec, SecretStore};
@@ -19,7 +19,7 @@ use axum::extract::{ConnectInfo, MatchedPath, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{AppendHeaders, Html, IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use base64::Engine;
 use pingora_core::server::ShutdownWatch;
@@ -905,6 +905,10 @@ struct DeploymentView {
     /// For a static deployment, the configured upstream addresses; empty for a
     /// managed one.
     upstreams: Vec<String>,
+    /// Whether any data-plane route points at this deployment. Agent sandboxes
+    /// may be intentionally registered without a route and must not count as
+    /// unavailable serving capacity in fleet status.
+    routed: bool,
     /// Exact hostnames this deployment is routed on — `host` rules only, since a
     /// `host_suffix` names no single certificate subject and a `path_prefix` names
     /// no hostname at all. Reported so the dashboard can say which routed names
@@ -1189,6 +1193,7 @@ async fn metrics_snapshot(
                 namespace: d.spec.namespace.clone(),
                 kind: deployment_kind(d),
                 upstreams: d.spec.upstreams.clone(),
+                routed: !d.spec.routes.is_empty(),
                 hosts: d
                     .spec
                     .routes
@@ -1603,7 +1608,7 @@ struct FeedIndexEntry {
 }
 
 /// `GET /feeds` — the namespaces that have events, narrowed to what the caller
-/// may read. A discovery aid for the dashboard and `serverctl`, not the feed
+/// may read. A discovery aid for the dashboard and `heyctl`, not the feed
 /// itself.
 async fn feeds_index(
     State(state): State<AdminState>,
@@ -1625,7 +1630,7 @@ async fn feeds_index(
 #[derive(Deserialize)]
 struct FeedQuery {
     /// `json` returns the events as structured data instead of RSS — what
-    /// `serverctl feed` and the dashboard read; a feed reader takes the
+    /// `heyctl feed` and the dashboard read; a feed reader takes the
     /// default.
     #[serde(default)]
     format: Option<String>,
@@ -1967,7 +1972,7 @@ fn render_directory_cards(entries: &[DirectoryEntry], unlinkable: &[String]) -> 
     if entries.is_empty() {
         let body = if unlinkable.is_empty() {
             "Nothing is registered yet. <code>POST /deployments</code>, or \
-             <code>serverctl apply</code>, and it appears here."
+             <code>heyctl apply</code>, and it appears here."
         } else {
             "No deployment has a linkable hostname."
         };
@@ -2117,14 +2122,16 @@ async fn register(
     // be orphaned by the swap that follows. Once it is no longer live the
     // autoscaler stops creating for it and kills anything it created (see
     // `Autoscaler::unclaimed`).
+    let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
     let replaced = old.is_some();
     let deployment = state.registry.upsert(spec);
-    if let Some(old) = old {
-        state.autoscaler.teardown(&old).await;
-    }
     if let Err(e) = state.registry.persist_one(&id) {
         tracing::error!(deployment = %id, error = %e, "failed to persist state");
+    }
+    drop(change);
+    if let Some(old) = old {
+        state.autoscaler.teardown(&old).await;
     }
     tracing::info!(deployment = %id, "registered");
     state.feed.announce(
@@ -2180,11 +2187,13 @@ async fn update(
         .into_response();
     }
 
+    let change = state.registry.change_guard().await;
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
 
-    let deployment = if old.spec.vm != spec.vm || old.spec.upstreams != spec.upstreams {
+    let rebuild = old.spec.vm != spec.vm || old.spec.upstreams != spec.upstreams;
+    let deployment = if rebuild {
         // The backend set changed — a managed VM *template*, or a static
         // deployment's upstream list (or a switch between the two kinds). The
         // running backends no longer match the spec, so rebuild from scratch
@@ -2192,9 +2201,7 @@ async fn update(
         //
         // Swap first, tear down second: see the note in `register`.
         tracing::info!(deployment = %id, "updating deployment (backends changed; rebuilding)");
-        let deployment = state.registry.upsert(spec);
-        state.autoscaler.teardown(&old).await;
-        deployment
+        state.registry.upsert(spec)
     } else {
         // Scaling/routes/health only: keep the pool live.
         tracing::info!(deployment = %id, "updating deployment (pool preserved)");
@@ -2206,6 +2213,10 @@ async fn update(
 
     if let Err(e) = state.registry.persist_one(&id) {
         tracing::error!(deployment = %id, error = %e, "failed to persist state");
+    }
+    drop(change);
+    if rebuild {
+        state.autoscaler.teardown(&old).await;
     }
     // Reconcile to the new policy immediately (scale up/down, warm pool).
     deployment.scale_signal.notify_one();
@@ -2234,6 +2245,7 @@ async fn scale(
     Path(id): Path<String>,
     Json(patch): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let _change = state.registry.change_guard().await;
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
@@ -2328,18 +2340,279 @@ async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> imp
     }
 }
 
+const MAX_DRAIN_REASON_LEN: usize = 512;
+
+/// Optional operator context for a static-upstream drain.
+#[derive(Debug, Default, Deserialize)]
+struct DrainUpstreamRequest {
+    /// Override the safety check that requires another healthy, accepting
+    /// upstream. Explicit because this can take the deployment fully offline.
+    #[serde(default)]
+    force: bool,
+    /// Stored with the drain so a later operator can tell why it exists.
+    reason: Option<String>,
+}
+
+/// The administrative and live state of one static upstream.
+#[derive(Serialize)]
+struct UpstreamTrafficResponse {
+    deployment_id: String,
+    upstream: String,
+    /// `accepting`, `draining` (requests remain), or `drained` (zero in flight).
+    state: &'static str,
+    healthy: bool,
+    in_flight: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<u64>,
+}
+
+fn upstream_traffic_status(
+    deployment: &Arc<crate::deployment::Deployment>,
+    upstream: &str,
+) -> UpstreamTrafficResponse {
+    let drain = deployment.upstream_drain(upstream);
+    let backends = deployment.backends();
+    let matching: Vec<_> = backends
+        .iter()
+        .filter(|backend| backend.peer == upstream)
+        .collect();
+    let in_flight = matching.iter().map(|backend| backend.in_flight()).sum();
+    let state = if drain.is_none() {
+        "accepting"
+    } else if in_flight == 0 {
+        "drained"
+    } else {
+        "draining"
+    };
+    UpstreamTrafficResponse {
+        deployment_id: deployment.spec.id.clone(),
+        upstream: upstream.to_string(),
+        state,
+        healthy: matching.iter().all(|backend| backend.is_healthy()),
+        in_flight,
+        reason: drain.as_ref().and_then(|drain| drain.reason.clone()),
+        started_at: drain.map(|drain| drain.started_at),
+    }
+}
+
+/// Uber's drain-safety invariant in app-lb's smaller model: never withdraw the
+/// last technically healthy destination unless the operator explicitly forces
+/// it. Health and drain are separate — a failed probe cannot erase intent.
+fn has_healthy_alternative(
+    deployment: &crate::deployment::Deployment,
+    upstream: &str,
+) -> bool {
+    deployment
+        .backends()
+        .iter()
+        .any(|backend| backend.peer != upstream && backend.is_available())
+}
+
+fn normalized_drain_reason(reason: Option<String>) -> Result<Option<String>, Response> {
+    let reason = reason
+        .map(|reason| reason.trim().to_string())
+        .filter(|reason| !reason.is_empty());
+    if reason.as_ref().is_some_and(|reason| reason.len() > MAX_DRAIN_REASON_LEN) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("drain reason must be at most {MAX_DRAIN_REASON_LEN} bytes"),
+        )
+        .into_response());
+    }
+    Ok(reason)
+}
+
+/// Publish the cordon before attempting persistence. If any durability step
+/// fails, the caller reports the error but the live backend remains closed to
+/// new traffic; reverting it could disagree with a rename that already landed.
+fn apply_upstream_drain(
+    registry: &Registry,
+    deployment: &crate::deployment::Deployment,
+    id: &str,
+    upstream: &str,
+    reason_was_supplied: bool,
+    reason: Option<String>,
+) -> std::io::Result<()> {
+    deployment.mutate_state(|runtime| {
+        if let Some(drain) = runtime
+            .upstream_drains
+            .iter_mut()
+            .find(|drain| drain.upstream == upstream)
+        {
+            if reason_was_supplied {
+                drain.reason = reason.clone();
+            }
+        } else {
+            runtime.upstream_drains.push(UpstreamDrain {
+                upstream: upstream.to_string(),
+                reason,
+                started_at: now_secs(),
+            });
+            runtime
+                .upstream_drains
+                .sort_by(|left, right| left.upstream.cmp(&right.upstream));
+        }
+    });
+    registry.persist_one(id)
+}
+
+/// Stop assigning new requests to a static upstream while existing requests
+/// finish. The intent is persisted before the request succeeds.
+async fn drain_upstream(
+    State(state): State<AdminState>,
+    Path((id, upstream)): Path<(String, String)>,
+    Json(request): Json<DrainUpstreamRequest>,
+) -> Response {
+    // The registry-level guard is stable across deployment replacement. It
+    // keeps the safety check, live mutation, and persisted record one operation.
+    let _change = state.registry.change_guard().await;
+    let Some(deployment) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    };
+    if !deployment.spec.is_static() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("deployment {id:?} has no static upstreams to drain"),
+        )
+        .into_response();
+    }
+    if !deployment
+        .backends()
+        .iter()
+        .any(|backend| backend.peer == upstream)
+    {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no upstream {upstream:?} in deployment {id:?}"),
+        )
+        .into_response();
+    }
+
+    let reason_was_supplied = request.reason.is_some();
+    let reason = match normalized_drain_reason(request.reason) {
+        Ok(reason) => reason,
+        Err(response) => return response,
+    };
+
+    let existing = deployment.upstream_drain(&upstream);
+    if existing.is_none()
+        && !request.force
+        && !has_healthy_alternative(&deployment, &upstream)
+    {
+        return err(
+            StatusCode::CONFLICT,
+            format!(
+                "refusing to drain upstream {upstream:?}: deployment {id:?} has no other healthy, \
+                 accepting upstream; retry with force=true only if taking it offline is intended"
+            ),
+        )
+        .into_response();
+    }
+
+    if let Err(error) = apply_upstream_drain(
+        &state.registry,
+        &deployment,
+        &id,
+        &upstream,
+        reason_was_supplied,
+        reason,
+    ) {
+        // Fail closed. The rename may already have committed before a later
+        // fsync reported an error, so restoring the accepting state could
+        // disagree with disk and would reopen traffic during a storage fault.
+        // A retry is idempotent and can confirm durability later.
+        tracing::error!(deployment = %id, %upstream, %error, "failed to persist upstream drain");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "upstream is cordoned, but drain durability could not be confirmed: {error}"
+            ),
+        )
+        .into_response();
+    }
+
+    let response = upstream_traffic_status(&deployment, &upstream);
+    tracing::info!(
+        deployment = %id,
+        %upstream,
+        force = request.force,
+        in_flight = response.in_flight,
+        reason = ?response.reason,
+        "static upstream cordoned; draining existing traffic",
+    );
+    let status = if response.in_flight == 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    (status, Json(response)).into_response()
+}
+
+/// Remove a durable static-upstream drain. A healthy target becomes eligible
+/// immediately; an unhealthy one remains excluded by the independent probe.
+async fn uncordon_upstream(
+    State(state): State<AdminState>,
+    Path((id, upstream)): Path<(String, String)>,
+) -> Response {
+    let _change = state.registry.change_guard().await;
+    let Some(deployment) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    };
+    if !deployment.spec.is_static() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("deployment {id:?} has no static upstreams to uncordon"),
+        )
+        .into_response();
+    }
+    if !deployment
+        .backends()
+        .iter()
+        .any(|backend| backend.peer == upstream)
+    {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no upstream {upstream:?} in deployment {id:?}"),
+        )
+        .into_response();
+    }
+
+    // Persist before publishing the accepting state. If the write fails, the
+    // live backend remains cordoned and no request can slip through a failed
+    // control-plane operation.
+    let mut next = (*deployment.state()).clone();
+    next.upstream_drains
+        .retain(|drain| drain.upstream != upstream);
+    if let Err(error) = state.registry.persist_snapshot(&deployment, &next) {
+        tracing::error!(deployment = %id, %upstream, %error, "failed to persist upstream uncordon");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("upstream uncordon was not saved: {error}"),
+        )
+        .into_response();
+    }
+    deployment.set_state(next);
+
+    tracing::info!(deployment = %id, %upstream, "static upstream uncordoned");
+    Json(upstream_traffic_status(&deployment, &upstream)).into_response()
+}
+
 async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
+    let change = state.registry.change_guard().await;
     let Some(d) = state.registry.remove(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    if let Err(e) = state.registry.forget(&id) {
+        tracing::error!(deployment = %id, error = %e, "failed to drop persisted state");
+    }
+    drop(change);
     // Removed from routing first, so the teardown can't race new requests in.
     state.autoscaler.teardown(&d).await;
     // Its counters fold into the global rollup and its entry goes; a fleet whose
     // ids churn would otherwise accumulate one per sandbox that ever existed.
     state.metrics.retire(&id);
-    if let Err(e) = state.registry.forget(&id) {
-        tracing::error!(deployment = %id, error = %e, "failed to drop persisted state");
-    }
     tracing::info!(deployment = %id, "deregistered");
     state.feed.announce(
         &d.spec,
@@ -2532,8 +2805,8 @@ async fn hold_a_vm(state: &AdminState, id: &str, wake: bool) -> Result<VmTarget,
         .into_response());
     }
 
-    if let Some(b) = d.select(&[]) {
-        return Ok(VmTarget::Ready(b.hold()));
+    if let Some(slot) = d.select(&[]).and_then(|backend| backend.try_hold()) {
+        return Ok(VmTarget::Ready(slot));
     }
     if let Some(sandbox_id) = booting_vm(&d) {
         tracing::info!(
@@ -2551,7 +2824,14 @@ async fn hold_a_vm(state: &AdminState, id: &str, wake: bool) -> Result<VmTarget,
         .into_response());
     }
     match crate::proxy::wait_for_capacity(&d, &[], &state.metrics, &state.feed).await {
-        Some(b) => Ok(VmTarget::Ready(b.hold())),
+        Some(b) => match b.try_hold() {
+            Some(slot) => Ok(VmTarget::Ready(slot)),
+            None => Err(err(
+                StatusCode::CONFLICT,
+                format!("deployment {id:?} stopped accepting work while the VM was selected"),
+            )
+            .into_response()),
+        },
         // The wait itself is what created a VM, so ask again before giving up:
         // a boot that got as far as `Running` and stalled on the health check is
         // still something to run a command in, and answering 503 here would send
@@ -3214,6 +3494,10 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
         .route("/deployments/:id/scaling", patch(scale))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
+        .route(
+            "/deployments/:id/upstreams/:upstream/drain",
+            put(drain_upstream).delete(uncordon_upstream),
+        )
         // CRUD-tier on purpose: running a command in a VM is at least as
         // powerful as editing the spec that boots it.
         .route("/deployments/:id/exec", post(exec))
@@ -3475,6 +3759,91 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod upstream_drains {
+        use super::*;
+
+        fn deployment() -> Arc<crate::deployment::Deployment> {
+            let spec = serde_json::from_str(
+                r#"{
+                    "id": "stage",
+                    "routes": [{"host": "stage.example.com"}],
+                    "upstreams": ["eu1.example:443", "us1.example:443"]
+                }"#,
+            )
+            .expect("the static deployment fixture parses");
+            Arc::new(crate::deployment::Deployment::new(spec))
+        }
+
+        #[test]
+        fn draining_requires_another_healthy_accepting_upstream() {
+            let deployment = deployment();
+            let us1 = deployment.backends()[1].clone();
+            assert!(has_healthy_alternative(&deployment, "eu1.example:443"));
+
+            us1.set_healthy(false);
+            assert!(
+                !has_healthy_alternative(&deployment, "eu1.example:443"),
+                "an unhealthy destination is not a safe alternative",
+            );
+
+            us1.set_healthy(true);
+            us1.set_draining(true);
+            assert!(
+                !has_healthy_alternative(&deployment, "eu1.example:443"),
+                "a destination already under operator drain is not an alternative",
+            );
+        }
+
+        #[test]
+        fn drain_reasons_are_trimmed_and_bounded() {
+            assert_eq!(
+                normalized_drain_reason(Some("  maintenance  ".into())).unwrap(),
+                Some("maintenance".into()),
+            );
+            assert_eq!(normalized_drain_reason(Some("  ".into())).unwrap(), None);
+            assert!(
+                normalized_drain_reason(Some("x".repeat(MAX_DRAIN_REASON_LEN + 1))).is_err()
+            );
+        }
+
+        #[test]
+        fn a_persistence_failure_leaves_the_upstream_cordoned() {
+            let blocked_parent = std::env::temp_dir().join(format!(
+                "app-lb-drain-failure-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::write(&blocked_parent, b"not a directory").unwrap();
+            let registry = Registry::new(blocked_parent.join("drain-state.json"));
+            let deployment = registry.upsert((*deployment()).spec.clone());
+
+            let result = apply_upstream_drain(
+                &registry,
+                &deployment,
+                "stage",
+                "eu1.example:443",
+                true,
+                Some("maintenance".into()),
+            );
+
+            assert!(result.is_err(), "the fixture must fail before durability is confirmed");
+            assert!(
+                deployment.backends()[0].is_draining(),
+                "a storage error must fail closed rather than reopen traffic",
+            );
+            assert_eq!(
+                deployment
+                    .upstream_drain("eu1.example:443")
+                    .and_then(|drain| drain.reason),
+                Some("maintenance".into()),
+            );
+            std::fs::remove_file(blocked_parent).unwrap();
+        }
+    }
 
     /// Both auth schemes must survive into the response as *separate*
     /// `WWW-Authenticate` lines. This has now broken twice, silently, in

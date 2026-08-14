@@ -19,7 +19,7 @@
     <li><a href="namespaces.html">Namespaces</a></li>
     <li><a href="feed.html" aria-current="page">The event feed</a></li>
     <li class="group">clients</li>
-    <li><a href="serverctl.html">serverctl</a></li>
+    <li><a href="heyctl.html">heyctl</a></li>
   </ul>
 </nav>
 <main>
@@ -52,13 +52,13 @@ pushing everything else off the feed.</p>
 
 <h2>Reading a feed</h2>
 <pre><code># which namespaces have events
-serverctl feed
+heyctl feed
 
 # the events, newest first
-serverctl feed team-a
+heyctl feed team-a
 
 # the RSS document itself
-serverctl feed team-a --xml &gt; feed.xml</code></pre>
+heyctl feed team-a --xml &gt; feed.xml</code></pre>
 <p>On the admin API: <code>GET /feeds</code> lists namespaces with events;
 <code>GET /feeds/team-a</code> (or <code>team-a.xml</code>) is RSS 2.0, and
 <code>?format=json</code> returns the same entries as structured data. Both sit on the
@@ -99,7 +99,7 @@ subscription view.</div>
 }</code></pre>
 
 <footer><a href="namespaces.html">← Namespaces</a> · next:
-<a href="serverctl.html">serverctl</a></footer>
+<a href="heyctl.html">heyctl</a></footer>
 </main>
 </div>
 </body>

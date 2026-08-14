@@ -38,6 +38,11 @@ different `source` values — pick one per line.
 Metrics are polled from app-lb, which already measures everything worth
 keeping.
 
+The latest successful poll also backs `GET /api/platform-status`. This is the
+live topology view: backend probe health, administrative drain state, in-flight
+requests, pool capacity, and whether the observation itself is stale. It does
+not query parquet, so an expensive historical query cannot make status disappear.
+
 ## Where guests send logs
 
 Every microVM sits on its **own /30**: the host is at `guest_ip - 1`. There is no
@@ -150,6 +155,7 @@ The JSON behind it:
 | Endpoint | |
 | --- | --- |
 | `GET /api/fleet?window=` | One row per deployment, plus whole-host CPU and memory |
+| `GET /api/platform-status` | Current app-lb topology, health/drain state, and staleness |
 | `GET /api/deployments/<id>?window=` | Bucketed series and summary figures |
 | `GET /api/deployments/<id>/logs?window=&from=&to=&level=&backend=&q=&limit=&before=` | Log lines, newest first |
 | `GET /stats` | Ingest counters, and rows still buffered in memory |
@@ -212,6 +218,7 @@ Configuration is environment-only:
 | `APP_LB_URL` | `http://127.0.0.1:9090` | app-lb admin API to poll |
 | `APP_LB_USER` | `admin` | Only used when a password is set |
 | `APP_LB_PASSWORD` | *(unset)* | Set when app-lb has `APP_LB_ADMIN_AUTH=1` |
+| `APP_OBS_SOURCE` | `app-lb` | Stable collector/edge name carried in status snapshots |
 | `HEYVM_URL` | *(unset)* | Sandbox daemon whose native log streams to tail (e.g. `http://127.0.0.1:34099`); **unset disables native tailing** |
 | `HEYVM_TOKEN` | *(unset)* | Bearer token for the daemon, needed when it runs with `JWT_SECRET` |
 | `APP_OBS_POLL_SECS` | `10` | Metrics poll interval |
@@ -259,9 +266,9 @@ one, `obs.<host>` hands every customer's logs to anyone who asks for them. So
 }
 ```
 
-Fill in the client id, store the secret (`serverctl create secret google
+Fill in the client id, store the secret (`heyctl create secret google
 --from-stdin client_secret`), and register the redirect URI Google needs —
-`serverctl describe deployment app-obs` prints the exact string. See
+`heyctl describe deployment app-obs` prints the exact string. See
 [app-lb's Google sign-in](../app-lb/README.md#google-sign-in) for the full set of
 options; `/healthz` stays public so the health probe still passes.
 

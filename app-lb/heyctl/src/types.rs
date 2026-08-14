@@ -716,9 +716,13 @@ pub struct FleetPool {
 #[serde(default)]
 pub struct DeploymentView {
     pub id: String,
+    /// Empty when the server omitted the default namespace.
+    pub namespace: String,
     /// `"vm"`, `"static"` or `"site"`.
     pub kind: String,
     pub upstreams: Vec<String>,
+    /// Whether at least one data-plane route points at this deployment.
+    pub routed: bool,
     /// Exact hostnames this deployment is routed on — `host` rules only, since
     /// a `host_suffix` names no single certificate subject.
     pub hosts: Vec<String>,
@@ -1173,6 +1177,34 @@ pub struct EvictOutcome {
 impl EvictOutcome {
     pub fn is_draining(&self) -> bool {
         self.outcome == "draining"
+    }
+}
+
+// -- PUT/DELETE /deployments/:id/upstreams/:upstream/drain ----------------
+
+#[derive(Debug, Default, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct UpstreamTrafficStatus {
+    pub deployment_id: String,
+    pub upstream: String,
+    /// `accepting`, `draining`, or `drained`.
+    pub state: String,
+    /// Probe state, independent from the administrative traffic state above.
+    pub healthy: bool,
+    pub in_flight: usize,
+    pub reason: Option<String>,
+    pub started_at: Option<u64>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl UpstreamTrafficStatus {
+    pub fn is_drained(&self) -> bool {
+        self.state == "drained" && self.in_flight == 0
+    }
+
+    pub fn is_accepting(&self) -> bool {
+        self.state == "accepting"
     }
 }
 

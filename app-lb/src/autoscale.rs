@@ -801,7 +801,7 @@ impl Autoscaler {
                 in_flight = b.in_flight(),
                 "draining VM",
             );
-            b.set_draining();
+            b.set_draining(true);
             drained += 1;
         }
         self.metrics.record_scale_down(&d.spec.id, drained);
@@ -1230,7 +1230,7 @@ impl Autoscaler {
             return;
         }
         for b in d.backends().iter() {
-            b.set_draining();
+            b.set_draining(true);
             if let Err(e) = self.vms.kill(&b.sandbox_id).await {
                 tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to kill VM");
             }
@@ -1285,7 +1285,7 @@ impl Autoscaler {
         {
             // Stop new traffic regardless of mode; a draining VM is skipped by
             // `select`, so no request is routed to it after this point.
-            b.set_draining();
+            b.set_draining(true);
 
             if !force {
                 tracing::info!(
@@ -1632,6 +1632,7 @@ mod tests {
             let d = reg.get("demo").unwrap();
             d.set_state(crate::deployment::DeploymentState {
                 suspended: vec!["sb-1".into()],
+                ..Default::default()
             });
 
             // What the fleet list looks like for a stopped KVM sandbox of ours.
@@ -1923,7 +1924,7 @@ mod tests {
         #[test]
         fn a_draining_vm_is_work() {
             let (d, fleet) = settled();
-            d.backends()[0].set_draining();
+            d.backends()[0].set_draining(true);
             assert!(!at_rest(&d, &fleet));
         }
 

@@ -150,7 +150,7 @@ pub fn route_from_parts(
 ///
 /// Accepts JSON or YAML, a single document or many: a JSON array, a multi-doc
 /// YAML stream, or one object. A `GET /deployments` response is unwrapped too,
-/// so `serverctl get deployment web -o json | serverctl apply -f -` round-trips.
+/// so `heyctl get deployment web -o json | heyctl apply -f -` round-trips.
 pub fn read_specs(path: &Path) -> Result<Vec<Value>> {
     let text = if path == Path::new("-") {
         std::io::read_to_string(std::io::stdin())
@@ -261,13 +261,13 @@ pub fn vm_mut<'a>(spec: &'a mut Value, id: &str) -> Result<&'a mut Map<String, V
     if is_site(spec) {
         bail!(
             "deployment {id:?} is a static site and has no VM template — it serves \
-             files off disk. Edit its `site` block with `serverctl edit deployment {id}`."
+             files off disk. Edit its `site` block with `heyctl edit deployment {id}`."
         );
     }
     if is_static(spec) {
         bail!(
             "deployment {id:?} is static (proxy_pass) and has no VM template — \
-             change where it points with `serverctl set upstreams {id} <addr>...`"
+             change where it points with `heyctl set upstreams {id} <addr>...`"
         );
     }
     spec.get_mut("vm")
@@ -357,7 +357,7 @@ pub fn artifact_mut<'a>(spec: &'a mut Value, id: &str) -> Result<&'a mut Map<Str
         bail!(
             "deployment {id:?} already builds its image from git; a deployment cannot both \
              build and pull. Drop the build source first with \
-             `serverctl set build {id} --clear`"
+             `heyctl set build {id} --clear`"
         );
     }
     let entry = spec
@@ -383,7 +383,7 @@ pub fn update_mut<'a>(spec: &'a mut Value, id: &str) -> Result<&'a mut Map<Strin
         bail!(
             "deployment {id:?} is a managed VM pool, not a static (proxy_pass) one — its \
              backends are microVMs, so there is no working directory on this host to update. \
-             Use `serverctl set build {id} --repo <url>` instead"
+             Use `heyctl set build {id} --repo <url>` instead"
         );
     }
     let entry = spec

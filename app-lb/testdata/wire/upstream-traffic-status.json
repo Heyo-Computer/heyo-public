@@ -1,0 +1,9 @@
+{
+  "deployment_id": "stage",
+  "upstream": "us1.example.com:443",
+  "state": "draining",
+  "healthy": true,
+  "in_flight": 3,
+  "reason": "regional maintenance",
+  "started_at": 1722400000
+}

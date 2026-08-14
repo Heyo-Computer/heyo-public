@@ -2,6 +2,7 @@
   "id": "docs",
   "kind": "site",
   "upstreams": [],
+  "routed": true,
   "hosts": [
     "docs.example.com"
   ],

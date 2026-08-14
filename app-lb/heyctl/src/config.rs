@@ -1,6 +1,6 @@
-//! The serverctl config file: named contexts, kubeconfig-style.
+//! The heyctl config file: named contexts, kubeconfig-style.
 //!
-//! One file, `~/.config/serverctl/config.json`, holding a set of named contexts
+//! One file, `~/.config/heyctl/config.json`, holding a set of named contexts
 //! (server + credentials) and which one is current. Written `0600` because it
 //! can hold a password — app-lb's admin API authenticates with HTTP Basic, and
 //! there is no token endpoint to trade it for something shorter-lived.
@@ -81,7 +81,7 @@ impl PasswordSource {
     pub fn describe(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Flag => "--password / SERVERCTL_PASSWORD",
+            Self::Flag => "--password / HEYCTL_PASSWORD",
             Self::Command => "password_command",
             Self::Stored => "stored in the config file",
         }
@@ -94,7 +94,7 @@ impl PasswordSource {
     pub fn describe_api_key(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Flag => "--api-key / SERVERCTL_ART_API_KEY",
+            Self::Flag => "--api-key / HEYCTL_ART_API_KEY",
             Self::Command => "api_key_command",
             Self::Stored => "stored in the config file",
         }
@@ -120,11 +120,11 @@ impl Config {
             return Ok(p.to_path_buf());
         }
         if let Some(dir) = dirs::config_dir() {
-            return Ok(dir.join("serverctl").join("config.json"));
+            return Ok(dir.join("heyctl").join("config.json"));
         }
         // No XDG config dir (an unusual container, say) — fall back to $HOME.
         let home = dirs::home_dir().context("no config directory and no home directory")?;
-        Ok(home.join(".serverctl").join("config.json"))
+        Ok(home.join(".heyctl").join("config.json"))
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -135,7 +135,7 @@ impl Config {
             Ok(text) => serde_json::from_str(&text)
                 .with_context(|| format!("parsing the config file {}", path.display())),
             // A missing config is the normal first-run state, not an error: the
-            // built-in default server makes `serverctl get deployments` work
+            // built-in default server makes `heyctl get deployments` work
             // against a local app-lb with no setup at all.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
@@ -164,7 +164,7 @@ impl Config {
             let entry = self
                 .contexts
                 .get(name)
-                .with_context(|| format!("no context named {name:?} — `serverctl config get-contexts` lists them"))?;
+                .with_context(|| format!("no context named {name:?} — `heyctl config get-contexts` lists them"))?;
             return Ok(Some((name.to_string(), entry.clone())));
         }
         if let Some(name) = &self.current_context
@@ -179,7 +179,7 @@ impl Config {
         if self.current_context.is_some() {
             bail!(
                 "current context {:?} is not in the config file — pick one with \
-                 `serverctl config use-context`",
+                 `heyctl config use-context`",
                 self.current_context.as_deref().unwrap_or_default()
             );
         }
@@ -197,7 +197,7 @@ impl Config {
     pub fn resolve_registry(&self, requested: Option<&str>) -> Result<Option<(String, RegistryEntry)>> {
         if let Some(name) = requested {
             let entry = self.registries.get(name).with_context(|| {
-                format!("no registry named {name:?} — `serverctl artifact registries` lists them")
+                format!("no registry named {name:?} — `heyctl artifact registries` lists them")
             })?;
             return Ok(Some((name.to_string(), entry.clone())));
         }
@@ -213,7 +213,7 @@ impl Config {
         if self.current_registry.is_some() {
             bail!(
                 "current registry {:?} is not in the config file — pick one with \
-                 `serverctl artifact use`",
+                 `heyctl artifact use`",
                 self.current_registry.as_deref().unwrap_or_default()
             );
         }
@@ -247,7 +247,7 @@ pub fn resolve_registry_endpoint(
         Some((n, e)) => (n, e),
         None if url.is_some() => ("(none)".to_string(), RegistryEntry::default()),
         None => bail!(
-            "no artifact store configured — run `serverctl artifact login <url>` first, \
+            "no artifact store configured — run `heyctl artifact login <url>` first, \
              or pass --registry-url"
         ),
     };
@@ -291,7 +291,7 @@ pub fn resolve_endpoint(
     };
 
     // Precedence, highest first: an explicit flag (which clap has already
-    // merged the SERVERCTL_* env vars into), then the context, then the
+    // merged the HEYCTL_* env vars into), then the context, then the
     // built-in default.
     let (password, password_source) = match password {
         Some(p) => (Some(p.to_string()), PasswordSource::Flag),

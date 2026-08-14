@@ -85,7 +85,7 @@ impl RegistryClient {
             // blob upload legitimately runs for minutes and must not be cut off
             // by a timeout meant for an unresponsive server.
             .timeout_connect(timeout)
-            .user_agent(concat!("serverctl/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("heyctl/", env!("CARGO_PKG_VERSION")))
             .tls_connector(Arc::new(connector))
             .build();
 
@@ -160,10 +160,10 @@ impl RegistryClient {
         match code {
             401 if self.api_key.is_some() => anyhow!(
                 "the store rejected this API key (HTTP 401) — check it against the store's \
-                 ART_API_KEY, or re-run `serverctl artifact login`"
+                 ART_API_KEY, or re-run `heyctl artifact login`"
             ),
             401 => anyhow!(
-                "this store requires an API key (HTTP 401) — run `serverctl artifact login`, \
+                "this store requires an API key (HTTP 401) — run `heyctl artifact login`, \
                  or pass --api-key"
             ),
             403 => anyhow!(
@@ -592,7 +592,7 @@ mod tests {
     fn packing_the_same_tree_twice_gives_the_same_bytes() {
         // Deterministic headers are what make a re-push of an unchanged context
         // a HEAD and nothing else.
-        let dir = std::env::temp_dir().join(format!("serverctl-pack-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("heyctl-pack-{}", std::process::id()));
         let ctx = dir.join("ctx");
         std::fs::create_dir_all(ctx.join("app")).unwrap();
         std::fs::write(ctx.join("app/main.rs"), b"fn main() {}").unwrap();
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn hashing_a_file_reports_the_digest_and_the_bytes_it_covered() {
-        let dir = std::env::temp_dir().join(format!("serverctl-art-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("heyctl-art-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("blob");
         std::fs::write(&path, b"hello").unwrap();

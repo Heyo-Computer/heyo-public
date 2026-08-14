@@ -799,7 +799,7 @@ fn is_supported_store(store: &str) -> bool {
 ///
 /// See <https://github.com/sarocu/artifacts> — `art heyvm import` puts heyvm's
 /// base images in, `art put dist.tgz --tag <name>` puts a site bundle in,
-/// `serverctl artifact push` puts a locally-built rootfs in, and any of them is
+/// `heyctl artifact push` puts a locally-built rootfs in, and any of them is
 /// pullable here.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ArtifactSpec {
@@ -2094,7 +2094,7 @@ impl std::fmt::Display for SpecError {
                 "a deployment sets both `build` and `artifact`: pick one — both rewrite \
                  `vm.image` when they run, so with both there is no answer to where the \
                  running image came from. Build from git, or pull a rootfs somebody already \
-                 built; to do both, build on one host and `serverctl artifact push` the result"
+                 built; to do both, build on one host and `heyctl artifact push` the result"
             ),
             Self::UpdateOnManagedDeployment => write!(
                 f,

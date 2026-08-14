@@ -680,7 +680,14 @@ impl ProxyHttp for LbProxy {
             ));
         }
 
-        // Pick a backend and resolve its address to a concrete `SocketAddr`. We
+        // Give back any slot from a failed attempt before reserving another.
+        ctx.release();
+
+        // Pick a backend, atomically reserve it, and resolve its address to a
+        // concrete `SocketAddr`. Reserving before the await is load-bearing: a
+        // cordon can then either prevent this request or see it in `in_flight`,
+        // but can never report drained and have this request appear afterward.
+        // We
         // resolve here — with async DNS — rather than handing the `host:port`
         // string to `HttpPeer::new`, because that constructor resolves with a
         // *blocking* `to_socket_addrs().unwrap()` that would stall the runtime on
@@ -688,7 +695,7 @@ impl ProxyHttp for LbProxy {
         // address doesn't resolve is treated like a connect failure: marked
         // unhealthy and skipped, so a bad static upstream fails over to a good one
         // (and the autoscaler's health re-probe restores it once it resolves).
-        let (backend, addr) = loop {
+        let addr = loop {
             let backend = match deployment.select(&ctx.failed) {
                 Some(b) => b,
                 None => {
@@ -707,8 +714,17 @@ impl ProxyHttp for LbProxy {
                 }
             };
 
+            // `select` is an intentionally approximate, lock-free shortlist.
+            // A health change or cordon may have won since then; retry instead
+            // of admitting work against that stale decision.
+            if !backend.try_acquire() {
+                ctx.failed.push(backend.peer.clone());
+                continue;
+            }
+            ctx.backend = Some(backend.clone());
+
             match resolve_peer(&backend.peer).await {
-                Some(addr) => break (backend, addr),
+                Some(addr) => break addr,
                 None => {
                     tracing::warn!(
                         peer = %backend.peer,
@@ -716,15 +732,11 @@ impl ProxyHttp for LbProxy {
                     );
                     backend.set_healthy(false);
                     ctx.failed.push(backend.peer.clone());
+                    ctx.release();
                     // Loop: pick another backend (or give up when none remain).
                 }
             }
         };
-
-        // Release any slot held from a previous attempt before taking a new one.
-        ctx.release();
-        backend.acquire();
-        ctx.backend = Some(backend);
 
         // Plaintext, in both modes: a managed VM's guest IP is on a host-local
         // tap network, and static proxy_pass upstreams are plaintext by design.

@@ -1,5 +1,5 @@
 [package]
-name = "serverctl"
+name = "heyctl"
 version.workspace = true
 edition.workspace = true
 description = "Client library and kubectl-shaped CLI for the app-lb admin API"
@@ -7,14 +7,14 @@ license = "Apache-2.0"
 
 # One crate, two products. The library is the whole crate minus `main.rs` and
 # `cmd/`; the CLI is a `[[bin]]` behind the default `cli` feature, so
-# `cargo install serverctl` still works and a library consumer writes
+# `cargo install heyctl` still works and a library consumer writes
 # `default-features = false` to get none of clap, rpassword or a terminal.
 #
 # The CLI being the library's own first consumer is the point: a field the client
 # stops understanding becomes a compile error here rather than a silently blank
 # column at somebody's terminal.
 [[bin]]
-name = "serverctl"
+name = "heyctl"
 path = "src/main.rs"
 required-features = ["cli"]
 
@@ -34,7 +34,7 @@ cli = [
 ]
 # A synchronous facade over the async client, for callers with no runtime.
 blocking = ["tokio/rt"]
-# kubeconfig-style context/credential discovery under ~/.config/serverctl.
+# kubeconfig-style context/credential discovery under ~/.config/heyctl.
 config-file = ["dep:dirs"]
 # The artifact-store client, which talks to `art serve` rather than to app-lb —
 # a different service with a different auth model (API key, not Basic).
@@ -59,8 +59,8 @@ clap_complete = { version = "4", optional = true }
 serde_yaml = { version = "0.9", optional = true }
 rpassword = { version = "7", optional = true }
 # Restoring the default SIGPIPE disposition (Rust ignores it, so
-# `serverctl get deployments | head` would panic on a closed pipe), and the
-# termios dance that puts a terminal in raw mode for `serverctl shell`.
+# `heyctl get deployments | head` would panic on a closed pipe), and the
+# termios dance that puts a terminal in raw mode for `heyctl shell`.
 libc = { version = "0.2", optional = true }
 dirs = { version = "6", optional = true }
 
@@ -97,7 +97,7 @@ sha2 = { workspace = true, optional = true }
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"], optional = true }
 # Packing a Docker build context for `artifact push-dockerfile`. `tar` brings
 # only `filetime`/`libc`; `flate2` is already in the tree behind ureq's `gzip`.
-# Not shared with app-lb's copy of the same job: serverctl deliberately does not
+# Not shared with app-lb's copy of the same job: heyctl deliberately does not
 # depend on the artifacts crate (see src/artifact.rs), and the two ends of the
 # wire are pinned by the round-trip test rather than by a shared type.
 tar = { version = "0.4", optional = true }

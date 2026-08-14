@@ -987,6 +987,7 @@ impl Jobs {
         deployment_id: &str,
         image: &str,
     ) -> Result<(), String> {
+        let change = self.registry.change_guard().await;
         let Some(old) = self.registry.get(deployment_id) else {
             return Err(format!(
                 "deployment {deployment_id:?} was removed while its image was building; \
@@ -1003,10 +1004,11 @@ impl Jobs {
         vm.image = Some(image.to_string());
 
         let deployment = self.registry.upsert(spec);
-        self.autoscaler.teardown(&old).await;
         if let Err(e) = self.registry.persist_one(&deployment.spec.id) {
             tracing::error!(error = %e, "failed to persist state after a build");
         }
+        drop(change);
+        self.autoscaler.teardown(&old).await;
         deployment.scale_signal.notify_one();
 
         self.update_record(job_id, |r| {
@@ -1293,7 +1295,7 @@ impl Jobs {
             spec.env.clone().unwrap_or_default().into_iter().collect();
         for from in &spec.env_from {
             let value = self.secrets.resolve(&from.secret_ref()).map_err(|e| {
-                format!("{e} — `serverctl get secrets` lists what this LB holds")
+                format!("{e} — `heyctl get secrets` lists what this LB holds")
             })?;
             env.insert(from.env_name(), value);
         }
@@ -1315,7 +1317,7 @@ impl Jobs {
         match auth {
             None => Ok(None),
             Some(r) => Ok(Some(self.secrets.resolve(r).map_err(|e| {
-                format!("{e} — `serverctl get secrets` lists what this LB holds")
+                format!("{e} — `heyctl get secrets` lists what this LB holds")
             })?)),
         }
     }
@@ -1328,7 +1330,7 @@ impl Jobs {
             None => Ok(None),
             Some(r) => Ok(Some((
                 self.secrets.resolve(r).map_err(|e| {
-                    format!("{e} — `serverctl get secrets` lists what this LB holds")
+                    format!("{e} — `heyctl get secrets` lists what this LB holds")
                 })?,
                 r.username.clone().unwrap_or_else(|| "x-access-token".into()),
             ))),
