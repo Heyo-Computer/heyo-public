@@ -1,5 +1,5 @@
 {
-  "name": "serverctl",
+  "name": "heyctl",
   "version": "0.1.0",
   "description": "Client for the app-lb admin API \u2014 deployments, autoscaling, exec and interactive shells for heyvm microVMs",
   "type": "module",

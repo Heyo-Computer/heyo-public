@@ -15,10 +15,10 @@ files itself, out of a directory on its own host — what nginx's `root` or a
 CloudFront origin bucket does.
 
 ```sh
-serverctl create deployment docs --host docs.example.com \
+heyctl create deployment docs --host docs.example.com \
   --site-root /srv/docs/dist --site-404 404.html
-serverctl apply -f examples/site.json    # …or with a build attached
-serverctl update docs                    # git pull, npm run build, re-verify
+heyctl apply -f examples/site.json    # …or with a build attached
+heyctl update docs                    # git pull, npm run build, re-verify
 ```
 
 The `update` block is what makes it a deploy rather than a directory: it runs
@@ -45,9 +45,9 @@ each**, unrouted, worked on by `exec` and `shell` rather than HTTP. A control
 plane creates these by the thousand and deletes them when the work is done.
 
 ```sh
-serverctl apply -f examples/sandbox.json
-serverctl exec sb-7f3a9c -- git clone https://github.com/example/repo /workspace/repo
-serverctl shell sb-7f3a9c
+heyctl apply -f examples/sandbox.json
+heyctl exec sb-7f3a9c -- git clone https://github.com/example/repo /workspace/repo
+heyctl shell sb-7f3a9c
 ```
 
 Four fields carry the design, and each is load-bearing:
@@ -55,7 +55,7 @@ Four fields carry the design, and each is load-bearing:
 - **`"routes": []`** — no ingress at all. A sandbox that does not serve traffic
   should not be on a hostname, and putting it on one would put it on the
   internet. Exposure is a later, reversible step:
-  `serverctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com`, and
+  `heyctl set routes sb-7f3a9c --host sb-7f3a9c.sb.example.com`, and
   `--none` to withdraw it again.
 - **`idle_action: "retain"`** — an idle sandbox is *stopped*, not destroyed, and
   the next `exec` resumes that same VM. The default (`destroy`) is right for
@@ -83,12 +83,12 @@ At fleet scale, expose sandboxes under one wildcard certificate
 The mirror image of [`artifacts.json`](#artifactsjson--managed-vm-pool-for-the-artifacts-store):
 that one *runs* a store, this one *pulls from* one. Note there is no `vm.image` —
 a pull writes it, so the spec starts without one and gains one the first time
-`serverctl pull` succeeds.
+`heyctl pull` succeeds.
 
 ```sh
-serverctl create secret art api_key=…          # the store's ART_API_KEY
-serverctl apply -f examples/artifact-pull.json
-serverctl pull web --wait
+heyctl create secret art api_key=…          # the store's ART_API_KEY
+heyctl apply -f examples/artifact-pull.json
+heyctl pull web --wait
 ```
 
 The image it names has to exist first. Either side of the store works:
@@ -98,8 +98,8 @@ The image it names has to exist first. Either side of the store works:
 art heyvm import web-v2
 
 # Or from anywhere, over the API:
-serverctl artifact login http://127.0.0.1:8080
-serverctl artifact push --image web-v2
+heyctl artifact login http://127.0.0.1:8080
+heyctl artifact push --image web-v2
 ```
 
 ### Notes on the spec
@@ -110,8 +110,8 @@ serverctl artifact push --image web-v2
   the path form whenever the store is on the same host as app-lb.
 
 - **`ref` is a tag here, so the deployment follows it.** Pushing over `web-v2`
-  and re-running `serverctl pull web` is a deploy. Put a digest here instead to
-  pin the bytes permanently, or pass one to `serverctl pull web --ref <digest>`
+  and re-running `heyctl pull web` is a deploy. Put a digest here instead to
+  pin the bytes permanently, or pass one to `heyctl pull web --ref <digest>`
   for a one-off rollback that leaves the spec alone.
 
 - **`grow_gb` is sparse and is about the guest, not the store.** The image is
@@ -145,10 +145,10 @@ So the machine API goes in `public_paths` and the dashboard is gated. A CI job
 cannot complete an OAuth flow, and a browser cannot produce an API key.
 
 ```sh
-serverctl create secret google --from-stdin client_secret < ~/.google-oauth-secret
-serverctl create secret github --from-stdin token < ~/.github-pat
-serverctl apply -f examples/artifacts-gated.json
-serverctl build artifacts --wait      # optional: build the image from the repo
+heyctl create secret google --from-stdin client_secret < ~/.google-oauth-secret
+heyctl create secret github --from-stdin token < ~/.github-pat
+heyctl apply -f examples/artifacts-gated.json
+heyctl build artifacts --wait      # optional: build the image from the repo
 ```
 
 ### Notes on the spec
@@ -208,14 +208,14 @@ backend the deployment has.
 
 In the Google Cloud console create an **OAuth 2.0 Client ID** of type *Web
 application* and register the redirect URI — with these settings,
-`https://internal.us2.heyo.work/__applb/auth/callback`. `serverctl describe
+`https://internal.us2.heyo.work/__applb/auth/callback`. `heyctl describe
 deployment gated-dashboard` prints the exact string once the spec is registered.
 
 Store the client secret, then apply the spec:
 
 ```sh
-serverctl create secret google --from-stdin client_secret < ~/.google-oauth-secret
-serverctl apply -f examples/gated-dashboard.json
+heyctl create secret google --from-stdin client_secret < ~/.google-oauth-secret
+heyctl apply -f examples/gated-dashboard.json
 ```
 
 ### Notes on the spec
@@ -284,7 +284,7 @@ curl -XPOST localhost:9090/deployments \
   -H 'content-type: application/json' \
   -d @examples/app-obs.json
 
-serverctl update app-obs --wait --logs
+heyctl update app-obs --wait --logs
 # or: curl -XPOST localhost:9090/deployments/app-obs/update
 #     curl localhost:9090/jobs/<id>
 ```
@@ -344,7 +344,7 @@ Store the git credential first (a private repo needs one; drop `build.auth` for
 a public one):
 
 ```sh
-serverctl create secret github --from-stdin token < ~/.github-pat
+heyctl create secret github --from-stdin token < ~/.github-pat
 # or, without the CLI:
 curl -XPOST localhost:9090/secrets -H 'content-type: application/json' \
   -d '{"id": "github", "data": {"token": "ghp_…"}}'
@@ -357,7 +357,7 @@ curl -XPOST localhost:9090/deployments \
   -H 'content-type: application/json' \
   -d @examples/git-build.json
 
-serverctl build web --wait --logs
+heyctl build web --wait --logs
 # or: curl -XPOST localhost:9090/deployments/web/build
 #     curl localhost:9090/jobs/<id>
 ```
@@ -612,9 +612,9 @@ normal upstream.
 - **Health is `GET /healthz`** — the admin API's always-open, unauthenticated
   probe endpoint (returns `200` regardless of `APP_LB_ADMIN_AUTH`), so the static
   re-probe stays green without credentials.
-- **Adding a Google `auth` block here locks `serverctl` out, and half-breaks the
+- **Adding a Google `auth` block here locks `heyctl` out, and half-breaks the
   dashboard.** A gate answers a browser with a `302` and everything else with a
-  `401` — including `serverctl`, which cannot do an OAuth flow, and including the
+  `401` — including `heyctl`, which cannot do an OAuth flow, and including the
   dashboard's own `fetch("metrics", {headers: {accept: "application/json"}})`.
   The page then signs you in and displays no data. If you want the hostname
   gated, list the machine paths in `public_paths`
@@ -726,8 +726,8 @@ deployment is half of it: `nats/image/` is the Firecracker rootfs, and
 
 ```sh
 cd examples/nats && ./build-image.sh
-serverctl apply -f examples/nats/nats.json
-serverctl exec nats -- /opt/nats/preflight.sh
+heyctl apply -f examples/nats/nats.json
+heyctl exec nats -- /opt/nats/preflight.sh
 ```
 
 It is worth reading for two things that generalize past NATS:

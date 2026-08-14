@@ -13,7 +13,7 @@
  *    of the pool, not the healthy part of it.
  */
 
-import type { Serverctl } from "./client.js";
+import type { Heyctl } from "./client.js";
 import { TimeoutError } from "./errors.js";
 import type { DeploymentStatus, JobRecord } from "./types.js";
 
@@ -69,7 +69,7 @@ const sleep = (ms: number, signal?: AbortSignal) =>
  * rejects.
  */
 export async function waitForJob(
-  client: Serverctl,
+  client: Heyctl,
   jobId: string,
   opts: WaitForJobOptions = {},
 ): Promise<JobRecord> {
@@ -102,7 +102,7 @@ export async function waitForJob(
  * sees one — there is nothing to wait for.
  */
 export async function waitForReady(
-  client: Serverctl,
+  client: Heyctl,
   id: string,
   opts: WaitForReadyOptions = {},
 ): Promise<DeploymentStatus> {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Serverctl, TimeoutError, waitForJob, waitForReady } from "../dist/index.js";
+import { Heyctl, TimeoutError, waitForJob, waitForReady } from "../dist/index.js";
 
 function stub(...replies) {
   const seen = [];
@@ -10,7 +10,7 @@ function stub(...replies) {
     if (!r) throw new Error(`no reply queued for ${url}`);
     return new Response(JSON.stringify(r), { status: 200 });
   };
-  return { fetch, seen, client: new Serverctl({ server: "http://x:1", fetch }) };
+  return { fetch, seen, client: new Heyctl({ server: "http://x:1", fetch }) };
 }
 
 const job = (status, log) => ({ id: "j1", deployment: "api", kind: "image-build", status, started_at: 0, log });

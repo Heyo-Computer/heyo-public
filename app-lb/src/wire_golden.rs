@@ -1,12 +1,12 @@
 //! Golden wire fixtures — the contract between this crate and its clients.
 //!
-//! `serverctl` deliberately depends on nothing from app-lb: it re-declares the
+//! `heyctl` deliberately depends on nothing from app-lb: it re-declares the
 //! wire types so that a client one version behind still renders what it
 //! understands. The cost of that independence is that nothing catches a field
 //! this crate starts emitting and the client silently ignores — an unknown field
 //! and an absent one look identical to a lenient deserializer, which is exactly
 //! how `DeploymentView::urls`, `PoolStatus::boot_timeout_secs` and three others
-//! went missing from `serverctl/src/types.rs` without a single test failing.
+//! went missing from `heyctl/src/types.rs` without a single test failing.
 //!
 //! So: this module writes `testdata/wire/*.json` from the *real* response types,
 //! and each client asserts it understood every key in them. Two properties make
@@ -57,7 +57,7 @@ fn golden(name: &str, value: &impl Serialize) {
          Every client re-declares these types, so this is an API change even if \
          no Rust caller broke.\n\
          Regenerate with `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden` and \
-         update serverctl/src/types.rs and sdk/typescript/src/types.ts to match.",
+         update heyctl/src/types.rs and sdk/typescript/src/types.ts to match.",
         path.display()
     );
 }
@@ -387,6 +387,7 @@ fn metrics_response_is_stable() {
                 namespace: "default".into(),
                 kind: "vm",
                 upstreams: vec![],
+                routed: true,
                 hosts: vec!["sandbox.example.com".into()],
                 urls: vec!["https://sandbox.example.com".into()],
                 site_root: None,
@@ -444,6 +445,7 @@ fn a_site_view_carries_its_root_and_spa_flag() {
             namespace: "default".into(),
             kind: "site",
             upstreams: vec![],
+            routed: true,
             hosts: vec!["docs.example.com".into()],
             urls: vec!["https://docs.example.com".into()],
             site_root: Some("/srv/docs/dist".into()),
@@ -689,6 +691,19 @@ fn the_small_responses_are_stable() {
         },
     );
 
+    golden(
+        "upstream-traffic-status",
+        &UpstreamTrafficResponse {
+            deployment_id: "stage".into(),
+            upstream: "us1.example.com:443".into(),
+            state: "draining",
+            healthy: true,
+            in_flight: 3,
+            reason: Some("regional maintenance".into()),
+            started_at: Some(1_722_400_000),
+        },
+    );
+
     // The one error shape clients can parse. Every *other* error app-lb produces
     // — the 401, and every axum extractor rejection — is plain text with no JSON
     // at all, which is why a client's error path cannot assume this envelope.
@@ -881,7 +896,7 @@ fn workflow_spec_is_stable() {
     );
 }
 
-/// A minimal object must round-trip through its defaults, or `serverctl create
+/// A minimal object must round-trip through its defaults, or `heyctl create
 /// workflow` would have to send every field.
 #[test]
 fn a_minimal_workflow_fills_its_defaults() {

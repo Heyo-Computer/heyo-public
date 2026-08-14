@@ -11,15 +11,15 @@
 use crate::ingest::Sink;
 use crate::sources::VmTarget;
 use crate::store::schema::{MetricRecord, Record};
-use serde::Deserialize;
-use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Reserved deployment id for whole-host samples, which belong to no
 /// deployment. Chosen to be a legal partition name while being unlikely to
 /// collide: app-lb ids in practice are slugs like `demo` or `vault-86a37f`.
 pub const HOST_DEPLOYMENT: &str = "_host";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct MetricsResponse {
     /// Unix seconds. Used as the timestamp for every row in the poll so a chart
     /// lines them up instead of smearing them across the collection latency.
@@ -28,70 +28,99 @@ struct MetricsResponse {
     deployments: Vec<DeploymentView>,
 }
 
-#[derive(Debug, Deserialize)]
-struct HostUsage {
-    available: bool,
-    cpu_percent: f64,
-    memory_used_bytes: u64,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct HostUsage {
+    pub available: bool,
+    pub cpu_percent: f64,
+    pub memory_used_bytes: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct DeploymentView {
-    id: String,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct DeploymentView {
+    pub id: String,
     /// `vm` or `static`. Optional because an older app-lb may not send it;
     /// see [`vm_targets`] for how that absence is handled.
     #[serde(default)]
-    kind: Option<String>,
-    pool: PoolStatus,
+    pub kind: Option<String>,
     #[serde(default)]
-    vms: Vec<VmView>,
-    metrics: DeploymentMetrics,
+    pub upstreams: Vec<String>,
+    /// Older app-lb versions did not report this field. Absence means unknown,
+    /// not routed: inventing a route would turn idle agent sandboxes into false
+    /// outages during a mixed-version rollout.
+    #[serde(default)]
+    pub routed: Option<bool>,
+    pub pool: PoolStatus,
+    #[serde(default)]
+    pub vms: Vec<VmView>,
+    pub metrics: DeploymentMetrics,
 }
 
-#[derive(Debug, Deserialize)]
-struct PoolStatus {
-    ready: u32,
-    draining: u32,
-    pending: u32,
-    total_in_flight: u32,
-    cpu_percent: Option<f64>,
-    memory_bytes: Option<u64>,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct PoolStatus {
+    #[serde(default)]
+    pub desired_replicas: Option<u32>,
+    pub ready: u32,
+    pub draining: u32,
+    pub pending: u32,
+    #[serde(default)]
+    pub min_replicas: Option<u32>,
+    pub total_in_flight: u32,
+    pub cpu_percent: Option<f64>,
+    pub memory_bytes: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct VmView {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct VmView {
     /// app-lb calls this `sandbox_id` for both kinds of backend, but for a
     /// static deployment it holds the upstream `host:port` rather than a
     /// sandbox. Stored as `backend` for that reason; the wire name is app-lb's.
-    #[serde(rename = "sandbox_id")]
-    backend: String,
-    in_flight: u32,
-    cpu_percent: Option<f64>,
-    memory_bytes: Option<u64>,
+    #[serde(rename(deserialize = "sandbox_id"))]
+    pub backend: String,
+    pub in_flight: u32,
+    #[serde(default)]
+    pub healthy: bool,
+    #[serde(default)]
+    pub draining: bool,
+    #[serde(default)]
+    pub uptime_secs: u64,
+    pub cpu_percent: Option<f64>,
+    pub memory_bytes: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DeploymentMetrics {
-    requests: StatusCounts,
-    latency_ms: Histogram,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct DeploymentMetrics {
+    pub requests: StatusCounts,
+    pub latency_ms: Histogram,
 }
 
-#[derive(Debug, Deserialize)]
-struct StatusCounts {
-    total: u64,
-    errors: u64,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct StatusCounts {
+    pub total: u64,
+    pub errors: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct Histogram {
-    count: u64,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct Histogram {
+    pub count: u64,
     /// Total of every sample, in the histogram's base unit. Cumulative like
     /// `count`, so the two together give a per-interval mean once differenced —
     /// see `MetricRecord::latency_count`.
-    sum: u64,
-    p50: f64,
-    p90: f64,
-    p99: f64,
+    pub sum: u64,
+    pub p50: f64,
+    pub p90: f64,
+    pub p99: f64,
+}
+
+/// The current topology and gauges behind the platform status API. Historical
+/// storage remains the flattened parquet rows below.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct LiveStatus {
+    pub schema_version: u8,
+    pub source: String,
+    pub observed_at_ms: i64,
+    pub app_lb_generated_at_ms: i64,
+    pub host: HostUsage,
+    pub deployments: Vec<DeploymentView>,
 }
 
 pub struct Poller {
@@ -100,6 +129,8 @@ pub struct Poller {
     auth: Option<(String, String)>,
     interval: Duration,
     sink: Sink,
+    source: String,
+    live: tokio::sync::watch::Sender<Option<LiveStatus>>,
     /// Where the current VM set goes after each successful poll, for the
     /// daemon log tailer. Deliberately never cleared on a failed poll: app-lb
     /// restarting must not stop log collection from sandboxes that are still
@@ -114,6 +145,8 @@ impl Poller {
         password: Option<String>,
         interval: Duration,
         sink: Sink,
+        source: String,
+        live: tokio::sync::watch::Sender<Option<LiveStatus>>,
         targets: Option<tokio::sync::watch::Sender<Vec<VmTarget>>>,
     ) -> Self {
         // app-lb's admin API is loopback and answers promptly or not at all; a
@@ -135,6 +168,8 @@ impl Poller {
             auth,
             interval,
             sink,
+            source,
+            live,
             targets,
         }
     }
@@ -165,6 +200,16 @@ impl Poller {
         let response = request.send().await?.error_for_status()?;
         let snapshot: MetricsResponse = response.json().await?;
 
+        let live = LiveStatus {
+            schema_version: 1,
+            source: self.source.clone(),
+            observed_at_ms: now_ms(),
+            app_lb_generated_at_ms: (snapshot.generated_at as i64).saturating_mul(1000),
+            host: snapshot.host.clone(),
+            deployments: snapshot.deployments.clone(),
+        };
+        self.live.send_replace(Some(live));
+
         if let Some(targets) = &self.targets {
             // send_if_modified so an unchanged fleet doesn't wake the tailer
             // manager every poll tick.
@@ -186,6 +231,12 @@ impl Poller {
         }
         Ok(count)
     }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as i64)
 }
 
 /// The sandboxes worth tailing daemon logs from: every backend of a VM
@@ -305,6 +356,7 @@ mod tests {
             "id": "demo",
             "kind": "vm",
             "upstreams": [],
+            "routed": true,
             "pool": {
                 "desired_replicas": 2, "ready": 2, "draining": 0, "pending": 1,
                 "total_in_flight": 3, "target_concurrency": 10, "min_replicas": 1,
@@ -337,7 +389,15 @@ mod tests {
         let snapshot = parse();
         assert_eq!(snapshot.generated_at, 1_785_260_096);
         assert_eq!(snapshot.deployments.len(), 1);
+        assert_eq!(snapshot.deployments[0].routed, Some(true));
         assert_eq!(snapshot.deployments[0].vms.len(), 2);
+    }
+
+    #[test]
+    fn an_old_response_keeps_routing_unknown() {
+        let old = SNAPSHOT.replace("\n            \"routed\": true,", "");
+        let snapshot: MetricsResponse = serde_json::from_str(&old).unwrap();
+        assert_eq!(snapshot.deployments[0].routed, None);
     }
 
     #[test]

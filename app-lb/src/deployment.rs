@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
@@ -29,6 +30,10 @@ pub fn now_secs() -> u64 {
 pub struct VmBackend {
     pub sandbox_id: String,
     pub peer: String,
+    /// Makes checking admission and reserving an in-flight slot atomic with an
+    /// operator drain. Selection itself is intentionally lock-free and may be
+    /// stale; [`try_acquire`](Self::try_acquire) is the authoritative gate.
+    admission: Mutex<()>,
     in_flight: AtomicUsize,
     draining: AtomicBool,
     healthy: AtomicBool,
@@ -62,6 +67,7 @@ impl VmBackend {
         Self {
             sandbox_id,
             peer,
+            admission: Mutex::new(()),
             in_flight: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
             healthy: AtomicBool::new(true),
@@ -115,11 +121,13 @@ impl VmBackend {
         self.is_healthy() && !self.is_draining()
     }
 
-    pub fn set_draining(&self) {
-        self.draining.store(true, Ordering::Relaxed);
+    pub fn set_draining(&self, draining: bool) {
+        let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        self.draining.store(draining, Ordering::Relaxed);
     }
 
     pub fn set_healthy(&self, healthy: bool) {
+        let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         self.healthy.store(healthy, Ordering::Relaxed);
     }
 
@@ -130,6 +138,20 @@ impl VmBackend {
     pub fn acquire(&self) {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         self.last_active.store(now_secs(), Ordering::Relaxed);
+    }
+
+    /// Reserve this backend for a new request if it is still accepting traffic.
+    ///
+    /// The admission mutex closes the selection-to-acquire race: after
+    /// `set_draining(true)` returns, either a request is already reflected in
+    /// `in_flight`, or it cannot acquire a slot.
+    pub fn try_acquire(&self) -> bool {
+        let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.is_available() {
+            return false;
+        }
+        self.acquire();
+        true
     }
 
     /// Saturating so a double-release can never wrap to `usize::MAX` and pin the
@@ -172,12 +194,11 @@ impl Drop for BackendSlot {
 }
 
 impl VmBackend {
-    /// Take an in-flight slot, released when the returned guard drops.
-    pub fn hold(self: &Arc<Self>) -> BackendSlot {
-        self.acquire();
-        BackendSlot {
+    /// Try to take an in-flight slot, released when the returned guard drops.
+    pub fn try_hold(self: &Arc<Self>) -> Option<BackendSlot> {
+        self.try_acquire().then(|| BackendSlot {
             backend: self.clone(),
-        }
+        })
     }
 }
 
@@ -224,6 +245,17 @@ impl PendingVm {
 /// LB learned. It is persisted alongside the spec because losing it leaks real
 /// resources — a suspended sandbox that app-lb forgets is invisible to the
 /// daemon's running-VM list and so is never reaped by anything.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct UpstreamDrain {
+    /// The exact `host:port` entry from `DeploymentSpec::upstreams`.
+    pub upstream: String,
+    /// Operator context for the drain. Informational; never used for routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// LB-clock Unix timestamp at which new traffic was stopped.
+    pub started_at: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeploymentState {
     /// Sandboxes this deployment stopped rather than destroyed, under
@@ -235,6 +267,13 @@ pub struct DeploymentState {
     /// the fleet list cannot be asked what we suspended.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspended: Vec<String>,
+    /// Static upstreams administratively removed from new-request selection.
+    ///
+    /// Separate from health: a failed probe may recover by itself; an operator
+    /// drain stays in force across health changes and process restarts until it
+    /// is explicitly removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_drains: Vec<UpstreamDrain>,
 }
 
 #[derive(Debug)]
@@ -257,6 +296,9 @@ pub struct Deployment {
     /// autoscaler when a request arrives with nowhere to go.
     pub ready_signal: Notify,
     pub scale_signal: Notify,
+    /// Keeps independent runtime-state writers from losing each other's fields.
+    /// In particular, suspended-VM bookkeeping must not erase an upstream drain.
+    state_change_lock: Mutex<()>,
     /// Consecutive VM boot failures — timeouts and terminal statuses alike.
     ///
     /// Runtime-only, like the pools: a restart (or a spec update, which builds a
@@ -286,6 +328,7 @@ impl Deployment {
             waiters: AtomicUsize::new(0),
             ready_signal: Notify::new(),
             scale_signal: Notify::new(),
+            state_change_lock: Mutex::new(()),
             boot_failures: AtomicU64::new(0),
             boot_backoff_until: AtomicU64::new(0),
         }
@@ -296,7 +339,34 @@ impl Deployment {
     }
 
     pub fn set_state(&self, state: DeploymentState) {
+        let _guard = self
+            .state_change_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.apply_state(state);
+    }
+
+    fn apply_state(&self, state: DeploymentState) {
+        if self.spec.is_static() {
+            for backend in self.backends().iter() {
+                backend.set_draining(
+                    state
+                        .upstream_drains
+                        .iter()
+                        .any(|drain| drain.upstream == backend.peer),
+                );
+            }
+        }
         self.state.store(Arc::new(state));
+    }
+
+    /// The durable operator drain for one static upstream, if any.
+    pub fn upstream_drain(&self, upstream: &str) -> Option<UpstreamDrain> {
+        self.state()
+            .upstream_drains
+            .iter()
+            .find(|drain| drain.upstream == upstream)
+            .cloned()
     }
 
     /// Read-modify-write the runtime state, returning whether it changed.
@@ -304,13 +374,17 @@ impl Deployment {
     /// The return value is what tells a caller whether the change is worth a
     /// disk write; these paths run every tick and usually change nothing.
     pub fn mutate_state(&self, f: impl FnOnce(&mut DeploymentState)) -> bool {
+        let _guard = self
+            .state_change_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let before = self.state();
         let mut next = (*before).clone();
         f(&mut next);
         if next == *before {
             return false;
         }
-        self.state.store(Arc::new(next));
+        self.apply_state(next);
         true
     }
 
@@ -331,6 +405,21 @@ impl Deployment {
     }
 
     pub fn set_backends(&self, backends: Vec<Arc<VmBackend>>) {
+        let _guard = self
+            .state_change_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.spec.is_static() {
+            let state = self.state();
+            for backend in &backends {
+                backend.set_draining(
+                    state
+                        .upstream_drains
+                        .iter()
+                        .any(|drain| drain.upstream == backend.peer),
+                );
+            }
+        }
         self.backends.store(Arc::new(backends));
     }
 
@@ -585,10 +674,71 @@ mod tests {
         // Excluding the first (e.g. it just failed to connect) moves on.
         assert_eq!(d.select(std::slice::from_ref(&a.peer)).unwrap().peer, b.peer);
 
-        b.set_draining();
+        b.set_draining(true);
         c.set_healthy(false);
         assert!(d.select(std::slice::from_ref(&a.peer)).is_none());
         assert_eq!(d.select(&[]).unwrap().peer, a.peer);
+    }
+
+    #[test]
+    fn a_durable_static_drain_stops_new_traffic_but_not_in_flight_work() {
+        let d = static_deployment(&["eu1.example:443", "us1.example:443"]);
+        let eu1 = d.backends()[0].clone();
+        eu1.acquire();
+
+        d.set_state(DeploymentState {
+            upstream_drains: vec![UpstreamDrain {
+                upstream: eu1.peer.clone(),
+                reason: Some("regional maintenance".into()),
+                started_at: 123,
+            }],
+            ..Default::default()
+        });
+
+        assert!(eu1.is_draining());
+        assert_eq!(eu1.in_flight(), 1, "the existing request remains accounted for");
+        assert_eq!(d.select(&[]).unwrap().peer, "us1.example:443");
+        eu1.release();
+        assert_eq!(eu1.in_flight(), 0);
+        assert!(eu1.is_draining(), "drain intent remains after work reaches zero");
+    }
+
+    #[test]
+    fn removing_a_static_drain_makes_a_healthy_upstream_available_again() {
+        let d = static_deployment(&["eu1.example:443", "us1.example:443"]);
+        let eu1 = d.backends()[0].clone();
+        d.set_state(DeploymentState {
+            upstream_drains: vec![UpstreamDrain {
+                upstream: eu1.peer.clone(),
+                reason: None,
+                started_at: 123,
+            }],
+            ..Default::default()
+        });
+        assert!(eu1.is_draining());
+
+        d.set_state(DeploymentState::default());
+        assert!(eu1.is_available());
+    }
+
+    #[test]
+    fn cordon_is_atomic_with_new_request_admission() {
+        let backend = Arc::new(VmBackend::for_upstream("eu1.example:443".into()));
+        assert!(backend.try_acquire());
+        assert_eq!(backend.in_flight(), 1);
+
+        backend.set_draining(true);
+        assert!(
+            !backend.try_acquire(),
+            "no slot may appear after set_draining returns",
+        );
+        assert_eq!(backend.in_flight(), 1, "the admitted request remains visible");
+
+        backend.release();
+        assert_eq!(backend.in_flight(), 0);
+        backend.set_draining(false);
+        assert!(backend.try_acquire(), "uncordon reopens admission when healthy");
+        backend.release();
     }
 
     #[test]

@@ -19,7 +19,7 @@
     <li><a href="namespaces.html">Namespaces</a></li>
     <li><a href="feed.html">The event feed</a></li>
     <li class="group">clients</li>
-    <li><a href="serverctl.html">serverctl</a></li>
+    <li><a href="heyctl.html">heyctl</a></li>
   </ul>
 </nav>
 <main>
@@ -93,9 +93,9 @@ means a TCP connect check.</p>
 pool until a job finishes and rewrites <code>vm.image</code>:</p>
 <ul>
   <li><code>build</code> — a git repository and Dockerfile, built on the app-lb host.
-  Run with <code>serverctl build &lt;id&gt;</code>.</li>
+  Run with <code>heyctl build &lt;id&gt;</code>.</li>
   <li><code>artifact</code> — a rootfs somebody already built, in an artifact store.
-  Run with <code>serverctl pull &lt;id&gt;</code>.</li>
+  Run with <code>heyctl pull &lt;id&gt;</code>.</li>
 </ul>
 <p>Static deployments use <code>update</code> instead: commands run in a working
 directory on the host (<code>git pull &amp;&amp; cargo build</code>…), then app-lb verifies

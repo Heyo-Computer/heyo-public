@@ -1,7 +1,7 @@
 #!/bin/bash
 # Check a booted NATS VM from the inside.
 #
-#     serverctl exec nats -- /opt/nats/preflight.sh
+#     heyctl exec nats -- /opt/nats/preflight.sh
 #
 # Two properties are worth a script, because neither is visible from outside and
 # both fail silently:

@@ -23,9 +23,9 @@ use ingest::http::IngestState;
 use query::Engine;
 use retention::Retention;
 use sources::applb::Poller;
+use std::sync::Arc;
 use store::schema::Record;
 use store::writer::Writer;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// How many records to take off the queue per blocking excursion.
@@ -120,6 +120,7 @@ async fn run(cfg: Config) {
     // deployment each serves; the channel starts empty so the tailer idles
     // until the first successful poll.
     let (targets_tx, targets_rx) = tokio::sync::watch::channel(Vec::new());
+    let (live_tx, live_rx) = tokio::sync::watch::channel(None);
     tokio::spawn(
         Poller::new(
             &cfg.applb_url,
@@ -127,6 +128,8 @@ async fn run(cfg: Config) {
             cfg.applb_password.clone(),
             cfg.poll_interval,
             sink.clone(),
+            cfg.source.clone(),
+            live_tx,
             Some(targets_tx),
         )
         .run(),
@@ -173,6 +176,8 @@ async fn run(cfg: Config) {
         buffered,
         flush_secs: cfg.flush_interval.as_secs(),
         retain_days: cfg.retain_days,
+        live: live_rx,
+        stale_after_secs: cfg.poll_interval.as_secs().saturating_mul(3).max(15),
     };
     let api_addr = cfg.api_addr.clone();
     tokio::spawn(async move {

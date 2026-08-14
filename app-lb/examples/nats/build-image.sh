@@ -67,12 +67,12 @@ cat <<EOF
 Built. Register the deployment:
 
   sed -i 's/"image": "[^"]*"/"image": "$IMAGE_NAME"/' $HERE/nats.json
-  serverctl apply -f $HERE/nats.json
-  serverctl rollout status nats
+  heyctl apply -f $HERE/nats.json
+  heyctl rollout status nats
 
 Then check the parts a health check cannot see — above all that the JetStream
 store really is on the data disk, not on a rootfs that the next cold boot
 discards:
 
-  serverctl exec nats -- /opt/nats/preflight.sh
+  heyctl exec nats -- /opt/nats/preflight.sh
 EOF

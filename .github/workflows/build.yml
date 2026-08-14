@@ -141,7 +141,7 @@ jobs:
       - name: Test app-lb
         run: |
           cargo test --locked --manifest-path app-lb/Cargo.toml -p app-lb
-          cargo test --locked --manifest-path app-lb/serverctl/Cargo.toml
+          cargo test --locked --manifest-path app-lb/heyctl/Cargo.toml
 
       - name: Test TypeScript SDK
         working-directory: app-lb/sdk/typescript

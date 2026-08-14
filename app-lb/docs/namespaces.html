@@ -19,7 +19,7 @@
     <li><a href="namespaces.html" aria-current="page">Namespaces</a></li>
     <li><a href="feed.html">The event feed</a></li>
     <li class="group">clients</li>
-    <li><a href="serverctl.html">serverctl</a></li>
+    <li><a href="heyctl.html">heyctl</a></li>
   </ul>
 </nav>
 <main>
@@ -35,7 +35,7 @@ keeps behaving as one namespace and nothing changes on the wire or on disk:</p>
 <code>_</code> <code>.</code>) because they appear in URLs and filenames unescaped.</p>
 
 <h2>On a token</h2>
-<pre><code>serverctl token mint team-a-operator --admin admin --namespace team-a</code></pre>
+<pre><code>heyctl token mint team-a-operator --admin admin --namespace team-a</code></pre>
 <p>A namespace-confined token behaves differently from a plain deployment-scoped one, and
 the differences are the point:</p>
 <ul>
@@ -70,7 +70,7 @@ operator for that namespace:</p>
 <pre><code># everyone can filter listings by namespace
 GET /deployments?namespace=team-a
 
-serverctl get deployments        # serverctl passes your token's view through</code></pre>
+heyctl get deployments        # heyctl passes your token's view through</code></pre>
 
 <div class="note">Data-plane gates compose with namespaces: a deployment's
 <code>auth</code> gate with the <code>app-token</code> provider admits a namespace token

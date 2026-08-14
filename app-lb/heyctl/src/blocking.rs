@@ -4,9 +4,9 @@
 //! forwards to the async client on a private current-thread runtime.
 //!
 //! ```no_run
-//! # fn f() -> serverctl::Result<()> {
-//! use serverctl::blocking::Client;
-//! use serverctl::ExecRequest;
+//! # fn f() -> heyctl::Result<()> {
+//! use heyctl::blocking::Client;
+//! use heyctl::ExecRequest;
 //!
 //! let lb = Client::builder("127.0.0.1:9090").token("applb_…").build()?;
 //! let out = lb.exec("sb-7f3a9c", &ExecRequest::new("uname -a"))?;
@@ -57,8 +57,8 @@ impl std::ops::Deref for Rt {
 fn block_on<F: std::future::Future>(rt: &Rt, f: F) -> Result<F::Output> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(Error::Invalid(
-            "serverctl::blocking cannot be used inside an async runtime — use \
-             serverctl::Client instead"
+            "heyctl::blocking cannot be used inside an async runtime — use \
+             heyctl::Client instead"
                 .into(),
         ));
     }
@@ -184,6 +184,14 @@ impl Client {
         run!(self, self.inner.deployment(id))
     }
 
+    pub fn deployment_with_timeout(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<DeploymentStatus> {
+        run!(self, self.inner.deployment_with_timeout(id, timeout))
+    }
+
     pub fn deployment_exists(&self, id: &str) -> Result<bool> {
         run!(self, self.inner.deployment_exists(id))
     }
@@ -206,6 +214,23 @@ impl Client {
 
     pub fn evict_vm(&self, id: &str, sandbox: &str, force: bool) -> Result<EvictOutcome> {
         run!(self, self.inner.evict_vm(id, sandbox, force))
+    }
+
+    pub fn cordon_upstream(
+        &self,
+        id: &str,
+        upstream: &str,
+        force: bool,
+        reason: Option<&str>,
+    ) -> Result<UpstreamTrafficStatus> {
+        run!(
+            self,
+            self.inner.cordon_upstream(id, upstream, force, reason)
+        )
+    }
+
+    pub fn uncordon_upstream(&self, id: &str, upstream: &str) -> Result<UpstreamTrafficStatus> {
+        run!(self, self.inner.uncordon_upstream(id, upstream))
     }
 
     pub fn deployment_ids(&self, page: usize) -> Result<Vec<String>> {
@@ -468,8 +493,8 @@ impl Shell {
 /// A session *is* a sequence of events that ends, so it iterates.
 ///
 /// ```no_run
-/// # fn f(shell: &mut serverctl::blocking::Shell) {
-/// use serverctl::ShellEvent;
+/// # fn f(shell: &mut heyctl::blocking::Shell) {
+/// use heyctl::ShellEvent;
 /// for event in shell.by_ref() {
 ///     if let ShellEvent::Output(bytes) = event {
 ///         // …
@@ -518,7 +543,7 @@ mod tests {
 
         let e = c.healthz().unwrap_err();
         assert!(matches!(&e, Error::Invalid(m) if m.contains("async runtime")), "{e:?}");
-        assert!(e.to_string().contains("serverctl::Client"), "it should name the fix: {e}");
+        assert!(e.to_string().contains("heyctl::Client"), "it should name the fix: {e}");
     }
 }
 
@@ -598,6 +623,29 @@ impl Raw<'_> {
 
     pub fn evict_vm(&self, id: &str, sandbox: &str, force: bool) -> Result<Value> {
         block_on(&self.client.rt, self.client.inner.raw().evict_vm(id, sandbox, force))?
+    }
+
+    pub fn cordon_upstream(
+        &self,
+        id: &str,
+        upstream: &str,
+        force: bool,
+        reason: Option<&str>,
+    ) -> Result<Value> {
+        block_on(
+            &self.client.rt,
+            self.client
+                .inner
+                .raw()
+                .cordon_upstream(id, upstream, force, reason),
+        )?
+    }
+
+    pub fn uncordon_upstream(&self, id: &str, upstream: &str) -> Result<Value> {
+        block_on(
+            &self.client.rt,
+            self.client.inner.raw().uncordon_upstream(id, upstream),
+        )?
     }
 
     pub fn start_build(&self, id: &str, git_ref: Option<&str>) -> Result<Value> {

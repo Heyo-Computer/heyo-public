@@ -1,7 +1,7 @@
 //! What can go wrong, as something a caller can branch on.
 //!
 //! The CLI this crate grew out of used `anyhow` throughout, and some of its
-//! messages named CLI commands ("run `serverctl login`"). A library cannot ship
+//! messages named CLI commands ("run `heyctl login`"). A library cannot ship
 //! that: a caller deciding whether to retry, wake a VM, or re-mint a token needs
 //! the *shape* of the failure, not a sentence about it.
 //!

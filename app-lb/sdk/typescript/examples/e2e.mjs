@@ -1,6 +1,6 @@
 // The same script the Rust SDK's e2e runs: create → wait → exec → token → job →
 // delete, against a live app-lb.
-import { Serverctl, NotFoundError, NoRunningVmError, ForbiddenError, UnauthorizedError } from "../dist/index.js";
+import { Heyctl, NotFoundError, NoRunningVmError, ForbiddenError, UnauthorizedError } from "../dist/index.js";
 
 const SERVER = process.env.APP_LB ?? "127.0.0.1:34294";
 let ok = 0, fail = 0;
@@ -11,7 +11,7 @@ const check = (label, got, want) => {
 };
 const truthy = (label, v) => check(label, !!v, true);
 
-const admin = new Serverctl({ server: SERVER, user: "admin", password: "hunter2" });
+const admin = new Heyctl({ server: SERVER, user: "admin", password: "hunter2" });
 
 console.log("== reachability and gates ==");
 await admin.healthz();
@@ -20,7 +20,7 @@ const gates = await admin.gates();
 check("both tiers are gated", gates, { view: true, crud: true });
 
 console.log("\n== an unauthenticated client is refused, and says why ==");
-const anon = new Serverctl({ server: SERVER });
+const anon = new Heyctl({ server: SERVER });
 try { await anon.deployments(); fail++; console.log("  FAIL  anon should be refused"); }
 catch (e) {
   truthy("UnauthorizedError", e instanceof UnauthorizedError);
@@ -59,7 +59,7 @@ const minted = await admin.mintToken({ name: "ts-agent", admin: "admin", deploym
 truthy("the secret is returned once", minted.token.startsWith("applb_"));
 check("scoped as asked", minted.deployments, ["ts-sb"]);
 
-const agent = new Serverctl({ server: SERVER, token: minted.token });
+const agent = new Heyctl({ server: SERVER, token: minted.token });
 check("the token reaches its own deployment", (await agent.deployment("ts-sb")).spec.id, "ts-sb");
 
 try { await agent.deployments(); fail++; console.log("  FAIL  a scoped token should not list the fleet"); }

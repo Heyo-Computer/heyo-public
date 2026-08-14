@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>heyctl — app-lb</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="side">
+  <a class="brand" href="index.html">app-lb</a>
+  <p class="tagline">load balancer &amp; microVM autoscaler</p>
+  <ul>
+    <li><a href="index.html">Overview</a></li>
+    <li class="group">app-lb</li>
+    <li><a href="deployments.html">Deployments &amp; scaling</a></li>
+    <li><a href="security.html">Auth, tokens &amp; the admin API</a></li>
+    <li><a href="namespaces.html">Namespaces</a></li>
+    <li><a href="feed.html">The event feed</a></li>
+    <li class="group">clients</li>
+    <li><a href="heyctl.html" aria-current="page">heyctl</a></li>
+  </ul>
+</nav>
+<main>
+<h1>heyctl</h1>
+<p class="lede">The CLI for app-lb's admin API. By default it talks to
+<code>http://127.0.0.1:9090</code>; reach a remote server over an SSH tunnel
+(<code>ssh -L 9090:127.0.0.1:9090 host</code>) and save it as a context with
+<code>heyctl login</code>.</p>
+
+<h2>Contexts &amp; identity</h2>
+<pre><code>heyctl login                  # verify credentials, save as a context
+heyctl whoami                 # which server, as whom, allowed to do what
+heyctl config get-contexts    # manage saved contexts
+heyctl logout</code></pre>
+<p>Credentials are the Basic pair or an app-token (<code>--token</code>, or
+<code>APP_LB_TOKEN</code>). Machine output is everywhere: <code>-o json</code>,
+<code>-o yaml</code>, <code>-o name</code>.</p>
+
+<h2>Reading the fleet</h2>
+<pre><code>heyctl get deployments        # also: vms, certs, secrets, jobs, workflows
+heyctl describe web           # spec, pool, backends, traffic
+heyctl status                 # whole-LB overview
+heyctl top                    # CPU/memory for deployments, VMs or the host
+heyctl feed                   # namespaces with events — see below</code></pre>
+
+<h2>Deployments</h2>
+<pre><code>heyctl apply -f web.json      # create or replace from a spec (JSON or YAML)
+heyctl create deployment …    # the flag-driven alternative
+heyctl edit web               # fetch spec → $EDITOR → put back
+heyctl scale web --min 1 --max 4
+heyctl restart web            # recycle VMs one eviction at a time
+heyctl rollout status web     # watch the pool converge
+heyctl delete web</code></pre>
+
+<h3>Changing one thing</h3>
+<pre><code>heyctl set image web web-rootfs-v2     # rebuilds the pool
+heyctl set env web RUST_LOG=debug      # KEY=VALUE, or KEY- to remove
+heyctl set upstreams legacy 10.0.0.5:3000
+heyctl set route web --host web.example.com
+heyctl set build web --repo https://github.com/example/web</code></pre>
+
+<h3>Images</h3>
+<pre><code>heyctl build web              # run the spec's build block, roll the pool
+heyctl pull web               # pull the spec's artifact instead
+heyctl artifact login …       # talk to an artifact store directly
+heyctl update legacy          # static deployment: run its update commands</code></pre>
+
+<h2>Inside a VM</h2>
+<pre><code>heyctl exec web -- uname -a   # one command; guest exit code becomes heyctl's
+heyctl shell web              # interactive PTY (alias: ssh)</code></pre>
+<p>Both go through app-lb, so they work wherever the admin API does — and they wake a
+scale-to-zero deployment that has no VM running.</p>
+
+<h2>Tokens</h2>
+<pre><code>heyctl token mint NAME [--admin none|view|admin]
+                     [-d ID]... [--all-deployments]
+                     [--namespace NS] [--expires-in HOURS] [-q]
+heyctl token list
+heyctl token describe ID
+heyctl token set ID [--name…] [--admin…] [-d…] [--never-expires]
+heyctl token revoke ID</code></pre>
+<p>The secret prints once, on stdout, with commentary on stderr — so
+<code>TOKEN=$(heyctl token mint agent -d web -q)</code> captures exactly the
+credential. The listing's scope column shows a namespace wall as
+<code>team-a:*</code> or <code>team-a:web</code>. See
+<a href="namespaces.html">Namespaces</a> for what <code>--namespace</code> means.</p>
+
+<h2>Feeds</h2>
+<pre><code>heyctl feed                   # which namespaces have events
+heyctl feed team-a            # events, newest first (-n limits)
+heyctl feed team-a --xml      # the RSS document, verbatim</code></pre>
+<pre><code>$ heyctl feed team-a
+WHEN         KIND      DEPLOYMENT  WHAT
+2m ago       issue     web         web: cold start timed out — a request waited 120s… (×3)
+1h ago       deployed  web         web deployed — serving at https://web.example.com</code></pre>
+<p>See <a href="feed.html">The event feed</a> for how events get there in the first
+place.</p>
+
+<h2>Libraries</h2>
+<p>The same API surface ships as libraries, wire-pinned against app-lb's golden fixtures
+so a field can't silently go missing:</p>
+<ul>
+  <li><strong>Rust</strong> — the <code>heyctl</code> crate: an async
+  <code>Client</code>, a blocking wrapper, and <code>client.raw()</code> for verbatim
+  JSON.</li>
+  <li><strong>TypeScript</strong> — <code>sdk/typescript</code>: <code>new
+  Heyctl({ server, token })</code> with typed <code>deployments()</code>,
+  <code>exec()</code>, <code>mintToken()</code>, <code>feeds()</code>,
+  <code>feedEvents()</code>…</li>
+</ul>
+
+<pre><code>heyctl completion bash        # also zsh, fish, elvish, powershell</code></pre>
+
+<footer><a href="feed.html">← The event feed</a> · <a href="index.html">Overview</a></footer>
+</main>
+</div>
+</body>
+</html>

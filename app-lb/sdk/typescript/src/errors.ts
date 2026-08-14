@@ -16,7 +16,7 @@
 /** What was presented, so a 401 can say something useful about it. */
 export type Credential = "none" | "basic" | "token";
 
-export class ServerctlError extends Error {
+export class HeyctlError extends Error {
   /** The HTTP status behind this, when there was one. */
   readonly status?: number;
 
@@ -45,7 +45,7 @@ export class ServerctlError extends Error {
  * those, deliberately, so token ids cannot be enumerated by watching which
  * failure comes back.
  */
-export class UnauthorizedError extends ServerctlError {
+export class UnauthorizedError extends HeyctlError {
   readonly presented: Credential;
   constructor(presented: Credential) {
     super(
@@ -65,7 +65,7 @@ export class UnauthorizedError extends ServerctlError {
 }
 
 /** `403`. The credential was good and its scope was not. */
-export class ForbiddenError extends ServerctlError {
+export class ForbiddenError extends HeyctlError {
   constructor(message: string) {
     super(message, 403);
   }
@@ -74,7 +74,7 @@ export class ForbiddenError extends ServerctlError {
   }
 }
 
-export class NotFoundError extends ServerctlError {
+export class NotFoundError extends HeyctlError {
   readonly kind: string;
   readonly name_: string;
   constructor(kind: string, name: string) {
@@ -85,7 +85,7 @@ export class NotFoundError extends ServerctlError {
 }
 
 /** `409` — a job is already running, or a secret is still referenced. */
-export class ConflictError extends ServerctlError {
+export class ConflictError extends HeyctlError {
   constructor(message: string) {
     super(message, 409);
   }
@@ -95,7 +95,7 @@ export class ConflictError extends ServerctlError {
  * `409` from exec/shell with `wake: false` and nothing running. Separate from
  * {@link ConflictError} because the remedy is specific: retry with `wake`.
  */
-export class NoRunningVmError extends ServerctlError {
+export class NoRunningVmError extends HeyctlError {
   readonly deployment: string;
   constructor(deployment: string) {
     super(`deployment ${JSON.stringify(deployment)} has no running VM (retry with wake)`, 409);
@@ -104,7 +104,7 @@ export class NoRunningVmError extends ServerctlError {
 }
 
 /** `503` — asked for a VM, none appeared inside `cold_start_timeout_secs`. */
-export class ColdStartTimeoutError extends ServerctlError {
+export class ColdStartTimeoutError extends HeyctlError {
   readonly deployment: string;
   constructor(deployment: string) {
     super(
@@ -124,7 +124,7 @@ export class ColdStartTimeoutError extends ServerctlError {
  * For `exec` this includes app-lb's own call timing out, in which case **the
  * command is still running in the guest**.
  */
-export class UpstreamError extends ServerctlError {
+export class UpstreamError extends HeyctlError {
   constructor(message: string) {
     super(message, 502);
   }
@@ -134,13 +134,13 @@ export class UpstreamError extends ServerctlError {
 }
 
 /** Any other `{"error": …}` this package has no specific class for. */
-export class ApiError extends ServerctlError {}
+export class ApiError extends HeyctlError {}
 
 /**
  * A response that could not be interpreted: an extractor rejection, an
  * empty-bodied router 404/405, or an intermediary's error page.
  */
-export class MalformedResponseError extends ServerctlError {
+export class MalformedResponseError extends HeyctlError {
   readonly body: string;
   constructor(status: number, body: string) {
     super(body ? `unexpected HTTP ${status}: ${body}` : `unexpected HTTP ${status}`, status);
@@ -149,7 +149,7 @@ export class MalformedResponseError extends ServerctlError {
 }
 
 /** The request never got an answer. */
-export class TransportError extends ServerctlError {
+export class TransportError extends HeyctlError {
   constructor(message: string, readonly cause?: unknown) {
     super(message);
   }
@@ -159,17 +159,17 @@ export class TransportError extends ServerctlError {
 }
 
 /** The WebSocket carrying a shell failed. */
-export class ShellError extends ServerctlError {}
+export class ShellError extends HeyctlError {}
 
 /** A `wait*` helper gave up. */
-export class TimeoutError extends ServerctlError {
+export class TimeoutError extends HeyctlError {
   constructor(what: string, afterMs: number) {
     super(`${what} did not finish within ${Math.round(afterMs / 1000)}s`);
   }
 }
 
 /** Bad input, caught before anything was sent. */
-export class InvalidRequestError extends ServerctlError {}
+export class InvalidRequestError extends HeyctlError {}
 
 /**
  * Turn a failed response into a typed error.
@@ -183,7 +183,7 @@ export function fromResponse(
   kind: string,
   name: string,
   presented: Credential,
-): ServerctlError {
+): HeyctlError {
   // The envelope if there is one; otherwise the body verbatim, which is where
   // the plain-text rejections live.
   let message: string | undefined;

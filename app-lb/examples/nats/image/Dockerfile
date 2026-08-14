@@ -51,8 +51,8 @@ COPY --from=upstream /usr/local/bin/nats-server /usr/local/bin/nats-server
 # iproute2 is what init.sh uses to bring eth0 up; the kernel's `ip=` parameter
 # configures the address, but nothing brings the link up on its own.
 #
-# openssh-server is the heyvm convention: it is how `serverctl shell` and
-# `serverctl exec` get into the VM, which is how you inspect a broker that is
+# openssh-server is the heyvm convention: it is how `heyctl shell` and
+# `heyctl exec` get into the VM, which is how you inspect a broker that is
 # up but not accepting.
 #
 # e2fsprogs is load-bearing and not incidental. The data disk arrives as a raw,
@@ -107,7 +107,7 @@ COPY image/resolv.conf /etc/heyo/resolv.conf
 # so it belongs on the rootfs; only the *store* goes on the data disk.
 COPY image/nats-server.conf /etc/nats/nats-server.conf
 
-# Callable from the host with:  serverctl exec nats -- /opt/nats/preflight.sh
+# Callable from the host with:  heyctl exec nats -- /opt/nats/preflight.sh
 COPY image/preflight.sh /opt/nats/preflight.sh
 RUN chmod +x /opt/nats/preflight.sh
 

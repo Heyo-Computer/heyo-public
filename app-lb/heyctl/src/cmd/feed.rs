@@ -1,4 +1,4 @@
-//! `serverctl feed` — the per-namespace event feed.
+//! `heyctl feed` — the per-namespace event feed.
 //!
 //! app-lb keeps a bounded ring of events per namespace: deployments that opted
 //! in (`feed.announce`, `feed.issues` in their spec) publish their lifecycle
@@ -6,13 +6,13 @@
 //! document carries. This command is the operator's view of it:
 //!
 //! ```text
-//! serverctl feed                 # which namespaces have events
-//! serverctl feed team-a          # the events, newest first
-//! serverctl feed team-a --xml    # the RSS document itself, verbatim
+//! heyctl feed                 # which namespaces have events
+//! heyctl feed team-a          # the events, newest first
+//! heyctl feed team-a --xml    # the RSS document itself, verbatim
 //! ```
 //!
 //! The feed is in memory on the server; a restart empties it. The durable
-//! record is `serverctl get jobs` and app-obs — this is the subscription view.
+//! record is `heyctl get jobs` and app-obs — this is the subscription view.
 
 use anyhow::Result;
 use clap::Args;
@@ -41,7 +41,7 @@ pub fn run(ctx: &Ctx, args: &FeedArgs) -> Result<()> {
     match &args.namespace {
         None => index(ctx),
         Some(ns) if args.xml => {
-            // Verbatim, stdout only: `serverctl feed team-a --xml > feed.xml`
+            // Verbatim, stdout only: `heyctl feed team-a --xml > feed.xml`
             // must produce exactly what the server serves.
             print!("{}", ctx.client.feed_rss(ns)?);
             Ok(())

@@ -210,7 +210,7 @@ fn get_vms(ctx: &Ctx, names: &[String], filter: Option<&str>) -> Result<()> {
         }
     }
     if table.is_empty() {
-        println!("No VMs in the pool. (`serverctl top vms` shows resource usage for running VMs.)");
+        println!("No VMs in the pool. (`heyctl top vms` shows resource usage for running VMs.)");
         return Ok(());
     }
     table.print();
@@ -293,7 +293,7 @@ fn get_workflows(ctx: &Ctx, names: &[String]) -> Result<()> {
 
     if workflows.is_empty() {
         println!(
-            "No CI workflows. (`serverctl create workflow build --repo <url> \
+            "No CI workflows. (`heyctl create workflow build --repo <url> \
              --network <net>` registers one.)"
         );
         return Ok(());
@@ -351,7 +351,7 @@ fn get_secrets(ctx: &Ctx, names: &[String]) -> Result<()> {
 
     if secrets.is_empty() {
         println!(
-            "No secrets stored. (`serverctl create secret github --from-stdin token` \
+            "No secrets stored. (`heyctl create secret github --from-stdin token` \
              stores one; values are never readable back.)"
         );
         return Ok(());
@@ -420,8 +420,8 @@ fn get_jobs(ctx: &Ctx, names: &[String], deployment: Option<&str>) -> Result<()>
 
     if jobs.is_empty() {
         println!(
-            "No jobs yet. (`serverctl set build <deployment> --repo <url>` records where an \
-             image comes from; `serverctl set update <deployment> --workdir <dir> --command \
+            "No jobs yet. (`heyctl set build <deployment> --repo <url>` records where an \
+             image comes from; `heyctl set update <deployment> --workdir <dir> --command \
              '<cmd>'` records how a static one is updated.)"
         );
         return Ok(());
@@ -559,7 +559,7 @@ pub fn describe(ctx: &Ctx, args: &DescribeArgs) -> Result<()> {
         bail!("describe only works on deployments");
     }
     if names.is_empty() {
-        bail!("describe needs a name, e.g. `serverctl describe deployment web`");
+        bail!("describe needs a name, e.g. `heyctl describe deployment web`");
     }
 
     // Metrics are a separate, separately-gated endpoint. Fetch once, and carry
@@ -638,7 +638,7 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
         }
 
         // The static counterpart of a managed deployment's "Build source": what
-        // `serverctl update` would run, and where.
+        // `heyctl update` would run, and where.
         if let Some(update) = &d.spec.update {
             output::section("Update (on the app-lb host)");
             output::field("Working dir", &update.working_dir);

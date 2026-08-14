@@ -352,7 +352,7 @@ impl Puller {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!(
                 "GET {url} answered {status}{} — `build.ref` must name a Dockerfile manifest \
-                 in this store. Push one with `serverctl artifact push-dockerfile --tag \
+                 in this store. Push one with `heyctl artifact push-dockerfile --tag \
                  {reference}`",
                 detail(&body)
             ));
@@ -694,7 +694,7 @@ impl Puller {
                 Ok(None) => {
                     return Err(format!(
                         "{manifest_err}. The store has no tag called {reference:?} — push one \
-                         with `serverctl artifact push --tag {reference}`, or \
+                         with `heyctl artifact push --tag {reference}`, or \
                          `art tag {reference} <digest>` on the store itself"
                     ));
                 }

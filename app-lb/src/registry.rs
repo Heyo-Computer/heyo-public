@@ -216,6 +216,13 @@ pub struct Registry {
     deployments: ArcSwap<HashMap<Arc<str>, Arc<Deployment>>>,
     routes: ArcSwap<RouteTable>,
     persist_path: PathBuf,
+    /// Serializes compound admin mutations by deployment identity. Deployment
+    /// objects are replaceable, so a mutex stored on one object cannot protect
+    /// a drain from racing a spec replacement.
+    change_lock: tokio::sync::Mutex<()>,
+    /// Every deployment uses a deterministic temporary filename. Serialize
+    /// writes so concurrent background and admin persistence cannot clobber it.
+    persist_lock: std::sync::Mutex<()>,
     /// Whether the last [`load`](Registry::load) left a file on disk that it
     /// could not turn into a deployment. Gates
     /// [`sweep_orphan_state`](Registry::sweep_orphan_state), which must not
@@ -229,8 +236,17 @@ impl Registry {
             deployments: ArcSwap::from_pointee(HashMap::new()),
             routes: ArcSwap::from_pointee(RouteTable::default()),
             persist_path: persist_path.into(),
+            change_lock: tokio::sync::Mutex::new(()),
+            persist_lock: std::sync::Mutex::new(()),
             load_skipped: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Hold across fetch → mutation/replacement → persistence. Administrative
+    /// writes are rare, so one registry-wide gate is simpler and safer than a
+    /// replaceable per-deployment lock.
+    pub async fn change_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.change_lock.lock().await
     }
 
     pub fn deployments(&self) -> Arc<HashMap<Arc<str>, Arc<Deployment>>> {
@@ -254,9 +270,59 @@ impl Registry {
     ///
     /// Replacing builds a fresh `Deployment`, so the old pool's VMs are dropped
     /// from routing immediately; the autoscaler reaps the orphaned sandboxes on
-    /// its next tick by diffing against the daemon's list.
+    /// its next tick by diffing against the daemon's list. A static deployment's
+    /// operator drains are carried for upstream addresses still present in the
+    /// replacement: replaying a deployment must not silently put a maintenance
+    /// target back into service.
     pub fn upsert(&self, spec: DeploymentSpec) -> Arc<Deployment> {
+        let previous = self.get(&spec.id);
+        let previous_drains = previous.as_ref().and_then(|previous| {
+            spec.is_static().then(|| {
+                previous
+                    .state()
+                    .upstream_drains
+                    .iter()
+                    .filter(|drain| spec.upstreams.contains(&drain.upstream))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        });
         let deployment = Arc::new(Deployment::new(spec));
+        if let Some(upstream_drains) = previous_drains {
+            deployment.set_state(DeploymentState {
+                upstream_drains,
+                ..Default::default()
+            });
+        }
+        if deployment.spec.is_static()
+            && let Some(previous) = previous.filter(|previous| previous.spec.is_static())
+        {
+            // Preserve the identity of every retained address. Requests already
+            // admitted hold these Arcs, so reusing them preserves health and
+            // in-flight accounting across an upstream-list edit or reorder.
+            let old = previous.backends();
+            let fresh = deployment.backends();
+            let mut used = vec![false; old.len()];
+            let backends = deployment
+                .spec
+                .upstreams
+                .iter()
+                .enumerate()
+                .map(|(fresh_index, upstream)| {
+                    if let Some((old_index, backend)) = old
+                        .iter()
+                        .enumerate()
+                        .find(|(index, backend)| !used[*index] && backend.peer == *upstream)
+                    {
+                        used[old_index] = true;
+                        backend.clone()
+                    } else {
+                        fresh[fresh_index].clone()
+                    }
+                })
+                .collect();
+            deployment.set_backends(backends);
+        }
         self.install(Some(deployment.clone()), &deployment.spec.id.clone());
         deployment
     }
@@ -277,13 +343,13 @@ impl Registry {
     pub fn update(&self, spec: DeploymentSpec) -> Option<Arc<Deployment>> {
         let old = self.get(&spec.id)?;
         let new = Arc::new(Deployment::new(spec));
-        new.set_backends((*old.backends()).clone());
-        new.set_pending((*old.pending()).clone());
         // Runtime state is carried for the same reason the pool is: an edit is
         // not a reset. Dropping it here would strand every sandbox this
         // deployment had suspended — they are absent from the daemon's fleet
         // list, so nothing else remembers them.
         new.set_state((*old.state()).clone());
+        new.set_backends((*old.backends()).clone());
+        new.set_pending((*old.pending()).clone());
         self.install(Some(new.clone()), &new.spec.id.clone());
         Some(new)
     }
@@ -346,21 +412,67 @@ impl Registry {
     /// fleet of agent sandboxes registers and deregisters constantly, and
     /// rewriting every spec on each change made a create storm quadratic.
     pub fn persist_one(&self, id: &str) -> std::io::Result<()> {
+        let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         let Some(d) = self.get(id) else {
             return self.forget(id);
         };
+        self.persist_snapshot_inner(&d, &d.state())
+    }
+
+    /// Persist an explicit next state without publishing it to request routing.
+    /// Used by uncordon so a failed disk write can never briefly admit traffic.
+    pub fn persist_snapshot(
+        &self,
+        deployment: &Deployment,
+        state: &DeploymentState,
+    ) -> std::io::Result<()> {
+        let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.persist_snapshot_inner(deployment, state)
+    }
+
+    fn persist_snapshot_inner(
+        &self,
+        deployment: &Deployment,
+        state: &DeploymentState,
+    ) -> std::io::Result<()> {
         let dir = self.state_dir();
+        let mut missing_dirs = Vec::new();
+        let mut ancestor = dir.as_path();
+        while !ancestor.as_os_str().is_empty() && !ancestor.exists() {
+            missing_dirs.push(ancestor.to_path_buf());
+            let Some(parent) = ancestor.parent() else {
+                break;
+            };
+            ancestor = parent;
+        }
         std::fs::create_dir_all(&dir)?;
+        // create_dir_all makes each directory visible, but those entries are
+        // not crash-durable until their parents are synced. Work from the
+        // highest newly-created directory down toward the state directory.
+        for created in missing_dirs.iter().rev() {
+            let parent = created
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         let record = StoredDeployment {
-            spec: d.spec.clone(),
-            state: (*d.state()).clone(),
+            spec: deployment.spec.clone(),
+            state: state.clone(),
         };
         let json = serde_json::to_vec_pretty(&record)?;
         // Write-then-rename so a crash mid-write can't truncate existing state.
-        let path = dir.join(state_file_name(id));
+        let path = dir.join(state_file_name(&deployment.spec.id));
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, &json)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &path)?;
+        // The rename is not durable until the directory entry is synced. A
+        // successful drain must not disappear after a host crash and silently
+        // reopen traffic on restart.
+        std::fs::File::open(dir)?.sync_all()
     }
 
     /// Drop one deployment's file. A missing file is success — deregistering
@@ -997,6 +1109,7 @@ mod tests {
         let d = r.upsert(spec("a", vec![host("a.local")]));
         d.set_state(DeploymentState {
             suspended: vec!["sb-1".into()],
+            ..Default::default()
         });
         r.persist_one("a").unwrap();
 
@@ -1015,10 +1128,83 @@ mod tests {
         let d = r.upsert(spec("a", vec![host("old.local")]));
         d.set_state(DeploymentState {
             suspended: vec!["sb-1".into()],
+            ..Default::default()
         });
 
         let updated = r.update(spec("a", vec![host("new.local")])).unwrap();
         assert_eq!(updated.state().suspended, vec!["sb-1"]);
+    }
+
+    #[test]
+    fn static_upstream_drains_survive_restart_and_deployment_replay() {
+        let state_file = scratch("static-upstream-drain");
+        let r = Registry::new(&state_file);
+        let d = r.upsert(static_spec(
+            "stage",
+            vec![host("stage.example.com")],
+            &["eu1.example:443", "us1.example:443"],
+        ));
+        d.set_state(DeploymentState {
+            upstream_drains: vec![
+                crate::deployment::UpstreamDrain {
+                    upstream: "eu1.example:443".into(),
+                    reason: Some("old maintenance".into()),
+                    started_at: 122,
+                },
+                crate::deployment::UpstreamDrain {
+                    upstream: "us1.example:443".into(),
+                    reason: Some("maintenance".into()),
+                    started_at: 123,
+                },
+            ],
+            ..Default::default()
+        });
+        r.persist_one("stage").unwrap();
+
+        let reloaded = Registry::new(&state_file);
+        reloaded.load().unwrap();
+        let loaded = reloaded.get("stage").unwrap();
+        let us1 = loaded
+            .backends()
+            .iter()
+            .find(|backend| backend.peer == "us1.example:443")
+            .cloned()
+            .unwrap();
+        assert!(us1.is_draining(), "persisted drain must apply before routing");
+        us1.acquire();
+
+        let replayed = reloaded.upsert(static_spec(
+            "stage",
+            vec![host("stage.example.com")],
+            &["us1.example:443", "ap1.example:443"],
+        ));
+        let replayed_us1 = replayed
+            .backends()
+            .iter()
+            .find(|backend| backend.peer == "us1.example:443")
+            .cloned()
+            .unwrap();
+        assert!(replayed_us1.is_draining(), "deployment replay must keep intent");
+        assert!(
+            Arc::ptr_eq(&us1, &replayed_us1),
+            "a retained address must keep the object requests already reference",
+        );
+        assert_eq!(
+            replayed_us1.in_flight(),
+            1,
+            "upstream-list edits must preserve admitted-request accounting",
+        );
+        assert!(
+            replayed
+                .state()
+                .upstream_drains
+                .iter()
+                .all(|drain| drain.upstream != "eu1.example:443"),
+            "drains for removed addresses must not survive",
+        );
+        replayed_us1.release();
+
+        std::fs::remove_dir_all(state_file.parent().unwrap()).ok();
     }
 
     #[test]
