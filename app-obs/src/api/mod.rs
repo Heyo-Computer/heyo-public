@@ -16,7 +16,6 @@ use crate::query::{
     Engine, HOST_DEPLOYMENT, LogBucket, LogFilter, MAX_LOG_LIMIT, MetricBucket, QueryError, Window,
 };
 use crate::sources::applb::LiveStatus;
-use crate::sources::nats;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect};
@@ -63,7 +62,6 @@ pub struct ApiState {
     /// the endpoint marks it stale instead of replacing evidence with emptiness.
     pub live: tokio::sync::watch::Receiver<Option<LiveStatus>>,
     pub stale_after_secs: u64,
-    pub telemetry: Option<Arc<nats::Stats>>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -105,7 +103,6 @@ struct PlatformStatusResponse {
     status: &'static str,
     stale: bool,
     stale_after_secs: u64,
-    telemetry: serde_json::Value,
     snapshot: Option<LiveStatus>,
 }
 
@@ -116,23 +113,11 @@ async fn platform_status(State(state): State<ApiState>) -> Json<PlatformStatusRe
     let now = Utc::now().timestamp_millis();
     let snapshot = state.live.borrow().clone();
     let stale = observation_is_stale(now, snapshot.as_ref(), state.stale_after_secs);
-    let mut status = overall_status(snapshot.as_ref(), stale);
-    let telemetry = state.telemetry.as_ref().map_or_else(
-        || serde_json::json!({ "configured": false }),
-        |stats| {
-            let snapshot = stats.snapshot();
-            if status == "healthy" && !snapshot.connected {
-                status = "degraded";
-            }
-            serde_json::to_value(snapshot).unwrap_or_default()
-        },
-    );
     Json(PlatformStatusResponse {
         generated_at_ms: now,
-        status,
+        status: overall_status(snapshot.as_ref(), stale),
         stale,
         stale_after_secs: state.stale_after_secs,
-        telemetry,
         snapshot,
     })
 }
@@ -183,8 +168,7 @@ fn overall_status(snapshot: Option<&LiveStatus>, stale: bool) -> &'static str {
             if intentionally_idle {
                 continue;
             }
-            if deployment.pool.min_replicas.is_none()
-                || deployment.pool.desired_replicas.is_none()
+            if deployment.pool.min_replicas.is_none() || deployment.pool.desired_replicas.is_none()
             {
                 degraded = true;
                 continue;

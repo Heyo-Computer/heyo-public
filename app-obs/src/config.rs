@@ -47,16 +47,9 @@ pub struct Config {
     /// Credentials for app-lb when `APP_LB_ADMIN_AUTH` is on there.
     pub applb_user: Option<String>,
     pub applb_password: Option<String>,
-    /// Stable name carried in live status and NATS observations, e.g.
-    /// `stage-edge`. This identifies the collector, never an individual VM.
+    /// Stable name carried in live status, e.g. `stage-edge`. This identifies
+    /// the collector, never an individual VM.
     pub source: String,
-    /// Optional core-NATS telemetry destination. HTTP polling remains the
-    /// source of truth; NATS distributes snapshots and is never in routing.
-    pub nats_url: Option<String>,
-    pub nats_user: Option<String>,
-    pub nats_password: Option<String>,
-    pub nats_token: Option<String>,
-    pub nats_subject: String,
     /// The sandbox daemon (`heyvmd`) whose native per-sandbox log streams are
     /// tailed. Unset disables the tailer — the safe default, since a daemon
     /// predating the stream endpoint would fail every attach.
@@ -101,11 +94,6 @@ impl Default for Config {
             applb_user: None,
             applb_password: None,
             source: "app-lb".into(),
-            nats_url: None,
-            nats_user: None,
-            nats_password: None,
-            nats_token: None,
-            nats_subject: "heyo.obs.app-lb.snapshot.v1".into(),
             heyvm_url: None,
             heyvm_token: None,
             poll_interval: Duration::from_secs(10),
@@ -150,21 +138,6 @@ impl Config {
         if let Ok(v) = std::env::var("APP_OBS_SOURCE") {
             cfg.source = v;
         }
-        if let Ok(v) = std::env::var("APP_OBS_NATS_URL") {
-            cfg.nats_url = Some(v);
-        }
-        if let Ok(v) = std::env::var("APP_OBS_NATS_USER") {
-            cfg.nats_user = Some(v);
-        }
-        if let Ok(v) = std::env::var("APP_OBS_NATS_PASSWORD") {
-            cfg.nats_password = Some(v);
-        }
-        if let Ok(v) = std::env::var("APP_OBS_NATS_TOKEN") {
-            cfg.nats_token = Some(v);
-        }
-        if let Ok(v) = std::env::var("APP_OBS_NATS_SUBJECT") {
-            cfg.nats_subject = v;
-        }
         if let Ok(v) = std::env::var("HEYVM_URL") {
             cfg.heyvm_url = Some(v);
         }
@@ -195,33 +168,7 @@ impl Config {
         if let Some(v) = parse_env("APP_OBS_QUERY_TIMEOUT_SECS") {
             cfg.query_timeout = Duration::from_secs(v);
         }
-        cfg.validate_nats();
         cfg
-    }
-
-    fn validate_nats(&self) {
-        if self.nats_url.is_none()
-            && (self.nats_user.is_some()
-                || self.nats_password.is_some()
-                || self.nats_token.is_some())
-        {
-            panic!("APP_OBS_NATS_URL is required when NATS credentials are configured");
-        }
-        if self.nats_user.is_some() != self.nats_password.is_some() {
-            panic!("APP_OBS_NATS_USER and APP_OBS_NATS_PASSWORD must be set together");
-        }
-        if self.nats_token.is_some() && self.nats_user.is_some() {
-            panic!("configure either APP_OBS_NATS_TOKEN or user/password, not both");
-        }
-        if self.nats_subject.is_empty()
-            || self
-                .nats_subject
-                .split('.')
-                .any(|token| token.is_empty() || token.contains(['*', '>']))
-            || self.nats_subject.chars().any(char::is_whitespace)
-        {
-            panic!("APP_OBS_NATS_SUBJECT must be a concrete NATS subject");
-        }
     }
 }
 

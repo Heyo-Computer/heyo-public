@@ -43,14 +43,6 @@ live topology view: backend probe health, administrative drain state, in-flight
 requests, pool capacity, and whether the observation itself is stale. It does
 not query parquet, so an expensive historical query cannot make status disappear.
 
-When `APP_OBS_NATS_URL` is set, that same versioned snapshot is published over
-core NATS on `heyo.obs.app-lb.snapshot.v1` by default. NATS distributes
-observations; it never participates in request selection. app-lb's local routing
-table remains authoritative, and parquet remains the durable metrics history.
-Publication runs in a detached latest-value worker and counts a snapshot only
-after a bounded NATS flush, so a broker outage cannot stall polling or claim a
-snapshot reached the broker when it was only queued in the client.
-
 ## Where guests send logs
 
 Every microVM sits on its **own /30**: the host is at `guest_ip - 1`. There is no
@@ -163,7 +155,7 @@ The JSON behind it:
 | Endpoint | |
 | --- | --- |
 | `GET /api/fleet?window=` | One row per deployment, plus whole-host CPU and memory |
-| `GET /api/platform-status` | Current app-lb topology, health/drain state, staleness, and NATS publishing health |
+| `GET /api/platform-status` | Current app-lb topology, health/drain state, and staleness |
 | `GET /api/deployments/<id>?window=` | Bucketed series and summary figures |
 | `GET /api/deployments/<id>/logs?window=&from=&to=&level=&backend=&q=&limit=&before=` | Log lines, newest first |
 | `GET /stats` | Ingest counters, and rows still buffered in memory |
@@ -223,11 +215,7 @@ Configuration is environment-only:
 | `APP_LB_URL` | `http://127.0.0.1:9090` | app-lb admin API to poll |
 | `APP_LB_USER` | `admin` | Only used when a password is set |
 | `APP_LB_PASSWORD` | *(unset)* | Set when app-lb has `APP_LB_ADMIN_AUTH=1` |
-| `APP_OBS_SOURCE` | `app-lb` | Stable collector/edge name carried in status and NATS snapshots |
-| `APP_OBS_NATS_URL` | *(unset)* | NATS server for best-effort live snapshot distribution; unset disables publishing |
-| `APP_OBS_NATS_USER` / `APP_OBS_NATS_PASSWORD` | *(unset)* | NATS user/password; both or neither, normally injected from HeyoSecret |
-| `APP_OBS_NATS_TOKEN` | *(unset)* | NATS token alternative to user/password |
-| `APP_OBS_NATS_SUBJECT` | `heyo.obs.app-lb.snapshot.v1` | Concrete core-NATS publish subject |
+| `APP_OBS_SOURCE` | `app-lb` | Stable collector/edge name carried in status snapshots |
 | `HEYVM_URL` | *(unset)* | Sandbox daemon whose native log streams to tail (e.g. `http://127.0.0.1:34099`); **unset disables native tailing** |
 | `HEYVM_TOKEN` | *(unset)* | Bearer token for the daemon, needed when it runs with `JWT_SECRET` |
 | `APP_OBS_POLL_SECS` | `10` | Metrics poll interval |

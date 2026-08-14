@@ -111,7 +111,6 @@ jobs:
             orchestrator
             app-obs
             artifacts
-            queue-fn
 
       - name: Test platform services
         run: |
@@ -120,7 +119,6 @@ jobs:
           cargo test --locked --manifest-path orchestrator/Cargo.toml
           cargo test --locked --manifest-path app-obs/Cargo.toml
           cargo test --locked --manifest-path artifacts/Cargo.toml
-          cargo test --locked --manifest-path queue-fn/Cargo.toml
 
   app-lb:
     name: test app-lb

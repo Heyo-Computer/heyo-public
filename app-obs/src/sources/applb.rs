@@ -10,7 +10,6 @@
 
 use crate::ingest::Sink;
 use crate::sources::VmTarget;
-use crate::sources::nats::Telemetry;
 use crate::store::schema::{MetricRecord, Record};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -112,8 +111,8 @@ pub(crate) struct Histogram {
     pub p99: f64,
 }
 
-/// The current topology and gauges behind the platform status API and NATS.
-/// Historical storage remains the flattened parquet rows below.
+/// The current topology and gauges behind the platform status API. Historical
+/// storage remains the flattened parquet rows below.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct LiveStatus {
     pub schema_version: u8,
@@ -132,7 +131,6 @@ pub struct Poller {
     sink: Sink,
     source: String,
     live: tokio::sync::watch::Sender<Option<LiveStatus>>,
-    telemetry: Option<Telemetry>,
     /// Where the current VM set goes after each successful poll, for the
     /// daemon log tailer. Deliberately never cleared on a failed poll: app-lb
     /// restarting must not stop log collection from sandboxes that are still
@@ -149,7 +147,6 @@ impl Poller {
         sink: Sink,
         source: String,
         live: tokio::sync::watch::Sender<Option<LiveStatus>>,
-        telemetry: Option<Telemetry>,
         targets: Option<tokio::sync::watch::Sender<Vec<VmTarget>>>,
     ) -> Self {
         // app-lb's admin API is loopback and answers promptly or not at all; a
@@ -173,7 +170,6 @@ impl Poller {
             sink,
             source,
             live,
-            telemetry,
             targets,
         }
     }
@@ -212,10 +208,7 @@ impl Poller {
             host: snapshot.host.clone(),
             deployments: snapshot.deployments.clone(),
         };
-        self.live.send_replace(Some(live.clone()));
-        if let Some(telemetry) = &self.telemetry {
-            telemetry.publish(live);
-        }
+        self.live.send_replace(Some(live));
 
         if let Some(targets) = &self.targets {
             // send_if_modified so an unchanged fleet doesn't wake the tailer

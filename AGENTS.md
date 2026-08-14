@@ -30,7 +30,7 @@
 - test: `cargo test`
 
 ## Platform services
-- paths: `heyosecret/`, `heyosecret-client/`, `orchestrator/`, `app-lb/`, `app-obs/`, `artifacts/`, `queue-fn/`
+- paths: `heyosecret/`, `heyosecret-client/`, `orchestrator/`, `app-lb/`, `app-obs/`, `artifacts/`
 - build: `cargo build --locked --manifest-path <path>/Cargo.toml`
 - check: `cargo check --locked --manifest-path <path>/Cargo.toml`
 - test: `cargo test --locked --manifest-path <path>/Cargo.toml`
