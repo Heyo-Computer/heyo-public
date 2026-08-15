@@ -117,7 +117,7 @@ jobs:
           required = {
               "heyosecret": ["heyosecret/database-url", "heyosecret/master-key"],
               "orchestrator": ["orchestrator/database-url", "orchestrator/jwt-secret", "orchestrator/internal-api-key", "cloud/internal-api-key"],
-              "app-lb": ["app-lb/admin-password"],
+              "app-lb": ["app-lb/admin-password", "cloud/internal-api-key"],
               "app-obs": ["app-lb/admin-password", "app-obs/api-token"],
           }[target]
           generated = {
@@ -283,6 +283,15 @@ jobs:
           set -eu
           : "${APP_LB_STATE_PATH:=/workspace/state/app-lb-state.json}"
           export APP_LB_STATE_PATH
+          if [ -z "${APP_LB_DAEMON_URL:-}" ]; then
+            host_gateway="$(ip -4 route show default | awk 'NR == 1 { print $3 }')"
+            if [ -z "$host_gateway" ]; then
+              echo "cannot determine the host gateway for APP_LB_DAEMON_URL" >&2
+              exit 1
+            fi
+            APP_LB_DAEMON_URL="http://${host_gateway}:3000"
+            export APP_LB_DAEMON_URL
+          fi
           mkdir -p "$(dirname "$APP_LB_STATE_PATH")"
           state_dir="${APP_LB_STATE_PATH%.*}.d"
           if [ ! -e "$APP_LB_STATE_PATH" ] && [ ! -d "$state_dir" ]; then
@@ -341,7 +350,7 @@ jobs:
             exit 0
           fi
           python3 - <<'PY'
-          import base64, json, os, subprocess, sys, time, urllib.request, uuid
+          import base64, json, os, subprocess, sys, time, urllib.error, urllib.request, uuid
 
           def required(name):
               value = os.environ.get(name, "").strip()
@@ -387,7 +396,7 @@ jobs:
           deployment_id=f"svc-{service}-{uuid.uuid4().hex[:12]}"
           priority={"heyosecret":10010,"orchestrator":10010,"app-lb":10010,"app-obs":10010}[service]
           if service == "app-lb":
-              route={"host":f"app-lb.{public_host}","entryPoints":["websecure"],"stripPrefix":False,"passHostHeader":True,"priority":priority}
+              route={"host":f"app-lb.{public_host}","pathPrefix":"/metrics","entryPoints":["websecure"],"stripPrefix":False,"passHostHeader":True,"priority":priority}
           else:
               route={"host":public_host,"pathPrefix":f"/{service}","entryPoints":["websecure"],"stripPrefix":True,"passHostHeader":False,"priority":priority}
           if os.environ.get("HEYO_TRAEFIK_CERT_RESOLVER"): route["certResolver"]=os.environ["HEYO_TRAEFIK_CERT_RESOLVER"]
@@ -407,7 +416,7 @@ jobs:
           elif service=="app-lb":
               payload["healthPath"]="/healthz"
               payload["env"]={"APP_LB_PROXY_ADDR":"0.0.0.0:8080","APP_LB_ADMIN_ADDR":"127.0.0.1:9090","APP_LB_STATE_PATH":"/workspace/state/app-lb-state.json","APP_LB_NAME":"stage-app-lb","APP_LB_DASHBOARD_USER":"admin","APP_LB_ADMIN_AUTH":"true"}
-              payload["envRefs"]=[envref("APP_LB_DASHBOARD_PASSWORD","app-lb/admin-password")]
+              payload["envRefs"]=[envref("APP_LB_DASHBOARD_PASSWORD","app-lb/admin-password"),envref("APP_LB_DAEMON_API_KEY","cloud/internal-api-key")]
           elif service=="app-obs":
               payload["healthPath"]="/healthz"
               payload["env"]={"APP_OBS_DATA_DIR":"/workspace/data","APP_OBS_INGEST_ADDR":"127.0.0.1:9500","APP_OBS_SYSLOG_ADDR":"127.0.0.1:9514","APP_OBS_API_ADDR":"0.0.0.0:8080","APP_LB_URL":f"https://app-lb.{public_host}","APP_LB_USER":"admin","APP_OBS_SOURCE":"stage-edge"}
@@ -420,16 +429,22 @@ jobs:
           elif service=="orchestrator":
               checks=[(f"https://{public_host}/orchestrator/health",lambda b:json.loads(b).get("deploymentGitSha")==git_sha)]
           elif service=="app-lb":
-              checks=[(f"https://app-lb.{public_host}/healthz",lambda b:b.strip()=="ok")]
+              checks=[(f"https://app-lb.{public_host}/metrics",lambda _:True,401),(f"https://app-lb.{public_host}/",lambda _:True,404)]
           else:
-              checks=[(f"https://{public_host}/app-obs/healthz",lambda b:b.strip()=="ok")]
-          for url,valid in checks:
+              checks=[(f"https://{public_host}/app-obs/healthz",lambda b:b.strip()=="ok",200)]
+          if service in {"heyosecret","orchestrator"}:
+              checks=[(url,valid,200) for url,valid in checks]
+          for url,valid,expected_status in checks:
               deadline=time.monotonic()+180; last_error="not checked"
               while time.monotonic()<deadline:
                   try:
-                      with urllib.request.urlopen(url,timeout=10) as response: body=response.read().decode()
-                      if valid(body): break
-                      last_error=f"unexpected response: {body[:300]}"
+                      try:
+                          response=urllib.request.urlopen(url,timeout=10)
+                      except urllib.error.HTTPError as error:
+                          response=error
+                      with response: body=response.read().decode()
+                      if response.status==expected_status and valid(body): break
+                      last_error=f"unexpected HTTP {response.status}: {body[:300]}"
                   except Exception as error: last_error=str(error)
                   time.sleep(5)
               else:

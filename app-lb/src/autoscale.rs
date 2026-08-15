@@ -1550,7 +1550,7 @@ mod tests {
         registry.upsert(spec());
         // A daemon URL nothing listens on: fine, because the graceful and
         // not-found paths never call it.
-        let vms = VmManager::new(Some("http://127.0.0.1:1".into()));
+        let vms = VmManager::new(Some("http://127.0.0.1:1".into()), None);
         (
             Autoscaler::new(
                 registry.clone(),
