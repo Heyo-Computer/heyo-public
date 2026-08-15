@@ -62,6 +62,7 @@ Configuration is environment-only:
 | `APP_LB_GUARD_PATH` | `app-lb-guard.json` | Where [block rules](#response-actions) persist, so a restart does not unblock an attacker |
 | `APP_LB_NAME` | `app-lb` | Display name in the dashboard header and page title |
 | `APP_LB_DAEMON_URL` | `http://127.0.0.1:34099` | heyvm daemon |
+| `APP_LB_DAEMON_API_KEY` | `HEYO_API_KEY` | Bearer credential for an authenticated heyvm daemon; use the HeyoSecret-backed host internal API key in deployments |
 | `APP_LB_DASHBOARD_PASSWORD` | *(unset)* | Set to gate the dashboard behind HTTP Basic Auth |
 | `APP_LB_DASHBOARD_USER` | `admin` | Basic Auth username (only used when a password is set) |
 | `APP_LB_DASHBOARD_AUTH` | `true` | `0`/`false` to leave the dashboard view tier open while the password keeps gating the CRUD API — for when your own sign-in (e.g. Google) fronts the pages |

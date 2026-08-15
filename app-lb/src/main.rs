@@ -507,7 +507,14 @@ fn main() {
         siem.as_ref().map(|s| s.sink.clone()),
     ));
 
-    let vms = VmManager::new(cfg.daemon_url.clone());
+    let daemon_api_key = ["APP_LB_DAEMON_API_KEY", "HEYO_API_KEY"]
+        .into_iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
+        });
+    let vms = VmManager::new(cfg.daemon_url.clone(), daemon_api_key);
 
     // The static cert pair, if configured. With ACME on it is the *fallback*,
     // served for any SNI without an issued cert of its own; with ACME off it is

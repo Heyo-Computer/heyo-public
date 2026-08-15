@@ -236,20 +236,30 @@ pub struct VmManager {
 impl VmManager {
     /// Targets the local daemon (`http://127.0.0.1:34099` by default), which is
     /// the only place `guest_ip` is available.
-    pub fn new(daemon_url: Option<String>) -> Self {
+    pub fn new(daemon_url: Option<String>, api_key: Option<String>) -> Self {
         Self {
             opts: HeyoClientOptions {
                 base_url: Some(
                     daemon_url.unwrap_or_else(|| heyo_sdk::DEFAULT_LOCAL_BASE_URL.to_string()),
                 ),
-                // A same-machine daemon runs without JWT_SECRET and skips auth.
-                api_key: None,
+                api_key,
                 timeout: Some(Duration::from_secs(30)),
             },
             http: reqwest::Client::builder()
                 .timeout(GUEST_LOG_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Build a request for daemon routes not covered by the SDK. Keep this in
+    /// step with `opts.api_key`: otherwise lifecycle calls authenticate while
+    /// their failure diagnostics quietly receive 401.
+    fn daemon_get(&self, url: &str) -> reqwest::RequestBuilder {
+        let request = self.http.get(url);
+        match self.opts.api_key.as_deref() {
+            Some(api_key) => request.bearer_auth(api_key),
+            None => request,
         }
     }
 
@@ -280,7 +290,7 @@ impl VmManager {
         let base = self.opts.base_url.as_deref()?.trim_end_matches('/');
         let url = format!("{base}/sandboxes/{sandbox_id}/logs?limit={lines}");
 
-        let body: GuestLogs = match self.http.get(&url).send().await {
+        let body: GuestLogs = match self.daemon_get(&url).send().await {
             Ok(r) if r.status().is_success() => r.json().await.ok()?,
             // Both are ordinary here — an older daemon has no such route, and a
             // sandbox killed between the decision and this call is gone. Debug,
@@ -760,6 +770,43 @@ mod tests {
             guest_ip: guest_ip.map(Into::into),
             metadata: None,
         }
+    }
+
+    #[test]
+    fn daemon_api_key_authenticates_sdk_and_direct_requests() {
+        let manager = VmManager::new(
+            Some("http://host.internal:3000".into()),
+            Some("service-token".into()),
+        );
+
+        assert_eq!(manager.opts.api_key.as_deref(), Some("service-token"));
+        let request = manager
+            .daemon_get("http://host.internal:3000/sandboxes/sb-1/logs")
+            .build()
+            .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .unwrap(),
+            "Bearer service-token",
+        );
+    }
+
+    #[test]
+    fn local_unauthenticated_daemon_remains_supported() {
+        let manager = VmManager::new(Some("http://127.0.0.1:34099".into()), None);
+        let request = manager
+            .daemon_get("http://127.0.0.1:34099/sandboxes/sb-1/logs")
+            .build()
+            .unwrap();
+
+        assert!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
     }
 
     #[test]
