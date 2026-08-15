@@ -107,12 +107,12 @@ jobs:
             printf 'USE_VALIDATED_SERVICE_ARTIFACTS=1\n' >> "$GITHUB_ENV"
           fi
 
-      - name: Verify deployment secret references
+      - name: Ensure deployment secret references
         run: |
           set -eu
           [ "${SERVICE_SELECTED:-0}" = 1 ] || { echo "Target not selected."; exit 0; }
           python3 - <<'PY'
-          import json, os, urllib.error, urllib.parse, urllib.request
+          import base64, json, os, secrets, urllib.error, urllib.parse, urllib.request
           target = os.environ["TARGET_HEYO_SERVICE"]
           required = {
               "heyosecret": ["heyosecret/database-url", "heyosecret/master-key"],
@@ -120,6 +120,10 @@ jobs:
               "app-lb": ["app-lb/admin-password"],
               "app-obs": ["app-lb/admin-password", "app-obs/api-token"],
           }[target]
+          generated = {
+              "app-lb/admin-password": "Generated app-lb dashboard password",
+              "app-obs/api-token": "Generated app-obs API token",
+          }
           host = os.environ.get("HEYO_PUBLIC_HOST", "").strip()
           token = os.environ.get("HEYOSECRET_INTERNAL_API_KEY", "").strip() or os.environ.get("ORCHESTRATOR_INTERNAL_API_KEY", "").strip()
           if not host or not token:
@@ -133,6 +137,32 @@ jobs:
                   with urllib.request.urlopen(request, timeout=15) as response:
                       metadata = json.load(response)
               except urllib.error.HTTPError as error:
+                  if error.code == 404 and path in generated:
+                      value = secrets.token_urlsafe(32).encode()
+                      body = json.dumps({
+                          "path": path,
+                          "valueBase64": base64.b64encode(value).decode(),
+                          "description": generated[path],
+                          "actor": "heyo-public-service-deploy",
+                          "metadata": {"generated": True, "purpose": "service deployment credential"},
+                      }).encode()
+                      write = urllib.request.Request(
+                          f"https://{host}/heyosecret/v1/secrets/write",
+                          data=body,
+                          headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                          method="POST",
+                      )
+                      try:
+                          with urllib.request.urlopen(write, timeout=15) as response:
+                              result = json.load(response)
+                      except urllib.error.HTTPError as write_error:
+                          raise SystemExit(f"failed to provision deployment secret {path}: HTTP {write_error.code}") from write_error
+                      except (OSError, ValueError) as write_error:
+                          raise SystemExit(f"failed to provision deployment secret {path}: {write_error}") from write_error
+                      if result.get("path") != path:
+                          raise SystemExit(f"unexpected write response for deployment secret {path}")
+                      print(f"Provisioned generated deployment secret: {path}")
+                      continue
                   raise SystemExit(f"required deployment secret {path} is unavailable: HTTP {error.code}") from error
               except (OSError, ValueError) as error:
                   raise SystemExit(f"failed to verify required deployment secret {path}: {error}") from error

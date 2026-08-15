@@ -23,6 +23,9 @@ HeyoSecret and orchestrator are built, validated, and deployed from this
 repository. The repo-local Heyo workflow uses the external Heyo CICD service
 and the orchestrator API to update their stable service routes. CICD remains a
 private consumer of orchestrator and is not published from this repository.
+When `app-lb` or `app-obs` is first deployed, the workflow creates its generated
+internal credentials in HeyoSecret if they do not already exist; later deploys
+reuse the active values rather than rotating them.
 
 ## Platform services
 
