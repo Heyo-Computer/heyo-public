@@ -1675,6 +1675,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "heyctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "clap_complete",
+ "dirs",
+ "flate2",
+ "futures",
+ "libc",
+ "reqwest 0.12.28",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tar",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "ureq",
+]
+
+[[package]]
 name = "heyo-sdk"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4382,31 +4407,6 @@ checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
 dependencies = [
  "base16ct",
  "serde",
-]
-
-[[package]]
-name = "heyctl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "clap_complete",
- "dirs",
- "flate2",
- "futures",
- "libc",
- "reqwest 0.12.28",
- "rpassword",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
- "tar",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "ureq",
 ]
 
 [[package]]
