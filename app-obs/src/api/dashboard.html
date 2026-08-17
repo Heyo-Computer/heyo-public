@@ -1328,6 +1328,29 @@ $("f-range").addEventListener("click", () => {
 
 window.addEventListener("hashchange", show);
 
+// Add dedicated relative time tray for logs
+const logControls = document.querySelectorAll('.controls')[1]; // second controls div
+const relSelect = document.createElement('select');
+relSelect.id = 'f-window';
+relSelect.className = 'text';
+relSelect.setAttribute('aria-label', 'Relative time');
+relSelect.innerHTML = `
+  <option value="1h">1 hour</option>
+  <option value="6h">6 hours</option>
+  <option value="24h" selected>24 hours</option>
+  <option value="7d">7 days</option>
+  <option value="30d">30 days</option>
+`;
+logControls.insertBefore(relSelect, logControls.firstChild);
+relSelect.addEventListener('change', () => {
+  const val = relSelect.value;
+  state.window = val;
+  // Sync global window UI
+  const btn = document.getElementById('windows').querySelector(`button[data-w="${val}"]`);
+  if (btn) btn.click();
+  loadLogs(false);
+});
+
 // Charts are drawn at a measured pixel width, so a resize needs a redraw.
 let resizeTimer = null;
 window.addEventListener("resize", () => {
