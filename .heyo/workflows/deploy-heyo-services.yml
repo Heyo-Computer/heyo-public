@@ -7,6 +7,8 @@ on:
       - 'heyosecret/**'
       - 'orchestrator/**'
       - 'heyosecret-client/**'
+      - 'app-lb/**'
+      - 'app-obs/**'
       - '.heyo/workflows/deploy-heyo-services.yml'
   workflow_dispatch:
     inputs:
@@ -18,6 +20,8 @@ on:
           - all
           - heyosecret
           - orchestrator
+          - app-lb
+          - app-obs
       forceStaleDeploy:
         description: "Allow deploying a commit that is no longer current on main"
         required: false
@@ -38,6 +42,10 @@ jobs:
             paths: heyosecret
           - target: orchestrator
             paths: orchestrator|heyosecret-client
+          - target: app-lb
+            paths: app-lb
+          - target: app-obs
+            paths: app-obs
     runs-on: namespace-profile-default
     env:
       ORCHESTRATOR_URL: ${{ secrets.HEYO_ORCHESTRATOR_URL }}
@@ -72,7 +80,7 @@ jobs:
           target="${TARGET_HEYO_SERVICE:?}"
           case "$requested" in
             ""|all) ;;
-            heyosecret|orchestrator) ;;
+            heyosecret|orchestrator|app-lb|app-obs) ;;
             *) echo "Unsupported requested public service: $requested" >&2; exit 1 ;;
           esac
           if [ -n "$requested" ]; then
@@ -99,17 +107,23 @@ jobs:
             printf 'USE_VALIDATED_SERVICE_ARTIFACTS=1\n' >> "$GITHUB_ENV"
           fi
 
-      - name: Verify deployment secret references
+      - name: Ensure deployment secret references
         run: |
           set -eu
           [ "${SERVICE_SELECTED:-0}" = 1 ] || { echo "Target not selected."; exit 0; }
           python3 - <<'PY'
-          import json, os, urllib.error, urllib.parse, urllib.request
+          import base64, json, os, secrets, urllib.error, urllib.parse, urllib.request
           target = os.environ["TARGET_HEYO_SERVICE"]
           required = {
               "heyosecret": ["heyosecret/database-url", "heyosecret/master-key"],
               "orchestrator": ["orchestrator/database-url", "orchestrator/jwt-secret", "orchestrator/internal-api-key", "cloud/internal-api-key"],
+              "app-lb": ["app-lb/admin-password", "cloud/internal-api-key"],
+              "app-obs": ["app-lb/admin-password", "app-obs/api-token"],
           }[target]
+          generated = {
+              "app-lb/admin-password": "Generated app-lb dashboard password",
+              "app-obs/api-token": "Generated app-obs API token",
+          }
           host = os.environ.get("HEYO_PUBLIC_HOST", "").strip()
           token = os.environ.get("HEYOSECRET_INTERNAL_API_KEY", "").strip() or os.environ.get("ORCHESTRATOR_INTERNAL_API_KEY", "").strip()
           if not host or not token:
@@ -123,6 +137,32 @@ jobs:
                   with urllib.request.urlopen(request, timeout=15) as response:
                       metadata = json.load(response)
               except urllib.error.HTTPError as error:
+                  if error.code == 404 and path in generated:
+                      value = secrets.token_urlsafe(32).encode()
+                      body = json.dumps({
+                          "path": path,
+                          "valueBase64": base64.b64encode(value).decode(),
+                          "description": generated[path],
+                          "actor": "heyo-public-service-deploy",
+                          "metadata": {"generated": True, "purpose": "service deployment credential"},
+                      }).encode()
+                      write = urllib.request.Request(
+                          f"https://{host}/heyosecret/v1/secrets/write",
+                          data=body,
+                          headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                          method="POST",
+                      )
+                      try:
+                          with urllib.request.urlopen(write, timeout=15) as response:
+                              result = json.load(response)
+                      except urllib.error.HTTPError as write_error:
+                          raise SystemExit(f"failed to provision deployment secret {path}: HTTP {write_error.code}") from write_error
+                      except (OSError, ValueError) as write_error:
+                          raise SystemExit(f"failed to provision deployment secret {path}: {write_error}") from write_error
+                      if result.get("path") != path:
+                          raise SystemExit(f"unexpected write response for deployment secret {path}")
+                      print(f"Provisioned generated deployment secret: {path}")
+                      continue
                   raise SystemExit(f"required deployment secret {path} is unavailable: HTTP {error.code}") from error
               except (OSError, ValueError) as error:
                   raise SystemExit(f"failed to verify required deployment secret {path}: {error}") from error
@@ -162,6 +202,15 @@ jobs:
         if: ${{ env.SERVICE_SELECTED == '1' }}
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install app-lb build dependencies
+        if: ${{ env.SERVICE_SELECTED == '1' && matrix.target == 'app-lb' }}
+        run: |
+          set -eu
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y cmake libssl-dev pkg-config
+          fi
+
       - name: Test or check selected service
         run: |
           set -eu
@@ -170,6 +219,8 @@ jobs:
           case "$TARGET_HEYO_SERVICE" in
             heyosecret) cargo test --locked --manifest-path heyosecret/Cargo.toml ;;
             orchestrator) cargo check --locked --manifest-path orchestrator/Cargo.toml --bin orchestrator ;;
+            app-lb) cargo test --locked --manifest-path app-lb/Cargo.toml -p app-lb ;;
+            app-obs) cargo test --locked --manifest-path app-obs/Cargo.toml ;;
           esac
 
       - name: Build selected release binary
@@ -189,8 +240,10 @@ jobs:
           rm -rf "$package"
           mkdir -p "$package"
           cp "$service/target/release/$service" "$package/$service"
-          mkdir -p "$package/migrations"
-          cp -R "$service/migrations/." "$package/migrations/"
+          if [ -d "$service/migrations" ]; then
+            mkdir -p "$package/migrations"
+            cp -R "$service/migrations/." "$package/migrations/"
+          fi
           case "$service" in
             heyosecret) cat > "$package/start.sh" <<'EOF'
           #!/usr/bin/env sh
@@ -212,6 +265,52 @@ jobs:
           touch "$HEYO_SERVICE_LOG" 2>/dev/null || true
           exec >>"$HEYO_SERVICE_LOG" 2>&1
           exec ./orchestrator
+          EOF
+              ;;
+            app-lb)
+              cat > "$package/bootstrap-state.json" <<'EOF'
+          [
+            {
+              "id": "app-lb-admin",
+              "routes": [{"path_prefix": "/"}],
+              "upstreams": ["127.0.0.1:9090"],
+              "health": {"path": "/healthz", "timeout_secs": 2}
+            }
+          ]
+          EOF
+              cat > "$package/start.sh" <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+          : "${APP_LB_STATE_PATH:=/workspace/state/app-lb-state.json}"
+          export APP_LB_STATE_PATH
+          if [ -z "${APP_LB_DAEMON_URL:-}" ]; then
+            host_gateway="$(ip -4 route show default | awk 'NR == 1 { print $3 }')"
+            if [ -z "$host_gateway" ]; then
+              echo "cannot determine the host gateway for APP_LB_DAEMON_URL" >&2
+              exit 1
+            fi
+            APP_LB_DAEMON_URL="http://${host_gateway}:3000"
+            export APP_LB_DAEMON_URL
+          fi
+          mkdir -p "$(dirname "$APP_LB_STATE_PATH")"
+          state_dir="${APP_LB_STATE_PATH%.*}.d"
+          if [ ! -e "$APP_LB_STATE_PATH" ] && [ ! -d "$state_dir" ]; then
+            cp /workspace/bootstrap-state.json "$APP_LB_STATE_PATH"
+          fi
+          : "${HEYO_SERVICE_LOG:=/workspace/service.log}"
+          touch "$HEYO_SERVICE_LOG" 2>/dev/null || true
+          exec >>"$HEYO_SERVICE_LOG" 2>&1
+          exec ./app-lb
+          EOF
+              ;;
+            app-obs) cat > "$package/start.sh" <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+          mkdir -p "${APP_OBS_DATA_DIR:-/workspace/data}"
+          : "${HEYO_SERVICE_LOG:=/workspace/service.log}"
+          touch "$HEYO_SERVICE_LOG" 2>/dev/null || true
+          exec >>"$HEYO_SERVICE_LOG" 2>&1
+          exec ./app-obs
           EOF
               ;;
           esac
@@ -251,7 +350,7 @@ jobs:
             exit 0
           fi
           python3 - <<'PY'
-          import base64, json, os, subprocess, sys, time, urllib.request, uuid
+          import base64, json, os, subprocess, sys, time, urllib.error, urllib.request, uuid
 
           def required(name):
               value = os.environ.get(name, "").strip()
@@ -295,8 +394,11 @@ jobs:
           git_sha=subprocess.check_output(["git","rev-parse","HEAD"], text=True).strip()
           archive_name=f"heyo-{service}-linux.tar.gz"
           deployment_id=f"svc-{service}-{uuid.uuid4().hex[:12]}"
-          priority={"heyosecret":10010,"orchestrator":10010}[service]
-          route={"host":public_host,"pathPrefix":f"/{service}","entryPoints":["websecure"],"stripPrefix":True,"passHostHeader":False,"priority":priority}
+          priority={"heyosecret":10010,"orchestrator":10010,"app-lb":10010,"app-obs":10010}[service]
+          if service == "app-lb":
+              route={"host":f"app-lb.{public_host}","pathPrefix":"/metrics","entryPoints":["websecure"],"stripPrefix":False,"passHostHeader":True,"priority":priority}
+          else:
+              route={"host":public_host,"pathPrefix":f"/{service}","entryPoints":["websecure"],"stripPrefix":True,"passHostHeader":False,"priority":priority}
           if os.environ.get("HEYO_TRAEFIK_CERT_RESOLVER"): route["certResolver"]=os.environ["HEYO_TRAEFIK_CERT_RESOLVER"]
           payload={"serviceId":service,"deploymentId":deployment_id,"userId":os.environ.get("HEYO_SERVICE_USER_ID","heyo-system"),"accountId":os.environ.get("HEYO_SERVICE_ACCOUNT_ID","heyo-system"),"name":f"heyo-{service}","archiveName":archive_name,"archiveBytesBase64":base64.b64encode(open(f"dist/{archive_name}","rb").read()).decode(),"region":os.environ.get("HEYO_SERVICE_REGION") or "EU","driver":os.environ.get("HEYO_SERVICE_DRIVER") or "libvirt","image":os.environ.get("HEYO_SERVICE_IMAGE") or "ubuntu:24.04","ports":[8080],"workingDirectory":"/workspace","startCommand":"./start.sh","sizeClass":os.environ.get("HEYO_SERVICE_SIZE_CLASS","small"),"ttlSeconds":0,"healthPath":"/health","healthTimeoutSeconds":900,"drainSeconds":30,"retirePrevious":True,"retirePreviousAsync":True,"deletePrevious":True,"metadata":{"gitSha":git_sha,"gitRef":os.environ.get("GITHUB_REF", ""),"repositoryUrl":repo,"workflow":"Deploy Heyo public services"},"revisionGuard":{"repositoryUrl":repo,"ref":required("CI_REF"),"expectedSha":required("CI_AFTER"),"force":os.environ.get("FORCE_STALE_SERVICE_DEPLOY","").lower() in {"1","true"}},"env":{},"envRefs":[],"route":route}
           if service=="heyosecret":
@@ -311,22 +413,41 @@ jobs:
               for name in ["ORCHESTRATOR_BACKEND_API_URL", "ORCHESTRATOR_TARGET_OS", "ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS", "ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS"]:
                   if os.environ.get(name): payload["env"][name]=os.environ[name]
               payload["envRefs"]=[envref("DATABASE_URL","orchestrator/database-url"),envref("ORCHESTRATOR_DATABASE_URL","orchestrator/database-url"),envref("JWT_SECRET","orchestrator/jwt-secret"),envref("ORCHESTRATOR_JWT_SECRET","orchestrator/jwt-secret"),envref("ORCHESTRATOR_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("HEYOSECRET_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("ORCHESTRATOR_HEYOSECRET_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("CLOUD_INTERNAL_API_KEY","cloud/internal-api-key")]
+          elif service=="app-lb":
+              payload["healthPath"]="/healthz"
+              payload["env"]={"APP_LB_PROXY_ADDR":"0.0.0.0:8080","APP_LB_ADMIN_ADDR":"127.0.0.1:9090","APP_LB_STATE_PATH":"/workspace/state/app-lb-state.json","APP_LB_NAME":"stage-app-lb","APP_LB_DASHBOARD_USER":"admin","APP_LB_ADMIN_AUTH":"true"}
+              payload["envRefs"]=[envref("APP_LB_DASHBOARD_PASSWORD","app-lb/admin-password"),envref("APP_LB_DAEMON_API_KEY","cloud/internal-api-key")]
+          elif service=="app-obs":
+              payload["healthPath"]="/healthz"
+              payload["env"]={"APP_OBS_DATA_DIR":"/workspace/data","APP_OBS_INGEST_ADDR":"127.0.0.1:9500","APP_OBS_SYSLOG_ADDR":"127.0.0.1:9514","APP_OBS_API_ADDR":"0.0.0.0:8080","APP_LB_URL":f"https://app-lb.{public_host}","APP_LB_USER":"admin","APP_OBS_SOURCE":"stage-edge"}
+              payload["envRefs"]=[envref("APP_LB_PASSWORD","app-lb/admin-password"),envref("APP_OBS_API_TOKEN","app-obs/api-token")]
           print("::heyo-cleanup-target::"+json.dumps({"deploymentId":deployment_id,"serviceId":service,"name":f"heyo-{service}","resourceType":"service-candidate","reason":f"{service} deploy failed before the candidate became active"}), flush=True)
           deploy(endpoint,key,payload)
 
           if service=="heyosecret":
               checks=[(f"https://{public_host}/heyosecret/health",lambda b:json.loads(b).get("status")=="ok"),(f"https://{public_host}/heyosecret/dashboard/api/session",lambda b:"dashboardEnabled" in json.loads(b))]
-          else: checks=[(f"https://{public_host}/orchestrator/health",lambda b:json.loads(b).get("deploymentGitSha")==git_sha)]
-          for url,valid in checks:
+          elif service=="orchestrator":
+              checks=[(f"https://{public_host}/orchestrator/health",lambda b:json.loads(b).get("deploymentGitSha")==git_sha)]
+          elif service=="app-lb":
+              checks=[(f"https://app-lb.{public_host}/metrics",lambda _:True,401),(f"https://app-lb.{public_host}/",lambda _:True,404)]
+          else:
+              checks=[(f"https://{public_host}/app-obs/healthz",lambda b:b.strip()=="ok",200)]
+          if service in {"heyosecret","orchestrator"}:
+              checks=[(url,valid,200) for url,valid in checks]
+          for url,valid,expected_status in checks:
               deadline=time.monotonic()+180; last_error="not checked"
               while time.monotonic()<deadline:
                   try:
-                      with urllib.request.urlopen(url,timeout=10) as response: body=response.read().decode()
-                      if valid(body): break
-                      last_error=f"unexpected response: {body[:300]}"
+                      try:
+                          response=urllib.request.urlopen(url,timeout=10)
+                      except urllib.error.HTTPError as error:
+                          response=error
+                      with response: body=response.read().decode()
+                      if response.status==expected_status and valid(body): break
+                      last_error=f"unexpected HTTP {response.status}: {body[:300]}"
                   except Exception as error: last_error=str(error)
                   time.sleep(5)
               else:
                   raise SystemExit(f"public {service} verification failed for {url}: {last_error}")
-          print(f"{service} {git_sha} is healthy at https://{public_host}/{service}/health")
+          print(f"{service} {git_sha} passed public health verification")
           PY

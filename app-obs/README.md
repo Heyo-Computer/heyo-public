@@ -214,6 +214,7 @@ Configuration is environment-only:
 | `APP_OBS_INGEST_ADDR` | `0.0.0.0:9500` | HTTP ingest; must be reachable from every tap gateway |
 | `APP_OBS_SYSLOG_ADDR` | `0.0.0.0:9514` | Syslog, UDP and TCP |
 | `APP_OBS_API_ADDR` | `127.0.0.1:9600` | Query API and dashboard |
+| `APP_OBS_API_TOKEN` | *(unset)* | Bearer token for dashboard/query routes; `/healthz` stays open |
 | `APP_OBS_INGEST_TOKEN` | *(unset)* | Bearer token for `/ingest`; **unset leaves ingest open** |
 | `APP_LB_URL` | `http://127.0.0.1:9090` | app-lb admin API to poll |
 | `APP_LB_USER` | `admin` | Only used when a password is set |
@@ -250,6 +251,12 @@ Keep `APP_OBS_API_ADDR` on loopback so the only external path to it is through
 app-lb, and note that the **ingest** listener is deliberately not fronted by
 app-lb — guests reach it directly on the tap network.
 
+For a direct orchestrator-managed API route, set `APP_OBS_API_TOKEN` and send it
+as `Authorization: Bearer <token>`. The query API and dashboard document then
+require the token while `/healthz` stays open for service readiness probes. A
+normal browser navigation cannot attach that header, so keep using app-lb's auth
+gate for an interactive dashboard.
+
 ### The dashboard is only as private as its `auth` block
 
 Loopback is not the gate. app-lb proxies this whole hostname, and **a proxied
@@ -272,8 +279,9 @@ Fill in the client id, store the secret (`heyctl create secret google
 [app-lb's Google sign-in](../app-lb/README.md#google-sign-in) for the full set of
 options; `/healthz` stays public so the health probe still passes.
 
-app-obs itself contains no authentication code. The gate runs in the proxy, ahead
-of any backend, so a second one here would only be a second thing to get wrong.
+The app-lb gate remains the interactive authentication layer. app-obs's optional
+bearer token is for direct machine-to-machine routes, such as Cloud's platform
+status proxy, rather than a replacement browser login flow.
 
 ## Building
 
