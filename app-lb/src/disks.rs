@@ -1973,6 +1973,37 @@ fn remove_all(cfg: &DiskConfig, sandbox_id: &str) -> (Vec<String>, Vec<String>) 
     (removed, failed)
 }
 
+/// Reclaim everything belonging to a sandbox whose boot never finished.
+///
+/// The give-up-path counterpart of [`discard_rootfs`], and the more aggressive
+/// of the two: this removes the `/workspace` data disk as well, which
+/// [`discard_rootfs`] deliberately preserves. That is safe *only* under the
+/// condition the caller is required to establish — that the sandbox was created
+/// for this boot and never became healthy — because then its data disk was
+/// `fallocate`d minutes ago and holds nothing but what the guest wrote while
+/// failing. A resumed replica fails that condition and must never be passed
+/// here; see [`BootOrigin`](crate::deployment::BootOrigin).
+///
+/// Without this, a deployment that can never boot — a bad `start_command`, an
+/// image with no server in it — leaves a full set of disks per attempt. At
+/// `disk_size_gb: 60` and a preallocated data disk that is 60 GB per failed
+/// boot, held until the seven-day sweep, on a host that is still trying.
+///
+/// Ordering matters and belongs to the caller: the VM must be gone before this
+/// runs, or the disks are pulled out from under a live hypervisor.
+///
+/// Best-effort and non-fatal, like every other reclamation path here. The
+/// returned `(removed, failed)` are paths, for the log line the caller writes.
+pub fn discard_failed_boot(cfg: &DiskConfig, sandbox_id: &str) -> (Vec<String>, Vec<String>) {
+    if !valid_sandbox_id(sandbox_id) {
+        return (
+            Vec::new(),
+            vec![format!("{sandbox_id:?} is not a sandbox id")],
+        );
+    }
+    remove_all(cfg, sandbox_id)
+}
+
 /// Remove only the rootfs copies of one sandbox, leaving everything else.
 ///
 /// The suspend-path counterpart of [`remove_all`], for the autoscaler: a
@@ -2349,6 +2380,52 @@ mod tests {
             // The id joins paths, so the same charset rule as every other entry
             // point; refused ids remove nothing.
             let (removed, failed) = discard_rootfs(&cfg, "../etc");
+            assert!(removed.is_empty());
+            assert_eq!(failed.len(), 1);
+        }
+
+        /// The give-up path is the opposite bargain from the suspend path: a VM
+        /// that never came up has no state worth keeping, so the data disk goes
+        /// too. This is the assertion that separates the two functions, and the
+        /// one that would make a wrong call expensive — `discard_failed_boot`
+        /// running where `discard_rootfs` belonged is the data loss `retain`
+        /// exists to prevent, which is why the origin gate lives in the caller.
+        #[test]
+        fn discard_failed_boot_takes_the_data_disk_too() {
+            let root = scratch("failed-boot");
+            let cfg = cfg_at(&root);
+            std::fs::create_dir_all(&cfg.tmp_dir).unwrap();
+            write(&cfg.data_dir.join("kvm/sb-1/rootfs.ext4"), 64);
+            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
+            write(&cfg.data_dir.join("run/sb-1/snapshot/mem"), 32);
+            write(&cfg.tmp_dir.join("firecracker-sb-1-rootfs.ext4"), 32);
+            // The neighbour whose id shares a prefix — the case a `starts_with`
+            // match would eat.
+            write(&cfg.data_dir.join("run/sb-12/data.ext4"), 32);
+            write(&cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4"), 32);
+
+            let (removed, failed) = discard_failed_boot(&cfg, "sb-1");
+            assert!(failed.is_empty(), "{failed:?}");
+            assert!(!removed.is_empty(), "{removed:?}");
+
+            // Gone: both per-sandbox directories, wholesale, plus the scratch.
+            assert!(!cfg.data_dir.join("run/sb-1").exists(), "the data disk is the point");
+            assert!(!cfg.data_dir.join("kvm/sb-1").exists());
+            assert!(!cfg.tmp_dir.join("firecracker-sb-1-rootfs.ext4").exists());
+
+            // Untouched: the neighbour, in both roots.
+            assert!(cfg.data_dir.join("run/sb-12/data.ext4").exists());
+            assert!(cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4").exists());
+
+            // Reclaiming twice is a no-op: the daemon's own delete may already
+            // have removed all of this, and racing it is not a failure.
+            let (removed, failed) = discard_failed_boot(&cfg, "sb-1");
+            assert!(removed.is_empty() && failed.is_empty(), "{removed:?} {failed:?}");
+
+            // Same charset rule as every other entry point that joins an id to a
+            // path — and it is checked *before* `remove_all`, whose debug assert
+            // would otherwise be the only thing standing in the way.
+            let (removed, failed) = discard_failed_boot(&cfg, "../etc");
             assert!(removed.is_empty());
             assert_eq!(failed.len(), 1);
         }

@@ -9,7 +9,7 @@
 //! never stall request handling.
 
 use crate::config::IdleAction;
-use crate::deployment::{Deployment, PendingVm, VmBackend, now_secs};
+use crate::deployment::{BootOrigin, Deployment, PendingVm, VmBackend, now_secs};
 use crate::health;
 use crate::metrics::Metrics;
 use crate::registry::Registry;
@@ -490,7 +490,10 @@ impl Autoscaler {
         let boot_timeout = d.spec.scaling.boot_timeout_secs;
         let mut still_pending = Vec::new();
         let mut promoted = Vec::new();
-        let mut doomed = Vec::new();
+        // Paired with the origin, because by the time these are killed the
+        // `PendingVm` that knew where each came from is gone — `set_pending`
+        // below keeps only what is still booting.
+        let mut doomed: Vec<(String, BootOrigin)> = Vec::new();
         // Sandbox ids of the promoted VMs, for the post-publish ownership check:
         // the probes below are awaits, so this deployment can be replaced while
         // they run, and a VM promoted onto a dropped object is unreachable.
@@ -504,6 +507,21 @@ impl Autoscaler {
                     age_secs = p.age_secs(),
                     "pending VM vanished from the daemon",
                 );
+                // Dropped from tracking here and never killed, because there is
+                // nothing left to kill — the daemon has no record of it. That is
+                // precisely the case that leaves disks nothing will ever
+                // reclaim: `destroy()` cleans up on delete, and no delete is
+                // coming for a sandbox the daemon has already forgotten.
+                //
+                // Safe to unlink without the kill the doomed path insists on,
+                // for the same reason `disks` refuses to classify anything as
+                // orphaned on a failed listing: `reconcile` returns early when
+                // `vms.list()` errors, so `fleet` is only ever a listing that
+                // *succeeded*, and an id absent from one is an id no hypervisor
+                // is running. The origin gate covers the rest — a `Created`
+                // sandbox never served, so there is no retained `/workspace`
+                // here to lose either way.
+                self.discard_failed_boot_of(d, &p.sandbox_id, p.origin).await;
                 continue;
             };
             let age = p.age_secs();
@@ -528,7 +546,7 @@ impl Autoscaler {
                         format!("gave up on VM {} after {age}s: {e}", p.sandbox_id),
                         now_secs(),
                     );
-                    doomed.push(p.sandbox_id.clone());
+                    doomed.push((p.sandbox_id.clone(), p.origin));
                     continue;
                 }
             };
@@ -587,7 +605,7 @@ impl Autoscaler {
                     ),
                     now_secs(),
                 );
-                doomed.push(p.sandbox_id.clone());
+                doomed.push((p.sandbox_id.clone(), p.origin));
                 continue;
             }
             still_pending.push(self.note_boot_progress(d, p, info, age));
@@ -630,9 +648,26 @@ impl Autoscaler {
             );
         }
 
-        for id in doomed {
-            if let Err(e) = self.vms.kill(&id).await {
-                tracing::warn!(sandbox = %id, error = %e, "failed to kill doomed VM");
+        for (id, origin) in doomed {
+            match self.vms.kill(&id).await {
+                // The kill is what makes reclamation safe: the disks below are
+                // only unlinked once the daemon says the hypervisor holding
+                // them is gone.
+                Ok(()) => self.discard_failed_boot_of(d, &id, origin).await,
+                Err(e) => {
+                    // Deliberately no reclamation on this path. The VM may well
+                    // still be running — a timed-out or refused delete says
+                    // nothing either way — and unlinking a live Firecracker's
+                    // backing files is worse than the leak. The disk sweep is
+                    // the backstop, and it is safe there because it re-checks
+                    // the fleet listing first.
+                    tracing::warn!(
+                        sandbox = %id,
+                        error = %e,
+                        "failed to kill doomed VM; leaving its disks for the sweep rather \
+                         than unlinking them under a VM that may still be running",
+                    );
+                }
             }
         }
 
@@ -727,7 +762,10 @@ impl Autoscaler {
                             "resumed suspended VM",
                         );
                         created.push(sandbox_id.clone());
-                        pending.push(PendingVm::new(sandbox_id));
+                        // `resumed`, not `new`: this sandbox's data disk is the
+                        // deployment's retained state, so if the boot never
+                        // finishes the give-up path must not reclaim it.
+                        pending.push(PendingVm::resumed(sandbox_id));
                         continue;
                     }
                     Err(e) => {
@@ -761,6 +799,20 @@ impl Autoscaler {
                         format!("{}: VM create failed", d.spec.id),
                         format!("the VM daemon refused to create a VM: {e}"),
                         now_secs(),
+                    );
+                    // The same embargo a failed *boot* earns, for the same
+                    // reason. `break` alone only ends this tick, and the next
+                    // one is 2s away: a daemon that is down, out of disk or
+                    // rejecting this spec turns into a create attempt every 2s
+                    // for as long as it stays broken, each one logged and fed.
+                    // A refused create is also the cheapest failure to repeat,
+                    // which is exactly why it needs the embargo the most.
+                    let (failures, delay) = d.note_boot_failure(now_secs());
+                    tracing::warn!(
+                        deployment = %d.spec.id,
+                        consecutive_failures = failures,
+                        backoff_secs = delay,
+                        "backing off VM creation after a refused create",
                     );
                     break; // daemon is unhappy; don't hammer it this tick
                 }
@@ -914,6 +966,67 @@ impl Autoscaler {
                 detail = %failed.join("; "),
                 "could not discard a suspended VM's rootfs copy; it stays until the \
                  sandbox is resumed or purged",
+            );
+        }
+    }
+
+    /// Reclaim the disks of a VM the pool has given up on.
+    ///
+    /// The counterpart of [`discard_rootfs_of`](Self::discard_rootfs_of) for
+    /// boots that never finished, and the reason [`BootOrigin`] exists: this
+    /// takes the `/workspace` data disk too, so it runs for
+    /// [`BootOrigin::Created`] only. A resumed replica is returned to the
+    /// caller untouched — its data disk is the state the pool suspended it to
+    /// keep, and a resume can fail for reasons that have nothing to do with
+    /// what is on it (a daemon restart, a full host, a transient refusal).
+    ///
+    /// What this fixes: a deployment that cannot boot used to kill each failed
+    /// VM and move on, and every attempt left a rootfs copy and a data disk
+    /// behind. With `disk_size_gb: 60` and a preallocated data disk, a guest
+    /// whose `start_command` does not exist bought 60 GB per attempt until the
+    /// seven-day sweep — while the backoff below kept it attempting.
+    ///
+    /// Best-effort by design: a failure here leaves exactly what was left
+    /// before this existed, and [`DiskStore::sweep`](crate::disks::DiskStore)
+    /// still catches it later.
+    async fn discard_failed_boot_of(
+        &self,
+        d: &Arc<Deployment>,
+        sandbox_id: &str,
+        origin: BootOrigin,
+    ) {
+        if origin != BootOrigin::Created {
+            tracing::info!(
+                deployment = %d.spec.id,
+                sandbox = %sandbox_id,
+                "keeping the disks of a resumed replica that failed to come up; its \
+                 /workspace is the deployment's retained state",
+            );
+            return;
+        }
+        let Some(cfg) = self.disk_cfg.clone() else {
+            return;
+        };
+        let id = sandbox_id.to_string();
+        let (removed, failed) =
+            tokio::task::spawn_blocking(move || crate::disks::discard_failed_boot(&cfg, &id))
+                .await
+                .unwrap_or_else(|e| (Vec::new(), vec![format!("discard task failed: {e}")]));
+        if !removed.is_empty() {
+            tracing::info!(
+                deployment = %d.spec.id,
+                sandbox = %sandbox_id,
+                removed = removed.len(),
+                "reclaimed the disks of a VM that never came up",
+            );
+        }
+        if !failed.is_empty() {
+            tracing::warn!(
+                deployment = %d.spec.id,
+                sandbox = %sandbox_id,
+                detail = %failed.join("; "),
+                "could not reclaim the disks of a VM that never came up; they stay until \
+                 the disk sweep reclaims them",
             );
         }
     }

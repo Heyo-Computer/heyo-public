@@ -3929,7 +3929,7 @@ mod tests {
                 sandbox_id: id.into(),
                 created_at,
                 status,
-                reported_at_secs: 0,
+                ..PendingVm::new(id.into())
             }
         }
 

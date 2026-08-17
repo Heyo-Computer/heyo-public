@@ -202,6 +202,29 @@ impl VmBackend {
     }
 }
 
+/// Where a pending VM came from, and therefore what may be deleted if its boot
+/// never finishes.
+///
+/// The whole point of the distinction is disk reclamation. A boot that fails
+/// leaves per-sandbox disks behind, and whether they are disposable is not a
+/// property of the failure — it is a property of where the sandbox came from.
+/// Guessing wrong in one direction leaks gigabytes; guessing wrong in the other
+/// destroys a deployment's retained state, so the origin is recorded at the
+/// moment it is known rather than inferred later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootOrigin {
+    /// `VmManager::create` made this sandbox for this boot. Nothing has ever
+    /// served from it and no earlier replica is hiding inside it: its
+    /// `/workspace` holds only whatever the guest managed to write on the way
+    /// to failing. Disks are disposable.
+    Created,
+    /// A suspended replica the pool resumed. Its `/workspace` *is* the
+    /// deployment's retained state — the reason `take_suspended` prefers it
+    /// over a fresh boot — so a failed resume must leave every disk alone and
+    /// let the sweep or an operator decide.
+    Resumed,
+}
+
 /// A VM that has been created but is not yet serving.
 ///
 /// The two progress fields exist because a boot that never finishes is otherwise
@@ -221,15 +244,30 @@ pub struct PendingVm {
     /// Age in seconds at which this VM's progress was last logged. Bounds the
     /// heartbeat: a pool of stuck VMs must not write a line per VM per 2s tick.
     pub reported_at_secs: u64,
+    /// Fresh boot or resumed replica. See [`BootOrigin`]; read only by the
+    /// autoscaler's give-up path, to decide whether the disks may be reclaimed.
+    pub origin: BootOrigin,
 }
 
 impl PendingVm {
+    /// A freshly created sandbox. The common case, and the one whose disks a
+    /// failed boot may reclaim.
     pub fn new(sandbox_id: String) -> Self {
         Self {
             sandbox_id,
             created_at: now_secs(),
             status: None,
             reported_at_secs: 0,
+            origin: BootOrigin::Created,
+        }
+    }
+
+    /// A suspended replica being woken up, whose data disk carries state from
+    /// before it was suspended and must outlive a failed resume.
+    pub fn resumed(sandbox_id: String) -> Self {
+        Self {
+            origin: BootOrigin::Resumed,
+            ..Self::new(sandbox_id)
         }
     }
 
@@ -978,6 +1016,31 @@ mod tests {
         assert_eq!(boot_backoff_secs(8), 3600, "capped, not 3840");
         // A streak long enough to overflow the shift must still cap cleanly.
         assert_eq!(boot_backoff_secs(1000), 3600);
+    }
+
+    /// The origin is what stands between a failed resume and the deletion of a
+    /// deployment's retained `/workspace`, so it is asserted at the constructors
+    /// rather than trusted: `new` is the disposable case and `resumed` is not,
+    /// and a default that silently drifted to `Created` would be invisible until
+    /// it took somebody's data disk.
+    #[test]
+    fn a_pending_vm_records_whether_its_disks_are_disposable() {
+        assert_eq!(
+            PendingVm::new("sb-1".into()).origin,
+            BootOrigin::Created,
+            "a fresh create has nothing worth keeping",
+        );
+        assert_eq!(
+            PendingVm::resumed("sb-1".into()).origin,
+            BootOrigin::Resumed,
+            "a resumed replica's data disk is the state it was suspended to keep",
+        );
+        // `resumed` builds on `new`, so guard the rest of the fields against a
+        // future edit to either constructor.
+        let r = PendingVm::resumed("sb-1".into());
+        assert_eq!(r.sandbox_id, "sb-1");
+        assert_eq!(r.status, None);
+        assert_eq!(r.reported_at_secs, 0);
     }
 
     #[test]
