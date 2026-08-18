@@ -68,15 +68,20 @@ fi
 sandboxes=$(curl -fsS --max-time 30 "$HEYVMD/deployed-sandboxes") \
     || { echo "cannot list $HEYVMD/deployed-sandboxes — daemon down?" >&2; exit 1; }
 
-# Registry-bound ids (column 2), the ownership whitelist.
-bound=$(cut -f2 "$REGISTRY_TSV" | sort -u | jq -R . | jq -s .)
+# Registry-bound ids (column 2), the ownership whitelist. Passed as a file:
+# a production registry has thousands of rows, and pushing the list through
+# --argjson means argv, which E2BIGs ("Argument list too long").
+bound_file=$(mktemp)
+trap 'rm -f "$bound_file"' EXIT
+cut -f2 "$REGISTRY_TSV" | sort -u > "$bound_file"
 
 now=$(date +%s)
 candidates=$(jq -r \
-    --argjson bound "$bound" \
+    --rawfile bound_raw "$bound_file" \
     --argjson now "$now" \
     --argjson min_age "$MIN_AGE_SECS" \
     --argjson stopped "$([[ "$INCLUDE_STOPPED" == 1 ]] && echo true || echo false)" '
+    ($bound_raw | split("\n") | map(select(. != ""))) as $bound |
     def age:
         # Older of uptime and time-since-status-change. The async-create
         # trackers stamp status_changed_at with "now" on every listing, so
