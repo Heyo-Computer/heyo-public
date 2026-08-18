@@ -913,10 +913,14 @@ impl SchemaRegistry {
             self.cfg.warm_spares.min(crate::spares::MAX_SPARES)
         );
         let registry = self.clone();
-        tokio::spawn(supervise(
+        // Claiming (or failure-killing) a spare pokes the wake handle, so the
+        // deficit is rebuilt immediately rather than on the next tick.
+        let wake = pool.replenish_wake();
+        tokio::spawn(supervise_with_wake(
             "warm-spares",
             Duration::from_secs(15),
             Duration::from_secs(60),
+            Some(wake),
             move || {
                 let registry = registry.clone();
                 let pool = pool.clone();
@@ -2810,6 +2814,24 @@ async fn supervise<F, Fut>(
     name: &'static str,
     first_delay: Duration,
     tick: Duration,
+    make_pass: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = usize> + Send + 'static,
+{
+    supervise_with_wake(name, first_delay, tick, None, make_pass).await
+}
+
+/// [`supervise`] with an optional early-wake handle: a `notify_one` on `wake`
+/// ends the current inter-pass wait immediately (or, if it lands mid-pass,
+/// the next one — `Notify` stores the permit). Passes stay serialized through
+/// this single loop, so an early wake can never race a tick into concurrent
+/// passes.
+async fn supervise_with_wake<F, Fut>(
+    name: &'static str,
+    first_delay: Duration,
+    tick: Duration,
+    wake: Option<Arc<tokio::sync::Notify>>,
     mut make_pass: F,
 ) where
     F: FnMut() -> Fut,
@@ -2819,7 +2841,16 @@ async fn supervise<F, Fut>(
     let mut actions: u64 = 0;
     let mut last_beat: Option<Instant> = None;
     loop {
-        tokio::time::sleep(if passes == 0 { first_delay } else { tick }).await;
+        let delay = if passes == 0 { first_delay } else { tick };
+        match &wake {
+            Some(n) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = n.notified() => {}
+                }
+            }
+            None => tokio::time::sleep(delay).await,
+        }
         passes += 1;
         let started = Instant::now();
         match tokio::spawn(make_pass()).await {

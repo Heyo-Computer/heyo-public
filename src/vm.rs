@@ -156,7 +156,14 @@ async fn admission_slot(schema: &str) -> Option<SemaphorePermit<'static>> {
 }
 
 /// How often [`wait_ready`] re-asks the daemon for a pending VM's status.
-const READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Fast while the VM is young: the per-id endpoint is a cheap lookup, and a
+/// Firecracker boot can be ready in low single-digit seconds, so coarse
+/// polling here is pure added latency against the upstream caller's deadline.
+/// After [`READY_POLL_FAST_WINDOW`] the build is slow anyway — back off so a
+/// long provision doesn't hammer the daemon for minutes.
+const READY_POLL_FAST_INTERVAL: Duration = Duration::from_millis(250);
+const READY_POLL_SLOW_INTERVAL: Duration = Duration::from_secs(2);
+const READY_POLL_FAST_WINDOW: Duration = Duration::from_secs(15);
 
 /// Pooler-side readiness wait: poll the *per-id* `GET /deployed-sandboxes/:id`
 /// until the sandbox leaves `provisioning`, tolerating transient daemon
@@ -173,7 +180,8 @@ const READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// deadline passes.
 pub(crate) async fn wait_ready(sandbox: &Sandbox, timeout: Duration, name: &str) -> Result<()> {
     use heyo_sdk::SandboxStatus;
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     let mut last_err: Option<HeyoError> = None;
     let mut error_streak = 0u32;
     loop {
@@ -222,7 +230,12 @@ pub(crate) async fn wait_ready(sandbox: &Sandbox, timeout: Duration, name: &str)
                 ),
             }
         }
-        sleep(READY_POLL_INTERVAL).await;
+        let interval = if started.elapsed() < READY_POLL_FAST_WINDOW {
+            READY_POLL_FAST_INTERVAL
+        } else {
+            READY_POLL_SLOW_INTERVAL
+        };
+        sleep(interval).await;
     }
 }
 

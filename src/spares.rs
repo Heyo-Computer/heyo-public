@@ -25,10 +25,11 @@
 //! adopts surviving spares after a pooler restart.
 
 use std::collections::HashSet;
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use heyo_sdk::{Sandbox, SandboxStatus};
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -52,6 +53,11 @@ pub struct SparePool {
     /// spare — its state is ambiguous after a partial claim, so it must never
     /// return to the pool.
     claimed: StdMutex<HashSet<String>>,
+    /// Poked whenever the pool shrinks (a spare claimed, or a failed claim
+    /// killed) so the replenisher rebuilds the deficit immediately instead of
+    /// on its next tick — a claimed spare must not leave the pool short for
+    /// up to a full tick during exactly the burst that is draining it.
+    poke: Arc<Notify>,
 }
 
 impl SparePool {
@@ -59,7 +65,15 @@ impl SparePool {
         Self {
             target: target.min(MAX_SPARES),
             claimed: StdMutex::new(HashSet::new()),
+            poke: Arc::new(Notify::new()),
         }
+    }
+
+    /// Handle the replenisher's supervisor selects on alongside its tick.
+    /// `notify_one` stores a permit when nobody is waiting, so a poke landing
+    /// mid-pass wakes the next wait instead of being lost.
+    pub fn replenish_wake(&self) -> Arc<Notify> {
+        self.poke.clone()
     }
 
     /// Snapshot of the ids this process has claimed (or is mid-claim on) —
@@ -99,7 +113,10 @@ impl SparePool {
             id
         };
         match Sandbox::connect(id.clone(), vm::local_opts()) {
-            Ok(sb) => Some(sb),
+            Ok(sb) => {
+                self.poke.notify_one();
+                Some(sb)
+            }
             Err(e) => {
                 warn!("connecting to claimed warm spare {id} failed: {e:#}");
                 self.claimed.lock().unwrap().remove(&id);
@@ -124,6 +141,7 @@ impl SparePool {
             Ok(sb) => match sb.kill().await {
                 Ok(()) => {
                     self.claimed.lock().unwrap().remove(id);
+                    self.poke.notify_one();
                     info!("warm-spares: killed spare {id} after a failed bring-up (claim released)");
                 }
                 Err(e) => warn!(
