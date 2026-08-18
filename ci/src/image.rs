@@ -17,7 +17,7 @@
 //!   to `/etc/profile.d` by a `RUN` (steps run under `sh -lc`, which reads it).
 //! - **The VM boots `init=/init.sh`** and must print `HEYVM_READY`. An image
 //!   without an init script builds fine and then fails every boot; see
-//!   `deploy/image/init.sh` for the contract.
+//!   `.ci/image/ci/init.sh` for the contract.
 //!
 //! ## The name is the cache key
 //!

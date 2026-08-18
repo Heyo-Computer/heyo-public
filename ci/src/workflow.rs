@@ -856,12 +856,19 @@ jobs:
     /// real thing: they are submitted to a live orchestrator, where a typo is a
     /// rejected submit somebody is waiting on rather than a compile error — and
     /// `deny_unknown_fields` means a misspelling like `stpes:` is a hard parse
-    /// failure. This repository also builds itself, so its own workflow being
-    /// wrong breaks its own CI. Reading them here moves that failure into
+    /// failure. This crate also builds itself, so its own workflow being wrong
+    /// breaks its own CI. Reading them here moves that failure into
     /// `cargo test`, where it costs seconds.
+    ///
+    /// Resolved from `CARGO_MANIFEST_DIR` rather than the working directory,
+    /// and one level up from it: since the subtree merge this crate is `ci/`
+    /// inside the monorepo, while the workflows it must satisfy live at the
+    /// repository root, which is the only place `ci` reads them from. So this
+    /// now checks every workflow here — `apps.yml` and `codegraph.yml` as well
+    /// as this crate's own — which is strictly more than it covered before.
     #[test]
     fn this_repositorys_own_workflows_parse_and_plan() {
-        let dir = std::path::Path::new(".ci/workflows");
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.ci/workflows"));
         let mut checked = 0;
         for entry in std::fs::read_dir(dir)
             .expect(".ci/workflows exists")
@@ -1476,15 +1483,19 @@ jobs:
 mod repo_workflow {
     use super::*;
 
-    /// This repository's own `.ci/workflows/build.yml` must parse and plan.
+    /// This crate's own `.ci/workflows/ci.yml` must parse and plan.
     ///
     /// It is the worked example the README points at, so a change that breaks
-    /// it breaks the documentation too — and it is the one workflow file that
-    /// ships in this repository, which makes it the only one a test can check
-    /// without inventing a fixture.
+    /// it breaks the documentation too — and it is the workflow that builds
+    /// this binary, so breaking it breaks the only route by which a fix for
+    /// breaking it can ship.
+    ///
+    /// Named `ci.yml` at the repository root, not `build.yml` beside this
+    /// crate: the subtree merge moved it there, because that is the one
+    /// location `ci` looks for workflows in a submitted tree.
     #[test]
     fn this_repositorys_own_workflow_is_valid() {
-        let path = ".ci/workflows/build.yml";
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../.ci/workflows/ci.yml");
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("{path} must exist and be readable: {e}"));
 

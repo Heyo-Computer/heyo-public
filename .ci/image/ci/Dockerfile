@@ -2,7 +2,7 @@
 # own CI needs.
 #
 # Built with:
-#   heyvm mvm build --local-only -f deploy/image/Dockerfile -c deploy/image \
+#   heyvm mvm build --local-only -f .ci/image/ci/Dockerfile -c .ci/image/ci \
 #       -n ci-rust --size-mb 6144
 #
 # Any machine running heyvmd has the heyvm CLI, so this runs on the host that

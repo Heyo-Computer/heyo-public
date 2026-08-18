@@ -959,7 +959,10 @@ fn encode_segment(s: &str) -> String {
 /// cached iroh tunnel means the tunnel is dead — the daemon restarted, the
 /// relay dropped it — and retrying through it can only fail the same way.
 pub(crate) fn is_transport(e: &HeyoError) -> bool {
-    matches!(e, HeyoError::Api { status: 0, .. } | HeyoError::Connection(_))
+    matches!(
+        e,
+        HeyoError::Api { status: 0, .. } | HeyoError::Connection(_)
+    )
 }
 
 #[derive(Debug)]

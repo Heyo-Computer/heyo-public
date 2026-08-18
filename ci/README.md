@@ -7,7 +7,7 @@ A machine becomes a runner by running `heyvmd` and joining a heyvm network.
 There is no agent to install: this process discovers those hosts, opens an iroh
 tunnel to each, and drives builds on them.
 
-It is a sibling of [app-lb](../app-lb) and [queue-fn](../queue-fn) — same
+It is a sibling of [app-lb](../app-lb) and of queue-fn (a private repository) — same
 conventions, same house style, different problem. app-lb keeps a pool of VMs warm
 behind an HTTP data plane; queue-fn runs a command in one per event; `ci` runs a
 workflow's worth of them per commit.
@@ -312,7 +312,7 @@ what `docker export` has never carried: **OCI metadata**. `ENV`, `CMD` and
 variable steps need must be written to `/etc/profile.d` by a `RUN` (steps run
 under `sh -lc`, which reads it), and the VM boots the kernel's `init=/init.sh`,
 which must print `HEYVM_READY`. An image without an init script builds
-successfully and then fails every boot; `deploy/image/init.sh` is the contract.
+successfully and then fails every boot; `.ci/image/ci/init.sh` is the contract.
 
 The runner host needs `docker`, `mke2fs` and — when heyvmd does not run as
 root — `fakeroot`. Each is checked by the build and named if absent, and the
@@ -379,7 +379,7 @@ quietly does nothing.
 
 ### This repository's own
 
-`.ci/workflows/build.yml` is one job that produces one thing: the release binary,
+`.ci/workflows/ci.yml` is one job that produces one thing: the release binary,
 uploaded as the `ci` artifact. `cargo test` parses and plans every file in that
 directory, so a typo in it fails here rather than at a submit somebody is waiting
 on.

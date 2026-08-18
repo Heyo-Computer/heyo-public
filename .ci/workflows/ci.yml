@@ -1,0 +1,390 @@
+# Build the `ci` release binary and upload it as an artifact.
+#
+# This is the orchestrator building itself. The process that reads this file,
+# plans the run and drives the VM is the program the run compiles — it serves
+# ci.us2.heyo.work, and since the subtree merge its source is `ci/` here rather
+# than a repository of its own.
+#
+# That is less delicate than it sounds, and it is worth saying why. This
+# workflow *builds*; it does not deploy. The artifact is picked up by a person,
+# or by `ci/deploy/ci.json`'s `update` block, never by this run. And a restart
+# in the middle of a run is not lost work: the job sits on a JetStream work
+# queue and the executor is idempotent, so it is redelivered. The one failure
+# this cannot catch is a `ci` binary too broken to dispatch anything, which is
+# the bootstrap every CI system has and not one a workflow file can solve.
+#
+# Submitted from the repository root, with an ordinary bundle:
+#
+#     git submit
+#
+# **No `--archive`**, as everywhere else here. This repository's whole history
+# bundles to a few MB against a 64 MB `CI_MAX_SOURCE_BYTES`, so `.git` exists in
+# the guest — the version stamp below is a real `git describe` — and the change
+# set is real, so the `paths:` filter actually filters.
+#
+# ## One job, and no checks yet
+#
+# `codegraph.yml`'s shape rather than `apps.yml`'s: `ci` is one buildable thing,
+# and whether it passes says nothing about the platform or about codegraph, so
+# it earns its own file and its own run page.
+#
+# `cargo fmt --check` and `cargo clippy` would work here — the image installs
+# both components rather than leaving a bare `--profile minimal` toolchain — and
+# are deliberately left for a follow-up. `cargo test` would run too: the 54
+# tests that need Postgres, NATS or a live heyvmd are all `#[ignore]`d, and the
+# other 321 need nothing. It is left out only because this file's job is the
+# artifact; the GitHub `platform-services` job already runs the suite.
+name: ci
+
+on:
+  submit:
+    paths:
+      # The crate's subtree. `ci/Cargo.toml` declares only registry
+      # dependencies — `heyo-sdk` and `async-nats` come from crates.io — so
+      # unlike most of the private monorepo there is no sibling path dep to
+      # list beside it. That is a deliberate property of the crate, not luck:
+      # the manifest documents why it takes the published `heyo-sdk` instead of
+      # the `mvm_ctrl` library, whose path deps and `[patch.crates-io]` only
+      # work from its own workspace root.
+      #
+      # Not narrowed to `ci/src/**`. The artifact below also carries
+      # `ci/migrations/*.sql` and `ci/deploy/supervisor/ci.conf`, so a change to
+      # either has to produce a new artifact even when the binary comes out
+      # byte-identical.
+      #
+      # One dot separates this from the entries below, and they are different
+      # trees: the matcher compares whole segments, so `ci/**` never reaches
+      # anything under `.ci/`, and it does not cover `ci-artifacts/` either —
+      # a literal segment matches only itself.
+      - 'ci/**'
+      # This workflow and the image it builds in — named precisely rather than
+      # as `.ci/**`, so adding a workflow for another crate does not rebuild
+      # this one.
+      - '.ci/workflows/ci.yml'
+      - '.ci/image/ci/**'
+
+jobs:
+  release:
+    # Redundant with `paths:` today: one job in a file whose filter is this same
+    # list can only ever run when this is true. Written out anyway, because it
+    # is the line that has to already be correct on the day a second job — fmt
+    # and clippy — is added to this file, and getting it wrong then is the
+    # mistake the README names: without the image and the workflow file listed
+    # here, editing the Dockerfile starts the workflow and then skips every job
+    # in it, which is the one change that must rebuild everything. `changed()`
+    # runs the same glob matcher as `paths:`, so the guard and the filter cannot
+    # disagree about what a pattern covers — including the case that matters, an
+    # unknown change set, where both are true.
+    if: ${{ changed('ci/**', '.ci/workflows/ci.yml', '.ci/image/ci/**') }}
+    # No `uses:`, so: any online host in the network this repository is assigned
+    # on /repos, exactly like the other two workflows here.
+    #
+    # This is the line whose meaning changed in the move. Standalone, the job
+    # said `uses: default` — the host the orchestrator itself runs on — because
+    # that repository existed to dogfood `ci`, and `default` is hardware that is
+    # by definition present. Here that would be wrong twice. It would put a
+    # `large` VM with a 40 GB disk on the box already serving ci.us2.heyo.work,
+    # its Postgres and its NATS. And `default` resolves through the local
+    # `daemon.json` (CI_DAEMON_STATE_PATH), not through the repository's
+    # network, so it can name a host that is not in the pool this repository
+    # builds on at all. Add `uses: <network>/<node>` if a specific machine is
+    # ever wanted.
+    vm:
+      driver: firecracker
+      build:
+        # Built by the runner's own daemon (`POST /images/build` — docker build
+        # → docker export → mke2fs, the `heyvm mvm build` pipeline behind HTTP)
+        # on whichever host the job lands on, the first time it lands there. The
+        # image is named for the hash of this Dockerfile, its context and
+        # `size_mb`, so an unchanged one is reused, any edit builds a new one,
+        # and the warm VMs made from the old rootfs stop matching at the same
+        # moment because the pool fingerprint includes the resolved image name.
+        #
+        # `ci` gets its own image rather than sharing `.ci/image/apps/`, and the
+        # deciding package is OpenSSL — in the opposite direction from the trap
+        # the README describes. This graph reaches `openssl-sys` twice (reqwest's
+        # default TLS is native-tls, once directly and once through `heyo-sdk`)
+        # and **nothing vendors it**: there is no `openssl-src` entry anywhere in
+        # `ci/Cargo.lock`, so it links the distribution's copy and genuinely
+        # needs `libssl-dev` — which `.ci/image/apps/Dockerfile` deliberately
+        # does not install, because app-lb's OpenSSL *is* vendored by
+        # `pingora-openssl`. The reverse holds too: the only build-adjacent
+        # crates in this graph are `cc` and `pkg-config` — no `aws-lc-sys`, no
+        # `libz-ng-sys` — so apps' `cmake` and `perl` would be minutes of image
+        # build on every runner for packages nothing here reaches.
+        dockerfile: .ci/image/ci/Dockerfile
+        # Defaulted to the Dockerfile's own directory, as `docker build -f`
+        # does; spelled out because init.sh being in it is the point.
+        context: .ci/image/ci
+        # 6 GB, carried over from the standalone repository's `--size-mb 6144`
+        # and measured against exactly this dependency graph: the built image
+        # uses ~1 GB, leaving ~4.7 GB for the CARGO_HOME registry, which grows
+        # into the rootfs at runtime (CARGO_HOME stays on the rootfs; only the
+        # target dir moves to the data disk). Unlike `.ci/image/apps`, nothing
+        # else shares this image, so this number has no second job it must equal.
+        size_mb: 6144
+      # `large` (4 CPU, 8 GB), as the standalone build used, and picked on
+      # memory rather than on the 510 packages in the lockfile. Nothing here is
+      # arrow/datafusion-shaped, so `xlarge` would buy cores that only make the
+      # VM harder to place; `medium`'s 4 GB is a bet against the largest single
+      # rustc invocation in the build, which is the `ci` crate itself — roughly
+      # 800 KB of Rust across 19 modules, `dispatch.rs` alone 161 KB, with
+      # maud's proc macros generating more on top. There is no swap in a
+      # microVM, so losing that bet is an OOM kill rather than a slow build.
+      size_class: large
+      # Mounted at /var/cache/ci by the image's init, which is where
+      # CARGO_TARGET_DIR points — deliberately *not* /workspace, which `ci`
+      # wipes on every checkout. This disk is what makes reusing a warm VM worth
+      # anything.
+      #
+      # 40 GB, carried over from the standalone repository, and the one number
+      # in this file that is inherited rather than measured: nothing records a
+      # release `target/` size for this crate. The margin is not generosity —
+      # cargo never garbage-collects a `target/`, so what it buys is how many
+      # reuses fit before init.sh's 85% guard wipes it. The build step prints
+      # `df`; shrink this once a few real runs have said what the number is.
+      disk_size_gb: 40
+      # 4 hours, comfortably past this job's 75-minute timeout.
+      #
+      # Explicit because the default (`CI_VM_TTL_SECONDS`, 3600) is *shorter*
+      # than this job's own ceiling, and whether the orchestrator's renewal loop
+      # extends it depends on the runner's heyvmd being new enough: the TTL used
+      # to be computed as `started_at + ttl`, an uptime cap renewal could not
+      # move, and a build past it was reaped mid-compile. That is fixed in
+      # mvm-ctrl, but this workflow cannot see which build a given runner is on.
+      # A create-time TTL is honoured either way. The standalone workflow set
+      # none and gave its build step 60 minutes, which sat exactly on that line.
+      ttl_seconds: 14400
+      # No setup_hooks: the toolchain, git and the OpenSSL headers are in the
+      # image. Hooks run on every cold VM, so baking them in is the difference
+      # between a build that starts in seconds and one that apt-gets a toolchain
+      # first.
+      #
+      # A dependency change is the one thing that must not reuse a warm VM: the
+      # cached registry and target/ in it were resolved against the old
+      # lockfile. Resolved against the repository root, so these are monorepo
+      # paths — `ci/Cargo.lock`, not the `Cargo.lock` the standalone file named.
+      #
+      # The manifest as well as the lockfile, although `ci` is a lone package
+      # with no workspace members: a feature edit changes what is compiled
+      # without moving the lockfile by a byte, and here that is not hypothetical
+      # — turning off reqwest's default features would take `openssl-sys` out of
+      # the build entirely, and that is the package deciding what the image has
+      # to contain.
+      #
+      # Both `rust-toolchain.toml` paths are listed although neither file
+      # exists: a missing file hashes to an explicit marker, so adding one later
+      # busts the pool at the moment it most needs busting. Both locations,
+      # because cargo searches upward from the working directory and would find
+      # either. It matters more than usual here — `ci` is edition 2024, so a pin
+      # would be a real constraint rather than a formality.
+      cache_key_files:
+        - ci/Cargo.lock
+        - ci/Cargo.toml
+        - ci/rust-toolchain.toml
+        - rust-toolchain.toml
+    env:
+      CARGO_TERM_COLOR: never
+    # Headroom over the sum of the steps below. A cold build of 510 packages —
+    # iroh, quinn and hickory under heyo-sdk, async-nats, sqlx, axum — is most
+    # of an hour; a warm VM reuses /var/cache/ci and relinks in minutes.
+    timeout-minutes: 75
+    steps:
+      # The image's init runs the same guard, but only at boot — a warm VM
+      # serves many runs between boots, and the disk fills *while* warm. Without
+      # this a pooled VM that crosses the threshold mid-lifetime fails every
+      # build with SIGBUS (rustc writes its output through mmap, and a mapped
+      # page that cannot be backed on a full filesystem kills the process) until
+      # the VM happens to be retired.
+      #
+      # It also refuses to build without the data disk at all. If /dev/vdb never
+      # attached, /var/cache/ci sits on the 6 GB rootfs alongside the toolchain
+      # and the registry, and a build that fills it dies with an unreadable
+      # SIGBUS mid-compile. Failing here names the actual problem in one line.
+      - name: Guard the cache disk
+        run: |
+          df -P "$CARGO_TARGET_DIR" /
+          if [ "$(stat -c %d "$CARGO_TARGET_DIR")" = "$(stat -c %d /)" ]; then
+            echo "FATAL: $CARGO_TARGET_DIR is on the rootfs — the data disk (/dev/vdb) is not attached." >&2
+            echo "The rootfs cannot hold a release target dir; check disk creation on the runner host." >&2
+            exit 1
+          fi
+          usage=$(df -P "$CARGO_TARGET_DIR" | awk 'NR==2 {gsub(/%/,""); print $5}')
+          if [ -n "$usage" ] && [ "$usage" -ge 85 ]; then
+            echo "cache disk at ${usage}%, wiping $CARGO_TARGET_DIR"
+            rm -rf "$CARGO_TARGET_DIR"
+          fi
+
+      - name: Build
+        # No `. "$HOME/.cargo/env"`: the image puts cargo on PATH through
+        # /etc/profile.d, and the daemon runs every step as `sh -lc`, which is a
+        # login shell and reads it.
+        #
+        # **Absolute, not `ci`.** Unlike GitHub, `ci` uses `working-directory:`
+        # verbatim — it renders `cd <value> && …` and does not join it onto the
+        # workspace — so a relative value resolves against the login shell's
+        # home directory and the step dies on `cd: no such file`. /workspace is
+        # where the source is extracted, and this repository has no root
+        # manifest, so being in the crate directory is also how cargo finds one.
+        working-directory: /workspace/ci
+        # `--locked` because the VM is fingerprinted on `Cargo.lock`: resolving
+        # a different dependency set than the one the fingerprint was taken from
+        # would make the warm VM's cache a claim that is not true.
+        #
+        # `--bins` rather than a bare `--release`: the package's one shipped
+        # target is the `ci` binary, and this skips compiling the `#[cfg(test)]`
+        # harness and its `tower` dev-dependency, which nothing here runs. It
+        # also stays correct the day a second binary appears — `default-run` in
+        # the manifest already anticipates one.
+        #
+        # No `--workspace`: `ci/Cargo.toml` has no `[workspace]` table and no
+        # members, so it would be a no-op today and a misleading one tomorrow.
+        #
+        # `cargo fetch` first, then a df of both filesystems: the registry lands
+        # in CARGO_HOME on the *rootfs*, which the guard step's check
+        # deliberately does not fail on — so if the rootfs is what filled, the
+        # line printed here is the one that says so, adjacent to the failure
+        # rather than under a screen of compile output.
+        #
+        # On failure, the guest kernel's ring buffer is the one witness to
+        # anything the kernel did to the build — an OOM kill, a block-layer I/O
+        # error, an ext4 complaint, or a machine-check event injected from the
+        # host (delivered to the mapping process as SIGBUS). rustc dying on a
+        # signal looks identical from the outside in all four cases; this tail
+        # is what tells them apart. Printing it here is safe — step output rides
+        # the exec channel, not the serial console that carries the marker
+        # protocol.
+        run: |
+          cargo fetch --locked
+          df -P / "$CARGO_TARGET_DIR"
+          free -m || true
+          if ! cargo build --release --locked --bins; then
+            echo "=== build failed; guest kernel log tail ==="
+            echo "(look for 'Out of memory: Killed process' — that means this"
+            echo " needs CARGO_BUILD_JOBS in the job's env, or a larger class)"
+            dmesg | tail -100 || true
+            df -P / "$CARGO_TARGET_DIR"
+            exit 1
+          fi
+        timeout-minutes: 60
+
+      # `ci` takes no arguments at all — no clap, no `env::args` anywhere in
+      # `src/` — and is configured entirely from `CI_*` variables, so there is
+      # no `--version` to call the way there is for `codegraph`. That is the
+      # same situation `app-lb` is in, and it gets the same link check first:
+      # weaker than "it boots", but it is precisely the failure an image missing
+      # a runtime library produces, and this binary is the one here that most
+      # deserves it — it is dynamically linked against libssl.so.3 and
+      # libcrypto.so.3, because nothing in its graph vendors OpenSSL. The `ldd`
+      # output is printed, not just grepped, so the log records what a host
+      # deploying this artifact must have installed.
+      #
+      # Then, unlike app-lb, it gets a real invocation — because `ci` validates
+      # its whole configuration *before* it binds a port or dials NATS
+      # (main.rs's startup order is deliberate and documented there). Run with
+      # an empty environment it therefore cannot start a listener, cannot hang,
+      # and must exit non-zero having printed `refusing to start`. That single
+      # line proves the dynamic linker resolved everything, the tracing
+      # subscriber initialised and `Config::from_env` ran.
+      #
+      # `env -i` rather than trusting the ambient environment: the daemon
+      # injects `CI`, `CI_JOB` and `CI_JOB_KEY` into every step, and a future
+      # variable in that family must not be able to turn this into a process
+      # that starts. `timeout` is belt to that braces — a 124 here is itself a
+      # finding, it would mean the startup order regressed and something bound
+      # before the config was checked.
+      - name: Smoke-test the binary
+        run: |
+          set -eu
+          bin="$CARGO_TARGET_DIR/release/ci"
+          [ -x "$bin" ] || { echo "FATAL: ci was not built at $bin" >&2; exit 1; }
+          ldd "$bin"
+          if ldd "$bin" | grep 'not found'; then
+            echo "FATAL: ci has unresolved shared libraries (see above)" >&2
+            exit 1
+          fi
+          out="$(timeout 20 env -i PATH=/usr/local/bin:/usr/bin:/bin "$bin" 2>&1)" && rc=0 || rc=$?
+          if [ "${rc:-0}" = "124" ]; then
+            echo "FATAL: ci did not exit within 20s on an empty environment — it must" >&2
+            echo "refuse to start before binding anything. Startup order has regressed." >&2
+            exit 1
+          fi
+          if [ "${rc:-0}" = "0" ]; then
+            echo "FATAL: ci exited 0 with no configuration at all; it said: $out" >&2
+            exit 1
+          fi
+          case "$out" in
+            *"refusing to start"*) echo "ok: ci links cleanly and refuses an empty config — $out" ;;
+            *) echo "FATAL: ci exited $rc without the startup message; it said: $out" >&2; exit 1 ;;
+          esac
+
+      # `ci/upload-artifact` tars its `path` relative to the *job's* working
+      # directory — /workspace, the repository root — not the step's. And
+      # CARGO_TARGET_DIR is outside the workspace entirely. So the binary is
+      # brought back in rather than the uploader taught about absolute paths,
+      # and the `ci/...` paths below are repository-relative because this step
+      # sets no `working-directory:` of its own.
+      #
+      # Stripped on the way: an artifact leaves the guest base64-encoded over
+      # the exec channel, so a third off the payload is a third off a transfer
+      # that is already the slowest part of a warm run. Drop `strip` if anybody
+      # ever wants to debug this from a core dump.
+      - name: Collect the binary
+        run: |
+          set -eu
+          mkdir -p dist
+          src="$CARGO_TARGET_DIR/release/ci"
+          [ -f "$src" ] || { echo "FATAL: ci was not built at $src" >&2; exit 1; }
+          cp "$src" dist/ci
+          strip dist/ci
+          # The supervisor config this binary is deployed under, shipped beside
+          # it exactly as apps.yml ships app-lb.conf. It is the one file a
+          # person needs to run the artifact — `ci` has no flags, so this list
+          # of `CI_*` variables *is* its command line — and the one most likely
+          # to drift from the binary it configures.
+          cp ci/deploy/supervisor/ci.conf dist/
+          # The migrations, which apps.yml has no equivalent of and this
+          # artifact genuinely needs: `ci` re-executes `migrations/*.sql` on
+          # every startup (CI_MIGRATIONS_DIR, no tracking table), so they are a
+          # runtime dependency of the binary, not a development file. Shipping
+          # them together is what stops a deployed binary from running a schema
+          # from a different commit — and it is what lets an operator point
+          # CI_MIGRATIONS_DIR at the unpacked artifact instead of at a source
+          # checkout, which is what ci.conf does.
+          mkdir -p dist/migrations
+          cp ci/migrations/*.sql dist/migrations/
+          # A real `git describe`, available only because this repository
+          # submits as a bundle — the checkout clones it in the guest, so
+          # /workspace is a repository with tags and history. A `--archive`
+          # submit would have neither, which is why `ci.sha` is recorded beside
+          # it rather than instead of it.
+          describe="$(git -C /workspace describe --tags --always --dirty 2>/dev/null || echo 'no-git')"
+          # Read out of the manifest rather than from the binary: `codegraph`
+          # and `heyctl` can be asked with `--version`, and this cannot, because
+          # it parses no arguments. The manifest in the submitted tree is the
+          # only statement of the version there is.
+          version="$(awk -F'"' '/^version = /{print $2; exit}' ci/Cargo.toml)"
+          cat > dist/BUILD-INFO <<EOF
+          version   $version
+          describe  $describe
+          commit    ${{ ci.sha }}
+          branch    ${{ ci.branch }}
+          run       ${{ ci.run_id }}
+          EOF
+          # The migrations are summed alongside the binary, unlike apps.yml's
+          # binaries-only list: these are SQL statements that will be executed
+          # against a production database, and the checksum is the cheap way to
+          # prove the file applied is the file built.
+          ( cd dist && sha256sum ci ci.conf migrations/*.sql > SHA256SUMS )
+          ls -la dist dist/migrations
+          cat dist/BUILD-INFO
+
+      # Lands in whichever sink the orchestrator is configured for — `disk`
+      # (CI_ARTIFACT_DIR) by default, or the central `art serve` when
+      # CI_ARTIFACT_SINK=artifacts. The workflow does not choose; it uploads.
+      # Downloadable from the run page either way. Worth noticing once: for this
+      # workflow the sink is the orchestrator this artifact replaces.
+      - uses: ci/upload-artifact
+        with:
+          name: ci
+          path: dist

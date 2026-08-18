@@ -1,6 +1,6 @@
 # The build image
 
-A Firecracker rootfs with a Rust toolchain, which is what `.ci/workflows/build.yml`
+A Firecracker rootfs with a Rust toolchain, which is what `.ci/workflows/ci.yml`
 runs in.
 
 **`ci` builds this itself, through the runner's daemon.** The workflow points
@@ -17,7 +17,7 @@ heyvmd is not root) `fakeroot`, which the build checks for and names if absent.
 That is a change. It used to be built out of band:
 
 ```bash
-heyvm mvm build --local-only -f deploy/image/Dockerfile -c deploy/image \
+heyvm mvm build --local-only -f .ci/image/ci/Dockerfile -c .ci/image/ci \
     -n ci-rust --size-mb 6144
 ```
 

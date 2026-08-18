@@ -7,10 +7,14 @@
   "health": { "path": "/healthz", "timeout_secs": 2 },
 
   "update": {
-    "working_dir": "/home/sarocu/Projects/ci",
+    "working_dir": "/home/sarocu/Projects",
     "commands": [
-      "git pull --ff-only",
-      "cargo build --release",
+      "test -d heyo-public/.git || git clone https://github.com/Heyo-Computer/heyo-public.git heyo-public",
+      "git -C heyo-public pull --ff-only",
+      "cargo build --release --locked --manifest-path heyo-public/ci/Cargo.toml",
+      "install -m 0755 heyo-public/ci/target/release/ci /usr/local/bin/ci",
+      "install -d -m 0755 /var/lib/ci/migrations",
+      "install -m 0644 heyo-public/ci/migrations/*.sql /var/lib/ci/migrations/",
       "supervisorctl restart ci"
     ],
     "env": { "CARGO_TERM_COLOR": "never" },

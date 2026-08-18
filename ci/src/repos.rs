@@ -282,7 +282,7 @@ mod tests {
             name_from_url("https://git.example.com/team/group/app.git"),
             "group/app"
         );
-        assert_eq!(name_from_url("/home/sarocu/Projects/ci"), "projects/ci");
+        assert_eq!(name_from_url("/srv/projects/ci"), "projects/ci");
         assert_eq!(name_from_url("app"), "app");
     }
 }
