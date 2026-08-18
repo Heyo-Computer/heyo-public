@@ -8,7 +8,7 @@
   "archive_on_expire": false,
   "free_bytes": 12884901888,
   "filesystem_bytes": 536870912000,
-  "min_free_bytes": 21474836480,
+  "orphan_ttl_secs": 900,
   "totals": {
     "disks": 3,
     "bytes": 3758096384,

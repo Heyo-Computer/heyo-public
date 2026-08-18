@@ -1034,9 +1034,10 @@ pub struct DiskInventory {
     /// could be measured. `None` means unknown, never "full".
     pub free_bytes: Option<u64>,
     pub filesystem_bytes: Option<u64>,
-    /// The floor below which the sweep reclaims orphans without waiting out the
-    /// TTL. `0` when pressure reclamation is disabled.
-    pub min_free_bytes: u64,
+    /// How long a disk with no daemon record survives, against `ttl_secs` for
+    /// everything else. Far shorter: an orphan is the disk of a VM that failed
+    /// to create or died without a trace, and nothing will ever resume it.
+    pub orphan_ttl_secs: u64,
     pub totals: DiskTotals,
     pub disks: Vec<DiskInfo>,
     pub archives: Vec<DiskArchiveView>,

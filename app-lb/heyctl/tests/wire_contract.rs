@@ -146,10 +146,13 @@ fn disk_inventory_understands_every_field() {
     // pressure path has a shape a client can render.
     assert_eq!(inv.free_bytes, Some(12_884_901_888));
     assert_eq!(inv.filesystem_bytes, Some(536_870_912_000));
-    assert!(inv.min_free_bytes > 0, "the reclaim floor must survive the wire");
+    // The orphan clock is the policy that matters here, and it must survive the
+    // wire: an orphan is the disk of a VM that never created, and retaining a
+    // copy of that on the seven-day TTL is the leak this separates out.
+    assert!(inv.orphan_ttl_secs > 0, "the orphan TTL must survive the wire");
     assert!(
-        inv.free_bytes.unwrap() < inv.min_free_bytes,
-        "the fixture is deliberately under the floor",
+        inv.orphan_ttl_secs < inv.ttl_secs,
+        "an orphan must expire sooner than a recoverable disk, not later",
     );
     assert_eq!(inv.totals.reclaimable_bytes, 2_147_483_648);
     assert!(

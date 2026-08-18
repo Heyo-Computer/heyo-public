@@ -353,16 +353,18 @@ fn get_disks(ctx: &Ctx, names: &[String], deployment: Option<&str>) -> Result<()
             Some(total) if total > 0 => format!(" of {}", output::bytes(total)),
             _ => String::new(),
         };
-        let pressure = inv.min_free_bytes > 0 && free < inv.min_free_bytes;
         println!("Host filesystem: {} free{capacity}.", output::bytes(free));
-        if pressure {
-            println!(
-                "Below the {} reclaim floor — orphaned disks are reclaimed without waiting \
-                 out the {} TTL.",
-                output::bytes(inv.min_free_bytes),
-                output::duration(inv.ttl_secs),
-            );
-        }
+    }
+    if inv.totals.orphan > 0 && inv.orphan_ttl_secs > 0 {
+        // Orphans are the category worth calling out separately: they are disks
+        // whose sandbox the daemon has no record of, so nothing will resume
+        // them, and they are on a much shorter clock than the rest.
+        println!(
+            "{} orphaned (no daemon record) — reclaimed after {}, not the {} TTL.",
+            inv.totals.orphan,
+            output::duration(inv.orphan_ttl_secs),
+            output::duration(inv.ttl_secs),
+        );
     }
     if inv.ttl_secs == 0 {
         println!("Expiry is off, so nothing is reclaimed automatically.");

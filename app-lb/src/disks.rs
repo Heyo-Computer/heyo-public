@@ -60,20 +60,26 @@ use std::time::Duration;
 /// human to remember this exists.
 pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// Free bytes below which the sweep reclaims orphans without waiting out
-/// [`DEFAULT_TTL_SECS`].
+/// How long a disk the daemon has *no record of* survives.
 ///
-/// 20 GiB, chosen against what the disks here actually cost rather than as a
-/// round number: a guest data disk is `disk_size_gb` and is allocated in full
-/// unless the daemon was told to make it sparse, and the rootfs copy is a
-/// multi-gigabyte byte-for-byte duplicate per boot. A threshold smaller than one
-/// VM's footprint would only fire once the host was already too full to boot
-/// anything, which is the failure this is meant to precede rather than describe.
+/// Fifteen minutes, against seven days for everything else, and the gap is the
+/// whole point. [`DEFAULT_TTL_SECS`] buys the ability to change your mind about
+/// a VM you retired — but an orphan is not a retired VM. The daemon has no
+/// record of the sandbox in either listing, so there is nothing to resume, no
+/// `heyvm start` that brings it back, and no delete coming that would clean it
+/// up. It is the disk of a VM that failed to create or died without a trace, and
+/// keeping a copy of that for a week is not caution, it is a leak with a
+/// calendar on it.
 ///
-/// It is a floor to act at, not a target to maintain: crossing it reclaims
-/// residue nobody owns, and if there is none, nothing happens and the host is
-/// simply full of disks that are in use.
-pub const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// Not zero, because the classification races creation: a sandbox whose files
+/// exist a moment before the daemon has a record of it would otherwise be
+/// deleted out from under a VM that is being built right now. Fifteen minutes is
+/// far longer than that window and far shorter than a week.
+///
+/// The other half of the safety argument is in [`DiskStore::sweep`], which
+/// refuses to run at all when either daemon listing failed — so "the daemon is
+/// restarting" classifies disks `Unknown`, never `Orphan`.
+pub const DEFAULT_ORPHAN_TTL_SECS: u64 = 15 * 60;
 
 /// Gap between expiry sweeps. The thing being watched moves on the order of
 /// days, so this is deliberately slow — it walks two directories and asks the
@@ -144,19 +150,12 @@ pub struct DiskConfig {
     pub archive_on_expire: bool,
     /// Ceiling on one archive, after which both children are killed.
     pub archive_timeout: Duration,
-    /// Free bytes below which the sweep stops waiting for [`ttl_secs`] and
-    /// reclaims orphaned disks immediately. `0` disables pressure reclamation
-    /// and restores the purely age-based behaviour.
-    ///
-    /// The rule this exists to break: expiry was on a calendar and nothing else,
-    /// so residue sat for a week while the host had no room to create a VM.
-    /// Every create then failed on ENOSPC, and — before the autoscaler learned
-    /// to back off — was retried every couple of seconds forever. A disk full of
-    /// sandboxes nobody owns is exactly the situation where a seven-day TTL is
-    /// the wrong instrument.
+    /// How long a disk with no daemon record survives. Separate from
+    /// [`ttl_secs`], and far shorter — see [`DEFAULT_ORPHAN_TTL_SECS`]. `0`
+    /// disables orphan expiry and falls back to `ttl_secs` behaviour.
     ///
     /// [`ttl_secs`]: Self::ttl_secs
-    pub min_free_bytes: u64,
+    pub orphan_ttl_secs: u64,
 }
 
 impl DiskConfig {
@@ -187,10 +186,8 @@ impl DiskConfig {
         let sweep_secs = parse_secs("APP_LB_DISK_SWEEP_SECS", DEFAULT_SWEEP_SECS)?.max(60);
         let archive_timeout =
             Duration::from_secs(parse_secs("APP_LB_DISK_ARCHIVE_TIMEOUT_SECS", 7200)?.max(60));
-        // Bytes, not seconds, but `parse_secs` is just "a non-negative integer
-        // from the environment with a default" and reusing it keeps the parse
-        // and its error message identical to every other knob here.
-        let min_free_bytes = parse_secs("APP_LB_DISK_MIN_FREE_BYTES", DEFAULT_MIN_FREE_BYTES)?;
+        let orphan_ttl_secs =
+            parse_secs("APP_LB_DISK_ORPHAN_TTL_SECS", DEFAULT_ORPHAN_TTL_SECS)?;
 
         Ok(Self {
             data_dir,
@@ -218,7 +215,7 @@ impl DiskConfig {
                 .filter(|v| !v.is_empty()),
             archive_on_expire: env_flag("APP_LB_DISK_ARCHIVE_ON_EXPIRE", false),
             archive_timeout,
-            min_free_bytes,
+            orphan_ttl_secs,
         })
     }
 }
@@ -415,39 +412,17 @@ impl DiskInfo {
     /// Deliberately total and side-effect-free: this is the predicate that
     /// decides whether gigabytes get deleted, so it is exercised directly in the
     /// tests rather than only through a sweep against a live daemon.
-    pub fn expired(&self, now: u64, ttl_secs: u64) -> bool {
-        if ttl_secs == 0 || self.held_by.is_some() {
+    pub fn expired(&self, now: u64, ttl_secs: u64, orphan_ttl_secs: u64) -> bool {
+        let ttl = match self.state {
+            DiskState::Orphan => orphan_ttl_secs,
+            _ => ttl_secs,
+        };
+        if ttl == 0 || self.held_by.is_some() {
             return false;
         }
-        now.saturating_sub(self.modified_at) >= ttl_secs
+        now.saturating_sub(self.modified_at) >= ttl
     }
 
-    /// Whether this disk may be reclaimed *right now*, ignoring its age,
-    /// because the host has run short of space.
-    ///
-    /// Age is the normal safety margin — a VM retired on Friday is still
-    /// recoverable the following Friday — and this is what replaces it when the
-    /// margin has become the problem. So it is deliberately the narrowest
-    /// category that exists: [`DiskState::Orphan`] means the daemon has no
-    /// record of this sandbox *at all*, in either of its listings. Not stopped,
-    /// not suspended, not merely unreferenced by a deployment — unknown to the
-    /// process that would be running it. There is nothing left to resume it,
-    /// and nothing that will ever delete it, because the daemon only cleans up
-    /// on a delete that is never coming.
-    ///
-    /// A `Stopped` disk is excluded even when nothing claims it: it still has a
-    /// daemon record, so `heyvm start` would bring it back, and a pool that
-    /// suspended a replica seconds before a sweep must not lose its
-    /// `/workspace`. `held_by` covers claimed and operator-retained disks and is
-    /// re-checked here rather than assumed.
-    ///
-    /// The other half of the safety argument lives in the caller: `sweep`
-    /// refuses to run at all on an incomplete listing, and an unreachable daemon
-    /// classifies every disk `Unknown` rather than `Orphan` — so "the daemon is
-    /// restarting" can never be read as "none of these are owned".
-    pub fn reclaimable_now(&self) -> bool {
-        self.held_by.is_none() && self.state == DiskState::Orphan
-    }
 }
 
 /// Why a disk is exempt from expiry, or `None` if it is a candidate.
@@ -585,16 +560,15 @@ pub struct Inventory {
     ///
     /// Present because "why is the host full" was not answerable from this
     /// document: it listed every disk and their sum, but not the one number that
-    /// says whether that sum is a problem. Free space is also what the pressure
-    /// reclamation in `sweep` triggers on, so reporting it here is what makes
-    /// that decision auditable rather than mysterious.
+    /// says whether that sum is a problem — a VM create fails on ENOSPC long
+    /// before any single disk in the list looks suspicious.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filesystem_bytes: Option<u64>,
-    /// The threshold `free_bytes` is compared against; `0` when pressure
-    /// reclamation is off.
-    pub min_free_bytes: u64,
+    /// How long a disk with no daemon record survives, against `ttl_secs` for
+    /// everything else.
+    pub orphan_ttl_secs: u64,
     pub totals: Totals,
     pub disks: Vec<DiskInfo>,
     pub archives: Vec<ArchiveView>,
@@ -828,15 +802,12 @@ impl DiskStore {
         let policies = self.policies.lock().unwrap().clone();
         let now = now_secs();
 
-        // One measurement, used for both the reported figure and the pressure
-        // decision below, so an operator reading the inventory sees the number
-        // the sweep actually acted on.
+        // Reported so "why is this host full" is answerable from the inventory
+        // itself rather than by shelling into the box.
         let (free_bytes, filesystem_bytes) = match free_bytes(&self.cfg.data_dir) {
             Some((free, total)) => (Some(free), Some(total)),
             None => (None, None),
         };
-        let pressure = self.cfg.min_free_bytes > 0
-            && free_bytes.is_some_and(|free| free < self.cfg.min_free_bytes);
 
         let mut disks: Vec<DiskInfo> = Vec::with_capacity(groups.len());
         for (sandbox_id, group) in groups.drain() {
@@ -902,11 +873,7 @@ impl DiskStore {
             if d.retain {
                 totals.retained += 1;
             }
-            // Under pressure the sweep takes orphans regardless of age, so the
-            // "would reclaim now" figure has to agree with it — a total that
-            // only ever counted the aged-out ones would report 0 on exactly the
-            // host that is about to reclaim gigabytes.
-            if d.expired(now, self.cfg.ttl_secs) || (pressure && d.reclaimable_now()) {
+            if d.expired(now, self.cfg.ttl_secs, self.cfg.orphan_ttl_secs) {
                 totals.expiring_now += 1;
                 totals.reclaimable_bytes += d.bytes;
             }
@@ -928,7 +895,7 @@ impl DiskStore {
                 .map(|b| format!("s3://{b}/{}", self.cfg.prefix)),
             free_bytes,
             filesystem_bytes,
-            min_free_bytes: self.cfg.min_free_bytes,
+            orphan_ttl_secs: self.cfg.orphan_ttl_secs,
             totals,
             disks,
             archives: self.archive_views(),
@@ -1563,45 +1530,16 @@ impl DiskStore {
 
         let now = now_secs();
 
-        // Is the host short of room? If so, age stops being the only reason to
-        // reclaim. Measured from the inventory rather than re-statted here so
-        // the decision and the number reported to operators are the same read.
-        let pressure = self.cfg.min_free_bytes > 0
-            && inv.free_bytes.is_some_and(|free| free < self.cfg.min_free_bytes);
-
         // Owned, not borrowed: `purge_resolved` consumes the `DiskInfo` so the
         // paths it acts on come from the inventory it was handed, not from one
         // re-read partway through the loop.
         let due: Vec<DiskInfo> = inv
             .disks
             .into_iter()
-            .filter(|d| d.expired(now, self.cfg.ttl_secs) || (pressure && d.reclaimable_now()))
+            .filter(|d| d.expired(now, self.cfg.ttl_secs, self.cfg.orphan_ttl_secs))
             .collect();
         if due.is_empty() {
-            if pressure {
-                // Worth saying: the host is under the threshold and this sweep
-                // found nothing it may take. That is not a quiet success — it
-                // means the space is held by disks in use, and no amount of
-                // sweeping will fix it.
-                tracing::warn!(
-                    free_bytes = inv.free_bytes.unwrap_or(0),
-                    min_free_bytes = self.cfg.min_free_bytes,
-                    "disk is below the reclaim threshold but nothing is reclaimable; every \
-                     disk here is claimed, retained, or belongs to a running sandbox",
-                );
-            }
             return outcome;
-        }
-
-        if pressure {
-            tracing::warn!(
-                free_bytes = inv.free_bytes.unwrap_or(0),
-                min_free_bytes = self.cfg.min_free_bytes,
-                count = due.len(),
-                bytes = due.iter().map(|d| d.bytes).sum::<u64>(),
-                "reclaiming orphaned disks early: the host is below the free-space threshold, \
-                 so waiting out the TTL would leave it unable to create a VM",
-            );
         }
 
         let archiving = self.cfg.archive_on_expire && self.cfg.bucket.is_some();
@@ -2226,11 +2164,7 @@ mod tests {
             endpoint: None,
             archive_on_expire: false,
             archive_timeout: Duration::from_secs(60),
-            // Off by default in tests: pressure reclamation depends on the real
-            // free space of whatever filesystem the scratch dir lands on, which
-            // is not something a unit test may assume. The tests that exercise
-            // it set a threshold explicitly.
-            min_free_bytes: 0,
+            orphan_ttl_secs: DEFAULT_ORPHAN_TTL_SECS,
         }
     }
 
@@ -2297,16 +2231,20 @@ mod tests {
         use super::*;
 
         #[test]
-        fn an_old_unclaimed_orphan_expires() {
-            let d = disk(DiskState::Orphan, false, false, 0);
-            assert!(d.expired(DEFAULT_TTL_SECS, DEFAULT_TTL_SECS));
+        fn an_old_unclaimed_disk_expires() {
+            // `Stopped`, not `Orphan`: these two cover the ordinary age rule, and
+            // the long TTL is now the one that governs a sandbox the daemon can
+            // still start. An orphan answers to a much shorter clock — see
+            // `an_orphan_expires_in_minutes_not_days`.
+            let d = disk(DiskState::Stopped, false, false, 0);
+            assert!(d.expired(DEFAULT_TTL_SECS, DEFAULT_TTL_SECS, DEFAULT_ORPHAN_TTL_SECS));
         }
 
         #[test]
         fn a_young_disk_does_not() {
-            let d = disk(DiskState::Orphan, false, false, 100);
-            assert!(!d.expired(100 + DEFAULT_TTL_SECS - 1, DEFAULT_TTL_SECS));
-            assert!(d.expired(100 + DEFAULT_TTL_SECS, DEFAULT_TTL_SECS));
+            let d = disk(DiskState::Stopped, false, false, 100);
+            assert!(!d.expired(100 + DEFAULT_TTL_SECS - 1, DEFAULT_TTL_SECS, DEFAULT_ORPHAN_TTL_SECS));
+            assert!(d.expired(100 + DEFAULT_TTL_SECS, DEFAULT_TTL_SECS, DEFAULT_ORPHAN_TTL_SECS));
         }
 
         /// The four guards, each on its own. Any one of them holding is enough,
@@ -2322,7 +2260,7 @@ mod tests {
                 disk(DiskState::Stopped, false, true, 0),
             ] {
                 assert!(d.held_by.is_some(), "expected a hold for {:?}", d.state);
-                assert!(!d.expired(ancient, DEFAULT_TTL_SECS), "{:?} expired", d.state);
+                assert!(!d.expired(ancient, DEFAULT_TTL_SECS, DEFAULT_ORPHAN_TTL_SECS), "{:?} expired", d.state);
             }
         }
 
@@ -2340,51 +2278,54 @@ mod tests {
         #[test]
         fn ttl_zero_disables_expiry_entirely() {
             let d = disk(DiskState::Orphan, false, false, 0);
-            assert!(!d.expired(u64::MAX / 2, 0));
+            assert!(!d.expired(u64::MAX / 2, 0, 0));
         }
 
-        /// What a *full host* may reclaim, which is a much narrower set than what
-        /// an old host may.
+        /// The disk of a VM that never created is worth nothing, and the policy
+        /// has to say so.
         ///
-        /// Age is the ordinary safety margin, and pressure reclamation spends it
-        /// — so the category has to be one where age was never the protection.
-        /// Only an orphan qualifies: the daemon has no record of the sandbox in
-        /// either listing, so nothing can resume it and nothing will ever delete
-        /// it. Everything else keeps its TTL, including a `Stopped` disk nobody
-        /// claims, because a stopped sandbox still has a record and `heyvm start`
-        /// would bring it back.
+        /// `DEFAULT_TTL_SECS` buys the chance to change your mind about a VM you
+        /// retired — a real thing to want, for a sandbox the daemon still has a
+        /// record of and could start again. An orphan is not that. There is no
+        /// record in either listing, so nothing resumes it and no delete is ever
+        /// coming for it; the seven-day grace was retaining a copy of a disk
+        /// whose VM failed to create. It gets minutes instead.
         #[test]
-        fn only_unheld_orphans_are_reclaimable_under_pressure() {
-            let fresh = disk(DiskState::Orphan, false, false, u64::MAX / 2);
+        fn an_orphan_expires_in_minutes_not_days() {
+            let d = disk(DiskState::Orphan, false, false, 0);
+
             assert!(
-                fresh.reclaimable_now(),
-                "an orphan is residue at any age — that is the whole point",
+                !d.expired(DEFAULT_ORPHAN_TTL_SECS - 1, DEFAULT_TTL_SECS, DEFAULT_ORPHAN_TTL_SECS),
+                "inside the creation-race window it must survive",
             );
             assert!(
-                !fresh.expired(0, DEFAULT_TTL_SECS),
-                "and it is deliberately not expired yet, or this would be redundant",
+                d.expired(DEFAULT_ORPHAN_TTL_SECS, DEFAULT_TTL_SECS, DEFAULT_ORPHAN_TTL_SECS),
+                "past it there is nothing left to protect",
+            );
+            assert!(
+                !d.expired(DEFAULT_ORPHAN_TTL_SECS, DEFAULT_TTL_SECS, 0),
+                "an orphan TTL of 0 disables orphan expiry rather than making it instant",
             );
 
-            for d in [
-                disk(DiskState::Running, false, false, 0),
-                disk(DiskState::Stopped, false, false, 0),
-                disk(DiskState::Unknown, false, false, 0),
-            ] {
-                assert!(
-                    !d.reclaimable_now(),
-                    "{:?} must keep its TTL even when the host is full",
-                    d.state,
-                );
-            }
+            // A sandbox the daemon still knows about keeps the long TTL: it is
+            // recoverable, which is exactly what the seven days are for.
+            let stopped = disk(DiskState::Stopped, false, false, 0);
+            assert!(
+                !stopped.expired(DEFAULT_ORPHAN_TTL_SECS, DEFAULT_TTL_SECS, DEFAULT_ORPHAN_TTL_SECS),
+                "a stopped sandbox is not residue and must not inherit the orphan TTL",
+            );
+            assert!(stopped.expired(DEFAULT_TTL_SECS, DEFAULT_TTL_SECS, DEFAULT_ORPHAN_TTL_SECS));
 
-            // A hold outranks pressure, exactly as it outranks age. An operator
-            // who pinned a disk did so to survive precisely this.
-            for d in [
+            // A hold still outranks age, on either clock.
+            for held in [
                 disk(DiskState::Orphan, true, false, 0),
                 disk(DiskState::Orphan, false, true, 0),
             ] {
-                assert!(d.held_by.is_some(), "the fixture should be held");
-                assert!(!d.reclaimable_now(), "a held orphan is not reclaimable");
+                assert!(held.held_by.is_some(), "the fixture should be held");
+                assert!(
+                    !held.expired(u64::MAX / 2, DEFAULT_TTL_SECS, DEFAULT_ORPHAN_TTL_SECS),
+                    "an operator who pinned a disk meant it",
+                );
             }
         }
     }

@@ -916,7 +916,7 @@ fn workflow_spec_is_stable() {
 #[test]
 fn disk_inventory_is_stable() {
     use crate::disks::{
-        DEFAULT_MIN_FREE_BYTES, DiskInfo, DiskPart, DiskState, Inventory, PartKind, Totals,
+        DEFAULT_ORPHAN_TTL_SECS, DiskInfo, DiskPart, DiskState, Inventory, PartKind, Totals,
     };
 
     let running = DiskInfo {
@@ -1014,12 +1014,9 @@ fn disk_inventory_is_stable() {
             archive_enabled: false,
             archive_on_expire: false,
             archive_target: None,
-            // A host under the threshold: 12 GiB free against a 20 GiB floor, so
-            // the fixture carries the shape a client sees when the sweep has a
-            // reason to reclaim early. The orphan below is what it would take.
             free_bytes: Some(12_884_901_888),
             filesystem_bytes: Some(536_870_912_000),
-            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+            orphan_ttl_secs: DEFAULT_ORPHAN_TTL_SECS,
             totals: Totals {
                 disks: 3,
                 bytes: 3_758_096_384,
