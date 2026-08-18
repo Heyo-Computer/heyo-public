@@ -1,0 +1,26 @@
+-- What a submit changed, so a workflow can decline to build.
+--
+-- Same rules as the rest: every statement idempotent, because the whole
+-- directory is re-executed on each startup.
+--
+-- **This is a run-level fact, not a job-level one, which is why it is not on
+-- `ci_job.plan`.** The expanded plan is copied onto every job row precisely
+-- because it can drift — a repository reassigned to another network mid-build
+-- must not move jobs already scheduled. The commit a run is for cannot drift:
+-- it is fixed the moment the bundle is unpacked. Copying a changed-path list
+-- into every job of every run would duplicate a monorepo-sized array N times to
+-- protect against a change that cannot happen.
+--
+-- Shaped as the internally-tagged `paths::Changes`:
+--
+--     {"kind":"known","paths":["packages/api/src/main.rs"]}
+--     {"kind":"unknown","reason":"the submit is a `--archive` tarball, …"}
+--
+-- The distinction is load-bearing and is not "an empty list". A tarball submit,
+-- a root commit and a `--dirty` submit all have no answer, and no answer must
+-- match every path filter — a run that skipped because nothing was known to
+-- change is a green tick on a commit nothing built. Rows written before this
+-- column existed take the DEFAULT, which is that same "no answer", so every
+-- historical run reads as "build everything" rather than as "changed nothing".
+ALTER TABLE ci_run ADD COLUMN IF NOT EXISTS changes JSONB NOT NULL
+    DEFAULT '{"kind":"unknown","reason":"this run predates change detection"}'::jsonb;

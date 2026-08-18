@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+#
+# git submit — submit the current tree to a CI orchestrator.
+#
+# Installed onto PATH as `git-submit`, which is what makes `git submit` work:
+# git runs any `git-<name>` on PATH as a subcommand. Installed as `git-ci` it
+# answers to `git ci` instead; it is the same script and names itself after
+# however it was invoked.
+#
+# What it sends is a `git bundle` of the branch, or a `git archive` tarball of
+# the tree with --archive. Either way no repository credential exists on the
+# server or in a build VM — you already had read access, so nothing else needs
+# it. It also means what runs is exactly what you submitted, rather than
+# whatever a ref resolved to by the time the server got around to cloning it.
+#
+# A bundle clones in the guest into a real repository, so `git describe` and
+# friends work in a step. It carries history to a root commit, because a bundle
+# that clones on its own has to — `git bundle create --depth` does not exist and
+# a partial slice is refused at clone time. For a repository with long history
+# and no need for `.git`, `--archive` sends one tree instead.
+#
+# ## Two credentials, and you want the first one
+#
+# A **repository token** (`ci.token`) is minted per repository from the CI app's
+# /repos page. It is revocable on its own and it tells the server which
+# repository is submitting, so the server does not have to believe a JSON field.
+#
+# The **shared secret** (`ci.secret`) is the installation-wide
+# `CI_WEBHOOK_SECRET`, HMAC'd over the body. It still works, and it is what an
+# installation with no registered repositories has. It cannot be revoked for one
+# repository and cannot say which repository it is for, which is why the other
+# one exists. A server with CI_REQUIRE_REPO_TOKEN set refuses it.
+#
+# Configuration, in order of precedence:
+#   CI_ENDPOINT       / git config ci.endpoint   the server's base URL
+#   CI_TOKEN          / git config ci.token      a repository submit token
+#   CI_WEBHOOK_SECRET / git config ci.secret     the shared HMAC secret
+set -euo pipefail
+
+GIT_SUBMIT_VERSION="0.4.0"
+
+# `git-submit` invoked as `git submit`, `git-ci` invoked as `git ci`. Only used
+# in messages, but a script that tells you to run a command that does not exist
+# on your machine is worse than one that says nothing.
+me="$(basename "$0")"
+cmd="git ${me#git-}"
+
+die() { printf '%s: %s\n' "$cmd" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Usage: $cmd [--dirty] [--ref <rev>] [--workflow <id>] [--dry-run] [--submit-empty]
+
+Submits a tarball of the tree to the CI orchestrator and prints the runs it
+started.
+
+Options:
+  --dirty          include uncommitted tracked changes
+  --submit-empty   submit even when the tree is identical to the default
+                   branch — a run that rebuilds what main already is
+  --archive        send a tree-only tarball instead of a git bundle (no .git in
+                   the guest, but a payload that does not carry history)
+  --ref <rev>      submit some other commit (default HEAD)
+  --workflow <id>  name the workflow object this run belongs to
+  --dry-run        print what would be sent, send nothing
+  --upgrade        reinstall from the release channel
+  --version        print the client version
+  -h, --help       show this
+
+Setup, from the /repos page of your CI:
+  git config ci.endpoint https://ci.example.com
+  git config ci.token    <the repository token it minted>
+EOF
+}
+
+# --- argument parsing -------------------------------------------------------
+
+rev="HEAD"
+dirty=0
+dry_run=0
+archive=0
+submit_empty=0
+workflow=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dirty)    dirty=1; shift ;;
+    --submit-empty) submit_empty=1; shift ;;
+    --archive)  archive=1; shift ;;
+    --dry-run)  dry_run=1; shift ;;
+    --ref)      rev="${2:?--ref needs a revision}"; shift 2 ;;
+    --workflow) workflow="${2:?--workflow needs an id}"; shift 2 ;;
+    --upgrade)
+      installer="${GIT_SUBMIT_INSTALL_URL:-https://heyo-cli-releases.s3.amazonaws.com/git-submit/latest/install-git-submit.sh}"
+      command -v curl >/dev/null 2>&1 || die "--upgrade needs curl"
+      curl --fail --show-error --silent --location "$installer" \
+        | GIT_SUBMIT_INSTALL_SOURCE=remote bash
+      exit $?
+      ;;
+    --version)  printf '%s %s\n' "$me" "$GIT_SUBMIT_VERSION"; exit 0 ;;
+    -h|--help)  usage; exit 0 ;;
+    *)          die "unknown argument $1 (try --help)" ;;
+  esac
+done
+
+for tool in git curl base64; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool is required but not on PATH"
+done
+
+git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+
+# --- configuration ----------------------------------------------------------
+
+endpoint="${CI_ENDPOINT:-$(git config --get ci.endpoint || true)}"
+[ -n "$endpoint" ] || die "no endpoint. Set CI_ENDPOINT or run:
+    git config ci.endpoint https://ci.example.com"
+base="${endpoint%/}"
+base="${base%/api/submit}"
+submit_url="$base/api/submit"
+
+token="${CI_TOKEN:-$(git config --get ci.token || true)}"
+secret="${CI_WEBHOOK_SECRET:-$(git config --get ci.secret || true)}"
+
+if [ -z "$token" ] && [ -z "$secret" ]; then
+  die "no credential. Register this repository at $base/repos, then:
+    git config ci.token <the token it mints>
+
+  Or, for an installation still using the shared secret:
+    git config ci.secret <the server's CI_WEBHOOK_SECRET>"
+fi
+
+# The HMAC path needs openssl; the token path does not, so it is only required
+# when it is actually going to be used.
+if [ -z "$token" ]; then
+  command -v openssl >/dev/null 2>&1 \
+    || die "openssl is required to sign with ci.secret. A repository token from
+    $base/repos needs no local crypto at all."
+fi
+
+# --- what to submit ---------------------------------------------------------
+
+sha="$(git rev-parse --verify "$rev^{commit}" 2>/dev/null)" \
+  || die "cannot resolve $rev to a commit"
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+[ "$branch" = "HEAD" ] && branch="detached"
+repo_url="$(git config --get remote.origin.url || echo "")"
+repo_name="$(basename "$(git rev-parse --show-toplevel)")"
+default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
+before="$(git rev-parse --verify "${rev}^" 2>/dev/null || echo "")"
+pusher_name="$(git config --get user.name || echo "")"
+pusher_email="$(git config --get user.email || echo "")"
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/git-submit.XXXXXX")"
+cleanup() { rm -rf "$work"; }
+trap cleanup EXIT
+
+tarball="$work/source.tar.gz"
+bundle="$work/source.bundle"
+
+# Resolve the one commit to send. `--dirty` builds a throwaway commit from the
+# index plus the worktree, so uncommitted tracked changes travel without
+# touching the real index or HEAD — the separate GIT_INDEX_FILE is what keeps
+# it from staging anything in the user's repository. The commit object is left
+# unreferenced and `git gc` collects it in due course.
+if [ "$dirty" -eq 1 ]; then
+  export GIT_INDEX_FILE="$work/index"
+  git read-tree "$sha"
+  git add -u
+  tree="$(git write-tree)"
+  unset GIT_INDEX_FILE
+  send_sha="$(git commit-tree "$tree" -p "$sha" -m 'git submit --dirty')"
+  sha="$sha-dirty"
+else
+  send_sha="$sha"
+fi
+
+# A submission whose tree is identical to the default branch builds something
+# CI has already built. That is almost always a forgotten commit or a missing
+# --dirty rather than a decision, so it is refused with the reason — before any
+# packing or upload — and `--submit-empty` is how the decision is spelled when
+# it is one. Compared as trees, not commits: an empty commit or a merge that
+# changes nothing is still an empty run. The comparison is against what will
+# actually travel (`send_sha`), so --dirty changes count.
+if [ "$submit_empty" -eq 0 ]; then
+  base_ref=""
+  for cand in ${default_branch:+"refs/remotes/origin/$default_branch" "refs/heads/$default_branch"} \
+              refs/remotes/origin/main refs/remotes/origin/master \
+              refs/heads/main refs/heads/master; do
+    if git rev-parse --verify --quiet "$cand^{commit}" >/dev/null 2>&1; then
+      base_ref="$cand"
+      break
+    fi
+  done
+  # No main to compare against is not an empty submission, it is an
+  # unanswerable question; such a repository submits as it always did.
+  if [ -n "$base_ref" ] && git diff --quiet "$base_ref" "$send_sha" 2>/dev/null; then
+    if git diff-index --quiet HEAD -- 2>/dev/null; then
+      die "nothing to run: the tree of $rev is identical to $base_ref and the
+    worktree is clean. Pass --submit-empty to start a run anyway."
+    else
+      die "nothing to run: the tree of $rev is identical to $base_ref. The
+    worktree has uncommitted changes, but they only travel with --dirty.
+    Use --dirty to include them, commit them, or pass --submit-empty to
+    run this tree as it is."
+    fi
+  fi
+fi
+
+if [ "$archive" -eq 1 ]; then
+  format="tar.gz"
+  payload_file="$tarball"
+  git archive --format=tar.gz -o "$tarball" "$send_sha"
+else
+  format="git-bundle"
+  payload_file="$bundle"
+  # `git bundle create` refuses a bare sha — "Refusing to create empty bundle" —
+  # so the commit needs a ref. Rather than write one into the user's repository
+  # and hope to clean it up, a throwaway bare repo borrows their object store
+  # through `alternates` and carries the ref instead. Nothing in the real
+  # repository is touched, including on a failed submit.
+  pack="$work/pack.git"
+  git init -q --bare "$pack"
+  printf '%s/objects\n' "$(git rev-parse --absolute-git-dir)" \
+    > "$pack/objects/info/alternates"
+  ref="refs/heads/$branch"
+  [ "$branch" = "detached" ] && ref="refs/heads/ci-submit"
+  git --git-dir="$pack" update-ref "$ref" "$send_sha"
+  git --git-dir="$pack" symbolic-ref HEAD "$ref"
+  # `--all` rather than the ref by name: the bundle then carries HEAD too, and a
+  # bundle without HEAD clones into a repository with nothing checked out.
+  git --git-dir="$pack" bundle create "$bundle" --all >/dev/null 2>&1 \
+    || die "could not pack a git bundle. Retry with --archive to send a tree instead."
+fi
+
+size="$(wc -c < "$payload_file" | tr -d ' ')"
+
+if [ "$dry_run" -eq 1 ]; then
+  printf 'would submit to %s\n' "$submit_url"
+  printf '  repository %s (%s)\n' "$repo_name" "${repo_url:-no remote}"
+  printf '  ref        refs/heads/%s\n' "$branch"
+  printf '  commit     %s\n' "$sha"
+  printf '  source     %s, %s bytes%s\n' "$format" "$size" \
+    "$([ "$dirty" -eq 1 ] && echo ' (including uncommitted changes)')"
+  printf '  credential %s\n' "$([ -n "$token" ] && echo 'repository token (ci.token)' || echo 'shared secret (ci.secret)')"
+  [ -n "$workflow" ] && printf '  workflow   %s\n' "$workflow"
+  if [ "$format" = "git-bundle" ]; then
+    printf '  refs:\n'
+    git bundle list-heads "$bundle" | sed 's/^/    /'
+  fi
+  printf '  files:\n'
+  git ls-tree -r --name-only "$send_sha" | head -20 | sed 's/^/    /'
+  exit 0
+fi
+
+# --- payload ----------------------------------------------------------------
+
+payload="$work/payload.json"
+content="$work/content.b64"
+
+# Through a file, never through an argument. Linux caps one argv entry at
+# MAX_ARG_STRLEN (128 KiB), and base64 of any real repository is past that — so
+# `--arg content "$b64"` fails with "Argument list too long" on everything except
+# a toy tree. A shell variable has no such limit, but a `printf` of one is only
+# safe while printf is a builtin, and the same value has to reach jq too.
+#
+# `base64 -w0` is GNU; BSD/macOS base64 wraps by default and has no -w. Piping
+# through tr removes the newlines either way, and leaves no trailing newline for
+# --rawfile to pick up.
+base64 < "$payload_file" | tr -d '\n' > "$content"
+
+if command -v jq >/dev/null 2>&1; then
+  jq -n \
+    --arg id "$repo_name" --arg name "$repo_name" --arg url "$repo_url" \
+    --arg db "$default_branch" --arg ref "refs/heads/$branch" \
+    --arg before "$before" --arg after "$sha" \
+    --arg pn "$pusher_name" --arg pe "$pusher_email" \
+    --arg wf "$workflow" --arg fmt "$format" --rawfile content "$content" \
+    '{repository:{id:$id,name:$name,url:$url,defaultBranch:(if $db=="" then null else $db end)},
+      ref:$ref, before:$before, after:$after, dryRun:false,
+      pusher:{name:$pn,email:$pe},
+      workflowId:(if $wf=="" then null else $wf end),
+      source:{format:$fmt, contentBase64:$content}}' > "$payload"
+else
+  # jq is not universally installed and this payload is simple enough to build
+  # by hand. Only the free-text fields need escaping; the rest are shas, refs and
+  # base64 — and the base64 is `cat`ed straight through rather than held in a
+  # variable, for the reason above.
+  esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+  {
+    printf '{"repository":{"id":"%s","name":"%s","url":"%s","defaultBranch":%s},' \
+      "$(esc "$repo_name")" "$(esc "$repo_name")" "$(esc "$repo_url")" \
+      "$([ -n "$default_branch" ] && printf '"%s"' "$(esc "$default_branch")" || printf 'null')"
+    printf '"ref":"refs/heads/%s","before":"%s","after":"%s","dryRun":false,' \
+      "$(esc "$branch")" "$before" "$sha"
+    printf '"pusher":{"name":"%s","email":"%s"},' "$(esc "$pusher_name")" "$(esc "$pusher_email")"
+    printf '"workflowId":%s,' \
+      "$([ -n "$workflow" ] && printf '"%s"' "$(esc "$workflow")" || printf 'null')"
+    printf '"source":{"format":"%s","contentBase64":"' "$format"
+    cat "$content"
+    printf '"}}'
+  } > "$payload"
+fi
+
+# The credential goes in a curl config file rather than on the command line: an
+# argv is world-readable in `ps` for as long as the upload takes, and a submit
+# of a large tree takes a while.
+auth_config="$work/auth.conf"
+umask 077
+if [ -n "$token" ]; then
+  printf 'header = "authorization: Bearer %s"\n' "$token" > "$auth_config"
+else
+  signature="sha256=$(openssl dgst -sha256 -hmac "$secret" -binary < "$payload" | od -An -tx1 | tr -d ' \n')"
+  printf 'header = "x-heyo-signature-256: %s"\n' "$signature" > "$auth_config"
+fi
+
+response="$work/response.json"
+code="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' \
+  --max-time "${CI_SUBMIT_TIMEOUT:-300}" \
+  -X POST "$submit_url" \
+  -H 'content-type: application/json' \
+  -H "x-heyo-git-ci-version: $GIT_SUBMIT_VERSION" \
+  --config "$auth_config" \
+  --data-binary "@$payload")" || die "could not reach $submit_url"
+
+if [ "$code" -ge 400 ]; then
+  if command -v jq >/dev/null 2>&1 && jq -e . "$response" >/dev/null 2>&1; then
+    jq -r '.error // .' "$response" >&2
+  else
+    cat "$response" >&2; printf '\n' >&2
+  fi
+  die "submit rejected (HTTP $code)"
+fi
+
+printf 'submitted %s on %s (%s bytes)\n' "${sha:0:12}" "$branch" "$size"
+if command -v jq >/dev/null 2>&1 && jq -e . "$response" >/dev/null 2>&1; then
+  # Warnings, not errors: the runs exist. A job pinned to a host that is briefly
+  # offline waits for it rather than failing, and this is the only place the
+  # person who submitted will see that before wondering why nothing moved.
+  jq -r '.warnings // [] | .[]' "$response" | while read -r warning; do
+    [ -n "$warning" ] && printf 'warning: %s\n' "$warning" >&2
+  done
+  url_base="$(jq -r '.url // ""' "$response")"
+  jq -r '.runs[]' "$response" 2>/dev/null | while read -r run; do
+    printf '  run %s  %sruns/%s\n' "$run" "$url_base" "$run"
+  done
+else
+  cat "$response"
+fi

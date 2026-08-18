@@ -1,0 +1,32 @@
+{
+  "id": "ci",
+  "routes": [
+    { "host": "ci.us2.heyo.work" }
+  ],
+  "upstreams": ["127.0.0.1:9500"],
+  "health": { "path": "/healthz", "timeout_secs": 2 },
+
+  "update": {
+    "working_dir": "/home/sarocu/Projects/ci",
+    "commands": [
+      "git pull --ff-only",
+      "cargo build --release",
+      "supervisorctl restart ci"
+    ],
+    "env": { "CARGO_TERM_COLOR": "never" },
+    "timeout_secs": 1800,
+    "verify_timeout_secs": 60
+  },
+
+  "auth": {
+    "provider": ["google", "app-token"],
+    "client_id": "REPLACE-ME.apps.googleusercontent.com",
+    "client_secret": { "secret": "google", "key": "client_secret" },
+    "allowed_domains": ["heyo.computer", "sarocu.com"],
+    "public_paths": ["/healthz", "/api/submit", "/api/stream/"],
+    "base_path": "/__applb/auth",
+    "cookie_domain": "us2.heyo.work",
+    "session_ttl_secs": 43200,
+    "forward_identity": true
+  }
+}
