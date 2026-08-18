@@ -179,6 +179,23 @@ pub fn status(ctx: &Ctx) -> Result<()> {
     output::field("Context", &ctx.endpoint.name);
     output::field("Uptime", output::duration(m.uptime_secs));
 
+    // Before the host and fleet numbers, because when this is false every one of
+    // them is stale: app-lb abandons the reconcile tick when it cannot list the
+    // daemon's sandboxes, so nothing scales, nothing boots, and the counters sit
+    // exactly where they were. Reading "0 ready" as an idle fleet is the mistake
+    // this line exists to prevent.
+    if !m.daemon.reachable {
+        output::section("VM daemon");
+        output::field("Reachable", "NO — the autoscaler is not running");
+        if let Some(err) = m.daemon.last_error.as_deref() {
+            output::field("Error", err);
+        }
+        output::field(
+            "Effect",
+            "no VM is created, promoted or reaped for any deployment while this persists",
+        );
+    }
+
     output::section("Host");
     if m.host.available {
         output::field(

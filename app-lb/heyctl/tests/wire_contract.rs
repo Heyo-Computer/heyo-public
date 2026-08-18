@@ -245,6 +245,19 @@ fn metrics_response_understands_every_field() {
         m.global.extra.keys().collect::<Vec<_>>()
     );
 
+    // The daemon block: the one field that says whether everything else here is
+    // live or frozen. The fixture is the unreachable case on purpose.
+    assert!(
+        m.daemon.extra.is_empty(),
+        "unknown daemon fields: {:?}",
+        m.daemon.extra.keys().collect::<Vec<_>>()
+    );
+    assert!(!m.daemon.reachable, "the fixture records an unreachable daemon");
+    assert!(
+        m.daemon.last_error.as_deref().is_some_and(|e| e.contains("deployed-sandboxes")),
+        "the reason must survive the wire, not just the boolean",
+    );
+
     let a = &m.global.autoscale;
     assert!(
         a.extra.is_empty(),

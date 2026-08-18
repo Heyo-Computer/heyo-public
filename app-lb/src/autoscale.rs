@@ -318,11 +318,23 @@ impl Autoscaler {
         // Managed deployments need the fleet list; if it fails, skip the VM work
         // this tick (the static probes above have already run).
         let fleet = match self.vms.list().await {
-            Ok(list) => vm::index_by_id(list),
+            Ok(list) => {
+                self.metrics.record_daemon_reachable();
+                vm::index_by_id(list)
+            }
             Err(e) => {
                 // Log explicitly: without this the loop fails silently and the
                 // pool just quietly stops updating.
                 tracing::error!(error = %e, "failed to list sandboxes; skipping VM reconcile this tick");
+                // And recorded, because this `return` is the widest-blast-radius
+                // branch in the file: it abandons the reconcile for *every*
+                // managed deployment, so nothing scales, nothing boots, and no
+                // per-deployment counter moves — not even `create_failures`,
+                // since `scale_up` is never reached. Every pool then reads
+                // `ready: 0` with a row of zeroes beside it, which is
+                // indistinguishable from an idle fleet unless something says the
+                // daemon is the thing that is missing.
+                self.metrics.record_daemon_unreachable(&e.to_string());
                 return;
             }
         };

@@ -380,6 +380,17 @@ fn metrics_response_is_stable() {
                 failed: 3,
                 healthy: true,
             }),
+            // Unreachable in the fixture, so the failure shape is what clients
+            // are held to: this is the state in which every other number on the
+            // page is stale and none of them say so.
+            daemon: crate::metrics::DaemonSnapshot {
+                reachable: false,
+                last_error: Some(
+                    "api error (0): network error calling /deployed-sandboxes: error sending \
+                     request for url (http://127.0.0.1:34099/deployed-sandboxes)"
+                        .into(),
+                ),
+            },
             security: Some(SecuritySummary {
                 open: 12,
                 urgent: 3,

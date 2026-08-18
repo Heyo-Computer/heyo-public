@@ -995,6 +995,13 @@ struct MetricsResponse {
     /// dropping queue is visible next to `obs.dropped`, which fails the same way.
     #[serde(skip_serializing_if = "Option::is_none")]
     security: Option<SecuritySummary>,
+    /// Whether app-lb can reach the VM daemon, and what it said if not.
+    ///
+    /// Fleet-wide and unconditional, unlike `obs`/`security`, because this one
+    /// gates everything: `Autoscaler::reconcile` abandons the tick when the
+    /// sandbox listing fails, so an unreachable daemon stops the entire control
+    /// plane while every per-deployment number stays exactly where it was.
+    daemon: crate::metrics::DaemonSnapshot,
     /// The slice of deployments this response carries. Scoped by the query
     /// parameters on `MetricsQuery` — at fleet scale the full list is megabytes,
     /// and the dashboard polls it every few seconds.
@@ -1289,6 +1296,7 @@ async fn metrics_snapshot(
         global,
         obs: state.obs.as_ref().map(|o| o.snapshot()),
         security: security_summary(&state),
+        daemon: state.metrics.daemon_snapshot(),
         deployments: views,
         matched,
         tracked_deployments: tracked,

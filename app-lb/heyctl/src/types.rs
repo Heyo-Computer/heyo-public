@@ -635,6 +635,10 @@ pub struct MetricsResponse {
     pub obs: Option<ObsStats>,
     /// Absent when the LB has security monitoring off (`APP_LB_SIEM=0`).
     pub security: Option<SecuritySummary>,
+    /// Whether app-lb can reach the VM daemon. When it cannot, the autoscaler
+    /// abandons every tick, so nothing scales or boots and every other number
+    /// here is frozen at whatever it was when the daemon went away.
+    pub daemon: DaemonStatus,
     pub deployments: Vec<DeploymentView>,
     /// How many deployments matched before `limit`/`offset`, so a caller can
     /// page without guessing.
@@ -874,6 +878,15 @@ pub struct AutoscaleCounts {
     pub create_failures: u64,
     /// What the daemon said the last time it refused.
     pub last_create_error: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DaemonStatus {
+    pub reachable: bool,
+    pub last_error: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }

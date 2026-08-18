@@ -432,6 +432,33 @@ pub struct Metrics {
     /// numbers in here and drops the entry.
     retired: Mutex<DeploymentMetricsSnapshot>,
     host: HostGauge,
+    /// Whether the last attempt to list the daemon's sandboxes succeeded, and
+    /// what it said if not.
+    ///
+    /// Fleet-wide rather than per-deployment because the consequence is
+    /// fleet-wide: `Autoscaler::reconcile` returns the moment `vms.list()`
+    /// fails, so *every* managed deployment stops reconciling at once. Nothing
+    /// scales, nothing boots, and no per-deployment counter moves — including
+    /// `create_failures`, because `scale_up` is never reached. Without this the
+    /// whole control plane can be down and every number on the dashboard reads
+    /// like a quiet afternoon.
+    daemon: DaemonGauge,
+}
+
+#[derive(Debug, Default)]
+struct DaemonGauge {
+    /// Starts `false` and is set by the first listing attempt either way, so
+    /// "never tried" and "tried and failed" are not conflated: `last_error` is
+    /// `None` in the first case and populated in the second.
+    reachable: std::sync::atomic::AtomicBool,
+    last_error: Mutex<Option<String>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DaemonSnapshot {
+    pub reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 impl Default for Metrics {
@@ -446,6 +473,7 @@ impl Metrics {
             per_deployment: ArcSwap::from_pointee(HashMap::new()),
             retired: Mutex::new(DeploymentMetricsSnapshot::empty()),
             host: HostGauge::default(),
+            daemon: DaemonGauge::default(),
         }
     }
 
@@ -481,6 +509,35 @@ impl Metrics {
             memory_total_bytes: self.host.memory_total_bytes.load(Ordering::Relaxed),
             memory_used_bytes: self.host.memory_used_bytes.load(Ordering::Relaxed),
             sampled_at_ms: self.host.sampled_at_ms.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The daemon answered a sandbox listing.
+    pub fn record_daemon_reachable(&self) {
+        self.daemon.reachable.store(true, Ordering::Relaxed);
+        if let Ok(mut last) = self.daemon.last_error.lock() {
+            *last = None;
+        }
+    }
+
+    /// The daemon did not answer, and what it said.
+    ///
+    /// The error is kept because the two shapes want different fixes and are
+    /// indistinguishable from a boolean: a connection refused means the daemon
+    /// is not listening where app-lb is looking — `APP_LB_DAEMON_URL` against a
+    /// daemon in API mode, which binds `--port` rather than the TUI's 34099 —
+    /// while a timeout or a 5xx means it is there and unwell.
+    pub fn record_daemon_unreachable(&self, error: &str) {
+        self.daemon.reachable.store(false, Ordering::Relaxed);
+        if let Ok(mut last) = self.daemon.last_error.lock() {
+            *last = Some(error.to_string());
+        }
+    }
+
+    pub fn daemon_snapshot(&self) -> DaemonSnapshot {
+        DaemonSnapshot {
+            reachable: self.daemon.reachable.load(Ordering::Relaxed),
+            last_error: self.daemon.last_error.lock().ok().and_then(|e| e.clone()),
         }
     }
 
