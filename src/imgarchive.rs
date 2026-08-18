@@ -777,8 +777,7 @@ async fn swap_and_boot(
         sandbox.start().await
     };
     started.context("booting the VM on the restored image")?;
-    sandbox
-        .wait_for_ready(cfg.ready_timeout)
+    crate::vm::wait_ready(sandbox, cfg.ready_timeout, schema)
         .await
         .with_context(|| format!("schema {schema}: VM did not become ready on the restored image"))?;
     Ok(())

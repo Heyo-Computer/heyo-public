@@ -12,6 +12,7 @@ mod dumpsrv;
 mod events;
 mod imgarchive;
 mod orphans;
+mod pending;
 mod proxy;
 mod reclaim;
 mod registry;
@@ -72,6 +73,15 @@ async fn main() -> Result<()> {
     }
     // Pull the dashboard settings out before `cfg` is moved into the registry.
     let dashboard_cfg = cfg.dashboard.clone();
+    // Pending-bring-up ledger (in-flight creates awaiting their registry
+    // binding) lives beside the registry file; load any crash leftovers before
+    // the first connection can race them.
+    pending::init(
+        cfg.state_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("pending-bringups.tsv"),
+    );
     let registry = Arc::new(SchemaRegistry::new(cfg));
     registry.spawn_reaper();
     // Slow, disk-reclaiming eviction tier: offload week-idle schemas to S3 and
@@ -103,6 +113,10 @@ async fn main() -> Result<()> {
     // kill it acked but didn't act on), reclaiming the stranded disk. No-op
     // unless PG_VM_POOL_ORPHAN_SWEEP_SECS (and PG_VM_POOL_RUN_DIR) are set.
     registry.spawn_orphan_reaper();
+    // Delete VMs whose bring-up handed out an id but never reached a registry
+    // binding — the "stuck in provisioning, bound to nothing" leak no other
+    // sweep covers. Always on; idle when the pending ledger is empty.
+    registry.spawn_pending_janitor();
     // A pooler that died mid-image-restore left up to a full raw image in the
     // run dir's dot-named scratch (invisible to the sb-* sweep). Clean that
     // up-front — this startup is the first moment we know no restore is

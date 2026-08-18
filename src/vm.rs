@@ -45,11 +45,12 @@ pub(crate) fn local_opts() -> HeyoClientOptions {
     }
 }
 
-/// HTTP timeout for the deploy POST specifically. `/sandbox-deploy` blocks
-/// server-side until the VM has fully booted, so tens of seconds is *normal*
-/// under load — the SDK's 60s default fires exactly when the daemon is
-/// busiest, and a client-side timeout doesn't cancel the server-side build:
-/// the "failed" deploy still finishes and leaves an orphan VM behind.
+/// HTTP timeout for the deploy POST specifically. Current heyvmd 202-accepts
+/// the deploy and builds in the background, so this normally answers in
+/// milliseconds — but an older daemon blocks the POST until the VM has fully
+/// booted, and either way a client-side timeout doesn't cancel the server-side
+/// build: the "failed" deploy still finishes and leaves an orphan VM behind.
+/// Generous is the safe direction.
 const DEPLOY_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// How many VM bring-ups (deploys of new VMs, boots of stopped ones) may hit
@@ -104,6 +105,157 @@ pub(crate) async fn bringup_slot(what: &str) -> Option<SemaphorePermit<'static>>
     Some(permit)
 }
 
+/// How many whole bring-ups (deploy through ready/restore) may be in flight at
+/// once. Overridden by `PG_VM_POOL_MAX_PENDING_BRINGUPS`; `0` disables.
+///
+/// Why a second gate when [`BRINGUP_GATE`] exists: that one meters the daemon
+/// calls that build or boot a VM — but heyvmd 202-accepts deploys and builds
+/// in the background, so the deploy POST releases its slot in milliseconds and
+/// a burst of N schemas still lands N concurrent builds (plus N ready-poll
+/// loops) on the daemon. This gate bounds the *pending population*: request
+/// N+1 queues here, at the pooler's front door, where waiting is free — the
+/// client just sees a slower connect — instead of inside a daemon that wedges
+/// under the herd. Sized well above the bring-up slots so the queue depth, not
+/// the daemon-call rate, is what it controls.
+const DEFAULT_PENDING_BRINGUPS: usize = 16;
+
+/// The admission gate itself. `None` inside means the operator disabled it.
+static ADMISSION_GATE: OnceLock<Option<Semaphore>> = OnceLock::new();
+
+fn admission_gate() -> Option<&'static Semaphore> {
+    ADMISSION_GATE
+        .get_or_init(|| {
+            let slots = std::env::var("PG_VM_POOL_MAX_PENDING_BRINGUPS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_PENDING_BRINGUPS);
+            if slots == 0 {
+                warn!("PG_VM_POOL_MAX_PENDING_BRINGUPS=0: bring-up admission gate disabled");
+            }
+            (slots > 0).then(|| Semaphore::new(slots))
+        })
+        .as_ref()
+}
+
+/// Take an admission slot for one whole bring-up. Held across all of
+/// `ensure_vm` — deploy, ready wait, Postgres bootstrap, restore — so it
+/// bounds how many bring-ups exist at once, not how fast they start.
+async fn admission_slot(schema: &str) -> Option<SemaphorePermit<'static>> {
+    let gate = admission_gate()?;
+    if let Ok(permit) = gate.try_acquire() {
+        return Some(permit);
+    }
+    let queued = Instant::now();
+    info!("schema {schema}: all bring-up admission slots busy; queueing at the pooler");
+    let permit = gate.acquire().await.expect("admission gate is never closed");
+    info!(
+        "schema {schema}: bring-up admitted after {:?} queued",
+        queued.elapsed()
+    );
+    Some(permit)
+}
+
+/// How often [`wait_ready`] re-asks the daemon for a pending VM's status.
+const READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Pooler-side readiness wait: poll the *per-id* `GET /deployed-sandboxes/:id`
+/// until the sandbox leaves `provisioning`, tolerating transient daemon
+/// errors until the deadline.
+///
+/// Replaces the SDK's `Sandbox::wait_for_ready`, which (a) fetches the FULL
+/// `/deployed-sandboxes` listing every poll and filters client-side — during a
+/// deploy burst that's O(inventory × in-flight) serialization pressure on
+/// exactly the endpoint that goes lock-contended first — and (b) aborts the
+/// whole bring-up on the first transient transport error, which under load
+/// converts one daemon hiccup into a synchronized batch of failed bring-ups,
+/// each leaving an orphan VM. Here a poll error is just a poll that taught us
+/// nothing: keep polling until the deadline, and report the last error if the
+/// deadline passes.
+pub(crate) async fn wait_ready(sandbox: &Sandbox, timeout: Duration, name: &str) -> Result<()> {
+    use heyo_sdk::SandboxStatus;
+    let deadline = Instant::now() + timeout;
+    let mut last_err: Option<HeyoError> = None;
+    let mut error_streak = 0u32;
+    loop {
+        match sandbox.get().await {
+            Ok(info) => {
+                error_streak = 0;
+                match info.status {
+                    SandboxStatus::Running => return Ok(()),
+                    // Terminal: the daemon gave up on the build; waiting longer
+                    // can't change the answer.
+                    SandboxStatus::Failed => bail!(
+                        "VM {name} ({}) failed to provision: {}",
+                        sandbox.sandbox_id(),
+                        info.error_message
+                            .as_deref()
+                            .unwrap_or("no reason reported")
+                    ),
+                    SandboxStatus::Provisioning | SandboxStatus::Unknown => {}
+                    // Stopped/Paused/ColdStored: settled but not running. Same
+                    // contract as the SDK's wait_for_ready — "no longer
+                    // provisioning" ends the wait, and the Postgres probe that
+                    // follows every bring-up is the real readiness authority.
+                    _ => return Ok(()),
+                }
+            }
+            // NotFound included: right after a 202 the record can lag the id,
+            // and during an incident the daemon may briefly answer nonsense.
+            // Only the deadline decides.
+            Err(e) => {
+                error_streak += 1;
+                if error_streak == 1 {
+                    warn!("{name}: readiness poll failed (retrying until deadline): {e:#}");
+                }
+                last_err = Some(e);
+            }
+        }
+        if Instant::now() >= deadline {
+            match last_err {
+                Some(e) => bail!(
+                    "VM {name} ({}) not ready within {timeout:?}; last daemon error: {e:#}",
+                    sandbox.sandbox_id()
+                ),
+                None => bail!(
+                    "VM {name} ({}) not ready within {timeout:?}: status never left provisioning",
+                    sandbox.sandbox_id()
+                ),
+            }
+        }
+        sleep(READY_POLL_INTERVAL).await;
+    }
+}
+
+/// `Sandbox::list` against the local daemon with bounded retries on transient
+/// failures. A momentarily unreachable or 5xx-ing daemon (deploy bursts make
+/// this the norm, not the exception) shouldn't instantly fail a bring-up or a
+/// cleanup that merely needed the inventory.
+pub(crate) async fn list_with_retry() -> Result<Vec<heyo_sdk::SandboxInfo>, HeyoError> {
+    const ATTEMPTS: u32 = 4;
+    let mut delay = Duration::from_millis(500);
+    for attempt in 1..=ATTEMPTS {
+        match Sandbox::list(local_opts()).await {
+            Ok(list) => return Ok(list),
+            Err(e) if attempt < ATTEMPTS && transient(&e) => {
+                warn!(
+                    "listing sandboxes failed (attempt {attempt}/{ATTEMPTS}, \
+                     retrying in {delay:?}): {e:#}"
+                );
+                sleep(delay).await;
+                delay *= 2;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop returns on the last attempt")
+}
+
+/// Errors worth retrying: transport failures (the SDK mints status 0 for those)
+/// and 5xx. A 4xx is the daemon answering coherently — retrying can't help.
+fn transient(e: &HeyoError) -> bool {
+    matches!(e, HeyoError::Api { status, .. } if *status == 0 || *status >= 500)
+}
+
 /// Bring up (or reattach to) the VM for `schema` and return a ready entry.
 /// `known_id` is the sandbox id from a prior bring-up of this schema (if any);
 /// reattaching by id avoids a data-loss race where a just-stopped VM is briefly
@@ -136,6 +288,11 @@ pub async fn ensure_vm(
     restore: Option<&RestoreSource>,
     spares: Option<(&crate::spares::SparePool, &std::collections::HashSet<String>)>,
 ) -> Result<Arc<SchemaEntry>> {
+    // Bound the number of concurrent bring-ups before any daemon traffic. A
+    // burst beyond the cap queues here (each waiter is one parked client
+    // connection) instead of becoming daemon load. Held to the end of the
+    // function: the pending *population* is what the daemon can't survive.
+    let _admission = admission_slot(schema).await;
     let name = format!("pg-{schema}");
     let keepalive = cfg.is_keepalive(schema);
 
@@ -1646,8 +1803,7 @@ async fn power_cycle(
             .await
             .with_context(|| format!("restarting {name} after power-cycle"))?;
     }
-    sandbox
-        .wait_for_ready(cfg.ready_timeout)
+    wait_ready(sandbox, cfg.ready_timeout, name)
         .await
         .with_context(|| format!("waiting for {name} after power-cycle"))?;
     // Reconnect from scratch: the guest_ip/tunnel from before the reboot may no
@@ -1817,7 +1973,7 @@ async fn resolve_sandbox(
 
     // 2. Fall back to find-by-name (first connect on a fresh pooler, or the
     //    known id was deleted).
-    if let Some(info) = Sandbox::list(local_opts())
+    if let Some(info) = list_with_retry()
         .await
         .context("listing sandboxes")?
         .into_iter()
@@ -1903,31 +2059,44 @@ async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Res
 /// `pg-<schema>` name (covers a VM freshly created inside the failed
 /// attempt); every step is logged, none propagate.
 pub(crate) async fn stop_after_failed_bringup(schema: &str, known_id: Option<&str>) {
-    let name = format!("pg-{schema}");
-    let list = match Sandbox::list(local_opts()).await {
-        Ok(l) => l,
-        Err(e) => {
-            warn!("schema {schema}: cannot list sandboxes to stop a leaked bring-up: {e:#}");
-            return;
+    // Act on ids we already hold — the pending ledger names the VM this very
+    // attempt created, `known_id` names a reattach target — so the common case
+    // needs no listing at all. Listing is the fallback, not the front door: a
+    // failed bring-up usually means a struggling daemon, and the old
+    // list-first version failed its listing in exactly those moments and
+    // silently cleaned up nothing (that's where the stranded-VM pileups came
+    // from). The stop (not delete) is deliberate: a post-ready failure can
+    // leave partial restore state on the disk, and the next attempt reuses
+    // the VM idempotently; a VM that stays unbound is the pending janitor's
+    // to delete.
+    let mut ids: Vec<String> = crate::pending::get(schema).into_iter().collect();
+    if let Some(id) = known_id
+        && !ids.iter().any(|i| i == id)
+    {
+        ids.push(id.to_string());
+    }
+    if ids.is_empty() {
+        let name = format!("pg-{schema}");
+        match list_with_retry().await {
+            Ok(list) => ids.extend(list.into_iter().filter(|i| i.name == name).map(|i| i.id)),
+            Err(e) => {
+                warn!("schema {schema}: cannot list sandboxes to stop a leaked bring-up: {e:#}");
+                return;
+            }
         }
-    };
-    for info in list {
-        if info.name != name && known_id != Some(info.id.as_str()) {
-            continue;
-        }
-        let Ok(sb) = Sandbox::connect(info.id.clone(), local_opts()) else {
+    }
+    for id in ids {
+        let Ok(sb) = Sandbox::connect(id.clone(), local_opts()) else {
             continue;
         };
         match tokio::time::timeout(Duration::from_secs(30), sb.stop()).await {
             Ok(Ok(())) => info!(
-                "schema {schema}: stopped VM {} left running by the failed bring-up",
-                info.id
+                "schema {schema}: stopped VM {id} left running by the failed bring-up"
             ),
             Ok(Err(e)) => warn!(
-                "schema {schema}: stopping leaked VM {} failed (may already be stopped): {e:#}",
-                info.id
+                "schema {schema}: stopping leaked VM {id} failed (may already be stopped): {e:#}"
             ),
-            Err(_) => warn!("schema {schema}: stopping leaked VM {} timed out", info.id),
+            Err(_) => warn!("schema {schema}: stopping leaked VM {id} timed out"),
         }
     }
 }
@@ -1968,7 +2137,7 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
         Err(HeyoError::NotFound(_)) => return Ok(None),
         Err(e) => return Err(anyhow::Error::new(e).context(format!("starting VM {name}"))),
     }
-    sb.wait_for_ready(cfg.ready_timeout)
+    wait_ready(&sb, cfg.ready_timeout, name)
         .await
         .with_context(|| format!("waiting for VM {name}"))?;
     Ok(Some(sb))
@@ -2012,10 +2181,43 @@ pub(crate) async fn create_vm(cfg: &Config, name: &str, keepalive: bool) -> Resu
         .await
         .with_context(|| format!("creating VM {name}"))?
     };
-    sandbox
-        .wait_for_ready(cfg.ready_timeout)
-        .await
-        .with_context(|| format!("waiting for created VM {name}"))?;
+    // The daemon 202-accepts deploys, so this id exists (with a daemon-side
+    // record behind it) long before the VM is usable — and until the registry
+    // binds schema→id on full bring-up success, this variable is the only
+    // owner. Ledger it immediately so a failure anywhere downstream leaves a
+    // *named* leak the failure path and the pending janitor can kill by id,
+    // instead of an anonymous `provisioning` record nothing ever reaps.
+    // (Spare creates skip the ledger: `spare-pg-*` are covered by purge.)
+    if let Some(schema) = name.strip_prefix("pg-") {
+        crate::pending::record(schema, sandbox.sandbox_id()).await;
+    }
+    if let Err(e) = wait_ready(&sandbox, cfg.ready_timeout, name).await {
+        // Kill the half-built VM now, by the id in hand — no listing, which is
+        // exactly what's unreachable when bring-ups fail en masse. It never
+        // served a client, so its disk holds nothing worth keeping. Best
+        // effort: if the kill can't land either, the ledger entry stays and
+        // the janitor retries once the daemon recovers.
+        match tokio::time::timeout(Duration::from_secs(30), sandbox.kill()).await {
+            Ok(Ok(())) => {
+                info!(
+                    "{name}: deleted half-provisioned VM {} after failed bring-up",
+                    sandbox.sandbox_id()
+                );
+                if let Some(schema) = name.strip_prefix("pg-") {
+                    crate::pending::clear(schema).await;
+                }
+            }
+            Ok(Err(kill_err)) => warn!(
+                "{name}: deleting half-provisioned VM {} failed (janitor will retry): {kill_err:#}",
+                sandbox.sandbox_id()
+            ),
+            Err(_) => warn!(
+                "{name}: deleting half-provisioned VM {} timed out (janitor will retry)",
+                sandbox.sandbox_id()
+            ),
+        }
+        return Err(e).with_context(|| format!("waiting for created VM {name}"));
+    }
     crate::events::record(crate::events::Event::VmCreated);
     Ok(sandbox)
 }

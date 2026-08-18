@@ -73,7 +73,10 @@ impl SparePool {
     /// registry). Returns a connected handle, or `None` when no spare is
     /// available (caller falls back to a cold create).
     pub async fn take(&self, bound: &HashSet<String>) -> Option<Sandbox> {
-        let infos = match Sandbox::list(vm::local_opts()).await {
+        // Retried: a transient list failure here doesn't just skip the spare —
+        // it silently downgrades the caller to a full cold create, adding
+        // daemon load at exactly the wrong moment.
+        let infos = match vm::list_with_retry().await {
             Ok(l) => l,
             Err(e) => {
                 warn!("listing sandboxes to claim a warm spare failed: {e:#}");

@@ -73,6 +73,11 @@ const ORPHAN_MAX_DELETES_PER_SWEEP: usize = 100;
 /// "gone?" ambiguity turn into a deletion, so we stop and try again next sweep.
 const ORPHAN_MAX_DAEMON_ERRORS: usize = 5;
 
+/// Cadence of the pending-bring-up janitor (see [`SchemaRegistry::spawn_pending_janitor`]).
+/// Frequent is fine: a pass over an empty ledger is a HashMap read.
+const PENDING_JANITOR_TICK: Duration = Duration::from_secs(300);
+const PENDING_JANITOR_FIRST_DELAY: Duration = Duration::from_secs(240);
+
 /// First-failure backoff for offloads (archive/freeze) of one schema.
 /// Doubles per consecutive failure, capped at [`OFFLOAD_BACKOFF_CAP`].
 const OFFLOAD_BACKOFF_BASE: Duration = Duration::from_secs(30 * 60);
@@ -632,6 +637,9 @@ impl SchemaRegistry {
                     // also clears any `archived` flag (this is a fresh VM id), so
                     // a just-restored schema is durably marked live again.
                     self.store.put(schema, entry.sandbox.sandbox_id());
+                    // The bring-up resolved: the id is durably bound, so the
+                    // pending ledger's claim on it is settled.
+                    crate::pending::clear(schema).await;
                     // A thawed schema's local offload artifact is now dead
                     // weight: the row is durably live, the data lives on the
                     // VM's disk, and the next freeze/compact rewrites the file
@@ -2279,6 +2287,96 @@ impl SchemaRegistry {
             let registry = registry.clone();
             async move { registry.sweep_orphans().await }
         }));
+    }
+
+    /// Reap bring-ups that started (the daemon accepted a create and handed out
+    /// an id — recorded in the pending ledger) but never resolved into a
+    /// registry binding: pooler died mid-bring-up, or the failure-path kill
+    /// couldn't reach the daemon. These VMs are the "stuck in `provisioning`,
+    /// bound to nothing" records no other sweep can touch — purge needs a
+    /// registry row or a spare name, the orphan-disk sweep needs the daemon to
+    /// have forgotten the id. Always on: the ledger only has entries if
+    /// bring-ups actually leaked.
+    pub fn spawn_pending_janitor(self: &Arc<Self>) {
+        let registry = self.clone();
+        info!(
+            "pending-bringup janitor: reaping unresolved bring-ups every {:?}",
+            PENDING_JANITOR_TICK
+        );
+        tokio::spawn(supervise(
+            "pending-janitor",
+            PENDING_JANITOR_FIRST_DELAY,
+            PENDING_JANITOR_TICK,
+            move || {
+                let registry = registry.clone();
+                async move { registry.pending_pass().await }
+            },
+        ));
+    }
+
+    /// One janitor pass; returns the number of entries resolved. An entry is
+    /// only acted on well after any legitimate bring-up would have finished,
+    /// and deletion needs the daemon to positively confirm the record — the
+    /// same ambiguity-never-deletes rule as the orphan-disk sweep.
+    async fn pending_pass(&self) -> usize {
+        // Twice the ready budget plus slack: a slow-but-alive bring-up (ready
+        // wait + restore) must never race its own janitor.
+        let min_age = self.cfg.ready_timeout * 2 + Duration::from_secs(300);
+        let stale = crate::pending::stale(min_age);
+        if stale.is_empty() {
+            return 0;
+        }
+        let mut resolved = 0usize;
+        for (schema, id) in stale {
+            // Bound after all — the bring-up won and only the ledger clear was
+            // lost (e.g. a crash between store.put and clear). Settled.
+            if self
+                .store
+                .record(&schema)
+                .is_some_and(|r| r.sandbox_id == id)
+            {
+                crate::pending::clear(&schema).await;
+                resolved += 1;
+                continue;
+            }
+            // A bring-up for this schema is in flight right now (cell present
+            // but uninitialized) — it may be reattaching to this very VM by
+            // name; hands off until it settles.
+            {
+                let map = self.entries.lock().await;
+                if map.get(&schema).is_some_and(|cell| cell.get().is_none()) {
+                    continue;
+                }
+            }
+            match self.daemon_state(&id).await {
+                DaemonState::Gone => {
+                    // Deleted out-of-band (or our failure-path kill did land) —
+                    // if a disk dir lingers, the orphan-disk sweep owns it now
+                    // that the daemon reports the id gone.
+                    crate::pending::clear(&schema).await;
+                    resolved += 1;
+                }
+                DaemonState::Present => match kill_by_id(&id).await {
+                    Ok(()) => {
+                        let msg = format!(
+                            "schema {schema}: deleted VM {id} stranded by a failed bring-up \
+                             (never bound to the registry)"
+                        );
+                        info!("pending-bringup janitor: {msg}");
+                        crate::events::journal_info("pending-janitor", msg);
+                        crate::pending::clear(&schema).await;
+                        resolved += 1;
+                    }
+                    Err(e) => warn!(
+                        "pending-bringup janitor: deleting stranded VM {id} \
+                         (schema {schema}) failed; retrying next pass: {e:#}"
+                    ),
+                },
+                // Daemon down or flaking: ambiguity never deletes.
+                DaemonState::Error => {}
+            }
+        }
+        resolved
     }
 
     /// One orphan-disk pass. Returns the number of directories deleted (for the
