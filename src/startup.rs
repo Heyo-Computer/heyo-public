@@ -30,7 +30,9 @@ pub type ClientStream = Box<dyn ClientIo>;
 pub struct StartupInfo {
     /// The database name from the startup packet — our schema key.
     pub database: String,
-    #[allow(dead_code)]
+    /// The role from the startup packet. Replayed upstream verbatim, and — for
+    /// a dedicated database — the key the pooler resolves the client's
+    /// credential from (see [`crate::dedicated`]).
     pub user: String,
     /// The full StartupMessage bytes (length prefix included) to replay upstream.
     pub raw: Vec<u8>,

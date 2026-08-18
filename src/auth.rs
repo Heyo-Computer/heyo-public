@@ -60,21 +60,40 @@ where
     if constant_time_eq(password, expected.as_bytes()) {
         Ok(())
     } else {
-        send_auth_failed(stream).await?;
+        send_fatal(stream, SQLSTATE_INVALID_PASSWORD, "password authentication failed").await?;
         bail!("password authentication failed");
     }
 }
 
-async fn send_auth_failed<S: AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
+/// `28P01 invalid_password`.
+pub const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
+
+/// `42501 insufficient_privilege` — what a client gets when it authenticated
+/// fine but is not allowed to route to the database it asked for (a dedicated
+/// credential reaching outside its own database, or a shared-password client
+/// reaching into a dedicated one). See [`crate::dedicated::Credentials::authorize`].
+pub const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
+
+/// Send a Postgres `ErrorResponse` with severity FATAL, so a rejected client
+/// sees a real error message (`psql`/libpq print the `M` field) instead of a
+/// dropped connection. `message` must not contain a NUL; everything the pooler
+/// passes here is either a constant or a name it has already validated.
+pub async fn send_fatal<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    sqlstate: &str,
+    message: &str,
+) -> Result<()> {
     // ErrorResponse: 'E', len, then NUL-terminated (field-code, value) pairs,
     // closed by a final NUL.
     let mut fields = Vec::new();
     fields.push(b'S');
     fields.extend_from_slice(b"FATAL\0");
     fields.push(b'C');
-    fields.extend_from_slice(b"28P01\0"); // invalid_password
+    fields.extend_from_slice(sqlstate.as_bytes());
+    fields.push(0);
     fields.push(b'M');
-    fields.extend_from_slice(b"password authentication failed\0");
+    fields.extend_from_slice(message.as_bytes());
+    fields.push(0);
     fields.push(0);
 
     let mut msg = Vec::with_capacity(5 + fields.len());
@@ -150,6 +169,27 @@ mod tests {
         assert_eq!(tag[0], b'E');
 
         assert!(server.await.unwrap().is_err());
+    }
+
+    /// The routing refusal path reuses `send_fatal` directly, so pin the frame:
+    /// a client that gets a malformed ErrorResponse sees a protocol error
+    /// instead of the reason it was refused.
+    #[tokio::test]
+    async fn send_fatal_frames_a_readable_error_response() {
+        let (mut pooler, mut client) = duplex(256);
+        send_fatal(&mut pooler, SQLSTATE_INSUFFICIENT_PRIVILEGE, "nope")
+            .await
+            .unwrap();
+        drop(pooler);
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf[0], b'E');
+        let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+        assert_eq!(len, buf.len() - 1, "length prefix must cover the whole body");
+        let body = &buf[5..];
+        assert_eq!(*body.last().unwrap(), 0, "field list must be NUL-terminated");
+        assert!(body.starts_with(b"SFATAL\0C42501\0Mnope\0"));
     }
 
     #[test]

@@ -32,6 +32,7 @@
 
 mod alerts;
 mod auth;
+mod dedicated;
 mod error;
 mod handlers;
 mod history;

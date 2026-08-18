@@ -8,6 +8,7 @@
 mod auth;
 mod config;
 mod dashboard;
+mod dedicated;
 mod dumpsrv;
 mod events;
 mod imgarchive;
@@ -181,8 +182,24 @@ async fn handle_conn(
     tls: Option<Arc<TlsReloader>>,
 ) -> Result<()> {
     let (mut client, info) = startup::read_startup(client, tls.as_deref()).await?;
-    if let Some(password) = registry.client_password() {
-        auth::require_password(&mut client, password).await?;
+    let creds = registry.dedicated();
+    // Which password this client must prove, decided from its *role* alone: a
+    // provisioned role is challenged with its own, everyone else with the
+    // shared `PG_VM_POOL_PASSWORD`. Keeping the requested database out of this
+    // step means the handshake looks the same either way, so the challenge
+    // can't be used to enumerate which database names are dedicated.
+    if let Some(password) = creds.challenge_password(&info.user, registry.client_password()) {
+        auth::require_password(&mut client, &password).await?;
+    }
+    // Authenticated — now, may this client route where it asked? A dedicated
+    // credential may open only its own database (so it can never provision a
+    // second VM), and a shared-password client may not open a dedicated one.
+    if let Err(reason) = creds.authorize(&info.user, &info.database) {
+        // Tell the client why rather than dropping the socket: "cannot open any
+        // other database" is exactly the feedback that stops someone retrying a
+        // typo'd database name forever.
+        auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
+        anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
     }
     let schema = info.database.clone();
     if !is_valid_schema(&schema) {

@@ -97,6 +97,11 @@ psql "host=127.0.0.1 port=6432 user=postgres dbname=tenant1"   # -> VM pg-tenant
 psql "host=127.0.0.1 port=6432 user=postgres dbname=tenant2"   # -> VM pg-tenant2
 ```
 
+That lazy-create-per-name behavior is the default contract. For credentials you
+hand to an application or a customer, provision a **dedicated database**
+instead: its own role and password, pinned to exactly one database, unable to
+create any more VMs. See "Dedicated databases" below.
+
 First connect to a new schema boots a VM (~2s); reconnects reuse or restart it.
 If Postgres dies while its VM stays up (OOM kill, segfault — the VM's PID 1 is
 a shell, so the sandbox still reports running), the pooler notices on the next
@@ -154,6 +159,7 @@ Config via env (all optional):
 | `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
 | `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
 | `PG_VM_POOL_STATE_FILE` | `~/.heyo/pg-vm-pool/registry.tsv` | persisted schema→VM map |
+| `PG_VM_POOL_DEDICATED_FILE` | `<state dir>/dedicated.tsv` | persisted dedicated-database credentials (database → role + password). Written `0600` — it holds cleartext passwords. See "Dedicated databases" |
 | `PG_VM_POOL_TLS_CERT` / `PG_VM_POOL_TLS_KEY` | unset (TLS off) | PEM cert chain + key; see TLS below |
 | `PG_VM_POOL_DASHBOARD_LISTEN` | unset (dashboard off) | HTTP listen address for the admin dashboard; setting it enables the dashboard — see Dashboard below |
 | `PG_VM_POOL_DASHBOARD_USER` / `PG_VM_POOL_DASHBOARD_PASSWORD` | unset (no auth) | HTTP Basic auth credentials for the dashboard (must be set together) |
@@ -500,6 +506,78 @@ the connection is also TLS — required reading if `PG_VM_POOL_LISTEN` binds to
 anything other than `127.0.0.1` (the pooler logs a startup warning in that
 case). Set `PG_VM_POOL_TLS_CERT`/`KEY` alongside it; see TLS below.
 
+### Dedicated databases
+
+`PG_VM_POOL_PASSWORD` gates the whole namespace: any client holding it can mint
+an unbounded number of VMs just by connecting with database names nobody has
+used yet. That's the right contract for a trusted control plane, and the wrong
+one for handing credentials to an application or a customer.
+
+A **dedicated database** is the scoped alternative. An operator provisions
+`(database, role, password)` up front, and that credential can open exactly one
+database:
+
+- it authenticates with **its own** password, never the shared one;
+- asking for any other database name is refused (`42501`) rather than
+  provisioned — so these credentials can never create a second VM;
+- conversely a dedicated database is reachable **only** through its own role, so
+  a shared-password client can't wander into it either.
+
+Below the routing decision nothing is special: the database name is still the
+schema key, so the VM is still `pg-<database>` and the idle reaper, the
+frozen/compacted/archived tiers, disk growth and the orphan sweeps all treat it
+like any other schema. Inside the VM the role is created `NOSUPERUSER
+NOCREATEDB NOCREATEROLE` and owns its database — full control of its own data,
+no path to anything else — and it is re-created on every bring-up, so a thaw or
+an S3 restore (which rebuilds the cluster from a dump that carries no roles)
+comes back with the role, its password, and the tenant's ownership intact.
+
+Provision over the admin API, which lives on the **dashboard's** listener and
+behind the same Basic auth (so `PG_VM_POOL_DASHBOARD_LISTEN` must be set):
+
+```sh
+# username defaults to the database name; password is generated if omitted
+curl -u admin:secret -X POST http://127.0.0.1:8080/api/databases \
+     -H 'content-type: application/json' -d '{"database":"acme"}'
+# -> 201 {"database":"acme","username":"acme","password":"WyGF0n32yJJgdzQVYRi7rrlv",
+#         "status":"provisioning","created_at":1787086289}
+
+curl -u admin:secret http://127.0.0.1:8080/api/databases          # list (no passwords)
+curl -u admin:secret -X DELETE http://127.0.0.1:8080/api/databases/acme   # revoke
+```
+
+The same operations are on the dashboard's **dedicated** page, including a form
+that generates the password and shows it once.
+
+The client then connects like any other Postgres endpoint, with its own
+credentials:
+
+```sh
+psql "host=pooler.example.com port=6432 user=acme dbname=acme"   # PGPASSWORD=…
+```
+
+Notes:
+
+- The password is returned exactly once, at provisioning. It is stored in
+  cleartext in `PG_VM_POOL_DEDICATED_FILE` (mode `0600`, default
+  `<state dir>/dedicated.tsv`) — that file is where to look if it's lost, and
+  it's why the pooler's state directory should not be world-readable. Pair this
+  with TLS for the same reason as `PG_VM_POOL_PASSWORD`: the challenge is
+  cleartext on the wire.
+- Names are strict — lowercase letters, digits and underscores, starting with a
+  letter, ≤63 bytes — because the name becomes a Postgres identifier, a VM name,
+  a dump/image filename and an S3 key. `pg_`/`spare` prefixes and Postgres'
+  catalog databases are rejected.
+- Provisioning a name the pooler has **already** backed as an ordinary schema is
+  refused: that VM holds someone else's data.
+- The VM is built by a background bring-up right after provisioning, so the
+  first real client connection is usually warm; it isn't required to be — a
+  client can connect immediately and just waits for the cold start.
+- Revoking is **non-destructive**: it removes the credential only. The VM, its
+  disk and its data are untouched, and the name drops back to ordinary schema
+  routing — which is also how an operator gets at the data afterwards. Reclaim
+  the storage with the existing reap/purge controls.
+
 ### TLS
 
 TLS is **off by default** and fully optional: without it the pooler answers the
@@ -575,6 +653,11 @@ What it gives you (browse to the listen address):
   guest IP, TTL, status) plus live **database size and backend count**, read
   over the pooler's own warm Postgres connection (a normal query, not a guest
   command).
+- **Dedicated databases** (`/dedicated`) — provision a database with its own
+  role and password (a credential that can never create a second VM), list what
+  is provisioned, and revoke. The same operations are available as JSON at
+  `/api/databases` on this listener, behind the same Basic auth — see
+  "Dedicated databases" above.
 - **Logs** — tail the pooler log (`/logs/pooler`), the heyvmd log
   (`/logs/heyvmd`), and any VM's in-guest Postgres log (`/logs/vm/<id>`).
 - **Controls** — stop / start / reboot / resize any VM from its detail page.

@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, DiskGrowConfig, PressureConfig};
+use crate::dedicated::{Credential, Credentials};
 use crate::dumpsrv::DumpServer;
 use crate::reclaim::{POST_STOP_RECLAIM_DELAY, RECLAIM_FIRST_DELAY, Reclaimer};
 use crate::spares::SparePool;
@@ -334,6 +335,11 @@ pub struct SchemaRegistry {
     offload_backoff: OffloadBackoff,
     // Single-flights the dashboard's purge action.
     purging: AtomicBool,
+    // Provisioned dedicated databases: `database → (role, password)`. Consulted
+    // on the auth path (which password to challenge for, and whether this
+    // client may route here at all) and on every bring-up (so the owning role
+    // exists inside the VM). Empty unless an operator has provisioned one.
+    dedicated: Arc<Credentials>,
 }
 
 impl SchemaRegistry {
@@ -349,6 +355,7 @@ impl SchemaRegistry {
         // never touch the guest's data disk. Either one enables it.
         let dumps = (cfg.freeze.is_some() || cfg.archive.is_some())
             .then(|| Arc::new(DumpServer::new(cfg.dump_net.dump_dir.clone())));
+        let dedicated = Arc::new(Credentials::load(cfg.dedicated_file.clone()));
         Self {
             cfg,
             entries: Mutex::new(HashMap::new()),
@@ -361,7 +368,67 @@ impl SchemaRegistry {
             dumps,
             offload_backoff: OffloadBackoff::new(),
             purging: AtomicBool::new(false),
+            dedicated,
         }
+    }
+
+    /// The provisioned dedicated-database credentials — the auth path's lookup
+    /// table and what the admin API/dashboard mutate.
+    pub fn dedicated(&self) -> &Arc<Credentials> {
+        &self.dedicated
+    }
+
+    /// The owning credential for `schema`, if it is a dedicated database. Every
+    /// bring-up passes this to [`vm::ensure_vm`] so the role exists (and owns
+    /// its database) inside whatever VM ends up serving it.
+    fn owner_of(&self, schema: &str) -> Option<Credential> {
+        self.dedicated.by_database(schema)
+    }
+
+    /// Provision a dedicated database: a fixed database name with its own login
+    /// role and password, whose credential can never be used to create another
+    /// VM (see [`crate::dedicated`]).
+    ///
+    /// Refuses a name the pooler has *already* backed as an ordinary schema —
+    /// that VM holds someone else's data, and provisioning over it would hand
+    /// that data to a brand-new credential. Recording the credential is all
+    /// this does; the VM is built by the first checkout, exactly like any other
+    /// schema (callers that want it warm up front can follow with
+    /// [`Self::spawn_provision`]).
+    pub fn create_dedicated(
+        &self,
+        database: &str,
+        role: &str,
+        password: &str,
+    ) -> Result<Credential> {
+        if self.store.record(database).is_some() && !self.dedicated.is_dedicated(database) {
+            bail!(
+                "{database:?} is already an existing pooler schema with its own VM and data; \
+                 pick a different name (or drop that schema first)"
+            );
+        }
+        self.dedicated.create(database, role, password)
+    }
+
+    /// Bring `schema`'s VM up in the background and let go of it immediately.
+    ///
+    /// Used right after provisioning so the tenant's first real connection
+    /// doesn't pay a cold start. Runs through the ordinary checkout path, so it
+    /// shares the bring-up gate, the pending-bring-up ledger and the
+    /// failed-bring-up cleanup with every other client — a failure here is
+    /// logged and left for the next connect to retry, never fatal to the
+    /// provisioning that triggered it.
+    pub fn spawn_provision(self: &Arc<Self>, schema: &str) {
+        let registry = self.clone();
+        let schema = schema.to_string();
+        tokio::spawn(async move {
+            match registry.checkout(&schema).await {
+                // Dropping the guard leaves the VM warm; the idle reaper takes
+                // it from here like any other unused schema.
+                Ok(_guard) => info!("schema {schema}: pre-provisioned VM is ready"),
+                Err(e) => warn!("schema {schema}: pre-provisioning failed (will retry on the first client connect): {e:#}"),
+            }
+        });
     }
 
     /// Sandbox ids currently bound to a schema — the exclusion set that keeps
@@ -405,6 +472,13 @@ impl SchemaRegistry {
         self.reclaimer.is_some()
     }
 
+    /// The port clients dial the pooler on, for rendering an example connection
+    /// string. Only the port: the host a client should use is whatever already
+    /// reaches this pooler, which a bind address like `0.0.0.0` can't tell us.
+    pub fn listen_port(&self) -> u16 {
+        self.cfg.listen_addr.port()
+    }
+
     /// The configured heyvmd run dir, if any (`PG_VM_POOL_RUN_DIR`).
     pub fn run_dir(&self) -> Option<PathBuf> {
         self.cfg.run_dir.clone()
@@ -439,6 +513,13 @@ impl SchemaRegistry {
     /// that no longer appear in the daemon's inventory at all.
     pub fn store_records(&self) -> Vec<(String, StoreRecord)> {
         self.store.records()
+    }
+
+    /// The durable record for one schema — which VM last backed it and which
+    /// storage tier its data is on. `None` when the pooler has never brought it
+    /// up (a just-provisioned dedicated database, before its first checkout).
+    pub fn store_record(&self, schema: &str) -> Option<StoreRecord> {
+        self.store.record(schema)
     }
 
     /// Live database stats for a warm, pooler-managed VM, read over the pooler's
@@ -619,6 +700,10 @@ impl SchemaRegistry {
                 _ => None,
             };
             let bound = self.spares.as_ref().map(|_| self.bound_ids()).unwrap_or_default();
+            // A dedicated database's owning role has to exist inside whatever
+            // VM serves it — including one a restore has just rebuilt from
+            // scratch, which carries the data but no roles.
+            let owner = self.owner_of(schema);
             match cell
                 .get_or_try_init(|| {
                     vm::ensure_vm(
@@ -627,6 +712,7 @@ impl SchemaRegistry {
                         known_id.as_deref(),
                         restore.as_ref(),
                         self.spares.as_deref().map(|p| (p, &bound)),
+                        owner.as_ref(),
                     )
                 })
                 .await
@@ -1382,7 +1468,15 @@ impl SchemaRegistry {
         let known_id = self.store.record(schema).map(|r| r.sandbox_id);
         // No spare pool here: this bring-up exists to dump an *existing* VM's
         // data — a fresh spare would have nothing to dump.
-        let entry = match vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), None, None).await {
+        let entry = match vm::ensure_vm(
+            &self.cfg,
+            schema,
+            known_id.as_deref(),
+            None,
+            None,
+            self.owner_of(schema).as_ref(),
+        )
+        .await {
             Ok(entry) => entry,
             Err(e) => {
                 // A bring-up that started the VM but never reached a ready
@@ -2009,7 +2103,15 @@ impl SchemaRegistry {
         }
 
         let known_id = self.store.record(schema).map(|r| r.sandbox_id);
-        let entry = match vm::ensure_vm(&self.cfg, schema, known_id.as_deref(), None, None).await {
+        let entry = match vm::ensure_vm(
+            &self.cfg,
+            schema,
+            known_id.as_deref(),
+            None,
+            None,
+            self.owner_of(schema).as_ref(),
+        )
+        .await {
             Ok(entry) => entry,
             Err(e) => {
                 // Same leak guard as archive_schema_inner's bring-up.

@@ -1,12 +1,17 @@
 //! Server-side-rendered HTML (maud). All values are interpolated through maud,
-//! which HTML-escapes by default; no secrets are ever rendered.
+//! which HTML-escapes by default; no secrets are rendered — with exactly one
+//! deliberate exception, [`dedicated_page`]'s one-time credential panel, which
+//! exists to hand a freshly generated password to the operator who asked for
+//! it and is never re-rendered on a later page load.
 
 use heyo_sdk::SandboxStatus;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
+use crate::dedicated::Credential;
 use crate::registry::{DbStats, GuestStats};
 
 use super::alerts::{Metric, RuleView};
+use super::dedicated::DatabaseInfo;
 use super::handlers::Banner;
 use super::history::Sample;
 use super::host::HostDisk;
@@ -38,6 +43,7 @@ fn shell_with_head(title: &str, extra_head: Markup, body: Markup) -> Markup {
                     a.brand href="/" { "pg-vm-pool" }
                     nav {
                         a href="/" { "Databases" }
+                        a href="/dedicated" { "dedicated" }
                         a href="/monitoring" { "monitoring" }
                         a href="/events" { "events" }
                         a href="/logs/pooler" { "pooler log" }
@@ -112,6 +118,175 @@ pub fn databases_page(st: &DashState, p: &SandboxPage) -> Markup {
             }
         },
     )
+}
+
+/// The dedicated-databases view: what's provisioned, the create form, and —
+/// immediately after a create — the one-time credential panel.
+///
+/// `outcome` is `Some` only on the response to a create POST: `Ok` renders the
+/// credential once, `Err` renders why it was refused with the form still
+/// filled-in-able. It is never carried in a URL, so the password stays out of
+/// browser history and referer headers.
+pub fn dedicated_page(
+    st: &DashState,
+    rows: &[DatabaseInfo],
+    b: &Banner,
+    outcome: Option<&anyhow::Result<Credential>>,
+) -> Markup {
+    // The port clients actually dial. The host is whatever they already use to
+    // reach the pooler, so the example connection string leaves it as a
+    // placeholder rather than guessing from a bind address like 0.0.0.0.
+    let port = st.registry.listen_port();
+    shell(
+        "Dedicated databases",
+        html! {
+            div.pagehead {
+                h1 { "Dedicated databases" }
+                div.pagehead-actions {
+                    a.button-link href="/dedicated" { "↻ refresh" }
+                }
+            }
+            (banner(b))
+            @match outcome {
+                Some(Ok(cred)) => (credential_panel(cred, port)),
+                Some(Err(e)) => div.banner.err { "could not provision: " (format!("{e:#}")) },
+                None => {}
+            }
+
+            p.note {
+                "A dedicated database has its own Postgres role and password and is served \
+                 by its own VM. Unlike the shared "
+                code { "PG_VM_POOL_PASSWORD" }
+                ", these credentials can only open the one database they were created for — \
+                 connecting with any other database name is refused rather than provisioning \
+                 a new VM. The VM itself is built on the first connection and is then managed \
+                 exactly like every other schema (idle-stop, freeze, archive, restore)."
+            }
+
+            @if rows.is_empty() {
+                p.dim { "No dedicated databases provisioned." }
+            } @else {
+                table.dedicated {
+                    thead {
+                        tr {
+                            th { "database" }
+                            th { "role" }
+                            th { "vm" }
+                            th { "storage" }
+                            th { "created" }
+                            th {}
+                        }
+                    }
+                    tbody {
+                        @for r in rows {
+                            tr {
+                                td { code { (r.database) } }
+                                td { code { (r.username) } }
+                                td {
+                                    @match &r.sandbox_id {
+                                        Some(id) => a href={ "/vm/" (id) } { (id) },
+                                        None => span.dim { "not built yet" },
+                                    }
+                                }
+                                td {
+                                    @match r.tier {
+                                        Some(t) => span.badge.s-stopped { (t) },
+                                        None => span.dim { "—" },
+                                    }
+                                }
+                                td.dim { (fmt_age(r.created_at)) }
+                                td.actions {
+                                    form method="post"
+                                        action={ "/dedicated/" (r.database) "/delete" } {
+                                        button.stop
+                                            title="Revoke this credential. The VM, its disk and its data are left untouched — the database simply goes back to ordinary schema routing."
+                                            onclick=(format!("return confirm('Revoke the credential for {}? The VM and its data are NOT deleted — the database returns to ordinary schema routing behind the shared password.')", r.database))
+                                            { "revoke" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            section.controls {
+                h2 { "provision a database" }
+                form.alert-add method="post" action="/dedicated" {
+                    label {
+                        span { "database name" }
+                        input type="text" name="database" placeholder="acme"
+                            pattern="[a-z][a-z0-9_]*" maxlength="63" required;
+                    }
+                    label {
+                        span { "role (default: same as database)" }
+                        input type="text" name="username" placeholder="acme"
+                            pattern="[a-z][a-z0-9_]*" maxlength="63";
+                    }
+                    label.grow {
+                        span { "password (blank = generate a strong one)" }
+                        input type="text" name="password" placeholder="leave blank to generate"
+                            minlength="12" maxlength="128";
+                    }
+                    button type="submit" { "provision" }
+                }
+                p.note {
+                    "Lowercase letters, digits and underscores only — the name becomes a \
+                     Postgres identifier, the VM name, and a storage key. The password is \
+                     shown once, here, and never again; it is stored in cleartext in "
+                    code { "dedicated.tsv" } " (mode 0600) beside the schema registry, which \
+                     is where to look if it is lost."
+                }
+            }
+
+            section.controls {
+                h2 { "API" }
+                p.note {
+                    "The same operations over JSON, behind this dashboard's Basic auth:"
+                }
+                pre.log {
+r#"POST   /api/databases        {"database":"acme","username":"acme","password":"…"}
+GET    /api/databases
+DELETE /api/databases/{database}"#
+                }
+                p.note {
+                    code { "username" } " and " code { "password" } " are optional — the role \
+                     defaults to the database name and the password is generated and returned \
+                     in the 201 response body. " code { "DELETE" } " revokes the credential \
+                     only; it never deletes a VM or its data."
+                }
+            }
+        },
+    )
+}
+
+/// The one-time credential panel shown straight after a successful provision.
+/// The only place the dashboard renders a password.
+fn credential_panel(cred: &Credential, port: u16) -> Markup {
+    let url = format!(
+        "postgres://{}:{}@<pooler-host>:{}/{}",
+        cred.role, cred.password, port, cred.database
+    );
+    html! {
+        section.controls.credential {
+            h2 { "provisioned — copy this now" }
+            dl.detail {
+                dt { "database" }
+                dd { code { (cred.database) } }
+                dt { "role" }
+                dd { code { (cred.role) } }
+                dt { "password" }
+                dd { code.secret { (cred.password) } }
+                dt { "connection URL" }
+                dd { code.secret { (url) } }
+            }
+            p.note {
+                "This password is not stored anywhere the dashboard will show it again. \
+                 The VM is being built in the background; a client can connect immediately \
+                 either way (the first connection waits for it)."
+            }
+        }
+    }
 }
 
 /// Per-hour event series for the monitoring page's activity charts, each as
@@ -511,6 +686,20 @@ fn fmt(v: f64) -> String {
 }
 
 /// Compact human duration for the chart caption: `3h 12m`, `42m`, `30s`.
+/// Render a unix timestamp as an age ("3h 12m ago"). A `0` (a hand-edited
+/// credential file with no timestamp column) renders as unknown rather than as
+/// a nonsense age since 1970.
+fn fmt_age(created_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if created_at == 0 || created_at > now {
+        return "—".to_string();
+    }
+    format!("{} ago", fmt_span(now - created_at))
+}
+
 fn fmt_span(secs: u64) -> String {
     if secs >= 3600 {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
@@ -1606,4 +1795,9 @@ form.alert-add label.grow { flex:1; min-width:220px; }
 form.alert-add input, form.alert-add select { font:inherit; padding:.3rem .5rem; color:var(--fg);
         background:var(--btn-bg); border:1px solid var(--btn-border); border-radius:6px; }
 form.alert-add input[type=number] { width:6rem; }
+table.dedicated { margin:.6rem 0 1rem; }
+section.controls.credential { border-color:var(--ok-border); background:var(--ok-bg); }
+section.controls.credential h2 { color:var(--ok-fg); }
+section.controls.credential dl.detail { max-width:none; }
+code.secret { user-select:all; word-break:break-all; white-space:normal; }
 "#;

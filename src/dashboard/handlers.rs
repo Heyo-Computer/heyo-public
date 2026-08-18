@@ -21,7 +21,7 @@ use super::{host, logs, model, views};
 const ACTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One-shot status banner carried across a redirect (`?msg=` / `?err=`).
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct Banner {
     pub msg: Option<String>,
     pub err: Option<String>,
@@ -535,7 +535,7 @@ pub async fn action_archive_image(
 
 /// Minimal query-value encoder: keep readable chars, map space→`+`, drop the
 /// rest, and cap length. `+` decodes back to a space via `Query`/serde_urlencoded.
-fn qenc(s: &str) -> String {
+pub(super) fn qenc(s: &str) -> String {
     s.chars()
         .map(|c| if c == ' ' { '+' } else { c })
         .filter(|c| c.is_ascii_alphanumeric() || "+.,:_-()".contains(*c))

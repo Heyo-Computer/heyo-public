@@ -2,14 +2,24 @@
 //! actions), so state-changing requests are gated identically to reads.
 
 use axum::middleware;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 
-use super::{auth, handlers, state::DashState};
+use super::{auth, dedicated, handlers, state::DashState};
 
 pub fn build(state: DashState) -> Router {
     Router::new()
         .route("/", get(handlers::databases))
+        // Dedicated databases: the HTML surface and the JSON admin API for
+        // provisioning a database with its own role + password. Both sit under
+        // the same Basic-auth layer as everything else.
+        .route("/dedicated", get(dedicated::page).post(dedicated::create))
+        .route("/dedicated/{database}/delete", post(dedicated::delete))
+        .route(
+            "/api/databases",
+            get(dedicated::api_list).post(dedicated::api_create),
+        )
+        .route("/api/databases/{database}", delete(dedicated::api_delete))
         .route("/monitoring", get(handlers::monitoring))
         .route("/events", get(handlers::events))
         .route("/monitoring/alerts", post(handlers::alert_add))

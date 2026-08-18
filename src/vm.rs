@@ -300,6 +300,7 @@ pub async fn ensure_vm(
     known_id: Option<&str>,
     restore: Option<&RestoreSource>,
     spares: Option<(&crate::spares::SparePool, &std::collections::HashSet<String>)>,
+    owner: Option<&crate::dedicated::Credential>,
 ) -> Result<Arc<SchemaEntry>> {
     // Bound the number of concurrent bring-ups before any daemon traffic. A
     // burst beyond the cap queues here (each waiter is one parked client
@@ -353,17 +354,17 @@ pub async fn ensure_vm(
         }
 
         let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
-        ensure_database(&pool, schema).await?;
+        ensure_database(&pool, schema, owner).await?;
 
         // Restore into the freshly-created, empty database before the entry is
         // handed to any client. A failure here must abort the bring-up: serving
         // an empty DB in place of a restored one would look like silent data loss.
         match restore {
-            Some(RestoreSource::S3(s3)) => restore_from_s3(cfg, &sandbox, schema, s3)
+            Some(RestoreSource::S3(s3)) => restore_from_s3(cfg, &sandbox, schema, s3, owner)
                 .await
                 .with_context(|| format!("restoring schema {schema} from S3"))?,
             Some(RestoreSource::Local { srv, port }) => {
-                restore_from_local(cfg, &sandbox, schema, srv, *port)
+                restore_from_local(cfg, &sandbox, schema, srv, *port, owner)
                     .await
                     .with_context(|| format!("restoring schema {schema} from the local dump"))?
             }
@@ -917,14 +918,28 @@ fn require_2xx(what: &str) -> String {
 /// retry fails on `relation already exists` — one interrupted restore wedged
 /// the schema forever. Object-level clean handles that; `--if-exists` keeps it
 /// a no-op on the genuinely fresh, empty database of the common case.
-fn restore_job_body(user: &str, db: &str, resolve: &str, url: &str) -> String {
+/// `keep_ownership` is set for a *dedicated* database ([`crate::dedicated`]),
+/// and it matters: the default `--no-owner --no-privileges` makes every
+/// restored object belong to the restoring superuser and drops the dump's
+/// grants, which for an ordinary schema is exactly right (the dump may name
+/// roles this cluster has never heard of) but for a dedicated one silently
+/// hands the tenant back a database it cannot read — its tables would come back
+/// owned by `postgres`. The owning role is guaranteed to exist before any
+/// restore runs (`ensure_database` creates it first), so here the dump's own
+/// ownership and grants can and must be replayed.
+fn restore_job_body(user: &str, db: &str, resolve: &str, url: &str, keep_ownership: bool) -> String {
     let done = RESTORE_JOB.done;
+    let ownership = if keep_ownership {
+        ""
+    } else {
+        "--no-owner --no-privileges "
+    };
     format!(
         "ec=0\n\
          code=$(curl -sS {resolve} -o {RESTORE_PATH} -w '%{{http_code}}' \"{url}\") || ec=$?\n\
          {}\
          if [ \"$ec\" = 0 ]; then\n\
-         \tpg_restore -h 127.0.0.1 -U {user} --clean --if-exists --no-owner --no-privileges -j \"$(nproc)\" -d {db} {RESTORE_PATH} || ec=$?\n\
+         \tpg_restore -h 127.0.0.1 -U {user} --clean --if-exists {ownership}-j \"$(nproc)\" -d {db} {RESTORE_PATH} || ec=$?\n\
          fi\n\
          rm -f {RESTORE_PATH}\n\
          printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n",
@@ -1297,6 +1312,7 @@ pub async fn restore_from_local(
     schema: &str,
     srv: &crate::dumpsrv::DumpServer,
     port: u16,
+    owner: Option<&crate::dedicated::Credential>,
 ) -> Result<()> {
     let path = srv.dump_path(schema);
     match crate::dumpsrv::dump_size(&path) {
@@ -1319,7 +1335,7 @@ pub async fn restore_from_local(
     let body = format!(
         "{}{}",
         gw_prelude(RESTORE_JOB.done),
-        restore_job_body(&user, &db, "", &url)
+        restore_job_body(&user, &db, "", &url, owner.is_some())
     );
     RESTORE_JOB.launch(cfg, sandbox, &body, RESTORE_PATH).await?;
     await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await?;
@@ -1385,6 +1401,7 @@ async fn restore_from_s3(
     sandbox: &Sandbox,
     schema: &str,
     s3: &S3Config,
+    owner: Option<&crate::dedicated::Credential>,
 ) -> Result<()> {
     let key = s3.object_key(schema);
 
@@ -1424,7 +1441,7 @@ async fn restore_from_s3(
         .launch(
             cfg,
             sandbox,
-            &restore_job_body(&user, &db, &resolve, &url),
+            &restore_job_body(&user, &db, &resolve, &url, owner.is_some()),
             RESTORE_PATH,
         )
         .await?;
@@ -2416,7 +2433,7 @@ mod tests {
             ),
             (
                 RESTORE_JOB,
-                restore_job_body(&user, &db, &resolve, url),
+                restore_job_body(&user, &db, &resolve, url, false),
                 RESTORE_PATH,
                 "_restore.job.sh",
             ),
@@ -2989,6 +3006,70 @@ mod tests {
         );
     }
 
+    /// A dedicated database's role must never be able to grow past the one
+    /// database it was provisioned for, even from inside its own VM — that is
+    /// the guest-side half of the guarantee `dedicated::Credentials::authorize`
+    /// makes at the pooler. Pin the attribute set so a future edit can't
+    /// quietly hand out CREATEDB or superuser.
+    #[test]
+    fn dedicated_role_ddl_is_unprivileged_and_quoted() {
+        let cred = crate::dedicated::Credential {
+            database: "acme".into(),
+            role: "acme_app".into(),
+            password: "hunter2hunter2".into(),
+            created_at: 0,
+        };
+        let create = role_ddl(&cred, false);
+        assert!(create.starts_with("CREATE ROLE \"acme_app\" WITH LOGIN "), "{create}");
+        for attr in ["NOSUPERUSER", "NOCREATEDB", "NOCREATEROLE"] {
+            assert!(create.contains(attr), "{attr} missing from: {create}");
+        }
+        assert!(create.contains("PASSWORD 'hunter2hunter2'"), "{create}");
+        // An existing role is realigned rather than re-created, so a restore
+        // into a fresh VM and a plain restart both converge on the same shape.
+        assert!(role_ddl(&cred, true).starts_with("ALTER ROLE \"acme_app\" WITH LOGIN "));
+
+        // Quoting: identifiers double their quotes, password literals double
+        // theirs. `dedicated`'s validation rejects both shapes, so this is
+        // defense in depth against a hand-edited credential file.
+        let odd = crate::dedicated::Credential {
+            database: "acme".into(),
+            role: "we\"ird".into(),
+            password: "it's-fine".into(),
+            created_at: 0,
+        };
+        let ddl = role_ddl(&odd, false);
+        assert!(ddl.contains(r#"ROLE "we""ird" WITH"#), "{ddl}");
+        assert!(ddl.contains("PASSWORD 'it''s-fine'"), "{ddl}");
+    }
+
+    /// A dedicated database restored from the frozen or S3-dump tier must come
+    /// back owned by its tenant role. `--no-owner --no-privileges` would land
+    /// every table on the restoring superuser instead, so the tenant would
+    /// reconnect to its own database and get "permission denied" on all of it —
+    /// data that looks lost. Pin that the flags are dropped exactly for the
+    /// dedicated case and kept for every other schema.
+    #[test]
+    fn restore_keeps_ownership_only_for_a_dedicated_database() {
+        let shared = restore_job_body("postgres", "tenant1", "", "http://x/y", false);
+        assert!(shared.contains("--no-owner --no-privileges"), "{shared}");
+
+        let dedicated = restore_job_body("postgres", "beta", "", "http://x/y", true);
+        assert!(!dedicated.contains("--no-owner"), "{dedicated}");
+        assert!(!dedicated.contains("--no-privileges"), "{dedicated}");
+        // Everything else about the invocation is unchanged — notably the
+        // idempotent clean that lets an interrupted restore be retried.
+        for expected in ["pg_restore -h 127.0.0.1 -U postgres --clean --if-exists", "-d beta"] {
+            assert!(dedicated.contains(expected), "{expected} missing from: {dedicated}");
+        }
+    }
+
+    #[test]
+    fn quote_ident_escapes_embedded_quotes() {
+        assert_eq!(quote_ident("acme"), "\"acme\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
     #[tokio::test]
     async fn resize_disk_rejects_out_of_range_sizes_without_calling_out() {
         let (base, seen) = resize_stub(axum::http::StatusCode::OK, "{}").await;
@@ -3005,20 +3086,126 @@ mod tests {
 /// schema name is client-supplied — it's already validated in main, and we
 /// double-quote-escape it here as defense in depth (identifiers can't be bound
 /// as parameters).
-async fn ensure_database(pool: &Pool, schema: &str) -> Result<()> {
+///
+/// `owner` is set for a *dedicated* database ([`crate::dedicated`]): its login
+/// role is created (or brought back in line) first and the database is created
+/// owned by it, so the tenant's own credential can create schemas and tables
+/// in it. Run on **every** bring-up rather than only at provisioning time,
+/// because it has to be idempotent anyway and because a restore from the
+/// frozen or archived tier materializes a *fresh* cluster — `pg_dump` of a
+/// single database carries no roles, so without this the restored VM would
+/// have the data but no role able to log into it.
+async fn ensure_database(
+    pool: &Pool,
+    schema: &str,
+    owner: Option<&crate::dedicated::Credential>,
+) -> Result<()> {
     let client = pool.get().await.context("checkout for db bootstrap")?;
+    if let Some(cred) = owner {
+        ensure_role(&client, cred).await?;
+    }
     let exists = client
         .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&schema])
         .await
         .context("checking pg_database")?
         .is_some();
+    let quoted = quote_ident(schema);
     if !exists {
-        let quoted = schema.replace('"', "\"\"");
+        let owned = match owner {
+            Some(cred) => format!(" OWNER {}", quote_ident(&cred.role)),
+            None => String::new(),
+        };
         client
-            .batch_execute(&format!("CREATE DATABASE \"{quoted}\""))
+            .batch_execute(&format!("CREATE DATABASE {quoted}{owned}"))
             .await
             .with_context(|| format!("creating database {schema}"))?;
         info!("created database {schema}");
+    } else if let Some(cred) = owner {
+        // The database predates its credential (provisioned over an existing
+        // schema VM) or was recreated by a restore under the bootstrap role.
+        // Ownership is what gives the tenant role CREATE on the database and,
+        // through `pg_database_owner`, on its `public` schema — so reconcile
+        // it rather than leaving a database its own role cannot write to.
+        let owned_by_role = client
+            .query_opt(
+                "SELECT 1 FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba \
+                 WHERE d.datname = $1 AND r.rolname = $2",
+                &[&schema, &cred.role],
+            )
+            .await
+            .context("checking database ownership")?
+            .is_some();
+        if !owned_by_role {
+            client
+                .batch_execute(&format!(
+                    "ALTER DATABASE {quoted} OWNER TO {}",
+                    quote_ident(&cred.role)
+                ))
+                .await
+                .with_context(|| {
+                    format!("giving role {} ownership of database {schema}", cred.role)
+                })?;
+            info!("database {schema}: owner set to {}", cred.role);
+        }
     }
     Ok(())
+}
+
+/// Create (or re-align) the login role behind a dedicated database.
+///
+/// Deliberately unprivileged — `NOSUPERUSER NOCREATEDB NOCREATEROLE` — so the
+/// credential can't grow past the one database it was provisioned for even
+/// inside its own VM. Ownership of that database (granted by the caller) is
+/// what gives it full control of its own data. Note that `NOSUPERUSER` also
+/// keeps it away from `COPY ... FROM PROGRAM` and `pg_read_file`, which the
+/// pooler's own bootstrap role uses and which would otherwise expose the
+/// guest's presigned-URL restore scripts.
+///
+/// The password is re-applied on every bring-up so the guest role always
+/// matches the record the pooler authenticates against — belt-and-braces,
+/// since the pg-fc image's `pg_hba.conf` is `trust` and the pooler is the layer
+/// that actually checks it.
+async fn ensure_role(
+    client: &deadpool_postgres::Object,
+    cred: &crate::dedicated::Credential,
+) -> Result<()> {
+    let exists = client
+        .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&cred.role])
+        .await
+        .context("checking pg_roles")?
+        .is_some();
+    client
+        .batch_execute(&role_ddl(cred, exists))
+        .await
+        .with_context(|| format!("provisioning role {}", cred.role))?;
+    if !exists {
+        info!(
+            "created role {} for dedicated database {}",
+            cred.role, cred.database
+        );
+    }
+    Ok(())
+}
+
+/// The `CREATE`/`ALTER ROLE` statement behind a dedicated database. Split out
+/// from [`ensure_role`] so the attribute set — the thing that decides how much
+/// the credential can do inside its own VM — and the quoting are testable
+/// without a live server.
+fn role_ddl(cred: &crate::dedicated::Credential, exists: bool) -> String {
+    let verb = if exists { "ALTER" } else { "CREATE" };
+    // The password is validated to printable, space-free ASCII, so the only
+    // character that can end the literal is a quote — double it, and rely on
+    // standard_conforming_strings (on by default) for backslashes.
+    let literal = cred.password.replace('\'', "''");
+    format!(
+        "{verb} ROLE {} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{literal}'",
+        quote_ident(&cred.role)
+    )
+}
+
+/// Double-quote a Postgres identifier, escaping any embedded quote. Identifiers
+/// can't be bound as query parameters, so every interpolated name goes through
+/// here.
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }

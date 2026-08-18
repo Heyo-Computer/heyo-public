@@ -75,6 +75,14 @@ pub struct Config {
     /// to the right VM (by id) after a restart instead of creating a duplicate
     /// with a fresh data disk. Env `PG_VM_POOL_STATE_FILE`.
     pub state_file: PathBuf,
+    /// Where dedicated-database credentials (`database → role + password`)
+    /// persist. These are the provisioned databases whose clients authenticate
+    /// with their own password instead of [`Self::pg_password`] and may open
+    /// only the one database they were created for — see [`crate::dedicated`].
+    /// Holds cleartext passwords, so it is written `0600`. Env
+    /// `PG_VM_POOL_DEDICATED_FILE`; defaults to `dedicated.tsv` next to the
+    /// state file.
+    pub dedicated_file: PathBuf,
     /// Where the monitoring event metrics keep their daily partition files
     /// (`events-YYYY-MM-DD.tsv`), so the restore/create charts survive
     /// restarts. Env `PG_VM_POOL_METRICS_DIR`; defaults to `metrics/` next to
@@ -540,6 +548,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_DATA_DISK_GB",
     "PG_VM_POOL_KEEPALIVE_SCHEMAS",
     "PG_VM_POOL_STATE_FILE",
+    "PG_VM_POOL_DEDICATED_FILE",
     "PG_VM_POOL_METRICS_DIR",
     "PG_VM_POOL_DISK_GROW_PCT",
     "PG_VM_POOL_DISK_MAX_GB",
@@ -643,6 +652,19 @@ impl Config {
             .unwrap_or_else(|_| {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 PathBuf::from(home).join(".heyo/pg-vm-pool/registry.tsv")
+            });
+        // Dedicated-database credentials live beside the state file unless
+        // pointed elsewhere — same directory, same lifecycle as the registry
+        // they key into.
+        let dedicated_file = std::env::var("PG_VM_POOL_DEDICATED_FILE")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                state_file
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("dedicated.tsv")
             });
         // Daily-partitioned event metrics live beside the state file unless
         // pointed elsewhere.
@@ -795,6 +817,7 @@ impl Config {
             keepalive_schemas,
             direct_connect,
             state_file,
+            dedicated_file,
             metrics_dir,
             disk_grow: DiskGrowConfig::from_env()?,
             tls_cert,
