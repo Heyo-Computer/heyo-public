@@ -297,6 +297,12 @@ fn populated_metrics() -> crate::metrics::Metrics {
     m.record_cold_start_hit("sandbox");
     m.record_cold_start_timeout("sandbox");
     m.record_boot_timeout("sandbox");
+    // A refused create, with the daemon's own words. Recorded in the fixture
+    // rather than left at zero so `last_create_error` appears in the wire shape
+    // at all — it is `skip_serializing_if = "Option::is_none"`, so a fixture
+    // with no failure would silently omit the one field a client needs to
+    // render the reason a pool is stuck.
+    m.record_create_failure("sandbox", "api error (500): No space left on device");
     m.record_host_usage(true, 8, 23.5, 33_554_432_000, 9_663_676_416, 1_722_400_000_000);
     m
 }
@@ -893,6 +899,141 @@ fn workflow_spec_is_stable() {
     golden(
         "workflow-list",
         &serde_json::json!({ "workflows": [workflow_spec()] }),
+    );
+}
+
+/// `GET /disks` — the inventory `heyctl get disks` renders.
+///
+/// Built with struct literals like every fixture here, so a field added to
+/// `DiskInfo` or `Totals` stops this module compiling until somebody decides
+/// whether the client should show it. That matters more for this response than
+/// most: the disk console was the only reader for a long time, and a column it
+/// quietly stopped rendering is a gigabyte nobody accounts for.
+///
+/// One row per state that reads differently, because the states are the whole
+/// point of the listing: a running VM's disk (never reclaimed), an orphan with
+/// no daemon record (pure residue), and one an operator pinned with `retain`.
+#[test]
+fn disk_inventory_is_stable() {
+    use crate::disks::{
+        DEFAULT_MIN_FREE_BYTES, DiskInfo, DiskPart, DiskState, Inventory, PartKind, Totals,
+    };
+
+    let running = DiskInfo {
+        sandbox_id: "sb-1a2b3c4d".into(),
+        name: Some("applb-web-00000000002a".into()),
+        deployment: Some("web".into()),
+        state: DiskState::Running,
+        claimed: true,
+        retain: false,
+        note: None,
+        bytes: 1_073_741_824,
+        // Sparse: the guest sees 8 GiB where the host has lost 1 GiB. The two
+        // columns exist because these routinely disagree by this much.
+        apparent_bytes: 8_589_934_592,
+        modified_at: 1_760_000_000,
+        expires_at: None,
+        held_by: Some("in use by a running sandbox"),
+        archived: None,
+        parts: vec![
+            DiskPart {
+                kind: PartKind::Data,
+                path: "run/sb-1a2b3c4d/data.ext4".into(),
+                bytes: 1_073_741_824,
+                apparent_bytes: 8_589_934_592,
+                modified_at: 1_760_000_000,
+            },
+            DiskPart {
+                kind: PartKind::Rootfs,
+                path: "run/sb-1a2b3c4d/rootfs.ext4".into(),
+                bytes: 1_178_599_424,
+                apparent_bytes: 1_178_599_424,
+                modified_at: 1_760_000_000,
+            },
+        ],
+        roots: vec!["run/sb-1a2b3c4d".into()],
+    };
+
+    let orphan = DiskInfo {
+        sandbox_id: "sb-99887766".into(),
+        name: None,
+        deployment: None,
+        state: DiskState::Orphan,
+        claimed: false,
+        retain: false,
+        note: None,
+        bytes: 2_147_483_648,
+        apparent_bytes: 2_147_483_648,
+        modified_at: 1_759_000_000,
+        expires_at: Some(1_759_604_800),
+        held_by: None,
+        archived: None,
+        parts: vec![DiskPart {
+            kind: PartKind::Data,
+            path: "run/sb-99887766/data.ext4".into(),
+            bytes: 2_147_483_648,
+            apparent_bytes: 2_147_483_648,
+            modified_at: 1_759_000_000,
+        }],
+        roots: vec!["run/sb-99887766".into()],
+    };
+
+    let pinned = DiskInfo {
+        sandbox_id: "sb-deadbeef".into(),
+        name: Some("applb-api-000000000007".into()),
+        deployment: Some("api".into()),
+        state: DiskState::Stopped,
+        claimed: false,
+        retain: true,
+        note: Some("keeping for the incident postmortem".into()),
+        bytes: 536_870_912,
+        apparent_bytes: 4_294_967_296,
+        modified_at: 1_758_000_000,
+        expires_at: None,
+        held_by: Some("retained by an operator"),
+        archived: None,
+        parts: vec![DiskPart {
+            kind: PartKind::Data,
+            path: "run/sb-deadbeef/data.ext4".into(),
+            bytes: 536_870_912,
+            apparent_bytes: 4_294_967_296,
+            modified_at: 1_758_000_000,
+        }],
+        roots: vec!["run/sb-deadbeef".into()],
+    };
+
+    golden(
+        "disks",
+        &Inventory {
+            complete: true,
+            incomplete_reason: None,
+            data_dir: "/var/lib/heyo".into(),
+            tmp_dir: "/tmp".into(),
+            ttl_secs: 604_800,
+            sweep_secs: 3600,
+            archive_enabled: false,
+            archive_on_expire: false,
+            archive_target: None,
+            // A host under the threshold: 12 GiB free against a 20 GiB floor, so
+            // the fixture carries the shape a client sees when the sweep has a
+            // reason to reclaim early. The orphan below is what it would take.
+            free_bytes: Some(12_884_901_888),
+            filesystem_bytes: Some(536_870_912_000),
+            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+            totals: Totals {
+                disks: 3,
+                bytes: 3_758_096_384,
+                apparent_bytes: 15_032_385_536,
+                running: 1,
+                stopped: 1,
+                orphan: 1,
+                retained: 1,
+                expiring_now: 1,
+                reclaimable_bytes: 2_147_483_648,
+            },
+            disks: vec![running, orphan, pinned],
+            archives: vec![],
+        },
     );
 }
 

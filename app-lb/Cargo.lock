@@ -175,6 +175,7 @@ dependencies = [
  "heyo-sdk",
  "http",
  "instant-acme",
+ "libc",
  "openssl",
  "pingora-core",
  "pingora-http",

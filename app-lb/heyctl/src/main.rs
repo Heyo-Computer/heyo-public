@@ -71,7 +71,7 @@ enum Command {
         cmd: cmd::auth::ConfigCmd,
     },
 
-    /// List deployments, VMs, certificates, secrets or jobs.
+    /// List deployments, VMs, certificates, secrets, jobs or disks.
     #[command(visible_alias = "list")]
     Get(cmd::read::GetArgs),
 

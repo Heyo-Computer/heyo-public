@@ -136,6 +136,14 @@ sha2.workspace = true
 tar = "0.4"
 flate2 = "1"
 
+# `statvfs`, for one question nothing else in the tree can answer: how much room
+# is left on the filesystem holding the guest disks. The disk sweep expired
+# things purely on age before this, so a host that filled up today reclaimed
+# nothing for a week while every VM create failed on ENOSPC — see
+# `disks::free_bytes`. Already in the lock file via `tar`/`filetime`, so this is
+# a dependency line rather than a new build.
+libc = "0.2"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

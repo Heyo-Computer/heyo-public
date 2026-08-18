@@ -31,6 +31,22 @@ const TICK: Duration = Duration::from_secs(2);
 /// every poll of a VM that will be up in ten seconds.
 const BOOT_HEARTBEAT: u64 = 30;
 
+/// How long a pending VM may be absent from the daemon's fleet listing before
+/// the pool gives up on it.
+///
+/// The value is a statement about the *daemon*, not the guest: it bounds how
+/// long a sandbox this LB created may take to show up in `GET /sandboxes`.
+/// Ninety seconds because a create is acknowledged (202, `provisioning`) before
+/// its rootfs copy finishes, and that copy is a full byte-for-byte read/write
+/// on any filesystem without reflink — tens of seconds for a multi-gigabyte
+/// image on a busy host, and worse when the disk is near full.
+///
+/// Far more important than the exact number is that it is not zero. Treating
+/// the first miss as death is what let a single replica slot create sandboxes
+/// every [`TICK`] without bound: each miss freed the slot, and each freed slot
+/// bought another VM and another data disk that nothing was tracking.
+const MISSING_GRACE: u64 = 90;
+
 /// How many deployments reconcile at once.
 ///
 /// The bound exists because the daemon is one process on one host: a fleet of
@@ -187,6 +203,86 @@ impl Autoscaler {
         }
     }
 
+    /// Take back replicas the daemon is running that this deployment is not
+    /// tracking.
+    ///
+    /// The other half of the duplicate-VM fix, for the case the grace window in
+    /// `promote_pending` cannot reach: a `create` whose *id was never learned*.
+    /// `VmManager::create` can fail client-side — the SDK gives it a bounded
+    /// timeout — after the daemon has already accepted the sandbox and begun
+    /// building it. `scale_up` sees an `Err`, records no pending VM, and breaks;
+    /// nothing here has any idea that sandbox exists. The slot stays empty, the
+    /// next tick creates another, and each attempt strands one more VM and one
+    /// more data disk. That is the shape observed in production: ten sandboxes
+    /// and ten disks alive on the daemon, none of them in any pool.
+    ///
+    /// Adoption closes it without a single extra daemon call — `fleet` is the
+    /// listing `reconcile` already fetched — and it is self-healing: whatever
+    /// was stranded is counted against `desired` on the very next tick, so the
+    /// pool stops creating replacements for capacity it already has.
+    ///
+    /// Ownership comes from the sandbox *name* ([`vm::owner_of`]), which is the
+    /// same rule `adopt_existing` uses at startup; this is that logic made
+    /// continuous rather than once-per-process.
+    ///
+    /// Three exclusions, each load-bearing:
+    /// * anything already in `backends` or `pending` — that is the normal case,
+    ///   not an orphan;
+    /// * suspended sandboxes, which are stopped deliberately and whose data disk
+    ///   *is* the deployment's retained state;
+    /// * terminal states, which the stopped-VM sweep owns; adopting one would
+    ///   mean waiting out a boot timeout on a VM that is already dead.
+    fn adopt_untracked(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
+        let pending = d.pending();
+        let backends = d.backends();
+        let tracked: HashSet<&str> = backends
+            .iter()
+            .map(|b| b.sandbox_id.as_str())
+            .chain(pending.iter().map(|p| p.sandbox_id.as_str()))
+            .collect();
+        let state = d.state();
+
+        let mut adopted = Vec::new();
+        for (id, info) in fleet {
+            if vm::owner_of(&info.name) != Some(d.spec.id.as_str())
+                || tracked.contains(id.as_str())
+                || state.suspended.contains(id)
+                || vm::is_terminal(&info.status)
+            {
+                continue;
+            }
+            // Dated from the daemon's own uptime, not from now: this VM may have
+            // been booting for minutes already, and starting its clock here
+            // would hand it a fresh `boot_timeout_secs` on every adoption.
+            let created_at = now_secs().saturating_sub(info.uptime_secs);
+            adopted.push(PendingVm {
+                created_at,
+                // `Resumed`, deliberately, though most of these will in fact be
+                // fresh creates. The origin decides whether the give-up path may
+                // delete the data disk, and an adopted VM's history is exactly
+                // what was lost — so take the conservative branch and keep the
+                // disk. A genuinely orphaned one is still reclaimed later by the
+                // disk sweep; the reverse mistake destroys retained state.
+                origin: BootOrigin::Resumed,
+                ..PendingVm::new(id.clone())
+            });
+        }
+
+        if adopted.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            deployment = %d.spec.id,
+            count = adopted.len(),
+            sandboxes = %adopted.iter().map(|p| p.sandbox_id.as_str()).collect::<Vec<_>>().join(","),
+            "adopting running VMs this deployment was not tracking; they count against \
+             desired capacity now, so the pool stops creating duplicates for them",
+        );
+        let mut next = (*pending).clone();
+        next.extend(adopted);
+        d.set_pending(next);
+    }
+
     /// One full pass over every deployment.
     ///
     /// Concurrent, not sequential. A fleet of agent sandboxes is thousands of
@@ -240,13 +336,27 @@ impl Autoscaler {
         // with nothing booting and nothing draining needs no `await` at all, and
         // at fleet scale that is nearly all of them. Doing their bookkeeping
         // inline keeps the concurrent stream carrying only real work.
+        // How many non-terminal sandboxes the daemon is running per owner, built
+        // once for the whole fleet. `at_rest` compares it against what each
+        // deployment tracks, so a VM that exists but is in no pool cannot hide
+        // behind the fast path.
+        let mut owned_running: HashMap<&str, usize> = HashMap::new();
+        for info in fleet.values() {
+            if vm::is_terminal(&info.status) {
+                continue;
+            }
+            if let Some(owner) = vm::owner_of(&info.name) {
+                *owned_running.entry(owner).or_default() += 1;
+            }
+        }
+
         let mut busy = Vec::new();
         for d in &managed {
             if !self.is_live(d) {
                 continue;
             }
             self.prune(d, &fleet);
-            if at_rest(d, &fleet) {
+            if at_rest(d, &fleet, &owned_running) {
                 self.apply_usage(d, &usage);
             } else {
                 busy.push(d);
@@ -317,6 +427,12 @@ impl Autoscaler {
         if !self.is_live(d) {
             return;
         }
+
+        // Before anything counts capacity: a VM the daemon is running for this
+        // deployment but that nothing here tracks is still capacity, and still
+        // costs a data disk. Counting it is what stops `scale_up` buying a
+        // duplicate for a slot that is already filled.
+        self.adopt_untracked(d, fleet);
 
         // `prune` already ran in `reconcile`, which needed a current backend
         // list to decide this deployment had work at all.
@@ -501,27 +617,50 @@ impl Autoscaler {
 
         for p in pending.iter() {
             let Some(info) = fleet.get(&p.sandbox_id) else {
-                tracing::warn!(
+                // Missing from the listing is *not* treated as gone, and this is
+                // the fix for an unbounded VM-creation loop that was observed in
+                // production: ten sandboxes and ten data disks for a single
+                // replica slot, none of them tracked here.
+                //
+                // The old code dropped the VM on the first miss. That freed the
+                // slot — `live = ready + pending` fell below `desired` — so the
+                // next tick created a replacement, 2s later, and the tick after
+                // that, for as long as the condition lasted. Meanwhile the
+                // sandbox it forgot was still the daemon's, still holding a
+                // `disk_size_gb` data disk nothing would ever reclaim.
+                //
+                // Absence is not proof of death: a sandbox still provisioning —
+                // copying a multi-gigabyte rootfs onto a loaded host — may not
+                // be listed yet. So it keeps its slot for [`MISSING_GRACE`],
+                // which is what stops the duplication, and only then is handed
+                // to the doomed path, which kills it *before* reclaiming its
+                // disks rather than unlinking under a VM that may still exist.
+                let now = now_secs();
+                if let Some(since) = hold_missing(p.missing_since, now) {
+                    if p.missing_since.is_none() {
+                        tracing::warn!(
+                            deployment = %d.spec.id,
+                            sandbox = %p.sandbox_id,
+                            age_secs = p.age_secs(),
+                            grace_secs = MISSING_GRACE,
+                            "pending VM is missing from the daemon's listing; holding its \
+                             slot rather than creating a replacement",
+                        );
+                    }
+                    still_pending.push(PendingVm {
+                        missing_since: Some(since),
+                        ..p.clone()
+                    });
+                    continue;
+                }
+                tracing::error!(
                     deployment = %d.spec.id,
                     sandbox = %p.sandbox_id,
                     age_secs = p.age_secs(),
-                    "pending VM vanished from the daemon",
+                    missing_secs = now.saturating_sub(p.missing_since.unwrap_or(now)),
+                    "pending VM never came back to the daemon's listing; giving up on it",
                 );
-                // Dropped from tracking here and never killed, because there is
-                // nothing left to kill — the daemon has no record of it. That is
-                // precisely the case that leaves disks nothing will ever
-                // reclaim: `destroy()` cleans up on delete, and no delete is
-                // coming for a sandbox the daemon has already forgotten.
-                //
-                // Safe to unlink without the kill the doomed path insists on,
-                // for the same reason `disks` refuses to classify anything as
-                // orphaned on a failed listing: `reconcile` returns early when
-                // `vms.list()` errors, so `fleet` is only ever a listing that
-                // *succeeded*, and an id absent from one is an id no hypervisor
-                // is running. The origin gate covers the rest — a `Created`
-                // sandbox never served, so there is no retained `/workspace`
-                // here to lose either way.
-                self.discard_failed_boot_of(d, &p.sandbox_id, p.origin).await;
+                doomed.push((p.sandbox_id.clone(), p.origin));
                 continue;
             };
             let age = p.age_secs();
@@ -692,8 +831,13 @@ impl Autoscaler {
         info: &SandboxInfo,
         age: u64,
     ) -> PendingVm {
+        // `missing_since` is cleared unconditionally: reaching here means this
+        // VM was in the listing this tick, so any earlier absence was the
+        // transient the grace window exists to absorb, and a later one starts
+        // its own window rather than inheriting a stale timestamp.
         let next = PendingVm {
             status: Some(info.status.clone()),
+            missing_since: None,
             ..p.clone()
         };
         let changed = p.status.as_ref() != Some(&info.status);
@@ -794,6 +938,13 @@ impl Autoscaler {
                 }
                 Err(e) => {
                     tracing::error!(deployment = %d.spec.id, error = %e, "failed to create VM");
+                    // Counted *and* kept verbatim. Before this the only trace of
+                    // a refused create was this log line, so a pool stuck at
+                    // `ready: 0` showed `vms_created: 0, scale_up_events: 0,
+                    // boot_timeouts: 0` — three zeroes that read as "idle" and
+                    // sent every investigation to the guest image, which in this
+                    // failure mode never runs at all.
+                    self.metrics.record_create_failure(&d.spec.id, &e.to_string());
                     self.feed.issue(
                         &d.spec,
                         format!("{}: VM create failed", d.spec.id),
@@ -1507,6 +1658,22 @@ impl BackgroundService for Autoscaler {
 /// `vm_port` is the deployment's proxied port, which the health check's own `port`
 /// overrides when set — the same resolution `health::probe` does, so the message
 /// names the port actually dialled rather than the one in the spec.
+/// Whether a pending VM that is absent from the fleet listing keeps its slot,
+/// and the timestamp to remember if so.
+///
+/// `Some(since)` means keep waiting and record `since` as when the absence
+/// began; `None` means the grace has elapsed and the pool should give up. Pure,
+/// so the rule that stops duplicate VM creation is testable without a daemon —
+/// the same reason [`Autoscaler::unclaimed`] is a separate function.
+///
+/// The first call for a given VM passes `None` and starts the clock at `now`,
+/// which is why a fresh absence always holds rather than being measured against
+/// a zero timestamp.
+fn hold_missing(missing_since: Option<u64>, now: u64) -> Option<u64> {
+    let since = missing_since.unwrap_or(now);
+    (now.saturating_sub(since) < MISSING_GRACE).then_some(since)
+}
+
 /// Whether `d` needs nothing this tick beyond a usage sample.
 ///
 /// This is the fast path that makes a fleet of thousands viable: at rest, a
@@ -1515,12 +1682,27 @@ impl BackgroundService for Autoscaler {
 /// count or a flag already in memory.
 ///
 /// Call after `prune`, so the backend list reflects the fleet snapshot.
-fn at_rest(d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) -> bool {
+fn at_rest(
+    d: &Arc<Deployment>,
+    fleet: &HashMap<String, SandboxInfo>,
+    owned_running: &HashMap<&str, usize>,
+) -> bool {
     let backends = d.backends();
     if !d.pending().is_empty() || backends.iter().any(|b| b.is_draining()) {
         return false;
     }
     if backends.len() != d.desired_replicas() as usize {
+        return false;
+    }
+    // The daemon runs more replicas for this deployment than it is tracking, so
+    // something was created that never made it into a pool — see
+    // `adopt_untracked`. Not at rest: those VMs are real, they hold real data
+    // disks, and only `reconcile_one` can take them back. Counted once per tick
+    // for the whole fleet, so this stays a hashmap lookup on the fast path.
+    if owned_running
+        .get(d.spec.id.as_str())
+        .is_some_and(|n| *n > backends.len())
+    {
         return false;
     }
     // A TTL past its halfway mark needs a renewal call, which is an await. A
@@ -2021,31 +2203,92 @@ mod tests {
             (d, fleet)
         }
 
+        /// The common case: the daemon runs exactly what the pool tracks.
+        fn no_extras() -> HashMap<&'static str, usize> {
+            HashMap::new()
+        }
+
+        /// The rule that stops a single replica slot from buying VMs forever.
+        ///
+        /// Before this, a pending VM absent from one fleet listing was dropped
+        /// on the spot. That freed the slot, `live` fell below `desired`, and
+        /// the next tick created a replacement — every 2s, each one holding a
+        /// `disk_size_gb` data disk nothing tracked. Ten sandboxes and ten disks
+        /// for one replica is what that looked like in production.
+        ///
+        /// So the first absence must *hold*, and holding must be bounded.
+        #[test]
+        fn a_missing_pending_vm_holds_its_slot_then_gives_up() {
+            let t = 1_000_000u64;
+
+            // First sighting: start the clock and keep the slot.
+            assert_eq!(hold_missing(None, t), Some(t), "a fresh absence holds");
+
+            // Still inside the window: keep holding, and keep the *original*
+            // timestamp — re-stamping it each tick would hold forever.
+            assert_eq!(hold_missing(Some(t), t + 1), Some(t));
+            assert_eq!(hold_missing(Some(t), t + MISSING_GRACE - 1), Some(t));
+
+            // Boundary and beyond: give up, so the VM is killed and reclaimed
+            // rather than silently forgotten.
+            assert_eq!(hold_missing(Some(t), t + MISSING_GRACE), None);
+            assert_eq!(hold_missing(Some(t), t + MISSING_GRACE * 10), None);
+
+            // Clock skew must not read as an elapsed grace: `saturating_sub`
+            // floors at zero, so a timestamp from the future still holds.
+            assert_eq!(hold_missing(Some(t + 5), t), Some(t + 5));
+        }
+
         #[test]
         fn an_idle_pool_at_its_desired_size_is_at_rest() {
             let (d, fleet) = settled();
-            assert!(at_rest(&d, &fleet));
+            assert!(at_rest(&d, &fleet, &no_extras()));
+        }
+
+        /// The fast path must not hide a VM that exists but is in no pool.
+        ///
+        /// This is the at-rest half of the duplicate-VM leak: a create that the
+        /// client gave up on while the daemon went on to build the sandbox
+        /// leaves a replica nothing tracks. If the pool is otherwise at its
+        /// desired size, every condition above says "nothing to do" and the VM
+        /// runs unreferenced until its TTL — a day here, holding its data disk
+        /// the whole time. Counting owned sandboxes is what routes this
+        /// deployment to `reconcile_one`, where `adopt_untracked` takes it back.
+        #[test]
+        fn a_running_vm_the_pool_does_not_track_is_work() {
+            let (d, fleet) = settled();
+            let owned = HashMap::from([("demo", 2)]);
+            assert_eq!(d.backends().len(), 1, "one tracked backend");
+            assert!(
+                !at_rest(&d, &fleet, &owned),
+                "the daemon runs two replicas for a pool that tracks one",
+            );
+            // Equal counts are the normal case and must stay on the fast path.
+            assert!(at_rest(&d, &fleet, &HashMap::from([("demo", 1)])));
+            // Fewer is not this check's business: a backend missing from the
+            // fleet is already caught below.
+            assert!(at_rest(&d, &fleet, &HashMap::from([("demo", 0)])));
         }
 
         #[test]
         fn a_booting_vm_is_work() {
             let (d, fleet) = settled();
             d.set_pending(vec![PendingVm::new("sb-2".into())]);
-            assert!(!at_rest(&d, &fleet));
+            assert!(!at_rest(&d, &fleet, &no_extras()));
         }
 
         #[test]
         fn a_draining_vm_is_work() {
             let (d, fleet) = settled();
             d.backends()[0].set_draining(true);
-            assert!(!at_rest(&d, &fleet));
+            assert!(!at_rest(&d, &fleet, &no_extras()));
         }
 
         #[test]
         fn being_below_the_desired_size_is_work() {
             let (d, fleet) = settled();
             d.set_backends(vec![]);
-            assert!(!at_rest(&d, &fleet));
+            assert!(!at_rest(&d, &fleet, &no_extras()));
         }
 
         /// Half the TTL gone means a renewal call is due, and that is an await.
@@ -2055,7 +2298,7 @@ mod tests {
             let entry = fleet.get_mut("sb-1").unwrap();
             entry.ttl_seconds = Some(3600);
             entry.uptime_secs = 1800;
-            assert!(!at_rest(&d, &fleet));
+            assert!(!at_rest(&d, &fleet, &no_extras()));
         }
 
         /// A backend the daemon no longer reports has just disappeared. Reading
@@ -2063,7 +2306,7 @@ mod tests {
         #[test]
         fn a_backend_missing_from_the_fleet_is_work() {
             let (d, _) = settled();
-            assert!(!at_rest(&d, &HashMap::new()));
+            assert!(!at_rest(&d, &HashMap::new(), &no_extras()));
         }
     }
 

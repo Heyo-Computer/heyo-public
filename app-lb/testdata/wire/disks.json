@@ -1,0 +1,104 @@
+{
+  "complete": true,
+  "data_dir": "/var/lib/heyo",
+  "tmp_dir": "/tmp",
+  "ttl_secs": 604800,
+  "sweep_secs": 3600,
+  "archive_enabled": false,
+  "archive_on_expire": false,
+  "free_bytes": 12884901888,
+  "filesystem_bytes": 536870912000,
+  "min_free_bytes": 21474836480,
+  "totals": {
+    "disks": 3,
+    "bytes": 3758096384,
+    "apparent_bytes": 15032385536,
+    "running": 1,
+    "stopped": 1,
+    "orphan": 1,
+    "retained": 1,
+    "expiring_now": 1,
+    "reclaimable_bytes": 2147483648
+  },
+  "disks": [
+    {
+      "sandbox_id": "sb-1a2b3c4d",
+      "name": "applb-web-00000000002a",
+      "deployment": "web",
+      "state": "running",
+      "claimed": true,
+      "retain": false,
+      "bytes": 1073741824,
+      "apparent_bytes": 8589934592,
+      "modified_at": 1760000000,
+      "held_by": "in use by a running sandbox",
+      "parts": [
+        {
+          "kind": "data",
+          "path": "run/sb-1a2b3c4d/data.ext4",
+          "bytes": 1073741824,
+          "apparent_bytes": 8589934592,
+          "modified_at": 1760000000
+        },
+        {
+          "kind": "rootfs",
+          "path": "run/sb-1a2b3c4d/rootfs.ext4",
+          "bytes": 1178599424,
+          "apparent_bytes": 1178599424,
+          "modified_at": 1760000000
+        }
+      ],
+      "roots": [
+        "run/sb-1a2b3c4d"
+      ]
+    },
+    {
+      "sandbox_id": "sb-99887766",
+      "state": "orphan",
+      "claimed": false,
+      "retain": false,
+      "bytes": 2147483648,
+      "apparent_bytes": 2147483648,
+      "modified_at": 1759000000,
+      "expires_at": 1759604800,
+      "parts": [
+        {
+          "kind": "data",
+          "path": "run/sb-99887766/data.ext4",
+          "bytes": 2147483648,
+          "apparent_bytes": 2147483648,
+          "modified_at": 1759000000
+        }
+      ],
+      "roots": [
+        "run/sb-99887766"
+      ]
+    },
+    {
+      "sandbox_id": "sb-deadbeef",
+      "name": "applb-api-000000000007",
+      "deployment": "api",
+      "state": "stopped",
+      "claimed": false,
+      "retain": true,
+      "note": "keeping for the incident postmortem",
+      "bytes": 536870912,
+      "apparent_bytes": 4294967296,
+      "modified_at": 1758000000,
+      "held_by": "retained by an operator",
+      "parts": [
+        {
+          "kind": "data",
+          "path": "run/sb-deadbeef/data.ext4",
+          "bytes": 536870912,
+          "apparent_bytes": 4294967296,
+          "modified_at": 1758000000
+        }
+      ],
+      "roots": [
+        "run/sb-deadbeef"
+      ]
+    }
+  ],
+  "archives": []
+}

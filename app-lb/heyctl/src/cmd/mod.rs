@@ -122,6 +122,9 @@ pub enum Resource {
     Workflow,
     /// A deploy job: an image build, an artifact pull, or a host update.
     Job,
+    /// A per-sandbox disk on the app-lb host: the `/workspace` data disk, the
+    /// rootfs copy and the boot scratch, with whatever still claims them.
+    Disk,
     /// `get all` — every kind that has a listing.
     All,
 }
@@ -139,6 +142,9 @@ impl Resource {
             // filtered by eye. One resource kind, several spellings people will
             // reach for.
             "job" | "build" | "bld" | "pull" | "update" | "run" => Some(Self::Job),
+            // `pv` and `volume` because that is what someone arriving from
+            // kubectl will type, and this listing answers the same question.
+            "disk" | "pv" | "volume" | "vol" | "storage" => Some(Self::Disk),
             "all" => Some(Self::All),
             _ => None,
         }
@@ -152,6 +158,7 @@ impl Resource {
             Self::Secret => "secret",
             Self::Workflow => "workflow",
             Self::Job => "job",
+            Self::Disk => "disk",
             Self::All => "all",
         }
     }
@@ -207,6 +214,20 @@ pub fn deployment_name(arg: &str) -> Result<String> {
         1 => Ok(names.into_iter().next().expect("len == 1")),
         _ => bail!("expected a deployment name, e.g. `web` or `deployment/web`"),
     }
+}
+
+/// Wall-clock seconds, for rendering an age against a server timestamp.
+///
+/// Shared rather than per-module because two commands already needed it. Note
+/// what it is *not* good for: where a response carries its own clock — job
+/// records do — measure against that instead, so a skewed client cannot invent
+/// a negative elapsed time. This is the fallback for responses that carry no
+/// timestamp of their own.
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -1,10 +1,10 @@
 //! `get` and `describe` — the read-only views of the control plane.
 
-use super::{Ctx, Resource, parse_ref};
+use super::{Ctx, Resource, now_secs, parse_ref};
 use crate::output::{self, OutputFormat, Table};
 use crate::types::{
-    CertStatus, DeploymentStatus, JobRecord, MetricsResponse, SecretSummary, WorkflowList,
-    WorkflowView,
+    CertStatus, DeploymentStatus, DiskInfo, DiskInventory, JobRecord, MetricsResponse,
+    SecretSummary, WorkflowList, WorkflowView,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -13,12 +13,12 @@ use std::time::Duration;
 
 #[derive(Args, Debug)]
 pub struct GetArgs {
-    /// What to list: deployments, vms, certs, secrets, jobs, or all. Accepts
-    /// `deployment/web` and trailing names, e.g. `get deploy web api`.
+    /// What to list: deployments, vms, certs, secrets, jobs, disks, or all.
+    /// Accepts `deployment/web` and trailing names, e.g. `get deploy web api`.
     #[arg(value_name = "RESOURCE", required = true)]
     pub args: Vec<String>,
 
-    /// Only show VMs or jobs belonging to this deployment.
+    /// Only show VMs, jobs or disks belonging to this deployment.
     #[arg(long, short = 'd', value_name = "NAME")]
     pub deployment: Option<String>,
 
@@ -51,6 +51,7 @@ fn get_once(ctx: &Ctx, kind: Resource, names: &[String], args: &GetArgs) -> Resu
         Resource::Secret => get_secrets(ctx, names),
         Resource::Workflow => get_workflows(ctx, names),
         Resource::Job => get_jobs(ctx, names, args.deployment.as_deref()),
+        Resource::Disk => get_disks(ctx, names, args.deployment.as_deref()),
         Resource::All => {
             get_deployments(ctx, &[])?;
             println!();
@@ -246,6 +247,150 @@ fn get_certs(ctx: &Ctx) -> Result<()> {
     }
     table.print();
     Ok(())
+}
+
+/// `get disks` — what each sandbox occupies on the app-lb host, and what holds
+/// it there.
+///
+/// The question this answers is "why is the host full", and before it existed
+/// the only place to ask was the `/storage` console in a browser. That gap is
+/// not cosmetic: a deployment whose VMs fail to boot leaves a data disk per
+/// attempt, and at a `disk_size_gb` of any size those add up long before anyone
+/// thinks to open a dashboard.
+///
+/// Two size columns because they routinely disagree by an order of magnitude: a
+/// data disk is created sparse at its full nominal size, so ON-DISK is what the
+/// host has actually lost and APPARENT is what the guest believes it has. Sorted
+/// by ON-DISK, because the reason for looking is almost always "what is big".
+///
+/// HELD is the reclaim story in one column — the phrase app-lb uses for why the
+/// sweep will not take a disk, or when it will.
+fn get_disks(ctx: &Ctx, names: &[String], deployment: Option<&str>) -> Result<()> {
+    let raw = ctx.client.raw().disks()?;
+    let inv: DiskInventory =
+        serde_json::from_value(raw.clone()).context("parsing the disk inventory")?;
+
+    let mut disks: Vec<&DiskInfo> = inv
+        .disks
+        .iter()
+        .filter(|d| names.is_empty() || names.iter().any(|n| n == &d.sandbox_id))
+        .filter(|d| deployment.is_none_or(|want| d.deployment.as_deref() == Some(want)))
+        .collect();
+    disks.sort_by_key(|d| std::cmp::Reverse(d.bytes));
+
+    if ctx.out.is_machine() {
+        // The whole document, not just the rows: `complete` and the totals are
+        // what make the list interpretable, and a filtered `-o json` that
+        // dropped them would be a worse answer than the server's own.
+        let ids: Vec<String> = disks.iter().map(|d| format!("disk/{}", d.sandbox_id)).collect();
+        return output::emit(&raw, ctx.out, &ids);
+    }
+
+    // Said before the table rather than after: every row below is unclassified
+    // when this is false, and an operator who reads "orphan" as "safe to delete"
+    // on an incomplete listing deletes a running VM's disk.
+    if !inv.complete {
+        println!(
+            "warning: the daemon did not answer both listings{}; nothing is classified as an \
+             orphan and the sweep will not run.",
+            inv.incomplete_reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default(),
+        );
+    }
+
+    if disks.is_empty() {
+        match (names.is_empty(), deployment) {
+            (true, None) => println!("No per-sandbox disks on this host ({}).", inv.data_dir),
+            (_, Some(d)) => println!("No disks belong to deployment {d:?}."),
+            _ => println!("No disks match."),
+        }
+        return Ok(());
+    }
+
+    let now = now_secs();
+    let mut table = Table::new([
+        "SANDBOX",
+        "DEPLOYMENT",
+        "STATE",
+        "ON-DISK",
+        "APPARENT",
+        "AGE",
+        "HELD",
+    ]);
+    for d in &disks {
+        table.row([
+            d.sandbox_id.clone(),
+            d.deployment.clone().unwrap_or_else(|| "—".into()),
+            d.state.label().to_string(),
+            output::bytes(d.bytes),
+            output::bytes(d.apparent_bytes),
+            output::duration(now.saturating_sub(d.modified_at)),
+            held_reason(d, now),
+        ]);
+    }
+    table.print();
+
+    let t = &inv.totals;
+    println!();
+    println!(
+        "{} disks, {} on disk ({} apparent) — {} running, {} stopped, {} orphan, {} retained.",
+        t.disks,
+        output::bytes(t.bytes),
+        output::bytes(t.apparent_bytes),
+        t.running,
+        t.stopped,
+        t.orphan,
+        t.retained,
+    );
+
+    // The number the table cannot show: whether the sum above is a problem.
+    // "Why can't this host create a VM" is answered here and nowhere else — a
+    // create fails on ENOSPC long before any single disk looks suspicious.
+    if let Some(free) = inv.free_bytes {
+        let capacity = match inv.filesystem_bytes {
+            Some(total) if total > 0 => format!(" of {}", output::bytes(total)),
+            _ => String::new(),
+        };
+        let pressure = inv.min_free_bytes > 0 && free < inv.min_free_bytes;
+        println!("Host filesystem: {} free{capacity}.", output::bytes(free));
+        if pressure {
+            println!(
+                "Below the {} reclaim floor — orphaned disks are reclaimed without waiting \
+                 out the {} TTL.",
+                output::bytes(inv.min_free_bytes),
+                output::duration(inv.ttl_secs),
+            );
+        }
+    }
+    if inv.ttl_secs == 0 {
+        println!("Expiry is off, so nothing is reclaimed automatically.");
+    } else if t.expiring_now > 0 {
+        println!(
+            "The sweep would reclaim {} now, freeing {}.",
+            t.expiring_now,
+            output::bytes(t.reclaimable_bytes),
+        );
+    }
+    Ok(())
+}
+
+/// The one-phrase answer to "will this be reclaimed, and if not why not".
+///
+/// `held_by` is app-lb's own wording and is preferred verbatim so the CLI and
+/// the console cannot drift into describing the same rule two ways.
+fn held_reason(d: &DiskInfo, now: u64) -> String {
+    if let Some(reason) = d.held_by.as_deref() {
+        return reason.to_string();
+    }
+    match d.expires_at {
+        // Already due: the sweep simply has not run yet, which is a different
+        // state from "will expire" and the one worth naming.
+        Some(at) if at <= now => "expiring".into(),
+        Some(at) => format!("in {}", output::duration(at.saturating_sub(now))),
+        None => "—".into(),
+    }
 }
 
 /// `get secrets` — names and key names. There is no flag that prints a value:
@@ -968,6 +1113,33 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
                     a.cold_start_waits, a.cold_start_hits, a.cold_start_timeouts, m.cold_start_s.p50
                 ),
             );
+            // The two failure counters, and only when non-zero: a healthy pool
+            // should not carry two permanent zeroes, but a stuck one must say
+            // which kind of stuck it is. They are the difference between "the
+            // guest never became healthy" (boot timeouts — debug the image) and
+            // "no VM was ever created" (create failures — debug the host), which
+            // otherwise look identical from out here: `ready: 0`.
+            if a.boot_timeouts > 0 {
+                output::field(
+                    "Boot failures",
+                    format!(
+                        "{} VMs never passed their health check inside the boot timeout",
+                        a.boot_timeouts
+                    ),
+                );
+            }
+            if a.create_failures > 0 {
+                output::field(
+                    "Create failures",
+                    match a.last_create_error.as_deref() {
+                        Some(err) => format!(
+                            "{} refused by the VM daemon — last error: {err}",
+                            a.create_failures
+                        ),
+                        None => format!("{} refused by the VM daemon", a.create_failures),
+                    },
+                );
+            }
         }
     }
 }

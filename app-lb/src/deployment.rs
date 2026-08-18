@@ -247,6 +247,17 @@ pub struct PendingVm {
     /// Fresh boot or resumed replica. See [`BootOrigin`]; read only by the
     /// autoscaler's give-up path, to decide whether the disks may be reclaimed.
     pub origin: BootOrigin,
+    /// When this VM first went missing from the daemon's fleet listing, if it
+    /// currently is. `None` means it was in the most recent listing.
+    ///
+    /// A created sandbox is this deployment's responsibility until something
+    /// explicitly kills it, and absence from one listing is not proof it is
+    /// gone — a sandbox still provisioning (copying a multi-gigabyte rootfs, on
+    /// a loaded host) may simply not be listed yet. Dropping it on the first
+    /// miss did two harmful things at once: it leaked the sandbox, *and* it
+    /// freed the replica slot, so the next tick created a duplicate — every 2s,
+    /// unboundedly, for as long as the condition lasted.
+    pub missing_since: Option<u64>,
 }
 
 impl PendingVm {
@@ -259,6 +270,7 @@ impl PendingVm {
             status: None,
             reported_at_secs: 0,
             origin: BootOrigin::Created,
+            missing_since: None,
         }
     }
 

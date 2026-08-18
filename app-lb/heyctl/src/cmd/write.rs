@@ -2206,6 +2206,16 @@ pub fn delete(ctx: &Ctx, args: &DeleteArgs) -> Result<()> {
             "jobs are a record of something that already happened and cannot be deleted; \
              the server keeps the most recent ones and forgets the rest"
         ),
+        // Reading the inventory is `get disks`; reclaiming from it is not wired
+        // up here on purpose. `DELETE /disks/:id` removes gigabytes with no
+        // undo — app-lb's own routing calls it the single most destructive route
+        // it exposes — so it wants its own command with its own confirmation,
+        // not a arm of the generic `delete` that `--all` also flows through.
+        Resource::Disk => bail!(
+            "disks are not deleted through `delete` — `get disks` shows what is on the host \
+             and why each one is held; reclaiming is `DELETE /disks/<sandbox>` or \
+             `POST /disks/sweep` on the admin API, which delete gigabytes with no undo"
+        ),
         Resource::All => bail!("`delete all` is not supported — name the deployments, or use --all"),
     }
 }

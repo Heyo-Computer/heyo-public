@@ -172,7 +172,8 @@
       "cold_start_waits": 0,
       "cold_start_hits": 0,
       "cold_start_timeouts": 0,
-      "boot_timeouts": 0
+      "boot_timeouts": 0,
+      "create_failures": 0
     }
   }
 }

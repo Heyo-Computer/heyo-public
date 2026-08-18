@@ -684,6 +684,18 @@ impl Client {
             .await
     }
 
+    /// The host's disk inventory: what each sandbox occupies, whether anything
+    /// still claims it, and what the expiry sweep would reclaim.
+    ///
+    /// One object rather than a bare list — the totals and the `complete` flag
+    /// are the half that makes the list safe to act on, and dropping them here
+    /// would leave the caller unable to tell "no orphans" from "the daemon did
+    /// not answer, so nothing was classified".
+    pub async fn disks(&self) -> Result<DiskInventory> {
+        self.read(Request::new(Method::Get, "/disks"), "disk", "")
+            .await
+    }
+
     pub(crate) fn ws(&self) -> Option<&Arc<WsConfig>> {
         self.ws.as_ref()
     }
@@ -765,6 +777,7 @@ impl Raw<'_> {
         certs       => "certificate", "/certs";
         workflows   => "workflow",   "/workflows";
         feeds       => "feed",       "/feeds";
+        disks       => "disk",       "/disks";
     }
 
     /// A namespace's feed events as app-lb sent them.

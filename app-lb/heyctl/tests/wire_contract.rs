@@ -15,7 +15,9 @@
 //! Regenerate the fixtures with:
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
-use heyctl::types::{UpstreamTrafficStatus, WorkflowList, WorkflowView};
+use heyctl::types::{
+    DiskInventory, DiskState, MetricsResponse, UpstreamTrafficStatus, WorkflowList, WorkflowView,
+};
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> String {
@@ -117,4 +119,149 @@ fn upstream_traffic_status_understands_every_field() {
     assert_eq!(status.in_flight, 3);
     assert_eq!(status.reason.as_deref(), Some("regional maintenance"));
     assert_eq!(status.started_at, Some(1_722_400_000));
+}
+
+/// The disk inventory `heyctl get disks` renders.
+///
+/// Checked field-by-field rather than only through `extra`, because this
+/// response is the one an operator reads while deciding whether gigabytes are
+/// safe to delete. A blanked column here is not a cosmetic regression: `held_by`
+/// going missing turns "never reclaim this" into an empty cell, and the two size
+/// fields disagreeing by design means silently rendering the wrong one
+/// misreports how full the host actually is.
+#[test]
+fn disk_inventory_understands_every_field() {
+    let inv: DiskInventory = serde_json::from_str(&fixture("disks")).expect("fixture parses");
+    assert!(
+        inv.extra.is_empty(),
+        "unknown inventory fields: {:?}",
+        inv.extra.keys().collect::<Vec<_>>()
+    );
+    assert!(inv.complete);
+    assert_eq!(inv.data_dir, "/var/lib/heyo");
+    assert_eq!(inv.ttl_secs, 604_800);
+    assert_eq!(inv.totals.disks, 3);
+    // The free-space block, which is what turns "here are the disks" into "and
+    // that is why a create just failed". A fixture below the floor, so the
+    // pressure path has a shape a client can render.
+    assert_eq!(inv.free_bytes, Some(12_884_901_888));
+    assert_eq!(inv.filesystem_bytes, Some(536_870_912_000));
+    assert!(inv.min_free_bytes > 0, "the reclaim floor must survive the wire");
+    assert!(
+        inv.free_bytes.unwrap() < inv.min_free_bytes,
+        "the fixture is deliberately under the floor",
+    );
+    assert_eq!(inv.totals.reclaimable_bytes, 2_147_483_648);
+    assert!(
+        inv.totals.extra.is_empty(),
+        "unknown totals fields: {:?}",
+        inv.totals.extra.keys().collect::<Vec<_>>()
+    );
+
+    assert_eq!(inv.disks.len(), 3);
+    for d in &inv.disks {
+        assert!(
+            d.extra.is_empty(),
+            "unknown disk fields on {}: {:?}",
+            d.sandbox_id,
+            d.extra.keys().collect::<Vec<_>>()
+        );
+        for p in &d.parts {
+            assert!(
+                p.extra.is_empty(),
+                "unknown disk-part fields: {:?}",
+                p.extra.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // The running disk: claimed, held, and sparse — the case where the two size
+    // columns differ by 8x and reporting either alone would mislead.
+    let running = &inv.disks[0];
+    assert_eq!(running.sandbox_id, "sb-1a2b3c4d");
+    assert_eq!(running.deployment.as_deref(), Some("web"));
+    assert_eq!(running.state, DiskState::Running);
+    assert!(running.claimed);
+    assert_eq!(running.bytes, 1_073_741_824);
+    assert_eq!(running.apparent_bytes, 8_589_934_592);
+    assert_eq!(running.held_by.as_deref(), Some("in use by a running sandbox"));
+    assert_eq!(running.parts.len(), 2);
+    assert_eq!(running.roots, vec!["run/sb-1a2b3c4d".to_string()]);
+
+    // The orphan: no daemon record, nothing holding it, and an expiry the sweep
+    // will act on. `held_by: None` is what makes it reclaimable.
+    let orphan = &inv.disks[1];
+    assert_eq!(orphan.state, DiskState::Orphan);
+    assert_eq!(orphan.deployment, None);
+    assert_eq!(orphan.held_by, None);
+    assert_eq!(orphan.expires_at, Some(1_759_604_800));
+
+    // The pinned one: an operator said never, which outranks any age.
+    let pinned = &inv.disks[2];
+    assert_eq!(pinned.state, DiskState::Stopped);
+    assert!(pinned.retain);
+    assert_eq!(pinned.note.as_deref(), Some("keeping for the incident postmortem"));
+    assert_eq!(pinned.expires_at, None);
+}
+
+/// A state this build has never heard of must degrade, not blank the listing.
+#[test]
+fn an_unknown_disk_state_degrades_to_unknown() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fixture("disks")).expect("fixture parses");
+    value["disks"][0]["state"] = serde_json::json!("quiescing");
+
+    let inv: DiskInventory = serde_json::from_value(value).expect("a newer server still parses");
+    assert_eq!(inv.disks[0].state, DiskState::Unknown);
+    assert_eq!(inv.disks[1].state, DiskState::Orphan, "the other rows are unaffected");
+}
+
+/// `GET /metrics`, which had no contract test at all until now.
+///
+/// That gap was not theoretical. `AutoscaleCounts` was missing `boot_timeouts`
+/// while app-lb had been sending it, so `heyctl describe` could not distinguish
+/// the two ways a pool gets stuck at `ready: 0` — a guest that never becomes
+/// healthy, and a VM that is never created. Both render as silence, and the
+/// second one sends you to debug an image that never ran.
+///
+/// Asserting `extra` is empty at every level is what keeps that from recurring:
+/// a lenient deserializer cannot tell an absent field from an unknown one, so
+/// without this a field app-lb adds is simply never shown.
+#[test]
+fn metrics_response_understands_every_field() {
+    let m: MetricsResponse =
+        serde_json::from_str(&fixture("metrics-response")).expect("fixture parses");
+    assert!(
+        m.extra.is_empty(),
+        "unknown metrics fields: {:?}",
+        m.extra.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        m.global.extra.is_empty(),
+        "unknown global-metrics fields: {:?}",
+        m.global.extra.keys().collect::<Vec<_>>()
+    );
+
+    let a = &m.global.autoscale;
+    assert!(
+        a.extra.is_empty(),
+        "unknown autoscale fields: {:?}",
+        a.extra.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(a.vms_created, 2);
+    assert_eq!(a.boot_timeouts, 1, "the field that had gone missing");
+    assert_eq!(a.create_failures, 1);
+    assert_eq!(
+        a.last_create_error.as_deref(),
+        Some("api error (500): No space left on device"),
+        "the reason a pool is stuck must survive the wire",
+    );
+
+    for d in &m.deployments {
+        assert!(
+            d.metrics.autoscale.extra.is_empty(),
+            "unknown per-deployment autoscale fields: {:?}",
+            d.metrics.autoscale.extra.keys().collect::<Vec<_>>()
+        );
+    }
 }

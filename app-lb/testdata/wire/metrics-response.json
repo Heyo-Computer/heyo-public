@@ -158,7 +158,9 @@
       "cold_start_waits": 1,
       "cold_start_hits": 1,
       "cold_start_timeouts": 1,
-      "boot_timeouts": 1
+      "boot_timeouts": 1,
+      "create_failures": 1,
+      "last_create_error": "api error (500): No space left on device"
     }
   },
   "obs": {
@@ -366,7 +368,9 @@
           "cold_start_waits": 1,
           "cold_start_hits": 1,
           "cold_start_timeouts": 1,
-          "boot_timeouts": 1
+          "boot_timeouts": 1,
+          "create_failures": 1,
+          "last_create_error": "api error (500): No space left on device"
         }
       }
     }

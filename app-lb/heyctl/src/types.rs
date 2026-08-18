@@ -863,6 +863,17 @@ pub struct AutoscaleCounts {
     pub cold_start_waits: u64,
     pub cold_start_hits: u64,
     pub cold_start_timeouts: u64,
+    /// VMs killed for never passing their health check inside the boot timeout.
+    /// Was absent from this struct while app-lb had been sending it — the exact
+    /// silent drift `extra` exists to catch, and the reason `describe` could not
+    /// tell "the guest never became healthy" from "no VM was ever created".
+    pub boot_timeouts: u64,
+    /// Creates the daemon refused outright. The distinguishing counter: with
+    /// `vms_created` and `boot_timeouts` both zero, a non-zero value here means
+    /// no VM ever existed, so the guest image is not the thing to debug.
+    pub create_failures: u64,
+    /// What the daemon said the last time it refused.
+    pub last_create_error: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -876,6 +887,159 @@ pub struct CertStatus {
     pub not_after: String,
     pub issuer: String,
     pub needs_renewal: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// -- GET /disks ------------------------------------------------------------
+
+/// What the daemon thinks of the sandbox a disk belongs to.
+///
+/// `Unknown` is not a parse failure — it is what app-lb reports when it could
+/// not reach the daemon, and such a disk is never reclaimed. A state this build
+/// does not recognise degrades to `Unknown` for the same reason: an unfamiliar
+/// word must not blank the whole listing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskState {
+    Running,
+    Stopped,
+    Orphan,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl DiskState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Orphan => "orphan",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One file on the host and what it is for.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DiskPart {
+    pub kind: String,
+    pub path: String,
+    /// Blocks actually allocated. The number that matters: a `data.ext4` is
+    /// created sparse at its full nominal size, so `apparent_bytes` routinely
+    /// reads tens of GiB for a fraction of that in real occupancy.
+    pub bytes: u64,
+    pub apparent_bytes: u64,
+    pub modified_at: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DiskArchiveRecord {
+    pub uri: String,
+    pub at: u64,
+    pub bytes: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DiskArchiveView {
+    pub id: String,
+    pub sandbox_id: String,
+    pub uri: String,
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
+    pub status: String,
+    pub bytes: u64,
+    pub expected_bytes: u64,
+    pub error: Option<String>,
+    pub purged: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// Everything on the host belonging to one sandbox.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DiskInfo {
+    pub sandbox_id: String,
+    /// The daemon's name for it, when the daemon still has a record.
+    pub name: Option<String>,
+    /// The deployment that owns it, from an `applb-<deployment>-<nonce>` name.
+    /// `None` for a sandbox app-lb did not create, or one whose name is gone.
+    pub deployment: Option<String>,
+    pub state: DiskState,
+    /// A live deployment lists this sandbox as one it intends to resume. A
+    /// claimed disk is never reclaimed, at any age.
+    pub claimed: bool,
+    /// Set by an operator: never reclaim this, whatever its age.
+    pub retain: bool,
+    pub note: Option<String>,
+    pub bytes: u64,
+    pub apparent_bytes: u64,
+    pub modified_at: u64,
+    /// When the sweep would reclaim this, or `None` if it never would.
+    pub expires_at: Option<u64>,
+    /// Why it will not be reclaimed, in a phrase meant to be shown verbatim.
+    pub held_by: Option<String>,
+    pub archived: Option<DiskArchiveRecord>,
+    pub parts: Vec<DiskPart>,
+    /// The directories a purge would remove.
+    pub roots: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DiskTotals {
+    pub disks: usize,
+    pub bytes: u64,
+    pub apparent_bytes: u64,
+    pub running: usize,
+    pub stopped: usize,
+    pub orphan: usize,
+    pub retained: usize,
+    /// Disks the sweep would reclaim right now, and what that would free.
+    pub expiring_now: usize,
+    pub reclaimable_bytes: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /disks` — the host's per-sandbox disk inventory.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DiskInventory {
+    /// Whether both daemon listings succeeded. When false nothing is classified
+    /// as an orphan and the sweep declines to run — so a listing that says
+    /// `complete: false` must not be read as "these disks are residue".
+    pub complete: bool,
+    pub incomplete_reason: Option<String>,
+    pub data_dir: String,
+    pub tmp_dir: String,
+    /// `0` when expiry is disabled.
+    pub ttl_secs: u64,
+    pub sweep_secs: u64,
+    pub archive_enabled: bool,
+    pub archive_on_expire: bool,
+    pub archive_target: Option<String>,
+    /// Free and total bytes on the filesystem holding the guest disks, when it
+    /// could be measured. `None` means unknown, never "full".
+    pub free_bytes: Option<u64>,
+    pub filesystem_bytes: Option<u64>,
+    /// The floor below which the sweep reclaims orphans without waiting out the
+    /// TTL. `0` when pressure reclamation is disabled.
+    pub min_free_bytes: u64,
+    pub totals: DiskTotals,
+    pub disks: Vec<DiskInfo>,
+    pub archives: Vec<DiskArchiveView>,
     #[serde(flatten)]
     pub extra: Extra,
 }

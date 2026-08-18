@@ -17,7 +17,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use crate::cmd::Ctx;
+use crate::cmd::{Ctx, now_secs};
 use crate::output::{self, Table};
 use crate::types::FeedEvent;
 
@@ -125,13 +125,6 @@ fn what_cell(e: &FeedEvent) -> String {
         out.push_str(&format!(" (×{})", e.count));
     }
     out
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -257,6 +257,25 @@ struct AutoscaleCounts {
     /// reach its own `min_replicas`, and a deployment that only ever produces
     /// these is one whose guest never starts.
     boot_timeouts: AtomicU64,
+    /// Creates the daemon refused — the pool asked for a VM and did not get an
+    /// id back.
+    ///
+    /// This existed nowhere before, and its absence was a genuine hole rather
+    /// than a missing nicety. `record_scale_up` returns early on zero, so a
+    /// deployment whose every create is rejected increments *nothing*:
+    /// `vms_created`, `scale_up_events` and `boot_timeouts` all sit at 0, which
+    /// is indistinguishable from a deployment nobody has asked anything of. The
+    /// only trace was a log line. A pool stuck at `ready: 0` with a `desired` of
+    /// 1 and three zeroes next to it is the single most confusing state this
+    /// system produces, and it is exactly the state a host with no room for a
+    /// `disk_size_gb` allocation lands in.
+    create_failures: AtomicU64,
+    /// What the daemon said the last time it refused. The counter says a pool is
+    /// stuck; this says why, which is the half that ends the investigation —
+    /// "No space left on device" and "image not found" produce identical
+    /// counters and want opposite fixes. Only the most recent is kept: a
+    /// deployment failing every 2s would otherwise be an unbounded log.
+    last_create_error: Mutex<Option<String>>,
 }
 
 impl AutoscaleCounts {
@@ -271,6 +290,12 @@ impl AutoscaleCounts {
             cold_start_hits: self.cold_start_hits.load(Ordering::Relaxed),
             cold_start_timeouts: self.cold_start_timeouts.load(Ordering::Relaxed),
             boot_timeouts: self.boot_timeouts.load(Ordering::Relaxed),
+            create_failures: self.create_failures.load(Ordering::Relaxed),
+            last_create_error: self
+                .last_create_error
+                .lock()
+                .ok()
+                .and_then(|e| e.clone()),
         }
     }
 }
@@ -286,6 +311,9 @@ pub struct AutoscaleSnapshot {
     pub cold_start_hits: u64,
     pub cold_start_timeouts: u64,
     pub boot_timeouts: u64,
+    pub create_failures: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_create_error: Option<String>,
 }
 
 impl AutoscaleSnapshot {
@@ -299,6 +327,10 @@ impl AutoscaleSnapshot {
         self.cold_start_hits += o.cold_start_hits;
         self.cold_start_timeouts += o.cold_start_timeouts;
         self.boot_timeouts += o.boot_timeouts;
+        self.create_failures += o.create_failures;
+        if self.last_create_error.is_none() {
+            self.last_create_error = o.last_create_error.clone();
+        }
     }
 }
 
@@ -559,6 +591,21 @@ impl Metrics {
     /// A booting VM was given up on for never passing its health check.
     pub fn record_boot_timeout(&self, deployment: &str) {
         self.deployment(deployment).autoscale.boot_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The daemon refused to create a VM, and what it said.
+    ///
+    /// The counterpart to `record_scale_up`, which deliberately records nothing
+    /// when zero VMs were created — so without this a pool whose every create is
+    /// rejected reports all zeroes and looks idle rather than broken.
+    pub fn record_create_failure(&self, deployment: &str, error: &str) {
+        let m = self.deployment(deployment);
+        m.autoscale.create_failures.fetch_add(1, Ordering::Relaxed);
+        // A poisoned lock loses the message, never the count: the counter is
+        // what a dashboard alerts on, and it is an atomic that cannot be lost.
+        if let Ok(mut last) = m.autoscale.last_create_error.lock() {
+            *last = Some(error.to_string());
+        }
     }
 
     // --- Reading (dashboard poll) ----------------------------------------

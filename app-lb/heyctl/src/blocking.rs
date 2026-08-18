@@ -406,6 +406,10 @@ impl Client {
     pub fn certs(&self) -> Result<Vec<CertStatus>> {
         run!(self, self.inner.certs())
     }
+
+    pub fn disks(&self) -> Result<DiskInventory> {
+        run!(self, self.inner.disks())
+    }
 }
 
 pub struct ClientBuilder {
@@ -582,7 +586,7 @@ macro_rules! raw_blocking_id {
 }
 
 impl Raw<'_> {
-    raw_blocking!(deployments, secrets, tokens, jobs, certs, workflows, feeds);
+    raw_blocking!(deployments, secrets, tokens, jobs, certs, workflows, feeds, disks);
     raw_blocking_id!(deployment, secret, token, job, deployment_jobs, spec, workflow);
 
     pub fn metrics(&self, query: &MetricsQuery) -> Result<Value> {
