@@ -1,0 +1,6 @@
+/target
+
+# Runtime state, when `ci` is run from a checkout with the default paths.
+/ci-logs
+/ci-workspaces
+/ci-artifacts

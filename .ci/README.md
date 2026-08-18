@@ -10,10 +10,16 @@ question together. See [One file or two?](#one-file-or-two) below.
 | `codegraph.yml` | `release` | `codegraph` | `codegraph` — binary, `SHA256SUMS`, `BUILD-INFO` |
 | `apps.yml` | `app-lb` | `app-lb`, `heyctl` | `app-lb` — both binaries, `app-lb.conf`, `SHA256SUMS`, `BUILD-INFO` |
 | `apps.yml` | `app-obs` | `app-obs`, `app-obs-dump` | `app-obs` — both binaries, `app-obs.conf`, `SHA256SUMS`, `BUILD-INFO` |
+| `ci.yml` | `release` | `ci` | `ci` — binary, `ci.conf`, `migrations/`, `SHA256SUMS`, `BUILD-INFO` |
 
 The other six crates here (`artifacts`, `computer`, `heyosecret`,
 `heyosecret-client`, `orchestrator`, `printer`) have no workflow yet. Adding one
 is the recipe at the bottom.
+
+`ci.yml` builds the orchestrator that reads these files. It only builds — the
+artifact is deployed by hand or by `ci/deploy/ci.json`'s `update` block, never by
+the run itself — and a restart mid-run is redelivered off the JetStream work
+queue, so the self-reference costs less than it looks like it should.
 
 ## One file or two?
 
@@ -57,7 +63,7 @@ From the **repository root**, not from a subdirectory:
 git submit
 ```
 
-No `--archive`. This repository's whole history bundles to **2.7 MB** against a
+No `--archive`. This repository's whole history bundles to **3.2 MB** against a
 64 MB `CI_MAX_SOURCE_BYTES`, so the default payload fits easily — which is worth
 stating because the private `heyo` monorepo is 322 MB and cannot. Two things
 follow from being on the good side of that line:
@@ -103,22 +109,28 @@ new binary belongs with something already built here. Then change these:
    `--workspace` **if the crate has members** — without it cargo builds only the
    root package, so a member like `heyctl` silently never gets built and the
    artifact is quietly missing a binary.
-5. **The image**, if the toolchain differs. There are two here and neither was
+5. **The image**, if the toolchain differs. There are three here and none was
    guessed — each package was read off `cargo tree`:
    - `image/codegraph/`: `build-essential` and `git` only. Nothing in that graph
      links a system library.
    - `image/apps/`: adds `cmake`, `perl` and `pkg-config`, because both app
      graphs reach `aws-lc-sys` (cmake) and app-lb also builds OpenSSL and
      zlib-ng from source (perl, cmake).
+   - `image/ci/`: adds `pkg-config` and **`libssl-dev`** — the counterexample
+     to the trap below. Nothing in that graph vendors OpenSSL, so it links
+     the distribution's copy. It has no `cmake` or `perl`, because the only
+     build-adjacent crates it reaches are `cc` and `pkg-config`.
 
-   The trap worth knowing: **`libssl-dev` is not in either image, and app-lb
-   links OpenSSL.** It does not need the distribution's copy, because
+   The trap worth knowing: **two images here link OpenSSL and only one installs
+   `libssl-dev`.** app-lb does not need the distribution's copy, because
    `pingora-openssl` turns on `openssl/vendored` and `openssl-src` compiles
-   OpenSSL into the binary — which is also the only reason `perl` is there. So
-   "it uses OpenSSL, add libssl-dev" is the wrong reflex; check whether
-   something in the graph already vendored it. An unnecessary package costs
-   image build time on every runner and hides what the build actually depends
-   on.
+   OpenSSL into the binary — which is also the only reason `perl` is there.
+   `ci` does need it: nothing in its graph vendors OpenSSL, and there is no
+   `openssl-src` entry in `ci/Cargo.lock` to prove it. So neither "it uses
+   OpenSSL, add libssl-dev" nor its opposite is the reflex — read the lockfile
+   for `openssl-src` and let that decide. An unnecessary package costs image
+   build time on every runner and hides what the build actually depends on; a
+   missing one fails the link at the very end of a cold build.
 6. **The `.ci/` entries in `paths:`** — name your own workflow and image
    directory rather than `.ci/**`, so adding a workflow for another crate does
    not rebuild yours. If you added a job to an existing file, add them to that

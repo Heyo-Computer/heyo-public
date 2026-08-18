@@ -1,0 +1,100 @@
+[package]
+name = "ci"
+version = "0.1.0"
+edition = "2024"
+default-run = "ci"
+
+[dependencies]
+# The heyvm boundary: networks, daemons, sandbox lifecycle, and the iroh tunnel
+# that lets us drive a remote runner. Same version app-lb and queue-fn pin, so
+# the three agree on SandboxInfo/SandboxStatus semantics.
+#
+# Deliberately NOT the `mvm_ctrl` library crate: that one has path deps on
+# `local-proxy`/`kvmbind`/`avfbind` plus a `[patch.crates-io]` that only applies
+# from a workspace root, and it requires embedders to intercept a `kvm-run <id>`
+# re-exec in argv before their own arg parser runs. The SDK is the supported
+# surface; where it is missing a route we call the daemon through its client.
+heyo-sdk = "0.1.6"
+
+# JetStream. Pinned to the version heyvm itself links (mvm-ctrl/Cargo.toml) so a
+# future decision to share a stream is a routing change, not a version upgrade.
+async-nats = "0.47"
+
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+    "net",
+    "process",
+    "signal",
+] }
+
+# 0.8, matching artifacts and heyosecret: path params are `{id}`, not `:id`.
+# app-lb and queue-fn are still on 0.7; this is a separate process, so that is
+# not a conflict.
+axum = "0.8"
+
+# Server-side rendering. The house choice — vault, vault-cp and artifacts all
+# use it. Templates are compile-checked Rust, so an unfilled placeholder is a
+# build error rather than something a browser discovers.
+maud = { version = "0.27", features = ["axum"] }
+
+# Copy-on-write config/registry snapshots so request handlers never take a lock
+# to read the runner set or the workflow list. Same pattern as app-lb's Registry.
+arc-swap = "1"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# The submitted source arrives as a gzipped tar. Pure-Rust rather than shelling
+# out to `tar`, because the archive is attacker-supplied: entry paths are checked
+# before anything is written, and a subprocess would make that the subprocess's
+# decision rather than ours.
+tar = "0.4"
+flate2 = "1"
+
+# Workflow-source hashing (the VM fingerprint) and artifact digests.
+sha2 = "0.10"
+# `git ci` signs its payload with HMAC-SHA256, matching the header the existing
+# `git submit` client sends.
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"
+# Constant-time comparison for the trigger HMAC and any bearer we check
+# ourselves. A byte-wise `==` on a signature leaks its prefix length.
+subtle = "2.6"
+
+# heyosecret and the artifacts store are both plain HTTP; heyo-sdk already links
+# reqwest, so this adds no second TLS stack.
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Run history, the job DAG and the VM pool. Postgres rather than the
+# JSON-file-per-object app-lb uses for specs: this data is append-heavy and
+# needs indexes and pagination, which a rewritten file does not give.
+#
+# Runtime `query()` + `bind()`, not the `query!` macros — so no live database is
+# needed to compile, matching heyosecret.
+sqlx = { version = "0.8", features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "chrono",
+    "json",
+] }
+
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+futures = "0.3"
+# The SSE log tail is a generator over polled state; `async_stream::stream!` is
+# the readable way to write one without hand-rolling a `Stream` impl.
+async-stream = "0.3"
+async-trait = "0.1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Exercises axum handlers with `ServiceExt::oneshot`, so page tests bind no port.
+tower = { version = "0.5", features = ["util"] }

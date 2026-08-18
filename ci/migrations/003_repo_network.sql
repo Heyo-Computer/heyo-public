@@ -1,0 +1,18 @@
+-- Which heyvm network a repository's builds run in.
+--
+-- Same rules as 001 and 002: every statement idempotent, because the whole
+-- directory is re-executed on each startup.
+--
+-- NULL means "the installation default" — the first entry of CI_NETWORK, or the
+-- account's own default network when that is `*`. A workflow's own
+-- `uses: <network>/<runner>` still wins over this, being the more specific
+-- statement, and so does a workflow object's `network`.
+--
+-- Stored as the network's **name**, not its id. A name is what someone typed
+-- into `heyvm network create`, what `uses:` spells, and what the dashboard
+-- shows; storing the id would make this column unreadable in exactly the query
+-- someone runs when a build went to the wrong place. The cost is that renaming a
+-- network in heyvm orphans the assignment — which surfaces as a refused submit
+-- naming both the network and what is actually served, rather than as a build
+-- that quietly moves.
+ALTER TABLE ci_repo ADD COLUMN IF NOT EXISTS network TEXT;
