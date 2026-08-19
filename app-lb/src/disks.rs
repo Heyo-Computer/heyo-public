@@ -2700,7 +2700,11 @@ mod tests {
         fn store(root: &Path) -> DiskStore {
             DiskStore::new(
                 cfg_at(root),
-                VmManager::new(Some("http://127.0.0.1:1".into()), None),
+                VmManager::new(
+                    Some("http://127.0.0.1:1".into()),
+                    None,
+                    crate::mounts::MountStore::new(root.join("mounts"), 0),
+                ),
                 Arc::new(Registry::new(
                     root.join("state.json").to_str().unwrap(),
                 )),

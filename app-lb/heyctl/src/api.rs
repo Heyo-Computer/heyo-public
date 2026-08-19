@@ -629,6 +629,19 @@ impl Client {
         .await
     }
 
+    /// Unpack a managed deployment's guest mounts and roll the pool onto the
+    /// trees. No reference override, unlike `start_pull`: one job covers every
+    /// mount, so a single `ref` would have nothing to attach itself to.
+    pub async fn start_mount_pull(&self, id: &str, force: bool) -> Result<JobRecord> {
+        self.read(
+            Request::new(Method::Post, format!("/deployments/{}/mounts/pull", seg(id)))
+                .json(json!({ "force": force })),
+            "deployment",
+            id,
+        )
+        .await
+    }
+
     pub async fn start_update(&self, id: &str) -> Result<JobRecord> {
         self.read(
             Request::new(Method::Post, format!("/deployments/{}/update", seg(id))).json(json!({})),
@@ -976,6 +989,17 @@ impl Raw<'_> {
         self.0
             .read(
                 Request::new(Method::Post, format!("/deployments/{}/pull", seg(id))).json(body),
+                "deployment",
+                id,
+            )
+            .await
+    }
+
+    pub async fn start_mount_pull(&self, id: &str, force: bool) -> Result<Value> {
+        self.0
+            .read(
+                Request::new(Method::Post, format!("/deployments/{}/mounts/pull", seg(id)))
+                    .json(json!({ "force": force })),
                 "deployment",
                 id,
             )

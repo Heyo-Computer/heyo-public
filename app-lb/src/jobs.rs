@@ -52,7 +52,7 @@
 
 use crate::artifact::{Puller, human as human_bytes};
 use crate::autoscale::Autoscaler;
-use crate::config::{ArtifactSpec, Backend, BuildSource, BuildSpec, UpdateSpec};
+use crate::config::{ArtifactSpec, Backend, BuildSource, BuildSpec, MountSpec, UpdateSpec};
 use crate::deployment::{Deployment, now_secs};
 use crate::health;
 use crate::registry::Registry;
@@ -103,6 +103,14 @@ pub enum JobKind {
     /// Run commands in a working directory on this host (static deployments and
     /// sites).
     HostUpdate,
+    /// Materialize a managed deployment's guest mounts from an artifact store,
+    /// and roll the pool onto the trees that came out.
+    ///
+    /// Its own kind rather than part of [`Self::ArtifactPull`] because the two
+    /// answer different questions and a deployment can want both: a pull decides
+    /// which *rootfs* the guests boot, this decides which *data* they boot with,
+    /// and neither implies the other.
+    MountPull,
 }
 
 impl JobKind {
@@ -111,6 +119,7 @@ impl JobKind {
             Self::ImageBuild => "build",
             Self::ArtifactPull => "pull",
             Self::HostUpdate => "update",
+            Self::MountPull => "mounts",
         }
     }
 
@@ -129,6 +138,8 @@ impl JobKind {
             Self::ArtifactPull => matches!(backend, Backend::Vm | Backend::Site),
             // Commands in a directory on this host. A VM's backend is not here.
             Self::HostUpdate => matches!(backend, Backend::Upstreams | Backend::Site),
+            // Trees mounted inside a guest. Only a VM has a guest.
+            Self::MountPull => backend == Backend::Vm,
         }
     }
 }
@@ -202,6 +213,14 @@ pub struct JobRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<usize>,
 
+    // -- mount-pull -------------------------------------------------------
+    /// One entry per guest mount, in spec order. A mount pull covers all of a
+    /// deployment's mounts in one job, and the single `digest`/`store` fields
+    /// above cannot describe eight of them — so this is the record, and those
+    /// stay empty on a mount pull.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountOutcome>,
+
     // -- host-update ------------------------------------------------------
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
@@ -219,6 +238,45 @@ pub struct JobRecord {
     pub error: Option<String>,
     /// Tail of the combined output of every step.
     pub log: Vec<String>,
+}
+
+/// What one guest mount's pull did, as the admin API reports it.
+///
+/// Deliberately the whole story per mount rather than a total across them: with
+/// several mounts on one deployment, "3 GB transferred" answers nothing, and
+/// which of them moved is the entire question when a pull takes longer than
+/// expected.
+#[derive(Debug, Clone, Serialize)]
+pub struct MountOutcome {
+    /// The guest path, which is the mount's identity within the deployment.
+    pub path: String,
+    pub store: String,
+    #[serde(rename = "ref")]
+    pub artifact_ref: String,
+    /// What the ref resolved to, and what was written back into the spec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// The tree on this host the guests will mount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<usize>,
+    /// Bytes transferred from the store. `0` with `reused` set means the tree
+    /// was already here; `0` without it means a local store hardlinked the
+    /// bundle rather than copying it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Uncompressed bytes in the tree — how much disk this mount costs the host,
+    /// which `bytes` cannot answer for a gzipped bundle or a hardlinked one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unpacked: Option<u64>,
+    /// Whether the tree was already on this host and nothing was fetched.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
+    /// Whether this mount's digest changed — the reason, or not, that the pool
+    /// was recycled.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub changed: bool,
 }
 
 impl JobRecord {
@@ -243,6 +301,7 @@ impl JobRecord {
             reused: false,
             site_root: None,
             files: None,
+            mounts: Vec::new(),
             working_dir: None,
             commands_total: None,
             commands_run: None,
@@ -321,6 +380,25 @@ impl std::fmt::Display for StartError {
                 "deployment {id:?} {}; its backends are microVMs, not processes on this \
                  host. Use `build` or `pull` to change its image",
                 describe_backend(*backend),
+            ),
+            Self::WrongKind {
+                id,
+                kind: JobKind::MountPull,
+                backend,
+            } => write!(
+                f,
+                "deployment {id:?} {}, so it has no guest to mount anything inside. Mounts \
+                 are a `vm` deployment's; a site serves its own files, and what a static \
+                 deployment forwards to is somebody else's process",
+                describe_backend(*backend),
+            ),
+            Self::NoSpec {
+                id,
+                kind: JobKind::MountPull,
+            } => write!(
+                f,
+                "deployment {id:?} declares no `vm.mounts` — add one with a `path` inside \
+                 the guest, a `store` and a `ref` naming a tarball, and this will unpack it"
             ),
             Self::NoSpec {
                 id,
@@ -401,6 +479,10 @@ pub struct JobConfig {
     /// startup; see [`crate::artifact::Puller`] for why that is not fatal.
     pub images_dir: Result<PathBuf, String>,
     pub git_bin: String,
+    /// Where guest mount trees are unpacked. Unlike `images_dir` this is not a
+    /// `Result`: it is app-lb's own directory and it was created at startup, so
+    /// there is nothing left to resolve here.
+    pub mounts: crate::mounts::MountStore,
     /// Shell that host-update commands are run through.
     pub shell: String,
     pub timeout: Duration,
@@ -570,6 +652,84 @@ impl Jobs {
                 jobs.run_pull(&job_id, &deployment_id, &spec, force).await
             },
         )
+    }
+
+    /// Materialize every guest mount a managed deployment declares, then roll the
+    /// pool onto the trees.
+    ///
+    /// One job for all of them rather than one per mount, because they are one
+    /// question: a deployment either has the data it says it has or it does not,
+    /// and half a set of mounts is not a state to leave a pool in. The record
+    /// carries a per-mount outcome so a slow pull is still attributable.
+    ///
+    /// Unlike a build or a rootfs pull there is **no one-off reference
+    /// override**. Those rewrite `vm.image`, a single field, and "pull this tag
+    /// just once" is a coherent thing to ask of it. With several mounts an
+    /// override would have to say which one it meant, and a rollback is already
+    /// expressible in the place it belongs: pin `digest`, or move `ref`.
+    ///
+    /// `force` re-fetches trees already on this host; see
+    /// [`crate::artifact::Puller::pull_mount`].
+    pub fn start_mount_pull(
+        self: &Arc<Self>,
+        deployment_id: &str,
+        force: bool,
+    ) -> Result<JobRecord, StartError> {
+        let deployment = self.claimable(deployment_id, JobKind::MountPull)?;
+        let mounts: Vec<MountSpec> = deployment
+            .spec
+            .vm
+            .as_ref()
+            .map(|vm| vm.mounts.clone())
+            .unwrap_or_default();
+        if mounts.is_empty() {
+            return Err(StartError::NoSpec {
+                id: deployment_id.to_string(),
+                kind: JobKind::MountPull,
+            });
+        }
+
+        // The record lists every mount before the first byte moves, so a job
+        // that is still running says what it is working through rather than
+        // growing a list as it goes.
+        let planned: Vec<MountOutcome> = mounts
+            .iter()
+            .map(|m| MountOutcome {
+                path: m.guest_path().to_string(),
+                store: m.store.clone(),
+                artifact_ref: m.artifact_ref.clone(),
+                digest: None,
+                tree: None,
+                files: None,
+                bytes: None,
+                unpacked: None,
+                reused: false,
+                changed: false,
+            })
+            .collect();
+
+        self.spawn(
+            deployment_id,
+            JobKind::MountPull,
+            move |r| {
+                r.mounts = planned;
+            },
+            move |jobs, job_id, deployment_id| async move {
+                jobs.run_mount_pull(&job_id, &deployment_id, mounts, force).await
+            },
+        )
+    }
+
+    /// Whether this deployment has a mount with no tree on this host — the
+    /// condition under which its pool cannot be created at all.
+    ///
+    /// The admin API asks this on register and on edit so the pull that fixes it
+    /// starts by itself, rather than leaving an operator to discover the reason
+    /// their pool is empty in the autoscaler's error line.
+    pub fn mounts_need_pulling(&self, spec: &crate::config::DeploymentSpec) -> bool {
+        spec.vm
+            .as_ref()
+            .is_some_and(|vm| vm.mounts.iter().any(|m| self.cfg.mounts.resolve(m).is_none()))
     }
 
     /// Run a static deployment's update commands on this host.
@@ -1132,6 +1292,183 @@ impl Jobs {
             if pulled.files == 1 { "" } else { "s" },
             crate::artifact::human(pulled.unpacked),
         ))
+    }
+
+    // -- guest mounts ------------------------------------------------------
+
+    /// Pull every mount, then move the pool onto whatever changed.
+    ///
+    /// Sequential rather than concurrent, and that is a choice rather than an
+    /// oversight: these are multi-gigabyte transfers landing on one host's disk,
+    /// and running eight of them at once makes all eight slower while making the
+    /// first one — which might have been the only one that had to move — late.
+    ///
+    /// A mount that fails ends the job with the mounts before it already
+    /// unpacked. That is safe because nothing has been rolled out yet: the trees
+    /// are content-addressed and unreferenced until the spec names them, so the
+    /// deployment goes on running whatever it was running, and the retry starts
+    /// from the first mount that has not landed.
+    async fn run_mount_pull(
+        &self,
+        job_id: &str,
+        deployment_id: &str,
+        mounts: Vec<MountSpec>,
+        force: bool,
+    ) -> Result<String, String> {
+        let mut resolved: Vec<(String, String)> = Vec::with_capacity(mounts.len());
+        let mut moved = 0u64;
+        let mut reused = 0usize;
+
+        for (index, mount) in mounts.iter().enumerate() {
+            // Resolved per mount rather than once: each names its own store, and
+            // eight mounts can hold eight credentials.
+            let api_key = self.store_key(mount.auth.as_ref())?;
+            let pulled = {
+                let mut log = |line: String| self.log(job_id, line);
+                self.puller
+                    .pull_mount(mount, &self.cfg.mounts, api_key.as_deref(), force, &mut log)
+                    .await
+                    .map_err(|e| format!("mount {}: {e}", mount.guest_path()))?
+            };
+
+            moved += pulled.bytes_written;
+            if pulled.reused {
+                reused += 1;
+            }
+            let tree = pulled.tree.display().to_string();
+            let (digest, files, unpacked, bytes, was_reused) = (
+                pulled.digest.clone(),
+                pulled.files,
+                pulled.unpacked,
+                pulled.bytes_written,
+                pulled.reused,
+            );
+            self.update_record(job_id, |r| {
+                if let Some(outcome) = r.mounts.get_mut(index) {
+                    outcome.digest = Some(digest);
+                    outcome.tree = Some(tree);
+                    outcome.bytes = Some(bytes);
+                    outcome.reused = was_reused;
+                    // Both describe an unpack that happened. On a reuse there
+                    // was none, and zero would read as "this bundle is empty"
+                    // rather than "nothing was written".
+                    if !was_reused {
+                        outcome.files = Some(files);
+                        outcome.unpacked = Some(unpacked);
+                    }
+                }
+            });
+            resolved.push((pulled.path, pulled.digest));
+        }
+
+        let rolled = self.roll_out_mounts(job_id, deployment_id, &resolved).await?;
+
+        let n = mounts.len();
+        Ok(format!(
+            "{n} mount{} ({reused} already on this host, {}){}",
+            if n == 1 { "" } else { "s" },
+            human_bytes(moved),
+            if rolled {
+                "; pool recycling"
+            } else {
+                "; the pool already has them"
+            },
+        ))
+    }
+
+    /// Write the resolved digests into the spec and recycle the pool, if
+    /// anything actually moved.
+    ///
+    /// Returns whether the pool was rolled. **Not** unconditional, unlike the
+    /// roll-out a build or a rootfs pull ends with, and the asymmetry is the
+    /// point: those recycle because the running VMs hold a *copy* of a rootfs
+    /// that may not be the one just materialized, and no name can prove
+    /// otherwise. A mount's tree is content-addressed and a running VM's copy of
+    /// it was built from the same digest, so an unchanged digest means the pool
+    /// already has exactly these bytes. Recycling anyway would make the pull
+    /// that runs on every registration — see [`Self::mounts_need_pulling`] —
+    /// into a fleet-wide restart.
+    ///
+    /// Mounts are matched by guest path rather than by index, because the spec
+    /// can be edited while the job runs and an index would then write a digest
+    /// onto a different mount than the one it was fetched for.
+    async fn roll_out_mounts(
+        &self,
+        job_id: &str,
+        deployment_id: &str,
+        resolved: &[(String, String)],
+    ) -> Result<bool, String> {
+        let change = self.registry.change_guard().await;
+        let Some(old) = self.registry.get(deployment_id) else {
+            return Err(format!(
+                "deployment {deployment_id:?} was removed while its mounts were being pulled; \
+                 the trees are on this host but nothing is using them"
+            ));
+        };
+        let mut spec = old.spec.clone();
+        let Some(vm) = spec.vm.as_mut() else {
+            return Err(format!(
+                "deployment {deployment_id:?} is no longer a managed VM deployment"
+            ));
+        };
+
+        let mut changed: Vec<String> = Vec::new();
+        let mut dropped: Vec<String> = Vec::new();
+        for (path, digest) in resolved {
+            match vm.mounts.iter_mut().find(|m| m.guest_path() == path) {
+                Some(mount) if mount.digest.as_deref() != Some(digest.as_str()) => {
+                    mount.digest = Some(digest.clone());
+                    changed.push(path.clone());
+                }
+                Some(_) => {}
+                None => dropped.push(path.clone()),
+            }
+        }
+
+        for path in &dropped {
+            self.log(
+                job_id,
+                format!("mount {path} was removed from the spec while it was being pulled; its \
+                         tree is on this host but nothing names it"),
+            );
+        }
+
+        if changed.is_empty() {
+            drop(change);
+            self.update_record(job_id, |r| {
+                r.push_log(
+                    "every mount is already pinned to the digest that was pulled; the pool is \
+                     left alone",
+                );
+            });
+            return Ok(false);
+        }
+
+        let deployment = self.registry.upsert(spec);
+        if let Err(e) = self.registry.persist_one(&deployment.spec.id) {
+            tracing::error!(error = %e, "failed to persist state after a mount pull");
+        }
+        drop(change);
+        self.autoscaler.teardown(&old).await;
+        deployment.scale_signal.notify_one();
+
+        let rolled = changed.clone();
+        self.update_record(job_id, |r| {
+            r.rolled_out = true;
+            for outcome in r.mounts.iter_mut() {
+                outcome.changed = rolled.contains(&outcome.path);
+            }
+            r.push_log(format!(
+                "{} moved to a new digest; pool recycling",
+                rolled.join(", ")
+            ));
+        });
+        tracing::info!(
+            deployment = %deployment_id,
+            mounts = %changed.join(","),
+            "rolled deployment onto new mount trees",
+        );
+        Ok(true)
     }
 
     // -- host updates ------------------------------------------------------

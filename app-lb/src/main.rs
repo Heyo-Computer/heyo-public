@@ -26,6 +26,7 @@ mod guard;
 mod health;
 mod jobs;
 mod metrics;
+mod mounts;
 mod obs;
 mod proxy;
 mod registry;
@@ -129,6 +130,18 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_IMAGES_DIR") {
         cfg.images_dir = Some(v);
+    }
+    if let Ok(v) = std::env::var("APP_LB_MOUNTS_DIR") {
+        cfg.mounts_dir = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_MOUNT_TTL_SECS") {
+        match v.trim().parse::<u64>() {
+            Ok(n) => cfg.mount_ttl_secs = n,
+            _ => panic!(
+                "APP_LB_MOUNT_TTL_SECS must be a number of seconds (0 to keep every mount \
+                 tree), got {v:?}"
+            ),
+        }
     }
     if let Ok(v) = std::env::var("APP_LB_GIT_BIN") {
         cfg.git_bin = v;
@@ -522,7 +535,25 @@ fn main() {
                 .ok()
                 .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
         });
-    let vms = VmManager::new(cfg.daemon_url.clone(), daemon_api_key);
+    // Where guest mount trees live. Created up front so a path app-lb cannot
+    // write to is a startup error rather than a pull that fails minutes later,
+    // and so the directory exists with the right permissions before heyvmd is
+    // ever pointed at something inside it.
+    let mount_store = mounts::MountStore::new(cfg.mounts_dir.clone().into(), cfg.mount_ttl_secs);
+    if let Err(e) = mount_store.ensure_root() {
+        panic!("{e}. Set APP_LB_MOUNTS_DIR to a directory app-lb can write and heyvmd can read");
+    }
+    if cfg.mount_ttl_secs == 0 {
+        tracing::info!(
+            dir = %cfg.mounts_dir,
+            "mount tree reclamation is off (APP_LB_MOUNT_TTL_SECS=0); trees no deployment \
+             names are kept until they are removed by hand",
+        );
+    }
+
+    let vms = VmManager::new(cfg.daemon_url.clone(), daemon_api_key, mount_store.clone());
+    // Kept for the sweeper, which is built after the last move of `registry`.
+    let mount_registry = registry.clone();
 
     // The static cert pair, if configured. With ACME on it is the *fallback*,
     // served for any SNI without an issued cert of its own; with ACME off it is
@@ -687,6 +718,7 @@ fn main() {
             art_bin: cfg.art_bin.clone(),
             images_dir,
             git_bin: cfg.git_bin.clone(),
+            mounts: mount_store.clone(),
             shell: cfg.update_shell.clone(),
             timeout: std::time::Duration::from_secs(cfg.build_timeout_secs),
             home: cfg.heyvm_home.clone(),
@@ -802,6 +834,20 @@ fn main() {
     // neither may hold up traffic.
     if let Some(disks) = disks {
         server.add_service(background_service("disks", disks::DiskSweeper::new(disks)));
+    }
+    // Mount-tree reclamation, on the same terms. Cheaper than the disk sweep —
+    // it reads one directory and compares names against the registry — but it
+    // unlinks gigabytes when it does act, which is not work for the proxy's
+    // path.
+    if cfg.mount_ttl_secs > 0 {
+        server.add_service(background_service(
+            "mounts",
+            mounts::MountSweeper::new(
+                mount_store,
+                mount_registry,
+                mounts::DEFAULT_SWEEP_SECS,
+            ),
+        ));
     }
     let proxy_handle = server.add_service(proxy_svc);
     // Don't accept traffic until the autoscaler has adopted existing VMs and

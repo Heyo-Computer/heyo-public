@@ -347,6 +347,10 @@ impl Client {
         run!(self, self.inner.start_pull(id, artifact_ref, force))
     }
 
+    pub fn start_mount_pull(&self, id: &str, force: bool) -> Result<JobRecord> {
+        run!(self, self.inner.start_mount_pull(id, force))
+    }
+
     pub fn start_update(&self, id: &str) -> Result<JobRecord> {
         run!(self, self.inner.start_update(id))
     }
@@ -658,6 +662,10 @@ impl Raw<'_> {
 
     pub fn start_pull(&self, id: &str, r: Option<&str>, force: bool) -> Result<Value> {
         block_on(&self.client.rt, self.client.inner.raw().start_pull(id, r, force))?
+    }
+
+    pub fn start_mount_pull(&self, id: &str, force: bool) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().start_mount_pull(id, force))?
     }
 
     pub fn start_update(&self, id: &str) -> Result<Value> {

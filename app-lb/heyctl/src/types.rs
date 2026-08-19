@@ -192,7 +192,54 @@ pub struct VmSpec {
     pub env_vars: Option<BTreeMap<String, String>>,
     pub setup_hooks: Option<Vec<String>>,
     pub open_ports: Vec<u16>,
+    /// Directories the guests boot with, unpacked from tarballs in an artifact
+    /// store. Empty on a deployment that declares none.
+    pub mounts: Vec<MountSpec>,
     pub ttl_seconds: u64,
+}
+
+/// One directory handed to every replica, unpacked from a tarball in an artifact
+/// store.
+///
+/// Read-only here, like every other spec mirror in this file: `heyctl apply`
+/// sends the file the user wrote rather than a reserialization of this struct,
+/// so a field this build has no name for still reaches the server intact.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct MountSpec {
+    /// Where it appears inside the guest.
+    pub path: String,
+    pub store: String,
+    #[serde(rename = "ref")]
+    pub artifact_ref: String,
+    pub auth: Option<SecretRef>,
+    pub strip_components: Option<usize>,
+    /// Defaults to true server-side; a spec that omits it is read-only.
+    pub read_only: bool,
+    /// What `ref` resolved to on the last pull. `None` means nothing has been
+    /// pulled yet — and a deployment whose mounts have no digest has no pool
+    /// either, because the autoscaler will not boot a guest without its data.
+    pub digest: Option<String>,
+}
+
+impl MountSpec {
+    /// One line: `/data/corpus <- 127.0.0.1:8080/corpus-2026-08 (ro)`.
+    ///
+    /// The store is trimmed the same way [`ArtifactSpec::summary`] trims it, so
+    /// the two read alike when a deployment has both.
+    pub fn summary(&self) -> String {
+        let store = self
+            .store
+            .trim_end_matches('/')
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        format!(
+            "{} <- {store}/{} ({})",
+            self.path,
+            self.artifact_ref,
+            if self.read_only { "ro" } else { "rw" },
+        )
+    }
 }
 
 /// Where a managed deployment's image is built from: a git checkout, or a
@@ -272,6 +319,43 @@ impl ArtifactSpec {
     /// purpose — the two share the SOURCE column, and a reader scanning a fleet
     /// should be able to tell a repo from a store at a glance without the
     /// column changing format underneath them.
+    pub fn summary(&self) -> String {
+        let store = self
+            .store
+            .trim_end_matches('/')
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        format!("{store}/{}", self.artifact_ref)
+    }
+}
+
+/// What one guest mount's pull did.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct MountOutcome {
+    /// The guest path, which is the mount's identity within the deployment.
+    pub path: String,
+    pub store: String,
+    #[serde(rename = "ref")]
+    pub artifact_ref: String,
+    pub digest: Option<String>,
+    /// The tree on this host the guests mount.
+    pub tree: Option<String>,
+    pub files: Option<usize>,
+    /// Bytes transferred from the store. `0` with `reused` means the tree was
+    /// already on the host.
+    pub bytes: Option<u64>,
+    /// Uncompressed size of the tree — what this mount costs the host's disk.
+    pub unpacked: Option<u64>,
+    pub reused: bool,
+    /// Whether this mount's digest changed, which is what recycles the pool.
+    pub changed: bool,
+}
+
+impl MountOutcome {
+    /// The store side of the mount, trimmed the same way [`MountSpec::summary`]
+    /// trims it. Without the guest path, which the caller has already used as
+    /// the label.
     pub fn summary(&self) -> String {
         let store = self
             .store
@@ -514,6 +598,12 @@ pub struct JobRecord {
     /// cannot give when the blob was hardlinked and the transfer was free.
     pub files: Option<usize>,
 
+    // mount-pull
+    /// One entry per guest mount. A mount pull covers all of a deployment's
+    /// mounts in one job, so the single `digest`/`store` fields above stay empty
+    /// on this kind and this carries the outcome instead.
+    pub mounts: Vec<MountOutcome>,
+
     // host-update
     pub working_dir: Option<String>,
     pub commands_total: Option<usize>,
@@ -547,6 +637,14 @@ impl JobRecord {
         self.kind == "artifact-pull"
     }
 
+    /// Whether this job materialized the deployment's guest mounts. Distinct
+    /// from [`Self::is_pull`] even though both fetch from a store: this one
+    /// changes what the guests *hold*, not what they boot, and its outcome is in
+    /// `mounts` rather than in `image`.
+    pub fn is_mount_pull(&self) -> bool {
+        self.kind == "mount-pull"
+    }
+
     /// The commit, short enough for a column.
     pub fn short_commit(&self) -> String {
         match &self.commit {
@@ -573,6 +671,17 @@ impl JobRecord {
                 _ => "—".into(),
             };
         }
+        if self.is_mount_pull() {
+            // What changed, not what was pulled: a mount pull that moved
+            // nothing is the common case, and reporting "3 mounts" for it would
+            // read as three deployments' worth of work.
+            let changed = self.mounts.iter().filter(|m| m.changed).count();
+            return match (self.mounts.len(), changed) {
+                (0, _) => "—".into(),
+                (total, 0) => format!("{total} unchanged"),
+                (total, n) => format!("{n}/{total} updated"),
+            };
+        }
         self.image.clone().unwrap_or_else(|| "—".into())
     }
 
@@ -584,6 +693,14 @@ impl JobRecord {
         }
         if self.is_pull() {
             return self.artifact_ref.clone().unwrap_or_else(|| "—".into());
+        }
+        if self.is_mount_pull() {
+            let paths: Vec<&str> = self.mounts.iter().map(|m| m.path.as_str()).take(2).collect();
+            return match (paths.is_empty(), self.mounts.len().saturating_sub(paths.len())) {
+                (true, _) => "—".into(),
+                (false, 0) => paths.join(","),
+                (false, more) => format!("{} +{more} more", paths.join(",")),
+            };
         }
         self.git_ref.clone().unwrap_or_else(|| "(default)".into())
     }

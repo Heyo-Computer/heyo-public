@@ -81,6 +81,8 @@ Configuration is environment-only:
 | `APP_LB_ART_BIN` | `art` | The `art` CLI that materializes a rootfs from a **local** artifact store; unused when `artifact.store` is a URL |
 | `APP_LB_IMAGES_DIR` | `$MVM_DATA_DIR/images/firecracker`, else `<home>/.heyo/images/firecracker` | Where a pulled rootfs is written. Must be the directory heyvmd resolves image names in |
 | `APP_LB_GIT_BIN` | `git` | The git binary used for checkouts |
+| `APP_LB_MOUNTS_DIR` | `/var/lib/app-lb/mounts` | Where a [guest mount](#mounting-a-directory-into-the-guests)'s tree is unpacked. heyvmd reads it, so it must be readable by the daemon's user |
+| `APP_LB_MOUNT_TTL_SECS` | `86400` (1 day) | How long a mount tree no deployment names survives. **`0` turns reclamation off** |
 | `APP_LB_UPDATE_SHELL` | `/bin/sh` | Shell a static deployment's `update.commands` run through |
 | `APP_LB_BUILD_TIMEOUT_SECS` | `1800` | Ceiling on one build step or update command, after which the child is killed |
 | `APP_LB_HEYVM_HOME` | *(unset)* | `HOME` for the heyvm child — set it when app-lb and heyvmd run as different users |
@@ -175,6 +177,11 @@ heyctl top                             # per-deployment CPU, memory, latency, 5x
 heyctl artifact login http://10.0.0.4:8080   # saves a registry; prompts for the API key
 heyctl artifact push --image web-v2          # a heyvm image, or a path to an .ext4
 heyctl pull demo --wait                      # materialize it here and roll the pool
+
+# Hand the guests a directory of data, from the same store.
+art put corpus.tgz --tag corpus-2026-08      # a bundle, as a site's is
+heyctl edit demo                             # add it under vm.mounts; the pull starts on save
+heyctl mounts pull demo --wait               # or run one by hand
 ```
 
 See [`heyctl/README.md`](heyctl/README.md) for the full command set, the context/credential
@@ -215,6 +222,10 @@ curl localhost:9090/metrics              # metrics snapshot (JSON)
 curl localhost:9090/certs                # issued TLS certificates and expiry
 curl localhost:9090/security             # security findings + the block rules in force
 curl localhost:9090/disks                # every per-sandbox disk on this host
+
+# Unpack the deployment's guest mounts and roll the pool onto them. Started
+# automatically on register/edit when a mount has no tree on this host.
+curl -XPOST localhost:9090/deployments/web/mounts/pull
 
 # Disk management. See "Disk management" — purging deletes gigabytes with no undo.
 curl -XPATCH localhost:9090/disks/sb-abc123 -H 'content-type: application/json' \
@@ -973,7 +984,8 @@ image came from. To do both, build on one host and
 the result for the others to pull. A static (`upstreams`) deployment cannot have
 an `artifact` block either, for the same reason it cannot have a `build`.
 
-The CLI side is `heyctl pull` and `heyctl set artifact`, plus
+The CLI side is `heyctl pull` and `heyctl set artifact` (and `heyctl mounts pull`
+for [guest mounts](#mounting-a-directory-into-the-guests)), plus
 `heyctl artifact` for talking to the store itself — see
 [`heyctl/README.md`](heyctl/README.md#artifact-stores).
 
@@ -1043,6 +1055,126 @@ rejected off one (a rootfs is one file, and nothing unpacks it).
 A site pull's job record carries `site_root` and `files` where a rootfs pull
 carries `image`. `bytes` is what crossed the wire, so `0` from a local store is
 normal — `art get` hardlinks the blob rather than copying it.
+
+### Mounting a directory into the guests
+
+The third thing an artifact bundle can become, and the only one that is neither
+the image nor the site. A rootfs decides what the guests **run**; a `vm.mounts`
+entry decides what they **hold**:
+
+```jsonc
+{
+  "id": "search",
+  "routes": [{"host": "search.example.com"}],
+  "vm": {
+    "driver": "firecracker",
+    "image": "search-1b9b737b73e2",
+    "port": 8080,
+    "mounts": [
+      {
+        "path": "/data/corpus",           // absolute, inside the guest
+        "store": "http://10.0.0.4:8080",  // an `art serve`, or an absolute store root
+        "ref": "corpus-2026-08",          // a tag, or a 64-hex digest
+        "strip_components": 1,            // drop the wrapper dir, as tar does
+        "read_only": true,                // the default
+        "auth": {"secret": "art", "key": "api_key"}
+      }
+    ]
+  }
+}
+```
+
+```sh
+tar czf corpus.tgz -C corpus .
+art put corpus.tgz --tag corpus-2026-08
+
+curl -XPOST localhost:9090/deployments/search -d @search.json   # 201, and a pull starts
+curl localhost:9090/jobs                                        # watch it land
+```
+
+Every replica boots with `/data/corpus` already populated, before the start
+command runs.
+
+**Why this is not just a bigger rootfs.** A corpus, a model, a seed database or a
+bundle of assets moves on its own schedule. Welding it into the image makes a new
+copy of it a new operating system: every host re-pulls gigabytes it already has,
+and a rollback of one is a rollback of both. As a mount it is its own digest,
+fetched once per host and shared by every deployment that names it.
+
+**How it reaches the guest.** app-lb resolves the reference, verifies the blob
+against its digest and unpacks it into a directory named after that digest under
+`APP_LB_MOUNTS_DIR`. heyvmd is given the *directory*: at boot it builds each VM
+its own ext4 image from it (`mke2fs -d`) and attaches it as a virtio-blk device
+the guest mounts at `path`. So the disk is per VM — no guest sees another's
+writes — and the tree itself is only ever read.
+
+**A mount is attached at boot, so `mounts` lives in the VM template.** Editing
+the list recycles the pool, exactly as changing `image` or `size_class` does.
+There is no hot-add.
+
+**Nothing boots until the tree is here.** A mount with no `digest`, or one whose
+digest names a tree this host does not hold, makes the autoscaler *refuse* the
+create rather than boot a replica silently missing its data — the pool stays at
+zero and the reason is on the job, the log and the deployment's feed. Registering
+or editing a deployment in that state starts a mount pull by itself, so the usual
+sequence is one call:
+
+```sh
+# Usually unnecessary — register/edit already starts one. This is for a tag that
+# has moved, and for `force`.
+curl -XPOST localhost:9090/deployments/search/mounts/pull      # 202 + a job record
+curl -XPOST localhost:9090/deployments/search/mounts/pull -H 'content-type: application/json' \
+  -d '{"force": true}'
+```
+
+**One job covers every mount**, sequentially — these are multi-gigabyte transfers
+onto one disk, and eight at once makes all eight slower. The record's `mounts`
+array carries a per-mount `digest`, `tree`, `files`, `bytes` and `unpacked`, so a
+job still running says which mount it is on. `heyctl describe job <id>` renders
+it a row at a time.
+
+**The pool is recycled only if a digest actually changed.** Unlike a build or an
+image pull — which recycle unconditionally, because a running VM holds a copy of
+whatever rootfs it booted from and no name can prove otherwise — a mount tree is
+content-addressed, and a running VM's copy was built from the same digest. An
+unchanged digest therefore means the pool already has exactly these bytes. This
+is what keeps the pull-on-every-registration from being a fleet-wide restart.
+
+**Mounts are read-only by default, and writable is refused on `kvm`.** On
+`firecracker` each VM's ext4 is its own and writes go nowhere else, so
+`"read_only": false` is a writable scratch copy seeded from the bundle, discarded
+with the VM. The KVM driver syncs a read-write mount image *back into the host
+directory* when the VM stops — and that directory is the shared, content-addressed
+tree every other replica boots from — so a writable mount there is rejected at
+registration rather than left to corrupt it. For writable space that survives a
+restart, use `vm.disk_size_gb`, which is a per-VM data disk at `/workspace`.
+
+**What a path may be.** Absolute, no `..`, and drawn from `[A-Za-z0-9/._-]` —
+it is interpolated into the guest's own mount command. Two mounts may not share a
+path or nest one inside another (the guest mounts them in array order, so the
+inner one would be hidden), and `/`, `/proc`, `/sys`, `/dev`, `/boot`, `/run` and
+`/workspace` are refused: the first six belong to the guest's boot, and
+`/workspace` is heyvm's data disk. At most 8 per deployment — heyvmd letters them
+`/dev/vdb`, `/dev/vdc`, … and the ceiling is really the alphabet.
+
+**Everything else works like the other two pulls.** Both transports (`art serve`
+URL vs local store root), digest verification on the way in, tags resolving at
+pull time while digests pin forever, `strip_components` for a bundle rolled with a
+wrapper directory, and the same refusal to unpack symlinks, hardlinks, devices or
+anything that escapes the destination.
+
+**Trees are shared and reclaimed.** The directory name is the digest (plus
+`-s<n>` when `strip_components` is set, because the strip changes the tree's
+shape), so ten deployments mounting one corpus hold one copy of it. A tree no
+registered spec names is reclaimed by a sweep every six hours, once it is older
+than `APP_LB_MOUNT_TTL_SECS` — a day by default, against a week for
+[VM disks](#disk-management), because a mount tree is re-fetchable from the store
+it came from and a VM disk is not. Removing one costs running VMs nothing: they
+already hold their own copies, and only the next create has to fetch again. The
+age is measured from when the tree was unpacked, so what the window really
+guarantees is that a tree a pull has just landed is never swept before the spec
+that names it is written; an older tree becomes eligible as soon as nothing
+names it. Set `0` to reclaim by hand instead.
 
 ## Updating a static deployment
 

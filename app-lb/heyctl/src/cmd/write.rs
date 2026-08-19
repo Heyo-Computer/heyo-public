@@ -944,6 +944,78 @@ pub fn set_artifact(ctx: &Ctx, args: &SetArtifactArgs) -> Result<()> {
     })
 }
 
+// -- mount pull ------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct MountPullArgs {
+    /// The deployment whose mounts to unpack, e.g. `search` or
+    /// `deployment/search`.
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+
+    /// Re-fetch trees already on the app-lb host. Rarely wanted: a tree's
+    /// directory name is its digest, so its presence already proves what is in
+    /// it.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Wait for the pull to finish and report the outcome.
+    #[arg(long, short = 'w')]
+    pub wait: bool,
+
+    /// Print the pull's output when it finishes. Implies --wait.
+    #[arg(long)]
+    pub logs: bool,
+
+    #[arg(long, value_name = "SECS", default_value_t = 1800)]
+    pub timeout: u64,
+}
+
+/// `heyctl mounts pull <id>` — unpack every mount the spec declares.
+///
+/// Rarely needed by hand: registering or editing a deployment whose mounts have
+/// no tree on the host starts one of these by itself. What is left for this
+/// command is a tag that has moved, and `--force`.
+///
+/// No `--ref`, unlike `heyctl pull`. That flag rewrites one field for one job;
+/// a deployment can declare eight mounts, and a single reference would have
+/// nothing to attach itself to. Roll back by pinning `digest` or moving the tag.
+pub fn pull_mounts(ctx: &Ctx, args: &MountPullArgs) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+    let started = ctx.client.raw().start_mount_pull(&id, args.force)?;
+
+    if ctx.out.is_machine() && !(args.wait || args.logs) {
+        let record: JobRecord = serde_json::from_value(started.clone()).unwrap_or_default();
+        return output::emit(&started, ctx.out, &[format!("job/{}", record.id)]);
+    }
+
+    let record: JobRecord =
+        serde_json::from_value(started).context("parsing the job the server started")?;
+    if !ctx.out.is_machine() {
+        let paths: Vec<&str> = record.mounts.iter().map(|m| m.path.as_str()).collect();
+        println!(
+            "job/{} started for deployment/{id} — {}",
+            record.id,
+            if paths.is_empty() {
+                "no mounts listed yet".to_string()
+            } else {
+                paths.join(", ")
+            },
+        );
+    }
+
+    if !(args.wait || args.logs) {
+        println!(
+            "\nIt runs on the app-lb host, one mount at a time, and takes as long as the \
+             transfers do — or no time at all for a tree that is already there. Follow it \
+             with `heyctl get job {}`.",
+            record.id
+        );
+        return Ok(());
+    }
+    wait_job(ctx, &record.id, Duration::from_secs(args.timeout), args.logs)
+}
+
 // -- pull ------------------------------------------------------------------
 
 #[derive(Args, Debug)]

@@ -142,6 +142,34 @@ pub struct PulledTree {
     pub reused: bool,
 }
 
+/// What a *guest mount* pull did. The third reading of a bundle, and its own
+/// type for the same reason [`PulledTree`] is: nothing here is a rootfs, and the
+/// destination is a content-addressed tree rather than a directory somebody
+/// named.
+#[derive(Debug, Clone)]
+pub struct PulledMount {
+    /// The guest path this tree will be mounted at. Carried through so a job
+    /// covering several mounts can report per-mount outcomes without the caller
+    /// re-pairing them by index.
+    pub path: String,
+    /// The bundle blob's digest — what the mount's `ref` resolved to, and what
+    /// gets written back into the spec.
+    pub digest: String,
+    /// The tree on this host, which is what the daemon is given.
+    pub tree: PathBuf,
+    /// Regular files unpacked. Zero on a reuse, where nothing was unpacked.
+    pub files: usize,
+    /// Uncompressed bytes written into the tree.
+    pub unpacked: u64,
+    /// Bytes transferred from the store. Zero from a local store means the blob
+    /// was hardlinked rather than copied.
+    pub bytes_written: u64,
+    /// Whether the tree for this digest was already on the host and nothing
+    /// moved. The common case on every replica after the first deployment to
+    /// name a given corpus.
+    pub reused: bool,
+}
+
 /// What a Dockerfile-manifest fetch produced: a build, laid out and ready to
 /// run.
 #[derive(Debug, Clone)]
@@ -572,6 +600,164 @@ impl Puller {
         Ok(PulledTree {
             digest,
             root,
+            files: unpacked.files,
+            unpacked: unpacked.bytes,
+            bytes_written,
+            reused: false,
+        })
+    }
+
+    // -- guest mounts: a bundle unpacked into a content-addressed tree ------
+
+    /// Resolve a mount's reference and unpack the bundle behind it into a tree
+    /// under the mount store, so the daemon has a directory to build a VM's
+    /// mount image from.
+    ///
+    /// The third destination for the same kind of bundle, and the one with the
+    /// least to arrange: a rootfs has to land under a name heyvmd resolves and a
+    /// site has to replace a tree that is being served *right now*, but a mount
+    /// tree is named after its own digest and nothing is reading the name until
+    /// it exists. So there is no staging-and-swap here — there is staging and a
+    /// single rename, and losing that rename to a concurrent pull of the same
+    /// digest is a success rather than a conflict.
+    ///
+    /// What does have to be arranged is that nothing incomplete ever appears
+    /// under the final name, for exactly the reason a half-written rootfs must
+    /// not: a create that finds the directory takes it as proof the bytes are
+    /// there, and `mke2fs -d` on a half-unpacked tree produces a VM whose data
+    /// is silently short.
+    ///
+    /// `force` re-fetches over a tree already on disk. As with a rootfs pull
+    /// there is normally no reason to — the directory name *is* the digest — so
+    /// it is for the one case the name cannot describe: a tree damaged after it
+    /// was written.
+    pub async fn pull_mount(
+        &self,
+        mount: &crate::config::MountSpec,
+        store: &crate::mounts::MountStore,
+        api_key: Option<&str>,
+        force: bool,
+        log: &mut (dyn FnMut(String) + Send),
+    ) -> Result<PulledMount, String> {
+        let remote = mount.is_remote();
+        let base = mount.store.trim().trim_end_matches('/').to_string();
+        let strip = mount.strip();
+        let guest_path = mount.guest_path().to_string();
+
+        // One round trip, and it is what makes the reuse check below possible
+        // without moving any bytes.
+        let (digest, size) = if remote {
+            self.resolve_remote(&base, &mount.artifact_ref, api_key, None)
+                .await?
+        } else {
+            if api_key.is_some() {
+                log(format!(
+                    "the auth on mount {guest_path} names a local store; a store root is \
+                     protected by file permissions, not by an API key, and the secret is unused"
+                ));
+            }
+            self.stat_local(&base, &mount.artifact_ref).await?
+        };
+        log(format!(
+            "{guest_path}: {} resolves to {digest} ({}) {} {base}",
+            mount.artifact_ref,
+            human(size),
+            if remote { "at" } else { "in" },
+        ));
+
+        let dest = store.tree_path(&digest, strip);
+        if dest.is_dir() && !force {
+            // Reusing a tree the sweep could be about to reclaim — a rollback to
+            // an old digest nothing currently names — leaves a millisecond in
+            // which the spec is written against a tree that has just been
+            // removed. Deliberately not defended against here: the next create
+            // refuses with a message naming the mount and the endpoint that
+            // fixes it, which is a better outcome than the state a lock or a
+            // reservation file would need to keep correct.
+            log(format!(
+                "{guest_path}: {} is already unpacked; nothing to fetch",
+                dest.display()
+            ));
+            return Ok(PulledMount {
+                path: guest_path,
+                digest,
+                tree: dest,
+                files: 0,
+                unpacked: 0,
+                bytes_written: 0,
+                reused: true,
+            });
+        }
+
+        store.ensure_root()?;
+        // Both the bundle and the tree it unpacks to live inside one staging
+        // directory, so a pull that dies halfway leaves exactly one thing behind
+        // and the sweep has one shape to recognise.
+        let staging = ScratchDir::new(store.staging_path(&unique_token()))?;
+        let bundle = staging.path().join("bundle");
+        let bytes_written = if remote {
+            self.fetch_blob(&base, &digest, api_key, &bundle, size, log)
+                .await?
+        } else {
+            let written = self.get_local(&base, &digest, &bundle).await?;
+            // `art get` hardlinks when it can, and a hardlink hashes nothing.
+            verify_file(&bundle, &digest).await?;
+            log(format!(
+                "{guest_path}: {} from {base} ({})",
+                human(size),
+                if written == 0 { "hardlinked" } else { "copied" }
+            ));
+            written
+        };
+
+        // Unpacking is synchronous and a corpus can be gigabytes of gzip: on the
+        // job task directly it would stall every other future on this runtime
+        // thread for the duration.
+        let tree = staging.path().join("tree");
+        let unpacked = {
+            let (bundle, tree) = (bundle.clone(), tree.clone());
+            tokio::task::spawn_blocking(move || {
+                // Created up front rather than left to the first entry: a bundle
+                // holding nothing would otherwise leave no directory at all, and
+                // an empty mount is a legitimate thing to ship.
+                std::fs::create_dir_all(&tree)
+                    .map_err(|e| format!("could not create {}: {e}", tree.display()))?;
+                crate::unpack::extract_into(&bundle, &tree, strip)
+            })
+            .await
+            .map_err(|e| format!("the unpack task did not finish: {e}"))??
+        };
+        // The bundle has served its purpose and is a second copy of the same
+        // bytes. Removing it before the rename keeps the high-water mark at one
+        // copy plus the tree rather than two.
+        let _ = tokio::fs::remove_file(&bundle).await;
+
+        // `force` means the tree on disk is not trusted, so it goes before the
+        // new one lands. Nothing reads a tree except a VM create, and one racing
+        // this window would have been reading the copy being replaced.
+        if force && dest.is_dir() {
+            log(format!(
+                "{guest_path}: replacing the existing tree at {}",
+                dest.display()
+            ));
+            std::fs::remove_dir_all(&dest).map_err(|e| {
+                format!("could not remove the damaged tree at {}: {e}", dest.display())
+            })?;
+        }
+
+        let tree = store.commit(&tree, &digest, strip)?;
+        log(format!(
+            "{guest_path}: unpacked {} file{} ({}) into {}",
+            unpacked.files,
+            if unpacked.files == 1 { "" } else { "s" },
+            human(unpacked.bytes),
+            tree.display(),
+        ));
+
+        Ok(PulledMount {
+            path: guest_path,
+            digest,
+            tree,
             files: unpacked.files,
             unpacked: unpacked.bytes,
             bytes_written,
@@ -1297,6 +1483,50 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// The directory counterpart of [`Scratch`]: a working directory removed on
+/// drop, so every early return between "started unpacking" and "moved it into
+/// place" cleans up after itself.
+///
+/// Nothing marks it committed, because nothing needs to: a commit *renames the
+/// tree out* of this directory, and what is left is the husk this should remove
+/// either way.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        std::fs::create_dir_all(&path).map_err(|e| {
+            format!("could not create the staging directory {}: {e}", path.display())
+        })?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A name no concurrent pull on this host will pick, for a staging directory.
+///
+/// The process id alone is not enough — one app-lb runs several pulls — and a
+/// counter alone is not enough across a restart, so it is both, plus the clock
+/// to separate two runs of the same pid that both start at zero.
+fn unique_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos:x}-{n:x}", std::process::id())
 }
 
 /// Hash a file already on disk and confirm it is the blob that was asked for.

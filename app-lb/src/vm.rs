@@ -10,13 +10,20 @@
 //! 2. `guest_ip` is only populated for tap-networked Firecracker/KVM on a local
 //!    daemon. It is the only address we can route to, so its absence is a hard
 //!    error, not something to retry.
+//! 3. `SandboxCreateOptions` cannot express guest mounts, so [`VmManager::create`]
+//!    posts the create body itself rather than calling `Sandbox::create`. The
+//!    body is still the SDK's own serialization of that struct — only the
+//!    `mounts` array and the four defaults the SDK would have filled in are
+//!    added here. See [`sdk_create_defaults`].
 
 use crate::config::VmSpec;
+use crate::mounts::MountStore;
 use heyo_sdk::{
     CommandResult, CommandRunOptions, HeyoClient, HeyoClientOptions, RequestOptions, Sandbox,
     SandboxCreateOptions, SandboxDriver, SandboxInfo, SandboxStatus, ShellOptions, ShellSession,
 };
 use serde::Deserialize;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -64,6 +71,20 @@ pub enum VmError {
         sandbox_id: String,
         value: String,
     },
+    /// The create body could not be serialized. Structurally impossible with the
+    /// types involved — every map key is a `String` and no field is a float —
+    /// but the alternative to a variant here is a panic on the autoscaler's
+    /// reconcile tick.
+    BadCreateBody(String),
+    /// A guest mount has no tree on this host, so the VM would boot without the
+    /// data its spec says it has. Refused rather than created: a replica missing
+    /// a mount is a replica that answers health checks and then fails on the
+    /// first request that needs the data, which is the failure mode this whole
+    /// path exists to avoid.
+    MountNotPulled {
+        path: String,
+        digest: Option<String>,
+    },
 }
 
 impl std::fmt::Display for VmError {
@@ -92,6 +113,20 @@ impl std::fmt::Display for VmError {
                     "sandbox {sandbox_id} reported unparseable guest_ip {value:?}"
                 )
             }
+            Self::BadCreateBody(e) => write!(f, "could not serialize the create request: {e}"),
+            Self::MountNotPulled { path, digest } => match digest {
+                Some(d) => write!(
+                    f,
+                    "the tree for guest mount {path} ({d}) is not on this host; run \
+                     `POST /deployments/<id>/mounts/pull` to fetch it, or point the mount at \
+                     a digest this host still holds"
+                ),
+                None => write!(
+                    f,
+                    "guest mount {path} has never been pulled; run \
+                     `POST /deployments/<id>/mounts/pull` to resolve its ref and unpack it"
+                ),
+            },
         }
     }
 }
@@ -191,6 +226,43 @@ struct GuestLogLine {
     message: String,
 }
 
+/// `POST /sandbox-deploy`'s answer, which is the id of a sandbox that is still
+/// provisioning. The SDK's own `CreateResponse` is private, and this is the only
+/// field either of them needs.
+#[derive(Deserialize)]
+struct CreatedSandbox {
+    id: String,
+}
+
+/// The defaults `heyo_sdk::Sandbox::create` fills in before posting, applied
+/// here because this posts the body itself.
+///
+/// Replicated rather than skipped, and it is not cosmetic. `size_class` is the
+/// one that bites: the daemon treats an absent size class as "no size class",
+/// falls through to `cpus`/`memory` — which app-lb never sends — and boots a
+/// Firecracker guest at **1 vCPU and 128 MB**. A spec that simply omitted
+/// `size_class` would go from `small` to unusable, and the only symptom would be
+/// guests that OOM under load.
+///
+/// `image` matters for the same reason in a quieter way: the SDK's default is
+/// `ubuntu:24.04` and the daemon's own is `microsandbox/python`, so a spec with
+/// no image would silently change operating systems.
+///
+/// Keep this in step with `augment_create_body` in the SDK.
+fn sdk_create_defaults(body: &mut Value) {
+    let Some(map) = body.as_object_mut() else {
+        return;
+    };
+    for (key, value) in [
+        ("region", json!("US")),
+        ("image", json!("ubuntu:24.04")),
+        ("size_class", json!("small")),
+        ("open_ports", json!([])),
+    ] {
+        map.entry(key).or_insert(value);
+    }
+}
+
 /// The last `lines` of guest output on one line, bounded.
 ///
 /// One line because this becomes a tracing *field*, and a field that spans
@@ -231,12 +303,17 @@ pub struct VmManager {
     /// For the daemon routes the SDK does not wrap. Cloning a `reqwest::Client`
     /// clones a handle, so this rides along with `VmManager` for free.
     http: reqwest::Client,
+    /// Where a guest mount's tree lives on this host. Held here rather than
+    /// passed in by the autoscaler so that a mount that has not been pulled
+    /// fails the *create*, and therefore travels the create-failure path that
+    /// already counts, reports and backs off — instead of needing a second one.
+    mounts: MountStore,
 }
 
 impl VmManager {
     /// Targets the local daemon (`http://127.0.0.1:34099` by default), which is
     /// the only place `guest_ip` is available.
-    pub fn new(daemon_url: Option<String>, api_key: Option<String>) -> Self {
+    pub fn new(daemon_url: Option<String>, api_key: Option<String>, mounts: MountStore) -> Self {
         Self {
             opts: HeyoClientOptions {
                 base_url: Some(
@@ -249,6 +326,7 @@ impl VmManager {
                 .timeout(GUEST_LOG_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
+            mounts,
         }
     }
 
@@ -319,9 +397,19 @@ impl VmManager {
 
     /// Create a VM and return immediately, without waiting for boot.
     ///
-    /// `wait_for_ready: Some(ZERO)` is deliberate: the autoscaler must not block
-    /// its reconcile loop for the ~minutes a VM can take. Readiness is tracked
+    /// Returning immediately is deliberate: the autoscaler must not block its
+    /// reconcile loop for the ~minutes a VM can take. Readiness is tracked
     /// across subsequent ticks instead.
+    ///
+    /// Posts the create body directly rather than going through
+    /// `Sandbox::create`, because `SandboxCreateOptions` has no `mounts` field
+    /// and the daemon's `CreateSandboxRequest` does. The body is still that
+    /// struct's own serialization — see [`sdk_create_defaults`] for the four
+    /// fields the SDK would have added, and why leaving them out would quietly
+    /// change what boots.
+    ///
+    /// Fails before touching the daemon if any of the spec's mounts has no tree
+    /// on this host; see [`VmError::MountNotPulled`].
     pub async fn create(&self, spec: &VmSpec, name: String) -> Result<Sandbox, VmError> {
         debug_assert!(
             matches!(spec.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm),
@@ -347,12 +435,65 @@ impl VmManager {
             open_ports,
             // Backstop: if this LB dies without reaping, the VM still expires.
             ttl_seconds: Some(spec.ttl_seconds),
+            // Unused on this path — `Sandbox::create` is what reads it, and the
+            // wait it describes (none) is what this method does anyway.
             wait_for_ready: Some(Duration::ZERO),
             region: None,
             archive_id: None,
         };
 
-        Ok(Sandbox::create(options, self.opts.clone()).await?)
+        // Resolved before the request, so a deployment whose mounts have not
+        // been pulled fails without asking the daemon for anything.
+        let mounts = self.guest_mounts(spec)?;
+
+        let mut body =
+            serde_json::to_value(&options).map_err(|e| VmError::BadCreateBody(e.to_string()))?;
+        sdk_create_defaults(&mut body);
+        if !mounts.is_empty() {
+            body["mounts"] = Value::Array(mounts);
+        }
+
+        // `POST /sandbox-deploy`, which is what `Sandbox::create` posts. It
+        // answers `202` with the id of a sandbox that is still provisioning;
+        // readiness is tracked across reconcile ticks either way.
+        let client = HeyoClient::new(self.opts.clone())?;
+        let created: CreatedSandbox = client
+            .request(
+                http::Method::POST,
+                "/sandbox-deploy",
+                Some(&body),
+                RequestOptions::default(),
+            )
+            .await?;
+
+        Ok(Sandbox::connect(created.id, self.opts.clone())?)
+    }
+
+    /// The daemon's `mounts` array for a spec: one host directory per guest
+    /// mount, in spec order.
+    ///
+    /// Order is load-bearing. heyvmd letters the devices `/dev/vdb`, `/dev/vdc`
+    /// … in exactly this order and mounts them in it, so two mounts swapping
+    /// places between one create and the next would hand a restarted replica a
+    /// different filesystem under the same path.
+    fn guest_mounts(&self, spec: &VmSpec) -> Result<Vec<Value>, VmError> {
+        spec.mounts
+            .iter()
+            .map(|mount| {
+                let tree =
+                    self.mounts
+                        .resolve(mount)
+                        .ok_or_else(|| VmError::MountNotPulled {
+                            path: mount.guest_path().to_string(),
+                            digest: mount.digest.clone(),
+                        })?;
+                Ok(json!({
+                    "host_path": tree.to_string_lossy(),
+                    "sandbox_path": mount.guest_path(),
+                    "read_only": mount.read_only,
+                }))
+            })
+            .collect()
     }
 
     pub fn connect(&self, sandbox_id: String) -> Result<Sandbox, VmError> {
@@ -748,6 +889,42 @@ mod guest_log_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MountSpec;
+
+    /// A mount store over a directory that does not exist, which is all the
+    /// tests that never resolve a mount need.
+    fn test_mounts() -> MountStore {
+        MountStore::new(std::path::PathBuf::from("/nonexistent/app-lb-mounts"), 0)
+    }
+
+    fn mount(path: &str, digest: Option<&str>) -> MountSpec {
+        MountSpec {
+            path: path.into(),
+            store: "/srv/art".into(),
+            artifact_ref: "corpus".into(),
+            auth: None,
+            strip_components: None,
+            read_only: true,
+            digest: digest.map(Into::into),
+        }
+    }
+
+    fn spec_with(mounts: Vec<MountSpec>) -> VmSpec {
+        VmSpec {
+            driver: SandboxDriver::Firecracker,
+            image: None,
+            port: 8080,
+            start_command: None,
+            size_class: None,
+            disk_size_gb: None,
+            working_directory: None,
+            env_vars: None,
+            setup_hooks: None,
+            open_ports: vec![],
+            mounts,
+            ttl_seconds: 3600,
+        }
+    }
 
     fn info(id: &str, status: SandboxStatus, guest_ip: Option<&str>) -> SandboxInfo {
         SandboxInfo {
@@ -777,6 +954,7 @@ mod tests {
         let manager = VmManager::new(
             Some("http://host.internal:3000".into()),
             Some("service-token".into()),
+            test_mounts(),
         );
 
         assert_eq!(manager.opts.api_key.as_deref(), Some("service-token"));
@@ -795,7 +973,7 @@ mod tests {
 
     #[test]
     fn local_unauthenticated_daemon_remains_supported() {
-        let manager = VmManager::new(Some("http://127.0.0.1:34099".into()), None);
+        let manager = VmManager::new(Some("http://127.0.0.1:34099".into()), None, test_mounts());
         let request = manager
             .daemon_get("http://127.0.0.1:34099/sandboxes/sb-1/logs")
             .build()
@@ -994,5 +1172,133 @@ mod tests {
         ]);
         assert_eq!(idx.len(), 2);
         assert_eq!(idx["sb-1"].status, SandboxStatus::Running);
+    }
+
+    // -- guest mounts ------------------------------------------------------
+
+    fn store_holding(digests: &[(&str, usize)]) -> (std::path::PathBuf, MountStore) {
+        let root = std::env::temp_dir().join(format!(
+            "app-lb-vm-mounts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = MountStore::new(root.clone(), 0);
+        for (digest, strip) in digests {
+            std::fs::create_dir_all(store.tree_path(digest, *strip)).unwrap();
+        }
+        (root, store)
+    }
+
+    const D1: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+    const D2: &str = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809";
+
+    /// A VM whose data is not on the host is refused before the daemon is asked
+    /// for anything. The alternative — creating it anyway — is a replica that
+    /// passes its health check and then fails on the first request that reads
+    /// the mount.
+    #[test]
+    fn a_mount_with_no_tree_refuses_the_create() {
+        let (root, store) = store_holding(&[]);
+        let manager = VmManager::new(None, None, store);
+
+        let never_pulled = manager
+            .guest_mounts(&spec_with(vec![mount("/data", None)]))
+            .unwrap_err();
+        assert!(
+            matches!(&never_pulled, VmError::MountNotPulled { path, digest }
+                if path == "/data" && digest.is_none()),
+            "{never_pulled}",
+        );
+        assert!(
+            never_pulled.to_string().contains("mounts/pull"),
+            "the error must say what fixes it: {never_pulled}",
+        );
+
+        // Pinned to bytes this host does not hold — a tree reclaimed by the
+        // sweep, or a spec copied from another host.
+        let elsewhere = manager
+            .guest_mounts(&spec_with(vec![mount("/data", Some(D1))]))
+            .unwrap_err();
+        assert!(
+            matches!(&elsewhere, VmError::MountNotPulled { digest, .. } if digest.is_some()),
+            "{elsewhere}",
+        );
+        assert!(elsewhere.to_string().contains(D1));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The daemon's `MountConfig` spelling, and the order it letters devices in.
+    #[test]
+    fn resolved_mounts_carry_the_daemons_field_names_in_spec_order() {
+        let (root, store) = store_holding(&[(D1, 0), (D2, 0)]);
+        let tree_one = store.tree_path(D1, 0);
+        let tree_two = store.tree_path(D2, 0);
+        let manager = VmManager::new(None, None, store);
+
+        let writable = MountSpec {
+            read_only: false,
+            ..mount("/scratch", Some(D2))
+        };
+        let mounts = manager
+            .guest_mounts(&spec_with(vec![mount("/data", Some(D1)), writable]))
+            .unwrap();
+
+        assert_eq!(
+            mounts,
+            vec![
+                json!({
+                    "host_path": tree_one.to_string_lossy(),
+                    "sandbox_path": "/data",
+                    "read_only": true,
+                }),
+                json!({
+                    "host_path": tree_two.to_string_lossy(),
+                    "sandbox_path": "/scratch",
+                    "read_only": false,
+                }),
+            ],
+            "order is load-bearing: heyvmd letters /dev/vdb, /dev/vdc in this order",
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A deployment with no mounts must produce exactly the body it always did,
+    /// so the array is absent rather than empty.
+    #[test]
+    fn a_spec_with_no_mounts_sends_none() {
+        let (root, store) = store_holding(&[]);
+        let manager = VmManager::new(None, None, store);
+        assert!(manager.guest_mounts(&spec_with(vec![])).unwrap().is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Posting the create body ourselves means the SDK's defaults are ours to
+    /// apply. `size_class` is the one that matters: without it the daemon boots
+    /// a Firecracker guest at 1 vCPU and 128 MB.
+    #[test]
+    fn the_sdk_defaults_are_applied_to_a_hand_built_body() {
+        let mut body = json!({ "name": "applb-demo-01" });
+        sdk_create_defaults(&mut body);
+        assert_eq!(body["size_class"], "small");
+        assert_eq!(body["image"], "ubuntu:24.04");
+        assert_eq!(body["region"], "US");
+        assert_eq!(body["open_ports"], json!([]));
+
+        // ...and never over a value the spec set.
+        let mut explicit = json!({
+            "image": "agent-base",
+            "size_class": "large",
+            "open_ports": [8080],
+        });
+        sdk_create_defaults(&mut explicit);
+        assert_eq!(explicit["image"], "agent-base");
+        assert_eq!(explicit["size_class"], "large");
+        assert_eq!(explicit["open_ports"], json!([8080]));
     }
 }

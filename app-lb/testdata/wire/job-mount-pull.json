@@ -1,0 +1,36 @@
+{
+  "id": "job-006",
+  "deployment": "sandbox",
+  "kind": "mount-pull",
+  "status": "succeeded",
+  "started_at": 1722400000,
+  "finished_at": 1722400123,
+  "rolled_out": true,
+  "mounts": [
+    {
+      "path": "/data/corpus",
+      "store": "http://127.0.0.1:8080",
+      "ref": "corpus-2026-08",
+      "digest": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "tree": "/var/lib/app-lb/mounts/0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0-s1",
+      "files": 1204,
+      "bytes": 734003200,
+      "unpacked": 2147483648,
+      "changed": true
+    },
+    {
+      "path": "/opt/models",
+      "store": "/srv/artifacts",
+      "ref": "embed-v4",
+      "digest": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+      "tree": "/var/lib/app-lb/mounts/1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+      "bytes": 0,
+      "reused": true
+    }
+  ],
+  "error": null,
+  "log": [
+    "cloning …",
+    "done"
+  ]
+}

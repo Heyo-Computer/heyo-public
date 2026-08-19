@@ -16,7 +16,8 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use heyctl::types::{
-    DiskInventory, DiskState, MetricsResponse, UpstreamTrafficStatus, WorkflowList, WorkflowView,
+    DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, UpstreamTrafficStatus,
+    WorkflowList, WorkflowView,
 };
 use std::path::PathBuf;
 
@@ -280,4 +281,64 @@ fn metrics_response_understands_every_field() {
             d.metrics.autoscale.extra.keys().collect::<Vec<_>>()
         );
     }
+}
+
+/// Guest mounts, which are the one part of the VM template whose *absence* has a
+/// consequence a client must be able to explain: a mount with no `digest` is a
+/// deployment whose pool cannot start.
+///
+/// `VmSpec` carries no `extra` map — it is a spec mirror rather than a response
+/// envelope — so this asserts the values landed instead. A rename or a dropped
+/// field shows up as a default here, which is exactly the silent-blank-column
+/// failure this file exists to catch.
+#[test]
+fn guest_mounts_survive_the_wire() {
+    let d: DeploymentStatus =
+        serde_json::from_str(&fixture("deployment-status-vm")).expect("fixture parses");
+    let vm = d.spec.vm.expect("the vm fixture has a template");
+
+    assert_eq!(vm.mounts.len(), 1, "the mount must not be dropped");
+    let m = &vm.mounts[0];
+    assert_eq!(m.path, "/data/corpus");
+    assert_eq!(m.store, "http://127.0.0.1:8080");
+    assert_eq!(m.artifact_ref, "corpus-2026-08", "`ref` on the wire");
+    assert_eq!(m.strip_components, Some(1));
+    assert!(m.read_only, "the fixture's mount is read-only");
+    assert!(m.auth.is_some(), "a SecretRef must survive as an opaque value");
+    assert!(
+        m.digest.as_deref().is_some_and(|d| d.len() == 64),
+        "the resolved digest is what says which bytes the guests hold",
+    );
+    assert!(m.summary().contains("/data/corpus"));
+}
+
+/// The third kind of pull, whose result lives in `mounts` rather than in
+/// `image` — so a client that only understood the other two would render a mount
+/// pull as a job that did nothing.
+#[test]
+fn a_mount_pull_reports_every_mount() {
+    let j: JobRecord = serde_json::from_str(&fixture("job-mount-pull")).expect("fixture parses");
+
+    assert!(j.is_mount_pull(), "kind is `mount-pull`, not `artifact-pull`");
+    assert_eq!(j.mounts.len(), 2);
+
+    let fetched = &j.mounts[0];
+    assert_eq!(fetched.path, "/data/corpus");
+    assert_eq!(fetched.artifact_ref, "corpus-2026-08", "`ref` on the wire");
+    assert_eq!(fetched.files, Some(1_204));
+    assert_eq!(fetched.bytes, Some(734_003_200));
+    assert_eq!(fetched.unpacked, Some(2_147_483_648));
+    assert!(fetched.changed, "this one moved the pool");
+    assert!(fetched.tree.is_some());
+
+    // The common case, and the one whose rendering must not read as an error:
+    // the tree was already on this host, so nothing was fetched or unpacked.
+    let reused = &j.mounts[1];
+    assert!(reused.reused);
+    assert!(!reused.changed);
+    assert_eq!(reused.bytes, Some(0));
+    assert_eq!(reused.files, None, "nothing was unpacked, which is not zero files");
+
+    assert_eq!(j.result_summary(), "1/2 updated");
+    assert_eq!(j.target_summary(), "/data/corpus,/opt/models");
 }

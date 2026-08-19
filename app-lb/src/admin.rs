@@ -836,6 +836,46 @@ fn err(code: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ApiErr
     )
 }
 
+/// Start a mount pull if this deployment could not create a VM without one.
+///
+/// Registration and edits both call it, because a mount whose tree is not on
+/// this host is not a degraded pool — it is *no* pool: the autoscaler refuses
+/// the create rather than booting a guest without its data. Leaving that to an
+/// operator to notice would make "register a deployment with mounts" a two-call
+/// sequence whose second call is only discoverable from an error line.
+///
+/// Best-effort, and quiet when it does nothing. `AlreadyRunning` is the ordinary
+/// outcome of editing a deployment twice while its first pull is still going,
+/// and the pull already in flight is fetching the same trees; a real failure to
+/// start is logged and shows up as an empty pool with the autoscaler saying
+/// exactly why.
+fn pull_mounts_if_needed(state: &AdminState, spec: &DeploymentSpec) {
+    if !state.jobs.mounts_need_pulling(spec) {
+        return;
+    }
+    match state.jobs.start_mount_pull(&spec.id, false) {
+        Ok(record) => tracing::info!(
+            deployment = %spec.id,
+            job = %record.id,
+            "mount pull started: this deployment declares mounts with no tree on this host",
+        ),
+        // One job per deployment at a time. If that job is itself the mount pull
+        // this edit would have started, there is nothing to do; if it is a build,
+        // nothing retries afterwards — the autoscaler's refusal to create says so
+        // and names the endpoint that fixes it.
+        Err(crate::jobs::StartError::AlreadyRunning(_)) => tracing::debug!(
+            deployment = %spec.id,
+            "another job holds this deployment's slot, so its mounts were not pulled",
+        ),
+        Err(e) => tracing::warn!(
+            deployment = %spec.id,
+            error = %e,
+            "could not start the mount pull this deployment needs; its pool will stay empty \
+             until one runs",
+        ),
+    }
+}
+
 fn status_of(d: &Arc<crate::deployment::Deployment>) -> DeploymentStatus {
     let backends = d.backends();
     DeploymentStatus {
@@ -2236,6 +2276,9 @@ async fn register(
     // ...and let ACME start issuing for any new hostname. Asynchronous: this
     // response does not wait for a certificate.
     state.nudge_acme();
+    // A deployment with unpulled mounts has nothing to boot until they are on
+    // this host, so the job that puts them there starts with the registration.
+    pull_mounts_if_needed(&state, &deployment.spec);
 
     (StatusCode::CREATED, Json(status_of(&deployment))).into_response()
 }
@@ -2313,6 +2356,9 @@ async fn update(
     // An edit can introduce a hostname, so this needs the same nudge as
     // registration.
     state.nudge_acme();
+    // An edit can also introduce a mount, or move one to a ref this host has
+    // never pulled.
+    pull_mounts_if_needed(&state, &deployment.spec);
     state.feed.announce(
         &deployment.spec,
         crate::feed::FeedEventKind::Updated,
@@ -3421,6 +3467,15 @@ struct BuildRequest {
 }
 
 #[derive(Deserialize, Default)]
+struct MountPullRequest {
+    /// Re-fetch trees already on this host. Rarely wanted, for the same reason a
+    /// rootfs pull's `force` is: the directory name is the digest, so the tree
+    /// being there is proof of what is in it.
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Deserialize, Default)]
 struct PullRequest {
     /// Pull this reference instead of the spec's. A one-off, like a build's:
     /// `{"ref": "<digest>"}` is what a rollback to known bytes looks like,
@@ -3493,6 +3548,33 @@ async fn start_pull(
     match state.jobs.start_pull(&id, req.artifact_ref, req.force) {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "artifact pull started");
+            (StatusCode::ACCEPTED, Json(record)).into_response()
+        }
+        Err(e) => job_start_error(e),
+    }
+}
+
+/// `POST /deployments/:id/mounts/pull` — unpack every guest mount this
+/// deployment declares, and roll the pool onto the trees.
+///
+/// `202` for the same reason the other two are: a corpus is not something to
+/// hold a request open for. Poll `GET /jobs/:job_id` — its `mounts` array
+/// carries a per-mount digest, tree and byte count, so a job still running says
+/// which mount it is on.
+///
+/// Not usually called by hand. Registering or editing a deployment whose mounts
+/// have no tree on this host starts one of these by itself; this endpoint is for
+/// the two cases that leaves: a tag that has moved, and a tree that needs
+/// re-fetching under `force`.
+async fn start_mount_pull(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<MountPullRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match state.jobs.start_mount_pull(&id, req.force) {
+        Ok(record) => {
+            tracing::info!(deployment = %id, job = %record.id, "mount pull started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
         }
         Err(e) => job_start_error(e),
@@ -3637,6 +3719,7 @@ fn router(state: AdminState) -> Router {
         // have one answer.
         .route("/deployments/:id/build", post(start_build))
         .route("/deployments/:id/pull", post(start_pull))
+        .route("/deployments/:id/mounts/pull", post(start_mount_pull))
         .route("/deployments/:id/update", post(start_update))
         .route("/deployments/:id/jobs", get(deployment_jobs))
         .route("/jobs", get(list_jobs))

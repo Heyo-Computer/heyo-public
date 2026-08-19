@@ -50,7 +50,45 @@ export interface VmSpec {
   env_vars?: Record<string, string>;
   setup_hooks?: string[];
   open_ports?: number[];
+  /**
+   * Directories every replica boots with, unpacked from tarballs in an artifact
+   * store. Attached at boot, so editing this list recycles the pool.
+   */
+  mounts?: MountSpec[];
   ttl_seconds?: number;
+}
+
+/**
+ * One directory handed to every replica of a managed deployment, unpacked from a
+ * tarball in an artifact store.
+ *
+ * The counterpart of `ArtifactSpec` for *data* rather than for the image: the
+ * rootfs decides what the guests run, this decides what they hold. A mount whose
+ * `digest` is absent has not been pulled on the target host, and a deployment
+ * with one has no pool at all — app-lb refuses to boot a guest that would be
+ * missing its data. `POST /deployments/:id/mounts/pull` is what fills it in, and
+ * registering or editing the deployment starts one of those automatically.
+ */
+export interface MountSpec {
+  /** Absolute path inside the guest. Unique within the deployment, and never
+   *  nested inside another mount. */
+  path: string;
+  /** An `art serve` URL, or an absolute store root on the app-lb host. */
+  store: string;
+  /** A tag or a 64-hex digest naming a `tar`/`tar.gz` of the directory. */
+  ref: string;
+  auth?: SecretRef;
+  /** Leading path components to drop while unpacking, as
+   *  `tar --strip-components` does. */
+  strip_components?: number;
+  /**
+   * Whether the guest mounts it read-only. Defaults to `true`, and is **refused
+   * on the `kvm` driver** when false: that driver syncs a writable mount back
+   * into the host tree every other replica boots from.
+   */
+  read_only?: boolean;
+  /** What `ref` resolved to on the last pull — which bytes the guests hold. */
+  digest?: string;
 }
 
 export interface SecretRef {
@@ -561,7 +599,11 @@ export interface WorkflowList {
   workflows: WorkflowSpec[];
 }
 
-export type JobKind = "image-build" | "artifact-pull" | "host-update";
+export type JobKind =
+  | "image-build"
+  | "artifact-pull"
+  | "mount-pull"
+  | "host-update";
 export type JobStatus = "running" | "succeeded" | "failed";
 
 export interface JobRecord {
@@ -588,10 +630,36 @@ export interface JobRecord {
   site_root?: string;
   /** Site pulls only: regular files unpacked. */
   files?: number;
+  /**
+   * Mount pulls only: one entry per guest mount, in spec order. A mount pull
+   * covers every mount on the deployment, so the single `store`/`digest` fields
+   * above stay empty on this kind.
+   */
+  mounts?: MountOutcome[];
   working_dir?: string;
   commands_total?: number;
   commands_run?: number;
   verified?: boolean;
+}
+
+/** What one guest mount's pull did. */
+export interface MountOutcome {
+  /** The guest path, which identifies the mount within the deployment. */
+  path: string;
+  store: string;
+  ref: string;
+  digest?: string;
+  /** The tree on the app-lb host the guests mount. */
+  tree?: string;
+  /** Regular files unpacked. Absent on a reuse, where nothing was unpacked. */
+  files?: number;
+  /** Bytes transferred. `0` with `reused` means the tree was already there. */
+  bytes?: number;
+  /** Uncompressed size of the tree — what the mount costs the host's disk. */
+  unpacked?: number;
+  reused?: boolean;
+  /** Whether this mount's digest changed, which is what recycles the pool. */
+  changed?: boolean;
 }
 
 export interface SecretSummary {

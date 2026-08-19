@@ -626,6 +626,34 @@ fn describe_job(j: &JobRecord) -> Result<()> {
                 _ => "—".into(),
             },
         );
+    } else if j.is_mount_pull() {
+        // One row per mount rather than the single Store/Ref/Digest triple a
+        // rootfs pull gets: this job covers all of a deployment's mounts, and
+        // which one moved is the whole question.
+        for m in &j.mounts {
+            let digest = m
+                .digest
+                .as_ref()
+                .map(|d| d.chars().take(12).collect::<String>())
+                .unwrap_or_else(|| "—".into());
+            let moved = match (m.bytes, m.reused) {
+                (_, true) => "already on this host".to_string(),
+                (Some(0), false) => "hardlinked from a local store".to_string(),
+                (Some(n), false) => output::bytes(n),
+                (None, false) => "—".into(),
+            };
+            output::field(
+                &m.path,
+                format!(
+                    "{} — {digest}, {moved}{}",
+                    m.summary(),
+                    if m.changed { " (changed)" } else { "" }
+                ),
+            );
+        }
+        if j.mounts.is_empty() {
+            output::field("Mounts", "—");
+        }
     } else if j.is_pull() {
         output::field("Store", output::opt_str(j.store.as_deref()));
         output::field("Ref", output::opt_str(j.artifact_ref.as_deref()));
@@ -660,6 +688,27 @@ fn describe_job(j: &JobRecord) -> Result<()> {
                 // except when it succeeded, which can only mean the check is off.
                 None if j.succeeded() => "not checked (verify_timeout_secs is 0)",
                 None => "not checked — the job failed before that point",
+            },
+        );
+    } else if j.is_mount_pull() {
+        output::field(
+            "Trees",
+            format!(
+                "{} on this host ({})",
+                j.mounts.len(),
+                output::bytes(j.mounts.iter().filter_map(|m| m.unpacked).sum::<u64>()),
+            ),
+        );
+        output::field(
+            "Rolled out",
+            if j.rolled_out {
+                "yes — vm.mounts digests updated, pool recycled"
+            } else if j.is_running() {
+                "not yet"
+            } else {
+                // The ordinary outcome of a pull that found every tree already
+                // pinned, which is what registering an unchanged spec does.
+                "no — the pool already had these trees"
             },
         );
     } else {
@@ -855,6 +904,27 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
             && !hooks.is_empty()
         {
             output::field("Setup hooks", hooks.join(" ; "));
+        }
+
+        if !vm.mounts.is_empty() {
+            output::section("Mounts");
+            for m in &vm.mounts {
+                // The digest is the answer to "which bytes are these guests
+                // holding?", and its absence is the answer to "why is the pool
+                // empty?" — so an unpulled mount says so here rather than
+                // showing a blank column.
+                let state = match &m.digest {
+                    Some(d) => format!("digest {}", d.chars().take(12).collect::<String>()),
+                    None => "NOT PULLED — the pool cannot start until it is".to_string(),
+                };
+                output::field(&m.path, format!("{} — {state}", m.summary()));
+                if let Some(n) = m.strip_components {
+                    output::field("  strip_components", n.to_string());
+                }
+                if let Some(auth) = &m.auth {
+                    output::field("  Store credential", format!("secret {}", auth.render()));
+                }
+            }
         }
 
         if let Some(build) = &d.spec.build {

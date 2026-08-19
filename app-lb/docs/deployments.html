@@ -102,6 +102,26 @@ directory on the host (<code>git pull &amp;&amp; cargo build</code>…), then ap
 the upstreams came back. Sites accept <code>update</code> <em>or</em> <code>artifact</code>
 — the two ways their files get replaced.</p>
 
+<h2>Mounting a directory into the guests</h2>
+<p>An image decides what the guests <em>run</em>; <code>vm.mounts</code> decides what they
+<em>hold</em>. Each entry names a tarball in an artifact store and a path inside the
+guest:</p>
+<pre><code>"mounts": [
+  { "path": "/data/corpus", "store": "http://10.0.0.4:8080",
+    "ref": "corpus-2026-08", "strip_components": 1 }
+]</code></pre>
+<p>app-lb verifies the bundle against its digest and unpacks it into a
+digest-named tree on the host; heyvmd builds each VM its own ext4 from that tree and
+attaches it, so the guest finds the directory populated before its start command runs.
+One copy per host, shared by every deployment naming the same digest.</p>
+<p>A mount is attached at boot, which is why it lives in the VM template: editing the
+list recycles the pool. A mount with no tree on this host makes the autoscaler
+<strong>refuse</strong> the create rather than boot a replica missing its data —
+registering or editing such a deployment starts the pull that fixes it, and
+<code>POST /deployments/:id/mounts/pull</code> runs one by hand. Mounts are read-only
+unless asked otherwise, and a writable one is refused on the <code>kvm</code> driver,
+whose backend would sync the guest's writes back into the shared tree.</p>
+
 <h2>A fuller example</h2>
 <pre><code>{
   "id": "agent",
@@ -114,6 +134,9 @@ the upstreams came back. Sites accept <code>update</code> <em>or</em> <code>arti
     "size_class": "medium",
     "disk_size_gb": 20,
     "env_vars": { "RUST_LOG": "info" },
+    "mounts": [
+      { "path": "/data/corpus", "store": "/srv/artifacts", "ref": "corpus-2026-08" }
+    ],
     "ttl_seconds": 86400
   },
   "scaling": {

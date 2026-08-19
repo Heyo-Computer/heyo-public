@@ -665,6 +665,7 @@ mod tests {
                 env_vars: None,
                 setup_hooks: None,
                 open_ports: vec![],
+                mounts: vec![],
                 ttl_seconds: 3600,
             }),
             scaling,

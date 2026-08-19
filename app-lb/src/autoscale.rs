@@ -960,7 +960,18 @@ impl Autoscaler {
                     self.feed.issue(
                         &d.spec,
                         format!("{}: VM create failed", d.spec.id),
-                        format!("the VM daemon refused to create a VM: {e}"),
+                        // A missing mount tree is refused *here*, before the
+                        // daemon is asked anything, so blaming the daemon for it
+                        // would send the reader to the wrong host's logs. Both
+                        // are still create failures, and both are counted: a
+                        // deployment whose mounts never land is exactly the
+                        // silent `ready: 0` this metric exists to explain.
+                        match &e {
+                            crate::vm::VmError::MountNotPulled { .. } => {
+                                format!("this deployment cannot boot yet: {e}")
+                            }
+                            _ => format!("the VM daemon refused to create a VM: {e}"),
+                        },
                         now_secs(),
                     );
                     // The same embargo a failed *boot* earns, for the same
@@ -1807,6 +1818,7 @@ mod tests {
                 env_vars: None,
                 setup_hooks: None,
                 open_ports: vec![],
+                mounts: vec![],
                 ttl_seconds: 3600,
             }),
             scaling: ScalingPolicy::default(),
@@ -1857,7 +1869,11 @@ mod tests {
         registry.upsert(spec());
         // A daemon URL nothing listens on: fine, because the graceful and
         // not-found paths never call it.
-        let vms = VmManager::new(Some("http://127.0.0.1:1".into()), None);
+        let vms = VmManager::new(
+            Some("http://127.0.0.1:1".into()),
+            None,
+            crate::mounts::MountStore::new(dir.join("mounts"), 0),
+        );
         (
             Autoscaler::new(
                 registry.clone(),

@@ -100,6 +100,24 @@ fn vm_spec() -> DeploymentSpec {
             ),
             setup_hooks: Some(vec!["apt-get update".into()]),
             open_ports: vec![9229],
+            // One mount with every optional field set, and a resolved digest:
+            // the pulled state is the one a client renders, and a fixture
+            // showing the pre-pull shape would leave `digest` untested.
+            mounts: vec![crate::config::MountSpec {
+                path: "/data/corpus".into(),
+                store: "http://127.0.0.1:8080".into(),
+                artifact_ref: "corpus-2026-08".into(),
+                auth: Some(crate::secrets::SecretRef {
+                    secret: "art-key".into(),
+                    key: "token".into(),
+                    username: None,
+                }),
+                strip_components: Some(1),
+                read_only: true,
+                digest: Some(
+                    "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0".into(),
+                ),
+            }],
             ttl_seconds: 86400,
         }),
         scaling: crate::config::ScalingPolicy {
@@ -515,6 +533,7 @@ fn job_records_are_stable() {
         reused: false,
         site_root: None,
         files: None,
+        mounts: vec![],
         working_dir: None,
         commands_total: None,
         commands_run: None,
@@ -558,6 +577,53 @@ fn job_records_are_stable() {
         files: Some(412),
         verified: Some(true),
         ..base("job-005", JobKind::ArtifactPull)
+    });
+
+    // The third reading of a pull, and the only fixture carrying `mounts`. Its
+    // per-mount outcomes are where a client learns which tree a deployment is
+    // actually booting with; the top-level `digest`/`store` stay empty here,
+    // because one job covers several mounts and those fields cannot say which.
+    golden("job-mount-pull", &JobRecord {
+        rolled_out: true,
+        mounts: vec![
+            crate::jobs::MountOutcome {
+                path: "/data/corpus".into(),
+                store: "http://127.0.0.1:8080".into(),
+                artifact_ref: "corpus-2026-08".into(),
+                digest: Some(
+                    "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0".into(),
+                ),
+                tree: Some(
+                    "/var/lib/app-lb/mounts/0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0-s1"
+                        .into(),
+                ),
+                files: Some(1_204),
+                bytes: Some(734_003_200),
+                unpacked: Some(2_147_483_648),
+                reused: false,
+                changed: true,
+            },
+            // Already on this host: nothing transferred, nothing unpacked, and
+            // the pool was not recycled for it.
+            crate::jobs::MountOutcome {
+                path: "/opt/models".into(),
+                store: "/srv/artifacts".into(),
+                artifact_ref: "embed-v4".into(),
+                digest: Some(
+                    "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809".into(),
+                ),
+                tree: Some(
+                    "/var/lib/app-lb/mounts/1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
+                        .into(),
+                ),
+                files: None,
+                bytes: Some(0),
+                unpacked: None,
+                reused: true,
+                changed: false,
+            },
+        ],
+        ..base("job-006", JobKind::MountPull)
     });
 
     golden("job-update", &JobRecord {

@@ -403,6 +403,78 @@ Three things worth knowing:
 `set artifact` on a deployment that already builds is refused, and vice versa. To do both, build
 on one host and push the result for the others to pull.
 
+### Mounting a directory into a deployment's VMs
+
+An image decides what the guests *run*; `vm.mounts` decides what they *hold*. Each entry names a
+tarball in an artifact store and a path inside the guest, and every replica boots with that path
+already populated — a corpus, a model, a seed database, a bundle of assets.
+
+There is no `heyctl set mounts`: the list is part of the VM template, so it is edited the way the
+rest of the template is, with `heyctl apply` or `heyctl edit`.
+
+```yaml
+# search.yaml
+id: search
+routes: [{ host: search.example.com }]
+vm:
+  driver: firecracker
+  image: search-1b9b737b73e2
+  port: 8080
+  mounts:
+    - path: /data/corpus
+      store: http://10.0.0.4:8080
+      ref: corpus-2026-08
+      strip_components: 1        # drop the wrapper dir, as tar does
+```
+
+```sh
+tar czf corpus.tgz -C corpus .
+art put corpus.tgz --tag corpus-2026-08     # a bundle, like a site's — `heyctl artifact push`
+                                            # is for rootfs images, not tarballs
+
+heyctl apply -f search.yaml     # a mount pull starts on its own
+heyctl get jobs                 # watch it land
+heyctl describe deployment/search
+```
+
+```
+Mounts
+  /data/corpus   /data/corpus <- 10.0.0.4:8080/corpus-2026-08 (ro) — digest 0f1e2d3c4b5a
+```
+
+`heyctl apply` and `heyctl edit` start the pull themselves whenever a mount has no tree on the
+app-lb host, so the usual path needs no second command. `heyctl mounts pull` is for the two cases
+that leaves — a tag that has moved, and a tree to re-fetch:
+
+```sh
+heyctl mounts pull search --wait
+heyctl mounts pull search --force --logs
+```
+
+Its job record carries a row per mount rather than a single digest, because one job covers them
+all:
+
+```
+JOB                DEPLOYMENT   KIND         STATUS      TARGET                     RESULT        TOOK
+job-91af0c2d55e3   search       mount-pull   succeeded   /data/corpus,/opt/models   1/2 updated   47s
+```
+
+Four things worth knowing:
+
+- **A deployment whose mounts have not been pulled has no pool.** app-lb refuses to create a VM
+  that would boot without the data its spec claims, so `heyctl get deployments` shows `0` ready
+  and the reason is on the job and in `heyctl describe`. It is a loud failure on purpose — the
+  alternative is a replica that passes its health check and then fails on the first request that
+  reads the mount.
+- **The pool recycles only when a digest actually changes.** Unlike a build or an image pull,
+  which roll unconditionally, a mount tree is content-addressed and a running VM's copy came from
+  the same digest. Re-running a pull that finds nothing new leaves the fleet alone.
+- **Mounts are read-only by default**, and a writable one is refused on the `kvm` driver, whose
+  backend syncs the guest's writes back into the tree every other replica boots from. For
+  writable space, `vm.disk_size_gb` is a per-VM data disk.
+- **Editing the list recycles the pool**, because a mount is attached at boot. It is a template
+  change like `image` or `size_class`, not a scaling knob.
+
 ## Artifact stores
 
 An artifact store (`art serve`) is a separate service from app-lb, so `heyctl artifact` keeps

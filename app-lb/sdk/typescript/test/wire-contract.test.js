@@ -28,7 +28,8 @@ const KNOWN = {
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
     DeploymentSpec: ["id", "namespace", "routes", "vm", "scaling", "health", "upstreams", "build", "artifact", "site", "update", "auth", "feed"],
     RouteRule: ["host", "host_suffix", "path_prefix"],
-    VmSpec: ["driver", "image", "port", "start_command", "size_class", "disk_size_gb", "working_directory", "env_vars", "setup_hooks", "open_ports", "ttl_seconds"],
+    VmSpec: ["driver", "image", "port", "start_command", "size_class", "disk_size_gb", "working_directory", "env_vars", "setup_hooks", "open_ports", "mounts", "ttl_seconds"],
+    MountSpec: ["path", "store", "ref", "auth", "strip_components", "read_only", "digest"],
     ScalingPolicy: ["min_replicas", "max_replicas", "warm_pool", "target_concurrency", "scale_to_zero_after_secs", "cold_start_timeout_secs", "drain_timeout_secs", "boot_timeout_secs", "idle_action"],
     HealthCheck: ["path", "port", "timeout_secs"],
     BuildSpec: ["repo", "store", "ref", "dockerfile", "context", "image_name", "image_size_mb", "auth"],
@@ -67,7 +68,8 @@ const KNOWN = {
     SiemStats: ["observed", "dropped", "analyzed", "raised", "suppressed", "tracked_clients", "clients_at_capacity"],
     WorkflowSpec: ["id", "repo", "ref", "path", "network", "auth", "secrets_prefix", "enabled"],
     WorkflowList: ["workflows"],
-    JobRecord: ["id", "deployment", "kind", "status", "started_at", "finished_at", "error", "log", "repo", "ref", "commit", "dockerfile", "image", "rolled_out", "store", "artifact", "digest", "bytes", "reused", "site_root", "files", "working_dir", "commands_total", "commands_run", "verified"],
+    JobRecord: ["id", "deployment", "kind", "status", "started_at", "finished_at", "error", "log", "repo", "ref", "commit", "dockerfile", "image", "rolled_out", "store", "artifact", "digest", "bytes", "reused", "site_root", "files", "working_dir", "commands_total", "commands_run", "verified", "mounts"],
+    MountOutcome: ["path", "store", "ref", "digest", "tree", "files", "bytes", "unpacked", "reused", "changed"],
     SecretSummary: ["id", "description", "keys", "updated_at", "encrypted_at_rest"],
     CertStatus: ["host", "not_after", "issuer", "needs_renewal"],
     ExecOutput: ["sandbox_id", "exit_code", "stdout", "stderr", "output"],
@@ -95,6 +97,7 @@ const FIXTURES = {
   "job-pull": "JobRecord",
   "job-site-pull": "JobRecord",
   "job-update": "JobRecord",
+  "job-mount-pull": "JobRecord",
   "job-failed": "JobRecord",
   "workflow": "WorkflowSpec",
   "workflow-minimal": "WorkflowSpec",
@@ -135,6 +138,10 @@ const ELEMENTS = {
   pending_vms: "PendingVmView", buckets: "Bucket", env_from: "SecretEnv",
   actions: "SuggestedAction", rules: "RuleView",
   workflows: "WorkflowSpec",
+  // `mounts` is a MountSpec on a VmSpec and a MountOutcome on a JobRecord — the
+  // spec's declaration of a mount, and what one pull of it did. Disambiguated
+  // below by the declaration we are inside, the same way `vms` and `auth` are.
+  mounts: "MountSpec",
 };
 
 const K = KNOWN.common;
@@ -155,11 +162,14 @@ function check(value, declName, path, unknown) {
       // or an update.
       let nested = NESTED[key];
       if (key === "vms") nested = declName === "DeploymentView" ? "VmView" : "VmStatus";
+      // ...and a mount's `auth` is a store credential, which the same rule
+      // already resolves to SecretRef.
       if (key === "auth") nested = declName === "DeploymentSpec" ? "AuthGate" : "SecretRef";
       if (nested) check(child, nested, `${path}.${key}`, unknown);
     } else if (Array.isArray(child)) {
       let elem = ELEMENTS[key];
       if (key === "vms") elem = declName === "DeploymentView" ? "VmView" : "VmStatus";
+      if (key === "mounts") elem = declName === "JobRecord" ? "MountOutcome" : "MountSpec";
       if (elem) {
         child.forEach((item, i) => {
           if (item && typeof item === "object") check(item, elem, `${path}.${key}[${i}]`, unknown);

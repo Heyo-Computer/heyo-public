@@ -137,6 +137,22 @@ pub struct LbConfig {
     /// under its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images_dir: Option<String>,
+    /// Where a guest mount's tree is unpacked, content-addressed by the digest of
+    /// the bundle it came from. Read by heyvmd when it builds each VM's mount
+    /// image, so it must be a path the daemon's user can read.
+    ///
+    /// Unlike `images_dir` this is app-lb's own directory rather than one the
+    /// daemon owns: the daemon is handed the path, and never has to find it.
+    #[serde(default = "default_mounts_dir")]
+    pub mounts_dir: String,
+    /// How long a mount tree that no deployment names survives before the sweep
+    /// removes it. `0` turns reclamation off, leaving every tree until somebody
+    /// deletes it by hand.
+    ///
+    /// Shorter than the disk retention window by design — see
+    /// [`crate::mounts::DEFAULT_TTL_SECS`].
+    #[serde(default = "default_mount_ttl_secs")]
+    pub mount_ttl_secs: u64,
     #[serde(default = "default_git_bin")]
     pub git_bin: String,
     /// The `aws` CLI, used for the DNS-01 challenge. Only reached when
@@ -194,6 +210,12 @@ fn default_art_bin() -> String {
 fn default_git_bin() -> String {
     "git".into()
 }
+fn default_mounts_dir() -> String {
+    "/var/lib/app-lb/mounts".into()
+}
+fn default_mount_ttl_secs() -> u64 {
+    crate::mounts::DEFAULT_TTL_SECS
+}
 fn default_aws_bin() -> String {
     "aws".into()
 }
@@ -237,6 +259,8 @@ impl Default for LbConfig {
             art_bin: default_art_bin(),
             images_dir: None,
             git_bin: default_git_bin(),
+            mounts_dir: default_mounts_dir(),
+            mount_ttl_secs: default_mount_ttl_secs(),
             aws_bin: default_aws_bin(),
             acme_wildcards: Vec::new(),
             route53_zone_id: None,
@@ -495,8 +519,10 @@ impl Default for HealthCheck {
 /// (`name` is generated per-replica; `wait_for_ready` is always zero because the
 /// autoscaler polls readiness itself rather than blocking its reconcile loop).
 ///
-/// Note the SDK cannot express vcpu/memory/mounts directly — `size_class` is the
-/// only resource knob, and the daemon resolves it host-side.
+/// Note the SDK cannot express vcpu/memory directly — `size_class` is the only
+/// resource knob, and the daemon resolves it host-side. It cannot express
+/// `mounts` either, which is why [`crate::vm::VmManager::create`] builds the
+/// create body itself rather than handing the SDK a `SandboxCreateOptions`.
 /// `PartialEq` is load-bearing: an in-place edit keeps the running pool only
 /// when the VM *template* is unchanged, so the update path compares old and new
 /// `VmSpec`s to decide whether the VMs must be rebuilt.
@@ -523,6 +549,15 @@ pub struct VmSpec {
     pub setup_hooks: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_ports: Vec<u16>,
+    /// Directories handed to every replica, unpacked from tarballs in an
+    /// artifact store. See [`MountSpec`].
+    ///
+    /// Part of the *template* rather than a block of its own, because a mount is
+    /// attached at boot and can never be added to a VM that is already running —
+    /// so changing this list has to recycle the pool, and being here is what
+    /// makes that happen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountSpec>,
     /// Backstop TTL so VMs die on their own if this LB crashes and never reaps
     /// them. Renewed by the autoscaler while it is alive.
     #[serde(default = "default_vm_ttl_secs")]
@@ -532,6 +567,287 @@ pub struct VmSpec {
 fn default_vm_ttl_secs() -> u64 {
     3600
 }
+
+/// The most guest mounts one deployment may declare.
+///
+/// heyvmd hands each mount a virtio-blk device, lettered from `/dev/vdb` after
+/// the rootfs and the optional `disk_size_gb` data disk, so the real ceiling is
+/// the alphabet. Eight is far below it and far above any spec that is describing
+/// data rather than assembling a filesystem a piece at a time — and a cap that
+/// is refused at registration beats one discovered as a guest that boots with
+/// its last mount silently missing.
+pub const MAX_MOUNTS: usize = 8;
+
+/// Guest paths a mount may not take, because something else already owns them.
+///
+/// The first five are the guest's own: mounting a tree over `/proc` or `/dev`
+/// produces a VM that boots into a kernel with no way to see itself, and the
+/// failure surfaces as an unreachable replica rather than as anything naming
+/// this spec. `/workspace` is heyvm's: a mount there suppresses the
+/// `disk_size_gb` data disk and makes the start command run from it, so it means
+/// something different from every other path and is not a mount this feature
+/// should be quietly issuing.
+const RESERVED_MOUNT_PATHS: [&str; 6] = ["/proc", "/sys", "/dev", "/boot", "/run", "/workspace"];
+
+/// A directory every replica boots with, unpacked from a tarball in an artifact
+/// store.
+///
+/// The third thing app-lb pulls out of a store, and the only one that is neither
+/// the image nor the site. [`ArtifactSpec`] materializes a *rootfs* the guest
+/// boots from; a [`SiteSpec`] pull lands a tree on **this** host and serves it;
+/// this lands a tree **inside** the guest, beside a rootfs it did not come from.
+///
+/// That separation is the whole point. A dataset, a model, a seed corpus or a
+/// bundle of assets moves on its own schedule, and shipping it inside the rootfs
+/// welds the two together: a new copy of a 4 GB corpus becomes a new image,
+/// every host re-pulls the operating system to get it, and a rollback of one is
+/// a rollback of both. As a mount it is its own digest, pulled once per host and
+/// shared by every replica that names it.
+///
+/// ## How it reaches the guest
+///
+/// app-lb resolves the reference, verifies the blob against its digest, and
+/// unpacks it into a directory on this host named after that digest. The daemon
+/// is given the directory, not the tarball: at boot heyvmd builds an ext4 image
+/// from it (`mke2fs -d`) and attaches it as a virtio-blk device that the guest's
+/// init mounts at [`path`](Self::path) *before* the start command runs, so a
+/// workload can read it on its first line.
+///
+/// Two consequences the spec does not show:
+///
+/// * **The disk is per VM.** Every replica gets its own image built from the
+///   same tree, so no guest can see another's writes and the tree itself is only
+///   ever read.
+/// * **A mount is boot-time only.** There is no hot-add, which is why this is
+///   part of [`VmSpec`]: editing the list is a template change, and a template
+///   change recycles the pool.
+///
+/// ## Why the tree is not fetched when the VM is created
+///
+/// The autoscaler creates VMs inside its reconcile tick, and a create that first
+/// fetched gigabytes would stall every deployment on the host behind one. So the
+/// fetch is a job — `POST /deployments/:id/mounts/pull` — which resolves the
+/// reference, unpacks the tree once, writes the resolved [`digest`](Self::digest)
+/// back into this block and recycles the pool onto it. Until that has happened
+/// there is no tree to mount, and the autoscaler refuses to create replicas
+/// rather than booting one that is silently missing its data.
+///
+/// One is started automatically when a deployment with mounts is registered or
+/// edited, so the usual path is: `POST /deployments` → a pull job → a pool.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct MountSpec {
+    /// Where the tree appears inside the guest: an absolute path, created if it
+    /// does not exist.
+    ///
+    /// Also the identity of the mount within the deployment — two mounts cannot
+    /// name the same path, and one cannot sit inside another, because the guest
+    /// mounts them in order and the second would hide the first.
+    pub path: String,
+    /// The store to pull from: an `http(s)://` `art serve`, or a store root on
+    /// this host. Exactly as [`ArtifactSpec::store`], including which of the two
+    /// transports each spelling selects.
+    pub store: String,
+    /// A tag or a 64-hex digest naming a `tar` or `tar.gz` of the directory.
+    ///
+    /// A tag is resolved every time the pull job runs, so a mount pinned to one
+    /// follows it; a digest is immutable and is what a rollback names. This is
+    /// the same bundle shape a site pulls — `art put data.tgz --tag corpus-v3`
+    /// puts one in.
+    #[serde(rename = "ref")]
+    pub artifact_ref: String,
+    /// API key for a store started with `ART_API_KEY`, as a reference into the
+    /// secret store. Only meaningful for the URL form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<SecretRef>,
+    /// Leading path components to drop while unpacking, as
+    /// `tar --strip-components` does — and needed for the same reason
+    /// [`ArtifactSpec::strip_components`] is: `tar czf corpus.tgz corpus` writes
+    /// every entry as `corpus/…`, so without a `1` here the guest finds its data
+    /// at `<path>/corpus` instead of at `<path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_components: Option<usize>,
+    /// Whether the guest mounts it read-only. Defaults to **true**: the tree is
+    /// data the deployment was given, and a replica that can scribble on its own
+    /// copy of it makes "which bytes is this VM serving?" a question with a
+    /// per-VM answer.
+    ///
+    /// Writable is allowed on `firecracker`, where each VM's ext4 image is its
+    /// own and nothing propagates back to the host tree. It is **refused on
+    /// `kvm`**, whose driver syncs a read-write mount image back into the host
+    /// directory when the VM stops — and that directory is the shared,
+    /// content-addressed tree every other replica is booting from, so one
+    /// replica's writes would rewrite what the digest names.
+    #[serde(default = "default_true")]
+    pub read_only: bool,
+    /// What [`artifact_ref`](Self::artifact_ref) resolved to, written by the pull
+    /// job. The answer to "which bytes is this deployment mounting?", and the
+    /// name of the tree on disk.
+    ///
+    /// Absent means nothing has been pulled yet and the pool cannot be created;
+    /// see the module note above. Setting it by hand pins the mount to a tree
+    /// already on this host, which is what an edit that must not re-fetch looks
+    /// like — a spec whose digest names no tree is rejected at registration, not
+    /// discovered at boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+impl MountSpec {
+    /// How many leading path components the unpack drops. Zero unless the spec
+    /// says otherwise, matching a bundle rolled with `tar -C dir .`.
+    pub fn strip(&self) -> usize {
+        self.strip_components.unwrap_or(0)
+    }
+
+    /// Whether `store` names a remote `art serve` rather than a path on this
+    /// host — the same distinction, and the same consequences, as
+    /// [`ArtifactSpec::is_remote`].
+    pub fn is_remote(&self) -> bool {
+        is_remote_store(&self.store)
+    }
+
+    /// The mount path with no trailing slash, which is how it is compared,
+    /// nested-checked and sent to the daemon. `path` is validated into this
+    /// shape, so this only ever trims whitespace.
+    pub fn guest_path(&self) -> &str {
+        self.path.trim().trim_end_matches('/')
+    }
+
+    /// Rejects a mount the pull could not satisfy or the guest could not boot
+    /// with. `driver` is a parameter because one rule genuinely depends on it:
+    /// see [`read_only`](Self::read_only).
+    fn validate(&self, driver: SandboxDriver) -> Result<(), SpecError> {
+        if let Some(why) = mount_path_problem(&self.path) {
+            return Err(SpecError::BadMountPath {
+                path: self.path.clone(),
+                why,
+            });
+        }
+        if !is_supported_store(&self.store) {
+            return Err(SpecError::BadMountStore {
+                path: self.guest_path().to_string(),
+                store: self.store.clone(),
+            });
+        }
+        if !is_valid_artifact_ref(&self.artifact_ref) {
+            return Err(SpecError::BadMountRef {
+                path: self.guest_path().to_string(),
+                reference: self.artifact_ref.clone(),
+            });
+        }
+        if let Some(auth) = &self.auth {
+            auth.validate().map_err(|e| SpecError::BadSecretRef {
+                field: "vm.mounts[].auth",
+                detail: e.to_string(),
+            })?;
+        }
+        if let Some(digest) = &self.digest
+            && !is_sha256_hex(digest)
+        {
+            return Err(SpecError::BadMountDigest {
+                path: self.guest_path().to_string(),
+                digest: digest.clone(),
+            });
+        }
+        if !self.read_only && driver == SandboxDriver::Kvm {
+            return Err(SpecError::WritableMountOnKvm(self.guest_path().to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// Why a guest mount path is unusable, or `None` if it is fine.
+///
+/// Stricter than "a path": it is compared against other mount paths, joined into
+/// a `mount` command by the guest's init, and used as the identity of a mount
+/// across an edit. The alphabet is therefore the conservative one — a path that
+/// needs a quote or a space is a path that behaves differently in one of those
+/// three places than it looks like it should.
+fn mount_path_problem(path: &str) -> Option<&'static str> {
+    let p = path.trim();
+    if p.is_empty() {
+        return Some("must not be empty");
+    }
+    if !p.starts_with('/') {
+        return Some("must be an absolute path inside the guest");
+    }
+    if p.len() > 255 {
+        return Some("must be shorter than 256 characters");
+    }
+    let trimmed = p.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Some("cannot be the guest's root directory");
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+    {
+        return Some(
+            "may contain only letters, digits, '/', '-', '_' and '.'; it is interpolated into \
+             the guest's mount command",
+        );
+    }
+    if std::path::Path::new(trimmed).components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return Some("must not contain '.' or '..' segments");
+    }
+    if trimmed.contains("//") {
+        return Some("must not contain an empty path segment");
+    }
+    if RESERVED_MOUNT_PATHS
+        .iter()
+        .any(|r| trimmed == *r || trimmed.starts_with(&format!("{r}/")))
+    {
+        return Some(
+            "is reserved: /proc, /sys, /dev, /boot and /run belong to the guest's own boot, \
+             and /workspace is heyvm's data disk",
+        );
+    }
+    None
+}
+
+/// Rejects a *set* of mounts: the rules one mount cannot see on its own.
+fn validate_mounts(mounts: &[MountSpec], driver: SandboxDriver) -> Result<(), SpecError> {
+    if mounts.len() > MAX_MOUNTS {
+        return Err(SpecError::TooManyMounts {
+            count: mounts.len(),
+            max: MAX_MOUNTS,
+        });
+    }
+    for mount in mounts {
+        mount.validate(driver)?;
+    }
+    // Quadratic over at most `MAX_MOUNTS` entries, and it has to compare pairs:
+    // the guest mounts these in order, so a path inside an earlier one is hidden
+    // by it from the moment the second mount lands.
+    for (i, a) in mounts.iter().enumerate() {
+        for b in &mounts[i + 1..] {
+            let (x, y) = (a.guest_path(), b.guest_path());
+            if x == y {
+                return Err(SpecError::DuplicateMountPath(x.to_string()));
+            }
+            for (outer, inner) in [(x, y), (y, x)] {
+                if inner.starts_with(&format!("{outer}/")) {
+                    return Err(SpecError::NestedMountPath {
+                        outer: outer.to_string(),
+                        inner: inner.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A sha256 in the only spelling the artifact store writes: 64 lowercase hex.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 
 /// Where a deployment's guest image is *built* from — a Dockerfile, and the
 /// files it copies in.
@@ -1968,6 +2284,46 @@ pub enum SpecError {
     UnsupportedArtifactStore(String),
     BadArtifactRef(String),
     ZeroGrow,
+    /// A `vm.mounts[].path` the guest could not mount, or could not survive
+    /// mounting. Carries *why* rather than a bare rejection: the rules are
+    /// several and unrelated, and "bad mount path" alone leaves the author
+    /// guessing which one they hit.
+    BadMountPath {
+        path: String,
+        why: &'static str,
+    },
+    /// Two mounts on the same guest path.
+    DuplicateMountPath(String),
+    /// One mount inside another. Ordered rather than symmetric, because which is
+    /// which is the fix.
+    NestedMountPath {
+        outer: String,
+        inner: String,
+    },
+    /// More mounts than a guest has device letters for. See [`MAX_MOUNTS`].
+    TooManyMounts {
+        count: usize,
+        max: usize,
+    },
+    /// The store half of a mount is empty or is neither a URL nor an absolute
+    /// path. Separate from [`Self::UnsupportedArtifactStore`] only so the
+    /// message can name the mount it belongs to — one spec can hold eight.
+    BadMountStore {
+        path: String,
+        store: String,
+    },
+    BadMountRef {
+        path: String,
+        reference: String,
+    },
+    /// A pinned `vm.mounts[].digest` that is not a sha256.
+    BadMountDigest {
+        path: String,
+        digest: String,
+    },
+    /// A writable mount on the `kvm` driver, which would sync the guest's writes
+    /// back into the shared tree. See [`MountSpec::read_only`].
+    WritableMountOnKvm(String),
     /// A secret reference somewhere in the spec is malformed. Carries the field
     /// it came from: four blocks can hold one, and "a secret ref is unusable"
     /// with no idea which is not an error message anyone can act on.
@@ -2267,6 +2623,49 @@ impl std::fmt::Display for SpecError {
                 "artifact.grow_gb must be greater than 0; omit it to keep the image at its \
                  stored size"
             ),
+            Self::BadMountPath { path, why } => write!(
+                f,
+                "vm.mounts[].path {path:?} {why}"
+            ),
+            Self::DuplicateMountPath(p) => write!(
+                f,
+                "two mounts both land on {p:?}; a guest path identifies a mount, so give \
+                 them separate paths"
+            ),
+            Self::NestedMountPath { outer, inner } => write!(
+                f,
+                "mount {inner:?} is inside mount {outer:?}; the guest mounts them in order, \
+                 so the inner one would be hidden by the outer. Move it elsewhere, or ship \
+                 both trees in the one tarball"
+            ),
+            Self::TooManyMounts { count, max } => write!(
+                f,
+                "{count} mounts is more than the {max} a guest is given device letters for; \
+                 combine them into fewer tarballs"
+            ),
+            Self::BadMountStore { path, store } => write!(
+                f,
+                "the store for mount {path:?} must be an `art serve` URL (http:// or \
+                 https://) or an absolute store root on this host, got {store:?}"
+            ),
+            Self::BadMountRef { path, reference } => write!(
+                f,
+                "the ref for mount {path:?} is neither a tag nor a digest: a tag is \
+                 [A-Za-z0-9._-] and may not start with `-` or `.`, and a digest is 64 \
+                 lowercase hex characters, got {reference:?}"
+            ),
+            Self::BadMountDigest { path, digest } => write!(
+                f,
+                "the digest pinned on mount {path:?} must be 64 lowercase hex characters, \
+                 got {digest:?}. Omit it to let a pull resolve `ref` and fill it in"
+            ),
+            Self::WritableMountOnKvm(p) => write!(
+                f,
+                "mount {p:?} is read_only: false on the kvm driver, which syncs a writable \
+                 mount back into the host tree when the VM stops — and that tree is the \
+                 content-addressed copy every other replica boots from. Keep the mount \
+                 read-only, or use the firecracker driver, where each VM's copy is its own"
+            ),
             Self::BadSecretRef { field, detail } => {
                 write!(f, "{field} is unusable: {detail}")
             }
@@ -2410,6 +2809,9 @@ impl DeploymentSpec {
             if vm.port == 0 {
                 return Err(SpecError::ZeroPort);
             }
+            // After the driver check, because one mount rule depends on which
+            // driver this is.
+            validate_mounts(&vm.mounts, vm.driver)?;
             if self.scaling.min_replicas > self.scaling.max_replicas {
                 return Err(SpecError::BadReplicaRange {
                     min: self.scaling.min_replicas,
@@ -2568,6 +2970,25 @@ impl WorkflowSpec {
 mod tests {
     use super::*;
 
+    /// A deployment with the given mounts, otherwise the minimal valid one.
+    fn spec_with_mounts(mounts: Vec<MountSpec>) -> DeploymentSpec {
+        let mut s = spec();
+        s.vm.as_mut().unwrap().mounts = mounts;
+        s
+    }
+
+    fn a_mount(path: &str) -> MountSpec {
+        MountSpec {
+            path: path.into(),
+            store: "/srv/artifacts".into(),
+            artifact_ref: "corpus".into(),
+            auth: None,
+            strip_components: None,
+            read_only: true,
+            digest: None,
+        }
+    }
+
     fn spec() -> DeploymentSpec {
         DeploymentSpec {
             namespace: "default".into(),
@@ -2589,6 +3010,7 @@ mod tests {
                 env_vars: None,
                 setup_hooks: None,
                 open_ports: vec![],
+                mounts: vec![],
                 ttl_seconds: 3600,
             }),
             scaling: ScalingPolicy::default(),
@@ -4118,5 +4540,233 @@ mod tests {
         };
         assert!(host_only.specificity() > long_path.specificity());
         assert!(long_path.specificity() > short_path.specificity());
+    }
+
+    // -- guest mounts ------------------------------------------------------
+
+    #[test]
+    fn a_mount_needs_an_absolute_traversal_free_path() {
+        for (path, fragment) in [
+            ("", "must not be empty"),
+            ("data", "absolute"),
+            ("/", "root directory"),
+            ("/data/../etc", "'..'"),
+            ("/data//corpus", "empty path segment"),
+            ("/data/my corpus", "may contain only"),
+        ] {
+            let err = spec_with_mounts(vec![a_mount(path)]).validate().unwrap_err();
+            let SpecError::BadMountPath { why, .. } = &err else {
+                panic!("{path:?} was accepted or misclassified: {err}");
+            };
+            assert!(why.contains(fragment), "{path:?}: {why}");
+        }
+    }
+
+    /// The guest's own directories, and heyvm's. Mounting over any of them
+    /// produces a VM that fails in a way whose message names none of this.
+    #[test]
+    fn the_guests_own_directories_are_refused() {
+        for path in ["/proc", "/sys/fs", "/dev", "/boot", "/run", "/workspace"] {
+            let err = spec_with_mounts(vec![a_mount(path)]).validate().unwrap_err();
+            assert!(
+                matches!(&err, SpecError::BadMountPath { why, .. } if why.contains("reserved")),
+                "{path} was accepted: {err}",
+            );
+        }
+        // A path that merely *starts with* a reserved name is not one of them.
+        spec_with_mounts(vec![a_mount("/development")]).validate().unwrap();
+        spec_with_mounts(vec![a_mount("/workspaces/data")]).validate().unwrap();
+    }
+
+    #[test]
+    fn two_mounts_cannot_share_or_nest_a_path() {
+        let err = spec_with_mounts(vec![a_mount("/data"), a_mount("/data")])
+            .validate()
+            .unwrap_err();
+        assert_eq!(err, SpecError::DuplicateMountPath("/data".into()));
+
+        // A trailing slash is the same path, not a different one.
+        let err = spec_with_mounts(vec![a_mount("/data"), a_mount("/data/")])
+            .validate()
+            .unwrap_err();
+        assert_eq!(err, SpecError::DuplicateMountPath("/data".into()));
+
+        // Nesting, in both orders: the guest mounts them in array order, so the
+        // inner one is hidden whichever way round they are declared.
+        for pair in [["/data", "/data/corpus"], ["/data/corpus", "/data"]] {
+            let err = spec_with_mounts(vec![a_mount(pair[0]), a_mount(pair[1])])
+                .validate()
+                .unwrap_err();
+            assert_eq!(
+                err,
+                SpecError::NestedMountPath {
+                    outer: "/data".into(),
+                    inner: "/data/corpus".into(),
+                },
+                "{pair:?}",
+            );
+        }
+
+        // Sharing a prefix without nesting is fine.
+        spec_with_mounts(vec![a_mount("/data"), a_mount("/database")])
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn there_is_a_ceiling_on_how_many_mounts_a_guest_gets() {
+        let many: Vec<MountSpec> = (0..=MAX_MOUNTS)
+            .map(|i| a_mount(&format!("/data{i}")))
+            .collect();
+        assert_eq!(
+            spec_with_mounts(many).validate().unwrap_err(),
+            SpecError::TooManyMounts {
+                count: MAX_MOUNTS + 1,
+                max: MAX_MOUNTS,
+            },
+        );
+
+        let exactly: Vec<MountSpec> = (0..MAX_MOUNTS)
+            .map(|i| a_mount(&format!("/data{i}")))
+            .collect();
+        spec_with_mounts(exactly).validate().unwrap();
+    }
+
+    #[test]
+    fn a_mounts_store_and_ref_are_held_to_the_artifact_rules() {
+        for store in ["", "   ", "relative/store", "ftp://example.com", "/srv/../etc"] {
+            let mut m = a_mount("/data");
+            m.store = store.into();
+            let err = spec_with_mounts(vec![m]).validate().unwrap_err();
+            assert!(
+                matches!(&err, SpecError::BadMountStore { path, .. } if path == "/data"),
+                "{store:?} was accepted: {err}",
+            );
+        }
+
+        for reference in ["", "-leading-dash", ".leading-dot", "has/slash", "has space"] {
+            let mut m = a_mount("/data");
+            m.artifact_ref = reference.into();
+            let err = spec_with_mounts(vec![m]).validate().unwrap_err();
+            assert!(
+                matches!(&err, SpecError::BadMountRef { path, .. } if path == "/data"),
+                "{reference:?} was accepted: {err}",
+            );
+        }
+
+        // Both spellings a store accepts.
+        for reference in ["corpus-2026.08_v3", &"a1b2c3d4".repeat(8)] {
+            let mut m = a_mount("/data");
+            m.artifact_ref = reference.into();
+            spec_with_mounts(vec![m]).validate().unwrap();
+        }
+    }
+
+    /// A pinned digest names a tree by its filename, so a value that is not a
+    /// sha256 could never name one.
+    #[test]
+    fn a_pinned_digest_must_be_a_sha256() {
+        for digest in ["deadbeef", &"A1B2C3D4".repeat(8), &"g".repeat(64), &"ab".repeat(33)] {
+            let mut m = a_mount("/data");
+            m.digest = Some(digest.into());
+            let err = spec_with_mounts(vec![m]).validate().unwrap_err();
+            assert!(
+                matches!(&err, SpecError::BadMountDigest { path, .. } if path == "/data"),
+                "{digest:?} was accepted: {err}",
+            );
+        }
+
+        let mut m = a_mount("/data");
+        m.digest = Some("0f1e2d3c4b5a".repeat(5) + "abcd");
+        assert_eq!(m.digest.as_ref().unwrap().len(), 64);
+        spec_with_mounts(vec![m]).validate().unwrap();
+    }
+
+    /// The one rule that depends on the driver: the KVM backend syncs a
+    /// read-write mount image back into the host directory when the VM stops,
+    /// and that directory is shared by every replica.
+    #[test]
+    fn a_writable_mount_is_refused_on_kvm_and_allowed_on_firecracker() {
+        let writable = MountSpec {
+            read_only: false,
+            ..a_mount("/scratch")
+        };
+
+        let mut on_kvm = spec_with_mounts(vec![writable.clone()]);
+        on_kvm.vm.as_mut().unwrap().driver = SandboxDriver::Kvm;
+        let err = on_kvm.validate().unwrap_err();
+        assert_eq!(err, SpecError::WritableMountOnKvm("/scratch".into()));
+        let message = err.to_string();
+        assert!(message.contains("firecracker"), "{message}");
+
+        spec_with_mounts(vec![writable]).validate().unwrap();
+
+        // Read-only is fine on both.
+        let mut ro_on_kvm = spec_with_mounts(vec![a_mount("/data")]);
+        ro_on_kvm.vm.as_mut().unwrap().driver = SandboxDriver::Kvm;
+        ro_on_kvm.validate().unwrap();
+    }
+
+    /// A mount is read-only unless the spec says otherwise, and that has to hold
+    /// for the spelling an operator actually writes — a YAML block with no
+    /// `read_only` key at all.
+    #[test]
+    fn a_mount_deserializes_read_only_by_default() {
+        let m: MountSpec = serde_json::from_value(serde_json::json!({
+            "path": "/data",
+            "store": "/srv/artifacts",
+            "ref": "corpus",
+        }))
+        .unwrap();
+        assert!(m.read_only);
+        assert_eq!(m.strip(), 0);
+        assert!(!m.is_remote());
+        assert_eq!(m.digest, None);
+
+        let remote: MountSpec = serde_json::from_value(serde_json::json!({
+            "path": "/data/",
+            "store": "https://art.example.com/",
+            "ref": "corpus",
+            "read_only": false,
+            "strip_components": 2,
+        }))
+        .unwrap();
+        assert!(!remote.read_only);
+        assert_eq!(remote.strip(), 2);
+        assert!(remote.is_remote());
+        assert_eq!(remote.guest_path(), "/data", "the trailing slash is not part of it");
+    }
+
+    /// Mounts are part of the VM *template*, which is what makes an edit to them
+    /// recycle the pool: the update path compares `old.spec.vm != new.spec.vm`.
+    #[test]
+    fn changing_a_mount_changes_the_template() {
+        let before = spec_with_mounts(vec![a_mount("/data")]);
+        let mut after = before.clone();
+        after.vm.as_mut().unwrap().mounts[0].digest = Some("ab".repeat(32));
+        assert_ne!(before.vm, after.vm, "a resolved digest must move the pool");
+
+        let mut moved = before.clone();
+        moved.vm.as_mut().unwrap().mounts[0].path = "/data2".into();
+        assert_ne!(before.vm, moved.vm);
+
+        assert_eq!(before.vm, spec_with_mounts(vec![a_mount("/data")]).vm);
+    }
+
+    /// An empty list is absent on the wire, so a deployment that never heard of
+    /// mounts serializes exactly as it did before they existed.
+    #[test]
+    fn mounts_are_absent_from_the_wire_when_there_are_none() {
+        let json = serde_json::to_value(spec()).unwrap();
+        assert!(json["vm"].get("mounts").is_none(), "{json}");
+
+        let with = serde_json::to_value(spec_with_mounts(vec![a_mount("/data")])).unwrap();
+        assert_eq!(with["vm"]["mounts"][0]["path"], "/data");
+        assert_eq!(with["vm"]["mounts"][0]["ref"], "corpus");
+        assert_eq!(with["vm"]["mounts"][0]["read_only"], true);
+        assert!(
+            with["vm"]["mounts"][0].get("digest").is_none(),
+            "an unpulled mount carries no digest",
+        );
     }
 }

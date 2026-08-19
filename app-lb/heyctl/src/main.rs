@@ -93,6 +93,13 @@ enum Command {
     /// image somebody else already made.
     Pull(cmd::write::PullArgs),
 
+    /// Unpack a managed deployment's guest mounts from an artifact store.
+    ///
+    /// Usually unnecessary: registering or editing a deployment whose mounts
+    /// have no tree on the app-lb host starts one of these automatically.
+    #[command(subcommand)]
+    Mounts(MountsCmd),
+
     /// Talk to an artifact store: log in, and push guest images others can pull.
     ///
     /// A store is a separate service from app-lb, so these commands use their
@@ -236,6 +243,12 @@ enum SetCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum MountsCmd {
+    /// Unpack every mount the spec declares, then roll the pool onto the trees.
+    Pull(cmd::write::MountPullArgs),
+}
+
+#[derive(Subcommand, Debug)]
 enum RolloutCmd {
     /// Wait until a deployment's pool is at its desired size and healthy.
     Status(cmd::write::RolloutStatusArgs),
@@ -291,6 +304,7 @@ fn run(cli: &Cli) -> Result<()> {
         },
         Command::Build(args) => cmd::write::build(&Ctx::new(g)?, args),
         Command::Pull(args) => cmd::write::pull(&Ctx::new(g)?, args),
+        Command::Mounts(MountsCmd::Pull(args)) => cmd::write::pull_mounts(&Ctx::new(g)?, args),
         Command::Update(args) => cmd::write::update(&Ctx::new(g)?, args),
         Command::Apply(args) => cmd::write::apply(&Ctx::new(g)?, args),
         Command::Edit(args) => cmd::write::edit(&Ctx::new(g)?, args),

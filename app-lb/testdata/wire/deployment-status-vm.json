@@ -27,6 +27,20 @@
       "open_ports": [
         9229
       ],
+      "mounts": [
+        {
+          "path": "/data/corpus",
+          "store": "http://127.0.0.1:8080",
+          "ref": "corpus-2026-08",
+          "auth": {
+            "secret": "art-key",
+            "key": "token"
+          },
+          "strip_components": 1,
+          "read_only": true,
+          "digest": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        }
+      ],
       "ttl_seconds": 86400
     },
     "scaling": {
