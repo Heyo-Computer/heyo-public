@@ -85,9 +85,11 @@ async fn main() -> Result<()> {
     );
     let registry = Arc::new(SchemaRegistry::new(cfg));
     registry.spawn_reaper();
-    // Slow, disk-reclaiming eviction tier: offload week-idle schemas to S3 and
-    // kill their VMs. No-op unless PG_VM_POOL_ARCHIVE_AFTER_SECS is configured.
-    registry.spawn_archiver();
+    // Offload pacer: trickles cold schemas down the storage ladder (compact →
+    // freeze → S3), one schema at a time and only while no client is waiting
+    // on a bring-up, instead of waking on a timer and running a long batch.
+    // No-op unless at least one of COMPACT/FREEZE/ARCHIVE_AFTER_SECS is set.
+    registry.spawn_offloader();
     // Emergency disk-pressure eviction: when the VM-disk filesystem crosses the
     // high-water mark, archive oldest-idle schemas (TTL overridden) until it
     // recovers. No-op unless PG_VM_POOL_PRESSURE_PATH is configured.
@@ -96,16 +98,9 @@ async fn main() -> Result<()> {
     // restores) claim instead of paying create + boot + initdb. No-op unless
     // PG_VM_POOL_WARM_SPARES > 0.
     registry.spawn_spare_replenisher();
-    // Local frozen tier: dump long-idle schemas to local files and delete
-    // their VMs (the dump server carries the bytes both ways). No-op unless
-    // PG_VM_POOL_FREEZE_AFTER_SECS is configured.
+    // Carries the frozen tier's dump bytes both ways (and the S3 tier's
+    // streamed dumps). No-op unless one of those tiers is configured.
     registry.spawn_dump_server();
-    registry.spawn_freezer();
-    // Compacted tier: image stopped, long-idle schemas' disks into local zstd
-    // files (~5-25x smaller than the ext4) and delete their VMs — no boot, no
-    // pg_dump; thaw is a decompress + boot. No-op unless
-    // PG_VM_POOL_COMPACT_AFTER_SECS (and PG_VM_POOL_RUN_DIR) are set.
-    registry.spawn_compactor();
     // Offline-trim stopped VMs' data disks so freed guest blocks return to the
     // host (Firecracker has no discard passthrough). No-op unless
     // PG_VM_POOL_RECLAIM_CMD is configured.

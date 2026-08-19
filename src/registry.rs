@@ -1,6 +1,7 @@
 //! Schema -> VM registry. One entry per schema, created once and reused.
 //! A background reaper stops VMs that go idle (no connections) for too long.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -35,19 +36,21 @@ const PRE_STOP_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 /// idle loop proves liveness roughly this often without spamming the log.
 const SUPERVISOR_HEARTBEAT: Duration = Duration::from_secs(900);
 
-/// Delay before the S3-eviction loop's first sweep after startup. Short enough
-/// that redeploys don't starve eviction (see [`supervise`]), long enough to let
-/// the pooler finish coming up first.
-const ARCHIVE_FIRST_SWEEP_DELAY: Duration = Duration::from_secs(120);
+/// How often the offload pacer wakes to consider one unit of housekeeping.
+/// Short on purpose: the tick is not how fast work happens (one job can take
+/// minutes), it is how quickly the pacer notices the host went quiet — a
+/// second after the last client bring-up drains, the next cold schema starts
+/// moving. A tick with nothing to do costs a couple of atomic loads.
+const OFFLOAD_TICK: Duration = Duration::from_secs(1);
 
-/// Cap on freezes per sweep pass. Each freeze costs a VM bring-up (a cold
-/// boot) + dump + kill — minutes — and the sweeps share one single-flight
-/// lock, so an uncapped pass over a large idle backlog (first enable on an
-/// existing fleet: hundreds of candidates) would monopolize eviction for
-/// hours. Capped, the backlog drains a batch per sweep interval and the S3 /
-/// pressure sweeps get windows in between; the pressure reaper remains the
-/// urgent path if disk demands faster.
-const FREEZE_MAX_PER_SWEEP: usize = 25;
+/// Grace before the pacer's first job, so a restart's reconnect storm and the
+/// warm pool's first fill happen against an otherwise idle host.
+const OFFLOAD_FIRST_DELAY: Duration = Duration::from_secs(60);
+
+/// Bounds on how long the pacer waits after a scan that found no work, taken
+/// from the configured `*_SWEEP_SECS` (see [`SchemaRegistry::offload_idle_rescan`]).
+const OFFLOAD_IDLE_RESCAN_MIN: Duration = Duration::from_secs(5);
+const OFFLOAD_IDLE_RESCAN_MAX: Duration = Duration::from_secs(60);
 
 /// Delay before the orphan-disk sweep's first pass after startup — long enough
 /// to let the pooler finish coming up and reattach warm VMs (so their disks are
@@ -973,31 +976,218 @@ impl SchemaRegistry {
         reclaimer.spawn_now()
     }
 
-    // ---- S3 eviction tier ---------------------------------------------------
+    // ---- offload tiers (compact / freeze / S3) ------------------------------
 
-    /// Spawn the background archive sweep if the S3 eviction tier is configured.
-    /// This is the slow, disk-reclaiming counterpart to the idle reaper: it
-    /// offloads a long-idle schema's data to S3 and *kills* the VM (freeing its
-    /// data disk), where the reaper only stops it.
-    pub fn spawn_archiver(self: &Arc<Self>) {
-        let Some(archive) = self.cfg.archive.clone() else {
-            info!("S3 eviction disabled (PG_VM_POOL_ARCHIVE_AFTER_SECS unset/0)");
+    /// Spawn the **offload pacer**: one task that trickles cold schemas down
+    /// the storage ladder — compact, freeze, promote-to-S3, archive-to-S3 — one
+    /// schema at a time, whenever the host has nothing better to do.
+    ///
+    /// This replaces the three periodic batch sweeps (S3 eviction, freeze,
+    /// compact). Batching was the wrong shape for the work. A sweep woke on its
+    /// own timer regardless of what the host was doing, then ran every
+    /// candidate it found back to back — each one a VM boot plus a `pg_dump`
+    /// plus an upload, minutes apiece, holding a bring-up slot and the shared
+    /// sweep lock throughout. On a fleet with a real backlog that is a
+    /// multi-hour block of self-inflicted load that lands, by construction, at
+    /// an arbitrary moment: exactly when clients are reconnecting, or when the
+    /// warm pool is trying to rebuild, is as likely as any other time.
+    ///
+    /// The pacer inverts it. It wakes every [`OFFLOAD_TICK`], and before taking
+    /// *each* job it re-asks whether the host is quiet (see
+    /// [`Self::offload_backpressure`]): no client is queued for a bring-up, no
+    /// reclaim pass is running, no other offload is in flight. One job runs at
+    /// a time, and the next one is re-evaluated against a fresh view of the
+    /// host a second later. The total work done is the same; it is spread thin
+    /// and yields to anything a user is waiting on.
+    ///
+    /// Scanning is cheap because it only happens when the pacer is actually
+    /// about to act: a tick during a busy host, or during a running job, is an
+    /// atomic load. When a scan finds nothing, the next one is deferred by the
+    /// configured sweep interval (the `*_SWEEP_SECS` vars keep that meaning),
+    /// so an idle fleet costs a scan a minute rather than one a second.
+    pub fn spawn_offloader(self: &Arc<Self>) {
+        let mut tiers: Vec<String> = Vec::new();
+        if let Some(c) = &self.cfg.compact {
+            tiers.push(format!(
+                "compact >= {:?} into {}",
+                c.compact_after,
+                c.compact_dir.display()
+            ));
+        }
+        if let Some(f) = &self.cfg.freeze {
+            tiers.push(format!(
+                "freeze >= {:?} into {}",
+                f.freeze_after,
+                f.dump_dir.display()
+            ));
+        }
+        if let Some(a) = &self.cfg.archive {
+            tiers.push(format!(
+                "S3 >= {:?} (s3://{}/{})",
+                a.archive_after, a.s3.bucket, a.s3.prefix
+            ));
+        }
+        if tiers.is_empty() {
+            info!(
+                "offload pacer disabled — no tier configured (PG_VM_POOL_COMPACT_AFTER_SECS / \
+                 FREEZE_AFTER_SECS / ARCHIVE_AFTER_SECS all unset)"
+            );
             return;
-        };
+        }
+        let idle_rescan = self.offload_idle_rescan();
         info!(
-            "S3 eviction: offloading VMs idle >= {:?} to s3://{}/{} (sweep every {:?})",
-            archive.archive_after, archive.s3.bucket, archive.s3.prefix, archive.sweep_interval
+            "offload pacer: {} — one schema at a time, only while the host is quiet \
+             (tick {OFFLOAD_TICK:?}, rescan {idle_rescan:?} when there is nothing to do)",
+            tiers.join(", "),
         );
+
         let registry = self.clone();
-        let (interval, after) = (archive.sweep_interval, archive.archive_after);
-        // Run the first sweep soon after startup — never a full `interval` later —
-        // so frequent redeploys can't indefinitely postpone eviction. Capped by
-        // the interval itself in case someone configures a very short sweep.
-        let first = ARCHIVE_FIRST_SWEEP_DELAY.min(interval);
-        tokio::spawn(supervise("s3-eviction", first, interval, move || {
-            let registry = registry.clone();
-            async move { registry.sweep_archive(after).await }
-        }));
+        tokio::spawn(async move {
+            tokio::time::sleep(OFFLOAD_FIRST_DELAY).await;
+            // When the last scan found nothing, don't scan again until this.
+            let mut hold_until: Option<Instant> = None;
+            let mut quiet_since: Option<Instant> = None;
+            loop {
+                tokio::time::sleep(OFFLOAD_TICK).await;
+                if hold_until.is_some_and(|t| Instant::now() < t) {
+                    continue;
+                }
+                if let Some(reason) = registry.offload_backpressure() {
+                    // Log the first deferral of each busy stretch only: this
+                    // loop runs 86 400 times a day and a busy host would
+                    // otherwise fill the log with it.
+                    if quiet_since.take().is_some() {
+                        debug!("offload pacer: holding off — {reason}");
+                    }
+                    continue;
+                }
+                quiet_since.get_or_insert_with(Instant::now);
+                let Some(job) = registry.next_offload_job().await else {
+                    hold_until = Some(Instant::now() + idle_rescan);
+                    continue;
+                };
+                hold_until = None;
+                // Run each job in its own task so a panic inside one offload
+                // is contained — the pacer must outlive any single schema.
+                let r = registry.clone();
+                let started = Instant::now();
+                let label = format!("{} {}", job.kind.as_str(), job.schema);
+                match tokio::spawn(async move { r.run_offload_job(job).await }).await {
+                    Ok(()) => debug!("offload pacer: {label} finished in {:?}", started.elapsed()),
+                    Err(e) if e.is_panic() => error!(
+                        "offload pacer: {label} PANICKED: {}",
+                        panic_message(e.into_panic())
+                    ),
+                    Err(e) => error!("offload pacer: {label} failed to run: {e}"),
+                }
+            }
+        });
+    }
+
+    /// Why background offloading should hold off this tick, if it should.
+    ///
+    /// Every condition here is "something a person is waiting on, or something
+    /// that would fight us for the same resource". Offloading is pure
+    /// housekeeping: it has no deadline, so it always loses.
+    fn offload_backpressure(&self) -> Option<&'static str> {
+        if crate::vm::bringups_waiting() > 0 {
+            return Some("client bring-ups are queued");
+        }
+        // A pass holds the boot gate; an offload that boots a VM to dump it
+        // would make it yield and lose that pass's progress.
+        if crate::reclaim::pass_running() {
+            return Some("a disk-reclaim pass is running");
+        }
+        // A manual batch sweep from the dashboard.
+        if self.sweeping.load(Ordering::SeqCst) {
+            return Some("a manual sweep is running");
+        }
+        // Any offload at all — ours, the pressure reaper's, or a dashboard
+        // button's. This is what keeps the whole host to one heavy offload at
+        // a time without a second lock.
+        if !self.archiving.lock().unwrap().is_empty() {
+            return Some("another offload is in flight");
+        }
+        None
+    }
+
+    /// How long to wait before re-scanning after a scan that found nothing.
+    /// Taken from the shortest configured `*_SWEEP_SECS` — those vars no
+    /// longer pace the work itself, only how eagerly an idle pooler looks for
+    /// new candidates — and clamped so neither a 1-second nor a 12-hour value
+    /// makes the pacer useless.
+    fn offload_idle_rescan(&self) -> Duration {
+        [
+            self.cfg.compact.as_ref().map(|c| c.sweep_interval),
+            self.cfg.freeze.as_ref().map(|f| f.sweep_interval),
+            self.cfg.archive.as_ref().map(|a| a.sweep_interval),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(OFFLOAD_IDLE_RESCAN_MAX)
+        .clamp(OFFLOAD_IDLE_RESCAN_MIN, OFFLOAD_IDLE_RESCAN_MAX)
+    }
+
+    /// The single most valuable offload available right now, or `None` when
+    /// nothing is eligible. Also keeps `last_active` honest for schemas that
+    /// look durably stale but are actually warm, so they aren't re-evaluated
+    /// as candidates on every scan.
+    async fn next_offload_job(&self) -> Option<OffloadJob> {
+        // Live cross-check: a schema warm with active connections, or whose
+        // in-memory idle clock is younger than the threshold, is not cold even
+        // if its durable `last_active` drifted (one long-lived connection with
+        // no new checkouts).
+        let live: HashMap<String, (usize, u64)> = self
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|e| (e.schema, (e.active, e.idle_secs)))
+            .collect();
+        let records = self.store_records();
+        let at = Instant::now();
+        let (job, refresh) = pick_offload_job(
+            &records,
+            &live,
+            self.offload_thresholds(),
+            &|schema| self.cfg.is_keepalive(schema),
+            &|schema| self.offload_backoff.active(schema, at).is_some(),
+            now_unix(),
+        );
+        for schema in refresh {
+            self.store.touch(&schema);
+        }
+        job
+    }
+
+    fn offload_thresholds(&self) -> OffloadThresholds {
+        OffloadThresholds {
+            compact_after: self.cfg.compact.as_ref().map(|c| c.compact_after.as_secs()),
+            freeze_after: self.cfg.freeze.as_ref().map(|f| f.freeze_after.as_secs()),
+            archive_after: self.cfg.archive.as_ref().map(|a| a.archive_after.as_secs()),
+        }
+    }
+
+    /// Perform one job. Each arm is the same per-schema entry point the
+    /// dashboard's buttons use, so failures journal and enter the per-schema
+    /// backoff exactly as they always have.
+    async fn run_offload_job(&self, job: OffloadJob) {
+        let OffloadJob { schema, kind } = job;
+        info!("offload pacer: {} schema {schema}", kind.as_str());
+        let res = match kind {
+            // `archive_schema` dispatches on the schema's current tier, so a
+            // frozen/compacted schema is promoted (a file upload, no VM) and a
+            // live one is dumped and killed.
+            OffloadKind::Promote | OffloadKind::Archive => self.archive_schema(&schema).await,
+            OffloadKind::Compact => self.compact_schema(&schema).await,
+            OffloadKind::Freeze => self.freeze_schema(&schema).await,
+        };
+        if let Err(e) = res {
+            warn!(
+                "offload pacer: {} schema {schema} failed (backing off): {e:#}",
+                kind.as_str()
+            );
+        }
     }
 
     /// Spawn the warm-spare replenisher if `PG_VM_POOL_WARM_SPARES` > 0: keeps
@@ -1201,12 +1391,18 @@ impl SchemaRegistry {
         archived
     }
 
-    /// Kick off one eviction sweep now, in the background, instead of waiting for
-    /// the periodic timer — the dashboard's "sweep now" control. Returns as soon
-    /// as the sweep is launched (it can take a long time for a big backlog); the
-    /// outcome shows up in the pooler log and the VMs' "Archived (S3)" status.
-    /// Errors if the eviction tier isn't configured, or if a sweep is already
-    /// running (the sweep itself is single-flighted, so this only reports it).
+    /// Archive **every** eligible schema now, in the background — the
+    /// dashboard's "sweep now" control, and the one place batch behaviour
+    /// survives. The offload pacer moves one schema at a time and defers to
+    /// client work; this is the operator override for "I want the disk back
+    /// now", so it runs the whole candidate list back to back and the pacer
+    /// stands down while it does (see [`Self::offload_backpressure`]).
+    ///
+    /// Returns as soon as the sweep is launched (it can take a long time for a
+    /// big backlog); the outcome shows up in the pooler log and the VMs'
+    /// "Archived (S3)" status. Errors if the eviction tier isn't configured,
+    /// or if a sweep is already running (the sweep itself is single-flighted,
+    /// so this only reports it).
     pub fn spawn_sweep_now(self: &Arc<Self>) -> Result<()> {
         let Some(archive) = self.cfg.archive.clone() else {
             bail!(
@@ -1228,12 +1424,13 @@ impl SchemaRegistry {
     /// One eviction pass: archive every non-keepalive schema untouched for at
     /// least `threshold`, skipping any that is currently warm-and-busy.
     ///
-    /// Returns how many schemas were successfully archived this pass, for the
-    /// supervisor's heartbeat.
+    /// The operator-triggered path only ([`Self::spawn_sweep_now`]) — routine
+    /// eviction is the offload pacer's, one schema at a time. Returns how many
+    /// schemas it archived.
     ///
-    /// Single-flighted: if a sweep (periodic or manual) is already in progress
-    /// this returns immediately having done nothing, so triggers can't stack
-    /// overlapping passes racing over the same candidates.
+    /// Single-flighted: if a sweep is already in progress this returns
+    /// immediately having done nothing, so triggers can't stack overlapping
+    /// passes racing over the same candidates.
     async fn sweep_archive(&self, threshold: Duration) -> usize {
         if self.sweeping.swap(true, Ordering::SeqCst) {
             info!("S3 eviction: a sweep is already running; skipping this one");
@@ -1942,125 +2139,6 @@ impl SchemaRegistry {
         });
     }
 
-    /// Spawn the freeze sweep if `PG_VM_POOL_FREEZE_AFTER_SECS` is configured:
-    /// dump long-idle schemas to local files and delete their VMs, shrinking a
-    /// cold schema's footprint from a filesystem image to dump-file bytes.
-    pub fn spawn_freezer(self: &Arc<Self>) {
-        let Some(freeze) = self.cfg.freeze.clone() else {
-            info!("local freeze tier disabled (PG_VM_POOL_FREEZE_AFTER_SECS unset/0)");
-            return;
-        };
-        info!(
-            "local freeze tier: dumping schemas idle >= {:?} to {} and deleting their \
-             VMs (sweep every {:?})",
-            freeze.freeze_after,
-            freeze.dump_dir.display(),
-            freeze.sweep_interval
-        );
-        let registry = self.clone();
-        let (interval, after) = (freeze.sweep_interval, freeze.freeze_after);
-        let first = ARCHIVE_FIRST_SWEEP_DELAY.min(interval);
-        tokio::spawn(supervise("local-freeze", first, interval, move || {
-            let registry = registry.clone();
-            async move { registry.sweep_freeze(after).await }
-        }));
-    }
-
-    /// One freeze pass: freeze every live, non-keepalive schema untouched for
-    /// at least `threshold`. Shares the sweep single-flight with the S3 sweep
-    /// and the pressure reaper, so the passes never interleave.
-    async fn sweep_freeze(&self, threshold: Duration) -> usize {
-        if self.sweeping.swap(true, Ordering::SeqCst) {
-            info!("local freeze: another sweep is running; skipping this pass");
-            return 0;
-        }
-        let _sweeping = SweepGuard(&self.sweeping);
-
-        let now = now_unix();
-        let threshold_secs = threshold.as_secs();
-        let live: HashMap<String, (usize, u64)> = self
-            .snapshot()
-            .await
-            .into_iter()
-            .map(|e| (e.schema, (e.active, e.idle_secs)))
-            .collect();
-
-        let mut candidates: Vec<String> = Vec::new();
-        let mut backing_off = 0usize;
-        for (schema, rec) in self.store_records() {
-            let ka = self.cfg.is_keepalive(&schema);
-            if classify_candidate(&rec, ka, now, threshold_secs, live.get(&schema).copied())
-                == SweepAction::Archive
-            {
-                // Same backoff skip as the S3 sweep — see sweep_archive.
-                if self.offload_backoff.active(&schema, Instant::now()).is_some() {
-                    backing_off += 1;
-                } else {
-                    candidates.push(schema);
-                }
-            }
-        }
-        if backing_off > 0 {
-            info!("local freeze sweep: {backing_off} candidate(s) skipped in failure backoff");
-        }
-        if candidates.is_empty() {
-            return 0;
-        }
-        let backlog = candidates.len().saturating_sub(FREEZE_MAX_PER_SWEEP);
-        candidates.truncate(FREEZE_MAX_PER_SWEEP);
-        info!(
-            "local freeze sweep: {} candidate(s) this pass{}",
-            candidates.len(),
-            if backlog > 0 {
-                format!(" ({backlog} more deferred to later sweeps)")
-            } else {
-                String::new()
-            }
-        );
-        let n = candidates.len();
-        let mut frozen = 0usize;
-        let mut consecutive_failures = 0usize;
-        let mut aborted = false;
-        for schema in candidates {
-            match self.freeze_schema(&schema).await {
-                Ok(()) => {
-                    frozen += 1;
-                    consecutive_failures = 0;
-                }
-                Err(e) => {
-                    warn!("freezing schema {schema} failed (will retry next sweep): {e:#}");
-                    consecutive_failures += 1;
-                    if consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES {
-                        error!(
-                            "local freeze sweep: aborting after {consecutive_failures} \
-                             consecutive failures — environment looks unhealthy; remaining \
-                             candidates will be retried next sweep"
-                        );
-                        aborted = true;
-                        break;
-                    }
-                }
-            }
-        }
-        crate::events::journal_info(
-            "sweep.freeze",
-            format!(
-                "froze {frozen}/{n} candidate(s){}{}",
-                if backlog > 0 {
-                    format!(" ({backlog} deferred)")
-                } else {
-                    String::new()
-                },
-                if aborted {
-                    " — ABORTED after 3 consecutive failures"
-                } else {
-                    ""
-                }
-            ),
-        );
-        frozen
-    }
-
     /// Dump one schema to the local dump store and delete its VM. The frozen
     /// twin of [`Self::archive_schema`], with the same guards: `archiving`
     /// claim (checkouts wait), live-session refusal, dump verified complete
@@ -2163,133 +2241,6 @@ impl SchemaRegistry {
     }
 
     // ---- compacted tier -----------------------------------------------------
-
-    /// Spawn the compact sweep if `PG_VM_POOL_COMPACT_AFTER_SECS` (and the run
-    /// dir) are configured: image stopped, long-idle schemas' disks into local
-    /// zstd files and delete their VMs. Unlike freezing this never boots a VM
-    /// — the disk is compacted offline exactly as the reclaim/image-archive
-    /// paths do — so a compact costs seconds of CPU, not a boot + pg_dump.
-    pub fn spawn_compactor(self: &Arc<Self>) {
-        let Some(compact) = self.cfg.compact.clone() else {
-            info!("compacted tier disabled (PG_VM_POOL_COMPACT_AFTER_SECS unset/0)");
-            return;
-        };
-        info!(
-            "compacted tier: imaging schemas idle >= {:?} into {} and deleting their \
-             VMs (sweep every {:?})",
-            compact.compact_after,
-            compact.compact_dir.display(),
-            compact.sweep_interval
-        );
-        let registry = self.clone();
-        let interval = compact.sweep_interval;
-        let after = compact.compact_after;
-        let first = ARCHIVE_FIRST_SWEEP_DELAY.min(interval);
-        tokio::spawn(supervise("compactor", first, interval, move || {
-            let registry = registry.clone();
-            async move { registry.sweep_compact(after).await }
-        }));
-    }
-
-    /// One compact pass: compact every live, non-keepalive, *stopped* schema
-    /// untouched for at least `threshold`. Shares the sweep single-flight
-    /// with the freeze/S3/pressure passes.
-    async fn sweep_compact(&self, threshold: Duration) -> usize {
-        if self.sweeping.swap(true, Ordering::SeqCst) {
-            info!("compact: another sweep is running; skipping this pass");
-            return 0;
-        }
-        let _sweeping = SweepGuard(&self.sweeping);
-
-        let now = now_unix();
-        let threshold_secs = threshold.as_secs();
-        let live: HashMap<String, (usize, u64)> = self
-            .snapshot()
-            .await
-            .into_iter()
-            .map(|e| (e.schema, (e.active, e.idle_secs)))
-            .collect();
-
-        let mut candidates: Vec<String> = Vec::new();
-        let mut backing_off = 0usize;
-        for (schema, rec) in self.store_records() {
-            let ka = self.cfg.is_keepalive(&schema);
-            // The extra gate vs. the freeze sweep: only schemas with NO warm
-            // entry. A warm entry means a VM process may hold the disk open;
-            // the idle reaper stops those first (its timeout is far shorter
-            // than any sensible compact_after), so waiting a sweep is cheaper
-            // than stalling 60s in the disk-release wait.
-            if live.contains_key(&schema) {
-                continue;
-            }
-            if classify_candidate(&rec, ka, now, threshold_secs, None) == SweepAction::Archive {
-                if self.offload_backoff.active(&schema, Instant::now()).is_some() {
-                    backing_off += 1;
-                } else {
-                    candidates.push(schema);
-                }
-            }
-        }
-        if backing_off > 0 {
-            info!("compact sweep: {backing_off} candidate(s) skipped in failure backoff");
-        }
-        if candidates.is_empty() {
-            return 0;
-        }
-        let backlog = candidates.len().saturating_sub(FREEZE_MAX_PER_SWEEP);
-        candidates.truncate(FREEZE_MAX_PER_SWEEP);
-        info!(
-            "compact sweep: {} candidate(s) this pass{}",
-            candidates.len(),
-            if backlog > 0 {
-                format!(" ({backlog} more deferred to later sweeps)")
-            } else {
-                String::new()
-            }
-        );
-        let n = candidates.len();
-        let mut compacted = 0usize;
-        let mut consecutive_failures = 0usize;
-        let mut aborted = false;
-        for schema in candidates {
-            match self.compact_schema(&schema).await {
-                Ok(()) => {
-                    compacted += 1;
-                    consecutive_failures = 0;
-                }
-                Err(e) => {
-                    warn!("compacting schema {schema} failed (will retry next sweep): {e:#}");
-                    consecutive_failures += 1;
-                    if consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES {
-                        error!(
-                            "compact sweep: aborting after {consecutive_failures} consecutive \
-                             failures — environment looks unhealthy; remaining candidates \
-                             will be retried next sweep"
-                        );
-                        aborted = true;
-                        break;
-                    }
-                }
-            }
-        }
-        crate::events::journal_info(
-            "sweep.compact",
-            format!(
-                "compacted {compacted}/{n} candidate(s){}{}",
-                if backlog > 0 {
-                    format!(" ({backlog} deferred)")
-                } else {
-                    String::new()
-                },
-                if aborted {
-                    " — ABORTED after 3 consecutive failures"
-                } else {
-                    ""
-                }
-            ),
-        );
-        compacted
-    }
 
     /// Compact one schema's stopped disk to a local image and delete its VM —
     /// the compacted twin of [`Self::freeze_schema`], with the same guards:
@@ -3145,6 +3096,131 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// One unit of offload work: move this schema one step down the ladder.
+#[derive(Debug, PartialEq)]
+struct OffloadJob {
+    schema: String,
+    kind: OffloadKind,
+}
+
+/// The steps, in the order the pacer prefers them when several schemas are
+/// eligible at once. The ordering is by cost-to-benefit, not by tier: the
+/// cheapest jobs that free the most are taken first, so a backlog drains in
+/// the order that gets the host healthy soonest.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+enum OffloadKind {
+    /// Upload an already-offloaded schema's local file to S3 and delete it.
+    /// No VM, no dump — a file upload that frees local disk outright.
+    Promote,
+    /// Image a stopped VM's disk to a local zstd file and delete the VM.
+    /// Seconds of CPU, no boot, and it frees the whole ext4.
+    Compact,
+    /// Dump a schema to S3 and delete its VM. Frees the most, costs the most
+    /// (boot + `pg_dump` + upload).
+    Archive,
+    /// Dump a schema to a local file and delete its VM. Same cost as an
+    /// archive but keeps the bytes on this host, so it ranks last.
+    Freeze,
+}
+
+impl OffloadKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            OffloadKind::Promote => "promoting",
+            OffloadKind::Compact => "compacting",
+            OffloadKind::Archive => "archiving",
+            OffloadKind::Freeze => "freezing",
+        }
+    }
+}
+
+/// The configured idle thresholds, in seconds; `None` means that tier is off.
+#[derive(Debug, Default, Clone, Copy)]
+struct OffloadThresholds {
+    compact_after: Option<u64>,
+    freeze_after: Option<u64>,
+    archive_after: Option<u64>,
+}
+
+/// Pick the single best offload job across the whole registry, plus the
+/// schemas whose durable `last_active` should be refreshed (they look stale
+/// but are actually warm). Pure, so the tier ladder and its precedence are
+/// testable without a registry, a daemon, or a clock.
+///
+/// Ties break toward the *coldest* schema: with a backlog, the one nobody has
+/// touched in longest is both the least likely to be needed back and the one
+/// whose disk has been dead weight longest.
+fn pick_offload_job(
+    records: &[(String, StoreRecord)],
+    live: &HashMap<String, (usize, u64)>,
+    t: OffloadThresholds,
+    keepalive: &dyn Fn(&str) -> bool,
+    backing_off: &dyn Fn(&str) -> bool,
+    now: u64,
+) -> (Option<OffloadJob>, Vec<String>) {
+    let mut best: Option<(OffloadKind, u64, &str)> = None;
+    let mut refresh: Vec<String> = Vec::new();
+    for (schema, rec) in records {
+        if keepalive(schema) || backing_off(schema) {
+            continue;
+        }
+        let idle = now.saturating_sub(rec.last_active);
+        let warm = live.get(schema).copied();
+        let kind = match rec.tier {
+            // Already in S3 — the bottom of the ladder.
+            Tier::Archived => continue,
+            // Offloaded locally: the only remaining step is promotion, and
+            // only once it is cold enough for the S3 threshold.
+            Tier::Frozen | Tier::Compacted => match t.archive_after {
+                Some(after) if idle >= after => OffloadKind::Promote,
+                _ => continue,
+            },
+            Tier::Live => {
+                let eligible = |after: Option<u64>, cross_check: Option<(usize, u64)>| {
+                    after.is_some_and(|after| {
+                        classify_candidate(rec, false, now, after, cross_check)
+                            == SweepAction::Archive
+                    })
+                };
+                // Compaction additionally requires no warm entry at all: a
+                // warm entry means a VM process may still hold the disk open,
+                // and the idle reaper (timeout far shorter than any sensible
+                // compact threshold) stops those first. Waiting a scan is
+                // cheaper than stalling in the disk-release wait.
+                let compactable = warm.is_none() && eligible(t.compact_after, None);
+                if compactable {
+                    OffloadKind::Compact
+                } else if eligible(t.archive_after, warm) {
+                    OffloadKind::Archive
+                } else if eligible(t.freeze_after, warm) {
+                    OffloadKind::Freeze
+                } else {
+                    // Durably stale but actually live: keep its clock honest
+                    // so it isn't re-evaluated as a candidate every scan.
+                    let stale_but_warm = [t.compact_after, t.archive_after, t.freeze_after]
+                        .into_iter()
+                        .flatten()
+                        .any(|after| {
+                            classify_candidate(rec, false, now, after, warm) == SweepAction::Refresh
+                        });
+                    if stale_but_warm {
+                        refresh.push(schema.clone());
+                    }
+                    continue;
+                }
+            }
+        };
+        if best.is_none_or(|(bk, bi, _)| (kind, Reverse(idle)) < (bk, Reverse(bi))) {
+            best = Some((kind, idle, schema));
+        }
+    }
+    let job = best.map(|(kind, _, schema)| OffloadJob {
+        schema: schema.to_string(),
+        kind,
+    });
+    (job, refresh)
+}
+
 /// What the archive sweep should do with one schema.
 #[derive(Debug, PartialEq)]
 enum SweepAction {
@@ -3236,6 +3312,134 @@ mod archive_tests {
             classify_candidate(&rec(now - week - 1, false), false, now, week, Some((0, week + 5))),
             SweepAction::Archive
         );
+    }
+
+    // ---- offload pacer job selection ----------------------------------------
+
+    const NOW: u64 = 10_000_000;
+    /// compact at 1h, archive at 1d — the shipped shape.
+    const LADDER: OffloadThresholds = OffloadThresholds {
+        compact_after: Some(3600),
+        freeze_after: None,
+        archive_after: Some(86_400),
+    };
+
+    fn tiered(tier: Tier, idle: u64) -> StoreRecord {
+        StoreRecord {
+            sandbox_id: "sb-x".into(),
+            last_active: NOW - idle,
+            tier,
+        }
+    }
+
+    fn pick(
+        records: &[(String, StoreRecord)],
+        live: &HashMap<String, (usize, u64)>,
+        t: OffloadThresholds,
+    ) -> Option<OffloadJob> {
+        pick_offload_job(records, live, t, &|_| false, &|_| false, NOW).0
+    }
+
+    fn schemas(names: &[(&str, Tier, u64)]) -> Vec<(String, StoreRecord)> {
+        names
+            .iter()
+            .map(|(n, tier, idle)| ((*n).to_string(), tiered(*tier, *idle)))
+            .collect()
+    }
+
+    /// The pacer takes exactly one job per scan, and takes them in
+    /// cost-to-benefit order: free local disk with a file upload before
+    /// spending a boot on a `pg_dump`.
+    #[test]
+    fn the_cheapest_most_valuable_job_is_picked_first() {
+        let ready = schemas(&[
+            ("hot-dump", Tier::Frozen, 90_000),  // promote: file upload, no VM
+            ("cold-live", Tier::Live, 200_000),  // compact: no boot
+            ("older-live", Tier::Live, 300_000), // compact, colder
+        ]);
+        let live = HashMap::new();
+
+        let job = pick(&ready, &live, LADDER).expect("work is available");
+        assert_eq!(job.kind, OffloadKind::Promote);
+        assert_eq!(job.schema, "hot-dump");
+
+        // With promotions done, the coldest compactable schema goes next.
+        let job = pick(&ready[1..], &live, LADDER).unwrap();
+        assert_eq!(job.kind, OffloadKind::Compact);
+        assert_eq!(job.schema, "older-live", "ties break toward the coldest");
+    }
+
+    /// A tier that isn't configured is never chosen — and with only the S3
+    /// tier on, a cold live schema is archived directly rather than sitting
+    /// there waiting for a compaction that will never come.
+    #[test]
+    fn only_configured_tiers_produce_jobs() {
+        let live = HashMap::new();
+        let cold = schemas(&[("cold", Tier::Live, 200_000)]);
+
+        let s3_only = OffloadThresholds {
+            archive_after: Some(86_400),
+            ..Default::default()
+        };
+        assert_eq!(pick(&cold, &live, s3_only).unwrap().kind, OffloadKind::Archive);
+
+        let compact_only = OffloadThresholds {
+            compact_after: Some(3600),
+            ..Default::default()
+        };
+        assert_eq!(
+            pick(&cold, &live, compact_only).unwrap().kind,
+            OffloadKind::Compact
+        );
+
+        // Nothing configured, nothing to do — and an already-archived schema
+        // is never work under any configuration.
+        assert!(pick(&cold, &live, OffloadThresholds::default()).is_none());
+        assert!(pick(&schemas(&[("done", Tier::Archived, 999_999)]), &live, LADDER).is_none());
+    }
+
+    /// The guards that keep the pacer off schemas someone is using: keepalive,
+    /// too-recent, warm-with-sessions, and per-schema failure backoff.
+    #[test]
+    fn in_use_and_backing_off_schemas_are_never_picked() {
+        let recs = schemas(&[("s", Tier::Live, 200_000)]);
+        let no_live = HashMap::new();
+
+        assert!(
+            pick_offload_job(&recs, &no_live, LADDER, &|_| true, &|_| false, NOW)
+                .0
+                .is_none(),
+            "keepalive"
+        );
+        assert!(
+            pick_offload_job(&recs, &no_live, LADDER, &|_| false, &|_| true, NOW)
+                .0
+                .is_none(),
+            "in failure backoff"
+        );
+        assert!(
+            pick(&schemas(&[("s", Tier::Live, 10)]), &no_live, LADDER).is_none(),
+            "not idle long enough"
+        );
+
+        // Warm with a live session: not compactable (warm at all), not
+        // archivable (the live cross-check refuses), and its durable clock is
+        // refreshed so the next scan doesn't reconsider it.
+        let warm: HashMap<String, (usize, u64)> = [("s".to_string(), (1usize, 5u64))].into();
+        let (job, refresh) = pick_offload_job(&recs, &warm, LADDER, &|_| false, &|_| false, NOW);
+        assert!(job.is_none());
+        assert_eq!(refresh, vec!["s".to_string()]);
+    }
+
+    /// A stopped-but-warm entry (VM stopped, entry still cached) must not be
+    /// compacted — the disk may still be held open — but is fair game for the
+    /// S3 tier, whose cross-check handles it.
+    #[test]
+    fn a_warm_entry_blocks_compaction_but_not_archiving() {
+        let recs = schemas(&[("s", Tier::Live, 200_000)]);
+        let idle_warm: HashMap<String, (usize, u64)> = [("s".to_string(), (0usize, 200_000u64))].into();
+        let job = pick(&recs, &idle_warm, LADDER).expect("still archivable");
+        assert_eq!(job.kind, OffloadKind::Archive);
     }
 }
 

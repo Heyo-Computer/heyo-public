@@ -98,11 +98,45 @@ pub(crate) async fn bringup_slot(what: &str) -> Option<SemaphorePermit<'static>>
         return Some(permit);
     }
     let queued = Instant::now();
+    let _waiting = Waiting::new();
     info!("{what}: all VM bring-up slots busy; queueing");
     // The gate is never closed, so acquire() cannot fail.
     let permit = gate.acquire().await.expect("bring-up gate is never closed");
     info!("{what}: bring-up slot acquired after {:?} queued", queued.elapsed());
     Some(permit)
+}
+
+/// How many bring-ups are queued right now — waiting for an admission slot or
+/// for a bring-up slot, i.e. work that has a client parked behind it.
+///
+/// Read by background work (the offload pacer) as backpressure: moving a cold
+/// schema to S3 is never worth making a client wait longer, so that work only
+/// runs while this is zero. Counted rather than derived from
+/// `Semaphore::available_permits`, which says how many slots are taken but not
+/// whether anyone is queued behind them.
+static BRINGUPS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn bringups_waiting() -> usize {
+    BRINGUPS_WAITING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// RAII counter for [`BRINGUPS_WAITING`]. A guard rather than a pair of
+/// fetch_add/fetch_sub calls because these waits sit inside futures a
+/// disconnecting client can cancel at any await point — a leaked increment
+/// would wedge background offloading permanently.
+struct Waiting;
+
+impl Waiting {
+    fn new() -> Self {
+        BRINGUPS_WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        BRINGUPS_WAITING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// How many whole bring-ups (deploy through ready/restore) may be in flight at
@@ -146,6 +180,7 @@ async fn admission_slot(schema: &str) -> Option<SemaphorePermit<'static>> {
         return Some(permit);
     }
     let queued = Instant::now();
+    let _waiting = Waiting::new();
     info!("schema {schema}: all bring-up admission slots busy; queueing at the pooler");
     let permit = gate.acquire().await.expect("admission gate is never closed");
     info!(

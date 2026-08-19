@@ -132,6 +132,15 @@ pub async fn boot_permit() -> RwLockReadGuard<'static, ()> {
 /// run dir is how a waiting boot asks an in-flight pass to stop early.
 pub const STOP_FILE: &str = ".reclaim-stop";
 
+/// Is a reclaim pass holding (or about to hold) the boot gate? Background work
+/// that would boot a VM checks this and defers: taking a boot permit now would
+/// make the pass yield, trading a whole pass's progress for a job that has
+/// nobody waiting on it. tokio's `RwLock` is fair, so a queued writer also
+/// reads as "running" here — which is the answer we want.
+pub fn pass_running() -> bool {
+    BOOT_GATE.try_read().is_err()
+}
+
 /// Runs the configured reclaim command, at most one instance at a time.
 pub struct Reclaimer {
     cmd: String,

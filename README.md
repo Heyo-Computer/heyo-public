@@ -169,7 +169,7 @@ Config via env (all optional):
 | `PG_VM_POOL_DASHBOARD_ALERTS_FILE` | `~/.heyo/pg-vm-pool/alerts.tsv` | where the monitoring page's webhook alert rules persist |
 | `PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS` | `60` | how often the alert evaluator samples host metrics and fires crossed alerts |
 | `PG_VM_POOL_ARCHIVE_AFTER_SECS` | `0` (off) | S3 eviction: offload a schema untouched this long to S3 and kill its VM; e.g. `604800` = 1 week — see "S3 eviction tier" |
-| `PG_VM_POOL_ARCHIVE_SWEEP_SECS` | `3600` | how often the eviction sweep scans for candidates |
+| `PG_VM_POOL_ARCHIVE_SWEEP_SECS` | `3600` | how long the offload pacer waits before re-scanning **after a scan that found nothing** (clamped to 5–60s). It no longer paces the work itself — see "Offload pacer" |
 | `PG_VM_POOL_S3_BUCKET` | unset | S3 bucket for dumps (required when eviction is on) |
 | `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the object per schema is `{prefix}{schema}.dump` |
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
@@ -178,7 +178,7 @@ Config via env (all optional):
 | `PG_VM_POOL_IMAGE_ARCHIVE` | unset (off) | `1` enables the image-level archive fallback: when a schema's dump-based archive fails (its Postgres won't boot or won't dump), its stopped VM's raw `data.ext4` is trimmed, zstd-compressed, and uploaded to S3 as `{prefix}{schema}.img.zst` instead — no boot needed; restore boots a fresh VM directly on the downloaded image. Also adds a per-VM "archive disk image" dashboard action. Requires the S3 tier and `PG_VM_POOL_RUN_DIR`, plus `zstd` (and ideally `e2fsck`/`debugfs`) on the host. Note an image preserves the pgdata version, so restoring needs a rootfs with a matching Postgres major |
 | `PG_VM_POOL_IMAGE_SPOOL_DIR` | `<state dir>/spool` | where the compressed image is staged (and integrity-checked) before upload; needs roughly the disk's allocated size free |
 | `PG_VM_POOL_FREEZE_AFTER_SECS` | `0` (off) | local freeze tier: dump a schema idle this long to a local file and delete its VM — see "Local freeze tier" |
-| `PG_VM_POOL_FREEZE_SWEEP_SECS` | `900` | how often the freeze sweep scans for candidates |
+| `PG_VM_POOL_FREEZE_SWEEP_SECS` | `900` | idle re-scan interval, as `ARCHIVE_SWEEP_SECS` (the shortest of the configured `*_SWEEP_SECS` wins) |
 | `PG_VM_POOL_DUMP_DIR` | `~/.heyo/pg-vm-pool/dumps` | where local dump files live |
 | `PG_VM_POOL_DUMP_LISTEN` | `0.0.0.0:6433` | local dump server bind; guests reach it at their default gateway, access is token-gated |
 | `PG_VM_POOL_WARM_SPARES` | `0` (off) | keep N pre-booted, initdb-complete spare VMs (`spare-pg-*`) for cold bring-ups to claim — an S3 restore skips create+boot+initdb and goes straight to download+load; capped at 16, each parked spare holds its size class's RAM |
@@ -219,6 +219,44 @@ over the host tap and skips the iroh tunnel entirely — no relay dependency,
 lower latency, faster bring-up. It falls back to a tunnel automatically if the
 daemon reports no `guest_ip`. Set `PG_VM_POOL_DIRECT_CONNECT=0` to force the
 tunnel path (e.g. if the pooler ever runs on a different machine than the VMs).
+
+### Offload pacer
+
+The three offload tiers below (compact, freeze, S3) don't have three timers.
+They share one **pacer**: a single task that wakes every second, asks whether
+the host is quiet, and if it is, does *one* schema's worth of work — then
+re-asks. The tiers only decide what is eligible; the pacer decides when.
+
+This replaced three periodic batch sweeps, and the reason is worth stating.
+Each sweep woke on its own interval regardless of what the host was doing, then
+ran every candidate it found back to back — each one a VM boot plus a `pg_dump`
+plus an upload, minutes apiece, holding a bring-up slot and the shared sweep
+lock throughout. On a fleet with a real backlog that is a multi-hour block of
+self-inflicted load landing at an arbitrary moment: as likely to be during a
+reconnect storm, or while the warm pool is rebuilding, as at 4am. The pacer does
+the same total work with the same thresholds, spread thin and yielding to
+anything a person is waiting on.
+
+Before every job it checks, and defers while any of these hold:
+
+- a client bring-up is queued (waiting for an admission or bring-up slot);
+- a disk-reclaim pass is running (an offload boots VMs; taking the boot gate
+  would make that pass yield and lose its progress);
+- another offload is in flight — the pacer's own, the pressure reaper's, or a
+  dashboard button's. One heavy offload at a time, host-wide.
+
+When several schemas are eligible it takes the cheapest-and-most-valuable job
+first — promote a local file to S3 (an upload, no VM), then compact (no boot),
+then archive, then freeze — breaking ties toward the coldest schema. Scanning
+only happens when the pacer is about to act, so a tick on a busy host or during
+a job is a couple of atomic loads; a scan that finds nothing defers the next one
+by the shortest configured `*_SWEEP_SECS` (clamped to 5–60s), which is all those
+vars now mean.
+
+Two things deliberately stay batch: **disk-pressure eviction**, which is an
+emergency and overrides both the thresholds and this politeness, and the
+dashboard's **"sweep now"** button, which is an operator saying "I want the disk
+back now" (the pacer stands down while it runs).
 
 ### Warm spare pool (`PG_VM_POOL_WARM_SPARES`)
 
@@ -311,10 +349,10 @@ it can't shadow the newer image — and the local file is removed.
 The idle reaper (`PG_VM_POOL_IDLE_TIMEOUT_SECS`) only **stops** an idle VM — its
 data disk still occupies host storage forever. On a host accumulating thousands
 of rarely-touched workbooks, disk is the binding constraint. The **eviction
-tier** is a second, slower reclamation stage: a background sweep (hourly by
-default) finds any non-keepalive schema untouched for a long window (e.g. a
-week), dumps its database to S3, and **kills** the VM — freeing the disk. The
-next client connection restores the dump into a fresh VM transparently.
+tier** is a second, slower reclamation stage: any non-keepalive schema untouched
+for a long window (e.g. a week) has its database dumped to S3 and its VM
+**killed** — freeing the disk. The next client connection restores the dump into
+a fresh VM transparently. When it happens is the offload pacer's call (below).
 
 Enable it by setting `PG_VM_POOL_ARCHIVE_AFTER_SECS` to a positive number and
 providing an S3 bucket + credentials (the pooler fails fast at startup if the
