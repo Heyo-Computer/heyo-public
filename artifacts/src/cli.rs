@@ -150,6 +150,24 @@ pub enum Command {
             num_args = 0..=1,
         )]
         dashboard_open: bool,
+        /// Serve the dashboard behind an upstream gate — app-lb — and trust the
+        /// identity it forwards. No local login; sign-in and sign-out belong to
+        /// the gate. Conflicts with `--admin-password` and `--dashboard-open`.
+        ///
+        /// **Only set this when something in front actually strips
+        /// `x-auth-request-*`.** app-lb does, unconditionally, before setting
+        /// them — that is what makes them unspoofable. In front of a listener
+        /// that anyone can reach directly, this is an open dashboard with extra
+        /// steps.
+        #[arg(
+            long,
+            env = "ART_DASHBOARD_GATE",
+            value_parser = clap::builder::BoolishValueParser::new(),
+            default_value = "false",
+            default_missing_value = "true",
+            num_args = 0..=1,
+        )]
+        dashboard_gate: bool,
     },
     /// Dockerfiles that define a rootfs.
     #[command(subcommand)]
@@ -478,9 +496,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             admin_password,
             admin_user,
             dashboard_open,
+            dashboard_gate,
         } => {
             let dashboard =
-                crate::config::DashboardAccess::resolve(admin_password, admin_user, dashboard_open)
+                crate::config::DashboardAccess::resolve(
+                    admin_password,
+                    admin_user,
+                    dashboard_open,
+                    dashboard_gate,
+                )
                     .map_err(|m| Error::Io {
                         context: m,
                         source: std::io::Error::new(

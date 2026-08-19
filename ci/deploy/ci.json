@@ -27,7 +27,7 @@
     "client_id": "REPLACE-ME.apps.googleusercontent.com",
     "client_secret": { "secret": "google", "key": "client_secret" },
     "allowed_domains": ["heyo.computer", "sarocu.com"],
-    "public_paths": ["/healthz", "/api/submit", "/api/stream/"],
+    "public_paths": ["/healthz", "/api/submit", "/api/stream/", "/__ui/"],
     "base_path": "/__applb/auth",
     "cookie_domain": "us2.heyo.work",
     "session_ttl_secs": 43200,

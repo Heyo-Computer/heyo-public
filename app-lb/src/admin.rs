@@ -174,6 +174,13 @@ struct AdminState {
     started_at: u64,
     /// Issued certificates, for `GET /certs`.
     certs: Arc<CertStore>,
+    /// Where the theme cookie is written and under what name — from
+    /// `APP_LB_UI_COOKIE_*`, else the fleet-wide `HEYO_UI_*`.
+    ///
+    /// Set it to the same realm as an `auth.cookie_domain` in the deployment
+    /// specs and one choice of light or dark covers every app in the fleet,
+    /// exactly as one sign-in does.
+    ui_cookies: Arc<crate::heyo_ui::CookieConfig>,
     /// Stored secrets. Values enter through this API and never leave it.
     secrets: Arc<SecretStore>,
     /// CI workflow objects. app-lb stores and serves them; the `ci`
@@ -307,6 +314,7 @@ impl AdminApi {
                 siem: siem.map(|s| s.stats.clone()),
                 guard,
                 siem_html,
+                ui_cookies: Arc::new(crate::heyo_ui::CookieConfig::from_env("APP_LB")),
                 disks,
                 disks_html,
                 public_url,
@@ -1570,8 +1578,11 @@ async fn delete_rule(State(state): State<AdminState>, Path(id): Path<String>) ->
 /// is attacking us and what do I do about it", which needs the full alert list,
 /// the ECS fields behind each one, and the buttons that change what the data
 /// plane does. The dashboard card links here and keeps its summary.
-async fn siem_console(State(state): State<AdminState>) -> impl IntoResponse {
-    Html(state.siem_html.to_string())
+async fn siem_console(
+    State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    Html(render_page(&state, &state.siem_html, &headers))
 }
 
 // ---- disks ----------------------------------------------------------------
@@ -1624,8 +1635,11 @@ async fn disks(State(state): State<AdminState>) -> Response {
 }
 
 /// `GET /storage` — the disk console.
-async fn storage_console(State(state): State<AdminState>) -> impl IntoResponse {
-    Html(state.disks_html.to_string())
+async fn storage_console(
+    State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    Html(render_page(&state, &state.disks_html, &headers))
 }
 
 // ---- the event feed -------------------------------------------------------
@@ -2075,19 +2089,66 @@ fn directory_lede(entries: &[DirectoryEntry]) -> String {
 /// underlying registry changes; the app name is substituted once at startup.
 async fn directory(
     State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
     caller: Option<axum::Extension<Caller>>,
 ) -> impl IntoResponse {
     let scope = visible_ids(&state, caller.as_ref().map(|c| &c.0));
     let (entries, unlinkable) = directory_entries(&state, scope.as_deref());
-    let html = state
-        .directory_html
+    let html = render_page(&state, &state.directory_html, &headers)
         .replace("{{LEDE}}", &html_escape(&directory_lede(&entries)))
         .replace("{{CARDS}}", &render_directory_cards(&entries, &unlinkable));
     Html(html)
 }
 
-async fn dashboard(State(state): State<AdminState>) -> impl IntoResponse {
-    Html(state.dashboard_html.to_string())
+async fn dashboard(
+    State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    Html(render_page(&state, &state.dashboard_html, &headers))
+}
+
+/// Fill the per-request half of a page: the theme, and who is signed in.
+///
+/// `{{APP_NAME}}` was substituted once at startup — it cannot change — but the
+/// theme is a property of the *caller*, and it has to be on the `<html>` tag in
+/// the first response or every navigation flashes the wrong palette before
+/// script can correct it. One `String` per page render, which is a rounding
+/// error next to the JSON these pages then fetch.
+fn render_page(state: &AdminState, page: &str, headers: &axum::http::HeaderMap) -> String {
+    let cookies = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    // Shown, never trusted. app-lb strips these three before setting them, so
+    // behind its own gate they are this process's word — but the admin listener
+    // can also be reached directly, so nothing is authorized on them: the
+    // dashboard's own gate still decides that.
+    let who = crate::heyo_ui::identity_from(|n| headers.get(n).and_then(|v| v.to_str().ok()))
+        .map(|i| crate::heyo_ui::escape(i.display()))
+        .unwrap_or_default();
+    page.replace("{{HTML_ATTRS}}", &state.ui_cookies.attrs(cookies))
+        .replace("{{WHO}}", &who)
+}
+
+/// `GET /__ui/*path` — the platform stylesheet, theme script and fonts.
+///
+/// Compiled into the binary and served from the same origin as the page: these
+/// dashboards are read over SSH tunnels and from networks with no route out,
+/// where a CDN would leave them unstyled.
+async fn ui_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    match crate::heyo_ui::asset(&path) {
+        Some(a) => (
+            [
+                (axum::http::header::CONTENT_TYPE, a.content_type),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    crate::heyo_ui::cache_control(&a),
+                ),
+            ],
+            a.bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+    }
 }
 
 /// Log the things a spec is allowed to say but probably didn't mean.
@@ -3496,6 +3557,9 @@ fn router(state: AdminState) -> Router {
         .route("/", get(directory))
         .route("/metrics", get(metrics_snapshot))
         .route("/dashboard", get(dashboard))
+        // Outside the gate with the other static assets: a sign-in page that
+        // cannot fetch its own stylesheet is a sign-in page nobody can read.
+        .route("/__ui/*path", get(ui_asset))
         // View tier, not CRUD: the dashboard is its consumer, so the browser's
         // cached view credentials have to work. It must never be ungated — it
         // enumerates attacker addresses and the probes that reached the fleet —
@@ -4141,9 +4205,60 @@ mod tests {
             assert!(DIRECTORY_HTML.contains("{{CARDS}}"));
             let rendered = DIRECTORY_HTML
                 .replace("{{APP_NAME}}", "app-lb")
+                .replace("{{HTML_ATTRS}}", r#"data-theme="dark""#)
+                .replace("{{WHO}}", "")
                 .replace("{{LEDE}}", &directory_lede(&[]))
                 .replace("{{CARDS}}", &render_directory_cards(&[], &[]));
             assert!(!rendered.contains("{{"), "an unfilled placeholder would ship to a browser");
+        }
+
+        /// Every page carries the two the shell fills per request, and nothing
+        /// survives rendering.
+        ///
+        /// `{{HTML_ATTRS}}` is the load-bearing one: it is how the theme reaches
+        /// the `<html>` tag in the first byte. A page that lost it would render
+        /// dark for somebody who chose light and only correct itself when the
+        /// script ran — the flash this design exists to avoid.
+        #[test]
+        fn every_page_carries_the_per_request_placeholders() {
+            for (name, page) in [
+                ("dashboard", DASHBOARD_HTML),
+                ("directory", DIRECTORY_HTML),
+                ("siem", SIEM_HTML),
+                ("disks", DISKS_HTML),
+            ] {
+                assert!(page.contains("{{HTML_ATTRS}}"), "{name} lost the theme attributes");
+                assert!(page.contains("{{WHO}}"), "{name} lost the identity slot");
+                let rendered = page
+                    .replace("{{APP_NAME}}", "app-lb")
+                    .replace("{{HTML_ATTRS}}", r#"data-theme="light""#)
+                    .replace("{{WHO}}", "ops@example.com")
+                    .replace("{{LEDE}}", "")
+                    .replace("{{CARDS}}", "");
+                assert!(!rendered.contains("{{"), "{name} left a placeholder unfilled");
+            }
+        }
+
+        /// The four pages share one stylesheet, one script and one toggle, all
+        /// served by this binary. A page that grew its own palette would drift
+        /// from the other four apps the moment either changed.
+        #[test]
+        fn every_page_uses_the_shared_ui_and_declares_no_palette_of_its_own() {
+            for (name, page) in [
+                ("dashboard", DASHBOARD_HTML),
+                ("directory", DIRECTORY_HTML),
+                ("siem", SIEM_HTML),
+                ("disks", DISKS_HTML),
+            ] {
+                assert!(page.contains(r#"href="/__ui/heyo.css""#), "{name} does not load the shared sheet");
+                assert!(page.contains(r#"src="/__ui/theme.js""#), "{name} does not load the shared toggle");
+                assert!(page.contains("data-theme-toggle"), "{name} has no theme control");
+                // The theme is a cookie now: localStorage is per-origin, so a
+                // choice made here would not survive a hop to ci or app-obs.
+                assert!(!page.contains("localStorage.setItem"), "{name} still persists a theme locally");
+                assert!(!page.contains("prefers-color-scheme"), "{name} redeclares a palette");
+                assert!(!page.contains("src=\"http"), "{name} loads an external asset");
+            }
         }
     }
 
@@ -4153,9 +4268,15 @@ mod tests {
         use super::*;
 
         #[test]
-        fn the_page_has_only_the_placeholder_the_constructor_fills() {
+        fn the_page_has_only_the_placeholders_the_handler_fills() {
             assert!(DISKS_HTML.contains("{{APP_NAME}}"));
-            let rendered = DISKS_HTML.replace("{{APP_NAME}}", "app-lb");
+            // `{{APP_NAME}}` is filled once at startup; the other two are filled
+            // per request, because the theme and the signed-in name belong to
+            // the caller rather than to the process.
+            let rendered = DISKS_HTML
+                .replace("{{APP_NAME}}", "app-lb")
+                .replace("{{HTML_ATTRS}}", r#"data-theme="dark""#)
+                .replace("{{WHO}}", "");
             assert!(
                 !rendered.contains("{{"),
                 "an unfilled placeholder would ship to a browser",
@@ -4332,52 +4453,81 @@ mod tests {
             ]
         }
 
-        /// One key, or the theme resets every time an operator follows a link
-        /// between the pages.
+        /// The theme is a **cookie** now, not this origin's localStorage, and no
+        /// page may keep one of its own.
+        ///
+        /// The property the old localStorage test protected — follow a link
+        /// between these four pages and the theme survives — is the weaker half
+        /// of what a cookie gives: localStorage is per *origin*, so the choice
+        /// stopped at app-lb. It now follows a person to ci, app-obs,
+        /// heyosecret and artifacts as well, because all five read the same
+        /// cookie. See `ui/README.md`.
         #[test]
-        fn every_page_persists_the_theme_under_the_same_key() {
+        fn no_page_keeps_a_theme_of_its_own() {
             for (name, html) in pages() {
+                // The accesses, not the word: the comment left where the old
+                // script stood explains why it went away, and says `localStorage`.
+                for access in ["localStorage.getItem", "localStorage.setItem"] {
+                    assert!(
+                        !html.contains(access),
+                        "{name} still keeps theme state in this origin's localStorage ({access})",
+                    );
+                }
                 assert!(
-                    html.contains(r#"localStorage.getItem("app-lb-theme")"#),
-                    "{name} does not restore the saved theme",
+                    html.contains("data-theme-toggle"),
+                    "{name} has no theme control at all",
                 );
                 assert!(
-                    html.contains(r#"localStorage.setItem("app-lb-theme", next)"#),
-                    "{name} does not save the theme it just applied",
+                    html.contains(r#"src="/__ui/theme.js""#),
+                    "{name} does not load the shared toggle",
                 );
             }
         }
 
-        /// The restore has to run in `<head>`, before the body exists. Applied
-        /// alongside the rest of the page script it would paint one frame in the
-        /// wrong theme on every load.
+        /// The theme has to be on `<html>` in the markup itself — not applied by
+        /// a script, however early it runs.
+        ///
+        /// The old test demanded the restore live in `<head>`, which was the
+        /// best a client-side theme could do: one blocking read before the body
+        /// exists. A server-rendered attribute is strictly better — the first
+        /// byte is already correct, and it is correct with scripting off.
         #[test]
-        fn the_theme_is_restored_before_the_body_renders() {
+        fn the_theme_is_in_the_markup_not_applied_by_script() {
             for (name, html) in pages() {
-                let head = html
-                    .split_once("</head>")
-                    .unwrap_or_else(|| panic!("{name} has no </head>"))
-                    .0;
+                let open_tag = html
+                    .split_once('>')
+                    .and_then(|(_, rest)| rest.split_once('>'))
+                    .map(|(tag, _)| tag.to_string())
+                    .unwrap_or_default();
                 assert!(
-                    head.contains(r#"localStorage.getItem("app-lb-theme")"#),
-                    "{name} restores the theme after <head>, which flashes",
+                    open_tag.contains("<html") && open_tag.contains("{{HTML_ATTRS}}"),
+                    "{name}: the theme must be stamped on the <html> tag, found {open_tag:?}",
+                );
+                // And nothing may set it afterwards: a page that also assigned
+                // `data-theme` from script would fight the server and flash.
+                let body = html.split_once("</head>").map(|(_, b)| b).unwrap_or(html);
+                assert!(
+                    !body.contains("setAttribute(\"data-theme\""),
+                    "{name} sets the theme from its own script",
                 );
             }
         }
 
-        /// Storage throws rather than returning null in a private window and
-        /// under some `file://` policies. A theme preference must not be able to
-        /// take a page's whole script block down with it.
+        /// One stylesheet for all four, served by this binary.
+        ///
+        /// Not a CDN: these pages are read over SSH tunnels and from networks
+        /// with no route out, where a remote stylesheet leaves an operator
+        /// staring at unstyled HTML during an incident.
         #[test]
-        fn theme_storage_failures_cannot_break_the_page() {
+        fn every_page_loads_the_shared_stylesheet_and_nothing_remote() {
             for (name, html) in pages() {
-                let uses = html.matches("localStorage").count();
-                let guards = html.matches("try {").count();
                 assert!(
-                    guards >= 2 && uses == 2,
-                    "{name}: every localStorage access must sit inside a try/catch \
-                     ({uses} accesses, {guards} guards)",
+                    html.contains(r#"href="/__ui/heyo.css""#),
+                    "{name} does not load the shared stylesheet",
                 );
+                for external in ["src=\"http", "href=\"http", "src=\"//", "href=\"//"] {
+                    assert!(!html.contains(external), "{name} loads an external asset ({external})");
+                }
             }
         }
     }

@@ -6,6 +6,12 @@
 //! a host process, not a microVM, so it is fronted the same way the pg-fc
 //! dashboard is.
 
+// The platform UI kit — tokens, the theme cookie and forwarded identity —
+// shared with app-lb, ci, heyosecret and artifacts. Included by path rather
+// than depended on as a crate: the five apps sit on three axum versions, so the
+// shared module names no framework type. See `ui/README.md`.
+#[path = "../../ui/ui.rs"]
+pub mod heyo_ui;
 mod api;
 mod compaction;
 mod config;
@@ -185,6 +191,7 @@ async fn run(cfg: Config) {
         retain_days: cfg.retain_days,
         live: live_rx,
         stale_after_secs: cfg.poll_interval.as_secs().saturating_mul(3).max(15),
+        ui_cookies: Arc::new(crate::heyo_ui::CookieConfig::from_env("APP_OBS")),
     };
     let api_addr = cfg.api_addr.clone();
     tokio::spawn(async move {

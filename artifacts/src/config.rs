@@ -63,6 +63,16 @@ pub enum DashboardAccess {
     Password(AdminCredentials),
     /// Mounted with no gate. Only ever from an explicit opt-in.
     Open,
+    /// Mounted behind an **upstream** gate — app-lb — which authenticates the
+    /// person and forwards `x-auth-request-*`. This app presents no login of
+    /// its own and shows who the gate says is here.
+    ///
+    /// Like [`Open`](Self::Open), it must be asked for by name. Trusting a
+    /// header is only sound when something in front strips it first, and
+    /// nothing this process can read tells it whether that is true — so the
+    /// operator asserts it, in one variable, and the log says what was
+    /// asserted.
+    Gate,
 }
 
 impl DashboardAccess {
@@ -75,17 +85,37 @@ impl DashboardAccess {
         password: Option<String>,
         user: String,
         open: bool,
+        gate: bool,
     ) -> Result<DashboardAccess, String> {
-        match (password.filter(|p| !p.is_empty()), open) {
-            (Some(_), true) => Err("ART_ADMIN_PASSWORD and ART_DASHBOARD_OPEN are both set; \
-                 pick one — a password means gated, open means no gate at all"
-                .to_string()),
-            (Some(password), false) => {
-                Ok(DashboardAccess::Password(AdminCredentials { user, password }))
+        let password = password.filter(|p| !p.is_empty());
+        // Every pair is refused rather than ordered. Whichever way a precedence
+        // rule resolved, half the configuration would be a lie, and the half
+        // that loses is the half somebody believed was protecting the page.
+        match (password.is_some(), open, gate) {
+            (true, true, _) => {
+                return Err("ART_ADMIN_PASSWORD and ART_DASHBOARD_OPEN are both set; \
+                     pick one — a password means gated, open means no gate at all"
+                    .to_string());
             }
-            (None, true) => Ok(DashboardAccess::Open),
-            (None, false) => Ok(DashboardAccess::Off),
+            (true, _, true) => {
+                return Err("ART_ADMIN_PASSWORD and ART_DASHBOARD_GATE are both set; \
+                     pick one — the gate authenticates upstream, a password here does not"
+                    .to_string());
+            }
+            (_, true, true) => {
+                return Err("ART_DASHBOARD_OPEN and ART_DASHBOARD_GATE are both set; \
+                     pick one — open means no identity at all, the gate means an identity \
+                     this app trusts"
+                    .to_string());
+            }
+            _ => {}
         }
+        Ok(match (password, open, gate) {
+            (Some(password), _, _) => DashboardAccess::Password(AdminCredentials { user, password }),
+            (None, true, _) => DashboardAccess::Open,
+            (None, _, true) => DashboardAccess::Gate,
+            (None, false, false) => DashboardAccess::Off,
+        })
     }
 }
 
@@ -215,20 +245,20 @@ mod tests {
         // The default has to stay the closed one: a forgotten variable must
         // never be the reason a store's contents became readable.
         assert!(matches!(
-            DashboardAccess::resolve(None, "admin".into(), false).unwrap(),
+            DashboardAccess::resolve(None, "admin".into(), false, false).unwrap(),
             DashboardAccess::Off
         ));
         // An empty password is a variable that was set to nothing, not a
         // request for an ungated dashboard.
         assert!(matches!(
-            DashboardAccess::resolve(Some(String::new()), "admin".into(), false).unwrap(),
+            DashboardAccess::resolve(Some(String::new()), "admin".into(), false, false).unwrap(),
             DashboardAccess::Off
         ));
     }
 
     #[test]
     fn a_password_gates_and_the_opt_in_opens() {
-        match DashboardAccess::resolve(Some("hunter2".into()), "ops".into(), false).unwrap() {
+        match DashboardAccess::resolve(Some("hunter2".into()), "ops".into(), false, false).unwrap() {
             DashboardAccess::Password(c) => {
                 assert_eq!(c.user, "ops");
                 assert_eq!(c.password, "hunter2");
@@ -236,7 +266,7 @@ mod tests {
             other => panic!("expected a gated dashboard, got {other:?}"),
         }
         assert!(matches!(
-            DashboardAccess::resolve(None, "admin".into(), true).unwrap(),
+            DashboardAccess::resolve(None, "admin".into(), true, false).unwrap(),
             DashboardAccess::Open
         ));
     }
@@ -245,7 +275,7 @@ mod tests {
     fn a_password_and_the_open_opt_in_together_are_an_error() {
         // Neither precedence rule is safe to pick silently: one of the two
         // settings would be a lie, and the operator cannot tell which.
-        let e = DashboardAccess::resolve(Some("hunter2".into()), "admin".into(), true).unwrap_err();
+        let e = DashboardAccess::resolve(Some("hunter2".into()), "admin".into(), true, false).unwrap_err();
         assert!(e.contains("ART_ADMIN_PASSWORD"), "{e}");
         assert!(e.contains("ART_DASHBOARD_OPEN"), "{e}");
     }

@@ -1,75 +1,50 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" {{HTML_ATTRS}}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>app-obs</title>
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
 <style>
-  /* Palette, surfaces and type carried over from app-lb's dashboard so the two
-     pages read as one system. The three series hues are validated for
-     colour-vision separation against both surfaces; do not substitute one
-     without re-checking the set. */
+  /* ------------------------------------------------------------------------
+     app-obs, layered on ui/heyo.css.
+
+     **The five names below are aliases, not a second palette.** This page and
+     app-lb's were written against `--surface`/`--plane`/`--text-2`; rather than
+     rewrite 250 rules and risk the charts, each old name now resolves to a
+     shared token. `var()` resolves at use time, so the theme still switches
+     underneath them — and there is exactly one place to look when a colour is
+     wrong.
+
+     The chart series and the plot furniture are *not* aliased: `--series-1..3`,
+     `--grid` and `--axis` are shared tokens with the same names, chosen for
+     colour-vision separation and validated against both grounds. They are the
+     one part of this page a redesign must not casually retint.
+     ------------------------------------------------------------------------ */
   :root {
-    color-scheme: light;
-    --plane:        #f9f9f7;
-    --surface:      #fcfcfb;
-    --text:         #0b0b0b;
-    --text-2:       #52514e;
-    --muted:        #898781;
-    --grid:         #e1e0d9;
-    --axis:         #c3c2b7;
-    --border:       rgba(11,11,11,0.10);
-    --series-1:     #2a78d6;  /* blue   — requests, throughput */
-    --series-1-dim: #cde2fb;
-    --series-2:     #1baf7a;  /* green  — ready, healthy capacity */
-    --series-3:     #eb6834;  /* orange — pending, warming up */
-    --good:         #0ca30c;
-    --warning:      #fab219;
-    --serious:      #ec835a;
-    --critical:     #d03b3b;  /* errors — a status, not a series slot */
-    --success-text: #006300;
-  }
-  :root[data-theme="dark"], :root.dark {
-    color-scheme: dark;
-    --plane:        #0d0d0d;
-    --surface:      #1a1a19;
-    --text:         #ffffff;
-    --text-2:       #c3c2b7;
-    --muted:        #898781;
-    --grid:         #2c2c2a;
-    --axis:         #383835;
-    --border:       rgba(255,255,255,0.10);
-    --series-1:     #3987e5;
-    --series-1-dim: #184f95;
-    --series-2:     #199e70;
-    --series-3:     #d95926;
-    --good:         #0ca30c;
-    --warning:      #fab219;
-    --serious:      #ec835a;
-    --critical:     #e35a5a;
-    --success-text: #0ca30c;
-  }
-  /* Dark mode is stepped deliberately, not flipped: each hue is its own value
-     chosen against the dark surface. */
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      color-scheme: dark;
-      --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
-      --muted:#898781; --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
-      --series-1:#3987e5; --series-1-dim:#184f95; --series-2:#199e70; --series-3:#d95926;
-      --critical:#e35a5a; --success-text:#0ca30c;
-    }
+    --plane: var(--bg-dark);
+    --surface: var(--bg-panel);
+    --text: var(--text-primary);
+    --text-2: var(--text-secondary);
+    --muted: var(--text-muted);
+    --border: var(--border-color);
+    --good: var(--success);
+    --success-text: var(--success);
   }
 
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--plane);
-    color: var(--text);
-    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
-    -webkit-font-smoothing: antialiased;
+  /* Section headings and table headers take the display face, which is what
+     makes a page read as part of this system at a glance. */
+  .section-title, table.data th, .tile .label, .row .fig .k {
+    font-family: var(--font-display);
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--text-muted);
   }
-  a { color: var(--series-1); text-decoration: none; }
+  .tile .value, .row .fig .v { font-family: var(--font-body); }
+
   .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 20px 64px; }
 
   header.top {
@@ -84,10 +59,10 @@
   .pill {
     display: inline-flex; align-items: center; gap: 6px;
     font-size: 12px; color: var(--text-2);
-    border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px;
+    border: 1px solid var(--border); border-radius: 0; padding: 4px 10px;
     background: var(--surface);
   }
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+  .dot { width: 7px; height: 7px; border-radius: 0; background: var(--good); }
   .dot.stale { background: var(--warning); }
   .dot.dead { background: var(--critical); }
 
@@ -96,25 +71,25 @@
     display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
     margin-bottom: 18px;
   }
-  .segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
+  .segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 0; overflow: hidden; }
   .segmented button {
     font: inherit; font-size: 12px; color: var(--text-2);
     background: var(--surface); border: 0; border-right: 1px solid var(--border);
     padding: 5px 11px; cursor: pointer; min-height: 26px;
   }
   .segmented button:last-child { border-right: 0; }
-  .segmented button[aria-pressed="true"] { background: var(--series-1); color: #fff; }
+  .segmented button[aria-pressed="true"] { background: var(--accent); color: var(--bg-dark); }
   button.ghost {
-    font: inherit; font-size: 12px; color: var(--text-2);
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 999px; padding: 5px 12px; cursor: pointer; min-height: 26px;
+    font: inherit; font-size: 12px; color: var(--text-secondary);
+    background: var(--bg-elevated); border: 1px solid var(--border-color);
+    padding: 5px 12px; cursor: pointer; min-height: 26px;
   }
   button.ghost:hover { color: var(--text); }
   button.ghost[aria-pressed="true"] { color: var(--text); border-color: var(--axis); }
   input.text, select.text {
     font: inherit; font-size: 13px; color: var(--text);
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 8px; padding: 5px 9px; min-height: 28px;
+    border-radius: 0; padding: 5px 9px; min-height: 28px;
   }
   input.text { min-width: 200px; flex: 1 1 220px; }
   /* A range end is a fixed-width thing; only the search box wants the slack. */
@@ -130,7 +105,7 @@
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: 0;
     padding: 16px 18px;
   }
 
@@ -151,7 +126,7 @@
   /* A legend is always present for two or more series. */
   .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 2px 0 6px; }
   .legend span { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
-  .legend i { width: 11px; height: 2px; border-radius: 1px; display: inline-block; }
+  .legend i { width: 11px; height: 2px; border-radius: 0; display: inline-block; }
 
   .plot { position: relative; }
   .plot svg { display: block; width: 100%; height: auto; }
@@ -161,15 +136,15 @@
   }
   .tip {
     position: absolute; pointer-events: none; opacity: 0; transition: opacity .08s;
-    background: var(--surface); border: 1px solid var(--axis); border-radius: 8px;
+    background: var(--surface); border: 1px solid var(--axis); border-radius: 0;
     padding: 7px 9px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.10);
     white-space: nowrap; z-index: 5;
   }
   .tip.on { opacity: 1; }
   .tip .when { color: var(--muted); margin-bottom: 4px; font-variant-numeric: tabular-nums; }
   .tip .row { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
-  .tip .row i { width: 9px; height: 2px; border-radius: 1px; }
-  .plot:focus-visible { outline: 2px solid var(--series-1); outline-offset: 3px; border-radius: 6px; }
+  .tip .row i { width: 9px; height: 2px; border-radius: 0; }
+  .plot:focus-visible { outline: 2px solid var(--series-1); outline-offset: 3px; border-radius: 0; }
 
   /* Fleet rows */
   .fleet { display: flex; flex-direction: column; gap: 8px; }
@@ -205,12 +180,12 @@
   /* max-width: 0 keeps this column out of the table's intrinsic width, so a
      long token or a wide fields block can never push the other columns (and
      the copy button) past the card edge — text wraps, the pre scrolls. */
-  .logs td.msg { width: 100%; max-width: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .logs td.msg { width: 100%; max-width: 0; overflow-wrap: anywhere; font-size: 12.5px; }
   .logs td.who { white-space: nowrap; color: var(--muted); font-size: 12px; max-width: 18ch; overflow: hidden; text-overflow: ellipsis; }
   .logs tr.has-fields { cursor: pointer; }
   .logs pre.fields {
     margin: 6px 0 2px; padding: 8px 10px; background: var(--plane);
-    border: 1px solid var(--border); border-radius: 8px;
+    border: 1px solid var(--border); border-radius: 0;
     font-size: 12px; overflow-x: auto; white-space: pre;
   }
   .logs td.act { text-align: right; white-space: nowrap; padding-left: 10px; }
@@ -219,7 +194,7 @@
   button.copy {
     font: inherit; font-size: 11px; color: var(--muted);
     background: transparent; border: 1px solid var(--border);
-    border-radius: 6px; padding: 2px 8px; cursor: pointer;
+    border-radius: 0; padding: 2px 8px; cursor: pointer;
     /* Holds its width when the label flips, so the row does not jump. */
     min-width: 56px;
   }
@@ -243,7 +218,7 @@
   .view.busy { opacity: 0.6; }
   .banner {
     border: 1px solid var(--border); border-left: 3px solid var(--warning);
-    background: var(--surface); border-radius: 8px; padding: 10px 14px;
+    background: var(--surface); border-radius: 0; padding: 10px 14px;
     font-size: 13px; color: var(--text-2); margin-bottom: 14px;
   }
   .banner.bad { border-left-color: var(--critical); }
@@ -260,13 +235,26 @@
 <body>
 <div class="wrap">
 
-<header class="top">
-  <h1><a href="#/">app-obs</a></h1>
-  <span class="sub" id="subtitle">logs and metrics</span>
-  <span class="spacer"></span>
-  <span class="pill"><span class="dot" id="livedot"></span><span id="updated">loading…</span></span>
-  <button class="ghost" id="pause" aria-pressed="false">pause</button>
-  <button class="ghost" id="theme">theme</button>
+<header class="topbar">
+  <a class="topbar-brand" href="#/"><span>heyo</span><span class="topbar-app">obs</span></a>
+  <!-- `subtitle`, `livedot` and `updated` keep their ids: the render loop
+       writes into all three by id, and a top bar that looked right while the
+       clock stopped would be a worse trade than a slightly fuller bar. -->
+  <nav class="topbar-nav">
+    <span class="sub" id="subtitle">logs and metrics</span>
+  </nav>
+  <div class="topbar-right">
+    <span class="pill"><span class="dot" id="livedot"></span><span id="updated">loading…</span></span>
+    <!-- Filled server-side from the identity app-lb forwards; empty on an
+         ungated deployment, which has nobody to name. -->
+    <span class="topbar-user">{{WHO}}</span>
+    <button class="btn btn-sm" id="pause" aria-pressed="false">pause</button>
+    <button class="btn btn-sm" id="tables" aria-pressed="false">table view</button>
+    <!-- The shared toggle: writes the fleet-wide theme cookie, so a choice made
+         here is the one ci and app-lb open with. Replaces this page's own
+         localStorage toggle, which was per-origin and so per-app. -->
+    <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
+  </div>
 </header>
 
 <div class="banner" id="banner" hidden></div>
@@ -1290,12 +1278,12 @@ $("tables").addEventListener("click", () => {
   else renderFleetTables(state.data);
 });
 
-$("theme").addEventListener("click", () => {
-  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
-  const current = document.documentElement.dataset.theme || (dark ? "dark" : "light");
-  document.documentElement.dataset.theme = current === "dark" ? "light" : "dark";
-  // Charts carry literal `var(--…)` strings, so the redraw is only needed for
-  // the measured geometry — but it is cheap and keeps everything consistent.
+// The theme itself is handled by the shared toggle (`/__ui/theme.js`), which
+// writes a cookie scoped to the parent domain so the choice follows a person
+// across every Heyo app rather than living in this origin's localStorage. All
+// this page has to do is redraw: chart geometry is measured, not tokenised.
+document.addEventListener("click", (ev) => {
+  if (!ev.target.closest || !ev.target.closest("[data-theme-toggle]")) return;
   if (state.data) state.route.view === "detail" ? renderDetail(state.data) : renderFleet(state.data);
 });
 

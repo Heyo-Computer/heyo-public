@@ -1,0 +1,864 @@
+/* ==========================================================================
+   Heyo platform UI — one stylesheet, five dashboards.
+   ==========================================================================
+
+   app-lb, app-obs, ci, heyosecret and artifacts each render their own HTML in
+   their own way (two are maud in Rust, three are `include_str!`d files), but
+   they are one product and a person moves between them in one sitting. This
+   file is the part they share: tokens, base type, and the handful of primitives
+   every one of them was independently reinventing — a top bar, a card, a table,
+   a status pill, a button, a form row.
+
+   The palette and type are the retail app's (`heyo/retail/src/styles/tokens.css`)
+   and the marketing site's (`marketing/src/styles/main.css`), which already
+   agree with each other to the hex digit. Nothing here is a new design; it is
+   those tokens carried into the dashboards.
+
+   ## Consuming it
+
+   Each app embeds this file at compile time and serves it from a stable path,
+   so there is no build step and no CDN:
+
+       const UI_CSS: &str = include_str!("../../ui/heyo.css");   // GET /__ui/heyo.css
+
+   The `<html>` element carries two attributes the app fills in server-side:
+
+       <html data-theme="dark" data-cookie-domain=".example.com">
+
+   `data-theme` is read from the theme cookie *before the page is sent*, which is
+   what stops the flash of the wrong palette on every navigation. See ui/README.md
+   for the cookie contract and ui/theme.js for the toggle.
+
+   ## Themes
+
+   Dark is the default and the canonical one — it is what the sites look like.
+   `[data-theme="light"]` is a full second palette rather than an inversion,
+   because app-lb and app-obs were light-first and their charts were validated
+   on a warm paper ground. `[data-theme="system"]` defers to the OS.
+
+   Only the tokens are redefined per theme. A rule further down this file that
+   hard-codes a colour is a bug in one of the two themes, and usually the one
+   nobody is looking at.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   Fonts — self-hosted, not fetched from Google.
+
+   A dashboard for a private network cannot depend on fonts.googleapis.com being
+   reachable, and a control plane that phones out on every page load is a
+   surprise nobody asked for. The latin subsets are 76 KB for all six faces,
+   which is less than one of the chart pages weighs.
+
+   `font-display: swap` so a cold cache renders in the fallback stack instantly
+   rather than holding text invisible; the fallbacks are chosen to be close
+   enough in metrics that the swap is not a layout jump.
+   -------------------------------------------------------------------------- */
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/ibm-plex-mono-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("fonts/ibm-plex-mono-500.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("fonts/ibm-plex-mono-600.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("fonts/ibm-plex-mono-700.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Silkscreen";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/silkscreen-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Silkscreen";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("fonts/silkscreen-700.woff2") format("woff2");
+}
+
+/* --------------------------------------------------------------------------
+   Tokens — dark, the default and the canonical palette.
+   -------------------------------------------------------------------------- */
+:root {
+  color-scheme: dark;
+
+  /* Surfaces, back to front. */
+  --bg-dark: #0a0c10;
+  --bg-panel: #12141a;
+  --bg-elevated: #1a1d24;
+
+  /* The one accent. Peach, and deliberately alone: everything that needs to
+     stand out competes for the same colour, which is what keeps a dashboard
+     from turning into a rainbow of equally urgent things. Status hues below
+     are for *state*, not for emphasis. */
+  --accent: #e4a97d;
+  --accent-dim: #c48a5f;
+  --accent-shadow: rgba(228, 169, 125, 0.41);
+
+  --text-primary: #ffffff;
+  --text-secondary: #c1c1c1;
+  --text-muted: #707070;
+
+  --border-color: #2a2d35;
+  --border-accent: #3a3d45;
+
+  /* Status. `--danger`/`--success` are retail's names and values; the other
+     three are app-lb's severity ladder, kept because its pages read them by
+     name and because "serious" and "critical" are genuinely different rows. */
+  --danger: #ff6b6b;
+  --success: #27c93f;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+
+  /* Chart series. **Not** derived from the accent, and not to be replaced with
+     tints of it: these three were chosen for separation under the common forms
+     of colour-vision deficiency and checked against both grounds. A palette
+     that reads as one family is the wrong goal for data — the goal is that no
+     two lines can be confused. */
+  --series-1: #3987e5;
+  --series-1-dim: #184f95;
+  --series-2: #199e70;
+  --series-3: #d95926;
+
+  /* Plot furniture, which is not the same as page furniture: a gridline must
+     sit under the data without disappearing on either ground. */
+  --grid: #23262e;
+  --axis: #383b44;
+
+  --shadow: rgba(0, 0, 0, 0.3);
+
+  --font-display: "Silkscreen", "Courier New", monospace;
+  --font-body: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Spacing and radius as tokens so five apps stop picking their own. The
+     radius is 0: every surface in this system is a rectangle, which is the
+     single most recognisable thing about the sites' look. */
+  --radius: 0px;
+  --gap-1: 4px;
+  --gap-2: 8px;
+  --gap-3: 12px;
+  --gap-4: 16px;
+  --gap-5: 24px;
+  --gap-6: 32px;
+}
+
+/* --------------------------------------------------------------------------
+   Tokens — light.
+
+   The warm paper ground app-lb and app-obs shipped, kept rather than replaced:
+   their chart hues were validated against it, and a light theme that is merely
+   dark-inverted goes grey and muddy. What changes from those pages is the
+   accent (peach, so both themes are recognisably the same product) and the
+   type.
+   -------------------------------------------------------------------------- */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-dark: #f9f9f7;
+  --bg-panel: #fcfcfb;
+  --bg-elevated: #ffffff;
+
+  /* Darkened from the dark theme's peach: #e4a97d on white is 1.9:1, which is
+     unreadable as text. This is the same hue at the lightness it needs to pass
+     against paper. */
+  --accent: #a55f2a;
+  --accent-dim: #8a4d1f;
+  --accent-shadow: rgba(165, 95, 42, 0.28);
+
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+
+  --border-color: #e1e0d9;
+  --border-accent: #c3c2b7;
+
+  --danger: #d03b3b;
+  --success: #0ca30c;
+  --warning: #b07d00;
+  --serious: #c25a2c;
+  --critical: #b32424;
+
+  --series-1: #2a78d6;
+  --series-1-dim: #cde2fb;
+  --series-2: #1baf7a;
+  --series-3: #eb6834;
+
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+
+  --shadow: rgba(11, 11, 11, 0.12);
+}
+
+/* `system` is the third value the cookie can hold, and it means "ask the OS".
+   Written as its own selector rather than as a bare media query so that a page
+   with no cookie at all stays dark — the default is a decision, not an
+   accident of what laptop somebody opened it on. */
+@media (prefers-color-scheme: light) {
+  :root[data-theme="system"] {
+    color-scheme: light;
+    --bg-dark: #f9f9f7;
+    --bg-panel: #fcfcfb;
+    --bg-elevated: #ffffff;
+    --accent: #a55f2a;
+    --accent-dim: #8a4d1f;
+    --accent-shadow: rgba(165, 95, 42, 0.28);
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --border-color: #e1e0d9;
+    --border-accent: #c3c2b7;
+    --danger: #d03b3b;
+    --success: #0ca30c;
+    --warning: #b07d00;
+    --serious: #c25a2c;
+    --critical: #b32424;
+    --series-1: #2a78d6;
+    --series-1-dim: #cde2fb;
+    --series-2: #1baf7a;
+    --series-3: #eb6834;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --shadow: rgba(11, 11, 11, 0.12);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Base
+   -------------------------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--bg-dark);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Silkscreen is a pixel face with no lowercase worth reading at small sizes and
+   no weight axis to speak of, so headings are uppercase, letterspaced, and sized
+   by hand. It is a label font, not a text font — anything longer than a line
+   belongs in the body face. */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  line-height: 1.25;
+  margin: 0 0 var(--gap-4);
+  color: var(--text-primary);
+}
+
+h1 { font-size: 18px; }
+h2 { font-size: 15px; }
+h3 { font-size: 13px; }
+h4, h5, h6 { font-size: 12px; }
+
+p {
+  margin: 0 0 var(--gap-4);
+  color: var(--text-secondary);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+a:hover {
+  color: var(--accent-dim);
+}
+
+/* Focus is never removed, only restyled. These are operational tools; somebody
+   drives them from the keyboard. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--font-body);
+  font-size: 12px;
+}
+
+pre {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  padding: var(--gap-3);
+  overflow-x: auto;
+  margin: 0 0 var(--gap-4);
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--border-color);
+  margin: var(--gap-5) 0;
+}
+
+/* Small print: timestamps, ids, "3 of 40 shown". Muted rather than smaller,
+   because 13px body text has no room below it. */
+.meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* --------------------------------------------------------------------------
+   Layout
+   -------------------------------------------------------------------------- */
+.wrap {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: var(--gap-5) var(--gap-5) var(--gap-6);
+}
+
+.wrap-wide {
+  max-width: none;
+}
+
+/* Any wide thing — a table, a chart, a log line — scrolls inside its own box.
+   The page body never scrolls sideways. */
+.scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  flex-wrap: wrap;
+}
+
+.row-tight { gap: var(--gap-2); }
+.spread { justify-content: space-between; }
+.grow { flex: 1 1 auto; min-width: 0; }
+
+.grid {
+  display: grid;
+  gap: var(--gap-4);
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+/* --------------------------------------------------------------------------
+   Top bar — the one piece of chrome every app shares.
+
+   Left: the product mark and which app this is. Right: navigation, the theme
+   toggle, and who is signed in. Five apps that each invented their own header
+   is how a person stops being able to tell at a glance which one they are
+   looking at.
+   -------------------------------------------------------------------------- */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-4);
+  padding: 0 var(--gap-5);
+  height: 52px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.topbar-brand {
+  display: flex;
+  align-items: baseline;
+  gap: var(--gap-2);
+  font-family: var(--font-display);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.topbar-brand:hover { color: var(--text-primary); }
+
+/* The app's own name, in the accent, so "which of the five am I in" is answered
+   by colour and position before anybody reads a word. */
+.topbar-app {
+  color: var(--accent);
+}
+
+.topbar-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-1);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.topbar-nav::-webkit-scrollbar { display: none; }
+
+.topbar-nav a {
+  padding: 6px 10px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.topbar-nav a:hover {
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+}
+
+/* The current page is marked with a border rather than a fill: a filled tab in
+   the accent competes with every alert on the page under it. */
+.topbar-nav a[aria-current="page"] {
+  color: var(--text-primary);
+  border-color: var(--border-accent);
+  background: var(--bg-elevated);
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  white-space: nowrap;
+}
+
+.topbar-user {
+  color: var(--text-muted);
+  font-size: 12px;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --------------------------------------------------------------------------
+   Theme toggle
+   -------------------------------------------------------------------------- */
+.theme-toggle {
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-family: var(--font-display);
+  font-size: 9px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.theme-toggle:hover {
+  border-color: var(--border-accent);
+  color: var(--text-primary);
+}
+
+/* --------------------------------------------------------------------------
+   Cards and panels
+   -------------------------------------------------------------------------- */
+.card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  padding: var(--gap-4);
+}
+
+.card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--gap-3);
+  margin-bottom: var(--gap-3);
+}
+
+.card-head h2,
+.card-head h3 {
+  margin: 0;
+}
+
+/* A number and its label. The number is the body face, not Silkscreen: a pixel
+   font makes 41,928 unreadable, and the whole point of a stat is being read at
+   a glance. */
+.stat {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  padding: var(--gap-3) var(--gap-4);
+}
+
+.stat-value {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--text-primary);
+}
+
+.stat-label {
+  margin-top: var(--gap-1);
+  font-family: var(--font-display);
+  font-size: 9px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* --------------------------------------------------------------------------
+   Tables — the primary object in four of these five apps.
+   -------------------------------------------------------------------------- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-panel);
+  text-align: left;
+  padding: var(--gap-2) var(--gap-3);
+  font-family: var(--font-display);
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-accent);
+  white-space: nowrap;
+}
+
+tbody td {
+  padding: var(--gap-2) var(--gap-3);
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  vertical-align: top;
+}
+
+tbody tr:hover td {
+  background: var(--bg-elevated);
+}
+
+/* A whole row that is a link. The anchor stays real — middle-click and "open in
+   new tab" keep working — and the row is just its hit area. */
+tr.link { cursor: pointer; }
+tr.link a.row { display: block; color: var(--text-primary); }
+
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* --------------------------------------------------------------------------
+   Status pills
+
+   One shape, five states. The colour is carried by the border and the text, not
+   by a filled background: a table of thirty filled pills is a table nobody can
+   read past.
+   -------------------------------------------------------------------------- */
+.pill {
+  display: inline-block;
+  padding: 2px 7px;
+  border: 1px solid var(--border-accent);
+  background: color-mix(in srgb, var(--bg-elevated) 70%, transparent);
+  color: var(--text-secondary);
+  font-family: var(--font-display);
+  font-size: 9px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.pill-ok,
+.pill-success,
+.pill-ready { border-color: var(--success); color: var(--success); }
+
+.pill-warn,
+.pill-pending,
+.pill-running { border-color: var(--warning); color: var(--warning); }
+
+.pill-fail,
+.pill-failure,
+.pill-error { border-color: var(--danger); color: var(--danger); }
+
+.pill-critical { border-color: var(--critical); color: var(--critical); }
+
+.pill-muted,
+.pill-skipped,
+.pill-idle { border-color: var(--border-color); color: var(--text-muted); }
+
+.pill-accent { border-color: var(--accent); color: var(--accent); }
+
+/* --------------------------------------------------------------------------
+   Buttons
+   -------------------------------------------------------------------------- */
+.btn {
+  /* `appearance: none` is not tidiness — it is the difference between this
+     button and the platform's. Firefox on Linux draws a `<button>` with the GTK
+     theme, and on a dark page that lands a light grey chip with dark text in the
+     middle of the top bar, ignoring both the background and the colour set
+     here. Every control in this file that a browser has an opinion about turns
+     that opinion off. */
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-accent);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn:disabled:hover {
+  border-color: var(--border-accent);
+  color: var(--text-primary);
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg-dark);
+  font-weight: 600;
+}
+
+.btn-primary:hover {
+  background: var(--accent-dim);
+  border-color: var(--accent-dim);
+  color: var(--bg-dark);
+}
+
+/* Destructive actions are outlined, never filled. A filled red button is the
+   easiest thing on a page to click by accident, and these ones destroy VMs. */
+.btn-danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.btn-danger:hover {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--bg-dark);
+}
+
+.btn-sm { padding: 3px 8px; font-size: 11px; }
+
+/* --------------------------------------------------------------------------
+   Forms
+   -------------------------------------------------------------------------- */
+label {
+  display: block;
+  margin-bottom: var(--gap-1);
+  font-family: var(--font-display);
+  font-size: 9px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+input[type="text"],
+input[type="password"],
+input[type="email"],
+input[type="search"],
+input[type="number"],
+select,
+textarea {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  padding: 7px 10px;
+  background: var(--bg-dark);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 12px;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.field {
+  margin-bottom: var(--gap-4);
+}
+
+/* --------------------------------------------------------------------------
+   Banners — one thing the page wants to say before anything else.
+   -------------------------------------------------------------------------- */
+.banner {
+  padding: var(--gap-3) var(--gap-4);
+  margin-bottom: var(--gap-4);
+  border: 1px solid var(--border-accent);
+  border-left-width: 3px;
+  background: var(--bg-panel);
+  color: var(--text-secondary);
+}
+
+.banner-warn { border-left-color: var(--warning); }
+.banner-error { border-left-color: var(--danger); }
+.banner-ok { border-left-color: var(--success); }
+.banner-info { border-left-color: var(--accent); }
+
+/* --------------------------------------------------------------------------
+   Empty states
+
+   Four of these apps have a page that is empty on a fresh install, and an empty
+   page that says nothing reads as a broken one. The convention is a line naming
+   what would be here and the command that would put it there.
+   -------------------------------------------------------------------------- */
+.empty {
+  padding: var(--gap-6) var(--gap-4);
+  text-align: center;
+  color: var(--text-muted);
+  border: 1px dashed var(--border-color);
+}
+
+.empty code {
+  color: var(--accent);
+}
+
+/* --------------------------------------------------------------------------
+   Log and console output
+
+   Streamed build logs, VM consoles, query results. Pre-wrapped rather than
+   scrolled sideways: a log line is read top to bottom, and horizontal scrolling
+   through 400 of them is not reading.
+   -------------------------------------------------------------------------- */
+.log {
+  background: var(--bg-dark);
+  border: 1px solid var(--border-color);
+  padding: var(--gap-3);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-y: auto;
+  max-height: 60vh;
+  color: var(--text-secondary);
+}
+
+.log .err { color: var(--danger); }
+.log .ok { color: var(--success); }
+
+/* --------------------------------------------------------------------------
+   Charts
+
+   The SVG/canvas belongs to each app; what is shared is the furniture around it
+   so two charts in two apps do not disagree about what a gridline looks like.
+   -------------------------------------------------------------------------- */
+.chart {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  padding: var(--gap-3);
+}
+
+.chart-grid { stroke: var(--grid); stroke-width: 1; }
+.chart-axis { stroke: var(--axis); stroke-width: 1; }
+.chart-label { fill: var(--text-muted); font-size: 10px; }
+.series-1 { stroke: var(--series-1); fill: var(--series-1); }
+.series-2 { stroke: var(--series-2); fill: var(--series-2); }
+.series-3 { stroke: var(--series-3); fill: var(--series-3); }
+
+.legend {
+  display: flex;
+  gap: var(--gap-4);
+  flex-wrap: wrap;
+  margin-top: var(--gap-2);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.legend-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 5px;
+  vertical-align: -1px;
+}
+
+/* --------------------------------------------------------------------------
+   Responsive
+
+   These are desktop tools and nobody administers a fleet from a phone, but a
+   tablet on a couch is real and a broken layout on one is embarrassing.
+   -------------------------------------------------------------------------- */
+@media (max-width: 860px) {
+  .wrap { padding: var(--gap-4) var(--gap-3) var(--gap-5); }
+  .topbar { padding: 0 var(--gap-3); gap: var(--gap-3); }
+  .topbar-user { display: none; }
+  .grid { grid-template-columns: 1fr; }
+}
+
+/* Print exists for one reason: somebody screenshots or PDFs an incident page
+   into a ticket. Paper is white; force the light tokens rather than burning a
+   toner cartridge on #0a0c10. */
+@media print {
+  :root {
+    color-scheme: light;
+    --bg-dark: #ffffff;
+    --bg-panel: #ffffff;
+    --bg-elevated: #ffffff;
+    --text-primary: #000000;
+    --text-secondary: #222222;
+    --text-muted: #555555;
+    --border-color: #cccccc;
+    --border-accent: #999999;
+  }
+  .topbar, .theme-toggle { display: none; }
+}

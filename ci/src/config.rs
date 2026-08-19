@@ -233,6 +233,21 @@ pub struct Config {
     pub heyosecret_url: Option<String>,
     pub heyosecret_token: Option<String>,
 
+    /// The parent domain the *theme* cookie is written for, and the name it is
+    /// written under.
+    ///
+    /// The theme half of what `auth.cookie_domain` does for the session in a
+    /// deployment spec: set both to the same realm and one choice of light or
+    /// dark covers every app in the fleet. Unset means a host-only cookie,
+    /// which is right for a single instance and for a local run.
+    ///
+    /// `CI_UI_COOKIE_DOMAIN` first, then the fleet-wide `HEYO_UI_COOKIE_DOMAIN`
+    /// — the same precedence `CI_HEYOSECRET_URL`/`HEYOSECRET_URL` uses, so an
+    /// operator can set one variable for every Heyo app on a host and override
+    /// it here if this one instance differs.
+    pub ui_cookie_domain: Option<String>,
+    pub ui_cookie_name: String,
+
     /// app-lb admin API, where `workflow` objects live.
     pub app_lb_url: Option<String>,
     pub app_lb_token: Option<String>,
@@ -505,6 +520,24 @@ impl Config {
             heyosecret_token: opt("CI_HEYOSECRET_TOKEN")
                 .or_else(|| opt("HEYOSECRET_INTERNAL_API_KEY"))
                 .or_else(|| opt("PLATFORM_INTERNAL_API_KEY")),
+            // Validated here rather than at render time: a domain the browser
+            // will silently discard is a toggle that appears to do nothing, and
+            // finding that out from a user is worse than a startup line.
+            ui_cookie_domain: opt("CI_UI_COOKIE_DOMAIN")
+                .or_else(|| opt(crate::heyo_ui::COOKIE_DOMAIN_ENV))
+                .and_then(|d| {
+                    let normalized = crate::heyo_ui::normalize_cookie_domain(&d);
+                    if normalized.is_none() {
+                        tracing::warn!(
+                            "CI_UI_COOKIE_DOMAIN={d:?} is not a domain a cookie can be \
+                             scoped to; the theme will be remembered per host instead"
+                        );
+                    }
+                    normalized
+                }),
+            ui_cookie_name: opt("CI_UI_COOKIE_NAME")
+                .or_else(|| opt(crate::heyo_ui::COOKIE_NAME_ENV))
+                .unwrap_or_else(|| crate::heyo_ui::THEME_COOKIE.to_string()),
             app_lb_url: opt("CI_APP_LB_URL").map(|u| u.trim_end_matches('/').to_string()),
             app_lb_token: opt("CI_APP_LB_TOKEN"),
             webhook_secret,

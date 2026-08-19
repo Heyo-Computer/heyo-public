@@ -14,8 +14,8 @@
       "ART_ROOT": "/workspace/store",
       "ART_LISTEN": "0.0.0.0:8080",
       "ART_API_KEY": "change-me",
-      "ART_ADMIN_USER": "admin",
-      "ART_ADMIN_PASSWORD": "change-me-too",
+      "ART_DASHBOARD_GATE": "1",
+      "HEYO_UI_COOKIE_DOMAIN": "us2.heyo.work",
       "ART_MIN_FREE_BYTES": "536870912",
       "RUST_LOG": "art=info,artifacts=info"
     },
@@ -33,9 +33,10 @@
     "client_secret": { "secret": "google", "key": "client_secret" },
     "allowed_domains": ["heyo.computer"],
     "allowed_emails": [],
-    "public_paths": ["/healthz", "/blobs/", "/manifests", "/tags", "/usage"],
+    "public_paths": ["/healthz", "/blobs/", "/manifests", "/tags", "/usage", "/__ui/"],
     "session_ttl_secs": 43200,
-    "forward_identity": false
+    "cookie_domain": "us2.heyo.work",
+    "forward_identity": true
   },
   "scaling": {
     "min_replicas": 1,

@@ -13,6 +13,12 @@ use subtle::ConstantTimeEq;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
+// The platform UI kit — tokens, the theme cookie and forwarded identity —
+// shared with app-lb, app-obs, ci and artifacts. Included by path rather than
+// depended on as a crate: this crate is edition 2021 and two of the others are
+// 2024, and the shared module is written to compile as both. See `ui/README.md`.
+#[path = "../../ui/ui.rs"]
+pub mod heyo_ui;
 mod auth;
 mod config;
 mod crypto;
@@ -32,6 +38,11 @@ use store::{PutSecretInput, SecretStore};
 struct AppState {
     config: Arc<Config>,
     store: SecretStore,
+    /// Where the theme cookie is written and under what name — resolved once at
+    /// startup from `HEYOSECRET_UI_COOKIE_*`, else the fleet-wide `HEYO_UI_*`.
+    /// Set the same parent domain here as in app-lb's `auth.cookie_domain` and
+    /// one choice of light or dark covers every app in the fleet.
+    ui_cookies: Arc<crate::heyo_ui::CookieConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,7 +69,11 @@ async fn main() -> Result<()> {
     let port = config.server_port;
 
     let dashboard_enabled = config.dashboard_enabled();
-    let state = AppState { config, store };
+    let state = AppState {
+        config,
+        store,
+        ui_cookies: Arc::new(crate::heyo_ui::CookieConfig::from_env("HEYOSECRET")),
+    };
 
     // Machine-facing JSON API, authenticated by the shared internal API key.
     // The permissive CORS policy applies only to these routes.

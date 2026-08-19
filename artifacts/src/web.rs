@@ -46,10 +46,64 @@ const OVERVIEW_ROWS: usize = 12;
 #[derive(Clone)]
 pub struct WebState {
     pub store: Store,
-    /// `None` is the open dashboard: mounted, no login, no session. Reachable
-    /// only from an explicit `ART_DASHBOARD_OPEN`, never from an unset variable
-    /// — see [`crate::config::DashboardAccess`].
+    /// `None` is a dashboard with no local login — either the open one
+    /// (`ART_DASHBOARD_OPEN`) or the gated one (`ART_DASHBOARD_GATE`), told
+    /// apart by `gate` below. Never from an unset variable — see
+    /// [`crate::config::DashboardAccess`].
     pub auth: Option<Arc<AdminAuth>>,
+    /// Authentication happens upstream, in app-lb, and this app trusts the
+    /// `x-auth-request-*` headers it forwards.
+    ///
+    /// Separate from `auth: None` because the two look identical from inside a
+    /// handler and mean opposite things: open serves anybody, gated serves only
+    /// a request that arrived with an identity attached.
+    pub gate: bool,
+    /// Where the theme cookie is written, and under what name.
+    pub ui: Arc<crate::heyo_ui::CookieConfig>,
+}
+
+/// Everything the page shell needs about *this* request.
+pub struct Shell {
+    /// `data-theme="…" data-cookie-domain="…"`, resolved from the cookie before
+    /// a byte is sent, so no page flashes the wrong palette.
+    pub attrs: String,
+    /// Who the gate says is here. `None` on an open or password dashboard,
+    /// which have no identity to show — a password is not a person.
+    pub who: Option<String>,
+    /// Whether to offer a local sign-out. False under a gate: the session is
+    /// app-lb's, and a button here could not end it.
+    pub signout: bool,
+}
+
+impl Default for Shell {
+    /// For a response rendered from an error value, which has no request in
+    /// hand and so cannot know the theme.
+    ///
+    /// The attributes are **empty rather than `data-theme="dark"`**: with no
+    /// attribute the toggle script reads the cookie and applies it on load, so
+    /// a light-mode reader gets one frame of dark and then their own palette.
+    /// Pinning dark here would have given them a dark error page and no
+    /// explanation. Every page rendered from a real request stamps the theme
+    /// server-side and does not flash at all.
+    fn default() -> Self {
+        Shell { attrs: String::new(), who: None, signout: false }
+    }
+}
+
+pub fn shell(st: &WebState, headers: &header::HeaderMap) -> Shell {
+    let cookies = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    Shell {
+        attrs: st.ui.attrs(cookies),
+        who: if st.gate { forwarded_identity(headers).map(|i| i.display().to_string()) } else { None },
+        signout: st.auth.is_some(),
+    }
+}
+
+/// The identity app-lb forwarded, if any.
+fn forwarded_identity(headers: &header::HeaderMap) -> Option<crate::heyo_ui::Identity> {
+    crate::heyo_ui::identity_from(|name| headers.get(name).and_then(|v| v.to_str().ok()))
 }
 
 // ---------------------------------------------------------------------------
@@ -62,20 +116,26 @@ pub struct LoginForm {
     password: String,
 }
 
-pub async fn login_page(State(st): State<WebState>, jar: CookieJar) -> Response {
-    // No gate means no login to present. Rendering a form that accepts nothing
-    // would be a worse lie than the redirect.
+pub async fn login_page(
+    State(st): State<WebState>,
+    headers: header::HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    // No local login to present — either there is no gate at all, or there is
+    // one and it is upstream. Rendering a form that accepts nothing would be a
+    // worse lie than the redirect.
     let Some(auth) = st.auth.as_deref() else {
         return Redirect::to("/dashboard").into_response();
     };
     if session_ok(auth, &jar) {
         return Redirect::to("/dashboard").into_response();
     }
-    page_bare("sign in", login_body(false)).into_response()
+    page_bare(&shell(&st, &headers), "sign in", login_body(false)).into_response()
 }
 
 pub async fn login_submit(
     State(st): State<WebState>,
+    headers: header::HeaderMap,
     jar: CookieJar,
     Form(form): Form<LoginForm>,
 ) -> Response {
@@ -87,7 +147,7 @@ pub async fn login_submit(
         // Same page, same status shape, no hint about which field was wrong.
         return (
             StatusCode::UNAUTHORIZED,
-            page_bare("sign in", login_body(true)),
+            page_bare(&shell(&st, &headers), "sign in", login_body(true)),
         )
             .into_response();
     }
@@ -120,6 +180,14 @@ fn session_ok(auth: &AdminAuth, jar: &CookieJar) -> bool {
 /// mode — one `None` here, rather than a bypass flag threaded through the
 /// checks, so there is no branch that can be reached with a gate configured.
 pub fn dashboard_authorized(st: &WebState, headers: &header::HeaderMap, jar: &CookieJar) -> bool {
+    // Under a gate, an identity *is* the authorization: app-lb only forwards
+    // one for a request it authenticated, and it strips the headers before
+    // setting them so a client cannot supply its own. A request with none is an
+    // app-token caller or a direct hit on the listener, and neither is a person
+    // this dashboard should answer.
+    if st.gate {
+        return forwarded_identity(headers).is_some();
+    }
     let Some(auth) = st.auth.as_deref() else {
         return true;
     };
@@ -141,7 +209,10 @@ pub async fn index() -> Redirect {
     Redirect::to("/dashboard")
 }
 
-pub async fn overview(State(st): State<WebState>) -> Result<Markup, WebError> {
+pub async fn overview(
+    State(st): State<WebState>,
+    headers: header::HeaderMap,
+) -> Result<Markup, WebError> {
     let usage = st.store.usage().await?;
     let tags = st.store.list_tags().await?;
     let blobs = st.store.list_blobs().await?;
@@ -150,9 +221,9 @@ pub async fn overview(State(st): State<WebState>) -> Result<Markup, WebError> {
     let shown: Vec<_> = blobs.iter().take(OVERVIEW_ROWS).collect();
 
     Ok(page(
+        &shell(&st, &headers),
         "overview",
         "/dashboard",
-        st.auth.is_some(),
         html! {
             // Hero: the one number this store exists to improve. Exactly one
             // per view, proportional figures (tabular-nums is for columns).
@@ -202,13 +273,16 @@ pub async fn overview(State(st): State<WebState>) -> Result<Markup, WebError> {
     ))
 }
 
-pub async fn blobs_page(State(st): State<WebState>) -> Result<Markup, WebError> {
+pub async fn blobs_page(
+    State(st): State<WebState>,
+    headers: header::HeaderMap,
+) -> Result<Markup, WebError> {
     let blobs = st.store.list_blobs().await?;
     let refs: Vec<&BlobInfo> = blobs.iter().collect();
     Ok(page(
+        &shell(&st, &headers),
         "blobs",
         "/dashboard/blobs",
-        st.auth.is_some(),
         html! {
             section {
                 (section_head("All blobs", blobs.len(), None))
@@ -220,6 +294,7 @@ pub async fn blobs_page(State(st): State<WebState>) -> Result<Markup, WebError> 
 
 pub async fn blob_page(
     State(st): State<WebState>,
+    headers: header::HeaderMap,
     Path(digest): Path<String>,
 ) -> Result<Markup, WebError> {
     let d = Digest::parse(&digest).map_err(crate::Error::from)?;
@@ -248,9 +323,9 @@ pub async fn blob_page(
 
     let saved = info.size.saturating_sub(info.allocated);
     Ok(page(
+        &shell(&st, &headers),
         "blob",
         "/dashboard/blobs",
-        st.auth.is_some(),
         html! {
             section {
                 h2 { "Blob" }
@@ -306,16 +381,19 @@ pub async fn blob_page(
     ))
 }
 
-pub async fn manifests_page(State(st): State<WebState>) -> Result<Markup, WebError> {
+pub async fn manifests_page(
+    State(st): State<WebState>,
+    headers: header::HeaderMap,
+) -> Result<Markup, WebError> {
     let mut rows = Vec::new();
     for d in st.store.list_manifests().await? {
         let m = st.store.get_manifest(&d).await.ok();
         rows.push((d, m));
     }
     Ok(page(
+        &shell(&st, &headers),
         "manifests",
         "/dashboard/manifests",
-        st.auth.is_some(),
         html! {
             section {
                 (section_head("Manifests", rows.len(), None))
@@ -343,14 +421,15 @@ pub async fn manifests_page(State(st): State<WebState>) -> Result<Markup, WebErr
 
 pub async fn manifest_page(
     State(st): State<WebState>,
+    headers: header::HeaderMap,
     Path(digest): Path<String>,
 ) -> Result<Markup, WebError> {
     let d = Digest::parse(&digest).map_err(crate::Error::from)?;
     let m: Manifest = st.store.get_manifest(&d).await?;
     Ok(page(
+        &shell(&st, &headers),
         "manifest",
         "/dashboard/manifests",
-        st.auth.is_some(),
         html! {
             section {
                 h2 { "Manifest" }
@@ -540,47 +619,54 @@ fn human(n: u64) -> String {
 
 /// `signout` is false on the open dashboard: there is no session to end, and a
 /// button that logs nobody out is a claim the page cannot keep.
-fn page(title: &str, active: &str, signout: bool, body: Markup) -> Markup {
+fn page(shell: &Shell, title: &str, active: &str, body: Markup) -> Markup {
+    let nav: Vec<(&str, &str, bool)> = vec![
+        ("Overview", "/dashboard", active == "/dashboard"),
+        ("Blobs", "/dashboard/blobs", active == "/dashboard/blobs"),
+        ("Manifests", "/dashboard/manifests", active == "/dashboard/manifests"),
+    ];
     html! {
         (DOCTYPE)
-        html lang="en" {
+        // Injected whole rather than as maud attributes: this is a run of
+        // several, built by the shared module from typed values.
+        (PreEscaped(format!("<html lang=\"en\" {}>", shell.attrs).replace(" >", ">")))
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "artifacts · " (title) }
+                (PreEscaped(crate::heyo_ui::head_tags()))
                 style { (PreEscaped(STYLE)) }
             }
             body {
-                header.top {
-                    a.brand href="/dashboard" { "artifacts" }
-                    nav {
-                        (nav_link("Overview", "/dashboard", active))
-                        (nav_link("Blobs", "/dashboard/blobs", active))
-                        (nav_link("Manifests", "/dashboard/manifests", active))
-                    }
-                    @if signout {
-                        form method="post" action="/logout" { button.signout type="submit" { "sign out" } }
+                (PreEscaped(crate::heyo_ui::topbar_html("artifacts", &nav, shell.who.as_deref())))
+                @if shell.signout {
+                    // Only the password dashboard has a session of its own to
+                    // end. Under app-lb the session is the gate's, and a button
+                    // here would clear nothing.
+                    form.signout-form method="post" action="/logout" {
+                        button.btn.btn-sm type="submit" { "sign out" }
                     }
                 }
                 main { (body) }
             }
-        }
+        (PreEscaped("</html>"))
     }
 }
 
-/// The login page has no nav and no sign-out.
-fn page_bare(title: &str, body: Markup) -> Markup {
+/// The login page: no nav, no identity, no sign-out.
+fn page_bare(shell: &Shell, title: &str, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" {
+        (PreEscaped(format!("<html lang=\"en\" {}>", shell.attrs).replace(" >", ">")))
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "artifacts · " (title) }
+                (PreEscaped(crate::heyo_ui::head_tags()))
                 style { (PreEscaped(STYLE)) }
             }
             body.centered { main { (body) } }
-        }
+        (PreEscaped("</html>"))
     }
 }
 
@@ -605,177 +691,84 @@ fn login_body(failed: bool) -> Markup {
     }
 }
 
-fn nav_link(label: &str, href: &str, active: &str) -> Markup {
-    let cls = if href == active { "nav-link active" } else { "nav-link" };
-    html! { a.(cls) href=(href) { (label) } }
-}
 
-/// Colours are the validated reference palette: a sequential blue ramp for
-/// magnitude and the fixed status trio for state. Dark mode is stepped for the
-/// dark surface rather than flipped, and the viewer's theme toggle wins over the
-/// OS preference in both directions.
+/// What is specific to the artifacts dashboard, layered on `ui/heyo.css`.
+///
+/// Tokens, type, tables, buttons, pills and forms come from the shared sheet.
+/// What is left here is this store's own vocabulary: the dedup hero, the stat
+/// tiles, the capacity meter and the sparkline bars.
+///
+/// The meter and the badges keep a **sequential** relationship to their value —
+/// good, warning, critical — rather than being tinted with the one accent,
+/// because the whole point of the capacity meter is that 94% looks different
+/// from 40% before anybody reads the number.
 const STYLE: &str = r#"
-:root {
-  color-scheme: light dark;
-  --surface:      #fcfcfb;
-  --plane:        #f9f9f7;
-  --ink:          #0b0b0b;
-  --ink-2:        #52514e;
-  --muted:        #898781;
-  --grid:         #e1e0d9;
-  --rule:         #c3c2b7;
-  /* sequential blue, light->dark: fill is step 450, track is step 150 */
-  --seq-fill:     #2a78d6;
-  --seq-track:    #b7d3f6;
-  --good:         #0ca30c;
-  --warning:      #fab219;
-  --critical:     #d03b3b;
-  --link:         #256abf;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --surface:    #1a1a19;
-    --plane:      #0d0d0d;
-    --ink:        #ffffff;
-    --ink-2:      #c3c2b7;
-    --muted:      #898781;
-    --grid:       #2c2c2a;
-    --rule:       #383835;
-    --seq-fill:   #3987e5;
-    --seq-track:  #184f95;
-    --link:       #86b6ef;
-  }
-}
-:root[data-theme="dark"] {
-  --surface:    #1a1a19;
-  --plane:      #0d0d0d;
-  --ink:        #ffffff;
-  --ink-2:      #c3c2b7;
-  --grid:       #2c2c2a;
-  --rule:       #383835;
-  --seq-fill:   #3987e5;
-  --seq-track:  #184f95;
-  --link:       #86b6ef;
-}
+main { max-width: 1200px; margin: 0 auto; padding: var(--gap-5) var(--gap-5) var(--gap-6); }
+section { margin-bottom: var(--gap-5); }
+body.centered { display: grid; place-items: center; min-height: 100vh; }
+body.centered main { width: min(360px, 92vw); }
 
-* { box-sizing: border-box; }
-body {
-  margin: 0; background: var(--plane); color: var(--ink);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 14px; line-height: 1.55;
-}
-body.centered { display: grid; place-items: center; min-height: 100vh; padding: 1rem; }
-main { max-width: 62rem; margin-inline: auto; padding: 1.5rem 1.25rem 4rem; }
+/* The sign-out button sits under the top bar rather than in it: it exists only
+   on the password dashboard, and a control that is present in one deployment
+   mode and absent in another does not belong in shared chrome. */
+.signout-form { max-width: 1200px; margin: var(--gap-3) auto calc(-1 * var(--gap-2)); padding: 0 var(--gap-5); text-align: right; }
 
-/* header */
-.top {
-  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
-  padding: 0.85rem 1.25rem; background: var(--surface);
-  border-bottom: 1px solid var(--rule);
-}
-.brand { font-weight: 700; letter-spacing: 0.04em; color: var(--ink); text-decoration: none; }
-nav { display: flex; gap: 0.25rem; flex: 1; flex-wrap: wrap; }
-.nav-link {
-  color: var(--ink-2); text-decoration: none; padding: 0.2rem 0.6rem;
-  border: 1px solid transparent;
-}
-.nav-link:hover { color: var(--ink); border-color: var(--grid); }
-.nav-link.active { color: var(--ink); border-color: var(--rule); background: var(--plane); }
-.signout {
-  font: inherit; color: var(--ink-2); background: none;
-  border: 1px solid var(--grid); padding: 0.2rem 0.6rem; cursor: pointer;
-}
-.signout:hover { color: var(--ink); border-color: var(--rule); }
+/* The hero: one number per view, the one this store exists to improve. */
+.hero { border: 1px solid var(--border-color); background: var(--bg-panel); padding: var(--gap-5) var(--gap-4); text-align: center; }
+.hero-value { font-size: 40px; line-height: 1; font-weight: 600; color: var(--accent); }
+.hero-label { margin-top: var(--gap-2); color: var(--text-muted); font-size: 12px; }
 
-/* hero — exactly one per view, proportional figures */
-.hero { padding: 1.5rem 0 1rem; }
-.hero-value { font-size: 52px; font-weight: 600; line-height: 1; letter-spacing: -0.02em; }
-.hero-label { color: var(--ink-2); margin-top: 0.4rem; }
+/* Stat tiles. `.tile` is `.stat` from the shared sheet with a grid around it;
+   kept under its own name because the markup is generated in six places. */
+.tiles { display: grid; gap: var(--gap-3); grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.tile { background: var(--bg-panel); border: 1px solid var(--border-color); padding: var(--gap-3) var(--gap-4); }
+.tile-value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile-label { margin-top: 2px; font-family: var(--font-display); font-size: 9px; letter-spacing: 0.8px; text-transform: uppercase; color: var(--text-muted); }
+.tile-note { margin-top: 2px; font-size: 11px; color: var(--text-muted); }
 
-/* stat tiles */
-.tiles {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
-  gap: 0.6rem; margin: 1rem 0 1.5rem;
-}
-.tile { background: var(--surface); border: 1px solid var(--grid); padding: 0.7rem 0.8rem; }
-.tile-label { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.09em; }
-.tile-value { font-size: 1.3rem; font-weight: 600; margin-top: 0.15rem; }
-.tile-note { color: var(--muted); font-size: 0.7rem; margin-top: 0.15rem; }
+/* Capacity meter. Three states, and the colour is the message. */
+.meter-wrap { border: 1px solid var(--border-color); background: var(--bg-panel); padding: var(--gap-3) var(--gap-4); }
+.meter-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--gap-3); }
+.meter-title { font-family: var(--font-display); font-size: 9px; letter-spacing: 0.8px; text-transform: uppercase; color: var(--text-muted); }
+.meter { position: relative; height: 8px; margin: var(--gap-2) 0; background: var(--bg-dark); border: 1px solid var(--border-color); }
+.meter-fill { position: absolute; inset: 0 auto 0 0; background: var(--success); }
+.meter-good .meter-fill { background: var(--success); }
+.meter-warning .meter-fill { background: var(--warning); }
+.meter-critical .meter-fill { background: var(--critical); }
+.meter-foot { color: var(--text-muted); font-size: 11px; }
 
-/* capacity meter */
-.meter-wrap { background: var(--surface); border: 1px solid var(--grid); padding: 0.85rem; margin-bottom: 1.75rem; }
-.meter-head { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
-.meter-title { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.09em; }
-.badge { font-size: 0.72rem; font-weight: 600; padding: 0.1rem 0.45rem; border: 1px solid currentColor; }
-.badge-glyph { font-weight: 700; }
-.badge-good { color: var(--good); }
+.badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }
+.badge-good { color: var(--success); }
 .badge-warning { color: var(--warning); }
 .badge-critical { color: var(--critical); }
-.meter { height: 10px; background: var(--seq-track); margin: 0.55rem 0 0.4rem; overflow: hidden; }
-.meter-fill { height: 100%; border-radius: 0 4px 4px 0; }
-.meter-good { background: var(--good); }
-.meter-warning { background: var(--warning); }
-.meter-critical { background: var(--critical); }
-.meter-foot { display: flex; justify-content: space-between; color: var(--ink-2); font-size: 0.78rem; }
+/* A glyph beside the colour, so the three states are distinguishable without
+   relying on hue — the same reason the chart series are not tints of one hue. */
+.badge-glyph { font-size: 10px; }
 
-/* sections & tables */
-.sec-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin: 1.75rem 0 0.5rem; }
-h2 { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.11em; color: var(--muted); margin: 0; font-weight: 600; }
-.count { color: var(--rule); font-weight: 400; }
-.more { color: var(--link); text-decoration: none; font-size: 0.78rem; }
-.more:hover { text-decoration: underline; }
-.scroll { overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; background: var(--surface); }
-th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--grid); }
-th { color: var(--muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
-tbody tr:hover { background: var(--plane); }
-.r { text-align: right; }
-/* tabular figures only in columns, where digits must line up */
-.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
-.mono, .name { white-space: nowrap; }
-.name { color: var(--ink); }
-a.mono { color: var(--link); text-decoration: none; }
-a.mono:hover { text-decoration: underline; }
-.pin { color: var(--seq-fill); }
-.digest { word-break: break-all; color: var(--ink-2); font-size: 0.82rem; margin: 0.25rem 0 1rem; }
-.empty { color: var(--muted); }
-code { background: var(--surface); border: 1px solid var(--grid); padding: 0.05rem 0.3rem; }
+/* Blob size bars, drawn in the table itself. */
+.barcell { min-width: 90px; }
+.spark { position: relative; height: 6px; background: var(--bg-dark); border: 1px solid var(--border-color); }
+.spark-wide { height: 8px; }
+.spark-fill { position: absolute; inset: 0 auto 0 0; background: var(--series-1); }
 
-/* sparsity bar: 2px surface gap keeps the fill off the track edge */
-.spark { width: 9rem; height: 8px; background: var(--seq-track); overflow: hidden; }
-.spark-wide { width: 100%; height: 10px; margin-top: 0.9rem; }
-.spark-fill { height: 100%; background: var(--seq-fill); border-radius: 0 4px 4px 0; }
-.barcell { width: 10rem; }
+.sec-head { display: flex; align-items: baseline; gap: var(--gap-2); margin-bottom: var(--gap-2); }
+.sec-head .count { color: var(--text-muted); font-size: 12px; }
+.sec-head .more { margin-left: auto; font-size: 12px; }
 
-/* login */
-.login { background: var(--surface); border: 1px solid var(--rule); padding: 1.75rem; width: min(22rem, 92vw); }
-.login h1 { margin: 0; font-size: 1.35rem; letter-spacing: 0.04em; }
-.sub { color: var(--muted); margin: 0.2rem 0 1.25rem; }
-.login label { display: block; color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.09em; margin-bottom: 0.2rem; }
-.login input {
-  font: inherit; width: 100%; padding: 0.45rem 0.55rem; margin-bottom: 0.9rem;
-  background: var(--plane); color: var(--ink); border: 1px solid var(--rule);
-}
-.login input:focus-visible, .signout:focus-visible, .login button:focus-visible, a:focus-visible {
-  outline: 2px solid var(--link); outline-offset: 2px;
-}
-.login button {
-  font: inherit; font-weight: 600; width: 100%; padding: 0.5rem;
-  background: var(--seq-fill); color: #fff; border: 1px solid var(--seq-fill); cursor: pointer;
-}
-.login button:hover { filter: brightness(1.08); }
-.err { color: var(--critical); border: 1px solid currentColor; padding: 0.4rem 0.55rem; margin-bottom: 1rem; font-size: 0.82rem; }
+.digest, .mono { font-family: var(--font-body); }
+td.name { color: var(--text-primary); }
+td.num, .num, .r { text-align: right; font-variant-numeric: tabular-nums; }
+.pin { color: var(--accent); }
+.sub { color: var(--text-muted); font-size: 12px; margin: 0 0 var(--gap-4); }
+.empty { color: var(--text-muted); padding: var(--gap-4) 0; border: 0; text-align: left; }
+.empty code { color: var(--accent); }
 
-@media (prefers-reduced-motion: no-preference) { .nav-link, .more, .signout { transition: color 0.12s; } }
-@media (max-width: 40rem) {
-  th, td { padding: 0.35rem 0.4rem; font-size: 0.8rem; }
-  .hero-value { font-size: 40px; }
-  .barcell, .spark { width: 5.5rem; }
-}
-@media (forced-colors: active) {
-  .meter-fill, .spark-fill { background: CanvasText; }
-  .tile, .meter-wrap, table { border-color: CanvasText; }
-}
+/* The login card, the one page with no top bar. */
+.login { border: 1px solid var(--border-color); background: var(--bg-panel); padding: var(--gap-5); }
+.login h1 { margin-bottom: var(--gap-1); }
+.login .err { color: var(--danger); margin-bottom: var(--gap-3); }
+.login button { width: 100%; margin-top: var(--gap-3); background: var(--accent); border: 1px solid var(--accent); color: var(--bg-dark); font-weight: 600; padding: 7px 12px; cursor: pointer; }
+.login button:hover { background: var(--accent-dim); border-color: var(--accent-dim); }
 "#;
 
 // ---------------------------------------------------------------------------
@@ -804,6 +797,7 @@ impl IntoResponse for WebError {
             tracing::error!(error = %self.0, "dashboard request failed");
         }
         let body = page_bare(
+            &Shell::default(),
             "error",
             html! {
                 div.login {
@@ -841,9 +835,17 @@ mod tests {
             WebState {
                 store,
                 auth: Some(Arc::new(AdminAuth::new("admin".into(), "pw".into()))),
+                gate: false,
+                ui: Default::default(),
             },
             dir,
         )
+    }
+
+    /// The shell these tests render against: default theme, nobody signed in
+    /// by a gate, sign-out offered (the password dashboard's shape).
+    fn test_shell() -> Shell {
+        Shell { attrs: r#"data-theme="dark""#.into(), who: None, signout: true }
     }
 
     fn usage(logical: u64, allocated: u64, avail: u64, total: u64) -> Usage {
@@ -914,19 +916,23 @@ mod tests {
     }
 
     #[test]
-    fn login_page_has_no_external_assets_and_no_script() {
-        let html = page_bare("sign in", login_body(false)).into_string();
-        // The VM has no route to a CDN, so anything remote would not load.
+    fn login_page_has_no_external_assets() {
+        let html = page_bare(&test_shell(), "sign in", login_body(false)).into_string();
+        // The VM has no route to a CDN, so anything remote would not load. The
+        // stylesheet and the theme script are this binary's own, at /__ui/ —
+        // same origin, and the only script on the page.
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
-        assert!(!html.contains("<script"));
+        assert!(!html.contains("src=\"//"));
+        assert!(html.contains(r#"href="/__ui/heyo.css""#));
+        assert!(html.contains(r#"src="/__ui/theme.js""#));
         assert!(html.contains("type=\"password\""));
         assert!(html.contains("autocomplete=\"current-password\""));
     }
 
     #[test]
     fn a_failed_login_does_not_say_which_field_was_wrong() {
-        let html = page_bare("sign in", login_body(true)).into_string();
+        let html = page_bare(&test_shell(), "sign in", login_body(true)).into_string();
         assert!(html.contains("Incorrect username or password"));
         assert!(!html.to_lowercase().contains("no such user"));
         assert!(!html.to_lowercase().contains("wrong password"));
@@ -934,26 +940,49 @@ mod tests {
 
     #[test]
     fn page_shell_marks_the_active_nav_item() {
-        let html = page("overview", "/dashboard", true, html! {}).into_string();
-        assert!(html.contains("nav-link active"));
+        let html = page(&test_shell(), "overview", "/dashboard", html! {}).into_string();
+        // The shared top bar marks the current page with `aria-current`, which
+        // is also what the stylesheet selects on — one signal, read by both a
+        // screen reader and the border under the tab.
+        assert!(html.contains(r#"<a href="/dashboard" aria-current="page">Overview</a>"#), "{html}");
         assert!(html.contains("/dashboard/blobs"));
-        assert!(!html.contains("<script"));
+        assert!(html.contains(r#"data-theme="dark""#));
     }
 
+    /// Under an upstream gate the page shows who app-lb says is here and offers
+    /// no sign-out — the session belongs to the gate, and a button here could
+    /// not end it.
     #[test]
-    fn dark_mode_is_stepped_not_flipped() {
-        // The dark values are their own steps from the same ramps, and the
-        // theme toggle must beat the OS preference in both directions.
-        assert!(STYLE.contains("prefers-color-scheme: dark"));
-        assert!(STYLE.contains("[data-theme=\"dark\"]"));
-        assert!(STYLE.contains(":not([data-theme=\"light\"])"));
-        assert!(STYLE.contains("forced-colors: active"));
+    fn a_gated_page_shows_the_forwarded_identity_and_no_signout() {
+        let shell = Shell {
+            attrs: r#"data-theme="dark""#.into(),
+            who: Some("ops@example.com".into()),
+            signout: false,
+        };
+        let html = page(&shell, "overview", "/dashboard", html! {}).into_string();
+        assert!(html.contains("ops@example.com"));
+        assert!(!html.contains("/logout"), "{html}");
+    }
+
+    /// Themes moved to the shared sheet, and this page must not re-declare
+    /// them: a second palette here would win by specificity in one app and
+    /// leave the other four looking different.
+    #[test]
+    fn the_local_stylesheet_declares_no_palette_of_its_own() {
+        assert!(!STYLE.contains(":root"), "tokens belong in ui/heyo.css");
+        assert!(!STYLE.contains("prefers-color-scheme"));
+        // It reads the shared tokens rather than hard-coding hexes. A stray
+        // `#rrggbb` here is a colour that will not follow the theme.
+        for line in STYLE.lines() {
+            let code = line.split("/*").next().unwrap_or("");
+            assert!(!code.contains('#'), "hard-coded colour in the local sheet: {line}");
+        }
     }
 
     #[tokio::test]
     async fn overview_renders_on_an_empty_store() {
         let (st, _dir) = state();
-        let html = overview(State(st)).await.unwrap().into_string();
+        let html = overview(State(st), Default::default()).await.unwrap().into_string();
         assert!(html.contains("No blobs yet"));
         assert!(html.contains("effective capacity"));
     }
@@ -973,7 +1002,7 @@ mod tests {
             .await
             .unwrap();
 
-        let html = blob_page(State(st), Path(blob.digest.to_string()))
+        let html = blob_page(State(st), Default::default(), Path(blob.digest.to_string()))
             .await
             .unwrap()
             .into_string();
@@ -985,7 +1014,7 @@ mod tests {
     async fn an_unreferenced_blob_says_so() {
         let (st, _dir) = state();
         let blob = st.store.insert_bytes(b"orphan".to_vec()).await.unwrap();
-        let html = blob_page(State(st), Path(blob.digest.to_string()))
+        let html = blob_page(State(st), Default::default(), Path(blob.digest.to_string()))
             .await
             .unwrap()
             .into_string();
@@ -996,10 +1025,11 @@ mod tests {
     #[tokio::test]
     async fn a_bad_digest_renders_an_html_error_not_json() {
         let (st, _dir) = state();
-        let resp = blob_page(State(st), Path("not-a-digest".into()))
+        let resp = blob_page(State(st), Default::default(), Path("not-a-digest".into()))
             .await
             .unwrap_err()
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
+

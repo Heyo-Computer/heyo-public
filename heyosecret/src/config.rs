@@ -22,6 +22,19 @@ pub struct Config {
     /// unaffected.
     #[serde(default)]
     pub admin_password: String,
+    /// Serve the dashboard behind an **upstream** gate — app-lb — and trust the
+    /// identity it forwards in `x-auth-request-*`, instead of presenting a
+    /// password login of this app's own.
+    ///
+    /// Set it only when something in front actually strips those headers before
+    /// setting them, which is what makes them unspoofable; app-lb does, always.
+    /// In front of a listener anyone can reach, this is an open dashboard.
+    ///
+    /// Combining it with `admin_password` is refused at startup rather than
+    /// resolved by precedence: whichever won, half the configuration would be a
+    /// lie, and the half that loses is the half somebody thought was the gate.
+    #[serde(default)]
+    pub dashboard_gate: bool,
     /// Whether the dashboard session cookie sets the `Secure` attribute.
     /// Leave false for local http; set true behind TLS in production.
     #[serde(default)]
@@ -92,6 +105,22 @@ impl Config {
         if config.admin_password.is_empty() {
             config.admin_password = env::var("HEYOSECRET_ADMIN_PASSWORD").unwrap_or_default();
         }
+        if !config.dashboard_gate {
+            config.dashboard_gate = matches!(
+                env::var("HEYOSECRET_DASHBOARD_GATE")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        if config.dashboard_gate && !config.admin_password.trim().is_empty() {
+            return Err(anyhow!(
+                "HEYOSECRET_DASHBOARD_GATE and HEYOSECRET_ADMIN_PASSWORD are both set; \
+                 pick one — the gate authenticates upstream, a password here does not"
+            ));
+        }
 
         if config.database_url.is_empty() {
             return Err(anyhow!(
@@ -141,9 +170,10 @@ impl Config {
         hasher.finalize().into()
     }
 
-    /// The dashboard is only reachable when an admin password is configured.
+    /// The dashboard is reachable when there is something authenticating it:
+    /// an admin password here, or a gate in front that says who is calling.
     pub fn dashboard_enabled(&self) -> bool {
-        !self.admin_password.trim().is_empty()
+        !self.admin_password.trim().is_empty() || self.dashboard_gate
     }
 
     pub fn acquire_timeout(&self) -> Duration {

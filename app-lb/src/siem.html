@@ -1,62 +1,68 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" {{HTML_ATTRS}}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{APP_NAME}} security</title>
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
 <style>
+  /* ------------------------------------------------------------------------
+     app-lb, layered on ui/heyo.css — the same sheet ci, app-obs, heyosecret and
+     artifacts serve, so the five read as one product.
+
+     **These names are aliases, not a second palette.** These pages were written
+     against `--surface`/`--plane`/`--text-2`; each now resolves to a shared
+     token rather than being renamed at several hundred call sites. `var()`
+     resolves at use time, so switching the theme still switches everything —
+     and there is one place to look when a colour is wrong.
+
+     `--series-1..3`, `--grid` and `--axis` are *not* aliased: they are shared
+     tokens under the same names, chosen for colour-vision separation and
+     validated against both grounds. Do not retint them to match the accent.
+     ------------------------------------------------------------------------ */
+  :root {
+    --plane: var(--bg-dark);
+    --surface: var(--bg-panel);
+    --text: var(--text-primary);
+    --text-2: var(--text-secondary);
+    --muted: var(--text-muted);
+    --border: var(--border-color);
+    --good: var(--success);
+    --success-text: var(--success);
+  }
+
+  /* Section headings, table headers and small labels take the display face,
+     which is most of what makes a page read as part of this system. */
+  .section-title, thead th, table th, .tile .label, .k {
+    font-family: var(--font-display);
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
   /* The dashboard's tokens. Copied rather than shared because both pages are
      `include_str!`d into the binary and there is no build step to share
      anything through. */
-  :root {
-    color-scheme: light;
-    --plane:        #f9f9f7;
-    --surface:      #fcfcfb;
-    --text:         #0b0b0b;
-    --text-2:       #52514e;
-    --muted:        #898781;
-    --grid:         #e1e0d9;
-    --border:       rgba(11,11,11,0.10);
-    --series-1:     #2a78d6;
-    --good:         #0ca30c;
-    --warning:      #fab219;
-    --serious:      #ec835a;
-    --critical:     #d03b3b;
-    --success-text: #006300;
-  }
-  :root[data-theme="dark"] {
-    color-scheme: dark;
-    --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
-    --muted:#898781; --grid:#2c2c2a; --border:rgba(255,255,255,0.10);
-    --series-1:#3987e5; --good:#0ca30c; --warning:#fab219; --serious:#ec835a;
-    --critical:#d03b3b; --success-text:#0ca30c;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      color-scheme: dark;
-      --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
-      --muted:#898781; --grid:#2c2c2a; --border:rgba(255,255,255,0.10);
-      --series-1:#3987e5; --success-text:#0ca30c;
-    }
-  }
 
   * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 28px 24px 72px;
-    background: var(--plane); color: var(--text);
-    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    -webkit-font-smoothing: antialiased;
-  }
+  /* Ground, colour and the IBM Plex Mono stack come from the shared
+     sheet; only this page's own padding is left. A local `font:` here
+     would put one app back on a system sans while the other four kept
+     the product face. */
+  body { padding: 28px 24px 72px; }
   .wrap { max-width: 1100px; margin: 0 auto; }
   header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
   h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
   .lede { color: var(--text-2); margin: 0 0 22px; }
   .links { margin-left: auto; display: flex; gap: 14px; align-items: baseline; }
-  .links a, .themebtn {
+  .links a {
     color: var(--text-2); text-decoration: none; font-size: 13px;
     border: 0; background: none; padding: 0; cursor: pointer; font-family: inherit;
   }
-  .links a:hover, .themebtn:hover { color: var(--text); text-decoration: underline; }
+  .links a:hover { color: var(--text); text-decoration: underline; }
 
   .section-title {
     font-size: 12px; text-transform: uppercase; letter-spacing: .07em;
@@ -64,11 +70,11 @@
   }
   .card {
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 10px; padding: 16px 18px; margin-bottom: 12px;
+    border-radius: 0; padding: 16px 18px; margin-bottom: 12px;
   }
 
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
-  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 14px 16px; }
   .tile .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
   .tile .value { font-size: 24px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .tile .value.attn { color: var(--critical); }
@@ -76,25 +82,25 @@
 
   .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
   select, input[type=text] {
-    font: inherit; font-size: 13px; padding: 5px 8px; border-radius: 7px;
+    font: inherit; font-size: 13px; padding: 5px 8px; border-radius: 0;
     border: 1px solid var(--border); background: var(--surface); color: var(--text);
   }
   .filters .spacer { margin-left: auto; }
 
   button.act {
-    font: inherit; font-size: 12.5px; padding: 5px 11px; border-radius: 7px; cursor: pointer;
+    font: inherit; font-size: 12.5px; padding: 5px 11px; border-radius: 0; cursor: pointer;
     border: 1px solid var(--border); background: var(--surface); color: var(--text);
   }
-  button.act:hover { border-color: var(--series-1); }
+  button.act:hover { border-color: var(--accent); }
   button.act.danger { color: var(--critical); }
   button.act.danger:hover { border-color: var(--critical); }
   button.act:disabled { opacity: .5; cursor: not-allowed; }
 
-  .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; flex: none; }
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 0; flex: none; }
   .tag.critical { background: color-mix(in srgb, var(--critical) 26%, transparent); color: var(--critical); }
   .tag.high     { background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
   .tag.medium   { background: color-mix(in srgb, var(--warning) 28%, transparent); color: var(--serious); }
-  .tag.low      { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
+  .tag.low      { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
   .tag.info     { background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--text-2); }
   .tag.block    { background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
   .tag.allow    { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
@@ -109,19 +115,19 @@
   .facts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
   .fact {
     font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    padding: 1px 6px; border-radius: 4px; background: color-mix(in srgb, var(--muted) 16%, transparent);
+    padding: 1px 6px; border-radius: 0; background: color-mix(in srgb, var(--muted) 16%, transparent);
     color: var(--text-2); overflow-wrap: anywhere;
   }
   details.respond { margin-top: 9px; }
   details.respond > summary {
-    cursor: pointer; font-size: 12.5px; color: var(--series-1); list-style: none;
+    cursor: pointer; font-size: 12.5px; color: var(--accent); list-style: none;
     display: inline-flex; align-items: center; gap: 5px;
   }
   details.respond > summary::-webkit-details-marker { display: none; }
   details.respond > summary::before { content: "▸"; font-size: 10px; }
   details.respond[open] > summary::before { content: "▾"; }
   .respond-body {
-    margin-top: 9px; padding: 12px 14px; border-radius: 8px;
+    margin-top: 9px; padding: 12px 14px; border-radius: 0;
     background: var(--plane); border: 1px solid var(--border);
   }
   .respond-body h4 {
@@ -132,14 +138,14 @@
   .respond-body li { margin-bottom: 4px; }
   .caveat {
     font-size: 12.5px; color: var(--text-2); margin-bottom: 14px; padding: 9px 11px;
-    border-left: 3px solid var(--warning); border-radius: 0 6px 6px 0;
+    border-left: 3px solid var(--warning); border-radius: 0;
     background: color-mix(in srgb, var(--warning) 9%, transparent);
   }
   .action { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 9px; }
   .action .effect { font-size: 12px; color: var(--text-2); flex: 1 1 260px; }
   details.ecs > summary { cursor: pointer; font-size: 12px; color: var(--muted); margin-top: 9px; }
   pre.ecs {
-    margin: 8px 0 0; padding: 10px 12px; border-radius: 8px; overflow: auto;
+    margin: 8px 0 0; padding: 10px 12px; border-radius: 0; overflow: auto;
     background: var(--plane); border: 1px solid var(--border);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
     color: var(--text-2); max-height: 320px;
@@ -169,11 +175,11 @@
     display: flex; gap: 14px; font-size: 11.5px; color: var(--text-2); margin-top: 6px;
   }
   .headline .swatch {
-    display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px;
+    display: inline-block; width: 8px; height: 8px; border-radius: 0; margin-right: 5px;
   }
 
   select.ttl {
-    font: inherit; font-size: 12px; padding: 3px 6px; border-radius: 6px;
+    font: inherit; font-size: 12px; padding: 3px 6px; border-radius: 0;
     border: 1px solid var(--border); background: var(--surface); color: var(--text);
   }
 
@@ -182,41 +188,37 @@
   code {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
     background: color-mix(in srgb, var(--muted) 16%, transparent);
-    padding: 1px 5px; border-radius: 4px;
+    padding: 1px 5px; border-radius: 0;
   }
 
   /* One line above the fold that reports what the last button press did. */
   .flash {
     position: sticky; top: 0; z-index: 5; margin: 0 0 14px;
-    padding: 10px 14px; border-radius: 8px; font-size: 13px; display: none;
+    padding: 10px 14px; border-radius: 0; font-size: 13px; display: none;
   }
   .flash.on { display: block; }
   .flash.ok { background: color-mix(in srgb, var(--good) 14%, var(--surface)); color: var(--success-text); }
   .flash.bad { background: color-mix(in srgb, var(--critical) 14%, var(--surface)); color: var(--critical); }
 </style>
-<script>
-// Before the body exists, so a stored choice is on the root element ahead of the
-// first paint. Doing this with the rest of the page script would render one
-// frame in the wrong theme on every load.
-//
-// The key is shared by /, /dashboard, /siem and /storage: a theme is a property
-// of the operator, not of the page, so following a link must not re-ask.
-try {
-  var t = localStorage.getItem("app-lb-theme");
-  if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
-} catch (e) { /* storage unavailable (private window, file://) — use the OS setting */ }
-</script>
+<!-- The theme used to be read from localStorage by a blocking script here.
+     It is now stamped on <html> by the server from a cookie, which is both
+     flash-free and shared across the fleet — localStorage is per-origin, so
+     the choice did not survive a hop to ci or app-obs. See ui/theme.js. -->
 </head>
 <body>
 <div class="wrap">
-  <header>
-    <h1>{{APP_NAME}} security</h1>
-    <div class="links">
+<header class="topbar">
+    <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
+    <nav class="topbar-nav">
       <a href="/">Directory</a>
       <a href="/dashboard">Dashboard</a>
+      <a href="/siem" aria-current="page">Security</a>
       <a href="/storage">Disks</a>
       <a href="/metrics">Metrics</a>
-      <button class="themebtn" id="themebtn" type="button">Theme</button>
+    </nav>
+    <div class="topbar-right">
+      <span class="topbar-user">{{WHO}}</span>
+      <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
     </div>
   </header>
   <p class="lede" id="lede">Loading…</p>
@@ -715,16 +717,9 @@ $("f-deployment").addEventListener("input", () => {
 });
 $("refresh").addEventListener("click", load);
 $("auto").addEventListener("change", schedule);
-$("themebtn").addEventListener("click", () => {
-  const root = document.documentElement;
-  const dark = root.getAttribute("data-theme") === "dark"
-    || (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
-  const next = dark ? "light" : "dark";
-  root.setAttribute("data-theme", next);
-  // Persisted so a refresh, or a hop to another app-lb page, keeps it. A
-  // failure here costs the preference and nothing else.
-  try { localStorage.setItem("app-lb-theme", next); } catch (e) { /* ignore */ }
-});
+// The theme toggle lives in the shared script (/__ui/theme.js): it writes a
+// cookie scoped to the parent domain, so the choice follows a person to every
+// Heyo app instead of stopping at this origin.
 
 load();
 schedule();

@@ -13,6 +13,13 @@
 
 mod artifacts;
 mod bus;
+// The platform UI kit — tokens, the theme cookie and forwarded identity —
+// shared with app-lb, app-obs, heyosecret and artifacts. Included by path
+// rather than depended on as a crate: those five apps sit on three different
+// axum versions, so the shared module deliberately names no framework type and
+// each one wires its own routes. See `ui/README.md`.
+#[path = "../../ui/ui.rs"]
+mod heyo_ui;
 mod config;
 mod dispatch;
 mod expr;

@@ -16,6 +16,7 @@ supporting CLIs, plugins, examples, docs, and reusable agent skills.
 - `app-obs/` — logs, metrics, retention, query API, and dashboard for deployments managed by app-lb.
 - `artifacts/` — content-addressed artifact store for ext4, wired into heyvm. Ships as a library, the `art` CLI, and a daemon.
 - `ci/` — heyvm-backed CI orchestrator and dashboard, with NATS JetStream as the job queue. Runs this repository's own `.ci/` workflows.
+- `ui/` — the shared dashboard UI: tokens, the theme cookie, forwarded identity and the fonts. app-lb, app-obs, ci, heyosecret and artifacts all serve it, so the five read as one product. See [`ui/README.md`](ui/README.md).
 - `plugins/` — printer plugins for agent integrations, codegraph, heyvm, and related tooling.
 - `skills/` — reusable public agent skills. The top-level catalog is intentionally small: `heyvm` and `git-submit`.
 - `examples/` — example projects and specs.

@@ -1,69 +1,57 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" {{HTML_ATTRS}}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{APP_NAME}} dashboard</title>
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
 <style>
+  /* ------------------------------------------------------------------------
+     app-lb, layered on ui/heyo.css — the same sheet ci, app-obs, heyosecret and
+     artifacts serve, so the five read as one product.
+
+     **These names are aliases, not a second palette.** These pages were written
+     against `--surface`/`--plane`/`--text-2`; each now resolves to a shared
+     token rather than being renamed at several hundred call sites. `var()`
+     resolves at use time, so switching the theme still switches everything —
+     and there is one place to look when a colour is wrong.
+
+     `--series-1..3`, `--grid` and `--axis` are *not* aliased: they are shared
+     tokens under the same names, chosen for colour-vision separation and
+     validated against both grounds. Do not retint them to match the accent.
+     ------------------------------------------------------------------------ */
   :root {
-    color-scheme: light;
-    --plane:        #f9f9f7;
-    --surface:      #fcfcfb;
-    --text:         #0b0b0b;
-    --text-2:       #52514e;
-    --muted:        #898781;
-    --grid:         #e1e0d9;
-    --axis:         #c3c2b7;
-    --border:       rgba(11,11,11,0.10);
-    --series-1:     #2a78d6;  /* blue   — requests / primary */
-    --series-1-dim: #cde2fb;
-    --series-2:     #1baf7a;  /* aqua   — created / positive flow */
-    --series-3:     #eb6834;  /* orange — reaped / drained flow */
-    --good:         #0ca30c;
-    --warning:      #fab219;
-    --serious:      #ec835a;
-    --critical:     #d03b3b;
-    --success-text: #006300;
-  }
-  :root[data-theme="dark"], :root.dark {
-    color-scheme: dark;
-    --plane:        #0d0d0d;
-    --surface:      #1a1a19;
-    --text:         #ffffff;
-    --text-2:       #c3c2b7;
-    --muted:        #898781;
-    --grid:         #2c2c2a;
-    --axis:         #383835;
-    --border:       rgba(255,255,255,0.10);
-    --series-1:     #3987e5;
-    --series-1-dim: #184f95;
-    --series-2:     #199e70;
-    --series-3:     #d95926;
-    --good:         #0ca30c;
-    --warning:      #fab219;
-    --serious:      #ec835a;
-    --critical:     #d03b3b;
-    --success-text: #0ca30c;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      color-scheme: dark;
-      --plane:#0d0d0d; --surface:#1a1a19; --text:#fff; --text-2:#c3c2b7;
-      --muted:#898781; --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
-      --series-1:#3987e5; --series-1-dim:#184f95; --series-2:#199e70; --series-3:#d95926;
-      --success-text:#0ca30c;
-    }
+    --plane: var(--bg-dark);
+    --surface: var(--bg-panel);
+    --text: var(--text-primary);
+    --text-2: var(--text-secondary);
+    --muted: var(--text-muted);
+    --border: var(--border-color);
+    --good: var(--success);
+    --success-text: var(--success);
   }
 
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--plane);
-    color: var(--text);
-    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
-    -webkit-font-smoothing: antialiased;
+  /* Section headings, table headers and small labels take the display face,
+     which is most of what makes a page read as part of this system. */
+  .section-title, thead th, table th, .tile .label, .k {
+    font-family: var(--font-display);
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--text-muted);
   }
-  a { color: var(--series-1); }
+
+
+  * { box-sizing: border-box; }
+  /* `body` is the shared sheet's: ground, colour and the IBM Plex Mono
+     stack all come from ui/heyo.css, and a local `font:` here would
+     silently put this page back on a system sans while the other four
+     apps stayed on the product face. */
+  /* Links are the accent, from the shared sheet. They used to be the blue
+     of chart series 1, which put a data colour on a control and made the
+     one peach thing on the page compete with it. */
   .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 20px 64px; }
 
   header.top {
@@ -76,15 +64,15 @@
   .pill {
     display: inline-flex; align-items: center; gap: 6px;
     font-size: 12px; color: var(--text-2);
-    border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px;
+    border: 1px solid var(--border); border-radius: 0; padding: 4px 10px;
     background: var(--surface);
   }
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+  .dot { width: 7px; height: 7px; border-radius: 0; background: var(--good); }
   .dot.stale { background: var(--warning); }
   button.ghost {
     font: inherit; font-size: 12px; color: var(--text-2);
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 999px; padding: 4px 12px; cursor: pointer;
+    border-radius: 0; padding: 4px 12px; cursor: pointer;
   }
   button.ghost:hover { color: var(--text); }
   /* An anchor that sits in the button row. Same pill, but it navigates rather
@@ -92,7 +80,7 @@
   a.ghost {
     font: inherit; font-size: 12px; color: var(--text-2); text-decoration: none;
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 999px; padding: 4px 12px;
+    border-radius: 0; padding: 4px 12px;
   }
   a.ghost:hover { color: var(--text); }
 
@@ -106,14 +94,14 @@
   /* A way out of a summary and into the page that can act on it. */
   .section-title a.out {
     text-transform: none; letter-spacing: 0; font-weight: 500;
-    color: var(--series-1); text-decoration: none; margin-left: auto;
+    color: var(--accent); text-decoration: none; margin-left: auto;
   }
   .section-title a.out:hover { text-decoration: underline; }
 
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: 0;
     padding: 16px 18px;
   }
 
@@ -134,7 +122,7 @@
   .hist { display: flex; flex-direction: column; gap: 5px; }
   .hbar { display: grid; grid-template-columns: 68px 1fr 52px; align-items: center; gap: 8px; }
   .hbar .k { font-size: 11px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
-  .hbar .track { height: 14px; background: var(--grid); border-radius: 4px; overflow: hidden; }
+  .hbar .track { height: 14px; background: var(--grid); border-radius: 0; overflow: hidden; }
   /* Transitioned because `renderHist` updates these in place rather than
      rebuilding them — a rebuilt element has no previous width to animate from. */
   /* `display: block` is load-bearing, not tidiness. The fill is a <span>, and
@@ -144,7 +132,7 @@
      browser quirk, which is why nothing about it is conditional. */
   .hbar .fill {
     display: block;
-    height: 100%; background: var(--series-1); border-radius: 4px; min-width: 2px;
+    height: 100%; background: var(--series-1); border-radius: 0; min-width: 2px;
     transition: width .45s cubic-bezier(.22,.61,.36,1);
   }
   @media (prefers-reduced-motion: reduce) { .hbar .fill { transition: none; } }
@@ -165,13 +153,13 @@
      hostnames still reads as one line of metadata, not a wall of links. */
   .dep-head .dep-link {
     font-size: 12px; font-variant-numeric: tabular-nums; text-decoration: none;
-    padding: 1px 7px; border-radius: 4px; white-space: nowrap;
-    color: var(--series-1); border: 1px solid color-mix(in srgb, var(--series-1) 35%, transparent);
+    padding: 1px 7px; border-radius: 0; white-space: nowrap;
+    color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   }
   .dep-head .dep-link::after { content: " ↗"; opacity: .6; }
-  .dep-head .dep-link:hover { background: color-mix(in srgb, var(--series-1) 12%, transparent); }
+  .dep-head .dep-link:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
   .dep-head .badge {
-    font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; padding: 2px 8px; border-radius: 0;
     border: 1px solid var(--border); color: var(--text-2);
     font-variant-numeric: tabular-nums;
   }
@@ -179,8 +167,8 @@
   @media (max-width: 720px) { .dep-grid { grid-template-columns: 1fr; } }
 
   .gauge-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-2); margin-bottom: 5px; }
-  .gauge-track { height: 10px; border-radius: 5px; background: var(--grid); overflow: hidden; position: relative; }
-  .gauge-fill { height: 100%; border-radius: 5px; background: var(--series-1); transition: width .3s ease; }
+  .gauge-track { height: 10px; border-radius: 0; background: var(--grid); overflow: hidden; position: relative; }
+  .gauge-fill { height: 100%; border-radius: 0; background: var(--accent); transition: width .3s ease; }
   .gauge-fill.warn { background: var(--warning); }
   .gauge-fill.crit { background: var(--critical); }
 
@@ -194,17 +182,17 @@
   table.vms td { padding: 5px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
   table.vms td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-2); }
   .vm-load { display: inline-flex; align-items: center; gap: 6px; }
-  .vm-load .track { width: 60px; height: 8px; background: var(--grid); border-radius: 4px; overflow: hidden; }
+  .vm-load .track { width: 60px; height: 8px; background: var(--grid); border-radius: 0; overflow: hidden; }
   /* Blockified for the same reason as `.hbar .fill` above: an inline span
      ignores width, so the per-VM load and CPU bars painted nothing either. */
-  .vm-load .fill { display: block; height: 100%; background: var(--series-1); border-radius: 4px; }
-  .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; }
+  .vm-load .fill { display: block; height: 100%; background: var(--series-1); border-radius: 0; }
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 0; }
   .tag.drain { background: color-mix(in srgb, var(--serious) 22%, transparent); color: var(--serious); }
   .tag.down { background: color-mix(in srgb, var(--critical) 22%, transparent); color: var(--critical); }
   .tag.ok { background: color-mix(in srgb, var(--good) 20%, transparent); color: var(--success-text); }
   /* A VM still booting, and the same VM once its boot has outlasted what a
      request will wait for — the point at which it stops being routine. */
-  .tag.boot { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
+  .tag.boot { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
   .tag.slow { background: color-mix(in srgb, var(--warning) 26%, transparent); color: var(--serious); }
   .tag.idle { background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--text-2); }
   /* Rows whose subject is on its way out (a cert near expiry, a failed job). */
@@ -214,13 +202,13 @@
   .chips { display: flex; flex-wrap: wrap; gap: 4px; }
   .chip {
     font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    padding: 1px 6px; border-radius: 4px; background: var(--grid); color: var(--text-2);
+    padding: 1px 6px; border-radius: 0; background: var(--grid); color: var(--text-2);
   }
 
   /* Job transcript in the modal. */
   pre.log {
     margin: 0; max-height: 46vh; overflow: auto; background: var(--plane);
-    border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px;
+    border: 1px solid var(--border); border-radius: 0; padding: 10px 12px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
     line-height: 1.5; white-space: pre-wrap; word-break: break-word;
   }
@@ -228,7 +216,7 @@
 
   .legend { display: flex; gap: 14px; font-size: 12px; color: var(--text-2); flex-wrap: wrap; }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
-  .swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .swatch { width: 10px; height: 10px; border-radius: 0; display: inline-block; }
   .empty { color: var(--muted); padding: 30px 0; text-align: center; }
   .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
 
@@ -237,14 +225,14 @@
   .btn {
     font: inherit; font-size: 12px; line-height: 1; color: var(--text-2);
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 6px; padding: 5px 10px; cursor: pointer; white-space: nowrap;
+    border-radius: 0; padding: 5px 10px; cursor: pointer; white-space: nowrap;
   }
   .btn:hover { color: var(--text); border-color: var(--axis); }
-  .btn.primary { color: #fff; background: var(--series-1); border-color: transparent; }
+  .btn.primary { color: #fff; background: var(--accent); border-color: transparent; }
   .btn.primary:hover { filter: brightness(1.06); }
   .btn.danger { color: var(--critical); }
   .btn.danger:hover { background: color-mix(in srgb, var(--critical) 12%, transparent); border-color: var(--critical); }
-  .btn.mini { padding: 3px 7px; font-size: 11px; border-radius: 5px; }
+  .btn.mini { padding: 3px 7px; font-size: 11px; border-radius: 0; }
   .btn:disabled { opacity: .5; cursor: default; }
   table.vms td.rowactions { display: flex; gap: 5px; }
 
@@ -254,7 +242,7 @@
   .dep-controls.on { display: flex; }
   .dep-controls input[type=search] {
     font: inherit; font-size: 12px; color: var(--text); background: var(--plane);
-    border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; min-width: 220px;
+    border: 1px solid var(--border); border-radius: 0; padding: 5px 9px; min-width: 220px;
   }
   .dep-range { font-size: 12px; color: var(--text-2); margin-left: auto; }
 
@@ -266,7 +254,7 @@
   }
   .modal-overlay.open { display: flex; }
   .modal {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 0;
     width: 100%; max-width: 620px; box-shadow: 0 12px 40px rgba(0,0,0,0.3);
   }
   .modal h2 { font-size: 16px; font-weight: 650; margin: 0; padding: 18px 20px 0; }
@@ -275,7 +263,7 @@
   .modal-body label { display: block; font-size: 12px; color: var(--text-2); margin: 12px 0 4px; }
   .modal-body input[type=number], .modal-body textarea {
     width: 100%; font: inherit; color: var(--text); background: var(--plane);
-    border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px;
+    border: 1px solid var(--border); border-radius: 0; padding: 8px 10px;
   }
   .modal-body textarea { min-height: 320px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; resize: vertical; }
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px; }
@@ -286,35 +274,38 @@
   #toast {
     position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
     background: var(--text); color: var(--surface); font-size: 13px;
-    padding: 9px 16px; border-radius: 8px; opacity: 0; transition: opacity .25s;
+    padding: 9px 16px; border-radius: 0; opacity: 0; transition: opacity .25s;
     pointer-events: none; z-index: 60; max-width: 90vw;
   }
   #toast.show { opacity: 1; }
   #toast.err { background: var(--critical); color: #fff; }
 </style>
-<script>
-// Before the body exists, so a stored choice is on the root element ahead of the
-// first paint. Doing this with the rest of the page script would render one
-// frame in the wrong theme on every load.
-//
-// The key is shared by /, /dashboard, /siem and /storage: a theme is a property
-// of the operator, not of the page, so following a link must not re-ask.
-try {
-  var t = localStorage.getItem("app-lb-theme");
-  if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
-} catch (e) { /* storage unavailable (private window, file://) — use the OS setting */ }
-</script>
+<!-- The theme used to be read from localStorage by a blocking script here.
+     It is now stamped on <html> by the server from a cookie, which is both
+     flash-free and shared across the fleet — localStorage is per-origin, so
+     the choice did not survive a hop to ci or app-obs. See ui/theme.js. -->
 </head>
 <body>
 <div class="wrap">
-  <header class="top">
-    <h1>{{APP_NAME}}</h1>
-    <span class="sub" id="uptime">—</span>
-    <span class="spacer"></span>
-    <span class="pill"><span class="dot" id="livedot"></span><span id="updated">connecting…</span></span>
-    <a class="ghost" href="/storage">Disks</a>
-    <button class="ghost" id="pausebtn">Pause</button>
-    <button class="ghost" id="themebtn">Theme</button>
+<header class="topbar">
+    <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
+    <nav class="topbar-nav">
+      <a href="/">Directory</a>
+      <a href="/dashboard" aria-current="page">Dashboard</a>
+      <a href="/siem">Security</a>
+      <a href="/storage">Disks</a>
+      <a href="/metrics">Metrics</a>
+    </nav>
+    <div class="topbar-right">
+      <!-- `uptime`, `livedot` and `updated` keep their ids: the poll loop
+           writes into all three, and a tidier bar that stopped updating would
+           be the wrong trade. -->
+      <span class="sub" id="uptime">—</span>
+      <span class="pill"><span class="dot" id="livedot"></span><span id="updated">connecting…</span></span>
+      <span class="topbar-user">{{WHO}}</span>
+      <button class="btn btn-sm" id="pausebtn">Pause</button>
+      <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
+    </div>
   </header>
 
   <div class="section-title">Host &amp; fleet</div>
@@ -1796,16 +1787,9 @@ $("pausebtn").addEventListener("click", () => {
   if (!paused) { poll(); pollSlow(); }
   else { clearTimeout(timer); clearTimeout(slowTimer); }
 });
-$("themebtn").addEventListener("click", () => {
-  const root = document.documentElement;
-  const dark = root.getAttribute("data-theme") === "dark"
-    || (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
-  const next = dark ? "light" : "dark";
-  root.setAttribute("data-theme", next);
-  // Persisted so a refresh, or a hop to another app-lb page, keeps it. A
-  // failure here costs the preference and nothing else.
-  try { localStorage.setItem("app-lb-theme", next); } catch (e) { /* ignore */ }
-});
+// The theme toggle lives in the shared script (/__ui/theme.js): it writes a
+// cookie scoped to the parent domain, so the choice follows a person to every
+// Heyo app instead of stopping at this origin.
 
 poll();
 // Second, independent loop. Started after `poll` so `depsById` is usually already

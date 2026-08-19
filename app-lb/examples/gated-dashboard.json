@@ -10,8 +10,9 @@
     "client_secret": { "secret": "google", "key": "client_secret" },
     "allowed_domains": ["heyo.computer"],
     "allowed_emails": [],
-    "public_paths": ["/healthz"],
+    "public_paths": ["/healthz", "/__ui/"],
     "session_ttl_secs": 43200,
+    "cookie_domain": "us2.heyo.work",
     "forward_identity": true
   }
 }

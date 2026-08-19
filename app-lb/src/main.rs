@@ -4,6 +4,14 @@
 //! admin API and the proxy routes traffic to a pool of VMs, booting and reaping
 //! them to match load.
 
+// The platform UI kit — tokens, the theme cookie and forwarded identity —
+// shared with app-obs, ci, heyosecret and artifacts. Included by path rather
+// than depended on as a crate: this crate is on axum 0.7 and three of the
+// others are on 0.8, and the shared module names no framework type. See
+// `ui/README.md`.
+#[path = "../../ui/ui.rs"]
+mod heyo_ui;
+
 mod acme;
 mod admin;
 mod artifact;

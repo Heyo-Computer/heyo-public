@@ -26,6 +26,11 @@ const DASHBOARD_HTML: &str = include_str!("assets/dashboard.html");
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(page))
+        // The shared stylesheet, theme toggle and fonts, served by this binary.
+        // Outside the session check on purpose: a login screen that cannot
+        // fetch its own stylesheet is a login screen nobody can read, and these
+        // are static public bytes.
+        .route("/__ui/{*path}", get(ui_asset))
         .route("/dashboard", get(page))
         .route("/dashboard/login", post(login))
         .route("/dashboard/logout", post(logout))
@@ -44,19 +49,81 @@ struct LoginRequest {
     password: String,
 }
 
-async fn page() -> Html<&'static str> {
-    Html(DASHBOARD_HTML)
+/// The dashboard shell.
+///
+/// Substituted rather than served verbatim, for one reason: the theme has to be
+/// on the `<html>` tag in the *first* response, or every navigation flashes the
+/// wrong palette before script can correct it. `{{HTML_ATTRS}}` is filled from
+/// the theme cookie, and `{{WHO}}` from the identity app-lb forwarded when this
+/// deployment is gated.
+///
+/// `str::replace` rather than a template engine, matching app-lb's dashboards —
+/// with the test below standing in for what maud would have checked at compile
+/// time: that no placeholder survives into a served page.
+async fn page(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {
+    Html(render_shell(&state, &headers))
+}
+
+fn render_shell(state: &AppState, headers: &HeaderMap) -> String {
+    let cookies = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    let who = forwarded_identity(state, headers)
+        .map(|i| crate::heyo_ui::escape(i.display()))
+        .unwrap_or_default();
+    DASHBOARD_HTML
+        .replace("{{HTML_ATTRS}}", &state.ui_cookies.attrs(cookies))
+        .replace("{{WHO}}", &who)
+}
+
+/// `GET /__ui/{*path}` — the platform stylesheet, theme script and fonts.
+async fn ui_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    match crate::heyo_ui::asset(&path) {
+        Some(a) => (
+            [
+                (axum::http::header::CONTENT_TYPE, a.content_type),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    crate::heyo_ui::cache_control(&a),
+                ),
+            ],
+            a.bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+    }
+}
+
+/// The identity app-lb forwarded, but only where this deployment says there is
+/// a gate in front to trust. Without `dashboard_gate` the headers are whatever
+/// the client sent.
+fn forwarded_identity(state: &AppState, headers: &HeaderMap) -> Option<crate::heyo_ui::Identity> {
+    if !state.config.dashboard_gate {
+        return None;
+    }
+    crate::heyo_ui::identity_from(|name| headers.get(name).and_then(|v| v.to_str().ok()))
 }
 
 /// Reports whether the dashboard is enabled and whether this request is
 /// already authenticated. Used by the frontend to decide which view to show.
 async fn session_info(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let enabled = state.config.dashboard_enabled();
+    let gated = state.config.dashboard_gate;
+    // Under a gate the identity *is* the session: app-lb only forwards one for
+    // a request it authenticated, and it strips the headers before setting
+    // them, so a client cannot supply its own.
     let authenticated = enabled
-        && auth::request_has_valid_session(&state.config.session_signing_key(), &headers);
+        && if gated {
+            forwarded_identity(&state, &headers).is_some()
+        } else {
+            auth::request_has_valid_session(&state.config.session_signing_key(), &headers)
+        };
     Json(json!({
         "dashboardEnabled": enabled,
         "authenticated": authenticated,
+        // The page uses this to decide whether to offer a sign-out: under a
+        // gate the session belongs to app-lb and a button here could not end it.
+        "gated": gated,
     }))
 }
 
@@ -94,6 +161,19 @@ fn require_session(state: &AppState, headers: &HeaderMap) -> Result<(), Response
             StatusCode::SERVICE_UNAVAILABLE,
             "dashboard is disabled",
         ));
+    }
+    if state.config.dashboard_gate {
+        return if forwarded_identity(state, headers).is_some() {
+            Ok(())
+        } else {
+            // A request that reached a gated deployment without an identity is
+            // either an app-token caller or a direct hit on the listener.
+            // Neither is a person this dashboard should answer.
+            Err(json_error(
+                StatusCode::UNAUTHORIZED,
+                "no forwarded identity; this dashboard is behind a gate",
+            ))
+        };
     }
     if auth::request_has_valid_session(&state.config.session_signing_key(), headers) {
         Ok(())
@@ -235,4 +315,47 @@ async fn revoke_secret(
 
 fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::DASHBOARD_HTML;
+
+    /// `str::replace` has no compile-time check that every placeholder was
+    /// filled — that is the cost of an `include_str!`d page over a maud one, and
+    /// this test is what pays it. A placeholder that survives is rendered
+    /// literally into the browser.
+    #[test]
+    fn every_placeholder_is_filled_and_none_are_invented() {
+        for token in ["{{HTML_ATTRS}}", "{{WHO}}"] {
+            assert!(
+                DASHBOARD_HTML.contains(token),
+                "{token} is gone from the page; the shell fills it, so something \
+                 that depends on it — the theme, or the signed-in name — is now \
+                 missing"
+            );
+        }
+        let rendered = DASHBOARD_HTML
+            .replace("{{HTML_ATTRS}}", r#"data-theme="dark""#)
+            .replace("{{WHO}}", "ops@example.com");
+        assert!(
+            !rendered.contains("{{"),
+            "a placeholder survived rendering: {:?}",
+            rendered
+                .match_indices("{{")
+                .map(|(i, _)| &rendered[i..(i + 24).min(rendered.len())])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The page must reach its stylesheet from a private network and over a
+    /// tunnel, so every asset it names is this binary's own.
+    #[test]
+    fn the_page_names_no_external_asset() {
+        assert!(DASHBOARD_HTML.contains(r#"href="/__ui/heyo.css""#));
+        assert!(DASHBOARD_HTML.contains(r#"src="/__ui/theme.js""#));
+        for external in ["src=\"http", "href=\"http", "src=\"//", "href=\"//"] {
+            assert!(!DASHBOARD_HTML.contains(external), "external asset: {external}");
+        }
+    }
 }

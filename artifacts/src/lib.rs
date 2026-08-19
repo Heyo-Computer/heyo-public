@@ -29,6 +29,12 @@ compile_error!(
 
 #[cfg(feature = "daemon")]
 pub mod admin;
+// The platform UI kit — tokens, the theme cookie and forwarded identity —
+// shared with app-lb, app-obs, ci and heyosecret. Included by path rather than
+// depended on as a crate, because those apps sit on three axum versions and two
+// Rust editions; the shared module names no framework type. See `ui/README.md`.
+#[path = "../../ui/ui.rs"]
+pub mod heyo_ui;
 pub mod cli;
 pub mod config;
 pub mod digest;

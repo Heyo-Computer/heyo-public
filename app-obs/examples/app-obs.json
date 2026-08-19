@@ -9,6 +9,8 @@
     "client_id": "REPLACE.apps.googleusercontent.com",
     "client_secret": { "secret": "google", "key": "client_secret" },
     "allowed_domains": ["heyo.work"],
-    "public_paths": ["/healthz"]
+    "public_paths": ["/healthz", "/__ui/"],
+    "cookie_domain": "us2.heyo.work",
+    "forward_identity": true
   }
 }

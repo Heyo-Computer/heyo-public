@@ -5,158 +5,156 @@
 //! here, where app-lb's `include_str!` + `str::replace` approach needs a test
 //! asserting no `{{` survives rendering.
 //!
-//! Pages are self-contained — the stylesheet is inline and there are no external
-//! assets. Everything in this ecosystem gets read over an SSH tunnel sooner or
-//! later, and a dashboard that needs a CDN is a dashboard that is blank exactly
-//! when someone is debugging.
+//! The look is the platform's, from `ui/heyo.css` — the same tokens the
+//! marketing and retail sites use — served by *this binary* at `/__ui/`, not by
+//! a CDN. That distinction is the one that matters: everything in this
+//! ecosystem gets read over an SSH tunnel sooner or later, and a dashboard that
+//! needs a third party is a dashboard that is blank exactly when someone is
+//! debugging. What is left in `STYLE` below is only what is peculiar to this
+//! app; anything a second app would want belongs in the shared file.
 
 use crate::runners::{Pool, Runner, RunnerSet, RunnerStatus};
 use crate::store::{ArtifactRow, JobRow, Repo, RepoToken, Run, StepRow};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use std::time::Duration;
 
-/// Inline stylesheet. Dark and light both come from `prefers-color-scheme`;
-/// nothing here needs a toggle.
+/// What is specific to `ci`, layered on `ui/heyo.css`.
+///
+/// Everything general — tokens, type, tables, buttons, forms, pills, banners —
+/// comes from the shared sheet. This is the residue: the step accordion, the
+/// job DAG, the repository cards, and the mapping from this app's status
+/// vocabulary onto the shared pill colours.
 const STYLE: &str = r#"
-:root {
-  --bg: #ffffff; --fg: #16181d; --muted: #666e7a; --line: #e3e6ea;
-  --accent: #2b5cff; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --idle: #6e7781;
-  --card: #f7f8fa;
+/* Page furniture. `main` is the shared `.wrap` by another name; ci's pages
+   predate it and there are 26 of them, so the element is styled instead of
+   every page being edited to add a class. */
+main { max-width: 1200px; margin: 0 auto; padding: var(--gap-5) var(--gap-5) var(--gap-6); }
+section { margin-bottom: var(--gap-6); }
+h1.page { font-size: 15px; margin: 0 0 var(--gap-1); }
+.sub { color: var(--text-muted); font-size: 12px; margin: calc(-1 * var(--gap-2)) 0 var(--gap-4); }
+
+/* This app's status vocabulary, mapped onto the shared status colours. The
+   names come from the database (`ci_job.status`, `ci_vm_pool.status`) and from
+   heyvm's runner states, so they are mapped here rather than renamed at 40 call
+   sites — and a status this list forgets still renders as a neutral pill rather
+   than as nothing. */
+.pill.online, .pill.success, .pill.ready { border-color: var(--success); color: var(--success); }
+.pill.stale, .pill.warn { border-color: var(--warning); color: var(--warning); }
+.pill.failure, .pill.orphaned, .pill.error { border-color: var(--danger); color: var(--danger); }
+.pill.running, .pill.building { border-color: var(--accent); color: var(--accent); }
+.pill.offline, .pill.queued, .pill.pending, .pill.skipped, .pill.cancelled, .pill.draining {
+  border-color: var(--border-color); color: var(--text-muted);
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1117; --fg: #e6edf3; --muted: #8b949e; --line: #23262d;
-    --accent: #6b8afd; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --idle: #6e7681;
-    --card: #161b22;
-  }
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0; background: var(--bg); color: var(--fg);
-  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-}
-header {
-  display: flex; align-items: baseline; gap: 1.5rem;
-  padding: 1rem 1.5rem; border-bottom: 1px solid var(--line);
-}
-header h1 { font-size: 1rem; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
-header nav { display: flex; gap: 1rem; }
-header nav a { color: var(--muted); text-decoration: none; }
-header nav a:hover, header nav a.on { color: var(--fg); }
-header .who { margin-left: auto; color: var(--muted); font-size: 0.875rem; }
-main { padding: 1.5rem; max-width: 72rem; }
-h2 { font-size: 0.95rem; margin: 0 0 0.75rem; font-weight: 650; }
-.sub { color: var(--muted); font-size: 0.875rem; margin: -0.5rem 0 1rem; }
-.scroll { overflow-x: auto; }
-table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
-th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--line); }
-th { color: var(--muted); font-weight: 500; font-size: 0.8rem; text-transform: uppercase;
-     letter-spacing: 0.04em; white-space: nowrap; }
-td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
-.pill {
-  display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px;
-  font-size: 0.78rem; font-weight: 550; border: 1px solid currentColor;
-}
-.pill.online { color: var(--ok); } .pill.stale { color: var(--warn); }
-.pill.offline { color: var(--idle); } .pill.orphaned { color: var(--bad); }
-.banner {
-  padding: 0.7rem 0.9rem; border-radius: 6px; margin-bottom: 1.25rem;
-  background: var(--card); border-left: 3px solid var(--bad); font-size: 0.9rem;
-}
-.empty { color: var(--muted); padding: 1.25rem 0; }
-section { margin-bottom: 2rem; }
-a { color: var(--accent); }
-tr.link:hover { background: var(--card); cursor: pointer; }
-td a.row { display: block; color: inherit; text-decoration: none; }
-.pill.success { color: var(--ok); } .pill.failure { color: var(--bad); }
-.pill.running, .pill.building { color: var(--accent); } .pill.queued, .pill.pending { color: var(--idle); }
-.pill.skipped, .pill.cancelled { color: var(--idle); }
-.meta { color: var(--muted); font-size: 0.85rem; }
-.meta code { color: var(--fg); }
-h1.page { font-size: 1.15rem; margin: 0 0 0.25rem; font-weight: 650; }
-.step { border: 1px solid var(--line); border-radius: 6px; margin-bottom: 0.6rem; }
+
+/* The step accordion on a job page. `details`/`summary` rather than a
+   scripted toggle: it works with JavaScript off, it is keyboard-navigable for
+   free, and `open` survives a page that re-renders under a live log stream. */
+.step { border: 1px solid var(--border-color); margin-bottom: var(--gap-2); background: var(--bg-panel); }
 .step > summary {
-  display: flex; align-items: center; gap: 0.6rem; padding: 0.55rem 0.8rem;
-  cursor: pointer; list-style: none; font-size: 0.9rem;
+  display: flex; align-items: center; gap: var(--gap-2);
+  padding: var(--gap-2) var(--gap-3); cursor: pointer; list-style: none; font-size: 12px;
 }
 .step > summary::-webkit-details-marker { display: none; }
-.step > summary::before { content: "▸"; color: var(--muted); font-size: 0.75rem; }
-.step[open] > summary::before { content: "▾"; }
+.step > summary::before { content: "\25b8"; color: var(--text-muted); font-size: 10px; }
+.step[open] > summary::before { content: "\25be"; }
 .step .grow { flex: 1; }
-pre.log {
-  margin: 0; padding: 0.7rem 0.9rem; border-top: 1px solid var(--line);
-  background: var(--card); overflow-x: auto; white-space: pre-wrap;
-  word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.82rem; line-height: 1.45; max-height: 32rem; overflow-y: auto;
-}
-pre.log:empty::after { content: "(no output)"; color: var(--muted); }
-.dag { display: flex; flex-direction: column; gap: 0.35rem; }
-.dag .wave { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
-.dag .needs { color: var(--muted); font-size: 0.8rem; }
-.notice {
-  padding: 0.7rem 0.9rem; border-radius: 6px; margin-bottom: 1.25rem;
-  background: var(--card); border-left: 3px solid var(--ok); font-size: 0.9rem;
-}
-form.row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: flex-end; }
-form.row label { display: flex; flex-direction: column; gap: 0.2rem;
-  font-size: 0.8rem; color: var(--muted); }
-input[type=text], select {
-  font: inherit; font-size: 0.85rem; padding: 0.35rem 0.5rem; min-width: 16rem;
-  border: 1px solid var(--line); border-radius: 5px;
-  background: var(--bg); color: var(--fg);
-}
-button {
-  font: inherit; font-size: 0.85rem; padding: 0.38rem 0.8rem; cursor: pointer;
-  border: 1px solid var(--line); border-radius: 5px;
-  background: var(--card); color: var(--fg);
-}
-button:hover { border-color: var(--accent); color: var(--accent); }
-button.quiet { background: none; border-color: transparent; color: var(--muted); }
-button.quiet:hover { color: var(--bad); border-color: var(--line); }
-.repo { border: 1px solid var(--line); border-radius: 6px; padding: 0.9rem 1rem;
-  margin-bottom: 0.9rem; }
-.repo h3 { margin: 0 0 0.15rem; font-size: 0.95rem; font-weight: 650; }
-.repo .head { display: flex; align-items: baseline; gap: 0.6rem; }
+
+/* Step output. The shared `.log` rules cover the body; these two are about
+   living inside a `<details>` — flush to the summary above it, and saying so
+   when a step produced nothing rather than collapsing to a 2px sliver. */
+pre.log { margin: 0; border-top: 1px solid var(--border-color); border-left: 0; border-right: 0; border-bottom: 0; max-height: 32rem; }
+pre.log:empty::after { content: "(no output)"; color: var(--text-muted); }
+
+/* The job graph on a run page: one row per wave, jobs left to right. */
+.dag { display: flex; flex-direction: column; gap: var(--gap-1); }
+.dag .wave { display: flex; gap: var(--gap-2); flex-wrap: wrap; align-items: center; }
+.dag .needs { color: var(--text-muted); font-size: 11px; }
+
+/* A registered repository on /repos. */
+.repo { border: 1px solid var(--border-color); background: var(--bg-panel); padding: var(--gap-3) var(--gap-4); margin-bottom: var(--gap-3); }
+.repo h3 { margin: 0 0 2px; }
+.repo .head { display: flex; align-items: baseline; gap: var(--gap-2); }
 .repo .head form { margin-left: auto; }
+
+/* A freshly minted token, shown exactly once. Dashed and in the warning colour
+   because that is the point: this is the only time anyone will see it, and the
+   border is the difference between a value you copy now and one you assume you
+   can come back for. `user-select: all` makes it one click to take. */
 .secret {
-  margin: 0.5rem 0 0; padding: 0.6rem 0.8rem; border-radius: 6px;
-  background: var(--card); border: 1px dashed var(--warn);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem;
-  white-space: pre-wrap; word-break: break-all; user-select: all;
+  margin: var(--gap-2) 0 0; padding: var(--gap-2) var(--gap-3);
+  background: var(--bg-dark); border: 1px dashed var(--warning);
+  font-size: 12px; white-space: pre-wrap; word-break: break-all; user-select: all;
 }
+
+/* A destructive control that should not look like a call to action — revoke,
+   delete, disable. Invisible until hovered, then unmistakably red. */
+button.quiet { background: none; border-color: transparent; color: var(--text-muted); }
+button.quiet:hover { color: var(--danger); border-color: var(--border-color); background: none; }
+
+/* `.notice` predates the shared `.banner` and means "this worked". Kept as an
+   alias rather than renamed at its call sites. */
+.notice { padding: var(--gap-3) var(--gap-4); margin-bottom: var(--gap-4);
+  background: var(--bg-panel); border: 1px solid var(--border-accent);
+  border-left: 3px solid var(--success); font-size: 12px; }
+.banner { border-left-color: var(--danger); }
+
+/* Forms on /repos are inline: label above field, wrapped in a row. */
+form.row { display: flex; gap: var(--gap-2); flex-wrap: wrap; align-items: flex-end; }
+form.row label { display: flex; flex-direction: column; gap: 2px; }
+form.row input[type=text], form.row select { min-width: 16rem; }
 "#;
+
+/// Everything the shell needs that is not the page itself.
+///
+/// One struct rather than three parameters threaded through seven page
+/// functions, and it exists because the *theme* has to reach the `<html>` tag.
+/// The alternative — reading the cookie in JavaScript on load — is a page that
+/// flashes the wrong ground on every navigation, which is the one thing people
+/// notice about a dashboard's theming.
+pub struct Chrome<'a> {
+    pub app_name: &'a str,
+    /// The app-lb identity, when there is one. An app-token caller and an
+    /// ungated deployment both render without it rather than inventing a user.
+    pub who: Option<&'a str>,
+    /// `data-theme="…" data-cookie-domain="…"`, already rendered by
+    /// `heyo_ui::html_attrs` from the request's cookie and this instance's
+    /// configuration. Owned, so a handler can build one and hand it to a page,
+    /// an error renderer and a redirect target without threading a second
+    /// lifetime through all three.
+    pub html_attrs: String,
+}
 
 /// Chrome shared by every page.
 ///
 /// `who` is the app-lb identity when there is one. An app-token caller and an
 /// ungated deployment both render without it rather than inventing a user.
-pub fn layout(app_name: &str, current: &str, who: Option<&str>, body: Markup) -> Markup {
+pub fn layout(chrome: &Chrome, current: &str, body: Markup) -> Markup {
+    let nav: Vec<(&str, &str, bool)> = vec![
+        ("Runs", "/", current == "runs"),
+        ("Networks", "/networks", current == "networks"),
+        ("Workflows", "/workflows", current == "workflows"),
+        ("VMs", "/vms", current == "vms"),
+        ("Repositories", "/repos", current == "repos"),
+    ];
     html! {
         (DOCTYPE)
-        html lang="en" {
+        // The attributes are rendered upstream and injected whole: maud escapes
+        // an attribute *value*, and this is a run of several attributes.
+        // `html_attrs` is built by the shared module from typed values, never
+        // from anything a request supplied.
+        (PreEscaped(format!("<html lang=\"en\" {}>", chrome.html_attrs)))
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (app_name) }
+                title { (chrome.app_name) }
+                (PreEscaped(crate::heyo_ui::head_tags()))
                 style { (PreEscaped(STYLE)) }
             }
             body {
-                header {
-                    h1 { (app_name) }
-                    nav {
-                        a href="/" class=[(current == "runs").then_some("on")] { "Runs" }
-                        a href="/networks" class=[(current == "networks").then_some("on")] { "Networks" }
-                        a href="/workflows" class=[(current == "workflows").then_some("on")] { "Workflows" }
-                        a href="/vms" class=[(current == "vms").then_some("on")] { "VMs" }
-                        a href="/repos" class=[(current == "repos").then_some("on")] { "Repositories" }
-                    }
-                    @if let Some(who) = who {
-                        span .who { (who) }
-                    }
-                }
+                (PreEscaped(crate::heyo_ui::topbar_html(chrome.app_name, &nav, chrome.who)))
                 main { (body) }
             }
-        }
+        (PreEscaped("</html>"))
     }
 }
 
@@ -311,8 +309,7 @@ fn short_job(job_id: &str) -> &str {
 /// last used it, so a machine a failed build left behind is visible rather than
 /// inferred.
 pub fn vms_page(
-    app_name: &str,
-    who: Option<&str>,
+    chrome: &Chrome,
     vms: &[crate::pool::PooledVmView],
     images: &[crate::image::CatalogEntry],
     notice: &Notice,
@@ -514,7 +511,7 @@ pub fn vms_page(
             }
         }
     };
-    layout(app_name, "vms", who, body)
+    layout(chrome, "vms", body)
 }
 
 /// Queue depth per route, keyed by network id or runner id.
@@ -556,8 +553,7 @@ fn queue_cell(depths: &QueueDepths, key: &str, dispatchable: bool) -> Markup {
 /// `GET /networks` — every network on the account, the hosts in each, and which
 /// of them this orchestrator builds for.
 pub fn networks_page(
-    app_name: &str,
-    who: Option<&str>,
+    chrome: &Chrome,
     pool: &Pool,
     depths: &QueueDepths,
     notice: &Notice,
@@ -631,11 +627,22 @@ pub fn networks_page(
             }
         }
     };
-    layout(app_name, "networks", who, body)
+    layout(chrome, "networks", body)
 }
 
 #[cfg(test)]
 mod tests {
+    /// The shell every page test renders against: this app, nobody signed in,
+    /// the default theme and a host-only cookie. Tests that care about the
+    /// signed-in name use [`chrome_as`].
+    fn chrome() -> Chrome<'static> {
+        Chrome { app_name: "ci", who: None, html_attrs: r#"data-theme="dark""#.into() }
+    }
+
+    fn chrome_as(who: &str) -> Chrome<'_> {
+        Chrome { app_name: "ci", who: Some(who), html_attrs: r#"data-theme="dark""#.into() }
+    }
+
     use super::*;
 
     pub(super) fn runner(id: &str, name: &str, status: RunnerStatus) -> Runner {
@@ -678,8 +685,7 @@ mod tests {
     #[test]
     fn the_page_lists_every_network_and_its_runners() {
         let html = networks_page(
-            "ci",
-            Some("Sam Currie"),
+            &chrome_as("Sam Currie"),
             &populated(),
             &QueueDepths::default(),
             &Notice::default(),
@@ -701,8 +707,7 @@ mod tests {
     #[test]
     fn served_and_unserved_networks_are_told_apart_with_the_fix_named() {
         let html = networks_page(
-            "ci",
-            None,
+            &chrome(),
             &populated(),
             &QueueDepths::default(),
             &Notice::default(),
@@ -718,8 +723,7 @@ mod tests {
     #[test]
     fn unjoined_daemons_get_their_own_section_naming_the_fix() {
         let html = networks_page(
-            "ci",
-            None,
+            &chrome(),
             &populated(),
             &QueueDepths::default(),
             &Notice::default(),
@@ -733,8 +737,7 @@ mod tests {
     #[test]
     fn an_empty_account_explains_how_to_add_a_network() {
         let html = networks_page(
-            "ci",
-            None,
+            &chrome(),
             &Pool::default(),
             &QueueDepths::default(),
             &Notice::default(),
@@ -750,8 +753,7 @@ mod tests {
         let mut pool = populated();
         pool.last_error = Some("heyvm control plane: GET /networks: timeout".into());
         let html = networks_page(
-            "ci",
-            None,
+            &chrome(),
             &pool,
             &QueueDepths::default(),
             &Notice::default(),
@@ -766,8 +768,7 @@ mod tests {
     #[test]
     fn an_anonymous_request_renders_no_identity() {
         let html = networks_page(
-            "ci",
-            None,
+            &chrome(),
             &populated(),
             &QueueDepths::default(),
             &Notice::default(),
@@ -808,7 +809,7 @@ mod tests {
             pooled("sb-2", "hd-1", "fp-aaaa", "idle", Some("failure")),
             pooled("sb-3", "hd-1", "fp-bbbb", "claimed", Some("running")),
         ];
-        let html = vms_page("ci", None, &vms, &[], &Notice::default()).into_string();
+        let html = vms_page(&chrome(), &vms, &[], &Notice::default()).into_string();
 
         assert!(
             html.contains("not reused"),
@@ -834,7 +835,7 @@ mod tests {
             "building",
             None,
         );
-        let html = vms_page("ci", None, &[building], &[], &Notice::default()).into_string();
+        let html = vms_page(&chrome(), &[building], &[], &Notice::default()).into_string();
 
         assert!(!html.contains("Nothing is pooled"), "{html}");
         assert!(html.contains("creating…"), "{html}");
@@ -860,7 +861,7 @@ mod tests {
                 None,
             ),
         ];
-        let html = vms_page("ci", None, &vms, &[], &Notice::default()).into_string();
+        let html = vms_page(&chrome(), &vms, &[], &Notice::default()).into_string();
         assert!(!html.contains("not reused"), "{html}");
     }
 
@@ -887,7 +888,7 @@ mod tests {
             image("ci-img-bbbbbbbbbbbb", "building", None),
             image("ci-img-cccccccccccc", "failed", Some("apt-get exited 100")),
         ];
-        let html = vms_page("ci", None, &[], &images, &Notice::default()).into_string();
+        let html = vms_page(&chrome(), &[], &images, &Notice::default()).into_string();
 
         assert!(!html.contains("No image has been built"), "{html}");
         assert!(html.contains("ci-img-aaaaaaaaaaaa"));
@@ -903,7 +904,7 @@ mod tests {
 
         // And with nothing built, the page says how one comes to exist rather
         // than showing an empty table.
-        let html = vms_page("ci", None, &[], &[], &Notice::default()).into_string();
+        let html = vms_page(&chrome(), &[], &[], &Notice::default()).into_string();
         assert!(html.contains("No image has been built"), "{html}");
         assert!(html.contains("vm.build"), "{html}");
     }
@@ -913,11 +914,11 @@ mod tests {
     #[test]
     fn a_healthy_pool_offers_no_cleanup() {
         let vms = [pooled("sb-1", "hd-1", "fp-aaaa", "idle", Some("success"))];
-        let html = vms_page("ci", None, &vms, &[], &Notice::default()).into_string();
+        let html = vms_page(&chrome(), &vms, &[], &Notice::default()).into_string();
         assert!(!html.contains("cleanup-failed"), "{html}");
         assert!(!html.contains("not reused"));
 
-        let html = vms_page("ci", None, &[], &[], &Notice::default()).into_string();
+        let html = vms_page(&chrome(), &[], &[], &Notice::default()).into_string();
         assert!(html.contains("Nothing is pooled"));
     }
 
@@ -939,7 +940,7 @@ mod tests {
         );
 
         let html =
-            networks_page("ci", None, &populated(), &depths, &Notice::default()).into_string();
+            networks_page(&chrome(), &populated(), &depths, &Notice::default()).into_string();
         assert!(html.contains("no consumer"), "{html}");
         assert!(
             html.contains(r#"class="pill failure""#),
@@ -966,7 +967,7 @@ mod tests {
         );
 
         let html =
-            networks_page("ci", None, &populated(), &depths, &Notice::default()).into_string();
+            networks_page(&chrome(), &populated(), &depths, &Notice::default()).into_string();
         assert!(html.contains("no consumer"));
         assert!(html.contains("idle"), "an empty live queue reads as idle");
     }
@@ -979,7 +980,7 @@ mod tests {
             ..QueueDepths::default()
         };
         let html =
-            networks_page("ci", None, &populated(), &depths, &Notice::default()).into_string();
+            networks_page(&chrome(), &populated(), &depths, &Notice::default()).into_string();
         assert!(html.contains("Queue depths are unavailable"), "{html}");
         assert!(html.contains("could not reach NATS"));
     }
@@ -991,8 +992,7 @@ mod tests {
         let mut pool = populated();
         pool.default_node_id = "hd-1".into(); // already a member of net-1
         let html = networks_page(
-            "ci",
-            None,
+            &chrome(),
             &pool,
             &QueueDepths::default(),
             &Notice::default(),
@@ -1017,8 +1017,7 @@ mod tests {
         let mut pool = populated();
         pool.default_node_id = String::new();
         let html = networks_page(
-            "ci",
-            None,
+            &chrome(),
             &pool,
             &QueueDepths::default(),
             &Notice::default(),
@@ -1032,8 +1031,7 @@ mod tests {
     #[test]
     fn a_notice_renders_above_the_networks() {
         let html = networks_page(
-            "ci",
-            None,
+            &chrome(),
             &populated(),
             &QueueDepths::default(),
             &Notice::done("This host is now a member of lab."),
@@ -1042,8 +1040,7 @@ mod tests {
         assert!(html.contains("This host is now a member of lab."));
 
         let html = networks_page(
-            "ci",
-            None,
+            &chrome(),
             &populated(),
             &QueueDepths::default(),
             &Notice::failed("nope"),
@@ -1059,8 +1056,7 @@ mod tests {
         let mut pool = populated();
         pool.networks[0].runners[0].name = "<script>alert(1)</script>".into();
         let html = networks_page(
-            "ci",
-            None,
+            &chrome(),
             &pool,
             &QueueDepths::default(),
             &Notice::default(),
@@ -1109,8 +1105,7 @@ fn short_ref(git_ref: &str) -> &str {
 
 /// `GET /` — recent runs.
 pub fn runs_page(
-    app_name: &str,
-    who: Option<&str>,
+    chrome: &Chrome,
     runs: &[Run],
     repos: &[Repo],
     repo_filter: Option<&str>,
@@ -1197,15 +1192,14 @@ pub fn runs_page(
             }
         }
     };
-    layout(app_name, "runs", who, body)
+    layout(chrome, "runs", body)
 }
 
 // ---- run detail ---------------------------------------------------------
 
 /// `GET /runs/{id}` — one run's jobs, in dependency order, plus its artifacts.
 pub fn run_page(
-    app_name: &str,
-    who: Option<&str>,
+    chrome: &Chrome,
     run: &Run,
     jobs: &[JobRow],
     artifacts: &[ArtifactRow],
@@ -1335,7 +1329,7 @@ pub fn run_page(
             }
         }
     };
-    layout(app_name, "runs", who, body)
+    layout(chrome, "runs", body)
 }
 
 /// `needs:` comes out of the stored plan rather than a column, because it is a
@@ -1394,8 +1388,7 @@ fn human_bytes(n: i64) -> String {
 /// mints it server-side and hands it to a fifteen-line `EventSource` handler;
 /// see [`crate::web::stream`] for why the stream needs its own credential.
 pub fn job_page(
-    app_name: &str,
-    who: Option<&str>,
+    chrome: &Chrome,
     run: &Run,
     job: &JobRow,
     steps: &[(StepRow, String)],
@@ -1442,7 +1435,7 @@ pub fn job_page(
             (live_log_script(&run.id, &job.job_key, token))
         }
     };
-    layout(app_name, "runs", who, body)
+    layout(chrome, "runs", body)
 }
 
 fn step_duration(s: &StepRow) -> String {
@@ -1522,8 +1515,7 @@ fn workflow_label(id: &str) -> &str {
 
 /// `GET /workflows` — what this installation knows how to build.
 pub fn workflows_page(
-    app_name: &str,
-    who: Option<&str>,
+    chrome: &Chrome,
     workflows: &[(String, Option<Run>)],
     pattern: &str,
 ) -> Markup {
@@ -1566,7 +1558,7 @@ pub fn workflows_page(
             }
         }
     };
-    layout(app_name, "workflows", who, body)
+    layout(chrome, "workflows", body)
 }
 
 // ---- registered repositories --------------------------------------------
@@ -1683,8 +1675,7 @@ fn token_rows(tokens: &[RepoToken]) -> Markup {
 
 /// `GET /repos` — what may submit, and with what.
 pub fn repos_page(
-    app_name: &str,
-    who: Option<&str>,
+    chrome: &Chrome,
     repos: &[RepoView],
     endpoint: &str,
     require_token: bool,
@@ -1834,11 +1825,22 @@ pub fn repos_page(
             }
         }
     };
-    layout(app_name, "repos", who, body)
+    layout(chrome, "repos", body)
 }
 
 #[cfg(test)]
 mod page_tests {
+    /// The shell these tests render against — this app, nobody signed in, the
+    /// default theme. Mirrors the one in `tests` above; two test modules, one
+    /// shell each, rather than a `pub(crate)` helper reaching across them.
+    fn chrome() -> Chrome<'static> {
+        Chrome { app_name: "ci", who: None, html_attrs: r#"data-theme="dark""#.into() }
+    }
+
+    fn chrome_as(who: &str) -> Chrome<'_> {
+        Chrome { app_name: "ci", who: Some(who), html_attrs: r#"data-theme="dark""#.into() }
+    }
+
     use super::*;
     // The networks fixture, reused so the repositories page is exercised
     // against the same pool the networks page renders.
@@ -1924,8 +1926,7 @@ mod page_tests {
     #[test]
     fn the_runs_page_lists_runs_and_links_to_them() {
         let html = runs_page(
-            "ci",
-            Some("Sam"),
+            &chrome_as("Sam"),
             &[run("success"), run("failure")],
             &[registered_repo()],
             None,
@@ -1945,7 +1946,7 @@ mod page_tests {
 
     #[test]
     fn an_empty_dashboard_says_how_to_start() {
-        let html = runs_page("ci", None, &[], &[], None).into_string();
+        let html = runs_page(&chrome(), &[], &[], None).into_string();
         assert!(html.contains("git submit"));
         assert!(
             html.contains("/repos"),
@@ -1960,8 +1961,7 @@ mod page_tests {
     #[test]
     fn a_filtered_page_with_no_runs_names_the_repo_and_offers_the_way_back() {
         let html = runs_page(
-            "ci",
-            None,
+            &chrome(),
             &[],
             &[registered_repo()],
             Some("019fca648a6e-00000001"),
@@ -1981,7 +1981,7 @@ mod page_tests {
         let mut r = run("success");
         r.repo_id = None;
         r.repo_name = None;
-        let html = runs_page("ci", None, &[r], &[registered_repo()], None).into_string();
+        let html = runs_page(&chrome(), &[r], &[registered_repo()], None).into_string();
         assert!(!html.contains("/?repo="), "nothing to filter by");
     }
 
@@ -1995,8 +1995,7 @@ mod page_tests {
             uri: "/var/lib/ci/dist".into(),
         }];
         let html = run_page(
-            "ci",
-            None,
+            &chrome(),
             &run("success"),
             &[job("build", "success"), job("deploy", "skipped")],
             &artifacts,
@@ -2017,7 +2016,7 @@ mod page_tests {
     fn a_job_error_is_surfaced_on_the_run_page() {
         let mut j = job("build", "failure");
         j.error = Some("step \"Build\" exited 101".into());
-        let html = run_page("ci", None, &run("failure"), &[j], &[], &[], Some(2)).into_string();
+        let html = run_page(&chrome(), &run("failure"), &[j], &[], &[], Some(2)).into_string();
         assert!(html.contains("exited 101"), "{html}");
     }
 
@@ -2030,8 +2029,7 @@ mod page_tests {
             (step(1, "Test", "failure"), "assertion failed\n".to_string()),
         ];
         let html = job_page(
-            "ci",
-            None,
+            &chrome(),
             &run("failure"),
             &job("build", "failure"),
             &steps,
@@ -2055,8 +2053,7 @@ mod page_tests {
     #[test]
     fn a_finished_job_page_carries_no_stream_token_or_script() {
         let html = job_page(
-            "ci",
-            None,
+            &chrome(),
             &run("success"),
             &job("build", "success"),
             &[(step(0, "Compile", "success"), "done\n".into())],
@@ -2073,8 +2070,7 @@ mod page_tests {
     #[test]
     fn a_running_job_page_wires_up_the_stream() {
         let html = job_page(
-            "ci",
-            None,
+            &chrome(),
             &run("running"),
             &job("build", "running"),
             &[(step(0, "Compile", "running"), "compiling\n".into())],
@@ -2083,9 +2079,16 @@ mod page_tests {
         .into_string();
         assert!(html.contains("EventSource"));
         assert!(html.contains("/api/stream/019fca648a6e-00000000/build?token=1234.abcd"));
-        // No external asset: the whole page must work over an SSH tunnel.
-        assert!(!html.contains("<script src"), "{html}");
-        assert!(!html.contains("http://") || !html.contains("cdn"), "{html}");
+        // No *external* asset: the whole page must work over an SSH tunnel and
+        // from a network with no route off it. Same-origin `/__ui/` is served
+        // by this binary and is fine; an absolute URL to anywhere is not.
+        // Checked as "no scheme-bearing src or href" rather than by naming
+        // known CDNs, because the failure this guards against is somebody
+        // adding a script tag for a host nobody thought to list.
+        for attr in ["src=\"http", "href=\"http", "src=\"//", "href=\"//"] {
+            assert!(!html.contains(attr), "external asset ({attr}) in {html}");
+        }
+        assert!(html.contains(r#"href="/__ui/heyo.css""#), "{html}");
     }
 
     /// Log text is guest output — arbitrary bytes chosen by whatever ran.
@@ -2096,8 +2099,7 @@ mod page_tests {
             "<script>alert(1)</script>\n".to_string(),
         )];
         let html = job_page(
-            "ci",
-            None,
+            &chrome(),
             &run("success"),
             &job("build", "success"),
             &steps,
@@ -2113,7 +2115,7 @@ mod page_tests {
     fn a_hostile_job_name_is_escaped() {
         let mut j = job("build", "success");
         j.display = "<img src=x onerror=alert(1)>".into();
-        let html = run_page("ci", None, &run("success"), &[j], &[], &[], Some(2)).into_string();
+        let html = run_page(&chrome(), &run("success"), &[j], &[], &[], Some(2)).into_string();
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;img"));
     }
@@ -2123,7 +2125,7 @@ mod page_tests {
     fn a_running_run_can_be_cancelled_and_a_finished_one_cannot() {
         let mut r = run("success");
         r.status = "running".into();
-        let html = run_page("ci", None, &r, &[], &[], &[], Some(2)).into_string();
+        let html = run_page(&chrome(), &r, &[], &[], &[], Some(2)).into_string();
         assert!(
             html.contains(r#"action="/runs/019fca648a6e-00000000/cancel""#),
             "{html}"
@@ -2133,7 +2135,7 @@ mod page_tests {
         for finished in ["success", "failure", "cancelled"] {
             let mut r = run(finished);
             r.status = finished.into();
-            let html = run_page("ci", None, &r, &[], &[], &[], Some(2)).into_string();
+            let html = run_page(&chrome(), &r, &[], &[], &[], Some(2)).into_string();
             assert!(!html.contains("/cancel"), "{finished}: {html}");
         }
     }
@@ -2151,8 +2153,7 @@ mod page_tests {
             ("deploy".to_string(), None),
         ];
         let html = run_page(
-            "ci",
-            None,
+            &chrome(),
             &run("failure"),
             &[job("build", "failure")],
             &[],
@@ -2175,12 +2176,12 @@ mod page_tests {
     #[test]
     fn retention_is_only_mentioned_when_it_applies() {
         let logs = [("build".to_string(), Some("boot".to_string()))];
-        let html = run_page("ci", None, &run("success"), &[], &[], &logs, None).into_string();
+        let html = run_page(&chrome(), &run("success"), &[], &[], &logs, None).into_string();
         assert!(html.contains("VM logs"));
         assert!(!html.contains("Discarded after"), "{html}");
 
         // And the section is absent entirely when no job captured one.
-        let html = run_page("ci", None, &run("success"), &[], &[], &[], Some(2)).into_string();
+        let html = run_page(&chrome(), &run("success"), &[], &[], &[], Some(2)).into_string();
         assert!(!html.contains("VM logs"), "{html}");
     }
 
@@ -2203,21 +2204,20 @@ mod page_tests {
     /// not render as an empty cell that reads as a broken row.
     #[test]
     fn an_unnamed_workflow_gets_a_placeholder() {
-        let html = workflows_page("ci", None, &[(String::new(), None)], "*.yml").into_string();
+        let html = workflows_page(&chrome(), &[(String::new(), None)], "*.yml").into_string();
         assert!(html.contains("(unnamed)"), "{html}");
 
         let mut r = run("success");
         r.workflow_id = String::new();
         r.workflow_name = None;
-        let html = runs_page("ci", None, &[r], &[], None).into_string();
+        let html = runs_page(&chrome(), &[r], &[], None).into_string();
         assert!(html.contains("(unnamed)"), "{html}");
     }
 
     #[test]
     fn the_workflows_page_lists_each_workflow_once_with_its_latest_run() {
         let html = workflows_page(
-            "ci",
-            None,
+            &chrome(),
             &[
                 ("myapp".into(), Some(run("success"))),
                 ("other".into(), None),
@@ -2262,8 +2262,7 @@ mod page_tests {
     #[test]
     fn the_repos_page_lists_a_registration_and_its_tokens() {
         let html = repos_page(
-            "ci",
-            Some("Sam"),
+            &chrome_as("Sam"),
             &[repo_view(true, false)],
             "https://ci.example.com",
             false,
@@ -2286,8 +2285,7 @@ mod page_tests {
     #[test]
     fn a_revoked_token_renders_as_revoked_without_a_second_revoke_button() {
         let html = repos_page(
-            "ci",
-            None,
+            &chrome(),
             &[repo_view(true, true)],
             "https://ci.example.com",
             false,
@@ -2304,8 +2302,7 @@ mod page_tests {
     #[test]
     fn a_minted_token_is_shown_once_with_the_two_lines_that_use_it() {
         let html = repos_page(
-            "ci",
-            Some("Sam"),
+            &chrome_as("Sam"),
             &[repo_view(true, false)],
             "https://ci.example.com",
             true,
@@ -2322,8 +2319,7 @@ mod page_tests {
 
         // And nowhere else: a page rendered without the flash must not carry it.
         let plain = repos_page(
-            "ci",
-            Some("Sam"),
+            &chrome_as("Sam"),
             &[repo_view(true, false)],
             "https://ci.example.com",
             false,
@@ -2337,8 +2333,7 @@ mod page_tests {
     #[test]
     fn an_empty_repos_page_says_what_submitting_without_one_means() {
         let html = repos_page(
-            "ci",
-            None,
+            &chrome(),
             &[],
             "https://ci.example.com",
             false,
@@ -2350,3 +2345,6 @@ mod page_tests {
         assert!(html.contains("A clone URL is required."));
     }
 }
+
+
+

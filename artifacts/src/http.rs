@@ -76,6 +76,8 @@ pub async fn serve(config: &Config, opts: ServeOptions) -> crate::Result<()> {
                     creds.user.clone(),
                     creds.password.clone(),
                 ))),
+                gate: false,
+                ui: Arc::new(crate::heyo_ui::CookieConfig::from_env("ART")),
             })
         }
         crate::config::DashboardAccess::Open => {
@@ -88,7 +90,29 @@ pub async fn serve(config: &Config, opts: ServeOptions) -> crate::Result<()> {
                 "dashboard open at /dashboard with no login (ART_DASHBOARD_OPEN); \
                  anyone who can reach this listener can read every tag and blob listing"
             );
-            Some(crate::web::WebState { store, auth: None })
+            Some(crate::web::WebState {
+                store,
+                auth: None,
+                gate: false,
+                ui: Arc::new(crate::heyo_ui::CookieConfig::from_env("ART")),
+            })
+        }
+        crate::config::DashboardAccess::Gate => {
+            // Info, not warn: unlike `Open`, this one *is* gated — but by
+            // something this process cannot see, so the log records the claim
+            // being made on the operator's behalf.
+            tracing::info!(
+                addr = %opts.addr,
+                "dashboard at /dashboard behind an upstream gate (ART_DASHBOARD_GATE); \
+                 requests without an x-auth-request-user header are refused, and the \
+                 identity shown is whatever the gate forwards"
+            );
+            Some(crate::web::WebState {
+                store,
+                auth: None,
+                gate: true,
+                ui: Arc::new(crate::heyo_ui::CookieConfig::from_env("ART")),
+            })
         }
         crate::config::DashboardAccess::Off => {
             // Off, not open. Tag names and blob sizes describe what an
@@ -180,11 +204,35 @@ pub fn web_router(web: Option<crate::web::WebState>) -> Router {
         // Login and logout sit outside the gate — the login page is how you get
         // through it, and a sign-out that needs a valid session is a sign-out
         // that cannot clear a stale one.
+        // The shared stylesheet, theme script and fonts, served by this binary
+        // and outside the gate: a sign-in page that cannot fetch its own CSS is
+        // a sign-in page nobody can read. They are static, public bytes — the
+        // same ones every other Heyo app serves.
+        .route("/__ui/{*path}", get(ui_asset))
         .route("/login", get(web::login_page).post(web::login_submit))
         .route("/logout", axum::routing::post(web::logout))
         .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// `GET /__ui/{*path}` — the platform stylesheet, theme toggle and fonts.
+///
+/// Compiled into the binary, so there is no asset directory to deploy beside it
+/// and nothing on disk to traverse out of. Same origin rather than a CDN: this
+/// dashboard is read from private networks and over tunnels.
+async fn ui_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    match crate::heyo_ui::asset(&path) {
+        Some(a) => (
+            [
+                (header::CONTENT_TYPE, a.content_type),
+                (header::CACHE_CONTROL, crate::heyo_ui::cache_control(&a)),
+            ],
+            a.bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+    }
 }
 
 async fn require_dashboard_auth(
@@ -979,6 +1027,8 @@ mod tests {
                 "admin".into(),
                 p.into(),
             ))),
+            gate: false,
+            ui: Default::default(),
         });
         web_router(web)
     }
@@ -990,6 +1040,8 @@ mod tests {
         web_router(Some(crate::web::WebState {
             store: store_at(d),
             auth: None,
+            gate: false,
+            ui: Default::default(),
         }))
     }
 
@@ -1069,7 +1121,12 @@ mod tests {
             api_key: Some(Arc::new("secret".to_string())),
             read_only: false,
         });
-        let merged = api.merge(web_router(Some(crate::web::WebState { store, auth: None })));
+        let merged = api.merge(web_router(Some(crate::web::WebState {
+            store,
+            auth: None,
+            gate: false,
+            ui: Default::default(),
+        })));
 
         let r = merged
             .clone()
@@ -1162,7 +1219,15 @@ mod tests {
         // The VM has no route to a CDN, so a remote asset would simply not load.
         assert!(!html.contains("http://"), "dashboard must not link out");
         assert!(!html.contains("https://"), "dashboard must not link out");
-        assert!(!html.contains("<script"), "dashboard must not need JS");
+        // **The dashboard must not *need* JS.** It no longer has none: the
+        // shared theme toggle is a script. What matters is that it is the only
+        // one, that it is `defer`red, and that nothing on the page depends on
+        // it — the theme itself is stamped on `<html>` server-side, every link
+        // is an anchor and every action is a form. With scripting off, the page
+        // renders in the right palette and everything works except the toggle.
+        assert_eq!(html.matches("<script").count(), 1, "one script, the theme toggle");
+        assert!(html.contains(r#"<script defer src="/__ui/theme.js">"#), "{html}");
+        assert!(html.contains("data-theme="), "the theme is server-rendered, not scripted");
     }
 
     #[tokio::test]

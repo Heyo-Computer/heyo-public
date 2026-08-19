@@ -16,7 +16,7 @@ use crate::query::{
 };
 use crate::sources::applb::LiveStatus;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -67,6 +67,11 @@ pub struct ApiState {
     /// the endpoint marks it stale instead of replacing evidence with emptiness.
     pub live: tokio::sync::watch::Receiver<Option<LiveStatus>>,
     pub stale_after_secs: u64,
+    /// Where the theme cookie is written and under what name — from
+    /// `APP_OBS_UI_COOKIE_*`, else the fleet-wide `HEYO_UI_*`. Point it at the
+    /// same parent domain as app-lb's `auth.cookie_domain` and one choice of
+    /// light or dark covers every app.
+    pub ui_cookies: Arc<crate::heyo_ui::CookieConfig>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -90,6 +95,10 @@ pub fn router(state: ApiState) -> Router {
         // checks this, and a probe that fails because a dashboard is busy would
         // take the deployment out of rotation for no reason.
         .route("/healthz", get(|| async { "ok\n" }))
+        // Open alongside `/healthz`: the stylesheet and fonts are static public
+        // bytes, and a page that renders unstyled because its CSS needed a
+        // token is worse than one whose CSS anyone can fetch.
+        .route("/__ui/{*path}", get(ui_asset))
         .merge(protected)
         .with_state(state)
 }
@@ -118,8 +127,52 @@ fn api_request_authorized(expected: Option<&str>, presented: Option<&str>) -> bo
     expected.is_none_or(|expected| token_matches(expected, presented))
 }
 
-async fn dashboard() -> impl IntoResponse {
-    Html(DASHBOARD_HTML)
+/// The dashboard shell.
+///
+/// Substituted rather than served verbatim so the theme is on the `<html>` tag
+/// in the first response — otherwise every navigation flashes the wrong palette
+/// before script can correct it. `{{WHO}}` is the identity app-lb forwarded,
+/// which is empty unless this deployment is gated.
+///
+/// `str::replace` rather than a template engine, matching app-lb's dashboards,
+/// with a test standing in for the compile-time check maud would have given.
+async fn dashboard(State(st): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    Html(render_dashboard(&st, &headers))
+}
+
+fn render_dashboard(st: &ApiState, headers: &HeaderMap) -> String {
+    let cookies = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    // Shown, never trusted: this page is read-only and the identity is a label.
+    // app-lb strips these headers before setting them, so on a gated deployment
+    // they are the gate's word; on an ungated one they are the caller's, which
+    // is why nothing here is authorized on them.
+    let who = crate::heyo_ui::identity_from(|n| headers.get(n).and_then(|v| v.to_str().ok()))
+        .map(|i| crate::heyo_ui::escape(i.display()))
+        .unwrap_or_default();
+    DASHBOARD_HTML
+        .replace("{{HTML_ATTRS}}", &st.ui_cookies.attrs(cookies))
+        .replace("{{WHO}}", &who)
+}
+
+/// `GET /__ui/{*path}` — the platform stylesheet, theme script and fonts,
+/// served by this binary rather than a CDN.
+async fn ui_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    match crate::heyo_ui::asset(&path) {
+        Some(a) => (
+            [
+                (axum::http::header::CONTENT_TYPE, a.content_type),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    crate::heyo_ui::cache_control(&a),
+                ),
+            ],
+            a.bytes,
+        )
+            .into_response(),
+        None => (axum::http::StatusCode::NOT_FOUND, "not found\n").into_response(),
+    }
 }
 
 /// Ingest counters plus what is still in memory.
@@ -627,6 +680,53 @@ impl IntoResponse for ApiError {
         // tool, and "something went wrong" would just mean two places to look.
         let body = Json(serde_json::json!({ "error": self.0.to_string() }));
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::DASHBOARD_HTML;
+
+    /// `str::replace` gives no compile-time proof that every placeholder was
+    /// filled — that is the cost of an `include_str!`d page, and this is what
+    /// pays it. A survivor is rendered literally into somebody's browser.
+    #[test]
+    fn every_placeholder_is_filled_and_none_are_invented() {
+        for token in ["{{HTML_ATTRS}}", "{{WHO}}"] {
+            assert!(DASHBOARD_HTML.contains(token), "{token} is gone from the page");
+        }
+        let rendered = DASHBOARD_HTML
+            .replace("{{HTML_ATTRS}}", r#"data-theme="dark""#)
+            .replace("{{WHO}}", "ops@example.com");
+        assert!(!rendered.contains("{{"), "a placeholder survived rendering");
+    }
+
+    /// This dashboard is read from private networks; every asset it names is
+    /// served by this binary.
+    #[test]
+    fn the_page_names_no_external_asset() {
+        assert!(DASHBOARD_HTML.contains(r#"href="/__ui/heyo.css""#));
+        assert!(DASHBOARD_HTML.contains(r#"src="/__ui/theme.js""#));
+        for external in ["src=\"http", "href=\"http", "src=\"//", "href=\"//"] {
+            assert!(!DASHBOARD_HTML.contains(external), "external asset: {external}");
+        }
+    }
+
+    /// The theme is a cookie now, not this origin's localStorage: three
+    /// dashboards on three subdomains are three origins, and a per-origin
+    /// choice is one a person makes over and over.
+    #[test]
+    fn the_page_does_not_keep_its_own_theme_state() {
+        // The accesses, not the word: the comments that explain why this moved
+        // to a cookie say `localStorage` and should keep saying it.
+        for access in ["localStorage.getItem", "localStorage.setItem"] {
+            assert!(
+                !DASHBOARD_HTML.contains(access),
+                "{access} — theme state belongs in the shared cookie, which crosses \
+                 origins; localStorage stops at this one"
+            );
+        }
+        assert!(DASHBOARD_HTML.contains("data-theme-toggle"));
     }
 }
 

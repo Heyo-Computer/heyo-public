@@ -76,6 +76,7 @@ pub fn router(
         // it after an `update` job to decide whether the service actually came
         // back, so a gate in front of it would make every deploy look failed.
         .route("/healthz", get(healthz))
+        .route("/__ui/{*path}", get(ui_asset))
         .route("/", get(runs_page))
         .route("/runs/{run_id}", get(run_page))
         // Admin-only like the other state-changing routes: cancelling stops
@@ -331,6 +332,57 @@ fn who_of(headers: &HeaderMap) -> Option<Identity> {
     Identity::from_headers(headers)
 }
 
+/// The page shell for one request: which app, who is signed in, and the theme
+/// their cookie asked for.
+///
+/// Built per request and per page rather than kept on `AppState`, because the
+/// theme is a property of the *caller*, not of the process — two people on one
+/// instance can be looking at different palettes.
+fn chrome<'a>(
+    state: &'a AppState,
+    headers: &HeaderMap,
+    who: Option<&'a Identity>,
+) -> pages::Chrome<'a> {
+    let cookies = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    let theme =
+        crate::heyo_ui::theme_from_cookie_header(cookies, &state.config.ui_cookie_name);
+    pages::Chrome {
+        app_name: &state.config.name,
+        who: who.map(|i| i.display()),
+        html_attrs: crate::heyo_ui::html_attrs(
+            theme,
+            state.config.ui_cookie_domain.as_deref(),
+            &state.config.ui_cookie_name,
+        ),
+    }
+}
+
+/// `GET /__ui/{*path}` — the shared stylesheet, the theme script and the fonts,
+/// served by this binary.
+///
+/// Same origin on purpose: these dashboards are read over SSH tunnels and from
+/// networks with no route to the public internet, so the look cannot depend on
+/// a CDN being reachable. The bytes are compiled in, so there is no directory
+/// to deploy alongside the binary and nothing to traverse out of.
+async fn ui_asset(Path(path): Path<String>) -> axum::response::Response {
+    match crate::heyo_ui::asset(&path) {
+        Some(a) => (
+            [
+                (axum::http::header::CONTENT_TYPE, a.content_type),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    crate::heyo_ui::cache_control(&a),
+                ),
+            ],
+            a.bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+    }
+}
+
 async fn runs_page(
     State(state): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
@@ -344,18 +396,17 @@ async fn runs_page(
     let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
     let repos = match state.store.repos().await {
         Ok(repos) => repos,
-        Err(e) => return page_error(&state, who.as_ref(), &e.to_string()),
+        Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
     };
     match state.store.recent_runs(RECENT_RUNS, repo).await {
         Ok(runs) => pages::runs_page(
-            &state.config.name,
-            who.as_ref().map(|i| i.display()),
+            &chrome(&state, &headers, who.as_ref()),
             &runs,
             &repos,
             repo,
         )
         .into_response(),
-        Err(e) => page_error(&state, who.as_ref(), &e.to_string()),
+        Err(e) => page_error(&state, &headers, who.as_ref(), &e.to_string()),
     }
 }
 
@@ -365,7 +416,6 @@ async fn run_page(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let who = who_of(&headers);
-    let name = who.as_ref().map(|i| i.display());
     match state.store.get_run(&run_id).await {
         Ok(Some(run)) => {
             let jobs = state.store.jobs_of(&run_id).await.unwrap_or_default();
@@ -383,8 +433,7 @@ async fn run_page(
             }
 
             pages::run_page(
-                &state.config.name,
-                name,
+                &chrome(&state, &headers, who.as_ref()),
                 &run,
                 &jobs,
                 &artifacts,
@@ -393,8 +442,8 @@ async fn run_page(
             )
             .into_response()
         }
-        Ok(None) => not_found(&state, who.as_ref(), &format!("No run {run_id}.")),
-        Err(e) => page_error(&state, who.as_ref(), &e.to_string()),
+        Ok(None) => not_found(&state, &headers, who.as_ref(), &format!("No run {run_id}.")),
+        Err(e) => page_error(&state, &headers, who.as_ref(), &e.to_string()),
     }
 }
 
@@ -425,7 +474,7 @@ async fn cancel_run(
         Ok(None) => {
             tracing::debug!("run {run_id} was already finished; nothing to cancel");
         }
-        Err(e) => return page_error(&state, who.as_ref(), &e.to_string()),
+        Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
     }
     // Back to the run, which now shows what happened — rather than a flash on a
     // page the browser would re-post on refresh.
@@ -438,15 +487,15 @@ async fn job_page(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let who = who_of(&headers);
-    let name = who.as_ref().map(|i| i.display());
 
     let Ok(Some(run)) = state.store.get_run(&run_id).await else {
-        return not_found(&state, who.as_ref(), &format!("No run {run_id}."));
+        return not_found(&state, &headers, who.as_ref(), &format!("No run {run_id}."));
     };
     let jobs = state.store.jobs_of(&run_id).await.unwrap_or_default();
     let Some(job) = jobs.into_iter().find(|j| j.job_key == job_key) else {
         return not_found(
             &state,
+            &headers,
             who.as_ref(),
             &format!("Run {run_id} has no job {job_key}."),
         );
@@ -468,8 +517,7 @@ async fn job_page(
     .then(|| stream::mint(&state.config, &run_id, &job_key));
 
     pages::job_page(
-        &state.config.name,
-        name,
+        &chrome(&state, &headers, who.as_ref()),
         &run,
         &job,
         &steps,
@@ -480,7 +528,6 @@ async fn job_page(
 
 async fn workflows_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let who = who_of(&headers);
-    let name = who.as_ref().map(|i| i.display());
     match state.store.recent_runs(500, None).await {
         Ok(runs) => {
             // Newest first already, so the first sighting of an id is its most
@@ -492,14 +539,13 @@ async fn workflows_page(State(state): State<AppState>, headers: HeaderMap) -> im
                 }
             }
             pages::workflows_page(
-                &state.config.name,
-                name,
+                &chrome(&state, &headers, who.as_ref()),
                 &seen,
                 &state.config.default_workflow_path,
             )
             .into_response()
         }
-        Err(e) => page_error(&state, who.as_ref(), &e.to_string()),
+        Err(e) => page_error(&state, &headers, who.as_ref(), &e.to_string()),
     }
 }
 
@@ -532,6 +578,7 @@ async fn may_manage(
         }
         return Err(refused(
             state,
+            headers,
             None,
             StatusCode::UNAUTHORIZED,
             "This request carries no identity, and this installation names its admins in \
@@ -553,6 +600,7 @@ async fn may_manage(
         Ok(role) if role == "admin" => Ok(Some(who)),
         Ok(_) => Err(refused(
             state,
+            headers,
             Some(&who),
             StatusCode::FORBIDDEN,
             "Registering a repository mints a credential that can run code on a runner, \
@@ -560,7 +608,7 @@ async fn may_manage(
         )),
         Err(e) => {
             tracing::error!("could not resolve a role: {e}");
-            Err(page_error(state, Some(&who), &e.to_string()))
+            Err(page_error(state, headers, Some(&who), &e.to_string()))
         }
     }
 }
@@ -600,6 +648,7 @@ fn check_origin(state: &AppState, headers: &HeaderMap) -> Result<(), axum::respo
     );
     Err(refused(
         state,
+        headers,
         None,
         StatusCode::FORBIDDEN,
         "This request came from another site. If it came from this dashboard, \
@@ -610,6 +659,7 @@ fn check_origin(state: &AppState, headers: &HeaderMap) -> Result<(), axum::respo
 
 fn refused(
     state: &AppState,
+    headers: &HeaderMap,
     who: Option<&Identity>,
     status: StatusCode,
     message: &str,
@@ -617,9 +667,8 @@ fn refused(
     (
         status,
         pages::layout(
-            &state.config.name,
+            &chrome(state, headers, who),
             "repos",
-            who.map(|i| i.display()),
             maud::html! {
                 div .banner { (message) }
                 p { a href="/" { "Back to runs" } }
@@ -632,12 +681,13 @@ fn refused(
 /// Render `/repos`, optionally with the outcome of the POST that produced it.
 async fn render_repos(
     state: &AppState,
+    headers: &HeaderMap,
     who: Option<&Identity>,
     flash: RepoFlash,
 ) -> axum::response::Response {
     let repos = match state.store.repos().await {
         Ok(r) => r,
-        Err(e) => return page_error(state, who, &e.to_string()),
+        Err(e) => return page_error(state, headers, who, &e.to_string()),
     };
 
     let mut views = Vec::with_capacity(repos.len());
@@ -655,8 +705,7 @@ async fn render_repos(
     }
 
     pages::repos_page(
-        &state.config.name,
-        who.map(|i| i.display()),
+        &chrome(state, headers, who),
         &views,
         &state.config.public_url,
         state.config.require_repo_token,
@@ -671,7 +720,7 @@ async fn repos_page(State(state): State<AppState>, headers: HeaderMap) -> impl I
         Ok(w) => w,
         Err(response) => return response,
     };
-    render_repos(&state, who.as_ref(), RepoFlash::default()).await
+    render_repos(&state, &headers, who.as_ref(), RepoFlash::default()).await
 }
 
 #[derive(serde::Deserialize)]
@@ -699,6 +748,7 @@ async fn register_repo(
     if url.is_empty() {
         return render_repos(
             &state,
+            &headers,
             who.as_ref(),
             RepoFlash::failed("A clone URL is required; it is what a submit is matched against."),
         )
@@ -723,6 +773,7 @@ async fn register_repo(
             None => {
                 return render_repos(
                     &state,
+                    &headers,
                     who.as_ref(),
                     RepoFlash::failed(format!(
                         "This orchestrator does not serve a network named {name:?}. \
@@ -749,6 +800,7 @@ async fn register_repo(
             );
             render_repos(
                 &state,
+                &headers,
                 who.as_ref(),
                 RepoFlash::done(format!(
                     "{} is registered. Mint a token for it below.",
@@ -757,7 +809,7 @@ async fn register_repo(
             )
             .await
         }
-        Err(e) => render_repos(&state, who.as_ref(), RepoFlash::failed(e.to_string())).await,
+        Err(e) => render_repos(&state, &headers, who.as_ref(), RepoFlash::failed(e.to_string())).await,
     }
 }
 
@@ -789,12 +841,13 @@ async fn create_repo_token(
         Ok(None) => {
             return render_repos(
                 &state,
+                &headers,
                 who.as_ref(),
                 RepoFlash::failed("That repository is not registered any more."),
             )
             .await;
         }
-        Err(e) => return page_error(&state, who.as_ref(), &e.to_string()),
+        Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
     };
 
     let name = match form.name.trim() {
@@ -816,12 +869,13 @@ async fn create_repo_token(
             );
             render_repos(
                 &state,
+                &headers,
                 who.as_ref(),
                 RepoFlash::minted(repo.name.clone(), plaintext),
             )
             .await
         }
-        Err(e) => render_repos(&state, who.as_ref(), RepoFlash::failed(e.to_string())).await,
+        Err(e) => render_repos(&state, &headers, who.as_ref(), RepoFlash::failed(e.to_string())).await,
     }
 }
 
@@ -846,7 +900,7 @@ async fn revoke_repo_token(
         Ok(false) => RepoFlash::done("That token was already revoked."),
         Err(e) => RepoFlash::failed(e.to_string()),
     };
-    render_repos(&state, who.as_ref(), flash).await
+    render_repos(&state, &headers, who.as_ref(), flash).await
 }
 
 #[derive(serde::Deserialize)]
@@ -882,6 +936,7 @@ async fn set_repo_network(
             Some(set) => {
                 return render_repos(
                     &state,
+                    &headers,
                     who.as_ref(),
                     RepoFlash::failed(format!(
                         "Network {} exists but this orchestrator does not take work for it. \
@@ -894,6 +949,7 @@ async fn set_repo_network(
             None => {
                 return render_repos(
                     &state,
+                    &headers,
                     who.as_ref(),
                     RepoFlash::failed(format!("No heyvm network is named {name:?}.")),
                 )
@@ -925,7 +981,7 @@ async fn set_repo_network(
         Ok(false) => RepoFlash::failed("That repository is not registered."),
         Err(e) => RepoFlash::failed(e.to_string()),
     };
-    render_repos(&state, who.as_ref(), flash).await
+    render_repos(&state, &headers, who.as_ref(), flash).await
 }
 
 #[derive(serde::Deserialize)]
@@ -963,7 +1019,7 @@ async fn set_repo_enabled(
         form.enabled,
         who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
     );
-    render_repos(&state, who.as_ref(), flash).await
+    render_repos(&state, &headers, who.as_ref(), flash).await
 }
 
 async fn delete_repo(
@@ -990,7 +1046,7 @@ async fn delete_repo(
         Ok(false) => RepoFlash::failed("That repository is not registered."),
         Err(e) => RepoFlash::failed(e.to_string()),
     };
-    render_repos(&state, who.as_ref(), flash).await
+    render_repos(&state, &headers, who.as_ref(), flash).await
 }
 
 /// Tail a job's step logs.
@@ -1064,27 +1120,35 @@ async fn log_stream(
         .into_response()
 }
 
-fn page_error(state: &AppState, who: Option<&Identity>, message: &str) -> axum::response::Response {
+fn page_error(
+    state: &AppState,
+    headers: &HeaderMap,
+    who: Option<&Identity>,
+    message: &str,
+) -> axum::response::Response {
     tracing::warn!("page render failed: {message}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         pages::layout(
-            &state.config.name,
+            &chrome(state, headers, who),
             "",
-            who.map(|i| i.display()),
             maud::html! { div .banner { (message) } },
         ),
     )
         .into_response()
 }
 
-fn not_found(state: &AppState, who: Option<&Identity>, message: &str) -> axum::response::Response {
+fn not_found(
+    state: &AppState,
+    headers: &HeaderMap,
+    who: Option<&Identity>,
+    message: &str,
+) -> axum::response::Response {
     (
         StatusCode::NOT_FOUND,
         pages::layout(
-            &state.config.name,
+            &chrome(state, headers, who),
             "",
-            who.map(|i| i.display()),
             maud::html! {
                 div .banner { (message) }
                 p { a href="/" { "Back to runs" } }
@@ -1154,8 +1218,7 @@ async fn networks_page(State(state): State<AppState>, headers: HeaderMap) -> imp
     let who = Identity::from_headers(&headers);
     let depths = queue_depths(&state).await;
     pages::networks_page(
-        &state.config.name,
-        who.as_ref().map(|i| i.display()),
+        &chrome(&state, &headers, who.as_ref()),
         &state.runners.snapshot(),
         &depths,
         &pages::Notice::default(),
@@ -1164,25 +1227,25 @@ async fn networks_page(State(state): State<AppState>, headers: HeaderMap) -> imp
 
 async fn vms_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let who = Identity::from_headers(&headers);
-    render_vms(&state, who.as_ref(), pages::Notice::default()).await
+    render_vms(&state, &headers, who.as_ref(), pages::Notice::default()).await
 }
 
 async fn render_vms(
     state: &AppState,
+    headers: &HeaderMap,
     who: Option<&Identity>,
     notice: pages::Notice,
 ) -> axum::response::Response {
     let vms = match state.dispatcher.vm_inventory().await {
         Ok(vms) => vms,
-        Err(e) => return page_error(state, who, &e.to_string()),
+        Err(e) => return page_error(state, headers, who, &e.to_string()),
     };
     // Read separately and never fatal: the images table is context for the
     // pool, and a page that refuses to render the VMs because the image
     // catalog was unreadable would hide the more important half.
     let images = state.dispatcher.image_inventory().await.unwrap_or_default();
     pages::vms_page(
-        &state.config.name,
-        who.map(|i| i.display()),
+        &chrome(state, headers, who),
         &vms,
         &images,
         &notice,
@@ -1209,7 +1272,7 @@ async fn destroy_vm(
         }
         Err(e) => pages::Notice::failed(e.to_string()),
     };
-    render_vms(&state, who.as_ref(), notice).await
+    render_vms(&state, &headers, who.as_ref(), notice).await
 }
 
 async fn cleanup_failed_vms(
@@ -1230,18 +1293,18 @@ async fn cleanup_failed_vms(
         }
         Err(e) => pages::Notice::failed(e.to_string()),
     };
-    render_vms(&state, who.as_ref(), notice).await
+    render_vms(&state, &headers, who.as_ref(), notice).await
 }
 
 async fn render_networks(
     state: &AppState,
+    headers: &HeaderMap,
     who: Option<&Identity>,
     notice: pages::Notice,
 ) -> axum::response::Response {
     let depths = queue_depths(state).await;
     pages::networks_page(
-        &state.config.name,
-        who.map(|i| i.display()),
+        &chrome(state, headers, who),
         &state.runners.snapshot(),
         &depths,
         &notice,
@@ -1270,6 +1333,7 @@ async fn join_network(
     if node_id.is_empty() {
         return render_networks(
             &state,
+            &headers,
             who.as_ref(),
             pages::Notice::failed(
                 "This machine's daemon could not be identified, so there is no host to                  add. Set CI_DEFAULT_NODE to its daemon id or name.",
@@ -1280,6 +1344,7 @@ async fn join_network(
     let Some(network) = pool.find(&network_id) else {
         return render_networks(
             &state,
+            &headers,
             who.as_ref(),
             pages::Notice::failed("That network no longer exists on this account."),
         )
@@ -1323,7 +1388,7 @@ async fn join_network(
             pages::Notice::failed(e.to_string())
         }
     };
-    render_networks(&state, who.as_ref(), notice).await
+    render_networks(&state, &headers, who.as_ref(), notice).await
 }
 
 #[cfg(test)]
