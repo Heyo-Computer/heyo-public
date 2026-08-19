@@ -69,6 +69,19 @@ const ORPHAN_MIN_AGE: Duration = Duration::from_secs(1800);
 /// pass; the rest drain over subsequent sweeps.
 const ORPHAN_MAX_DELETES_PER_SWEEP: usize = 100;
 
+/// Cap on leftover boot artefacts pruned per sweep (see the rootfs prune in
+/// [`SchemaRegistry::sweep_orphans`]). Higher than the directory cap: removing
+/// one file from a stopped VM's directory is cheap and completely reversible —
+/// the daemon rebuilds it from the base image on the next boot — where
+/// deleting a directory is not.
+const ORPHAN_MAX_ROOTFS_PRUNES_PER_SWEEP: usize = 250;
+
+/// Name of the per-VM rootfs copy heyvmd clones into `run/<id>/` at boot and
+/// removes again on a clean stop. One that outlives its VM is pure waste
+/// (~200MB each on the pg image); see the prune in
+/// [`SchemaRegistry::sweep_orphans`].
+const VM_ROOTFS_FILE: &str = "rootfs.ext4";
+
 /// Abort an orphan sweep after this many consecutive daemon errors while
 /// checking sandbox liveness: a flaking/restarting heyvmd must never let a
 /// "gone?" ambiguity turn into a deletion, so we stop and try again next sweep.
@@ -348,7 +361,7 @@ impl SchemaRegistry {
         let reclaimer = cfg
             .reclaim
             .as_ref()
-            .map(|r| Arc::new(Reclaimer::new(r.cmd.clone())));
+            .map(|r| Arc::new(Reclaimer::new(r.cmd.clone(), cfg.run_dir.clone())));
         let spares = (cfg.warm_spares > 0).then(|| Arc::new(SparePool::new(cfg.warm_spares)));
         // The dump server has two consumers: the frozen tier (freeze + thaw)
         // and the S3 archive tier, whose dumps *stream* through it so they
@@ -2462,7 +2475,7 @@ impl SchemaRegistry {
                     crate::pending::clear(&schema).await;
                     resolved += 1;
                 }
-                DaemonState::Present => match kill_by_id(&id).await {
+                DaemonState::Present { .. } => match kill_by_id(&id).await {
                     Ok(()) => {
                         let msg = format!(
                             "schema {schema}: deleted VM {id} stranded by a failed bring-up \
@@ -2502,6 +2515,16 @@ impl SchemaRegistry {
     /// the only copy, so it is reported at error level and never deleted.
     /// Conditions 2 and 3 are re-checked immediately before each `remove_dir_all`
     /// against a fresh snapshot, since classification does many awaits.
+    ///
+    /// The same pass also **prunes leftover boot artefacts** from directories
+    /// it is keeping. heyvmd clones the base image into `<dir>/rootfs.ext4`
+    /// on every boot and deletes it on a clean stop, so a copy sitting next to
+    /// a *stopped* VM's data disk is the residue of an unclean one — a daemon
+    /// restart, a watchdog kill, a host reboot. It is ~200MB per VM, nothing
+    /// reads it (the next boot overwrites it), and on a large fleet it is the
+    /// single biggest reclaimable item in the run dir. Deleting it needs the
+    /// same in-use and age guards as a directory, plus the daemon reporting the
+    /// VM not running; the cost of being wrong is one extra image clone.
     async fn sweep_orphans(&self) -> usize {
         let Some(run_dir) = self.cfg.run_dir.clone() else {
             return 0;
@@ -2569,6 +2592,7 @@ impl SchemaRegistry {
         // round-trip only for dirs that survive it.
         let mut deletable: Vec<(PathBuf, String, String)> = Vec::new(); // (path, id, why)
         let mut dataloss: Vec<(String, String)> = Vec::new(); // (schema, id)
+        let mut stale_rootfs: Vec<(PathBuf, String)> = Vec::new(); // (rootfs path, id)
         let (mut alive, mut held, mut daemon_errs) = (0usize, 0usize, 0usize);
         let mut aborted = false;
         for (path, id) in dirs {
@@ -2577,7 +2601,18 @@ impl SchemaRegistry {
                 continue;
             }
             match self.daemon_state(&id).await {
-                DaemonState::Present => alive += 1,
+                DaemonState::Present { running } => {
+                    alive += 1;
+                    // The VM is stopped (or the daemon says so while nothing
+                    // holds its files open, which amounts to the same thing):
+                    // any rootfs clone left in its directory is dead weight.
+                    if !running {
+                        let rootfs = path.join(VM_ROOTFS_FILE);
+                        if file_older_than(&rootfs, ORPHAN_MIN_AGE) {
+                            stale_rootfs.push((rootfs, id));
+                        }
+                    }
+                }
                 DaemonState::Error => {
                     daemon_errs += 1;
                     if daemon_errs >= ORPHAN_MAX_DAEMON_ERRORS {
@@ -2617,10 +2652,15 @@ impl SchemaRegistry {
 
         let backlog = deletable.len().saturating_sub(ORPHAN_MAX_DELETES_PER_SWEEP);
         deletable.truncate(ORPHAN_MAX_DELETES_PER_SWEEP);
+        let rootfs_backlog = stale_rootfs
+            .len()
+            .saturating_sub(ORPHAN_MAX_ROOTFS_PRUNES_PER_SWEEP);
+        stale_rootfs.truncate(ORPHAN_MAX_ROOTFS_PRUNES_PER_SWEEP);
         info!(
-            "orphan-disk sweep: {} deletable, {alive} live, {held} in use, {} data-loss orphan(s), \
-             {too_new} too new{}{}",
+            "orphan-disk sweep: {} deletable, {} stale rootfs cop(ies), {alive} live, {held} in \
+             use, {} data-loss orphan(s), {too_new} too new{}{}",
             deletable.len() + backlog,
+            stale_rootfs.len() + rootfs_backlog,
             dataloss.len(),
             if backlog > 0 { format!(", {backlog} deferred to later passes") } else { String::new() },
             if aborted { " (classification aborted early — daemon unhealthy)" } else { "" },
@@ -2667,7 +2707,45 @@ impl SchemaRegistry {
                 if failed > 0 { format!(", {failed} could not be removed") } else { String::new() },
             );
         }
-        removed
+
+        // Boot-artefact prune. Every guard re-confirmed per file: nothing in
+        // the directory is open, the daemon still reports the VM not running,
+        // and the file itself is still old. A VM that booted since
+        // classification fails all three — the boot re-clones the rootfs, so
+        // even the mtime alone gives it away.
+        let (mut pruned, mut pruned_bytes) = (0usize, 0u64);
+        for (rootfs, id) in stale_rootfs {
+            let Some(dir) = rootfs.parent() else { continue };
+            if crate::orphans::dir_held_open(dir, &open) {
+                continue;
+            }
+            if !file_older_than(&rootfs, ORPHAN_MIN_AGE) {
+                continue;
+            }
+            if !matches!(self.daemon_state(&id).await, DaemonState::Present { running: false }) {
+                continue;
+            }
+            let bytes = crate::orphans::file_allocated_bytes(&rootfs);
+            match std::fs::remove_file(&rootfs) {
+                Ok(()) => {
+                    pruned += 1;
+                    pruned_bytes += bytes;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(
+                    "orphan-disk sweep: pruning stale rootfs {} failed: {e}",
+                    rootfs.display()
+                ),
+            }
+        }
+        if pruned > 0 {
+            info!(
+                "orphan-disk sweep: pruned {pruned} stale rootfs cop(ies) of stopped VMs, {} \
+                 freed (each is re-cloned from the base image on that VM's next boot)",
+                crate::orphans::human_iec(pruned_bytes),
+            );
+        }
+        removed + pruned
     }
 
     /// What heyvmd's per-id endpoint says about sandbox `id`. Uses `get`
@@ -2684,7 +2762,9 @@ impl SchemaRegistry {
             }
         };
         match sb.get().await {
-            Ok(_) => DaemonState::Present,
+            Ok(info) => DaemonState::Present {
+                running: info.status == heyo_sdk::SandboxStatus::Running,
+            },
             Err(HeyoError::NotFound(_)) => DaemonState::Gone,
             Err(e) => {
                 debug!("orphan-disk sweep: daemon error checking {id}: {e:#}");
@@ -2696,6 +2776,17 @@ impl SchemaRegistry {
     fn is_archiving(&self, schema: &str) -> bool {
         self.archiving.lock().unwrap().contains(schema)
     }
+}
+
+/// Does `path` exist and has it been untouched for at least `age`? False for a
+/// missing file, and false when the mtime can't be read or lies in the future —
+/// the callers use this as a "safe to delete" gate, so unknown means no.
+fn file_older_than(path: &std::path::Path, age: Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|md| md.modified())
+        .ok()
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+        .is_some_and(|elapsed| elapsed >= age)
 }
 
 /// One GiB, for device-size math.
@@ -3003,7 +3094,10 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// `Error` is kept distinct from `Gone` on purpose: only `Gone` may delete, so
 /// a flaking daemon can never turn "I can't tell" into a destructive action.
 enum DaemonState {
-    Present,
+    /// The daemon knows this sandbox. `running` distinguishes a live VM (whose
+    /// files are in use) from a stopped record (whose boot-time artefacts are
+    /// dead weight — see the rootfs prune in [`SchemaRegistry::sweep_orphans`]).
+    Present { running: bool },
     Gone,
     Error,
 }
@@ -3244,6 +3338,25 @@ fn used_pct(used: u64, avail: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The age gate on the rootfs prune is what keeps a VM that is booting
+    /// right now (fresh clone, not yet opened by Firecracker) out of the
+    /// candidate set — so "can't tell" and "brand new" must both read false.
+    #[test]
+    fn file_age_gate_is_false_for_fresh_and_missing_files() {
+        let dir = std::env::temp_dir().join(format!("pgfc-age-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("rootfs.ext4");
+        std::fs::write(&f, b"x").unwrap();
+
+        assert!(!file_older_than(&f, Duration::from_secs(1800)), "just written");
+        assert!(file_older_than(&f, Duration::ZERO), "any age passes a zero floor");
+        assert!(
+            !file_older_than(&dir.join("nope.ext4"), Duration::ZERO),
+            "a missing file is never a deletion candidate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The manual image archive must work for a registry-less stray (adopt
     /// the viewed VM), follow the registry when it agrees, and refuse — never

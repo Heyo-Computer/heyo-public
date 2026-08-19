@@ -131,6 +131,14 @@ pub async fn dir_allocated_bytes(dir: std::path::PathBuf) -> u64 {
     .unwrap_or(0)
 }
 
+/// Best-effort on-disk (allocated) size of one file, in bytes — the same
+/// `blocks()` accounting [`dir_allocated_bytes`] uses, for a single path.
+/// Unreadable or missing yields 0; callers use it only to label output.
+pub fn file_allocated_bytes(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map(|md| md.blocks() * 512).unwrap_or(0)
+}
+
 /// Compact IEC byte string (e.g. `51.0 GiB`) for log lines.
 pub fn human_iec(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];

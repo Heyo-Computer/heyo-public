@@ -123,6 +123,7 @@ async fn main() -> Result<()> {
     // up-front — this startup is the first moment we know no restore is
     // running — and let the sweep keep it clean from here.
     if let Some(run_dir) = registry.run_dir() {
+        check_run_dir(&run_dir);
         crate::imgarchive::gc_restore_scratch(&run_dir);
     }
 
@@ -211,6 +212,40 @@ async fn handle_conn(
     // reaper's radar until the client disconnects.
     let guard = registry.checkout(&schema).await?;
     proxy::splice(client, guard.entry(), &info.raw).await
+}
+
+/// Sanity-check `PG_VM_POOL_RUN_DIR` at startup: it must be *heyvmd's* run dir
+/// (the one holding `sb-<id>/`), not merely a directory that exists.
+///
+/// Everything that returns disk — the orphan sweep, the rootfs prune, the
+/// reclaim command, compaction, image archiving, pressure eviction — resolves
+/// paths under it, and every one of them treats "nothing there" as "nothing to
+/// do". So a run dir pointed at the wrong path (the default `~/.heyo/run` on a
+/// host whose daemon actually runs out of, say, a mounted array) doesn't fail:
+/// it silently turns off disk reclamation while every log line still reads
+/// normal. That is worth a loud line at startup.
+fn check_run_dir(run_dir: &std::path::Path) {
+    let sandboxes = std::fs::read_dir(run_dir).map(|entries| {
+        entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("sb-"))
+            .count()
+    });
+    match sandboxes {
+        Ok(0) => warn!(
+            "PG_VM_POOL_RUN_DIR={} holds no sb-<id>/ directories — if heyvmd's run dir is \
+             elsewhere, every disk-reclaiming feature (orphan sweep, rootfs prune, reclaim \
+             command, compaction, image archive, pressure eviction) is silently doing nothing. \
+             Check the daemon's data dir and PG_VM_POOL_RECLAIM_CMD's argument too",
+            run_dir.display()
+        ),
+        Ok(n) => info!("run dir {} holds {n} VM directories", run_dir.display()),
+        Err(e) => warn!(
+            "PG_VM_POOL_RUN_DIR={} is not readable ({e}) — disk verification, the orphan \
+             sweep and the local offload tiers all need it",
+            run_dir.display()
+        ),
+    }
 }
 
 /// Conservative guard on the client-supplied schema name: it becomes both a

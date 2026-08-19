@@ -36,6 +36,18 @@
 # can't reach past the fs). The shrunk fs is re-fscked before anything mounts
 # it; a disk that fails that check is reported and left unmounted.
 #
+# YIELDING: the caller (normally pg-vm-pool) must keep VM boots and this script
+# disjoint in time — the in-use scan below is a snapshot taken at pass start, so
+# a VM booted mid-pass would be invisible to it and its filesystem could be
+# fscked underneath the running guest. The pooler enforces that by blocking
+# boots for the whole run, which on a big fleet is minutes. So when a boot is
+# waiting it creates $STOP_FILE ("$RUN_DIR/.reclaim-stop"): this script finishes
+# the disk it is on, records where it stopped in $CURSOR_FILE, and exits, and
+# the next run resumes after that disk. Stopping between disks (never inside
+# one) is the only safe point, and cooperation is the only safe mechanism — the
+# script runs under sudo, so a caller that "killed" it would only reap the shell
+# while the root e2fsck kept writing.
+#
 # Usage:
 #   sudo ./reclaim-disks.sh [RUN_DIR]        # default RUN_DIR: ~/.heyo/run
 #   sudo DRY_RUN=1 ./reclaim-disks.sh [DIR]  # report candidates, change nothing
@@ -60,6 +72,18 @@ DRY_RUN="${DRY_RUN:-0}"
 SHRINK="${SHRINK:-0}"
 MIN_FS_MB="${MIN_FS_MB:-2048}"
 PRUNE_SWAP="${PRUNE_SWAP:-0}"
+# Cooperative early stop. A pass over a big fleet takes minutes, and the pooler
+# must not boot a VM while this script might fsck its disk — so it blocks boots
+# for the whole run. When a boot is waiting, the pooler creates STOP_FILE; this
+# script finishes the disk it is on and exits. It can't just be killed: it runs
+# under sudo, so the pooler can only signal the shell it spawned while the root
+# e2fsck under it keeps writing — which is exactly the corruption the mutual
+# exclusion exists to prevent.
+STOP_FILE="${STOP_FILE:-$RUN_DIR/.reclaim-stop}"
+# Where a stopped pass left off, so the next one resumes after that disk instead
+# of re-walking the same prefix forever. On a host that yields often, this is
+# what makes fleet-wide progress possible at all.
+CURSOR_FILE="${CURSOR_FILE:-$RUN_DIR/.reclaim-cursor}"
 
 die() { echo "error: $*" >&2; exit 1; }
 human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
@@ -140,6 +164,21 @@ disk_in_use() {
 shopt -s nullglob
 disks=("$RUN_DIR"/sb-*/data.ext4)
 [ "${#disks[@]}" -gt 0 ] || die "no sb-*/data.ext4 disks under $RUN_DIR"
+
+# Resume after the disk the last (stopped) pass finished. The glob order is
+# stable, so rotating the list is enough — no state beyond one path.
+resume_from=""
+[ "$DRY_RUN" = 1 ] || resume_from=$(cat "$CURSOR_FILE" 2>/dev/null || true)
+if [ -n "$resume_from" ]; then
+    for i in "${!disks[@]}"; do
+        if [ "${disks[$i]}" = "$resume_from" ]; then
+            start=$(( (i + 1) % ${#disks[@]} ))
+            [ "$start" -gt 0 ] && disks=("${disks[@]:$start}" "${disks[@]:0:$start}")
+            echo "resuming after $resume_from"
+            break
+        fi
+    done
+fi
 
 reclaimed=0 trimmed=0 skipped=0 failed=0 shrunk=0 dry_reclaimable=0
 
@@ -324,9 +363,26 @@ trim_one() {
 # that "did nothing" — make a flagless run visible in the first line.
 echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR (dry-run=$DRY_RUN shrink=$SHRINK prune-swap=$PRUNE_SWAP; $(e2fsck -V 2>&1 | head -n1))"
 snapshot_open_files
+stopped_early=0 done_count=0 last_done=""
 for disk in "${disks[@]}"; do
+    # Between disks — never inside one — is the only safe place to stop: a
+    # half-finished e2fsck is exactly what must not be left behind.
+    if [ -e "$STOP_FILE" ]; then
+        stopped_early=1
+        break
+    fi
     trim_one "$disk"
+    done_count=$((done_count + 1))
+    last_done="$disk"
 done
+if [ "$DRY_RUN" != 1 ]; then
+    if [ "$stopped_early" = 1 ] && [ -n "$last_done" ]; then
+        printf '%s\n' "$last_done" >"$CURSOR_FILE" 2>/dev/null || true
+    else
+        # A complete pass has no remainder to resume from.
+        rm -f "$CURSOR_FILE" 2>/dev/null || true
+    fi
+fi
 
 echo "----"
 if [ "$DRY_RUN" = 1 ]; then
@@ -334,5 +390,7 @@ if [ "$DRY_RUN" = 1 ]; then
 else
     shrink_note=""
     [ "$SHRINK" = 1 ] && shrink_note=" ($shrunk filesystem(s) shrunk)"
-    echo "trimmed $trimmed disk(s), reclaimed $(human "$reclaimed")$shrink_note; $skipped in use, $failed failed"
+    stop_note=""
+    [ "$stopped_early" = 1 ] && stop_note=" — stopped early after $done_count/${#disks[@]} disk(s) (a VM needed to boot); next run resumes here"
+    echo "trimmed $trimmed disk(s), reclaimed $(human "$reclaimed")$shrink_note; $skipped in use, $failed failed$stop_note"
 fi

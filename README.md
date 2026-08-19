@@ -220,6 +220,42 @@ lower latency, faster bring-up. It falls back to a tunnel automatically if the
 daemon reports no `guest_ip`. Set `PG_VM_POOL_DIRECT_CONNECT=0` to force the
 tunnel path (e.g. if the pooler ever runs on a different machine than the VMs).
 
+### Warm spare pool (`PG_VM_POOL_WARM_SPARES`)
+
+A cold bring-up pays create + boot + `initdb` before it can serve anything, and
+that work is identical for every schema — so it can be done ahead of time. With
+`PG_VM_POOL_WARM_SPARES=N` (max 16) a background replenisher keeps N pre-booted
+`spare-pg-*` VMs with an empty cluster ready; a bring-up that needs a brand-new
+VM (first connect, or a restore whose VM was killed) **claims** one and goes
+straight to creating the schema database. A claimed spare keeps its name — the
+registry's `schema → sandbox-id` binding is what owns it, as for every VM.
+
+Two properties matter for it to actually be faster than a cold create:
+
+- **Claiming never lists.** `GET /deployed-sandboxes` is heyvmd's most expensive
+  and most lock-contended call (it drains its whole handle map under a write
+  lock); on a host with thousands of sandboxes it is seconds. The replenisher
+  lists on its own cadence and publishes the ids it verified; a claim pops one
+  from that shelf and spends a single by-id lookup confirming it is still there.
+  An empty shelf answers "cold-create" immediately rather than paying for a
+  listing to discover it has nothing.
+- **A spare counts only when its Postgres answers.** heyvmd reports a VM running
+  as soon as the guest signals ready, which is not the same as a healthy
+  postmaster; a half-failed boot leaves a "running" spare that poisons the first
+  claim that takes it while the pool reports itself full. Every pass TCP-probes
+  each free spare's 5432, and a spare unreachable for 5 minutes is deleted and
+  rebuilt (capped per pass — when *every* spare probes sick the cause is usually
+  the host or the daemon, and deleting the whole pool at once is just another
+  create burst).
+
+Passes build the deficit a few VMs at a time rather than one at a time (an empty
+pool with a target of a dozen must not take a dozen sequential boots to fill),
+one failed build no longer cancels the rest of the pass, and a claim or a failed
+claim wakes the replenisher immediately instead of leaving the pool short until
+its next tick. Stranded *stopped* spares — the residue of a daemon restart — are
+restarted in preference to creating new ones, and are only counted once they are
+genuinely up.
+
 ### Local freeze tier
 
 Between "idle-stopped VM" (full filesystem image on disk) and "archived to S3"
@@ -411,6 +447,27 @@ Pin the script at a root-owned path (`chown root:root`, `chmod 0755`) so the
 sudoers entry can't be repointed by editing a user-writable file, and pass the
 run dir in the sudoers line exactly as in the command so `sudo -n` matches.
 
+**A pass yields to a waiting boot.** The script's in-use scan is a snapshot
+taken at pass start, so a VM booted mid-pass would be invisible to it and its
+filesystem could be fscked underneath the running guest. The pooler closes that
+window by holding a gate for the pass's whole duration and taking the read side
+of it around every VM boot — but on a large fleet a pass is minutes, not
+seconds, and a boot that simply waited it out would stall a client cold start, a
+warm-spare restart or a thaw for exactly that long.
+
+So a waiting boot asks the pass to stop: the pooler creates
+`<run-dir>/.reclaim-stop`, the script finishes the disk it is on and exits, and
+the gate is released *after* the child has actually exited. Where it stopped is
+recorded in `<run-dir>/.reclaim-cursor` and the next run resumes after that
+disk, so a host that yields often still walks the whole fleet. Deliberately
+cooperative rather than a kill: the command runs under `sudo`, so the pooler can
+only signal the shell it spawned while `sudo`'s root-owned `e2fsck` keeps
+writing — handing the gate back then would cause exactly the corruption the gate
+prevents. An older deployed script that doesn't know about the stop file still
+works; the boot just waits for the full pass, as before. (Redeploy the script
+after upgrading if you want yielding: `install -D -m 0755 reclaim-disks.sh
+/home/sam/.heyo/bin/reclaim-disks.sh`.)
+
 #### Orphaned disks (`PG_VM_POOL_ORPHAN_SWEEP_SECS`)
 
 Slack reclamation trims a *live* schema's disk; it does nothing for a disk whose
@@ -456,6 +513,24 @@ ambiguity can never become a destructive action. Unlike slack reclamation this
 needs no root — just delete permission on the run dir (the pooler runs as the
 same user heyvmd creates the directories as); if jailer left root-owned files a
 removal fails and is logged rather than silently half-done.
+
+The same pass also **prunes leftover rootfs copies** from directories it keeps.
+heyvmd clones the base image into `<run-dir>/sb-<id>/rootfs.ext4` on every boot
+and deletes it again on a clean stop, so a copy sitting beside a *stopped* VM's
+data disk is residue from an unclean one — a daemon restart, a watchdog kill, a
+host reboot. On the pg image that is ~200 MB per VM and on a large fleet it is
+the biggest reclaimable item in the run dir (measured at ~1 TB on a host with
+~5 600 sandboxes). It is deleted only under the same in-use and age guards as a
+directory, plus heyvmd reporting the VM **not running** — and the cost of being
+wrong is one extra image clone on the next boot, since that boot rewrites the
+file anyway.
+
+At startup the pooler counts `sb-<id>/` directories under `PG_VM_POOL_RUN_DIR`
+and warns if there are none. Every disk-reclaiming feature here resolves paths
+under that directory and treats "nothing there" as "nothing to do", so a run dir
+pointed at the wrong path (e.g. the default `~/.heyo/run` on a host whose daemon
+actually runs out of a mounted array) disables all of them without a single
+error line. Check `PG_VM_POOL_RECLAIM_CMD`'s argument at the same time.
 
 ### Managing with supervisord
 

@@ -772,8 +772,9 @@ async fn swap_and_boot(
     let started = {
         // A reclaim pass must not be mid-fsck on this disk when the VM boots,
         // and the boot counts against the global bring-up gate like any other.
-        let _slot = crate::vm::bringup_slot(schema).await;
+        // Permit before slot — see `vm::bring_up_existing`.
         let _permit = crate::reclaim::boot_permit().await;
+        let _slot = crate::vm::bringup_slot(schema).await;
         sandbox.start().await
     };
     started.context("booting the VM on the restored image")?;

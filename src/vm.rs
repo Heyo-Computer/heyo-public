@@ -165,6 +165,27 @@ const READY_POLL_FAST_INTERVAL: Duration = Duration::from_millis(250);
 const READY_POLL_SLOW_INTERVAL: Duration = Duration::from_secs(2);
 const READY_POLL_FAST_WINDOW: Duration = Duration::from_secs(15);
 
+/// How long a *continuous* run of 404s on the per-id endpoint is tolerated
+/// before the wait gives up on that sandbox id.
+///
+/// A 404 right after the deploy's 202 is normal for a moment (the daemon hands
+/// out the id, then its provision tracker starts answering for it). A 404 that
+/// persists is not a slow build: it means the record backing this id is gone —
+/// overwhelmingly because heyvmd restarted (its watchdog does exactly that, and
+/// the tracker is in-memory), taking the half-built VM with it. Waiting out the
+/// full ready timeout there burns minutes of the caller's deadline plus an
+/// admission slot on an id that can never resolve, and — since heyvmd restarts
+/// kill every running VM — it happens to every in-flight bring-up at once. Fail
+/// fast instead: the caller retries with a fresh create against the fresh
+/// daemon, which is the only thing that can work.
+const READY_NOTFOUND_GRACE: Duration = Duration::from_secs(45);
+
+/// Ready budget for a warm spare specifically, floored against the (much
+/// longer) client-facing `ready_timeout`. A spare has no client waiting on it
+/// and no data to lose: one that hasn't booted in this long is a sick build to
+/// throw away and retry, not something to keep a replenish pass parked on.
+pub(crate) const SPARE_READY_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Pooler-side readiness wait: poll the *per-id* `GET /deployed-sandboxes/:id`
 /// until the sandbox leaves `provisioning`, tolerating transient daemon
 /// errors until the deadline.
@@ -179,15 +200,30 @@ const READY_POLL_FAST_WINDOW: Duration = Duration::from_secs(15);
 /// nothing: keep polling until the deadline, and report the last error if the
 /// deadline passes.
 pub(crate) async fn wait_ready(sandbox: &Sandbox, timeout: Duration, name: &str) -> Result<()> {
+    wait_ready_within(sandbox, timeout, name, READY_NOTFOUND_GRACE).await
+}
+
+/// [`wait_ready`] with the 404 grace spelled out, so tests can exercise both
+/// sides of it without waiting real minutes.
+async fn wait_ready_within(
+    sandbox: &Sandbox,
+    timeout: Duration,
+    name: &str,
+    notfound_grace: Duration,
+) -> Result<()> {
     use heyo_sdk::SandboxStatus;
     let started = Instant::now();
     let deadline = started + timeout;
     let mut last_err: Option<HeyoError> = None;
     let mut error_streak = 0u32;
+    // Start of the current uninterrupted run of 404s, if any (see
+    // READY_NOTFOUND_GRACE). Cleared by any answer that isn't a 404.
+    let mut missing_since: Option<Instant> = None;
     loop {
         match sandbox.get().await {
             Ok(info) => {
                 error_streak = 0;
+                missing_since = None;
                 match info.status {
                     SandboxStatus::Running => return Ok(()),
                     // Terminal: the daemon gave up on the build; waiting longer
@@ -214,6 +250,21 @@ pub(crate) async fn wait_ready(sandbox: &Sandbox, timeout: Duration, name: &str)
                 error_streak += 1;
                 if error_streak == 1 {
                     warn!("{name}: readiness poll failed (retrying until deadline): {e:#}");
+                }
+                if matches!(e, HeyoError::NotFound(_)) {
+                    let since = *missing_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= notfound_grace {
+                        bail!(
+                            "VM {name} ({}) has been unknown to heyvmd for {:?} — the record \
+                             behind this id is gone (heyvmd restarts drop in-flight creates, \
+                             and take every running VM with them). Not waiting out the ready \
+                             timeout; retry with a fresh create. Last daemon error: {e:#}",
+                            sandbox.sandbox_id(),
+                            since.elapsed(),
+                        );
+                    }
+                } else {
+                    missing_since = None;
                 }
                 last_err = Some(e);
             }
@@ -1820,10 +1871,11 @@ async fn power_cycle(
     drop(tunnel);
     // The stop→start gap makes the disk look reclaimable; hold the boot permit
     // across both so a reclaim pass can't start working on it in between.
-    // The bring-up slot bounds how many such boots hit the daemon at once.
+    // The bring-up slot bounds how many such boots hit the daemon at once, and
+    // is taken *after* the permit (see `bring_up_existing`).
     {
-        let _slot = bringup_slot(name).await;
         let _permit = crate::reclaim::boot_permit().await;
+        let _slot = bringup_slot(name).await;
         sandbox
             .stop()
             .await
@@ -2135,7 +2187,26 @@ pub(crate) async fn stop_after_failed_bringup(schema: &str, known_id: Option<&st
 /// image, size class, thin data disk, TTL 0 — just parked with an empty
 /// cluster until claimed.
 pub(crate) async fn create_spare(cfg: &Config, name: &str) -> Result<Sandbox> {
-    create_vm(cfg, name, false).await
+    create_vm_within(cfg, name, false, cfg.ready_timeout.min(SPARE_READY_TIMEOUT)).await
+}
+
+/// Is this VM's Postgres accepting connections? A plain TCP connect to the
+/// guest's 5432 — enough to prove the guest booted, mounted its data disk,
+/// finished `initdb` and started the postmaster, which is the whole point of
+/// holding a spare. Cheap (no daemon call beyond the id lookup, no auth, no
+/// pool) so the replenisher can run it over the pool every pass.
+///
+/// `Ok(None)` means the check doesn't apply: the daemon reports no `guest_ip`
+/// (non-tap backend, or not assigned yet), so there is no direct address to
+/// probe and the caller must fall back to the daemon's own status.
+pub(crate) async fn pg_listening(sandbox: &Sandbox) -> Result<Option<bool>> {
+    let Some(target) = direct_target(sandbox).await? else {
+        return Ok(None);
+    };
+    let connected = tokio::time::timeout(PG_PROBE_ATTEMPT, tokio::net::TcpStream::connect(target))
+        .await
+        .is_ok_and(|r| r.is_ok());
+    Ok(Some(connected))
 }
 
 /// Connect to an existing sandbox by id and force it to a running, ready state.
@@ -2155,11 +2226,18 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
     // A stopped VM's disk may be mid-fsck/shrink under a reclaim pass; booting
     // over that destroys the filesystem. Hold the permit only across start():
     // once the VM process has the disk open, the next pass's in-use scan
-    // protects it. The bring-up slot comes first (same order everywhere) and
-    // covers the boot only — the ready wait below is cheap polling.
+    // protects it.
+    //
+    // Permit first, slot second — the order everywhere a boot takes both. The
+    // permit can block (it preempts a reclaim pass, but the pass still has to
+    // reach a yield point); waiting for it while holding one of the three
+    // bring-up slots would spend the pooler's scarcest resource on a wait that
+    // needs no daemon at all, and three such boots would freeze every
+    // bring-up on the host. Reclaim never takes a bring-up slot, so there is
+    // no cycle to deadlock on.
     let started = {
-        let _slot = bringup_slot(name).await;
         let _permit = crate::reclaim::boot_permit().await;
+        let _slot = bringup_slot(name).await;
         sb.start().await
     };
     match started {
@@ -2177,6 +2255,17 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
 /// `pub(crate)` for the image-restore path, which creates the VM itself and
 /// swaps the restored disk in under it before first use.
 pub(crate) async fn create_vm(cfg: &Config, name: &str, keepalive: bool) -> Result<Sandbox> {
+    create_vm_within(cfg, name, keepalive, cfg.ready_timeout).await
+}
+
+/// [`create_vm`] with an explicit readiness budget — warm spares get a shorter
+/// one than a client-facing bring-up (see [`SPARE_READY_TIMEOUT`]).
+async fn create_vm_within(
+    cfg: &Config,
+    name: &str,
+    keepalive: bool,
+    ready_timeout: Duration,
+) -> Result<Sandbox> {
     info!(
         "creating VM {name}{}",
         if keepalive { " (keep-alive)" } else { "" }
@@ -2221,7 +2310,7 @@ pub(crate) async fn create_vm(cfg: &Config, name: &str, keepalive: bool) -> Resu
     if let Some(schema) = name.strip_prefix("pg-") {
         crate::pending::record(schema, sandbox.sandbox_id()).await;
     }
-    if let Err(e) = wait_ready(&sandbox, cfg.ready_timeout, name).await {
+    if let Err(e) = wait_ready(&sandbox, ready_timeout, name).await {
         // Kill the half-built VM now, by the id in hand — no listing, which is
         // exactly what's unreachable when bring-ups fail en masse. It never
         // served a client, so its disk holds nothing worth keeping. Best
@@ -2956,6 +3045,90 @@ mod tests {
             !matches!(probe_pg(&pool_at(port)).await, PgProbe::Unreachable(_)),
             "a slow-but-listening VM must not be classified Unreachable"
         );
+    }
+
+    /// Spin an in-process daemon stub for `GET /deployed-sandboxes/:id` that
+    /// 404s the first `misses` calls and reports `running` after that.
+    /// Returns the base URL to point a `Sandbox` at.
+    async fn status_stub(misses: usize) -> String {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/deployed-sandboxes/{id}",
+            axum::routing::get(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < misses {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            format!("Sandbox not found: {id}"),
+                        )
+                            .into_response();
+                    }
+                    axum::Json(serde_json::json!({
+                        "id": id,
+                        "status": "running",
+                        "status_changed_at": "2026-08-19T00:00:00Z",
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(axum::serve(listener, app).into_future());
+        base
+    }
+
+    fn stub_sandbox(base: &str) -> Sandbox {
+        Sandbox::connect(
+            "sb-test".to_string(),
+            HeyoClientOptions {
+                base_url: Some(base.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// A sandbox id heyvmd has permanently forgotten (its restart dropped the
+    /// in-flight create) must fail fast, not hold the caller — and its
+    /// admission slot — for the whole ready timeout.
+    #[tokio::test]
+    async fn a_sustained_404_ends_the_ready_wait_well_inside_the_timeout() {
+        let base = status_stub(usize::MAX).await;
+        let sb = stub_sandbox(&base);
+        let started = Instant::now();
+        let err = wait_ready_within(
+            &sb,
+            Duration::from_secs(30),
+            "pg-x",
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown to heyvmd"),
+            "the 404 grace, not the deadline, ended the wait: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "gave up after {:?} — should be ~the grace",
+            started.elapsed()
+        );
+    }
+
+    /// The moment after a 202 where the daemon hasn't published the record yet
+    /// is normal and must not fail the bring-up.
+    #[tokio::test]
+    async fn a_brief_404_right_after_the_deploy_is_tolerated() {
+        let base = status_stub(3).await;
+        let sb = stub_sandbox(&base);
+        wait_ready_within(&sb, Duration::from_secs(30), "pg-x", Duration::from_secs(5))
+            .await
+            .expect("a short 404 window must be ridden out, not treated as a dead id");
     }
 
     /// Spin an in-process daemon stub that records resize requests and answers
