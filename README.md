@@ -506,6 +506,33 @@ works; the boot just waits for the full pass, as before. (Redeploy the script
 after upgrading if you want yielding: `install -D -m 0755 reclaim-disks.sh
 /home/sam/.heyo/bin/reclaim-disks.sh`.)
 
+#### Stale rootfs copies (`prune-stale-rootfs.sh`)
+
+Usually the largest single reclaimable item on a host, and the one nothing else
+touches. heyvmd clones the base image into `<run-dir>/sb-<id>/rootfs.ext4` on
+every **boot** and deletes it again on a clean **stop**; a copy sitting beside a
+stopped VM's data disk is residue from a stop that never ran its cleanup — a
+watchdog restart of the daemon, a SIGKILL, a host reboot. At ~190MB each that is
+most of a terabyte on a fleet of a few thousand (measured: 1.05TB of 3.2TB used
+on a 5600-sandbox host). `reclaim-disks.sh` only touches `data.ext4`, and the
+orphan sweep only deletes directories heyvmd has *forgotten*, so these
+accumulate indefinitely.
+
+```
+sudo ./prune-stale-rootfs.sh /mnt/md0/heyvm/run             # dry run: what and how much
+sudo DELETE=1 ./prune-stale-rootfs.sh /mnt/md0/heyvm/run    # reclaim it
+```
+
+Nothing is orphaned: a rootfs copy holds no sandbox state (the schema's data is
+`data.ext4`, the binding is the registry), and the next boot re-clones it from
+the base image — the same thing heyvmd's own `stop` does. Guards: skips any file
+a process holds open (device:inode, so a *running* VM's copy is never touched
+even under jailer's chroot), skips anything younger than `MIN_AGE_MINS` (default
+30) so a VM mid-boot can't be caught between clone and open, and only ever
+matches `sb-*/rootfs.ext4` — never a base image, a data disk, or a
+`snapshot/rootfs.ext4` checkpoint. The pooler's orphan sweep prunes these
+continuously once running; the script is for draining an existing backlog now.
+
 #### Orphaned disks (`PG_VM_POOL_ORPHAN_SWEEP_SECS`)
 
 Slack reclamation trims a *live* schema's disk; it does nothing for a disk whose
