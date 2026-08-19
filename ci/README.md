@@ -144,7 +144,15 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           REGION: ${{ vars.REGION }}
       - uses: ci/upload-artifact
-        with: { name: bin-${{ matrix.target }}, path: target/release/app }
+        with:
+          name: bin-${{ matrix.target }}
+          path: target/release/app
+          # Optional, and only the `artifacts` sink keeps it: what a person
+          # browsing that store sees beside the digest. Written as a *label* on
+          # the blob and the manifest, never as a manifest annotation — a
+          # manifest is addressed by its own hash, so wording in one would give
+          # two builds of identical bytes two digests as soon as it changed.
+          description: The app binary for ${{ matrix.target }}, release build.
 
   deploy:
     uses: prod-runners              # any online host in that network

@@ -384,7 +384,16 @@ jobs:
       # CI_ARTIFACT_SINK=artifacts. The workflow does not choose; it uploads.
       # Downloadable from the run page either way. Worth noticing once: for this
       # workflow the sink is the orchestrator this artifact replaces.
+      # `description:` is what the artifact store shows beside the digest. It is
+      # written as a label on the blob and the manifest, not as a manifest
+      # annotation: a manifest is addressed by its own hash, and wording in one
+      # would give two builds of identical bytes two digests as soon as this
+      # line changed. Only the `artifacts` sink keeps it.
       - uses: ci/upload-artifact
         with:
           name: ci
+          description: >-
+            The ci orchestrator binary for x86_64-linux, with SHA256SUMS —
+            the build of the service that produced this artifact.
+            Built from ${{ ci.branch }}.
           path: dist

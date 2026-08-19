@@ -44,6 +44,7 @@ pub mod gc;
 pub mod heyvm;
 #[cfg(feature = "daemon")]
 pub mod http;
+pub mod labels;
 pub mod lock;
 pub mod manifest;
 pub mod store;
@@ -55,6 +56,7 @@ pub mod web;
 pub use config::Config;
 pub use digest::Digest;
 pub use error::{Error, Result};
+pub use labels::{Label, Labelled};
 pub use manifest::{BlobRef, Entry, Manifest};
 pub use manifest::{KIND_BUNDLE, KIND_DOCKERFILE, KIND_GENERIC, KIND_ROOTFS};
 pub use store::{BlobInfo, Materialize, Materialized, Method, Store, Usage};

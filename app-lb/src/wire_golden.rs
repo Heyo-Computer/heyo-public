@@ -171,6 +171,7 @@ fn vm_spec() -> DeploymentSpec {
             cookie_domain: Some(".example.com".into()),
             redirect_url: Some("https://sandbox.example.com/__applb/auth/callback".into()),
             forward_identity: true,
+            jwt: None,
         }),
     }
 }
@@ -243,6 +244,65 @@ fn static_spec() -> DeploymentSpec {
         update: None,
         auth: None,
     }
+}
+
+/// A JWT-gated spec, so `JwtSpec` appears in the fixtures at all.
+///
+/// Its own fixture rather than a field on [`vm_spec`]: a gate accepting Google
+/// and a gate accepting a JWT are different policies, and the Google one is what
+/// every client has been rendering — adding a `jwt` block to it would change a
+/// fixture nobody's code has a reason to re-read.
+fn jwt_spec() -> DeploymentSpec {
+    let mut s = vm_spec();
+    s.id = "search".into();
+    s.build = None;
+    s.auth = Some(crate::config::AuthGate {
+        // Both, because the mixed gate is the interesting one: a person opens
+        // the UI in a browser, the UI's own calls carry the token it was issued.
+        provider: serde_json::from_str(r#"["google","jwt"]"#).expect("providers parse"),
+        client_id: Some("1234.apps.googleusercontent.com".into()),
+        client_secret: Some(crate::secrets::SecretRef {
+            secret: "google-oauth".into(),
+            key: "client_secret".into(),
+            username: None,
+        }),
+        allowed_domains: vec!["example.com".into()],
+        allowed_emails: vec![],
+        public_paths: vec!["/healthz".into()],
+        base_path: "/__applb/auth".into(),
+        session_ttl_secs: 43200,
+        cookie_name: "applb_session".into(),
+        cookie_domain: None,
+        redirect_url: None,
+        forward_identity: true,
+        jwt: Some(crate::config::JwtSpec {
+            secret: Some(crate::secrets::SecretRef {
+                secret: "heyo-auth".into(),
+                key: "jwt_secret".into(),
+                username: None,
+            }),
+            public_key: None,
+            jwks_url: None,
+            algorithms: vec!["HS256".into()],
+            issuer: "auth-service".into(),
+            audience: Some("heyo-app".into()),
+            require: [
+                (
+                    "role".to_string(),
+                    serde_json::json!(["user", "admin"]),
+                ),
+                ("accountId".to_string(), serde_json::json!("acct_7f3c")),
+            ]
+            .into_iter()
+            .collect(),
+            subject_claim: "userId".into(),
+            email_claim: "email".into(),
+            name_claim: "name".into(),
+            leeway_secs: Some(30),
+            cookie: Some("heyo_access_token".into()),
+        }),
+    });
+    s
 }
 
 /// An artifact-backed spec, so `ArtifactSpec` appears in the fixtures at all.
@@ -333,6 +393,7 @@ fn deployment_status_is_stable() {
         ("deployment-status-static", static_spec()),
         ("deployment-status-artifact", artifact_spec()),
         ("deployment-status-site-artifact", site_artifact_spec()),
+        ("deployment-status-jwt", jwt_spec()),
     ] {
         spec.validate().unwrap_or_else(|e| {
             panic!("fixture {name} describes a deployment the server would reject: {e}")

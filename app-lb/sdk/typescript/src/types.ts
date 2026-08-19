@@ -179,9 +179,63 @@ export interface AuthGate {
   cookie_domain?: string;
   redirect_url?: string;
   forward_identity?: boolean;
+  /** How to verify a JWT, when `jwt` is among the providers. */
+  jwt?: JwtSpec;
 }
 
-export type AuthProvider = "google" | "app-token";
+export type AuthProvider = "google" | "app-token" | "jwt";
+
+/**
+ * How a gate verifies a JWT somebody else issued, and which ones it lets past.
+ *
+ * The `jwt` provider holds no state: there is no session cookie and no token
+ * table, because the credential carries its own proof. Everything the gate needs
+ * is therefore configuration — which key, which algorithm, which issuer, which
+ * claim is the user, which claims must hold — which is also what makes one gate
+ * front the Heyo auth API, an Auth0 tenant or a Keycloak realm.
+ *
+ * Exactly one of `secret`, `public_key` and `jwks_url` is set.
+ */
+export interface JwtSpec {
+  /** HMAC shared secret (the `HS*` algorithms), as a secret-store reference. */
+  secret?: SecretRef;
+  /** An inline PEM public key or certificate, for `RS*`/`PS*`/`ES*`. */
+  public_key?: string;
+  /** The issuer's JWKS endpoint, for a provider that rotates keys. */
+  jwks_url?: string;
+  /**
+   * The signature algorithms this gate accepts, e.g. `["HS256"]`.
+   *
+   * Required, with no default: the algorithm is named in the token's own header,
+   * and a verifier that trusted that would accept an unsigned token.
+   */
+  algorithms: string[];
+  /** The `iss` a token must carry, exactly. Required. */
+  issuer: string;
+  /** The `aud` a token must carry, if the issuer sets one. */
+  audience?: string;
+  /**
+   * Claims a token must satisfy on top of verifying. A value or a list of them
+   * per claim: a list is an OR within that claim, and the map is an AND across
+   * claims. A claim that is itself a list — scopes, roles, groups — is satisfied
+   * by containing one of the wanted values.
+   */
+  require?: Record<string, unknown>;
+  /** Which claim is forwarded as `x-auth-request-user`. Defaults to `sub`. */
+  subject_claim?: string;
+  /** Which claim is forwarded as `x-auth-request-email`. Defaults to `email`. */
+  email_claim?: string;
+  /** Which claim is forwarded as `x-auth-request-name`. Defaults to `name`. */
+  name_claim?: string;
+  /** Clock skew allowed on `exp`/`nbf`, in seconds. Capped at 300. */
+  leeway_secs?: number;
+  /**
+   * A cookie to read the token from when there is no `Authorization` header —
+   * the only way a browser page navigation can carry one. The header wins when
+   * both are present.
+   */
+  cookie?: string;
+}
 
 export interface DeploymentSpec {
   id: string;

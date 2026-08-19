@@ -38,7 +38,8 @@ const KNOWN = {
     UpdateSpec: ["working_dir", "commands", "env", "env_from", "auth", "timeout_secs", "verify_timeout_secs"],
     SecretEnv: ["secret", "key", "as"],
     SecretRef: ["secret", "key", "username"],
-    AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity"],
+    AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity", "jwt"],
+    JwtSpec: ["secret", "public_key", "jwks_url", "algorithms", "issuer", "audience", "require", "subject_claim", "email_claim", "name_claim", "leeway_secs", "cookie"],
     DeploymentView: ["id", "namespace", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
     UpstreamTrafficStatus: ["deployment_id", "upstream", "state", "healthy", "in_flight", "reason", "started_at"],
     PoolStatus: ["desired_replicas", "ready", "draining", "pending", "total_in_flight", "target_concurrency", "min_replicas", "max_replicas", "warm_pool", "utilization", "cpu_percent", "memory_bytes", "boot_timeout_secs", "cold_start_timeout_secs"],
@@ -90,6 +91,7 @@ const FIXTURES = {
   "deployment-status-static": "DeploymentStatus",
   "deployment-status-artifact": "DeploymentStatus",
   "deployment-status-site-artifact": "DeploymentStatus",
+  "deployment-status-jwt": "DeploymentStatus",
   "deployment-view-site": "DeploymentView",
   "metrics-response": "MetricsResponse",
   "security-response": "SecurityResponse",
@@ -121,6 +123,10 @@ const NESTED = {
   spec: "DeploymentSpec", vm: "VmSpec", scaling: "ScalingPolicy", health: "HealthCheck",
   build: "BuildSpec", artifact: "ArtifactSpec", site: "SiteSpec", update: "UpdateSpec",
   auth: "AuthGate", client_secret: "SecretRef", pool: "PoolStatus", host: "HostUsage",
+  // `jwt` is the gate's verification policy. Its own `secret` is a SecretRef,
+  // and `require` is a free-form claim map with no declaration to check against
+  // — app-lb may carry any claim name there without that being an API change.
+  jwt: "JwtSpec",
   feed: "FeedSpec",
   fleet: "FleetPool", obs: "ObsStats", metrics: "DeploymentMetrics",
   security: "SecuritySummary", totals: "SeverityTotals", stats: "SiemStats",
@@ -165,6 +171,9 @@ function check(value, declName, path, unknown) {
       // ...and a mount's `auth` is a store credential, which the same rule
       // already resolves to SecretRef.
       if (key === "auth") nested = declName === "DeploymentSpec" ? "AuthGate" : "SecretRef";
+      if (key === "secret") nested = "SecretRef";
+      // A free-form claim map: the keys are whatever the issuer sends.
+      if (key === "require") nested = undefined;
       if (nested) check(child, nested, `${path}.${key}`, unknown);
     } else if (Array.isArray(child)) {
       let elem = ELEMENTS[key];

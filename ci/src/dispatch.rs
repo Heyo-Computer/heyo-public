@@ -1771,6 +1771,10 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 let path = with("path").ok_or_else(|| {
                     DispatchError::Artifact("ci/upload-artifact needs `with.path`".into())
                 })?;
+                // Optional, and only the `artifacts` sink has anywhere to put
+                // it. Substituted like every other `with:` value, so a workflow
+                // can write `${{ ci.branch }}` into it.
+                let description = with("description").filter(|d| !d.trim().is_empty());
 
                 // Read out of the guest through exec and base64, the same way
                 // the source went in — the daemon's file routes address a
@@ -1831,6 +1835,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     job_key: plan.key.clone(),
                     workflow_id: run.map(|r| r.workflow_id).unwrap_or_default(),
                     name: name.clone(),
+                    description,
                 };
                 let stored = self
                     .artifacts

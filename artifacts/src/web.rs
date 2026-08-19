@@ -29,6 +29,7 @@
 
 use crate::admin::{AdminAuth, SESSION_COOKIE};
 use crate::digest::Digest;
+use crate::labels::Label;
 use crate::manifest::Manifest;
 use crate::store::{BlobInfo, Store, Usage};
 use crate::tags::TagName;
@@ -38,6 +39,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Rows before the overview stops listing and points at the full page.
@@ -216,6 +218,7 @@ pub async fn overview(
     let usage = st.store.usage().await?;
     let tags = st.store.list_tags().await?;
     let blobs = st.store.list_blobs().await?;
+    let names = Names::load(&st.store).await?;
 
     let pinned = blobs.iter().filter(|b| b.nlink > 1).count();
     let shown: Vec<_> = blobs.iter().take(OVERVIEW_ROWS).collect();
@@ -252,12 +255,20 @@ pub async fn overview(
                     p.empty { "No tags. " code { "art tag <name> <ref>" } }
                 } @else {
                     table {
-                        thead { tr { th { "Tag" } th { "Target" } } }
+                        thead { tr { th { "Tag" } th { "Target" } th { "What it is" } } }
                         tbody {
                             @for (t, d) in &tags {
                                 tr {
                                     td.name { (t.as_str()) }
                                     td { a.mono href=(format!("/dashboard/blob/{d}")) { (short(d)) } }
+                                    // The tag says what to type; this says
+                                    // whether it is the one you want.
+                                    td {
+                                        @match names.label(d).and_then(Label::display_name) {
+                                            Some(name) => span.labelname { (name) },
+                                            None => span.muted { "—" },
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -267,7 +278,7 @@ pub async fn overview(
 
             section {
                 (section_head("Largest blobs", blobs.len(), Some("/dashboard/blobs")))
-                (blob_table(&shown))
+                (blob_table(&shown, &names))
             }
         },
     ))
@@ -278,6 +289,7 @@ pub async fn blobs_page(
     headers: header::HeaderMap,
 ) -> Result<Markup, WebError> {
     let blobs = st.store.list_blobs().await?;
+    let names = Names::load(&st.store).await?;
     let refs: Vec<&BlobInfo> = blobs.iter().collect();
     Ok(page(
         &shell(&st, &headers),
@@ -286,7 +298,7 @@ pub async fn blobs_page(
         html! {
             section {
                 (section_head("All blobs", blobs.len(), None))
-                (blob_table(&refs))
+                (blob_table(&refs, &names))
             }
         },
     ))
@@ -299,6 +311,7 @@ pub async fn blob_page(
 ) -> Result<Markup, WebError> {
     let d = Digest::parse(&digest).map_err(crate::Error::from)?;
     let info = st.store.stat(&d).await?;
+    let label = st.store.get_label(&d).await?;
 
     // Which tags and manifests point here. Both lists are small enough to scan
     // directly; an index would be a second source of truth for something the
@@ -328,8 +341,9 @@ pub async fn blob_page(
         "/dashboard/blobs",
         html! {
             section {
-                h2 { "Blob" }
+                (heading("Blob", label.as_ref()))
                 p.digest.mono { (info.digest.as_str()) }
+                (description(label.as_ref()))
                 section.tiles {
                     (tile("Logical", &human(info.size), None))
                     (tile("On disk", &human(info.allocated), None))
@@ -385,6 +399,7 @@ pub async fn manifests_page(
     State(st): State<WebState>,
     headers: header::HeaderMap,
 ) -> Result<Markup, WebError> {
+    let names = Names::load(&st.store).await?;
     let mut rows = Vec::new();
     for d in st.store.list_manifests().await? {
         let m = st.store.get_manifest(&d).await.ok();
@@ -401,10 +416,11 @@ pub async fn manifests_page(
                     p.empty { "No manifests." }
                 } @else {
                     table {
-                        thead { tr { th { "Digest" } th { "Kind" } th.r { "Entries" } th.r { "Total" } } }
+                        thead { tr { th { "What" } th { "Digest" } th { "Kind" } th.r { "Entries" } th.r { "Total" } } }
                         tbody {
                             @for (d, m) in &rows {
                                 tr {
+                                    td { (names.cell(d)) }
                                     td { a.mono href=(format!("/dashboard/manifest/{d}")) { (short(d)) } }
                                     td { (m.as_ref().map(|m| m.kind.as_str()).unwrap_or("unreadable")) }
                                     td.r { (m.as_ref().map(|m| m.entries.len()).unwrap_or(0)) }
@@ -426,14 +442,27 @@ pub async fn manifest_page(
 ) -> Result<Markup, WebError> {
     let d = Digest::parse(&digest).map_err(crate::Error::from)?;
     let m: Manifest = st.store.get_manifest(&d).await?;
+    let label = st.store.get_label(&d).await?;
+    let tags: Vec<TagName> = st
+        .store
+        .list_tags()
+        .await?
+        .into_iter()
+        .filter(|(_, td)| *td == d)
+        .map(|(t, _)| t)
+        .collect();
     Ok(page(
         &shell(&st, &headers),
         "manifest",
         "/dashboard/manifests",
         html! {
             section {
-                h2 { "Manifest" }
+                (heading("Manifest", label.as_ref()))
                 p.digest.mono { (d.as_str()) }
+                @if !tags.is_empty() {
+                    p { @for t in &tags { span.tagchip { (t.as_str()) } } }
+                }
+                (description(label.as_ref()))
                 section.tiles {
                     (tile("Kind", &m.kind, None))
                     (tile("Schema", &m.schema.to_string(), None))
@@ -475,6 +504,38 @@ pub async fn manifest_page(
 // ---------------------------------------------------------------------------
 // Components
 // ---------------------------------------------------------------------------
+
+/// A detail page's heading: what the thing is called, falling back to what kind
+/// of thing it is.
+///
+/// The name replaces the generic word rather than sitting beside it. A page
+/// headed "Blob" over a digest told the reader only what they already knew from
+/// the URL; one headed "Debian rootfs, hermes agents" is the answer they came
+/// for, and the word "blob" is still in the breadcrumb above it.
+fn heading(kind: &str, label: Option<&Label>) -> Markup {
+    match label.and_then(Label::display_name) {
+        Some(name) => html! { h2 { (name) } p.muted { (kind) } },
+        None => html! { h2 { (kind) } },
+    }
+}
+
+/// A label's description, when it has one beyond its name.
+///
+/// Suppressed when the description *is* the display name — a label with only a
+/// one-line description already had it promoted into the heading, and printing
+/// it twice reads as a rendering fault rather than as emphasis.
+fn description(label: Option<&Label>) -> Markup {
+    let Some(label) = label else {
+        return html! {};
+    };
+    let Some(text) = &label.description else {
+        return html! {};
+    };
+    if label.name.is_none() && text.lines().count() <= 1 {
+        return html! {};
+    }
+    html! { p.description { (text) } }
+}
 
 fn section_head(title: &str, count: usize, more: Option<&str>) -> Markup {
     html! {
@@ -561,7 +622,13 @@ fn sparsity_bar(b: &BlobInfo, wide: bool) -> Markup {
     }
 }
 
-fn blob_table(blobs: &[&BlobInfo]) -> Markup {
+/// The rows of a blob listing, with whatever is known about what each one *is*.
+///
+/// The identity column comes first, before the digest, and that ordering is the
+/// whole fix: a table that opened with twelve hex characters made the reader
+/// scan every row to find the one they wanted, because the leading column
+/// carried no information a person holds in their head.
+fn blob_table(blobs: &[&BlobInfo], names: &Names) -> Markup {
     html! {
         @if blobs.is_empty() {
             p.empty { "No blobs yet. " code { "art put <file>" } }
@@ -570,6 +637,7 @@ fn blob_table(blobs: &[&BlobInfo]) -> Markup {
                 table {
                     thead {
                         tr {
+                            th { "What" }
                             th { "Digest" }
                             th.r { "Logical" }
                             th.r { "On disk" }
@@ -580,6 +648,7 @@ fn blob_table(blobs: &[&BlobInfo]) -> Markup {
                     tbody {
                         @for b in blobs {
                             tr {
+                                td { (names.cell(&b.digest)) }
                                 td { a.mono href=(format!("/dashboard/blob/{}", b.digest)) { (short(&b.digest)) } }
                                 td.r.num { (human(b.size)) }
                                 td.r.num { (human(b.allocated)) }
@@ -591,6 +660,58 @@ fn blob_table(blobs: &[&BlobInfo]) -> Markup {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// The labels and tags for a page's worth of rows, fetched once.
+///
+/// Both are whole-store reads — a `readdir` of the label shards and one of the
+/// tag directory — so they are done per *page*, not per row. Asking per row
+/// would turn a listing of a thousand blobs into two thousand directory walks.
+pub struct Names {
+    labels: HashMap<Digest, Label>,
+    tags: HashMap<Digest, Vec<TagName>>,
+}
+
+impl Names {
+    async fn load(store: &Store) -> Result<Names, crate::Error> {
+        Ok(Names {
+            labels: store.label_map().await?,
+            tags: store.tags_by_digest().await?,
+        })
+    }
+
+    fn label(&self, d: &Digest) -> Option<&Label> {
+        self.labels.get(d)
+    }
+
+    fn tags(&self, d: &Digest) -> &[TagName] {
+        self.tags.get(d).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// One table cell: the tags that name a digest, and what somebody called
+    /// it.
+    ///
+    /// A tag is rendered as a chip and the label as text, because they are
+    /// different kinds of thing — a tag is an address you can type into the next
+    /// command, a label is prose about what you would get. An unlabelled,
+    /// untagged blob gets a dash rather than an empty cell, so "nothing is known
+    /// about this" is visibly a state rather than a rendering bug.
+    fn cell(&self, d: &Digest) -> Markup {
+        let tags = self.tags(d);
+        let name = self.label(d).and_then(Label::display_name);
+        html! {
+            @if tags.is_empty() && name.is_none() {
+                span.muted { "—" }
+            } @else {
+                @for t in tags {
+                    span.tagchip { (t.as_str()) }
+                }
+                @if let Some(name) = name {
+                    span.labelname { (name) }
                 }
             }
         }
@@ -757,6 +878,21 @@ body.centered main { width: min(360px, 92vw); }
 
 .digest, .mono { font-family: var(--font-body); }
 td.name { color: var(--text-primary); }
+
+/* Identity: what a digest is called, and what resolves to it.
+
+   A tag is a chip and a label is plain text, because they are different kinds
+   of claim. A chip reads as a token you can copy into a command — which is
+   exactly what a tag is — while a description is prose and should not be
+   dressed up as something clickable. The muted dash is the third state, and it
+   has to be visible: an empty cell reads as a broken renderer rather than as
+   "nothing is known about this". */
+.tagchip { display: inline-block; margin-right: 6px; padding: 1px 6px; border: 1px solid var(--border-color); background: var(--bg-dark); font-size: 11px; color: var(--text-primary); }
+.labelname { color: var(--text-primary); }
+.muted { color: var(--text-muted); }
+/* `pre-wrap`, because a description is the one field in this store that carries
+   line breaks somebody typed on purpose. */
+.description { white-space: pre-wrap; color: var(--text-secondary); max-width: 70ch; margin-bottom: var(--gap-3); }
 td.num, .num, .r { text-align: right; font-variant-numeric: tabular-nums; }
 .pin { color: var(--accent); }
 .sub { color: var(--text-muted); font-size: 12px; margin: 0 0 var(--gap-4); }
@@ -1031,5 +1167,214 @@ mod tests {
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
-}
 
+    // -- identity in the listings ------------------------------------------
+
+    /// The complaint this feature answers: every listing was a column of hex.
+    /// A row now leads with what the thing is, and the digest follows it.
+    #[tokio::test]
+    async fn a_listing_leads_with_what_the_thing_is() {
+        let (st, _dir) = state();
+        let blob = st.store.insert_bytes(b"rootfs".to_vec()).await.unwrap();
+        st.store
+            .set_tag(&TagName::parse("web-v2").unwrap(), &blob.digest)
+            .await
+            .unwrap();
+        st.store
+            .set_label(
+                &blob.digest,
+                &Label::new(Some("the web rootfs".into()), None).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let html = blobs_page(State(st), Default::default())
+            .await
+            .unwrap()
+            .into_string();
+        assert!(html.contains("the web rootfs"), "the label is missing");
+        assert!(html.contains("web-v2"), "the tag is missing");
+        // The identity column comes before the digest, which is the ordering
+        // that makes the table scannable.
+        let what = html.find("<th>What</th>").expect("a What column");
+        let digest = html.find("<th>Digest</th>").expect("a Digest column");
+        assert!(what < digest, "identity has to lead the row");
+    }
+
+    /// Nothing known about a blob is a *state*, and it has to look like one. An
+    /// empty cell reads as a broken renderer.
+    #[tokio::test]
+    async fn an_unlabelled_blob_says_so_rather_than_showing_a_blank() {
+        let (st, _dir) = state();
+        st.store.insert_bytes(b"anonymous".to_vec()).await.unwrap();
+        let html = blobs_page(State(st), Default::default())
+            .await
+            .unwrap()
+            .into_string();
+        assert!(html.contains(r#"<span class="muted">—</span>"#), "{html}");
+    }
+
+    /// A detail page is headed by what the thing is called, with the generic
+    /// word demoted — the heading used to say "Blob" over a digest, which the
+    /// reader already knew from the URL.
+    #[tokio::test]
+    async fn a_labelled_blob_page_is_headed_by_its_name() {
+        let (st, _dir) = state();
+        let blob = st.store.insert_bytes(b"rootfs".to_vec()).await.unwrap();
+        st.store
+            .set_label(
+                &blob.digest,
+                &Label::new(
+                    Some("the web rootfs".into()),
+                    Some("debian, plus the hermes agents".into()),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let html = blob_page(
+            State(st.clone()),
+            Default::default(),
+            axum::extract::Path(blob.digest.to_string()),
+        )
+        .await
+        .unwrap()
+        .into_string();
+        assert!(html.contains("<h2>the web rootfs</h2>"), "{html}");
+        assert!(html.contains("debian, plus the hermes agents"));
+
+        // An unlabelled one keeps the generic heading.
+        let bare = st.store.insert_bytes(b"bare".to_vec()).await.unwrap();
+        let html = blob_page(
+            State(st),
+            Default::default(),
+            axum::extract::Path(bare.digest.to_string()),
+        )
+        .await
+        .unwrap()
+        .into_string();
+        assert!(html.contains("<h2>Blob</h2>"), "{html}");
+    }
+
+    /// A one-line, name-less label is promoted into the heading; printing it
+    /// again underneath reads as a rendering fault.
+    #[tokio::test]
+    async fn a_description_only_label_is_not_shown_twice() {
+        let (st, _dir) = state();
+        let blob = st.store.insert_bytes(b"x".to_vec()).await.unwrap();
+        st.store
+            .set_label(
+                &blob.digest,
+                &Label::new(None, Some("just the one line".into())).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let html = blob_page(
+            State(st),
+            Default::default(),
+            axum::extract::Path(blob.digest.to_string()),
+        )
+        .await
+        .unwrap()
+        .into_string();
+        assert_eq!(
+            html.matches("just the one line").count(),
+            1,
+            "the description was promoted to the heading and printed again",
+        );
+    }
+
+    /// Manifests get the same treatment, and a manifest's tags are shown on its
+    /// own page — previously only a blob's were.
+    #[tokio::test]
+    async fn a_manifest_page_shows_its_tags_and_its_label() {
+        let (st, _dir) = state();
+        let blob = st.store.insert_bytes(b"entry".to_vec()).await.unwrap();
+        let m = Manifest::new(crate::KIND_GENERIC).with_entry("f", blob.digest.clone(), blob.size);
+        let md = st.store.put_manifest(&m).await.unwrap();
+        st.store
+            .set_tag(&TagName::parse("bundle-v1").unwrap(), &md)
+            .await
+            .unwrap();
+        st.store
+            .set_label(&md, &Label::new(Some("the nightly bundle".into()), None).unwrap())
+            .await
+            .unwrap();
+
+        let html = manifest_page(
+            State(st.clone()),
+            Default::default(),
+            axum::extract::Path(md.to_string()),
+        )
+        .await
+        .unwrap()
+        .into_string();
+        assert!(html.contains("<h2>the nightly bundle</h2>"), "{html}");
+        assert!(html.contains("bundle-v1"), "a manifest's tags belong on its page");
+
+        // And it appears in the listing with both.
+        let html = manifests_page(State(st), Default::default())
+            .await
+            .unwrap()
+            .into_string();
+        assert!(html.contains("the nightly bundle"));
+        assert!(html.contains("bundle-v1"));
+    }
+
+    /// The overview's tag table answers "what is this tag" as well as "what
+    /// does it point at".
+    #[tokio::test]
+    async fn the_overview_tag_table_says_what_each_tag_is() {
+        let (st, _dir) = state();
+        let blob = st.store.insert_bytes(b"rootfs".to_vec()).await.unwrap();
+        st.store
+            .set_tag(&TagName::parse("web-v2").unwrap(), &blob.digest)
+            .await
+            .unwrap();
+        st.store
+            .set_label(&blob.digest, &Label::new(Some("the web rootfs".into()), None).unwrap())
+            .await
+            .unwrap();
+
+        let html = overview(State(st), Default::default()).await.unwrap().into_string();
+        assert!(html.contains("What it is"));
+        assert!(html.contains("the web rootfs"));
+    }
+
+    /// A label is attacker-supplied text rendered into HTML. maud escapes by
+    /// construction; this is the regression test that says so out loud.
+    #[tokio::test]
+    async fn a_label_cannot_inject_markup() {
+        let (st, _dir) = state();
+        let blob = st.store.insert_bytes(b"x".to_vec()).await.unwrap();
+        st.store
+            .set_label(
+                &blob.digest,
+                &Label::new(
+                    Some("<script>alert(1)</script>".into()),
+                    Some("<img src=x onerror=alert(2)>".into()),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        for html in [
+            blobs_page(State(st.clone()), Default::default()).await.unwrap().into_string(),
+            blob_page(
+                State(st.clone()),
+                Default::default(),
+                axum::extract::Path(blob.digest.to_string()),
+            )
+            .await
+            .unwrap()
+            .into_string(),
+        ] {
+            assert!(!html.contains("<script>alert(1)</script>"), "{html}");
+            assert!(!html.contains("<img src=x"), "{html}");
+            assert!(html.contains("&lt;script&gt;"), "escaped rather than dropped");
+        }
+    }
+}

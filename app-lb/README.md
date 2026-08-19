@@ -1907,6 +1907,133 @@ A token admitted at the data plane forwards **no** `x-auth-request-*` identity
 headers: a token is not a person, and putting a name upstream that belongs to
 nobody would be worse than sending none.
 
+### Gating a deployment with a JWT
+
+The third provider, and the only one where app-lb holds no state at all. A
+`google` gate issues a session; an `app-token` gate looks a credential up in its
+own table; a `jwt` gate verifies a token **somebody else issued** and keeps
+nothing. That makes it the right fit for an application whose users already sign
+in elsewhere — and app-lb never becomes a second place identity lives.
+
+```jsonc
+{
+  "auth": {
+    "provider": "jwt",
+    "jwt": {
+      "secret":        {"secret": "heyo-auth", "key": "jwt_secret"},
+      "algorithms":    ["HS256"],
+      "issuer":        "auth-service",
+      "audience":      "heyo-app",
+      "subject_claim": "userId",
+      "require":       {"role": ["user", "admin"]}
+    }
+  }
+}
+```
+
+That block is the [Heyo auth API](https://github.com/Heyo-Computer) exactly: it
+signs HS256 with `JWT_SECRET`, issues `auth-service` for `heyo-app`, and puts the
+user id in `userId` rather than `sub`. Nothing about the gate is shaped around
+it, though — the same block with `jwks_url`, `RS256` and the default `sub` fronts
+an Auth0, Okta, Cognito or Keycloak deployment:
+
+```jsonc
+"jwt": {
+  "jwks_url":   "https://example.auth0.com/.well-known/jwks.json",
+  "algorithms": ["RS256"],
+  "issuer":     "https://example.auth0.com/",
+  "audience":   "https://api.example.com",
+  "require":    {"permissions": "deploy:write"}
+}
+```
+
+**`algorithms` is required and has no default.** This is the one field worth
+understanding rather than copying. A JWT names its own algorithm in its header,
+and the header is part of the token — which is to say, attacker-controlled. A
+verifier that dispatches on it accepts two forged tokens: one with `alg: none`
+and no signature at all, and one signed `HS256` using the gate's *public* key as
+the HMAC secret, which anybody can compute because the key is public. app-lb
+therefore lets the spec decide and never the token, and refuses at registration a
+block that names an algorithm its key could not verify — a public key alongside
+`HS256` is that attack written down as configuration.
+
+**Where the key comes from** — exactly one of three, and the choice is about
+rotation rather than security:
+
+| Field | For | Notes |
+| --- | --- | --- |
+| `secret` | `HS256/384/512` | A secret-store reference. The same value *mints* tokens, so it is never a literal in a spec. Rotating it in the store takes effect on the next request. |
+| `public_key` | `RS*`, `PS*`, `ES*` | An inline PEM (or a certificate). Public, so it is in the spec rather than the secret store — putting it there would imply it needs protecting. |
+| `jwks_url` | `RS*`, `PS*`, `ES*` | The issuer's key set. Cached for ten minutes and refetched when a token names a `kid` it does not hold, so a rotation needs nothing done here. **`https://` unless it is loopback** — see below. |
+
+A JWKS URL is held to a stricter transport rule than anything else app-lb
+fetches, and the asymmetry is deliberate. A blob from an artifact store is
+verified against a digest the spec names, so a tampered response is caught; a key
+set *is* what everything else is checked against, so anyone who can rewrite that
+response can mint tokens this gate accepts. Plaintext to another host is
+therefore refused at registration — that is an authentication bypass, not an
+eavesdropping risk. `http://127.0.0.1:8080/jwks` is allowed, for the same reason
+OAuth carves out loopback redirect URIs: there is no path to be on.
+
+**`require` is the allow-list**, and `allowed_domains`/`allowed_emails` are not:
+those match a *Google* identity — the domain against the `hd` claim, for the
+reasons in [Google sign-in](#google-sign-in) — and mean nothing for a token from
+your own issuer. A gate that accepts `jwt` without `google` is **refused** if it
+sets them, rather than looking guarded and letting everyone through.
+
+`require` is more general anyway. A value or a list per claim, OR within a claim
+and AND across them, and a claim that is itself a list is satisfied by containing
+one of the wanted values — which is what makes every scope claim work:
+
+```jsonc
+"require": {
+  "role":   ["admin", "owner"],   // role is one of these…
+  "tier":   2,                    // …and tier is exactly 2 (a number, not "2")
+  "scopes": "deploy"              // …and the scopes array contains "deploy"
+}
+```
+
+An empty `require` admits any token the issuer signed for this audience. Unlike
+Google's empty allow-list — where the population is everyone with a Google
+account — that is precisely "a signed-in user of this product", and often the
+whole intent.
+
+**What is always checked**, before `require` is looked at: the algorithm is one
+the gate named, the signature verifies, `exp` has not passed (and `nbf` has
+arrived), `iss` matches exactly, and `aud` matches when the gate names one. A
+token with **no `exp` is refused** — a credential that never expires is one this
+gate could not revoke if it leaked, since it did not issue it. `leeway_secs`
+covers clock skew, capped at 300.
+
+**The identity goes upstream** as `x-auth-request-user`, `-email` and `-name`,
+read from `subject_claim`, `email_claim` and `name_claim` — which is why those
+are configurable, since `userId` and `sub` are both common. The subject is the
+one claim a gate cannot do without, and a token missing it is refused rather than
+arriving upstream as an anonymous user. Claims beyond those three are not
+forwarded, deliberately: the token itself is still in the `Authorization` header,
+so an application that wants more can read it, signed, from the request it
+already has.
+
+**A cookie, for browsers.** A page navigation cannot set a header, so a gate can
+name a cookie to read the token from:
+
+```jsonc
+"jwt": { "…": "…", "cookie": "heyo_access_token" }
+```
+
+The `Authorization` header still wins when both are present — a request that sets
+it is stating what it presents.
+
+**Mixing providers** works as it does everywhere else. `["google", "jwt"]` is the
+common shape for a product UI: a person opens it in a browser and signs in with
+Google; the UI's own API calls carry the token the auth service gave it. Both are
+alternatives, and neither knows about the other.
+
+A refused token is logged and sent to [security monitoring](#security-monitoring)
+as `gate-jwt` with the reason — expired, wrong issuer, bad signature. The caller
+gets a bare `401`: which of those it was is exactly the feedback somebody probing
+a gate is looking for.
+
 ### Tokens in a URL
 
 The shell WebSocket — and only the shell WebSocket — also accepts

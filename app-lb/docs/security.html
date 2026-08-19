@@ -43,15 +43,51 @@ it:</p>
   <li><strong>Providers are alternatives.</strong> <code>google</code> admits a person with
   a session (domain matching uses Google's <code>hd</code> claim, so a personal Gmail with a
   lookalike address does not pass); <code>app-token</code> admits a program presenting
-  <code>Authorization: Bearer applb_…</code>. A gate listing both admits either. The default
+  <code>Authorization: Bearer applb_…</code>; <code>jwt</code> admits a token another service
+  issued. A gate listing several admits any of them. The default
   is Google-only — a gate that should accept programs must say
-  <code>"app-token"</code> explicitly.</li>
+  <code>"app-token"</code> or <code>"jwt"</code> explicitly.</li>
   <li><strong><code>public_paths</code></strong> are prefix-matched and skip the gate
   entirely — health checks and webhooks.</li>
   <li><strong><code>forward_identity</code></strong> adds
   <code>x-auth-request-email</code>/<code>-user</code> upstream for signed-in people, and
   app-lb strips those header names from inbound requests so nobody can forge them. A token
   is not a person: token-admitted requests carry no identity headers.</li>
+</ul>
+
+<h2>Verifying a JWT</h2>
+<p>The <code>jwt</code> provider verifies a token <em>somebody else</em> issued, and keeps
+nothing: no session, no token table. For an application whose users already sign in
+elsewhere — and so that app-lb never becomes a second place identity lives.</p>
+<pre><code>"auth": {
+  "provider": "jwt",
+  "jwt": {
+    "secret":        { "secret": "heyo-auth", "key": "jwt_secret" },
+    "algorithms":    ["HS256"],
+    "issuer":        "auth-service",
+    "audience":      "heyo-app",
+    "subject_claim": "userId",
+    "require":       { "role": ["user", "admin"] }
+  }
+}</code></pre>
+<ul>
+  <li><strong><code>algorithms</code> is required and has no default.</strong> A token names
+  its own algorithm in a header the caller controls; a verifier that trusted it would accept
+  both an unsigned token (<code>alg: none</code>) and one signed <code>HS256</code> with the
+  gate's <em>public</em> key as the secret. The spec decides, never the token — and a block
+  naming an algorithm its key could not verify is refused at registration.</li>
+  <li><strong>The key</strong> is one of <code>secret</code> (a secret-store reference, for
+  <code>HS*</code>), <code>public_key</code> (an inline PEM) or <code>jwks_url</code> (the
+  issuer's key set, cached and refetched on an unknown <code>kid</code>).</li>
+  <li><strong><code>require</code> is the allow-list</strong> — any claim, against a value or
+  a set. <code>allowed_domains</code>/<code>allowed_emails</code> describe a Google identity
+  and are <em>refused</em> on a gate with no <code>google</code> provider, rather than
+  appearing to restrict something they do not.</li>
+  <li><strong>A token with no <code>exp</code> is refused.</strong> app-lb did not issue it and
+  could not revoke it, so its expiry is the only thing that ever stops it.</li>
+  <li>The identity goes upstream from <code>subject_claim</code>, <code>email_claim</code> and
+  <code>name_claim</code>. Nothing else is copied: the token is still in the
+  <code>Authorization</code> header for the application to read itself.</li>
 </ul>
 
 <div class="warn"><strong>The gate runs before the cold-start wait.</strong> An

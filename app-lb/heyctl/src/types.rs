@@ -430,6 +430,75 @@ pub struct AuthGate {
     pub cookie_domain: Option<String>,
     pub redirect_url: Option<String>,
     pub forward_identity: bool,
+    /// How a JWT is verified, when `jwt` is among the providers.
+    pub jwt: Option<JwtSpec>,
+}
+
+/// How a gate verifies a JWT somebody else issued, and which ones it admits.
+///
+/// Exactly one of `secret`, `public_key` and `jwks_url` is set — the server
+/// refuses a spec with none or several.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct JwtSpec {
+    pub secret: Option<SecretRef>,
+    pub public_key: Option<String>,
+    pub jwks_url: Option<String>,
+    pub algorithms: Vec<String>,
+    pub issuer: String,
+    pub audience: Option<String>,
+    /// Claims a token must satisfy. Free-form: the keys are whatever the issuer
+    /// sends, so this stays a `Value` rather than being modelled.
+    pub require: BTreeMap<String, Value>,
+    pub subject_claim: String,
+    pub email_claim: String,
+    pub name_claim: String,
+    pub leeway_secs: Option<u64>,
+    pub cookie: Option<String>,
+}
+
+impl JwtSpec {
+    /// Where the verifying key comes from, in one column.
+    pub fn key_summary(&self) -> String {
+        match (&self.secret, &self.public_key, &self.jwks_url) {
+            (Some(r), _, _) => format!("shared secret {}", r.render()),
+            (_, Some(_), _) => "an inline public key".to_string(),
+            (_, _, Some(url)) => format!("the key set at {url}"),
+            _ => "<none>".to_string(),
+        }
+    }
+
+    /// The claims a token has to satisfy, rendered the way the spec reads:
+    /// `role=admin|owner, accountId=acct_7f3c`.
+    pub fn require_summary(&self) -> String {
+        if self.require.is_empty() {
+            return "any token this issuer signed".to_string();
+        }
+        self.require
+            .iter()
+            .map(|(claim, wanted)| {
+                let rendered = match wanted {
+                    Value::Array(vs) => vs
+                        .iter()
+                        .map(render_claim_value)
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                    single => render_claim_value(single),
+                };
+                format!("{claim}={rendered}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// A claim value without JSON's quotes around a string, since every other value
+/// in this view is printed bare.
+fn render_claim_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 impl AuthGate {
@@ -467,6 +536,11 @@ impl AuthGate {
     /// Whether a program can get past this gate with an app-token.
     pub fn accepts_app_token(&self) -> bool {
         self.providers().iter().any(|p| p == "app-token")
+    }
+
+    /// Whether a JWT from the configured issuer gets past this gate.
+    pub fn accepts_jwt(&self) -> bool {
+        self.providers().iter().any(|p| p == "jwt")
     }
 
     /// The URL that has to be registered with the provider, given a hostname.

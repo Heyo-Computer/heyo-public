@@ -159,9 +159,15 @@ pub fn router(state: ServeState) -> Router {
     let rest = Router::new()
         .route("/blobs/{digest}", get(get_blob).head(head_blob))
         .route("/manifests/{reference}", get(get_manifest))
-        .route("/manifests", put(put_manifest))
+
         .route("/tags", get(list_tags))
         .route("/tags/{name}", get(get_tag).put(put_tag).delete(delete_tag))
+        .route("/blobs", get(list_blobs))
+        .route("/manifests", get(list_manifests).put(put_manifest))
+        .route(
+            "/labels/{reference}",
+            get(get_label).put(put_label).delete(delete_label),
+        )
         .route("/usage", get(get_usage))
         .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT))
         .with_state(state.clone());
@@ -416,6 +422,135 @@ async fn put_manifest(
         .into_response())
 }
 
+/// Everything in the store, with whatever a person has said about it.
+///
+/// New, and the reason the dashboard existed before the API did: a client had no
+/// way to ask "what is in here" at all — only `GET /blobs/{digest}` for
+/// something it already knew the name of. A store you can only address by
+/// content hash is a store you cannot browse.
+///
+/// Each row carries the label and the tags pointing at it, because those are the
+/// two things that turn a digest into something a person recognises, and asking
+/// for them per row would be a request each.
+async fn list_blobs(State(st): State<ServeState>) -> Result<Response, ApiError> {
+    let blobs = st.store.list_blobs().await?;
+    let labels = st.store.label_map().await?;
+    let tags = st.store.tags_by_digest().await?;
+    let body: Vec<_> = blobs
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "digest": b.digest.as_str(),
+                "size": b.size,
+                "allocated": b.allocated,
+                "nlink": b.nlink,
+                "name": labels.get(&b.digest).and_then(|l| l.name.clone()),
+                "description": labels.get(&b.digest).and_then(|l| l.description.clone()),
+                "tags": tag_names(&tags, &b.digest),
+            })
+        })
+        .collect();
+    Ok(Json(body).into_response())
+}
+
+/// The manifests, with the same treatment.
+///
+/// `kind` and `entries` come from the manifest itself; `name` and `description`
+/// are the label, which is *not* part of it — see [`crate::labels`] for why a
+/// manifest's description cannot live inside a manifest.
+async fn list_manifests(State(st): State<ServeState>) -> Result<Response, ApiError> {
+    let labels = st.store.label_map().await?;
+    let tags = st.store.tags_by_digest().await?;
+    let mut body = Vec::new();
+    for d in st.store.list_manifests().await? {
+        let m = st.store.get_manifest(&d).await.ok();
+        body.push(serde_json::json!({
+            "digest": d.as_str(),
+            "kind": m.as_ref().map(|m| m.kind.clone()),
+            "entries": m.as_ref().map(|m| m.entries.len()).unwrap_or(0),
+            "size": m.as_ref().map(|m| m.total_size()).unwrap_or(0),
+            "name": labels.get(&d).and_then(|l| l.name.clone()),
+            "description": labels.get(&d).and_then(|l| l.description.clone()),
+            "tags": tag_names(&tags, &d),
+        }));
+    }
+    Ok(Json(body).into_response())
+}
+
+fn tag_names(
+    tags: &std::collections::HashMap<Digest, Vec<TagName>>,
+    d: &Digest,
+) -> Vec<String> {
+    tags.get(d)
+        .map(|ts| ts.iter().map(|t| t.as_str().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// What somebody has called this digest.
+///
+/// Takes a *reference*, not a digest, so `GET /labels/web-v2` works — a person
+/// asking what something is called generally has the tag, not the hash.
+///
+/// `200` with `{"name": null, "description": null}` for an unlabelled digest
+/// rather than a `404`: the digest exists, the label is what does not, and a
+/// client rendering a row wants to tell those apart without special-casing an
+/// error.
+async fn get_label(
+    State(st): State<ServeState>,
+    Path(reference): Path<String>,
+) -> Result<Response, ApiError> {
+    let r = Ref::parse(&reference).map_err(Error::from)?;
+    let d = st.store.resolve(&r).await?;
+    let label = st.store.get_label(&d).await?.unwrap_or_default();
+    Ok(Json(serde_json::json!({
+        "digest": d.as_str(),
+        "name": label.name,
+        "description": label.description,
+    }))
+    .into_response())
+}
+
+/// Name and describe a digest. Replaces the whole label — this is a `PUT`, and
+/// a body naming only a description clears the name.
+async fn put_label(
+    State(st): State<ServeState>,
+    Path(reference): Path<String>,
+    Json(body): Json<LabelBody>,
+) -> Result<Response, ApiError> {
+    st.writable()?;
+    let r = Ref::parse(&reference).map_err(Error::from)?;
+    let d = st.store.resolve(&r).await?;
+    // A digest the store does not hold is refused by `set_label` itself, so
+    // this route and the CLI cannot disagree about it.
+    let label = crate::labels::Label::new(body.name, body.description).map_err(Error::from)?;
+    st.store.set_label(&d, &label).await?;
+    Ok(Json(serde_json::json!({
+        "digest": d.as_str(),
+        "name": label.name,
+        "description": label.description,
+    }))
+    .into_response())
+}
+
+async fn delete_label(
+    State(st): State<ServeState>,
+    Path(reference): Path<String>,
+) -> Result<Response, ApiError> {
+    st.writable()?;
+    let r = Ref::parse(&reference).map_err(Error::from)?;
+    let d = st.store.resolve(&r).await?;
+    let removed = st.store.remove_label(&d).await?;
+    Ok(Json(serde_json::json!({"digest": d.as_str(), "removed": removed})).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct LabelBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
 async fn list_tags(State(st): State<ServeState>) -> Result<Response, ApiError> {
     let tags = st.store.list_tags().await?;
     let body: Vec<_> = tags
@@ -511,9 +646,10 @@ impl IntoResponse for ApiError {
             // a better key would not help.
             Error::ReadOnly => StatusCode::FORBIDDEN,
             Error::NotFound(_) | Error::TagNotFound(_) => StatusCode::NOT_FOUND,
-            Error::Digest(_) | Error::TagName(_) | Error::ManifestVersion(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            Error::Digest(_)
+            | Error::TagName(_)
+            | Error::Label(_)
+            | Error::ManifestVersion(_) => StatusCode::BAD_REQUEST,
             Error::AmbiguousManifest { .. } => StatusCode::CONFLICT,
             Error::DigestMismatch { .. } => StatusCode::CONFLICT,
             Error::NoSpace { .. } => StatusCode::INSUFFICIENT_STORAGE,
@@ -1280,5 +1416,218 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
         assert_eq!(v["blobs"], 1);
         assert!(v["fsTotal"].as_u64().unwrap() > 0);
+    }
+
+    // -- labels and listings -----------------------------------------------
+
+    /// The endpoint the store never had: "what is in here". A client could
+    /// previously only ask about a digest it already knew.
+    #[tokio::test]
+    async fn the_listings_answer_what_is_in_the_store() {
+        let d = tmpdir();
+        let (app, store) = app(&d, None, false);
+        let blob = store.insert_bytes(b"rootfs".to_vec()).await.unwrap();
+        let m = crate::Manifest::new(crate::KIND_GENERIC)
+            .with_entry("rootfs.ext4", blob.digest.clone(), blob.size);
+        let md = store.put_manifest(&m).await.unwrap();
+        store
+            .set_tag(&TagName::parse("web-v2").unwrap(), &md)
+            .await
+            .unwrap();
+        store
+            .set_label(
+                &blob.digest,
+                &crate::Label::new(Some("the web rootfs".into()), Some("debian + hermes".into()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let r = app
+            .clone()
+            .oneshot(HttpRequest::get("/blobs").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let rows: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(rows[0]["digest"], blob.digest.as_str());
+        assert_eq!(rows[0]["name"], "the web rootfs");
+        assert_eq!(rows[0]["description"], "debian + hermes");
+        assert_eq!(rows[0]["size"], 6);
+        assert_eq!(rows[0]["tags"], serde_json::json!([]));
+
+        let r = app
+            .clone()
+            .oneshot(HttpRequest::get("/manifests").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(rows[0]["digest"], md.as_str());
+        assert_eq!(rows[0]["kind"], crate::KIND_GENERIC);
+        assert_eq!(rows[0]["entries"], 1);
+        // The tag that resolves to it, which is what a person types.
+        assert_eq!(rows[0]["tags"], serde_json::json!(["web-v2"]));
+        assert_eq!(rows[0]["name"], serde_json::Value::Null);
+    }
+
+    /// `PUT /manifests` still works after the route learned to answer `GET`.
+    #[tokio::test]
+    async fn the_manifests_route_still_accepts_a_put() {
+        let d = tmpdir();
+        let (app, store) = app(&d, None, false);
+        let blob = store.insert_bytes(b"x".to_vec()).await.unwrap();
+        let m = crate::Manifest::new(crate::KIND_GENERIC)
+            .with_entry("x", blob.digest.clone(), blob.size);
+
+        let r = app
+            .oneshot(
+                HttpRequest::put("/manifests")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&m).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "{}", r.status());
+    }
+
+    #[tokio::test]
+    async fn a_label_round_trips_over_http_and_is_addressable_by_tag() {
+        let d = tmpdir();
+        let (app, store) = app(&d, None, false);
+        let blob = store.insert_bytes(b"rootfs".to_vec()).await.unwrap();
+        store
+            .set_tag(&TagName::parse("web-v2").unwrap(), &blob.digest)
+            .await
+            .unwrap();
+
+        // Unlabelled: a 200 with nulls, not a 404. The digest exists; the label
+        // is what does not, and a client rendering a row should not have to
+        // special-case an error to learn that.
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/labels/{}", blob.digest))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(body["name"], serde_json::Value::Null);
+
+        // Written by tag — a person naming something has the tag, not the hash.
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::put("/labels/web-v2")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"name":"the web rootfs","description":"debian + hermes"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let stored = store.get_label(&blob.digest).await.unwrap().unwrap();
+        assert_eq!(stored.name.as_deref(), Some("the web rootfs"));
+
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::delete("/labels/web-v2")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(store.get_label(&blob.digest).await.unwrap(), None);
+    }
+
+    /// A label on a digest the store does not hold would be metadata about
+    /// nothing, sitting there until a sweep noticed.
+    #[tokio::test]
+    async fn labelling_something_the_store_does_not_have_is_refused() {
+        let d = tmpdir();
+        let (app, _store) = app(&d, None, false);
+        let absent = "0".repeat(64);
+
+        let r = app
+            .oneshot(
+                HttpRequest::put(format!("/labels/{absent}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"name":"nothing"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_unusable_label_is_refused_with_a_reason() {
+        let d = tmpdir();
+        let (app, store) = app(&d, None, false);
+        let blob = store.insert_bytes(b"x".to_vec()).await.unwrap();
+
+        for body in [
+            r#"{}"#.to_string(),
+            format!(r#"{{"name":"{}"}}"#, "x".repeat(crate::labels::MAX_NAME + 1)),
+            r#"{"name":"two\nlines"}"#.to_string(),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(
+                    HttpRequest::put(format!("/labels/{}", blob.digest))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{body} was accepted");
+            assert!(body_string(r).await.contains("invalid_label"));
+        }
+    }
+
+    /// Labels are writes, so a read-only daemon refuses them — and still serves
+    /// the reads, which is the whole point of the mode.
+    #[tokio::test]
+    async fn a_read_only_daemon_serves_labels_but_will_not_set_them() {
+        let d = tmpdir();
+        let (app, store) = app(&d, None, true);
+        let blob = store.insert_bytes(b"x".to_vec()).await.unwrap();
+        store
+            .set_label(&blob.digest, &crate::Label::new(Some("x".into()), None).unwrap())
+            .await
+            .unwrap();
+
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/labels/{}", blob.digest))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        for req in [
+            HttpRequest::put(format!("/labels/{}", blob.digest))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"name":"y"}"#))
+                .unwrap(),
+            HttpRequest::delete(format!("/labels/{}", blob.digest))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        ] {
+            let r = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        }
     }
 }

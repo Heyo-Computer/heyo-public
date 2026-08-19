@@ -87,6 +87,28 @@ pub enum Command {
     /// as a subprocess uses this to find a manifest's entries without needing
     /// the store's HTTP daemon.
     Manifest { reference: String },
+    /// Name and describe a blob or manifest.
+    ///
+    /// A label is metadata *about* content, not part of it: naming something
+    /// does not change its digest, so every tag and manifest entry still
+    /// resolves afterwards. It is what turns a column of hashes into a list
+    /// somebody can read.
+    ///
+    /// Both fields are replaced together — `art label web-v2 --name x` on a
+    /// labelled digest clears its description. `--clear` removes the label.
+    Label {
+        reference: String,
+        /// Short, for a table cell. At most 80 characters.
+        #[arg(long)]
+        name: Option<String>,
+        /// What it is and why it is here. At most 2000 characters; `-` reads
+        /// stdin, for a description that would be awkward to quote.
+        #[arg(long)]
+        description: Option<String>,
+        /// Remove the label entirely.
+        #[arg(long, conflicts_with_all = ["name", "description"])]
+        clear: bool,
+    },
     /// Point a tag at a digest.
     Tag { name: String, reference: String },
     /// Remove a tag. The blob it named becomes collectable.
@@ -386,6 +408,50 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 for (k, v) in &m.annotations {
                     println!("annotation {k}={v}");
+                }
+            }
+        }
+
+        Command::Label {
+            reference,
+            name,
+            description,
+            clear,
+        } => {
+            // `resolve`, not `resolve_blob`: a manifest is labelled as itself
+            // rather than as whatever blob it happens to name first, which is
+            // the whole point of being able to describe one.
+            let d = store.resolve(&parse_ref(&reference)?).await?;
+            if clear {
+                let removed = store.remove_label(&d).await?;
+                if json {
+                    print_json(&serde_json::json!({"digest": d.as_str(), "removed": removed}));
+                } else if removed {
+                    println!("{d} unlabelled");
+                } else {
+                    println!("{d} had no label");
+                }
+                return Ok(());
+            }
+            let description = match description.as_deref() {
+                Some("-") => Some(read_stdin_string()?),
+                other => other.map(str::to_string),
+            };
+            let label = crate::labels::Label::new(name, description)?;
+            store.set_label(&d, &label).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "digest": d.as_str(),
+                    "name": label.name,
+                    "description": label.description,
+                }));
+            } else {
+                println!("{d}");
+                if let Some(n) = &label.name {
+                    println!("name        {n}");
+                }
+                if let Some(desc) = &label.description {
+                    println!("description {desc}");
                 }
             }
         }
@@ -715,26 +781,59 @@ impl Drop for Scratch {
 
 async fn list(store: &Store, what: &LsWhat, json: bool) -> Result<()> {
     // Tags are the default view: they are the names a human actually knows.
+    //
+    // Both other views carry the label and the tags alongside the digest, which
+    // is what makes them readable at all: a hash says nothing about what it is,
+    // and `art ls --blobs` was previously a wall of them.
     if what.blobs {
         let blobs = store.list_blobs().await?;
+        let labels = store.label_map().await?;
+        let tags = store.tags_by_digest().await?;
         if json {
-            let v: Vec<_> = blobs.iter().map(blob_json).collect();
+            let v: Vec<_> = blobs
+                .iter()
+                .map(|b| {
+                    let mut row = blob_json(b);
+                    let label = labels.get(&b.digest);
+                    row["name"] = serde_json::json!(label.and_then(|l| l.name.clone()));
+                    row["description"] =
+                        serde_json::json!(label.and_then(|l| l.description.clone()));
+                    row["tags"] = serde_json::json!(tag_names(&tags, &b.digest));
+                    row
+                })
+                .collect();
             print_json(&serde_json::Value::Array(v));
         } else {
             for b in &blobs {
                 println!(
-                    "{}  {:>10}  {:>10}  links={}",
+                    "{}  {:>10}  {:>10}  links={}  {}",
                     b.digest,
                     human(b.size),
                     human(b.allocated),
-                    b.nlink
+                    b.nlink,
+                    describe_row(labels.get(&b.digest), &tags, &b.digest),
                 );
             }
         }
     } else if what.manifests {
         let ds = store.list_manifests().await?;
+        let labels = store.label_map().await?;
+        let tags = store.tags_by_digest().await?;
         if json {
-            let v: Vec<_> = ds.iter().map(|d| serde_json::json!(d.as_str())).collect();
+            let mut v = Vec::new();
+            for d in &ds {
+                let m = store.get_manifest(d).await.ok();
+                let label = labels.get(d);
+                v.push(serde_json::json!({
+                    "digest": d.as_str(),
+                    "kind": m.as_ref().map(|m| m.kind.clone()),
+                    "entries": m.as_ref().map(|m| m.entries.len()).unwrap_or(0),
+                    "size": m.as_ref().map(|m| m.total_size()).unwrap_or(0),
+                    "name": label.and_then(|l| l.name.clone()),
+                    "description": label.and_then(|l| l.description.clone()),
+                    "tags": tag_names(&tags, d),
+                }));
+            }
             print_json(&serde_json::Value::Array(v));
         } else {
             for d in ds {
@@ -743,7 +842,10 @@ async fn list(store: &Store, what: &LsWhat, json: bool) -> Result<()> {
                     .await
                     .map(|m| m.kind)
                     .unwrap_or_else(|_| "?".into());
-                println!("{d}  {kind}");
+                println!(
+                    "{d}  {kind}  {}",
+                    describe_row(labels.get(&d), &tags, &d)
+                );
             }
         }
     } else {
@@ -761,6 +863,55 @@ async fn list(store: &Store, what: &LsWhat, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read a description from stdin.
+///
+/// The escape hatch for prose: a paragraph with quotes and newlines in it is
+/// miserable to pass as an argument, and `art label x --description - <<'EOF'`
+/// is how a person writes one. Trailing whitespace goes, because a heredoc ends
+/// with a newline nobody typed.
+fn read_stdin_string() -> Result<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| crate::Error::Io {
+            context: "read the description from stdin".into(),
+            source: e,
+        })?;
+    Ok(buf.trim_end().to_string())
+}
+
+/// The tag names pointing at a digest.
+fn tag_names(
+    tags: &std::collections::HashMap<Digest, Vec<TagName>>,
+    d: &Digest,
+) -> Vec<String> {
+    tags.get(d)
+        .map(|ts| ts.iter().map(|t| t.as_str().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// The trailing "what is this" column of a listing row: the tags that name it
+/// and what somebody called it.
+///
+/// Tags first. A tag is what you type into the next command, so it is the more
+/// actionable of the two; the label is the prose that says whether you want to.
+fn describe_row(
+    label: Option<&crate::labels::Label>,
+    tags: &std::collections::HashMap<Digest, Vec<TagName>>,
+    d: &Digest,
+) -> String {
+    let mut parts = Vec::new();
+    let names = tag_names(tags, d);
+    if !names.is_empty() {
+        parts.push(names.join(","));
+    }
+    if let Some(name) = label.and_then(|l| l.display_name()) {
+        parts.push(name.to_string());
+    }
+    parts.join("  ")
 }
 
 async fn run_heyvm(
@@ -976,6 +1127,7 @@ fn report_gc(store: &Store, r: &GcReport, json: bool, dry_run: bool) {
                 "links": p.links,
             })).collect::<Vec<_>>(),
             "manifestsRemoved": r.manifests_removed.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+            "labelsRemoved": r.labels_removed,
             "dryRun": dry_run,
         }));
         return;
@@ -990,6 +1142,17 @@ fn report_gc(store: &Store, r: &GcReport, json: bool, dry_run: bool) {
         r.removed_count(),
         human(r.bytes_freed)
     );
+    // Only when there were any. A label is tidied *after* its subject, so this
+    // line is a footnote to the removal above rather than a category of its
+    // own, and printing "labels 0" on every sweep of a store nobody has
+    // labelled would be noise in the common case.
+    if r.labels_removed > 0 {
+        println!(
+            "{}      {} description(s) of removed content",
+            if dry_run { "would drop" } else { "dropped" },
+            r.labels_removed,
+        );
+    }
     for p in &r.pinned {
         println!(
             "  pinned {} by {} materialization(s); find with:\n    {}",

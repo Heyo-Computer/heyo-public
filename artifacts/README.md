@@ -114,6 +114,7 @@ art put <file|-> [--squash] [--tag NAME]    art get <ref> -o FILE [--writable]
 art cat <ref>                               art stat <ref>
 art ls [--blobs|--tags|--manifests]         art usage
 art tag <name> <ref>                        art untag <name>
+art label <ref> [--name N] [--description D|-] [--clear]
 art manifest <ref>                          art rm <ref> [--force]
 art verify [<ref>|--all]                    art gc [--dry-run] [--min-age 1h]
 
@@ -179,6 +180,63 @@ Two consequences worth stating plainly:
 Packing is deterministic (`tar::HeaderMode::Deterministic`), so re-pushing an
 unchanged tree lands on the same digest and uploads nothing.
 
+## Names and descriptions
+
+A digest is the only name content has, and that is the right contract — but it
+leaves a store you cannot read. `art ls --blobs` was a column of 64-hex strings,
+and the dashboard was the same column with sizes beside it.
+
+A **label** is a name and a description for a digest:
+
+```sh
+art label web-v2 --name "the web rootfs" --description "debian + hermes agents"
+art label <digest> --description -   <<'EOF'
+The base image every sandbox boots from.
+Rebuild with `art heyvm import` after `make images`.
+EOF
+art label web-v2 --clear
+```
+
+```
+$ art ls --blobs
+1b9b737b73e2…  581 MiB   20.0 GiB  links=3  web-v2  the web rootfs
+9f2ce41a0d84…  4.1 MiB   4.1 MiB   links=1  —
+```
+
+**A label is metadata *about* content, never part of it.** Naming something does
+not change its digest, so every tag, manifest entry and outstanding
+materialization still resolves afterwards. That is the whole reason it is a
+side-car file rather than a field:
+
+- **A blob has nowhere to put a name.** Its bytes are an ext4 image or a tarball.
+- **A manifest has somewhere, and it is still wrong.** A manifest is addressed by
+  the hash of its own JSON, so a `name` field inside it makes *renaming a fork*:
+  a new digest, the old tags still pointing at the old manifest, and two
+  manifests describing one thing. This is the same argument that keeps a
+  timestamp out of a manifest, and it bites harder — nobody edits a timestamp,
+  and people edit descriptions constantly.
+
+So one mechanism serves both, because blobs and manifests are addressed the same
+way. Labels are swept by `art gc` once the thing they describe is gone.
+
+### Labels and tags answer different questions
+
+| | tag | label |
+|---|---|---|
+| what it is | an address | a description |
+| unique | yes | no |
+| charset | `[A-Za-z0-9_.-]`, ≤64 | any text; ≤80 and ≤2000 characters |
+| moving it | changes what resolves | changes nothing |
+| `art get <this>` | works | does not |
+
+Both are shown together everywhere, because between them they answer "what is
+this?" — the tag says what to type, the label says whether you want it.
+
+Limits are in characters, not bytes. A name is refused if it carries a control
+character, because it is rendered inline in a table cell, an `art ls` row and a
+log field, and one newline breaks all three; a description keeps its line breaks
+and refuses everything else.
+
 ## Serving
 
 `art serve` exposes the store over HTTP. Uploads and downloads stream, so a
@@ -189,11 +247,26 @@ GET    /healthz              always open, no auth — this is the readiness prob
 HEAD   /blobs/{digest}       size and allocation without transferring anything
 GET    /blobs/{digest}       stream the content
 PUT    /blobs/{digest}       201 stored · 200 already had it · 409 digest mismatch
+GET    /blobs                what is in the store, with labels and tags
 GET    /manifests/{ref}      by digest or tag
+GET    /manifests            the manifests, with labels and tags
 PUT    /manifests            returns the manifest's digest
 GET    /tags                 GET|PUT|DELETE /tags/{name}
+GET    /labels/{ref}         GET|PUT|DELETE — a name and description by ref
 GET    /usage
 ```
+
+`GET /blobs` and `GET /manifests` are the browse routes: before them a client
+could only ask about a digest it already had, which made the store unlistable
+over HTTP. Each row carries the label and the tags pointing at it, fetched once
+per request rather than per row.
+
+`GET /labels/{ref}` answers `200` with nulls for an unlabelled digest rather than
+`404` — the digest exists, the label is what does not, and a client rendering a
+row should not have to special-case an error to learn that. `PUT` replaces the
+whole label; a body naming only a description clears the name. `GET /manifests/
+{ref}` is deliberately **not** enriched: its body is the manifest's own bytes,
+which a client may re-hash, so a label has no business in it.
 
 Everything except `/healthz` sits behind `ART_API_KEY` when one is set
 (`Authorization: Bearer` or `X-Api-Key`, compared in constant time over a hash
@@ -216,6 +289,15 @@ A server-rendered dashboard lives at `/dashboard`: an overview with the
 effective-capacity figure, stat tiles and a filesystem meter, a blob list with a
 stored-versus-logical bar per row, and detail pages showing which tags and
 manifests reference a given blob.
+
+Every listing leads with **what the thing is** — the tags that name it as chips,
+and its [label](#names-and-descriptions) as text — and the digest follows. That
+ordering is the point: a table whose first column was twelve hex characters made
+the reader scan every row to find the one they wanted. A detail page is headed by
+the label's name where there is one, with the generic word ("Blob", "Manifest")
+demoted beneath it — a heading of "Blob" over a digest told the reader only what
+the URL already had. An unlabelled, untagged row shows a muted dash, so "nothing
+is known about this" reads as a state rather than as a broken renderer.
 
 ```sh
 ART_ADMIN_PASSWORD=… art serve --listen 0.0.0.0:8080
@@ -298,6 +380,7 @@ $ART_ROOT/
   .store.lock            flock; shared for a commit, exclusive for a sweep
   blobs/<aa>/<64-hex>    mode 0444, immutable
   manifests/<aa>/<64-hex>  canonical JSON, addressed by its own sha256
+  labels/<aa>/<64-hex>   a name and description for a blob or a manifest
   tags/<name>            one digest and a newline
   tmp/                   incoming; named only on the no-O_TMPFILE path
 ```

@@ -23,6 +23,19 @@
 //! - **There is no `GET /tags/{name}`** despite the README; a tag resolves
 //!   through `GET /manifests/{tag}`.
 //!
+//! ## Labels: what a person sees in the store
+//!
+//! The three constraints above are why the store's own view of a CI artifact
+//! used to be a digest, a flattened tag and a bag of `ci.*` annotations nobody
+//! reads. `PUT /labels/{digest}` is the store's answer: mutable metadata keyed
+//! by digest, which — unlike an annotation — can say what something *is* without
+//! changing the manifest's hash and breaking dedup.
+//!
+//! So the push sets one on both objects it creates. The blob's names the file;
+//! the manifest's names the artifact, and carries whatever the workflow's
+//! `description:` said. A store fronted by `art serve` then lists "app-lb — the
+//! proxy and heyctl, release build" rather than twelve hex characters.
+//!
 //! The push sequence is lifted from `app-lb/serverctl/src/artifact.rs`: hash,
 //! `HEAD /blobs/{digest}` (a 404 is an answer, not an error), `PUT
 //! /blobs/{digest}` with an explicit `Content-Length` so the store's free-space
@@ -52,6 +65,13 @@ pub struct ArtifactRef {
     pub job_key: String,
     pub workflow_id: String,
     pub name: String,
+    /// What the workflow's `description:` said, if anything.
+    ///
+    /// Only the `artifacts` sink has anywhere to put it — disk and S3 store a
+    /// file and a key — which is why it is `Option` rather than a defaulted
+    /// string: absent means "the workflow said nothing", and a sink with no
+    /// concept of a description ignores it either way.
+    pub description: Option<String>,
 }
 
 #[async_trait]
@@ -239,11 +259,28 @@ impl ArtifactSink for ArtifactsSink {
             .auth(self.http.put(format!("{base}/tags/{tag}")))
             // The body is the bare digest as text/plain, not JSON.
             .header(reqwest::header::CONTENT_TYPE, "text/plain")
-            .body(manifest_digest)
+            .body(manifest_digest.clone())
             .send()
             .await
             .map_err(|e| ArtifactError::Transport(e.to_string()))?;
         check(put_tag, "setting a tag").await?;
+
+        // Both objects get a label, and they say different things: the blob is
+        // the tarball, the manifest is the artifact. Which matters on the blob
+        // page, where the only other thing on offer is a size.
+        //
+        // Best-effort, and deliberately last. A label is what the store shows a
+        // person, not what a client resolves through — so a store too old to
+        // have the route, or one that refuses the write, must leave the upload
+        // succeeded rather than fail a build over a caption.
+        self.label(
+            &digest,
+            &format!("{} ({})", r.name, r.workflow_id),
+            r.description.as_deref(),
+        )
+        .await;
+        self.label(&manifest_digest, &r.name, r.description.as_deref())
+            .await;
 
         Ok(StoredArtifact {
             sink: "artifacts",
@@ -251,6 +288,33 @@ impl ArtifactSink for ArtifactsSink {
             size_bytes: size,
             uri: tag,
         })
+    }
+}
+
+impl ArtifactsSink {
+    /// Name and describe one digest, ignoring every way it can fail.
+    ///
+    /// Logged rather than returned: every caller is on the success path of an
+    /// upload that has already stored the bytes, and there is no outcome here
+    /// that should turn a green build red.
+    async fn label(&self, digest: &str, name: &str, description: Option<&str>) {
+        let base = &self.config.url;
+        let body = serde_json::json!({ "name": name, "description": description });
+        match self
+            .auth(self.http.put(format!("{base}/labels/{digest}")))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {}
+            // A 404 is the ordinary answer from a store predating labels, and
+            // is not worth a warning on every upload.
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                tracing::debug!(digest, "the store has no /labels route; skipping");
+            }
+            Ok(r) => tracing::warn!(digest, status = %r.status(), "could not label an artifact"),
+            Err(e) => tracing::warn!(digest, error = %e, "could not label an artifact"),
+        }
     }
 }
 
@@ -409,6 +473,7 @@ mod tests {
             job_key: "build-x86_64".into(),
             workflow_id: "myapp".into(),
             name: "binary.tar.gz".into(),
+            description: None,
         }
     }
 
@@ -453,6 +518,7 @@ mod tests {
             job_key: "..".into(),
             workflow_id: "..".into(),
             name: "..".into(),
+            description: None,
         };
         let tag = tag_for(&r);
         assert!(!tag.is_empty());
@@ -563,5 +629,31 @@ mod tests {
             message: "nope".into(),
         };
         assert!(e.to_string().contains("CI_ARTIFACT_TOKEN"), "{e}");
+    }
+
+    /// The property that makes a description safe to add at all: it is metadata
+    /// *about* the artifact, so it must not reach the manifest.
+    ///
+    /// A manifest is addressed by its own hash. Putting a description in an
+    /// annotation would give two uploads of identical bytes two different
+    /// manifest digests the moment somebody edited the workflow's wording — and
+    /// the store would accumulate a manifest per edit instead of deduplicating.
+    /// The description goes to `PUT /labels/{digest}`, which is mutable and
+    /// keyed by digest, precisely so it can change without moving anything.
+    #[test]
+    fn a_description_does_not_change_the_manifest() {
+        let plain = aref();
+        let described = ArtifactRef {
+            description: Some("the proxy and heyctl, release build".into()),
+            ..aref()
+        };
+
+        let a = manifest_for(&plain, "d".repeat(64).as_str(), 10);
+        let b = manifest_for(&described, "d".repeat(64).as_str(), 10);
+        assert_eq!(a, b, "the description leaked into the manifest");
+
+        // ...and the tag is likewise untouched, so the artifact stays where
+        // anything already pointing at it expects to find it.
+        assert_eq!(tag_for(&plain), tag_for(&described));
     }
 }

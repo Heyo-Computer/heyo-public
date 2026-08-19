@@ -87,6 +87,9 @@ pub struct GcReport {
     pub pinned: Vec<Pin>,
     pub manifests_scanned: u64,
     pub manifests_removed: Vec<Digest>,
+    /// Labels whose digest no longer names anything. See the sweep below for
+    /// why they are counted rather than listed.
+    pub labels_removed: u64,
 }
 
 impl GcReport {
@@ -166,11 +169,52 @@ pub async fn collect(store: &Store, policy: GcPolicy) -> Result<GcReport> {
             report.manifests_removed.push(digest);
         }
 
+        // -- labels --------------------------------------------------------
+        //
+        // A label describes a digest and is referenced by nothing, so it cannot
+        // keep anything alive and nothing keeps it alive either. What it can do
+        // is outlive its subject: collect the blob a label names and the label
+        // is left describing an address that resolves to nothing.
+        //
+        // Swept last, so the two phases that could have orphaned a label have
+        // already run. There is no grace window: a label is only removed once
+        // its subject is gone, and re-inserting those bytes later deserves a
+        // fresh description rather than the one that outlived them.
+        //
+        // "Gone" means *not on disk or removed by this sweep*, and the second
+        // half is what makes a dry run tell the truth. Under `dry_run` nothing
+        // is unlinked, so asking the filesystem alone would find every subject
+        // still present and report that no labels would be removed — while a
+        // real run of the same sweep removed them. A dry run that under-reports
+        // is worse than no dry run, because it is the thing people read before
+        // deciding to run it for real.
+        //
+        // Counted rather than listed: a caller reporting a sweep wants to know
+        // the tidying happened, and a hundred digests whose objects were just
+        // reported as removed is a second copy of the same list.
+        let swept: HashSet<&Digest> = report
+            .removed
+            .iter()
+            .chain(report.manifests_removed.iter())
+            .collect();
+        for digest in inner.label_digests()? {
+            let gone = swept.contains(&digest)
+                || !(inner.blob_exists(&digest) || inner.manifest_exists(&digest));
+            if !gone {
+                continue;
+            }
+            if !policy.dry_run {
+                sparse::unlink_if_present(&inner.label_path_of(&digest))?;
+            }
+            report.labels_removed += 1;
+        }
+
         tracing::info!(
             scanned = report.scanned,
             removed = report.removed.len(),
             bytes_freed = report.bytes_freed,
             pinned = report.pinned.len(),
+            labels_removed = report.labels_removed,
             dry_run = policy.dry_run,
             root = %root.display(),
             "garbage collection finished"
@@ -452,5 +496,77 @@ mod tests {
         let now = SystemTime::now();
         let future = now + Duration::from_secs(600);
         assert!(is_young(now, future, Duration::ZERO));
+    }
+
+    /// A label describes a digest and cannot keep anything alive. What it can do
+    /// is outlive its subject, which is the one thing the sweep has to fix.
+    #[tokio::test]
+    async fn labels_outliving_their_subject_are_swept() {
+        let d = tmpdir();
+        let s = store_in(&d);
+
+        let kept = s.insert_bytes(b"kept".to_vec()).await.unwrap();
+        let doomed = s.insert_bytes(b"doomed".to_vec()).await.unwrap();
+        s.set_tag(&TagName::parse("keep").unwrap(), &kept.digest).await.unwrap();
+
+        for (digest, name) in [(&kept.digest, "the kept one"), (&doomed.digest, "the doomed one")] {
+            s.set_label(digest, &crate::Label::new(Some(name.into()), None).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let report = collect(&s, now_policy()).await.unwrap();
+        assert_eq!(report.removed, vec![doomed.digest.clone()]);
+        assert_eq!(report.labels_removed, 1, "the orphaned label goes with its blob");
+
+        assert!(
+            s.get_label(&kept.digest).await.unwrap().is_some(),
+            "a label whose subject survived is untouched",
+        );
+        assert_eq!(s.get_label(&doomed.digest).await.unwrap(), None);
+    }
+
+    /// A dry run reports the tidying it would do and does none of it — the same
+    /// contract the blob and manifest phases keep.
+    #[tokio::test]
+    async fn a_dry_run_leaves_orphaned_labels_alone() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let doomed = s.insert_bytes(b"doomed".to_vec()).await.unwrap();
+        s.set_label(&doomed.digest, &crate::Label::new(Some("x".into()), None).unwrap())
+            .await
+            .unwrap();
+
+        let report = collect(
+            &s,
+            GcPolicy {
+                dry_run: true,
+                ..now_policy()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.labels_removed, 1);
+        assert!(s.get_label(&doomed.digest).await.unwrap().is_some());
+    }
+
+    /// A manifest's label is swept when the manifest is, and kept when it is
+    /// not — the sweep asks about both kinds because one label store serves
+    /// both.
+    #[tokio::test]
+    async fn a_tagged_manifests_label_survives_collection() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let blob = s.insert_bytes(b"entry".to_vec()).await.unwrap();
+        let m = crate::Manifest::new(KIND_GENERIC).with_entry("f", blob.digest.clone(), blob.size);
+        let md = s.put_manifest(&m).await.unwrap();
+        s.set_tag(&TagName::parse("bundle").unwrap(), &md).await.unwrap();
+        s.set_label(&md, &crate::Label::new(Some("a bundle".into()), None).unwrap())
+            .await
+            .unwrap();
+
+        let report = collect(&s, now_policy()).await.unwrap();
+        assert_eq!(report.labels_removed, 0);
+        assert!(s.get_label(&md).await.unwrap().is_some());
     }
 }

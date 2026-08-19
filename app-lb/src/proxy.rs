@@ -650,8 +650,15 @@ impl ProxyHttp for LbProxy {
         }
 
         if let (true, Some(identity)) = (gate.forward_identity, ctx.identity.as_ref()) {
-            upstream.insert_header("x-auth-request-email", crate::auth::header_safe(&identity.email))?;
             upstream.insert_header("x-auth-request-user", crate::auth::header_safe(&identity.subject))?;
+            // Omitted rather than sent empty. A Google identity always has an
+            // address; a JWT one may not — a token issued to a service has no
+            // person behind it — and `x-auth-request-email: ` upstream reads as
+            // "signed in as nobody" rather than as "not applicable".
+            let email = crate::auth::header_safe(&identity.email);
+            if !email.is_empty() {
+                upstream.insert_header("x-auth-request-email", email)?;
+            }
             if let Some(name) = &identity.name {
                 let name = crate::auth::header_safe(name);
                 if !name.is_empty() {

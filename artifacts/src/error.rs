@@ -31,6 +31,9 @@ pub enum Error {
     #[error("invalid tag name: {0}")]
     TagName(#[from] crate::tags::TagError),
 
+    #[error("invalid label: {0}")]
+    Label(#[from] crate::labels::LabelError),
+
     #[error(
         "refusing to write {needed} bytes: only {available} free, and {reserve} is reserved \
          (ART_MIN_FREE_BYTES)"
@@ -94,6 +97,7 @@ impl Error {
             Error::TagNotFound(_) => "tag_not_found",
             Error::Digest(_) => "invalid_digest",
             Error::TagName(_) => "invalid_tag",
+            Error::Label(_) => "invalid_label",
             Error::NoSpace { .. } => "no_space",
             Error::LinkLimit { .. } => "link_limit",
             Error::DigestMismatch { .. } => "digest_mismatch",

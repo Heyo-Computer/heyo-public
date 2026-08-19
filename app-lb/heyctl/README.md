@@ -630,6 +630,65 @@ straight back in — which is what makes *removing* someone take effect immediat
 when their cookie expires. Reordering or re-casing a list is free: the policy fingerprint sorts
 and lowercases before hashing, so only a real change to who may enter invalidates a session.
 
+### Putting a deployment behind a JWT
+
+The other kind of gate: instead of app-lb signing people in, it verifies a token **somebody
+else** issued. For an application whose users already sign in elsewhere.
+
+There is no `heyctl set jwt`. The block has a dozen fields and is written once, so it goes in
+with the rest of the spec — `heyctl apply -f`, or `heyctl edit deployment <id>`:
+
+```yaml
+# search.yaml
+id: search
+routes: [{ host: search.example.com }]
+upstreams: ["127.0.0.1:8080"]
+auth:
+  provider: jwt
+  jwt:
+    secret:        { secret: heyo-auth, key: jwt_secret }
+    algorithms:    ["HS256"]
+    issuer:        auth-service
+    audience:      heyo-app
+    subject_claim: userId              # the Heyo auth API's subject is not `sub`
+    require:       { role: [user, admin] }
+```
+
+```sh
+heyctl create secret heyo-auth --from-stdin jwt_secret < ~/.heyo-jwt-secret
+heyctl apply -f search.yaml
+heyctl describe deployment search
+```
+
+```
+Sign-in gate
+  Provider              jwt
+  JWT issuer            auth-service
+  JWT audience          heyo-app
+  JWT key               shared secret heyo-auth/jwt_secret
+  JWT algorithms        HS256
+  JWT admits            role=user|admin
+  JWT subject claim     userId -> x-auth-request-user
+```
+
+The same block with `jwks_url`, `RS256` and the default `sub` fronts an Auth0, Okta, Cognito or
+Keycloak deployment — nothing about the gate is specific to one issuer.
+
+Four things worth knowing, all of them enforced when the spec is registered rather than
+discovered at runtime:
+
+- **`algorithms` is required and has no default.** A token names its own algorithm in a header
+  the caller controls, so the spec decides and never the token — otherwise an unsigned token
+  (`alg: none`) or one signed with the gate's *public* key as an HMAC secret would verify. A
+  block naming an algorithm its key could not verify is refused.
+- **`require` is the allow-list, not `--allow-domain`/`--allow-email`.** Those match a Google
+  identity and are *refused* on a gate with no `google` provider, rather than looking like they
+  restrict something. `require` takes any claim, against a value or a set of them.
+- **A token with no `exp` is refused.** app-lb did not issue it and cannot revoke it, so the
+  expiry is the only thing that ever stops it.
+- **Mixing works.** `provider: [google, jwt]` is the common shape for a product UI: a person
+  signs in with Google, and the UI's own API calls carry the token the auth service gave it.
+
 ### Scaling and rollouts
 
 ```sh

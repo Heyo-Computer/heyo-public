@@ -1,9 +1,19 @@
-//! Google sign-in as a gate in front of a deployment.
+//! The sign-in gate in front of a deployment.
 //!
 //! A gated deployment's requests do not reach a backend until the caller has
-//! signed in with Google and passed the deployment's allow-list. The application
-//! behind it is unchanged and unaware: it sees only requests that got through,
-//! optionally with the caller's identity in `x-auth-request-*` headers.
+//! presented a credential the gate accepts. The application behind it is
+//! unchanged and unaware: it sees only requests that got through, optionally
+//! with the caller's identity in `x-auth-request-*` headers.
+//!
+//! Three kinds of credential, and a gate may take any combination of them —
+//! they are alternatives, not requirements:
+//!
+//! * **Google sign-in**, below: an OAuth redirect and a session cookie, for
+//!   people in browsers.
+//! * **An app-token** this LB minted ([`crate::tokens`]), for programs.
+//! * **A JWT somebody else issued** ([`crate::jwt`]), for an application whose
+//!   users already sign in elsewhere. The only one where app-lb holds no state
+//!   at all: no session to issue, no table to look in, just a key and a policy.
 //!
 //! The flow is the OAuth 2.0 authorization code grant with PKCE, run by the
 //! proxy on the deployment's own hostname:
@@ -161,6 +171,9 @@ pub struct Authenticator {
     /// Queues rejected sign-ins for analysis. `None` when `APP_LB_SIEM=0`, and in
     /// tests.
     security: Option<crate::siem::SecuritySink>,
+    /// Issuer key sets for `jwks_url` gates. One cache for the whole LB, so two
+    /// deployments behind the same issuer fetch its keys once between them.
+    jwks: crate::jwt::JwksCache,
 }
 
 impl Authenticator {
@@ -221,6 +234,7 @@ impl Authenticator {
                 .unwrap_or_default(),
             token_endpoint: GOOGLE_TOKEN.to_string(),
             authorize_endpoint: GOOGLE_AUTHORIZE.to_string(),
+            jwks: crate::jwt::JwksCache::new(),
         }
     }
 
@@ -314,6 +328,50 @@ impl Authenticator {
             return Decision::Allow(Box::new(None));
         }
 
+        // A JWT, if this gate takes them. Checked before the session cookie for
+        // the same reason an app-token is, and after the app-token because that
+        // one is a cheap table lookup while this may have to reach the issuer
+        // for a key.
+        //
+        // `reported` keeps a gate that accepts *both* machine credentials from
+        // counting one bad bearer twice. The SIEM's brute-force rule counts
+        // observations per source per window, so a mixed gate would otherwise
+        // reach its threshold at half the failures a single-provider one does —
+        // and the second observation says nothing the first did not.
+        let mut reported = false;
+        if let Some(policy) = gate.jwt_policy()
+            && let Some(presented) = self.jwt_candidate(policy, req)
+        {
+            match self.verify_jwt(policy, &presented).await {
+                Ok(identity) => {
+                    tracing::debug!(
+                        deployment = %deployment_id,
+                        subject = %identity.subject,
+                        "request admitted by JWT",
+                    );
+                    return Decision::Allow(Box::new(Some(identity)));
+                }
+                Err(e) => {
+                    // The reason goes here and to the SIEM; the caller gets a
+                    // bare 401. "Expired" and "signed with the wrong key" are
+                    // precisely the feedback somebody probing a gate wants.
+                    tracing::info!(
+                        deployment = %deployment_id,
+                        path = %req.path,
+                        error = %e,
+                        "refused a JWT at the gate",
+                    );
+                    self.observe_auth(
+                        deployment_id,
+                        req,
+                        crate::siem::AuthAction::GateJwt,
+                        None,
+                    );
+                    reported = true;
+                }
+            }
+        }
+
         // Reaching here with a bearer in hand means it was presented and did not
         // admit — expired, revoked, forged, or scoped to another deployment.
         //
@@ -321,7 +379,7 @@ impl Authenticator {
         // `Authorization` header on any request to a gated deployment, so
         // observing the no-credential case would flood the queue with the single
         // most common non-event there is.
-        if gate.accepts_app_token() && req.bearer.is_some() {
+        if gate.accepts_app_token() && req.bearer.is_some() && !reported {
             self.observe_auth(deployment_id, req, crate::siem::AuthAction::GateToken, None);
         }
 
@@ -337,6 +395,78 @@ impl Authenticator {
         }
     }
 
+    /// The token a JWT gate should try, from the `Authorization` header or the
+    /// cookie the gate names.
+    ///
+    /// The header wins when both are present: a request that sets
+    /// `Authorization` is stating what it is presenting, and preferring a cookie
+    /// it happens to also carry would make the outcome depend on something the
+    /// caller did not mean to send.
+    ///
+    /// Only the *first* cookie of that name is considered, unlike the session
+    /// cookie's several-candidates walk. A session cookie is app-lb's own and a
+    /// realm can legitimately put two on one host; a JWT cookie belongs to the
+    /// application, and trying each of a browser's cookies against an issuer's
+    /// key is a way to turn one request into several signature checks.
+    fn jwt_candidate(&self, policy: &crate::config::JwtSpec, req: &RequestInfo<'_>) -> Option<String> {
+        if let Some(bearer) = &req.bearer {
+            return Some(bearer.clone());
+        }
+        let name = policy.cookie.as_deref()?;
+        cookie_values(&req.cookies, name)
+            .into_iter()
+            .next()
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Verify a presented token and turn its claims into an identity.
+    async fn verify_jwt(
+        &self,
+        policy: &crate::config::JwtSpec,
+        token: &str,
+    ) -> Result<Identity, crate::jwt::JwtError> {
+        // Resolved per request rather than at registration, so rotating the
+        // secret in the store takes effect on the next request instead of on the
+        // next time somebody re-registers the deployment.
+        let key = match (&policy.secret, &policy.public_key) {
+            (Some(reference), _) => Some(crate::jwt::Key::Secret(
+                self.secrets
+                    .resolve(reference)
+                    .map_err(|e| crate::jwt::JwtError::Key(e.to_string()))?
+                    .into_bytes(),
+            )),
+            (None, Some(pem)) => Some(crate::jwt::Key::Public(
+                crate::jwt::public_key_from_pem(pem).map_err(crate::jwt::JwtError::Key)?,
+            )),
+            // Neither: a `jwks_url` gate, whose key comes from the cache.
+            (None, None) => None,
+        };
+
+        let claims = crate::jwt::verify(token, policy, key.as_ref(), &self.jwks, now_secs()).await?;
+
+        // The subject is the one claim a gate cannot do without: it is what goes
+        // upstream as `x-auth-request-user`, and a token missing it means
+        // `subject_claim` names something this issuer does not send. Refused
+        // rather than defaulted, because the alternative is every request
+        // arriving upstream as the same anonymous user.
+        let subject = claims
+            .string(&policy.subject_claim)
+            .ok_or_else(|| crate::jwt::JwtError::Require(policy.subject_claim.clone()))?;
+
+        Ok(Identity {
+            subject,
+            // Optional: a token issued to a service has no address, and a gate
+            // that required one would refuse exactly the machine-to-machine case
+            // this provider is good at.
+            email: claims.string(&policy.email_claim).unwrap_or_default(),
+            name: claims.string(&policy.name_claim),
+            // A Google Workspace concept. Nothing else issues it, and inventing
+            // one from an email suffix is the mistake `AuthGate::allows`
+            // documents at length.
+            hosted_domain: None,
+        })
+    }
+
     /// Begin a sign-in: redirect to Google, remembering where to come back to.
     fn start(
         &self,
@@ -350,12 +480,24 @@ impl Authenticator {
         // than sending a browser into an OAuth round trip that ends in a blank
         // `client_id`.
         let Some((client_id, _)) = gate.google_credentials() else {
+            let mut accepts: Vec<&str> = Vec::new();
+            let mut detail: Vec<&str> = Vec::new();
+            if gate.accepts_app_token() {
+                accepts.push("\"app-token\"");
+                detail.push("an app-token as `Authorization: Bearer applb_…` or `?app_token=`");
+            }
+            if gate.accepts_jwt() {
+                accepts.push("\"jwt\"");
+                detail.push("a JWT from this deployment's issuer as `Authorization: Bearer …`");
+            }
             return Response::json(
                 401,
-                "{\"error\":\"authentication required\",\"accepts\":[\"app-token\"],\
-                 \"detail\":\"present an app-token as `Authorization: Bearer applb_…` \
-                 or `?app_token=`\"}\n"
-                    .to_string(),
+                format!(
+                    "{{\"error\":\"authentication required\",\"accepts\":[{}],\
+                     \"detail\":\"present {}\"}}\n",
+                    accepts.join(","),
+                    detail.join(", or "),
+                ),
             );
         };
 
@@ -928,7 +1070,9 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Length-then-content comparison that doesn't short-circuit, so a matching
 /// prefix cannot be timed out of a signature or a nonce.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// Shared with [`crate::jwt`], which compares an HMAC for the same reason.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -1102,6 +1246,7 @@ mod tests {
             cookie_domain: None,
             redirect_url: None,
             forward_identity: true,
+            jwt: None,
         }
     }
 
@@ -1331,6 +1476,346 @@ mod tests {
                 .find(|c| c.starts_with(FLOW_COOKIE))
                 .expect("the flow cookie is cleared");
             assert!(!flow.contains("Domain="), "{flow}");
+        }
+    }
+
+    // -- JWTs at the data plane --------------------------------------------
+
+    mod jwt_gate {
+        use super::*;
+        use base64::Engine;
+        use serde_json::json;
+
+        const SECRET: &str = "a-shared-secret-of-some-length";
+
+        /// An authenticator whose secret store holds the issuer's signing key,
+        /// as a real deployment's would.
+        fn with_secret() -> Authenticator {
+            let secrets = Arc::new(SecretStore::new("/nonexistent/secrets.json", None));
+            secrets.put(SecretSpec {
+                id: "heyo-auth".into(),
+                description: None,
+                data: BTreeMap::from([("jwt_secret".to_string(), SECRET.to_string())]),
+                updated_at: 0,
+            });
+            Authenticator::new(vec![7u8; 32], secrets, None, None)
+        }
+
+        /// A gate for the Heyo auth API, plus whatever other providers are named.
+        fn jwt_gate(providers: &str, extra: &str) -> AuthGate {
+            serde_json::from_str(&format!(
+                r#"{{"provider":{providers},
+                     "client_id":"cid","client_secret":{{"secret":"g"}},
+                     "allowed_domains":["example.com"],
+                     "jwt":{{
+                       "secret":{{"secret":"heyo-auth","key":"jwt_secret"}},
+                       "algorithms":["HS256"],
+                       "issuer":"auth-service",
+                       "audience":"heyo-app",
+                       "subject_claim":"userId"
+                       {extra}
+                     }}}}"#
+            ))
+            .unwrap()
+        }
+
+        /// A token the Heyo auth API would have issued.
+        fn heyo_token(overrides: serde_json::Value) -> String {
+            let mut claims = json!({
+                "userId": "u_1f2e",
+                "email": "someone@example.com",
+                "name": "A Person",
+                "role": "admin",
+                "iss": "auth-service",
+                "aud": "heyo-app",
+                "exp": now_secs() + 3600,
+            });
+            for (k, v) in overrides.as_object().unwrap() {
+                claims[k] = v.clone();
+            }
+            let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            let signed = format!(
+                "{}.{}",
+                b64(json!({"alg": "HS256", "typ": "JWT"}).to_string().as_bytes()),
+                b64(claims.to_string().as_bytes())
+            );
+            format!("{signed}.{}", b64(&hmac(SECRET.as_bytes(), signed.as_bytes())))
+        }
+
+        fn bearing<'a>(path: &'a str, token: &str) -> RequestInfo<'a> {
+            RequestInfo {
+                bearer: Some(token.to_string()),
+                ..req(path, vec![])
+            }
+        }
+
+        #[tokio::test]
+        async fn a_token_from_the_issuer_gets_through_and_brings_its_identity() {
+            let a = with_secret();
+            let g = jwt_gate(r#""jwt""#, "");
+
+            let Decision::Allow(identity) =
+                a.decide(&g, "web", "default", &bearing("/private", &heyo_token(json!({})))).await
+            else {
+                panic!("a valid token should have been admitted");
+            };
+            let identity = identity.expect("a JWT gate forwards who the caller is");
+            // `userId`, because that is what `subject_claim` named — the whole
+            // reason the claim is configurable.
+            assert_eq!(identity.subject, "u_1f2e");
+            assert_eq!(identity.email, "someone@example.com");
+            assert_eq!(identity.name.as_deref(), Some("A Person"));
+            // Nothing but Google issues one, and inventing it from an email
+            // suffix is the mistake `AuthGate::allows` documents at length.
+            assert_eq!(identity.hosted_domain, None);
+        }
+
+        #[tokio::test]
+        async fn a_token_the_gate_will_not_take_does_not_get_through() {
+            let a = with_secret();
+            let g = jwt_gate(r#""jwt""#, "");
+
+            for (what, token) in [
+                ("expired", heyo_token(json!({"exp": now_secs() - 1}))),
+                ("another issuer", heyo_token(json!({"iss": "somewhere-else"}))),
+                ("another audience", heyo_token(json!({"aud": "heyo-server"}))),
+                ("no expiry", {
+                    // Built by hand: `heyo_token` always sets one.
+                    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+                    let claims = json!({"userId": "u", "iss": "auth-service", "aud": "heyo-app"});
+                    let signed = format!(
+                        "{}.{}",
+                        b64(json!({"alg": "HS256"}).to_string().as_bytes()),
+                        b64(claims.to_string().as_bytes())
+                    );
+                    format!("{signed}.{}", b64(&hmac(SECRET.as_bytes(), signed.as_bytes())))
+                }),
+                ("not a token at all", "nonsense".to_string()),
+            ] {
+                assert!(
+                    matches!(
+                        a.decide(&g, "web", "default", &bearing("/private", &token)).await,
+                        Decision::Answered(_)
+                    ),
+                    "{what} was admitted",
+                );
+            }
+        }
+
+        /// The gate's allow-list. A token that is perfectly valid and belongs to
+        /// somebody this deployment does not admit.
+        #[tokio::test]
+        async fn require_keeps_out_a_valid_token_from_the_wrong_person() {
+            let a = with_secret();
+            let g = jwt_gate(r#""jwt""#, r#", "require": {"role": "admin"}"#);
+
+            let Decision::Allow(_) =
+                a.decide(&g, "web", "default", &bearing("/private", &heyo_token(json!({})))).await
+            else {
+                panic!("an admin should have been admitted");
+            };
+            assert!(
+                matches!(
+                    a.decide(
+                        &g,
+                        "web",
+                        "default",
+                        &bearing("/private", &heyo_token(json!({"role": "user"})))
+                    )
+                    .await,
+                    Decision::Answered(_)
+                ),
+                "a non-admin was admitted through a `require` that names admin",
+            );
+        }
+
+        /// A browser navigating cannot set an `Authorization` header, so a gate
+        /// can be told to read the token out of the cookie the application put
+        /// it in.
+        #[tokio::test]
+        async fn a_token_can_arrive_in_a_cookie() {
+            let a = with_secret();
+            let g = jwt_gate(r#""jwt""#, r#", "cookie": "heyo_access_token""#);
+            let token = heyo_token(json!({}));
+
+            let in_cookie = req("/private", vec![format!("heyo_access_token={token}")]);
+            let Decision::Allow(identity) = a.decide(&g, "web", "default", &in_cookie).await else {
+                panic!("a token in the named cookie should have been admitted");
+            };
+            assert_eq!(identity.unwrap().subject, "u_1f2e");
+
+            // A gate that names no cookie reads none, however the browser
+            // spells it — the header is the only credential it asked for.
+            let g = jwt_gate(r#""jwt""#, "");
+            assert!(matches!(
+                a.decide(&g, "web", "default", &in_cookie).await,
+                Decision::Answered(_)
+            ));
+        }
+
+        /// The header states what the caller is presenting. A cookie the browser
+        /// happens to also carry must not decide the outcome.
+        #[tokio::test]
+        async fn the_authorization_header_wins_over_the_cookie() {
+            let a = with_secret();
+            let g = jwt_gate(r#""jwt""#, r#", "cookie": "heyo_access_token""#);
+            let good = heyo_token(json!({}));
+
+            let mut r = req("/private", vec![format!("heyo_access_token={good}")]);
+            r.bearer = Some(heyo_token(json!({"exp": now_secs() - 1})));
+            assert!(
+                matches!(a.decide(&g, "web", "default", &r).await, Decision::Answered(_)),
+                "the valid cookie was used in place of the expired header",
+            );
+        }
+
+        /// The providers are alternatives. A person signs into the UI with
+        /// Google; the UI's own calls carry the token the issuer gave it.
+        #[tokio::test]
+        async fn a_gate_can_accept_a_session_or_a_jwt() {
+            let a = with_secret();
+            let g = jwt_gate(r#"["google","jwt"]"#, "");
+
+            // The token path.
+            let Decision::Allow(who) =
+                a.decide(&g, "web", "default", &bearing("/api", &heyo_token(json!({}))))
+                    .await
+            else {
+                panic!("a valid token should have been admitted");
+            };
+            assert_eq!(who.unwrap().subject, "u_1f2e");
+
+            // The session path, unchanged.
+            let id = identity("someone@example.com", Some("example.com"));
+            let cookie = session_cookie(&a, &g, &id, now_secs() + 3600);
+            let Decision::Allow(who) =
+                a.decide(&g, "web", "default", &req("/dashboard", vec![cookie])).await
+            else {
+                panic!("a live Google session should still be honoured");
+            };
+            assert_eq!(who.unwrap().email, "someone@example.com");
+
+            // Neither: a browser is still sent to Google, because that is the
+            // only one of the two a browser can start.
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &req("/dashboard", vec![])).await
+            else {
+                panic!("an unauthenticated browser must not be let through");
+            };
+            assert_eq!(r.status, 302);
+        }
+
+        /// A gate that takes no browser credential has no sign-in to start, so
+        /// it answers with what would actually work rather than redirecting to a
+        /// flow that cannot complete.
+        #[tokio::test]
+        async fn a_browser_at_a_jwt_only_gate_is_told_what_it_needs() {
+            let a = with_secret();
+            let g: AuthGate = serde_json::from_str(
+                r#"{"provider":"jwt","jwt":{"secret":{"secret":"heyo-auth","key":"jwt_secret"},
+                    "algorithms":["HS256"],"issuer":"auth-service"}}"#,
+            )
+            .unwrap();
+
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &req("/", vec![])).await else {
+                panic!("an unauthenticated request must not be let through");
+            };
+            assert_eq!(r.status, 401);
+            // Valid JSON, not just a string with the right substrings in it —
+            // this is what an API client parses to find out what to do next.
+            let body: serde_json::Value =
+                serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{}: {e}", r.body));
+            assert_eq!(body["accepts"], serde_json::json!(["jwt"]));
+            assert_eq!(body["error"], "authentication required");
+            assert!(body["detail"].as_str().is_some_and(|d| d.contains("Bearer")), "{body}");
+            assert!(r.location.is_none(), "there is no flow to redirect to");
+        }
+
+        /// A gate taking both machine credentials names both.
+        #[tokio::test]
+        async fn a_gate_taking_both_machine_credentials_says_so() {
+            let a = with_secret();
+            let g: AuthGate = serde_json::from_str(
+                r#"{"provider":["app-token","jwt"],"jwt":{"secret":{"secret":"heyo-auth","key":"jwt_secret"},
+                    "algorithms":["HS256"],"issuer":"auth-service"}}"#,
+            )
+            .unwrap();
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &req("/", vec![])).await else {
+                panic!("an unauthenticated request must not be let through");
+            };
+            let body: serde_json::Value =
+                serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{}: {e}", r.body));
+            assert_eq!(body["accepts"], serde_json::json!(["app-token", "jwt"]));
+        }
+
+        #[tokio::test]
+        async fn a_google_only_gate_ignores_jwts_entirely() {
+            let a = with_secret();
+            // Same block, but `jwt` is not among the providers, so it is inert.
+            let mut g = jwt_gate(r#""google""#, "");
+            assert!(g.jwt.is_some());
+            assert!(g.jwt_policy().is_none(), "the block is inert without the provider");
+
+            assert!(
+                matches!(
+                    a.decide(&g, "web", "default", &bearing("/private", &heyo_token(json!({})))).await,
+                    Decision::Answered(_)
+                ),
+                "a JWT was honoured by a gate that does not list the provider",
+            );
+
+            // And with the provider added, the same request gets through.
+            g.provider = serde_json::from_str(r#"["google","jwt"]"#).unwrap();
+            assert!(matches!(
+                a.decide(&g, "web", "default", &bearing("/private", &heyo_token(json!({})))).await,
+                Decision::Allow(_)
+            ));
+        }
+
+        #[tokio::test]
+        async fn public_paths_are_still_public_on_a_jwt_gate() {
+            let a = with_secret();
+            let mut g = jwt_gate(r#""jwt""#, "");
+            g.public_paths = vec!["/healthz".into()];
+            let Decision::Allow(identity) = a.decide(&g, "web", "default", &req("/healthz", vec![])).await
+            else {
+                panic!("a public path must be served without a credential");
+            };
+            assert!(identity.is_none(), "an ungated request carries no identity");
+        }
+
+        /// Rotating the signing key in the store takes effect on the next
+        /// request, not on the next time somebody re-registers the deployment.
+        #[tokio::test]
+        async fn rotating_the_secret_invalidates_tokens_immediately() {
+            let secrets = Arc::new(SecretStore::new("/nonexistent/secrets.json", None));
+            secrets.put(SecretSpec {
+                id: "heyo-auth".into(),
+                description: None,
+                data: BTreeMap::from([("jwt_secret".to_string(), SECRET.to_string())]),
+                updated_at: 0,
+            });
+            let a = Authenticator::new(vec![7u8; 32], secrets.clone(), None, None);
+            let g = jwt_gate(r#""jwt""#, "");
+            let token = heyo_token(json!({}));
+
+            assert!(matches!(
+                a.decide(&g, "web", "default", &bearing("/private", &token)).await,
+                Decision::Allow(_)
+            ));
+
+            secrets.put(SecretSpec {
+                id: "heyo-auth".into(),
+                description: None,
+                data: BTreeMap::from([("jwt_secret".to_string(), "rotated".to_string())]),
+                updated_at: 1,
+            });
+            assert!(
+                matches!(
+                    a.decide(&g, "web", "default", &bearing("/private", &token)).await,
+                    Decision::Answered(_)
+                ),
+                "a token signed with the previous secret still verified",
+            );
         }
     }
 

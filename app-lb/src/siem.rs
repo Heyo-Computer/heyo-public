@@ -232,6 +232,9 @@ pub enum AuthAction {
     AdminScope,
     /// Data-plane app-token gate: a bearer was presented and rejected.
     GateToken,
+    /// Data-plane JWT gate: a token was presented and did not verify or did not
+    /// satisfy the gate's claims.
+    GateJwt,
     /// Sign-in: the state/nonce did not match the flow cookie. CSRF-shaped.
     SigninState,
     /// Sign-in: the OAuth token exchange failed.
@@ -248,6 +251,7 @@ impl AuthAction {
             Self::AdminRejected => "admin-rejected",
             Self::AdminScope => "admin-scope",
             Self::GateToken => "gate-token",
+            Self::GateJwt => "gate-jwt",
             Self::SigninState => "signin-state",
             Self::SigninExchange => "signin-exchange",
             Self::SigninToken => "signin-token",

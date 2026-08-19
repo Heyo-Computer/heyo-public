@@ -342,3 +342,35 @@ fn a_mount_pull_reports_every_mount() {
     assert_eq!(j.result_summary(), "1/2 updated");
     assert_eq!(j.target_summary(), "/data/corpus,/opt/models");
 }
+
+/// A JWT gate's verification policy, which is the one part of a spec whose
+/// *misreading* is a security question: a client that dropped `require` would
+/// render a restricted deployment as open to anyone the issuer signs for.
+#[test]
+fn a_jwt_gate_survives_the_wire() {
+    let d: DeploymentStatus =
+        serde_json::from_str(&fixture("deployment-status-jwt")).expect("fixture parses");
+    let gate = d.spec.auth.expect("the fixture is gated");
+
+    assert!(gate.accepts_jwt(), "the provider list carries `jwt`");
+    assert!(
+        gate.providers().iter().any(|p| p == "google"),
+        "the fixture is the mixed gate: a person signs in, a program presents a token",
+    );
+
+    let jwt = gate.jwt.expect("the verification policy must not be dropped");
+    assert_eq!(jwt.issuer, "auth-service");
+    assert_eq!(jwt.audience.as_deref(), Some("heyo-app"));
+    assert_eq!(jwt.algorithms, vec!["HS256"]);
+    assert_eq!(jwt.subject_claim, "userId", "the Heyo auth API's subject is not `sub`");
+    assert_eq!(jwt.cookie.as_deref(), Some("heyo_access_token"));
+    assert_eq!(jwt.leeway_secs, Some(30));
+    assert!(jwt.secret.is_some(), "a SecretRef must survive as an opaque value");
+
+    // The claim map is the gate's allow-list, and it renders as one.
+    assert_eq!(jwt.require.len(), 2);
+    let summary = jwt.require_summary();
+    assert!(summary.contains("role=user|admin"), "{summary}");
+    assert!(summary.contains("accountId=acct_7f3c"), "{summary}");
+    assert!(jwt.key_summary().contains("heyo-auth"), "{}", jwt.key_summary());
+}

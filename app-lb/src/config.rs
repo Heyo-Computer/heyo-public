@@ -3,7 +3,7 @@
 use crate::secrets::SecretRef;
 use heyo_sdk::{SandboxDriver, SandboxSize};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 fn default_proxy_addr() -> String {
     "0.0.0.0:6188".into()
@@ -1608,6 +1608,372 @@ pub struct AuthGate {
     /// client cannot forge them.
     #[serde(default = "default_true")]
     pub forward_identity: bool,
+    /// How to verify a JWT, when `jwt` is among the providers. See [`JwtSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt: Option<JwtSpec>,
+}
+
+/// The default claim a subject is read from, and the default leeway.
+const DEFAULT_SUBJECT_CLAIM: &str = "sub";
+const DEFAULT_EMAIL_CLAIM: &str = "email";
+const DEFAULT_NAME_CLAIM: &str = "name";
+
+/// Ceiling on `leeway_secs`.
+///
+/// Five minutes is more clock skew than any two machines that can reach each
+/// other should have, and the field's whole job is to paper over skew. A gate
+/// that wanted an hour of it would be asking for expired tokens to keep working
+/// for an hour, which is not leeway — it is a longer expiry, and belongs to
+/// whoever issues the token.
+pub const MAX_JWT_LEEWAY_SECS: u64 = 300;
+
+/// How a gate verifies a JWT, and which ones it lets past.
+///
+/// The block exists because a JWT gate is configuration all the way down. app-lb
+/// did not issue the token and cannot ask anyone about it, so every question —
+/// which key, which algorithm, which issuer, which claim is the user, which
+/// claims must hold — is something the spec has to answer. The upside of that is
+/// versatility: the Heyo auth API and an Auth0 tenant differ only in this block.
+///
+/// A gate for the Heyo auth API is:
+///
+/// ```jsonc
+/// "auth": {
+///   "provider": "jwt",
+///   "jwt": {
+///     "secret":     {"secret": "heyo-auth", "key": "jwt_secret"},
+///     "algorithms": ["HS256"],
+///     "issuer":     "auth-service",
+///     "audience":   "heyo-app",
+///     "subject_claim": "userId",
+///     "require":    {"role": ["user", "admin"]}
+///   }
+/// }
+/// ```
+///
+/// and the same gate in front of an OIDC provider is the same block with
+/// `jwks_url`, `RS256` and the default `sub`.
+///
+/// ## The allow-list is `require`, not `allowed_emails`
+///
+/// [`AuthGate::allowed_domains`] and [`AuthGate::allowed_emails`] describe a
+/// *Google* identity: the domain is matched on the `hd` claim precisely because
+/// an email suffix proves nothing there. Neither statement transfers to a token
+/// from your own issuer, where the claims mean what that issuer says they mean —
+/// so a gate that accepts `jwt` without also accepting `google` is refused if it
+/// sets them, rather than appearing to restrict something it does not.
+///
+/// `require` is the equivalent and it is more general: any claim, against a
+/// value or a set of them. An empty `require` admits any token the issuer signed
+/// for this audience, which — unlike Google's empty allow-list, where the
+/// population is everyone with a Google account — is exactly "a signed-in user
+/// of this product", and a reasonable thing to want.
+///
+/// ## What is not here
+///
+/// There is no claim forwarding. The gate puts `x-auth-request-{email,user,name}`
+/// upstream like any other, and beyond that the application can read the token
+/// itself: it is still in the `Authorization` header the request arrived with,
+/// signed, and the app already trusts the issuer or it would not be behind this
+/// gate. Copying claims into headers would only give it a second, weaker copy.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct JwtSpec {
+    /// The HMAC shared secret, as a reference into the secret store. For the
+    /// `HS*` algorithms, and the shape the Heyo auth API uses (`JWT_SECRET`).
+    ///
+    /// A reference rather than a literal for the usual reason, and one specific
+    /// to this: the same value verifies *and mints* tokens, so a spec carrying it
+    /// would hand anyone who can read a deployment the ability to issue
+    /// identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretRef>,
+    /// A PEM public key or certificate, inline. For the `RS*`, `PS*` and `ES*`
+    /// algorithms when the issuer publishes one key rather than a key set.
+    ///
+    /// Inline rather than a [`SecretRef`] because it is a *public* key: putting
+    /// it in the secret store would imply it needs protecting and make rotating
+    /// it a two-step operation for no gain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// The issuer's JWKS endpoint, usually `<issuer>/.well-known/jwks.json`.
+    ///
+    /// The right choice for any provider that rotates keys: the set is fetched,
+    /// cached for ten minutes, and refetched when a token names a `kid` that is
+    /// not in it — so a rotation needs nothing done here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_url: Option<String>,
+    /// The signature algorithms this gate accepts, e.g. `["HS256"]` or
+    /// `["RS256", "ES256"]`.
+    ///
+    /// **Required, with no default.** The algorithm is named in the token's own
+    /// header, which is attacker-controlled input, and a verifier that dispatches
+    /// on it accepts both an unsigned token (`alg: none`) and one signed with a
+    /// public key used as an HMAC secret. See [`crate::jwt`].
+    pub algorithms: Vec<String>,
+    /// The `iss` a token must carry, exactly.
+    ///
+    /// Required, because a signature proves only that *a* holder of the key
+    /// signed the token — and with a shared secret that is every service the
+    /// secret was ever handed to.
+    pub issuer: String,
+    /// The `aud` a token must carry, if the issuer sets one. Matched against a
+    /// string audience or a member of an array one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    /// Claims a token must satisfy, on top of being validly signed.
+    ///
+    /// A value or a list of them per claim: a list is an OR within that claim,
+    /// and the map is an AND across claims. A claim that is *itself* a list —
+    /// scopes, roles, groups — is satisfied when it contains one of the wanted
+    /// values, which is what makes `{"scopes": "deploy"}` mean what it looks
+    /// like.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub require: BTreeMap<String, serde_json::Value>,
+    /// Which claim holds the stable user id forwarded as `x-auth-request-user`.
+    /// `sub` unless the issuer says otherwise — the Heyo auth API uses `userId`.
+    #[serde(default = "default_subject_claim")]
+    pub subject_claim: String,
+    /// Which claim holds the address forwarded as `x-auth-request-email`.
+    #[serde(default = "default_email_claim")]
+    pub email_claim: String,
+    /// Which claim holds the display name. Absent from most tokens, and absent
+    /// here means the header is simply not sent.
+    #[serde(default = "default_name_claim")]
+    pub name_claim: String,
+    /// Clock skew allowed on `exp` and `nbf`, in seconds. Capped at
+    /// [`MAX_JWT_LEEWAY_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leeway_secs: Option<u64>,
+    /// A cookie to read the token from when there is no `Authorization` header.
+    ///
+    /// For a browser application whose sign-in put the JWT in a cookie — common,
+    /// and the only way a page navigation can carry a credential at all, since a
+    /// browser cannot set a header on one. The `Authorization` header still wins
+    /// when both are present: a request that says what it is presenting means it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie: Option<String>,
+}
+
+fn default_subject_claim() -> String {
+    DEFAULT_SUBJECT_CLAIM.to_string()
+}
+fn default_email_claim() -> String {
+    DEFAULT_EMAIL_CLAIM.to_string()
+}
+fn default_name_claim() -> String {
+    DEFAULT_NAME_CLAIM.to_string()
+}
+
+impl JwtSpec {
+    /// Whether this gate accepts a token signed with `alg`.
+    ///
+    /// Compared against the configured names rather than a parsed set, so the
+    /// answer is a function of what the spec says and nothing else.
+    pub fn accepts(&self, alg: crate::jwt::Algorithm) -> bool {
+        self.algorithms.iter().any(|a| a == alg.as_str())
+    }
+
+    /// The JWKS endpoint, or the empty string for a gate holding a static key.
+    /// Callers reach this only after establishing there is no static key.
+    pub fn jwks_url(&self) -> &str {
+        self.jwks_url.as_deref().unwrap_or("")
+    }
+
+    pub fn leeway_secs(&self) -> u64 {
+        self.leeway_secs.unwrap_or(0).min(MAX_JWT_LEEWAY_SECS)
+    }
+
+    /// Everything about this block that decides *who* gets in, as one string.
+    ///
+    /// Feeds [`AuthGate::policy_fingerprint`]. Deliberately covers the key
+    /// source as well as the policy: rotating an issuer is as much a change of
+    /// who may enter as editing `require` is. The secret's *value* is not here —
+    /// only which store entry it names — because this digest is not a secret and
+    /// ends up in a cookie.
+    fn fingerprint(&self) -> String {
+        let key = match (&self.secret, &self.public_key, &self.jwks_url) {
+            (Some(r), _, _) => format!("secret:{}/{}", r.secret, r.key),
+            (_, Some(pem), _) => format!("pem:{}", pem.trim()),
+            (_, _, Some(url)) => format!("jwks:{url}"),
+            _ => String::new(),
+        };
+        let mut algorithms = self.algorithms.clone();
+        algorithms.sort();
+        // `require` is a BTreeMap, so it renders in a stable order without
+        // sorting it here.
+        let require: Vec<String> = self
+            .require
+            .iter()
+            .map(|(claim, value)| format!("{claim}={value}"))
+            .collect();
+        format!(
+            "{key}|{}|{}|{}|{}|{}",
+            algorithms.join(","),
+            self.issuer,
+            self.audience.as_deref().unwrap_or(""),
+            require.join(","),
+            self.subject_claim,
+        )
+    }
+
+    /// Whether the key material is a shared secret, which is what decides the
+    /// algorithm family this gate may name.
+    fn is_symmetric(&self) -> bool {
+        self.secret.is_some()
+    }
+
+    /// [`validate`](Self::validate), reachable from the verifier's tests so the
+    /// two halves of the algorithm-confusion defence can be asserted together:
+    /// the spec that describes the attack is refused, *and* a token exercising
+    /// it would not verify anyway.
+    #[cfg(test)]
+    pub fn validate_for_test(&self) -> Result<(), SpecError> {
+        self.validate()
+    }
+
+    fn validate(&self) -> Result<(), SpecError> {
+        // Exactly one source of key material. Two would leave "which key
+        // verified this?" answerable only by reading the code.
+        let sources = [
+            ("jwt.secret", self.secret.is_some()),
+            ("jwt.public_key", self.public_key.is_some()),
+            ("jwt.jwks_url", self.jwks_url.is_some()),
+        ];
+        let named: Vec<&str> = sources.iter().filter(|(_, set)| *set).map(|(n, _)| *n).collect();
+        match named.as_slice() {
+            [] => return Err(SpecError::NoJwtKey),
+            [_] => {}
+            many => {
+                return Err(SpecError::AmbiguousJwtKey(
+                    many.iter().map(|n| n.to_string()).collect(),
+                ));
+            }
+        }
+
+        if let Some(secret) = &self.secret {
+            secret.validate().map_err(|e| SpecError::BadSecretRef {
+                field: "jwt.secret",
+                detail: e.to_string(),
+            })?;
+        }
+        if let Some(pem) = &self.public_key {
+            crate::jwt::public_key_from_pem(pem).map_err(SpecError::BadJwtPublicKey)?;
+        }
+        if let Some(url) = &self.jwks_url {
+            match jwks_url_problem(url.trim()) {
+                None => {}
+                Some(JwksUrlProblem::Malformed) => {
+                    return Err(SpecError::BadJwksUrl(url.trim().to_string()));
+                }
+                Some(JwksUrlProblem::Plaintext) => {
+                    return Err(SpecError::InsecureJwksUrl(url.trim().to_string()));
+                }
+            }
+        }
+
+        if self.algorithms.is_empty() {
+            return Err(SpecError::NoJwtAlgorithms);
+        }
+        for name in &self.algorithms {
+            let alg = crate::jwt::Algorithm::parse(name)
+                .ok_or_else(|| SpecError::BadJwtAlgorithm(name.clone()))?;
+            // The family has to match the key, or the gate could never verify
+            // anything — and, for a public key named alongside `HS256`, would be
+            // the algorithm-confusion setup itself written down as configuration.
+            if alg.is_symmetric() != self.is_symmetric() {
+                return Err(SpecError::JwtAlgorithmKeyMismatch {
+                    algorithm: name.clone(),
+                    symmetric_key: self.is_symmetric(),
+                });
+            }
+        }
+
+        if self.issuer.trim().is_empty() || self.issuer.trim().len() != self.issuer.len() {
+            return Err(SpecError::BadJwtIssuer(self.issuer.clone()));
+        }
+        if let Some(aud) = &self.audience
+            && (aud.trim().is_empty() || aud.trim().len() != aud.len())
+        {
+            return Err(SpecError::BadJwtAudience(aud.clone()));
+        }
+        for claim in [&self.subject_claim, &self.email_claim, &self.name_claim] {
+            if claim.trim().is_empty() {
+                return Err(SpecError::EmptyJwtClaimName);
+            }
+        }
+        for claim in self.require.keys() {
+            if claim.trim().is_empty() {
+                return Err(SpecError::EmptyJwtClaimName);
+            }
+        }
+        if self.leeway_secs.is_some_and(|n| n > MAX_JWT_LEEWAY_SECS) {
+            return Err(SpecError::JwtLeewayTooLarge {
+                secs: self.leeway_secs.unwrap_or(0),
+                max: MAX_JWT_LEEWAY_SECS,
+            });
+        }
+        if let Some(cookie) = &self.cookie
+            && !is_valid_cookie_name(cookie)
+        {
+            return Err(SpecError::BadCookieName(cookie.clone()));
+        }
+        Ok(())
+    }
+}
+
+/// What is wrong with a JWKS URL, or `None`.
+enum JwksUrlProblem {
+    Malformed,
+    /// `http://` to somewhere other than this host.
+    Plaintext,
+}
+
+/// Whether a JWKS endpoint is one app-lb will fetch verifying keys from.
+///
+/// The transport rule is the security one, and it is stricter than the artifact
+/// store's for a reason the two do not share. A blob from a store is verified
+/// against a digest the spec names, so a tampered response is caught; a key set
+/// **is** the thing everything else is checked against, so anyone who can rewrite
+/// the response can mint tokens this gate will accept. Plaintext HTTP therefore
+/// buys a complete authentication bypass for anyone on the path.
+///
+/// Loopback is the exception, and the same one OAuth carves out for redirect
+/// URIs: there is no path to be on. An issuer running beside app-lb on this host
+/// is a real deployment shape, and refusing it would push people to terminate
+/// TLS just to satisfy a check.
+fn jwks_url_problem(url: &str) -> Option<JwksUrlProblem> {
+    if url.contains(char::is_whitespace) || url.contains('\0') {
+        return Some(JwksUrlProblem::Malformed);
+    }
+    if let Some(rest) = url.strip_prefix("https://") {
+        return rest.is_empty().then_some(JwksUrlProblem::Malformed);
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Some(JwksUrlProblem::Malformed);
+    };
+    if rest.is_empty() {
+        return Some(JwksUrlProblem::Malformed);
+    }
+    // The authority, up to the path/query and without any port.
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or_else(|| rest.split(['/', '?', '#']).next().unwrap_or(""));
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+        || host.starts_with("127.");
+    (!loopback).then_some(JwksUrlProblem::Plaintext)
+}
+
+/// The characters a cookie name may hold (RFC 6265 token). Shared by the session
+/// cookie and the JWT gate's, so the two cannot drift.
+fn is_valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1625,6 +1991,15 @@ pub enum AuthProvider {
     /// `allowed_domains`/`allowed_emails`: those describe humans and mean
     /// nothing for a credential issued to a process.
     AppToken,
+    /// A JWT somebody else issued, presented as `Authorization: Bearer <jwt>`
+    /// or in a cookie the gate names. For an application whose users already
+    /// sign in somewhere else — the Heyo auth API, or any OIDC provider.
+    ///
+    /// Unlike the other two this gate holds no state at all: there is no session
+    /// to issue and no token table to look in, because the credential carries
+    /// its own proof. Configured by [`AuthGate::jwt`]; the allow-list is that
+    /// block's `require`, for the reason given there.
+    Jwt,
 }
 
 /// The providers a gate accepts.
@@ -1835,6 +2210,17 @@ impl AuthGate {
         if let Some(realm) = &self.cookie_domain {
             material.push_str(&format!("|realm={}", realm.to_ascii_lowercase()));
         }
+        // Likewise appended only when present, so a gate written before JWTs
+        // existed hashes exactly what it did before.
+        //
+        // It belongs in the material for a narrow but real case: a gate that
+        // accepts both `google` and `jwt` issues session cookies, and those
+        // sessions must not outlive a tightened `require` or a rotated issuer
+        // any more than they outlive a tightened `allowed_emails`. A jwt-only
+        // gate issues no session at all, so for it this changes nothing.
+        if let Some(jwt) = &self.jwt {
+            material.push_str(&format!("|jwt={}", jwt.fingerprint()));
+        }
         let digest = openssl::hash::hash(
             openssl::hash::MessageDigest::sha256(),
             material.as_bytes(),
@@ -1851,6 +2237,19 @@ impl AuthGate {
     /// Whether an app-token scoped to this deployment gets past the gate.
     pub fn accepts_app_token(&self) -> bool {
         self.provider.contains(AuthProvider::AppToken)
+    }
+
+    /// Whether a JWT from the configured issuer gets past the gate.
+    pub fn accepts_jwt(&self) -> bool {
+        self.provider.contains(AuthProvider::Jwt)
+    }
+
+    /// The JWT policy, present whenever `validate()` passed and `jwt` is among
+    /// the providers. An `Option` for the same reason `google_credentials` is:
+    /// the two are linked only by validation, and a gate reaching the verifier
+    /// without one should say so rather than invent a policy.
+    pub fn jwt_policy(&self) -> Option<&JwtSpec> {
+        self.jwt.as_ref().filter(|_| self.accepts_jwt())
     }
 
     /// The OAuth client id, present whenever `validate()` passed and Google is
@@ -1899,6 +2298,26 @@ impl AuthGate {
             // deployment is behind Google sign-in, and it is not.
             return Err(SpecError::OauthWithoutGoogle);
         }
+
+        match (self.accepts_jwt(), &self.jwt) {
+            (true, Some(jwt)) => {
+                jwt.validate()?;
+                // These describe a Google identity and are checked against a
+                // Google identity; a JWT gate's allow-list is `jwt.require`.
+                // Refused rather than ignored, because somebody writing them
+                // believes this deployment is restricted and it would not be.
+                if !self.accepts_google()
+                    && (!self.allowed_domains.is_empty() || !self.allowed_emails.is_empty())
+                {
+                    return Err(SpecError::AllowListOnJwtGate);
+                }
+            }
+            (true, None) => return Err(SpecError::JwtWithoutPolicy),
+            // A `jwt` block on a gate that will never verify one, for the same
+            // reason OAuth credentials without `google` are refused.
+            (false, Some(_)) => return Err(SpecError::JwtPolicyWithoutProvider),
+            (false, None) => {}
+        }
         for d in &self.allowed_domains {
             // Surrounding whitespace is rejected rather than trimmed: the match
             // is exact, so a stored " example.com " would let nobody in while
@@ -1925,12 +2344,7 @@ impl AuthGate {
         if self.session_ttl_secs == 0 {
             return Err(SpecError::ZeroSessionTtl);
         }
-        if self.cookie_name.is_empty()
-            || !self
-                .cookie_name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
-        {
+        if !is_valid_cookie_name(&self.cookie_name) {
             return Err(SpecError::BadCookieName(self.cookie_name.clone()));
         }
         if let Some(d) = &self.cookie_domain
@@ -2249,6 +2663,38 @@ pub enum SpecError {
     NoAuthProvider,
     /// OAuth credentials on a gate that never runs an OAuth flow.
     OauthWithoutGoogle,
+    /// `jwt` is among the providers but there is no `jwt` block to verify with.
+    JwtWithoutPolicy,
+    /// A `jwt` block on a gate that will never verify one.
+    JwtPolicyWithoutProvider,
+    /// `allowed_domains`/`allowed_emails` on a gate with no Google provider.
+    /// They describe a Google identity and would restrict nothing here.
+    AllowListOnJwtGate,
+    /// A `jwt` block naming no key material at all.
+    NoJwtKey,
+    /// A `jwt` block naming more than one source of key material.
+    AmbiguousJwtKey(Vec<String>),
+    BadJwtPublicKey(String),
+    BadJwksUrl(String),
+    /// A JWKS endpoint reached over plaintext HTTP, somewhere other than this
+    /// host. Whoever can rewrite that response can mint tokens the gate accepts.
+    InsecureJwksUrl(String),
+    /// `jwt.algorithms` is empty. There is no default: see [`JwtSpec::algorithms`].
+    NoJwtAlgorithms,
+    BadJwtAlgorithm(String),
+    /// An algorithm whose key family is not the one the block configured — an
+    /// HMAC algorithm against a public key, or the reverse.
+    JwtAlgorithmKeyMismatch {
+        algorithm: String,
+        symmetric_key: bool,
+    },
+    BadJwtIssuer(String),
+    BadJwtAudience(String),
+    EmptyJwtClaimName,
+    JwtLeewayTooLarge {
+        secs: u64,
+        max: u64,
+    },
     /// Neither an allowed domain nor an allowed address was given.
     EmptyAllowList,
     BadAllowedDomain(String),
@@ -2498,7 +2944,103 @@ impl std::fmt::Display for SpecError {
             Self::NoAuthProvider => write!(
                 f,
                 "auth.provider is empty, so nothing could ever get past the gate — \
-                 name at least one of \"google\" or \"app-token\""
+                 name at least one of \"google\", \"app-token\" or \"jwt\""
+            ),
+            Self::JwtWithoutPolicy => write!(
+                f,
+                "auth.provider lists `jwt` but there is no auth.jwt block, so there is no \
+                 key to verify a token with. Set auth.jwt.algorithms, auth.jwt.issuer and \
+                 one of secret / public_key / jwks_url"
+            ),
+            Self::JwtPolicyWithoutProvider => write!(
+                f,
+                "auth sets an auth.jwt block but does not list the `jwt` provider, so no \
+                 token will ever be verified — add \"jwt\" to auth.provider, or drop the \
+                 block"
+            ),
+            Self::AllowListOnJwtGate => write!(
+                f,
+                "auth sets allowed_domains/allowed_emails on a gate with no `google` \
+                 provider. Those are matched against a Google identity — the domain against \
+                 the `hd` claim — and restrict nothing here, so a gate carrying them would \
+                 look guarded and not be. Use auth.jwt.require, which can name any claim"
+            ),
+            Self::NoJwtKey => write!(
+                f,
+                "auth.jwt names no key: set `secret` (a secret-store reference, for HS*), \
+                 `public_key` (an inline PEM, for RS*/PS*/ES*) or `jwks_url` (the issuer's \
+                 key set)"
+            ),
+            Self::AmbiguousJwtKey(fields) => write!(
+                f,
+                "auth.jwt names more than one key ({}), so which one verified a token would \
+                 depend on the order this happens to check them. Keep exactly one",
+                fields.join(" and ")
+            ),
+            Self::BadJwtPublicKey(e) => write!(f, "auth.jwt.public_key is {e}"),
+            Self::InsecureJwksUrl(u) => write!(
+                f,
+                "auth.jwt.jwks_url {u:?} is plaintext http:// to another host. The key set is \
+                 what every token is checked against, so anyone able to rewrite that response \
+                 could mint tokens this gate would accept — which is an authentication bypass, \
+                 not an eavesdropping risk. Use https://, or a loopback address for an issuer \
+                 running on this host"
+            ),
+            Self::BadJwksUrl(u) => write!(
+                f,
+                "auth.jwt.jwks_url {u:?} must be an http:// or https:// URL — usually \
+                 <issuer>/.well-known/jwks.json"
+            ),
+            Self::NoJwtAlgorithms => write!(
+                f,
+                "auth.jwt.algorithms is required and has no default: the algorithm is named \
+                 in the token's own header, and a gate that trusted that would accept an \
+                 unsigned token. Name the one the issuer signs with, e.g. [\"HS256\"]"
+            ),
+            Self::BadJwtAlgorithm(a) => write!(
+                f,
+                "auth.jwt.algorithms names {a:?}, which is not a supported JWS algorithm. \
+                 Supported: HS256/384/512, RS256/384/512, PS256/384/512, ES256/384. \
+                 `none` is not, and never will be"
+            ),
+            Self::JwtAlgorithmKeyMismatch {
+                algorithm,
+                symmetric_key,
+            } => match symmetric_key {
+                true => write!(
+                    f,
+                    "auth.jwt.algorithms names {algorithm:?}, which needs a key pair, but the \
+                     block configures a shared `secret`. Use jwks_url or public_key, or name \
+                     an HS* algorithm"
+                ),
+                false => write!(
+                    f,
+                    "auth.jwt.algorithms names {algorithm:?}, which is HMAC, but the block \
+                     configures a public key. A public key used as an HMAC secret is the \
+                     algorithm-confusion attack, so this is refused: use `secret` for HS*, or \
+                     name an RS*/PS*/ES* algorithm"
+                ),
+            },
+            Self::BadJwtIssuer(i) => write!(
+                f,
+                "auth.jwt.issuer {i:?} must be the exact `iss` the tokens carry, with no \
+                 surrounding whitespace"
+            ),
+            Self::BadJwtAudience(a) => write!(
+                f,
+                "auth.jwt.audience {a:?} must be the exact `aud` the tokens carry, with no \
+                 surrounding whitespace"
+            ),
+            Self::EmptyJwtClaimName => write!(
+                f,
+                "auth.jwt names an empty claim; subject_claim, email_claim, name_claim and \
+                 every key of `require` have to name a claim"
+            ),
+            Self::JwtLeewayTooLarge { secs, max } => write!(
+                f,
+                "auth.jwt.leeway_secs is {secs}, above the {max}s ceiling. Leeway covers \
+                 clock skew between two machines; a longer one is a longer expiry, and that \
+                 belongs to whoever issues the token"
             ),
             Self::OauthWithoutGoogle => write!(
                 f,
@@ -3710,6 +4252,7 @@ mod tests {
             cookie_domain: None,
             redirect_url: None,
             forward_identity: true,
+            jwt: None,
         }
     }
 
@@ -4768,5 +5311,346 @@ mod tests {
             with["vm"]["mounts"][0].get("digest").is_none(),
             "an unpulled mount carries no digest",
         );
+    }
+
+    // -- JWT gates ---------------------------------------------------------
+
+    mod jwt_gates {
+        use super::*;
+
+        /// A spec whose `auth.jwt` block is the given JSON, otherwise valid.
+        fn with_jwt(provider: &str, jwt: serde_json::Value) -> DeploymentSpec {
+            let mut s = spec();
+            let mut gate = serde_json::json!({
+                "provider": serde_json::from_str::<serde_json::Value>(provider).unwrap(),
+                "base_path": "/__applb/auth",
+            });
+            if provider.contains("google") {
+                gate["client_id"] = serde_json::json!("cid.apps.googleusercontent.com");
+                gate["client_secret"] = serde_json::json!({"secret": "google"});
+                gate["allowed_domains"] = serde_json::json!(["example.com"]);
+            }
+            if !jwt.is_null() {
+                gate["jwt"] = jwt;
+            }
+            s.auth = Some(serde_json::from_value(gate).expect("the gate parses"));
+            s
+        }
+
+        fn heyo_block() -> serde_json::Value {
+            serde_json::json!({
+                "secret": {"secret": "heyo-auth", "key": "jwt_secret"},
+                "algorithms": ["HS256"],
+                "issuer": "auth-service",
+                "audience": "heyo-app",
+                "subject_claim": "userId",
+            })
+        }
+
+        /// The shape a Heyo auth API gate is actually written in.
+        #[test]
+        fn the_heyo_auth_api_gate_is_a_valid_spec() {
+            with_jwt(r#""jwt""#, heyo_block()).validate().unwrap();
+
+            let gate = with_jwt(r#""jwt""#, heyo_block()).auth.unwrap();
+            let jwt = gate.jwt_policy().expect("the policy is reachable");
+            assert!(jwt.accepts(crate::jwt::Algorithm::Hs256));
+            assert!(!jwt.accepts(crate::jwt::Algorithm::Hs512));
+            assert_eq!(jwt.subject_claim, "userId");
+            // The defaults nobody wrote down.
+            assert_eq!(jwt.email_claim, "email");
+            assert_eq!(jwt.name_claim, "name");
+            assert_eq!(jwt.leeway_secs(), 0);
+        }
+
+        #[test]
+        fn a_gate_needs_exactly_one_source_of_key_material() {
+            let mut none = heyo_block();
+            none.as_object_mut().unwrap().remove("secret");
+            assert_eq!(
+                with_jwt(r#""jwt""#, none).validate().unwrap_err(),
+                SpecError::NoJwtKey,
+            );
+
+            let mut two = heyo_block();
+            two["jwks_url"] = serde_json::json!("https://idp.example.com/.well-known/jwks.json");
+            let err = with_jwt(r#""jwt""#, two).validate().unwrap_err();
+            assert!(
+                matches!(&err, SpecError::AmbiguousJwtKey(fields) if fields.len() == 2),
+                "{err}",
+            );
+        }
+
+        /// The provider and the block have to agree, in both directions —
+        /// neither a policy nothing consults nor a provider with no policy.
+        #[test]
+        fn the_provider_and_the_block_must_agree() {
+            assert_eq!(
+                with_jwt(r#""jwt""#, serde_json::Value::Null).validate().unwrap_err(),
+                SpecError::JwtWithoutPolicy,
+            );
+            assert_eq!(
+                with_jwt(r#""google""#, heyo_block()).validate().unwrap_err(),
+                SpecError::JwtPolicyWithoutProvider,
+            );
+        }
+
+        /// `algorithms` has no default, because the only available default would
+        /// be "whatever the token says".
+        #[test]
+        fn algorithms_are_required_and_checked() {
+            let mut empty = heyo_block();
+            empty["algorithms"] = serde_json::json!([]);
+            assert_eq!(
+                with_jwt(r#""jwt""#, empty).validate().unwrap_err(),
+                SpecError::NoJwtAlgorithms,
+            );
+
+            for bad in ["none", "NONE", "HS128", "RSA256", ""] {
+                let mut block = heyo_block();
+                block["algorithms"] = serde_json::json!([bad]);
+                assert_eq!(
+                    with_jwt(r#""jwt""#, block).validate().unwrap_err(),
+                    SpecError::BadJwtAlgorithm(bad.to_string()),
+                    "{bad:?} was accepted as an algorithm",
+                );
+            }
+        }
+
+        /// The written-down form of the algorithm-confusion attack: a public key
+        /// alongside an HMAC algorithm. Refused at registration, so it cannot
+        /// reach the verifier at all.
+        #[test]
+        fn an_algorithm_must_match_the_kind_of_key_configured() {
+            let mut block = heyo_block();
+            block["algorithms"] = serde_json::json!(["RS256"]);
+            let err = with_jwt(r#""jwt""#, block).validate().unwrap_err();
+            assert!(
+                matches!(&err, SpecError::JwtAlgorithmKeyMismatch { symmetric_key: true, .. }),
+                "{err}",
+            );
+            assert!(err.to_string().contains("jwks_url"), "{err}");
+
+            let mut block = heyo_block();
+            block.as_object_mut().unwrap().remove("secret");
+            block["jwks_url"] = serde_json::json!("https://idp.example.com/.well-known/jwks.json");
+            block["algorithms"] = serde_json::json!(["HS256"]);
+            let err = with_jwt(r#""jwt""#, block).validate().unwrap_err();
+            assert!(
+                matches!(&err, SpecError::JwtAlgorithmKeyMismatch { symmetric_key: false, .. }),
+                "{err}",
+            );
+            assert!(
+                err.to_string().contains("algorithm-confusion"),
+                "the message has to say why, not just no: {err}",
+            );
+        }
+
+        #[test]
+        fn an_issuer_is_required_and_exact() {
+            let mut block = heyo_block();
+            block.as_object_mut().unwrap().remove("issuer");
+            // A block with no issuer at all does not even deserialize, which is
+            // the strongest form of "required" available.
+            let gate = serde_json::json!({"provider": "jwt", "jwt": block});
+            assert!(serde_json::from_value::<AuthGate>(gate).is_err());
+
+            for bad in ["", "  ", " auth-service", "auth-service "] {
+                let mut block = heyo_block();
+                block["issuer"] = serde_json::json!(bad);
+                assert_eq!(
+                    with_jwt(r#""jwt""#, block).validate().unwrap_err(),
+                    SpecError::BadJwtIssuer(bad.to_string()),
+                );
+            }
+        }
+
+        #[test]
+        fn a_jwks_url_must_be_one() {
+            for bad in ["", "idp.example.com/jwks", "ftp://idp/jwks", "https://a b/jwks"] {
+                let mut block = heyo_block();
+                block.as_object_mut().unwrap().remove("secret");
+                block["jwks_url"] = serde_json::json!(bad);
+                block["algorithms"] = serde_json::json!(["RS256"]);
+                assert!(
+                    matches!(
+                        with_jwt(r#""jwt""#, block).validate().unwrap_err(),
+                        SpecError::BadJwksUrl(_)
+                    ),
+                    "{bad:?} was accepted as a JWKS URL",
+                );
+            }
+
+            let mut block = heyo_block();
+            block.as_object_mut().unwrap().remove("secret");
+            block["jwks_url"] = serde_json::json!("https://idp.example.com/.well-known/jwks.json");
+            block["algorithms"] = serde_json::json!(["RS256", "ES256"]);
+            with_jwt(r#""jwt""#, block).validate().unwrap();
+        }
+
+        /// The key set is what every token is checked against, so rewriting it
+        /// mints identities. Plaintext to another host is refused; loopback is
+        /// the OAuth carve-out — there is no path to be on.
+        #[test]
+        fn a_jwks_url_must_be_https_unless_it_is_loopback() {
+            let jwks = |url: &str| {
+                let mut block = heyo_block();
+                block.as_object_mut().unwrap().remove("secret");
+                block["jwks_url"] = serde_json::json!(url);
+                block["algorithms"] = serde_json::json!(["RS256"]);
+                with_jwt(r#""jwt""#, block).validate()
+            };
+
+            for url in [
+                "http://idp.example.com/.well-known/jwks.json",
+                "http://10.0.0.4:8080/jwks",
+                "http://localhost.evil.example/jwks",
+            ] {
+                assert!(
+                    matches!(jwks(url), Err(SpecError::InsecureJwksUrl(_))),
+                    "{url} was accepted over plaintext",
+                );
+            }
+            assert!(
+                jwks("http://idp.example.com/jwks")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("authentication bypass"),
+                "the message has to say why plaintext is refused here and not elsewhere",
+            );
+
+            for url in [
+                "http://127.0.0.1:8080/jwks",
+                "http://127.0.0.53/jwks",
+                "http://localhost:3000/.well-known/jwks.json",
+                "http://[::1]:8080/jwks",
+                "https://idp.example.com/jwks",
+            ] {
+                jwks(url).unwrap_or_else(|e| panic!("{url} was refused: {e}"));
+            }
+        }
+
+        #[test]
+        fn a_public_key_that_will_never_parse_is_caught_at_registration() {
+            let mut block = heyo_block();
+            block.as_object_mut().unwrap().remove("secret");
+            block["public_key"] = serde_json::json!("-----BEGIN PUBLIC KEY-----\nnope\n-----END PUBLIC KEY-----");
+            block["algorithms"] = serde_json::json!(["RS256"]);
+            assert!(matches!(
+                with_jwt(r#""jwt""#, block).validate().unwrap_err(),
+                SpecError::BadJwtPublicKey(_),
+            ));
+        }
+
+        /// The allow-lists describe a Google identity. On a gate with no Google
+        /// provider they would restrict nothing, so a spec carrying them is
+        /// refused rather than left looking guarded.
+        #[test]
+        fn a_google_allow_list_is_refused_on_a_jwt_only_gate() {
+            let mut s = with_jwt(r#""jwt""#, heyo_block());
+            s.auth.as_mut().unwrap().allowed_emails = vec!["someone@example.com".into()];
+            assert_eq!(s.validate().unwrap_err(), SpecError::AllowListOnJwtGate);
+
+            let mut s = with_jwt(r#""jwt""#, heyo_block());
+            s.auth.as_mut().unwrap().allowed_domains = vec!["example.com".into()];
+            assert_eq!(s.validate().unwrap_err(), SpecError::AllowListOnJwtGate);
+
+            // On a gate that *does* accept Google they are exactly as meaningful
+            // as they always were.
+            with_jwt(r#"["google","jwt"]"#, heyo_block()).validate().unwrap();
+        }
+
+        #[test]
+        fn leeway_is_capped_and_claim_names_are_not_empty() {
+            let mut block = heyo_block();
+            block["leeway_secs"] = serde_json::json!(MAX_JWT_LEEWAY_SECS + 1);
+            assert!(matches!(
+                with_jwt(r#""jwt""#, block).validate().unwrap_err(),
+                SpecError::JwtLeewayTooLarge { .. },
+            ));
+
+            for field in ["subject_claim", "email_claim", "name_claim"] {
+                let mut block = heyo_block();
+                block[field] = serde_json::json!("  ");
+                assert_eq!(
+                    with_jwt(r#""jwt""#, block).validate().unwrap_err(),
+                    SpecError::EmptyJwtClaimName,
+                );
+            }
+
+            let mut block = heyo_block();
+            block["require"] = serde_json::json!({"": "admin"});
+            assert_eq!(
+                with_jwt(r#""jwt""#, block).validate().unwrap_err(),
+                SpecError::EmptyJwtClaimName,
+            );
+        }
+
+        /// The gate's session signature is keyed on its policy, and a JWT policy
+        /// is part of who may enter — so tightening one signs out the sessions
+        /// issued under the old one, exactly as tightening an allow-list does.
+        #[test]
+        fn the_jwt_policy_is_part_of_the_gates_fingerprint() {
+            let mixed = |block: serde_json::Value| {
+                with_jwt(r#"["google","jwt"]"#, block).auth.unwrap().policy_fingerprint()
+            };
+            let base = mixed(heyo_block());
+
+            for change in [
+                serde_json::json!({"require": {"role": "admin"}}),
+                serde_json::json!({"issuer": "someone-else"}),
+                serde_json::json!({"audience": "heyo-server"}),
+                serde_json::json!({"algorithms": ["HS512"]}),
+                serde_json::json!({"secret": {"secret": "other", "key": "jwt_secret"}}),
+                serde_json::json!({"subject_claim": "sub"}),
+            ] {
+                let mut block = heyo_block();
+                for (k, v) in change.as_object().unwrap() {
+                    block[k] = v.clone();
+                }
+                assert_ne!(base, mixed(block), "{change} did not move the fingerprint");
+            }
+
+            // ...and a gate with no JWT block hashes exactly what it did before
+            // the field existed, so an upgrade does not sign anyone out.
+            let before = auth_gate().policy_fingerprint();
+            assert_ne!(before, base);
+        }
+
+        /// A block written with only what is required, to pin the defaults that
+        /// fill in the rest.
+        #[test]
+        fn a_minimal_block_gets_the_documented_defaults() {
+            let block = serde_json::json!({
+                "jwks_url": "https://idp.example.com/.well-known/jwks.json",
+                "algorithms": ["RS256"],
+                "issuer": "https://idp.example.com/",
+            });
+            let s = with_jwt(r#""jwt""#, block);
+            s.validate().unwrap();
+            let jwt = s.auth.unwrap().jwt.unwrap();
+            assert_eq!(jwt.subject_claim, "sub");
+            assert_eq!(jwt.email_claim, "email");
+            assert_eq!(jwt.audience, None);
+            assert!(jwt.require.is_empty(), "an empty require admits any token the issuer signed");
+            assert_eq!(jwt.cookie, None);
+            assert_eq!(jwt.leeway_secs(), 0);
+        }
+
+        /// A gate that never mentions JWTs serializes exactly as it did before
+        /// the block existed.
+        #[test]
+        fn the_block_is_absent_from_the_wire_when_unused() {
+            let json = serde_json::to_value(auth_gate()).unwrap();
+            assert!(json.get("jwt").is_none(), "{json}");
+
+            let with = serde_json::to_value(with_jwt(r#""jwt""#, heyo_block()).auth.unwrap()).unwrap();
+            assert_eq!(with["jwt"]["issuer"], "auth-service");
+            assert_eq!(with["jwt"]["subject_claim"], "userId");
+            // Defaults are written out, so reading a spec back shows what is in
+            // force rather than what somebody happened to type.
+            assert_eq!(with["jwt"]["email_claim"], "email");
+            assert!(with["jwt"].get("require").is_none(), "an empty require is not written");
+        }
     }
 }

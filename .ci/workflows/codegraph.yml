@@ -203,7 +203,15 @@ jobs:
       # (CI_ARTIFACT_DIR) by default, or the central `art serve` when
       # CI_ARTIFACT_SINK=artifacts. The workflow does not choose; it uploads.
       # Downloadable from the run page either way.
+      # `description:` is what a person browsing the artifact store sees beside
+      # the digest. Set as a *label* on the blob and the manifest rather than as
+      # a manifest annotation — a manifest is addressed by its own hash, so
+      # editing this line would otherwise fork the manifest for byte-identical
+      # builds. Only the `artifacts` sink stores it; disk and S3 ignore it.
       - uses: ci/upload-artifact
         with:
           name: codegraph
+          description: >-
+            The codegraph CLI, a release binary for x86_64-linux, with
+            SHA256SUMS. Built from ${{ ci.branch }}.
           path: dist

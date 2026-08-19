@@ -275,9 +275,24 @@ jobs:
       # (CI_ARTIFACT_DIR) by default, or the central `art serve` when
       # CI_ARTIFACT_SINK=artifacts. The workflow does not choose; it uploads.
       # Downloadable from the run page either way.
+      #
+      # `description:` is what the artifact store shows a person browsing it.
+      # Only the `artifacts` sink has anywhere to put it — disk and S3 store a
+      # file and a key — and it is set on the blob and the manifest as a
+      # *label*, never as a manifest annotation: a manifest is addressed by its
+      # own hash, so wording that lived in one would give two builds of
+      # identical bytes two digests the first time somebody edited this line.
+      #
+      # Worth writing as prose rather than repeating `name:`. The store lists it
+      # beside a digest, and "app-lb" next to `1b9b737b73e2` says nothing the
+      # tag did not; what a reader wants is which binaries are in the tarball.
       - uses: ci/upload-artifact
         with:
           name: app-lb
+          description: >-
+            The app-lb proxy and the heyctl CLI, release binaries for
+            x86_64-linux, with the supervisor unit and SHA256SUMS.
+            Built from ${{ ci.branch }}.
           path: dist
 
   # ---------------------------------------------------------------------------
@@ -433,7 +448,13 @@ jobs:
           ls -la dist
           cat dist/BUILD-INFO
 
+      # See the app-lb job for why this is prose and why it is a label rather
+      # than a manifest annotation.
       - uses: ci/upload-artifact
         with:
           name: app-obs
+          description: >-
+            The app-obs collector and the app-obs-dump reader, release binaries
+            for x86_64-linux, with the supervisor unit and SHA256SUMS.
+            Built from ${{ ci.branch }}.
           path: dist

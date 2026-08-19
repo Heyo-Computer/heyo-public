@@ -16,6 +16,10 @@ The other six crates here (`artifacts`, `computer`, `heyosecret`,
 `heyosecret-client`, `orchestrator`, `printer`) have no workflow yet. Adding one
 is the recipe at the bottom.
 
+[`install.sh`](install.sh) is the other end of that table: it pulls the newest
+of each back out of the store and installs it. See
+[Installing what these build](#installing-what-these-build).
+
 `ci.yml` builds the orchestrator that reads these files. It only builds — the
 artifact is deployed by hand or by `ci/deploy/ci.json`'s `update` block, never by
 the run itself — and a restart mid-run is redelivered off the JetStream work
@@ -54,6 +58,59 @@ build on every runner for byte-identical contents. They still get separate warm
 VM pools: the pool fingerprint includes `cache_key_files`, and those differ.
 Both `vm.build.size_mb` values must stay equal, because that number is part of
 the hash that names the image.
+
+## Installing what these build
+
+```sh
+ART_URL=https://art.us2.heyo.work ART_API_KEY=… sh .ci/install.sh
+```
+
+That installs `app-lb`, `app-obs` and `ci` — binaries into `/usr/local/bin`,
+supervisor programs into `/etc/supervisor/conf.d`, and `ci`'s migrations into
+`/var/lib/ci/migrations`, which is where the shipped `ci.conf` points
+`CI_MIGRATIONS_DIR`. Nothing is restarted unless you pass `--restart`.
+
+```sh
+sh .ci/install.sh --list            # what the store has, and what each thing is
+sh .ci/install.sh --dry-run         # fetch and verify, install nothing
+sh .ci/install.sh app-lb            # just one
+sh .ci/install.sh --ref ci-apps-019fca…-app-lb-app-lb app-lb   # roll back
+PREFIX=~/.local SUPERVISOR_DIR= sh .ci/install.sh   # unprivileged, no units
+```
+
+**How it finds anything.** `ci` flattens an artifact's coordinates into one tag,
+because the store's tag charset has no `/`:
+
+```
+ci-<workflow>-<run>-<job>-<name>
+```
+
+which for the table above is `ci-apps-<run>-app-lb-app-lb`,
+`ci-apps-<run>-app-obs-app-obs`, `ci-ci-<run>-release-ci` and
+`ci-codegraph-<run>-release-codegraph`. The run id is `%012x-%08x` — epoch
+milliseconds in hex, then a sequence — so it is fixed-width and zero-padded, and
+**sorting the tags lexicographically sorts them chronologically**. That is the
+one load-bearing coincidence in the whole script, so it matches the exact hex
+widths rather than a wildcard: a tag that does not have them is not considered
+at all, instead of sorting somewhere arbitrary.
+
+**What it checks.** A blob's name *is* the sha256 of its bytes, so verifying the
+download against the digest it was fetched by is free, and it covers the
+transfer and the store in one comparison. Then `sha256sum -c SHA256SUMS` runs
+inside the unpacked tree — the build's own statement about what it produced. A
+mismatch on either refuses that app and names both hashes.
+
+**What it will not do.** It never overwrites a supervisor config. Those hold
+edited secrets — the shipped `app-lb.conf` carries
+`APP_LB_DASHBOARD_PASSWORD="change-me"` and every real deployment has changed it
+— so an existing file is kept and the new one written beside it as
+`<name>.conf.new`, with a warning that a new setting will not apply until you
+merge it.
+
+The `description:` each workflow sets on its upload is what `--list` prints, and
+it is stored as an artifact *label* rather than a manifest annotation — a
+manifest is addressed by its own hash, so wording inside one would fork the
+manifest for byte-identical builds the first time somebody edited it.
 
 ## Submitting
 

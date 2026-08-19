@@ -1052,7 +1052,37 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
         if let Some(secret) = &auth.client_secret {
             output::field("Client secret", format!("secret {}", secret.render()));
         }
-        output::field("Who may enter", auth.allow_summary());
+        // Only meaningful for Google, which is the only provider these two
+        // describe — a JWT gate's allow-list is `jwt.require`, printed below.
+        if auth.providers().iter().any(|p| p == "google") {
+            output::field("Who may enter", auth.allow_summary());
+        }
+        if let Some(jwt) = &auth.jwt {
+            output::field("JWT issuer", &jwt.issuer);
+            output::field(
+                "JWT audience",
+                jwt.audience.as_deref().unwrap_or("(not checked)"),
+            );
+            output::field("JWT key", jwt.key_summary());
+            output::field("JWT algorithms", jwt.algorithms.join(", "));
+            output::field("JWT admits", jwt.require_summary());
+            output::field(
+                "JWT subject claim",
+                format!("{} -> x-auth-request-user", jwt.subject_claim),
+            );
+            if let Some(cookie) = &jwt.cookie {
+                output::field("JWT cookie", format!("{cookie} (when no Authorization header)"));
+            }
+            // A block the gate will never consult is worth saying out loud: the
+            // server refuses that spec, so seeing it here means the deployment
+            // predates the check or was written by hand against an older LB.
+            if !auth.accepts_jwt() {
+                output::field(
+                    "JWT",
+                    "NOT IN USE — `jwt` is not among this gate's providers",
+                );
+            }
+        }
         if !auth.public_paths.is_empty() {
             output::field("Public paths", auth.public_paths.join(", "));
         }

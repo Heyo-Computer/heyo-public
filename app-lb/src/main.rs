@@ -25,6 +25,7 @@ mod feed;
 mod guard;
 mod health;
 mod jobs;
+mod jwt;
 mod metrics;
 mod mounts;
 mod obs;

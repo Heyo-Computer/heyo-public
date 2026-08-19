@@ -7,9 +7,16 @@
 //! .store.lock            flock, see crate::lock
 //! blobs/<aa>/<64-hex>    mode 0444
 //! manifests/<aa>/<64-hex>  canonical JSON, addressed by its own sha256
+//! labels/<aa>/<64-hex>   a name and description for either of the above
 //! tags/<name>            one digest and a newline
 //! tmp/                   incoming files, named only on the no-O_TMPFILE path
 //! ```
+//!
+//! Two of those are mutable — `tags/` and `labels/` — and both are written the
+//! same way: temp file in the same directory, `sync_all`, rename. A label is
+//! keyed by digest and describes whatever that digest names, blob or manifest;
+//! see [`crate::labels`] for why the name lives beside the content and not in
+//! it.
 //!
 //! **Fanout is two hex characters — 256 shards, one level.** ext4 directories
 //! are htree-indexed, so lookup was never the constraint; what the fanout
@@ -25,6 +32,7 @@
 use crate::config::Config;
 use crate::digest::Digest;
 use crate::error::{Error, IoContext, Result};
+use crate::labels::{Label, Labelled};
 use crate::lock::{LockMode, StoreLock};
 use crate::manifest::Manifest;
 use crate::sys::space::{self, FileStat};
@@ -131,7 +139,7 @@ impl Store {
         // All 256 shards up front. They cost 256 inodes each for blobs and
         // manifests, and their existence removes any mkdir race from the insert
         // path.
-        for sub in ["blobs", "manifests"] {
+        for sub in ["blobs", "manifests", "labels"] {
             for i in 0u16..256 {
                 let d = root.join(sub).join(format!("{i:02x}"));
                 std::fs::create_dir_all(&d).ctx(format!("create {}", d.display()))?;
@@ -303,6 +311,90 @@ impl Store {
         blocking(move || inner.list_digests("manifests")).await
     }
 
+    // -- labels ------------------------------------------------------------
+
+    /// Give a digest a name and a description, replacing whatever it had.
+    ///
+    /// Refuses a digest the store does not hold. A label on absent content is
+    /// metadata about nothing: it describes an address that resolves nowhere,
+    /// and it sits there until a sweep notices. Enforced here rather than in the
+    /// CLI and the HTTP layer separately, so the two cannot disagree about it —
+    /// which they did, briefly.
+    ///
+    /// Takes no store lock. A label is referenced by nothing and nothing
+    /// resolves through one, so the worst a concurrent write can do is decide
+    /// which of two descriptions is current, and the rename makes that atomic.
+    /// Locking here would make labelling contend with a garbage collection.
+    ///
+    /// The existence check is therefore not a guarantee: a sweep between the
+    /// check and the rename leaves a label describing content that has just
+    /// gone. That is exactly the orphan the sweep already knows how to remove,
+    /// which is why this is a check against mistakes rather than a lock against
+    /// races.
+    pub async fn set_label(&self, d: &Digest, label: &Label) -> Result<()> {
+        label.validate()?;
+        let inner = self.inner.clone();
+        let (d, label) = (d.clone(), label.clone());
+        blocking(move || {
+            if !(inner.blob_exists(&d) || inner.manifest_exists(&d)) {
+                return Err(Error::NotFound(d));
+            }
+            inner.set_label(&d, &label)
+        })
+        .await
+    }
+
+    /// The label for a digest, or `None` if it has never been given one.
+    ///
+    /// `None` rather than an error, because "unlabelled" is the ordinary state
+    /// of most of a store and every caller of this is rendering a row.
+    pub async fn get_label(&self, d: &Digest) -> Result<Option<Label>> {
+        let inner = self.inner.clone();
+        let d = d.clone();
+        blocking(move || inner.get_label(&d)).await
+    }
+
+    /// Remove a digest's label. `false` if it had none.
+    pub async fn remove_label(&self, d: &Digest) -> Result<bool> {
+        let inner = self.inner.clone();
+        let d = d.clone();
+        blocking(move || sparse::unlink_if_present(&inner.label_path(&d))).await
+    }
+
+    /// Every label in the store, digest-ordered.
+    ///
+    /// One `readdir` of 256 shards rather than a `stat` per row: a listing page
+    /// needs the label for every blob it shows, and asking per digest turns one
+    /// page load into a thousand syscalls.
+    pub async fn list_labels(&self) -> Result<Vec<Labelled>> {
+        let inner = self.inner.clone();
+        blocking(move || inner.list_labels()).await
+    }
+
+    /// Labels as a lookup, for a caller rendering many rows at once.
+    pub async fn label_map(&self) -> Result<std::collections::HashMap<Digest, Label>> {
+        Ok(self
+            .list_labels()
+            .await?
+            .into_iter()
+            .map(|l| (l.digest, l.label))
+            .collect())
+    }
+
+    /// Which tags point at each digest.
+    ///
+    /// The inverse of [`Self::list_tags`], and the direction every listing
+    /// actually asks in: a row knows its digest and wants the names. Several
+    /// tags can name one digest, so the value is a list.
+    pub async fn tags_by_digest(&self) -> Result<std::collections::HashMap<Digest, Vec<TagName>>> {
+        let mut out: std::collections::HashMap<Digest, Vec<TagName>> =
+            std::collections::HashMap::new();
+        for (tag, digest) in self.list_tags().await? {
+            out.entry(digest).or_default().push(tag);
+        }
+        Ok(out)
+    }
+
     // -- tags --------------------------------------------------------------
 
     pub async fn set_tag(&self, t: &TagName, d: &Digest) -> Result<()> {
@@ -409,6 +501,10 @@ impl Inner {
 
     fn tag_path(&self, t: &TagName) -> PathBuf {
         self.root.join("tags").join(t.as_str())
+    }
+
+    fn label_path(&self, d: &Digest) -> PathBuf {
+        self.root.join("labels").join(d.shard()).join(d.as_str())
     }
 
     fn tmp_dir(&self) -> PathBuf {
@@ -705,6 +801,62 @@ impl Inner {
         space::fsync_dir(&dir)
     }
 
+    fn set_label(&self, d: &Digest, label: &Label) -> Result<()> {
+        let dir = self.root.join("labels").join(d.shard());
+        let final_path = self.label_path(d);
+        // Same directory as the destination, so the rename is within one
+        // filesystem, and prefixed with a dot so a half-written label can never
+        // be mistaken for one by `list_labels`.
+        let tmp = dir.join(format!(".{}.{}.tmp", d.as_str(), std::process::id()));
+
+        let body = label.to_json();
+        let write = (|| -> Result<()> {
+            let f = std::fs::File::create(&tmp).ctx(format!("create {}", tmp.display()))?;
+            sparse::pwrite_all(f.as_raw_fd(), &body, 0).ctx("write label")?;
+            f.sync_all().ctx("fsync label")?;
+            Ok(())
+        })();
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &final_path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).ctx(format!("rename label into {}", final_path.display()));
+        }
+        space::fsync_dir(&dir)
+    }
+
+    fn get_label(&self, d: &Digest) -> Result<Option<Label>> {
+        let p = self.label_path(d);
+        let bytes = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).ctx(format!("read {}", p.display())),
+        };
+        // A label that will not parse is reported as absent rather than as a
+        // failure. It is metadata about content, so losing it costs a column;
+        // failing the read would take the page that was rendering the row with
+        // it, which is a strictly worse trade.
+        match serde_json::from_slice::<Label>(&bytes) {
+            Ok(label) => Ok(Some(label)),
+            Err(e) => {
+                tracing::warn!(digest = %d, error = %e, "skipping unreadable label");
+                Ok(None)
+            }
+        }
+    }
+
+    fn list_labels(&self) -> Result<Vec<Labelled>> {
+        let mut out = Vec::new();
+        for digest in self.list_digests("labels")? {
+            if let Some(label) = self.get_label(&digest)? {
+                out.push(Labelled { digest, label });
+            }
+        }
+        Ok(out)
+    }
+
     fn get_tag(&self, t: &TagName) -> Result<Digest> {
         let p = self.tag_path(t);
         let body = match std::fs::read_to_string(&p) {
@@ -848,6 +1000,25 @@ impl Inner {
 
     pub(crate) fn manifest_digests(&self) -> Result<Vec<Digest>> {
         self.list_digests("manifests")
+    }
+
+    pub(crate) fn label_digests(&self) -> Result<Vec<Digest>> {
+        self.list_digests("labels")
+    }
+
+    pub(crate) fn label_path_of(&self, d: &Digest) -> PathBuf {
+        self.label_path(d)
+    }
+
+    /// Whether a digest still names a blob. A plain existence check — the
+    /// garbage collector asks it about a label's subject, where the size and
+    /// link count a `stat` would also return are of no interest.
+    pub(crate) fn blob_exists(&self, d: &Digest) -> bool {
+        self.blob_path(d).exists()
+    }
+
+    pub(crate) fn manifest_exists(&self, d: &Digest) -> bool {
+        self.manifest_path(d).exists()
     }
 }
 
@@ -1425,5 +1596,179 @@ mod tests {
         assert_eq!(s.list_blobs().await.unwrap().len(), 1);
         assert_eq!(s.stat(&digests[0]).await.unwrap().nlink, 1);
         assert!(std::fs::read_dir(s.root().join("tmp")).unwrap().count() == 0);
+    }
+
+    // -- labels ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_label_round_trips_and_replaces_wholesale() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let info = s.insert_bytes(b"hello".to_vec()).await.unwrap();
+
+        assert_eq!(s.get_label(&info.digest).await.unwrap(), None);
+
+        let l = Label::new(Some("greeting".into()), Some("the usual".into())).unwrap();
+        s.set_label(&info.digest, &l).await.unwrap();
+        assert_eq!(s.get_label(&info.digest).await.unwrap(), Some(l));
+
+        // A second write replaces both fields together — this is a PUT, not a
+        // merge, so a label naming only a name has no description afterwards.
+        let renamed = Label::new(Some("hello".into()), None).unwrap();
+        s.set_label(&info.digest, &renamed).await.unwrap();
+        let got = s.get_label(&info.digest).await.unwrap().unwrap();
+        assert_eq!(got.name.as_deref(), Some("hello"));
+        assert_eq!(got.description, None, "the previous description is gone");
+    }
+
+    /// The property the whole design exists for: naming something does not
+    /// move it. Every tag, manifest entry and materialization still resolves.
+    #[tokio::test]
+    async fn labelling_does_not_change_what_anything_resolves_to() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let info = s.insert_bytes(b"rootfs".to_vec()).await.unwrap();
+        let tag = TagName::parse("web-v2").unwrap();
+        s.set_tag(&tag, &info.digest).await.unwrap();
+
+        let before = s.get_tag(&tag).await.unwrap();
+        s.set_label(
+            &info.digest,
+            &Label::new(Some("the web rootfs".into()), None).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(s.get_tag(&tag).await.unwrap(), before);
+        assert_eq!(s.stat(&info.digest).await.unwrap().digest, info.digest);
+    }
+
+    /// One mechanism for both kinds. A manifest is addressed by a digest like
+    /// anything else, so it is labelled the same way — and labelling it does not
+    /// give it a new digest, which is what putting the name *inside* would.
+    #[tokio::test]
+    async fn a_manifest_is_labelled_like_a_blob() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let blob = s.insert_bytes(b"entry".to_vec()).await.unwrap();
+        let m = Manifest::new(KIND_GENERIC).with_entry("f", blob.digest.clone(), blob.size);
+        let md = s.put_manifest(&m).await.unwrap();
+
+        s.set_label(&md, &Label::new(Some("a bundle".into()), None).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.put_manifest(&m).await.unwrap(),
+            md,
+            "the manifest's own digest is unmoved by a label",
+        );
+        assert_eq!(
+            s.get_label(&md).await.unwrap().unwrap().name.as_deref(),
+            Some("a bundle"),
+        );
+        // ...and the blob it names is a different subject with its own label.
+        assert_eq!(s.get_label(&blob.digest).await.unwrap(), None);
+    }
+
+    /// A label on content the store does not hold describes an address that
+    /// resolves nowhere. Refused in the store itself, so the CLI and the HTTP
+    /// route cannot disagree about it.
+    #[tokio::test]
+    async fn a_label_needs_something_to_describe() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let absent = Digest::parse(&"0".repeat(64)).unwrap();
+
+        let err = s
+            .set_label(&absent, &Label::new(Some("nothing".into()), None).unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err}");
+        assert_eq!(s.get_label(&absent).await.unwrap(), None);
+
+        // Validation still comes first: an unusable label is refused before the
+        // store is asked whether the digest exists, so the error names the thing
+        // the caller can actually fix.
+        let info = s.insert_bytes(b"real".to_vec()).await.unwrap();
+        let err = s.set_label(&info.digest, &Label::default()).await.unwrap_err();
+        assert!(matches!(err, Error::Label(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn removing_a_label_reports_whether_there_was_one() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let info = s.insert_bytes(b"x".to_vec()).await.unwrap();
+
+        assert!(!s.remove_label(&info.digest).await.unwrap());
+        s.set_label(&info.digest, &Label::new(Some("x".into()), None).unwrap())
+            .await
+            .unwrap();
+        assert!(s.remove_label(&info.digest).await.unwrap());
+        assert_eq!(s.get_label(&info.digest).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn listing_labels_skips_the_unreadable_and_the_half_written() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let a = s.insert_bytes(b"a".to_vec()).await.unwrap();
+        let b = s.insert_bytes(b"b".to_vec()).await.unwrap();
+        s.set_label(&a.digest, &Label::new(Some("A".into()), None).unwrap())
+            .await
+            .unwrap();
+        s.set_label(&b.digest, &Label::new(Some("B".into()), None).unwrap())
+            .await
+            .unwrap();
+
+        // Corrupt one, and drop a temp file beside it of the kind an
+        // interrupted write leaves behind.
+        let path = s.root().join("labels").join(b.digest.shard()).join(b.digest.as_str());
+        std::fs::write(&path, b"{not json").unwrap();
+        std::fs::write(path.with_file_name(format!(".{}.99.tmp", b.digest)), b"{}").unwrap();
+
+        let listed = s.list_labels().await.unwrap();
+        assert_eq!(listed.len(), 1, "a broken label costs its own row and no more");
+        assert_eq!(listed[0].digest, a.digest);
+
+        // And the map a listing page builds agrees with it.
+        let map = s.label_map().await.unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&a.digest));
+    }
+
+    /// The direction a listing asks in: given a digest, what names it?
+    #[tokio::test]
+    async fn tags_are_indexable_by_what_they_point_at() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let info = s.insert_bytes(b"shared".to_vec()).await.unwrap();
+        let other = s.insert_bytes(b"lonely".to_vec()).await.unwrap();
+
+        for name in ["latest", "web-v2"] {
+            s.set_tag(&TagName::parse(name).unwrap(), &info.digest).await.unwrap();
+        }
+
+        let by_digest = s.tags_by_digest().await.unwrap();
+        let mut names: Vec<&str> = by_digest[&info.digest].iter().map(|t| t.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["latest", "web-v2"], "several tags can name one digest");
+        assert!(!by_digest.contains_key(&other.digest));
+    }
+
+    /// A label is metadata, and a label that will not parse must cost exactly
+    /// one column — never the read of the thing it describes.
+    #[tokio::test]
+    async fn an_unreadable_label_does_not_fail_the_object() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let info = s.insert_bytes(b"hello".to_vec()).await.unwrap();
+        let path = s.root().join("labels").join(info.digest.shard()).join(info.digest.as_str());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"garbage").unwrap();
+
+        assert_eq!(s.get_label(&info.digest).await.unwrap(), None);
+        assert_eq!(s.stat(&info.digest).await.unwrap().size, 5);
     }
 }
