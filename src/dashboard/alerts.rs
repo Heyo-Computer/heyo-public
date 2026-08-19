@@ -360,7 +360,7 @@ async fn sample(st: &DashState) -> Sample {
 /// webhook payload's `detail`.
 async fn probe_heyvmd() -> std::result::Result<(), String> {
     const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-    let url = format!("{}/health", heyo_sdk::DEFAULT_LOCAL_BASE_URL);
+    let url = format!("{}/health", crate::vm::daemon_base_url());
     let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => return Err(format!("building probe client: {e}")),

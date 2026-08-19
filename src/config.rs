@@ -585,6 +585,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_S3_ENDPOINT",
     "PG_VM_POOL_S3_ACCESS_KEY_ID",
     "PG_VM_POOL_S3_SECRET_ACCESS_KEY",
+    "PG_VM_POOL_DAEMON_URL",
 ];
 
 impl Config {

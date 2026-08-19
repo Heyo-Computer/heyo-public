@@ -35,12 +35,34 @@ const PG_PROBE_WINDOW: Duration = Duration::from_secs(15);
 /// threshold — exceeding it yields `PgProbe::Stalled`, never `Unreachable`.
 const PG_PROBE_ATTEMPT: Duration = Duration::from_secs(3);
 
+/// The heyvmd daemon every call in this crate addresses. Defaults to the SDK's
+/// local daemon (`http://127.0.0.1:34099`); `PG_VM_POOL_DAEMON_URL` overrides
+/// it.
+///
+/// Read once and cached, because it is on the bring-up hot path and because a
+/// per-call `env::var` takes a process-wide lock — which would show up as
+/// contention in exactly the concurrent bring-up measurements this indirection
+/// exists to make possible. The override has two uses: pointing the pooler at
+/// a daemon on another port, and letting `crate::loadtest` aim the *whole*
+/// pooler at an in-process daemon stub — the only way to put a
+/// thousand-sandbox fleet under it without a thousand VMs.
+pub(crate) fn daemon_base_url() -> &'static str {
+    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URL.get_or_init(|| {
+        std::env::var("PG_VM_POOL_DAEMON_URL")
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string())
+    })
+}
+
 /// Fresh options targeting the local heyvmd daemon. Built per call so we don't
 /// rely on `HeyoClientOptions: Clone`. Shared with the dashboard so its control
 /// actions hit the same daemon.
 pub(crate) fn local_opts() -> HeyoClientOptions {
     HeyoClientOptions {
-        base_url: Some(DEFAULT_LOCAL_BASE_URL.to_string()),
+        base_url: Some(daemon_base_url().to_string()),
         ..Default::default()
     }
 }
@@ -2072,7 +2094,11 @@ async fn probe_pg_window(pool: &Pool, window: Duration) -> PgProbe {
 /// in that window would create a *duplicate* VM with a fresh, empty data disk
 /// and silently lose the schema's data. Only when there's no known id (a
 /// genuinely new schema) or it was deleted do we list-by-name / create.
-async fn resolve_sandbox(
+/// `pub(crate)` for `crate::loadtest`, which times this phase on its own: it is
+/// the whole "silent" window between a client connecting and the daemon seeing
+/// any traffic for its VM, and measuring it without a real Postgres behind the
+/// VM is the only way to attribute cold-start latency to fleet size.
+pub(crate) async fn resolve_sandbox(
     cfg: &Config,
     name: &str,
     keepalive: bool,
@@ -2133,7 +2159,7 @@ async fn resolve_sandbox(
 /// `Sandbox::resize_disk`. Swap to the SDK call once 0.1.6 ships — the wire
 /// format here is byte-identical to it.
 pub(crate) async fn resize_disk(sandbox_id: &str, target_gb: u64) -> Result<()> {
-    resize_disk_at(DEFAULT_LOCAL_BASE_URL, sandbox_id, target_gb).await
+    resize_disk_at(daemon_base_url(), sandbox_id, target_gb).await
 }
 
 /// [`resize_disk`] against an explicit daemon base URL — split out so tests

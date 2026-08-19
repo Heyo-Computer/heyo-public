@@ -1062,7 +1062,8 @@ impl SchemaRegistry {
                     continue;
                 }
                 quiet_since.get_or_insert_with(Instant::now);
-                let Some(job) = registry.next_offload_job().await else {
+                let policy = registry.offload_policy();
+                let Some(job) = registry.next_offload_job(policy).await else {
                     hold_until = Some(Instant::now() + idle_rescan);
                     continue;
                 };
@@ -1073,7 +1074,7 @@ impl SchemaRegistry {
                 let started = Instant::now();
                 let label = format!("{} {}", job.kind.as_str(), job.schema);
                 match tokio::spawn(async move { r.run_offload_job(job).await }).await {
-                    Ok(()) => debug!("offload pacer: {label} finished in {:?}", started.elapsed()),
+                    Ok(_) => debug!("offload pacer: {label} finished in {:?}", started.elapsed()),
                     Err(e) if e.is_panic() => error!(
                         "offload pacer: {label} PANICKED: {}",
                         panic_message(e.into_panic())
@@ -1133,7 +1134,7 @@ impl SchemaRegistry {
     /// nothing is eligible. Also keeps `last_active` honest for schemas that
     /// look durably stale but are actually warm, so they aren't re-evaluated
     /// as candidates on every scan.
-    async fn next_offload_job(&self) -> Option<OffloadJob> {
+    async fn next_offload_job(&self, policy: OffloadPolicy) -> Option<OffloadJob> {
         // Live cross-check: a schema warm with active connections, or whose
         // in-memory idle clock is younger than the threshold, is not cold even
         // if its durable `last_active` drifted (one long-lived connection with
@@ -1149,7 +1150,7 @@ impl SchemaRegistry {
         let (job, refresh) = pick_offload_job(
             &records,
             &live,
-            self.offload_thresholds(),
+            policy,
             &|schema| self.cfg.is_keepalive(schema),
             &|schema| self.offload_backoff.active(schema, at).is_some(),
             now_unix(),
@@ -1160,34 +1161,55 @@ impl SchemaRegistry {
         job
     }
 
-    fn offload_thresholds(&self) -> OffloadThresholds {
-        OffloadThresholds {
+    /// Routine housekeeping: the configured thresholds, cheapest job first.
+    fn offload_policy(&self) -> OffloadPolicy {
+        OffloadPolicy {
             compact_after: self.cfg.compact.as_ref().map(|c| c.compact_after.as_secs()),
             freeze_after: self.cfg.freeze.as_ref().map(|f| f.freeze_after.as_secs()),
             archive_after: self.cfg.archive.as_ref().map(|a| a.archive_after.as_secs()),
+            image_archive: self.image_archive_enabled(),
+            mode: OffloadMode::Routine,
+        }
+    }
+
+    /// Emergency policy: every idle schema is a candidate whatever its age
+    /// (threshold `0`), coldest first, and freezing is dropped entirely — it
+    /// costs a boot and leaves the bytes on the host, which is the one thing
+    /// that cannot help here. The tiers themselves must still be configured:
+    /// pressure eviction overrides the *thresholds*, never the operator's
+    /// choice of where data may go.
+    fn pressure_policy(&self) -> OffloadPolicy {
+        OffloadPolicy {
+            compact_after: self.cfg.compact.as_ref().map(|_| 0),
+            freeze_after: None,
+            archive_after: self.cfg.archive.as_ref().map(|_| 0),
+            image_archive: self.image_archive_enabled(),
+            mode: OffloadMode::Pressure,
         }
     }
 
     /// Perform one job. Each arm is the same per-schema entry point the
     /// dashboard's buttons use, so failures journal and enter the per-schema
     /// backoff exactly as they always have.
-    async fn run_offload_job(&self, job: OffloadJob) {
+    async fn run_offload_job(&self, job: OffloadJob) -> Result<()> {
         let OffloadJob { schema, kind } = job;
-        info!("offload pacer: {} schema {schema}", kind.as_str());
+        info!("offload: {} schema {schema}", kind.as_str());
         let res = match kind {
             // `archive_schema` dispatches on the schema's current tier, so a
             // frozen/compacted schema is promoted (a file upload, no VM) and a
             // live one is dumped and killed.
             OffloadKind::Promote | OffloadKind::Archive => self.archive_schema(&schema).await,
             OffloadKind::Compact => self.compact_schema(&schema).await,
+            OffloadKind::ImageArchive => self.archive_schema_as_image(&schema, None).await,
             OffloadKind::Freeze => self.freeze_schema(&schema).await,
         };
-        if let Err(e) = res {
+        if let Err(e) = &res {
             warn!(
-                "offload pacer: {} schema {schema} failed (backing off): {e:#}",
+                "offload: {} schema {schema} failed (backing off): {e:#}",
                 kind.as_str()
             );
         }
+        res
     }
 
     /// Spawn the warm-spare replenisher if `PG_VM_POOL_WARM_SPARES` > 0: keeps
@@ -1292,78 +1314,67 @@ impl SchemaRegistry {
             ),
         );
 
-        // Live view for skipping busy schemas without paying a bring-up.
-        let active: HashMap<String, usize> = self
-            .snapshot()
-            .await
-            .into_iter()
-            .map(|e| (e.schema, e.active))
-            .collect();
-        // Oldest last-active first. The TTL is deliberately not consulted:
-        // under pressure, "least recently used" is the whole policy.
-        let mut candidates: Vec<(String, u64)> = self
-            .store_records()
-            .into_iter()
-            .filter(|(schema, rec)| rec.tier == Tier::Live && !self.cfg.is_keepalive(schema))
-            .map(|(schema, rec)| (schema, rec.last_active))
-            .collect();
-        candidates.sort_by_key(|(_, last_active)| *last_active);
-
-        let now = now_unix();
+        // The emergency ladder, re-picked from scratch before every job: take
+        // whatever frees the most bytes for the least work right now — which,
+        // on a nearly-full host, means never booting a VM while any no-boot
+        // option remains (see `OffloadKind::rank`). Candidate selection is
+        // shared with the routine pacer, so the guards that keep a busy or
+        // recently-failed schema out of reach are the same ones.
+        //
+        // Why re-pick rather than walk a list: each job changes the tier of
+        // the schema it touches, and a compaction that frees 180MB is worth
+        // more than the promotion of an image that frees 7MB — so the right
+        // next job is a function of what just happened, not of an ordering
+        // computed before any of it did.
+        let policy = self.pressure_policy();
         let mut archived = 0usize;
         let mut consecutive_failures = 0usize;
-        for (schema, last_active) in candidates {
+        loop {
             match disk_used_pct(&p.path).await {
                 Some(cur) if cur < p.low_pct => {
                     info!(
                         "disk-pressure: {} down to {cur:.1}% (< {:.1}%) after {archived} \
-                         emergency archive(s); standing down",
+                         emergency offload(s); standing down",
                         p.path.display(),
                         p.low_pct
                     );
                     crate::events::journal_info(
                         "sweep.pressure",
                         format!(
-                            "stood down at {cur:.1}% after {archived} emergency archive(s)"
+                            "stood down at {cur:.1}% after {archived} emergency offload(s)"
                         ),
                     );
                     return archived;
                 }
                 _ => {}
             }
-            if active.get(&schema).copied().unwrap_or(0) > 0 {
-                continue; // live sessions — archive_schema would refuse anyway
-            }
-            if self.offload_backoff.active(&schema, Instant::now()).is_some() {
-                // Recently failed: retrying now burns ~5 min of wedged
-                // bring-up while the disk keeps filling. The next candidates
-                // (or the exhausted-candidates error) serve the emergency
-                // better than repeating a known failure.
-                continue;
-            }
-            let idle_hours = now.saturating_sub(last_active) / 3600;
-            info!(
-                "disk-pressure: emergency-archiving schema {schema} (idle ~{idle_hours}h, \
-                 TTL overridden)"
-            );
-            match self.archive_schema(&schema).await {
+            let Some(job) = self.next_offload_job(policy).await else {
+                break;
+            };
+            let kind = job.kind;
+            let schema = job.schema.clone();
+            match self.run_offload_job(job).await {
                 Ok(()) => {
                     archived += 1;
                     consecutive_failures = 0;
                 }
-                Err(e) => {
-                    warn!("disk-pressure: archiving schema {schema} failed: {e:#}");
+                Err(_) => {
+                    // The failure is already logged and journaled by the
+                    // operation itself, and the schema is now in backoff — so
+                    // the next pick skips it rather than looping on it.
                     consecutive_failures += 1;
                     if consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES {
                         error!(
                             "disk-pressure: aborting after {consecutive_failures} consecutive \
-                             failures — environment unhealthy; re-checking in {:?}",
+                             failures (last: {} {schema}) — environment unhealthy; \
+                             re-checking in {:?}",
+                            kind.as_str(),
                             p.check_interval
                         );
                         crate::events::journal_error(
                             "sweep.pressure",
                             format!(
-                                "ABORTED after 3 consecutive failures ({archived} archived first)"
+                                "ABORTED after 3 consecutive failures ({archived} offloaded first)"
                             ),
                         );
                         return archived;
@@ -3103,11 +3114,8 @@ struct OffloadJob {
     kind: OffloadKind,
 }
 
-/// The steps, in the order the pacer prefers them when several schemas are
-/// eligible at once. The ordering is by cost-to-benefit, not by tier: the
-/// cheapest jobs that free the most are taken first, so a backlog drains in
-/// the order that gets the host healthy soonest.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+/// One step down the storage ladder.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum OffloadKind {
     /// Upload an already-offloaded schema's local file to S3 and delete it.
     /// No VM, no dump — a file upload that frees local disk outright.
@@ -3115,11 +3123,16 @@ enum OffloadKind {
     /// Image a stopped VM's disk to a local zstd file and delete the VM.
     /// Seconds of CPU, no boot, and it frees the whole ext4.
     Compact,
+    /// Trim + compress a stopped VM's disk straight to S3 and delete the VM.
+    /// Like `Compact` in cost and in needing no boot, but it leaves nothing
+    /// behind on the host at all. Pressure-only, and only where the image
+    /// tier is configured.
+    ImageArchive,
     /// Dump a schema to S3 and delete its VM. Frees the most, costs the most
     /// (boot + `pg_dump` + upload).
     Archive,
     /// Dump a schema to a local file and delete its VM. Same cost as an
-    /// archive but keeps the bytes on this host, so it ranks last.
+    /// archive but keeps the bytes on this host.
     Freeze,
 }
 
@@ -3128,18 +3141,70 @@ impl OffloadKind {
         match self {
             OffloadKind::Promote => "promoting",
             OffloadKind::Compact => "compacting",
+            OffloadKind::ImageArchive => "image-archiving",
             OffloadKind::Archive => "archiving",
             OffloadKind::Freeze => "freezing",
         }
     }
+
+    /// Preference order (lower wins) when several schemas are eligible at
+    /// once. It differs by mode because the two modes optimise for different
+    /// things — see [`OffloadMode`].
+    fn rank(self, mode: OffloadMode) -> u8 {
+        match mode {
+            // Routine: cheapest-first. A promotion is a file upload that frees
+            // local disk outright, so it goes before anything that touches a
+            // VM; a dump-based archive beats a freeze because it gets the
+            // bytes off the host.
+            OffloadMode::Routine => match self {
+                OffloadKind::Promote => 0,
+                OffloadKind::Compact => 1,
+                OffloadKind::ImageArchive => 2,
+                OffloadKind::Archive => 3,
+                OffloadKind::Freeze => 4,
+            },
+            // Pressure: bytes-per-second-of-work, and never boot a VM if
+            // there is any alternative. Compacting frees ~96% of a schema's
+            // footprint in about three seconds of CPU with no daemon call at
+            // all; a promotion frees only the (already tiny) image; the
+            // boot-and-dump path goes last because on a nearly-full host it is
+            // both the slowest and the likeliest to fail — booting needs a
+            // ~200MB rootfs clone that the disk may not have room for.
+            OffloadMode::Pressure => match self {
+                OffloadKind::Compact => 0,
+                OffloadKind::ImageArchive => 1,
+                OffloadKind::Promote => 2,
+                OffloadKind::Archive => 3,
+                OffloadKind::Freeze => 4,
+            },
+        }
+    }
 }
 
-/// The configured idle thresholds, in seconds; `None` means that tier is off.
+/// Why the pacer is picking work, which changes both what is eligible and
+/// which job wins.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+enum OffloadMode {
+    /// Routine housekeeping against the configured idle thresholds.
+    #[default]
+    Routine,
+    /// The disk is past its high-water mark. Thresholds are ignored (every
+    /// schema without live sessions is a candidate, coldest first) and the
+    /// ranking shifts to whatever frees the most, fastest, without a boot.
+    Pressure,
+}
+
+/// What the picker is allowed to propose: the configured idle thresholds in
+/// seconds (`None` = that tier is off), plus the mode.
 #[derive(Debug, Default, Clone, Copy)]
-struct OffloadThresholds {
+struct OffloadPolicy {
     compact_after: Option<u64>,
     freeze_after: Option<u64>,
     archive_after: Option<u64>,
+    /// Whether the no-boot image archive is available (`PG_VM_POOL_IMAGE_ARCHIVE`
+    /// + the S3 tier + a run dir). Only ever offered under pressure.
+    image_archive: bool,
+    mode: OffloadMode,
 }
 
 /// Pick the single best offload job across the whole registry, plus the
@@ -3153,12 +3218,12 @@ struct OffloadThresholds {
 fn pick_offload_job(
     records: &[(String, StoreRecord)],
     live: &HashMap<String, (usize, u64)>,
-    t: OffloadThresholds,
+    t: OffloadPolicy,
     keepalive: &dyn Fn(&str) -> bool,
     backing_off: &dyn Fn(&str) -> bool,
     now: u64,
 ) -> (Option<OffloadJob>, Vec<String>) {
-    let mut best: Option<(OffloadKind, u64, &str)> = None;
+    let mut best: Option<(u8, u64, &str, OffloadKind)> = None;
     let mut refresh: Vec<String> = Vec::new();
     for (schema, rec) in records {
         if keepalive(schema) || backing_off(schema) {
@@ -3188,8 +3253,17 @@ fn pick_offload_job(
                 // compact threshold) stops those first. Waiting a scan is
                 // cheaper than stalling in the disk-release wait.
                 let compactable = warm.is_none() && eligible(t.compact_after, None);
+                // The image archive is the other no-boot route off a stopped
+                // disk, and the only one that leaves nothing behind. Same
+                // warm-entry rule, for the same reason.
+                let imageable = t.image_archive
+                    && t.mode == OffloadMode::Pressure
+                    && warm.is_none()
+                    && eligible(t.archive_after, None);
                 if compactable {
                     OffloadKind::Compact
+                } else if imageable {
+                    OffloadKind::ImageArchive
                 } else if eligible(t.archive_after, warm) {
                     OffloadKind::Archive
                 } else if eligible(t.freeze_after, warm) {
@@ -3210,11 +3284,12 @@ fn pick_offload_job(
                 }
             }
         };
-        if best.is_none_or(|(bk, bi, _)| (kind, Reverse(idle)) < (bk, Reverse(bi))) {
-            best = Some((kind, idle, schema));
+        let rank = kind.rank(t.mode);
+        if best.is_none_or(|(br, bi, _, _)| (rank, Reverse(idle)) < (br, Reverse(bi))) {
+            best = Some((rank, idle, schema, kind));
         }
     }
-    let job = best.map(|(kind, _, schema)| OffloadJob {
+    let job = best.map(|(_, _, schema, kind)| OffloadJob {
         schema: schema.to_string(),
         kind,
     });
@@ -3318,10 +3393,12 @@ mod archive_tests {
 
     const NOW: u64 = 10_000_000;
     /// compact at 1h, archive at 1d — the shipped shape.
-    const LADDER: OffloadThresholds = OffloadThresholds {
+    const LADDER: OffloadPolicy = OffloadPolicy {
         compact_after: Some(3600),
         freeze_after: None,
         archive_after: Some(86_400),
+        image_archive: false,
+        mode: OffloadMode::Routine,
     };
 
     fn tiered(tier: Tier, idle: u64) -> StoreRecord {
@@ -3335,7 +3412,7 @@ mod archive_tests {
     fn pick(
         records: &[(String, StoreRecord)],
         live: &HashMap<String, (usize, u64)>,
-        t: OffloadThresholds,
+        t: OffloadPolicy,
     ) -> Option<OffloadJob> {
         pick_offload_job(records, live, t, &|_| false, &|_| false, NOW).0
     }
@@ -3377,13 +3454,13 @@ mod archive_tests {
         let live = HashMap::new();
         let cold = schemas(&[("cold", Tier::Live, 200_000)]);
 
-        let s3_only = OffloadThresholds {
+        let s3_only = OffloadPolicy {
             archive_after: Some(86_400),
             ..Default::default()
         };
         assert_eq!(pick(&cold, &live, s3_only).unwrap().kind, OffloadKind::Archive);
 
-        let compact_only = OffloadThresholds {
+        let compact_only = OffloadPolicy {
             compact_after: Some(3600),
             ..Default::default()
         };
@@ -3394,7 +3471,7 @@ mod archive_tests {
 
         // Nothing configured, nothing to do — and an already-archived schema
         // is never work under any configuration.
-        assert!(pick(&cold, &live, OffloadThresholds::default()).is_none());
+        assert!(pick(&cold, &live, OffloadPolicy::default()).is_none());
         assert!(pick(&schemas(&[("done", Tier::Archived, 999_999)]), &live, LADDER).is_none());
     }
 
@@ -3429,6 +3506,124 @@ mod archive_tests {
         let (job, refresh) = pick_offload_job(&recs, &warm, LADDER, &|_| false, &|_| false, NOW);
         assert!(job.is_none());
         assert_eq!(refresh, vec!["s".to_string()]);
+    }
+
+    /// Under pressure the thresholds stop mattering: a schema idle for a
+    /// minute is as evictable as one idle for a week, coldest first. That is
+    /// the whole point — the disk is full *now*.
+    #[test]
+    fn pressure_ignores_the_idle_thresholds() {
+        let reg = OffloadPolicy {
+            compact_after: Some(3600),
+            archive_after: Some(86_400),
+            ..Default::default()
+        };
+        let pressure = OffloadPolicy {
+            mode: OffloadMode::Pressure,
+            ..reg
+        };
+        // Far too recent for either configured threshold.
+        let fresh = schemas(&[("s", Tier::Live, 60)]);
+        let live = HashMap::new();
+        assert!(pick(&fresh, &live, reg).is_none(), "routine leaves it alone");
+
+        let pressed = OffloadPolicy {
+            compact_after: Some(0),
+            archive_after: Some(0),
+            ..pressure
+        };
+        assert_eq!(
+            pick(&fresh, &live, pressed).unwrap().kind,
+            OffloadKind::Compact
+        );
+    }
+
+    /// The ordering that matters at 99% full: never spend a VM boot while a
+    /// no-boot job is available. Compacting frees ~96% of a schema's
+    /// footprint in seconds of CPU; booting to dump needs a ~200MB rootfs
+    /// clone the disk may not have room for.
+    #[test]
+    fn pressure_prefers_no_boot_work_over_dumping() {
+        let pressed = OffloadPolicy {
+            compact_after: Some(0),
+            freeze_after: None,
+            archive_after: Some(0),
+            image_archive: true,
+            mode: OffloadMode::Pressure,
+        };
+        // A compactable (stopped, not warm) schema and a warm one that could
+        // only be reached by the boot-and-dump path.
+        let recs = schemas(&[("stopped", Tier::Live, 1000), ("warm", Tier::Live, 5000)]);
+        let live: HashMap<String, (usize, u64)> = [("warm".to_string(), (0usize, 5000u64))].into();
+
+        let job = pick(&recs, &live, pressed).unwrap();
+        assert_eq!(job.kind, OffloadKind::Compact);
+        assert_eq!(
+            job.schema, "stopped",
+            "the colder schema loses to the one that needs no boot"
+        );
+
+        // With compaction unconfigured, the no-boot route is the image
+        // archive — still ahead of dumping, and it leaves nothing on the host.
+        let no_compact = OffloadPolicy {
+            compact_after: None,
+            ..pressed
+        };
+        assert_eq!(
+            pick(&recs, &live, no_compact).unwrap().kind,
+            OffloadKind::ImageArchive
+        );
+
+        // With neither, the dump path is all that's left — and it can serve
+        // the warm schema the no-boot routes could not.
+        let dumps_only = OffloadPolicy {
+            compact_after: None,
+            image_archive: false,
+            ..pressed
+        };
+        assert_eq!(
+            pick(&dumps_only_recs(), &live, dumps_only).unwrap().kind,
+            OffloadKind::Archive
+        );
+    }
+
+    fn dumps_only_recs() -> Vec<(String, StoreRecord)> {
+        schemas(&[("warm", Tier::Live, 5000)])
+    }
+
+    /// Freezing is dropped under pressure however it is configured: it costs a
+    /// boot *and* leaves the bytes on the host, which cannot relieve a full
+    /// disk. And the image archive is never offered routinely — a dump is
+    /// smaller and version-independent, so it stays the normal path.
+    #[test]
+    fn pressure_drops_freezing_and_routine_never_image_archives() {
+        let recs = schemas(&[("s", Tier::Live, 999_999)]);
+        let live = HashMap::new();
+
+        let freeze_only_pressure = OffloadPolicy {
+            freeze_after: Some(0),
+            mode: OffloadMode::Pressure,
+            ..Default::default()
+        };
+        // Pressure policy construction drops freeze; even handed one, there is
+        // no S3/compact target, so nothing frees the disk.
+        assert_eq!(
+            pick(&recs, &live, freeze_only_pressure).unwrap().kind,
+            OffloadKind::Freeze,
+            "the picker honours what it is given — pressure_policy() is what drops freezing"
+        );
+
+        let routine_with_images = OffloadPolicy {
+            archive_after: Some(0),
+            image_archive: true,
+            mode: OffloadMode::Routine,
+            ..Default::default()
+        };
+        assert_eq!(
+            pick(&recs, &live, routine_with_images).unwrap().kind,
+            OffloadKind::Archive,
+            "routine archiving dumps; images are the pressure-only shortcut"
+        );
     }
 
     /// A stopped-but-warm entry (VM stopped, entry still cached) must not be

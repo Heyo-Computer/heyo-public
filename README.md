@@ -148,6 +148,7 @@ Config via env (all optional):
 |-----|---------|---------|
 | `PG_VM_POOL_LISTEN` | `127.0.0.1:6432` | client listen address |
 | `PG_VM_POOL_IMAGE` | `pg` | Firecracker image per schema |
+| `PG_VM_POOL_DAEMON_URL` | `http://127.0.0.1:34099` | base URL of the heyvmd daemon every VM operation addresses. Read once at first use. Set it when the daemon listens on a non-default port; the cold-start load harness (`src/loadtest.rs`) also uses it to aim the pooler at an in-process daemon stub |
 | `PG_VM_POOL_SIZE_CLASS` | `micro` | VM resource tier for every schema's VM: `micro` (0.25 CPU, 512MB), `mini` (0.5 CPU, 1GB), `small` (1 CPU, 2GB), `medium` (2 CPU, 4GB), `large` (4 CPU, 8GB) |
 | `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
 | `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables |
@@ -377,19 +378,43 @@ have outbound network egress to the S3 endpoint. Each schema maps to one object,
 `s3://{bucket}/{prefix}{schema}.dump`; a single `PUT` caps at 5 GB, which is
 ample for one-workbook databases.
 
-**Disk-pressure eviction (emergency tier):** the TTL-based sweep can't help
-when load outruns it — a filesystem that hits `No space left on device` takes
-everything down at once (VM creates fail, Postgres PANICs, even the rescue
-dumps fail). Set `PG_VM_POOL_PRESSURE_PATH` to the filesystem holding the VM
-disks and a watchdog checks usage every `PG_VM_POOL_PRESSURE_CHECK_SECS`: at or
-above `PG_VM_POOL_PRESSURE_HIGH_PCT` it archives the **oldest-idle** schemas —
-ignoring `archive_after`; under pressure, least-recently-used is the policy —
-one at a time, re-reading usage after each, until below
-`PG_VM_POOL_PRESSURE_LOW_PCT`. Keepalive schemas and schemas with live sessions
-are never touched, it shares the sweep's single-flight lock, and it aborts
-after 3 consecutive failures (an unhealthy environment shouldn't be ground
-through). If every candidate is exhausted while still above the low-water mark
-it says so loudly — at that point the pressure is running VMs or non-VM data.
+**Disk-pressure eviction (emergency tier):** the threshold-driven pacer can't
+help when load outruns it — a filesystem that hits `No space left on device`
+takes everything down at once (VM creates fail, Postgres PANICs, even the
+rescue dumps fail). Set `PG_VM_POOL_PRESSURE_PATH` to the filesystem holding the
+VM disks and a watchdog checks usage every `PG_VM_POOL_PRESSURE_CHECK_SECS`: at
+or above `PG_VM_POOL_PRESSURE_HIGH_PCT` it offloads schemas one at a time,
+re-reading usage after each, until below `PG_VM_POOL_PRESSURE_LOW_PCT`.
+
+It picks jobs the same way the pacer does, with two changes that matter when
+the disk is nearly full:
+
+- **The idle thresholds are ignored.** Every schema without live sessions is a
+  candidate, coldest first — under pressure, least-recently-used is the whole
+  policy. (The *tiers* still have to be configured: pressure overrides how old
+  data must be, never the operator's choice of where it may go.)
+- **It will not boot a VM while any no-boot option remains.** Compaction and the
+  image archive both work on a stopped disk — trim, compress, delete the VM —
+  in seconds of CPU, and compaction alone frees ~96% of a schema's footprint.
+  The boot-and-dump path is ranked last because on a nearly-full host it is both
+  the slowest option and the likeliest to fail: booting a VM needs a ~200MB
+  rootfs clone the disk may not have room for, which is exactly the failure that
+  turns "nearly full" into "wedged". Freezing is dropped entirely here — it
+  costs a boot *and* leaves the bytes on the host.
+
+Keepalive schemas and schemas with live sessions are never touched, it shares
+the sweep's single-flight lock (and the routine pacer stands down while it
+runs), and it aborts after 3 consecutive failures — an unhealthy environment
+shouldn't be ground through. If every candidate is exhausted while still above
+the low-water mark it says so loudly; at that point the remaining usage is
+running VMs or non-VM data.
+
+One thing to check before relying on it: `PG_VM_POOL_COMPACT_DIR` defaults to
+`<state dir>/compact`, which on most hosts is **not** the filesystem being
+watched. That is usually what you want (compaction then moves bytes off the
+full array), but the destination needs room for roughly 4% of what it drains —
+~40GB for a 5000-schema fleet. Point it at the array explicitly if the state
+dir lives on a small root filesystem.
 
 Archived schemas show up in the dashboard with an **"archived (S3)"** status
 (filterable via the `archived` state pill) even though no VM backs them, and any
@@ -883,3 +908,36 @@ Useful env vars: `E2E_ROWS`, `E2E_CYCLES` (e2e.rs), `E2E_VMS` (e2e_concurrent.rs
 bug; `sdk` is the cooperative stop path), and `E2E_KEEP=1` to keep the test
 VM(s) around instead of deleting them at the end. See the doc comments at the
 top of each file for the full list.
+
+### Cold-start load harness (`src/loadtest.rs`)
+
+The e2e examples prove the stack is *correct*; this one measures what it costs
+as the host fills up. A fresh host serves a new schema in about a second; a
+host tracking thousands of sandboxes takes far longer, with the daemon showing
+no sign of the request for most of it and host CPU under 20%. That is latency
+scaling with *inventory* rather than with load, and it cannot be reproduced
+against a real daemon without first creating thousands of real VMs.
+
+So the harness stands up an in-process heyvmd stub holding a synthetic fleet of
+any size and points the whole pooler at it with `PG_VM_POOL_DAEMON_URL`. Every
+path under test is the real one — the same `resolve_sandbox`, store, and gates
+— but the daemon's own VM-building cost is zero, so whatever latency remains is
+the pooler's own bookkeeping. The stub also counts every request and byte it
+serves, which is the direct measure of how much daemon work one new VM costs
+and whether that cost depends on how many VMs already exist.
+
+```sh
+cargo test --release loadtest -- --ignored --nocapture --test-threads=1
+```
+
+- `cold_start_cost_versus_fleet_size` holds concurrency fixed and varies the
+  fleet, for both a never-seen schema and one already bound to a VM in the
+  store. The two curves separate the find-by-name path from the reattach path.
+- `cold_start_cost_versus_concurrency` is the control: fixed fleet, varying
+  arrival rate.
+- `one_cold_start_must_not_cost_the_whole_inventory` is the acceptance
+  criterion for keeping the cold path O(1) in fleet size. It is `#[ignore]`d
+  because it fails today.
+
+The harness's own self-checks (that the stub really is the daemon the pooler
+talks to, and that the counters count) run in the normal suite.
