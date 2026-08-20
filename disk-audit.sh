@@ -10,10 +10,20 @@
 #   the run dir   one sb-<id>/ directory per VM, holding data.ext4 (the
 #                 schema's database) and, between boots it shouldn't survive,
 #                 a rootfs.ext4 clone;
-#   heyvmd        the sandbox records — what `heyvm list` and the dashboard
-#                 report. Loses records while directories survive (a DELETE
-#                 that 404s before cleanup, a restart dropping in-flight
-#                 state), so it under-reports;
+#   heyvmd        TWO views, merged here. The API listing (`GET
+#                 /deployed-sandboxes`, what the dashboard shows) reflects only
+#                 the daemon's IN-MEMORY state: running VMs it reattached at
+#                 boot plus sandboxes created/started since the process last
+#                 started — right after a daemon restart it shrinks to ~the
+#                 running set. The durable truth is the persisted store
+#                 (<heyo-data>/sandboxes/<id>/sandbox.yaml), which the per-id
+#                 endpoint — and the pooler's orphan sweep — answer from. A
+#                 sandbox is "known" if EITHER knows it; classifying off the
+#                 listing alone once mislabeled 7315 healthy stopped schemas
+#                 as data-loss orphans an hour after a daemon restart. The
+#                 persisted store can still lose records while directories
+#                 survive (a DELETE that 404s before cleanup) — that gap is
+#                 the real orphan bucket;
 #   registry.tsv  the pooler's schema → sandbox-id binding and storage tier.
 #                 The only thing that says which disk holds whose data.
 #
@@ -57,6 +67,17 @@
 #
 #   REGISTRY_TSV=~/.heyo/pg-vm-pool/registry.tsv   pooler state
 #   HEYVMD=http://127.0.0.1:34099                  daemon API
+#   DAEMON_SANDBOXES_DIR=/path      heyvmd's persisted store (the directory
+#                                   holding <id>/sandbox.yaml). Default: auto —
+#                                   `sandboxes/` next to RUN_DIR, then
+#                                   ~/.heyo/sandboxes. Without it the audit
+#                                   falls back to the API listing alone and
+#                                   over-reports orphans after a daemon restart
+#                                   (warned loudly).
+#   PERSISTED_IDS=/path/to/ids.txt  audit from a captured id list (one sandbox
+#                                   id per line) instead of scanning
+#                                   DAEMON_SANDBOXES_DIR — pairs with
+#                                   DAEMON_JSON for off-host analysis
 #   DAEMON_JSON=/path/to/list.json  analyse a saved `GET /deployed-sandboxes`
 #                                   instead of calling the daemon (also lets a
 #                                   wedged daemon be audited from a capture)
@@ -70,6 +91,8 @@ set -uo pipefail
 RUN_DIR="${1:-${HOME}/.heyo/run}"
 REGISTRY_TSV="${REGISTRY_TSV:-$HOME/.heyo/pg-vm-pool/registry.tsv}"
 HEYVMD="${HEYVMD:-http://127.0.0.1:34099}"
+DAEMON_SANDBOXES_DIR="${DAEMON_SANDBOXES_DIR:-}"
+PERSISTED_IDS="${PERSISTED_IDS:-}"
 DAEMON_JSON="${DAEMON_JSON:-}"
 OUT_DIR="${OUT_DIR:-$(mktemp -d -t disk-audit-XXXXXX)}"
 
@@ -105,6 +128,7 @@ find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name 'sb-*' -printf '%f\n' 2>/d
         "$OUT_DIR/disk.tsv" - >> "$OUT_DIR/disk.tsv"
 
 # ---- 2. what the daemon knows ----------------------------------------------
+# 2a. The API listing (live statuses, but in-memory only — see header).
 if [ -n "$DAEMON_JSON" ]; then
     [ -r "$DAEMON_JSON" ] || die "cannot read DAEMON_JSON=$DAEMON_JSON"
     daemon_src="$DAEMON_JSON"
@@ -119,8 +143,46 @@ else
 fi
 command -v jq >/dev/null || die "missing required tool: jq"
 jq -r '.[] | [.id, (.status // "unknown"), (.name // "")] | @tsv' "$daemon_src" \
-    > "$OUT_DIR/daemon.tsv" 2>/dev/null ||
+    > "$OUT_DIR/listing.tsv" 2>/dev/null ||
     die "could not parse the daemon listing as JSON (truncated response?)"
+
+# 2b. The persisted store (<id>/sandbox.yaml) — the durable record set the
+# per-id endpoint and the pooler's orphan sweep answer from. Auto-discover it
+# next to the run dir (heyvmd keeps run/ and sandboxes/ under one data dir),
+# then under ~/.heyo.
+listing_only=0
+if [ -n "$PERSISTED_IDS" ]; then
+    [ -r "$PERSISTED_IDS" ] || die "cannot read PERSISTED_IDS=$PERSISTED_IDS"
+    sort -u "$PERSISTED_IDS" > "$OUT_DIR/persisted.txt"
+else
+    if [ -z "$DAEMON_SANDBOXES_DIR" ]; then
+        for cand in "$(dirname "$RUN_DIR")/sandboxes" "$HOME/.heyo/sandboxes"; do
+            [ -d "$cand" ] && { DAEMON_SANDBOXES_DIR="$cand"; break; }
+        done
+    fi
+    if [ -n "$DAEMON_SANDBOXES_DIR" ] && [ -d "$DAEMON_SANDBOXES_DIR" ]; then
+        echo "scanning persisted store $DAEMON_SANDBOXES_DIR ..." >&2
+        find "$DAEMON_SANDBOXES_DIR" -mindepth 2 -maxdepth 2 -name sandbox.yaml \
+             -printf '%h\n' 2>/dev/null | awk -F/ '{print $NF}' | sort -u \
+            > "$OUT_DIR/persisted.txt"
+    else
+        : > "$OUT_DIR/persisted.txt"
+        listing_only=1
+        echo "warning: heyvmd's persisted store not found (set DAEMON_SANDBOXES_DIR) —" >&2
+        echo "         classifying off the API listing ALONE. The listing only shows" >&2
+        echo "         in-memory sandboxes, so if the daemon restarted recently every" >&2
+        echo "         stopped-but-persisted sandbox below is MISREPORTED as an orphan." >&2
+    fi
+fi
+
+# Known = listing ∪ persisted. Listing rows keep their live status; persisted
+# ids absent from the listing get the synthetic status `persisted` (on disk,
+# not loaded — a stopped sandbox the daemon serves by id but doesn't list).
+{
+    cat "$OUT_DIR/listing.tsv"
+    awk -F'\t' 'NR==FNR { listed[$1]=1; next } !($1 in listed) { print $1 "\tpersisted\t" }' \
+        "$OUT_DIR/listing.tsv" "$OUT_DIR/persisted.txt"
+} > "$OUT_DIR/daemon.tsv"
 
 # ---- 3. what the registry claims -------------------------------------------
 # `schema \t sandbox_id \t last_active \t tier`; 2-column legacy rows are live.
@@ -176,15 +238,21 @@ END {
         unbacked++
         print schema[id] "\t" id > out "/schema-unbacked.txt"
     }
-    for (id in status) if (status[id] == "running") drunning++; else dstopped++
+    for (id in status) {
+        if (status[id] == "running") drunning++
+        else if (status[id] == "persisted") dpersist++
+        else dstopped++
+    }
     for (id in tier) tiers[tier[id]]++
 
     printf "dirs\t%d\t%d\n", dirs, disk_bytes + root_bytes
     printf "dirs.data\t%d\t%d\n", dirs, disk_bytes
     printf "dirs.rootfs\t%d\t%d\n", root_files + 0, root_bytes
     printf "daemon\t%d\t0\n", drecords + 0
+    printf "daemon.listed\t%d\t0\n", drecords - dpersist
     printf "daemon.running\t%d\t0\n", drunning + 0
     printf "daemon.stopped\t%d\t0\n", dstopped + 0
+    printf "daemon.persisted\t%d\t0\n", dpersist + 0
     printf "registry\t%d\t0\n", rrows + 0
     for (t in tiers) printf "registry.%s\t%d\t0\n", t, tiers[t]
     printf "both\t%d\t%d\n", both + 0, both_bytes + 0
@@ -211,9 +279,11 @@ row "  sb-<id>/ dirs" dirs
 row "  data.ext4" dirs.data
 row "  rootfs.ext4" dirs.rootfs
 echo "heyvmd records"
-plain "  total" daemon
-plain "  running" daemon.running
-plain "  stopped/other" daemon.stopped
+plain "  known (list∪store)" daemon
+plain "  listed by API" daemon.listed "in-memory: running + touched since daemon start"
+plain "    of which running" daemon.running
+plain "    stopped/other" daemon.stopped
+plain "  persisted only" daemon.persisted "on disk, not loaded — normal after a daemon restart"
 echo "registry rows"
 plain "  total" registry
 for t in live compacted frozen archived; do
@@ -222,8 +292,8 @@ for t in live compacted frozen archived; do
 done
 echo
 echo "reconciliation"
-row "  matched" both "directory + daemon record"
-row "  ORPHAN (no record)" orphan "the delta — invisible to every daemon-side count"
+row "  matched" both "directory + daemon record (listed or persisted)"
+row "  ORPHAN (no record)" orphan "neither listed nor persisted — truly forgotten"
 row "    unowned" orphan.unowned "no schema wants it; the sweep deletes these"
 row "    offloaded" orphan.offloaded "data is durably elsewhere; the sweep deletes these"
 row "    DATA-LOSS" orphan.dataloss "registry says live — this disk is the only copy"
@@ -236,11 +306,23 @@ echo
 echo "id lists: $OUT_DIR"
 ls -1 "$OUT_DIR" | sed 's/^/  /'
 echo
+if [ "$listing_only" = 1 ]; then
+    echo "WARNING: persisted store not scanned — every count above treats the API listing"
+    echo "         as heyvmd's whole memory. If the daemon restarted since these sandboxes"
+    echo "         were last touched, the orphan/DATA-LOSS buckets are inflated by every"
+    echo "         stopped-but-persisted sandbox. Set DAEMON_SANDBOXES_DIR and re-run"
+    echo "         before acting on ANY bucket."
+    echo
+fi
 if [ "$(get orphan.dataloss)" != 0 ]; then
     echo "NOTE: $(get orphan.dataloss) data-loss orphan(s). Each is a schema whose registry row"
     echo "      still says 'live' while heyvmd has forgotten its VM. Nothing deletes these —"
     echo "      but the next client connect rebinds the schema to a fresh EMPTY VM, after"
-    echo "      which the disk becomes an ordinary orphan and is swept. See"
+    echo "      which the disk becomes an ordinary orphan and is swept. Spot-check before"
+    echo "      acting (column 2 is the sandbox id):"
+    echo "        while IFS=\$'\\t' read -r _ id _; do curl -s -o /dev/null -w \"\$id %{http_code}\\n\" \\"
+    echo "          $HEYVMD/deployed-sandboxes/\$id; done < $OUT_DIR/orphan-DATA-LOSS.txt"
+    echo "      (a 200 means the daemon still knows it — not an orphan). See"
     echo "      $OUT_DIR/orphan-DATA-LOSS.txt"
 fi
 echo "nothing was modified: this audit only reads."
