@@ -51,6 +51,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
+    // Fail startup, loudly and with the fix in the message, if any configured
+    // offload tier's output directory can't be created or written — an
+    // unwritable dir otherwise degrades every offload into its most expensive
+    // fallback path at job time (see the method's docs for the full story).
+    cfg.preflight_offload_dirs()?;
     let listen_addr = cfg.listen_addr;
     // File-backed event metrics (daily partitions) for the monitoring charts;
     // memory-only if the dir can't be created.
@@ -104,6 +109,9 @@ async fn main() -> Result<()> {
     // restores) claim instead of paying create + boot + initdb. No-op unless
     // PG_VM_POOL_WARM_SPARES > 0.
     registry.spawn_spare_replenisher();
+    // Persists debounced activity bumps to the registry file (mapping changes
+    // flush immediately inside the store; this loop only owes idle clocks).
+    registry.spawn_store_flusher();
     // Carries the frozen tier's dump bytes both ways (and the S3 tier's
     // streamed dumps). No-op unless one of those tiers is configured.
     registry.spawn_dump_server();

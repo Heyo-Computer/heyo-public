@@ -42,6 +42,10 @@ pub enum Event {
     /// A VM/sandbox directory was deleted outright: an orphan-sweep removal
     /// or a purge-pass kill. The other half of "are we draining the disk".
     VmDeleted,
+    /// A warm spare was claimed off the shelf by a bring-up. Compared against
+    /// the replenisher's target this shows whether the pool is sized for the
+    /// claim rate ("0 ready" with a tall claims chart = demand, not failure).
+    SpareClaimed,
 }
 
 impl Event {
@@ -53,6 +57,7 @@ impl Event {
             Event::VmCreated => "vm_created",
             Event::OffloadDone => "offload_done",
             Event::VmDeleted => "vm_deleted",
+            Event::SpareClaimed => "spare_claimed",
         }
     }
 
@@ -65,6 +70,7 @@ impl Event {
             "vm_created" => Some(Event::VmCreated),
             "offload_done" => Some(Event::OffloadDone),
             "vm_deleted" => Some(Event::VmDeleted),
+            "spare_claimed" => Some(Event::SpareClaimed),
             _ => None,
         }
     }
@@ -464,6 +470,7 @@ mod tests {
             Event::VmCreated,
             Event::OffloadDone,
             Event::VmDeleted,
+            Event::SpareClaimed,
         ] {
             assert_eq!(Event::parse(e.as_str()), Some(e), "token {:?}", e.as_str());
         }

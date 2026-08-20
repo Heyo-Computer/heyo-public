@@ -151,7 +151,7 @@ Config via env (all optional):
 | `PG_VM_POOL_DAEMON_URL` | `http://127.0.0.1:34099` | base URL of the heyvmd daemon every VM operation addresses. Read once at first use. Set it when the daemon listens on a non-default port; the cold-start load harness (`src/loadtest.rs`) also uses it to aim the pooler at an in-process daemon stub |
 | `PG_VM_POOL_SIZE_CLASS` | `micro` | VM resource tier for every schema's VM: `micro` (0.25 CPU, 512MB), `mini` (0.5 CPU, 1GB), `small` (1 CPU, 2GB), `medium` (2 CPU, 4GB), `large` (4 CPU, 8GB) |
 | `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
-| `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables |
+| `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables. The effective timeout is jittered ±15% per schema and at most 24 VMs stop per reaper pass (oldest-idle first) — so a cohort of VMs that went idle together drains as a slope, not a cliff, instead of mass-stopping into a reclaim pass + synchronized cold-start storm |
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
 | `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
@@ -563,7 +563,10 @@ seconds, and a boot that simply waited it out would stall a client cold start, a
 warm-spare restart or a thaw for exactly that long.
 
 So a waiting boot asks the pass to stop: the pooler creates
-`<run-dir>/.reclaim-stop`, the script finishes the disk it is on and exits, and
+`<run-dir>/.reclaim-stop`, the script yields at its next safe point — between
+disks, at a stage boundary inside one, or by killing its own discard-stage
+fsck (which only punches free blocks on a verified-clean filesystem, so
+interruption is safe; a mid-way disk is simply re-trimmed next pass) — and
 the gate is released *after* the child has actually exited. Where it stopped is
 recorded in `<run-dir>/.reclaim-cursor` and the next run resumes after that
 disk, so a host that yields often still walks the whole fleet. Deliberately

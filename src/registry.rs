@@ -221,6 +221,26 @@ impl SchemaEntry {
             && self.active.load(Ordering::SeqCst) == 0
             && self.last_active.lock().unwrap().elapsed() >= timeout
     }
+
+}
+
+/// Cap on VMs the idle reaper stops in one pass (oldest-idle first; the rest
+/// wait a tick). See [`SchemaRegistry::reap_idle`] for why mass stops are
+/// worse than a few extra minutes of warm RAM.
+const IDLE_MAX_STOPS_PER_PASS: usize = 24;
+
+/// Per-schema idle-timeout jitter: a deterministic factor in [0.85, 1.15)
+/// derived from the schema name. Clients that arrive (and go quiet) together
+/// would otherwise expire together and stop as one wave; spreading each
+/// schema's effective timeout ±15% breaks the cohort up permanently without
+/// any state. Deterministic so a schema's effective timeout is stable across
+/// passes and restarts.
+fn jittered_timeout(schema: &str, timeout: Duration) -> Duration {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    schema.hash(&mut h);
+    let unit = (h.finish() % 1000) as f64 / 1000.0;
+    timeout.mul_f64(0.85 + 0.30 * unit)
 }
 
 /// RAII marker for one in-flight client connection. Bumps the entry's active
@@ -461,11 +481,8 @@ impl SchemaRegistry {
     /// the spare pool from handing out a VM some schema already owns (a spare
     /// keeps its `spare-pg-*` name after being claimed, so the name alone
     /// can't tell).
-    fn bound_ids(&self) -> HashSet<String> {
-        self.store_records()
-            .into_iter()
-            .map(|(_, r)| r.sandbox_id)
-            .collect()
+    fn bound_ids(&self) -> std::sync::Arc<HashSet<String>> {
+        self.store.bound_ids()
     }
 
     /// Password clients must present before the pooler proxies them anywhere;
@@ -751,7 +768,7 @@ impl SchemaRegistry {
                         schema,
                         known_id.as_deref(),
                         restore.as_ref(),
-                        self.spares.as_deref().map(|p| (p, &bound)),
+                        self.spares.as_deref().map(|p| (p, &*bound)),
                         owner.as_ref(),
                     )
                 })
@@ -856,6 +873,22 @@ impl SchemaRegistry {
         )
     }
 
+    /// Spawn the registry-store flush loop: activity bumps (`touch`/`put` on
+    /// unchanged mappings) only mark the store dirty, and this loop persists
+    /// them at most once per [`crate::store::FLUSH_INTERVAL`] — one O(rows)
+    /// serialize per interval however many schemas a storm touches, instead of
+    /// one per schema. Mapping *changes* still flush immediately inside the
+    /// store, so this loop is durability-relevant only for idle clocks.
+    pub fn spawn_store_flusher(self: &Arc<Self>) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(crate::store::FLUSH_INTERVAL).await;
+                registry.store.flush_dirty();
+            }
+        });
+    }
+
     /// Spawn the background idle-reaper if an idle timeout is configured.
     pub fn spawn_reaper(self: &Arc<Self>) {
         let Some(timeout) = self.cfg.idle_timeout else {
@@ -882,23 +915,51 @@ impl SchemaRegistry {
         }));
     }
 
-    /// Evict and stop every idle VM. Eviction (removing the map cell) happens
+    /// Evict and stop idle VMs — at most [`IDLE_MAX_STOPS_PER_PASS`] per
+    /// pass, oldest-idle first. Eviction (removing the map cell) happens
     /// under the lock so a concurrent `checkout` either sees the entry before
     /// eviction (and bumps `active`, sparing it) or misses it and brings up a
     /// fresh VM. The actual stop happens after the lock is released.
     ///
+    /// The cap plus the per-schema timeout jitter (see [`jittered_timeout`])
+    /// keep a cohort of VMs that went idle together — clients that arrived in
+    /// one burst — from all stopping in one pass: an uncapped mass stop reads
+    /// as "the fleet fell off a cliff" on the dashboard, floods the post-stop
+    /// reclaim trigger with hundreds of disks at once, and converts into a
+    /// synchronized cold-start (and spare-claim) storm when those schemas
+    /// return. The excess stays warm one more tick.
+    ///
     /// Returns how many VMs were stopped, for the supervisor's heartbeat.
     async fn reap_idle(&self, timeout: Duration) -> usize {
         let mut victims: Vec<(String, Arc<SchemaEntry>)> = Vec::new();
+        let deferred;
         {
             let mut map = self.entries.lock().await;
-            map.retain(|schema, cell| match cell.get() {
-                Some(entry) if entry.is_idle(timeout) => {
-                    victims.push((schema.clone(), entry.clone()));
-                    false
+            // Collect every expired entry with its idle age, then take only
+            // the oldest-idle CAP of them out of the map.
+            let mut expired: Vec<(String, Duration)> = map
+                .iter()
+                .filter_map(|(schema, cell)| {
+                    let entry = cell.get()?;
+                    entry
+                        .is_idle(jittered_timeout(schema, timeout))
+                        .then(|| (schema.clone(), entry.idle_for()))
+                })
+                .collect();
+            expired.sort_by_key(|(_, idle)| std::cmp::Reverse(*idle));
+            deferred = expired.len().saturating_sub(IDLE_MAX_STOPS_PER_PASS);
+            for (schema, _) in expired.into_iter().take(IDLE_MAX_STOPS_PER_PASS) {
+                if let Some(entry) = map.get(&schema).and_then(|cell| cell.get()).cloned() {
+                    map.remove(&schema);
+                    victims.push((schema, entry));
                 }
-                _ => true,
-            });
+            }
+        }
+        if deferred > 0 {
+            info!(
+                "idle reaper: stopping {} oldest-idle VM(s) this pass, deferring {deferred}                  (cap {IDLE_MAX_STOPS_PER_PASS}/pass smooths mass expiries)",
+                victims.len()
+            );
         }
         let stopped = victims.len();
         // Device-growth candidates discovered while stopping: (schema, id,
@@ -1356,6 +1417,10 @@ impl SchemaRegistry {
             Duration::from_secs(15),
             Duration::from_secs(60),
             Some(wake),
+            // Every claim wakes this loop, and a pass costs a full daemon
+            // listing — floor the cadence so a claim storm coalesces into one
+            // pass per floor instead of one listing per claim.
+            Duration::from_secs(5),
             move || {
                 let registry = registry.clone();
                 let pool = pool.clone();
@@ -2259,11 +2324,30 @@ impl SchemaRegistry {
         } else if let Some(dir) = self.cfg.run_dir.as_ref().map(|d| d.join(sandbox_id)) {
             tokio::time::sleep(Duration::from_secs(2)).await;
             if dir.exists() {
-                warn!(
-                    "schema {schema}: image-archived and VM killed, but {} still \
-                     exists — the orphan sweep will reclaim it",
-                    dir.display()
-                );
+                // Same immediate cleanup as `vm::kill_and_reclaim`: the image
+                // is durably in S3 and the space is needed now — if the
+                // daemon confirms the id is gone, remove the leftover dir
+                // ourselves instead of waiting for a sweep pass.
+                match self.daemon_state(sandbox_id).await {
+                    DaemonState::Gone => match tokio::fs::remove_dir_all(&dir).await {
+                        Ok(()) => info!(
+                            "schema {schema}: image-archived; the daemon left {} behind, \
+                             removed it directly",
+                            dir.display()
+                        ),
+                        Err(e) => warn!(
+                            "schema {schema}: image-archived, but removing leftover {} \
+                             failed ({e}) — the orphan sweep will reclaim it",
+                            dir.display()
+                        ),
+                    },
+                    _ => warn!(
+                        "schema {schema}: image-archived and VM killed, but {} still \
+                         exists and the daemon still answers for {sandbox_id} — the \
+                         orphan sweep will reclaim it",
+                        dir.display()
+                    ),
+                }
             }
         }
         // The pgdata version travels with an image (unlike a dump), so a
@@ -2393,7 +2477,10 @@ impl SchemaRegistry {
     }
 
     /// Kick off one purge pass now, in the background — the dashboard's
-    /// double-opt-in "purge" button. Deletes sandboxes that are pure waste:
+    /// double-opt-in "purge" button. Works from the durable registry plus
+    /// per-id daemon probes, so it finds waste even right after a daemon
+    /// restart empties the in-memory listing. Deletes sandboxes that are pure
+    /// waste:
     ///
     /// - VMs still backing schemas whose tier is `frozen`/`archived` — the
     ///   tier flip is only ever written after a size-verified durable dump,
@@ -2440,9 +2527,32 @@ impl SchemaRegistry {
 
         let (mut offloaded, mut spares, mut failed) = (0usize, 0usize, 0usize);
         // 1. Leftover VMs of durably offloaded schemas.
+        //
+        // The daemon's listing is IN-MEMORY only (running + touched since
+        // daemon start) — after a daemon restart it is nearly empty while
+        // thousands of stopped VMs sit in the persisted store, which is
+        // exactly the population a purge exists to delete. So a record whose
+        // id is missing from the listing is probed per-id (the per-id GET
+        // falls back to the daemon's persisted store) rather than skipped;
+        // only a confirmed-gone (or unreachable) id is passed over. On a big
+        // backlog this is thousands of cheap local GETs — progress is logged
+        // so a long pass reads as working, not hung.
+        let mut probed = 0usize;
         for (schema, rec) in self.store_records() {
-            if rec.tier == Tier::Live || !live_ids.contains(&rec.sandbox_id) {
+            if rec.tier == Tier::Live {
                 continue;
+            }
+            if !live_ids.contains(&rec.sandbox_id) {
+                probed += 1;
+                if probed % 500 == 0 {
+                    info!(
+                        "purge: probed {probed} persisted-only candidate(s),                          deleted {offloaded} so far"
+                    );
+                }
+                match self.daemon_state(&rec.sandbox_id).await {
+                    DaemonState::Present { .. } => {}
+                    DaemonState::Gone | DaemonState::Error => continue,
+                }
             }
             info!("purge: schema {schema} is {} but VM {} still exists — deleting",
                 rec.tier.as_str(), rec.sandbox_id);
@@ -2758,6 +2868,8 @@ impl SchemaRegistry {
             first,
             interval,
             Some(wake.clone()),
+            // No floor: the drain-rearm wake is already delayed 20s.
+            Duration::ZERO,
             move || {
                 let registry = registry.clone();
                 let wake = wake.clone();
@@ -3409,7 +3521,7 @@ async fn supervise<F, Fut>(
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = usize> + Send + 'static,
 {
-    supervise_with_wake(name, first_delay, tick, None, make_pass).await
+    supervise_with_wake(name, first_delay, tick, None, Duration::ZERO, make_pass).await
 }
 
 /// [`supervise`] with an optional early-wake handle: a `notify_one` on `wake`
@@ -3417,11 +3529,20 @@ async fn supervise<F, Fut>(
 /// the next one — `Notify` stores the permit). Passes stay serialized through
 /// this single loop, so an early wake can never race a tick into concurrent
 /// passes.
+///
+/// `wake_floor` is the minimum gap between the end of one pass and the start
+/// of the next, whatever the wake handle does. A per-event wake with an
+/// expensive pass (the spare replenisher's full daemon listing, woken on
+/// every claim) otherwise amplifies a claim storm into a listing storm —
+/// exactly when the daemon is busiest. Wakes landing inside the floor
+/// coalesce into the one pass that runs when it expires. `Duration::ZERO`
+/// disables the floor.
 async fn supervise_with_wake<F, Fut>(
     name: &'static str,
     first_delay: Duration,
     tick: Duration,
     wake: Option<Arc<tokio::sync::Notify>>,
+    wake_floor: Duration,
     mut make_pass: F,
 ) where
     F: FnMut() -> Fut,
@@ -3430,6 +3551,7 @@ async fn supervise_with_wake<F, Fut>(
     let mut passes: u64 = 0;
     let mut actions: u64 = 0;
     let mut last_beat: Option<Instant> = None;
+    let mut last_end: Option<Instant> = None;
     loop {
         let delay = if passes == 0 { first_delay } else { tick };
         match &wake {
@@ -3440,6 +3562,12 @@ async fn supervise_with_wake<F, Fut>(
                 }
             }
             None => tokio::time::sleep(delay).await,
+        }
+        if let Some(end) = last_end {
+            let since = end.elapsed();
+            if since < wake_floor {
+                tokio::time::sleep(wake_floor - since).await;
+            }
         }
         passes += 1;
         let started = Instant::now();
@@ -3470,6 +3598,7 @@ async fn supervise_with_wake<F, Fut>(
             // Cancellation only happens on runtime shutdown; nothing to recover.
             Err(e) => warn!("{name}: pass {passes} did not complete: {e}"),
         }
+        last_end = Some(Instant::now());
     }
 }
 
@@ -3934,6 +4063,24 @@ mod archive_tests {
     /// Concurrent workers exclude in-flight schemas through the same predicate
     /// as backoff: with the top-ranked schema excluded, the picker returns the
     /// next-best job instead of re-picking the same one forever.
+    #[test]
+    fn jittered_timeout_is_stable_bounded_and_spread() {
+        let base = Duration::from_secs(1000);
+        let a = jittered_timeout("acme", base);
+        // Deterministic: same schema, same answer.
+        assert_eq!(a, jittered_timeout("acme", base));
+        // Bounded to [0.85, 1.15) x base for any schema.
+        let mut distinct = std::collections::HashSet::new();
+        for i in 0..100 {
+            let t = jittered_timeout(&format!("schema-{i}"), base);
+            assert!(t >= Duration::from_secs(850), "{t:?} below floor");
+            assert!(t < Duration::from_secs(1150), "{t:?} above ceiling");
+            distinct.insert(t);
+        }
+        // And actually spread, not collapsed onto a few values.
+        assert!(distinct.len() > 50, "only {} distinct timeouts", distinct.len());
+    }
+
     #[test]
     fn in_flight_exclusion_yields_the_second_best_job() {
         let ready = schemas(&[

@@ -74,11 +74,21 @@ MIN_FS_MB="${MIN_FS_MB:-2048}"
 PRUNE_SWAP="${PRUNE_SWAP:-0}"
 # Cooperative early stop. A pass over a big fleet takes minutes, and the pooler
 # must not boot a VM while this script might fsck its disk — so it blocks boots
-# for the whole run. When a boot is waiting, the pooler creates STOP_FILE; this
-# script finishes the disk it is on and exits. It can't just be killed: it runs
-# under sudo, so the pooler can only signal the shell it spawned while the root
-# e2fsck under it keeps writing — which is exactly the corruption the mutual
-# exclusion exists to prevent.
+# for the whole run. When a boot is waiting, the pooler creates STOP_FILE and
+# this script yields at its NEXT SAFE POINT and exits: between disks, at stage
+# boundaries inside a disk (each stage leaves the filesystem clean), and even
+# mid-discard — the discard e2fsck runs on a just-verified-clean filesystem
+# where it only punches free blocks, so it is killed outright (partially
+# punched free space is simply re-trimmed next pass). The only waits that must
+# run to completion are a single journal-recovery fsck or an in-progress
+# shrink, so a boot's worst case is one fsck/resize2fs on the largest disk,
+# not a whole per-disk pipeline. A disk yielded mid-way is NOT recorded in the
+# cursor, so the next pass redoes it from the top (every stage is idempotent).
+# The pooler can't just kill this script: it runs under sudo, so the pooler
+# can only signal the shell it spawned while the root e2fsck under it keeps
+# writing — which is exactly the corruption the mutual exclusion prevents.
+# Killing our OWN child mid-discard is different: we are the root process that
+# owns it, and the discard stage is the one provably safe to interrupt.
 STOP_FILE="${STOP_FILE:-$RUN_DIR/.reclaim-stop}"
 # Where a stopped pass left off, so the next one resumes after that disk instead
 # of re-walking the same prefix forever. On a host that yields often, this is
@@ -310,6 +320,14 @@ trim_one() {
         return 1
     fi
 
+    # A boot is waiting: yield now. The journal is recovered and the
+    # filesystem verified clean, so leaving prune/shrink/trim for the next
+    # pass costs nothing but this disk's not-yet-reclaimed bytes.
+    if [ -e "$STOP_FILE" ]; then
+        echo "yield (boot waiting; disk clean, re-trimmed next pass)  $disk"
+        return 3
+    fi
+
     # Drop the dead swapfile — only now, on a recovered journal (see above).
     # On a clean filesystem debugfs's rm fully deallocates (1.47+); older
     # debugfs leaves a zero-dtime deleted inode, which the preen right after
@@ -323,6 +341,13 @@ trim_one() {
             failed=$((failed + 1))
             return 1
         fi
+    fi
+
+    # Same yield before committing to a shrink — resize2fs relocates data
+    # and must never be interrupted, so don't start one with a boot waiting.
+    if [ -e "$STOP_FILE" ]; then
+        echo "yield (boot waiting; disk clean, re-trimmed next pass)  $disk"
+        return 3
     fi
 
     # Optional filesystem shrink (see shrink_fs).
@@ -341,8 +366,31 @@ trim_one() {
     # The reclaim itself: punch every free block and unused inode-table block
     # out of the backing file. File-level fallocate(PUNCH_HOLE) — works even
     # where loop-device discard doesn't.
-    fsck_out=$(e2fsck -fp -E discard "$disk" 2>&1)
-    if [ $? -ge 4 ]; then
+    #
+    # This is the long stage on a large disk, so it runs killably: the
+    # filesystem was verified clean immediately above, and on a clean fs
+    # -E discard only punches FREE blocks — interrupting it leaves some
+    # punched and the rest for the next pass, never an inconsistent
+    # filesystem. Poll for the stop file while it runs.
+    local dfsck_out_f dfsck_pid
+    dfsck_out_f=$(mktemp)
+    e2fsck -fp -E discard "$disk" >"$dfsck_out_f" 2>&1 &
+    dfsck_pid=$!
+    while kill -0 "$dfsck_pid" 2>/dev/null; do
+        if [ -e "$STOP_FILE" ]; then
+            kill "$dfsck_pid" 2>/dev/null
+            wait "$dfsck_pid" 2>/dev/null
+            rm -f "$dfsck_out_f"
+            echo "yield (boot waiting, stopped mid-discard; disk clean, re-trimmed next pass)  $disk"
+            return 3
+        fi
+        sleep 2
+    done
+    wait "$dfsck_pid"
+    local dfsck_rc=$?
+    fsck_out=$(cat "$dfsck_out_f")
+    rm -f "$dfsck_out_f"
+    if [ "$dfsck_rc" -ge 4 ]; then
         echo "FAIL  (discard fsck)  $disk"
         [ -n "$fsck_out" ] && echo "$fsck_out" | grep -v '^$' | head -n 2 | sed 's/^/      /'
         failed=$((failed + 1))
@@ -365,13 +413,19 @@ echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR (dry-run=$DRY_RUN shrin
 snapshot_open_files
 stopped_early=0 done_count=0 last_done=""
 for disk in "${disks[@]}"; do
-    # Between disks — never inside one — is the only safe place to stop: a
-    # half-finished e2fsck is exactly what must not be left behind.
+    # Cheapest stop point: before even starting the next disk. trim_one has
+    # its own within-disk yield points for stops that land mid-pipeline.
     if [ -e "$STOP_FILE" ]; then
         stopped_early=1
         break
     fi
     trim_one "$disk"
+    if [ $? -eq 3 ]; then
+        # Yielded mid-disk: not recorded as done, so the next pass redoes this
+        # disk from the top (every stage is idempotent).
+        stopped_early=1
+        break
+    fi
     done_count=$((done_count + 1))
     last_done="$disk"
 done

@@ -25,22 +25,27 @@
 //! Schema names are validated upstream to contain no control chars (so never a
 //! tab or newline), so this needs no escaping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-/// `touch()` bumps `last_active` in memory on every client checkout, but only
-/// flushes to disk when the on-disk value is older than this — the sweep reads
-/// the in-memory value, so disk freshness only matters across a pooler restart,
-/// where minutes of staleness are harmless against a week-long threshold. Keeps
-/// a busy schema from fsync-storming the registry on every connect.
-const FLUSH_DEBOUNCE_SECS: u64 = 60;
+/// `touch()`/`put()` bump `last_active` in memory on every client checkout;
+/// the [`Store::flush_dirty`] loop persists the whole map at most this often
+/// when anything changed. The sweep reads the in-memory value, so disk
+/// freshness only matters across a pooler restart, where seconds of staleness
+/// are harmless against hour-long thresholds. A **global** debounce, not
+/// per-schema: at 20k+ registry rows a serialize is O(rows), and the old
+/// per-schema debounce made a storm of *distinct* schemas serialize the whole
+/// map once per schema — the exact load spike a storm shouldn't amplify.
+/// Mapping changes (a new/changed schema→VM binding) still flush immediately:
+/// losing one to a crash would strand a served schema, not just age a clock.
+pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Where a schema's data currently lives — the storage tier ladder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -102,13 +107,11 @@ impl StoreRecord {
     }
 }
 
-/// Internal map value: a [`StoreRecord`] plus the `last_active` value currently
-/// on disk, used to debounce flushes.
+/// Internal map value backing a [`StoreRecord`].
 struct Rec {
     sandbox_id: String,
     last_active: u64,
     tier: Tier,
-    flushed_last_active: u64,
 }
 
 impl Rec {
@@ -134,6 +137,13 @@ pub struct Store {
     /// on a saturated disk that stalls for seconds — it must never hold up
     /// readers or in-memory updates. `Arc` so write closures can own it.
     written: Arc<Mutex<u64>>,
+    /// In-memory state is newer than the file — the [`Self::flush_dirty`] loop
+    /// owes a write. Set by the activity-bump paths, which no longer serialize.
+    dirty: AtomicBool,
+    /// Cached set of every bound `sandbox_id`, rebuilt lazily after a mapping
+    /// change. `bound_ids()` is on the cold-checkout hot path (the spare-claim
+    /// safety check) — without the cache every checkout re-scanned all rows.
+    bound_cache: Mutex<Option<Arc<HashSet<String>>>>,
 }
 
 impl Store {
@@ -158,6 +168,8 @@ impl Store {
             map: Mutex::new(map),
             seq: AtomicU64::new(0),
             written: Arc::new(Mutex::new(0)),
+            dirty: AtomicBool::new(false),
+            bound_cache: Mutex::new(None),
         }
     }
 
@@ -194,25 +206,25 @@ impl Store {
             let mut map = self.map.lock().unwrap();
             match map.get_mut(schema) {
                 Some(r) if r.sandbox_id == id && r.tier == Tier::Live => {
-                    // Unchanged live mapping: just a debounced activity bump.
+                    // Unchanged live mapping: an activity bump. The flush loop
+                    // persists it (see FLUSH_INTERVAL) — no O(rows) serialize
+                    // on the checkout path.
                     r.last_active = now;
-                    if now.saturating_sub(r.flushed_last_active) >= FLUSH_DEBOUNCE_SECS {
-                        r.flushed_last_active = now;
-                        Some(self.stamp(serialize(&map)))
-                    } else {
-                        None
-                    }
+                    self.dirty.store(true, Ordering::Relaxed);
+                    None
                 }
                 _ => {
+                    // A new or changed binding flushes immediately: this is
+                    // what makes a served schema findable after a crash.
                     map.insert(
                         schema.to_string(),
                         Rec {
                             sandbox_id: id.to_string(),
                             last_active: now,
                             tier: Tier::Live,
-                            flushed_last_active: now,
                         },
                     );
+                    *self.bound_cache.lock().unwrap() = None;
                     Some(self.stamp(serialize(&map)))
                 }
             }
@@ -220,24 +232,50 @@ impl Store {
         self.write_detached(snapshot);
     }
 
-    /// Bump `last_active` for `schema` to now (in memory), flushing only past
-    /// [`FLUSH_DEBOUNCE_SECS`]. No-op if the schema isn't known yet.
-    pub fn touch(&self, schema: &str) {
-        let now = now_unix();
+    /// The set of every `sandbox_id` bound to some schema, cached across calls
+    /// and rebuilt only after a mapping change. Cheap enough for the checkout
+    /// path (an `Arc` clone in the common case).
+    pub fn bound_ids(&self) -> Arc<HashSet<String>> {
+        let mut cache = self.bound_cache.lock().unwrap();
+        if let Some(set) = cache.as_ref() {
+            return set.clone();
+        }
+        let set = Arc::new(
+            self.map
+                .lock()
+                .unwrap()
+                .values()
+                .map(|r| r.sandbox_id.clone())
+                .collect::<HashSet<String>>(),
+        );
+        *cache = Some(set.clone());
+        set
+    }
+
+    /// Persist the map if any activity bump landed since the last flush — the
+    /// body of the global debounce loop (see [`FLUSH_INTERVAL`]). One O(rows)
+    /// serialize per interval max, however many schemas were touched.
+    pub fn flush_dirty(&self) {
+        if !self.dirty.swap(false, Ordering::Relaxed) {
+            return;
+        }
         let snapshot = {
-            let mut map = self.map.lock().unwrap();
-            let Some(r) = map.get_mut(schema) else {
-                return;
-            };
-            r.last_active = now;
-            if now.saturating_sub(r.flushed_last_active) >= FLUSH_DEBOUNCE_SECS {
-                r.flushed_last_active = now;
-                Some(self.stamp(serialize(&map)))
-            } else {
-                None
-            }
+            let map = self.map.lock().unwrap();
+            Some(self.stamp(serialize(&map)))
         };
         self.write_detached(snapshot);
+    }
+
+    /// Bump `last_active` for `schema` to now (in memory); the flush loop
+    /// persists it within [`FLUSH_INTERVAL`]. No-op if the schema isn't known.
+    pub fn touch(&self, schema: &str) {
+        let now = now_unix();
+        let mut map = self.map.lock().unwrap();
+        let Some(r) = map.get_mut(schema) else {
+            return;
+        };
+        r.last_active = now;
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// Move `schema` to an offloaded tier ([`Tier::Frozen`] or
@@ -340,7 +378,6 @@ fn parse(s: &str, now: u64) -> HashMap<String, Rec> {
                     sandbox_id: id.to_string(),
                     last_active,
                     tier,
-                    flushed_last_active: last_active,
                 },
             ))
         })
@@ -382,6 +419,49 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmp_store(tag: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("pg-fc-store-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Store::load(dir.join("registry.tsv"))
+    }
+
+    #[test]
+    fn bound_ids_cache_tracks_mapping_changes() {
+        let store = tmp_store("bound");
+        assert!(store.bound_ids().is_empty());
+        store.put("a", "sb-1");
+        store.put("b", "sb-2");
+        let set = store.bound_ids();
+        assert!(set.contains("sb-1") && set.contains("sb-2"));
+        // Rebinding a schema swaps its id out of the set.
+        store.put("a", "sb-9");
+        let set = store.bound_ids();
+        assert!(set.contains("sb-9") && !set.contains("sb-1"));
+        // An unchanged-mapping put (activity bump) must not clear the cache —
+        // same Arc handed back.
+        let before = store.bound_ids();
+        store.put("a", "sb-9");
+        assert!(Arc::ptr_eq(&before, &store.bound_ids()));
+    }
+
+    #[test]
+    fn activity_bumps_flush_via_flush_dirty_not_inline() {
+        let store = tmp_store("dirty");
+        store.put("a", "sb-1"); // mapping change: writes inline (no runtime)
+        assert!(store.path.exists());
+        // Wipe the file; a pure activity bump must NOT rewrite it inline...
+        std::fs::remove_file(&store.path).unwrap();
+        store.touch("a");
+        store.put("a", "sb-1"); // unchanged mapping = bump, not a write
+        assert!(!store.path.exists(), "activity bump wrote inline");
+        // ...but the flush loop's body persists it once, and only when dirty.
+        store.flush_dirty();
+        assert!(store.path.exists(), "flush_dirty did not write");
+        std::fs::remove_file(&store.path).unwrap();
+        store.flush_dirty(); // not dirty anymore: stays clean
+        assert!(!store.path.exists(), "flush_dirty wrote while clean");
+    }
 
     #[test]
     fn parses_new_four_column_format() {

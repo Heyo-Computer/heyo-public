@@ -793,15 +793,44 @@ pub async fn kill_and_reclaim(
         }
     }
 
-    let size = crate::orphans::dir_allocated_bytes(dir.clone()).await;
-    warn!(
-        "schema {schema}: {accomplished}, but its VM's data disk survived the kill — \
-         {} still exists ({}). The daemon dropped the sandbox record without removing \
-         the directory, so the space is stranded until it's reclaimed (the orphan-disk \
-         sweep will remove it if PG_VM_POOL_ORPHAN_SWEEP_SECS is set)",
-        dir.display(),
-        crate::orphans::human_iec(size),
-    );
+    // The daemon acked the kill but the directory survived — its known
+    // failure mode (an acked kill that never removes the dir). The data is
+    // durably offloaded and the space is needed NOW, not on some later sweep
+    // pass — so re-confirm the daemon no longer knows the id, then remove the
+    // directory ourselves. The confirm matters: only a daemon-forgotten id is
+    // provably nobody's VM (the per-id GET checks the persisted store too).
+    match sandbox.get().await {
+        Err(HeyoError::NotFound(_)) => {
+            let size = crate::orphans::dir_allocated_bytes(dir.clone()).await;
+            match tokio::fs::remove_dir_all(&dir).await {
+                Ok(()) => info!(
+                    "schema {schema}: {accomplished}; VM {id} killed — the daemon left {} \
+                     behind, removed it directly ({} freed)",
+                    dir.display(),
+                    crate::orphans::human_iec(size),
+                ),
+                Err(e) => warn!(
+                    "schema {schema}: {accomplished}, but removing the surviving disk dir {} \
+                     failed ({e}) — {} stranded until the orphan sweep gets it",
+                    dir.display(),
+                    crate::orphans::human_iec(size),
+                ),
+            }
+        }
+        // The daemon still claims the id (or can't answer): removing the dir
+        // under it could destroy a VM it still tracks. Leave it to the sweep,
+        // which re-checks with the same per-id probe.
+        _ => {
+            let size = crate::orphans::dir_allocated_bytes(dir.clone()).await;
+            warn!(
+                "schema {schema}: {accomplished}, but its VM's data disk survived the kill \
+                 and the daemon still answers for {id} — {} left for the orphan-disk sweep \
+                 ({} stranded)",
+                dir.display(),
+                crate::orphans::human_iec(size),
+            );
+        }
+    }
     Ok(())
 }
 

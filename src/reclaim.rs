@@ -40,8 +40,13 @@
 //!
 //! Serving a database beats reclaiming slack, so a waiting boot asks the pass
 //! to stop: [`boot_permit`] signals, [`Reclaimer::run_once`] creates the
-//! script's **stop file**, and the script returns after the disk it is on
-//! (seconds). The gate is released only once the child has actually exited.
+//! script's **stop file**, and the script yields at its next safe point —
+//! between disks, at stage boundaries inside a disk, or by killing its own
+//! discard-stage fsck (safe: it only punches free blocks on a verified-clean
+//! filesystem). Only a journal-recovery fsck or an in-progress shrink must
+//! run to completion, so the boot's worst case is one fsck/resize on the
+//! largest disk, not a whole pass or even a whole per-disk pipeline. The
+//! gate is released only once the child has actually exited.
 //!
 //! It is deliberately *not* a kill. The command runs through `sudo`, so the
 //! pooler can only signal the shell it spawned — `sudo` and the `e2fsck` under
@@ -167,8 +172,8 @@ impl Reclaimer {
         match &self.stop_file {
             Some(path) => match std::fs::File::create(path) {
                 Ok(_) => info!(
-                    "disk reclaim: a VM needs to boot — asked the pass to stop after the \
-                     current disk ({})",
+                    "disk reclaim: a VM needs to boot — asked the pass to yield at its \
+                     next safe point ({})",
                     path.display()
                 ),
                 Err(e) => warn!(

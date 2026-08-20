@@ -282,6 +282,51 @@ impl FreezeConfig {
 /// Where the local dump store lives and where its HTTP server listens. Parsed
 /// independently of the frozen tier because two consumers share the server:
 /// freeze/thaw, and the S3 archive tier's *streamed* dumps (the guest pipes
+impl Config {
+    /// Create and write-probe every configured offload output directory, so a
+    /// bad path or root-owned parent fails startup with a named fix instead of
+    /// degrading at job time. The degradation is expensive and quiet: an
+    /// unwritable compact dir fails every compact into backoff, the picker
+    /// falls back to BOOT-based dump archiving, the dump then fails too (dump
+    /// dir), and the image fallback rescues it — after paying a boot that
+    /// inflates (rootfs clone + swapfile + WAL) the very disk the offload was
+    /// meant to drain.
+    pub fn preflight_offload_dirs(&self) -> anyhow::Result<()> {
+        let mut dirs: Vec<(&str, &std::path::Path)> = Vec::new();
+        // The dump server's landing dir carries both the frozen tier and the
+        // S3 tier's streamed dumps — probe it whenever either consumer is on.
+        if self.freeze.is_some() || self.archive.is_some() {
+            dirs.push(("dump dir (PG_VM_POOL_DUMP_DIR)", &self.dump_net.dump_dir));
+        }
+        if let Some(c) = &self.compact {
+            dirs.push(("compact dir (PG_VM_POOL_COMPACT_DIR)", &c.compact_dir));
+        }
+        if let Some(i) = &self.image_archive {
+            dirs.push(("image spool dir (PG_VM_POOL_IMAGE_SPOOL_DIR)", &i.spool_dir));
+        }
+        for (what, dir) in dirs {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                anyhow::anyhow!(
+                    "{what}: cannot create {}: {e} — if the parent is root-owned, create                      it owned by the pooler's user: sudo install -d -o $(id -un) -g $(id -gn) {}",
+                    dir.display(),
+                    dir.display()
+                )
+            })?;
+            let probe = dir.join(".pg-vm-pool-write-probe");
+            std::fs::write(&probe, b"probe")
+                .and_then(|_| std::fs::remove_file(&probe))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{what}: {} exists but is not writable by this process: {e} —                          likely created with sudo and root-owned; fix:                          sudo chown $(id -un):$(id -gn) {}",
+                        dir.display(),
+                        dir.display()
+                    )
+                })?;
+        }
+        Ok(())
+    }
+}
+
 /// `pg_dump` to this server so the archive never touches its own data disk;
 /// the pooler then uploads the landed file to S3). Always present on `Config`;
 /// the server itself runs only when a consumer is enabled.

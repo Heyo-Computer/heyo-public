@@ -212,6 +212,7 @@ impl SparePool {
                     // Id in hand — record it under whatever name the daemon
                     // reports (still its spare name until the registry binds).
                     crate::inventory::insert(&info.name, &info.id);
+                    crate::events::record(crate::events::Event::SpareClaimed);
                     self.poke.notify_one();
                     return Some(sb);
                 }
@@ -231,6 +232,7 @@ impl SparePool {
                 // (killing the spare) if it can't be served.
                 Err(e) => {
                     warn!("warm-spares: confirming spare {id} failed ({e:#}); claiming it anyway");
+                    crate::events::record(crate::events::Event::SpareClaimed);
                     self.poke.notify_one();
                     return Some(sb);
                 }

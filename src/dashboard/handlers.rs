@@ -81,6 +81,7 @@ pub async fn monitoring(
         vms_created: crate::events::hourly_counts(crate::events::Event::VmCreated, 24),
         offloads_done: crate::events::hourly_counts(crate::events::Event::OffloadDone, 24),
         vms_deleted: crate::events::hourly_counts(crate::events::Event::VmDeleted, 24),
+        spares_claimed: crate::events::hourly_counts(crate::events::Event::SpareClaimed, 24),
     };
     Ok(views::monitoring_page(
         &st,

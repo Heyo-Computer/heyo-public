@@ -297,6 +297,7 @@ pub struct ActivitySeries {
     pub vms_created: Vec<(u64, u32)>,
     pub offloads_done: Vec<(u64, u32)>,
     pub vms_deleted: Vec<(u64, u32)>,
+    pub spares_claimed: Vec<(u64, u32)>,
 }
 
 /// The monitoring view: whole-host CPU/memory/disk saturation plus pooler-fleet
@@ -451,6 +452,16 @@ pub fn monitoring_page(
 
             h3.sub-head { "VMs created" }
             (hourly_bar_chart(&activity.vms_created, "VM"))
+
+            h3.sub-head { "warm spares claimed" }
+            (hourly_bar_chart(&activity.spares_claimed, "claim"))
+            p.note {
+                "Bring-ups served off the warm-spare shelf. Read together with the "
+                "\"warm spares ready\" tile: 0 ready next to a tall bar here means the "
+                "pool is being drained by demand as fast as the replenisher rebuilds it "
+                "(raise " code { "PG_VM_POOL_WARM_SPARES" } ", max 16) — not that "
+                "spare builds are failing."
+            }
 
             h3.sub-head { "offloads completed" }
             (hourly_bar_chart(&activity.offloads_done, "offload"))
