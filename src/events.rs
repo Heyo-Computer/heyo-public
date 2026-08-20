@@ -35,6 +35,13 @@ pub enum Event {
     RestoreLocal,
     /// A new VM was created (schema VMs and warm spares alike).
     VmCreated,
+    /// A schema moved one step down the offload ladder: dump-archived to S3,
+    /// frozen, compacted, image-archived, or a local dump promoted to S3.
+    /// Each one frees disk (or is about to, via the kill that follows).
+    OffloadDone,
+    /// A VM/sandbox directory was deleted outright: an orphan-sweep removal
+    /// or a purge-pass kill. The other half of "are we draining the disk".
+    VmDeleted,
 }
 
 impl Event {
@@ -44,6 +51,8 @@ impl Event {
             Event::RestoreS3 => "restore_s3",
             Event::RestoreLocal => "restore_local",
             Event::VmCreated => "vm_created",
+            Event::OffloadDone => "offload_done",
+            Event::VmDeleted => "vm_deleted",
         }
     }
 
@@ -54,6 +63,8 @@ impl Event {
             "restore_s3" => Some(Event::RestoreS3),
             "restore_local" => Some(Event::RestoreLocal),
             "vm_created" => Some(Event::VmCreated),
+            "offload_done" => Some(Event::OffloadDone),
+            "vm_deleted" => Some(Event::VmDeleted),
             _ => None,
         }
     }
@@ -442,6 +453,22 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every variant's on-disk token must survive a write/reload cycle —
+    /// a rename here silently zeroes historical chart data.
+    #[test]
+    fn event_tokens_roundtrip() {
+        for e in [
+            Event::RestoreS3,
+            Event::RestoreLocal,
+            Event::VmCreated,
+            Event::OffloadDone,
+            Event::VmDeleted,
+        ] {
+            assert_eq!(Event::parse(e.as_str()), Some(e), "token {:?}", e.as_str());
+        }
+        assert_eq!(Event::parse("from_the_future"), None);
+    }
 
     /// The global log is shared across tests in one binary, so tests use
     /// far-apart timestamp ranges instead of clearing it. `DIR` is never

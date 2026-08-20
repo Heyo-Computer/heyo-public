@@ -1395,12 +1395,14 @@ impl SchemaRegistry {
         }));
     }
 
-    /// One pressure check: no-op below the high-water mark; above it, archive
-    /// oldest-idle schemas one at a time, re-reading usage after each, until
-    /// below the low-water mark or out of candidates. Claims the same
-    /// single-flight flag as the periodic sweep, so the two never interleave
-    /// over the same schemas. Returns how many schemas were archived.
-    async fn pressure_pass(&self, p: &PressureConfig) -> usize {
+    /// One pressure check: no-op below the high-water mark; above it, run
+    /// emergency offloads through the parallel drain loop (up to
+    /// `offload_workers` concurrent jobs, no-boot kinds first, usage re-read
+    /// between dispatches) until below the low-water mark or out of
+    /// candidates. Claims the same single-flight flag as the periodic sweep,
+    /// so the two never interleave over the same schemas. Returns how many
+    /// schemas were offloaded.
+    async fn pressure_pass(self: &Arc<Self>, p: &PressureConfig) -> usize {
         let Some(pct) = disk_used_pct(&p.path).await else {
             warn!(
                 "disk-pressure: could not read filesystem usage of {}; skipping this check",
@@ -1451,64 +1453,9 @@ impl SchemaRegistry {
         // next job is a function of what just happened, not of an ordering
         // computed before any of it did.
         let policy = self.pressure_policy();
-        let mut archived = 0usize;
-        let mut consecutive_failures = 0usize;
-        loop {
-            match disk_used_pct(&p.path).await {
-                Some(cur) if cur < p.low_pct => {
-                    info!(
-                        "disk-pressure: {} down to {cur:.1}% (< {:.1}%) after {archived} \
-                         emergency offload(s); standing down",
-                        p.path.display(),
-                        p.low_pct
-                    );
-                    crate::events::journal_info(
-                        "sweep.pressure",
-                        format!(
-                            "stood down at {cur:.1}% after {archived} emergency offload(s)"
-                        ),
-                    );
-                    return archived;
-                }
-                _ => {}
-            }
-            let Some(job) = self.next_offload_job(policy, &HashSet::new()).await else {
-                break;
-            };
-            let kind = job.kind;
-            let schema = job.schema.clone();
-            match self.run_offload_job(job).await {
-                Ok(()) => {
-                    archived += 1;
-                    consecutive_failures = 0;
-                }
-                // A benign claim race (a dispatcher worker or dashboard job
-                // holds the schema) says nothing about environment health.
-                Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {}
-                Err(_) => {
-                    // The failure is already logged and journaled by the
-                    // operation itself, and the schema is now in backoff — so
-                    // the next pick skips it rather than looping on it.
-                    consecutive_failures += 1;
-                    if consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES {
-                        error!(
-                            "disk-pressure: aborting after {consecutive_failures} consecutive \
-                             failures (last: {} {schema}) — environment unhealthy; \
-                             re-checking in {:?}",
-                            kind.as_str(),
-                            p.check_interval
-                        );
-                        crate::events::journal_error(
-                            "sweep.pressure",
-                            format!(
-                                "ABORTED after 3 consecutive failures ({archived} offloaded first)"
-                            ),
-                        );
-                        return archived;
-                    }
-                }
-            }
-        }
+        let archived = self
+            .offload_drain_loop(policy, Some(p), "disk-pressure", "sweep.pressure")
+            .await;
         if let Some(cur) = disk_used_pct(&p.path).await
             && cur >= p.low_pct
         {
@@ -1527,6 +1474,253 @@ impl SchemaRegistry {
             );
         }
         archived
+    }
+
+    /// The parallel drain core shared by the emergency pressure pass and the
+    /// dashboard's TTL sweep: run offload jobs through up to `offload_workers`
+    /// concurrent slots — at most one of which may boot a VM (boot-kinds
+    /// compete with clients for the FIFO bring-up gate) — until the stand-down
+    /// condition is met, the backlog runs dry, or the failure circuit breaker
+    /// trips.
+    ///
+    /// `stand_down = Some(p)` re-reads disk usage between dispatches and stops
+    /// once below `p.low_pct` (the emergency pass); `None` runs the eligible
+    /// backlog dry (the manual TTL sweep). `log_tag` / `journal_kind` name the
+    /// caller in the pooler log and the events journal.
+    ///
+    /// The caller holds the `sweeping` single-flight guard for the duration
+    /// (which also pauses the routine pacer's dispatches — see
+    /// [`Self::dispatch_backpressure`]). Unlike the routine pacer there is no
+    /// host-load gate: both callers are operator or emergency paths where
+    /// freeing disk outranks background politeness. Job children still run
+    /// nice-19 (see `imgarchive`), and per-schema claim exclusion keeps
+    /// workers, the pacer, and dashboard buttons off each other's schemas.
+    ///
+    /// On stand-down or abort, in-flight jobs are left to finish (each only
+    /// frees more disk) and still count toward the returned total.
+    async fn offload_drain_loop(
+        self: &Arc<Self>,
+        mut policy: OffloadPolicy,
+        stand_down: Option<&PressureConfig>,
+        log_tag: &str,
+        journal_kind: &str,
+    ) -> usize {
+        /// How often to re-read disk usage while every worker slot is busy.
+        const FULL_RECHECK: Duration = Duration::from_secs(2);
+        enum DrainEnd {
+            StoodDown(f64),
+            Dry,
+            Aborted,
+        }
+        let workers = self.cfg.offload_workers.max(1);
+        let mut jobs: tokio::task::JoinSet<JobOutcome> = tokio::task::JoinSet::new();
+        let mut in_flight: HashMap<tokio::task::Id, (String, OffloadKind)> = HashMap::new();
+        let mut archived = 0usize;
+        let mut consecutive_failures = 0usize;
+        let end = loop {
+            // Stand down the moment usage is below the low-water mark.
+            if let Some(p) = stand_down
+                && let Some(cur) = disk_used_pct(&p.path).await
+                && cur < p.low_pct
+            {
+                break DrainEnd::StoodDown(cur);
+            }
+            if consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES {
+                break DrainEnd::Aborted;
+            }
+            // Fill every free worker slot.
+            while jobs.len() < workers {
+                // At most one boot-kind job in flight (see the pacer).
+                policy.no_boot = in_flight.values().any(|(_, kind)| kind.boots());
+                let excluded: HashSet<String> =
+                    in_flight.values().map(|(schema, _)| schema.clone()).collect();
+                let Some(job) = self.next_offload_job(policy, &excluded).await else {
+                    break;
+                };
+                let (schema, kind) = (job.schema.clone(), job.kind);
+                info!(
+                    "{log_tag}: dispatching {} {schema} ({}/{workers} in flight)",
+                    kind.as_str(),
+                    jobs.len() + 1
+                );
+                let reg = Arc::clone(self);
+                let task_id = jobs
+                    .spawn(async move {
+                        match reg.run_offload_job(job).await {
+                            Ok(()) => JobOutcome::Done,
+                            // A benign claim race (a pacer worker or dashboard
+                            // job holds the schema) says nothing about
+                            // environment health.
+                            Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {
+                                JobOutcome::Skipped
+                            }
+                            // Already logged and journaled by the operation
+                            // itself, and the schema is now in backoff — the
+                            // next pick skips it rather than looping on it.
+                            Err(_) => JobOutcome::Failed,
+                        }
+                    })
+                    .id();
+                in_flight.insert(task_id, (schema, kind));
+            }
+            if jobs.is_empty() {
+                // Nothing runnable and nothing in flight: backlog drained.
+                break DrainEnd::Dry;
+            }
+            // Wait for a completion; under a stand-down condition, wake at
+            // least every FULL_RECHECK so a full set of slow jobs can't delay
+            // noticing that usage already dropped below the low-water mark.
+            let next = if stand_down.is_some() {
+                tokio::select! {
+                    r = jobs.join_next_with_id() => r,
+                    _ = tokio::time::sleep(FULL_RECHECK) => continue,
+                }
+            } else {
+                jobs.join_next_with_id().await
+            };
+            match next {
+                Some(Ok((task_id, outcome))) => {
+                    in_flight.remove(&task_id);
+                    match outcome {
+                        JobOutcome::Done => {
+                            archived += 1;
+                            consecutive_failures = 0;
+                        }
+                        JobOutcome::Skipped => {}
+                        JobOutcome::Failed => consecutive_failures += 1,
+                    }
+                }
+                Some(Err(e)) => {
+                    let label = in_flight
+                        .remove(&e.id())
+                        .map(|(schema, kind)| format!("{} {schema}", kind.as_str()))
+                        .unwrap_or_else(|| "?".into());
+                    if e.is_panic() {
+                        error!("{log_tag}: {label} PANICKED: {}", panic_message(e.into_panic()));
+                    } else {
+                        error!("{log_tag}: {label} failed to run: {e}");
+                    }
+                    consecutive_failures += 1;
+                }
+                None => {}
+            }
+        };
+        // Let in-flight jobs finish — each only frees more disk — and count
+        // them before reporting.
+        if !jobs.is_empty() {
+            info!(
+                "{log_tag}: waiting for {} in-flight offload(s) to finish",
+                jobs.len()
+            );
+        }
+        while let Some(res) = jobs.join_next_with_id().await {
+            match res {
+                Ok((task_id, outcome)) => {
+                    in_flight.remove(&task_id);
+                    if matches!(outcome, JobOutcome::Done) {
+                        archived += 1;
+                    }
+                }
+                Err(e) => {
+                    let label = in_flight
+                        .remove(&e.id())
+                        .map(|(schema, kind)| format!("{} {schema}", kind.as_str()))
+                        .unwrap_or_else(|| "?".into());
+                    error!("{log_tag}: {label} did not finish cleanly: {e}");
+                }
+            }
+        }
+        match end {
+            DrainEnd::StoodDown(cur) => {
+                // stand_down is always Some here (the only branch that breaks
+                // with StoodDown read it), but stay total.
+                let low = stand_down.map(|p| p.low_pct).unwrap_or_default();
+                info!(
+                    "{log_tag}: down to {cur:.1}% (< {low:.1}%) after {archived} offload(s); \
+                     standing down"
+                );
+                crate::events::journal_info(
+                    journal_kind,
+                    format!("stood down at {cur:.1}% after {archived} emergency offload(s)"),
+                );
+            }
+            DrainEnd::Aborted => {
+                error!(
+                    "{log_tag}: aborting after {consecutive_failures} consecutive failures — \
+                     environment unhealthy"
+                );
+                crate::events::journal_error(
+                    journal_kind,
+                    format!(
+                        "ABORTED after {consecutive_failures} consecutive failures \
+                         ({archived} offloaded first)"
+                    ),
+                );
+            }
+            // The caller reports "dry" its own way (the pressure pass checks
+            // whether the disk is still over the mark; the TTL sweep just
+            // journals the total).
+            DrainEnd::Dry => {}
+        }
+        archived
+    }
+
+    /// Offload every schema whose disk has been idle longer than `ttl_secs`,
+    /// now, in the background — the dashboard's manual TTL sweep. Runs the
+    /// same parallel drain loop as the emergency pressure pass (up to
+    /// `offload_workers` concurrent jobs, pressure-mode ranking: no-boot
+    /// kinds first, at most one boot-kind in flight) but ignores disk usage
+    /// entirely: it runs the TTL backlog dry. Freezing is dropped for the
+    /// same reason the pressure pass drops it — it costs a boot and leaves
+    /// the bytes on the host.
+    ///
+    /// Returns as soon as the sweep is launched; progress lands in the pooler
+    /// log and the events journal (`sweep.ttl`). Errors if no offload tier
+    /// is configured or a sweep is already running.
+    pub fn spawn_ttl_sweep_now(self: &Arc<Self>, ttl_secs: u64) -> Result<()> {
+        anyhow::ensure!(
+            self.cfg.archive.is_some() || self.cfg.compact.is_some(),
+            "no offload tier is configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_* \
+             and/or PG_VM_POOL_COMPACT_AFTER_SECS)"
+        );
+        if self.sweeping.load(Ordering::SeqCst) {
+            bail!("an eviction sweep is already running");
+        }
+        let registry = self.clone();
+        tokio::spawn(async move {
+            if registry.sweeping.swap(true, Ordering::SeqCst) {
+                info!("ttl-sweep: another eviction sweep started first; skipping");
+                return;
+            }
+            let _sweeping = SweepGuard(&registry.sweeping);
+            info!(
+                "ttl-sweep: offloading every schema idle > {ttl_secs}s (operator request, \
+                 up to {} concurrent job(s))",
+                registry.cfg.offload_workers.max(1)
+            );
+            crate::events::journal_info(
+                "sweep.ttl",
+                format!("manual TTL sweep engaged: offloading every schema idle > {ttl_secs}s"),
+            );
+            let policy = OffloadPolicy {
+                compact_after: registry.cfg.compact.as_ref().map(|_| ttl_secs),
+                // Costs a boot and keeps the bytes local — useless for draining.
+                freeze_after: None,
+                archive_after: registry.cfg.archive.as_ref().map(|_| ttl_secs),
+                image_archive: registry.image_archive_enabled(),
+                no_boot: false,
+                mode: OffloadMode::Pressure,
+            };
+            let n = registry
+                .offload_drain_loop(policy, None, "ttl-sweep", "sweep.ttl")
+                .await;
+            info!("ttl-sweep: finished — {n} schema(s) offloaded");
+            crate::events::journal_info(
+                "sweep.ttl",
+                format!("manual TTL sweep finished: {n} schema(s) offloaded"),
+            );
+        });
+        Ok(())
     }
 
     /// Archive **every** eligible schema now, in the background — the
@@ -1758,6 +1952,7 @@ impl SchemaRegistry {
             Ok(()) => {
                 self.offload_backoff.clear(schema);
                 crate::events::journal_info("archive", format!("schema {schema} → archived (S3)"));
+                crate::events::record(crate::events::Event::OffloadDone);
             }
             // Losing the claim race to another worker / the dashboard is
             // benign — no backoff, no error journal.
@@ -2103,7 +2298,10 @@ impl SchemaRegistry {
     pub async fn archive_schema_as_image(&self, schema: &str, viewed_id: Option<&str>) -> Result<()> {
         let res = self.archive_schema_as_image_inner(schema, viewed_id).await;
         match &res {
-            Ok(()) => self.offload_backoff.clear(schema),
+            Ok(()) => {
+                self.offload_backoff.clear(schema);
+                crate::events::record(crate::events::Event::OffloadDone);
+            }
             // Benign claim race — no error journal.
             Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {
                 crate::events::journal_info(
@@ -2249,7 +2447,10 @@ impl SchemaRegistry {
             info!("purge: schema {schema} is {} but VM {} still exists — deleting",
                 rec.tier.as_str(), rec.sandbox_id);
             match kill_by_id(&rec.sandbox_id).await {
-                Ok(()) => offloaded += 1,
+                Ok(()) => {
+                    offloaded += 1;
+                    crate::events::record(crate::events::Event::VmDeleted);
+                }
                 Err(e) => {
                     failed += 1;
                     warn!("purge: deleting {} failed: {e:#}", rec.sandbox_id);
@@ -2266,7 +2467,10 @@ impl SchemaRegistry {
             }
             info!("purge: unclaimed spare {} — deleting", s.id);
             match kill_by_id(&s.id).await {
-                Ok(()) => spares += 1,
+                Ok(()) => {
+                    spares += 1;
+                    crate::events::record(crate::events::Event::VmDeleted);
+                }
                 Err(e) => {
                     failed += 1;
                     warn!("purge: deleting spare {} failed: {e:#}", s.id);
@@ -2322,6 +2526,7 @@ impl SchemaRegistry {
                     "freeze",
                     format!("schema {schema} → frozen (local dump)"),
                 );
+                crate::events::record(crate::events::Event::OffloadDone);
             }
             // Benign claim race — no backoff, no error journal.
             Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {
@@ -2432,6 +2637,7 @@ impl SchemaRegistry {
                     "compact",
                     format!("schema {schema} → compacted (local image)"),
                 );
+                crate::events::record(crate::events::Event::OffloadDone);
             }
             // Benign claim race — no backoff, no error journal.
             Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {
@@ -2855,6 +3061,7 @@ impl SchemaRegistry {
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => {
                     removed += 1;
+                    crate::events::record(crate::events::Event::VmDeleted);
                     freed += bytes;
                     info!(
                         "orphan-disk sweep: reclaimed {} ({}) — {why}",
@@ -3298,6 +3505,14 @@ impl Drop for SweepGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
+}
+
+/// What one drain-loop offload job came to, for the failure circuit breaker:
+/// a benign claim race is neither success nor failure.
+enum JobOutcome {
+    Done,
+    Skipped,
+    Failed,
 }
 
 /// Sentinel for a benign claim conflict: the schema is already being offloaded

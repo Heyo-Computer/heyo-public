@@ -72,6 +72,10 @@ pub fn reset() {
 mod tests {
     use super::*;
 
+    /// Both tests mutate the one process-global cache; without this they race
+    /// under cargo's parallel test threads and fail flakily.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn info(id: &str, name: &str) -> heyo_sdk::SandboxInfo {
         serde_json::from_value(serde_json::json!({
             "id": id,
@@ -84,6 +88,7 @@ mod tests {
 
     #[test]
     fn insert_lookup_remove_roundtrip() {
+        let _serial = SERIAL.lock().unwrap();
         reset();
         insert("pg-alpha", "sb-1");
         assert_eq!(lookup("pg-alpha").as_deref(), Some("sb-1"));
@@ -94,6 +99,7 @@ mod tests {
 
     #[test]
     fn absorb_merges_and_skips_nameless() {
+        let _serial = SERIAL.lock().unwrap();
         reset();
         insert("pg-keep", "sb-keep");
         absorb(&[info("sb-2", "pg-two"), info("sb-3", "")]);

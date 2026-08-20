@@ -295,6 +295,8 @@ pub struct ActivitySeries {
     pub restores_s3: Vec<(u64, u32)>,
     pub restores_local: Vec<(u64, u32)>,
     pub vms_created: Vec<(u64, u32)>,
+    pub offloads_done: Vec<(u64, u32)>,
+    pub vms_deleted: Vec<(u64, u32)>,
 }
 
 /// The monitoring view: whole-host CPU/memory/disk saturation plus pooler-fleet
@@ -344,6 +346,16 @@ pub fn monitoring_page(
                             button.reap type="submit"
                                 title="Run an S3 eviction sweep now: archive every long-idle schema and free its disk, instead of waiting for the periodic timer." {
                                 "sweep idle → S3 now"
+                            }
+                        }
+                        form method="post" action="/monitoring/ttl-sweep" class="inline-form" {
+                            input type="number" name="ttl_secs" value="1800" min="0" step="60"
+                                style="width:7em"
+                                title="idle TTL in seconds: any schema whose disk has been untouched longer than this is offloaded";
+                            button.reap type="submit"
+                                title="Offload every schema idle longer than the TTL now, through the parallel worker pool (no-boot kinds first: compact / image-archive / promote; at most one job boots a VM). Ignores disk usage — runs the whole backlog. Their VMs are deleted only after the data is durably offloaded."
+                                onclick="return confirm('Offload EVERY schema idle longer than the TTL? VMs are deleted after their data is durably offloaded (compact/archive). This runs the whole backlog through the worker pool.')" {
+                                "offload idle > TTL now"
                             }
                         }
                     }
@@ -439,6 +451,22 @@ pub fn monitoring_page(
 
             h3.sub-head { "VMs created" }
             (hourly_bar_chart(&activity.vms_created, "VM"))
+
+            h3.sub-head { "offloads completed" }
+            (hourly_bar_chart(&activity.offloads_done, "offload"))
+            p.note {
+                "Every successful step down the offload ladder — S3 dump archive, "
+                "freeze, compact, image archive, or a local dump promoted to S3. "
+                "Disk drains only while this chart and the one below are non-zero."
+            }
+
+            h3.sub-head { "VMs deleted (orphan sweep + purge)" }
+            (hourly_bar_chart(&activity.vms_deleted, "deletion"))
+            p.note {
+                "Sandbox directories removed outright: orphan-sweep reclaims and "
+                "purge-pass kills. Deletions done by hand on the host (e.g. bulk "
+                code { "rm" } " from an audit list) bypass the pooler and are not counted."
+            }
 
             (alerts_section(st))
         },

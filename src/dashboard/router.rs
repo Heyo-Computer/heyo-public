@@ -28,6 +28,7 @@ pub fn build(state: DashState) -> Router {
         .route("/monitoring/alerts/{id}/pause", post(handlers::alert_pause))
         .route("/monitoring/alerts/{id}/resume", post(handlers::alert_resume))
         .route("/monitoring/sweep", post(handlers::action_sweep_now))
+        .route("/monitoring/ttl-sweep", post(handlers::action_ttl_sweep))
         .route("/monitoring/reclaim", post(handlers::action_reclaim_now))
         .route("/monitoring/purge", post(handlers::action_purge))
         .route("/vm/{id}", get(handlers::vm_detail))

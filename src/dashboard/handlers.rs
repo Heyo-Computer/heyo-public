@@ -79,6 +79,8 @@ pub async fn monitoring(
         restores_s3: crate::events::hourly_counts(crate::events::Event::RestoreS3, 24),
         restores_local: crate::events::hourly_counts(crate::events::Event::RestoreLocal, 24),
         vms_created: crate::events::hourly_counts(crate::events::Event::VmCreated, 24),
+        offloads_done: crate::events::hourly_counts(crate::events::Event::OffloadDone, 24),
+        vms_deleted: crate::events::hourly_counts(crate::events::Event::VmDeleted, 24),
     };
     Ok(views::monitoring_page(
         &st,
@@ -138,6 +140,33 @@ pub async fn action_sweep_now(State(st): State<DashState>) -> Redirect {
         Ok(()) => Redirect::to(&format!(
             "/monitoring?msg={}",
             qenc("eviction sweep started; watch the pooler log")
+        )),
+        Err(e) => Redirect::to(&format!("/monitoring?err={}", qenc(&e.to_string()))),
+    }
+}
+
+/// Form for the monitoring page's manual TTL sweep.
+#[derive(Deserialize)]
+pub struct TtlSweepForm {
+    pub ttl_secs: u64,
+}
+
+/// Offload every schema idle longer than the operator-chosen TTL, now, in the
+/// background, through the parallel drain loop (pressure-mode ranking: no-boot
+/// kinds first, at most one boot-kind job in flight). Ignores disk usage — it
+/// runs the TTL backlog dry. Redirects immediately; progress lands in the
+/// pooler log and the events journal.
+pub async fn action_ttl_sweep(
+    State(st): State<DashState>,
+    Form(form): Form<TtlSweepForm>,
+) -> Redirect {
+    match st.registry.spawn_ttl_sweep_now(form.ttl_secs) {
+        Ok(()) => Redirect::to(&format!(
+            "/monitoring?msg={}",
+            qenc(&format!(
+                "TTL sweep started: offloading every schema idle > {}s; watch the events page",
+                form.ttl_secs
+            ))
         )),
         Err(e) => Redirect::to(&format!("/monitoring?err={}", qenc(&e.to_string()))),
     }

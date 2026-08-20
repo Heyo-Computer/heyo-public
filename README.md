@@ -402,8 +402,18 @@ help when load outruns it — a filesystem that hits `No space left on device`
 takes everything down at once (VM creates fail, Postgres PANICs, even the
 rescue dumps fail). Set `PG_VM_POOL_PRESSURE_PATH` to the filesystem holding the
 VM disks and a watchdog checks usage every `PG_VM_POOL_PRESSURE_CHECK_SECS`: at
-or above `PG_VM_POOL_PRESSURE_HIGH_PCT` it offloads schemas one at a time,
-re-reading usage after each, until below `PG_VM_POOL_PRESSURE_LOW_PCT`.
+or above `PG_VM_POOL_PRESSURE_HIGH_PCT` it offloads schemas through the same
+worker pool as the pacer (up to `PG_VM_POOL_OFFLOAD_WORKERS` concurrent jobs, at
+most one of which may boot a VM; no host-load gate — this is an emergency),
+re-reading usage between dispatches, until below `PG_VM_POOL_PRESSURE_LOW_PCT`.
+
+The monitoring page also carries a manual **"offload idle > TTL now"** control:
+enter an idle TTL in seconds and every schema whose disk has been untouched
+longer than that is offloaded through the same parallel drain loop — pressure-
+mode ranking (no-boot kinds first: compact / image-archive / promote), disk
+usage ignored, the whole backlog run dry. It's the operator override for "the
+threshold is 30 minutes but the backlog is growing — drain everything idle over
+X right now".
 
 It picks jobs the same way the pacer does, with two changes that matter when
 the disk is nearly full:
