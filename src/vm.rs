@@ -799,8 +799,11 @@ pub async fn kill_and_reclaim(
     // pass — so re-confirm the daemon no longer knows the id, then remove the
     // directory ourselves. The confirm matters: only a daemon-forgotten id is
     // provably nobody's VM (the per-id GET checks the persisted store too).
-    match sandbox.get().await {
-        Err(HeyoError::NotFound(_)) => {
+    // Bounded: this confirm runs against the same per-id endpoint that can
+    // wedge on a struggling daemon — an unanswered probe means "not provably
+    // gone", which lands in the leave-it-for-the-sweep arm below.
+    match tokio::time::timeout(Duration::from_secs(5), sandbox.get()).await {
+        Ok(Err(HeyoError::NotFound(_))) => {
             let size = crate::orphans::dir_allocated_bytes(dir.clone()).await;
             match tokio::fs::remove_dir_all(&dir).await {
                 Ok(()) => info!(

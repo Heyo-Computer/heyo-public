@@ -320,7 +320,7 @@ if [ "$(get orphan.dataloss)" != 0 ]; then
     echo "      but the next client connect rebinds the schema to a fresh EMPTY VM, after"
     echo "      which the disk becomes an ordinary orphan and is swept. Spot-check before"
     echo "      acting (column 2 is the sandbox id):"
-    echo "        while IFS=\$'\\t' read -r _ id _; do curl -s -o /dev/null -w \"\$id %{http_code}\\n\" \\"
+    echo "        while IFS=\$'\\t' read -r _ id _; do curl -s -m 5 -o /dev/null -w \"\$id %{http_code}\\n\" \\"
     echo "          $HEYVMD/deployed-sandboxes/\$id; done < $OUT_DIR/orphan-DATA-LOSS.txt"
     echo "      (a 200 means the daemon still knows it — not an orphan). See"
     echo "      $OUT_DIR/orphan-DATA-LOSS.txt"

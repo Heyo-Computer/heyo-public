@@ -2328,7 +2328,13 @@ impl SchemaRegistry {
                 // is durably in S3 and the space is needed now — if the
                 // daemon confirms the id is gone, remove the leftover dir
                 // ourselves instead of waiting for a sweep pass.
-                match self.daemon_state(sandbox_id).await {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.daemon_state(sandbox_id),
+                )
+                .await
+                .unwrap_or(DaemonState::Error)
+                {
                     DaemonState::Gone => match tokio::fs::remove_dir_all(&dir).await {
                         Ok(()) => info!(
                             "schema {schema}: image-archived; the daemon left {} behind, \
@@ -2549,9 +2555,17 @@ impl SchemaRegistry {
                         "purge: probed {probed} persisted-only candidate(s),                          deleted {offloaded} so far"
                     );
                 }
-                match self.daemon_state(&rec.sandbox_id).await {
-                    DaemonState::Present { .. } => {}
-                    DaemonState::Gone | DaemonState::Error => continue,
+                // Bounded: a wedged per-id endpoint must not hang a
+                // 13k-candidate pass — an unanswered probe is treated like
+                // Error (skip this record, keep walking).
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.daemon_state(&rec.sandbox_id),
+                )
+                .await
+                {
+                    Ok(DaemonState::Present { .. }) => {}
+                    Ok(DaemonState::Gone | DaemonState::Error) | Err(_) => continue,
                 }
             }
             info!("purge: schema {schema} is {} but VM {} still exists — deleting",
