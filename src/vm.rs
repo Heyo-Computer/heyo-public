@@ -10,8 +10,9 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use deadpool_postgres::{Config as PgConfig, Pool, Runtime};
 use heyo_sdk::{
-    CommandResult, CommandRunOptions, DEFAULT_LOCAL_BASE_URL, HeyoClientOptions, HeyoError,
-    P2pTunnel, Sandbox, SandboxCreateOptions, SandboxDriver,
+    CommandResult, CommandRunOptions, DEFAULT_LOCAL_BASE_URL, HeyoClient, HeyoClientOptions,
+    HeyoError, P2pTunnel, RequestOptions, Sandbox, SandboxCreateOptions, SandboxDriver,
+    SandboxInfo,
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::time::sleep;
@@ -347,19 +348,23 @@ async fn wait_ready_within(
     }
 }
 
-/// `Sandbox::list` against the local daemon with bounded retries on transient
-/// failures. A momentarily unreachable or 5xx-ing daemon (deploy bursts make
-/// this the norm, not the exception) shouldn't instantly fail a bring-up or a
-/// cleanup that merely needed the inventory.
-pub(crate) async fn list_with_retry() -> Result<Vec<heyo_sdk::SandboxInfo>, HeyoError> {
+/// Run a daemon call with bounded retries on transient failures. A momentarily
+/// unreachable or 5xx-ing daemon (deploy bursts make this the norm, not the
+/// exception) shouldn't instantly fail a bring-up or a cleanup that merely
+/// needed an answer.
+async fn with_daemon_retry<T, F, Fut>(what: &str, mut call: F) -> Result<T, HeyoError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, HeyoError>>,
+{
     const ATTEMPTS: u32 = 4;
     let mut delay = Duration::from_millis(500);
     for attempt in 1..=ATTEMPTS {
-        match Sandbox::list(local_opts()).await {
-            Ok(list) => return Ok(list),
+        match call().await {
+            Ok(v) => return Ok(v),
             Err(e) if attempt < ATTEMPTS && transient(&e) => {
                 warn!(
-                    "listing sandboxes failed (attempt {attempt}/{ATTEMPTS}, \
+                    "{what} failed (attempt {attempt}/{ATTEMPTS}, \
                      retrying in {delay:?}): {e:#}"
                 );
                 sleep(delay).await;
@@ -369,6 +374,42 @@ pub(crate) async fn list_with_retry() -> Result<Vec<heyo_sdk::SandboxInfo>, Heyo
         }
     }
     unreachable!("loop returns on the last attempt")
+}
+
+/// `Sandbox::list` against the local daemon with bounded retries on transient
+/// failures. Every successful listing warms the name→id cache for free.
+pub(crate) async fn list_with_retry() -> Result<Vec<SandboxInfo>, HeyoError> {
+    let list = with_daemon_retry("listing sandboxes", || Sandbox::list(local_opts())).await?;
+    crate::inventory::absorb(&list);
+    Ok(list)
+}
+
+/// Resolve one sandbox by exact name via `GET /deployed-sandboxes?name=`,
+/// with the same transient-retry policy as [`list_with_retry`].
+///
+/// A daemon that understands the filter (heyvmd ≥0.44) answers with at most
+/// one entry — O(1) instead of the O(fleet) inventory pull this call replaces.
+/// An *old* daemon ignores the query and returns the full list; the exact
+/// match is selected client-side either way (correct against both), and
+/// whatever came back is absorbed into the cache — an old daemon's full list
+/// warms it for free. Raw `HeyoClient::request` rather than an SDK method
+/// because the pinned heyo-sdk 0.1.5 predates `Sandbox::find_by_name`
+/// (precedent: the dashboard's inactive-page listing).
+pub(crate) async fn find_by_name_with_retry(name: &str) -> Result<Option<SandboxInfo>, HeyoError> {
+    let client = HeyoClient::new(local_opts())?;
+    let response = with_daemon_retry("by-name sandbox lookup", || {
+        let mut opts = RequestOptions::default();
+        opts.query.push(("name".to_string(), name.to_string()));
+        client.request::<Vec<SandboxInfo>>(
+            reqwest::Method::GET,
+            "/deployed-sandboxes",
+            None::<&()>,
+            opts,
+        )
+    })
+    .await?;
+    crate::inventory::absorb(&response);
+    Ok(response.into_iter().find(|s| s.name == name))
 }
 
 /// Errors worth retrying: transport failures (the SDK mints status 0 for those)
@@ -2114,16 +2155,29 @@ pub(crate) async fn resolve_sandbox(
         }
     }
 
-    // 2. Fall back to find-by-name (first connect on a fresh pooler, or the
-    //    known id was deleted).
-    if let Some(info) = list_with_retry()
+    // 2. Fall back to by-name resolution (first connect on a fresh pooler, or
+    //    the known id was deleted). The positive-only cache answers repeat
+    //    lookups without any daemon traffic; a hit is verified by id (a stale
+    //    entry evicts itself), and a miss goes to the authoritative `?name=`
+    //    daemon lookup — never the O(fleet) inventory pull this used to be,
+    //    and never straight to create.
+    if let Some(id) = crate::inventory::lookup(name) {
+        match bring_up_existing(cfg, name, &id).await? {
+            Some(sb) => return Ok((sb, false)),
+            None => {
+                crate::inventory::remove_id(&id);
+                info!("cached VM {name} ({id}) is gone; asking the daemon by name");
+            }
+        }
+    }
+    if let Some(info) = find_by_name_with_retry(name)
         .await
-        .context("listing sandboxes")?
-        .into_iter()
-        .find(|s| s.name == name)
+        .context("by-name sandbox lookup")?
     {
-        if let Some(sb) = bring_up_existing(cfg, name, &info.id).await? {
-            return Ok((sb, false));
+        crate::inventory::insert(name, &info.id);
+        match bring_up_existing(cfg, name, &info.id).await? {
+            Some(sb) => return Ok((sb, false)),
+            None => crate::inventory::remove_id(&info.id),
         }
     }
 
@@ -2220,10 +2274,12 @@ pub(crate) async fn stop_after_failed_bringup(schema: &str, known_id: Option<&st
     }
     if ids.is_empty() {
         let name = format!("pg-{schema}");
-        match list_with_retry().await {
-            Ok(list) => ids.extend(list.into_iter().filter(|i| i.name == name).map(|i| i.id)),
+        match find_by_name_with_retry(&name).await {
+            Ok(found) => ids.extend(found.map(|i| i.id)),
             Err(e) => {
-                warn!("schema {schema}: cannot list sandboxes to stop a leaked bring-up: {e:#}");
+                warn!(
+                    "schema {schema}: cannot resolve {name} to stop a leaked bring-up: {e:#}"
+                );
                 return;
             }
         }
@@ -2309,6 +2365,7 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
     wait_ready(&sb, cfg.ready_timeout, name)
         .await
         .with_context(|| format!("waiting for VM {name}"))?;
+    crate::inventory::insert(name, id);
     Ok(Some(sb))
 }
 
@@ -2371,6 +2428,7 @@ async fn create_vm_within(
     if let Some(schema) = name.strip_prefix("pg-") {
         crate::pending::record(schema, sandbox.sandbox_id()).await;
     }
+    crate::inventory::insert(name, sandbox.sandbox_id());
     if let Err(e) = wait_ready(&sandbox, ready_timeout, name).await {
         // Kill the half-built VM now, by the id in hand — no listing, which is
         // exactly what's unreachable when bring-ups fail en masse. It never
@@ -2383,6 +2441,7 @@ async fn create_vm_within(
                     "{name}: deleted half-provisioned VM {} after failed bring-up",
                     sandbox.sandbox_id()
                 );
+                crate::inventory::remove_id(sandbox.sandbox_id());
                 if let Some(schema) = name.strip_prefix("pg-") {
                     crate::pending::clear(schema).await;
                 }

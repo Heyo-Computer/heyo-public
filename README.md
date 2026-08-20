@@ -935,9 +935,31 @@ cargo test --release loadtest -- --ignored --nocapture --test-threads=1
   store. The two curves separate the find-by-name path from the reattach path.
 - `cold_start_cost_versus_concurrency` is the control: fixed fleet, varying
   arrival rate.
-- `one_cold_start_must_not_cost_the_whole_inventory` is the acceptance
-  criterion for keeping the cold path O(1) in fleet size. It is `#[ignore]`d
-  because it fails today.
+- `one_cold_start_must_not_cost_the_whole_inventory` is the regression guard
+  for keeping the cold path O(1) in fleet size. It runs in the normal suite
+  (it was the acceptance criterion for the by-name work below, and holds now).
 
 The harness's own self-checks (that the stub really is the daemon the pooler
 talks to, and that the counters count) run in the normal suite.
+
+### The by-name cold path and the inventory cache
+
+Resolving a schema the pooler has never served used to pull the ENTIRE
+`GET /deployed-sandboxes` inventory just to find its VM by name — ~1MB per
+cold start at a fleet of 5000, serialized behind a busy daemon (the measured
+production shape: p95 ≈ 25s at 32 concurrent bring-ups). Two pieces replaced
+that:
+
+- **By-name daemon lookup** (`vm::find_by_name_with_retry`): the cold path
+  asks `GET /deployed-sandboxes?name=<exact>` — a current heyvmd answers off
+  its name index with at most one entry. An old daemon ignores the query and
+  returns the full list; the exact match is picked client-side either way, so
+  no version negotiation is needed and either side can ship first.
+- **Positive-only name→id cache** (`src/inventory.rs`): warmed by every
+  listing the pooler pays for anywhere and written through on create/claim/
+  kill. A hit skips daemon traffic entirely (verified by id — stale entries
+  self-evict); a *miss* always goes to the authoritative by-name lookup before
+  any create, because heyvmd does not enforce name uniqueness and a duplicate
+  VM would mean a fresh empty data disk under a schema that has data. If the
+  daemon is unreachable the bring-up fails, as it always has — it never
+  creates blind.

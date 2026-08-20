@@ -12,6 +12,7 @@ mod dedicated;
 mod dumpsrv;
 mod events;
 mod imgarchive;
+mod inventory;
 /// Cold-start load harness. Test-only: it aims the whole pooler at an
 /// in-process daemon stub, which is not something a running pooler should be
 /// able to do by accident.

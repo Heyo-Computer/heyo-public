@@ -202,6 +202,9 @@ impl SparePool {
             // create *after* that failure rather than instead of it.
             match sb.get().await {
                 Ok(info) if info.status == SandboxStatus::Running => {
+                    // Id in hand — record it under whatever name the daemon
+                    // reports (still its spare name until the registry binds).
+                    crate::inventory::insert(&info.name, &info.id);
                     self.poke.notify_one();
                     return Some(sb);
                 }

@@ -2073,6 +2073,7 @@ impl SchemaRegistry {
                 return;
             }
         };
+        crate::inventory::absorb(&infos);
         let live_ids: HashSet<String> = infos.iter().map(|s| s.id.clone()).collect();
         let bound: HashSet<String> = self
             .store_records()
@@ -2905,6 +2906,7 @@ async fn kill_by_id(id: &str) -> Result<()> {
     let sb = heyo_sdk::Sandbox::connect(id.to_string(), vm::local_opts())
         .context("connecting to sandbox")?;
     sb.kill().await.context("killing sandbox")?;
+    crate::inventory::remove_id(id);
     Ok(())
 }
 

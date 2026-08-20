@@ -3,11 +3,17 @@
 Cross-repo work: `pg-fc` (this repo) and the heyo monorepo (`mvm-ctrl` = heyvmd daemon,
 `sdk-rs` = heyo-sdk source, 0.1.6 in-tree; pg-fc pins published 0.1.5).
 
-> **HANDOFF STATE (2026-08-19).** Phase 1 is DONE, Phase 2a was just starting.
-> Phase 1 lives as **uncommitted changes in the heyo repo** — commit/push them before
-> switching machines or redo them from the spec below:
-> `mvm-ctrl/src/{persistence,sandbox,api}.rs` modified, `mvm-ctrl/tests/by_name_lookup_test.rs` new,
-> `mvm-ctrl/Cargo.lock` incidentally touched. pg-fc is clean (harness et al. committed at `def4d61`).
+> **HANDOFF STATE (2026-08-19, later).** ALL PHASES IMPLEMENTED. Phase 1 is
+> committed in heyo (`729d8993` "wip"); phases 2a/2b/3 live as **uncommitted
+> changes in the heyo repo** (`mvm-ctrl/src/{api,cli,persistence,sandbox}.rs`,
+> `mvm-ctrl/src/driver/firecracker.rs`, `mvm-ctrl/src/linux_vm_image.rs`,
+> `sdk-rs/src/sandbox.rs`, `sdk-rs/tests/find_by_name_stub.rs` new — the other
+> sdk-rs diffs are unrelated pre-existing UDS work). Phases 4/5 are uncommitted
+> in pg-fc (`src/inventory.rs` new, `src/{main,vm,registry,spares,loadtest}.rs`,
+> `README.md`). The acceptance test is un-ignored and GREEN; all suites pass
+> (note: heyo's `tests/checkpoint_fork_e2e_test.rs` has a pre-existing broken
+> import unrelated to this work). Remaining: commit both repos, run the
+> end-state verification against a real daemon (section below).
 
 ## Why
 
@@ -79,7 +85,23 @@ What was implemented (all tests pass: `cargo test --lib persistence::` = 7,
 - Two `unused import` warnings in mvm-ctrl (`validate_virtual_network_name`, `VirtualNetworkMode`)
   pre-exist this work.
 
-## Phase 2a — heyvmd spawn_blocking wraps — ⏸ IN PROGRESS (nothing written yet)
+## Phase 2a — heyvmd spawn_blocking wraps — ✅ DONE (uncommitted in heyo)
+
+Implemented as specced, with these deltas: the call-site catalog undercounted —
+~70 `self.persistence.*` sites converted (mechanical `X(...)` → `X_async(...).await`),
+plus two bare `persistence.*` sites inside spawned tasks and three multi-line
+chains the regex missed. Three sync fns had to become `async`
+(`get_persisted_sandbox`, `set_show_display`, `set_macos_guest_user`) with all
+callers updated including cli.rs (`.await` only; one sync-closure restructure at
+the Windows `local_windows_sandbox` binding, one in api.rs's `or_else`).
+`effective_exec_env` also became async (Windows-only load inside). firecracker.rs:
+`FirecrackerVirtualNetwork::configured_for(id)` async constructor wraps
+config+allocation (the O(fleet) `used_firecracker_virtual_subnets` scan) in
+spawn_blocking, used at both create paths and `republish_port_forwarding`;
+`persist_virtual_network_allocation` is async spawn_blocking. linux_vm_image.rs
+tar → `tokio::process`. `PersistenceManager::at` is now `pub(crate)` (tests).
+
+Original spec follows:
 
 Next concrete step: add async wrappers on `PersistenceManager` (it's already
 `Arc<PersistenceManager>` on `SandboxManager.persistence`), then convert sandbox.rs call sites.
@@ -111,7 +133,25 @@ Also in 2a:
 - `mvm-ctrl/src/linux_vm_image.rs:187`: GB-scale `tar -xzf` via `std::process::Command` →
   `tokio::process::Command`.
 
-## Phase 2b — heyvmd handles-map restructure — ⬜ PENDING
+## Phase 2b — heyvmd handles-map restructure — ✅ DONE (uncommitted in heyo)
+
+Implemented as specced: `type HandleCell = Arc<tokio::sync::Mutex<Box<dyn VmHandle>>>`
++ `handle_cell()` wrapper at the ~30 insert sites; every get/get_mut/remove site
+converted to brief-guard→clone-Arc→drop-guard→lock-cell (macOS/Windows cfg'd fns
+converted blind — they don't compile on Linux, review on those targets).
+Notables: the execute/export/shell "remove handle, work, re-insert" dances are
+gone (handle stays in the map, mutex serializes); `snapshot_sandbox_infos`
+probes via `timeout(LIST_STATUS_PROBE_TIMEOUT, lock+is_running)` per VM with the
+map guard dropped, timeout → running:true; `start_sandbox`'s stale-handle removal
+re-checks `Arc::ptr_eq` before removing; iteration/collect sites (SDN hosts
+sync, sibling hosts, `usage_sampling_targets`) use `try_lock` and skip busy
+handles (same observable behavior as the old remove-during-exec window);
+apple_virt republish hooks use `try_lock` and skip when busy. Tests (in
+sandbox.rs `mod tests`, manual struct-literal manager + `StubHandle`):
+`wedged_handle_probe_timeout_does_not_delay_listing`,
+`busy_handle_does_not_block_map_writers_or_listers` — both green.
+
+Original spec follows:
 
 `VmHandle` has `&mut self` methods (start/stop/execute — driver/driver.rs:379+), so
 `Arc<dyn VmHandle>` does NOT compile. Target shape:
@@ -132,7 +172,17 @@ handles: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<Box<dyn VmHandle>>>>>
 - Tests: concurrent list + start/stop no deadlock; one wedged handle's probe timeout doesn't delay
   the rest of a listing.
 
-## Phase 3 — sdk-rs 0.1.6 — ⬜ PENDING
+## Phase 3 — sdk-rs (now 0.1.7 in-tree) — ✅ DONE (uncommitted in heyo)
+
+Implemented: `info()` delegates to `get()` (behavior change documented in its
+doc comment — no changelog file exists in sdk-rs); `find_by_name` +
+`find_by_name_with_client` (matching the tree's new `*_with_client` pattern
+from the unrelated in-flight UDS work). `tests/find_by_name_stub.rs` runs a raw
+tokio-TCP HTTP stub in two modes (honors `?name=` / ignores it) plus asserts
+`info()` hits only the per-id route — 3 tests, green. In-tree version is 0.1.7
+(bumped by the unrelated UDS work), so "0.1.6" below reads as "next publish".
+
+Original spec follows:
 
 `sdk-rs/src/sandbox.rs`: `info()` (:162 — currently full list + client-side filter!) delegates to
 `get()` (per-id GET; `wait_for_ready` inherits the fix — it polls `info()` per tick). Add
@@ -141,7 +191,15 @@ GET `/deployed-sandboxes` with query `[("name", name)]` + client-side `.find()` 
 old daemons). Tests: stub that honors the filter + stub that ignores it. Changelog: `info()` now
 returns persisted metadata for stopped sandboxes where it previously NotFound'd.
 
-## Phase 4 — pg-fc inventory cache + by-name resolve — ⬜ PENDING
+## Phase 4 — pg-fc inventory cache + by-name resolve — ✅ DONE (uncommitted in pg-fc)
+
+Implemented as specced (all bullets). Deltas: the shared retry helper is
+`with_daemon_retry(what, FnMut() -> Future)`; `resolve_sandbox`'s cached-hit
+`bring_up_existing` errors propagate (matches old step-2 semantics);
+found-then-gone also evicts. `spares::take` inserts under `info.name` at claim.
+README gained "The by-name cold path and the inventory cache" section.
+
+Original spec follows:
 
 - New `src/inventory.rs` (pending.rs idiom — `OnceLock` + std `Mutex`, await-free sections):
   `lookup(name) -> Option<String>`, `insert(name, id)`, `remove_id(id)` (retain-based),
@@ -166,7 +224,7 @@ returns persisted metadata for stopped sandboxes where it previously NotFound'd.
 - `src/spares.rs`: replenisher absorbs via list_with_retry already; insert at claim where id in hand.
 - README: document cache + by-name in the cold-start section.
 
-## Phase 5 — pg-fc loadtest — ⬜ PENDING
+## Phase 5 — pg-fc loadtest — ✅ DONE (uncommitted in pg-fc)
 
 `src/loadtest.rs`:
 - Stub `Daemon`: add `supports_name_filter: StdMutex<bool>` (default true). `list` handler (:167):
@@ -181,6 +239,12 @@ returns persisted metadata for stopped sandboxes where it previously NotFound'd.
   `old_daemon_full_list_fallback_still_resolves` (+ second resolve hits cache → no second list).
 - Re-run sweeps, record before/after (before, committed at def4d61: new-schema p50 61ms/1.0MB/op
   at fleet 5000 vs known-schema 1ms/213B flat; serialized-daemon model p95 25s at conc 32).
+
+  **AFTER (2026-08-19, this implementation):** new-schema p50 2ms / 249B/op, FLAT from fleet 0
+  to 5000 (calls/op 3.0: one `?name` lookup, one deploy, one by-id get); known-schema 1ms/213B
+  flat, unchanged. The serialized-daemon model (800ms/listing, one at a time) collapses from
+  p95 25s to **p95 15ms at conc 32** — the cold path never touches the full listing, so the
+  modeled listing delay never fires. Acceptance test un-ignored and green.
 
 ## Verification (end state)
 

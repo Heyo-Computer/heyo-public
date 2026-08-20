@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Path as AxPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -135,6 +135,10 @@ struct Daemon {
     /// blocking VM work.
     list_serial: StdMutex<bool>,
     list_gate: tokio::sync::Mutex<()>,
+    /// Whether the stub honors `GET /deployed-sandboxes?name=` (a current
+    /// heyvmd) or ignores the query and serves the full inventory (an old
+    /// one). Default true; flip off to model the fallback.
+    supports_name_filter: StdMutex<bool>,
 }
 
 impl Daemon {
@@ -165,7 +169,29 @@ fn seed_schema(i: usize) -> String {
     format!("seed-{i:06}")
 }
 
-async fn list(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+async fn list(
+    State(d): State<Arc<Daemon>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    // A current heyvmd answers `?name=` with the one exact match (or an empty
+    // array) straight off its name index — no fleet scan, no listing delay.
+    // An old daemon's handler took only `State`, so with the filter off the
+    // param is ignored and the full inventory goes over the wire.
+    if *d.supports_name_filter.lock().unwrap()
+        && let Some(name) = params.get("name")
+    {
+        let found: Vec<serde_json::Value> = d
+            .vms
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|vm| &vm.name == name)
+            .map(Vm::view)
+            .collect();
+        let body = serde_json::to_string(&found).unwrap();
+        d.metrics.hit("GET /deployed-sandboxes?name", body.len());
+        return ([("content-type", "application/json")], body);
+    }
     let all: Vec<serde_json::Value> = d.vms.lock().unwrap().values().map(Vm::view).collect();
     let body = serde_json::to_string(&all).unwrap();
     d.metrics.hit("GET /deployed-sandboxes", body.len());
@@ -272,6 +298,7 @@ fn daemon() -> &'static Arc<Daemon> {
             list_delay: StdMutex::new(Duration::ZERO),
             list_serial: StdMutex::new(false),
             list_gate: tokio::sync::Mutex::const_new(()),
+            supports_name_filter: StdMutex::new(true),
         });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding daemon stub");
         listener.set_nonblocking(true).unwrap();
@@ -364,6 +391,11 @@ fn config_for(fleet: usize, warm_spares: usize) -> Config {
     set("PG_VM_POOL_WARM_SPARES", &warm_spares.to_string());
 
     crate::pending::init(dir.join("pending.tsv"));
+    // Process-wide state the cells would otherwise leak into each other: the
+    // name→id cache warms as a side effect of every resolve, and the stub's
+    // filter support is a per-cell scenario knob.
+    crate::inventory::reset();
+    *daemon().supports_name_filter.lock().unwrap() = true;
     Config::from_env().expect("building the harness config")
 }
 
@@ -640,12 +672,12 @@ async fn cold_start_behind_a_realistic_daemon() {
 /// for. It is invisible in a CPU graph because the pooler spends the time
 /// waiting on the daemon to serialize a list it then throws away.
 ///
-/// Ignored because it fails today by design — it is the acceptance criterion
-/// for removing the listing from the cold path (resolve by name via a by-name
-/// daemon lookup, or trust the store's binding), not a claim about current
-/// behavior.
+/// This was the acceptance criterion for removing the listing from the cold
+/// path, and it holds now: a new schema resolves through the name→id cache
+/// and the daemon's `?name=` lookup (`vm::find_by_name_with_retry`), so the
+/// bytes one bring-up pulls are flat in fleet size. Runs in the normal suite
+/// as the regression guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "acceptance criterion for removing find-by-name from the cold path"]
 async fn one_cold_start_must_not_cost_the_whole_inventory() {
     let _exclusive = exclusive().await;
     let small = resolve_cell("guard/small", 100, 1, Ask::New, Listing::Instant).await;
@@ -661,6 +693,120 @@ async fn one_cold_start_must_not_cost_the_whole_inventory() {
          bring-up cost scales with inventory",
         human(large.bytes_per_op),
         human(small.bytes_per_op),
+    );
+}
+
+/// The fixed cold path itself: resolving a schema whose VM exists on the
+/// daemon but is unknown to the pooler (fresh cache, no registry row) must
+/// cost one `?name=` lookup — not an inventory pull, and above all not a
+/// deploy (a duplicate VM with an empty data disk is the data-loss case the
+/// authoritative lookup exists to prevent).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn by_name_lookup_finds_without_pulling_inventory() {
+    let _exclusive = exclusive().await;
+    let cfg = config_for(500, 0);
+    daemon().seed(500);
+    daemon().metrics.reset();
+
+    let name = format!("pg-{}", seed_schema(42));
+    let (sb, from_spare) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None)
+        .await
+        .expect("resolving a daemon-known schema");
+    assert_eq!(sb.sandbox_id(), seed_id(42));
+    assert!(!from_spare);
+
+    let calls = daemon().metrics.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.get("GET /deployed-sandboxes").copied().unwrap_or(0),
+        0,
+        "the cold path must not pull the inventory: {calls:?}"
+    );
+    assert_eq!(
+        calls.get("GET /deployed-sandboxes?name").copied().unwrap_or(0),
+        1,
+        "exactly one by-name lookup: {calls:?}"
+    );
+    assert_eq!(
+        calls.get("POST /sandbox-deploy").copied().unwrap_or(0),
+        0,
+        "an existing VM must be reattached, never recreated: {calls:?}"
+    );
+}
+
+/// The duplicate-VM guard behind the positive-only cache design: a VM the
+/// daemon knows about but the cache doesn't (pooler restarted, cache cold, no
+/// registry row) must be found by the authoritative by-name call and
+/// reattached — a cache miss is never treated as "doesn't exist".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn existing_vm_absent_from_cache_is_reattached_not_recreated() {
+    let _exclusive = exclusive().await;
+    let cfg = config_for(50, 0);
+    daemon().seed(50);
+
+    // Warm the cache with one resolve, then wipe it — the "restarted pooler"
+    // state, with the VM still very much alive daemon-side.
+    let name = format!("pg-{}", seed_schema(7));
+    crate::vm::resolve_sandbox(&cfg, &name, false, None, None)
+        .await
+        .expect("first resolve");
+    crate::inventory::reset();
+    daemon().metrics.reset();
+
+    let (sb, _) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None)
+        .await
+        .expect("resolving after a cache wipe");
+    assert_eq!(sb.sandbox_id(), seed_id(7), "the same VM, not a duplicate");
+
+    let calls = daemon().metrics.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.get("POST /sandbox-deploy").copied().unwrap_or(0),
+        0,
+        "a cache miss must go to the daemon, never straight to create: {calls:?}"
+    );
+    assert_eq!(
+        calls.get("GET /deployed-sandboxes?name").copied().unwrap_or(0),
+        1,
+        "the authoritative by-name lookup answers the miss: {calls:?}"
+    );
+}
+
+/// Version skew: an old daemon ignores `?name=` and serves the full
+/// inventory. Resolution must still land on the exact match (client-side
+/// filter), the full list must warm the cache for free, and a second resolve
+/// must be answered from the cache without another listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_daemon_full_list_fallback_still_resolves() {
+    let _exclusive = exclusive().await;
+    let cfg = config_for(100, 0);
+    daemon().seed(100);
+    *daemon().supports_name_filter.lock().unwrap() = false;
+    daemon().metrics.reset();
+
+    let name = format!("pg-{}", seed_schema(3));
+    let (sb, _) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None)
+        .await
+        .expect("resolving against an old daemon");
+    assert_eq!(sb.sandbox_id(), seed_id(3));
+
+    let full_lists = |calls: &BTreeMap<&'static str, u64>| {
+        calls.get("GET /deployed-sandboxes").copied().unwrap_or(0)
+    };
+    let calls = daemon().metrics.calls.lock().unwrap().clone();
+    assert_eq!(full_lists(&calls), 1, "old daemon: one full-list fallback: {calls:?}");
+    assert_eq!(calls.get("POST /sandbox-deploy").copied().unwrap_or(0), 0);
+
+    // The absorbed full list covers every seeded name — the next cold resolve
+    // is a cache hit and never lists.
+    let other = format!("pg-{}", seed_schema(90));
+    let (sb, _) = crate::vm::resolve_sandbox(&cfg, &other, false, None, None)
+        .await
+        .expect("second resolve");
+    assert_eq!(sb.sandbox_id(), seed_id(90));
+    let calls = daemon().metrics.calls.lock().unwrap().clone();
+    assert_eq!(
+        full_lists(&calls),
+        1,
+        "the second resolve must be served from the warmed cache: {calls:?}"
     );
 }
 
