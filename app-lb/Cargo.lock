@@ -1702,9 +1702,9 @@ dependencies = [
 
 [[package]]
 name = "heyo-sdk"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04a11061522ef1b56cc9b06753cd035c995962696d2887f4a4f0eb76e0b3d054"
+checksum = "60ea004311300fe8cb88448b8943346887cb68af1334188b6d22ce959cdd5b10"
 dependencies = [
  "anyhow",
  "async-stream",

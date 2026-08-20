@@ -1372,9 +1372,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "heyo-sdk"
-version = "0.1.6"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "301ae743934cbdbda13dd5f0399d6ec03572c57e91dc7b9a65c63afc6a3f82ac"
+checksum = "60ea004311300fe8cb88448b8943346887cb68af1334188b6d22ce959cdd5b10"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1384,6 +1384,9 @@ dependencies = [
  "flate2",
  "futures-util",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "iroh",
  "iroh-tickets",
  "reqwest 0.12.28",
@@ -1392,6 +1395,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
+ "tower-service",
  "url",
 ]
 

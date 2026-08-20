@@ -14,7 +14,7 @@ default-run = "ci"
 # from a workspace root, and it requires embedders to intercept a `kvm-run <id>`
 # re-exec in argv before their own arg parser runs. The SDK is the supported
 # surface; where it is missing a route we call the daemon through its client.
-heyo-sdk = "0.1.6"
+heyo-sdk = "0.1.8"
 
 # JetStream. Pinned to the version heyvm itself links (mvm-ctrl/Cargo.toml) so a
 # future decision to share a stream is a routing change, not a version upgrade.
