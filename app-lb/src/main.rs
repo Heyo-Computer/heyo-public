@@ -552,7 +552,13 @@ fn main() {
         );
     }
 
-    let vms = VmManager::new(cfg.daemon_url.clone(), daemon_api_key, mount_store.clone());
+    let vms = VmManager::new(cfg.daemon_url.clone(), daemon_api_key, mount_store.clone())
+        .unwrap_or_else(|e| panic!("cannot build the heyvm daemon client: {e}"));
+    // Which transport won: a unix socket when the daemon published a live one,
+    // else loopback TCP. Worth a line because nothing else reveals it — a
+    // socket client reports `http://localhost` as its base URL, and the choice
+    // is made from the environment rather than from app-lb's own config.
+    tracing::info!(transport = %vms.transport(), "heyvm daemon transport");
     // Kept for the sweeper, which is built after the last move of `registry`.
     let mount_registry = registry.clone();
 

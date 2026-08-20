@@ -2704,7 +2704,8 @@ mod tests {
                     Some("http://127.0.0.1:1".into()),
                     None,
                     crate::mounts::MountStore::new(root.join("mounts"), 0),
-                ),
+                )
+                .unwrap(),
                 Arc::new(Registry::new(
                     root.join("state.json").to_str().unwrap(),
                 )),

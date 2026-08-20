@@ -35,7 +35,9 @@ unroutable, so the driver is rejected at registration.
 ## Requirements
 
 - Linux with KVM (`/dev/kvm`)
-- A running `heyvmd` daemon (default `http://127.0.0.1:34099`)
+- A running `heyvmd` daemon. With no `APP_LB_DAEMON_URL` set, app-lb prefers a
+  unix socket when the daemon publishes a live one (`heyvmd --socket`), and
+  otherwise uses `http://127.0.0.1:34099`
 - `cmake` — a hard build dependency of `pingora-core`, via `flate2`'s `zlib-ng` backend
 
 ## Run
@@ -61,7 +63,7 @@ Configuration is environment-only:
 | `APP_LB_AUTH_KEY` | `app-lb-auth-key` | Signing key for sign-in sessions; generated `0600` on first use |
 | `APP_LB_GUARD_PATH` | `app-lb-guard.json` | Where [block rules](#response-actions) persist, so a restart does not unblock an attacker |
 | `APP_LB_NAME` | `app-lb` | Display name in the dashboard header and page title |
-| `APP_LB_DAEMON_URL` | `http://127.0.0.1:34099` | heyvm daemon |
+| `APP_LB_DAEMON_URL` | *(auto: unix socket, else `http://127.0.0.1:34099`)* | heyvm daemon. Left unset, app-lb takes a unix socket when one is discoverable and alive — `HEYVM_SOCKET`, then `socket_path` in `~/.heyo/daemon.json` — and falls back to loopback TCP. Set this to name a non-default or remote daemon: an explicit address is always honoured as given, never traded for a local socket. The transport actually chosen is logged at startup |
 | `APP_LB_DAEMON_API_KEY` | `HEYO_API_KEY` | Bearer credential for an authenticated heyvm daemon; use the HeyoSecret-backed host internal API key in deployments |
 | `APP_LB_DASHBOARD_PASSWORD` | *(unset)* | Set to gate the dashboard behind HTTP Basic Auth |
 | `APP_LB_DASHBOARD_USER` | `admin` | Basic Auth username (only used when a password is set) |

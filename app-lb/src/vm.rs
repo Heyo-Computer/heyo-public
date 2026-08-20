@@ -296,13 +296,25 @@ fn render_guest_log(logs: &[GuestLogLine], lines: usize) -> String {
     out
 }
 
+/// How long a daemon call may take before it is abandoned. Unchanged from the
+/// TCP-only client this replaced; a socket is faster, not more patient.
+const DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Talks to the heyvm daemon.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VmManager {
-    opts: HeyoClientOptions,
-    /// For the daemon routes the SDK does not wrap. Cloning a `reqwest::Client`
-    /// clones a handle, so this rides along with `VmManager` for free.
-    http: reqwest::Client,
+    /// The daemon transport, built once and shared by every call here.
+    ///
+    /// One client rather than an options struct each call site rebuilds: a unix
+    /// socket cannot be described by [`HeyoClientOptions`] — it has a URL and a
+    /// socket has a path — so a client built by `local_auto_with` has to be
+    /// passed through. Sharing it is also what makes the bearer uniform: the
+    /// routes the SDK does not wrap used to carry their own copy of the key,
+    /// which is a 401 on the diagnostics the moment the two drift apart.
+    client: HeyoClient,
+    /// What `client` ended up dialing, for the startup log. `base_url` cannot
+    /// answer it — a socket client reports `http://localhost`.
+    transport: String,
     /// Where a guest mount's tree lives on this host. Held here rather than
     /// passed in by the autoscaler so that a mount that has not been pulled
     /// fails the *create*, and therefore travels the create-failure path that
@@ -310,35 +322,62 @@ pub struct VmManager {
     mounts: MountStore,
 }
 
+/// `HeyoClient` is not `Debug`, and which daemon was reached is the half of
+/// this struct worth printing anyway.
+impl std::fmt::Debug for VmManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmManager")
+            .field("transport", &self.transport)
+            .field("mounts", &self.mounts)
+            .finish()
+    }
+}
+
 impl VmManager {
-    /// Targets the local daemon (`http://127.0.0.1:34099` by default), which is
-    /// the only place `guest_ip` is available.
-    pub fn new(daemon_url: Option<String>, api_key: Option<String>, mounts: MountStore) -> Self {
-        Self {
-            opts: HeyoClientOptions {
-                base_url: Some(
-                    daemon_url.unwrap_or_else(|| heyo_sdk::DEFAULT_LOCAL_BASE_URL.to_string()),
-                ),
-                api_key,
-                timeout: Some(Duration::from_secs(30)),
-            },
-            http: reqwest::Client::builder()
-                .timeout(GUEST_LOG_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+    /// Targets the local daemon, which is the only place `guest_ip` is
+    /// available.
+    ///
+    /// With no `daemon_url`, prefers a unix socket: `HEYVM_SOCKET`, then
+    /// `socket_path` from `~/.heyo/daemon.json`, each connect-verified before
+    /// it is trusted — the daemon only clears that field on a graceful
+    /// shutdown, so a crash leaves a path pointing at nothing. Falling back to
+    /// `http://127.0.0.1:34099` costs nothing, because socket mode is additive
+    /// on the daemon side: the TCP listener is there either way.
+    ///
+    /// An explicit `daemon_url` is an instruction, not a hint, and is honoured
+    /// as given. It is how a non-default or remote daemon is named, and a
+    /// local socket silently winning over it would quietly talk to the wrong
+    /// machine.
+    pub fn new(
+        daemon_url: Option<String>,
+        api_key: Option<String>,
+        mounts: MountStore,
+    ) -> Result<Self, VmError> {
+        let explicit = daemon_url.is_some();
+        let opts = HeyoClientOptions {
+            base_url: daemon_url,
+            api_key,
+            timeout: Some(DAEMON_TIMEOUT),
+        };
+        let client = if explicit {
+            HeyoClient::new(opts)?
+        } else {
+            HeyoClient::local_auto_with(opts)?
+        };
+        let transport = match client.socket_path() {
+            Some(path) => format!("unix:{}", path.display()),
+            None => client.base_url().to_string(),
+        };
+        Ok(Self {
+            client,
+            transport,
             mounts,
-        }
+        })
     }
 
-    /// Build a request for daemon routes not covered by the SDK. Keep this in
-    /// step with `opts.api_key`: otherwise lifecycle calls authenticate while
-    /// their failure diagnostics quietly receive 401.
-    fn daemon_get(&self, url: &str) -> reqwest::RequestBuilder {
-        let request = self.http.get(url);
-        match self.opts.api_key.as_deref() {
-            Some(api_key) => request.bearer_auth(api_key),
-            None => request,
-        }
+    /// Which daemon endpoint this manager reached — a socket path or a URL.
+    pub fn transport(&self) -> &str {
+        &self.transport
     }
 
     /// The tail of what a guest itself printed, as the daemon captured it.
@@ -347,7 +386,8 @@ impl VmManager {
     /// command, piping the workload's `/var/log/heyvm-start.log` and
     /// `heyvm-start.err.log` into a per-sandbox ring buffer it serves at
     /// `GET /sandboxes/:id/logs`. `heyo_sdk` wraps exec, shell and the lifecycle
-    /// but not that route, so this is a direct call at the daemon.
+    /// but not that route, so this goes through the client's raw request helper
+    /// — same transport and same bearer as everything else here.
     ///
     /// **Best-effort by construction**: an unreachable daemon, a guest with no
     /// `socat` or `/dev/vsock` to run the forwarders, a response shape we do not
@@ -365,10 +405,20 @@ impl VmManager {
         if !crate::disks::valid_sandbox_id(sandbox_id) {
             return None;
         }
-        let base = self.opts.base_url.as_deref()?.trim_end_matches('/');
-        let url = format!("{base}/sandboxes/{sandbox_id}/logs?limit={lines}");
+        let response = self
+            .client
+            .raw_request(
+                http::Method::GET,
+                &format!("/sandboxes/{sandbox_id}/logs"),
+                None::<&serde_json::Value>,
+                RequestOptions {
+                    timeout: Some(GUEST_LOG_TIMEOUT),
+                    query: vec![("limit".to_string(), lines.to_string())],
+                },
+            )
+            .await;
 
-        let body: GuestLogs = match self.daemon_get(&url).send().await {
+        let body: GuestLogs = match response {
             Ok(r) if r.status().is_success() => r.json().await.ok()?,
             // Both are ordinary here — an older daemon has no such route, and a
             // sandbox killed between the decision and this call is gone. Debug,
@@ -392,7 +442,7 @@ impl VmManager {
     /// `Sandbox::info()` fetches this same full list and filters client-side, so
     /// per-VM polling is quadratic.
     pub async fn list(&self) -> Result<Vec<SandboxInfo>, VmError> {
-        Ok(Sandbox::list(self.opts.clone()).await?)
+        Ok(Sandbox::list_with_client(&self.client).await?)
     }
 
     /// Create a VM and return immediately, without waiting for boot.
@@ -456,7 +506,7 @@ impl VmManager {
         // `POST /sandbox-deploy`, which is what `Sandbox::create` posts. It
         // answers `202` with the id of a sandbox that is still provisioning;
         // readiness is tracked across reconcile ticks either way.
-        let client = HeyoClient::new(self.opts.clone())?;
+        let client = &self.client;
         let created: CreatedSandbox = client
             .request(
                 http::Method::POST,
@@ -466,7 +516,7 @@ impl VmManager {
             )
             .await?;
 
-        Ok(Sandbox::connect(created.id, self.opts.clone())?)
+        Ok(Sandbox::connect_with_client(self.client.clone(), created.id))
     }
 
     /// The daemon's `mounts` array for a spec: one host directory per guest
@@ -497,7 +547,7 @@ impl VmManager {
     }
 
     pub fn connect(&self, sandbox_id: String) -> Result<Sandbox, VmError> {
-        Ok(Sandbox::connect(sandbox_id, self.opts.clone())?)
+        Ok(Sandbox::connect_with_client(self.client.clone(), sandbox_id))
     }
 
     /// Fetch the daemon's cached host + per-sandbox usage snapshot.
@@ -507,7 +557,7 @@ impl VmManager {
     /// its cache. There is no typed SDK method for it, so we go through the
     /// client's generic request helper.
     pub async fn system_usage(&self) -> Result<SystemUsage, VmError> {
-        let client = HeyoClient::new(self.opts.clone())?;
+        let client = &self.client;
         let usage = client
             .request::<SystemUsage>(
                 http::Method::GET,
@@ -637,7 +687,7 @@ impl VmManager {
         const PAGE: usize = 200;
         const MAX_PAGES: usize = 200;
 
-        let client = HeyoClient::new(self.opts.clone())?;
+        let client = &self.client;
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
 
@@ -744,6 +794,9 @@ impl InactiveSandbox {
             start_command: None,
             working_directory: None,
             size_class: None,
+            // Added to `SandboxInfo` after 0.1.6; unset for the same
+            // reason the rest of these are — nothing here reads it.
+            disk_size_gb: None,
             env_vars: None,
             setup_hooks: None,
             uptime_secs: 0,
@@ -936,6 +989,9 @@ mod tests {
             start_command: None,
             working_directory: None,
             size_class: None,
+            // Added to `SandboxInfo` after 0.1.6; unset for the same
+            // reason the rest of these are — nothing here reads it.
+            disk_size_gb: None,
             env_vars: None,
             setup_hooks: None,
             uptime_secs: 0,
@@ -950,41 +1006,33 @@ mod tests {
     }
 
     #[test]
-    fn daemon_api_key_authenticates_sdk_and_direct_requests() {
+    fn daemon_api_key_reaches_every_daemon_request() {
         let manager = VmManager::new(
             Some("http://host.internal:3000".into()),
             Some("service-token".into()),
             test_mounts(),
-        );
+        )
+        .unwrap();
 
-        assert_eq!(manager.opts.api_key.as_deref(), Some("service-token"));
-        let request = manager
-            .daemon_get("http://host.internal:3000/sandboxes/sb-1/logs")
-            .build()
-            .unwrap();
-        assert_eq!(
-            request
-                .headers()
-                .get(reqwest::header::AUTHORIZATION)
-                .unwrap(),
-            "Bearer service-token",
-        );
+        // One client serves the lifecycle calls and the guest-log diagnostics
+        // alike, so the bearer cannot reach one and miss the other. The
+        // separate request builder this replaced had to be kept in step with
+        // `opts.api_key` by hand, and a drift there was a silent 401 on
+        // exactly the path you reach for when something is already wrong.
+        assert_eq!(manager.client.api_key(), Some("service-token"));
+        assert_eq!(manager.transport(), "http://host.internal:3000");
     }
 
     #[test]
-    fn local_unauthenticated_daemon_remains_supported() {
-        let manager = VmManager::new(Some("http://127.0.0.1:34099".into()), None, test_mounts());
-        let request = manager
-            .daemon_get("http://127.0.0.1:34099/sandboxes/sb-1/logs")
-            .build()
-            .unwrap();
+    fn an_explicit_daemon_url_is_never_traded_for_a_socket() {
+        // Holds even on a host serving a live socket: a named address is how a
+        // non-default or remote daemon is reached, so preferring a local
+        // socket over it would quietly talk to the wrong machine.
+        let manager =
+            VmManager::new(Some("http://127.0.0.1:34099".into()), None, test_mounts()).unwrap();
 
-        assert!(
-            request
-                .headers()
-                .get(reqwest::header::AUTHORIZATION)
-                .is_none()
-        );
+        assert_eq!(manager.transport(), "http://127.0.0.1:34099");
+        assert!(manager.client.socket_path().is_none());
     }
 
     #[test]
@@ -1203,7 +1251,7 @@ mod tests {
     #[test]
     fn a_mount_with_no_tree_refuses_the_create() {
         let (root, store) = store_holding(&[]);
-        let manager = VmManager::new(None, None, store);
+        let manager = VmManager::new(None, None, store).unwrap();
 
         let never_pulled = manager
             .guest_mounts(&spec_with(vec![mount("/data", None)]))
@@ -1238,7 +1286,7 @@ mod tests {
         let (root, store) = store_holding(&[(D1, 0), (D2, 0)]);
         let tree_one = store.tree_path(D1, 0);
         let tree_two = store.tree_path(D2, 0);
-        let manager = VmManager::new(None, None, store);
+        let manager = VmManager::new(None, None, store).unwrap();
 
         let writable = MountSpec {
             read_only: false,
@@ -1273,7 +1321,7 @@ mod tests {
     #[test]
     fn a_spec_with_no_mounts_sends_none() {
         let (root, store) = store_holding(&[]);
-        let manager = VmManager::new(None, None, store);
+        let manager = VmManager::new(None, None, store).unwrap();
         assert!(manager.guest_mounts(&spec_with(vec![])).unwrap().is_empty());
         std::fs::remove_dir_all(&root).ok();
     }

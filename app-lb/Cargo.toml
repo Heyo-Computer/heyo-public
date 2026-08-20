@@ -56,7 +56,7 @@ pingora-http = "0.8.1"
 http = "1"
 bytes = "1"
 
-heyo-sdk = "0.1.6"
+heyo-sdk = "0.1.7"
 
 # ACME (Let's Encrypt) client for per-deployment certificates. In-process rather
 # than shelling out to certbot: no external binary, and no root — the account key

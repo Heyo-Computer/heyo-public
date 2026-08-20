@@ -53,7 +53,8 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/app-lb
 ```
 
 Requirements (see the top-level `README.md`): a running `heyvmd` daemon
-(default `http://127.0.0.1:34099`) and, for VM deployments, KVM on the host.
+(a unix socket when it serves one, else `http://127.0.0.1:34099`) and, for VM
+deployments, KVM on the host.
 `heyvmd` must be running before app-lb can boot or adopt VMs.
 
 ## Install the unit

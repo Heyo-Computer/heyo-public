@@ -1873,7 +1873,8 @@ mod tests {
             Some("http://127.0.0.1:1".into()),
             None,
             crate::mounts::MountStore::new(dir.join("mounts"), 0),
-        );
+        )
+        .unwrap();
         (
             Autoscaler::new(
                 registry.clone(),
@@ -2196,6 +2197,9 @@ mod tests {
             start_command: None,
             working_directory: None,
             size_class: None,
+            // Added to `SandboxInfo` after 0.1.6; unset for the same
+            // reason the rest of these are — nothing here reads it.
+            disk_size_gb: None,
             env_vars: None,
             setup_hooks: None,
             uptime_secs: 0,
