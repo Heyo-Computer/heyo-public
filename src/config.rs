@@ -160,6 +160,20 @@ pub struct Config {
     /// set without it, it stays off with a warning. Env
     /// `PG_VM_POOL_ORPHAN_SWEEP_SECS`.
     pub orphan_sweep: Option<Duration>,
+    /// How many offload jobs the pacer may run concurrently. `1` (the
+    /// default) preserves the classic one-schema-at-a-time pacing; higher
+    /// values let no-boot offloads (compact/promote) overlap. Dispatch is
+    /// still gated on client backpressure, host load
+    /// ([`Self::offload_load_max`]), and at most ONE VM-booting job
+    /// (archive/freeze) at a time — those share the bring-up gate with
+    /// clients. Env `PG_VM_POOL_OFFLOAD_WORKERS` (clamped to 1..=16).
+    pub offload_workers: usize,
+    /// Normalized host load (1-minute loadavg / online cores) at or above
+    /// which the dispatcher stops adding offload jobs beyond the first.
+    /// Linux load counts uninterruptible-I/O tasks too, so this backs off
+    /// under disk saturation as well as CPU. Env
+    /// `PG_VM_POOL_OFFLOAD_LOAD_MAX` (default 0.75).
+    pub offload_load_max: f64,
 }
 
 /// Settings for automatic disk-slack reclamation. Present (`Some`) only when
@@ -570,6 +584,8 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_RECLAIM_INTERVAL_SECS",
     "PG_VM_POOL_RUN_DIR",
     "PG_VM_POOL_ORPHAN_SWEEP_SECS",
+    "PG_VM_POOL_OFFLOAD_WORKERS",
+    "PG_VM_POOL_OFFLOAD_LOAD_MAX",
     "PG_VM_POOL_WARM_SPARES",
     "PG_VM_POOL_FREEZE_AFTER_SECS",
     "PG_VM_POOL_FREEZE_SWEEP_SECS",
@@ -724,6 +740,20 @@ impl Config {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
+        let offload_workers = match std::env::var("PG_VM_POOL_OFFLOAD_WORKERS") {
+            Ok(v) => match v.trim().parse::<usize>() {
+                Ok(n) => n.clamp(1, 16),
+                Err(_) => anyhow::bail!("invalid PG_VM_POOL_OFFLOAD_WORKERS {v:?}: expected 1-16"),
+            },
+            Err(_) => 1,
+        };
+        let offload_load_max = match std::env::var("PG_VM_POOL_OFFLOAD_LOAD_MAX") {
+            Ok(v) => match v.trim().parse::<f64>() {
+                Ok(f) if f > 0.0 => f,
+                _ => anyhow::bail!("invalid PG_VM_POOL_OFFLOAD_LOAD_MAX {v:?}: expected > 0"),
+            },
+            Err(_) => 0.75,
+        };
         let freeze = FreezeConfig::from_env()?;
         // Explicit run dir, else reuse the pressure path (same directory: the
         // heyvmd run dir holding every VM's sb-<id>/). `None` means kill
@@ -833,6 +863,8 @@ impl Config {
             reclaim,
             run_dir,
             orphan_sweep,
+            offload_workers,
+            offload_load_max,
         })
     }
 }

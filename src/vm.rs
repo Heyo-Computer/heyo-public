@@ -31,6 +31,24 @@ const VM_PG_PORT: u16 = 5432;
 /// silent this long.
 const PG_PROBE_WINDOW: Duration = Duration::from_secs(15);
 
+/// Poll interval while waiting for Postgres to come up, two-speed. init.sh
+/// signals HEYVM_READY ~1s *before* the postmaster binds 5432, so nearly
+/// every bring-up spends its first probes hitting a not-yet-open port — at
+/// the old flat 500ms quantum that rounded up to half a second of pure sleep
+/// on EVERY cold start. Probe fast (a refused connect on the local bridge is
+/// ~free) while the wait still looks like a normal boot, then back off to the
+/// old cadence for the pathological waits `wait_pg_ready`'s 300s timeout
+/// exists for.
+const PG_POLL_FAST: Duration = Duration::from_millis(100);
+const PG_POLL_SLOW: Duration = Duration::from_millis(500);
+const PG_POLL_FAST_WINDOW: Duration = Duration::from_secs(5);
+
+/// The poll interval for an in-flight Postgres wait that started `elapsed`
+/// ago (see [`PG_POLL_FAST`]).
+fn pg_poll_interval(elapsed: Duration) -> Duration {
+    if elapsed < PG_POLL_FAST_WINDOW { PG_POLL_FAST } else { PG_POLL_SLOW }
+}
+
 /// Per-attempt bound inside that window. Only guards against a connect that
 /// hangs forever (the pool has no create timeout); it is not a health
 /// threshold — exceeding it yields `PgProbe::Stalled`, never `Unreachable`.
@@ -455,7 +473,9 @@ pub async fn ensure_vm(
     // burst beyond the cap queues here (each waiter is one parked client
     // connection) instead of becoming daemon load. Held to the end of the
     // function: the pending *population* is what the daemon can't survive.
+    let mut phase = Instant::now();
     let _admission = admission_slot(schema).await;
+    let admission_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
     let name = format!("pg-{schema}");
     let keepalive = cfg.is_keepalive(schema);
 
@@ -483,6 +503,7 @@ pub async fn ensure_vm(
         ),
         _ => resolve_sandbox(cfg, &name, keepalive, known_id, spares).await?,
     };
+    let resolve_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
     let sandbox_id = sandbox.sandbox_id().to_string();
 
     // The rest of the bring-up can still fail (ready-timeout, restore error).
@@ -503,7 +524,9 @@ pub async fn ensure_vm(
         }
 
         let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
+        let pg_ready_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
         ensure_database(&pool, schema, owner).await?;
+        let create_db_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
 
         // Restore into the freshly-created, empty database before the entry is
         // handed to any client. A failure here must abort the bring-up: serving
@@ -528,8 +551,22 @@ pub async fn ensure_vm(
             }
             None => {}
         }
+        let restore_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
 
         let slots = client_slot_budget(&pool, &name).await;
+        let bootstrap_took = phase.elapsed();
+
+        // One line per bring-up, next to the registry's total "VM ready in":
+        // which phase ate the time is the whole diagnosis when cold starts
+        // regress. `resolve+boot` spans create/reattach/spare-claim through
+        // the guest boot; `pg-ready` is the wait for the postmaster. The gate
+        // waits (admission, bring-up slot, boot gate) also log themselves
+        // when they actually queued.
+        info!(
+            "schema {schema}: bring-up phases — admission {admission_took:?}, resolve+boot \
+             {resolve_took:?}, pg-ready {pg_ready_took:?}, create-db {create_db_took:?}, \
+             restore {restore_took:?}, slots {bootstrap_took:?}",
+        );
 
         Ok(Arc::new(SchemaEntry::new(
             sandbox, target, tunnel, pool, keepalive, slots,
@@ -2110,7 +2147,8 @@ fn classify_pg_error(e: &tokio_postgres::Error) -> PgProbe {
 /// merely stalled, the port was open at least once and `Stalled` wins, since
 /// the caller must not take a destructive action on that evidence.
 async fn probe_pg_window(pool: &Pool, window: Duration) -> PgProbe {
-    let deadline = Instant::now() + window;
+    let start = Instant::now();
+    let deadline = start + window;
     let mut last_err = String::new();
     let mut stalled: Option<String> = None;
     loop {
@@ -2125,7 +2163,7 @@ async fn probe_pg_window(pool: &Pool, window: Duration) -> PgProbe {
                 None => PgProbe::Unreachable(last_err),
             };
         }
-        sleep(Duration::from_millis(500)).await;
+        sleep(pg_poll_interval(start.elapsed())).await;
     }
 }
 
@@ -2583,7 +2621,7 @@ async fn wait_pg_ready(pool: &Pool, timeout: Duration, name: &str) -> Result<()>
             );
             last_log = Instant::now();
         }
-        sleep(Duration::from_millis(500)).await;
+        sleep(pg_poll_interval(start.elapsed())).await;
     }
 }
 

@@ -171,6 +171,8 @@ Config via env (all optional):
 | `PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS` | `60` | how often the alert evaluator samples host metrics and fires crossed alerts |
 | `PG_VM_POOL_ARCHIVE_AFTER_SECS` | `0` (off) | S3 eviction: offload a schema untouched this long to S3 and kill its VM; e.g. `604800` = 1 week — see "S3 eviction tier" |
 | `PG_VM_POOL_ARCHIVE_SWEEP_SECS` | `3600` | how long the offload pacer waits before re-scanning **after a scan that found nothing** (clamped to 5–60s). It no longer paces the work itself — see "Offload pacer" |
+| `PG_VM_POOL_OFFLOAD_WORKERS` | `1` | how many offload jobs the pacer may run concurrently (1–16). `1` keeps the classic one-schema-at-a-time pacing; higher values let no-boot jobs (compact/promote) overlap on a backlogged host. At most ONE in-flight job may boot a VM regardless, and jobs beyond the first are dispatched only under `PG_VM_POOL_OFFLOAD_LOAD_MAX` — see "Offload pacer" |
+| `PG_VM_POOL_OFFLOAD_LOAD_MAX` | `0.75` | normalized host load (1-min loadavg / cores; on Linux this includes tasks blocked on disk I/O) at or above which the pacer stops adding jobs beyond the first — aggressive with headroom, single file without |
 | `PG_VM_POOL_S3_BUCKET` | unset | S3 bucket for dumps (required when eviction is on) |
 | `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the object per schema is `{prefix}{schema}.dump` |
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
@@ -189,7 +191,7 @@ Config via env (all optional):
 | `PG_VM_POOL_RECLAIM_CMD` | unset (off) | shell command that offline-trims stopped VMs' disks (normally `sudo -n .../reclaim-disks.sh <run-dir>`); setting it enables automatic disk reclamation — see "Reclaiming disk slack" |
 | `PG_VM_POOL_RECLAIM_INTERVAL_SECS` | `3600` | how often the periodic reclaim run fires (extra runs also fire right after idle reaps) |
 | `PG_VM_POOL_RUN_DIR` | falls back to `PG_VM_POOL_PRESSURE_PATH` | the heyvmd run dir (holds each VM's `sb-<id>/`). Used to verify a killed VM's disk directory is actually gone after archive/freeze, and to locate orphaned directories for the sweep below. When a kill leaves the directory behind (stranding the disk) the pooler logs it loudly instead of reporting "disk reclaimed". Unset ⇒ that removal is left unverified and the orphan sweep is disabled |
-| `PG_VM_POOL_ORPHAN_SWEEP_SECS` | unset (off) | how often to sweep the run dir for **orphaned** disk directories — an `sb-<id>/` heyvmd has forgotten (a kill it acked but didn't act on). Requires `PG_VM_POOL_RUN_DIR`. Deletes only directories the daemon confirms gone (per-id 404) that are also not held open and belong to an offloaded/unreferenced schema; a `live` schema whose VM vanished is logged as a data-loss orphan and never deleted — see "Reclaiming disk slack" |
+| `PG_VM_POOL_ORPHAN_SWEEP_SECS` | unset (off) | how often to sweep the run dir for **orphaned** disk directories — an `sb-<id>/` heyvmd has forgotten (a kill it acked but didn't act on). Requires `PG_VM_POOL_RUN_DIR`. Deletes only directories the daemon confirms gone (per-id 404) that are also not held open and belong to an offloaded/unreferenced schema; a `live` schema whose VM vanished is logged as a data-loss orphan and never deleted. When a pass hits its per-pass cap (100 deletions) with a backlog remaining, it re-arms after ~20s instead of waiting the whole interval — but only while no client bring-up is queued — so a large backlog drains in minutes without ever growing the per-pass blast radius — see "Reclaiming disk slack" |
 
 Postgres inside each VM **tunes itself to the VM's resources at every boot**:
 `init.sh` reads live RAM/vCPUs/disk and regenerates
@@ -224,9 +226,11 @@ tunnel path (e.g. if the pooler ever runs on a different machine than the VMs).
 ### Offload pacer
 
 The three offload tiers below (compact, freeze, S3) don't have three timers.
-They share one **pacer**: a single task that wakes every second, asks whether
-the host is quiet, and if it is, does *one* schema's worth of work — then
-re-asks. The tiers only decide what is eligible; the pacer decides when.
+They share one **pacer**: a dispatcher that wakes every second, asks whether
+the host is quiet, and if it is, dispatches *one* schema's worth of work — then
+re-asks. The tiers only decide what is eligible; the pacer decides when. Up to
+`PG_VM_POOL_OFFLOAD_WORKERS` jobs may be in flight at once (default 1 — the
+classic strictly-serial pacing).
 
 This replaced three periodic batch sweeps, and the reason is worth stating.
 Each sweep woke on its own interval regardless of what the host was doing, then
@@ -238,13 +242,28 @@ reconnect storm, or while the warm pool is rebuilding, as at 4am. The pacer does
 the same total work with the same thresholds, spread thin and yielding to
 anything a person is waiting on.
 
-Before every job it checks, and defers while any of these hold:
+Before dispatching every job it checks, and defers while any of these hold
+(in-flight jobs always run to completion — deferral only pauses NEW work):
 
 - a client bring-up is queued (waiting for an admission or bring-up slot);
 - a disk-reclaim pass is running (an offload boots VMs; taking the boot gate
   would make that pass yield and lose its progress);
-- another offload is in flight — the pacer's own, the pressure reaper's, or a
-  dashboard button's. One heavy offload at a time, host-wide.
+- all `PG_VM_POOL_OFFLOAD_WORKERS` slots are taken.
+
+With workers > 1, three brakes keep the extra concurrency from outbidding
+clients: every job **beyond the first** is dispatched only while normalized
+host load (1-min loadavg / cores — which on Linux counts tasks blocked on disk
+I/O, so it backs off under disk saturation too) is below
+`PG_VM_POOL_OFFLOAD_LOAD_MAX`; at most ONE in-flight job may boot a VM
+(archive/freeze share the FIFO bring-up gate with waiting clients); and the
+offload path's `zstd`/`e2fsck` children run at `nice` 19 with best-effort-low
+I/O priority, with the zstd thread count split across workers instead of every
+job taking `-T0`. Per-schema exclusivity is unchanged — the `archiving` claim
+each job takes also excludes it from concurrent picks, so workers, the
+pressure pass, and dashboard buttons never collide on a schema (a lost claim
+race is journaled as a skip, not a failure). Side effect worth knowing: a
+dashboard-button offload no longer pauses the pacer host-wide — it only makes
+that one schema unpickable.
 
 When several schemas are eligible it takes the cheapest-and-most-valuable job
 first — promote a local file to S3 (an upload, no VM), then compact (no boot),

@@ -2566,6 +2566,7 @@ dependencies = [
  "hex",
  "heyo-sdk",
  "hmac",
+ "libc",
  "maud",
  "reqwest 0.12.28",
  "rustls-pki-types",

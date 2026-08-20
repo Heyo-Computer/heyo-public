@@ -90,6 +90,13 @@ const VM_ROOTFS_FILE: &str = "rootfs.ext4";
 /// "gone?" ambiguity turn into a deletion, so we stop and try again next sweep.
 const ORPHAN_MAX_DAEMON_ERRORS: usize = 5;
 
+/// Drain mode: when a sweep's per-pass caps left candidates behind, re-run
+/// after this long instead of waiting the whole configured interval — but
+/// only if no client bring-up is queued at that moment. Turns the per-pass
+/// cap from a throughput ceiling (100 per interval) into a blast-radius
+/// bound (100 per ~20s while a backlog exists and the host is quiet).
+const ORPHAN_DRAIN_REARM: Duration = Duration::from_secs(20);
+
 /// Cadence of the pending-bring-up janitor (see [`SchemaRegistry::spawn_pending_janitor`]).
 /// Frequent is fine: a pass over an empty ledger is a HashMap read.
 const PENDING_JANITOR_TICK: Duration = Duration::from_secs(300);
@@ -322,10 +329,13 @@ pub struct SchemaRegistry {
     // restarts, so a reconnect after a stop/reap/restart reattaches to the same
     // VM (by id) rather than creating a duplicate with a fresh, empty data disk.
     store: Store,
-    // Schemas whose VM is mid-archive (dump + kill in flight). A checkout for a
-    // schema in this set waits until it clears, then cold-starts — which
-    // restores from S3. Guards against a client bringing a VM back up while the
-    // archiver is dumping and killing it. Held for the whole archive operation.
+    // Schemas whose VM is mid-offload (dump/compact + kill in flight). A
+    // checkout for a schema in this set waits until it clears, then
+    // cold-starts — which restores from S3. Guards against a client bringing a
+    // VM back up while the offload is dumping and killing it. Held for the
+    // whole operation (per-schema, via ArchivingGuard); the dispatcher also
+    // consults it at pick time so concurrent workers, the pressure pass, and
+    // dashboard buttons never pick each other's schemas.
     archiving: StdMutex<HashSet<String>>,
     // True while an eviction sweep is running. Single-flights the sweep so the
     // periodic timer and a manual "sweep now" can't stack overlapping passes over
@@ -611,13 +621,27 @@ impl SchemaRegistry {
         // schema as recently used even long after its VM leaves the warm map
         // (the in-memory `SchemaEntry::last_active` doesn't survive that).
         self.store.touch(schema);
+        let mut offload_waited: Option<Instant> = None;
         loop {
             // If this schema is mid-archive (dump + kill in flight), don't race
             // the archiver by bringing the VM back up. Wait for it to clear; the
-            // subsequent cold start restores from S3.
+            // subsequent cold start restores from S3. This wait used to be
+            // completely silent — a client parked here for a whole offload
+            // read as unexplained connect latency — so name it, once, and
+            // account for it when it ends.
             if self.is_archiving(schema) {
+                if offload_waited.is_none() {
+                    offload_waited = Some(Instant::now());
+                    info!(
+                        "schema {schema}: client waiting for an in-flight offload of this \
+                         schema to finish before (re)connecting"
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
+            }
+            if let Some(t) = offload_waited.take() {
+                info!("schema {schema}: offload cleared after {:?}; proceeding", t.elapsed());
             }
 
             // Warm path: claim the entry under the map lock, which the reaper
@@ -992,19 +1016,38 @@ impl SchemaRegistry {
     /// an arbitrary moment: exactly when clients are reconnecting, or when the
     /// warm pool is trying to rebuild, is as likely as any other time.
     ///
-    /// The pacer inverts it. It wakes every [`OFFLOAD_TICK`], and before taking
-    /// *each* job it re-asks whether the host is quiet (see
-    /// [`Self::offload_backpressure`]): no client is queued for a bring-up, no
-    /// reclaim pass is running, no other offload is in flight. One job runs at
-    /// a time, and the next one is re-evaluated against a fresh view of the
-    /// host a second later. The total work done is the same; it is spread thin
+    /// The pacer inverts it. It wakes every [`OFFLOAD_TICK`], and before
+    /// dispatching *each* job it re-asks whether the host is quiet (see
+    /// [`Self::dispatch_backpressure`]): no client is queued for a bring-up
+    /// and no reclaim pass is running. Up to `PG_VM_POOL_OFFLOAD_WORKERS`
+    /// jobs run concurrently (default 1 — the classic one-at-a-time pacing),
+    /// with three brakes on the extra concurrency:
+    ///
+    ///   - the FIRST job is always allowed, but every additional one is
+    ///     dispatched only while normalized host load (load1/cores, which on
+    ///     Linux includes tasks blocked on disk I/O) is below
+    ///     `PG_VM_POOL_OFFLOAD_LOAD_MAX` — aggressive with headroom, single
+    ///     file without;
+    ///   - at most ONE in-flight job may boot a VM (archive/freeze), because
+    ///     boots share the FIFO bring-up gate with waiting clients;
+    ///   - backpressure pauses NEW dispatch only — in-flight jobs always run
+    ///     to completion (they hold per-schema claims, not host-wide locks).
+    ///
+    /// Each dispatch re-picks against a fresh view of the host, excluding
+    /// schemas already in flight here or claimed elsewhere (dashboard buttons,
+    /// the pressure pass). The total work done is the same; it is spread thin
     /// and yields to anything a user is waiting on.
     ///
     /// Scanning is cheap because it only happens when the pacer is actually
-    /// about to act: a tick during a busy host, or during a running job, is an
-    /// atomic load. When a scan finds nothing, the next one is deferred by the
+    /// about to act: a tick during a busy host is an atomic load. When a scan
+    /// finds nothing (with no jobs in flight), the next one is deferred by the
     /// configured sweep interval (the `*_SWEEP_SECS` vars keep that meaning),
     /// so an idle fleet costs a scan a minute rather than one a second.
+    ///
+    /// If this dispatcher task were ever dropped, its JoinSet would abort
+    /// in-flight jobs mid-offload — safe for data (compaction/spool land via
+    /// atomic rename; children are `kill_on_drop`) but it can leave a stale
+    /// `.tmp` behind, so the loop body stays panic-free by construction.
     pub fn spawn_offloader(self: &Arc<Self>) {
         let mut tiers: Vec<String> = Vec::new();
         if let Some(c) = &self.cfg.compact {
@@ -1035,9 +1078,12 @@ impl SchemaRegistry {
             return;
         }
         let idle_rescan = self.offload_idle_rescan();
+        let workers = self.cfg.offload_workers;
+        let load_max = self.cfg.offload_load_max;
         info!(
-            "offload pacer: {} — one schema at a time, only while the host is quiet \
-             (tick {OFFLOAD_TICK:?}, rescan {idle_rescan:?} when there is nothing to do)",
+            "offload pacer: {} — up to {workers} concurrent job(s), at most one that boots a VM, \
+             extras only while load/core < {load_max} (tick {OFFLOAD_TICK:?}, rescan \
+             {idle_rescan:?} when there is nothing to do)",
             tiers.join(", "),
         );
 
@@ -1047,12 +1093,56 @@ impl SchemaRegistry {
             // When the last scan found nothing, don't scan again until this.
             let mut hold_until: Option<Instant> = None;
             let mut quiet_since: Option<Instant> = None;
+            // In-flight jobs, each in its own JoinSet task so a panic inside
+            // one offload is contained — the pacer must outlive any single
+            // schema. The side map keys by task id so a job's label survives
+            // its panic (a JoinError only carries the id).
+            let mut jobs: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+            let mut in_flight: HashMap<tokio::task::Id, (String, OffloadKind, Instant)> =
+                HashMap::new();
             loop {
-                tokio::time::sleep(OFFLOAD_TICK).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(OFFLOAD_TICK) => {}
+                    Some(res) = jobs.join_next_with_id(), if !jobs.is_empty() => {
+                        match res {
+                            Ok((task_id, ())) => {
+                                if let Some((schema, kind, started)) = in_flight.remove(&task_id) {
+                                    debug!(
+                                        "offload pacer: {} {schema} finished in {:?} \
+                                         ({} still in flight)",
+                                        kind.as_str(),
+                                        started.elapsed(),
+                                        jobs.len()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                let label = in_flight
+                                    .remove(&e.id())
+                                    .map(|(s, k, _)| format!("{} {s}", k.as_str()))
+                                    .unwrap_or_else(|| "?".into());
+                                if e.is_panic() {
+                                    error!(
+                                        "offload pacer: {label} PANICKED: {}",
+                                        panic_message(e.into_panic())
+                                    );
+                                } else {
+                                    error!("offload pacer: {label} failed to run: {e}");
+                                }
+                            }
+                        }
+                        // A completion is not a dispatch opportunity; the next
+                        // tick (≤1s away) re-evaluates the host fresh.
+                        continue;
+                    }
+                }
                 if hold_until.is_some_and(|t| Instant::now() < t) {
                     continue;
                 }
-                if let Some(reason) = registry.offload_backpressure() {
+                if jobs.len() >= workers {
+                    continue;
+                }
+                if let Some(reason) = registry.dispatch_backpressure() {
                     // Log the first deferral of each busy stretch only: this
                     // loop runs 86 400 times a day and a busy host would
                     // otherwise fill the log with it.
@@ -1062,35 +1152,54 @@ impl SchemaRegistry {
                     continue;
                 }
                 quiet_since.get_or_insert_with(Instant::now);
-                let policy = registry.offload_policy();
-                let Some(job) = registry.next_offload_job(policy).await else {
-                    hold_until = Some(Instant::now() + idle_rescan);
+                if !dispatch_allowance(jobs.len(), workers, normalized_load(), load_max) {
+                    continue;
+                }
+                let mut policy = registry.offload_policy();
+                // At most one boot-kind job in flight: those compete with
+                // waiting clients for the FIFO bring-up gate.
+                policy.no_boot = in_flight.values().any(|(_, kind, _)| kind.boots());
+                let excluded: HashSet<String> =
+                    in_flight.values().map(|(schema, ..)| schema.clone()).collect();
+                let Some(job) = registry.next_offload_job(policy, &excluded).await else {
+                    // Only arm the idle hold when nothing is running: with
+                    // jobs in flight an empty pick usually means "everything
+                    // eligible is already claimed", and holding would delay
+                    // the dispatch that should follow their completion.
+                    if jobs.is_empty() {
+                        hold_until = Some(Instant::now() + idle_rescan);
+                    }
                     continue;
                 };
                 hold_until = None;
-                // Run each job in its own task so a panic inside one offload
-                // is contained — the pacer must outlive any single schema.
                 let r = registry.clone();
-                let started = Instant::now();
-                let label = format!("{} {}", job.kind.as_str(), job.schema);
-                match tokio::spawn(async move { r.run_offload_job(job).await }).await {
-                    Ok(_) => debug!("offload pacer: {label} finished in {:?}", started.elapsed()),
-                    Err(e) if e.is_panic() => error!(
-                        "offload pacer: {label} PANICKED: {}",
-                        panic_message(e.into_panic())
-                    ),
-                    Err(e) => error!("offload pacer: {label} failed to run: {e}"),
-                }
+                let (schema, kind) = (job.schema.clone(), job.kind);
+                info!(
+                    "offload dispatch: {} {schema} ({}/{workers} in flight)",
+                    kind.as_str(),
+                    jobs.len() + 1
+                );
+                let task_id = jobs
+                    .spawn(async move {
+                        let _ = r.run_offload_job(job).await;
+                    })
+                    .id();
+                in_flight.insert(task_id, (schema, kind, Instant::now()));
             }
         });
     }
 
-    /// Why background offloading should hold off this tick, if it should.
+    /// Why the dispatcher should not start a NEW offload job this tick, if it
+    /// shouldn't. (In-flight jobs are never interrupted — they hold per-schema
+    /// claims, not host-wide locks.)
     ///
     /// Every condition here is "something a person is waiting on, or something
     /// that would fight us for the same resource". Offloading is pure
-    /// housekeeping: it has no deadline, so it always loses.
-    fn offload_backpressure(&self) -> Option<&'static str> {
+    /// housekeeping: it has no deadline, so it always loses. Concurrency
+    /// between offloads themselves is the dispatcher's business (worker cap +
+    /// load gate + pick-time exclusion), not this function's — dashboard and
+    /// pressure-pass claims are excluded at pick time via `is_archiving`.
+    fn dispatch_backpressure(&self) -> Option<&'static str> {
         if crate::vm::bringups_waiting() > 0 {
             return Some("client bring-ups are queued");
         }
@@ -1102,12 +1211,6 @@ impl SchemaRegistry {
         // A manual batch sweep from the dashboard.
         if self.sweeping.load(Ordering::SeqCst) {
             return Some("a manual sweep is running");
-        }
-        // Any offload at all — ours, the pressure reaper's, or a dashboard
-        // button's. This is what keeps the whole host to one heavy offload at
-        // a time without a second lock.
-        if !self.archiving.lock().unwrap().is_empty() {
-            return Some("another offload is in flight");
         }
         None
     }
@@ -1134,7 +1237,17 @@ impl SchemaRegistry {
     /// nothing is eligible. Also keeps `last_active` honest for schemas that
     /// look durably stale but are actually warm, so they aren't re-evaluated
     /// as candidates on every scan.
-    async fn next_offload_job(&self, policy: OffloadPolicy) -> Option<OffloadJob> {
+    ///
+    /// `in_flight` is the caller's own set of schemas it already has jobs
+    /// running for (the dispatcher's accounting); on top of it, any schema
+    /// whose [`ArchivingGuard`] is currently claimed — a dashboard button, the
+    /// pressure pass, or another worker mid-claim — is skipped, so concurrent
+    /// pickers never collide on the same schema.
+    async fn next_offload_job(
+        &self,
+        policy: OffloadPolicy,
+        in_flight: &HashSet<String>,
+    ) -> Option<OffloadJob> {
         // Live cross-check: a schema warm with active connections, or whose
         // in-memory idle clock is younger than the threshold, is not cold even
         // if its durable `last_active` drifted (one long-lived connection with
@@ -1152,7 +1265,11 @@ impl SchemaRegistry {
             &live,
             policy,
             &|schema| self.cfg.is_keepalive(schema),
-            &|schema| self.offload_backoff.active(schema, at).is_some(),
+            &|schema| {
+                in_flight.contains(schema)
+                    || self.is_archiving(schema)
+                    || self.offload_backoff.active(schema, at).is_some()
+            },
             now_unix(),
         );
         for schema in refresh {
@@ -1168,6 +1285,7 @@ impl SchemaRegistry {
             freeze_after: self.cfg.freeze.as_ref().map(|f| f.freeze_after.as_secs()),
             archive_after: self.cfg.archive.as_ref().map(|a| a.archive_after.as_secs()),
             image_archive: self.image_archive_enabled(),
+            no_boot: false,
             mode: OffloadMode::Routine,
         }
     }
@@ -1184,6 +1302,7 @@ impl SchemaRegistry {
             freeze_after: None,
             archive_after: self.cfg.archive.as_ref().map(|_| 0),
             image_archive: self.image_archive_enabled(),
+            no_boot: false,
             mode: OffloadMode::Pressure,
         }
     }
@@ -1204,10 +1323,15 @@ impl SchemaRegistry {
             OffloadKind::Freeze => self.freeze_schema(&schema).await,
         };
         if let Err(e) = &res {
-            warn!(
-                "offload: {} schema {schema} failed (backing off): {e:#}",
-                kind.as_str()
-            );
+            if e.downcast_ref::<AlreadyOffloading>().is_some() {
+                // Benign: another worker / the dashboard claimed it first.
+                debug!("offload: {} schema {schema} skipped — already in flight", kind.as_str());
+            } else {
+                warn!(
+                    "offload: {} schema {schema} failed (backing off): {e:#}",
+                    kind.as_str()
+                );
+            }
         }
         res
     }
@@ -1348,7 +1472,7 @@ impl SchemaRegistry {
                 }
                 _ => {}
             }
-            let Some(job) = self.next_offload_job(policy).await else {
+            let Some(job) = self.next_offload_job(policy, &HashSet::new()).await else {
                 break;
             };
             let kind = job.kind;
@@ -1358,6 +1482,9 @@ impl SchemaRegistry {
                     archived += 1;
                     consecutive_failures = 0;
                 }
+                // A benign claim race (a dispatcher worker or dashboard job
+                // holds the schema) says nothing about environment health.
+                Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {}
                 Err(_) => {
                     // The failure is already logged and journaled by the
                     // operation itself, and the schema is now in backoff — so
@@ -1407,7 +1534,7 @@ impl SchemaRegistry {
     /// survives. The offload pacer moves one schema at a time and defers to
     /// client work; this is the operator override for "I want the disk back
     /// now", so it runs the whole candidate list back to back and the pacer
-    /// stands down while it does (see [`Self::offload_backpressure`]).
+    /// stands down while it does (see [`Self::dispatch_backpressure`]).
     ///
     /// Returns as soon as the sweep is launched (it can take a long time for a
     /// big backlog); the outcome shows up in the pooler log and the VMs'
@@ -1632,6 +1759,14 @@ impl SchemaRegistry {
                 self.offload_backoff.clear(schema);
                 crate::events::journal_info("archive", format!("schema {schema} → archived (S3)"));
             }
+            // Losing the claim race to another worker / the dashboard is
+            // benign — no backoff, no error journal.
+            Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {
+                crate::events::journal_info(
+                    "archive",
+                    format!("schema {schema} skipped — another offload is in flight"),
+                );
+            }
             Err(e) => {
                 let (n, delay) = self.offload_backoff.record_failure(schema, Instant::now());
                 crate::events::journal_error(
@@ -1663,7 +1798,10 @@ impl SchemaRegistry {
         // checkouts stuck waiting are released even on error/panic.
         let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
             Some(g) => g,
-            None => bail!("schema {schema} is already being archived"),
+            None => {
+                return Err(anyhow::Error::new(AlreadyOffloading)
+                    .context(format!("schema {schema} is already being archived")));
+            }
         };
 
         // Evict the warm entry under the map lock, refusing if it has live
@@ -1768,7 +1906,10 @@ impl SchemaRegistry {
         };
         let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
             Some(g) => g,
-            None => bail!("schema {schema} is already being archived"),
+            None => {
+                return Err(anyhow::Error::new(AlreadyOffloading)
+                    .context(format!("schema {schema} is already being archived")));
+            }
         };
         anyhow::ensure!(
             self.store.record(schema).map(|r| r.tier) == Some(Tier::Frozen),
@@ -1836,7 +1977,10 @@ impl SchemaRegistry {
         };
         let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
             Some(g) => g,
-            None => bail!("schema {schema} is already being archived"),
+            None => {
+                return Err(anyhow::Error::new(AlreadyOffloading)
+                    .context(format!("schema {schema} is already being archived")));
+            }
         };
         let path = compact.compact_path(schema);
         let len = crate::imgarchive::promote_compact(&archive.s3, schema, &path)
@@ -1960,6 +2104,13 @@ impl SchemaRegistry {
         let res = self.archive_schema_as_image_inner(schema, viewed_id).await;
         match &res {
             Ok(()) => self.offload_backoff.clear(schema),
+            // Benign claim race — no error journal.
+            Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {
+                crate::events::journal_info(
+                    "archive.image",
+                    format!("schema {schema} skipped — another offload is in flight"),
+                );
+            }
             Err(e) => {
                 crate::events::journal_error("archive.image", format!("schema {schema}: {e:#}"));
             }
@@ -2001,7 +2152,10 @@ impl SchemaRegistry {
         }
         let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
             Some(g) => g,
-            None => bail!("schema {schema} is already being archived"),
+            None => {
+                return Err(anyhow::Error::new(AlreadyOffloading)
+                    .context(format!("schema {schema} is already being archived")));
+            }
         };
         // Evict the warm entry under the map lock, refusing live sessions —
         // same serialization against checkout as the dump path.
@@ -2169,6 +2323,13 @@ impl SchemaRegistry {
                     format!("schema {schema} → frozen (local dump)"),
                 );
             }
+            // Benign claim race — no backoff, no error journal.
+            Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {
+                crate::events::journal_info(
+                    "freeze",
+                    format!("schema {schema} skipped — another offload is in flight"),
+                );
+            }
             Err(e) => {
                 let (n, delay) = self.offload_backoff.record_failure(schema, Instant::now());
                 crate::events::journal_error(
@@ -2192,7 +2353,10 @@ impl SchemaRegistry {
         }
         let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
             Some(g) => g,
-            None => bail!("schema {schema} is already being frozen/archived"),
+            None => {
+                return Err(anyhow::Error::new(AlreadyOffloading)
+                    .context(format!("schema {schema} is already being frozen/archived")));
+            }
         };
         {
             let mut map = self.entries.lock().await;
@@ -2269,6 +2433,13 @@ impl SchemaRegistry {
                     format!("schema {schema} → compacted (local image)"),
                 );
             }
+            // Benign claim race — no backoff, no error journal.
+            Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {
+                crate::events::journal_info(
+                    "compact",
+                    format!("schema {schema} skipped — another offload is in flight"),
+                );
+            }
             Err(e) => {
                 let (n, delay) = self.offload_backoff.record_failure(schema, Instant::now());
                 crate::events::journal_error(
@@ -2292,7 +2463,10 @@ impl SchemaRegistry {
         }
         let _guard = match ArchivingGuard::claim(&self.archiving, schema) {
             Some(g) => g,
-            None => bail!("schema {schema} is already being offloaded"),
+            None => {
+                return Err(anyhow::Error::new(AlreadyOffloading)
+                    .context(format!("schema {schema} is already being offloaded")));
+            }
         };
         {
             let mut map = self.entries.lock().await;
@@ -2357,7 +2531,8 @@ impl SchemaRegistry {
         };
         info!(
             "orphan-disk sweep: reclaiming forgotten sb-<id>/ dirs under {} every {:?} \
-             (min age {:?}, ≤{} deletions/pass)",
+             (min age {:?}, ≤{} deletions/pass; re-arms after {ORPHAN_DRAIN_REARM:?} while \
+             a backlog remains and no client is waiting)",
             run_dir.display(),
             interval,
             ORPHAN_MIN_AGE,
@@ -2365,10 +2540,39 @@ impl SchemaRegistry {
         );
         let registry = self.clone();
         let first = ORPHAN_FIRST_DELAY.min(interval);
-        tokio::spawn(supervise("orphan-reaper", first, interval, move || {
-            let registry = registry.clone();
-            async move { registry.sweep_orphans().await }
-        }));
+        // Drain mode: a pass that hit its per-pass cap left work behind. Wake
+        // the supervisor again shortly instead of waiting a whole interval —
+        // but only if no client bring-up is queued at that moment; clients
+        // first. `Notify` stores the permit, so a wake landing mid-pass just
+        // triggers the next one, and the sweep's own single-flight makes a
+        // double wake harmless.
+        let wake = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn(supervise_with_wake(
+            "orphan-reaper",
+            first,
+            interval,
+            Some(wake.clone()),
+            move || {
+                let registry = registry.clone();
+                let wake = wake.clone();
+                async move {
+                    let (acted, deferred) = registry.sweep_orphans().await;
+                    if deferred > 0 {
+                        debug!(
+                            "orphan-disk sweep: {deferred} candidate(s) deferred — \
+                             re-checking in ~{ORPHAN_DRAIN_REARM:?}"
+                        );
+                        tokio::spawn(async move {
+                            tokio::time::sleep(ORPHAN_DRAIN_REARM).await;
+                            if crate::vm::bringups_waiting() == 0 {
+                                wake.notify_one();
+                            }
+                        });
+                    }
+                    acted
+                }
+            },
+        ));
     }
 
     /// Reap bring-ups that started (the daemon accepted a create and handed out
@@ -2461,8 +2665,13 @@ impl SchemaRegistry {
         resolved
     }
 
-    /// One orphan-disk pass. Returns the number of directories deleted (for the
-    /// supervisor heartbeat). Single-flighted on its own flag.
+    /// One orphan-disk pass. Returns `(acted, deferred)`: directories deleted
+    /// plus rootfs copies pruned (for the supervisor heartbeat), and how many
+    /// candidates the per-pass caps pushed to a later pass — a non-zero
+    /// `deferred` is what makes the reaper re-arm early (drain mode) instead
+    /// of waiting a whole interval. Failed deletions are NOT deferred work:
+    /// retrying them seconds later just re-fails (root-owned files etc.).
+    /// Single-flighted on its own flag.
     ///
     /// A directory is deleted only when **all** of these hold, checked in
     /// cheapest-first order so a live disk is ruled out before any daemon
@@ -2474,6 +2683,7 @@ impl SchemaRegistry {
     ///      the *list* is unreliable, so we never classify off it);
     ///   4. its schema is offloaded (`frozen`/`archived`, data safe elsewhere)
     ///      or the id is unreferenced by any registry entry (dead).
+    ///
     /// A `live`-tier schema whose VM is gone is a data-loss orphan: its disk is
     /// the only copy, so it is reported at error level and never deleted.
     /// Conditions 2 and 3 are re-checked immediately before each `remove_dir_all`
@@ -2488,13 +2698,13 @@ impl SchemaRegistry {
     /// single biggest reclaimable item in the run dir. Deleting it needs the
     /// same in-use and age guards as a directory, plus the daemon reporting the
     /// VM not running; the cost of being wrong is one extra image clone.
-    async fn sweep_orphans(&self) -> usize {
+    async fn sweep_orphans(&self) -> (usize, usize) {
         let Some(run_dir) = self.cfg.run_dir.clone() else {
-            return 0;
+            return (0, 0);
         };
         if self.orphan_sweeping.swap(true, Ordering::SeqCst) {
             info!("orphan-disk sweep: a pass is already running; skipping");
-            return 0;
+            return (0, 0);
         }
         let _guard = SweepGuard(&self.orphan_sweeping);
 
@@ -2516,7 +2726,7 @@ impl SchemaRegistry {
             Ok(e) => e,
             Err(e) => {
                 warn!("orphan-disk sweep: cannot read run dir {}: {e}", run_dir.display());
-                return 0;
+                return (0, 0);
             }
         };
         let now = SystemTime::now();
@@ -2546,7 +2756,7 @@ impl SchemaRegistry {
         }
         if dirs.is_empty() {
             debug!("orphan-disk sweep: no candidate dirs ({too_new} too new)");
-            return 0;
+            return (0, 0);
         }
 
         let open = crate::orphans::open_inodes();
@@ -2708,7 +2918,7 @@ impl SchemaRegistry {
                 crate::orphans::human_iec(pruned_bytes),
             );
         }
-        removed + pruned
+        (removed + pruned, backlog + rootfs_backlog)
     }
 
     /// What heyvmd's per-id endpoint says about sandbox `id`. Uses `get`
@@ -2738,6 +2948,22 @@ impl SchemaRegistry {
 
     fn is_archiving(&self, schema: &str) -> bool {
         self.archiving.lock().unwrap().contains(schema)
+    }
+
+    /// Warm-spare pool depth `(ready, target)`; `None` when the pool is
+    /// disabled. Zero ready is the single biggest cold-start signal: the next
+    /// new-schema connect pays a full create + boot instead of a spare claim.
+    pub fn spare_pool_depth(&self) -> Option<(usize, usize)> {
+        self.spares.as_ref().map(|p| p.depth())
+    }
+
+    /// The schemas currently claimed by an offload, whatever started it
+    /// (dispatcher workers, the pressure pass, dashboard buttons) — the
+    /// dashboard's "offloads in flight" readout.
+    pub fn archiving_schemas(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.archiving.lock().unwrap().iter().cloned().collect();
+        v.sort();
+        v
     }
 }
 
@@ -3074,6 +3300,23 @@ impl Drop for SweepGuard<'_> {
     }
 }
 
+/// Sentinel for a benign claim conflict: the schema is already being offloaded
+/// by someone else (another dispatcher worker, the pressure pass, a dashboard
+/// button). Losing that race is normal under concurrent workers, not a schema
+/// failure — callers downcast for this to skip the failure backoff and the
+/// error journal, and the pressure pass doesn't count it toward its
+/// consecutive-failure circuit breaker.
+#[derive(Debug)]
+struct AlreadyOffloading;
+
+impl std::fmt::Display for AlreadyOffloading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another offload of this schema is already in flight")
+    }
+}
+
+impl std::error::Error for AlreadyOffloading {}
+
 /// RAII claim on the `archiving` set: inserts on `claim`, removes on `Drop`, so
 /// a schema is never left stuck "archiving" if the operation errors or panics.
 struct ArchivingGuard<'a> {
@@ -3100,6 +3343,36 @@ impl Drop for ArchivingGuard<'_> {
     fn drop(&mut self) {
         self.set.lock().unwrap().remove(&self.schema);
     }
+}
+
+/// Normalized host load: the 1-minute loadavg divided by online cores, `None`
+/// when it can't be read (no /proc — non-Linux dev hosts). Linux load counts
+/// tasks in uninterruptible I/O sleep as well as runnable ones, so this rises
+/// under disk saturation too — exactly the two resources an extra offload
+/// worker would fight clients for.
+fn normalized_load() -> Option<f64> {
+    let load1: f64 = std::fs::read_to_string("/proc/loadavg")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let cores = std::thread::available_parallelism().ok()?.get() as f64;
+    Some(load1 / cores)
+}
+
+/// May the dispatcher start another offload job right now? The first job is
+/// always allowed (parity with the classic single pacer, which had no load
+/// gate); every extra one requires both a free worker slot and known load
+/// headroom — an unreadable load means no extras, never a stampede.
+fn dispatch_allowance(in_flight: usize, workers: usize, load: Option<f64>, load_max: f64) -> bool {
+    if in_flight >= workers {
+        return false;
+    }
+    if in_flight == 0 {
+        return true;
+    }
+    load.is_some_and(|l| l < load_max)
 }
 
 fn now_unix() -> u64 {
@@ -3147,6 +3420,15 @@ impl OffloadKind {
             OffloadKind::Archive => "archiving",
             OffloadKind::Freeze => "freezing",
         }
+    }
+
+    /// Whether this kind boots a VM to do its work — and therefore competes
+    /// with waiting clients for the FIFO bring-up gate. The dispatcher caps
+    /// boot kinds at one in flight however many workers are configured.
+    /// (`pick_offload_job` only emits Archive/Freeze for `Tier::Live`
+    /// records, so kind ⇒ boot is exact.)
+    fn boots(self) -> bool {
+        matches!(self, OffloadKind::Archive | OffloadKind::Freeze)
     }
 
     /// Preference order (lower wins) when several schemas are eligible at
@@ -3206,6 +3488,11 @@ struct OffloadPolicy {
     /// Whether the no-boot image archive is available (`PG_VM_POOL_IMAGE_ARCHIVE`
     /// + the S3 tier + a run dir). Only ever offered under pressure.
     image_archive: bool,
+    /// When set, VM-booting kinds (archive/freeze) are ineligible this pick.
+    /// The dispatcher sets it while a boot-kind job is already in flight so
+    /// that at most one offload at a time competes with clients for the
+    /// bring-up gate. Default `false` = all kinds allowed.
+    no_boot: bool,
     mode: OffloadMode,
 }
 
@@ -3266,9 +3553,9 @@ fn pick_offload_job(
                     OffloadKind::Compact
                 } else if imageable {
                     OffloadKind::ImageArchive
-                } else if eligible(t.archive_after, warm) {
+                } else if !t.no_boot && eligible(t.archive_after, warm) {
                     OffloadKind::Archive
-                } else if eligible(t.freeze_after, warm) {
+                } else if !t.no_boot && eligible(t.freeze_after, warm) {
                     OffloadKind::Freeze
                 } else {
                     // Durably stale but actually live: keep its clock honest
@@ -3400,6 +3687,7 @@ mod archive_tests {
         freeze_after: None,
         archive_after: Some(86_400),
         image_archive: false,
+        no_boot: false,
         mode: OffloadMode::Routine,
     };
 
@@ -3424,6 +3712,93 @@ mod archive_tests {
             .iter()
             .map(|(n, tier, idle)| ((*n).to_string(), tiered(*tier, *idle)))
             .collect()
+    }
+
+    // ---- dispatcher worker-pool seams ---------------------------------------
+
+    /// Concurrent workers exclude in-flight schemas through the same predicate
+    /// as backoff: with the top-ranked schema excluded, the picker returns the
+    /// next-best job instead of re-picking the same one forever.
+    #[test]
+    fn in_flight_exclusion_yields_the_second_best_job() {
+        let ready = schemas(&[
+            ("busy", Tier::Live, 300_000), // coldest — would win unexcluded
+            ("next", Tier::Live, 200_000),
+        ]);
+        let live = HashMap::new();
+        let (job, _) = pick_offload_job(&ready, &live, LADDER, &|_| false, &|s| s == "busy", NOW);
+        let job = job.unwrap();
+        assert_eq!(job.schema, "next");
+        assert_eq!(job.kind, OffloadKind::Compact);
+    }
+
+    /// `no_boot` fences off the VM-booting kinds (archive/freeze) while a
+    /// boot-kind job is in flight — no-boot work still flows, and the
+    /// stale-but-warm refresh still fires.
+    #[test]
+    fn no_boot_policy_skips_dump_kinds_but_not_compact_or_promote() {
+        let fenced = OffloadPolicy { no_boot: true, ..LADDER };
+        let no_live: HashMap<String, (usize, u64)> = HashMap::new();
+
+        // Warm (so not compactable) and cold enough to archive: the fence
+        // withholds it entirely...
+        let warm: HashMap<String, (usize, u64)> = [("w".to_string(), (0, 90_000))].into();
+        let recs = schemas(&[("w", Tier::Live, 90_000)]);
+        assert!(pick(&recs, &warm, fenced).is_none());
+        // ...where the plain policy would dump it.
+        assert_eq!(pick(&recs, &warm, LADDER).unwrap().kind, OffloadKind::Archive);
+
+        // Compact and promote are untouched by the fence.
+        let ready = schemas(&[("p", Tier::Frozen, 90_000), ("c", Tier::Live, 7200)]);
+        assert_eq!(pick(&ready, &no_live, fenced).unwrap().kind, OffloadKind::Promote);
+        assert_eq!(pick(&ready[1..], &no_live, fenced).unwrap().kind, OffloadKind::Compact);
+
+        // A durably-stale-but-actually-warm schema still gets its clock
+        // refreshed under the fence (nothing eligible, refresh intact).
+        let young_warm: HashMap<String, (usize, u64)> = [("w".to_string(), (0, 30))].into();
+        let (job, refresh) =
+            pick_offload_job(&recs, &young_warm, fenced, &|_| false, &|_| false, NOW);
+        assert!(job.is_none());
+        assert_eq!(refresh, vec!["w".to_string()]);
+    }
+
+    /// The load gate: the first job is always allowed; extras need a free
+    /// worker slot AND known headroom; unreadable load never stampedes.
+    #[test]
+    fn dispatch_allowance_matrix() {
+        // Worker cap wins over everything.
+        assert!(!dispatch_allowance(1, 1, Some(0.0), 0.75));
+        assert!(!dispatch_allowance(4, 4, Some(0.0), 0.75));
+        // First job: always, however loaded (or unreadable).
+        assert!(dispatch_allowance(0, 4, Some(99.0), 0.75));
+        assert!(dispatch_allowance(0, 4, None, 0.75));
+        // Extras: only with measured headroom.
+        assert!(dispatch_allowance(1, 4, Some(0.2), 0.75));
+        assert!(!dispatch_allowance(1, 4, Some(0.75), 0.75));
+        assert!(!dispatch_allowance(1, 4, Some(2.0), 0.75));
+        assert!(!dispatch_allowance(1, 4, None, 0.75));
+    }
+
+    /// Kind ⇒ boot is exact: only the dump-based kinds take the bring-up gate,
+    /// so only they are capped at one in flight.
+    #[test]
+    fn only_dump_kinds_boot() {
+        assert!(!OffloadKind::Promote.boots());
+        assert!(!OffloadKind::Compact.boots());
+        assert!(!OffloadKind::ImageArchive.boots());
+        assert!(OffloadKind::Archive.boots());
+        assert!(OffloadKind::Freeze.boots());
+    }
+
+    /// The benign claim-race sentinel must survive anyhow context wrapping —
+    /// the wrappers downcast through the chain to skip backoff and journaling.
+    #[test]
+    fn already_offloading_downcasts_through_context() {
+        let e =
+            anyhow::Error::new(AlreadyOffloading).context("schema x is already being archived");
+        assert!(e.downcast_ref::<AlreadyOffloading>().is_some());
+        let plain = anyhow::anyhow!("some other failure");
+        assert!(plain.downcast_ref::<AlreadyOffloading>().is_none());
     }
 
     /// The pacer takes exactly one job per scan, and takes them in
@@ -3551,6 +3926,7 @@ mod archive_tests {
             freeze_after: None,
             archive_after: Some(0),
             image_archive: true,
+            no_boot: false,
             mode: OffloadMode::Pressure,
         };
         // A compactable (stopped, not warm) schema and a warm one that could

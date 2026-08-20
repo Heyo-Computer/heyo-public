@@ -323,6 +323,14 @@ pub fn monitoring_page(
     let archived = rows.iter().filter(|r| r.offload == Some("archived")).count();
     let frozen = rows.iter().filter(|r| r.offload == Some("frozen")).count();
     let compacted = rows.iter().filter(|r| r.offload == Some("compacted")).count();
+    let offloading = st.registry.archiving_schemas();
+    let offloading_names = offloading.join(", ");
+    // The blocking activity a slow cold start hides behind: clients parked in
+    // the bring-up queue, a reclaim pass holding the boot gate, and an empty
+    // spare shelf (next new schema pays a full create + boot).
+    let queued_bringups = crate::vm::bringups_waiting();
+    let reclaim_running = crate::reclaim::pass_running();
+    let spare_depth = st.registry.spare_pool_depth();
 
     shell(
         "Monitoring",
@@ -397,10 +405,20 @@ pub fn monitoring_page(
                 (stat("allocated vCPU", &alloc_vcpu.to_string(), Some("across running VMs")))
                 (stat("allocated RAM", &human_bytes(alloc_mem), Some("across running VMs")))
                 (stat("guest CPU", &format!("{guest_cpu:.0}%"), Some("cores busy, top-convention")))
+                @if let Some((ready, target)) = spare_depth {
+                    (stat("warm spares ready", &ready.to_string(),
+                        Some(&format!("target {target}{}", if ready == 0 { " — cold creates!" } else { "" }))))
+                }
+                (stat("bring-ups queued", &queued_bringups.to_string(),
+                    if queued_bringups > 0 { Some("clients waiting for a VM") } else { None }))
+                (stat("reclaim pass", if reclaim_running { "running" } else { "idle" },
+                    if reclaim_running { Some("holds the boot gate — VM boots wait") } else { None }))
                 @if st.registry.archive_enabled() {
                     (stat("compacted (local)", &compacted.to_string(), None))
                     (stat("frozen (local)", &frozen.to_string(), None))
                     (stat("archived (S3)", &archived.to_string(), None))
+                    (stat("offloads in flight", &offloading.len().to_string(),
+                        if offloading.is_empty() { None } else { Some(offloading_names.as_str()) }))
                 }
             }
             p.note {

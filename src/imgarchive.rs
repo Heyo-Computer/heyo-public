@@ -264,7 +264,7 @@ pub async fn compact_disk(
 /// final path always a verified-complete image.
 async fn compact_via_tmp(schema: &str, disk: &Path, tmp: &Path, dest: &Path) -> Result<u64> {
     run_ok(
-        Command::new("zstd").args(["-q", "-f", "-3", "-T0", "-o"]).arg(tmp).arg(disk),
+        deprioritize(Command::new("zstd").args(["-q", "-f", "-3", zstd_threads(), "-o"]).arg(tmp).arg(disk)),
         "compressing the disk image (is zstd installed?)",
         ZSTD_TIMEOUT,
     )
@@ -279,7 +279,7 @@ async fn compact_via_tmp(schema: &str, disk: &Path, tmp: &Path, dest: &Path) -> 
          refusing to keep it"
     );
     run_ok(
-        Command::new("zstd").args(["-q", "-t"]).arg(tmp),
+        deprioritize(Command::new("zstd").args(["-q", "-t"]).arg(tmp)),
         "verifying the compacted image (zstd -t)",
         ZSTD_TIMEOUT,
     )
@@ -359,7 +359,7 @@ async fn archive_via_spool(
     // -3 is zstd's default level: the bulk of these images is zeros and
     // page-structured data where higher levels buy little for a lot of CPU.
     run_ok(
-        Command::new("zstd").args(["-q", "-f", "-3", "-T0", "-o"]).arg(spool).arg(disk),
+        deprioritize(Command::new("zstd").args(["-q", "-f", "-3", zstd_threads(), "-o"]).arg(spool).arg(disk)),
         "compressing the disk image (is zstd installed?)",
         ZSTD_TIMEOUT,
     )
@@ -378,7 +378,7 @@ async fn archive_via_spool(
     // image at all — both before a byte is uploaded. History says exactly
     // this: torn files under disk pressure that every tool "succeeded" on.
     run_ok(
-        Command::new("zstd").args(["-q", "-t"]).arg(spool),
+        deprioritize(Command::new("zstd").args(["-q", "-t"]).arg(spool)),
         "verifying the spooled image (zstd -t)",
         ZSTD_TIMEOUT,
     )
@@ -865,7 +865,7 @@ async fn wait_disk_released(disk: &Path) -> Result<()> {
 /// Exit 0/1 = clean/corrected; anything else archives the disk as-is.
 async fn trim_disk(schema: &str, disk: &Path) {
     match run(
-        Command::new("e2fsck").args(["-fp", "-E", "discard"]).arg(disk),
+        deprioritize(Command::new("e2fsck").args(["-fp", "-E", "discard"]).arg(disk)),
         FSCK_TIMEOUT,
     )
     .await
@@ -891,6 +891,7 @@ async fn pg_version_of(disk: &Path) -> Option<String> {
             cmd.arg("-c");
         }
         cmd.args(["-R", "cat /pgdata/PG_VERSION"]).arg(disk);
+        deprioritize(&mut cmd);
         let Ok(out) = run(&mut cmd, Duration::from_secs(30)).await else {
             return None;
         };
@@ -926,9 +927,7 @@ async fn check_ext4_magic(path: &Path) -> Result<()> {
 /// proves the payload without materializing it. `zstd -dc` is killed as soon
 /// as the superblock has streamed out.
 async fn check_compressed_ext4_magic(spool: &Path) -> Result<()> {
-    let mut child = Command::new("zstd")
-        .args(["-q", "-dc"])
-        .arg(spool)
+    let mut child = deprioritize(Command::new("zstd").args(["-q", "-dc"]).arg(spool))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -1030,6 +1029,53 @@ async fn free_bytes(dir: &Path) -> Option<u64> {
     // POSIX -P format: header, then one line; "Available" is field 4.
     let avail_kb: u64 = text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()?;
     Some(avail_kb * 1024)
+}
+
+/// Best-effort: run this child at the lowest CPU priority (nice 19) and the
+/// lowest *best-effort* I/O priority (class 2, level 7 — deliberately not the
+/// idle class, which can starve indefinitely behind sustained client I/O and
+/// turn a bounded job into an unbounded disk-latency bet). For OFFLOAD-path
+/// children only: restore-path children have a waiting client behind them and
+/// keep normal priority, and the reclaim script runs while the boot gate is
+/// held, where slowness lengthens the client-visible outage. A denied or
+/// unsupported call just leaves the child at the parent's priority — it never
+/// fails the exec.
+fn deprioritize(cmd: &mut Command) -> &mut Command {
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+            // ioprio_set(IOPRIO_WHO_PROCESS=1, self, class BE (2) << 13 | 7).
+            // Effective under BFQ/CFQ; a no-op under none/mq-deadline, where
+            // the dispatcher's load gate is the real protection.
+            #[cfg(target_os = "linux")]
+            libc::syscall(libc::SYS_ioprio_set, 1i32, 0i32, (2i32 << 13) | 7i32);
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// The `-T` argument for offload compressions: all cores (`-T0`) with a
+/// single offload worker — the classic behavior — or an even split when
+/// `PG_VM_POOL_OFFLOAD_WORKERS` allows several concurrent offloads, so N
+/// parallel zstds don't oversubscribe every core even at nice 19. Read from
+/// the env directly (the same lazy pattern as vm.rs's bring-up gates) so
+/// these helpers stay Config-free.
+fn zstd_threads() -> &'static str {
+    static ARG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ARG.get_or_init(|| {
+        let workers: usize = std::env::var("PG_VM_POOL_OFFLOAD_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1);
+        if workers <= 1 {
+            "-T0".to_string()
+        } else {
+            let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            format!("-T{}", (cores / workers).max(1))
+        }
+    })
 }
 
 /// Run an external command with a wall-clock bound. `kill_on_drop` reaps it

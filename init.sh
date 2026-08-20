@@ -168,7 +168,19 @@ if [ -b "$DATA_DEV" ]; then
 fi
 
 mkdir -p "$PGDATA"
-chown -R postgres:postgres "$WORKSPACE"
+# Recursive chown scales with the FILE COUNT of the whole database — on a
+# populated cluster it was a multi-second tax on EVERY boot, straight onto the
+# client's cold-start latency. Ownership only ever needs fixing once (first
+# boot, or a disk adopted by restore/readopt surgery), so probe $PGDATA's
+# owner and skip the walk when it is already postgres. Caveat accepted: a
+# chown interrupted mid-walk (crash during first boot) can leave $PGDATA
+# flipped while some children are not, and this guard would then skip the
+# repair — but Postgres fails loudly on the EPERM in that state, and
+# `chown -R postgres:postgres /workspace` from a rescue exec fixes it; that
+# rare recovery beats paying the full walk on every clean boot.
+if [ "$(stat -c %U "$PGDATA" 2>/dev/null)" != "postgres" ]; then
+    chown -R postgres:postgres "$WORKSPACE"
+fi
 chmod 700 "$PGDATA"
 
 # Initialize the cluster the first time this volume is used.

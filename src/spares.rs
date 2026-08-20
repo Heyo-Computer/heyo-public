@@ -161,6 +161,13 @@ impl SparePool {
         self.claimed.lock().unwrap().clone()
     }
 
+    /// `(ready, target)`: warm spares on the shelf right now vs the
+    /// configured pool size — the dashboard's pool-depth readout. Zero ready
+    /// means the next cold connect pays a full create + boot + initdb.
+    pub fn depth(&self) -> (usize, usize) {
+        (self.ready.lock().unwrap().len(), self.target)
+    }
+
     /// Claim one warm spare, excluding `bound` ids (schema-bound per the
     /// registry). Returns a connected handle, or `None` when no spare is
     /// available (caller falls back to a cold create).

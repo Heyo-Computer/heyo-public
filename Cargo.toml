@@ -17,6 +17,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 futures = "0.3.32"
+# pre_exec deprioritization (nice 19 + ioprio best-effort-lowest) of the
+# offload path's zstd/e2fsck children, so background reaping never outbids a
+# client for CPU or disk. Already resolved in Cargo.lock via tokio/socket2.
+libc = "0.2"
 # Client-facing TLS (SSLRequest upgrade). Both crates are already in the tree
 # via heyo-sdk's reqwest stack with the `ring` provider — default features are
 # off so we don't drag in the aws-lc-rs provider on top.
