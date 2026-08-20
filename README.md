@@ -510,6 +510,21 @@ Pin the script at a root-owned path (`chown root:root`, `chmod 0755`) so the
 sudoers entry can't be repointed by editing a user-writable file, and pass the
 run dir in the sudoers line exactly as in the command so `sudo -n` matches.
 
+**Verify after any change to the script path, run dir, or flags** — sudoers
+matches the argument list byte-for-byte, and a stale entry fails every
+automated run without anything obviously breaking (the pooler just logs a
+failed reclaim once an hour):
+
+```
+# as the pooler's user; prints the command if the entry matches, errors if not
+sudo -n -l /opt/pg-vm-pool/reclaim-disks.sh /workbooks/heyvm/run --shrink --prune-swap
+```
+
+then confirm the next periodic run's summary line (`trimmed N disk(s),
+reclaimed …`) appears in the pooler log. The two historical failure modes are
+exactly this: env vars stripped by `sudo` (hence flags-as-arguments) and an
+argument list that drifted from the sudoers pin after a run-dir change.
+
 **A pass yields to a waiting boot.** The script's in-use scan is a snapshot
 taken at pass start, so a VM booted mid-pass would be invisible to it and its
 filesystem could be fscked underneath the running guest. The pooler closes that
