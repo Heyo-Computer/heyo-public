@@ -54,6 +54,38 @@ mount -t devtmpfs devtmpfs /dev       2>/dev/null || true
 mount -t tmpfs    tmpfs    /run       2>/dev/null || true
 mount -t tmpfs    tmpfs    /tmp       2>/dev/null || true
 
+# /dev/shm: where Postgres puts its DYNAMIC shared memory segments (parallel
+# query, parallel index builds) whenever a cluster's `dynamic_shared_memory_type`
+# is `posix`. devtmpfs carries device nodes only, so without this explicit mount
+# the directory does not exist at all — and because nothing reconciled the
+# cluster's DSM setting against what the guest could actually provide, that
+# broke boots in two different ways (both observed 2026-08-21):
+#
+#   · a FRESH initdb probed POSIX shm, failed, and baked
+#     `dynamic_shared_memory_type = sysv` permanently into that cluster's
+#     postgresql.conf ("selecting dynamic shared memory implementation ... sysv");
+#   · a RESTORED cluster whose conf already said `posix` could not start AT ALL:
+#     `FATAL: could not open shared memory segment "/PostgreSQL.<n>": No such
+#     file or directory`, then `database system is shut down`. No timeout is
+#     involved — the boot simply never produces a listener, so it burns the
+#     pooler's full ready budget and reads as a bring-up timeout.
+#
+# Sized at half of RAM (the kernel's own tmpfs default). That is a CAP, not a
+# reservation: pages are charged only as segments are actually created, so it
+# does not interact with the strict overcommit set below.
+#
+# DSM_TYPE carries the outcome down to the generated tuning conf, which pins the
+# cluster's setting to what this VM can really do on EVERY boot — in both
+# directions. That reconciliation is the actual fix: baking a DSM type at initdb
+# time and never revisiting it is what let a cluster outlive the assumption.
+mkdir -p /dev/shm
+if mount -t tmpfs -o mode=1777,size=50% tmpfs /dev/shm 2>/dev/null; then
+    DSM_TYPE=posix
+else
+    DSM_TYPE=sysv
+    echo "[init] WARNING: /dev/shm not mounted — pinning dynamic_shared_memory_type=sysv"
+fi
+
 # --- temp-file scratch on tmpfs (RAM) ----------------------------------------
 # Postgres spills large sorts/hashes/CTEs/index-builds to temp files. On the
 # persistent data disk those blocks are stranded forever — the guest issues no
@@ -368,6 +400,13 @@ effective_cache_size = ${effective_cache_mb}MB
 work_mem = ${work_mem_mb}MB
 maintenance_work_mem = ${maint_mem_mb}MB
 temp_buffers = ${temp_buffers_mb}MB
+
+# Pinned from what this boot actually mounted, not from what initdb guessed
+# when the cluster was born. This include is appended to the END of
+# postgresql.conf, so it overrides the value initdb wrote there — which is how
+# a cluster that baked `sysv` (or a restored one that baked `posix`) is healed
+# instead of failing forever. See the /dev/shm mount near the top.
+dynamic_shared_memory_type = ${DSM_TYPE}
 
 # Concurrency ceiling the per-backend knobs above were sized against
 # (${backend_budget_mb}MB of non-shared_buffers headroom / ${max_conns} connections =

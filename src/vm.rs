@@ -506,21 +506,22 @@ pub async fn ensure_vm(
     let (sandbox, provenance) = match restore {
         // An image restore builds its own VM (download, disk swap, boot on the
         // real data) — the database is complete before Postgres first starts,
-        // so there is nothing to restore into and no spare worth claiming.
-        // Image-materialized VMs are `Created`: the durable copy is the image,
-        // so a failed bring-up can kill them too.
-        Some(RestoreSource::S3Image(s3)) => (
-            crate::imgarchive::materialize_from_image(cfg, schema, s3)
+        // so there is nothing to restore *into*. It still needs a booted VM to
+        // swap the disk underneath, though, and a warm spare is by far the
+        // cheapest one available: see [`claim_restore_vehicle`]. The
+        // provenance it reports is what tells the failure path below how to
+        // dispose of the VM — a claimed spare must be released through the
+        // pool, never killed behind its back.
+        Some(RestoreSource::S3Image(s3)) => {
+            crate::imgarchive::materialize_from_image(cfg, schema, s3, spares)
                 .await
-                .with_context(|| format!("restoring schema {schema} from its S3 disk image"))?,
-            Provenance::Created,
-        ),
-        Some(RestoreSource::LocalImage(path)) => (
-            crate::imgarchive::materialize_from_local_image(cfg, schema, path)
+                .with_context(|| format!("restoring schema {schema} from its S3 disk image"))?
+        }
+        Some(RestoreSource::LocalImage(path)) => {
+            crate::imgarchive::materialize_from_local_image(cfg, schema, path, spares)
                 .await
-                .with_context(|| format!("thawing schema {schema} from its compacted image"))?,
-            Provenance::Created,
-        ),
+                .with_context(|| format!("thawing schema {schema} from its compacted image"))?
+        }
         _ => resolve_sandbox(cfg, &name, keepalive, known_id, spares).await?,
     };
 
@@ -2277,6 +2278,13 @@ pub(crate) enum Provenance {
     Created,
 }
 
+/// The warm-spare pool and the set of sandbox ids already bound to a schema,
+/// as threaded through a bring-up. `None` when the pool is disabled.
+pub(crate) type Spares<'a> = Option<(
+    &'a crate::spares::SparePool,
+    &'a std::collections::HashSet<String>,
+)>;
+
 pub(crate) async fn resolve_sandbox(
     cfg: &Config,
     name: &str,
@@ -2334,6 +2342,45 @@ pub(crate) async fn resolve_sandbox(
 
     // 4. No spare: create from scratch.
     create_vm(cfg, name, keepalive)
+        .await
+        .map(|sb| (sb, Provenance::Created))
+}
+
+/// A booted, ready VM for an image restore to use as its *vehicle*: the caller
+/// stops it immediately, overwrites its data disk with the restored image, and
+/// boots it on the real data.
+///
+/// A warm spare is the ideal vehicle *because* the restore throws its contents
+/// away. The expensive part of a cold create is the guest's first boot — mkfs,
+/// the swapfile, a full `initdb` — and the disk swap discards every bit of it.
+/// Claiming a spare skips that work, and with it the daemon's fixed
+/// serial-console readiness window, which is what made image restores the
+/// slowest and most failure-prone bring-up on a loaded host while net-new
+/// schemas (which have always claimed spares, via [`resolve_sandbox`] step 3)
+/// stayed fast. The pool's own docs name S3 restores as its reason to exist;
+/// this is the wiring that was missing.
+///
+/// The returned [`Provenance`] must reach every failure path: a claimed spare
+/// is disposed of through [`crate::spares::SparePool::release_failed`] (kill
+/// *and* unclaim), never a bare `kill`, or its id stays in the pool's
+/// `claimed` set for the life of the process — a running VM and disk nothing
+/// can reclaim, with the replenisher building a replacement on top of it.
+pub(crate) async fn claim_restore_vehicle(
+    cfg: &Config,
+    schema: &str,
+    spares: Spares<'_>,
+) -> Result<(Sandbox, Provenance)> {
+    if let Some((pool, bound)) = spares
+        && let Some(sb) = pool.take(bound).await
+    {
+        info!(
+            "schema {schema}: claiming warm spare {} as the image-restore vehicle",
+            sb.sandbox_id()
+        );
+        return Ok((sb, Provenance::Spare));
+    }
+    let name = format!("pg-{schema}");
+    create_vm(cfg, &name, cfg.is_keepalive(schema))
         .await
         .map(|sb| (sb, Provenance::Created))
 }

@@ -525,11 +525,12 @@ async fn upload_parts(
 /// the image, create a fresh VM, and swap the image in under it (see the
 /// module docs for why the copy is in-place). Returns the booted, ready
 /// sandbox; `ensure_vm` takes it from there.
-pub async fn materialize_from_image(
+pub(crate) async fn materialize_from_image(
     cfg: &Config,
     schema: &str,
     s3: &S3Config,
-) -> Result<heyo_sdk::Sandbox> {
+    spares: crate::vm::Spares<'_>,
+) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     let run_dir = cfg
         .run_dir
         .as_ref()
@@ -582,7 +583,7 @@ pub async fn materialize_from_image(
         );
     }
 
-    let res = materialize_inner(cfg, schema, s3, &key, &http, expect_len, &zst, &raw).await;
+    let res = materialize_inner(cfg, schema, s3, &key, &http, expect_len, &zst, &raw, spares).await;
     let _ = tokio::fs::remove_file(&zst).await;
     let _ = tokio::fs::remove_file(&raw).await;
     res
@@ -594,11 +595,12 @@ pub async fn materialize_from_image(
 /// never deleted here — that's the caller's move once the thaw is confirmed
 /// (registry row flipped live), so a failed boot always leaves the data where
 /// it was.
-pub async fn materialize_from_local_image(
+pub(crate) async fn materialize_from_local_image(
     cfg: &Config,
     schema: &str,
     src: &Path,
-) -> Result<heyo_sdk::Sandbox> {
+    spares: crate::vm::Spares<'_>,
+) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     let run_dir = cfg
         .run_dir
         .as_ref()
@@ -637,7 +639,7 @@ pub async fn materialize_from_local_image(
             crate::orphans::human_iec(len),
         );
     }
-    let res = adopt_zst_image(cfg, schema, src, &raw).await;
+    let res = adopt_zst_image(cfg, schema, src, &raw, spares).await;
     let _ = tokio::fs::remove_file(&raw).await;
     res
 }
@@ -652,21 +654,27 @@ async fn materialize_inner(
     expect_len: u64,
     zst: &Path,
     raw: &Path,
-) -> Result<heyo_sdk::Sandbox> {
+    spares: crate::vm::Spares<'_>,
+) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     download(s3, http, key, expect_len, zst).await?;
-    adopt_zst_image(cfg, schema, zst, raw).await
+    adopt_zst_image(cfg, schema, zst, raw, spares).await
 }
 
 /// The shared tail of every image restore: decompress `zst` into `raw`,
-/// verify it is ext4, then run the readopt maneuver (fresh VM, disk swap,
+/// verify it is ext4, then run the readopt maneuver (a booted VM, disk swap,
 /// boot on the real data). Deletes nothing — each caller owns its files'
 /// lifecycles.
+///
+/// Returns the VM together with where it came from, because the two origins
+/// must be *disposed of* differently on failure — see the dispatch below and
+/// [`crate::vm::claim_restore_vehicle`].
 async fn adopt_zst_image(
     cfg: &Config,
     schema: &str,
     zst: &Path,
     raw: &Path,
-) -> Result<heyo_sdk::Sandbox> {
+    spares: crate::vm::Spares<'_>,
+) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     run_ok(
         Command::new("zstd").args(["-q", "-d", "-f", "--sparse", "-o"]).arg(raw).arg(zst),
         "decompressing the disk image (is zstd installed?)",
@@ -692,37 +700,53 @@ async fn adopt_zst_image(
         );
     }
 
-    // The readopt maneuver: fresh VM (created booted+ready), stop it, copy
-    // the image in place over its empty disk, boot on the real data.
-    let name = format!("pg-{schema}");
-    let sandbox = crate::vm::create_vm(cfg, &name, cfg.is_keepalive(schema)).await?;
+    // The readopt maneuver: a booted, ready VM — a warm spare whenever the
+    // pool has one — stopped, its empty disk overwritten in place with the
+    // image, then booted on the real data.
+    let (sandbox, provenance) = crate::vm::claim_restore_vehicle(cfg, schema, spares).await?;
     if let Err(e) = swap_and_boot(cfg, &sandbox, schema, raw).await {
         // The half-adopted VM must not survive at all: merely *stopping* it
-        // leaves a `pg-<schema>` sandbox holding an empty-or-torn database
-        // that a later find-by-name would happily serve as the schema, and a
-        // stopped daemon-known sandbox is invisible to every reclaimer (not
-        // an orphan, not spare-named, no registry row). Kill it — sandbox,
-        // disk and all; the durable copy is still the S3 image. Best-effort:
-        // on a kill failure the loud warn is all we can do, and the next
-        // restore attempt's create will conflict on the name and surface it.
+        // leaves a sandbox holding an empty-or-torn database that a later
+        // find-by-name would happily serve as the schema, and a stopped
+        // daemon-known sandbox is invisible to every reclaimer (not an
+        // orphan, no registry row). Destroy it — sandbox, disk and all; the
+        // durable copy is still the image we were restoring from.
+        //
+        // *How* depends on where it came from. A claimed spare goes back
+        // through the pool: `release_failed` kills it AND drops the id from
+        // `claimed`, so the replenisher rebuilds. A bare `kill` here would
+        // destroy the VM while leaving its id claimed for the life of the
+        // process — the pool would shrink by one on every failed restore and
+        // never recover, which is precisely the pool a busy restore path has
+        // just started depending on.
         warn!(
-            "schema {schema}: image restore failed after VM create; killing {}",
+            "schema {schema}: image restore failed after claiming its VM; destroying {}",
             sandbox.sandbox_id()
         );
-        match tokio::time::timeout(Duration::from_secs(30), sandbox.kill()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(kill_err)) => warn!(
-                "schema {schema}: killing half-adopted VM {} failed: {kill_err:#}",
-                sandbox.sandbox_id()
-            ),
-            Err(_) => warn!(
-                "schema {schema}: killing half-adopted VM {} timed out",
-                sandbox.sandbox_id()
-            ),
+        match provenance {
+            crate::vm::Provenance::Spare => {
+                if let Some((pool, _)) = spares {
+                    pool.release_failed(sandbox.sandbox_id()).await;
+                }
+            }
+            // Best-effort: on a kill failure the loud warn is all we can do,
+            // and the next restore attempt's create will conflict on the name
+            // and surface it.
+            _ => match tokio::time::timeout(Duration::from_secs(30), sandbox.kill()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(kill_err)) => warn!(
+                    "schema {schema}: killing half-adopted VM {} failed: {kill_err:#}",
+                    sandbox.sandbox_id()
+                ),
+                Err(_) => warn!(
+                    "schema {schema}: killing half-adopted VM {} timed out",
+                    sandbox.sandbox_id()
+                ),
+            },
         }
         return Err(e);
     }
-    Ok(sandbox)
+    Ok((sandbox, provenance))
 }
 
 async fn swap_and_boot(
