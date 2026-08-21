@@ -567,6 +567,16 @@ pass isn't touching therefore costs nothing at all, and the pass keeps running
 through cold starts and warm-spare restarts instead of losing its progress to
 them.
 
+A pass under per-disk locks also runs at `nice` 19 with best-effort-low I/O
+priority (inherited through `sudo` by the `e2fsck` underneath), where one under
+the global gate runs at full priority. The mode decides who the pass is
+competing with: under the gate it is holding up every VM boot on the host, so
+finishing fast *is* the client-facing priority; under locks it runs alongside
+live traffic instead, and an fsck-and-trim sweep over every stopped disk at
+normal I/O priority competes with heyvmd itself — saturate it far enough and its
+watchdog restarts it, which drops every in-flight create and kills every running
+VM (the `has been unknown to heyvmd` bring-up failure).
+
 Because the permit is only held across `start()`, a VM that boots mid-pass ends
 up holding its disk open while the pass-start in-use snapshot still predates it.
 So the script asks that question twice: against the snapshot (free — it catches
