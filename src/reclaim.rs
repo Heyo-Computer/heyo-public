@@ -569,6 +569,27 @@ impl Reclaimer {
             .arg(&self.cmd)
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        // Priority follows the exclusion mode, because the mode decides who
+        // this pass is competing with.
+        //
+        // Under the global gate it competes with nobody: every VM boot on the
+        // host is blocked until it exits, so finishing fast IS the client-facing
+        // priority and it runs at full tilt.
+        //
+        // Under per-disk locks that is exactly inverted — the pass now runs
+        // *alongside* live traffic instead of instead of it. An fsck + shrink +
+        // hole-punch sweep over every stopped disk, at normal CPU and I/O
+        // priority, then competes with the daemon the whole host depends on;
+        // saturate it far enough and heyvmd's watchdog restarts it, which drops
+        // every in-flight create and kills every running VM (see
+        // `vm::READY_NOTFOUND_GRACE`). Slack is worth less than that, so under
+        // locks the sweep yields the machine like any other background job.
+        //
+        // `nice`/`ioprio` are inherited across the `sudo` in the configured
+        // command, so setting them on the shell covers the `e2fsck` underneath.
+        if per_disk_locks() {
+            crate::imgarchive::deprioritize(&mut command);
+        }
         let run = tokio::time::timeout(RECLAIM_TIMEOUT, command.output());
         tokio::pin!(run);
         // A boot that arrived while this pass was still QUEUED on the gate is
@@ -1011,6 +1032,52 @@ mod tests {
         // A rollback to a script that doesn't write the marker drops us back.
         std::fs::remove_file(&marker).unwrap();
         assert!(!refresh_per_disk(&marker));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pass yields the machine only when it is sharing it. Asserted as a
+    /// relative change so it holds whatever niceness the test runner started
+    /// at, and because the exact value is the platform's business.
+    #[tokio::test]
+    async fn a_pass_yields_the_machine_only_under_per_disk_locks() {
+        let _serial = serial().await;
+        let dir = scratch("nice");
+        let marker = dir.join(LOCK_MARKER);
+        let out = dir.join("niceness");
+        // `$$` is the `sh -c` the pass spawns, which is what inherits the
+        // priority set in pre_exec (and what `sudo` would inherit it from).
+        let r = Reclaimer::new(
+            format!("ps -o nice= -p $$ | tr -d ' ' > {}", out.display()),
+            Some(dir.clone()),
+        );
+        let read = || -> i32 {
+            std::fs::read_to_string(&out)
+                .expect("the pass ran")
+                .trim()
+                .parse()
+                .expect("a niceness")
+        };
+
+        // Gate mode: the pass is blocking every boot on the host, so it runs at
+        // whatever priority the pooler has.
+        PER_DISK.store(false, Ordering::Release);
+        r.run_once().await;
+        let under_gate = read();
+
+        // Per-disk mode: it runs alongside live traffic, so it gets out of the
+        // way. (run_once clears the marker before launching, so this also
+        // covers the priority being decided from the latch and not the file.)
+        std::fs::write(&marker, format!("{LOCK_PROTOCOL}\n")).unwrap();
+        assert!(refresh_per_disk(&marker));
+        r.run_once().await;
+        let under_locks = read();
+
+        assert!(
+            under_locks > under_gate,
+            "a pass sharing the host must yield it: nice was {under_gate} under the gate \
+             and {under_locks} under per-disk locks"
+        );
+        PER_DISK.store(false, Ordering::Release);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1034,13 +1034,19 @@ async fn free_bytes(dir: &Path) -> Option<u64> {
 /// Best-effort: run this child at the lowest CPU priority (nice 19) and the
 /// lowest *best-effort* I/O priority (class 2, level 7 — deliberately not the
 /// idle class, which can starve indefinitely behind sustained client I/O and
-/// turn a bounded job into an unbounded disk-latency bet). For OFFLOAD-path
-/// children only: restore-path children have a waiting client behind them and
-/// keep normal priority, and the reclaim script runs while the boot gate is
-/// held, where slowness lengthens the client-visible outage. A denied or
-/// unsupported call just leaves the child at the parent's priority — it never
-/// fails the exec.
-fn deprioritize(cmd: &mut Command) -> &mut Command {
+/// turn a bounded job into an unbounded disk-latency bet).
+///
+/// For background children only. Restore-path children have a waiting client
+/// behind them and keep normal priority. So does a reclaim pass running under
+/// the global boot gate — it is holding up every VM boot on the host, so
+/// slowness there *is* the client-visible outage. A reclaim pass under per-disk
+/// locks is the opposite case: it runs alongside live traffic rather than
+/// instead of it, so it is deprioritized like any other background sweep (see
+/// `reclaim::Reclaimer::run_once`).
+///
+/// A denied or unsupported call just leaves the child at the parent's priority
+/// — it never fails the exec.
+pub(crate) fn deprioritize(cmd: &mut Command) -> &mut Command {
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
