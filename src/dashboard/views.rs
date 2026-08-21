@@ -333,6 +333,14 @@ pub fn monitoring_page(
     // working on that VM's own disk, unless it has fallen back to the global
     // gate), and an empty spare shelf (next new schema pays a full create +
     // boot).
+    // Running VMs no warm entry tracks (spares excluded): unused by
+    // definition, invisible to the idle reaper, and a disk the offload
+    // ladder can't compact — the untracked-reaper stops them within two of
+    // its passes. A persistently high number here means it isn't running.
+    let untracked = running
+        .iter()
+        .filter(|r| r.live_sessions.is_none() && !r.name.starts_with(crate::spares::SPARE_PREFIX))
+        .count();
     let queued_bringups = crate::vm::bringups_waiting();
     let reclaim_running = crate::reclaim::pass_running();
     let spare_depth = st.registry.spare_pool_depth();
@@ -424,6 +432,8 @@ pub fn monitoring_page(
                     (stat("warm spares ready", &ready.to_string(),
                         Some(&format!("target {target}{}", if ready == 0 { " — cold creates!" } else { "" }))))
                 }
+                (stat("running, untracked", &untracked.to_string(),
+                    if untracked > 0 { Some("no warm entry — reaper stops these in ≤2 passes") } else { None }))
                 (stat("bring-ups queued", &queued_bringups.to_string(),
                     if queued_bringups > 0 { Some("clients waiting for a VM") } else { None }))
                 (stat("reclaim pass", if reclaim_running { "running" } else { "idle" },
