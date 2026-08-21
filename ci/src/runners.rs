@@ -908,6 +908,10 @@ impl Runners {
     /// means anyone who ever saw the ticket has the host. Probing costs one
     /// round trip per tunnel and turns a silent exposure into a startup error.
     ///
+    /// That round trip does double duty: it is also the only proof that the
+    /// tunnel carries data before it is cached. Both obligations are discharged
+    /// by the same request, and neither is optional — see the `Err` arm below.
+    ///
     /// `CI_ALLOW_UNAUTHENTICATED_RUNNERS=true` downgrades it to a warning, for a
     /// single-machine development loop where the tunnel never leaves localhost.
     async fn assert_daemon_requires_auth(
@@ -944,9 +948,22 @@ impl Runners {
         let open = match probe {
             // A protected route answering without a bearer is the failure.
             Ok(r) => r.status().is_success(),
-            // A transport error proves nothing about auth; let the real request
-            // report it rather than failing here for the wrong reason.
-            Err(_) => return Ok(()),
+            // A transport error still proves nothing about auth — but it proves
+            // the tunnel does not carry data, and that is worth failing on here.
+            //
+            // This used to return `Ok(())` and let the real request report it.
+            // The real request is `ensure_image`, the first tunnel traffic a job
+            // sends, so a tunnel whose QUIC connection is up and whose data path
+            // is blackholed would be cached anyway and surface a full request
+            // timeout later — attributed to `POST /images/build`, a route that
+            // has nothing to do with it. Failing here names the runner and the
+            // tunnel instead, and leaves nothing cached for the next job.
+            Err(e) => {
+                return Err(RunnerError::Unreachable {
+                    runner: runner_id.to_string(),
+                    reason: format!("the tunnel carried no reply to a probe request: {e}"),
+                });
+            }
         };
 
         if !open {
@@ -1536,16 +1553,37 @@ mod tests {
             .expect("the opt-out permits it");
     }
 
-    /// A daemon that cannot be reached at all proves nothing about its auth, so
-    /// the probe must not report it as authenticated *or* as open — it defers to
-    /// the real request, which will fail with a transport error that says so.
+    /// A daemon that cannot be reached proves nothing about its auth, so the
+    /// probe must not report it as open — but it must still fail, and it must
+    /// fail as `Unreachable` rather than as an auth verdict.
+    ///
+    /// The probe used to return `Ok(())` here and defer to the real request.
+    /// That real request is the first tunnel traffic a job sends, so deferring
+    /// meant caching a tunnel that carries nothing and rediscovering it one
+    /// request timeout later, blamed on whichever route happened to be first.
     #[tokio::test]
-    async fn an_unreachable_daemon_does_not_read_as_a_failed_auth_check() {
+    async fn an_unreachable_daemon_fails_as_unreachable_not_as_an_auth_verdict() {
         // Port 1 on loopback: nothing listens, and connecting fails fast.
         let dead = HeyoClient::local_at("http://127.0.0.1:1").expect("client");
-        test_runners(false)
+        let err = test_runners(false)
             .assert_daemon_requires_auth("hd-dead", &dead)
             .await
-            .expect("a transport error is not evidence of open auth");
+            .expect_err("a tunnel that carries nothing must not be cached");
+        assert!(
+            matches!(&err, RunnerError::Unreachable { runner, .. } if runner == "hd-dead"),
+            "a transport failure must not be reported as an auth verdict: {err:?}"
+        );
+    }
+
+    /// The opt-out covers *auth*, not reachability. A dead tunnel is still dead
+    /// however permissive the config is, and must not be cached either way.
+    #[tokio::test]
+    async fn allowing_unauthenticated_runners_does_not_excuse_a_dead_tunnel() {
+        let dead = HeyoClient::local_at("http://127.0.0.1:1").expect("client");
+        let err = test_runners(true)
+            .assert_daemon_requires_auth("hd-dead", &dead)
+            .await
+            .expect_err("the opt-out is about bearers, not about transport");
+        assert!(matches!(err, RunnerError::Unreachable { .. }), "{err:?}");
     }
 }
