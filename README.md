@@ -246,8 +246,9 @@ Before dispatching every job it checks, and defers while any of these hold
 (in-flight jobs always run to completion — deferral only pauses NEW work):
 
 - a client bring-up is queued (waiting for an admission or bring-up slot);
-- a disk-reclaim pass is running (an offload boots VMs; taking the boot gate
-  would make that pass yield and lose its progress);
+- a disk-reclaim pass is running (an offload boots VMs, and may collide with
+  the disk the pass is on and make it yield — losing its progress for work
+  nobody is waiting on);
 - all `PG_VM_POOL_OFFLOAD_WORKERS` slots are taken.
 
 With workers > 1, three brakes keep the extra concurrency from outbidding
@@ -554,13 +555,44 @@ reclaimed …`) appears in the pooler log. The two historical failure modes are
 exactly this: env vars stripped by `sudo` (hence flags-as-arguments) and an
 argument list that drifted from the sudoers pin after a run-dir change.
 
-**A pass yields to a waiting boot.** The script's in-use scan is a snapshot
-taken at pass start, so a VM booted mid-pass would be invisible to it and its
-filesystem could be fscked underneath the running guest. The pooler closes that
-window by holding a gate for the pass's whole duration and taking the read side
-of it around every VM boot — but on a large fleet a pass is minutes, not
-seconds, and a boot that simply waited it out would stall a client cold start, a
-warm-spare restart or a thaw for exactly that long.
+**Passes and boots are excluded per disk.** The script's in-use scan is a
+snapshot taken at pass start, so a VM booted mid-pass would be invisible to it
+and its filesystem could be fscked underneath the running guest. The hazard is
+per-*disk* — a boot of VM A is only endangered by work on A's disk — so that is
+how the exclusion is keyed. Both sides `flock` a file per sandbox,
+`<run-dir>/.reclaim-locks/<id>.lock`: the pooler holds it across the VM's
+`start()`, the script holds it across one disk's whole pipeline and skips any
+disk it can't lock (`skip (a VM boot holds the disk lock)`). A boot of a VM the
+pass isn't touching therefore costs nothing at all, and the pass keeps running
+through cold starts and warm-spare restarts instead of losing its progress to
+them.
+
+Because the permit is only held across `start()`, a VM that boots mid-pass ends
+up holding its disk open while the pass-start in-use snapshot still predates it.
+So the script asks that question twice: against the snapshot (free — it catches
+everything already running), and then, for whatever survives, once *live while
+holding the disk's lock*, which is the only moment the answer is guaranteed to
+stay true (`skip (booted during this pass)`). Under the global gate the live
+scan is skipped entirely — no VM can boot during a pass at all.
+
+The pooler can't tell by inspection whether the script it invokes implements
+this, so the script declares it: it writes `perdisk-1` into
+`<run-dir>/.reclaim-locks/.protocol` at every pass start, and the pooler deletes
+that marker before each run and re-reads it after the child exits. No marker
+means an older script, and the pooler falls back to a global boot gate — one it
+holds for the pass's whole duration, with every VM boot on the host taking the
+read side. The latch is re-derived every pass, so rolling the script back
+returns the pooler to the gate on that script's first run rather than leaving it
+trusting a stale answer. The dashboard's "reclaim pass" tile says which scheme
+is in force. `flock(1)` missing, or a `<run-dir>/.reclaim-locks` that isn't
+writable by both the (root) script and the pooler, also means the gate — safe,
+just slower.
+
+**A pass yields to a waiting boot.** Under the gate, a pass on a large fleet is
+minutes, not seconds, and a boot that simply waited it out would stall a client
+cold start, a warm-spare restart or a thaw for exactly that long. Under per-disk
+locks the same applies to a boot that collides with the pass on its own disk —
+and the disk the pass is on is precisely the one that boot wants.
 
 So a waiting boot asks the pass to stop: the pooler creates
 `<run-dir>/.reclaim-stop`, the script yields at its next safe point — between
@@ -573,10 +605,10 @@ disk, so a host that yields often still walks the whole fleet. Deliberately
 cooperative rather than a kill: the command runs under `sudo`, so the pooler can
 only signal the shell it spawned while `sudo`'s root-owned `e2fsck` keeps
 writing — handing the gate back then would cause exactly the corruption the gate
-prevents. An older deployed script that doesn't know about the stop file still
-works; the boot just waits for the full pass, as before. (Redeploy the script
-after upgrading if you want yielding: `install -D -m 0755 reclaim-disks.sh
-/home/sam/.heyo/bin/reclaim-disks.sh`.)
+prevents. An older deployed script that knows neither the lock files nor the
+stop file still works; boots just wait for the full pass, as before. (Redeploy
+the script after upgrading if you want per-disk locks and yielding:
+`install -D -m 0755 reclaim-disks.sh /home/sam/.heyo/bin/reclaim-disks.sh`.)
 
 #### Stale rootfs copies (`prune-stale-rootfs.sh`)
 

@@ -262,6 +262,24 @@ const READY_NOTFOUND_GRACE: Duration = Duration::from_secs(45);
 /// throw away and retry, not something to keep a replenish pass parked on.
 pub(crate) const SPARE_READY_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Exclusive use of the process-wide VM state for the caller's whole test.
+///
+/// The daemon stub's fleet and counters, the environment a `Config` reads, the
+/// bring-up gate, and the reclaim boot gate and its waiting-boot count are all
+/// process-wide. `cargo test` runs test functions in parallel, so two tests
+/// touching any of them measure each other — which is not a flaky result, it is
+/// a wrong one. It cannot be delegated to `--test-threads=1` either: that flag
+/// is for readable output, this is for correctness.
+///
+/// One lock rather than one per module, because the state is shared across
+/// them: a `loadtest` bring-up takes a reclaim boot permit, and a `reclaim`
+/// test asserting on the waiting-boot count sees it.
+#[cfg(test)]
+pub(crate) async fn test_exclusive() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
+}
+
 /// Pooler-side readiness wait: poll the *per-id* `GET /deployed-sandboxes/:id`
 /// until the sandbox leaves `provisioning`, tolerating transient daemon
 /// errors until the deadline.
@@ -2041,7 +2059,7 @@ async fn power_cycle(
     // The bring-up slot bounds how many such boots hit the daemon at once, and
     // is taken *after* the permit (see `bring_up_existing`).
     {
-        let _permit = crate::reclaim::boot_permit().await;
+        let _permit = crate::reclaim::boot_permit(sandbox.sandbox_id()).await;
         let _slot = bringup_slot(name).await;
         sandbox
             .stop()
@@ -2412,8 +2430,9 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
     info!("bringing up existing VM {name} ({id})");
     // A stopped VM's disk may be mid-fsck/shrink under a reclaim pass; booting
     // over that destroys the filesystem. Hold the permit only across start():
-    // once the VM process has the disk open, the next pass's in-use scan
-    // protects it.
+    // once the VM process has the disk open, the reclaim script's in-use checks
+    // protect it — the pass-start snapshot between passes, and the live
+    // re-check it runs under this same per-disk lock during one.
     //
     // Permit first, slot second — the order everywhere a boot takes both. The
     // permit can block (it preempts a reclaim pass, but the pass still has to
@@ -2423,7 +2442,7 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
     // bring-up on the host. Reclaim never takes a bring-up slot, so there is
     // no cycle to deadlock on.
     let started = {
-        let _permit = crate::reclaim::boot_permit().await;
+        let _permit = crate::reclaim::boot_permit(id).await;
         let _slot = bringup_slot(name).await;
         sb.start().await
     };

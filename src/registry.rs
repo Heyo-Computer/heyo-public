@@ -390,6 +390,9 @@ pub struct SchemaRegistry {
 
 impl SchemaRegistry {
     pub fn new(cfg: Config) -> Self {
+        // Per-disk reclaim locks live under the run dir. Publish it once here:
+        // the boot path is a free function with no access to the config.
+        crate::reclaim::set_run_dir(cfg.run_dir.clone());
         let store = Store::load(cfg.state_file.clone());
         let reclaimer = cfg
             .reclaim
@@ -1002,7 +1005,7 @@ impl SchemaRegistry {
         if !grow.is_empty() {
             tokio::spawn(async move {
                 for (schema, id, target) in grow {
-                    let _permit = crate::reclaim::boot_permit().await;
+                    let _permit = crate::reclaim::boot_permit(&id).await;
                     match vm::resize_disk(&id, target).await {
                         Ok(()) => {
                             info!("schema {schema}: data device grown to {target}GiB");

@@ -106,6 +106,17 @@ const SPARE_MAX_CULLS_PER_PASS: usize = 2;
 /// restarted and dropped every spare).
 const TAKE_MAX_ATTEMPTS: usize = 3;
 
+/// How long a stranded-spare restart waits on a reclaim permit before giving
+/// up for this pass. [`SparePool::replenish`] does not return until every build
+/// in its batch has, and passes are serialized in one supervisor loop, so a
+/// restart parked on a reclaim pass freezes the whole shelf behind it — the
+/// surplus cull and the republish of ready spares included. The symptom is the
+/// worst one available: `take` finds an empty shelf and every new schema pays a
+/// cold create, for as long as the pass runs. Restarting one spare is not worth
+/// that, so it is abandoned and retried on the next pass (60s away, or sooner —
+/// every claim wakes the loop).
+const SPARE_PERMIT_WAIT: Duration = Duration::from_secs(15);
+
 pub struct SparePool {
     target: usize,
     /// Sandbox ids claimed by this process (bound to a schema, or mid-claim).
@@ -535,10 +546,18 @@ async fn restart_spare(id: String) -> Option<String> {
         }
     };
     let started = {
-        // Opening a stopped disk — exclusive with reclaim passes, and bounded
-        // by the bring-up gate like every other boot. Permit before slot (see
-        // `vm::bring_up_existing`).
-        let _permit = crate::reclaim::boot_permit().await;
+        // Opening a stopped disk — exclusive with reclaim work on *this* disk,
+        // and bounded by the bring-up gate like every other boot. Permit before
+        // slot (see `vm::bring_up_existing`), and bounded so this build can
+        // never stall the pass it belongs to (see `SPARE_PERMIT_WAIT`).
+        let Some(_permit) = crate::reclaim::boot_permit_within(&id, SPARE_PERMIT_WAIT).await
+        else {
+            info!(
+                "warm-spares: a disk-reclaim pass still holds spare {id}'s disk after \
+                 {SPARE_PERMIT_WAIT:?} — leaving it for the next pass"
+            );
+            return None;
+        };
         let _slot = vm::bringup_slot("warm-spares").await;
         sb.start().await
     };

@@ -329,8 +329,10 @@ pub fn monitoring_page(
     let offloading = st.registry.archiving_schemas();
     let offloading_names = offloading.join(", ");
     // The blocking activity a slow cold start hides behind: clients parked in
-    // the bring-up queue, a reclaim pass holding the boot gate, and an empty
-    // spare shelf (next new schema pays a full create + boot).
+    // the bring-up queue, a reclaim pass (which only delays a boot when it is
+    // working on that VM's own disk, unless it has fallen back to the global
+    // gate), and an empty spare shelf (next new schema pays a full create +
+    // boot).
     let queued_bringups = crate::vm::bringups_waiting();
     let reclaim_running = crate::reclaim::pass_running();
     let spare_depth = st.registry.spare_pool_depth();
@@ -425,7 +427,13 @@ pub fn monitoring_page(
                 (stat("bring-ups queued", &queued_bringups.to_string(),
                     if queued_bringups > 0 { Some("clients waiting for a VM") } else { None }))
                 (stat("reclaim pass", if reclaim_running { "running" } else { "idle" },
-                    if reclaim_running { Some("holds the boot gate — VM boots wait") } else { None }))
+                    if !reclaim_running {
+                        None
+                    } else if crate::reclaim::per_disk_locks() {
+                        Some("per-disk locks — VM boots unaffected")
+                    } else {
+                        Some("global boot gate — boots preempt it, ~1 disk of latency")
+                    }))
                 @if st.registry.archive_enabled() {
                     (stat("compacted (local)", &compacted.to_string(), None))
                     (stat("frozen (local)", &frozen.to_string(), None))

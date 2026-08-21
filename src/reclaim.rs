@@ -24,11 +24,50 @@
 //! snapshot *once, at pass start*, so a VM booted mid-pass is invisible to it
 //! and its filesystem could be fscked/shrunk underneath the running guest,
 //! which destroys it. All VM boots go through this process, so the pooler
-//! closes that window itself: [`boot_permit`] is the read side of a gate whose
-//! write side is held for the full duration of every reclaim run. Boots wait
-//! for an in-flight pass instead of corrupting a disk. Runs are additionally
-//! single-flighted so the periodic timer, the post-reap trigger, and the
-//! dashboard button can't stack overlapping sweeps.
+//! closes that window itself. There are two mechanisms for it, and which one
+//! is in play depends on what the deployed script supports.
+//!
+//! # Per-disk locks (preferred)
+//!
+//! The hazard is per-*disk*: a boot of VM A is only endangered by work on A's
+//! disk. So the exclusion is keyed by disk. Both sides `flock` a well-known
+//! file per sandbox — `<run dir>/.reclaim-locks/<id>.lock` — the pooler across
+//! `start()`, the script across one disk's whole pipeline, skipping any disk it
+//! cannot lock. A boot of an untouched VM therefore never waits at all, and a
+//! pass keeps running through cold starts and warm-spare restarts instead of
+//! surrendering its progress to them.
+//!
+//! The lock alone does not close the snapshot race, because a permit is only
+//! held across `start()`: a VM that booted mid-pass holds its disk open but is
+//! invisible to a scan taken before it existed, and the gate used to rule that
+//! out only by making mid-pass boots impossible. So the script asks the in-use
+//! question twice — once against the snapshot and then, for whatever survives
+//! that, once *live while holding the disk's lock*, which is the only moment
+//! the answer is guaranteed to stay true. Together they make the exclusion
+//! exact rather than brute-force: the snapshot covers VMs already running
+//! (including across a pooler restart, which drops every lock), the live check
+//! covers VMs that booted during the pass, and the lock is what makes the live
+//! check's answer hold for as long as that disk is being worked on.
+//!
+//! Both sides have to agree, so the mode is negotiated, never assumed. A script
+//! that implements locking writes [`LOCK_PROTOCOL`] into the lock dir's
+//! [`LOCK_MARKER`] at every pass start; [`Reclaimer::run_once`] deletes that
+//! marker before launching the child and re-reads it once the child has exited.
+//! Present and recognised ⇒ per-disk mode; absent ⇒ the deployed script
+//! predates locking, and the global gate below is used instead. The latch is
+//! self-correcting in both directions, so a rollback to an older script drops
+//! the pooler back to the gate on that script's first pass. (One narrow hole is
+//! accepted deliberately: a rollback landing between a boot taking a disk lock
+//! and the older script reaching that same disk. That needs an operator
+//! rollback inside a sub-second window, and is not worth a config knob.)
+//!
+//! # The global boot gate (fallback)
+//!
+//! With no run dir (nowhere to put lock files), or against a script that does
+//! not honour them, boots and passes are instead kept disjoint in time:
+//! [`boot_permit`] is the read side of a gate whose write side is held for the
+//! full duration of every reclaim run. Correct, but coarse — every boot on the
+//! host waits on work being done to a disk that isn't its own.
 //!
 //! **Boots make passes yield.** On a large fleet a pass is not "seconds": it
 //! fscks and trims every stopped disk, and [`RECLAIM_TIMEOUT`] lets it run for
@@ -39,14 +78,19 @@
 //! slot, as they used to) starves the whole pooler.
 //!
 //! Serving a database beats reclaiming slack, so a waiting boot asks the pass
-//! to stop: [`boot_permit`] signals, [`Reclaimer::run_once`] creates the
-//! script's **stop file**, and the script yields at its next safe point —
+//! to stop: it registers in [`BOOTS_WAITING`], [`Reclaimer::run_once`] creates
+//! the script's **stop file**, and the script yields at its next safe point —
 //! between disks, at stage boundaries inside a disk, or by killing its own
 //! discard-stage fsck (safe: it only punches free blocks on a verified-clean
 //! filesystem). Only a journal-recovery fsck or an in-progress shrink must
 //! run to completion, so the boot's worst case is one fsck/resize on the
 //! largest disk, not a whole pass or even a whole per-disk pipeline. The
 //! gate is released only once the child has actually exited.
+//!
+//! Preemption is not exclusive to the fallback: in per-disk mode a boot that
+//! collides with the script on its *own* disk registers the same way. The disk
+//! the pass is on is precisely the one that boot wants, so asking it to yield
+//! is the shortest path to the lock.
 //!
 //! It is deliberately *not* a kill. The command runs through `sudo`, so the
 //! pooler can only signal the shell it spawned — `sudo` and the `e2fsck` under
@@ -62,9 +106,10 @@
 //! pass resumes after the last disk it finished, so a host that yields often
 //! still walks the whole fleet.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -88,43 +133,321 @@ pub const POST_STOP_RECLAIM_DELAY: Duration = Duration::from_secs(30);
 /// redeploys can't starve reclamation (see `registry::supervise`).
 pub const RECLAIM_FIRST_DELAY: Duration = Duration::from_secs(300);
 
-/// Boot↔reclaim mutual exclusion. Readers are VM boots (start of a stopped VM,
-/// power-cycle, dashboard start/reboot); the writer is a reclaim run, held for
-/// the run's whole duration. Rationale: the script's in-use scan is a snapshot
-/// taken at pass start, so only keeping boots and passes disjoint in time makes
-/// "stopped disk" a stable fact for the length of a pass. Freshly *created*
-/// disks don't need the permit — they didn't exist when the pass enumerated.
+/// Directory under the run dir holding one lock file per sandbox, and the
+/// marker the script writes to declare that it honours them. Created
+/// world-writable: a non-root pooler and a root (`sudo`) script both create
+/// files here, and whichever gets there first must not lock the other out.
+pub const LOCK_DIR: &str = ".reclaim-locks";
+/// Marker file inside [`LOCK_DIR`]; its contents are the negotiated protocol.
+pub const LOCK_MARKER: &str = ".protocol";
+/// The only per-disk locking protocol this pooler understands. Bump it in both
+/// this file and `reclaim-disks.sh` if the lock layout ever changes, so a
+/// mismatched pair degrades to the boot gate instead of to corruption.
+pub const LOCK_PROTOCOL: &str = "perdisk-1";
+
+/// Poll interval while waiting on a contended disk lock. Contention is rare
+/// (only a boot of the exact VM the script is working on) and the wait is one
+/// disk long at worst, so polling tightly costs nothing measurable and keeps
+/// the wait cancel-safe — a blocking `flock` would park a runtime thread that
+/// no timeout could reclaim.
+const LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// `<run dir>/.reclaim-locks`, or `None` when no run dir is configured. Set
+/// once at startup by [`set_run_dir`] because the boot path is a free function
+/// with no access to the config.
+static LOCK_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Whether the deployed script has been observed to honour per-disk locks.
+/// False until proven otherwise: the fallback is slow, the alternative is a
+/// destroyed filesystem.
+static PER_DISK: AtomicBool = AtomicBool::new(false);
+
+/// Publish the run dir for the boot path and prime the per-disk latch from any
+/// marker a previous pooler's last pass left behind — otherwise every redeploy
+/// would spend its first [`RECLAIM_FIRST_DELAY`] back on the global gate.
+/// [`Reclaimer::run_once`] re-validates the latch on the next pass either way.
+pub fn set_run_dir(run_dir: Option<PathBuf>) {
+    let dir = run_dir.map(|d| d.join(LOCK_DIR));
+    if let Some(d) = &dir {
+        ensure_lock_dir(d);
+        let per_disk = refresh_per_disk(&d.join(LOCK_MARKER));
+        info!(
+            "disk reclaim: per-disk boot locks in {} ({})",
+            d.display(),
+            if per_disk {
+                "active — VM boots don't wait on passes"
+            } else {
+                "not yet negotiated; boots use the global gate until the first pass"
+            }
+        );
+    }
+    let _ = LOCK_ROOT.set(dir);
+}
+
+/// Create the lock dir 0777. Best effort: if it fails, `open_lock` fails too
+/// and the boot falls back to the gate, which is slow but safe.
+fn ensure_lock_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777));
+}
+
+/// Re-read the marker and latch what it says. Returns the new state.
+fn refresh_per_disk(marker: &Path) -> bool {
+    let ok = std::fs::read_to_string(marker)
+        .map(|s| s.trim() == LOCK_PROTOCOL)
+        .unwrap_or(false);
+    PER_DISK.store(ok, Ordering::Release);
+    ok
+}
+
+/// Is the pooler excluding boots per disk rather than with the global gate?
+/// Dashboard copy only — the boot path reads the latch directly.
+pub fn per_disk_locks() -> bool {
+    PER_DISK.load(Ordering::Acquire)
+}
+
+/// This sandbox's lock file, or `None` when there is no run dir. The id is
+/// pasted into a path, so it is checked: an id carrying `/` or `..` would
+/// otherwise let a bad daemon response name a file outside the lock dir.
+fn lock_path(sandbox_id: &str) -> Option<PathBuf> {
+    if sandbox_id.is_empty() || sandbox_id.contains('/') || sandbox_id.contains("..") {
+        return None;
+    }
+    LOCK_ROOT
+        .get()?
+        .as_ref()
+        .map(|d| d.join(format!("{sandbox_id}.lock")))
+}
+
+/// Open a lock file for `flock`, creating it if this is the VM's first boot.
+fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+    match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(d) = path.parent() {
+                ensure_lock_dir(d);
+            }
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                // The file is a name to lock, never a place to keep anything;
+                // truncating it would be pointless and, if the script has it
+                // open, rude.
+                .truncate(false)
+                .mode(0o666)
+                .open(path)
+        }
+        // Created by the root script under a stricter umask than it intended.
+        // `flock(2)` works on any open descriptor whatever its access mode, so
+        // a read-only handle still takes a fully exclusive lock.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            OpenOptions::new().read(true).open(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `Ok(true)` when this descriptor now holds the lock, `Ok(false)` when the
+/// reclaim script holds it. The lock is released when the file is dropped.
+fn try_flock(f: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::last_os_error();
+    // EAGAIN and EWOULDBLOCK are the same value on Linux; match both rather
+    // than relying on that.
+    match e.raw_os_error() {
+        Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN => Ok(false),
+        _ => Err(e),
+    }
+}
+
+/// Boot↔reclaim mutual exclusion, fallback flavour. Readers are VM boots
+/// (start of a stopped VM, power-cycle, dashboard start/reboot); the writer is
+/// a reclaim run, held for the run's whole duration. Rationale: the script's
+/// in-use scan is a snapshot taken at pass start, so only keeping boots and
+/// passes disjoint in time makes "stopped disk" a stable fact for the length of
+/// a pass. Freshly *created* disks don't need a permit at all — they didn't
+/// exist when the pass enumerated.
+///
+/// In per-disk mode nothing takes the read side and this is uncontended; a pass
+/// still takes the write side, so the fallback remains correct the moment the
+/// latch flips back.
 ///
 /// tokio's RwLock is fair: a waiting pass blocks later boots until it finishes,
 /// and a waiting boot blocks later passes. Unbounded stalls are avoided not by
-/// the lock but by [`PREEMPT`] — a boot that has to wait cancels the pass.
+/// the lock but by [`BOOTS_WAITING`] — a boot that has to wait cancels the pass.
 static BOOT_GATE: RwLock<()> = RwLock::const_new(());
 
-/// Raised by a boot that found the gate held, watched by the running pass.
-/// `notify_one` (not `notify_waiters`) so a signal that lands in the instant
-/// between the pass taking the gate and arming its watch is *stored* rather
-/// than lost — the pass drains any stale permit at its start, so the only
-/// effect of that storage is at worst one extra early exit.
+/// How many VM boots are parked on reclaim work right now, in either mode.
+///
+/// This — not the [`preempt`] notification — is what a running pass consults,
+/// and it is why a request raised while the pass was merely *queued* on the
+/// gate can no longer be dropped. tokio's `RwLock` is fair, so `try_read` fails
+/// from the instant a writer queues: a boot arriving in the window between
+/// `write().await` being called and being granted parks behind that writer. The
+/// old code treated the notification such a boot had already sent as stale and
+/// drained it, and the pass then ran to completion — up to [`RECLAIM_TIMEOUT`]
+/// — with a client-facing boot waiting on it, which is the exact failure the
+/// yield exists to prevent. A count read *after* acquiring has no such window.
+/// The notification is now only a wakeup; the count is the truth.
+static BOOTS_WAITING: AtomicUsize = AtomicUsize::new(0);
+
+/// Wakes a running pass so it can re-read [`BOOTS_WAITING`]. `notify_one` (not
+/// `notify_waiters`) so a signal that lands in the instant between the pass
+/// taking the gate and arming its watch is *stored* rather than lost; a stored
+/// signal that outlives its boot is harmless, because the pass re-reads the
+/// count before acting on it.
 fn preempt() -> &'static tokio::sync::Notify {
     static PREEMPT: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
     PREEMPT.get_or_init(tokio::sync::Notify::new)
 }
 
-/// Take the boot side of the gate: resolves immediately unless a reclaim pass
-/// is running, in which case the pass is asked to yield and this waits for it
-/// to finish the disk it is on. Hold the guard across the daemon call that
-/// (re)opens a stopped VM's disk — once the VM process holds the disk open,
-/// the next pass's in-use scan protects it.
+/// Registers a parked boot for the length of its wait. Drop-based so a
+/// cancelled bring-up (a timed-out spare restart, a dropped client) leaves the
+/// count accurate instead of pinning every future pass into yielding.
+struct WaitingGuard;
+
+impl WaitingGuard {
+    fn new() -> Self {
+        BOOTS_WAITING.fetch_add(1, Ordering::SeqCst);
+        preempt().notify_one();
+        Self
+    }
+}
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        BOOTS_WAITING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Is any boot parked on reclaim work? Read by the running pass.
+fn boots_waiting() -> bool {
+    BOOTS_WAITING.load(Ordering::SeqCst) > 0
+}
+
+/// A boot's claim on a stopped VM's disk: an `flock` on that VM's lock file in
+/// per-disk mode, the read side of [`BOOT_GATE`] in the fallback. Either is
+/// released on drop.
+pub enum BootPermit {
+    /// Both fields exist purely for their `Drop`: closing the file releases the
+    /// `flock`, dropping the guard releases the gate. Nothing ever reads them.
+    Disk { _lock: std::fs::File },
+    Gate { _gate: RwLockReadGuard<'static, ()> },
+}
+
+/// Take the boot side of the exclusion for `sandbox_id`. In per-disk mode this
+/// resolves immediately unless a reclaim pass is working on *this VM's* disk;
+/// in the fallback, unless a pass is running at all, in which case it is asked
+/// to yield and this waits for it to finish the disk it is on.
+///
+/// Hold the guard across the daemon call that (re)opens the stopped VM's disk,
+/// and no longer: once the VM process holds the disk open, the script's in-use
+/// checks are what protect it — the pass-start snapshot when the boot happened
+/// between passes, and the live re-check it runs under this same lock when the
+/// boot happened during one.
 ///
 /// Take this *before* a bring-up slot, never after: a boot parked here while
 /// holding one of the (three) slots converts a reclaim pass into a fleet-wide
 /// bring-up stall, which is the failure this preemption exists to prevent.
-pub async fn boot_permit() -> RwLockReadGuard<'static, ()> {
+pub async fn boot_permit(sandbox_id: &str) -> BootPermit {
+    match acquire(sandbox_id, None).await {
+        Some(p) => p,
+        // Only a bounded wait can come back empty; stay total rather than
+        // panicking on a case the signature allows.
+        None => BootPermit::Gate { _gate: gate_wait().await },
+    }
+}
+
+/// [`boot_permit`] that gives up after `limit` instead of waiting indefinitely.
+/// `None` means the permit was NOT taken and the caller must not boot — for
+/// background work that would rather retry on its next pass than block it (see
+/// `spares::restart_spare`).
+pub async fn boot_permit_within(sandbox_id: &str, limit: Duration) -> Option<BootPermit> {
+    acquire(sandbox_id, Some(limit)).await
+}
+
+async fn acquire(sandbox_id: &str, limit: Option<Duration>) -> Option<BootPermit> {
+    if per_disk_locks()
+        && let Some(path) = lock_path(sandbox_id)
+    {
+        match disk_permit(&path, sandbox_id, limit).await {
+            Ok(Some(f)) => return Some(BootPermit::Disk { _lock: f }),
+            Ok(None) => return None,
+            // Never boot unprotected: an unusable lock file means we cannot
+            // tell what the script is doing, so fall back to the gate, which
+            // needs nothing from the filesystem.
+            Err(e) => warn!(
+                "disk reclaim: per-disk lock {} unusable ({e}) — falling back to the global \
+                 boot gate for {sandbox_id}",
+                path.display()
+            ),
+        }
+    }
+    match limit {
+        None => Some(BootPermit::Gate {
+            _gate: gate_wait().await,
+        }),
+        Some(limit) => {
+            // Bound to a `let` rather than returned from the tail, so the
+            // abandoned `gate_wait` is dropped at this statement — the point we
+            // gave up — instead of at whatever temporary scope the caller
+            // happens to end it in. What it carries is worth being deliberate
+            // about: a `WaitingGuard` still raised would make every later pass
+            // yield the instant it started, and a `read()` still queued on a
+            // fair `RwLock` would make the next pass wait behind a boot that
+            // has gone home.
+            let attempt = tokio::time::timeout(limit, gate_wait()).await;
+            attempt.ok().map(|g| BootPermit::Gate { _gate: g })
+        }
+    }
+}
+
+/// Lock just this VM's disk. `Ok(None)` only when `limit` expired.
+async fn disk_permit(
+    path: &Path,
+    sandbox_id: &str,
+    limit: Option<Duration>,
+) -> std::io::Result<Option<std::fs::File>> {
+    let f = open_lock(path)?;
+    if try_flock(&f)? {
+        return Ok(Some(f));
+    }
+    // The script is on exactly this disk. The disk it is on is the one we want,
+    // so asking it to yield is the shortest path to the lock.
+    let waited = Instant::now();
+    let _waiting = WaitingGuard::new();
+    loop {
+        if let Some(limit) = limit
+            && waited.elapsed() >= limit
+        {
+            return Ok(None);
+        }
+        tokio::time::sleep(LOCK_POLL).await;
+        if try_flock(&f)? {
+            info!(
+                "VM boot waited {:?} for the reclaim pass to release {sandbox_id}'s disk",
+                waited.elapsed()
+            );
+            return Ok(Some(f));
+        }
+    }
+}
+
+/// Fallback: the read side of the global gate, registering as a waiter (and so
+/// preempting the pass) only if it isn't free.
+async fn gate_wait() -> RwLockReadGuard<'static, ()> {
     if let Ok(guard) = BOOT_GATE.try_read() {
         return guard;
     }
     let waited = Instant::now();
-    preempt().notify_one();
+    let _waiting = WaitingGuard::new();
     let guard = BOOT_GATE.read().await;
     info!(
         "VM boot waited {:?} for the disk-reclaim pass to yield",
@@ -137,11 +460,12 @@ pub async fn boot_permit() -> RwLockReadGuard<'static, ()> {
 /// run dir is how a waiting boot asks an in-flight pass to stop early.
 pub const STOP_FILE: &str = ".reclaim-stop";
 
-/// Is a reclaim pass holding (or about to hold) the boot gate? Background work
-/// that would boot a VM checks this and defers: taking a boot permit now would
-/// make the pass yield, trading a whole pass's progress for a job that has
-/// nobody waiting on it. tokio's `RwLock` is fair, so a queued writer also
-/// reads as "running" here — which is the answer we want.
+/// Is a reclaim pass running (or about to start)? Background work that would
+/// boot a VM checks this and defers: even in per-disk mode such a job may
+/// collide with the disk the pass is on and make it yield, trading a whole
+/// pass's progress for work nobody is waiting on. Every pass takes the write
+/// side of [`BOOT_GATE`] in both modes, and tokio's `RwLock` is fair, so a
+/// queued writer also reads as "running" here — which is the answer we want.
 pub fn pass_running() -> bool {
     BOOT_GATE.try_read().is_err()
 }
@@ -153,6 +477,10 @@ pub struct Reclaimer {
     /// `None` when no run dir is configured — then a pass cannot be asked to
     /// yield and boots wait it out, which is slow but never unsafe.
     stop_file: Option<std::path::PathBuf>,
+    /// The per-disk locking marker (`<run dir>/.reclaim-locks/.protocol`) this
+    /// pass renegotiates. `None` with no run dir, where per-disk locks are
+    /// impossible anyway.
+    marker: Option<PathBuf>,
     running: AtomicBool,
 }
 
@@ -160,7 +488,8 @@ impl Reclaimer {
     pub fn new(cmd: String, run_dir: Option<std::path::PathBuf>) -> Self {
         Self {
             cmd,
-            stop_file: run_dir.map(|d| d.join(STOP_FILE)),
+            stop_file: run_dir.as_ref().map(|d| d.join(STOP_FILE)),
+            marker: run_dir.map(|d| d.join(LOCK_DIR).join(LOCK_MARKER)),
             running: AtomicBool::new(false),
         }
     }
@@ -211,7 +540,10 @@ impl Reclaimer {
         }
         let _guard = RunningGuard(&self.running);
 
-        // Exclusive with VM boots for the whole run — see BOOT_GATE.
+        // Exclusive with VM boots for the whole run — see BOOT_GATE. In
+        // per-disk mode nothing takes the read side, so this is uncontended;
+        // it is still taken so the fallback is correct the instant the latch
+        // flips back.
         let waited = Instant::now();
         let _exclusive = BOOT_GATE.write().await;
         if waited.elapsed() > Duration::from_secs(1) {
@@ -220,10 +552,14 @@ impl Reclaimer {
                 waited.elapsed()
             );
         }
-        // Drop a stop request raised before this run owned the gate — it was
-        // aimed at the previous pass and would end this one immediately.
-        let _ = futures::FutureExt::now_or_never(preempt().notified());
         self.clear_stop();
+        // Renegotiate per-disk mode from scratch. The marker is re-created by
+        // the script itself when it supports locking, so clearing it here is
+        // what makes a rollback to an older script drop us back to the gate
+        // rather than trust a stale latch (see the module docs).
+        if let Some(marker) = &self.marker {
+            let _ = std::fs::remove_file(marker);
+        }
 
         debug!("disk reclaim: running `{}`", self.cmd);
         let started = Instant::now();
@@ -235,7 +571,13 @@ impl Reclaimer {
             .kill_on_drop(true);
         let run = tokio::time::timeout(RECLAIM_TIMEOUT, command.output());
         tokio::pin!(run);
-        let mut yielding = false;
+        // A boot that arrived while this pass was still QUEUED on the gate is
+        // already parked, and the notification it sent landed before there was
+        // anyone to hear it. Read the count, which has no such window.
+        let mut yielding = boots_waiting();
+        if yielding {
+            self.request_stop();
+        }
         let result = loop {
             tokio::select! {
                 res = &mut run => break res,
@@ -243,10 +585,14 @@ impl Reclaimer {
                 // is on, then keep waiting for it to actually exit — the gate
                 // must not be handed back while root-owned work is still
                 // writing to a disk. Only the first request does anything;
-                // later signals are left stored for the next pass to drain.
+                // later signals are left stored, and re-checking the count is
+                // what keeps a stored signal that outlived its boot from
+                // cutting a later pass short.
                 _ = preempt().notified(), if !yielding => {
-                    yielding = true;
-                    self.request_stop();
+                    if boots_waiting() {
+                        yielding = true;
+                        self.request_stop();
+                    }
                 }
             }
         };
@@ -267,6 +613,27 @@ impl Reclaimer {
             }
             Ok(Ok(out)) => out,
         };
+        // The child has exited, so the marker (if any) is this script's answer
+        // about per-disk locking, not a leftover. Only re-latch on a run that
+        // actually happened: a launch failure or a timeout says nothing about
+        // what the script supports, and a timeout's root children may still be
+        // holding disks, so the previous answer stands.
+        if let Some(marker) = &self.marker {
+            let was = per_disk_locks();
+            let now = refresh_per_disk(marker);
+            if now != was && now {
+                info!(
+                    "disk reclaim: the deployed script honours per-disk locks ({LOCK_PROTOCOL}) \
+                     — VM boots no longer wait on passes"
+                );
+            } else if now != was {
+                warn!(
+                    "disk reclaim: the deployed script did not claim per-disk locking \
+                     ({LOCK_PROTOCOL}); falling back to the global boot gate — every VM boot \
+                     now waits for a pass to yield"
+                );
+            }
+        }
         if yielding {
             info!(
                 "disk reclaim: pass yielded to a VM boot after {:?}; it resumes from where it \
@@ -364,6 +731,23 @@ fn tail(s: &str, n: usize) -> &str {
 mod tests {
     use super::*;
 
+    /// [`BOOT_GATE`], [`BOOTS_WAITING`] and [`PER_DISK`] are process-wide, and
+    /// cargo runs a test binary's tests concurrently in one process — so every
+    /// test that touches them takes this first. It is the same lock the
+    /// `loadtest` stub takes, because a bring-up there takes a boot permit
+    /// here: two separate locks left this module's assertions reading another
+    /// module's waiting boots.
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::vm::test_exclusive().await
+    }
+
+    /// Pin the fallback mode for a test about the gate. (`lock_path` already
+    /// returns `None` while `LOCK_ROOT` is unset, which no test sets — this is
+    /// belt and braces against ordering.)
+    fn use_gate_mode() {
+        PER_DISK.store(false, Ordering::Release);
+    }
+
     /// A run dir for one test, cleaned up by the caller.
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("pgfc-reclaim-{tag}-{}", std::process::id()));
@@ -374,6 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_once_counts_trimmed_disks() {
+        let _serial = serial().await;
         let r = Reclaimer::new(
             "printf 'reclaim-disks: 3 disk(s)\ntrim  -1.0GB  /a\ntrim  -2.0GB  /b\n\
              skip  (in use)  /c\n----\ntrimmed 2 disk(s), reclaimed 3.0GB\n'"
@@ -395,6 +780,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_once_reports_failure_as_zero() {
+        let _serial = serial().await;
         let r = Reclaimer::new("echo boom >&2; exit 3".to_string(), None);
         assert_eq!(r.run_once().await, 0);
         // Flag released for the next run.
@@ -437,6 +823,8 @@ mod tests {
     /// and only after the script has actually exited.
     #[tokio::test]
     async fn a_waiting_boot_makes_the_pass_stop_early() {
+        let _serial = serial().await;
+        use_gate_mode();
         let dir = scratch("yield");
         let stop = dir.join(STOP_FILE);
         // Stands in for the script's between-disks check: run "forever", stop
@@ -457,7 +845,7 @@ mod tests {
         // Let the run acquire the write side of the gate and arm its watch.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let waited = Instant::now();
-        let permit = boot_permit().await;
+        let permit = boot_permit("sb-yield").await;
         assert!(
             waited.elapsed() < Duration::from_secs(5),
             "boot waited {:?} for the pass — the stop request did not land",
@@ -472,11 +860,166 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_yield_signal_does_not_cut_the_next_pass_short() {
-        // Signal with nobody running: `notify_one` stores the permit.
+        let _serial = serial().await;
+        use_gate_mode();
+        // Signal with nobody waiting: `notify_one` stores the permit.
         preempt().notify_one();
-        // The next pass must drain it and still run to completion.
+        // The next pass wakes on it, sees a waiting count of zero, and runs to
+        // completion — the signal is a wakeup, not the decision.
         let r = Reclaimer::new("echo 'trim  -1.0GB  /a'".to_string(), None);
         assert_eq!(r.run_once().await, 1);
+        assert!(!boots_waiting());
+    }
+
+    /// Regression. tokio's `RwLock` is fair, so `try_read` fails from the
+    /// instant a pass *queues* for the write side — a boot arriving in the
+    /// window between `write().await` being called and being granted therefore
+    /// raised its stop request before the pass existed to hear it. The pass
+    /// then drained that request as "stale" and ran to completion with a
+    /// client-facing boot parked behind it, for as long as `RECLAIM_TIMEOUT`.
+    #[tokio::test]
+    async fn a_boot_that_arrives_while_the_pass_is_queued_still_makes_it_yield() {
+        let _serial = serial().await;
+        use_gate_mode();
+        let dir = scratch("queued");
+        let stop = dir.join(STOP_FILE);
+        let r = Arc::new(Reclaimer::new(
+            format!(
+                "i=0; while [ ! -e {} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; \
+                 echo 'trim  -1.0GB  /a'",
+                stop.display()
+            ),
+            Some(dir.clone()),
+        ));
+
+        // An in-flight boot, so the pass has to queue for the gate.
+        let in_flight = boot_permit("sb-inflight").await;
+        let run = tokio::spawn({
+            let r = r.clone();
+            async move { r.run_once().await }
+        });
+        // Let run_once reach `BOOT_GATE.write().await` and park there.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The boot this test is about: it arrives while the pass is queued.
+        let waiter = tokio::spawn(async { boot_permit("sb-waiter").await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(boots_waiting(), "the queued boot registered itself");
+
+        // Hand the gate to the pass. It must read the count it could not have
+        // heard about, and yield at once.
+        drop(in_flight);
+        let permit = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the boot waited out the whole pass — its request was dropped")
+            .unwrap();
+        assert_eq!(run.await.unwrap(), 1, "the pass yielded, it was not killed");
+        drop(permit);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancelled boot (a timed-out spare restart) must not leave the count
+    /// raised — every later pass would yield the instant it started and the
+    /// fleet would never be trimmed — nor stay queued as a reader on the fair
+    /// gate, where the next pass would wait behind a boot that gave up.
+    #[tokio::test]
+    async fn a_boot_that_gives_up_waiting_stops_preempting() {
+        let _serial = serial().await;
+        use_gate_mode();
+        let held = BOOT_GATE.write().await;
+        assert!(
+            boot_permit_within("sb-impatient", Duration::from_millis(100))
+                .await
+                .is_none(),
+            "a bounded wait against a held gate gives up"
+        );
+        assert!(!boots_waiting(), "and deregisters on the way out");
+        drop(held);
+    }
+
+    /// The whole point of per-disk locks: a boot of a VM the pass is not
+    /// touching does not wait, and one of the VM it *is* touching does.
+    #[tokio::test]
+    async fn per_disk_locks_only_hold_up_the_disk_being_worked_on() {
+        // Contending on a lock registers in BOOTS_WAITING, which is global.
+        let _serial = serial().await;
+        let dir = scratch("perdisk");
+        let a = dir.join("sb-a.lock");
+        let b = dir.join("sb-b.lock");
+
+        // Stand in for the script holding sb-a's lock across its pipeline.
+        let script = open_lock(&a).unwrap();
+        assert!(try_flock(&script).unwrap());
+
+        // A boot of sb-b is untouched by that.
+        let other = disk_permit(&b, "sb-b", Some(Duration::from_millis(100)))
+            .await
+            .unwrap();
+        assert!(other.is_some(), "an unrelated VM's boot does not wait at all");
+
+        // A boot of sb-a waits, and gets the disk as soon as the script lets go.
+        let contended = disk_permit(&a, "sb-a", Some(Duration::from_millis(100)))
+            .await
+            .unwrap();
+        assert!(contended.is_none(), "the disk under the pass is held");
+        drop(script);
+        let after = disk_permit(&a, "sb-a", Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert!(after.is_some(), "and is handed over once the pass releases it");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A boot blocked on its own disk still asks the pass to yield — the disk
+    /// the pass is on is exactly the one that boot wants.
+    #[tokio::test]
+    async fn a_contended_disk_lock_preempts_the_pass() {
+        let _serial = serial().await;
+        let dir = scratch("perdisk-preempt");
+        let path = dir.join("sb-c.lock");
+        let script = open_lock(&path).unwrap();
+        assert!(try_flock(&script).unwrap());
+
+        let boot = tokio::spawn({
+            let path = path.clone();
+            async move { disk_permit(&path, "sb-c", Some(Duration::from_secs(5))).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(boots_waiting(), "a colliding boot asks the pass to yield");
+
+        drop(script);
+        assert!(boot.await.unwrap().unwrap().is_some());
+        assert!(!boots_waiting());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mode is negotiated, not assumed: only the protocol this pooler
+    /// speaks counts, and anything else means "older script, use the gate".
+    #[tokio::test]
+    async fn the_marker_latches_only_a_protocol_this_pooler_speaks() {
+        let _serial = serial().await;
+        let dir = scratch("marker");
+        let marker = dir.join(LOCK_MARKER);
+
+        assert!(!refresh_per_disk(&marker), "no marker at all: fall back");
+        std::fs::write(&marker, b"perdisk-99\n").unwrap();
+        assert!(!refresh_per_disk(&marker), "a protocol we don't speak: fall back");
+        std::fs::write(&marker, format!("{LOCK_PROTOCOL}\n")).unwrap();
+        assert!(refresh_per_disk(&marker), "ours, trailing newline and all");
+
+        // A rollback to a script that doesn't write the marker drops us back.
+        std::fs::remove_file(&marker).unwrap();
+        assert!(!refresh_per_disk(&marker));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sandbox id is pasted into a path, so it is checked.
+    #[test]
+    fn lock_path_rejects_ids_that_would_escape_the_lock_dir() {
+        for bad in ["", "../../etc/shadow", "sb-a/../../x", "a/b"] {
+            assert!(lock_path(bad).is_none(), "{bad:?} must not name a lock file");
+        }
     }
 
     #[test]

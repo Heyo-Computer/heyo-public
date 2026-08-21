@@ -340,16 +340,11 @@ fn daemon() -> &'static Arc<Daemon> {
 /// Guards the process environment while a `Config` is built from it.
 static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
-/// Exclusive use of the stub for the caller's whole test.
-///
-/// The fleet, the counters and the environment a `Config` reads are all
-/// process-wide, so two tests running at once measure each other — which is
-/// not a flaky result, it is a wrong one. `cargo test` runs test functions in
-/// parallel by default, so this cannot be delegated to `--test-threads=1`:
-/// that flag is for readable output, this is for correctness.
+/// Exclusive use of the stub for the caller's whole test. Shared with every
+/// other test that touches process-wide VM state — a bring-up here takes a
+/// reclaim boot permit, so `reclaim`'s tests must not run alongside these.
 async fn exclusive() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    LOCK.lock().await
+    crate::vm::test_exclusive().await
 }
 
 /// A pooler configuration pointed at the stub, with a state file holding

@@ -36,17 +36,41 @@
 # can't reach past the fs). The shrunk fs is re-fscked before anything mounts
 # it; a disk that fails that check is reported and left unmounted.
 #
-# YIELDING: the caller (normally pg-vm-pool) must keep VM boots and this script
-# disjoint in time — the in-use scan below is a snapshot taken at pass start, so
-# a VM booted mid-pass would be invisible to it and its filesystem could be
-# fscked underneath the running guest. The pooler enforces that by blocking
-# boots for the whole run, which on a big fleet is minutes. So when a boot is
-# waiting it creates $STOP_FILE ("$RUN_DIR/.reclaim-stop"): this script finishes
-# the disk it is on, records where it stopped in $CURSOR_FILE, and exits, and
-# the next run resumes after that disk. Stopping between disks (never inside
-# one) is the only safe point, and cooperation is the only safe mechanism — the
-# script runs under sudo, so a caller that "killed" it would only reap the shell
-# while the root e2fsck kept writing.
+# EXCLUSION: the caller (normally pg-vm-pool) must keep VM boots and this script
+# off the same disk — the in-use scan below is a snapshot taken at pass start,
+# so a VM booted mid-pass would be invisible to it and its filesystem could be
+# fscked underneath the running guest.
+#
+# PER-DISK LOCKS are how that is enforced. Both sides flock a file per sandbox,
+# "$LOCK_DIR/<id>.lock": the pooler holds it across the VM's start(), this
+# script holds it across one disk's whole pipeline and SKIPS any disk it cannot
+# lock (a boot owns it). A boot of a VM this pass isn't touching then costs
+# nothing at all, and the pass keeps running through cold starts and warm-spare
+# restarts instead of losing its progress to them.
+#
+# The lock alone is not enough, because the pooler drops it the moment start()
+# returns — a VM that booted mid-pass holds its disk open but is invisible to a
+# snapshot taken before it existed. So the in-use question is asked twice: once
+# against the snapshot (free, catches everything already running at pass start)
+# and, for whatever survives that, once live while holding the disk's lock,
+# which is the only moment the answer is guaranteed to stay true. See
+# disk_in_use_live.
+#
+# The pooler cannot tell by inspection whether the script it invokes implements
+# this, so it is declared: this script writes $LOCK_PROTOCOL into $LOCK_MARKER
+# at every pass start, and the pooler deletes that marker before each run and
+# re-reads it after. No marker means an older script, and the pooler falls back
+# to blocking every boot for the whole run. Keep $LOCK_PROTOCOL in step with
+# the constant of the same name in the pooler's src/reclaim.rs: a mismatched
+# pair must degrade to the slow path, never to a shared disk.
+#
+# YIELDING is the second half, and still applies under either scheme: when a
+# boot is waiting the pooler creates $STOP_FILE ("$RUN_DIR/.reclaim-stop"), and
+# this script finishes the disk it is on, records where it stopped in
+# $CURSOR_FILE, and exits; the next run resumes after that disk. Stopping
+# between disks (never inside one) is the only safe point, and cooperation is
+# the only safe mechanism — the script runs under sudo, so a caller that
+# "killed" it would only reap the shell while the root e2fsck kept writing.
 #
 # Usage:
 #   sudo ./reclaim-disks.sh [RUN_DIR]        # default RUN_DIR: ~/.heyo/run
@@ -94,6 +118,13 @@ STOP_FILE="${STOP_FILE:-$RUN_DIR/.reclaim-stop}"
 # of re-walking the same prefix forever. On a host that yields often, this is
 # what makes fleet-wide progress possible at all.
 CURSOR_FILE="${CURSOR_FILE:-$RUN_DIR/.reclaim-cursor}"
+# Per-disk boot locks, and the marker declaring that this script takes them.
+# See EXCLUSION above; LOCK_PROTOCOL must match the pooler's constant.
+LOCK_DIR="${LOCK_DIR:-$RUN_DIR/.reclaim-locks}"
+LOCK_MARKER="$LOCK_DIR/.protocol"
+LOCK_PROTOCOL="perdisk-1"
+# Set below once the lock dir and the flock(1) binary are both known good.
+PER_DISK_LOCKS=0
 
 die() { echo "error: $*" >&2; exit 1; }
 human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
@@ -133,6 +164,24 @@ if [ "$PRUNE_SWAP" = 1 ]; then
     command -v debugfs >/dev/null || die "missing required tool for PRUNE_SWAP=1: debugfs"
 fi
 
+# Declare per-disk boot locking to the caller (see EXCLUSION at the top).
+# Everything here is best effort: if flock(1) is missing, or the lock dir can't
+# be made writable by both this root script and a non-root pooler, we simply
+# don't claim support — the pooler then keeps every VM boot on the host blocked
+# for this whole run, which is slower but equally safe. 0777/0666 because the
+# two sides normally run as different users and either may create a file first.
+if command -v flock >/dev/null && mkdir -p "$LOCK_DIR" 2>/dev/null; then
+    chmod 0777 "$LOCK_DIR" 2>/dev/null || true
+    if printf '%s\n' "$LOCK_PROTOCOL" >"$LOCK_MARKER" 2>/dev/null; then
+        chmod 0666 "$LOCK_MARKER" 2>/dev/null || true
+        PER_DISK_LOCKS=1
+    fi
+fi
+if [ "$PER_DISK_LOCKS" != 1 ]; then
+    echo "warning: per-disk boot locks unavailable (need flock(1) and a writable" \
+         "$LOCK_DIR) — the caller must block every VM boot for this whole run" >&2
+fi
+
 # Point-in-time set of every file held open by any process, keyed by
 # device:inode. A live Firecracker keeps its data disk open as a plain fd under
 # /proc/<pid>/fd — but Firecracker usually runs under *jailer*, which chroots the
@@ -169,6 +218,29 @@ disk_in_use() {
     local key
     key=$(stat -c '%d:%i' "$1" 2>/dev/null) || return 0
     [ -n "${OPEN_INODES[$key]:-}" ]
+}
+
+# Same question, asked NOW instead of against the pass-start snapshot, for one
+# disk. Only sound — and only called — while this pass holds that disk's lock.
+#
+# Per-disk locks let VMs boot during a pass, and the pooler releases a disk's
+# lock as soon as start() returns, so by the time we take that lock the VM is
+# running and holding its disk open while the snapshot still predates it.
+# Trusting the snapshot there would fsck a live guest's filesystem. Holding the
+# lock is what turns this second scan into a decision rather than a guess: no
+# new boot can claim this disk while we have it, so what it sees stays true for
+# as long as we need it to.
+#
+# Costs one /proc walk per candidate disk, which is why it is not the primary
+# check: the snapshot filters the disks that were already running at pass start
+# for free, and only what survives that pays for a live scan. Under the global
+# gate it is never called at all — no VM can boot during a pass in the first
+# place. Fails closed, like disk_in_use.
+disk_in_use_live() {
+    local key
+    key=$(stat -c '%d:%i' "$1" 2>/dev/null) || return 0
+    find /proc/[0-9]*/fd -maxdepth 1 -type l -exec stat -L -c '%d:%i' {} + 2>/dev/null \
+        | grep -qxF "$key"
 }
 
 shopt -s nullglob
@@ -239,6 +311,14 @@ trim_one() {
         pid="${OPEN_INODES[${key:-none}]:-?}"
         [ -r "/proc/$pid/comm" ] && comm=$(cat "/proc/$pid/comm" 2>/dev/null)
         echo "skip  (in use by pid $pid/$comm)  $disk"
+        skipped=$((skipped + 1))
+        return 0
+    fi
+    # A VM that booted after the snapshot was taken (see disk_in_use_live).
+    # LOCK_HELD, not PER_DISK_LOCKS: the answer is only trustworthy while this
+    # pass holds the disk's lock, so the caller says whether it does.
+    if [ "${LOCK_HELD:-0}" = 1 ] && disk_in_use_live "$disk"; then
+        echo "skip  (booted during this pass)  $disk"
         skipped=$((skipped + 1))
         return 0
     fi
@@ -384,7 +464,11 @@ trim_one() {
             echo "yield (boot waiting, stopped mid-discard; disk clean, re-trimmed next pass)  $disk"
             return 3
         fi
-        sleep 2
+        # 100ms, not seconds: this is both how fast a waiting boot is noticed
+        # and how much dead time every disk pays after its discard finishes.
+        # The loop is two syscalls (a signal probe and a stat), so 10Hz is free
+        # next to the fsck it is watching.
+        sleep 0.1
     done
     wait "$dfsck_pid"
     local dfsck_rc=$?
@@ -406,10 +490,61 @@ trim_one() {
     return 0
 }
 
+# Run trim_one under this disk's boot lock, so a VM boot and this pass can never
+# be working on the same data.ext4 — the exact hazard the caller's old
+# block-every-boot rule was paying for fleet-wide.
+#
+# Non-blocking on purpose: a disk whose lock is held is one a VM is booting
+# right now, so the next pass will find it stopped anyway. Waiting would trade
+# this pass's progress for a disk we are about to be told to leave alone.
+#
+# The lock rides fd 9 on a brace group, NOT `exec`: a brace group runs in this
+# same shell (so trim_one's counter updates survive, which a subshell would
+# discard) and a redirection that fails merely fails the group, where a failed
+# `exec` redirection would silently exit the whole script.
+run_locked() {
+    local disk="$1" lock lock_rc
+    if [ "$PER_DISK_LOCKS" != 1 ] || [ "$DRY_RUN" = 1 ]; then
+        LOCK_HELD=0
+        trim_one "$disk"
+        return $?
+    fi
+    lock="$LOCK_DIR/$(basename "$(dirname "$disk")").lock"
+    : >>"$lock" 2>/dev/null && chmod 0666 "$lock" 2>/dev/null
+
+    # 100/101 are out of trim_one's range (0, 1, 3), so the three outcomes stay
+    # distinguishable after the group closes fd 9 and releases the lock.
+    lock_rc=100
+    {
+        if flock -n 9; then
+            LOCK_HELD=1
+            trim_one "$disk"
+            lock_rc=$?
+            LOCK_HELD=0
+        else
+            lock_rc=101
+        fi
+    } 9>>"$lock"
+
+    case "$lock_rc" in
+        100)
+            echo "skip  (lock file unusable: $lock)  $disk"
+            skipped=$((skipped + 1))
+            return 0
+            ;;
+        101)
+            echo "skip  (a VM boot holds the disk lock)  $disk"
+            skipped=$((skipped + 1))
+            return 0
+            ;;
+        *) return "$lock_rc" ;;
+    esac
+}
+
 # Announce the active flags: env vars silently stripped by sudo's env_reset
 # (`SHRINK=1 sudo …` instead of `sudo SHRINK=1 …`) have twice produced runs
 # that "did nothing" — make a flagless run visible in the first line.
-echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR (dry-run=$DRY_RUN shrink=$SHRINK prune-swap=$PRUNE_SWAP; $(e2fsck -V 2>&1 | head -n1))"
+echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR (dry-run=$DRY_RUN shrink=$SHRINK prune-swap=$PRUNE_SWAP per-disk-locks=$PER_DISK_LOCKS; $(e2fsck -V 2>&1 | head -n1))"
 snapshot_open_files
 stopped_early=0 done_count=0 last_done=""
 for disk in "${disks[@]}"; do
@@ -419,7 +554,7 @@ for disk in "${disks[@]}"; do
         stopped_early=1
         break
     fi
-    trim_one "$disk"
+    run_locked "$disk"
     if [ $? -eq 3 ]; then
         # Yielded mid-disk: not recorded as done, so the next pass redoes this
         # disk from the top (every stage is idempotent).

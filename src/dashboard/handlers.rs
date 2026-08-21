@@ -303,13 +303,13 @@ async fn run_lifecycle(id: &str, act: Lifecycle) -> anyhow::Result<()> {
             // reclaim passes (see reclaim::boot_permit) and bounded by the
             // bring-up gate so a manual action can't pile onto a busy daemon.
             Lifecycle::Start => {
-                let _permit = crate::reclaim::boot_permit().await;
+                let _permit = crate::reclaim::boot_permit(id).await;
                 let _slot = vm::bringup_slot("dashboard-start").await;
                 sb.start().await
             }
             Lifecycle::Stop => sb.stop().await,
             Lifecycle::Reboot => {
-                let _permit = crate::reclaim::boot_permit().await;
+                let _permit = crate::reclaim::boot_permit(id).await;
                 let _slot = vm::bringup_slot("dashboard-reboot").await;
                 // Not sb.restart(): the SDK builds that as the cloud-dialect
                 // path /deployed-sandboxes/{id}/restart, which the local
