@@ -511,6 +511,73 @@ pub async fn action_reap(
     ))
 }
 
+/// Bring an offloaded schema (frozen locally, compacted, or archived to S3)
+/// back online. Its row carries the sandbox id the schema *used* to have —
+/// that VM was deleted as part of the offload, so every lifecycle action on it
+/// 404s at the daemon ("Sandbox not found"). The only route back is the
+/// registry's cold path, which creates a fresh VM and materializes the data
+/// into it; a `checkout` is exactly what a client connection would drive.
+///
+/// The guard is dropped the moment the bring-up resolves: this is a warm-up,
+/// not a session, so the idle reaper owns the VM from there. Download +
+/// decompress + boot (or `pg_restore`) runs for minutes on a large workbook,
+/// well past `ACTION_TIMEOUT`, so it goes to the background like the reap.
+pub async fn action_restore(
+    State(st): State<DashState>,
+    Path(id): Path<String>,
+    Form(f): Form<NextForm>,
+) -> Redirect {
+    let back = |query: String| -> Redirect {
+        match f.dest() {
+            Some(n) => {
+                let sep = if n.contains('?') { '&' } else { '?' };
+                Redirect::to(&format!("{n}{sep}{query}"))
+            }
+            None => Redirect::to(&format!("/vm/{id}?{query}")),
+        }
+    };
+    let row = match model::find_row(&st, &id).await {
+        Ok(row) => row,
+        Err(e) => return back(format!("err={}", qenc(&e.to_string()))),
+    };
+    let Some(row) = row else {
+        return back(format!("err={}", qenc("no such VM")));
+    };
+    if row.offload.is_none() {
+        return back(format!(
+            "err={}",
+            qenc("this VM is not offloaded — there is nothing to restore")
+        ));
+    }
+    let Some(schema) = row.schema else {
+        return back(format!(
+            "err={}",
+            qenc("not a pooler-managed schema VM — nothing to restore")
+        ));
+    };
+    let registry = st.registry.clone();
+    tokio::spawn(async move {
+        match registry.checkout(&schema).await {
+            Ok(guard) => {
+                let vm = guard.entry().sandbox_id();
+                drop(guard);
+                let msg = format!("schema {schema} restored into VM {vm}");
+                tracing::info!("manual restore: {msg}");
+                crate::events::journal_info("restore", msg);
+            }
+            Err(e) => {
+                let msg = format!("restoring schema {schema} failed: {e:#}");
+                tracing::warn!("manual restore: {msg}");
+                crate::events::journal_error("restore", msg);
+            }
+        }
+    });
+    back(format!(
+        "msg={}",
+        qenc("restore started; watch the pooler log")
+    ))
+}
+
 /// The per-VM "archive as image" action: archive the schema's raw disk to S3
 /// with no boot and no `pg_dump` — for schemas whose Postgres won't come up
 /// (version-mismatched pgdata, sick disks), where the reap path only burns

@@ -1235,21 +1235,33 @@ pub fn vm_detail_page(
                         "rootfs with a matching Postgres major."
                     }
                 }
-                form.resize method="post" action={ "/vm/" (r.id) "/resize" } {
-                    label { "resize to " }
-                    select name="size_class" {
-                        @for s in SIZE_CLASSES {
-                            option value=(s) selected[r.size_class.as_deref() == Some(s)] { (s) }
+                // Same dead-id reason the lifecycle buttons are hidden for an
+                // offloaded schema: there is no sandbox left to resize. The
+                // size class is picked afresh when the restore builds the VM.
+                @if r.offload.is_none() {
+                    form.resize method="post" action={ "/vm/" (r.id) "/resize" } {
+                        label { "resize to " }
+                        select name="size_class" {
+                            @for s in SIZE_CLASSES {
+                                option value=(s) selected[r.size_class.as_deref() == Some(s)] { (s) }
+                            }
                         }
+                        button type="submit" { "resize" }
                     }
-                    button type="submit" { "resize" }
                 }
                 p.note {
-                    "Pooler-managed VMs stopped here auto-restart on the next client "
-                    "connection; a resize takes effect on the VM's next boot."
-                    @if st.registry.archive_enabled() {
-                        " Reaping to S3 dumps the database, deletes the VM and its disk, "
-                        "and restores the data into a fresh VM on the next connection."
+                    @if let Some(tier) = r.offload {
+                        "This schema's data lives only in its " (tier) " copy — its VM was "
+                        "deleted, so there is nothing to start, stop or resize. Restoring "
+                        "builds a fresh VM and loads the data into it; the next client "
+                        "connection does the same thing on its own."
+                    } @else {
+                        "Pooler-managed VMs stopped here auto-restart on the next client "
+                        "connection; a resize takes effect on the VM's next boot."
+                        @if st.registry.archive_enabled() {
+                            " Reaping to S3 dumps the database, deletes the VM and its disk, "
+                            "and restores the data into a fresh VM on the next connection."
+                        }
                     }
                 }
             }
@@ -1435,6 +1447,13 @@ fn vm_table(rows: &[VmRow], archive_enabled: bool, next: &str) -> Markup {
 /// pages); `None` from the detail page (stay on the detail page).
 fn action_buttons(r: &VmRow, archive_enabled: bool, next: Option<&str>) -> Markup {
     let running = r.status == SandboxStatus::Running;
+    // An offloaded schema has no sandbox: the VM was deleted as part of the
+    // offload and the id this (synthetic) row carries is dead, so start/stop/
+    // reboot on it can only 404 at the daemon ("Sandbox not found"). The way
+    // back is a restore into a FRESH VM — the same cold path the schema's next
+    // client connection would take — so offer that instead of the lifecycle
+    // buttons.
+    let offloaded = r.offload.is_some();
     // Offer manual reap only for an idle, pooler-managed, running schema VM —
     // archiving one with live sessions is refused server-side, so don't tempt it.
     let can_reap = archive_enabled
@@ -1451,7 +1470,14 @@ fn action_buttons(r: &VmRow, archive_enabled: bool, next: Option<&str>) -> Marku
         }
     };
     html! {
-        @if running {
+        @if offloaded {
+            form method="post" action={ "/vm/" (r.id) "/restore" } {
+                (next_input())
+                button.start
+                    title="Bring this schema back online now: a fresh VM is created and the offloaded data restored into it. Runs in the background — exactly what the next client connection would do on its own."
+                    { "restore" }
+            }
+        } @else if running {
             form method="post" action={ "/vm/" (r.id) "/stop" } { (next_input()) button.stop { "stop" } }
             form method="post" action={ "/vm/" (r.id) "/reboot" } { (next_input()) button { "reboot" } }
         } @else {
@@ -1588,6 +1614,70 @@ fn human_secs(s: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row shaped like the ones `model::build_rows` produces, with the
+    /// offload tier under test. `offload: Some(_)` is the synthetic row spliced
+    /// in for a schema whose VM was deleted by an offload — `id` is the dead
+    /// sandbox id, and `status` is only a placeholder.
+    fn row(offload: Option<&'static str>) -> VmRow {
+        VmRow {
+            id: "sb-81e254cb".into(),
+            name: "pg-demo".into(),
+            schema: Some("demo".into()),
+            pool_managed: true,
+            status: SandboxStatus::Stopped,
+            size_class: None,
+            cpus: None,
+            memory_bytes: None,
+            disk_size_gb: None,
+            cpu_percent: None,
+            image: None,
+            region: None,
+            status_changed_at: None,
+            uptime_secs: 0,
+            ttl_seconds: None,
+            guest_ip: None,
+            error_message: None,
+            live_sessions: None,
+            client_slots: None,
+            idle_secs: None,
+            keepalive: false,
+            target: None,
+            tunneled: None,
+            offload,
+        }
+    }
+
+    /// An offloaded schema's sandbox is deleted by the offload, so its row
+    /// carries a dead id: a `start` form there posts to a sandbox the daemon
+    /// 404s ("Sandbox not found: sb-… (calling /sandbox/sb-…/start)"). Offer
+    /// the restore that actually works instead.
+    #[test]
+    fn offloaded_rows_offer_restore_not_the_dead_lifecycle_buttons() {
+        let html = action_buttons(&row(Some("archived")), true, None).into_string();
+        assert!(html.contains("/vm/sb-81e254cb/restore"), "must offer restore: {html}");
+        assert!(!html.contains("/start"), "no start on a deleted sandbox: {html}");
+        assert!(!html.contains("/stop"), "no stop on a deleted sandbox: {html}");
+        assert!(!html.contains("/reboot"), "no reboot on a deleted sandbox: {html}");
+        // Reaping is already-offloaded work; nothing to dump.
+        assert!(!html.contains("/reap"), "no reap on an offloaded schema: {html}");
+
+        // The local tiers are offloaded the same way — same dead id, same fix.
+        for tier in ["frozen", "compacted"] {
+            let html = action_buttons(&row(Some(tier)), true, None).into_string();
+            assert!(html.contains("/restore"), "{tier} must offer restore: {html}");
+            assert!(!html.contains("/start"), "{tier} must not offer start: {html}");
+        }
+    }
+
+    /// A live (merely stopped) VM keeps the ordinary lifecycle buttons — its
+    /// sandbox still exists, and `start` on it is what wakes it.
+    #[test]
+    fn stopped_but_live_rows_keep_start() {
+        let html = action_buttons(&row(None), true, None).into_string();
+        assert!(html.contains("/vm/sb-81e254cb/start"), "stopped VM starts: {html}");
+        assert!(!html.contains("/restore"), "nothing to restore: {html}");
+    }
 
     #[test]
     fn meter_level_bands() {
