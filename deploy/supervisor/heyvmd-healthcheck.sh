@@ -37,22 +37,42 @@ CURL_TIMEOUT="${HEYVMD_HEALTHCHECK_CURL_TIMEOUT_SECS:-20}"
 FAIL_THRESHOLD="${HEYVMD_HEALTHCHECK_FAIL_THRESHOLD:-8}"
 COOLDOWN_SECS="${HEYVMD_HEALTHCHECK_COOLDOWN_SECS:-600}"
 
+# /health carries `runtimeLagMs` (heyvmd >= the runtime_lag heartbeat): how
+# late the daemon's 1s timer wakes. High lag = worker threads parked by
+# blocking work (the thing a restart might actually cure); low lag with a
+# slow /deployed-sandboxes = lock convoy (a restart only kills VMs). Logged
+# every poll so the restart log finally says WHY, and flagged above
+# LAG_WARN_MS. Parsed with grep so the script has no jq dependency.
+LAG_WARN_MS="${HEYVMD_HEALTHCHECK_LAG_WARN_MS:-500}"
+lag_field() { # $1 = health JSON, $2 = field (current|p99_60s|max_60s)
+  printf '%s' "$1" | grep -o "\"$2\":[0-9]*" | head -1 | grep -o '[0-9]*$'
+}
+
 fails=0
 while true; do
-  if curl -fsS --max-time "$CURL_TIMEOUT" "$HEALTH_URL" >/dev/null 2>&1; then
+  if health=$(curl -fsS --max-time "$CURL_TIMEOUT" "$HEALTH_URL" 2>/dev/null); then
     fails=0
+    lag_now=$(lag_field "$health" current); lag_p99=$(lag_field "$health" p99_60s)
+    if [ -n "${lag_p99:-}" ] && [ "$lag_p99" -ge "$LAG_WARN_MS" ]; then
+      echo "$(date -Is) heyvmd runtime lag high: now=${lag_now}ms p99_60s=${lag_p99}ms" \
+           "— worker threads parked by blocking work (NOT restarting while /health answers)"
+    fi
     # Runtime is alive. Separately report (log-only, never restart) a
-    # slow/wedged sandbox manager so the signal isn't lost.
+    # slow/wedged sandbox manager so the signal isn't lost — with the lag
+    # alongside, so the log distinguishes a lock convoy (low lag) from a
+    # parked runtime (high lag).
     if ! curl -fsS --max-time "$CURL_TIMEOUT" "$LIST_URL" >/dev/null 2>&1; then
       echo "$(date -Is) heyvmd /health OK but $LIST_URL slow/failing" \
-           "(manager busy or lock-contended — NOT restarting)"
+           "(runtime lag now=${lag_now:-?}ms p99=${lag_p99:-?}ms; manager busy or" \
+           "lock-contended — NOT restarting)"
     fi
   else
     fails=$((fails + 1))
     echo "$(date -Is) heyvmd /health check failed (${fails}/${FAIL_THRESHOLD}): $HEALTH_URL"
     if [ "$fails" -ge "$FAIL_THRESHOLD" ]; then
       echo "$(date -Is) restarting heyvmd after ${fails} consecutive failures" \
-           "— this kills every running VM"
+           "(VMs survive: detached console + stopasgroup/killasgroup=false; the fresh" \
+           "daemon reattaches them)"
       supervisorctl restart heyvmd
       fails=0
       sleep "$COOLDOWN_SECS"

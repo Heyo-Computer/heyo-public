@@ -892,6 +892,127 @@ impl SchemaRegistry {
         });
     }
 
+    /// Spawn the untracked-VM reconciler alongside the idle reaper.
+    ///
+    /// The idle reaper only ever sees `self.entries` — VMs this pooler
+    /// process brought up and still tracks. A running VM with **no warm
+    /// entry and no bring-up in flight** is unused by definition (every
+    /// client path runs through a warm entry), yet nothing stops it: VMs
+    /// left running across a pooler restart, VMs whose idle-stop failed
+    /// (a failed stop is logged, not retried), VMs the daemon booted on its
+    /// own. Worse, the offload ladder cannot pass them: compaction refuses a
+    /// disk a running VM holds open and backs off (30m→24h), and while
+    /// compaction is *eligible* the picker never falls through to the dump
+    /// archive. The visible symptom is "many running VMs, no sessions,
+    /// nothing offboarding".
+    ///
+    /// This loop lists the daemon's running VMs and stops every one that is
+    /// bound to a live schema but tracked by nothing — only after seeing the
+    /// same VM untracked on **two consecutive passes**, so a bring-up that
+    /// lands between the listing and the map check is never stopped
+    /// mid-flight. Unbound running VMs (no live registry row) are left
+    /// alone: the purge owns offloaded-tier leftovers and anything else is
+    /// not the pooler's to stop. Same cadence as the idle reaper.
+    pub fn spawn_untracked_reaper(self: &Arc<Self>) {
+        let Some(timeout) = self.cfg.idle_timeout else {
+            return; // idle reaping off ⇒ the operator wants VMs left running
+        };
+        let tick = (timeout / 4).max(Duration::from_secs(5));
+        let registry = self.clone();
+        let suspects: Arc<tokio::sync::Mutex<HashSet<String>>> = Arc::default();
+        tokio::spawn(supervise("untracked-reaper", tick, tick, move || {
+            let registry = registry.clone();
+            let suspects = suspects.clone();
+            async move {
+                let mut suspects = suspects.lock().await;
+                registry.reap_untracked(&mut suspects).await
+            }
+        }));
+    }
+
+    /// One reconciler pass — see [`Self::spawn_untracked_reaper`]. Returns
+    /// how many VMs were stopped.
+    async fn reap_untracked(&self, suspects: &mut HashSet<String>) -> usize {
+        let infos = match vm::list_with_retry().await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("untracked-reaper: listing sandboxes failed; skipping pass: {e:#}");
+                return 0;
+            }
+        };
+        // id → schema for every live row.
+        let live_by_id: HashMap<String, String> = self
+            .store_records()
+            .into_iter()
+            .filter(|(_, r)| r.tier == Tier::Live)
+            .map(|(schema, r)| (r.sandbox_id, schema))
+            .collect();
+        let spare_claimed = self
+            .spares
+            .as_ref()
+            .map(|p| p.claimed_ids())
+            .unwrap_or_default();
+        let mut seen_now: HashSet<String> = HashSet::new();
+        let mut stopped = 0usize;
+        for info in infos
+            .iter()
+            .filter(|i| i.status == heyo_sdk::SandboxStatus::Running)
+        {
+            if info.name.starts_with(crate::spares::SPARE_PREFIX)
+                || spare_claimed.contains(&info.id)
+            {
+                continue; // the spare pool owns these
+            }
+            let Some(schema) = live_by_id.get(&info.id) else {
+                continue; // not bound to a live schema: not ours to stop
+            };
+            // Tracked = a cell exists, warm OR initializing (bring-up in flight).
+            if self.entries.lock().await.contains_key(schema) {
+                continue;
+            }
+            if self.is_archiving(schema) || crate::pending::get(schema).is_some() {
+                continue;
+            }
+            seen_now.insert(info.id.clone());
+            if !suspects.contains(&info.id) {
+                continue; // first sighting: confirm next pass
+            }
+            info!(
+                "untracked-reaper: VM {} (schema {schema}) is running with no warm entry \
+                 and no bring-up in flight on two consecutive passes — stopping it so the \
+                 idle/offload ladder can reclaim it",
+                info.id
+            );
+            match heyo_sdk::Sandbox::connect(info.id.clone(), vm::local_opts()) {
+                Ok(sb) => match tokio::time::timeout(Duration::from_secs(30), sb.stop()).await {
+                    Ok(Ok(())) => {
+                        stopped += 1;
+                        crate::events::journal_info(
+                            "untracked",
+                            format!("schema {schema}: stopped untracked running VM {}", info.id),
+                        );
+                    }
+                    Ok(Err(e)) => warn!("untracked-reaper: stopping {} failed: {e:#}", info.id),
+                    Err(_) => warn!("untracked-reaper: stopping {} timed out", info.id),
+                },
+                Err(e) => warn!("untracked-reaper: connecting to {} failed: {e:#}", info.id),
+            }
+        }
+        if !seen_now.is_empty() && stopped == 0 {
+            info!(
+                "untracked-reaper: {} running VM(s) tracked by nothing — confirming next pass",
+                seen_now.len()
+            );
+        }
+        *suspects = seen_now;
+        if stopped > 0
+            && let Some(reclaimer) = &self.reclaimer
+        {
+            reclaimer.spawn_soon(POST_STOP_RECLAIM_DELAY);
+        }
+        stopped
+    }
+
     /// Spawn the background idle-reaper if an idle timeout is configured.
     pub fn spawn_reaper(self: &Arc<Self>) {
         let Some(timeout) = self.cfg.idle_timeout else {
@@ -2585,11 +2706,29 @@ impl SchemaRegistry {
             }
         }
         // 2. Unclaimed spares.
+        //
+        // `bound` / `claimed` above are snapshots from the START of the pass,
+        // and step 1 can run for a long time (it probes every persisted-only
+        // record). A spare claimed and bound to a schema DURING the pass is
+        // invisible to those snapshots and would be killed under a live
+        // schema — the VM is gone, the registry still says live, and the
+        // client's next connect gets an empty database. So re-read both right
+        // before each kill, and skip anything claimed since.
         for s in &infos {
             if !s.name.starts_with(crate::spares::SPARE_PREFIX)
                 || bound.contains(&s.id)
                 || claimed.contains(&s.id)
             {
+                continue;
+            }
+            let bound_now = self.store.bound_ids();
+            let claimed_now = self
+                .spares
+                .as_ref()
+                .map(|p| p.claimed_ids())
+                .unwrap_or_default();
+            if bound_now.contains(&s.id) || claimed_now.contains(&s.id) {
+                info!("purge: spare {} was claimed during this pass — keeping it", s.id);
                 continue;
             }
             info!("purge: unclaimed spare {} — deleting", s.id);

@@ -96,6 +96,9 @@ async fn main() -> Result<()> {
     );
     let registry = Arc::new(SchemaRegistry::new(cfg));
     registry.spawn_reaper();
+    // Stops running VMs nothing tracks (left over from a pooler restart, a
+    // failed idle-stop, or a daemon-side boot) so the ladder can reclaim them.
+    registry.spawn_untracked_reaper();
     // Offload pacer: trickles cold schemas down the storage ladder (compact →
     // freeze → S3), one schema at a time and only while no client is waiting
     // on a bring-up, instead of waking on a timer and running a long batch.
