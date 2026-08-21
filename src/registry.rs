@@ -379,6 +379,8 @@ pub struct SchemaRegistry {
     // Per-schema failure memory so the sweeps skip recently-failed offloads
     // instead of burning a ready-timeout on the same sick schemas every pass.
     offload_backoff: OffloadBackoff,
+    /// Per-schema bring-up circuit breaker — see [`BringupBreaker`].
+    bringup_breaker: BringupBreaker,
     // Single-flights the dashboard's purge action.
     purging: AtomicBool,
     // Provisioned dedicated databases: `database → (role, password)`. Consulted
@@ -416,6 +418,7 @@ impl SchemaRegistry {
             spares,
             dumps,
             offload_backoff: OffloadBackoff::new(),
+            bringup_breaker: BringupBreaker::default(),
             purging: AtomicBool::new(false),
             dedicated,
         }
@@ -710,6 +713,18 @@ impl SchemaRegistry {
             // slow or stuck bring-up is visible — otherwise a client just parks
             // here silently until ready_timeout, which reads as a hang in the log.
             let started = Instant::now();
+            // Circuit breaker: a schema whose last bring-ups failed is held
+            // off with a fast, explicit error instead of re-running (and
+            // re-failing) a bring-up that can cost 30+ minutes of S3 download
+            // and a VM apiece — a client that reconnects on every failure
+            // otherwise keeps a restore storm running indefinitely.
+            if let Some((failures, retry_in)) = self.bringup_breaker.holding(schema) {
+                bail!(
+                    "schema {schema}: {failures} consecutive bring-up failure(s); holding \
+                     off new attempts for another {retry_in:?} (last error is on the \
+                     events page)"
+                );
+            }
             info!("schema {schema}: cold start, bringing up VM (or awaiting in-progress bring-up)");
             // Reattach to the VM we last used for this schema (survives eviction
             // and process restarts), else find-or-create by name. If the schema
@@ -812,6 +827,7 @@ impl SchemaRegistry {
                         }
                     }
                     info!("schema {schema}: VM ready in {:?}", started.elapsed());
+                    self.bringup_breaker.clear(schema);
                     let Some(guard) =
                         ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await
                     else {
@@ -842,6 +858,13 @@ impl SchemaRegistry {
                     // it — so no reaper, purge, or sweep ever reclaims its
                     // RAM or disk.
                     vm::stop_after_failed_bringup(schema, known_id.as_deref()).await;
+                    let (n, hold) = self.bringup_breaker.record_failure(schema);
+                    if n > 1 {
+                        warn!(
+                            "schema {schema}: {n} consecutive bring-up failures — holding off \
+                             new attempts for {hold:?}"
+                        );
+                    }
                     return Err(e);
                 }
             }
@@ -954,6 +977,7 @@ impl SchemaRegistry {
             .unwrap_or_default();
         let mut seen_now: HashSet<String> = HashSet::new();
         let mut stopped = 0usize;
+        let mut superseded_seen = 0usize;
         for info in infos
             .iter()
             .filter(|i| i.status == heyo_sdk::SandboxStatus::Running)
@@ -963,25 +987,45 @@ impl SchemaRegistry {
             {
                 continue; // the spare pool owns these
             }
-            let Some(schema) = live_by_id.get(&info.id) else {
-                continue; // not bound to a live schema: not ours to stop
+            // Bound to a live schema, or a SUPERSEDED DUPLICATE: a running
+            // `pg-<schema>` VM that is not that schema's current binding (a
+            // retrying bring-up created it and moved on; nothing references
+            // it, so neither the idle reaper, the ladder nor the purge will
+            // ever touch it). Duplicates are stopped, never deleted — if the
+            // rebind was wrong, the superseded disk may hold the real data.
+            let (schema, superseded) = match live_by_id.get(&info.id) {
+                Some(schema) => (schema.clone(), false),
+                None => {
+                    let Some(schema) = info.name.strip_prefix("pg-") else {
+                        continue; // not a pooler-shaped VM: not ours to stop
+                    };
+                    match self.store.record(schema) {
+                        Some(rec) if rec.sandbox_id != info.id => (schema.to_string(), true),
+                        _ => continue, // no row, or this IS the binding (live_by_id miss = non-live tier; purge owns it)
+                    }
+                }
             };
+            let schema = schema.as_str();
             // Tracked = a cell exists, warm OR initializing (bring-up in flight).
-            if self.entries.lock().await.contains_key(schema) {
+            if self.entries.lock().await.contains_key(schema) && !superseded {
                 continue;
             }
-            if self.is_archiving(schema) || crate::pending::get(schema).is_some() {
+            if self.is_archiving(schema) || crate::pending::get(schema).as_deref() == Some(&info.id) {
                 continue;
+            }
+            if superseded {
+                superseded_seen += 1;
             }
             seen_now.insert(info.id.clone());
             if !suspects.contains(&info.id) {
                 continue; // first sighting: confirm next pass
             }
             info!(
-                "untracked-reaper: VM {} (schema {schema}) is running with no warm entry \
+                "untracked-reaper: VM {} (schema {schema}{}) is running with no warm entry \
                  and no bring-up in flight on two consecutive passes — stopping it so the \
                  idle/offload ladder can reclaim it",
-                info.id
+                info.id,
+                if superseded { ", superseded duplicate" } else { "" }
             );
             match heyo_sdk::Sandbox::connect(info.id.clone(), vm::local_opts()) {
                 Ok(sb) => match tokio::time::timeout(Duration::from_secs(30), sb.stop()).await {
@@ -1000,7 +1044,8 @@ impl SchemaRegistry {
         }
         if !seen_now.is_empty() && stopped == 0 {
             info!(
-                "untracked-reaper: {} running VM(s) tracked by nothing — confirming next pass",
+                "untracked-reaper: {} running VM(s) tracked by nothing ({superseded_seen} \
+                 superseded duplicate(s)) — confirming next pass",
                 seen_now.len()
             );
         }
@@ -3784,6 +3829,53 @@ enum DaemonState {
     Error,
 }
 
+/// Per-schema bring-up circuit breaker.
+///
+/// A failed bring-up is expensive — a cold create, or a 30+ minute S3 image
+/// download — and a client that reconnects on every failure turns one broken
+/// schema into a standing storm: another VM, another download, another
+/// failure, forever (observed: ~14 concurrent `pg-<schema>` VMs for one
+/// schema). After the first failure the schema is held off with a fast
+/// explicit error: 1m, then 2m, 4m, … capped at [`BRINGUP_BREAKER_CAP`]. A
+/// successful bring-up clears it. In-memory only (a pooler restart resets
+/// it — fine: the hold exists to stop a tight loop, not to remember history).
+#[derive(Default)]
+struct BringupBreaker {
+    state: StdMutex<HashMap<String, (u32, Instant)>>,
+}
+
+const BRINGUP_BREAKER_BASE: Duration = Duration::from_secs(60);
+const BRINGUP_BREAKER_CAP: Duration = Duration::from_secs(15 * 60);
+
+impl BringupBreaker {
+    fn hold_for(failures: u32) -> Duration {
+        let exp = failures.saturating_sub(1).min(10);
+        (BRINGUP_BREAKER_BASE * 2u32.pow(exp)).min(BRINGUP_BREAKER_CAP)
+    }
+
+    /// `Some((failures, remaining))` while the schema is being held off.
+    fn holding(&self, schema: &str) -> Option<(u32, Duration)> {
+        let state = self.state.lock().unwrap();
+        let (failures, last) = state.get(schema)?;
+        let hold = Self::hold_for(*failures);
+        let since = last.elapsed();
+        (since < hold).then(|| (*failures, hold - since))
+    }
+
+    /// Returns `(consecutive failures, hold applied)`.
+    fn record_failure(&self, schema: &str) -> (u32, Duration) {
+        let mut state = self.state.lock().unwrap();
+        let entry = state.entry(schema.to_string()).or_insert((0, Instant::now()));
+        entry.0 += 1;
+        entry.1 = Instant::now();
+        (entry.0, Self::hold_for(entry.0))
+    }
+
+    fn clear(&self, schema: &str) {
+        self.state.lock().unwrap().remove(schema);
+    }
+}
+
 struct SweepGuard<'a>(&'a AtomicBool);
 
 impl Drop for SweepGuard<'_> {
@@ -4219,6 +4311,27 @@ mod archive_tests {
     /// Concurrent workers exclude in-flight schemas through the same predicate
     /// as backoff: with the top-ranked schema excluded, the picker returns the
     /// next-best job instead of re-picking the same one forever.
+    #[test]
+    fn bringup_breaker_holds_then_clears() {
+        let b = BringupBreaker::default();
+        assert!(b.holding("a").is_none());
+        assert_eq!(b.record_failure("a"), (1, Duration::from_secs(60)));
+        assert_eq!(b.record_failure("a").1, Duration::from_secs(120));
+        assert_eq!(b.record_failure("a").1, Duration::from_secs(240));
+        let (n, remaining) = b.holding("a").expect("held after failures");
+        assert_eq!(n, 3);
+        assert!(remaining <= Duration::from_secs(240));
+        // Exponent is capped, not overflowed, and the hold is capped at 15m.
+        for _ in 0..40 {
+            b.record_failure("a");
+        }
+        assert_eq!(b.holding("a").unwrap().1.as_secs().div_ceil(60), 15);
+        // Other schemas are independent; success clears.
+        assert!(b.holding("b").is_none());
+        b.clear("a");
+        assert!(b.holding("a").is_none());
+    }
+
     #[test]
     fn jittered_timeout_is_stable_bounded_and_spread() {
         let base = Duration::from_secs(1000);
