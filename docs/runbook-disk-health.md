@@ -201,6 +201,24 @@ and `PRUNE_SWAP=1` on the next reclaim pass for the re-created swapfiles.
   that ran on the old binary before its last restart (or dirs already
   removed by the pooler/loop). `supervisord.log` dates the switch.
 
+**Repeated `pg-<schema>` VMs, ~5 schemas, 70 VMs, all new, no sessions
+(2026-08-21):** a retry storm. The pooler log for one schema showed the
+chain: heyvmd going unreachable repeatedly (`network error calling
+/sandbox/...`, "unknown to heyvmd for 46s — heyvmd restarts drop in-flight
+creates"), S3-image restores taking 32–39 minutes per attempt, boots that
+reach the guest but miss heyvmd's hard-coded 30s `HEYVM_READY` window under
+load ("Received 32 serial lines but no HEYVM_READY"), and a client
+reconnecting instantly after every failure. Three pooler fixes landed:
+`Provenance` (a VM *created* by a failed bring-up is killed, not left
+running), the untracked-reaper stops superseded `pg-<schema>` duplicates,
+and a per-schema **bring-up circuit breaker** (1m→15m exponential hold with
+an explicit error) so one broken schema can no longer keep a restore storm
+running. Root cause to chase on the daemon side: why heyvmd restarts
+(`supervisord.log` spawned/exited lines, panics in heyvmd.log) and the
+30s readiness ceiling (`wait_for_serial_ready`) being too tight for a
+loaded host restoring multi-GB images — the "Last N serial lines" block
+in the pooler log shows where init stalls.
+
 Recovering the 67 DATA-LOSS schemas: their data is still in S3 (the
 archive is kept on restore). Flip each row back to `archived` in the
 registry (tier column, pooler stopped) and the next connect restores it

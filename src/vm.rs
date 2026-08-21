@@ -503,24 +503,27 @@ pub async fn ensure_vm(
     // restore, whose database is partially loaded — which is why the restore
     // job runs `pg_restore --clean --if-exists` (idempotent over that débris).
     let known_id = if restore.is_some() { None } else { known_id };
-    let (sandbox, claimed_spare) = match restore {
+    let (sandbox, provenance) = match restore {
         // An image restore builds its own VM (download, disk swap, boot on the
         // real data) — the database is complete before Postgres first starts,
         // so there is nothing to restore into and no spare worth claiming.
+        // Image-materialized VMs are `Created`: the durable copy is the image,
+        // so a failed bring-up can kill them too.
         Some(RestoreSource::S3Image(s3)) => (
             crate::imgarchive::materialize_from_image(cfg, schema, s3)
                 .await
                 .with_context(|| format!("restoring schema {schema} from its S3 disk image"))?,
-            false,
+            Provenance::Created,
         ),
         Some(RestoreSource::LocalImage(path)) => (
             crate::imgarchive::materialize_from_local_image(cfg, schema, path)
                 .await
                 .with_context(|| format!("thawing schema {schema} from its compacted image"))?,
-            false,
+            Provenance::Created,
         ),
         _ => resolve_sandbox(cfg, &name, keepalive, known_id, spares).await?,
     };
+
     let resolve_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
     let sandbox_id = sandbox.sandbox_id().to_string();
 
@@ -592,11 +595,45 @@ pub async fn ensure_vm(
     }
     .await;
 
-    if result.is_err()
-        && claimed_spare
-        && let Some((pool, _)) = spares
-    {
-        pool.release_failed(&sandbox_id).await;
+    if result.is_err() {
+        match provenance {
+            Provenance::Spare => {
+                if let Some((pool, _)) = spares {
+                    pool.release_failed(&sandbox_id).await;
+                }
+            }
+            // A VM this attempt created held no data before it; leaving it
+            // running after a failed bring-up is how a retrying client piles
+            // up a dozen running VMs for one schema (each retry creates
+            // another, the find-by-name reuse notwithstanding). Kill it and
+            // drop its pending-ledger entry; the durable copy — S3 dump,
+            // image, or nothing yet — is untouched, and the next attempt
+            // starts clean.
+            Provenance::Created => {
+                warn!(
+                    "schema {schema}: bring-up failed after creating VM {sandbox_id} — \
+                     killing it so a retry does not leave another one running"
+                );
+                // `sandbox` moved into the bring-up future; connect by id.
+                let kill = async {
+                    Sandbox::connect(sandbox_id.clone(), local_opts())?.kill().await
+                };
+                match tokio::time::timeout(Duration::from_secs(60), kill).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(
+                        "schema {schema}: killing failed-bring-up VM {sandbox_id} failed \
+                         (the pending-bringup janitor will retry): {e:#}"
+                    ),
+                    Err(_) => warn!(
+                        "schema {schema}: killing failed-bring-up VM {sandbox_id} timed out \
+                         (the pending-bringup janitor will retry)"
+                    ),
+                }
+                crate::pending::clear(schema).await;
+                crate::inventory::remove_id(&sandbox_id);
+            }
+            Provenance::Existing => {}
+        }
     }
     result
 }
@@ -2227,17 +2264,30 @@ async fn probe_pg_window(pool: &Pool, window: Duration) -> PgProbe {
 /// the whole "silent" window between a client connecting and the daemon seeing
 /// any traffic for its VM, and measuring it without a real Postgres behind the
 /// VM is the only way to attribute cold-start latency to fleet size.
+/// Where `resolve_sandbox`'s VM came from — what a failed bring-up must do
+/// with it. An `Existing` VM (reattached by id or name) is never touched on
+/// failure: its disk is the schema's data. A `Spare` claim is released (the
+/// pool kills it). A `Created` VM is killed: it held nothing before this
+/// attempt, and leaving it running is how one retrying client piles up a
+/// dozen running VMs for a single schema.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Provenance {
+    Existing,
+    Spare,
+    Created,
+}
+
 pub(crate) async fn resolve_sandbox(
     cfg: &Config,
     name: &str,
     keepalive: bool,
     known_id: Option<&str>,
     spares: Option<(&crate::spares::SparePool, &std::collections::HashSet<String>)>,
-) -> Result<(Sandbox, bool)> {
+) -> Result<(Sandbox, Provenance)> {
     // 1. Reattach to the VM we last used for this schema, by id.
     if let Some(id) = known_id {
         match bring_up_existing(cfg, name, id).await {
-            Ok(Some(sb)) => return Ok((sb, false)),
+            Ok(Some(sb)) => return Ok((sb, Provenance::Existing)),
             Ok(None) => info!("known VM {name} ({id}) is gone; find-or-create by name"),
             Err(e) => warn!("reattaching {name} ({id}) failed ({e:#}); find-or-create by name"),
         }
@@ -2251,7 +2301,7 @@ pub(crate) async fn resolve_sandbox(
     //    and never straight to create.
     if let Some(id) = crate::inventory::lookup(name) {
         match bring_up_existing(cfg, name, &id).await? {
-            Some(sb) => return Ok((sb, false)),
+            Some(sb) => return Ok((sb, Provenance::Existing)),
             None => {
                 crate::inventory::remove_id(&id);
                 info!("cached VM {name} ({id}) is gone; asking the daemon by name");
@@ -2264,7 +2314,7 @@ pub(crate) async fn resolve_sandbox(
     {
         crate::inventory::insert(name, &info.id);
         match bring_up_existing(cfg, name, &info.id).await? {
-            Some(sb) => return Ok((sb, false)),
+            Some(sb) => return Ok((sb, Provenance::Existing)),
             None => crate::inventory::remove_id(&info.id),
         }
     }
@@ -2279,11 +2329,13 @@ pub(crate) async fn resolve_sandbox(
         && let Some(sb) = pool.take(bound).await
     {
         info!("claiming warm spare {} for {name}", sb.sandbox_id());
-        return Ok((sb, true));
+        return Ok((sb, Provenance::Spare));
     }
 
     // 4. No spare: create from scratch.
-    create_vm(cfg, name, keepalive).await.map(|sb| (sb, false))
+    create_vm(cfg, name, keepalive)
+        .await
+        .map(|sb| (sb, Provenance::Created))
 }
 
 /// Grow a sandbox's persistent data device to `target_gb` through the

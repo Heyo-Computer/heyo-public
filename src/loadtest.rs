@@ -704,11 +704,11 @@ async fn by_name_lookup_finds_without_pulling_inventory() {
     daemon().metrics.reset();
 
     let name = format!("pg-{}", seed_schema(42));
-    let (sb, from_spare) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None)
+    let (sb, provenance) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None)
         .await
         .expect("resolving a daemon-known schema");
     assert_eq!(sb.sandbox_id(), seed_id(42));
-    assert!(!from_spare);
+    assert_eq!(provenance, crate::vm::Provenance::Existing);
 
     let calls = daemon().metrics.calls.lock().unwrap().clone();
     assert_eq!(
