@@ -108,20 +108,74 @@ audit splits it into two deletable classes; neither needs the daemon:
 | ORPHAN unowned / offloaded | no daemon record at all (not listed, no `sandboxes/<id>/sandbox.yaml`) | the loop below |
 | matched, but registry says archived/compacted | daemon record still exists | dashboard **purge** (needs the patched heyvmd — it probes persisted-only VMs and removes run dirs) |
 
-The loop re-checks the persisted store and open files at deletion time, so
+The script re-checks the persisted store and open files at deletion time, so
 it is safe with VMs running, and it is idempotent — re-run it against a
-fresh audit's lists as many times as needed:
+fresh audit's lists as many times as needed.
+
+Two things it does that the 2026-08-21 version of this loop did not, both of
+which cost a run (see the addendum below): the audit's id column **already
+carries the `sb-` prefix**, so the run-dir path is `$RUN/$id` and never
+`$RUN/sb-$id`; and every gate fails **closed**, aborting on a missing tool or
+an empty fd snapshot rather than quietly deleting without a check.
 
 ```bash
 cd /tmp/disk-audit-XXXX            # the newest audit's id lists
+cat > drain.sh <<'SH'
+set -u
 RUN=/mnt/md0/heyvm/run; STORE=/mnt/md0/heyvm/sandboxes
-del() { id=$1
-  [ -e "$STORE/$id/sandbox.yaml" ] && { echo "skip $id (persisted)"; return; }
-  sudo fuser -s "$RUN/sb-$id/data.ext4" 2>/dev/null && { echo "skip $id (in use)"; return; }
-  sudo rm -rf "$RUN/sb-$id"; }
-while IFS=$'\t' read -r id _;     do del "$id"; done < orphan-unowned.txt     # id = col 1
-while IFS=$'\t' read -r _ id _ _; do del "$id"; done < orphan-offloaded.txt   # id = col 2
+LIST=${1:?usage: drain.sh <orphan-offloaded.txt|orphan-unowned.txt>}
+
+# Preflight. A gate that cannot run must stop the script, never wave rows
+# through: the previous version piped `fuser`'s stderr to /dev/null, so on a
+# host without psmisc the in-use check silently always-passed.
+[ "$(id -u)" = 0 ] || { echo "run under sudo — other users' fds are invisible"; exit 1; }
+command -v stat >/dev/null || { echo "no stat(1)"; exit 1; }
+
+# Every (device:inode) held open by any process, snapshotted once. Firecracker
+# runs under jailer, so an fd's PATH is chroot-relative and will NOT equal the
+# host path — matching by path silently misses running VMs. device:inode is the
+# same file object through any chroot, bind mount, or namespace. This is the
+# check reclaim-disks.sh uses, and it needs only coreutils.
+declare -A OPEN=()
+while read -r k; do OPEN["$k"]=1; done < <(
+    find /proc/[0-9]*/fd -maxdepth 1 -type l -exec stat -L -c '%d:%i' {} + 2>/dev/null)
+echo "fd snapshot: ${#OPEN[@]} open file(s)"
+[ "${#OPEN[@]}" -gt 0 ] || { echo "empty fd snapshot — refusing to delete blind"; exit 1; }
+
+n=0; skip=0
+del() {
+    id=$1 held=
+    # Assert the id form rather than assuming it. A silent mismatch deletes
+    # nothing, reports nothing, and takes hours to notice.
+    case "$id" in sb-*) ;; *) echo "unexpected id form: $id" >&2; return;; esac
+    d=$RUN/$id
+    [ -d "$d" ] || return                                              # already gone
+    [ -e "$STORE/$id/sandbox.yaml" ] && { skip=$((skip+1)); return; }  # daemon still knows it
+    for f in "$d"/*.ext4; do
+        [ -e "$f" ] || continue
+        k=$(stat -c '%d:%i' "$f" 2>/dev/null) || { held=unreadable; break; }
+        [ -n "${OPEN[$k]:-}" ] && { held=open; break; }
+    done
+    [ -n "$held" ] && { echo; echo "skip $id ($held)"; skip=$((skip+1)); return; }
+    rm -rf "$d" && n=$((n+1))
+    printf '\r%d deleted, %d skipped ' "$n" "$skip"
+}
+# id is col 2 in orphan-offloaded.txt, col 1 in orphan-unowned.txt.
+case $LIST in
+    *offloaded*) while IFS=$'\t' read -r _ id _ _; do del "$id"; done < "$LIST" ;;
+    *)           while IFS=$'\t' read -r id _;     do del "$id"; done < "$LIST" ;;
+esac
+echo
+SH
+sudo -v && sudo bash drain.sh orphan-offloaded.txt
 ```
+
+Run `orphan-offloaded.txt` first: every row there has a registry tier of
+compacted/frozen/archived, so the durable copy is elsewhere by definition and a
+mistake costs a local cache. `orphan-unowned.txt` has no such backstop and is
+where the multi-GB disks are — audit its size distribution, and spot-check the
+big ones with `dump-oldpg.sh --list --adopt-unbound`, before pointing this at
+it.
 
 Do NOT use the per-id `curl` spot-check the audit prints as the gate: on an
 un-patched heyvmd that GET *boots* the VM (~120s each). The local checks
@@ -150,6 +204,58 @@ Why the pooler's own orphan sweep didn't do this: it deletes 100 per pass
 and needs `PG_VM_POOL_ORPHAN_SWEEP_SECS` + the drain re-arm build; check
 `grep 'orphan-disk sweep' pg-vm-pool.log`. It is the steady-state tool; the
 loop is for incident-scale backlogs.
+
+## The sweep aborts every pass (2026-08-21)
+
+Signature: nearly every per-pass summary ends `(classification aborted early —
+daemon unhealthy)`, with `0 deletable` and a **high** `live` count, while the
+rare complete pass reports the whole backlog at once.
+
+```
+orphan-disk sweep: 0 deletable, ... 1149 live, 331 in use, ... (classification aborted early)
+orphan-disk sweep: 2503 deletable, ... 1713 live, 474 in use, ... 2403 deferred
+```
+
+Read the ratio, not the abort. A partial scan sampling a run dir that is ~53%
+forgotten should carry that proportion into `deletable`; complete passes show
+`deletable/live ≈ 1.5`, aborted ones `≈ 0`. Zero orphans after a thousand
+healthy probes is not sampling noise — the forgotten directories sort **late**
+in readdir order (each sweep frees low directory slots, new VMs refill them, so
+the untouched backlog accretes at the tail). Any abort therefore loses
+essentially the entire deletable set, however far the pass got.
+
+Root cause: `daemon_errs` was cleared only in the `Gone` arm, so the breaker
+counted "errors since the last orphan" rather than consecutive ones. In the
+`Present`-heavy prefix nothing ever cleared it and five *scattered* errors
+killed the pass. Fixed by clearing the run on any answered probe
+(`daemon_error_run` in `registry.rs`); a genuine burst still aborts.
+
+Measured before the fix on a pooler host: 38 of 40 passes aborted, **11
+directories reclaimed in 7 hours** against a 2.5k backlog, with the sweep
+looking healthy in every individual log line. Cross-check that the backlog is
+static rather than being re-minted by differencing two complete passes against
+the deletions between them — 2696 → 2503 with 202 deleted was ~9 new orphans in
+6.8 hours, i.e. nothing is leaking.
+
+## Two ways this drain loop silently did nothing (2026-08-21)
+
+Both were found by watching the loop rather than trusting it. Both produced
+*zero output and zero deletions* while appearing to run.
+
+1. **Double `sb-` prefix.** The audit's id column already carries it
+   (`disk-audit.sh` keys on the directory *name*), so `$RUN/sb-$id` built
+   `/mnt/md0/heyvm/run/sb-sb-be1607f8`. `rm -rf` on a nonexistent path is a
+   silent no-op returning 0. Note the audit's own printed `curl` helper uses
+   `$id` unprefixed — that is the correct form.
+2. **`fuser` not installed.** `2>/dev/null` on that line hid
+   `fuser: command not found`, the `&&` never fired, and the in-use gate
+   passed vacuously for every row. The current script uses the coreutils
+   device:inode snapshot instead, and aborts if it comes back empty.
+
+These compound dangerously: with the wrong path, `fuser` also returns "not in
+use" for a path that does not exist. Fixing only the `rm` line would have
+deleted disks belonging to running VMs. Check `pgrep -af 'rm -rf|fuser'` early
+— a loop that is working shows an `rm` in `D` state.
 
 ## Disk re-inflating with few sessions (2026-08-20, 36% → 60% in 2h)
 

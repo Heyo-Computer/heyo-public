@@ -145,7 +145,10 @@ wanted() {
     return 1
 }
 # Is any process holding this file open? (same device:inode scan as
-# reclaim-disks.sh, simplified to a single-file check via fuser fallback.)
+# reclaim-disks.sh, narrowed to a single file.) Deliberately NOT fuser: it is
+# not installed on every pooler host, and a missing tool must not be able to
+# turn this gate off — see the 2026-08-21 addendum in docs/runbook-disk-health.md.
+# Fails closed: a disk that cannot be stat'd reads as in use.
 disk_in_use() {
     local key
     key=$(stat -c '%d:%i' "$1" 2>/dev/null) || return 0

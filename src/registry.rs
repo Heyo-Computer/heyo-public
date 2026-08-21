@@ -88,6 +88,16 @@ const VM_ROOTFS_FILE: &str = "rootfs.ext4";
 /// Abort an orphan sweep after this many consecutive daemon errors while
 /// checking sandbox liveness: a flaking/restarting heyvmd must never let a
 /// "gone?" ambiguity turn into a deletion, so we stop and try again next sweep.
+///
+/// "Consecutive" means *since the last probe the daemon answered* — `Present`
+/// and `Gone` alike; [`daemon_error_run`] owns that rule so no match arm can
+/// drift from it. Clearing the run on `Gone` alone (as this once did) quietly
+/// redefines the breaker as "errors since the last orphan", which on a host
+/// whose forgotten dirs sort late in readdir order never clears at all: the
+/// `Present`-heavy prefix accumulates strays until five of them abort the pass
+/// before it has reached a single deletable dir. Measured on a pooler host
+/// before the fix — 38 of 40 passes aborted, 11 dirs reclaimed in 7 hours
+/// against a 2.5k backlog, while the sweep looked healthy in every log line.
 const ORPHAN_MAX_DAEMON_ERRORS: usize = 5;
 
 /// Drain mode: when a sweep's per-pass caps left candidates behind, re-run
@@ -3292,7 +3302,9 @@ impl SchemaRegistry {
                 held += 1;
                 continue;
             }
-            match self.daemon_state(&id).await {
+            let state = self.daemon_state(&id).await;
+            daemon_errs = daemon_error_run(daemon_errs, &state);
+            match state {
                 DaemonState::Present { running } => {
                     alive += 1;
                     // The VM is stopped (or the daemon says so while nothing
@@ -3306,7 +3318,6 @@ impl SchemaRegistry {
                     }
                 }
                 DaemonState::Error => {
-                    daemon_errs += 1;
                     if daemon_errs >= ORPHAN_MAX_DAEMON_ERRORS {
                         warn!(
                             "orphan-disk sweep: aborting after {daemon_errs} consecutive daemon \
@@ -3319,7 +3330,6 @@ impl SchemaRegistry {
                     continue;
                 }
                 DaemonState::Gone => {
-                    daemon_errs = 0;
                     match by_id.get(&id) {
                         Some((schema, Tier::Live)) => dataloss.push((schema.clone(), id.clone())),
                         Some((schema, _)) => {
@@ -3827,6 +3837,22 @@ enum DaemonState {
     Present { running: bool },
     Gone,
     Error,
+}
+
+/// Advance the orphan sweep's daemon-error breaker by one probe. `run` is the
+/// consecutive-error count carried through classification; reaching
+/// [`ORPHAN_MAX_DAEMON_ERRORS`] aborts the pass.
+///
+/// Only an indeterminate `Error` extends the run. `Present` and `Gone` are both
+/// answers from a daemon that is plainly responding, so either one clears it —
+/// the breaker exists to catch a daemon that has stopped answering, not to
+/// count how far apart two orphans are. The match is exhaustive on purpose: a
+/// new [`DaemonState`] variant has to state which side of that line it is on.
+fn daemon_error_run(run: usize, state: &DaemonState) -> usize {
+    match state {
+        DaemonState::Error => run + 1,
+        DaemonState::Present { .. } | DaemonState::Gone => 0,
+    }
 }
 
 /// Per-schema bring-up circuit breaker.
@@ -4746,6 +4772,40 @@ fn used_pct(used: u64, avail: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The orphan sweep's abort breaker must count *consecutive* daemon
+    /// errors. It once cleared its run only on `Gone`, which made it count
+    /// "errors since the last orphan" instead — and a run dir's forgotten
+    /// directories sort late in readdir order, so classification walks a long
+    /// `Present`-heavy prefix first. Five strays anywhere in that prefix
+    /// aborted the pass before it reached a single deletable dir, and the
+    /// backlog sat still while every log line looked healthy.
+    #[test]
+    fn daemon_error_breaker_counts_only_consecutive_errors() {
+        let err = DaemonState::Error;
+        let present = DaemonState::Present { running: false };
+
+        // A genuine burst still trips it: the safety property is the whole
+        // point of the breaker and this fix must not soften it.
+        let mut run = 0;
+        for _ in 0..ORPHAN_MAX_DAEMON_ERRORS {
+            run = daemon_error_run(run, &err);
+        }
+        assert!(run >= ORPHAN_MAX_DAEMON_ERRORS, "errors in a row must abort the pass");
+
+        // The regression: strays separated by healthy probes are not a run,
+        // however many of them a long scan accumulates.
+        let mut run = 0;
+        for _ in 0..ORPHAN_MAX_DAEMON_ERRORS * 3 {
+            run = daemon_error_run(run, &err);
+            assert!(run < ORPHAN_MAX_DAEMON_ERRORS, "one stray error must not abort a pass");
+            run = daemon_error_run(run, &present);
+            assert_eq!(run, 0, "a Present probe is the daemon answering");
+        }
+
+        // `Gone` clears it too — it always did, and must keep doing so.
+        assert_eq!(daemon_error_run(ORPHAN_MAX_DAEMON_ERRORS - 1, &DaemonState::Gone), 0);
+    }
 
     /// The age gate on the rootfs prune is what keeps a VM that is booting
     /// right now (fresh clone, not yet opened by Firecracker) out of the
