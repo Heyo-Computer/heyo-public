@@ -263,6 +263,6 @@ fn check_run_dir(run_dir: &std::path::Path) {
 /// Conservative guard on the client-supplied schema name: it becomes both a
 /// Postgres database identifier and part of the VM name, so cap length (PG's
 /// 63-byte identifier limit) and reject control characters.
-fn is_valid_schema(s: &str) -> bool {
+pub(crate) fn is_valid_schema(s: &str) -> bool {
     !s.is_empty() && s.len() <= 63 && s.chars().all(|c| !c.is_control())
 }

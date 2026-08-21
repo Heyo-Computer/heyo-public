@@ -45,6 +45,7 @@ fn shell_with_head(title: &str, extra_head: Markup, body: Markup) -> Markup {
                         a href="/" { "Databases" }
                         a href="/dedicated" { "dedicated" }
                         a href="/monitoring" { "monitoring" }
+                        a href="/archives" { "archives" }
                         a href="/events" { "events" }
                         a href="/logs/pooler" { "pooler log" }
                         a href="/logs/heyvmd" { "heyvmd log" }
@@ -606,6 +607,261 @@ fn vm_history_chart(samples: &[Sample], current: usize) -> Markup {
 /// sessions all started at the same minute" (a sweep's worth of boot-to-dump
 /// attempts that failed and were never stopped shows up here as a cluster of
 /// `archive`/`freeze` errors around one timestamp).
+/// Archive recovery — see [`super::archives`] for the failure this addresses.
+///
+/// The lookup box is the point of the page: an operator arrives knowing a
+/// workbook id and needing to know whether its data is recoverable. The scan
+/// below is opt-in supporting evidence, not the main event.
+pub fn archives_page(
+    st: &DashState,
+    looked: Option<&Result<super::archives::Lookup, String>>,
+    scanned: Option<&Result<Vec<super::archives::ArchiveRow>, String>>,
+    b: &Banner,
+) -> Markup {
+    use crate::events::fmt_ts;
+    use crate::orphans::human_iec;
+    let current = match looked {
+        Some(Ok(l)) => l.schema.clone(),
+        _ => String::new(),
+    };
+    shell(
+        "Archives",
+        html! {
+            div.pagehead { h1 { "Archive recovery" } }
+            (banner(b))
+            @if st.cfg.basic_auth.is_none() {
+                div.summary { span.warn { "auth: OFF — this page can repoint a schema's storage" } }
+            }
+            p.note {
+                "A schema is restored from S3 only when its registry tier says "
+                code { "archived" } ". If this server has no record of a workbook — or has one "
+                "that says " code { "live" } " — every connect builds a " b { "fresh empty "
+                "database" } " while the archive sits unread in the bucket. Nothing logs an "
+                "error: as far as the pooler is concerned, it served the schema it was asked for."
+            }
+            form method="get" action="/archives" class="inline-form" {
+                input type="text" name="lookup" value=(current)
+                    placeholder="workbook / schema id" size="32" required
+                    title="The schema id the client connects as — the same string used as the database name and the S3 object key.";
+                button type="submit" { "look up" }
+            }
+
+            @if let Some(result) = looked {
+                @match result {
+                    Err(e) => div.summary { span.warn { (e) } },
+                    Ok(l) => {
+                        h2 { "Workbook " code { (l.schema) } }
+                        table.events {
+                            tbody {
+                                tr {
+                                    td { "archive in S3" }
+                                    td {
+                                        @match &l.archive {
+                                            None => span.warn { "none — neither the dump nor the image key holds a usable object" },
+                                            Some(a) => {
+                                                b { (a.kind) } " · " (human_iec(a.bytes))
+                                                " · modified " (a.modified)
+                                                br;
+                                                code.dim { (a.key) }
+                                            }
+                                        }
+                                    }
+                                }
+                                tr {
+                                    td { "this server" }
+                                    td {
+                                        @match &l.record {
+                                            None => span.warn { "no registry record at all — every connect creates a new empty database" },
+                                            Some(r) => {
+                                                "tier " b { (r.tier.as_str()) }
+                                                " · bound to " code { (r.sandbox_id) }
+                                                " · last active " (fmt_ts(r.last_active))
+                                            }
+                                        }
+                                    }
+                                }
+                                tr {
+                                    td { "its disk" }
+                                    td {
+                                        @match l.disk_bytes {
+                                            None => span.dim { "no data.ext4 on this host" },
+                                            Some(bytes) => {
+                                                (human_iec(bytes))
+                                                @if bytes <= 160 * 1024 * 1024 {
+                                                    " " span.warn { "(about what an empty cluster uses)" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        @if l.actionable() {
+                            form method="post" action="/archives/restore" class="inline-form" {
+                                input type="hidden" name="schema" value=(l.schema);
+                                button.reap type="submit"
+                                    title="Mark this workbook archived (creating its registry row if there is none) and restore it from S3 straight away."
+                                    onclick=(confirm_for_lookup(l))
+                                    { "align this VM with the archive" }
+                            }
+                            p.note.dim {
+                                "This writes the archived tier — creating the registry row if this "
+                                "server has none — and then runs the same restore a client connect "
+                                "would: download, decompress, swap the disk, boot. It runs in the "
+                                "background; the result lands on the "
+                                a href="/events" { "events page" } "."
+                            }
+                        } @else {
+                            p.note { "Nothing to align to: no usable archive exists for this id in S3." }
+                        }
+                    }
+                }
+            }
+
+            h2 { "Sweep for others" }
+            @match scanned {
+                None => p.note {
+                    "The sweep HEADs every schema whose tier is not already "
+                    code { "archived" } " and lists the ones with an archive waiting — hundreds of "
+                    "round-trips on a mature host, so it is opt-in. "
+                    a.button-link href="/archives?scan=1" { "run the sweep" }
+                },
+                Some(Err(e)) => div.summary { span.warn { (e) } },
+                Some(Ok(rows)) => {
+                    @let suspect = rows.iter().filter(|r| r.verdict.suspect()).count();
+                    div.summary {
+                        span { b { (rows.len()) } " schema(s) with an archive but not on the archived tier" }
+                        @if suspect > 0 { span.warn { (suspect) " need attention" } }
+                    }
+                    p.note.dim {
+                        "Having an archive while the tier says otherwise is not by itself wrong: a "
+                        "restore does not delete the archive it restored from, so a schema that "
+                        "was archived and later thawed sits at " code { "live" } " with its old "
+                        "archive still in the bucket — the healthy steady state. What separates "
+                        "the two is the VM the row binds, so its disk is shown alongside. Compare "
+                        b { "last active" } " against " b { "archived at" } " too: activity after "
+                        "the archive was written means the live disk may hold the newer copy."
+                    }
+                    @if rows.is_empty() {
+                        p.note { "Nothing found: no live-tier schema has an archive waiting in S3." }
+                    } @else {
+                        table.events {
+                            thead {
+                                tr {
+                                    th { "schema" } th { "tier" } th { "last active" }
+                                    th { "bound VM" } th { "its disk" }
+                                    th { "archive in S3" } th { "archived at" } th { "reads as" } th { "" }
+                                }
+                            }
+                            tbody {
+                                @for r in rows {
+                                    tr {
+                                        td { a href={ "/archives?lookup=" (r.schema) } { code { (r.schema) } } }
+                                        td { (r.tier.as_str()) }
+                                        td.dim { (fmt_ts(r.last_active)) }
+                                        td.dim { code { (r.sandbox_id) } }
+                                        td {
+                                            @match r.disk_bytes {
+                                                None => span.warn { "missing" },
+                                                Some(bytes) => (human_iec(bytes)),
+                                            }
+                                        }
+                                        td title=(r.archive_key) {
+                                            (r.archive_kind) " · " (human_iec(r.archive_bytes))
+                                        }
+                                        td.dim { (r.archive_modified) }
+                                        td {
+                                            @if r.verdict.suspect() {
+                                                span.warn { (r.verdict.label()) }
+                                            } @else {
+                                                span.dim { (r.verdict.label()) }
+                                            }
+                                        }
+                                        td {
+                                            form method="post" action="/archives/restore" class="inline-form" {
+                                                input type="hidden" name="schema" value=(r.schema);
+                                                button.reap type="submit"
+                                                    onclick=(confirm_for_row(r))
+                                                    { "align" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// Confirm text for the lookup card. The three cases are genuinely different
+/// decisions and the dialog is the last thing between an operator and a
+/// database they did not mean to replace.
+fn confirm_for_lookup(l: &super::archives::Lookup) -> String {
+    use crate::orphans::human_iec;
+    let archive = l
+        .archive
+        .as_ref()
+        .map(|a| format!("{} archive ({})", a.kind, human_iec(a.bytes)))
+        .unwrap_or_else(|| "archive".into());
+    match (l.would_displace_data(), &l.record) {
+        (Some(bytes), _) => format!(
+            "WARNING: {} is bound to a disk holding {}, which looks like real data. Restoring \
+             from its {} ABANDONS that disk and serves the archived copy instead. Only do this \
+             if you know the current database is wrong.",
+            l.schema,
+            human_iec(bytes),
+            archive
+        ),
+        (None, None) => format!(
+            "Adopt {} from its {}? This server has no record of this workbook, so nothing is \
+             being served for it today.",
+            l.schema, archive
+        ),
+        (None, Some(r)) => format!(
+            "Point {} at its {}? Its tier is currently `{}` and the VM it binds has no \
+             meaningful data on this host.",
+            l.schema,
+            archive,
+            r.tier.as_str()
+        ),
+    }
+}
+
+/// Confirm text for a sweep row — same three-way distinction, from the row's
+/// own evidence.
+fn confirm_for_row(r: &super::archives::ArchiveRow) -> String {
+    use crate::orphans::human_iec;
+    match r.disk_bytes {
+        None => format!(
+            "Point {} at its {} archive ({})? The VM it binds has no disk on this host, so \
+             nothing is being served from it today.",
+            r.schema,
+            r.archive_kind,
+            human_iec(r.archive_bytes)
+        ),
+        Some(bytes) if r.verdict.suspect() => format!(
+            "Point {} at its {} archive ({})? Its current disk has allocated only {} — about what \
+             an empty cluster uses — so this looks like a schema rebound to a fresh VM.",
+            r.schema,
+            r.archive_kind,
+            human_iec(r.archive_bytes),
+            human_iec(bytes)
+        ),
+        Some(bytes) => format!(
+            "WARNING: {}'s current disk holds {}, which looks like real data. Restoring from the \
+             {} archive ({}, {}) ABANDONS that disk and serves the older copy instead.",
+            r.schema,
+            human_iec(bytes),
+            r.archive_kind,
+            human_iec(r.archive_bytes),
+            r.archive_modified
+        ),
+    }
+}
+
 pub fn events_page(st: &DashState, entries: &[crate::events::JournalEntry]) -> Markup {
     use crate::events::{Level, fmt_ts};
     let errors = entries.iter().filter(|e| e.level == Level::Error).count();

@@ -31,6 +31,7 @@
 //! and guest call is timeout-bounded so one wedged VM can't hang a request.
 
 mod alerts;
+mod archives;
 mod auth;
 mod dedicated;
 mod error;

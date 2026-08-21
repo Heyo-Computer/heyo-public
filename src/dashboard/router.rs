@@ -5,7 +5,7 @@ use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::Router;
 
-use super::{auth, dedicated, handlers, state::DashState};
+use super::{archives, auth, dedicated, handlers, state::DashState};
 
 pub fn build(state: DashState) -> Router {
     Router::new()
@@ -20,6 +20,10 @@ pub fn build(state: DashState) -> Router {
             get(dedicated::api_list).post(dedicated::api_create),
         )
         .route("/api/databases/{database}", delete(dedicated::api_delete))
+        // Archive reconciliation: schemas whose data is in S3 but whose
+        // registry tier stops the pooler from ever restoring it.
+        .route("/archives", get(archives::page))
+        .route("/archives/restore", post(archives::restore))
         .route("/monitoring", get(handlers::monitoring))
         .route("/events", get(handlers::events))
         .route("/monitoring/alerts", post(handlers::alert_add))

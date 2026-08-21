@@ -111,6 +111,67 @@ fn choose_restore(dump_len: Option<u64>, image_len: Option<u64>) -> RestoreKind 
 /// HEAD both keys and pick the restore source for an archived schema. Any
 /// transport failure falls back to the dump path — exactly what every
 /// archived schema used before images existed.
+/// What a restore of `schema` would actually find in S3 right now: the object
+/// the checkout path would choose, or `None` when neither key holds anything
+/// usable.
+///
+/// Shares [`choose_restore`]'s precedence with [`pick_restore`] on purpose —
+/// the dashboard's archive-reconciliation page must never advertise a restore
+/// that the checkout path would then decline to perform, and the two would
+/// drift apart the moment they each decided "is there an archive?" for
+/// themselves. Takes the HTTP client so a scan over many schemas reuses one
+/// connection pool instead of building a client per probe.
+pub(crate) async fn probe_archive(
+    s3: &S3Config,
+    http: &reqwest::Client,
+    schema: &str,
+) -> Option<ArchiveProbe> {
+    let len_of = |r: anyhow::Result<Option<crate::s3::ObjectId>>| match r {
+        Ok(id) => id,
+        Err(_) => None,
+    };
+    let dump_key = s3.object_key(schema);
+    let image_key = s3.image_object_key(schema);
+    let dump = len_of(s3.head_object(http, &dump_key, HEAD_TIMEOUT).await);
+    let image = len_of(s3.head_object(http, &image_key, HEAD_TIMEOUT).await);
+    match choose_restore(
+        dump.as_ref().map(|d| d.content_length),
+        image.as_ref().map(|i| i.content_length),
+    ) {
+        // `choose_restore` defaults to Dump when neither key is usable, so the
+        // size gate has to be re-checked here — that default is a restore-path
+        // convenience (it produces the better error message), not a claim that
+        // an object exists.
+        RestoreKind::Dump => dump.filter(|d| d.content_length >= MIN_DUMP_BYTES).map(|d| {
+            ArchiveProbe { kind: RestoreKind::Dump, key: dump_key, bytes: d.content_length, last_modified: d.last_modified }
+        }),
+        RestoreKind::Image => image.filter(|i| i.content_length >= MIN_IMAGE_BYTES).map(|i| {
+            ArchiveProbe { kind: RestoreKind::Image, key: image_key, bytes: i.content_length, last_modified: i.last_modified }
+        }),
+    }
+}
+
+/// The S3 object a restore would use, as reported by [`probe_archive`].
+pub(crate) struct ArchiveProbe {
+    pub kind: RestoreKind,
+    pub key: String,
+    pub bytes: u64,
+    /// RFC-1123 `Last-Modified` straight from the HEAD, shown verbatim: the
+    /// operator is comparing it against a registry timestamp by eye, and a
+    /// reformat that silently shifted the zone would be worse than useless.
+    pub last_modified: String,
+}
+
+impl ArchiveProbe {
+    /// "dump" or "image", for operator-facing text.
+    pub(crate) fn kind_str(&self) -> &'static str {
+        match self.kind {
+            RestoreKind::Dump => "dump",
+            RestoreKind::Image => "image",
+        }
+    }
+}
+
 pub async fn pick_restore(s3: &S3Config, schema: &str) -> RestoreKind {
     let Ok(http) = reqwest::Client::builder().build() else {
         return RestoreKind::Dump;

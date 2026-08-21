@@ -519,6 +519,86 @@ impl SchemaRegistry {
         self.cfg.archive.is_some()
     }
 
+    /// Point `schema` back at its S3 archive: set its tier to `Archived` so the
+    /// next checkout takes the restore path instead of reattaching to a dead
+    /// binding — or, when the bound VM is gone, creating a fresh empty VM and
+    /// serving an empty database while a good archive sits unread in S3.
+    ///
+    /// The re-probe is not a formality. The dashboard page an operator acts
+    /// from may be minutes old, and marking a schema archived when no archive
+    /// is actually there converts a recoverable problem into an unservable
+    /// one: the checkout would fail outright instead of quietly serving
+    /// nothing. Refusing here costs one HEAD.
+    ///
+    /// Only the tier is written. The VM the row currently binds is left alone
+    /// — once the tier is `Archived` the checkout path forces `known_id` to
+    /// `None`, so that VM is unreferenced and the orphan sweep reclaims it.
+    /// Killing it here would add a daemon round-trip, and a failure mode, to
+    /// an action whose whole value is that it writes one field.
+    pub async fn adopt_archive(&self, schema: &str) -> Result<String> {
+        if !crate::is_valid_schema(schema) {
+            bail!("{schema:?} is not a valid schema name");
+        }
+        let Some(a) = self.cfg.archive.as_ref() else {
+            bail!("the S3 archive tier is not configured");
+        };
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("building the S3 HTTP client")?;
+        // Probe before writing anything. Marking a schema archived when no
+        // archive is actually there converts "serves an empty database" into
+        // "cannot be served at all" — the checkout would fail outright. One
+        // HEAD buys the difference.
+        let Some(probe) = crate::imgarchive::probe_archive(&a.s3, &http, schema).await else {
+            bail!(
+                "schema {schema}: no usable archive in S3 (checked both the dump and image keys) \
+                 — refusing to mark it archived"
+            );
+        };
+        let prev = self.store.adopt_archived(schema).await;
+        let what = format!(
+            "{} archive ({})",
+            probe.kind_str(),
+            crate::orphans::human_iec(probe.bytes)
+        );
+        let (verb, detail) = match &prev {
+            None => (
+                "adopted",
+                "this server had no record of it at all".to_string(),
+            ),
+            Some(r) if r.tier == Tier::Archived => (
+                "re-confirmed",
+                format!("it was already archived, bound to {}", r.sandbox_id),
+            ),
+            Some(r) => (
+                "repaired",
+                format!(
+                    "its tier was `{}`, bound to VM {} — that VM is now unreferenced and the \
+                     disk sweep will reclaim it",
+                    r.tier.as_str(),
+                    r.sandbox_id
+                ),
+            ),
+        };
+        let msg = format!("schema {schema} {verb}: restores from its {what} ({detail})");
+        crate::events::journal_info("archive-fix", msg.clone());
+        Ok(msg)
+    }
+
+    /// One schema's durable registry row, or `None` when this server has no
+    /// record of it — the state that makes a workbook with an archive in S3
+    /// unrecoverable through an ordinary connect.
+    pub fn schema_record(&self, schema: &str) -> Option<StoreRecord> {
+        self.store.record(schema)
+    }
+
+    /// The S3 archive tier's client config, for the dashboard's archive
+    /// reconciliation page. `None` when the tier isn't configured.
+    pub fn archive_s3(&self) -> Option<crate::s3::S3Config> {
+        self.cfg.archive.as_ref().map(|a| a.s3.clone())
+    }
+
     /// Whether the image-level archive is configured — gates the dashboard's
     /// per-VM "archive as image" control.
     pub fn image_archive_enabled(&self) -> bool {

@@ -232,6 +232,70 @@ impl Store {
         self.write_detached(snapshot);
     }
 
+    /// Bind `schema` to the archived tier so the next checkout restores it from
+    /// S3, **creating the row when none exists**.
+    ///
+    /// The recovery case this exists for: a workbook whose archive is sitting
+    /// in S3 but which this server has no record of at all — a registry lost
+    /// to a rollback, a host rebuild, a row that never landed. Neither
+    /// existing entry point covers it: [`Self::set_tier`] returns early on a
+    /// missing row, and [`Self::put`] writes `Tier::Live` and demands a VM id.
+    /// Without this the schema is unrecoverable through the pooler: every
+    /// connect creates a fresh empty database beside an archive nothing reads.
+    ///
+    /// A newly created row carries a synthetic `sandbox_id`, and it matters
+    /// that it is neither empty nor plausible. Empty is fatal: [`parse`] drops
+    /// any line whose id field is blank, so a blank placeholder would work
+    /// until the next pooler restart and then vanish without a trace.
+    /// Plausible is worse: anything shaped like `sb-<hex>` invites some future
+    /// sweep to go looking for a directory that was never there. The id is
+    /// inert in every consumer — an archived row's id is never dialled,
+    /// because the checkout path forces `known_id` to `None` whenever it
+    /// chooses a restore source, and it matches no `sb-*` directory the orphan
+    /// sweep scans.
+    ///
+    /// Returns the record it replaced, so the caller can tell an operator
+    /// whether this repaired a row or invented one.
+    pub async fn adopt_archived(&self, schema: &str) -> Option<StoreRecord> {
+        let (prev, snapshot) = {
+            let mut map = self.map.lock().unwrap();
+            let prev = map.get(schema).map(Rec::view);
+            // Keep the existing binding when repairing a row: it is the only
+            // remaining pointer to whatever VM was serving this schema, and an
+            // operator reading registry.tsv afterwards should still see it.
+            let sandbox_id = prev
+                .as_ref()
+                .map(|r| r.sandbox_id.clone())
+                .unwrap_or_else(|| format!("{ADOPTED_ID_PREFIX}{schema}"));
+            let last_active = prev.as_ref().map(|r| r.last_active).unwrap_or_else(now_unix);
+            map.insert(
+                schema.to_string(),
+                Rec {
+                    sandbox_id,
+                    last_active,
+                    tier: Tier::Archived,
+                },
+            );
+            *self.bound_cache.lock().unwrap() = None;
+            (prev, self.stamp(serialize(&map)))
+        };
+        let (seq, contents) = snapshot;
+        let path = self.path.clone();
+        let written = self.written.clone();
+        // Durable before returning, unlike the debounced `put`/`touch` path:
+        // this is a hand-repaired row an operator is about to act on, and
+        // losing it to a crash would silently undo the recovery.
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || write_latest(&path, &written, seq, &contents)).await
+        {
+            warn!(
+                "persisting the adopted archive row to {} did not complete: {e}",
+                self.path.display()
+            );
+        }
+        prev
+    }
+
     /// The set of every `sandbox_id` bound to some schema, cached across calls
     /// and rebuilt only after a mapping change. Cheap enough for the checkout
     /// path (an `Arc` clone in the common case).
@@ -361,6 +425,12 @@ fn now_unix() -> u64 {
 
 /// Parse the TSV, tolerating the legacy 2-column format. `now` fills in a
 /// missing `last_active` so upgraded entries start their eviction clock fresh.
+/// Prefix for the synthetic `sandbox_id` on a row created by
+/// [`Store::adopt_archived`]. Deliberately unlike a real sandbox id (`sb-…`)
+/// so it reads as "no VM yet" to a human scanning registry.tsv, and so no
+/// sweep keyed on the `sb-` shape ever mistakes it for a directory.
+const ADOPTED_ID_PREFIX: &str = "pending-restore-";
+
 fn parse(s: &str, now: u64) -> HashMap<String, Rec> {
     s.lines()
         .filter_map(|line| {
@@ -419,6 +489,47 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row adopted by [`Store::adopt_archived`] must survive a write/read
+    /// round-trip. This is the whole reason its placeholder id is a non-empty
+    /// string: [`parse`] silently drops any line whose id field is blank, so a
+    /// blank placeholder would look fine in memory and then disappear on the
+    /// next pooler restart — taking the operator's recovery with it, and
+    /// leaving a workbook that once again builds an empty database on connect.
+    #[test]
+    fn adopted_rows_survive_a_registry_round_trip() {
+        let mut map = HashMap::new();
+        map.insert(
+            "wb1".to_string(),
+            Rec {
+                sandbox_id: format!("{ADOPTED_ID_PREFIX}wb1"),
+                last_active: 1_700_000_000,
+                tier: Tier::Archived,
+            },
+        );
+        let back = parse(&serialize(&map), 0);
+        let r = back.get("wb1").expect("an adopted row must survive a round-trip");
+        assert_eq!(r.tier, Tier::Archived, "the tier is the whole point of the row");
+        assert_eq!(r.last_active, 1_700_000_000);
+
+        // The failure this guards against, stated directly.
+        let mut blank = HashMap::new();
+        blank.insert(
+            "wb2".to_string(),
+            Rec { sandbox_id: String::new(), last_active: 0, tier: Tier::Archived },
+        );
+        assert!(
+            parse(&serialize(&blank), 0).is_empty(),
+            "parse drops a blank sandbox_id — an adopted row's placeholder must never be empty"
+        );
+
+        // And it must not be mistakable for a real VM directory.
+        assert!(
+            !ADOPTED_ID_PREFIX.starts_with("sb-"),
+            "a placeholder shaped like a sandbox id invites a sweep to hunt for a directory \
+             that never existed"
+        );
+    }
 
     fn tmp_store(tag: &str) -> Store {
         let dir = std::env::temp_dir().join(format!("pg-fc-store-test-{tag}-{}", std::process::id()));
