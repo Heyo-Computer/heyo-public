@@ -79,6 +79,31 @@ struct Placement<'a> {
     vm: Option<&'a str>,
 }
 
+/// The queue's own account of a job the reaper is about to fail.
+///
+/// The reaper's question — "why did nobody run this" — cannot be answered
+/// from the runner pool alone. A pool full of online hosts and a job that
+/// nobody touched is a contradiction until you ask the queue, and the queue
+/// distinguishes three cases the pool cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueVerdict {
+    /// Nothing is bound to the subject: the message is waiting for a reader
+    /// that does not exist.
+    NoConsumer,
+    /// Bound, and the message is still sitting there undelivered.
+    Waiting(u64),
+    /// Bound, and something is holding the message right now without having
+    /// acked it. Not this process — this process would have logged it.
+    InFlightElsewhere(u64),
+    /// Bound, and the queue is empty while the row still says `queued`.
+    /// The message was delivered *and acked*, and not by us: under
+    /// `WorkQueue` retention an ack is what deletes it. Another consumer on
+    /// the same durable took the job.
+    TakenElsewhere,
+    /// NATS could not be asked; say nothing rather than guess.
+    Unknown,
+}
+
 pub struct Dispatcher {
     pub config: Arc<Config>,
     pub store: Store,
@@ -2075,6 +2100,17 @@ impl Dispatcher {
     pub fn spawn_consumers(self: Arc<Self>) {
         let interval = self.config.heyvm.refresh_interval;
         tokio::spawn(async move {
+            // Said once, at the top, so "which ci am I reading" is answerable
+            // from the first page of a log rather than inferred from behaviour.
+            // Two instances that share a subject prefix share every durable
+            // built from it; this line is where that becomes obvious.
+            tracing::info!(
+                instance = %self.config.instance_id,
+                prefix = %self.config.nats_prefix,
+                "binding job consumers; a second instance with this prefix would \
+                 share these durables and compete for the same jobs"
+            );
+
             let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2105,7 +2141,21 @@ impl Dispatcher {
                     if alive {
                         continue;
                     }
-                    tracing::info!("starting a consumer for {key}");
+                    // The durable, not just the route. Durable names derive only
+                // from the route and CI_NATS_SUBJECT_PREFIX, so two instances
+                // sharing a prefix bind the *same* durable and compete for the
+                // same messages — silently, because neither is doing anything
+                // wrong from its own point of view. Printing the name each
+                // instance claims, next to who is claiming it, is what makes
+                // that collision visible in two log files side by side.
+                let durable = self
+                    .bus
+                    .durable_for(&route)
+                    .unwrap_or_else(|_| "<unnameable>".to_string());
+                tracing::info!(
+                    instance = %self.config.instance_id,
+                    "starting a consumer for {key} on durable {durable}"
+                );
                     let d = self.clone();
                     let r = route.clone();
                     running.insert(key, tokio::spawn(consume(d, r)));
@@ -2184,6 +2234,7 @@ impl Dispatcher {
         };
 
         let pool = self.runners.snapshot();
+        let mut verdicts: HashMap<String, QueueVerdict> = HashMap::new();
         for job in stuck {
             // Where this job was actually routed, re-derived from its plan.
             //
@@ -2211,7 +2262,47 @@ impl Dispatcher {
                 continue;
             }
 
-            let detail = Self::stuck_job_detail(placed, job.network.as_deref(), &pool, wait);
+            // What the queue says, asked once per distinct route: the reaper
+            // is batched, and one NATS round trip per job would turn a backlog
+            // into a burst of them.
+            let route = placed.as_ref().map(|p| match p.node {
+                Some(node) => Route::Runner(node.id.clone()),
+                None => Route::Network(p.network.network_id.clone()),
+            });
+            let verdict = match &route {
+                None => QueueVerdict::Unknown,
+                Some(r) => {
+                    let key = format!("{r:?}");
+                    if let Some(v) = verdicts.get(&key) {
+                        *v
+                    } else {
+                        let v = match self.bus.depth(r).await {
+                            Err(e) => {
+                                tracing::warn!("could not read the queue for {key}: {e}");
+                                QueueVerdict::Unknown
+                            }
+                            Ok(None) => QueueVerdict::NoConsumer,
+                            Ok(Some(d)) if d.waiting > 0 => QueueVerdict::Waiting(d.waiting),
+                            Ok(Some(d)) if d.in_flight > 0 => {
+                                QueueVerdict::InFlightElsewhere(d.in_flight)
+                            }
+                            Ok(Some(_)) => QueueVerdict::TakenElsewhere,
+                        };
+                        verdicts.insert(key, v);
+                        v
+                    }
+                }
+            };
+
+            let detail =
+                Self::stuck_job_detail(
+                    placed,
+                    job.network.as_deref(),
+                    &pool,
+                    wait,
+                    verdict,
+                    &self.config.instance_id,
+                );
             tracing::warn!(job = %job.job_key, "{detail}");
             if let Err(e) = self
                 .store
@@ -2244,9 +2335,43 @@ impl Dispatcher {
         stored_network: Option<&str>,
         pool: &crate::runners::Pool,
         wait: std::time::Duration,
+        verdict: QueueVerdict,
+        instance: &str,
     ) -> String {
         let waited = format!("no runner took this job within {}s.", wait.as_secs());
         let stale = Self::staleness(pool);
+
+        // The queue outranks the pool. A healthy pool cannot explain a message
+        // that left the queue without this process ever seeing it, and that is
+        // the case most likely to be misread as a runner problem.
+        if let QueueVerdict::TakenElsewhere = verdict {
+            return format!(
+                "{waited} Its message was published and is no longer on the queue, yet \
+                 this orchestrator never received it — so another consumer on the same \
+                 durable acked it. Durable names come only from the route and \
+                 CI_NATS_SUBJECT_PREFIX, so a second `ci` sharing that prefix competes \
+                 for these messages and wins some of them. Check for a second running \
+                 instance before looking at runners; this one is `{instance}`.{stale}"
+            );
+        }
+        if let QueueVerdict::NoConsumer = verdict {
+            return format!(
+                "{waited} Nothing is bound to its subject at all — the message was \
+                 published to a queue with no consumer. This instance binds consumers \
+                 only for networks in CI_NETWORK and for hosts that are online, so \
+                 either it does not serve this route or the bind is failing (it would \
+                 log `could not bind a consumer, retrying`).{stale}"
+            );
+        }
+        if let QueueVerdict::InFlightElsewhere(n) = verdict {
+            return format!(
+                "{waited} Its message has been delivered to a consumer and not acked \
+                 ({n} in flight on this route), but this orchestrator is not the one \
+                 holding it. That is another `ci` on the same durable — durable names \
+                 derive only from the route and CI_NATS_SUBJECT_PREFIX. Check for a \
+                 second running instance.{stale}"
+            );
+        }
 
         let Some(p) = placed else {
             // The plan would not parse, or placement itself failed. Say only
@@ -2899,6 +3024,101 @@ mod tests {
 
     // ---- the stuck-job diagnosis ----------------------------------------
 
+    /// The failure that cost days: a healthy pool, a bound consumer, an empty
+    /// queue, and a job nothing ran. Only the queue can explain it, and the
+    /// answer must name the second instance rather than the runners.
+    #[test]
+    fn an_empty_queue_with_a_queued_row_blames_another_consumer() {
+        let pool = healthy_ci_runners();
+        let placed = Placement {
+            network: set_named(&pool, "ci-runners"),
+            node: None,
+            vm: None,
+        };
+        let detail = Dispatcher::stuck_job_detail(
+            Some(placed),
+            Some("ci-runners"),
+            &pool,
+            WAIT,
+            QueueVerdict::TakenElsewhere,
+            "ci-abc123",
+        );
+        assert!(detail.contains("no longer on the queue"), "{detail}");
+        assert!(detail.contains("another consumer"), "{detail}");
+        assert!(detail.contains("CI_NATS_SUBJECT_PREFIX"), "names the cause: {detail}");
+        assert!(detail.contains("ci-abc123"), "names this instance: {detail}");
+        // The pool is healthy and therefore irrelevant; saying anything about
+        // hosts here is what sent the last investigation the wrong way.
+        assert!(!detail.contains("online host(s)"), "{detail}");
+        assert!(!detail.contains("add a host"), "{detail}");
+    }
+
+    /// Delivered and unacked is the same collision caught a moment earlier.
+    #[test]
+    fn an_in_flight_message_this_instance_does_not_hold_blames_the_same_thing() {
+        let pool = healthy_ci_runners();
+        let placed = Placement {
+            network: set_named(&pool, "ci-runners"),
+            node: None,
+            vm: None,
+        };
+        let detail = Dispatcher::stuck_job_detail(
+            Some(placed),
+            None,
+            &pool,
+            WAIT,
+            QueueVerdict::InFlightElsewhere(2),
+            "ci-abc123",
+        );
+        assert!(detail.contains("2 in flight"), "{detail}");
+        assert!(detail.contains("second running instance"), "{detail}");
+    }
+
+    /// Nothing bound is decisive on its own and outranks the pool.
+    #[test]
+    fn no_consumer_bound_says_so_rather_than_describing_hosts() {
+        let pool = healthy_ci_runners();
+        let placed = Placement {
+            network: set_named(&pool, "ci-runners"),
+            node: None,
+            vm: None,
+        };
+        let detail = Dispatcher::stuck_job_detail(
+            Some(placed),
+            None,
+            &pool,
+            WAIT,
+            QueueVerdict::NoConsumer,
+            "ci-abc123",
+        );
+        assert!(detail.contains("Nothing is bound to its subject"), "{detail}");
+        assert!(detail.contains("could not bind a consumer"), "{detail}");
+        assert!(!detail.contains("online host(s)"), "{detail}");
+    }
+
+    /// A message still waiting is genuinely a pool question, so the pool-based
+    /// reasoning must still be reachable.
+    #[test]
+    fn a_waiting_message_still_falls_through_to_the_pool_explanation() {
+        let pool = healthy_ci_runners();
+        let placed = Placement {
+            network: set_named(&pool, "ci-runners"),
+            node: None,
+            vm: None,
+        };
+        let detail = Dispatcher::stuck_job_detail(
+            Some(placed),
+            None,
+            &pool,
+            WAIT,
+            QueueVerdict::Waiting(1),
+            "ci-abc123",
+        );
+        assert!(detail.contains("online host(s)"), "{detail}");
+        assert!(!detail.contains("another consumer"), "{detail}");
+    }
+
+
     const WAIT: std::time::Duration = std::time::Duration::from_secs(900);
 
     /// A served network with online hosts, for the case that looks impossible.
@@ -2944,7 +3164,7 @@ mod tests {
             node: None,
             vm: None,
         };
-        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT);
+        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT, QueueVerdict::Unknown, "ci-test");
 
         assert!(detail.contains("2 online host(s)"), "{detail}");
         assert!(detail.contains("nothing consumed the queue"), "{detail}");
@@ -2982,7 +3202,7 @@ mod tests {
             node: Some(&offline),
             vm: None,
         };
-        let detail = Dispatcher::stuck_job_detail(Some(placed), None, &pool, WAIT);
+        let detail = Dispatcher::stuck_job_detail(Some(placed), None, &pool, WAIT, QueueVerdict::Unknown, "ci-test");
 
         assert!(detail.contains("pinned to host mac-mini (hd-gone)"), "{detail}");
         assert!(detail.contains("is offline"), "{detail}");
@@ -2998,7 +3218,7 @@ mod tests {
             node: None,
             vm: None,
         };
-        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("lab"), &pool, WAIT);
+        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("lab"), &pool, WAIT, QueueVerdict::Unknown, "ci-test");
         assert!(detail.contains("does not serve that network"), "{detail}");
         assert!(detail.contains("CI_NETWORK"), "{detail}");
         assert!(detail.contains("prod-runners"), "must say what it does serve: {detail}");
@@ -3030,7 +3250,7 @@ mod tests {
             node: None,
             vm: None,
         };
-        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT);
+        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT, QueueVerdict::Unknown, "ci-test");
         assert!(detail.contains("no hosts in it"), "{detail}");
         assert!(detail.contains("One daemon is registered but in no network"), "{detail}");
     }
@@ -3057,7 +3277,7 @@ mod tests {
             node: None,
             vm: None,
         };
-        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT);
+        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT, QueueVerdict::Unknown, "ci-test");
         assert!(detail.contains("this host (orphaned)"), "{detail}");
         assert!(!detail.contains("is pinned to"), "{detail}");
     }
@@ -3065,7 +3285,7 @@ mod tests {
     /// An unplaceable job must not have a cause invented for it.
     #[test]
     fn an_unplaceable_job_says_only_what_is_known() {
-        let detail = Dispatcher::stuck_job_detail(None, Some("ci-runners"), &test_pool(), WAIT);
+        let detail = Dispatcher::stuck_job_detail(None, Some("ci-runners"), &test_pool(), WAIT, QueueVerdict::Unknown, "ci-test");
         assert!(detail.contains("could not work out a live target"), "{detail}");
         assert!(detail.contains("ci-runners"), "{detail}");
         assert!(!detail.contains("is pinned to"), "{detail}");
@@ -3076,7 +3296,7 @@ mod tests {
     fn a_stale_pool_is_admitted_in_the_message() {
         let mut pool = test_pool();
         pool.last_error = Some("GET /me/daemons: timed out".into());
-        let detail = Dispatcher::stuck_job_detail(None, Some("nope"), &pool, WAIT);
+        let detail = Dispatcher::stuck_job_detail(None, Some("nope"), &pool, WAIT, QueueVerdict::Unknown, "ci-test");
         assert!(detail.contains("may be stale"), "{detail}");
         assert!(detail.contains("timed out"), "{detail}");
     }
@@ -3091,8 +3311,8 @@ mod tests {
             vm: None,
         };
         for detail in [
-            Dispatcher::stuck_job_detail(Some(network), None, &pool, WAIT),
-            Dispatcher::stuck_job_detail(None, Some("x"), &pool, WAIT),
+            Dispatcher::stuck_job_detail(Some(network), None, &pool, WAIT, QueueVerdict::Unknown, "ci-test"),
+            Dispatcher::stuck_job_detail(None, Some("x"), &pool, WAIT, QueueVerdict::Unknown, "ci-test"),
         ] {
             assert!(detail.contains("within 900s"), "{detail}");
         }
