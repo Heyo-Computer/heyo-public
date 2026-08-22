@@ -13,6 +13,7 @@
 #[path = "../../ui/ui.rs"]
 pub mod heyo_ui;
 mod api;
+mod alerts;
 mod compaction;
 mod config;
 mod ingest;
@@ -182,6 +183,31 @@ async fn run(cfg: Config) {
     // engine to quiesce queries around each swap.
     tokio::spawn(Compaction::new(&cfg.data_dir, cfg.compact_interval, engine.clone()).run());
 
+    // Alert rules: loaded from the file once, then held in a shared lock the
+    // API mutates and the checker reads. A corrupt file is fatal — see
+    // `alerts::load` — because silently starting with no rules would drop every
+    // operator-configured alert the moment the JSON got truncated.
+    let alerts_file = cfg.alerts_file.clone();
+    let alerts = match alerts::load(std::path::Path::new(&alerts_file)) {
+        Ok(rules) => {
+            tracing::info!(
+                file = %alerts_file,
+                count = rules.len(),
+                "loaded alert rules",
+            );
+            Arc::new(tokio::sync::RwLock::new(rules))
+        }
+        Err(e) => panic!(
+            "cannot load alert rules from {alerts_file}: {e} — refusing to start with an \
+             empty set, which would silently drop every configured alert",
+        ),
+    };
+
+    // The checker reads the same engine the API does. Cloned here because
+    // `engine` moves into `ApiState` below.
+    let checker_engine = engine.clone();
+    tokio::spawn(alerts::checker(checker_engine, alerts.clone()));
+
     let api_state = ApiState {
         engine,
         sink: sink.clone(),
@@ -192,6 +218,8 @@ async fn run(cfg: Config) {
         live: live_rx,
         stale_after_secs: cfg.poll_interval.as_secs().saturating_mul(3).max(15),
         ui_cookies: Arc::new(crate::heyo_ui::CookieConfig::from_env("APP_OBS")),
+        alerts: alerts.clone(),
+        alerts_file: alerts_file.clone(),
     };
     let api_addr = cfg.api_addr.clone();
     tokio::spawn(async move {

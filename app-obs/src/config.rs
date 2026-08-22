@@ -10,6 +10,13 @@ fn default_data_dir() -> String {
     "/var/lib/app-obs/data".into()
 }
 
+/// The default alerts file lives inside the data directory so it shares its
+/// lifetime and permissions without an extra knob to remember. Overridable via
+/// `APP_OBS_ALERTS_FILE` for anyone who wants it elsewhere.
+fn default_alerts_file(data_dir: &str) -> String {
+    format!("{data_dir}/alerts.json")
+}
+
 /// Ingest binds all interfaces on purpose. Every microVM sits on its own /30
 /// with the host at `guest_ip - 1`, so there is no single address that works
 /// for every guest — they each reach us on their own tap gateway. See the
@@ -83,6 +90,11 @@ pub struct Config {
     /// Ceiling on a single query. A dashboard that gets a 504 is a nuisance; one
     /// that pins a core for ten minutes is a problem.
     pub query_timeout: Duration,
+    /// Where the alert rules are persisted, as JSON. Defaults to
+    /// `<data_dir>/alerts.json` so it sits with everything else this process
+    /// owns; `APP_OBS_ALERTS_FILE` overrides it. Loaded on startup and rewritten
+    /// on every create/delete.
+    pub alerts_file: String,
 }
 
 impl Default for Config {
@@ -108,6 +120,7 @@ impl Default for Config {
             compact_interval: Duration::from_secs(600),
             query_concurrency: 4,
             query_timeout: Duration::from_secs(30),
+            alerts_file: default_alerts_file(&default_data_dir()),
         }
     }
 }
@@ -176,6 +189,16 @@ impl Config {
         }
         if let Some(v) = parse_env("APP_OBS_QUERY_TIMEOUT_SECS") {
             cfg.query_timeout = Duration::from_secs(v);
+        }
+        // `APP_OBS_ALERTS_FILE` wins outright; otherwise the file follows the
+        // data directory, which may itself have been overridden above — so this
+        // is resolved last, against the final `data_dir`.
+        if let Ok(v) = std::env::var("APP_OBS_ALERTS_FILE")
+            && !v.is_empty()
+        {
+            cfg.alerts_file = v;
+        } else {
+            cfg.alerts_file = default_alerts_file(&cfg.data_dir);
         }
         cfg
     }
