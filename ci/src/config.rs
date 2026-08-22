@@ -390,7 +390,9 @@ impl Config {
                 .to_string(),
             relay: opt("CI_IROH_RELAY"),
             refresh_interval: secs("CI_RUNNER_REFRESH_SECS", 30)?,
-            runner_wait: secs("CI_RUNNER_WAIT_SECS", 900)?,
+            // Longer than `bus::ladder_total()` (21 min), and checked
+            // below so the two cannot drift apart again.
+            runner_wait: secs("CI_RUNNER_WAIT_SECS", 1800)?,
             vm_ttl: secs("CI_VM_TTL_SECONDS", 3600)?,
             local_runner: opt("CI_LOCAL_RUNNER").map(|v| match v.as_str() {
                 "1" | "true" | "yes" | "on" => heyo_sdk::DEFAULT_LOCAL_BASE_URL.to_string(),
@@ -409,6 +411,31 @@ impl Config {
                 nkey_seed: opt("CI_NATS_NKEY"),
             },
         )?;
+
+        // The reaper must outlast the queue's own retries.
+        //
+        // `fail_jobs_waiting_for_a_runner` fails jobs still sitting `queued`. A
+        // delivery that fails *before* `claim_job` — picking a runner, say —
+        // leaves the job exactly that, so a job being retried normally is
+        // indistinguishable from one nothing ever took. Reaping first replaces
+        // the real error with "no runner took this job", which blames the hosts
+        // for something that never involved them.
+        //
+        // Checked rather than merely defaulted, because both sides are
+        // configurable and a wrong pairing fails silently and intermittently —
+        // only for jobs whose first delivery happens to fail.
+        let ladder = crate::bus::ladder_total();
+        if heyvm.runner_wait <= ladder {
+            return Err(ConfigError::BadValue {
+                var: "CI_RUNNER_WAIT_SECS",
+                value: heyvm.runner_wait.as_secs().to_string(),
+                reason: format!(
+                    "must exceed the redelivery ladder ({}s), or a job still being \
+                     retried is failed as though no runner ever took it",
+                    ladder.as_secs()
+                ),
+            });
+        }
 
         let nats_prefix = opt("CI_NATS_SUBJECT_PREFIX").unwrap_or_else(|| "ci".to_string());
         if !is_subject_token(&nats_prefix) {

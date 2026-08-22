@@ -2185,30 +2185,33 @@ impl Dispatcher {
 
         let pool = self.runners.snapshot();
         for job in stuck {
-            // Re-checked rather than assumed: a host that came online between
-            // the query and now will have taken the job, and failing it here
-            // would kill work that is about to start.
-            let online = job
-                .runner_hd_id
-                .as_deref()
-                .and_then(|id| pool.locate(id))
-                .is_some_and(|(_, r)| r.status.is_dispatchable());
-            if online {
+            // Where this job was actually routed, re-derived from its plan.
+            //
+            // NOT from `runner_hd_id`: that column is written only by
+            // `claim_job`, and every row here is `queued` — never claimed — so
+            // it is always NULL. Reading it made the pinned branch below dead
+            // code and reported every stuck job as though it were waiting on a
+            // network, whatever its `uses:` said.
+            let plan: Option<JobPlan> = serde_json::from_value(job.plan.clone()).ok();
+            let placed = plan.as_ref().and_then(|p| Self::place(&pool, p).ok());
+
+            // A host that came online between the query and now will take the
+            // job, and failing it here would kill work about to start.
+            //
+            // Only a *pinned* job gets this reprieve. An unpinned one whose
+            // network is full of online hosts and which still went unclaimed for
+            // the whole window is not about to be taken — nothing is reading its
+            // queue — and skipping it would leave the run queued for ever with
+            // no error, which is the exact silence this reaper exists to end.
+            if placed
+                .as_ref()
+                .and_then(|p| p.node)
+                .is_some_and(|n| n.status.is_dispatchable())
+            {
                 continue;
             }
 
-            let where_to = job
-                .runner_hd_id
-                .clone()
-                .or_else(|| job.network.clone())
-                .unwrap_or_else(|| "its network".to_string());
-            let detail = format!(
-                "no runner took this job within {}s. It is pinned to {where_to}, which \
-                 is not online — a pinned job waits for its own host rather than \
-                 migrating, because the warm VM pool is host-local. Bring that host \
-                 back, set `fallback: any` on the job, or point `uses:` elsewhere.",
-                wait.as_secs()
-            );
+            let detail = Self::stuck_job_detail(placed, job.network.as_deref(), &pool, wait);
             tracing::warn!(job = %job.job_key, "{detail}");
             if let Err(e) = self
                 .store
@@ -2221,6 +2224,131 @@ impl Dispatcher {
             if let Err(e) = self.advance_run(&job.run_id).await {
                 tracing::warn!(run = %job.run_id, "could not advance after failing: {e}");
             }
+        }
+    }
+
+    /// Why a job nobody took was never going to be taken.
+    ///
+    /// Takes the placement re-derived from the job's plan, because the routing
+    /// decision is the thing being explained and no column records it. The
+    /// earlier version read `runner_hd_id`, which `claim_job` alone writes, so
+    /// for a `queued` row it was always NULL: the message printed the network
+    /// name into a sentence claiming a host pin, and told the reader to bring
+    /// back a host that had never been chosen.
+    ///
+    /// The cases have different fixes, so they get different sentences — and
+    /// the one that matters most is a healthy network that still went unread,
+    /// which means no consumer is bound to its queue.
+    fn stuck_job_detail(
+        placed: Option<Placement<'_>>,
+        stored_network: Option<&str>,
+        pool: &crate::runners::Pool,
+        wait: std::time::Duration,
+    ) -> String {
+        let waited = format!("no runner took this job within {}s.", wait.as_secs());
+        let stale = Self::staleness(pool);
+
+        let Some(p) = placed else {
+            // The plan would not parse, or placement itself failed. Say only
+            // what is known rather than inventing a cause.
+            let where_to = stored_network.unwrap_or("its network");
+            return format!(
+                "{waited} It was routed to {where_to}, and this orchestrator could not \
+                 work out a live target for it now. Check /runners for the network's \
+                 hosts and CI_NETWORK for whether it is served.{stale}"
+            );
+        };
+
+        // Pinned: a host was named, and a pin deliberately does not migrate.
+        if let Some(node) = p.node {
+            return format!(
+                "{waited} It is pinned to host {} ({}) in network {}, which is {}. A \
+                 pinned job waits for its own host rather than migrating, because the \
+                 warm VM pool is host-local. Bring that host back, set `fallback: any` \
+                 on the job, or point `uses:` elsewhere.{stale}",
+                node.name,
+                node.id,
+                p.network.network_name,
+                node.status.as_str()
+            );
+        }
+
+        // Unpinned: it was on the network's shared queue.
+        let set = p.network;
+        let live: Vec<&str> = set.dispatchable().map(|r| r.name.as_str()).collect();
+
+        // Served is checked before liveness, and the order is load-bearing: an
+        // unserved network's hosts can all be online and it still gets no
+        // consumer, so reporting their health would name a symptom that is not
+        // the cause.
+        if !set.served {
+            return format!(
+                "{waited} It was on the shared queue for network {}, not pinned to any \
+                 host, and this orchestrator does not serve that network — CI_NETWORK \
+                 selects {}. Nothing here binds a consumer to its queue, however \
+                 healthy its hosts look on /runners.{stale}",
+                set.network_name,
+                Self::or_none(&pool.served_names())
+            );
+        }
+
+        if !live.is_empty() {
+            // The case that looks impossible from the dashboard and is the most
+            // useful thing this message can say: hosts are up, so the job was
+            // not waiting on capacity — nothing read its queue at all.
+            return format!(
+                "{waited} It was on the shared queue for network {} ({}), which has {} \
+                 online host(s) — {}. Hosts being up means this was never a capacity \
+                 problem: nothing consumed the queue. Check the Queue column on \
+                 /networks — `no consumer` there is the proof, and a bind that keeps \
+                 failing logs `could not bind a consumer, retrying`.{stale}",
+                set.network_name,
+                set.network_id,
+                live.len(),
+                live.join(", ")
+            );
+        }
+
+        let why = if set.runners.is_empty() {
+            let hint = match pool.unjoined.len() {
+                0 => String::new(),
+                1 => " One daemon is registered but in no network at all.".to_string(),
+                n => format!(" {n} daemons are registered but in no network at all."),
+            };
+            format!("it has no hosts in it.{hint}")
+        } else {
+            let states: Vec<String> = set
+                .runners
+                .iter()
+                .map(|r| format!("{} ({})", r.name, r.status.as_str()))
+                .collect();
+            format!("no host in it is online: {}", states.join(", "))
+        };
+
+        format!(
+            "{waited} It was on the shared queue for network {}, not pinned to any host, \
+             and {why}. Check /runners, then add a host with `heyvm network add-host` or \
+             point `uses:` at a network that has one.{stale}",
+            set.network_name
+        )
+    }
+
+    /// A comma list, or an explicit "none" — an empty list rendered as nothing
+    /// reads like the sentence was truncated.
+    fn or_none(names: &[String]) -> String {
+        if names.is_empty() {
+            "no networks".to_string()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    /// Appended when the pool view is known to be stale, so a diagnosis drawn
+    /// from it is not read as authoritative.
+    fn staleness(pool: &crate::runners::Pool) -> String {
+        match &pool.last_error {
+            Some(e) => format!(" (this view of the pool may be stale: {e})"),
+            None => String::new(),
         }
     }
 
@@ -2766,6 +2894,207 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             exit_code: exit,
+        }
+    }
+
+    // ---- the stuck-job diagnosis ----------------------------------------
+
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(900);
+
+    /// A served network with online hosts, for the case that looks impossible.
+    fn healthy_ci_runners() -> crate::runners::Pool {
+        use crate::runners::{Runner, RunnerSet, RunnerStatus};
+        let mut pool = test_pool();
+        pool.networks.push(RunnerSet {
+            network_id: "net-3".into(),
+            network_name: "ci-runners".into(),
+            is_default: false,
+            served: true,
+            runners: vec![
+                Runner {
+                    id: "hd-YdBcLuMVw4mA-zv9".into(),
+                    name: "this host".into(),
+                    status: RunnerStatus::Online,
+                    last_seen_at: None,
+                },
+                Runner {
+                    id: "hd-second".into(),
+                    name: "builder-2".into(),
+                    status: RunnerStatus::Online,
+                    last_seen_at: None,
+                },
+            ],
+        });
+        pool
+    }
+
+    fn set_named<'a>(pool: &'a crate::runners::Pool, name: &str) -> &'a crate::runners::RunnerSet {
+        pool.find(name).expect("network in the test pool")
+    }
+
+    /// Hosts up, job unread for the whole window. Capacity was never the
+    /// problem, so the message must point at the queue's consumer rather than
+    /// telling somebody to bring a host back that is already online — which is
+    /// what sent the last investigation looking at host health for an hour.
+    #[test]
+    fn a_healthy_network_that_went_unread_blames_the_consumer_not_the_hosts() {
+        let pool = healthy_ci_runners();
+        let placed = Placement {
+            network: set_named(&pool, "ci-runners"),
+            node: None,
+            vm: None,
+        };
+        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT);
+
+        assert!(detail.contains("2 online host(s)"), "{detail}");
+        assert!(detail.contains("nothing consumed the queue"), "{detail}");
+        // Deliberately NOT the `starting a consumer for …` line: that is logged
+        // before the bind is attempted (dispatch.rs, `spawn_consumers`), and
+        // `consume` retries a failing bind for ever without the task finishing —
+        // so it prints once per route per process whether or not a consumer was
+        // ever bound. `Bus::depth` returning `Ok(None)`, which is what the Queue
+        // column renders as `no consumer`, is the signal that actually proves it.
+        assert!(detail.contains("Queue column"), "names real evidence: {detail}");
+        assert!(detail.contains("could not bind a consumer"), "{detail}");
+        assert!(
+            !detail.contains("starting a consumer"),
+            "that line proves nothing about binding: {detail}"
+        );
+        assert!(detail.contains("net-3"), "names the id the subject uses: {detail}");
+        assert!(!detail.contains("Bring that host back"), "the hosts are up: {detail}");
+        assert!(!detail.contains("is pinned to"), "not a pin: {detail}");
+    }
+
+    /// The pinned wording is reachable again — it was dead code before, since
+    /// the column it keyed on is never set for a queued job.
+    #[test]
+    fn a_pinned_job_names_its_host_and_that_hosts_status() {
+        use crate::runners::{Runner, RunnerStatus};
+        let pool = healthy_ci_runners();
+        let offline = Runner {
+            id: "hd-gone".into(),
+            name: "mac-mini".into(),
+            status: RunnerStatus::Offline,
+            last_seen_at: None,
+        };
+        let placed = Placement {
+            network: set_named(&pool, "ci-runners"),
+            node: Some(&offline),
+            vm: None,
+        };
+        let detail = Dispatcher::stuck_job_detail(Some(placed), None, &pool, WAIT);
+
+        assert!(detail.contains("pinned to host mac-mini (hd-gone)"), "{detail}");
+        assert!(detail.contains("is offline"), "{detail}");
+        assert!(detail.contains("`fallback: any`"), "{detail}");
+    }
+
+    /// An unserved network is a config answer, not a dead host.
+    #[test]
+    fn an_unserved_network_names_ci_network_and_what_is_served() {
+        let pool = test_pool();
+        let placed = Placement {
+            network: set_named(&pool, "lab"),
+            node: None,
+            vm: None,
+        };
+        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("lab"), &pool, WAIT);
+        assert!(detail.contains("does not serve that network"), "{detail}");
+        assert!(detail.contains("CI_NETWORK"), "{detail}");
+        assert!(detail.contains("prod-runners"), "must say what it does serve: {detail}");
+        // The hosts in an unserved network are online and irrelevant; saying so
+        // is what stops the reader chasing host health again.
+        assert!(detail.contains("however healthy its hosts look"), "{detail}");
+    }
+
+    /// The commonest cause is pointed at rather than left as an empty network.
+    #[test]
+    fn an_empty_network_mentions_daemons_that_joined_nothing() {
+        use crate::runners::{Runner, RunnerSet, RunnerStatus};
+        let mut pool = test_pool();
+        pool.networks.push(RunnerSet {
+            network_id: "net-3".into(),
+            network_name: "ci-runners".into(),
+            is_default: false,
+            served: true,
+            runners: vec![],
+        });
+        pool.unjoined.push(Runner {
+            id: "hd-YdBcLuMVw4mA-zv9".into(),
+            name: "this host".into(),
+            status: RunnerStatus::Online,
+            last_seen_at: None,
+        });
+        let placed = Placement {
+            network: set_named(&pool, "ci-runners"),
+            node: None,
+            vm: None,
+        };
+        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT);
+        assert!(detail.contains("no hosts in it"), "{detail}");
+        assert!(detail.contains("One daemon is registered but in no network"), "{detail}");
+    }
+
+    /// Members present, none dispatchable: name them and their states.
+    #[test]
+    fn an_offline_network_lists_each_host_and_its_status() {
+        use crate::runners::{Runner, RunnerSet, RunnerStatus};
+        let mut pool = test_pool();
+        pool.networks.push(RunnerSet {
+            network_id: "net-3".into(),
+            network_name: "ci-runners".into(),
+            is_default: false,
+            served: true,
+            runners: vec![Runner {
+                id: "hd-YdBcLuMVw4mA-zv9".into(),
+                name: "this host".into(),
+                status: RunnerStatus::Orphaned,
+                last_seen_at: None,
+            }],
+        });
+        let placed = Placement {
+            network: set_named(&pool, "ci-runners"),
+            node: None,
+            vm: None,
+        };
+        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT);
+        assert!(detail.contains("this host (orphaned)"), "{detail}");
+        assert!(!detail.contains("is pinned to"), "{detail}");
+    }
+
+    /// An unplaceable job must not have a cause invented for it.
+    #[test]
+    fn an_unplaceable_job_says_only_what_is_known() {
+        let detail = Dispatcher::stuck_job_detail(None, Some("ci-runners"), &test_pool(), WAIT);
+        assert!(detail.contains("could not work out a live target"), "{detail}");
+        assert!(detail.contains("ci-runners"), "{detail}");
+        assert!(!detail.contains("is pinned to"), "{detail}");
+    }
+
+    /// A diagnosis drawn from a stale pool must not read as authoritative.
+    #[test]
+    fn a_stale_pool_is_admitted_in_the_message() {
+        let mut pool = test_pool();
+        pool.last_error = Some("GET /me/daemons: timed out".into());
+        let detail = Dispatcher::stuck_job_detail(None, Some("nope"), &pool, WAIT);
+        assert!(detail.contains("may be stale"), "{detail}");
+        assert!(detail.contains("timed out"), "{detail}");
+    }
+
+    /// How long it waited is the one fact every variant carries.
+    #[test]
+    fn every_variant_reports_the_wait() {
+        let pool = healthy_ci_runners();
+        let network = Placement {
+            network: set_named(&pool, "ci-runners"),
+            node: None,
+            vm: None,
+        };
+        for detail in [
+            Dispatcher::stuck_job_detail(Some(network), None, &pool, WAIT),
+            Dispatcher::stuck_job_detail(None, Some("x"), &pool, WAIT),
+        ] {
+            assert!(detail.contains("within 900s"), "{detail}");
         }
     }
 

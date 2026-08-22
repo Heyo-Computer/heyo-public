@@ -93,6 +93,23 @@ pub fn backoff_for(attempt: u32) -> Duration {
     BACKOFF[idx]
 }
 
+/// How long the redelivery ladder takes to exhaust every delivery.
+///
+/// The waits *between* [`MAX_DELIVER`] deliveries — so `MAX_DELIVER - 1` rungs,
+/// saturating at the last entry. With the ladder above and four deliveries that
+/// is 60s + 5m + 15m = 21 minutes.
+///
+/// This exists because something else has to be longer than it.
+/// `CI_RUNNER_WAIT_SECS` reaps a job that is still `queued`, and a job being
+/// retried by this ladder is `queued` for the whole of it — `run_job` picks a
+/// runner *before* `claim_job`, so a failure there never moves the row off
+/// `queued`. A reaper set shorter than this kills a job the queue was still
+/// legitimately retrying, and overwrites the real error with "no runner took
+/// this job", which is both wrong and the opposite of a lead.
+pub fn ladder_total() -> Duration {
+    (1..MAX_DELIVER as u32).map(backoff_for).sum()
+}
+
 /// A job is worth retrying a few times — a runner rebooting mid-build is
 /// transient — but not forever: past this it is the workflow that is broken, and
 /// redelivering forever hides that behind a queue that never drains.
@@ -467,7 +484,6 @@ mod tests {
         format!("citest{}", crate::vm::new_id().replace('-', ""))
     }
 
-    #[test]
     /// nats-server overrides `ack_wait` with `backoff[0]` when a ladder is set,
     /// so the two must agree or the configured window is silently discarded.
     /// This is a compile-time guard on the pair; the server's behaviour itself
@@ -480,6 +496,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn the_backoff_ladder_saturates() {
         assert_eq!(backoff_for(1), ACK_WAIT);
         assert_eq!(backoff_for(2), Duration::from_secs(5 * 60));
@@ -513,6 +530,27 @@ mod tests {
     async fn cleanup(bus: &Bus) {
         let _ = bus.js.delete_stream(bus.jobs_stream()).await;
         let _ = bus.js.delete_stream(bus.events_stream()).await;
+    }
+
+    /// The ladder is three waits, not four: `MAX_DELIVER` deliveries have
+    /// `MAX_DELIVER - 1` gaps between them.
+    #[test]
+    fn the_ladder_totals_the_waits_between_deliveries() {
+        assert_eq!(ladder_total(), Duration::from_secs(60 + 5 * 60 + 15 * 60));
+        assert_eq!(ladder_total().as_secs(), 1260);
+    }
+
+    /// The guard that keeps the reaper behind the ladder. If `MAX_DELIVER` or
+    /// `BACKOFF` grows this fails, and `CI_RUNNER_WAIT_SECS`'s default has to
+    /// move with it — which is the point, because the failure it prevents is
+    /// silent and shows up only for jobs whose first delivery happens to fail.
+    #[test]
+    fn the_default_runner_wait_outlasts_the_ladder() {
+        assert!(
+            Duration::from_secs(1800) > ladder_total(),
+            "CI_RUNNER_WAIT_SECS default must exceed {:?}",
+            ladder_total()
+        );
     }
 
     #[tokio::test]
