@@ -76,19 +76,41 @@ jobs:
     # disagree about what a pattern covers — including the case that matters, an
     # unknown change set, where both are true.
     if: ${{ changed('ci/**', '.ci/workflows/ci.yml', '.ci/image/ci/**') }}
-    # No `uses:`, so: any online host in the network this repository is assigned
-    # on /repos, exactly like the other two workflows here.
+    # Pinned, unlike the other two workflows here, and the reason is the cache
+    # disk below rather than anything about this host.
     #
-    # This is the line whose meaning changed in the move. Standalone, the job
-    # said `uses: default` — the host the orchestrator itself runs on — because
-    # that repository existed to dogfood `ci`, and `default` is hardware that is
-    # by definition present. Here that would be wrong twice. It would put a
-    # `large` VM with a 40 GB disk on the box already serving ci.us2.heyo.work,
-    # its Postgres and its NATS. And `default` resolves through the local
-    # `daemon.json` (CI_DAEMON_STATE_PATH), not through the repository's
-    # network, so it can name a host that is not in the pool this repository
-    # builds on at all. Add `uses: <network>/<node>` if a specific machine is
-    # ever wanted.
+    # **The warm pool is host-local.** A pooled VM is claimed by
+    # `(runner_hd_id, fingerprint, idle)` — a VM warmed on one host is invisible
+    # to a job that lands on another. Unpinned, this job goes on the network's
+    # shared queue and takes whichever host is free, so the 40 GB
+    # `/var/cache/ci` disk that "is what makes reusing a warm VM worth anything"
+    # is only reused when the job happens to come back to the host that built
+    # it. Across four runners that is a cold build most of the time: an hour of
+    # compiling 510 packages instead of minutes of relinking. Pinning is what
+    # makes the disk a cache rather than four disks that each miss.
+    #
+    # **Named, not `default`.** They resolve to the same machine today and are
+    # not the same instruction. `uses: default` reads the local `daemon.json`
+    # (CI_DAEMON_STATE_PATH) and can therefore name a host that is not in this
+    # repository's network at all, which is a placement nobody asked for and a
+    # refused job at submit. `<network>/<node>` resolves through the pool this
+    # repository actually builds on, and `Runner::matches` takes the friendly
+    # name case-insensitively, so this stays readable and survives the id
+    # changing under it.
+    #
+    # **The cost, accepted deliberately.** This is the box already serving
+    # ci.us2.heyo.work, its Postgres and its NATS, and this job puts a `large`
+    # VM (4 CPU, 8 GB) with a 40 GB disk on it. That is a real load on the
+    # machine the dashboard runs on, taken knowingly for the cache locality
+    # above. If this host starts contending, the fix is a dedicated build runner
+    # named here — not going back to unpinned, which loses the disk.
+    #
+    # **No `fallback: any`.** Migrating discards the warm VM and the populated
+    # cache the pin exists to reuse, so a migrated build is a cold build that
+    # also starts filling a second 40 GB disk elsewhere. A pinned job waits for
+    # its own host; if that host is down, `CI_RUNNER_WAIT_SECS` fails the job
+    # naming it, which is the honest outcome.
+    uses: ci-runners/us2.heyo.computer
     vm:
       driver: firecracker
       build:

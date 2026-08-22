@@ -2365,11 +2365,15 @@ impl Dispatcher {
         }
         if let QueueVerdict::InFlightElsewhere(n) = verdict {
             return format!(
-                "{waited} Its message has been delivered to a consumer and not acked \
-                 ({n} in flight on this route), but this orchestrator is not the one \
-                 holding it. That is another `ci` on the same durable — durable names \
-                 derive only from the route and CI_NATS_SUBJECT_PREFIX. Check for a \
-                 second running instance.{stale}"
+                "{waited} {n} message(s) on this route are delivered and unacked while \
+                 this job's row still says `queued`, and this orchestrator logged \
+                 nothing for it. Two things look identical here and both are worth \
+                 checking: a second `ci` sharing CI_NATS_SUBJECT_PREFIX binds the same \
+                 durable and competes for these messages; or this instance took the \
+                 message and wedged before its first log line — the ack heartbeat \
+                 keeps a held message in flight indefinitely, so a stuck consumer \
+                 looks exactly like a rival one. `ps` for a second process, then look \
+                 for a query with no timeout in pg_stat_activity.{stale}"
             );
         }
 
@@ -3070,8 +3074,12 @@ mod tests {
             QueueVerdict::InFlightElsewhere(2),
             "ci-abc123",
         );
-        assert!(detail.contains("2 in flight"), "{detail}");
-        assert!(detail.contains("second running instance"), "{detail}");
+        assert!(detail.contains("2 message(s)"), "{detail}");
+        // Both causes named, because a wedged local consumer and a rival one
+        // produce the same counters — the heartbeat holds a message in flight
+        // for as long as the loop holds it.
+        assert!(detail.contains("second `ci`"), "{detail}");
+        assert!(detail.contains("wedged before its first log line"), "{detail}");
     }
 
     /// Nothing bound is decisive on its own and outranks the pool.
