@@ -803,6 +803,35 @@ impl fmt::Display for WorkflowError {
 impl std::error::Error for WorkflowError {}
 
 #[cfg(test)]
+mod repo_workflow_files {
+    /// The workflows this repository actually runs must stay parseable by the
+    /// parser that runs them. A syntax slip in `.ci/workflows/*.yml` otherwise
+    /// surfaces as a run that never starts, on the server, after the push.
+    #[test]
+    fn the_repos_own_workflows_parse() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../.ci/workflows");
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return, // crate used outside the monorepo
+        };
+        let mut seen = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yml") {
+                continue;
+            }
+            let yaml = std::fs::read_to_string(&path).unwrap();
+            let name = path.display().to_string();
+            let wf = super::Workflow::parse(&name, &yaml)
+                .unwrap_or_else(|e| panic!("{name} does not parse: {e}"));
+            assert!(!wf.jobs.is_empty(), "{name} has no jobs");
+            seen += 1;
+        }
+        assert!(seen >= 3, "expected the repo's workflow files, found {seen}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
