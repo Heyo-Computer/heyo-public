@@ -346,8 +346,7 @@ fn chrome<'a>(
     let cookies = headers
         .get(axum::http::header::COOKIE)
         .and_then(|v| v.to_str().ok());
-    let theme =
-        crate::heyo_ui::theme_from_cookie_header(cookies, &state.config.ui_cookie_name);
+    let theme = crate::heyo_ui::theme_from_cookie_header(cookies, &state.config.ui_cookie_name);
     pages::Chrome {
         app_name: &state.config.name,
         who: who.map(|i| i.display()),
@@ -399,13 +398,8 @@ async fn runs_page(
         Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
     };
     match state.store.recent_runs(RECENT_RUNS, repo).await {
-        Ok(runs) => pages::runs_page(
-            &chrome(&state, &headers, who.as_ref()),
-            &runs,
-            &repos,
-            repo,
-        )
-        .into_response(),
+        Ok(runs) => pages::runs_page(&chrome(&state, &headers, who.as_ref()), &runs, &repos, repo)
+            .into_response(),
         Err(e) => page_error(&state, &headers, who.as_ref(), &e.to_string()),
     }
 }
@@ -809,7 +803,15 @@ async fn register_repo(
             )
             .await
         }
-        Err(e) => render_repos(&state, &headers, who.as_ref(), RepoFlash::failed(e.to_string())).await,
+        Err(e) => {
+            render_repos(
+                &state,
+                &headers,
+                who.as_ref(),
+                RepoFlash::failed(e.to_string()),
+            )
+            .await
+        }
     }
 }
 
@@ -875,7 +877,15 @@ async fn create_repo_token(
             )
             .await
         }
-        Err(e) => render_repos(&state, &headers, who.as_ref(), RepoFlash::failed(e.to_string())).await,
+        Err(e) => {
+            render_repos(
+                &state,
+                &headers,
+                who.as_ref(),
+                RepoFlash::failed(e.to_string()),
+            )
+            .await
+        }
     }
 }
 
@@ -1244,13 +1254,7 @@ async fn render_vms(
     // pool, and a page that refuses to render the VMs because the image
     // catalog was unreadable would hide the more important half.
     let images = state.dispatcher.image_inventory().await.unwrap_or_default();
-    pages::vms_page(
-        &chrome(state, headers, who),
-        &vms,
-        &images,
-        &notice,
-    )
-    .into_response()
+    pages::vms_page(&chrome(state, headers, who), &vms, &images, &notice).into_response()
 }
 
 async fn destroy_vm(
@@ -1426,7 +1430,9 @@ mod tests {
         let url = std::env::var("CI_TEST_DATABASE_URL").expect("CI_TEST_DATABASE_URL");
         let config = test_config();
         let dir = std::env::temp_dir().join(format!("ci-web-logs-{}", crate::vm::new_id()));
-        let store = Store::connect(&url, dir).await.expect("store");
+        let store = Store::connect(&url, dir, std::time::Duration::from_secs(30))
+            .await
+            .expect("store");
         store
             .migrate(std::path::Path::new("migrations"))
             .await

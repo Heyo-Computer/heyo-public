@@ -1178,6 +1178,115 @@ guarantees is that a tree a pull has just landed is never swept before the spec
 that names it is written; an older tree becomes eligible as soon as nothing
 names it. Set `0` to reclaim by hand instead.
 
+### A workspace that outlives the VM
+
+`vm.disk_size_gb` gives each replica a `/workspace` disk, and `idle_action:
+retain` keeps it across scale-to-zero — but the disk belongs to the *sandbox*.
+A rollout, a `serverctl restart`, a rebuild that recycles the pool, an edit to
+the template: each boots a new sandbox with an empty `/workspace`, and the old
+one's contents sit on the host until the disk sweep removes them. For an agent
+harness whose sessions, cloned repositories and generated files all live there,
+that is the state of the deployment, and it has to belong to the deployment.
+
+`vm.workspace` does that:
+
+```json
+"vm": {
+  "driver": "firecracker",
+  "image": "fastcar",
+  "port": 3000,
+  "disk_size_gb": 40,
+  "workspace": {
+    "store": "https://art.example.com",
+    "auth": { "secret": "art", "key": "api_key" }
+  }
+},
+"scaling": { "min_replicas": 1, "max_replicas": 1, "idle_action": "retain" }
+```
+
+| Field | |
+| --- | --- |
+| `path` | Guest path. Defaults to `/workspace`, which is also the only path heyvmd sizes from `disk_size_gb` — elsewhere the image is 1.5× its content with a 2 GiB floor. |
+| `store` | Where snapshots go: `s3://bucket[/prefix]` (via the `aws` CLI and its own credentials; `APP_LB_DISK_ARCHIVE_ENDPOINT` applies), an `http(s)://` `art serve`, or the absolute path of a local store. |
+| `ref` | The tag the newest snapshot is published under in an artifact store. Defaults to `workspace-<deployment id>`. S3 keys by deployment id instead: `<prefix>/<id>/<digest>.tar.gz` plus a `latest` pointer. |
+| `auth` | A secret reference for the artifact store, like `artifact.auth`. |
+
+What happens:
+
+- **Seed.** When the autoscaler creates the replica it hands heyvmd the
+  workspace's current tree on this host as a writable mount at `path`; the
+  daemon builds the VM its own ext4 image from it (`mke2fs -d`) and mounts it
+  before `start_command` runs. With no tree on this host yet, the newest
+  snapshot is restored from the store first; with none there either, the
+  workspace starts empty. An unreachable store is **not** "empty" — the pool
+  waits and says why, because booting empty and then pushing would overwrite
+  the real snapshot.
+- **Capture.** When the replica retires for any reason — drained by a rollout,
+  evicted, torn down by an edit or `delete`, suspended by `idle_action:
+  retain` — app-lb runs `sync` in the guest, stops the VM, replays the image's
+  journal (`e2fsck -p`), extracts it (`debugfs rdump`), and points the
+  deployment at the new tree. **The replacement is not created until that has
+  landed.** That is the guarantee, and it is also the cost: a rollout of a
+  workspace deployment has a gap of drain + capture + boot, which for a few
+  gigabytes of repositories is a minute or two.
+- **Push.** Each capture is bundled (`tar.gz`, named by its sha256) and sent
+  to the store under `ref`, so the workspace survives the host too. A push
+  that fails is retried on a backoff and never blocks the rollout — the tree
+  the next VM needs is already here. A push is refused, loudly, if the store's
+  tag has moved to a snapshot this host never saw (the deployment running
+  somewhere else); nothing is overwritten.
+
+`describe` shows where it stands:
+
+```
+Workspace
+  /workspace          https://art.example.com (idle)
+    Snapshot          9f2c1e7a4b30 — 4,812 files, 1.3 GB, captured from applb-fastcar-17 at 2026-08-22 10:14:02 UTC
+    In store          9f2c1e7a4b30 at 2026-08-22 10:15:40 UTC
+```
+
+and `GET /deployments/:id` carries the same as `workspace`, including a
+`blocked` line whenever the pool is at zero because of it (`workspace
+capturing`, `workspace restore pending: …`).
+
+To force a snapshot of a running replica, recycle it: `heyctl restart <id>`
+drains it, the capture runs, and the autoscaler boots its replacement from the
+result.
+
+Rules and caveats, each of which the spec validation enforces or the docs
+above imply:
+
+- `scaling.max_replicas` must be `1` and `warm_pool` must be `0`: one
+  directory, one writer. Two replicas would each capture a divergent copy and
+  the last to land would win.
+- `driver` must be `firecracker`. The KVM driver syncs a writable mount back
+  into the shared host tree itself when the VM stops, which is a different
+  feature with different semantics.
+- A mount may not sit on, inside, or around the workspace path.
+- **Ownership is flattened.** app-lb extracts and rebuilds the tree as its own
+  user, so inside the guest every file comes back owned by that uid. A
+  workload that runs as root does not notice; one that checks ownership does —
+  `git` refuses a repository owned by another user unless
+  `safe.directory` says otherwise, and Postgres refuses a data directory that
+  is not its own. Modes, symlinks and mtimes survive. Keep a database in the
+  workspace only with that in mind; pointing `DATABASE_URL` at a server
+  outside the VM is the better shape anyway.
+- A capture is taken only from a VM seeded from the **current** snapshot. A
+  replica of an older lineage — an orphan adopted late, a resume of a VM from
+  before a rollout — is left stopped for a person rather than allowed to
+  overwrite the newer state; `describe` names it and `/disks` lists its
+  image. Purge it there once you have looked.
+- The host keeps the current snapshot and the one before it under
+  `APP_LB_WORKSPACES_DIR` (default `/var/lib/app-lb/workspaces/<id>/`), plus
+  any bundle not yet pushed. heyvmd must be able to read that directory, as
+  with `APP_LB_MOUNTS_DIR`. `e2fsprogs` (`debugfs`, `e2fsck`, already required
+  by heyvmd for `mke2fs`) must be installed; `/usr/sbin` and `/sbin` are
+  searched when they are not on app-lb's `PATH`, or set
+  `APP_LB_DEBUGFS_BIN` / `APP_LB_E2FSCK_BIN`. `APP_LB_WORKSPACE_TIMEOUT_SECS`
+  (default 3600) bounds one capture, push or restore.
+- Deregistering the deployment captures and pushes its final state and leaves
+  the host directory in place; registering it again restores from it.
+
 ## Updating a static deployment
 
 A static deployment's backend is a process on some host — usually *this* host,

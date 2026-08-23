@@ -789,6 +789,11 @@ struct DeploymentStatus {
     pending: usize,
     total_in_flight: usize,
     vms: Vec<VmStatus>,
+    /// The deployment's workspace, when the spec declares one: which snapshot
+    /// the pool runs from, whether the store has it, and what — if anything —
+    /// is holding the pool at zero. See [`crate::workspace`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<crate::workspace::WorkspaceStatus>,
 }
 
 fn is_default_namespace_str(ns: &String) -> bool {
@@ -876,9 +881,10 @@ fn pull_mounts_if_needed(state: &AdminState, spec: &DeploymentSpec) {
     }
 }
 
-fn status_of(d: &Arc<crate::deployment::Deployment>) -> DeploymentStatus {
+fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> DeploymentStatus {
     let backends = d.backends();
     DeploymentStatus {
+        workspace: state.autoscaler.workspaces().status(d),
         spec: d.spec.clone(),
         kind: deployment_kind(d),
         desired_replicas: d.desired_replicas(),
@@ -2280,7 +2286,7 @@ async fn register(
     // this host, so the job that puts them there starts with the registration.
     pull_mounts_if_needed(&state, &deployment.spec);
 
-    (StatusCode::CREATED, Json(status_of(&deployment))).into_response()
+    (StatusCode::CREATED, Json(status_of(&state, &deployment))).into_response()
 }
 
 /// Edit a deployment in place: `PUT /deployments/:id`.
@@ -2366,7 +2372,7 @@ async fn update(
         now_secs(),
     );
 
-    Json(status_of(&deployment)).into_response()
+    Json(status_of(&state, &deployment)).into_response()
 }
 
 /// Manually scale a deployment: `PATCH /deployments/:id/scaling`.
@@ -2435,7 +2441,7 @@ async fn scale(
     tracing::info!(deployment = %id, "scaled");
     deployment.scale_signal.notify_one();
 
-    Json(status_of(&deployment)).into_response()
+    Json(status_of(&state, &deployment)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -2463,7 +2469,7 @@ async fn list(
                 .is_none_or(|s| s.iter().any(|id| id == &d.spec.id))
         })
         .filter(|d| q.namespace.as_ref().is_none_or(|ns| &d.spec.namespace == ns))
-        .map(status_of)
+        .map(|d| status_of(&state, d))
         .collect();
     out.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
     Json(out)
@@ -2471,7 +2477,7 @@ async fn list(
 
 async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
     match state.registry.get(&id) {
-        Some(d) => Json(status_of(&d)).into_response(),
+        Some(d) => Json(status_of(&state, &d)).into_response(),
         None => err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response(),
     }
 }

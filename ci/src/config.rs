@@ -167,8 +167,16 @@ pub struct HeyvmConfig {
     pub relay: Option<String>,
     /// How often the runner set is re-read from the control plane.
     pub refresh_interval: Duration,
-    /// How long a job pinned to an offline runner waits before failing.
+    /// How long a job waits for a runner that is never going to take it —
+    /// pinned to an offline host, or on a queue with no consumer — before it
+    /// is failed. Not a cap on waiting behind a busy runner: see `queue_wait`.
     pub runner_wait: Duration,
+    /// How long a job may wait *on capacity* — queued behind work a live,
+    /// bound consumer is busy with — before it is failed. `None` (the default)
+    /// means as long as it takes: a job's own timeouts start when it is picked
+    /// up, never while it is queued, so a backlog on one host is a wait, not a
+    /// failure. `CI_QUEUE_WAIT_SECS` sets a cap for deployments that want one.
+    pub queue_wait: Option<Duration>,
     /// Backstop TTL on every VM we create, so a crashed orchestrator does not
     /// strand a fleet. Renewed while a VM is pooled.
     pub vm_ttl: Duration,
@@ -211,6 +219,9 @@ pub struct Config {
 
     /// Postgres connection string. Not dialed until the store is built.
     pub database_url: String,
+    /// Bound on every statement, so a database that accepts a connection and
+    /// then answers nothing cannot hang a consumer silently. `0` disables it.
+    pub db_statement_timeout: Duration,
     /// Where step logs are appended. Postgres holds the path and byte length;
     /// multi-megabyte log blobs in a row would be a mistake.
     pub log_dir: PathBuf,
@@ -393,6 +404,10 @@ impl Config {
             // Longer than `bus::ladder_total()` (21 min), and checked
             // below so the two cannot drift apart again.
             runner_wait: secs("CI_RUNNER_WAIT_SECS", 1800)?,
+            queue_wait: match opt("CI_QUEUE_WAIT_SECS") {
+                None => None,
+                Some(_) => Some(secs("CI_QUEUE_WAIT_SECS", 0)?),
+            },
             vm_ttl: secs("CI_VM_TTL_SECONDS", 3600)?,
             local_runner: opt("CI_LOCAL_RUNNER").map(|v| match v.as_str() {
                 "1" | "true" | "yes" | "on" => heyo_sdk::DEFAULT_LOCAL_BASE_URL.to_string(),
@@ -532,6 +547,11 @@ impl Config {
             nats,
             nats_prefix,
             database_url,
+            // 30s is far past any query this makes — the heaviest is the
+            // `/vms` inventory join over a table with one row per pooled VM —
+            // and far short of the ~5 minutes a suspended database instance
+            // can take to wake, which is the stall this is here to cut.
+            db_statement_timeout: secs("CI_DB_STATEMENT_TIMEOUT_SECS", 30)?,
             log_dir,
             workspace_dir,
             migrations_dir: PathBuf::from(

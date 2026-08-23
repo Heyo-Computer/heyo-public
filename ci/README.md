@@ -377,6 +377,28 @@ a failure naming the host it was waiting for. It is checked on the lease loop an
 re-confirmed against the live pool first, so a host that comes back in the
 meantime keeps its job.
 
+### Timeouts start at pickup, not at submit
+
+Every clock a job has — `CI_MAX_JOB_SECONDS`, the job's `timeout-minutes`, each
+step's `timeout-minutes` — starts when a consumer **claims** the job off its
+queue (`started_at`), never when it was submitted (`queued_at`). Each route is
+consumed one job at a time, so N jobs submitted together against one host form a
+line: the first runs, and the rest wait their turn with their budgets untouched.
+The run page shows the two separately, as **Queued** (time on the queue) and
+**Duration** (time since pickup).
+
+`CI_RUNNER_WAIT_SECS` is **not** a bound on that line. It fails a job that has
+waited for a runner that was never going to take it — a pinned host that is
+offline, a subject with no consumer, a message some other instance consumed. A
+job whose route has work in flight *and* a backlog behind it is waiting on
+capacity, and the reaper leaves it alone however old it is. (It used to be
+failed as "nothing consumed the queue", which is how several workflows submitted
+against one backend produced one success and the rest timed out.)
+
+If a deployment does want a cap on queue time, `CI_QUEUE_WAIT_SECS` is that cap
+and nothing else: a job that has sat behind a busy runner longer than it is
+failed with a message saying so. It is unset by default, which means no cap.
+
 **`vm:` describes the machine.** GitHub gives you an opaque runner image; here
 the author declares the driver, image, size and setup hooks — and, via
 `cache_key_files`, what should invalidate the warm VM the next run would reuse.

@@ -327,6 +327,7 @@ mod tests {
                 setup_hooks: None,
                 open_ports: vec![],
                 mounts: vec![],
+                workspace: None,
                 ttl_seconds: 3600,
             }),
             scaling: Default::default(),

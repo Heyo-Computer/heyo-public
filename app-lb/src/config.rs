@@ -558,6 +558,16 @@ pub struct VmSpec {
     /// makes that happen.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountSpec>,
+    /// A writable directory that belongs to the *deployment* rather than to any
+    /// one VM: captured when a replica retires and seeded into the next one, so
+    /// its contents survive restarts, rebuilds and rollouts. See
+    /// [`WorkspaceSpec`].
+    ///
+    /// In the template for the same reason `mounts` is: it is attached at boot,
+    /// and a VM booted without it has nowhere to put the state the next VM is
+    /// supposed to inherit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceSpec>,
     /// Backstop TTL so VMs die on their own if this LB crashes and never reaps
     /// them. Renewed by the autoscaler while it is alive.
     #[serde(default = "default_vm_ttl_secs")]
@@ -756,6 +766,206 @@ impl MountSpec {
     }
 }
 
+/// The default guest path of a [`WorkspaceSpec`], and the one heyvm treats
+/// specially: a mount there replaces the `disk_size_gb` data disk and is sized
+/// from it, so `disk_size_gb` becomes the workspace's capacity.
+pub const DEFAULT_WORKSPACE_PATH: &str = "/workspace";
+
+/// A persistent, writable workspace owned by the deployment.
+///
+/// The fourth thing app-lb moves between a store and a guest, and the only one
+/// that moves in **both directions**. A [`MountSpec`] is data the deployment
+/// was *given*; a workspace is data the deployment *makes* — the agent's
+/// sessions, the repositories it cloned, the files it was asked to keep — and
+/// it has to outlive the VM that wrote it. heyvm's own `/workspace` data disk
+/// does not: it belongs to one sandbox, so every rollout, every `restart`, and
+/// every rebuild that recycles the pool boots a replica with an empty one.
+///
+/// ## The lifecycle
+///
+/// * **Seed.** When the autoscaler creates a replica it hands heyvmd the
+///   workspace's current tree on this host as a writable mount at
+///   [`path`](Self::path). The daemon builds the VM its own ext4 image from
+///   that tree (`mke2fs -d`), so the guest writes to a block device and the
+///   tree itself is only read. With no tree yet — a fresh host, or a swept
+///   one — the latest snapshot is pulled from [`store`](Self::store) first;
+///   with no snapshot in the store either, the workspace starts empty.
+/// * **Capture.** When a replica retires for any reason — drained by a
+///   rollout, evicted, torn down by an edit or a deregistration, suspended by
+///   `idle_action: retain` — app-lb syncs the guest, stops the VM, replays the
+///   image's journal, extracts it into a new tree, and points the deployment
+///   at that tree. The replacement is not created until that has happened,
+///   which is the whole guarantee: the next VM boots from the last VM's final
+///   state, not from whatever the store held when the host came up.
+/// * **Push.** Each capture is bundled (`tar.gz`, named by its sha256) and sent
+///   to the store under [`ref`](Self::artifact_ref), so the workspace survives
+///   the host too. A push that fails is retried; it never blocks the rollout,
+///   because the tree the next VM needs is already here.
+///
+/// ## What this costs, and what it refuses
+///
+/// A capture stops the VM, so a rollout of a workspace deployment has a gap:
+/// the old replica is drained and stopped, its tree is extracted, and only then
+/// does the new one boot. That is inherent to single-writer state and it is why
+/// `scaling.max_replicas` **must be 1** — two replicas would each capture their
+/// own divergent copy and the last one to land would win. `warm_pool` must be
+/// `0` for the same reason, and the driver must be `firecracker`: the KVM
+/// driver has its own idea of what a writable mount means when the VM stops.
+///
+/// Ownership is flattened: the tree is extracted and rebuilt by app-lb's own
+/// user, so every file comes back owned by that uid inside the guest. A
+/// workload that runs as root reads and writes them regardless; one that
+/// checks ownership (git's `safe.directory`, Postgres's data-directory check)
+/// needs to be told. Modes, symlinks and timestamps survive.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorkspaceSpec {
+    /// Where the workspace appears inside the guest. Defaults to
+    /// [`DEFAULT_WORKSPACE_PATH`], which is also the only path heyvmd sizes from
+    /// `disk_size_gb`; anywhere else gets 1.5× its content with a 2 GiB floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Where snapshots go, in one of three forms:
+    ///
+    /// * `s3://bucket[/prefix]` — an S3 bucket, reached with the `aws` CLI and
+    ///   whatever credentials it finds (`APP_LB_DISK_ARCHIVE_ENDPOINT` applies
+    ///   for an S3-compatible store). Snapshots land at
+    ///   `<prefix>/<deployment>/<digest>.tar.gz` with a `latest` pointer.
+    /// * `http(s)://host:port` — a remote `art serve`. Each snapshot is a blob,
+    ///   and [`ref`](Self::artifact_ref) is the tag that names the newest.
+    /// * an absolute path — a local `ART_ROOT`, reached through the `art` CLI.
+    pub store: String,
+    /// The tag the newest snapshot is published under (artifact stores only —
+    /// S3 uses the deployment id as its key prefix). Defaults to
+    /// `workspace-<deployment id>`.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub artifact_ref: Option<String>,
+    /// Credentials for the store, as a secret reference. Artifact stores only;
+    /// the `aws` CLI reads its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<SecretRef>,
+}
+
+/// Which transport a [`WorkspaceSpec::store`] names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceStore {
+    /// `s3://bucket/prefix`, with the prefix never leading- or trailing-slashed
+    /// and possibly empty.
+    S3 { bucket: String, prefix: String },
+    /// A remote `art serve`, base URL with no trailing slash.
+    Remote(String),
+    /// A local store root.
+    Local(String),
+}
+
+impl WorkspaceSpec {
+    /// The guest path with no trailing slash.
+    pub fn guest_path(&self) -> &str {
+        self.path
+            .as_deref()
+            .map(|p| p.trim().trim_end_matches('/'))
+            .filter(|p| !p.is_empty())
+            .unwrap_or(DEFAULT_WORKSPACE_PATH)
+    }
+
+    /// The tag snapshots are published under in an artifact store.
+    pub fn tag(&self, deployment_id: &str) -> String {
+        match self.artifact_ref.as_deref().map(str::trim) {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => format!("workspace-{deployment_id}"),
+        }
+    }
+
+    /// Parse `store`. `None` when it is none of the three forms.
+    pub fn backend(&self) -> Option<WorkspaceStore> {
+        let store = self.store.trim();
+        if let Some(rest) = store.strip_prefix("s3://") {
+            let (bucket, prefix) = match rest.split_once('/') {
+                Some((b, p)) => (b, p.trim_matches('/')),
+                None => (rest, ""),
+            };
+            let bucket_ok = !bucket.is_empty()
+                && bucket
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.'));
+            if !bucket_ok {
+                return None;
+            }
+            return Some(WorkspaceStore::S3 {
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
+            });
+        }
+        if !is_supported_store(store) {
+            return None;
+        }
+        if is_remote_store(store) {
+            Some(WorkspaceStore::Remote(store.trim_end_matches('/').to_string()))
+        } else {
+            Some(WorkspaceStore::Local(store.to_string()))
+        }
+    }
+
+    fn validate(
+        &self,
+        driver: SandboxDriver,
+        scaling: &ScalingPolicy,
+        mounts: &[MountSpec],
+    ) -> Result<(), SpecError> {
+        if driver != SandboxDriver::Firecracker {
+            return Err(SpecError::WorkspaceDriver(driver));
+        }
+        if let Some(path) = &self.path
+            && let Some(why) = workspace_path_problem(path)
+        {
+            return Err(SpecError::BadWorkspacePath {
+                path: path.clone(),
+                why,
+            });
+        }
+        if self.backend().is_none() {
+            return Err(SpecError::BadWorkspaceStore(self.store.clone()));
+        }
+        if let Some(r) = &self.artifact_ref
+            && !is_valid_artifact_ref(r.trim())
+        {
+            return Err(SpecError::BadWorkspaceRef(r.clone()));
+        }
+        if let Some(auth) = &self.auth {
+            auth.validate().map_err(|e| SpecError::BadSecretRef {
+                field: "vm.workspace.auth",
+                detail: e.to_string(),
+            })?;
+        }
+        if scaling.max_replicas != 1 {
+            return Err(SpecError::WorkspaceReplicas(scaling.max_replicas));
+        }
+        if scaling.warm_pool != 0 {
+            return Err(SpecError::WorkspaceWarmPool(scaling.warm_pool));
+        }
+        let ws = self.guest_path();
+        for m in mounts {
+            let p = m.guest_path();
+            if p == ws || p.starts_with(&format!("{ws}/")) || ws.starts_with(&format!("{p}/")) {
+                return Err(SpecError::WorkspaceCollidesWithMount {
+                    workspace: ws.to_string(),
+                    mount: p.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`mount_path_problem`] with `/workspace` allowed: for a workspace that path
+/// is not reserved, it is the point.
+fn workspace_path_problem(path: &str) -> Option<&'static str> {
+    let trimmed = path.trim().trim_end_matches('/');
+    if trimmed == DEFAULT_WORKSPACE_PATH {
+        return None;
+    }
+    mount_path_problem(path)
+}
+
 /// Why a guest mount path is unusable, or `None` if it is fine.
 ///
 /// Stricter than "a path": it is compared against other mount paths, joined into
@@ -844,7 +1054,7 @@ fn validate_mounts(mounts: &[MountSpec], driver: SandboxDriver) -> Result<(), Sp
 }
 
 /// A sha256 in the only spelling the artifact store writes: 64 lowercase hex.
-fn is_sha256_hex(s: &str) -> bool {
+pub fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
@@ -2777,6 +2987,24 @@ pub enum SpecError {
         field: &'static str,
         detail: String,
     },
+    /// A workspace on a driver other than `firecracker`. See [`WorkspaceSpec`].
+    WorkspaceDriver(SandboxDriver),
+    BadWorkspacePath {
+        path: String,
+        why: &'static str,
+    },
+    /// `vm.workspace.store` is not `s3://…`, a URL, or an absolute path.
+    BadWorkspaceStore(String),
+    BadWorkspaceRef(String),
+    /// A workspace with more than one replica: two writers, one snapshot.
+    WorkspaceReplicas(u32),
+    WorkspaceWarmPool(u32),
+    /// The workspace and a mount would land on the same guest path, or one
+    /// inside the other.
+    WorkspaceCollidesWithMount {
+        workspace: String,
+        mount: String,
+    },
 }
 
 impl std::fmt::Display for SpecError {
@@ -3211,6 +3439,40 @@ impl std::fmt::Display for SpecError {
             Self::BadSecretRef { field, detail } => {
                 write!(f, "{field} is unusable: {detail}")
             }
+            Self::WorkspaceDriver(d) => write!(
+                f,
+                "vm.workspace needs the firecracker driver, got {d:?}: the kvm driver syncs a \
+                 writable mount back into the host tree itself when the VM stops, which is not \
+                 the capture this feature performs"
+            ),
+            Self::BadWorkspacePath { path, why } => {
+                write!(f, "vm.workspace.path {path:?} {why}")
+            }
+            Self::BadWorkspaceStore(s) => write!(
+                f,
+                "vm.workspace.store {s:?} is not a snapshot destination: use `s3://bucket/prefix`, \
+                 an `http(s)://` artifact store, or the absolute path of a local one"
+            ),
+            Self::BadWorkspaceRef(r) => write!(
+                f,
+                "vm.workspace.ref {r:?} is not a tag: [A-Za-z0-9._-], not starting with `-` or `.`"
+            ),
+            Self::WorkspaceReplicas(n) => write!(
+                f,
+                "vm.workspace needs scaling.max_replicas = 1, got {n}: the workspace is one \
+                 directory with one writer, captured from the replica that retires and seeded \
+                 into the one that replaces it; two replicas would each capture a different copy"
+            ),
+            Self::WorkspaceWarmPool(n) => write!(
+                f,
+                "vm.workspace needs scaling.warm_pool = 0, got {n}: a warm replica is booted \
+                 ahead of time from a tree the live replica is still changing"
+            ),
+            Self::WorkspaceCollidesWithMount { workspace, mount } => write!(
+                f,
+                "vm.workspace.path {workspace:?} and mount {mount:?} overlap; a mount cannot sit \
+                 on or inside the workspace, and the workspace cannot sit inside a mount"
+            ),
         }
     }
 }
@@ -3354,6 +3616,9 @@ impl DeploymentSpec {
             // After the driver check, because one mount rule depends on which
             // driver this is.
             validate_mounts(&vm.mounts, vm.driver)?;
+            if let Some(workspace) = &vm.workspace {
+                workspace.validate(vm.driver, &self.scaling, &vm.mounts)?;
+            }
             if self.scaling.min_replicas > self.scaling.max_replicas {
                 return Err(SpecError::BadReplicaRange {
                     min: self.scaling.min_replicas,
@@ -3553,6 +3818,7 @@ mod tests {
                 setup_hooks: None,
                 open_ports: vec![],
                 mounts: vec![],
+                workspace: None,
                 ttl_seconds: 3600,
             }),
             scaling: ScalingPolicy::default(),
@@ -5311,6 +5577,132 @@ mod tests {
             with["vm"]["mounts"][0].get("digest").is_none(),
             "an unpulled mount carries no digest",
         );
+    }
+
+    // -- workspaces --------------------------------------------------------
+
+    mod workspaces {
+        use super::*;
+
+        fn with_workspace(ws: serde_json::Value) -> DeploymentSpec {
+            let mut s = spec();
+            s.vm.as_mut().unwrap().workspace = Some(serde_json::from_value(ws).unwrap());
+            s.scaling.max_replicas = 1;
+            s.scaling.warm_pool = 0;
+            s
+        }
+
+        #[test]
+        fn the_three_store_forms_parse_and_nothing_else_does() {
+            let ws = |store: &str| WorkspaceSpec {
+                path: None,
+                store: store.into(),
+                artifact_ref: None,
+                auth: None,
+            };
+            assert_eq!(
+                ws("s3://my-bucket/ws/").backend(),
+                Some(WorkspaceStore::S3 {
+                    bucket: "my-bucket".into(),
+                    prefix: "ws".into()
+                })
+            );
+            assert_eq!(
+                ws("s3://my-bucket").backend(),
+                Some(WorkspaceStore::S3 {
+                    bucket: "my-bucket".into(),
+                    prefix: String::new()
+                })
+            );
+            assert_eq!(
+                ws("https://art.example.com/").backend(),
+                Some(WorkspaceStore::Remote("https://art.example.com".into()))
+            );
+            assert_eq!(
+                ws("/srv/artifacts").backend(),
+                Some(WorkspaceStore::Local("/srv/artifacts".into()))
+            );
+            assert_eq!(ws("s3://").backend(), None);
+            assert_eq!(ws("s3://Bad_Bucket").backend(), None);
+            assert_eq!(ws("ftp://x").backend(), None);
+            assert_eq!(ws("relative/path").backend(), None);
+        }
+
+        #[test]
+        fn defaults_are_workspace_and_a_tag_named_after_the_deployment() {
+            let s = with_workspace(serde_json::json!({"store": "s3://b"}));
+            let ws = s.vm.as_ref().unwrap().workspace.as_ref().unwrap();
+            assert_eq!(ws.guest_path(), "/workspace");
+            assert_eq!(ws.tag("fastcar"), "workspace-fastcar");
+            s.validate().expect("the minimal workspace is valid");
+
+            let s = with_workspace(
+                serde_json::json!({"store": "https://art", "ref": "fc-ws", "path": "/data/"}),
+            );
+            let ws = s.vm.as_ref().unwrap().workspace.as_ref().unwrap();
+            assert_eq!(ws.guest_path(), "/data");
+            assert_eq!(ws.tag("fastcar"), "fc-ws");
+            s.validate().unwrap();
+        }
+
+        #[test]
+        fn one_writer_only() {
+            let mut s = with_workspace(serde_json::json!({"store": "s3://b"}));
+            s.scaling.max_replicas = 2;
+            assert!(matches!(s.validate(), Err(SpecError::WorkspaceReplicas(2))));
+
+            let mut s = with_workspace(serde_json::json!({"store": "s3://b"}));
+            s.scaling.warm_pool = 1;
+            assert!(matches!(s.validate(), Err(SpecError::WorkspaceWarmPool(1))));
+
+            let mut s = with_workspace(serde_json::json!({"store": "s3://b"}));
+            s.vm.as_mut().unwrap().driver = SandboxDriver::Kvm;
+            assert!(matches!(s.validate(), Err(SpecError::WorkspaceDriver(_))));
+        }
+
+        #[test]
+        fn workspace_is_allowed_for_the_workspace_but_still_not_for_a_mount() {
+            let s = with_workspace(serde_json::json!({"store": "s3://b", "path": "/workspace"}));
+            s.validate().unwrap();
+            let s = with_workspace(serde_json::json!({"store": "s3://b", "path": "/proc/x"}));
+            assert!(matches!(s.validate(), Err(SpecError::BadWorkspacePath { .. })));
+            let s = with_workspace(serde_json::json!({"store": "s3://b", "path": "relative"}));
+            assert!(matches!(s.validate(), Err(SpecError::BadWorkspacePath { .. })));
+        }
+
+        #[test]
+        fn a_mount_may_not_overlap_the_workspace() {
+            let mut s = with_workspace(serde_json::json!({"store": "s3://b", "path": "/data"}));
+            s.vm.as_mut().unwrap().mounts = vec![a_mount("/data/corpus")];
+            assert!(matches!(s.validate(), Err(SpecError::WorkspaceCollidesWithMount { .. })));
+            let mut s = with_workspace(serde_json::json!({"store": "s3://b", "path": "/data/ws"}));
+            s.vm.as_mut().unwrap().mounts = vec![a_mount("/data")];
+            assert!(matches!(s.validate(), Err(SpecError::WorkspaceCollidesWithMount { .. })));
+            let mut s = with_workspace(serde_json::json!({"store": "s3://b"}));
+            s.vm.as_mut().unwrap().mounts = vec![a_mount("/data")];
+            s.validate().unwrap();
+        }
+
+        #[test]
+        fn bad_store_and_ref_are_named() {
+            let s = with_workspace(serde_json::json!({"store": "nope"}));
+            assert!(matches!(s.validate(), Err(SpecError::BadWorkspaceStore(_))));
+            let s = with_workspace(serde_json::json!({"store": "s3://b", "ref": "-x"}));
+            assert!(matches!(s.validate(), Err(SpecError::BadWorkspaceRef(_))));
+        }
+
+        /// Absent from the wire when unset, so existing specs round-trip
+        /// byte-for-byte.
+        #[test]
+        fn absent_when_unset_and_a_template_change_when_set() {
+            let json = serde_json::to_value(spec()).unwrap();
+            assert!(json["vm"].get("workspace").is_none(), "{json}");
+            let with = with_workspace(serde_json::json!({"store": "s3://b"}));
+            assert_ne!(spec().vm, with.vm, "adding a workspace must recycle the pool");
+            let json = serde_json::to_value(&with).unwrap();
+            assert_eq!(json["vm"]["workspace"]["store"], "s3://b");
+            assert!(json["vm"]["workspace"].get("path").is_none());
+        }
     }
 
     // -- JWT gates ---------------------------------------------------------

@@ -118,6 +118,7 @@ fn vm_spec() -> DeploymentSpec {
                     "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0".into(),
                 ),
             }],
+            workspace: None,
             ttl_seconds: 86400,
         }),
         scaling: crate::config::ScalingPolicy {
@@ -428,6 +429,7 @@ fn deployment_status_is_stable() {
                 } else {
                     vec![]
                 },
+                workspace: None,
             },
         );
     }

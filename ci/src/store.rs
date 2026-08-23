@@ -227,6 +227,10 @@ pub struct JobRow {
     /// ids, so this is what a redelivery executes.
     pub plan: serde_json::Value,
     pub error: Option<String>,
+    /// When the job went on the queue. Distinct from `started_at`, and the
+    /// difference is the point: every timeout a job has is measured from
+    /// `started_at`, the moment a consumer claimed it — never from here.
+    pub queued_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -249,9 +253,20 @@ impl JobRow {
             outputs: r.get("outputs"),
             plan: r.get("plan"),
             error: r.get("error"),
+            // Older rows predate the column's backfill; a missing value reads
+            // as "not queued" rather than taking the query down.
+            queued_at: r.try_get("queued_at").ok().flatten(),
             started_at: r.get("started_at"),
             finished_at: r.get("finished_at"),
         }
+    }
+
+    /// How long the job sat on the queue before a consumer claimed it — or has
+    /// sat so far. `None` until it has been queued.
+    pub fn queue_wait(&self) -> Option<std::time::Duration> {
+        let queued = self.queued_at?;
+        let end = self.started_at.unwrap_or_else(Utc::now);
+        Some((end - queued).to_std().unwrap_or_default())
     }
 }
 
@@ -394,16 +409,51 @@ pub struct RunRequest {
 pub struct Store {
     pool: PgPool,
     log_dir: PathBuf,
+    /// Restored on the migration connection, which clears it for its own use.
+    statement_timeout: Duration,
 }
 
 impl Store {
-    pub async fn connect(database_url: &str, log_dir: PathBuf) -> Result<Self, StoreError> {
+    pub async fn connect(
+        database_url: &str,
+        log_dir: PathBuf,
+        statement_timeout: Duration,
+    ) -> Result<Self, StoreError> {
+        // Every connection, not the DSN: `options=-c statement_timeout=…` is
+        // silently dropped by some poolers, and this has to hold on the
+        // connection actually executing the query.
+        let setting = format!("SET statement_timeout = {}", statement_timeout.as_millis());
         let pool = PgPoolOptions::new()
             .max_connections(10)
             // Fail fast at startup rather than after the default 30s: a wrong
             // `CI_DATABASE_URL` should look like a configuration error, not a
             // hang.
             .acquire_timeout(Duration::from_secs(10))
+            // **`acquire_timeout` does not bound a query.** It bounds getting a
+            // connection *out of the pool*; once one is checked out, a statement
+            // the server never answers waits for ever. That is not hypothetical
+            // here: a database behind a pool that suspends idle instances leaves
+            // an established socket that accepts writes and returns nothing, the
+            // same shape as a tunnel whose QUIC connection is up and whose data
+            // path is dead.
+            //
+            // What made it expensive is where it lands. `run_job` reads the job
+            // row and claims it *before* its first log statement, so a wedge
+            // there is a consumer that has stopped working while saying nothing
+            // at all: the job row stays `queued`, the message stays in flight
+            // with the ack heartbeat renewing it, and the only visible symptom
+            // is a reaper failing the job much later for a reason that is not
+            // the reason.
+            //
+            // A bounded statement turns all of that into one error, logged,
+            // retried by the delivery ladder.
+            .after_connect(move |conn, _meta| {
+                let setting = setting.clone();
+                Box::pin(async move {
+                    sqlx::query(&setting).execute(conn).await?;
+                    Ok(())
+                })
+            })
             .connect(database_url)
             .await
             .map_err(|e| StoreError::Connect(e.to_string()))?;
@@ -413,7 +463,11 @@ impl Store {
                 path: log_dir.clone(),
                 reason: e.to_string(),
             })?;
-        Ok(Self { pool, log_dir })
+        Ok(Self {
+            pool,
+            log_dir,
+            statement_timeout,
+        })
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -471,6 +525,19 @@ impl Store {
             .await
             .map_err(StoreError::sql)?;
 
+        // Migrations are exempt from the statement timeout. DDL is legitimately
+        // slow — a `CREATE INDEX` over a grown table is the case — and it is not
+        // the failure the timeout exists for: this session already holds the
+        // advisory lock below, so exactly one process runs it and a wedge is
+        // visible as a start that never completes rather than a consumer that
+        // quietly stops. Restored explicitly at the end, not to `DEFAULT`, which
+        // would return this connection to the pool with the server's setting
+        // rather than ours.
+        sqlx::query("SET statement_timeout = 0")
+            .execute(&mut *conn)
+            .await
+            .map_err(StoreError::sql)?;
+
         // The lock is held on this one connection and released explicitly
         // below; a dropped connection also releases it, so a panicking migrator
         // cannot wedge every future start.
@@ -491,6 +558,14 @@ impl Store {
         let _ = sqlx::query("SET lock_timeout = DEFAULT")
             .execute(&mut *conn)
             .await;
+        // Ours, not `DEFAULT`: this connection goes back into the pool and must
+        // carry the same bound `after_connect` gave every other one.
+        let _ = sqlx::query(&format!(
+            "SET statement_timeout = {}",
+            self.statement_timeout.as_millis()
+        ))
+        .execute(&mut *conn)
+        .await;
         result
     }
 
@@ -1726,7 +1801,9 @@ mod tests {
     async fn test_store() -> Store {
         let url = std::env::var("CI_TEST_DATABASE_URL").expect("CI_TEST_DATABASE_URL");
         let dir = std::env::temp_dir().join(format!("ci-test-logs-{}", crate::vm::new_id()));
-        let store = Store::connect(&url, dir).await.expect("connects");
+        let store = Store::connect(&url, dir, std::time::Duration::from_secs(30))
+            .await
+            .expect("connects");
         store
             .migrate(Path::new("migrations"))
             .await

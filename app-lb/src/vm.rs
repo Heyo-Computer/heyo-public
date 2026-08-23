@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::time::Duration;
 
 /// Marks a sandbox as ours and records which deployment owns it, so VMs can be
@@ -460,7 +461,17 @@ impl VmManager {
     ///
     /// Fails before touching the daemon if any of the spec's mounts has no tree
     /// on this host; see [`VmError::MountNotPulled`].
-    pub async fn create(&self, spec: &VmSpec, name: String) -> Result<Sandbox, VmError> {
+    ///
+    /// `workspace` is the deployment's workspace tree, when it has one — see
+    /// [`crate::workspace`]. It goes **last** in the mount list, writable, so
+    /// its image index on the daemon is `spec.mounts.len()`; the capture path
+    /// relies on that to find the image again.
+    pub async fn create(
+        &self,
+        spec: &VmSpec,
+        name: String,
+        workspace: Option<&Path>,
+    ) -> Result<Sandbox, VmError> {
         debug_assert!(
             matches!(spec.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm),
             "DeploymentSpec::validate must reject other drivers before reaching here",
@@ -494,7 +505,14 @@ impl VmManager {
 
         // Resolved before the request, so a deployment whose mounts have not
         // been pulled fails without asking the daemon for anything.
-        let mounts = self.guest_mounts(spec)?;
+        let mut mounts = self.guest_mounts(spec)?;
+        if let (Some(tree), Some(ws)) = (workspace, spec.workspace.as_ref()) {
+            mounts.push(json!({
+                "host_path": tree.to_string_lossy(),
+                "sandbox_path": ws.guest_path(),
+                "read_only": false,
+            }));
+        }
 
         let mut body =
             serde_json::to_value(&options).map_err(|e| VmError::BadCreateBody(e.to_string()))?;
@@ -975,6 +993,7 @@ mod tests {
             setup_hooks: None,
             open_ports: vec![],
             mounts,
+            workspace: None,
             ttl_seconds: 3600,
         }
     }

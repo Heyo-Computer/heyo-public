@@ -927,6 +927,61 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
             }
         }
 
+        if let Some(ws) = &d.workspace {
+            output::section("Workspace");
+            let short = |d: &Option<String>| match d {
+                Some(d) => d.chars().take(12).collect::<String>(),
+                None => "(empty)".to_string(),
+            };
+            output::field(&ws.path, format!("{} ({})", ws.store, ws.phase));
+            output::field(
+                "  Snapshot",
+                match ws.captured_at {
+                    Some(at) => format!(
+                        "{} — {} files, {}, captured from {} at {}",
+                        short(&ws.digest),
+                        ws.files,
+                        output::bytes(ws.bytes),
+                        ws.captured_from.as_deref().unwrap_or("?"),
+                        output::timestamp(at),
+                    ),
+                    None => short(&ws.digest),
+                },
+            );
+            output::field(
+                "  In store",
+                if ws.push_pending {
+                    format!("NOT YET — push pending (store holds {})", short(&ws.pushed))
+                } else {
+                    match ws.pushed_at {
+                        Some(at) => format!("{} at {}", short(&ws.pushed), output::timestamp(at)),
+                        None => short(&ws.pushed),
+                    }
+                },
+            );
+            for p in &ws.pending {
+                output::field(
+                    "  Capture queued",
+                    format!(
+                        "{} (then {}{})",
+                        p.sandbox_id,
+                        p.then,
+                        if p.attempts > 0 {
+                            format!(", {} failed attempt(s)", p.attempts)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                );
+            }
+            if let Some(why) = &ws.blocked {
+                output::field("  Pool held", why);
+            }
+            if let Some(e) = &ws.last_error {
+                output::field("  Last error", e);
+            }
+        }
+
         if let Some(build) = &d.spec.build {
             output::section("Build source");
             output::field("Repo", &build.repo);

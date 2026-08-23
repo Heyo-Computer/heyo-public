@@ -55,7 +55,45 @@ export interface VmSpec {
    * store. Attached at boot, so editing this list recycles the pool.
    */
   mounts?: MountSpec[];
+  /**
+   * A writable directory owned by the deployment rather than by any one VM:
+   * captured when a replica retires (rollout, restart, eviction, idle
+   * suspend) and seeded into its replacement, with every snapshot pushed to
+   * `store`. Requires `scaling.max_replicas: 1`, `warm_pool: 0` and the
+   * firecracker driver.
+   */
+  workspace?: WorkspaceSpec;
   ttl_seconds?: number;
+}
+
+export interface WorkspaceSpec {
+  /** Guest path. Defaults to `/workspace`, which `disk_size_gb` then sizes. */
+  path?: string;
+  /** `s3://bucket[/prefix]`, an `http(s)://` artifact store, or a local store root. */
+  store: string;
+  /** Tag the newest snapshot is published under (artifact stores). Defaults to `workspace-<id>`. */
+  ref?: string;
+  auth?: SecretRef;
+}
+
+export interface WorkspaceStatus {
+  path: string;
+  store: string;
+  /** The snapshot the pool runs from; `null` is the empty workspace. */
+  digest: string | null;
+  captured_at: number | null;
+  captured_from: string | null;
+  files: number;
+  bytes: number;
+  /** The snapshot the store is known to hold. */
+  pushed: string | null;
+  pushed_at: number | null;
+  push_pending: boolean;
+  phase: "idle" | "restoring" | "capturing" | "pushing" | "blocked";
+  /** Why no replica can be created right now, when none can. */
+  blocked?: string;
+  pending?: { sandbox_id: string; then: "kill" | "suspend"; queued_at: number; attempts: number }[];
+  last_error?: string;
 }
 
 /**
@@ -293,6 +331,8 @@ export interface DeploymentStatus {
   pending: number;
   total_in_flight: number;
   vms: VmStatus[];
+  /** Present when the spec declares `vm.workspace`. */
+  workspace?: WorkspaceStatus;
 }
 
 export interface UpstreamTrafficStatus {

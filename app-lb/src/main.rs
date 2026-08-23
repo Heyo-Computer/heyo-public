@@ -38,6 +38,7 @@ mod tls;
 mod tokens;
 mod unpack;
 mod vm;
+mod workspace;
 mod workflows;
 
 use crate::acme::{AcmeConfig, AcmeManager, ChallengeTable};
@@ -633,6 +634,30 @@ fn main() {
         }
     };
 
+    // Deployment-owned workspaces (`vm.workspace`). Needs the daemon's data
+    // directory to find a stopped VM's workspace image; without one, the same
+    // as without disk management, a workspace deployment cannot be served and
+    // the create path says so.
+    let workspaces = Arc::new(workspace::Workspaces::new(
+        workspace::WorkspaceConfig::from_env(
+            &cfg,
+            disk_cfg
+                .as_ref()
+                .map(|c| c.data_dir.clone())
+                .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent")),
+        ),
+        vms.clone(),
+        registry.clone(),
+        secrets.clone(),
+    ));
+    if let Err(e) = workspaces.ensure_root() {
+        panic!("{e}. Set APP_LB_WORKSPACES_DIR to a directory app-lb can write and heyvmd can read");
+    }
+    match workspaces.load() {
+        0 => {}
+        n => tracing::info!(count = n, "loaded workspace records"),
+    }
+
     // `background_service` hands back an Arc to the same task the service runs,
     // which is how the admin API reaches the autoscaler to tear deployments down.
     let autoscaler_svc = background_service(
@@ -643,6 +668,7 @@ fn main() {
             metrics.clone(),
             event_feed.clone(),
             disk_cfg.clone(),
+            workspaces.clone(),
         ),
     );
     let autoscaler = autoscaler_svc.task();
@@ -856,6 +882,12 @@ fn main() {
             ),
         ));
     }
+    // Workspace captures, pushes and restores: gigabytes of disk and network
+    // I/O, run one at a time off the proxy's path.
+    server.add_service(background_service(
+        "workspaces",
+        workspace::WorkspaceWorker::new(workspaces.clone()),
+    ));
     let proxy_handle = server.add_service(proxy_svc);
     // Don't accept traffic until the autoscaler has adopted existing VMs and
     // built the warm pool; otherwise the first requests all eat a cold start.

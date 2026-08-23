@@ -90,8 +90,15 @@ enum QueueVerdict {
     /// Nothing is bound to the subject: the message is waiting for a reader
     /// that does not exist.
     NoConsumer,
-    /// Bound, and the message is still sitting there undelivered.
+    /// Bound, and the message is still sitting there undelivered — while
+    /// nothing on the route is in flight. The consumer exists but is not
+    /// pulling.
     Waiting(u64),
+    /// Bound, working, and behind: something on the route is in flight and
+    /// this job's message is queued behind it. That is capacity, not a fault —
+    /// each route is consumed one job at a time — and a job here has not
+    /// started, so none of its timeouts have either.
+    Busy { in_flight: u64, waiting: u64 },
     /// Bound, and something is holding the message right now without having
     /// acked it. Not this process — this process would have logged it.
     InFlightElsewhere(u64),
@@ -102,6 +109,33 @@ enum QueueVerdict {
     TakenElsewhere,
     /// NATS could not be asked; say nothing rather than guess.
     Unknown,
+}
+
+impl QueueVerdict {
+    /// Read the queue's two counters into a verdict.
+    ///
+    /// The order matters. A route with work in flight *and* a backlog is a
+    /// runner that is simply busy, and must be recognised before either
+    /// counter is read on its own — read as `Waiting` it would be failed as
+    /// "nothing consumed the queue", which is how N jobs on one host came to
+    /// produce one success and N-1 timeouts.
+    fn from_depth(depth: Option<crate::bus::QueueDepth>) -> Self {
+        match depth {
+            None => Self::NoConsumer,
+            Some(d) if d.in_flight > 0 && d.waiting > 0 => Self::Busy {
+                in_flight: d.in_flight,
+                waiting: d.waiting,
+            },
+            Some(d) if d.waiting > 0 => Self::Waiting(d.waiting),
+            Some(d) if d.in_flight > 0 => Self::InFlightElsewhere(d.in_flight),
+            Some(_) => Self::TakenElsewhere,
+        }
+    }
+
+    /// Whether the job is waiting its turn behind a live consumer.
+    fn is_capacity_wait(self) -> bool {
+        matches!(self, Self::Busy { .. })
+    }
 }
 
 pub struct Dispatcher {
@@ -1933,6 +1967,29 @@ async fn copy_tree(
     Ok(())
 }
 
+/// Run one job under `CI_MAX_JOB_SECONDS`, measured from now — the moment the
+/// job was taken off the queue — and never from when it was queued.
+///
+/// Its own function so the property is testable without NATS: three jobs
+/// taken one after another from one route each get the whole ceiling, however
+/// long the ones before them took.
+async fn bounded_from_pickup<F>(
+    ceiling: Duration,
+    job_key: &str,
+    job: F,
+) -> Result<JobStatus, DispatchError>
+where
+    F: std::future::Future<Output = Result<JobStatus, DispatchError>>,
+{
+    match tokio::time::timeout(ceiling, job).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(DispatchError::JobTimeout {
+            job: job_key.to_string(),
+            after: ceiling,
+        }),
+    }
+}
+
 /// The pull loop for one route.
 ///
 /// One task per route rather than one shared task: a slow build on one runner
@@ -2014,15 +2071,15 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
             // never reaches its own release. The lease reclaims it once this
             // dispatcher stops renewing, which is exactly the case leases exist
             // for.
+            //
+            // The clock starts *here*, on pickup. A job that sat on this
+            // route's queue behind another build has spent none of its budget
+            // waiting: each route is consumed one job at a time, so N jobs on
+            // one runner each get the full ceiling from the moment they are
+            // taken, not from when they were submitted.
             let ceiling = dispatcher.config.max_job_duration;
             let outcome =
-                match tokio::time::timeout(ceiling, dispatcher.run_job(&job, attempt)).await {
-                    Ok(outcome) => outcome,
-                    Err(_) => Err(DispatchError::JobTimeout {
-                        job: job.job_key.clone(),
-                        after: ceiling,
-                    }),
-                };
+                bounded_from_pickup(ceiling, &job.job_key, dispatcher.run_job(&job, attempt)).await;
             // Before the ack, always — including on the error paths below, which
             // is why it is aborted here rather than in each arm.
             heartbeat.abort();
@@ -2142,20 +2199,20 @@ impl Dispatcher {
                         continue;
                     }
                     // The durable, not just the route. Durable names derive only
-                // from the route and CI_NATS_SUBJECT_PREFIX, so two instances
-                // sharing a prefix bind the *same* durable and compete for the
-                // same messages — silently, because neither is doing anything
-                // wrong from its own point of view. Printing the name each
-                // instance claims, next to who is claiming it, is what makes
-                // that collision visible in two log files side by side.
-                let durable = self
-                    .bus
-                    .durable_for(&route)
-                    .unwrap_or_else(|_| "<unnameable>".to_string());
-                tracing::info!(
-                    instance = %self.config.instance_id,
-                    "starting a consumer for {key} on durable {durable}"
-                );
+                    // from the route and CI_NATS_SUBJECT_PREFIX, so two instances
+                    // sharing a prefix bind the *same* durable and compete for the
+                    // same messages — silently, because neither is doing anything
+                    // wrong from its own point of view. Printing the name each
+                    // instance claims, next to who is claiming it, is what makes
+                    // that collision visible in two log files side by side.
+                    let durable = self
+                        .bus
+                        .durable_for(&route)
+                        .unwrap_or_else(|_| "<unnameable>".to_string());
+                    tracing::info!(
+                        instance = %self.config.instance_id,
+                        "starting a consumer for {key} on durable {durable}"
+                    );
                     let d = self.clone();
                     let r = route.clone();
                     running.insert(key, tokio::spawn(consume(d, r)));
@@ -2281,12 +2338,7 @@ impl Dispatcher {
                                 tracing::warn!("could not read the queue for {key}: {e}");
                                 QueueVerdict::Unknown
                             }
-                            Ok(None) => QueueVerdict::NoConsumer,
-                            Ok(Some(d)) if d.waiting > 0 => QueueVerdict::Waiting(d.waiting),
-                            Ok(Some(d)) if d.in_flight > 0 => {
-                                QueueVerdict::InFlightElsewhere(d.in_flight)
-                            }
-                            Ok(Some(_)) => QueueVerdict::TakenElsewhere,
+                            Ok(depth) => QueueVerdict::from_depth(depth),
                         };
                         verdicts.insert(key, v);
                         v
@@ -2294,15 +2346,48 @@ impl Dispatcher {
                 }
             };
 
-            let detail =
-                Self::stuck_job_detail(
-                    placed,
-                    job.network.as_deref(),
-                    &pool,
-                    wait,
-                    verdict,
-                    &self.config.instance_id,
-                );
+            // Behind a busy runner, not waiting on one that will never come.
+            // The job has not been picked up, so its clock has not started;
+            // CI_RUNNER_WAIT_SECS does not apply. Only an explicit
+            // CI_QUEUE_WAIT_SECS bounds this wait, and by default nothing does.
+            if verdict.is_capacity_wait() {
+                let queued_for = job.queue_wait().unwrap_or_default();
+                match Self::capacity_wait_exceeded(queued_for, self.config.heyvm.queue_wait) {
+                    None => {
+                        tracing::debug!(
+                            job = %job.job_key,
+                            waited = queued_for.as_secs(),
+                            "queued behind a busy runner; its timeouts start at pickup"
+                        );
+                        continue;
+                    }
+                    Some(cap) => {
+                        let detail = Self::capacity_wait_detail(queued_for, cap, verdict);
+                        tracing::warn!(job = %job.job_key, "{detail}");
+                        if let Err(e) = self
+                            .store
+                            .set_job_status(&job.id, JobStatus::Failure, Some(&detail))
+                            .await
+                        {
+                            tracing::warn!(job = %job.job_key, "could not fail a stuck job: {e}");
+                            continue;
+                        }
+                        if let Err(e) = self.advance_run(&job.run_id).await {
+                            tracing::warn!(run = %job.run_id, "could not advance after failing: {e}");
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            let detail = Self::stuck_job_detail(
+                placed,
+                job.network.as_deref(),
+                &pool,
+                wait,
+                verdict,
+                &self.config.instance_id,
+            );
             tracing::warn!(job = %job.job_key, "{detail}");
             if let Err(e) = self
                 .store
@@ -2316,6 +2401,32 @@ impl Dispatcher {
                 tracing::warn!(run = %job.run_id, "could not advance after failing: {e}");
             }
         }
+    }
+
+    /// Whether a capacity wait has run past its configured cap, and what the
+    /// cap was. `None` is the usual answer: with no `CI_QUEUE_WAIT_SECS` a job
+    /// waits behind a busy runner for as long as it takes.
+    fn capacity_wait_exceeded(queued_for: Duration, cap: Option<Duration>) -> Option<Duration> {
+        cap.filter(|cap| queued_for > *cap)
+    }
+
+    /// The message for a job failed by `CI_QUEUE_WAIT_SECS`. Says what the
+    /// job was waiting on so it is not misread as a dead runner.
+    fn capacity_wait_detail(queued_for: Duration, cap: Duration, verdict: QueueVerdict) -> String {
+        let behind = match verdict {
+            QueueVerdict::Busy { in_flight, waiting } => {
+                format!("{in_flight} job(s) in flight and {waiting} queued ahead of or with it")
+            }
+            _ => "other work".to_string(),
+        };
+        format!(
+            "queued for {}s behind a busy runner ({behind}), past CI_QUEUE_WAIT_SECS ({}s). \
+             The runner is up and working; this job never started, so none of its own \
+             timeouts applied. Raise or unset CI_QUEUE_WAIT_SECS, add a host to the \
+             network, or resubmit when the backlog clears.",
+            queued_for.as_secs(),
+            cap.as_secs()
+        )
     }
 
     /// Why a job nobody took was never going to be taken.
@@ -3049,8 +3160,14 @@ mod tests {
         );
         assert!(detail.contains("no longer on the queue"), "{detail}");
         assert!(detail.contains("another consumer"), "{detail}");
-        assert!(detail.contains("CI_NATS_SUBJECT_PREFIX"), "names the cause: {detail}");
-        assert!(detail.contains("ci-abc123"), "names this instance: {detail}");
+        assert!(
+            detail.contains("CI_NATS_SUBJECT_PREFIX"),
+            "names the cause: {detail}"
+        );
+        assert!(
+            detail.contains("ci-abc123"),
+            "names this instance: {detail}"
+        );
         // The pool is healthy and therefore irrelevant; saying anything about
         // hosts here is what sent the last investigation the wrong way.
         assert!(!detail.contains("online host(s)"), "{detail}");
@@ -3079,7 +3196,10 @@ mod tests {
         // produce the same counters — the heartbeat holds a message in flight
         // for as long as the loop holds it.
         assert!(detail.contains("second `ci`"), "{detail}");
-        assert!(detail.contains("wedged before its first log line"), "{detail}");
+        assert!(
+            detail.contains("wedged before its first log line"),
+            "{detail}"
+        );
     }
 
     /// Nothing bound is decisive on its own and outranks the pool.
@@ -3099,7 +3219,10 @@ mod tests {
             QueueVerdict::NoConsumer,
             "ci-abc123",
         );
-        assert!(detail.contains("Nothing is bound to its subject"), "{detail}");
+        assert!(
+            detail.contains("Nothing is bound to its subject"),
+            "{detail}"
+        );
         assert!(detail.contains("could not bind a consumer"), "{detail}");
         assert!(!detail.contains("online host(s)"), "{detail}");
     }
@@ -3126,8 +3249,178 @@ mod tests {
         assert!(!detail.contains("another consumer"), "{detail}");
     }
 
-
     const WAIT: std::time::Duration = std::time::Duration::from_secs(900);
+
+    // ---- timeouts start at pickup, not at enqueue ------------------------
+
+    /// The bug: N jobs queued on one route, which is consumed one at a time.
+    /// The first ran; the rest aged past CI_RUNNER_WAIT_SECS on the queue and
+    /// were failed as "nothing consumed the queue". With work in flight and
+    /// a backlog behind it the queue is busy, and a busy queue is a wait.
+    #[test]
+    fn a_backlog_behind_a_working_consumer_is_a_capacity_wait_not_a_fault() {
+        let depth = crate::bus::QueueDepth {
+            in_flight: 1,
+            waiting: 2,
+        };
+        let verdict = QueueVerdict::from_depth(Some(depth));
+        assert_eq!(
+            verdict,
+            QueueVerdict::Busy {
+                in_flight: 1,
+                waiting: 2
+            }
+        );
+        assert!(verdict.is_capacity_wait());
+
+        // The other readings are unchanged: these are real faults.
+        assert_eq!(QueueVerdict::from_depth(None), QueueVerdict::NoConsumer);
+        assert_eq!(
+            QueueVerdict::from_depth(Some(crate::bus::QueueDepth {
+                in_flight: 0,
+                waiting: 3
+            })),
+            QueueVerdict::Waiting(3)
+        );
+        assert_eq!(
+            QueueVerdict::from_depth(Some(crate::bus::QueueDepth {
+                in_flight: 2,
+                waiting: 0
+            })),
+            QueueVerdict::InFlightElsewhere(2)
+        );
+        assert_eq!(
+            QueueVerdict::from_depth(Some(crate::bus::QueueDepth {
+                in_flight: 0,
+                waiting: 0
+            })),
+            QueueVerdict::TakenElsewhere
+        );
+        for v in [
+            QueueVerdict::NoConsumer,
+            QueueVerdict::Waiting(1),
+            QueueVerdict::InFlightElsewhere(1),
+            QueueVerdict::TakenElsewhere,
+            QueueVerdict::Unknown,
+        ] {
+            assert!(!v.is_capacity_wait(), "{v:?}");
+        }
+    }
+
+    /// Without CI_QUEUE_WAIT_SECS a capacity wait is never failed, however
+    /// long it has gone on; with it, only once the cap is passed.
+    #[test]
+    fn a_capacity_wait_is_unbounded_unless_a_queue_wait_is_configured() {
+        let days = Duration::from_secs(3 * 24 * 3600);
+        assert_eq!(Dispatcher::capacity_wait_exceeded(days, None), None);
+        let cap = Duration::from_secs(3600);
+        assert_eq!(
+            Dispatcher::capacity_wait_exceeded(Duration::from_secs(3599), Some(cap)),
+            None
+        );
+        assert_eq!(
+            Dispatcher::capacity_wait_exceeded(Duration::from_secs(3600), Some(cap)),
+            None
+        );
+        assert_eq!(
+            Dispatcher::capacity_wait_exceeded(Duration::from_secs(3601), Some(cap)),
+            Some(cap)
+        );
+        let detail = Dispatcher::capacity_wait_detail(
+            Duration::from_secs(3601),
+            cap,
+            QueueVerdict::Busy {
+                in_flight: 1,
+                waiting: 4,
+            },
+        );
+        assert!(detail.contains("CI_QUEUE_WAIT_SECS (3600s)"), "{detail}");
+        assert!(detail.contains("never started"), "{detail}");
+        assert!(!detail.contains("no runner took"), "{detail}");
+    }
+
+    /// A job's queue wait is `queued_at → started_at`; its run time is
+    /// `started_at → finished_at`. The two never overlap, so time on the queue
+    /// is not charged to the job.
+    #[test]
+    fn queue_wait_is_measured_to_pickup_and_the_run_clock_starts_there() {
+        use chrono::{TimeZone, Utc};
+        let queued = Utc.with_ymd_and_hms(2026, 8, 22, 10, 0, 0).unwrap();
+        let picked_up = queued + chrono::Duration::minutes(45);
+        let done = picked_up + chrono::Duration::minutes(5);
+        let job = crate::store::JobRow {
+            id: "r.j".into(),
+            run_id: "r".into(),
+            job_key: "j".into(),
+            base_id: "j".into(),
+            display: "j".into(),
+            network: None,
+            runner_hd_id: None,
+            fingerprint: None,
+            sandbox_id: None,
+            status: "success".into(),
+            attempt: 1,
+            matrix: serde_json::json!({}),
+            outputs: serde_json::json!({}),
+            plan: serde_json::json!({}),
+            error: None,
+            queued_at: Some(queued),
+            started_at: Some(picked_up),
+            finished_at: Some(done),
+        };
+        assert_eq!(job.queue_wait(), Some(Duration::from_secs(45 * 60)));
+        let ran = (done - picked_up).to_std().unwrap();
+        assert_eq!(ran, Duration::from_secs(5 * 60));
+
+        let never_queued = crate::store::JobRow {
+            queued_at: None,
+            started_at: None,
+            ..job
+        };
+        assert_eq!(never_queued.queue_wait(), None);
+    }
+
+    /// Three jobs on one route with capacity one. Each takes 90% of the
+    /// ceiling, so the last one is taken long after the ceiling has elapsed
+    /// since it was queued. All three must succeed: the ceiling is measured
+    /// from pickup, and a job that overruns it from *pickup* is still cut off.
+    #[tokio::test(start_paused = true)]
+    async fn each_job_on_a_busy_route_gets_the_whole_ceiling_from_pickup() {
+        let ceiling = Duration::from_secs(100);
+        let queued_at = tokio::time::Instant::now();
+        let mut outcomes = Vec::new();
+        for key in ["job-1", "job-2", "job-3"] {
+            // Picked up only now: the previous job ran to its end first.
+            let picked_up = tokio::time::Instant::now();
+            let outcome = bounded_from_pickup(ceiling, key, async {
+                tokio::time::sleep(Duration::from_secs(90)).await;
+                Ok(JobStatus::Success)
+            })
+            .await;
+            outcomes.push((key, picked_up.duration_since(queued_at), outcome));
+        }
+        for (key, waited, outcome) in &outcomes {
+            assert!(
+                matches!(outcome, Ok(JobStatus::Success)),
+                "{key} waited {}s and should have succeeded: {outcome:?}",
+                waited.as_secs()
+            );
+        }
+        // The third job was taken 180s after enqueue — well past the 100s
+        // ceiling — and that did not count against it.
+        assert_eq!(outcomes[2].1, Duration::from_secs(180));
+
+        // The ceiling is real, from pickup: a job that runs past it is cut.
+        let late = bounded_from_pickup(ceiling, "job-4", async {
+            tokio::time::sleep(Duration::from_secs(101)).await;
+            Ok(JobStatus::Success)
+        })
+        .await;
+        assert!(
+            matches!(late, Err(DispatchError::JobTimeout { ref job, after }) if job == "job-4" && after == ceiling),
+            "{late:?}"
+        );
+    }
 
     /// A served network with online hosts, for the case that looks impossible.
     fn healthy_ci_runners() -> crate::runners::Pool {
@@ -3172,7 +3465,14 @@ mod tests {
             node: None,
             vm: None,
         };
-        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT, QueueVerdict::Unknown, "ci-test");
+        let detail = Dispatcher::stuck_job_detail(
+            Some(placed),
+            Some("ci-runners"),
+            &pool,
+            WAIT,
+            QueueVerdict::Unknown,
+            "ci-test",
+        );
 
         assert!(detail.contains("2 online host(s)"), "{detail}");
         assert!(detail.contains("nothing consumed the queue"), "{detail}");
@@ -3182,14 +3482,23 @@ mod tests {
         // so it prints once per route per process whether or not a consumer was
         // ever bound. `Bus::depth` returning `Ok(None)`, which is what the Queue
         // column renders as `no consumer`, is the signal that actually proves it.
-        assert!(detail.contains("Queue column"), "names real evidence: {detail}");
+        assert!(
+            detail.contains("Queue column"),
+            "names real evidence: {detail}"
+        );
         assert!(detail.contains("could not bind a consumer"), "{detail}");
         assert!(
             !detail.contains("starting a consumer"),
             "that line proves nothing about binding: {detail}"
         );
-        assert!(detail.contains("net-3"), "names the id the subject uses: {detail}");
-        assert!(!detail.contains("Bring that host back"), "the hosts are up: {detail}");
+        assert!(
+            detail.contains("net-3"),
+            "names the id the subject uses: {detail}"
+        );
+        assert!(
+            !detail.contains("Bring that host back"),
+            "the hosts are up: {detail}"
+        );
         assert!(!detail.contains("is pinned to"), "not a pin: {detail}");
     }
 
@@ -3210,9 +3519,19 @@ mod tests {
             node: Some(&offline),
             vm: None,
         };
-        let detail = Dispatcher::stuck_job_detail(Some(placed), None, &pool, WAIT, QueueVerdict::Unknown, "ci-test");
+        let detail = Dispatcher::stuck_job_detail(
+            Some(placed),
+            None,
+            &pool,
+            WAIT,
+            QueueVerdict::Unknown,
+            "ci-test",
+        );
 
-        assert!(detail.contains("pinned to host mac-mini (hd-gone)"), "{detail}");
+        assert!(
+            detail.contains("pinned to host mac-mini (hd-gone)"),
+            "{detail}"
+        );
         assert!(detail.contains("is offline"), "{detail}");
         assert!(detail.contains("`fallback: any`"), "{detail}");
     }
@@ -3226,13 +3545,26 @@ mod tests {
             node: None,
             vm: None,
         };
-        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("lab"), &pool, WAIT, QueueVerdict::Unknown, "ci-test");
+        let detail = Dispatcher::stuck_job_detail(
+            Some(placed),
+            Some("lab"),
+            &pool,
+            WAIT,
+            QueueVerdict::Unknown,
+            "ci-test",
+        );
         assert!(detail.contains("does not serve that network"), "{detail}");
         assert!(detail.contains("CI_NETWORK"), "{detail}");
-        assert!(detail.contains("prod-runners"), "must say what it does serve: {detail}");
+        assert!(
+            detail.contains("prod-runners"),
+            "must say what it does serve: {detail}"
+        );
         // The hosts in an unserved network are online and irrelevant; saying so
         // is what stops the reader chasing host health again.
-        assert!(detail.contains("however healthy its hosts look"), "{detail}");
+        assert!(
+            detail.contains("however healthy its hosts look"),
+            "{detail}"
+        );
     }
 
     /// The commonest cause is pointed at rather than left as an empty network.
@@ -3258,9 +3590,19 @@ mod tests {
             node: None,
             vm: None,
         };
-        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT, QueueVerdict::Unknown, "ci-test");
+        let detail = Dispatcher::stuck_job_detail(
+            Some(placed),
+            Some("ci-runners"),
+            &pool,
+            WAIT,
+            QueueVerdict::Unknown,
+            "ci-test",
+        );
         assert!(detail.contains("no hosts in it"), "{detail}");
-        assert!(detail.contains("One daemon is registered but in no network"), "{detail}");
+        assert!(
+            detail.contains("One daemon is registered but in no network"),
+            "{detail}"
+        );
     }
 
     /// Members present, none dispatchable: name them and their states.
@@ -3285,7 +3627,14 @@ mod tests {
             node: None,
             vm: None,
         };
-        let detail = Dispatcher::stuck_job_detail(Some(placed), Some("ci-runners"), &pool, WAIT, QueueVerdict::Unknown, "ci-test");
+        let detail = Dispatcher::stuck_job_detail(
+            Some(placed),
+            Some("ci-runners"),
+            &pool,
+            WAIT,
+            QueueVerdict::Unknown,
+            "ci-test",
+        );
         assert!(detail.contains("this host (orphaned)"), "{detail}");
         assert!(!detail.contains("is pinned to"), "{detail}");
     }
@@ -3293,8 +3642,18 @@ mod tests {
     /// An unplaceable job must not have a cause invented for it.
     #[test]
     fn an_unplaceable_job_says_only_what_is_known() {
-        let detail = Dispatcher::stuck_job_detail(None, Some("ci-runners"), &test_pool(), WAIT, QueueVerdict::Unknown, "ci-test");
-        assert!(detail.contains("could not work out a live target"), "{detail}");
+        let detail = Dispatcher::stuck_job_detail(
+            None,
+            Some("ci-runners"),
+            &test_pool(),
+            WAIT,
+            QueueVerdict::Unknown,
+            "ci-test",
+        );
+        assert!(
+            detail.contains("could not work out a live target"),
+            "{detail}"
+        );
         assert!(detail.contains("ci-runners"), "{detail}");
         assert!(!detail.contains("is pinned to"), "{detail}");
     }
@@ -3304,7 +3663,14 @@ mod tests {
     fn a_stale_pool_is_admitted_in_the_message() {
         let mut pool = test_pool();
         pool.last_error = Some("GET /me/daemons: timed out".into());
-        let detail = Dispatcher::stuck_job_detail(None, Some("nope"), &pool, WAIT, QueueVerdict::Unknown, "ci-test");
+        let detail = Dispatcher::stuck_job_detail(
+            None,
+            Some("nope"),
+            &pool,
+            WAIT,
+            QueueVerdict::Unknown,
+            "ci-test",
+        );
         assert!(detail.contains("may be stale"), "{detail}");
         assert!(detail.contains("timed out"), "{detail}");
     }
@@ -3319,8 +3685,22 @@ mod tests {
             vm: None,
         };
         for detail in [
-            Dispatcher::stuck_job_detail(Some(network), None, &pool, WAIT, QueueVerdict::Unknown, "ci-test"),
-            Dispatcher::stuck_job_detail(None, Some("x"), &pool, WAIT, QueueVerdict::Unknown, "ci-test"),
+            Dispatcher::stuck_job_detail(
+                Some(network),
+                None,
+                &pool,
+                WAIT,
+                QueueVerdict::Unknown,
+                "ci-test",
+            ),
+            Dispatcher::stuck_job_detail(
+                None,
+                Some("x"),
+                &pool,
+                WAIT,
+                QueueVerdict::Unknown,
+                "ci-test",
+            ),
         ] {
             assert!(detail.contains("within 900s"), "{detail}");
         }
@@ -3778,6 +4158,7 @@ mod tests {
         let store = crate::store::Store::connect(
             &config.database_url,
             std::env::temp_dir().join(format!("ci-e2e-logs-{}", crate::vm::new_id())),
+            config.db_statement_timeout,
         )
         .await
         .expect("store");

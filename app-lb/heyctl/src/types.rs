@@ -44,8 +44,53 @@ pub struct DeploymentStatus {
     pub pending: usize,
     pub total_in_flight: usize,
     pub vms: Vec<VmStatus>,
+    /// Present when the spec declares `vm.workspace`.
+    pub workspace: Option<WorkspaceStatus>,
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+/// `vm.workspace`, mirrored read-only like [`MountSpec`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceSpec {
+    /// Defaults to `/workspace` server-side.
+    pub path: Option<String>,
+    pub store: String,
+    #[serde(rename = "ref")]
+    pub artifact_ref: Option<String>,
+    pub auth: Option<SecretRef>,
+}
+
+/// Where a deployment's workspace stands: the snapshot its pool runs from,
+/// whether the store has it, and what is holding the pool if anything is.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceStatus {
+    pub path: String,
+    pub store: String,
+    pub digest: Option<String>,
+    pub captured_at: Option<u64>,
+    pub captured_from: Option<String>,
+    pub files: u64,
+    pub bytes: u64,
+    pub pushed: Option<String>,
+    pub pushed_at: Option<u64>,
+    pub push_pending: bool,
+    /// `idle`, `restoring`, `capturing`, `pushing` or `blocked`.
+    pub phase: String,
+    pub blocked: Option<String>,
+    pub pending: Vec<PendingCapture>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct PendingCapture {
+    pub sandbox_id: String,
+    pub then: String,
+    pub queued_at: u64,
+    pub attempts: u32,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -195,6 +240,9 @@ pub struct VmSpec {
     /// Directories the guests boot with, unpacked from tarballs in an artifact
     /// store. Empty on a deployment that declares none.
     pub mounts: Vec<MountSpec>,
+    /// A writable directory owned by the deployment, captured when a replica
+    /// retires and seeded into the next. See the server's `WorkspaceSpec`.
+    pub workspace: Option<WorkspaceSpec>,
     pub ttl_seconds: u64,
 }
 

@@ -18,11 +18,11 @@ mod bus;
 // rather than depended on as a crate: those five apps sit on three different
 // axum versions, so the shared module deliberately names no framework type and
 // each one wires its own routes. See `ui/README.md`.
-#[path = "../../ui/ui.rs"]
-mod heyo_ui;
 mod config;
 mod dispatch;
 mod expr;
+#[path = "../../ui/ui.rs"]
+mod heyo_ui;
 mod image;
 mod nats_auth;
 mod objects;
@@ -135,7 +135,13 @@ async fn main() {
     // Postgres before NATS: a bad connection string is far more common than a
     // bad NATS one, and failing on the likelier cause first makes the message
     // people actually see the useful one.
-    let store = match Store::connect(&config.database_url, config.log_dir.clone()).await {
+    let store = match Store::connect(
+        &config.database_url,
+        config.log_dir.clone(),
+        config.db_statement_timeout,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("ci: refusing to start — {e}");

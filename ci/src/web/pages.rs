@@ -636,11 +636,19 @@ mod tests {
     /// the default theme and a host-only cookie. Tests that care about the
     /// signed-in name use [`chrome_as`].
     fn chrome() -> Chrome<'static> {
-        Chrome { app_name: "ci", who: None, html_attrs: r#"data-theme="dark""#.into() }
+        Chrome {
+            app_name: "ci",
+            who: None,
+            html_attrs: r#"data-theme="dark""#.into(),
+        }
     }
 
     fn chrome_as(who: &str) -> Chrome<'_> {
-        Chrome { app_name: "ci", who: Some(who), html_attrs: r#"data-theme="dark""#.into() }
+        Chrome {
+            app_name: "ci",
+            who: Some(who),
+            html_attrs: r#"data-theme="dark""#.into(),
+        }
     }
 
     use super::*;
@@ -1246,7 +1254,7 @@ pub fn run_page(
                     table {
                         thead { tr {
                             th { "Job" } th { "Status" } th { "Runner" }
-                            th { "VM" } th { "Needs" } th { "Duration" }
+                            th { "VM" } th { "Needs" } th { "Queued" } th { "Duration" }
                         } }
                         tbody {
                             @for j in jobs {
@@ -1258,6 +1266,7 @@ pub fn run_page(
                                     td { (j.runner_hd_id.as_deref().unwrap_or("—")) }
                                     td .mono { (j.sandbox_id.as_deref().unwrap_or("—")) }
                                     td .mono { (job_needs(j)) }
+                                    td { (job_queue_wait(j)) }
                                     td { (job_duration(j)) }
                                 }
                             }
@@ -1351,6 +1360,16 @@ fn job_needs(j: &JobRow) -> String {
     } else {
         needs
     }
+}
+
+/// How long the job waited on the queue before being claimed — or has waited
+/// so far. Shown beside the duration because the two clocks are separate: a job
+/// behind a busy runner accrues queue time, not run time, and its timeouts
+/// have not started.
+fn job_queue_wait(j: &JobRow) -> String {
+    j.queue_wait()
+        .map(human_duration)
+        .unwrap_or_else(|| "—".into())
 }
 
 fn job_duration(j: &JobRow) -> String {
@@ -1834,11 +1853,19 @@ mod page_tests {
     /// default theme. Mirrors the one in `tests` above; two test modules, one
     /// shell each, rather than a `pub(crate)` helper reaching across them.
     fn chrome() -> Chrome<'static> {
-        Chrome { app_name: "ci", who: None, html_attrs: r#"data-theme="dark""#.into() }
+        Chrome {
+            app_name: "ci",
+            who: None,
+            html_attrs: r#"data-theme="dark""#.into(),
+        }
     }
 
     fn chrome_as(who: &str) -> Chrome<'_> {
-        Chrome { app_name: "ci", who: Some(who), html_attrs: r#"data-theme="dark""#.into() }
+        Chrome {
+            app_name: "ci",
+            who: Some(who),
+            html_attrs: r#"data-theme="dark""#.into(),
+        }
     }
 
     use super::*;
@@ -1886,6 +1913,7 @@ mod page_tests {
             outputs: serde_json::json!({}),
             plan: serde_json::json!({ "needs": ["build"] }),
             error: None,
+            queued_at: Some(Utc::now()),
             started_at: Some(Utc::now()),
             finished_at: Some(Utc::now()),
         }
@@ -2345,6 +2373,3 @@ mod page_tests {
         assert!(html.contains("A clone URL is required."));
     }
 }
-
-
-

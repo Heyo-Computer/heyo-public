@@ -14,6 +14,7 @@ use crate::health;
 use crate::metrics::Metrics;
 use crate::registry::Registry;
 use crate::vm::{self, VmManager};
+use crate::workspace::{Then, Workspaces};
 use async_trait::async_trait;
 use futures::StreamExt;
 use heyo_sdk::SandboxInfo;
@@ -100,6 +101,10 @@ pub struct Autoscaler {
     /// [`discard_rootfs_of`](Self::discard_rootfs_of); `None` degrades to
     /// leaving the copy in place, exactly the pre-existing behaviour.
     disk_cfg: Option<crate::disks::DiskConfig>,
+    /// Deployment-owned workspaces. Every path that retires a VM goes through
+    /// it when the deployment has one, so a workspace is captured before the
+    /// VM that holds it is destroyed; see [`crate::workspace`].
+    workspaces: Arc<Workspaces>,
 }
 
 impl Autoscaler {
@@ -109,6 +114,7 @@ impl Autoscaler {
         metrics: Arc<Metrics>,
         feed: Arc<crate::feed::Feed>,
         disk_cfg: Option<crate::disks::DiskConfig>,
+        workspaces: Arc<Workspaces>,
     ) -> Self {
         Self {
             registry,
@@ -118,6 +124,43 @@ impl Autoscaler {
             creates: tokio::sync::Semaphore::new(CREATE_CONCURRENCY),
             feed,
             disk_cfg,
+            workspaces,
+        }
+    }
+
+    /// The workspace store, for the admin API's status view.
+    pub fn workspaces(&self) -> &Arc<Workspaces> {
+        &self.workspaces
+    }
+
+    /// Whether a deployment's VMs carry a workspace that must be captured
+    /// before they are destroyed.
+    fn has_workspace(d: &Deployment) -> bool {
+        d.spec
+            .vm
+            .as_ref()
+            .is_some_and(|vm| vm.workspace.is_some())
+    }
+
+    /// Destroy a VM — or, for a workspace deployment, stop it and queue its
+    /// capture, after which the worker destroys it. The VM is not running by
+    /// the time this returns either way.
+    async fn kill_or_capture(&self, d: &Arc<Deployment>, sandbox_id: &str, what: &str) {
+        if Self::has_workspace(d) {
+            if let Err(e) = self.workspaces.retire(d, sandbox_id, Then::Kill).await {
+                tracing::warn!(
+                    deployment = %d.spec.id,
+                    sandbox = %sandbox_id,
+                    error = %e,
+                    "could not stop the VM to capture its workspace; killing it would lose \
+                     whatever it wrote since the last capture, so it is left for the next \
+                     tick to retry",
+                );
+            }
+            return;
+        }
+        if let Err(e) = self.vms.kill(sandbox_id).await {
+            tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill {what}");
         }
     }
 
@@ -197,9 +240,7 @@ impl Autoscaler {
                 sandbox = %id,
                 "deployment was deregistered or rebuilt while this VM was being created; killing it",
             );
-            if let Err(e) = self.vms.kill(&id).await {
-                tracing::warn!(sandbox = %id, error = %e, "failed to kill abandoned VM");
-            }
+            self.kill_or_capture(d, &id, "abandoned VM").await;
         }
     }
 
@@ -800,6 +841,17 @@ impl Autoscaler {
         }
 
         for (id, origin) in doomed {
+            // A resumed replica of a workspace deployment holds the
+            // deployment's state; give the capture a chance before it goes.
+            // A fresh one that never came up holds nothing worth keeping.
+            if Self::has_workspace(d) {
+                if origin == BootOrigin::Created {
+                    self.workspaces.forget(&d.spec.id, &id);
+                } else {
+                    self.kill_or_capture(d, &id, "failed resume").await;
+                    continue;
+                }
+            }
             match self.vms.kill(&id).await {
                 // The kill is what makes reclamation safe: the disks below are
                 // only unlinked once the daemon says the hypervisor holding
@@ -905,6 +957,18 @@ impl Autoscaler {
             // start `RECONCILE_CONCURRENCY` hypervisors at once.
             let _permit = self.creates.acquire().await;
 
+            // A workspace deployment boots from its last capture, so while a
+            // capture or restore is in flight there is nothing correct to boot
+            // from. Not a failure and not backed off: the worker nudges the
+            // scale signal when the tree is ready.
+            let seeded = match self.workspaces.seed_for_create(d) {
+                Ok(seeded) => seeded,
+                Err(why) => {
+                    tracing::info!(deployment = %d.spec.id, "not creating a replica yet: {why}");
+                    break;
+                }
+            };
+
             // A suspended sandbox is preferred over a fresh one, and not just to
             // save a boot: it *is* the deployment's state. Creating a new VM
             // while one sits stopped would strand that VM's `/workspace` disk
@@ -918,6 +982,7 @@ impl Autoscaler {
                             "resumed suspended VM",
                         );
                         created.push(sandbox_id.clone());
+                        self.workspaces.note_resumed(&d.spec.id, &sandbox_id);
                         // `resumed`, not `new`: this sandbox's data disk is the
                         // deployment's retained state, so if the boot never
                         // finishes the give-up path must not reclaim it.
@@ -942,9 +1007,18 @@ impl Autoscaler {
             }
 
             let name = vm::replica_name(&d.spec.id, self.next_nonce());
-            match self.vms.create(d.spec.vm_spec(), name).await {
+            let tree = seeded.as_ref().map(|s| s.tree.as_path());
+            match self.vms.create(d.spec.vm_spec(), name, tree).await {
                 Ok(sandbox) => {
                     let sandbox_id = sandbox.sandbox_id().to_string();
+                    if let Some(seeded) = &seeded {
+                        self.workspaces.note_seeded(
+                            &d.spec.id,
+                            &sandbox_id,
+                            seeded.digest.clone(),
+                            d.spec.vm_spec().mounts.len(),
+                        );
+                    }
                     created.push(sandbox_id.clone());
                     pending.push(PendingVm::new(sandbox_id));
                 }
@@ -1064,6 +1138,29 @@ impl Autoscaler {
         let retain = d.spec.scaling.idle_action == IdleAction::Retain;
         let mut suspended = Vec::new();
         for b in done {
+            if Self::has_workspace(d) {
+                // Stopped and queued for capture. What happens afterwards —
+                // kept suspended for `retain`, or destroyed — is the worker's
+                // to do once the tree is out; recording it as suspended now
+                // would let the next tick resume it mid-capture.
+                let then = if retain { Then::Suspend } else { Then::Kill };
+                tracing::info!(
+                    deployment = %d.spec.id,
+                    sandbox = %b.sandbox_id,
+                    ?then,
+                    "retiring VM for workspace capture",
+                );
+                if let Err(e) = self.workspaces.retire(d, &b.sandbox_id, then).await {
+                    tracing::warn!(
+                        deployment = %d.spec.id,
+                        sandbox = %b.sandbox_id,
+                        error = %e,
+                        "could not stop the VM for capture; it is still running and will be \
+                         adopted and drained again next tick",
+                    );
+                }
+                continue;
+            }
             if retain {
                 tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "suspending VM");
                 match self.vms.suspend(&b.sandbox_id).await {
@@ -1347,6 +1444,13 @@ impl Autoscaler {
             if d.is_some_and(|d| d.state().suspended.contains(&info.id)) {
                 continue; // claimed: nothing to decide
             }
+            // A stopped VM of a workspace deployment is either waiting for its
+            // capture, or is one the capture refused (an older lineage) and
+            // kept for a person. Neither is this sweep's to resume or destroy.
+            if d.is_some_and(|d| Self::has_workspace(d) && self.workspaces.holds(owner, &info.id))
+            {
+                continue;
+            }
             if d.is_some_and(|d| d.spec.is_managed() && d.spec.scaling.idle_action == IdleAction::Retain)
             {
                 match reclaimable.iter_mut().find(|(o, _)| o == owner) {
@@ -1516,14 +1620,20 @@ impl Autoscaler {
             d.set_backends(Vec::new());
             return;
         }
+        let workspace = Self::has_workspace(d);
         for b in d.backends().iter() {
             b.set_draining(true);
-            if let Err(e) = self.vms.kill(&b.sandbox_id).await {
-                tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to kill VM");
-            }
+            self.kill_or_capture(d, &b.sandbox_id, "VM").await;
         }
         for p in d.pending().iter() {
-            if let Err(e) = self.vms.kill(&p.sandbox_id).await {
+            // A fresh boot that never became ready wrote nothing worth keeping;
+            // a resumed replica is the deployment's state.
+            if workspace && p.origin == BootOrigin::Created {
+                self.workspaces.forget(&d.spec.id, &p.sandbox_id);
+            }
+            if workspace && p.origin != BootOrigin::Created {
+                self.kill_or_capture(d, &p.sandbox_id, "pending VM").await;
+            } else if let Err(e) = self.vms.kill(&p.sandbox_id).await {
                 tracing::warn!(sandbox = %p.sandbox_id, error = %e, "failed to kill pending VM");
             }
         }
@@ -1536,6 +1646,14 @@ impl Autoscaler {
                 sandbox = %sandbox_id,
                 "destroying suspended VM as its deployment goes away",
             );
+            if workspace {
+                // Already stopped; the worker skips the extraction if nothing
+                // was written since the capture that suspended it.
+                if let Err(e) = self.workspaces.retire_stopped(d, sandbox_id, Then::Kill) {
+                    tracing::warn!(sandbox = %sandbox_id, error = %e, "could not queue the capture");
+                }
+                continue;
+            }
             if let Err(e) = self.vms.kill(sandbox_id).await {
                 tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill suspended VM");
             }
@@ -1591,6 +1709,18 @@ impl Autoscaler {
                 in_flight = b.in_flight(),
                 "evicting VM (force kill)",
             );
+            if Self::has_workspace(d) {
+                // Stopped now, destroyed after its capture. `prune` drops the
+                // backend next tick, when the daemon stops listing it.
+                return match self.workspaces.retire(d, sandbox_id, Then::Kill).await {
+                    Ok(()) => {
+                        self.metrics.record_reaped(&d.spec.id, 1);
+                        d.scale_signal.notify_one();
+                        EvictOutcome::Killed
+                    }
+                    Err(e) => EvictOutcome::KillFailed(e),
+                };
+            }
             if let Err(e) = self.vms.kill(sandbox_id).await {
                 tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill evicted VM");
                 return EvictOutcome::KillFailed(e.to_string());
@@ -1819,6 +1949,7 @@ mod tests {
                 setup_hooks: None,
                 open_ports: vec![],
                 mounts: vec![],
+                workspace: None,
                 ttl_seconds: 3600,
             }),
             scaling: ScalingPolicy::default(),
@@ -1875,6 +2006,26 @@ mod tests {
             crate::mounts::MountStore::new(dir.join("mounts"), 0),
         )
         .unwrap();
+        let workspaces = Arc::new(crate::workspace::Workspaces::new(
+            crate::workspace::WorkspaceConfig {
+                root: dir.join("workspaces"),
+                data_dir: dir.clone(),
+                tar_bin: "tar".into(),
+                aws_bin: "aws".into(),
+                art_bin: "art".into(),
+                debugfs_bin: "debugfs".into(),
+                e2fsck_bin: "e2fsck".into(),
+                s3_endpoint: None,
+                home: None,
+                timeout: Duration::from_secs(60),
+            },
+            vms.clone(),
+            registry.clone(),
+            Arc::new(crate::secrets::SecretStore::new(
+                dir.join("secrets.json"),
+                None,
+            )),
+        ));
         (
             Autoscaler::new(
                 registry.clone(),
@@ -1884,6 +2035,7 @@ mod tests {
                 // No disk config: rootfs discarding quietly stands down, which
                 // is also the production behaviour when the data dir is unknown.
                 None,
+                workspaces,
             ),
             registry,
         )

@@ -918,7 +918,9 @@ mod tests {
     async fn test_pool() -> (Pool, crate::store::Store) {
         let url = std::env::var("CI_TEST_DATABASE_URL").expect("CI_TEST_DATABASE_URL");
         let dir = std::env::temp_dir().join(format!("ci-pool-logs-{}", crate::vm::new_id()));
-        let store = crate::store::Store::connect(&url, dir).await.unwrap();
+        let store = crate::store::Store::connect(&url, dir, std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
         store
             .migrate(Path::new("migrations"))
             .await

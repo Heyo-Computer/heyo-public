@@ -1,0 +1,35 @@
+{
+  "id": "heyo-mcp",
+  "routes": [
+    { "host": "mcp.us2.heyo.work" }
+  ],
+  "upstreams": ["127.0.0.1:9600"],
+  "health": { "path": "/healthz", "timeout_secs": 2 },
+
+  "update": {
+    "working_dir": "/home/sarocu/Projects",
+    "commands": [
+      "test -d heyo-public/.git || git clone https://github.com/Heyo-Computer/heyo-public.git heyo-public",
+      "git -C heyo-public pull --ff-only",
+      "npm --prefix heyo-public/mcp ci",
+      "npm --prefix heyo-public/mcp run build",
+      "supervisorctl restart heyo-mcp"
+    ],
+    "timeout_secs": 900,
+    "verify_timeout_secs": 60
+  },
+
+  "auth": {
+    "provider": "jwt",
+    "jwt": {
+      "secret": { "secret": "heyo-auth", "key": "jwt_secret" },
+      "algorithms": ["HS256"],
+      "issuer": "auth-service",
+      "audience": "heyo-app",
+      "subject_claim": "userId",
+      "require": { "role": ["user", "admin"] }
+    },
+    "public_paths": ["/healthz"],
+    "forward_identity": true
+  }
+}

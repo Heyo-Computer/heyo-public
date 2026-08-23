@@ -169,6 +169,31 @@ pub fn opt_bytes(n: Option<u64>) -> String {
 }
 
 /// Compact duration, kubectl's AGE style: `12s`, `4m30s`, `3h12m`, `6d4h`.
+/// A unix timestamp as `YYYY-MM-DD HH:MM:SS UTC`. Hand-rolled rather than a
+/// date crate: one format, UTC only, and the civil-date arithmetic is twelve
+/// lines.
+pub fn timestamp(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Howard Hinnant's days-to-civil.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC",
+        rem / 3_600,
+        (rem % 3_600) / 60,
+        rem % 60
+    )
+}
+
 pub fn duration(secs: u64) -> String {
     if secs < 60 {
         return format!("{secs}s");
@@ -247,5 +272,16 @@ mod tests {
         assert_eq!(millis(4.25), "4.2ms");
         assert_eq!(millis(250.0), "250ms");
         assert_eq!(millis(1500.0), "1.50s");
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    #[test]
+    fn renders_utc_civil_time() {
+        assert_eq!(super::timestamp(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(super::timestamp(951_782_400), "2000-02-29 00:00:00 UTC");
+        assert_eq!(super::timestamp(1_755_820_800), "2025-08-22 00:00:00 UTC");
+        assert_eq!(super::timestamp(1_755_864_661), "2025-08-22 12:11:01 UTC");
     }
 }

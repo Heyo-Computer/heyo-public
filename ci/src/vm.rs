@@ -67,7 +67,24 @@ const POLL_SLACK: Duration = Duration::from_secs(30);
 
 /// Base64 bytes per upload exec. See [`Vm::upload_bytes`] for where this number
 /// comes from — it is measured against a real guest, not chosen.
-const UPLOAD_CHUNK: usize = 24 * 1024;
+///
+/// **28 KiB — the ceiling
+/// `the_upload_chunk_stays_under_the_measured_guest_limit` allows**, which is
+/// the measured-good 32 KiB less the 4 KiB margin that test reserves for the
+/// wrapper (`mkdir -p`, a `printf`, a `base64 -d`, and a path of unknown
+/// length).
+///
+/// Raised from 24 KiB because **chunk count is checkout latency**: uploads are
+/// strictly serial — the per-sandbox exec lock forbids two execs at once — so
+/// every chunk is a POST plus at least one poll over the iroh tunnel. This
+/// repository's 3.65 MiB packfile is ~4.9 MiB of base64: 210 chunks at 24 KiB,
+/// 179 at 28.
+///
+/// Going higher means moving that test's margin, and the margin is the reason a
+/// bad value fails at compile time instead of as a hung build. A chunk size that
+/// overshoots `MAX_ARG_STRLEN` breaks *every* upload, so it wants a probe
+/// against a real guest rather than an argument from arithmetic.
+const UPLOAD_CHUNK: usize = 28 * 1024;
 
 /// One line of a VM's own log, as `GET /sandboxes/{id}/logs` returns it.
 ///
@@ -611,11 +628,17 @@ impl Vm {
             encode_segment(operation_id)
         );
         loop {
-            tokio::time::sleep(interval).await;
-            // Exponential up to a ceiling: a `cargo build` polled every 250ms
-            // for ten minutes is 2400 pointless round trips over an iroh tunnel.
-            interval = (interval * 2).min(POLL_MAX);
-
+            // **Ask before sleeping.** The sleep used to come first, which made
+            // `POLL_MIN` a floor on every exec rather than a gap between polls —
+            // and most execs here are not builds. `upload_bytes` sends the whole
+            // repository as ~200 sequential chunk writes, each finishing in
+            // milliseconds inside the guest and each then waiting out 250ms
+            // before anybody asked: a minute of pure sleep in a checkout that
+            // takes five.
+            //
+            // The cost is one extra round trip for a command that really is
+            // long, which `cargo build` pays once against 3600 seconds of
+            // compiling.
             let record: ExecOperationRecord = self
                 .sandbox
                 .client()
@@ -638,6 +661,13 @@ impl Vm {
             if record.is_terminal() {
                 return self.finish(operation_id, record);
             }
+
+            // Backoff moved to the tail with the sleep. Exponential up to a
+            // ceiling: a `cargo build` polled every 250ms for ten minutes is
+            // 2400 pointless round trips over an iroh tunnel.
+            tokio::time::sleep(interval).await;
+            interval = (interval * 2).min(POLL_MAX);
+
             if Instant::now() >= deadline {
                 return Err(VmError::ExecTimeout {
                     sandbox: self.id.clone(),
@@ -703,8 +733,13 @@ impl Vm {
     /// command as `env … sh -lc '<script>'`, so the script is one argv entry and
     /// Linux's `MAX_ARG_STRLEN` (128 KiB) bounds it. Probed against a real
     /// Firecracker guest: 32 KiB succeeds, 128 KiB returns `bash:
-    /// /usr/bin/env: Argument list too long`. [`UPLOAD_CHUNK`] leaves room for
-    /// the wrapper on top of the payload.
+    /// /usr/bin/env: Argument list too long`. [`UPLOAD_CHUNK`] is that measured
+    /// 32 KiB less a 4 KiB margin for the wrapper.
+    ///
+    /// **Chunk count is checkout latency.** The loop below is strictly serial —
+    /// one exec per chunk, and the per-sandbox lock forbids two at once — so
+    /// every chunk costs a POST and at least one poll over the iroh tunnel.
+    /// Halving the chunk size doubles the checkout.
     ///
     /// Base64's alphabet is `A-Za-z0-9+/=`, none of which is special inside
     /// single quotes, so a chunk needs no escaping — which is also why it cannot
@@ -1393,6 +1428,30 @@ mod tests {
         // rather than as a hung build.
         const _: () = assert!(UPLOAD_CHUNK <= 32 * 1024 - 4096);
         const _: () = assert!(UPLOAD_CHUNK >= 8 * 1024);
+    }
+
+    /// Chunk count is checkout latency, so it is asserted as a number rather
+    /// than left to be rediscovered from a slow run.
+    ///
+    /// Uploads are strictly serial — one exec per chunk, and the per-sandbox
+    /// lock forbids overlap — so every chunk is a POST plus at least one poll
+    /// over the iroh tunnel. At roughly a second each, this bound is the
+    /// difference between a checkout measured in minutes and one measured in
+    /// many. Lowering `UPLOAD_CHUNK` is therefore a latency decision, and this
+    /// makes it one somebody has to take deliberately.
+    #[test]
+    fn a_repository_sized_upload_does_not_regress_into_hundreds_of_chunks() {
+        // This repository's packfile, the payload a bundle submit actually
+        // sends. Base64 is 4 bytes out for every 3 in.
+        const PACKFILE_BYTES: usize = 3_827_000; // ~3.65 MiB
+        let encoded = PACKFILE_BYTES.div_ceil(3) * 4;
+        let chunks = encoded.div_ceil(UPLOAD_CHUNK);
+        assert!(
+            chunks <= 190,
+            "a bundle submit would take {chunks} serial execs; at ~1s each that is \
+             {}s of checkout before a single build step runs",
+            chunks,
+        );
     }
 
     /// Base64 is `A-Za-z0-9+/=` — nothing special inside single quotes — which
