@@ -10,6 +10,7 @@
 //! this module built, so partition pruning and a row cap are always applied —
 //! neither is something a caller can forget.
 
+use crate::alerts::{Alert, AlertMetric, new_id};
 use crate::ingest::{Sink, token_matches};
 use crate::query::{
     Engine, HOST_DEPLOYMENT, LogBucket, LogFilter, MAX_LOG_LIMIT, MetricBucket, QueryError, Window,
@@ -19,7 +20,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use axum::{Json, Router};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,12 @@ pub struct ApiState {
     /// same parent domain as app-lb's `auth.cookie_domain` and one choice of
     /// light or dark covers every app.
     pub ui_cookies: Arc<crate::heyo_ui::CookieConfig>,
+    /// Alert rules, shared with the background checker task. Reads via the API
+    /// take a read lock; creates and deletes take a write lock and persist to
+    /// `alerts_file`.
+    pub alerts: Arc<tokio::sync::RwLock<Vec<Alert>>>,
+    /// Where alert rules are persisted on every create/delete.
+    pub alerts_file: String,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -84,6 +91,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/platform-status", get(platform_status))
         .route("/api/deployments/{id}", get(detail))
         .route("/api/deployments/{id}/logs", get(logs))
+        .route("/api/alerts", get(list_alerts).post(create_alert))
+        .route("/api/alerts/{id}", delete(delete_alert))
         .route("/stats", get(stats))
         .route_layer(middleware::from_fn_with_state(
             state.api_token.clone(),
@@ -496,6 +505,121 @@ async fn logs(
     }))
 }
 
+/// The body of `POST /api/alerts`.
+#[derive(Debug, Deserialize)]
+struct CreateAlertRequest {
+    deployment: String,
+    /// Defaults to `errors` when omitted — it is the only metric today, and
+    /// requiring a field that has one value would be busywork for the caller.
+    #[serde(default)]
+    metric: Option<AlertMetric>,
+    threshold: f64,
+    webhook_url: String,
+}
+
+/// `GET /api/alerts` — every rule, in storage order. A snapshot under a read
+/// lock rather than a re-read from disk, so the list and the checker always
+/// agree about what is configured.
+async fn list_alerts(State(state): State<ApiState>) -> Json<Vec<Alert>> {
+    Json(state.alerts.read().await.clone())
+}
+
+/// `POST /api/alerts` — create a rule.
+///
+/// The deployment must be one the engine knows about, so a typo cannot leave a
+/// rule that can never fire (and that would never be caught, because the
+/// checker silently skips unknown deployments). Persisted before the lock is
+/// released, so the rule is live the moment the 201 comes back.
+async fn create_alert(
+    State(state): State<ApiState>,
+    Json(req): Json<CreateAlertRequest>,
+) -> Result<(StatusCode, Json<Alert>), AlertsApiError> {
+    if !state.engine.deployments().contains(&req.deployment) {
+        return Err(AlertsApiError::UnknownDeployment);
+    }
+    // `reqwest` builds any URL; validate the scheme so a stored rule cannot be
+    // pointed at an internal listener by someone who only has the API. Both
+    // http and https are allowed because the webhook is reached over loopback
+    // or a private network as often as the internet.
+    if !valid_webhook_url(&req.webhook_url) {
+        return Err(AlertsApiError::BadWebhook);
+    }
+
+    let alert = Alert {
+        id: new_id(),
+        deployment: req.deployment,
+        metric: req.metric.unwrap_or(AlertMetric::Errors),
+        threshold: req.threshold,
+        webhook_url: req.webhook_url,
+    };
+
+    let path = state.alerts_file.clone();
+    {
+        let mut alerts = state.alerts.write().await;
+        alerts.push(alert.clone());
+        crate::alerts::save(std::path::Path::new(&path), &alerts)
+            .map_err(AlertsApiError::Persist)?;
+    }
+
+    Ok((StatusCode::CREATED, Json(alert)))
+}
+
+/// `DELETE /api/alerts/:id` — remove a rule by id. Idempotent: a missing id is
+/// 204, because the caller's end state ("that rule is gone") is already true.
+async fn delete_alert(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AlertsApiError> {
+    let path = state.alerts_file.clone();
+    let mut alerts = state.alerts.write().await;
+    let before = alerts.len();
+    alerts.retain(|a| a.id != id);
+    if alerts.len() == before {
+        // Nothing changed on disk, so no rewrite — and no error either.
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    crate::alerts::save(std::path::Path::new(&path), &alerts)
+        .map_err(AlertsApiError::Persist)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A webhook URL must be `http` or `https` with a host. Anything else is a
+/// mistake or an attempt to reach a non-HTTP listener.
+fn valid_webhook_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .map(|u| {
+            matches!(u.scheme(), "http" | "https")
+                && u.host_str().map(|h| !h.is_empty()).unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// Failures from the alert routes, mapped to status codes a caller can act on.
+enum AlertsApiError {
+    UnknownDeployment,
+    BadWebhook,
+    Persist(std::io::Error),
+}
+
+impl IntoResponse for AlertsApiError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            Self::UnknownDeployment => {
+                (StatusCode::BAD_REQUEST, "deployment is not known to this collector")
+            }
+            Self::BadWebhook => (
+                StatusCode::BAD_REQUEST,
+                "webhook_url must be an absolute http or https URL with a host",
+            ),
+            Self::Persist(e) => {
+                tracing::error!(error = %e, "could not persist alerts file");
+                (StatusCode::INTERNAL_SERVER_ERROR, "could not persist the alert")
+            }
+        };
+        (status, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
 fn freshness(state: &ApiState) -> Freshness {
     Freshness {
         buffered_rows: state.buffered.load(Ordering::Relaxed),
@@ -814,6 +938,21 @@ mod tests {
             Some("status-secret"),
             Some("Bearer wrong")
         ));
+    }
+
+    #[test]
+    fn webhook_urls_must_be_http_or_https_with_a_host() {
+        // Absolute http and https URLs with a host are accepted; loopback and
+        // private hosts are fine, because the webhook is often reached locally.
+        assert!(valid_webhook_url("http://127.0.0.1:9090/hook"));
+        assert!(valid_webhook_url("https://example.com/hook"));
+        // Other schemes, missing hosts, and garbage are refused — a stored rule
+        // must not be pointed at a file or an internal non-HTTP listener.
+        assert!(!valid_webhook_url("file:///etc/passwd"));
+        assert!(!valid_webhook_url("ftp://example.com/hook"));
+        assert!(!valid_webhook_url("http://"));
+        assert!(!valid_webhook_url("not a url"));
+        assert!(!valid_webhook_url(""));
     }
 
     #[test]

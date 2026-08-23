@@ -8,8 +8,8 @@ Runs as a **static (`proxy_pass`) deployment** registered with app-lb — it is 
 host process, not a microVM, so it is fronted the same way the pg-fc dashboard
 is.
 
-> **Status: phase 2.** Collection, storage, retention-by-deletion, the query API
-> and the dashboard work. S3 tiering and webhook alerts are not built yet.
+> **Status: phase 2.** Collection, storage, retention-by-deletion, the query API,
+> the dashboard and webhook alerts work. S3 tiering is not built yet.
 
 ## How logs arrive: native tail, or push
 
