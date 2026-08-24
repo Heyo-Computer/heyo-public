@@ -407,7 +407,24 @@ impl Dispatcher {
                             git_ref: req.r#ref.clone(),
                             sha: req.after.clone(),
                             before_sha: req.before.clone(),
-                            changes: changes.clone(),
+                            // A workflow forced by `--only` gets *unknown*
+                            // changes, not the real diff. The real diff is what
+                            // just declined it at the workflow gate, and the
+                            // job-level `if: changed(...)` conditions read the
+                            // same diff — bypassing one while the other still
+                            // says "nothing relevant changed" produces a run
+                            // whose every job skips, which reads as CI passing
+                            // a build it never did. Unknown is the codebase's
+                            // fail-open answer: every changed() filter admits,
+                            // and the reason string says why on the run page.
+                            changes: if named {
+                                crate::paths::Changes::unknown(
+                                    "run forced by `git submit --only`; every changed() \
+                                     filter admits",
+                                )
+                            } else {
+                                changes.clone()
+                            },
                             actor_subject: actor.map(|a| a.subject.clone()),
                             actor_email: actor
                                 .map(|a| a.email.clone())

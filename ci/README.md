@@ -59,7 +59,10 @@ case-insensitively; the flag repeats. Two edges are deliberate:
 - **A named workflow runs even when its `branches:`/`paths:` filters would have
   declined** — naming it is the decision those filters exist to infer, the way
   a manual dispatch outranks a path filter. The response says so
-  (`trigger filters bypassed by --only`) whenever that happened.
+  (`trigger filters bypassed by --only`) whenever that happened. The run is
+  created with *unknown* changes, so job-level `if: changed(...)` conditions
+  admit as well — otherwise the jobs would read the same diff that declined the
+  workflow and skip to a green run that built nothing.
 - **A selector that matches no workflow file fails the submit** rather than
   silently starting nothing, and one that names a workflow without `submit` in
   its `on:` list says exactly that.

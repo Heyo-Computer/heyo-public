@@ -67,9 +67,10 @@ Options:
                    (.ci/workflows/apps.yml), its basename with or without the
                    extension (apps.yml, apps), or the workflow's own name:
                    field, matched case-insensitively. A named workflow runs
-                   even when its branch/paths filters would have declined —
-                   naming it is the decision — and a selector that matches no
-                   file fails the submit instead of silently starting nothing.
+                   even when its branch/paths filters (and its jobs' changed()
+                   conditions) would have declined — naming it is the decision —
+                   and a selector that matches no file fails the submit instead
+                   of silently starting nothing.
   --workflow <id>  name the workflow object this run belongs to
   --dry-run        print what would be sent, send nothing
   --upgrade        reinstall from the release channel
