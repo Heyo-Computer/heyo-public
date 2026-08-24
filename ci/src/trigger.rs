@@ -361,34 +361,29 @@ fn clone_bundle(bundle: &Path, root: &Path) -> Result<(), TriggerError> {
             })
     };
 
-    // Verify first: `git bundle verify` rejects a truncated or corrupt bundle,
-    // and a bundle whose prerequisites are absent — which is exactly what a
-    // client that tried to send a shallow slice would produce, and which would
-    // otherwise fail later as an unexplained empty checkout.
-    let verify = git(&["bundle", "verify", &bundle.display().to_string()])?;
-    if !verify.status.success() {
+    // `git bundle verify` needs a repository to run in — "need a repository to
+    // verify a bundle" otherwise — because a bundle may declare prerequisite
+    // commits and the check is against *some* object store. The orchestrator's
+    // own working directory is deliberately not a repository (and must not be
+    // relied on either way: `cargo test` runs inside one, which is exactly how
+    // this dependence went unnoticed), so verify gets a scratch repo of its
+    // own. Empty on purpose: against no objects at all, "verifies" means the
+    // bundle is complete, so a client that sent a shallow slice is named here
+    // as missing its prerequisites rather than failing later as an unexplained
+    // empty checkout.
+    let scratch = bundle.with_extension("verify");
+    let _ = std::fs::remove_dir_all(&scratch);
+    let init = git(&["init", "--quiet", &scratch.display().to_string()])?;
+    if !init.status.success() {
         return Err(TriggerError::BadArchive(format!(
-            "the git bundle is not usable on its own: {}",
-            String::from_utf8_lossy(&verify.stderr).trim()
+            "could not prepare a scratch repository to verify the bundle: {}",
+            String::from_utf8_lossy(&init.stderr).trim()
         )));
     }
-
-    // `verify` is not enough, and the gap is not obvious: a file containing
-    // nothing but the header `# v2 git bundle` **passes** it — reported as
-    // "is okay", "0 refs", "records a complete history" — and then clones into
-    // an empty repository. The submitter's next error would be "no workflow
-    // files matched", sending them to look at their glob when the real problem
-    // is that nothing was sent. So the refs are counted explicitly.
-    let heads = git(&["bundle", "list-heads", &bundle.display().to_string()])?;
-    if heads.stdout.iter().all(u8::is_ascii_whitespace) {
-        return Err(TriggerError::BadArchive(
-            "the git bundle contains no refs, so there is nothing to check out. \
-             It passed `git bundle verify`, which reports a ref-less bundle as \
-             complete — check that the client packed a branch and not a bare \
-             commit."
-                .to_string(),
-        ));
-    }
+    let scratch_dir = scratch.display().to_string();
+    let inspected = inspect_bundle(&git, &scratch_dir, bundle);
+    let _ = std::fs::remove_dir_all(&scratch);
+    inspected?;
 
     let out = git(&[
         // A hooks path that cannot exist, so nothing in the submitted history
@@ -405,6 +400,58 @@ fn clone_bundle(bundle: &Path, root: &Path) -> Result<(), TriggerError> {
             "cloning the submitted bundle failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
+    }
+    Ok(())
+}
+
+/// The bundle checks that need a repository: verify, then a ref count.
+///
+/// Split out of [`clone_bundle`] so the scratch repository is removed on every
+/// exit path without a guard type. `scratch_dir` is a freshly `git init`ed
+/// directory; see the call site for why it is empty.
+fn inspect_bundle(
+    git: &dyn Fn(&[&str]) -> Result<std::process::Output, TriggerError>,
+    scratch_dir: &str,
+    bundle: &Path,
+) -> Result<(), TriggerError> {
+    // Verify first: `git bundle verify` rejects a truncated or corrupt bundle,
+    // and a bundle whose prerequisites are absent — which is exactly what a
+    // client that tried to send a shallow slice would produce.
+    let verify = git(&[
+        "-C",
+        scratch_dir,
+        "bundle",
+        "verify",
+        &bundle.display().to_string(),
+    ])?;
+    if !verify.status.success() {
+        return Err(TriggerError::BadArchive(format!(
+            "the git bundle is not usable on its own: {}",
+            String::from_utf8_lossy(&verify.stderr).trim()
+        )));
+    }
+
+    // `verify` is not enough, and the gap is not obvious: a file containing
+    // nothing but the header `# v2 git bundle` **passes** it — reported as
+    // "is okay", "0 refs", "records a complete history" — and then clones into
+    // an empty repository. The submitter's next error would be "no workflow
+    // files matched", sending them to look at their glob when the real problem
+    // is that nothing was sent. So the refs are counted explicitly.
+    let heads = git(&[
+        "-C",
+        scratch_dir,
+        "bundle",
+        "list-heads",
+        &bundle.display().to_string(),
+    ])?;
+    if heads.stdout.iter().all(u8::is_ascii_whitespace) {
+        return Err(TriggerError::BadArchive(
+            "the git bundle contains no refs, so there is nothing to check out. \
+             It passed `git bundle verify`, which reports a ref-less bundle as \
+             complete — check that the client packed a branch and not a bare \
+             commit."
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -690,6 +737,111 @@ impl std::error::Error for TriggerError {}
 
 #[cfg(test)]
 mod tests {
+    mod bundles {
+        use super::super::clone_bundle;
+        use std::path::{Path, PathBuf};
+        use std::process::Command;
+
+        fn sh_git(dir: &Path, args: &[&str]) {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        fn temp(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("ci-bundle-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// The plain path: a complete bundle clones into a working tree. The
+        /// verify runs in a scratch repository the code makes itself — the
+        /// production process does not sit inside a git repository, and `git
+        /// bundle verify` refuses to run without one ("need a repository to
+        /// verify a bundle"). `cargo test` *does* run inside one, which is how
+        /// that dependence originally went unnoticed; the scratch repo is what
+        /// makes this path independent of where the process happens to be.
+        #[test]
+        fn a_complete_bundle_clones() {
+            let dir = temp("ok");
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            sh_git(&repo, &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("a.txt"), "hello").unwrap();
+            sh_git(&repo, &["add", "a.txt"]);
+            sh_git(&repo, &["commit", "-qm", "one"]);
+            let bundle = dir.join("src.bundle");
+            sh_git(
+                &repo,
+                &["bundle", "create", &bundle.display().to_string(), "--all"],
+            );
+
+            let root = dir.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            clone_bundle(&bundle, &root).expect("a complete bundle clones");
+            assert_eq!(
+                std::fs::read_to_string(root.join("a.txt")).unwrap(),
+                "hello"
+            );
+            assert!(
+                !dir.join("src.verify").exists(),
+                "the scratch repo is cleaned up"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A sliced bundle — one with prerequisite commits — is refused at
+        /// verify, by name. The scratch repository being *empty* is what makes
+        /// this real: verified against some ambient repository that happens to
+        /// hold the objects, a slice would falsely pass and then clone into an
+        /// empty checkout.
+        #[test]
+        fn a_bundle_with_prerequisites_is_refused() {
+            let dir = temp("slice");
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            sh_git(&repo, &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("a.txt"), "one").unwrap();
+            sh_git(&repo, &["add", "a.txt"]);
+            sh_git(&repo, &["commit", "-qm", "one"]);
+            std::fs::write(repo.join("a.txt"), "two").unwrap();
+            sh_git(&repo, &["commit", "-aqm", "two"]);
+            let bundle = dir.join("src.bundle");
+            sh_git(
+                &repo,
+                &[
+                    "bundle",
+                    "create",
+                    &bundle.display().to_string(),
+                    "main^..main",
+                ],
+            );
+
+            let root = dir.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let err = clone_bundle(&bundle, &root).expect_err("a slice must be refused");
+            let text = err.to_string();
+            assert!(
+                text.contains("not usable on its own"),
+                "the refusal names the bundle, got: {text}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     mod only_selectors {
         use crate::trigger::selector_matches;
 
