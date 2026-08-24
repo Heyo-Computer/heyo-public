@@ -398,28 +398,45 @@ jobs:
         # actually bites on this build, so the number is worth having in the log
         # next to the CARGO_BUILD_JOBS that was chosen against it.
         #
-        # The build is teed onto the cache disk. When this step hits its
-        # ceiling, the daemon kills the command and throws away everything it
-        # printed — the 2026-08-22 timeout left no way to tell a compile crawl
-        # from a hang. The file survives on /dev/vdb, so the next run (or a
-        # shell into the warm VM) reads exactly where the last one stopped.
-        # `tee` also decouples the exit code from the pipe, hence the rc file.
+        # Two rules learned from three runs that died at their ceiling with
+        # nothing to read (2026-08-22 through -24):
+        #
+        # * **Build output goes to a file, never the serial console.** A step's
+        #   stdout is the guest's serial line; ~135 minutes of cargo through it
+        #   is megabytes of console traffic — plus terminal progress redraws,
+        #   since cargo sees a tty — and a backpressured serial pipe throttles
+        #   the build it is narrating. The daemon then discards the whole
+        #   buffer if its ceiling fires, so streaming bought nothing. The file
+        #   lives on the cache disk and survives every outcome; the tail is
+        #   printed below, win or lose.
+        # * **The guest bounds the build itself**, five minutes under the
+        #   step's ceiling. GNU timeout signals the child's whole process
+        #   group, so cargo and every rustc die together, the exec's end
+        #   marker still reaches the daemon, and this step comes back as a
+        #   *failure with a log* instead of a daemon-side kill with nothing.
+        #   Exit 124 is the in-guest timeout itself.
         run: |
           df -P / "$CARGO_TARGET_DIR"
           free -m || true
-          rm -f /tmp/build-rc
-          ( cargo build --release --locked --bins; echo "$?" > /tmp/build-rc ) 2>&1             | tee "$CARGO_TARGET_DIR/app-obs-build.log"
-          rc="$(cat /tmp/build-rc 2>/dev/null || echo 1)"
+          log="$CARGO_TARGET_DIR/app-obs-build.log"
+          rc=0
+          timeout -k 60 7800 env CARGO_TERM_PROGRESS_WHEN=never             cargo build --release --locked --bins > "$log" 2>&1 || rc=$?
           if [ "$rc" -ne 0 ]; then
-            echo "=== build failed (exit $rc); guest kernel log tail ==="
+            if [ "$rc" -eq 124 ]; then
+              echo "=== the in-guest timeout killed the build after 7800s ==="
+            fi
+            echo "=== build failed (exit $rc); last 100 log lines ==="
+            tail -100 "$log" 2>/dev/null || echo "(no log at $log)"
+            echo "=== guest kernel log tail ==="
             echo "(look for 'Out of memory: Killed process' — that means"
             echo " CARGO_BUILD_JOBS is still too high for this size_class)"
-            dmesg | tail -100 || true
+            dmesg | tail -50 || true
             df -P / "$CARGO_TARGET_DIR"
             exit 1
           fi
+          tail -5 "$log"
         # 135, raised from 105 with the job ceiling: the wipe-then-cold-build
-        # case has to fit. With the fetch split out, all 135 minutes are rustc.
+        # case has to fit. The in-guest 7800s above must stay under this.
         timeout-minutes: 135
 
       # `app-obs` takes no arguments either — it reads `APP_OBS_*` from the
