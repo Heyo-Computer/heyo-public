@@ -110,7 +110,46 @@ pub struct SubmitRequest {
     /// object whose repository matches", resolved by the caller.
     #[serde(default)]
     pub workflow_id: Option<String>,
+    /// Run only the workflow *files* these selectors name — `git submit
+    /// --only`. A selector matches a file's path (`.ci/workflows/apps.yml`),
+    /// its basename with or without the extension (`apps.yml`, `apps`), or the
+    /// workflow's own `name:`, case-insensitively. Empty means every file the
+    /// glob finds, which is what every client sent before the field existed.
+    ///
+    /// Distinct from `workflow_id`, which picks a registered workflow *object*
+    /// (a glob + network + secrets scope); this picks files inside whatever
+    /// glob applies. A selector that matches nothing fails the submit — an
+    /// explicitly named workflow silently not running is the failure mode this
+    /// flag exists to avoid.
+    #[serde(default)]
+    pub only: Vec<String>,
     pub source: SourceArchive,
+}
+
+/// Whether one `--only` selector names this workflow file.
+///
+/// `path` is the file's path as [`find_workflows`] reports it (relative, forward
+/// slashes); `name` is the parsed workflow's `name:`, when it has one.
+pub fn selector_matches(selector: &str, path: &str, name: Option<&str>) -> bool {
+    let sel = selector.trim();
+    if sel.is_empty() {
+        return false;
+    }
+    if sel.eq_ignore_ascii_case(path) {
+        return true;
+    }
+    let base = path.rsplit('/').next().unwrap_or(path);
+    if sel.eq_ignore_ascii_case(base) {
+        return true;
+    }
+    let stem = base
+        .strip_suffix(".yml")
+        .or_else(|| base.strip_suffix(".yaml"))
+        .unwrap_or(base);
+    if sel.eq_ignore_ascii_case(stem) {
+        return true;
+    }
+    name.is_some_and(|n| sel.eq_ignore_ascii_case(n.trim()))
 }
 
 impl SubmitRequest {
@@ -651,6 +690,43 @@ impl std::error::Error for TriggerError {}
 
 #[cfg(test)]
 mod tests {
+    mod only_selectors {
+        use crate::trigger::selector_matches;
+
+        #[test]
+        fn a_selector_names_a_file_by_path_basename_stem_or_workflow_name() {
+            let path = ".ci/workflows/apps.yml";
+            let name = Some("Platform apps");
+            for sel in [
+                ".ci/workflows/apps.yml",
+                "apps.yml",
+                "apps",
+                "APPS",
+                "platform apps",
+            ] {
+                assert!(selector_matches(sel, path, name), "{sel}");
+            }
+            for sel in ["app", "apps.yaml", "ci", "", "  "] {
+                assert!(!selector_matches(sel, path, name), "{sel}");
+            }
+        }
+
+        #[test]
+        fn yaml_extension_and_no_name_still_match() {
+            assert!(selector_matches("nightly", "workflows/nightly.yaml", None));
+            assert!(selector_matches(
+                "nightly.yaml",
+                "workflows/nightly.yaml",
+                None
+            ));
+            assert!(!selector_matches(
+                "nightly.yml",
+                "workflows/nightly.yaml",
+                None
+            ));
+        }
+    }
+
     use super::*;
     use std::io::Write;
 
@@ -1314,6 +1390,7 @@ mod tests {
             dry_run: false,
             pusher: None,
             workflow_id: None,
+            only: Vec::new(),
             source: SourceArchive {
                 format: "tar.gz".into(),
                 content_base64: String::new(),

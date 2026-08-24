@@ -279,6 +279,18 @@ impl Dispatcher {
 
         let mut run_ids = Vec::new();
         let mut patterns_tried = Vec::new();
+        // `--only` bookkeeping: which selectors found a workflow file at all.
+        // Checked across every source, after the loop — a selector that matched
+        // nothing anywhere is a mistake worth failing the submit over, and a
+        // per-source check would wrongly fail a selector that matches the
+        // *other* object's glob.
+        let only: Vec<String> = req
+            .only
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut only_matched: Vec<bool> = vec![false; only.len()];
         // Workflow files that matched the glob and then declined to build, with
         // the filter that declined. Kept apart from `warnings` because they are
         // the difference between "nothing matched your glob" — a mistake worth
@@ -305,7 +317,33 @@ impl Dispatcher {
             for (path, text) in &files {
                 let wf = crate::workflow::Workflow::parse(path, text)
                     .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+                // `--only`: the submit names the workflow files it wants, and
+                // every other file is left alone — not "declined", not warned
+                // about, simply not asked.
+                let named = if only.is_empty() {
+                    false
+                } else {
+                    let mut hit = false;
+                    for (i, sel) in only.iter().enumerate() {
+                        if crate::trigger::selector_matches(sel, path, wf.name.as_deref()) {
+                            only_matched[i] = true;
+                            hit = true;
+                        }
+                    }
+                    if !hit {
+                        continue;
+                    }
+                    true
+                };
                 if !wf.on.iter().any(|t| t == "submit") {
+                    if named {
+                        // Explicitly asked for, and unable to comply: that is
+                        // an answer for the terminal, not a line in a log.
+                        return Err(DispatchError::Workflow(format!(
+                            "{path} was named by --only but does not trigger on `submit`; \
+                             add `submit` to its `on:` list to run it this way"
+                        )));
+                    }
                     tracing::info!("{path} does not trigger on `submit`; skipping");
                     continue;
                 }
@@ -313,10 +351,21 @@ impl Dispatcher {
                 // is the unit a run is created for: in a repository with an
                 // `api.yml` and a `web.yml`, a commit touching only `api/` must
                 // produce one run and not two.
+                //
+                // A workflow named by `--only` runs even when the gate says no:
+                // naming it *is* the decision the gate exists to infer, the way
+                // a manual dispatch outranks a path filter. Said out loud in the
+                // response, so a run on an unexpected branch is never a mystery.
                 if let Err(why) = wf.on_submit.admits(req.branch(), &changes) {
-                    tracing::info!("{path} declined this submit: {why}");
-                    skipped.push(format!("{path}: {why}"));
-                    continue;
+                    if named {
+                        warnings.push(format!(
+                            "{path}: trigger filters bypassed by --only ({why})"
+                        ));
+                    } else {
+                        tracing::info!("{path} declined this submit: {why}");
+                        skipped.push(format!("{path}: {why}"));
+                        continue;
+                    }
                 }
                 let mut plan = crate::plan::Plan::build(&wf)
                     .map_err(|e| DispatchError::Workflow(e.to_string()))?;
@@ -385,6 +434,23 @@ impl Dispatcher {
         // correctly build nothing. Failing the submit for that would make `git
         // submit` red on a healthy repository, and would break any hook that
         // treats a failed submit as something to retry.
+        // Selectors are checked before the started-nothing check: "--only
+        // apps-obs matched no workflow file" is the answer when it is true, and
+        // "nothing matched your glob" would send the reader to the wrong knob.
+        let unmatched: Vec<&str> = only
+            .iter()
+            .zip(&only_matched)
+            .filter(|(_, hit)| !**hit)
+            .map(|(s, _)| s.as_str())
+            .collect();
+        if !unmatched.is_empty() {
+            return Err(DispatchError::Workflow(format!(
+                "--only {:?} matched no workflow file under {} — a selector is a file's \
+                 path, its basename with or without .yml, or the workflow's `name:`",
+                unmatched.join(", "),
+                patterns_tried.join(", "),
+            )));
+        }
         if run_ids.is_empty() && skipped.is_empty() {
             return Err(crate::trigger::TriggerError::NoWorkflows(format!(
                 "{} (nothing matched, or nothing triggering on `submit`)",

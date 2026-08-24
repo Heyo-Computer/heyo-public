@@ -47,7 +47,26 @@ git submit --dry-run    # show what would be sent
 git submit              # submit HEAD
 git submit --dirty      # include uncommitted tracked changes
 git submit --archive    # send a tree-only tarball instead of a bundle
+git submit --only apps  # run one workflow file, skip the rest
 ```
+
+`--only <workflow>` starts runs for just the workflow files it names and leaves
+every other one alone. A selector is the file's path
+(`.ci/workflows/apps.yml`), its basename with or without the extension
+(`apps.yml`, `apps`), or the workflow's own `name:`, matched
+case-insensitively; the flag repeats. Two edges are deliberate:
+
+- **A named workflow runs even when its `branches:`/`paths:` filters would have
+  declined** — naming it is the decision those filters exist to infer, the way
+  a manual dispatch outranks a path filter. The response says so
+  (`trigger filters bypassed by --only`) whenever that happened.
+- **A selector that matches no workflow file fails the submit** rather than
+  silently starting nothing, and one that names a workflow without `submit` in
+  its `on:` list says exactly that.
+
+The field rides the payload as `only`; a server older than this build ignores
+unknown fields and would run everything, so upgrade the server before leaning
+on it.
 
 `git submit` sends a **`git bundle`**, which clones in the guest into a real
 repository — so `git describe`, `git log` and `git rev-parse` work in a step. Two

@@ -37,7 +37,7 @@
 #   CI_WEBHOOK_SECRET / git config ci.secret     the shared HMAC secret
 set -euo pipefail
 
-GIT_SUBMIT_VERSION="0.4.0"
+GIT_SUBMIT_VERSION="0.5.0"
 
 # `git-submit` invoked as `git submit`, `git-ci` invoked as `git ci`. Only used
 # in messages, but a script that tells you to run a command that does not exist
@@ -49,7 +49,7 @@ die() { printf '%s: %s\n' "$cmd" "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-Usage: $cmd [--dirty] [--ref <rev>] [--workflow <id>] [--dry-run] [--submit-empty]
+Usage: $cmd [--dirty] [--ref <rev>] [--only <workflow>] [--workflow <id>] [--dry-run] [--submit-empty]
 
 Submits a tarball of the tree to the CI orchestrator and prints the runs it
 started.
@@ -61,6 +61,15 @@ Options:
   --archive        send a tree-only tarball instead of a git bundle (no .git in
                    the guest, but a payload that does not carry history)
   --ref <rev>      submit some other commit (default HEAD)
+  --only <workflow>
+                   run only this workflow file, skipping every other one the
+                   repository has. Repeatable. A selector is the file's path
+                   (.ci/workflows/apps.yml), its basename with or without the
+                   extension (apps.yml, apps), or the workflow's own name:
+                   field, matched case-insensitively. A named workflow runs
+                   even when its branch/paths filters would have declined —
+                   naming it is the decision — and a selector that matches no
+                   file fails the submit instead of silently starting nothing.
   --workflow <id>  name the workflow object this run belongs to
   --dry-run        print what would be sent, send nothing
   --upgrade        reinstall from the release channel
@@ -81,6 +90,7 @@ dry_run=0
 archive=0
 submit_empty=0
 workflow=""
+only=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --dirty)    dirty=1; shift ;;
@@ -89,6 +99,7 @@ while [ $# -gt 0 ]; do
     --dry-run)  dry_run=1; shift ;;
     --ref)      rev="${2:?--ref needs a revision}"; shift 2 ;;
     --workflow) workflow="${2:?--workflow needs an id}"; shift 2 ;;
+    --only)     only+=("${2:?--only needs a workflow name}"); shift 2 ;;
     --upgrade)
       installer="${GIT_SUBMIT_INSTALL_URL:-https://heyo-cli-releases.s3.amazonaws.com/git-submit/latest/install-git-submit.sh}"
       command -v curl >/dev/null 2>&1 || die "--upgrade needs curl"
@@ -242,6 +253,7 @@ if [ "$dry_run" -eq 1 ]; then
     "$([ "$dirty" -eq 1 ] && echo ' (including uncommitted changes)')"
   printf '  credential %s\n' "$([ -n "$token" ] && echo 'repository token (ci.token)' || echo 'shared secret (ci.secret)')"
   [ -n "$workflow" ] && printf '  workflow   %s\n' "$workflow"
+  [ "${#only[@]}" -gt 0 ] && printf '  only       %s\n' "${only[*]}"
   if [ "$format" = "git-bundle" ]; then
     printf '  refs:\n'
     git bundle list-heads "$bundle" | sed 's/^/    /'
@@ -274,10 +286,12 @@ if command -v jq >/dev/null 2>&1; then
     --arg before "$before" --arg after "$sha" \
     --arg pn "$pusher_name" --arg pe "$pusher_email" \
     --arg wf "$workflow" --arg fmt "$format" --rawfile content "$content" \
+    --arg only "$(printf '%s\n' ${only[@]+"${only[@]}"})" \
     '{repository:{id:$id,name:$name,url:$url,defaultBranch:(if $db=="" then null else $db end)},
       ref:$ref, before:$before, after:$after, dryRun:false,
       pusher:{name:$pn,email:$pe},
       workflowId:(if $wf=="" then null else $wf end),
+      only:($only | split("\n") | map(select(length > 0))),
       source:{format:$fmt, contentBase64:$content}}' > "$payload"
 else
   # jq is not universally installed and this payload is simple enough to build
@@ -294,6 +308,14 @@ else
     printf '"pusher":{"name":"%s","email":"%s"},' "$(esc "$pusher_name")" "$(esc "$pusher_email")"
     printf '"workflowId":%s,' \
       "$([ -n "$workflow" ] && printf '"%s"' "$(esc "$workflow")" || printf 'null')"
+    printf '"only":['
+    sep=""
+    for sel in ${only[@]+"${only[@]}"}; do
+      printf '%s"%s"' "$sep" "$(esc "$sel")"
+      sep=","
+    done
+    printf '],'
+
     printf '"source":{"format":"%s","contentBase64":"' "$format"
     cat "$content"
     printf '"}}'
