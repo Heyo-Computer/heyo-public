@@ -1618,7 +1618,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                        -exec rm -rf {{}} +; \
                      tar -C {tmp} -cf - . | tar -C {wd} -xf -; \
                      rm -rf {tmp} {src}; \
-                     git -C {wd} log --oneline -1; ls -a {wd} | head -50",
+                     git -C {wd} -c color.ui=never log --oneline -1; ls -a {wd} | head -50",
                     wd = shell_quote(&workdir),
                     tmp = shell_quote(&format!("{wd}/.ci-clone")),
                     src = shell_quote(&remote),

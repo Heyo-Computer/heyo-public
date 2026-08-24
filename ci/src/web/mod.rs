@@ -1231,6 +1231,7 @@ async fn networks_page(State(state): State<AppState>, headers: HeaderMap) -> imp
         &chrome(&state, &headers, who.as_ref()),
         &state.runners.snapshot(),
         &depths,
+        &state.runners.tunnel_failures(),
         &pages::Notice::default(),
     )
 }
@@ -1311,6 +1312,7 @@ async fn render_networks(
         &chrome(state, headers, who),
         &state.runners.snapshot(),
         &depths,
+        &state.runners.tunnel_failures(),
         &notice,
     )
     .into_response()

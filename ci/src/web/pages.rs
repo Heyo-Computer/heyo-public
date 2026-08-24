@@ -13,9 +13,10 @@
 //! debugging. What is left in `STYLE` below is only what is peculiar to this
 //! app; anything a second app would want belongs in the shared file.
 
-use crate::runners::{Pool, Runner, RunnerSet, RunnerStatus};
+use crate::runners::{Pool, Runner, RunnerSet, RunnerStatus, TunnelFailure};
 use crate::store::{ArtifactRow, JobRow, Repo, RepoToken, Run, StepRow};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// What is specific to `ci`, layered on `ui/heyo.css`.
@@ -163,10 +164,15 @@ fn status_pill(status: RunnerStatus) -> Markup {
 }
 
 fn runner_rows(runners: &[Runner]) -> Markup {
-    runner_rows_marking(runners, "", &QueueDepths::default())
+    runner_rows_marking(runners, "", &QueueDepths::default(), &HashMap::new())
 }
 
-fn runner_rows_marking(runners: &[Runner], this_host: &str, depths: &QueueDepths) -> Markup {
+fn runner_rows_marking(
+    runners: &[Runner],
+    this_host: &str,
+    depths: &QueueDepths,
+    tunnel_failures: &HashMap<String, TunnelFailure>,
+) -> Markup {
     html! {
         @for r in runners {
             tr {
@@ -179,7 +185,17 @@ fn runner_rows_marking(runners: &[Runner], this_host: &str, depths: &QueueDepths
                     }
                 }
                 td .mono { (r.id) }
-                td { (status_pill(r.status)) }
+                td {
+                    (status_pill(r.status))
+                    // `Online` is the cloud's word, carried by the daemon's
+                    // heartbeat; the tunnel is how jobs actually reach it, and
+                    // the two can disagree. A row that says both is the only
+                    // honest answer to "the tab says idle but every job fails".
+                    @if let Some(failure) = tunnel_failures.get(&r.id) {
+                        " " span .pill.failure title=(failure.reason) { "tunnel down" }
+                        div .meta { (failure.ago()) ": " (failure.reason) }
+                    }
+                }
                 td { (queue_cell(depths, &r.id, r.status.is_dispatchable())) }
                 td .mono { (r.last_seen_at.as_deref().unwrap_or("—")) }
             }
@@ -204,6 +220,7 @@ fn network_section(
     default_id: &str,
     this_host: &str,
     depths: &QueueDepths,
+    tunnel_failures: &HashMap<String, TunnelFailure>,
 ) -> Markup {
     let joined = !this_host.is_empty() && set.runners.iter().any(|r| r.id == this_host);
     html! {
@@ -253,7 +270,7 @@ fn network_section(
                             th { "Name" } th { "Daemon" } th { "Status" }
                             th { "Queue" } th { "Last seen" }
                         } }
-                        tbody { (runner_rows_marking(&set.runners, this_host, depths)) }
+                        tbody { (runner_rows_marking(&set.runners, this_host, depths, tunnel_failures)) }
                     }
                 }
             }
@@ -556,6 +573,7 @@ pub fn networks_page(
     chrome: &Chrome,
     pool: &Pool,
     depths: &QueueDepths,
+    tunnel_failures: &HashMap<String, TunnelFailure>,
     notice: &Notice,
 ) -> Markup {
     let served = pool.served().count();
@@ -608,7 +626,7 @@ pub fn networks_page(
                 }
             }
             @for set in &pool.networks {
-                (network_section(set, &pool.default_network_id, &pool.default_node_id, depths))
+                (network_section(set, &pool.default_network_id, &pool.default_node_id, depths, tunnel_failures))
             }
         }
 
@@ -696,6 +714,7 @@ mod tests {
             &chrome_as("Sam Currie"),
             &populated(),
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::default(),
         )
         .into_string();
@@ -710,6 +729,31 @@ mod tests {
         assert!(html.contains("Sam Currie"));
     }
 
+    /// A runner the cloud calls Online but whose tunnel carries nothing shows
+    /// both facts on one row — the exact disagreement that used to be
+    /// invisible while jobs burned their retries.
+    #[test]
+    fn a_dead_tunnel_is_shown_next_to_an_online_status() {
+        let mut failures = HashMap::new();
+        failures.insert(
+            "hd-1".to_string(),
+            crate::runners::TunnelFailure {
+                reason: "the tunnel carried no reply to a probe request: timeout".into(),
+                at: std::time::Instant::now(),
+            },
+        );
+        let html = networks_page(
+            &chrome(),
+            &populated(),
+            &QueueDepths::default(),
+            &failures,
+            &Notice::default(),
+        )
+        .into_string();
+        assert!(html.contains("tunnel down"), "{html}");
+        assert!(html.contains("carried no reply"));
+    }
+
     /// The distinction the whole page turns on: a network this instance builds
     /// for, versus one that merely exists.
     #[test]
@@ -718,6 +762,7 @@ mod tests {
             &chrome(),
             &populated(),
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::default(),
         )
         .into_string();
@@ -734,6 +779,7 @@ mod tests {
             &chrome(),
             &populated(),
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::default(),
         )
         .into_string();
@@ -748,6 +794,7 @@ mod tests {
             &chrome(),
             &Pool::default(),
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::default(),
         )
         .into_string();
@@ -764,6 +811,7 @@ mod tests {
             &chrome(),
             &pool,
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::default(),
         )
         .into_string();
@@ -779,6 +827,7 @@ mod tests {
             &chrome(),
             &populated(),
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::default(),
         )
         .into_string();
@@ -947,8 +996,14 @@ mod tests {
             }),
         );
 
-        let html =
-            networks_page(&chrome(), &populated(), &depths, &Notice::default()).into_string();
+        let html = networks_page(
+            &chrome(),
+            &populated(),
+            &depths,
+            &HashMap::new(),
+            &Notice::default(),
+        )
+        .into_string();
         assert!(html.contains("no consumer"), "{html}");
         assert!(
             html.contains(r#"class="pill failure""#),
@@ -974,8 +1029,14 @@ mod tests {
             }),
         );
 
-        let html =
-            networks_page(&chrome(), &populated(), &depths, &Notice::default()).into_string();
+        let html = networks_page(
+            &chrome(),
+            &populated(),
+            &depths,
+            &HashMap::new(),
+            &Notice::default(),
+        )
+        .into_string();
         assert!(html.contains("no consumer"));
         assert!(html.contains("idle"), "an empty live queue reads as idle");
     }
@@ -987,8 +1048,14 @@ mod tests {
             error: Some("could not reach NATS".into()),
             ..QueueDepths::default()
         };
-        let html =
-            networks_page(&chrome(), &populated(), &depths, &Notice::default()).into_string();
+        let html = networks_page(
+            &chrome(),
+            &populated(),
+            &depths,
+            &HashMap::new(),
+            &Notice::default(),
+        )
+        .into_string();
         assert!(html.contains("Queue depths are unavailable"), "{html}");
         assert!(html.contains("could not reach NATS"));
     }
@@ -1003,6 +1070,7 @@ mod tests {
             &chrome(),
             &pool,
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::default(),
         )
         .into_string();
@@ -1028,6 +1096,7 @@ mod tests {
             &chrome(),
             &pool,
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::default(),
         )
         .into_string();
@@ -1042,6 +1111,7 @@ mod tests {
             &chrome(),
             &populated(),
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::done("This host is now a member of lab."),
         )
         .into_string();
@@ -1051,6 +1121,7 @@ mod tests {
             &chrome(),
             &populated(),
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::failed("nope"),
         )
         .into_string();
@@ -1067,6 +1138,7 @@ mod tests {
             &chrome(),
             &pool,
             &QueueDepths::default(),
+            &HashMap::new(),
             &Notice::default(),
         )
         .into_string();

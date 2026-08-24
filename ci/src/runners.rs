@@ -298,15 +298,48 @@ impl Pool {
 }
 
 /// Pool discovery plus the per-runner tunnel cache.
+/// The last time a runner's tunnel failed, and how.
+///
+/// Kept so the networks page can say "Online, but unreachable over iroh" —
+/// the cloud's `Online` comes from the daemon's heartbeat, a different path
+/// entirely, so the two disagreeing is exactly the state an operator needs to
+/// see and previously could not: the tab showed a healthy idle runner while
+/// every job against it burned its retry ladder.
+#[derive(Debug, Clone)]
+pub struct TunnelFailure {
+    pub reason: String,
+    pub at: std::time::Instant,
+}
+
+impl TunnelFailure {
+    /// `"3m ago"`, for a table cell.
+    pub fn ago(&self) -> String {
+        let secs = self.at.elapsed().as_secs();
+        match secs {
+            0..=89 => format!("{secs}s ago"),
+            90..=5399 => format!("{}m ago", secs / 60),
+            _ => format!("{}h ago", secs / 3600),
+        }
+    }
+}
+
 pub struct Runners {
     config: Arc<Config>,
     snapshot: ArcSwap<Pool>,
     /// One client per runner, each owning its iroh tunnel. Keyed on daemon id.
     ///
-    /// A `Mutex` rather than a lock-free map because establishing a tunnel is a
-    /// network round trip that must not be raced: two concurrent misses for the
-    /// same runner would open two tunnels and leak one.
+    /// The lock is held only to look up and to insert — never across the dial
+    /// and its probes. It used to be, and the cost was head-of-line blocking
+    /// for the whole fleet: one runner whose tunnel dials but carries no data
+    /// held the lock for the dial timeout plus the probe, and every job on
+    /// every *other* runner queued behind it. Two concurrent misses for the
+    /// same runner may now both dial; the first to insert wins and the loser's
+    /// client is dropped, which closes its tunnel — a leaked dial for a moment,
+    /// never a leaked tunnel.
     tunnels: Mutex<HashMap<String, HeyoClient>>,
+    /// Last tunnel failure per runner, for the networks page. Std mutex: the
+    /// critical sections are map operations.
+    failures: std::sync::Mutex<HashMap<String, TunnelFailure>>,
 }
 
 impl Runners {
@@ -315,7 +348,28 @@ impl Runners {
             config,
             snapshot: ArcSwap::from_pointee(Pool::default()),
             tunnels: Mutex::new(HashMap::new()),
+            failures: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Each runner's most recent tunnel failure, if it has not carried traffic
+    /// since.
+    pub fn tunnel_failures(&self) -> HashMap<String, TunnelFailure> {
+        self.failures.lock().unwrap().clone()
+    }
+
+    fn note_tunnel_failure(&self, runner_id: &str, reason: &str) {
+        self.failures.lock().unwrap().insert(
+            runner_id.to_string(),
+            TunnelFailure {
+                reason: reason.to_string(),
+                at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    fn clear_tunnel_failure(&self, runner_id: &str) {
+        self.failures.lock().unwrap().remove(runner_id);
     }
 
     pub fn snapshot(&self) -> Arc<Pool> {
@@ -736,11 +790,39 @@ impl Runners {
     /// Cheap on a hit. On a miss it fetches a ticket, dials over iroh, and — the
     /// first time — proves the daemon actually enforces authentication.
     pub async fn client_for(&self, runner_id: &str) -> Result<HeyoClient, RunnerError> {
-        let mut cache = self.tunnels.lock().await;
-        if let Some(c) = cache.get(runner_id) {
+        if let Some(c) = self.tunnels.lock().await.get(runner_id) {
             return Ok(c.clone());
         }
 
+        let dialed = self.dial(runner_id).await;
+        match &dialed {
+            Ok(_) => self.clear_tunnel_failure(runner_id),
+            Err(RunnerError::Unreachable { reason, .. }) => {
+                self.note_tunnel_failure(runner_id, reason);
+            }
+            Err(RunnerError::DaemonUnauthenticated(_)) => {
+                self.note_tunnel_failure(
+                    runner_id,
+                    "daemon refused: it serves its API without authentication",
+                );
+            }
+            Err(_) => {}
+        }
+        let client = dialed?;
+
+        let mut cache = self.tunnels.lock().await;
+        if let Some(existing) = cache.get(runner_id) {
+            // A concurrent miss dialed too and beat us here. Theirs is the one
+            // everybody else already holds; ours is dropped, which closes it.
+            return Ok(existing.clone());
+        }
+        cache.insert(runner_id.to_string(), client.clone());
+        tracing::info!(runner = runner_id, "opened an iroh tunnel to the daemon");
+        Ok(client)
+    }
+
+    /// Ticket, dial, probe — everything that must not run under the cache lock.
+    async fn dial(&self, runner_id: &str) -> Result<HeyoClient, RunnerError> {
         let ticket = self.connection_ticket(runner_id).await?;
         // Bounded. This runs *before* the VM boot timeout applies, so an iroh
         // dial that never completes is a job with no steps and no error — the
@@ -764,9 +846,6 @@ impl Runners {
         })?;
 
         self.assert_daemon_requires_auth(runner_id, &client).await?;
-
-        cache.insert(runner_id.to_string(), client.clone());
-        tracing::info!(runner = runner_id, "opened an iroh tunnel to the daemon");
         Ok(client)
     }
 
@@ -933,7 +1012,44 @@ impl Runners {
             }
         };
 
-        let probe = anon
+        // Two probes with two different questions, because conflating them
+        // turned load into an outage: the old single probe hit `/sandboxes`
+        // with 10 seconds, and a daemon that was merely busy — a host mid way
+        // through preallocating a 40 GB data disk answers slowly — read as "the
+        // tunnel carried no data". Every job then burned its whole retry
+        // ladder against a runner that was fine, while the networks tab showed
+        // it Online, because the heartbeat rides a different path entirely.
+        //
+        // **Transport** is asked of `/health`: public on the daemon, no auth,
+        // no work — it reads a struct. If that carries no reply in 30 seconds
+        // the tunnel really is dead, and failing here names the runner and the
+        // tunnel instead of whatever request would have hit it first.
+        let transport = anon
+            .raw_request(
+                Method::GET,
+                "/health",
+                None::<&()>,
+                RequestOptions {
+                    timeout: Some(Duration::from_secs(30)),
+                    query: Vec::new(),
+                },
+            )
+            .await;
+        if let Err(e) = transport {
+            return Err(RunnerError::Unreachable {
+                runner: runner_id.to_string(),
+                reason: format!("the tunnel carried no reply to a probe request: {e}"),
+            });
+        }
+
+        // **Auth** is asked of `/sandboxes`, which must refuse an anonymous
+        // caller. The tunnel is already proven, so a transport error here is a
+        // daemon too loaded to answer a real route in time — retried once with
+        // a longer budget, and past that the question is left *open* with a
+        // warning rather than the runner declared unreachable: the lint runs
+        // again on every fresh tunnel, and an actually-open daemon answers
+        // quickly precisely because it is doing no auth work.
+        let mut probe = anon
             .raw_request(
                 Method::GET,
                 "/sandboxes",
@@ -944,25 +1060,31 @@ impl Runners {
                 },
             )
             .await;
+        if probe.is_err() {
+            probe = anon
+                .raw_request(
+                    Method::GET,
+                    "/sandboxes",
+                    None::<&()>,
+                    RequestOptions {
+                        timeout: Some(Duration::from_secs(30)),
+                        query: Vec::new(),
+                    },
+                )
+                .await;
+        }
 
         let open = match probe {
             // A protected route answering without a bearer is the failure.
             Ok(r) => r.status().is_success(),
-            // A transport error still proves nothing about auth — but it proves
-            // the tunnel does not carry data, and that is worth failing on here.
-            //
-            // This used to return `Ok(())` and let the real request report it.
-            // The real request is `ensure_image`, the first tunnel traffic a job
-            // sends, so a tunnel whose QUIC connection is up and whose data path
-            // is blackholed would be cached anyway and surface a full request
-            // timeout later — attributed to `POST /images/build`, a route that
-            // has nothing to do with it. Failing here names the runner and the
-            // tunnel instead, and leaves nothing cached for the next job.
             Err(e) => {
-                return Err(RunnerError::Unreachable {
-                    runner: runner_id.to_string(),
-                    reason: format!("the tunnel carried no reply to a probe request: {e}"),
-                });
+                tracing::warn!(
+                    runner = runner_id,
+                    "the tunnel is up (/health answers) but /sandboxes did not reply to the \
+                     auth probe ({e}); proceeding without the auth verdict — the daemon is \
+                     likely under load. The check runs again on the next tunnel."
+                );
+                return Ok(());
             }
         };
 
