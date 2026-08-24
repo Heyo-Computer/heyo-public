@@ -340,6 +340,11 @@ pub struct Runners {
     /// Last tunnel failure per runner, for the networks page. Std mutex: the
     /// critical sections are map operations.
     failures: std::sync::Mutex<HashMap<String, TunnelFailure>>,
+    /// Which sandbox drivers each daemon supports (`GET /capabilities`),
+    /// learned on first need and kept for the life of the process — a host
+    /// does not change operating systems between jobs. `None` is a daemon that
+    /// answered without the field: an older build, treated as "cannot tell".
+    capabilities: std::sync::Mutex<HashMap<String, Option<Arc<Vec<String>>>>>,
 }
 
 impl Runners {
@@ -349,6 +354,7 @@ impl Runners {
             snapshot: ArcSwap::from_pointee(Pool::default()),
             tunnels: Mutex::new(HashMap::new()),
             failures: std::sync::Mutex::new(HashMap::new()),
+            capabilities: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -911,6 +917,64 @@ impl Runners {
             )));
         }
         Ok(())
+    }
+
+    /// The sandbox drivers a runner's daemon says it supports.
+    ///
+    /// `Ok(None)` is an honest "cannot tell" — a daemon predating
+    /// `/capabilities`, or one that answered without the field — and the
+    /// caller should give it the benefit of the doubt rather than refuse a
+    /// fleet that merely has not upgraded. `Err` is a runner that could not be
+    /// asked at all.
+    pub async fn supported_drivers(
+        &self,
+        runner_id: &str,
+    ) -> Result<Option<Arc<Vec<String>>>, RunnerError> {
+        if let Some(known) = self.capabilities.lock().unwrap().get(runner_id) {
+            return Ok(known.clone());
+        }
+        let client = self.client_for(runner_id).await?;
+        let response = client
+            .raw_request(
+                Method::GET,
+                "/capabilities",
+                None::<&()>,
+                RequestOptions {
+                    timeout: Some(Duration::from_secs(30)),
+                    query: Vec::new(),
+                },
+            )
+            .await
+            .map_err(|e| RunnerError::Unreachable {
+                runner: runner_id.to_string(),
+                reason: format!("GET /capabilities failed: {e}"),
+            })?;
+        let drivers: Option<Arc<Vec<String>>> = if response.status().is_success() {
+            response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.get("supportedDrivers")
+                        .and_then(|d| d.as_array())
+                        .map(|list| {
+                            Arc::new(
+                                list.iter()
+                                    .filter_map(|s| s.as_str().map(str::to_string))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                })
+        } else {
+            // A 404 is an older daemon; anything else is still not evidence
+            // about what it can run.
+            None
+        };
+        self.capabilities
+            .lock()
+            .unwrap()
+            .insert(runner_id.to_string(), drivers.clone());
+        Ok(drivers)
     }
 
     /// Drop a runner's tunnel so the next `client_for` redials.

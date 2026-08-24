@@ -193,12 +193,19 @@ wants, and membership of that network is what makes a host eligible.
 
 ```yaml
 uses: default                       # the host this CI is running on
-uses: prod-runners                  # any online host in that network
+uses: prod-runners                  # any online host there that can run vm.driver
 uses: prod-runners/bigbox           # that host; `vm:` builds a VM on it
 uses: prod-runners/bigbox/sb-1a34   # that existing VM; `vm:` is unused and
                                     # every step is an exec into it
 # absent                            # the repository's assigned network, any host
 ```
+
+An unpinned job goes to the first online host **whose daemon supports the
+job's `vm.driver`** (`GET /capabilities` on the daemon, learned once per host):
+a macOS daemon that joined the network advertises `apple_container`/`apple_virt`
+and is skipped by a `driver: firecracker` job instead of being handed a VM it
+cannot boot. A *pinned* job gets the same check as a named error. A daemon too
+old to answer `/capabilities` is given the benefit of the doubt.
 
 **`uses:` carries everything needed to place the job**, and the third form is
 why that matters. A sandbox does not record which host it is on — `SandboxInfo`
@@ -403,11 +410,22 @@ meantime keeps its job.
 
 Every clock a job has — `CI_MAX_JOB_SECONDS`, the job's `timeout-minutes`, each
 step's `timeout-minutes` — starts when a consumer **claims** the job off its
-queue (`started_at`), never when it was submitted (`queued_at`). Each route is
-consumed one job at a time, so N jobs submitted together against one host form a
+queue (`started_at`), never when it was submitted (`queued_at`). A runner's own
+queue is consumed one job at a time, so N pinned jobs against one host form a
 line: the first runs, and the rest wait their turn with their budgets untouched.
-The run page shows the two separately, as **Queued** (time on the queue) and
-**Duration** (time since pickup).
+The network's shared queue **fans out** (bounded, currently 4): unpinned jobs
+run on different runners concurrently instead of queueing behind whichever one
+is mid-build. The run page shows the two clocks separately, as **Queued** (time
+on the queue) and **Duration** (time since pickup).
+
+**Cancelling frees the queue immediately.** A cancelled job used to hold its
+queue slot until the running step's own end — the daemon cannot abort an exec,
+and the dispatcher waited for it — so a cancelled two-hour build read as
+`running` on the networks page while everything behind it sat `queued`. The
+dispatcher now abandons the wait within seconds (`CANCEL_POLL`), records the
+step `cancelled`, releases the VM, and acks the message so it is not
+redelivered. The command already running in the guest finishes on its own or
+hits its in-guest timeout; its VM is repooled and swept normally.
 
 `CI_RUNNER_WAIT_SECS` is **not** a bound on that line. It fails a job that has
 waited for a runner that was never going to take it — a pinned host that is

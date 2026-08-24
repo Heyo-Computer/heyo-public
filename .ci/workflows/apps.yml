@@ -60,10 +60,18 @@ jobs:
   # ---------------------------------------------------------------------------
   app-lb:
     if: ${{ changed('app-lb/**', '.ci/workflows/apps.yml', '.ci/image/apps/**') }}
-    # Any online host in the network the repository is assigned on /repos.
-    # Deliberately not pinned: nothing here needs a particular machine, and
-    # pinning would idle the build behind one host's queue. Add
-    # `uses: <network>/<node>` if a specific runner is wanted.
+    # Pinned to the orchestrator's own host — the Linux CI machine. `default`
+    # rather than a spelled-out `<network>/<node>`, so the pin survives the
+    # host being renamed or the network reorganised.
+    #
+    # This used to be unpinned ("any online host"), and the 2026-08-24 run is
+    # why it no longer is: a macbook daemon joined the network and the job
+    # landed on it — a firecracker build on a host that only runs apple_*
+    # drivers. Placement filters on driver capability now, but the warm VM,
+    # its cache disk and the image catalog all live on one machine, so "any
+    # host" was never what these jobs meant; every placement elsewhere is a
+    # cold build.
+    uses: default
     vm:
       driver: firecracker
       build:
@@ -300,6 +308,9 @@ jobs:
   # ---------------------------------------------------------------------------
   app-obs:
     if: ${{ changed('app-obs/**', '.ci/workflows/apps.yml', '.ci/image/apps/**') }}
+    # Pinned like app-lb, and for one reason more: this is the slowest build in
+    # the repository, so a stray placement pays the full cold datafusion build.
+    uses: default
     vm:
       driver: firecracker
       build:

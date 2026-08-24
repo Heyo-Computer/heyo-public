@@ -46,6 +46,11 @@ use std::time::Duration;
 /// How long to wait for a VM to boot before giving up on a job.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How often a running step checks whether its job was cancelled. The cost is
+/// one indexed row read per tick per running job; the benefit is a cancel
+/// button that frees the queue in seconds instead of at the step's own end.
+const CANCEL_POLL: Duration = Duration::from_secs(15);
+
 /// Default per-step timeout when the workflow does not set `timeout-minutes`.
 /// Bounded well under the job timeout so one runaway step cannot consume the
 /// whole job budget and leave later steps no time at all.
@@ -1082,6 +1087,8 @@ impl Dispatcher {
         // cannot name a VM without saying where it is.
         let vm = placement.vm.map(str::to_string);
 
+        let driver = driver_name(plan.vm.driver);
+
         if let Some(node) = placement.node {
             if !node.status.is_dispatchable() {
                 return Err(DispatchError::RunnerOffline {
@@ -1089,16 +1096,65 @@ impl Dispatcher {
                     status: node.status.as_str(),
                 });
             }
+            // A pinned job still gets the capability check — a firecracker
+            // job pinned to a macbook fails *here*, by name, rather than as
+            // whatever the wrong daemon's create error happens to say. A VM
+            // named by `uses:` skips it: the VM already exists there, so the
+            // question is settled. "Cannot tell" and "cannot ask" both let the
+            // pin stand; the pin was explicit, and the job's own failure will
+            // be attributed to the runner either way.
+            if vm.is_none()
+                && let Ok(Some(supported)) = self.runners.supported_drivers(&node.id).await
+                && !host_can_run(Some(&supported), driver)
+            {
+                return Err(DispatchError::RunnerCannotRun {
+                    runner: node.name.clone(),
+                    driver,
+                    supported: supported.join(", "),
+                });
+            }
             return Ok((node.id.clone(), vm));
         }
-        // Least-recently-used across the online set would need per-runner load;
-        // for now the first online host wins, which is stable and predictable.
-        placement
-            .network
-            .dispatchable()
-            .next()
-            .map(|r| (r.id.clone(), vm))
-            .ok_or_else(|| DispatchError::NoOnlineRunner(placement.network.network_name.clone()))
+        // Unpinned: the first online host **that can run the job's driver**.
+        // The set is small and stable, so first-match stays predictable — but
+        // predictable used to mean "whichever host the cloud listed first",
+        // and when a macbook joined the network that was the macbook, handed a
+        // firecracker job macOS cannot run. Every skip is collected so the
+        // error names each host and why, instead of "no online runner" on a
+        // page showing three of them.
+        let mut skipped: Vec<String> = Vec::new();
+        for candidate in placement.network.dispatchable() {
+            match self.runners.supported_drivers(&candidate.id).await {
+                Ok(Some(supported)) if !host_can_run(Some(&supported), driver) => {
+                    skipped.push(format!(
+                        "{} supports {}",
+                        candidate.name,
+                        supported.join(", ")
+                    ));
+                }
+                // Known-capable, or old enough that it cannot say: it gets the
+                // job. Refusing every un-upgraded daemon would take down a
+                // working fleet to enforce a check it cannot answer.
+                Ok(_) => return Ok((candidate.id.clone(), vm)),
+                Err(e) => {
+                    tracing::warn!(
+                        runner = %candidate.name,
+                        "skipping for this job; its capabilities could not be read: {e}"
+                    );
+                    skipped.push(format!("{} could not be reached", candidate.name));
+                }
+            }
+        }
+        if skipped.is_empty() {
+            return Err(DispatchError::NoOnlineRunner(
+                placement.network.network_name.clone(),
+            ));
+        }
+        Err(DispatchError::NoCapableRunner {
+            network: placement.network.network_name.clone(),
+            driver,
+            skipped: skipped.join("; "),
+        })
     }
 
     /// Resolve `vm.build` to an image name, building it on `runner` if that
@@ -1819,7 +1875,45 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 .unwrap_or(DEFAULT_STEP_TIMEOUT)
                 .min(plan.timeout);
 
-            match vm.exec(&sid, &command, &env, timeout).await {
+            // The exec is raced against a cancellation watch. The boundary
+            // check above stops anything *after* a cancelled step; this stops
+            // the waiting itself, which used to be the gap that mattered: a
+            // cancelled two-hour build held this route's queue to the step's
+            // own end, with the run page saying cancelled and the networks
+            // page saying running. The daemon still has no way to abort the
+            // exec, so the guest command runs on to its own timeout — but the
+            // dispatcher stops waiting for it, releases the VM, and the queue
+            // moves. The step is recorded cancelled with a line saying what
+            // was left behind.
+            let raced = {
+                let watch = async {
+                    let mut ticker = tokio::time::interval(CANCEL_POLL);
+                    ticker.tick().await; // the immediate first tick
+                    loop {
+                        ticker.tick().await;
+                        if matches!(self.store.is_job_cancelled(&msg.job_id).await, Ok(true)) {
+                            break;
+                        }
+                    }
+                };
+                tokio::select! {
+                    out = vm.exec(&sid, &command, &env, timeout) => Some(out),
+                    _ = watch => None,
+                }
+            };
+            let Some(executed) = raced else {
+                let note = "\n[ci] cancelled while this step was running; the command in the \
+                            guest is left to finish or hit its own timeout, and nothing after \
+                            this step ran\n";
+                let _ = self.store.append_log(&sid, &log_path, note).await;
+                let _ = self
+                    .store
+                    .finish_step(&sid, StepStatus::Cancelled, None, Some("cancelled"))
+                    .await;
+                return Err(DispatchError::Cancelled(plan.key.clone()));
+            };
+
+            match executed {
                 Ok(out) => {
                     let (text, outputs) = split_outputs(&out, &sid);
                     // Masked before it is persisted, not when it is rendered: a
@@ -2093,6 +2187,11 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
     use futures::StreamExt;
 
     let label = format!("{route:?}");
+    /// How many unpinned jobs one network queue may be running at once — the
+    /// fan-out bound for `Route::Network` below. Small: each slot can be a VM
+    /// create somewhere in the fleet.
+    const NETWORK_CONCURRENCY: usize = 4;
+    let network_slots = Arc::new(tokio::sync::Semaphore::new(NETWORK_CONCURRENCY));
     loop {
         let consumer = match dispatcher.bus.consumer_for(&route).await {
             Ok(c) => c,
@@ -2129,113 +2228,161 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 continue;
             };
 
-            // Tell JetStream this job is still being worked on, for as long as
-            // it is. `ack_wait` is deliberately short so a dispatcher that dies
-            // releases its job in about a minute; this is what stops that same
-            // short window from redelivering a *healthy* long build underneath
-            // itself and putting two dispatchers on one VM.
-            let msg = Arc::new(msg);
-            let heartbeat = {
-                let msg = Arc::clone(&msg);
-                let job_key = job.job_key.clone();
-                tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(crate::bus::ACK_PROGRESS_EVERY);
-                    // The first tick is immediate and would be a no-op ack a
-                    // moment after delivery.
-                    ticker.tick().await;
-                    loop {
-                        ticker.tick().await;
-                        if let Err(e) = msg.ack_with(AckKind::Progress).await {
-                            // Logged, not fatal: one missed heartbeat still
-                            // leaves most of the window, and the next tick may
-                            // well land.
-                            tracing::warn!(job = %job_key, "could not extend the ack window: {e}");
-                        }
-                    }
-                })
-            };
-
-            // `CI_MAX_JOB_SECONDS` is enforced here, and only here. It used to
-            // reach JetStream as `ack_wait` and nothing else, so once the ack
-            // window stopped being derived from it the setting would have become
-            // decorative — a documented ceiling on a job that bounded nothing.
-            //
-            // A job cut off this way leaves its VM claimed, because `run_job`
-            // never reaches its own release. The lease reclaims it once this
-            // dispatcher stops renewing, which is exactly the case leases exist
-            // for.
-            //
-            // The clock starts *here*, on pickup. A job that sat on this
-            // route's queue behind another build has spent none of its budget
-            // waiting: each route is consumed one job at a time, so N jobs on
-            // one runner each get the full ceiling from the moment they are
-            // taken, not from when they were submitted.
-            let ceiling = dispatcher.config.max_job_duration;
-            let outcome =
-                bounded_from_pickup(ceiling, &job.job_key, dispatcher.run_job(&job, attempt)).await;
-            // Before the ack, always — including on the error paths below, which
-            // is why it is aborted here rather than in each arm.
-            heartbeat.abort();
-
-            match outcome {
-                Ok(status) => {
-                    tracing::info!(job = %job.job_key, "finished: {}", status.as_str());
-                    let _ = msg.ack().await;
+            match &route {
+                // A runner's own queue is strictly serial: one job on that
+                // host at a time, each getting its full budget from pickup.
+                Route::Runner(_) => {
+                    process_delivery(Arc::clone(&dispatcher), msg, job, attempt).await;
                 }
-                Err(e) => {
-                    // Retryable up to `MAX_DELIVER`. Past that JetStream stops
-                    // redelivering, so the job is marked failed here rather than
-                    // left `running` forever with nothing coming back to it.
-                    tracing::warn!(job = %job.job_key, attempt, "failed: {e}");
-                    if attempt >= crate::bus::MAX_DELIVER as i32 {
-                        let _ = dispatcher
-                            .store
-                            .set_job_status(
-                                &job.job_id,
-                                JobStatus::Failure,
-                                Some(&format!("giving up after {attempt} attempts: {e}")),
-                            )
-                            .await;
-                        let _ = msg.ack().await;
-                    } else {
-                        // Negative-ack with the ladder's delay rather than
-                        // waiting out `ack_wait`, which is job-length.
-                        let delay = crate::bus::backoff_for(attempt as u32);
-                        // Written on *every* attempt, not only the last. The
-                        // ladder is 60s, 5 minutes, then 15, so a job that can
-                        // never work — an image the host does not have is the
-                        // usual one — used to show an empty error for twenty
-                        // minutes before the fourth delivery finally recorded
-                        // the reason. Saying it now, with what happens next, is
-                        // the difference between a page that explains the wait
-                        // and one that looks like nothing is happening.
-                        let detail = format!(
-                            "attempt {attempt} of {} failed: {e}. Retrying in {}s.",
-                            crate::bus::MAX_DELIVER,
-                            delay.as_secs()
-                        );
-                        let _ = dispatcher.store.note_job_error(&job.job_id, &detail).await;
-                        dispatcher
-                            .bus
-                            .publish_event(
-                                &job.run_id,
-                                &job.job_key,
-                                &serde_json::json!({"status": "running", "error": detail}),
-                            )
-                            .await;
-                        let _ = msg
-                            .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
-                            .await;
-                    }
+                // The network's shared queue is where "any host" jobs wait, and
+                // consuming it serially made every unpinned job queue behind
+                // whichever one happened to be running — on *any* runner. One
+                // stuck placement (a host mid retry-ladder, a cancelled build
+                // running out its step) then read as the whole network being
+                // busy while other hosts sat idle. Bounded fan-out lets
+                // unpinned jobs run on different runners at once; the bound
+                // keeps a burst from starting more VM creates than a host
+                // fleet wants concurrently.
+                Route::Network(_) => {
+                    let permit = network_slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("the semaphore is never closed");
+                    let dispatcher = Arc::clone(&dispatcher);
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        process_delivery(dispatcher, msg, job, attempt).await;
+                    });
                 }
-            }
-
-            // Whatever happened, the run may now have newly-ready jobs — or be
-            // finished. Advancing here is what turns a DAG into a sequence.
-            if let Err(e) = dispatcher.advance_run(&job.run_id).await {
-                tracing::warn!(run = %job.run_id, "could not advance: {e}");
             }
         }
+    }
+}
+
+/// One delivered job, end to end: heartbeat, execute, ack or retry, advance.
+///
+/// Split out of [`consume`] so the two route kinds can schedule it
+/// differently — see the call sites there.
+async fn process_delivery(
+    dispatcher: Arc<Dispatcher>,
+    msg: async_nats::jetstream::Message,
+    job: JobMessage,
+    attempt: i32,
+) {
+    // Tell JetStream this job is still being worked on, for as long as
+    // it is. `ack_wait` is deliberately short so a dispatcher that dies
+    // releases its job in about a minute; this is what stops that same
+    // short window from redelivering a *healthy* long build underneath
+    // itself and putting two dispatchers on one VM.
+    let msg = Arc::new(msg);
+    let heartbeat = {
+        let msg = Arc::clone(&msg);
+        let job_key = job.job_key.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(crate::bus::ACK_PROGRESS_EVERY);
+            // The first tick is immediate and would be a no-op ack a
+            // moment after delivery.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if let Err(e) = msg.ack_with(AckKind::Progress).await {
+                    // Logged, not fatal: one missed heartbeat still
+                    // leaves most of the window, and the next tick may
+                    // well land.
+                    tracing::warn!(job = %job_key, "could not extend the ack window: {e}");
+                }
+            }
+        })
+    };
+
+    // `CI_MAX_JOB_SECONDS` is enforced here, and only here. It used to
+    // reach JetStream as `ack_wait` and nothing else, so once the ack
+    // window stopped being derived from it the setting would have become
+    // decorative — a documented ceiling on a job that bounded nothing.
+    //
+    // A job cut off this way leaves its VM claimed, because `run_job`
+    // never reaches its own release. The lease reclaims it once this
+    // dispatcher stops renewing, which is exactly the case leases exist
+    // for.
+    //
+    // The clock starts *here*, on pickup. A job that sat on a queue
+    // behind another build has spent none of its budget waiting: a
+    // runner's queue is consumed one job at a time and the network
+    // queue fans out, but either way the ceiling is measured from the
+    // moment the job is taken, not from when it was submitted.
+    let ceiling = dispatcher.config.max_job_duration;
+    let outcome =
+        bounded_from_pickup(ceiling, &job.job_key, dispatcher.run_job(&job, attempt)).await;
+    // Before the ack, always — including on the error paths below, which
+    // is why it is aborted here rather than in each arm.
+    heartbeat.abort();
+
+    match outcome {
+        Ok(status) => {
+            tracing::info!(job = %job.job_key, "finished: {}", status.as_str());
+            let _ = msg.ack().await;
+        }
+        Err(DispatchError::Cancelled(_)) => {
+            // Terminal, not retryable: redelivering a cancelled job
+            // only makes `start_job` refuse it again in fifteen
+            // minutes, and until then the message sits on the queue
+            // reading as one more running job.
+            tracing::info!(job = %job.job_key, "cancelled; releasing its queue slot");
+            let _ = msg.ack().await;
+        }
+        Err(e) => {
+            // Retryable up to `MAX_DELIVER`. Past that JetStream stops
+            // redelivering, so the job is marked failed here rather than
+            // left `running` forever with nothing coming back to it.
+            tracing::warn!(job = %job.job_key, attempt, "failed: {e}");
+            if attempt >= crate::bus::MAX_DELIVER as i32 {
+                let _ = dispatcher
+                    .store
+                    .set_job_status(
+                        &job.job_id,
+                        JobStatus::Failure,
+                        Some(&format!("giving up after {attempt} attempts: {e}")),
+                    )
+                    .await;
+                let _ = msg.ack().await;
+            } else {
+                // Negative-ack with the ladder's delay rather than
+                // waiting out `ack_wait`, which is job-length.
+                let delay = crate::bus::backoff_for(attempt as u32);
+                // Written on *every* attempt, not only the last. The
+                // ladder is 60s, 5 minutes, then 15, so a job that can
+                // never work — an image the host does not have is the
+                // usual one — used to show an empty error for twenty
+                // minutes before the fourth delivery finally recorded
+                // the reason. Saying it now, with what happens next, is
+                // the difference between a page that explains the wait
+                // and one that looks like nothing is happening.
+                let detail = format!(
+                    "attempt {attempt} of {} failed: {e}. Retrying in {}s.",
+                    crate::bus::MAX_DELIVER,
+                    delay.as_secs()
+                );
+                let _ = dispatcher.store.note_job_error(&job.job_id, &detail).await;
+                dispatcher
+                    .bus
+                    .publish_event(
+                        &job.run_id,
+                        &job.job_key,
+                        &serde_json::json!({"status": "running", "error": detail}),
+                    )
+                    .await;
+                let _ = msg
+                    .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
+                    .await;
+            }
+        }
+    }
+
+    // Whatever happened, the run may now have newly-ready jobs — or be
+    // finished. Advancing here is what turns a DAG into a sequence.
+    if let Err(e) = dispatcher.advance_run(&job.run_id).await {
+        tracing::warn!(run = %job.run_id, "could not advance: {e}");
     }
 }
 
@@ -2932,6 +3079,25 @@ fn output_marker(step_id: &str) -> String {
     format!("::ci-output::{step_id}::")
 }
 
+/// The wire spelling of a driver, as `/capabilities` lists them.
+fn driver_name(driver: heyo_sdk::SandboxDriver) -> &'static str {
+    match driver {
+        heyo_sdk::SandboxDriver::Firecracker => "firecracker",
+        heyo_sdk::SandboxDriver::Kvm => "kvm",
+        heyo_sdk::SandboxDriver::Libvirt => "libvirt",
+    }
+}
+
+/// Whether a host's advertised drivers admit this job. `None` — a daemon that
+/// could not say — admits: refusing a fleet that has not upgraded to enforce a
+/// check it cannot answer would be worse than the occasional misplaced job.
+fn host_can_run(supported: Option<&[String]>, driver: &str) -> bool {
+    match supported {
+        Some(list) => list.iter().any(|d| d == driver),
+        None => true,
+    }
+}
+
 /// How long a VM released into the warm pool may sit idle before the daemon
 /// reaps it: the longer of the instance default and the workflow's own
 /// `ttl_seconds`. See the comment at the call site in `release_vm`.
@@ -2997,6 +3163,19 @@ pub enum DispatchError {
         status: &'static str,
     },
     NoOnlineRunner(String),
+    /// Every online host in the network was skipped — wrong driver, or
+    /// unreadable capabilities. Carries the per-host reasons.
+    NoCapableRunner {
+        network: String,
+        driver: &'static str,
+        skipped: String,
+    },
+    /// A job pinned to a host whose daemon does not support its driver.
+    RunnerCannotRun {
+        runner: String,
+        driver: &'static str,
+        supported: String,
+    },
     NoNetwork,
     /// `uses: default` with no resolvable local daemon.
     NoDefaultNode,
@@ -3133,6 +3312,25 @@ impl std::fmt::Display for DispatchError {
             Self::NoOnlineRunner(net) => {
                 write!(f, "no host in network {net:?} is online to take this job")
             }
+            Self::NoCapableRunner {
+                network,
+                driver,
+                skipped,
+            } => write!(
+                f,
+                "no host in network {network:?} can run this job's `driver: {driver}`: {skipped}. \
+                 Pin the job with `uses: <network>/<node>`, or add a host whose daemon \
+                 supports {driver}"
+            ),
+            Self::RunnerCannotRun {
+                runner,
+                driver,
+                supported,
+            } => write!(
+                f,
+                "this job is pinned to {runner:?}, whose daemon supports [{supported}] but not \
+                 the job's `driver: {driver}`. Point `uses:` at a host that can run it"
+            ),
             Self::NoNetwork => write!(
                 f,
                 "the runner pool has not resolved a network yet; check CI_NETWORK \
@@ -3147,9 +3345,9 @@ impl std::fmt::Display for DispatchError {
             ),
             Self::Cancelled(job) => write!(
                 f,
-                "job {job:?} was cancelled. The step that was already running was \
-                 allowed to finish — the daemon has no way to abort one — and \
-                 nothing after it ran."
+                "job {job:?} was cancelled. The dispatcher stopped waiting on the step \
+                 that was running — the command in the guest finishes or hits its own \
+                 timeout, since the daemon cannot abort it — and nothing after it ran."
             ),
             Self::VmNotSweepable(id) => write!(
                 f,
@@ -4119,6 +4317,33 @@ mod tests {
             .find("}; __ci_rc=$?")
             .expect("captured right after the block");
         assert!(brace > 0);
+    }
+
+    /// The macbook problem: a network holding one macOS daemon and one Linux
+    /// daemon must never hand a firecracker job to the mac. `None` — a daemon
+    /// too old to say — admits, deliberately.
+    #[test]
+    fn a_host_takes_only_jobs_its_daemon_can_run() {
+        let mac = vec!["apple_container".to_string(), "apple_virt".to_string()];
+        let linux = vec![
+            "firecracker_containerd".to_string(),
+            "firecracker".to_string(),
+            "kvm".to_string(),
+        ];
+        assert!(!super::host_can_run(Some(&mac), "firecracker"));
+        assert!(super::host_can_run(Some(&linux), "firecracker"));
+        assert!(super::host_can_run(Some(&linux), "kvm"));
+        assert!(!super::host_can_run(Some(&mac), "kvm"));
+        assert!(super::host_can_run(Some(&mac), "apple_virt"));
+        assert!(
+            super::host_can_run(None, "firecracker"),
+            "an old daemon admits"
+        );
+        assert_eq!(
+            super::driver_name(heyo_sdk::SandboxDriver::Firecracker),
+            "firecracker"
+        );
+        assert_eq!(super::driver_name(heyo_sdk::SandboxDriver::Kvm), "kvm");
     }
 
     /// A workflow that declares a long `ttl_seconds` keeps its warm VM that

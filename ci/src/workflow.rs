@@ -825,6 +825,9 @@ mod repo_workflow_files {
             let wf = super::Workflow::parse(&name, &yaml)
                 .unwrap_or_else(|e| panic!("{name} does not parse: {e}"));
             assert!(!wf.jobs.is_empty(), "{name} has no jobs");
+            // Planning is where `uses:` targets and job graphs are validated;
+            // a workflow that parses but cannot plan still never runs.
+            crate::plan::Plan::build(&wf).unwrap_or_else(|e| panic!("{name} does not plan: {e}"));
             seen += 1;
         }
         assert!(

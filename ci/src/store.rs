@@ -123,6 +123,10 @@ pub enum StepStatus {
     Success,
     Failure,
     Skipped,
+    /// The job was cancelled while this step was running; the dispatcher
+    /// abandoned the wait. Distinct from `Failure` so the run page says what
+    /// happened rather than implying the step's command was at fault.
+    Cancelled,
 }
 
 impl StepStatus {
@@ -133,6 +137,7 @@ impl StepStatus {
             Self::Success => "success",
             Self::Failure => "failure",
             Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
         }
     }
 }
