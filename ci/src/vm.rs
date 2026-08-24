@@ -113,6 +113,64 @@ fn unknown_source() -> String {
     "?".to_string()
 }
 
+/// The daemon's log listing, rendered for a person.
+///
+/// Two transformations, both learned from reading a real capture:
+///
+/// * **The daemon answers most-recent-first** (mvm-ctrl `get_logs` reverses
+///   before paginating), which is right for a dashboard tail and exactly wrong
+///   for a log attached to a run. Flipped back to chronological here.
+/// * **The serial shell echoes every command it is fed**, so each step's whole
+///   wrapped script lands in the console channel — quote-mangled, wrapped, and
+///   interleaved with the exec protocol's own `__HEYVM_…` marker lines. None
+///   of that is the guest saying anything. Those runs are folded into one
+///   `[ci] (…elided)` line each, so the log keeps its shape without the noise.
+///   The scripts themselves are in the workflow file, and the step's real
+///   output is in the step's own log.
+fn render_log_lines(logs: &[LogLine], total: usize) -> String {
+    let mut out = String::new();
+    if total > logs.len() {
+        // Said once at the top rather than left for someone to infer from a
+        // log that starts mid-boot.
+        out.push_str(&format!(
+            "[ci] showing the last {} of {} lines\n",
+            logs.len(),
+            total
+        ));
+    }
+    let mut elided = 0usize;
+    let mut flush = |out: &mut String, elided: &mut usize| {
+        if *elided > 0 {
+            out.push_str(&format!(
+                "[ci] ({} line{} of step-script echo elided)\n",
+                elided,
+                if *elided == 1 { "" } else { "s" }
+            ));
+            *elided = 0;
+        }
+    };
+    for entry in logs.iter().rev() {
+        let msg = &entry.message;
+        // The `> ` prefix is the shell's continuation prompt — the echo of a
+        // multi-line command being typed, never guest output. The marker
+        // strings are the exec protocol itself, echoed or emitted.
+        let is_echo = entry.source == "console"
+            && (msg.starts_with("> ")
+                || msg == ">"
+                || msg.contains("__HEYVM_")
+                || msg.contains("__HEYYVM_")
+                || msg.contains("__ci_rc=$?"));
+        if is_echo {
+            elided += 1;
+            continue;
+        }
+        flush(&mut out, &mut elided);
+        out.push_str(&format!("{:<7} {}\n", entry.source, msg));
+    }
+    flush(&mut out, &mut elided);
+    out
+}
+
 /// `vm.build` — the Dockerfile a job's image is made from.
 ///
 /// Both paths are repository-relative and validated like `cache_key_files`: the
@@ -884,20 +942,7 @@ impl Vm {
                 source: e,
             })?;
 
-        let mut out = String::new();
-        if response.total > response.logs.len() {
-            // Said once at the top rather than left for someone to infer from a
-            // log that starts mid-boot.
-            out.push_str(&format!(
-                "[ci] showing the last {} of {} lines\n",
-                response.logs.len(),
-                response.total
-            ));
-        }
-        for entry in &response.logs {
-            out.push_str(&format!("{:<7} {}\n", entry.source, entry.message));
-        }
-        Ok(out)
+        Ok(render_log_lines(&response.logs, response.total))
     }
 
     pub async fn renew_ttl(&self, ttl: Duration) -> Result<(), VmError> {
@@ -1148,6 +1193,65 @@ impl fmt::Display for VmError {
 }
 
 impl std::error::Error for VmError {}
+
+#[cfg(test)]
+mod log_render_tests {
+    use super::{LogLine, render_log_lines};
+
+    fn line(source: &str, message: &str) -> LogLine {
+        LogLine {
+            source: source.into(),
+            message: message.into(),
+        }
+    }
+
+    /// The daemon answers newest-first and full of the serial shell's command
+    /// echo; what a run keeps must be chronological with the echo folded away.
+    #[test]
+    fn chronological_with_the_echo_folded() {
+        // As the daemon would answer: newest first.
+        let logs = vec![
+            line("stdout", "   Compiling serde v1.0.229"),
+            line(
+                "console",
+                "> }; __ci_rc=$?; printf ... echo __HEYYVM_abc_END__ $?",
+            ),
+            line("console", "> cargo build --release"),
+            line("console", "HEYVM_READY"),
+            line("console", "[    0.000000] Linux version 6.1.102"),
+        ];
+        let text = render_log_lines(&logs, logs.len());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "console [    0.000000] Linux version 6.1.102",
+                "console HEYVM_READY",
+                "[ci] (2 lines of step-script echo elided)",
+                "stdout     Compiling serde v1.0.229",
+            ],
+        );
+    }
+
+    /// Only the console channel is folded: a build whose own output happens to
+    /// start with `> ` is the guest speaking, and it stays.
+    #[test]
+    fn stdout_is_never_elided() {
+        let logs = vec![line("stdout", "> some quoted diff line")];
+        let text = render_log_lines(&logs, 1);
+        assert_eq!(text, "stdout  > some quoted diff line\n");
+    }
+
+    #[test]
+    fn truncation_is_announced_once_at_the_top() {
+        let logs = vec![line("console", "late line")];
+        let text = render_log_lines(&logs, 400);
+        assert!(
+            text.starts_with("[ci] showing the last 1 of 400 lines\n"),
+            "{text}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

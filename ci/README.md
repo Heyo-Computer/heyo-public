@@ -407,6 +407,13 @@ the author declares the driver, image, size and setup hooks — and, via
 (instead of `timeout-minutes:`) is a parse error naming the job, not a field that
 quietly does nothing.
 
+**The warm pool's idle TTL honors the workflow.** A VM released back into the
+pool is renewed to the *longer* of `CI_VM_TTL_SECONDS` (default 3600) and the
+job's own `vm.ttl_seconds`. Before this, a workflow that declared a four-hour
+TTL because its cold build is expensive still had its warm VM reaped by the
+daemon one hour after the run ended — so any push more than an hour after the
+last one booted a blank VM and paid the full cold build again.
+
 ### This repository's own
 
 `.ci/workflows/ci.yml` is one job that produces one thing: the release binary,

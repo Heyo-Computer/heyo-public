@@ -1415,7 +1415,17 @@ impl Dispatcher {
             }
             return;
         }
-        if let Err(e) = vm.renew_ttl(self.config.heyvm.vm_ttl).await {
+        // The idle TTL honors the workflow's own `ttl_seconds` when that is
+        // longer than `CI_VM_TTL_SECONDS`. A job declares a long TTL precisely
+        // because its cold build is expensive — apps.yml sets 4 hours against
+        // the 1-hour default — and repooling the VM with the *shorter* value
+        // meant the warm cache died an hour after every run. Any push more than
+        // an hour after the last one then booted a blank VM, and the cold build
+        // was exactly the one that could not fit its ceiling. The pool sweep
+        // still ages out idle VMs on its own terms; this only stops the daemon
+        // reaping them out from under it early.
+        let idle_ttl = idle_pool_ttl(plan.vm.ttl_seconds, self.config.heyvm.vm_ttl);
+        if let Err(e) = vm.renew_ttl(idle_ttl).await {
             tracing::warn!(vm = vm.id(), "could not renew the TTL: {e}");
         }
         if let Err(e) = self.pool.release(vm.id()).await {
@@ -2839,6 +2849,13 @@ fn output_marker(step_id: &str) -> String {
     format!("::ci-output::{step_id}::")
 }
 
+/// How long a VM released into the warm pool may sit idle before the daemon
+/// reaps it: the longer of the instance default and the workflow's own
+/// `ttl_seconds`. See the comment at the call site in `release_vm`.
+fn idle_pool_ttl(spec_ttl_seconds: Option<u64>, default: Duration) -> Duration {
+    Duration::from_secs(spec_ttl_seconds.unwrap_or(0).max(default.as_secs()))
+}
+
 /// Split the combined stream into the log text and the step's declared outputs.
 fn split_outputs(out: &ExecOutput, step_id: &str) -> (String, Value) {
     let combined = out.combined();
@@ -4019,6 +4036,22 @@ mod tests {
             .find("}; __ci_rc=$?")
             .expect("captured right after the block");
         assert!(brace > 0);
+    }
+
+    /// A workflow that declares a long `ttl_seconds` keeps its warm VM that
+    /// long while idle; one that declares nothing (or something shorter) gets
+    /// the instance default. Repooling with the short default was how a warm
+    /// cache died an hour after every run.
+    #[test]
+    fn the_pool_keeps_a_vm_as_long_as_the_workflow_asked() {
+        use std::time::Duration;
+        let default = Duration::from_secs(3600);
+        assert_eq!(
+            super::idle_pool_ttl(Some(14_400), default),
+            Duration::from_secs(14_400)
+        );
+        assert_eq!(super::idle_pool_ttl(Some(60), default), default);
+        assert_eq!(super::idle_pool_ttl(None, default), default);
     }
 
     #[test]

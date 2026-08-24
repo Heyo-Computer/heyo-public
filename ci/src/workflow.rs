@@ -827,7 +827,10 @@ mod repo_workflow_files {
             assert!(!wf.jobs.is_empty(), "{name} has no jobs");
             seen += 1;
         }
-        assert!(seen >= 3, "expected the repo's workflow files, found {seen}");
+        assert!(
+            seen >= 3,
+            "expected the repo's workflow files, found {seen}"
+        );
     }
 }
 
