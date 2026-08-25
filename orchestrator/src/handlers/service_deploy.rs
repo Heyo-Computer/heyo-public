@@ -12,12 +12,12 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use heyosecret_client::{HeyoSecretClient, HeyoSecretClientOptions};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, Value as SeaValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sea_orm::{ConnectionTrait, DbBackend, Statement, Value as SeaValue};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
-use tokio::time::{sleep, timeout};
+use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -36,6 +36,7 @@ const CANDIDATE_DIAGNOSTIC_MAX_BYTES: usize = 12 * 1024;
 const SERVICE_CANDIDATE_EVENT_SUBSCRIBE_TIMEOUT_SECONDS: u64 = 10;
 const SERVICE_CANDIDATE_STATUS_POLL_INTERVAL_SECONDS: u64 = 5;
 const SERVICE_REVISION_CHECK_TIMEOUT_SECONDS: u64 = 30;
+const SERVICE_RETIREMENT_RECONCILE_INTERVAL_SECONDS: u64 = 15;
 const DEFAULT_GIT_AUTH_TOKEN_SECRET_PATH: &str = "cicd/git-auth-token";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1145,6 +1146,146 @@ async fn record_service_deployment_event(
     Ok(())
 }
 
+#[derive(Debug)]
+struct PendingServiceRetirement {
+    deployment_id: String,
+    service_id: String,
+    previous_deployment_id: String,
+    delete_previous: bool,
+}
+
+pub async fn run_retirement_reconciler(state: AppState) {
+    let mut ticker = interval(Duration::from_secs(
+        SERVICE_RETIREMENT_RECONCILE_INTERVAL_SECONDS,
+    ));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        if let Err(error) = reconcile_pending_service_retirements(&state).await {
+            warn!("failed to reconcile pending service retirements: {error:#}");
+        }
+    }
+}
+
+async fn reconcile_pending_service_retirements(state: &AppState) -> Result<()> {
+    for retirement in list_pending_service_retirements().await? {
+        let retired = if retirement.delete_previous {
+            // A previous instance can stop itself before it records the stop.
+            // Retrying delete is the durable operation: Cloud treats an absent
+            // deployment as success and destroys a still-running sandbox.
+            finish_previous_service_deployment_retirement(
+                state,
+                &retirement.service_id,
+                &retirement.deployment_id,
+                &retirement.previous_deployment_id,
+                true,
+            )
+            .await
+        } else {
+            stop_previous_service_deployment(
+                state,
+                &retirement.service_id,
+                &retirement.deployment_id,
+                &retirement.previous_deployment_id,
+                retirement.delete_previous,
+            )
+            .await
+        };
+        if !retired {
+            warn!(
+                service_id = retirement.service_id,
+                deployment_id = retirement.deployment_id,
+                previous = retirement.previous_deployment_id,
+                "pending service retirement did not complete successfully"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn list_pending_service_retirements() -> Result<Vec<PendingServiceRetirement>> {
+    let db = db::get_db()?;
+    let rows = db
+        .query_all(Statement::from_string(
+            DbBackend::Postgres,
+            "WITH retirement_intents AS (
+                SELECT DISTINCT ON (
+                    deployment_id,
+                    metadata->'response'->>'previousDeploymentId'
+                )
+                    deployment_id,
+                    service_id,
+                    metadata->'response'->>'previousDeploymentId' AS previous_deployment_id,
+                    COALESCE(
+                        (metadata->'response'->>'deletePrevious')::BOOLEAN,
+                        FALSE
+                    ) AS delete_previous,
+                    created_at,
+                    COALESCE(
+                        NULLIF(metadata->'response'->>'drainSeconds', '')::BIGINT,
+                        0
+                    ) AS drain_seconds
+                FROM service_deployment_events
+                WHERE phase = 'previous-retire-wait'
+                    AND metadata->'response'->>'previousDeploymentId' IS NOT NULL
+                ORDER BY
+                    deployment_id,
+                    metadata->'response'->>'previousDeploymentId',
+                    created_at DESC,
+                    id DESC
+            )
+            SELECT
+                intent.deployment_id,
+                intent.service_id,
+                intent.previous_deployment_id,
+                intent.delete_previous
+            FROM retirement_intents intent
+            WHERE intent.created_at
+                    + GREATEST(intent.drain_seconds, 0) * INTERVAL '1 second' <= NOW()
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM service_deployment_states state
+                    WHERE state.active_deployment_id = intent.previous_deployment_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM service_deployment_events completed
+                    WHERE completed.deployment_id = intent.deployment_id
+                        AND completed.status = 'passed'
+                        AND completed.metadata->'response'->>'previousDeploymentId'
+                            = intent.previous_deployment_id
+                        AND (
+                            (
+                                intent.delete_previous
+                                AND completed.phase = 'previous-deleted'
+                            )
+                            OR (
+                                NOT intent.delete_previous
+                                AND completed.phase IN ('previous-stopped', 'previous-retained')
+                            )
+                        )
+                )
+            ORDER BY intent.created_at ASC
+            LIMIT 20"
+                .to_string(),
+        ))
+        .await
+        .context("failed to list pending service deployment retirements")?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(PendingServiceRetirement {
+                deployment_id: row.try_get("", "deployment_id")?,
+                service_id: row.try_get("", "service_id")?,
+                previous_deployment_id: row.try_get("", "previous_deployment_id")?,
+                delete_previous: row.try_get("", "delete_previous")?,
+            })
+        })
+        .collect()
+}
+
 fn schedule_previous_service_deployment_retirement(
     state: AppState,
     service_id: String,
@@ -1204,6 +1345,23 @@ async fn retire_previous_service_deployment(
         sleep(Duration::from_secs(drain_seconds)).await;
     }
 
+    stop_previous_service_deployment(
+        state,
+        service_id,
+        deployment_id,
+        previous_deployment_id,
+        delete_previous,
+    )
+    .await
+}
+
+async fn stop_previous_service_deployment(
+    state: &AppState,
+    service_id: &str,
+    deployment_id: &str,
+    previous_deployment_id: &str,
+    delete_previous: bool,
+) -> bool {
     let stop_metadata = json!({ "previousDeploymentId": previous_deployment_id });
     let _ = record_service_deployment_event(
         state,
@@ -1252,6 +1410,23 @@ async fn retire_previous_service_deployment(
     )
     .await;
 
+    finish_previous_service_deployment_retirement(
+        state,
+        service_id,
+        deployment_id,
+        previous_deployment_id,
+        delete_previous,
+    )
+    .await
+}
+
+async fn finish_previous_service_deployment_retirement(
+    state: &AppState,
+    service_id: &str,
+    deployment_id: &str,
+    previous_deployment_id: &str,
+    delete_previous: bool,
+) -> bool {
     if !delete_previous {
         let _ = record_service_deployment_event(
             state,
