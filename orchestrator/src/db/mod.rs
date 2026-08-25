@@ -82,7 +82,7 @@ pub async fn init_database(config: &Config) -> Result<()> {
         .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_seconds))
         .idle_timeout(Duration::from_secs(config.db_idle_timeout_seconds))
         .max_lifetime(Duration::from_secs(config.db_max_lifetime_seconds))
-        .sqlx_logging(true);
+        .sqlx_logging(false);
 
     let db = Database::connect(options).await?;
     run_migrations(&db).await?;
