@@ -148,14 +148,30 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = store
-        .migrate(std::path::Path::new(&config.migrations_dir))
-        .await
-    {
+    // The embedded set always, first: the binary's own schema is not
+    // optional. A directory, if one is named, runs *after* it — so a stale
+    // CI_MIGRATIONS_DIR left in a supervisor conf from before the migrations
+    // were compiled in cannot shadow the binary, only add to it.
+    if let Err(e) = store.migrate().await {
         eprintln!("ci: refusing to start — {e}");
         std::process::exit(1);
     }
-    tracing::info!("database ready");
+    if let Some(dir) = &config.migrations_dir {
+        tracing::warn!(
+            "CI_MIGRATIONS_DIR is set: also running SQL from {} after the {} migrations \
+             compiled into this binary",
+            dir.display(),
+            store::EMBEDDED_MIGRATIONS.len()
+        );
+        if let Err(e) = store.migrate_from_dir(dir).await {
+            eprintln!("ci: refusing to start — {e}");
+            std::process::exit(1);
+        }
+    }
+    tracing::info!(
+        "database ready ({} migrations applied)",
+        store::EMBEDDED_MIGRATIONS.len()
+    );
 
     let bus = match Bus::connect(&config.nats, &config.nats_prefix).await {
         Ok(b) => Arc::new(b),

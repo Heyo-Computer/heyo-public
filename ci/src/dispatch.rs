@@ -4799,10 +4799,7 @@ mod tests {
         )
         .await
         .expect("store");
-        store
-            .migrate(std::path::Path::new("migrations"))
-            .await
-            .expect("migrations");
+        store.migrate().await.expect("migrations");
 
         let runners = Arc::new(Runners::new(config.clone()));
         runners.refresh().await.expect("local runner resolves");

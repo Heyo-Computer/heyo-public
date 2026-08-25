@@ -956,6 +956,17 @@ heyosecret's approach. Every statement must be idempotent; additive changes are
 `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, because the `CREATE TABLE` above is a
 no-op once the table exists.
 
+**They are compiled into the binary.** `build.rs` embeds every `.sql` in the
+directory, in filename order, so a deployed `ci` cannot be separated from its
+schema. It used to read `CI_MIGRATIONS_DIR` at startup, which made the schema a
+second thing to deploy, and the one time the two came apart the failure was a
+binary refused by Postgres on its first query for a column its own migration
+adds — not at startup, where a missing file would at least have been loud.
+`CI_MIGRATIONS_DIR` remains for running *additional* SQL from disk, after the
+embedded set and logged as such — never instead of it, so a stale setting left
+in a supervisor conf cannot shadow the binary's schema. Unset is the default
+and the right setting for every deploy.
+
 Two things make that actually safe. **A Postgres advisory lock**, because
 `CREATE TABLE IF NOT EXISTS` is *not* concurrency-safe — two sessions both find
 the table absent and the loser dies on `pg_type_typname_nsp_index`, and two

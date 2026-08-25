@@ -365,14 +365,12 @@ jobs:
           # of `CI_*` variables *is* its command line — and the one most likely
           # to drift from the binary it configures.
           cp ci/deploy/supervisor/ci.conf dist/
-          # The migrations, which apps.yml has no equivalent of and this
-          # artifact genuinely needs: `ci` re-executes `migrations/*.sql` on
-          # every startup (CI_MIGRATIONS_DIR, no tracking table), so they are a
-          # runtime dependency of the binary, not a development file. Shipping
-          # them together is what stops a deployed binary from running a schema
-          # from a different commit — and it is what lets an operator point
-          # CI_MIGRATIONS_DIR at the unpacked artifact instead of at a source
-          # checkout, which is what ci.conf does.
+          # The migrations, for reading beside the binary that carries them.
+          # They are compiled into `ci` (build.rs) and re-executed on every
+          # startup, so the binary alone is a complete deploy; this copy is what
+          # an operator points CI_MIGRATIONS_DIR at to run this exact build's
+          # SQL by hand, never a checkout, which is how a binary and its schema
+          # once came apart.
           mkdir -p dist/migrations
           cp ci/migrations/*.sql dist/migrations/
           # A real `git describe`, available only because this repository

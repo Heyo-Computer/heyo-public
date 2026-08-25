@@ -1474,10 +1474,7 @@ mod tests {
         let store = Store::connect(&url, dir, std::time::Duration::from_secs(30))
             .await
             .expect("store");
-        store
-            .migrate(std::path::Path::new("migrations"))
-            .await
-            .expect("migrations");
+        store.migrate().await.expect("migrations");
         let runners = test_runners(config.clone());
         let dispatcher = Arc::new(Dispatcher {
             config: config.clone(),

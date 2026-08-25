@@ -13,6 +13,14 @@
 //! on every startup, with no tracking table — heyosecret's approach. It puts one
 //! obligation on the SQL (every statement idempotent) in exchange for removing a
 //! whole class of "the migration table disagrees with the schema" incidents.
+//!
+//! **The files are compiled into the binary** (`build.rs`), so a deployed `ci`
+//! cannot be separated from its schema: the failure that motivated it was a
+//! binary installed without its newest `.sql`, refused by Postgres on the first
+//! query for a column its own migration adds. `CI_MIGRATIONS_DIR` still exists
+//! as an explicit override for running SQL from disk, and is no longer a
+//! default that quietly points at whatever happens to be in the working
+//! directory.
 
 use crate::plan::{JobPlan, Plan};
 use chrono::{DateTime, Utc};
@@ -22,6 +30,27 @@ use sqlx::{PgPool, Row};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
+
+/// One schema migration: its file name, which orders it and names it in
+/// errors, and its SQL.
+#[derive(Debug, Clone)]
+pub struct Migration {
+    pub name: String,
+    pub sql: String,
+}
+
+/// The migrations this binary was built with.
+pub fn embedded_migrations() -> Vec<Migration> {
+    EMBEDDED_MIGRATIONS
+        .iter()
+        .map(|(name, sql)| Migration {
+            name: name.to_string(),
+            sql: sql.to_string(),
+        })
+        .collect()
+}
 
 /// Advisory-lock key serializing migrations across processes. An arbitrary
 /// constant; it only has to be the same in every instance and unlikely to
@@ -479,10 +508,70 @@ impl Store {
         &self.pool
     }
 
-    /// Apply `migrations/*.sql` in filename order.
+    /// Apply the migrations compiled into this binary, in filename order.
     ///
     /// Every file is re-executed on every startup, so each statement must be
     /// idempotent. There is no tracking table by design — see the module doc.
+    pub async fn migrate(&self) -> Result<(), StoreError> {
+        self.apply(&embedded_migrations()).await
+    }
+
+    /// Apply `*.sql` from a directory, in addition to the embedded set.
+    ///
+    /// The `CI_MIGRATIONS_DIR` path, for an operator running SQL the binary
+    /// does not carry. Reading a directory is the failure mode the embedded
+    /// set exists to remove, so it is opt-in, runs second, and is named in the
+    /// log.
+    pub async fn migrate_from_dir(&self, dir: &Path) -> Result<(), StoreError> {
+        let migrations = Self::read_migrations(dir).await?;
+        self.apply(&migrations).await
+    }
+
+    async fn read_migrations(dir: &Path) -> Result<Vec<Migration>, StoreError> {
+        let mut entries = Vec::new();
+        let mut rd = tokio::fs::read_dir(dir)
+            .await
+            .map_err(|e| StoreError::Migrations {
+                path: dir.to_path_buf(),
+                reason: e.to_string(),
+            })?;
+        while let Some(entry) = rd.next_entry().await.map_err(|e| StoreError::Migrations {
+            path: dir.to_path_buf(),
+            reason: e.to_string(),
+        })? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("sql") {
+                entries.push(path);
+            }
+        }
+        entries.sort();
+        if entries.is_empty() {
+            return Err(StoreError::Migrations {
+                path: dir.to_path_buf(),
+                reason: "no .sql files found".to_string(),
+            });
+        }
+        let mut migrations = Vec::with_capacity(entries.len());
+        for path in entries {
+            let sql =
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .map_err(|e| StoreError::Migrations {
+                        path: path.clone(),
+                        reason: e.to_string(),
+                    })?;
+            migrations.push(Migration {
+                name: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string()),
+                sql,
+            });
+        }
+        Ok(migrations)
+    }
+
+    /// Run a migration set, serialized and bounded as described below.
     ///
     /// **Serialized by a Postgres advisory lock**, and that is not belt and
     /// braces. `CREATE TABLE IF NOT EXISTS` is *not* concurrency-safe: two
@@ -500,10 +589,10 @@ impl Store {
     /// build — and Postgres reports some of those cycles as `deadlock detected`
     /// rather than waiting at all. Failing fast and retrying turns both into a
     /// few seconds of startup delay.
-    pub async fn migrate(&self, dir: &Path) -> Result<(), StoreError> {
+    async fn apply(&self, migrations: &[Migration]) -> Result<(), StoreError> {
         let mut last: Option<StoreError> = None;
         for attempt in 1..=MIGRATION_ATTEMPTS {
-            match self.migrate_once(dir).await {
+            match self.migrate_once(migrations).await {
                 Ok(()) => return Ok(()),
                 Err(e) if is_lock_contention(&e) && attempt < MIGRATION_ATTEMPTS => {
                     tracing::warn!(
@@ -519,7 +608,7 @@ impl Store {
         Err(last.unwrap_or_else(|| StoreError::Sql("migration retries exhausted".into())))
     }
 
-    async fn migrate_once(&self, dir: &Path) -> Result<(), StoreError> {
+    async fn migrate_once(&self, migrations: &[Migration]) -> Result<(), StoreError> {
         let mut conn = self.pool.acquire().await.map_err(StoreError::sql)?;
 
         // Bounded so a migration never blocks indefinitely behind a live
@@ -552,7 +641,7 @@ impl Store {
             .await
             .map_err(StoreError::sql)?;
 
-        let result = self.run_migrations(dir, &mut conn).await;
+        let result = self.run_migrations(migrations, &mut conn).await;
 
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(MIGRATION_LOCK_KEY)
@@ -576,50 +665,18 @@ impl Store {
 
     async fn run_migrations(
         &self,
-        dir: &Path,
+        migrations: &[Migration],
         conn: &mut sqlx::PgConnection,
     ) -> Result<(), StoreError> {
-        let mut entries = Vec::new();
-        let mut rd = tokio::fs::read_dir(dir)
-            .await
-            .map_err(|e| StoreError::Migrations {
-                path: dir.to_path_buf(),
-                reason: e.to_string(),
-            })?;
-        while let Some(entry) = rd.next_entry().await.map_err(|e| StoreError::Migrations {
-            path: dir.to_path_buf(),
-            reason: e.to_string(),
-        })? {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("sql") {
-                entries.push(path);
-            }
-        }
-        entries.sort();
-
-        if entries.is_empty() {
-            return Err(StoreError::Migrations {
-                path: dir.to_path_buf(),
-                reason: "no .sql files found".to_string(),
-            });
-        }
-
-        for path in entries {
-            let sql =
-                tokio::fs::read_to_string(&path)
-                    .await
-                    .map_err(|e| StoreError::Migrations {
-                        path: path.clone(),
-                        reason: e.to_string(),
-                    })?;
-            sqlx::raw_sql(&sql)
+        for m in migrations {
+            sqlx::raw_sql(&m.sql)
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| StoreError::Migrations {
-                    path: path.clone(),
+                    path: PathBuf::from(&m.name),
                     reason: e.to_string(),
                 })?;
-            tracing::debug!("applied migration {}", path.display());
+            tracing::debug!("applied migration {}", m.name);
         }
         Ok(())
     }
@@ -1743,6 +1800,31 @@ impl std::error::Error for StoreError {}
 
 #[cfg(test)]
 mod tests {
+    /// The binary carries every migration in the directory, in order. A
+    /// file that exists on disk and not here is exactly the drift `build.rs`
+    /// exists to prevent, so this reads the directory independently.
+    #[test]
+    fn every_migration_on_disk_is_compiled_in_and_in_order() {
+        let mut on_disk: Vec<String> = std::fs::read_dir("migrations")
+            .expect("migrations/ beside Cargo.toml")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".sql"))
+            .collect();
+        on_disk.sort();
+        let embedded: Vec<&str> = EMBEDDED_MIGRATIONS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            embedded, on_disk,
+            "rebuild: build.rs did not see the directory"
+        );
+        assert!(embedded.windows(2).all(|w| w[0] < w[1]), "{embedded:?}");
+        assert!(
+            EMBEDDED_MIGRATIONS
+                .iter()
+                .all(|(_, sql)| !sql.trim().is_empty()),
+            "an empty migration is a file that was written and forgotten"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1809,10 +1891,7 @@ mod tests {
         let store = Store::connect(&url, dir, std::time::Duration::from_secs(30))
             .await
             .expect("connects");
-        store
-            .migrate(Path::new("migrations"))
-            .await
-            .expect("migrations apply");
+        store.migrate().await.expect("migrations apply");
         store
     }
 
@@ -1850,7 +1929,7 @@ jobs:
         let store = test_store().await;
         for _ in 0..3 {
             store
-                .migrate(Path::new("migrations"))
+                .migrate()
                 .await
                 .expect("re-applying migrations is a no-op");
         }

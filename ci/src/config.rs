@@ -244,9 +244,12 @@ pub struct Config {
     /// `cache_key_files`, and by nothing else — the guest gets the repository
     /// over git, not from here.
     pub workspace_dir: PathBuf,
-    /// Where `*.sql` migrations live. Overridable because the process runs from
-    /// a deploy directory that is not always the source tree.
-    pub migrations_dir: PathBuf,
+    /// Also run `*.sql` from this directory, after the set compiled into the
+    /// binary. Unset — the default, and the right setting for every deploy —
+    /// means the embedded migrations alone, which cannot drift from the binary
+    /// the way a directory on disk did. Additive rather than a replacement so
+    /// a stale setting left in a conf cannot shadow the binary's own schema.
+    pub migrations_dir: Option<PathBuf>,
 
     pub artifact_sink: ArtifactSinkKind,
     pub artifact_dir: PathBuf,
@@ -570,9 +573,7 @@ impl Config {
             db_statement_timeout: secs("CI_DB_STATEMENT_TIMEOUT_SECS", 30)?,
             log_dir,
             workspace_dir,
-            migrations_dir: PathBuf::from(
-                opt("CI_MIGRATIONS_DIR").unwrap_or_else(|| "migrations".to_string()),
-            ),
+            migrations_dir: opt("CI_MIGRATIONS_DIR").map(PathBuf::from),
             artifact_sink,
             artifact_dir,
             s3,

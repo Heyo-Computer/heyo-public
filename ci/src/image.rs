@@ -852,10 +852,7 @@ mod tests {
         let store = crate::store::Store::connect(&url, dir, std::time::Duration::from_secs(30))
             .await
             .unwrap();
-        store
-            .migrate(Path::new("migrations"))
-            .await
-            .expect("migrations");
+        store.migrate().await.expect("migrations");
         Catalog::new(store.pool().clone())
     }
 
