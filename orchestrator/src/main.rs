@@ -34,8 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,orchestrator=info")),
         )
         .init();
 
@@ -135,6 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     tokio::spawn(orchestration::run_runtime_reconciler(state.clone()));
+    tokio::spawn(handlers::service_deploy::run_retirement_reconciler(
+        state.clone(),
+    ));
 
     let app = Router::new()
         .route("/health", get(health_check))
