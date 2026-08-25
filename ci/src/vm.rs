@@ -1046,8 +1046,14 @@ impl Vm {
     /// fingerprint, so changing it *there* retires the warm VM and pays a cold
     /// build, while changing it here does not. Held under the sandbox lock
     /// like `exec` and `destroy`, because a restart takes the handle out of the
-    /// manager's map. The VM comes back *running*; the caller parks it again.
-    pub async fn resize(&self, class: SandboxSize) -> Result<(), VmError> {
+    /// manager's map.
+    ///
+    /// `timeout` is the boot budget, not the SDK's 60-second default: the
+    /// daemon answers only once the VM is back, and for a *running* VM that is
+    /// a stop and a full boot. (A stopped one — the pool's normal state — is
+    /// resized in place by a daemon new enough to skip the restart, and comes
+    /// back stopped; an older daemon boots it, and the caller parks it again.)
+    pub async fn resize(&self, class: SandboxSize, timeout: Duration) -> Result<(), VmError> {
         let _guard = self.lock.lock().await;
         self.sandbox
             .client()
@@ -1055,7 +1061,10 @@ impl Vm {
                 reqwest::Method::POST,
                 &format!("/sandboxes/{}/resize", self.id),
                 Some(&serde_json::json!({ "size_class": class.as_str() })),
-                RequestOptions::default(),
+                RequestOptions {
+                    timeout: Some(timeout),
+                    query: Vec::new(),
+                },
             )
             .await
             .map(|_| ())

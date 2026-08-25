@@ -3054,13 +3054,15 @@ impl Dispatcher {
         let result = async {
             let options = self.runners.options_for(&taken.runner_hd_id).await?;
             let vm = self.vms.open(options, sandbox_id.to_string()).await?;
-            vm.resize(class).await?;
+            vm.resize(class, BOOT_TIMEOUT).await?;
             let size = self
                 .observe_size("resize", &vm, Some(class))
                 .await
                 .map(|s| s.label())
                 .unwrap_or_else(|| "a size the daemon did not report back".to_string());
-            // The daemon restarts the VM to apply the change; park it again.
+            // An older daemon restarts the VM to apply the change and hands it
+            // back running; park it again. A newer one leaves a stopped VM
+            // stopped, and stopping a stopped VM is a no-op.
             if let Err(e) = vm.stop().await {
                 tracing::warn!(vm = sandbox_id, "resized but could not stop: {e}");
             }
