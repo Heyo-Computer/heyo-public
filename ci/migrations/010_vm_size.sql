@@ -1,0 +1,14 @@
+-- The size class a pooled VM was created with, so /vms can answer "what did
+-- this machine get" without a round trip to its daemon.
+--
+-- Same rules as the rest: idempotent, because the directory is re-executed on
+-- every startup.
+--
+-- This is the class the job *asked for* — `vm.size_class` in the workflow, the
+-- value `POST /sandbox-deploy` was sent — recorded at creation. Whether the
+-- daemon honoured it is checked once, right after the create, against what the
+-- daemon reports back (`SandboxInfo::size_class`, which newer daemons fill in),
+-- and logged as a warning when the two disagree. Nullable: a job that names no
+-- class gets the daemon's default, and rows from before this column have no
+-- record either way.
+ALTER TABLE ci_vm_pool ADD COLUMN IF NOT EXISTS size_class TEXT;

@@ -1012,6 +1012,78 @@ impl Vm {
             })
     }
 
+    /// What the daemon says this VM was given.
+    ///
+    /// Read from the native `GET /sandboxes/<id>` rather than the SDK's
+    /// `info()`: the compat shape the SDK deserializes has room for a class
+    /// name only, and the numbers are the point — a daemon too old to name a
+    /// class still knows its vCPU count, and "8 CPU, 16 GB" is the answer to
+    /// "is this VM the size I asked for" whatever it is called. Every field is
+    /// optional and an absent one is *unreported*, never a default: a daemon
+    /// that says nothing must not be read as saying `small`.
+    pub async fn size(&self) -> Result<VmSize, VmError> {
+        self.sandbox
+            .client()
+            .request::<VmSize>(
+                reqwest::Method::GET,
+                &format!("/sandboxes/{}", self.id),
+                None::<&()>,
+                RequestOptions::default(),
+            )
+            .await
+            .map_err(|e| VmError::Daemon {
+                sandbox: self.id.clone(),
+                what: "reading the VM's size",
+                source: e,
+            })
+    }
+
+    /// Give the VM a different size class, in place.
+    ///
+    /// The daemon rewrites the VM's persisted cpus and memory and restarts it
+    /// — disks kept, so the build cache survives — which is the whole reason
+    /// this exists: the workflow's `size_class` is part of the pool
+    /// fingerprint, so changing it *there* retires the warm VM and pays a cold
+    /// build, while changing it here does not. Held under the sandbox lock
+    /// like `exec` and `destroy`, because a restart takes the handle out of the
+    /// manager's map. The VM comes back *running*; the caller parks it again.
+    pub async fn resize(&self, class: SandboxSize) -> Result<(), VmError> {
+        let _guard = self.lock.lock().await;
+        self.sandbox
+            .client()
+            .request::<serde_json::Value>(
+                reqwest::Method::POST,
+                &format!("/sandboxes/{}/resize", self.id),
+                Some(&serde_json::json!({ "size_class": class.as_str() })),
+                RequestOptions::default(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| VmError::Daemon {
+                sandbox: self.id.clone(),
+                what: "resizing the sandbox",
+                source: e,
+            })
+    }
+
+    /// Stop the VM, keeping its disks.
+    ///
+    /// This is how a VM is parked between jobs. The daemon keeps the rootfs
+    /// clone and the data disk — only `destroy` removes them — so a stopped VM
+    /// started again by [`Self::ensure_running`] boots with its build cache
+    /// exactly as the last job left it, and costs the host nothing but disk
+    /// while it waits. Serialized on the sandbox lock like `exec` and `destroy`:
+    /// `stop` takes the handle out of the manager's map, and racing a command
+    /// against that is how a step ends with "no VM handle found".
+    pub async fn stop(&self) -> Result<(), VmError> {
+        let _guard = self.lock.lock().await;
+        self.sandbox.stop().await.map_err(|e| VmError::Daemon {
+            sandbox: self.id.clone(),
+            what: "stopping the sandbox",
+            source: e,
+        })
+    }
+
     /// Delete the VM. A 404 is success — the SDK already treats it that way.
     pub async fn destroy(&self) -> Result<(), VmError> {
         let _guard = self.lock.lock().await;
@@ -1099,6 +1171,70 @@ pub(crate) fn is_transport(e: &HeyoError) -> bool {
         e,
         HeyoError::Api { status: 0, .. } | HeyoError::Connection(_)
     )
+}
+
+/// A VM's resources as its daemon reports them.
+///
+/// Deserialized leniently from the daemon's own `SandboxInfo`: every field is
+/// optional and unknown ones are ignored, so a daemon from before it reported
+/// sizing yields an all-`None` value rather than an error. That value renders
+/// as "unreported", which is a finding in itself — it says the runner's heyvmd
+/// is too old to be checked, not that the VM is any particular size.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct VmSize {
+    /// The daemon's class name: the one the create request named, or the tier
+    /// its cpus and memory match exactly (newer daemons derive it).
+    #[serde(default)]
+    pub size_class: Option<String>,
+    #[serde(default)]
+    pub cpus: Option<u32>,
+    /// Bytes.
+    #[serde(default)]
+    pub memory: Option<u64>,
+}
+
+impl VmSize {
+    pub fn is_reported(&self) -> bool {
+        self.size_class.is_some() || self.cpus.is_some() || self.memory.is_some()
+    }
+
+    /// `xlarge (8 CPU, 16 GB)`, or whichever parts the daemon gave, or
+    /// `unreported`.
+    pub fn label(&self) -> String {
+        let numbers = match (self.cpus, self.memory) {
+            (Some(c), Some(m)) => Some(format!("{c} CPU, {}", human_bytes(m))),
+            (Some(c), None) => Some(format!("{c} CPU")),
+            (None, Some(m)) => Some(human_bytes(m)),
+            (None, None) => None,
+        };
+        match (&self.size_class, numbers) {
+            (Some(class), Some(n)) => format!("{class} ({n})"),
+            (Some(class), None) => class.clone(),
+            (None, Some(n)) => n,
+            (None, None) => "unreported".to_string(),
+        }
+    }
+
+    /// Whether the daemon's class is the one asked for. `None` when the daemon
+    /// named no class — an old daemon is not a wrong-sized VM.
+    pub fn matches(&self, wanted: SandboxSize) -> Option<bool> {
+        self.size_class.as_deref().map(|got| got == wanted.as_str())
+    }
+}
+
+/// `16 GB`, `512 MB`, `1.5 GB` — bytes at the scale a size class is spoken in.
+fn human_bytes(bytes: u64) -> String {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+    if bytes >= GB {
+        if bytes % GB == 0 {
+            format!("{} GB", bytes / GB)
+        } else {
+            format!("{:.1} GB", bytes as f64 / GB as f64)
+        }
+    } else {
+        format!("{} MB", bytes / MB)
+    }
 }
 
 #[derive(Debug)]
@@ -1311,6 +1447,35 @@ mod log_render_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_vm_size_is_labelled_from_whatever_the_daemon_gave() {
+        let full = VmSize {
+            size_class: Some("xlarge".into()),
+            cpus: Some(8),
+            memory: Some(16 * 1024 * 1024 * 1024),
+        };
+        assert_eq!(full.label(), "xlarge (8 CPU, 16 GB)");
+        assert_eq!(full.matches(SandboxSize::Xlarge), Some(true));
+        assert_eq!(full.matches(SandboxSize::Large), Some(false));
+
+        // An explicitly sized VM, or a daemon that names no class: the numbers
+        // are still an answer, and "is it the class I asked for" is not one.
+        let numbers = VmSize {
+            size_class: None,
+            cpus: Some(2),
+            memory: Some(1536 * 1024 * 1024),
+        };
+        assert_eq!(numbers.label(), "2 CPU, 1.5 GB");
+        assert_eq!(numbers.matches(SandboxSize::Small), None);
+        assert!(numbers.is_reported());
+
+        // A daemon too old to report sizing is unreported, never `small`.
+        let nothing: VmSize = serde_json::from_str(r#"{"id":"sb-1","status":"stopped"}"#).unwrap();
+        assert!(!nothing.is_reported());
+        assert_eq!(nothing.label(), "unreported");
+        assert_eq!(nothing.matches(SandboxSize::Small), None);
+    }
+
     use super::*;
 
     /// A daemon stand-in on a local port that answers one HTTP request per

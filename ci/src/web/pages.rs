@@ -320,6 +320,43 @@ fn short_job(job_id: &str) -> &str {
 /// `GET /vms` — the warm pool, and what is left over in it.
 ///
 /// Two questions this has to answer, and the layout follows them. **Is reuse
+/// The daemon's size classes, in order, as `heyvm resize --size-class` spells
+/// them. Mirrors `SizeClass::ALL` in mvm-ctrl; the SDK enum has the same set
+/// and the form value round-trips through it, so a name that is not here is
+/// refused rather than guessed.
+const SIZE_CLASSES: [&str; 6] = ["micro", "mini", "small", "medium", "large", "xlarge"];
+
+/// What the Size cell says under the class the job asked for.
+enum SizeVerdict {
+    /// The daemon named the class asked for.
+    AsDeclared(String),
+    /// The daemon named a different class — the finding the cell exists for.
+    Different(String),
+    /// The daemon gave numbers but no class name (an explicitly sized VM, or
+    /// a daemon that reports cpus and memory only).
+    Unclassified(String),
+    /// The daemon reported nothing about size: too old to be checked.
+    Unreported,
+    /// This app has not read the size yet (a row from before it did).
+    Unread,
+}
+
+fn size_verdict(v: &crate::pool::PooledVmView) -> SizeVerdict {
+    if v.observed_at.is_none() {
+        return SizeVerdict::Unread;
+    }
+    if !v.observed.is_reported() {
+        return SizeVerdict::Unreported;
+    }
+    let got = v.observed.label();
+    match (v.observed.size_class.as_deref(), v.size_class.as_deref()) {
+        (Some(o), Some(w)) if o == w => SizeVerdict::AsDeclared(got),
+        (Some(_), Some(_)) => SizeVerdict::Different(got),
+        (Some(_), None) => SizeVerdict::AsDeclared(got),
+        (None, _) => SizeVerdict::Unclassified(got),
+    }
+}
+
 /// working**: rows are grouped by runner and fingerprint, because a pool that is
 /// working shows one row per fingerprint per host and a pool that is not shows
 /// several. **What is left over**: each row carries the outcome of the run that
@@ -386,7 +423,7 @@ pub fn vms_page(
                 div .scroll {
                     table {
                         thead { tr {
-                            th { "VM" } th { "Host" } th { "Fingerprint" } th { "Status" }
+                            th { "VM" } th { "Host" } th { "Fingerprint" } th { "Size" } th { "Status" }
                             th { "Last run" } th { "Age" } th { "Last used" } th { }
                         } }
                         tbody {
@@ -416,6 +453,32 @@ pub fn vms_page(
                                         @if seen.get(&(v.runner_hd_id.as_str(), v.fingerprint.as_str()))
                                             .copied().unwrap_or(0) > 1 {
                                             " " span .pill.failure { "not reused" }
+                                        }
+                                    }
+                                    // Asked versus got. The first is the job's
+                                    // `vm.size_class`; the second is what the
+                                    // runner's daemon reported the last time
+                                    // this app touched the VM — its own class
+                                    // name and the cpus and memory behind it.
+                                    // "Is this VM the size I declared" was
+                                    // unanswerable from here before, and a
+                                    // `xlarge` build on a `small` VM looks
+                                    // exactly like a slow build.
+                                    td .mono {
+                                        @if let Some(size) = v.size_class.as_deref() {
+                                            (size)
+                                        } @else {
+                                            span .meta { "—" }
+                                        }
+                                        @if v.status != "building" {
+                                            br;
+                                            @match size_verdict(v) {
+                                                SizeVerdict::AsDeclared(got) => span .meta { "got " (got) },
+                                                SizeVerdict::Different(got) => span .pill.failure { "got " (got) },
+                                                SizeVerdict::Unclassified(got) => span .meta { "got " (got) },
+                                                SizeVerdict::Unreported => span .meta { "size unreported" },
+                                                SizeVerdict::Unread => span .meta { "size not read yet" },
+                                            }
                                         }
                                     }
                                     td {
@@ -452,6 +515,27 @@ pub fn vms_page(
                                             form method="post"
                                                  action={ "/vms/" (v.sandbox_id) "/destroy" } {
                                                 button .quiet type="submit" { "Destroy" }
+                                            }
+                                        }
+                                        // In place, cache kept: the only way to
+                                        // change a pooled VM's size without a
+                                        // cold build, since editing the class in
+                                        // the workflow retires the VM. Idle only;
+                                        // the daemon restarts the VM to apply it.
+                                        @if v.status == "idle" {
+                                            form method="post"
+                                                 action={ "/vms/" (v.sandbox_id) "/resize" } {
+                                                select name="size_class" {
+                                                    @for class in SIZE_CLASSES {
+                                                        option value=(class)
+                                                            selected[v.observed.size_class.as_deref()
+                                                                .or(v.size_class.as_deref()) == Some(class)] {
+                                                            (class)
+                                                        }
+                                                    }
+                                                }
+                                                " "
+                                                button .quiet type="submit" { "Resize" }
                                             }
                                         }
                                     }
@@ -846,6 +930,13 @@ mod tests {
             runner_hd_id: runner.into(),
             fingerprint: fingerprint.into(),
             workflow_id: "build".into(),
+            size_class: Some("large".into()),
+            observed: crate::vm::VmSize {
+                size_class: Some("large".into()),
+                cpus: Some(4),
+                memory: Some(8 * 1024 * 1024 * 1024),
+            },
+            observed_at: Some(chrono::Utc::now()),
             status: status.into(),
             claimed_by_job: None,
             last_job: Some("run.build".into()),
@@ -855,6 +946,37 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_used_at: chrono::Utc::now(),
         }
+    }
+
+    /// The size cell says what the daemon gave, and flags it when that is not
+    /// what the job asked for — the finding the cell exists to surface.
+    #[test]
+    fn a_vm_that_is_not_the_size_it_asked_for_is_flagged() {
+        let mut small = pooled("sb-small", "hd-1", "fp-a", "idle", Some("success"));
+        small.size_class = Some("xlarge".into());
+        small.observed = crate::vm::VmSize {
+            size_class: Some("small".into()),
+            cpus: Some(1),
+            memory: Some(2 * 1024 * 1024 * 1024),
+        };
+        let mut unread = pooled("sb-old", "hd-1", "fp-b", "idle", Some("success"));
+        unread.observed_at = None;
+        let mut mute = pooled("sb-mute", "hd-1", "fp-c", "idle", Some("success"));
+        mute.observed = crate::vm::VmSize::default();
+
+        let html =
+            vms_page(&chrome(), &[small, unread, mute], &[], &Notice::default()).into_string();
+        assert!(html.contains("got small (1 CPU, 2 GB)"), "{html}");
+        assert!(html.contains("size not read yet"), "{html}");
+        assert!(html.contains("size unreported"), "{html}");
+        // The as-declared fixture from `pooled` is never flagged.
+        let fine = pooled("sb-fine", "hd-1", "fp-d", "idle", Some("success"));
+        let html = vms_page(&chrome(), &[fine], &[], &Notice::default()).into_string();
+        assert!(html.contains("got large (4 CPU, 8 GB)"), "{html}");
+        assert!(!html.contains("pill failure\">got"), "{html}");
+        // Idle rows offer a resize; the form speaks the daemon's class names.
+        assert!(html.contains("/vms/sb-fine/resize"), "{html}");
+        assert!(html.contains(r#"option value="xlarge""#), "{html}");
     }
 
     /// The two questions the page exists to answer.

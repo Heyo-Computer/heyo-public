@@ -100,34 +100,43 @@ jobs:
       disk_size_gb: 30
       # 4 hours, comfortably past this job's 90-minute timeout.
       #
-      # Explicit because the default (`CI_VM_TTL_SECONDS`, 3600) is shorter than
-      # a cold build here, and whether the orchestrator's renewal loop actually
-      # extends it depends on the *runner's* heyvmd being new enough: the TTL
-      # used to be computed as `started_at + ttl`, an uptime cap that renewal
-      # could not move, and a build past the cap was reaped mid-compile. That is
-      # fixed in mvm-ctrl (`fix: dont truncate live disks, accurate ttl`), but
-      # this workflow cannot see which build a given runner is on. A create-time
-      # TTL is honoured either way, so this is correct against both.
+      # This bounds a *running* VM, and nothing else: between jobs the VM is
+      # stopped, which the daemon's reaper ignores, and `CI_VM_IDLE_SECS` (a
+      # week by default) is what retires it. Explicit because the default
+      # (`CI_VM_TTL_SECONDS`, 3600) is shorter than a cold build here, and
+      # whether the orchestrator's renewal loop actually extends it depends on
+      # the *runner's* heyvmd being new enough: the TTL used to be computed as
+      # `started_at + ttl`, an uptime cap that renewal could not move, and a
+      # build past the cap was reaped mid-compile. That is fixed in mvm-ctrl
+      # (`fix: dont truncate live disks, accurate ttl`), but this workflow
+      # cannot see which build a given runner is on. A create-time TTL is
+      # honoured either way, so this is correct against both.
       ttl_seconds: 14400
-      # A dependency change is the one thing that must not reuse a warm VM: the
-      # cached registry and target/ in it were resolved against the old
-      # lockfile. Resolved against the repository root, so these are monorepo
-      # paths.
+      # What must retire the warm VM: the toolchain. Nothing else on this list.
       #
-      # Both manifests, not just the lockfile. `heyctl` is a workspace *member*,
-      # so cargo records its version in Cargo.lock but not its contents: editing
-      # its feature list changes what gets compiled without moving the lockfile
-      # by one byte. The root manifest carries `[workspace.dependencies]` for
-      # the same reason.
+      # `Cargo.lock` and the manifests used to be here, on the theory that a
+      # cache resolved against the old lockfile was stale. It is not: cargo
+      # fingerprints every unit by package id, features, profile and rustc, so
+      # a lockfile bump rebuilds the crates that moved and relinks — minutes —
+      # while busting the pool on it threw the whole `target/` away and paid
+      # the full cold build (OpenSSL, aws-lc, every dependency) for a version
+      # bump. app-lb's lockfile moved four times in the week of 2026-08-17;
+      # each was a cold run that a warm one would have finished in a fraction
+      # of the time. The whole point of the cache disk is to survive exactly
+      # this.
       #
-      # The two `rust-toolchain.toml` paths are listed although neither exists —
-      # a missing file hashes to an explicit marker, so adding one later busts
+      # A toolchain change is different in kind: `target/` is keyed to the
+      # rustc that wrote it, and a new one rebuilds everything anyway, so a
+      # fresh disk costs nothing extra and starts clean. The two
+      # `rust-toolchain.toml` paths are listed although neither exists — a
+      # missing file hashes to an explicit marker, so adding one later busts
       # the pool at the moment it most needs busting. Both locations, because
       # cargo searches upward from the working directory and would find either.
+      #
+      # Everything else that should retire a VM already does through the
+      # fingerprint: the image (its Dockerfile and context are hashed into the
+      # image name), and every field of this `vm:` block.
       cache_key_files:
-        - app-lb/Cargo.lock
-        - app-lb/Cargo.toml
-        - app-lb/heyctl/Cargo.toml
         - app-lb/rust-toolchain.toml
         - rust-toolchain.toml
     env:
@@ -311,6 +320,15 @@ jobs:
     # Pinned like app-lb, and for one reason more: this is the slowest build in
     # the repository, so a stray placement pays the full cold datafusion build.
     uses: default
+    # After app-lb, not beside it. Both jobs are pinned to one host, and run
+    # together they ask it for 12 vCPUs and 24 GB on top of everything else it
+    # does — the two builds then contend for the same cores and each takes
+    # longer than it would alone, which on a cold run is the difference between
+    # fitting the timeout and not. `needs` only orders them: an explicit `if:`
+    # is evaluated on its own terms once the dependency is terminal, so this
+    # job still runs when app-lb was skipped for not having changed, and still
+    # runs — and reports its own result — when app-lb failed.
+    needs: [app-lb]
     vm:
       driver: firecracker
       build:
@@ -333,17 +351,17 @@ jobs:
       # workspace here by a wide margin, again because of arrow and datafusion.
       disk_size_gb: 40
       # See the app-lb job for why this is set explicitly rather than left to
-      # `CI_VM_TTL_SECONDS`. It matters more here: this is the longest build in
-      # the repository, so it is the one most likely to meet a stale runner's
+      # `CI_VM_TTL_SECONDS`, and why it says nothing about how long the parked
+      # VM lives. It matters more here: this is the longest build in the
+      # repository, so it is the one most likely to meet a stale runner's
       # uptime cap.
       ttl_seconds: 14400
-      # `app-obs` is a single package, not a workspace, so there is no sibling
-      # manifest to list — the lockfile and its own manifest are the whole
-      # dependency surface. Both `rust-toolchain.toml` paths for the same
-      # missing-file-hashes-to-a-marker reason as above.
+      # The toolchain only — see the app-lb job for why the lockfile and
+      # manifest are deliberately not here. It matters most on this job: a
+      # cold datafusion build is the longest thing this repository does, and a
+      # dependency bump that busted the pool paid all of it for a version
+      # number.
       cache_key_files:
-        - app-obs/Cargo.lock
-        - app-obs/Cargo.toml
         - app-obs/rust-toolchain.toml
         - rust-toolchain.toml
     env:

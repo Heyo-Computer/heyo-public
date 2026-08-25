@@ -178,8 +178,23 @@ pub struct HeyvmConfig {
     /// failure. `CI_QUEUE_WAIT_SECS` sets a cap for deployments that want one.
     pub queue_wait: Option<Duration>,
     /// Backstop TTL on every VM we create, so a crashed orchestrator does not
-    /// strand a fleet. Renewed while a VM is pooled.
+    /// strand a fleet. Renewed on the lease loop while a job holds the VM.
+    ///
+    /// Only a *running* VM is subject to it: the daemon's reaper skips stopped
+    /// sandboxes, and a released VM is stopped — see `vm_idle` for the clock
+    /// that bounds those.
     pub vm_ttl: Duration,
+    /// How long an idle pooled VM is kept before the sweep destroys it.
+    ///
+    /// A VM handed back to the pool is *stopped*, so an idle one costs disk —
+    /// the rootfs clone and the cache disk — and nothing else, and this bounds
+    /// that disk rather than memory or CPU. It has to be this app's own clock:
+    /// heyvmd's TTL only ever reaps a running VM, which is precisely why a
+    /// stopped one needs a sweep here. Measured from the VM's last use, so a
+    /// workflow that runs at all keeps its cache; default a week, so a build
+    /// cache survives a weekend and the predecessor of a retired fingerprint
+    /// does not sit on a 40 GB disk for ever.
+    pub vm_idle: Duration,
     /// Drive one local `heyvmd` directly instead of discovering hosts through
     /// the cloud.
     ///
@@ -409,6 +424,7 @@ impl Config {
                 Some(_) => Some(secs("CI_QUEUE_WAIT_SECS", 0)?),
             },
             vm_ttl: secs("CI_VM_TTL_SECONDS", 3600)?,
+            vm_idle: secs("CI_VM_IDLE_SECS", 7 * 24 * 3600)?,
             local_runner: opt("CI_LOCAL_RUNNER").map(|v| match v.as_str() {
                 "1" | "true" | "yes" | "on" => heyo_sdk::DEFAULT_LOCAL_BASE_URL.to_string(),
                 other => other.trim_end_matches('/').to_string(),

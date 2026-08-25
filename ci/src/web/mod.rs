@@ -97,6 +97,9 @@ pub fn router(
         // on a claimed one it would fail a live build — which is why the pool
         // refuses those rather than trusting the page not to offer them.
         .route("/vms/{sandbox_id}/destroy", post(destroy_vm))
+        // Admin-only for the same reason: a resize restarts the VM. Idle ones
+        // only, refused by the pool rather than trusted to the page.
+        .route("/vms/{sandbox_id}/resize", post(resize_vm))
         .route("/vms/cleanup-failed", post(cleanup_failed_vms))
         .route("/workflows", get(workflows_page))
         // Behind the gate on purpose, and admin-only on top of it: a submit
@@ -1276,6 +1279,42 @@ async fn destroy_vm(
             pages::Notice::done(message)
         }
         Err(e) => pages::Notice::failed(e.to_string()),
+    };
+    render_vms(&state, &headers, who.as_ref(), notice).await
+}
+
+#[derive(serde::Deserialize)]
+struct ResizeForm {
+    size_class: String,
+}
+
+async fn resize_vm(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<ResizeForm>,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+    // Parsed through the SDK's own enum so the page and the daemon cannot
+    // disagree about what a class is called.
+    let class: Result<heyo_sdk::SandboxSize, _> =
+        serde_json::from_value(serde_json::Value::String(form.size_class.clone()));
+    let notice = match class {
+        Err(_) => pages::Notice::failed(format!("{:?} is not a size class", form.size_class)),
+        Ok(class) => match state.dispatcher.resize_pooled_vm(&sandbox_id, class).await {
+            Ok(message) => {
+                tracing::info!(
+                    "resized pooled VM {sandbox_id} to {} by {}",
+                    class.as_str(),
+                    who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+                );
+                pages::Notice::done(message)
+            }
+            Err(e) => pages::Notice::failed(e.to_string()),
+        },
     };
     render_vms(&state, &headers, who.as_ref(), notice).await
 }

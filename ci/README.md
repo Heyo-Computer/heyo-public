@@ -152,9 +152,8 @@ jobs:
       build:                         # or `image:` — see "Images" below
         dockerfile: deploy/image/Dockerfile
       size_class: medium
-      cache_key_files:               # busts the warm VM when these change
-        - Cargo.lock
-        - rust-toolchain.toml
+      cache_key_files:               # busts the warm VM when these change —
+        - rust-toolchain.toml        # the toolchain, not Cargo.lock; see below
     strategy:
       matrix:
         target: [x86_64, aarch64]
@@ -447,12 +446,18 @@ the author declares the driver, image, size and setup hooks — and, via
 (instead of `timeout-minutes:`) is a parse error naming the job, not a field that
 quietly does nothing.
 
-**The warm pool's idle TTL honors the workflow.** A VM released back into the
-pool is renewed to the *longer* of `CI_VM_TTL_SECONDS` (default 3600) and the
-job's own `vm.ttl_seconds`. Before this, a workflow that declared a four-hour
-TTL because its cold build is expensive still had its warm VM reaped by the
-daemon one hour after the run ended — so any push more than an hour after the
-last one booted a blank VM and paid the full cold build again.
+**A released VM is parked, not left running.** It is stopped — the daemon
+keeps its rootfs and its cache disk; only `destroy` removes those — and started
+again by the next job that claims it. Before this a pooled VM idled *running*
+until the daemon's TTL reaped it, which made the warm cache a matter of cadence:
+the next push had to land inside the TTL (an hour by default, four for
+`apps.yml`) or it booted a blank VM and paid the full cold build. For a
+repository pushed to a few times a day, most gaps are longer than that, so
+most builds were cold, and a `xlarge` sat on 16 GB of the host in between.
+Stopped, the VM costs disk and nothing else, the reaper ignores it, and
+`CI_VM_IDLE_SECS` (default a week) is what retires it — see the pool section.
+The TTL it is parked with is still the longer of `CI_VM_TTL_SECONDS` and the
+job's `vm.ttl_seconds`, because that is what it boots with next time.
 
 ### This repository's own
 
@@ -588,6 +593,8 @@ fingerprint = sha256( canonical_json(vm block, minus cache_key_files)
 ```
 
 A job claims an idle VM on its runner with a matching fingerprint, or builds one.
+A claimed VM is stopped — that is how `release` leaves it — so the claim starts
+it and waits for the boot, seconds against the minutes a fresh one costs.
 Two decisions in there:
 
 - **`cache_key_files` is stripped before hashing.** Otherwise editing the *list*
@@ -596,13 +603,56 @@ Two decisions in there:
   `Cargo.lock`" and "an empty `Cargo.lock`" indistinguishable, so *adding* a
   lockfile later would not bust the pool — the moment it most needs busting.
 
+**List only what must retire the cache in `cache_key_files`.** `Cargo.lock`
+is the obvious candidate and the wrong one for a cargo build: cargo fingerprints every unit by package id, features, profile and compiler, so
+a lockfile bump rebuilds the crates that moved and relinks, while busting the
+pool on it throws the whole `target/` away and pays the cold build for a
+version number. A toolchain file belongs there — a new rustc rebuilds
+everything anyway — and the image and the `vm:` block are already in the
+fingerprint. `apps.yml` says the same at the site.
+
 `/vms` shows the pool and answers the two questions worth asking of it. **Is
 reuse working** — rows are grouped by host and fingerprint, and a fingerprint
 appearing twice on one host is flagged `not reused`, because that is two VMs
 where one would have done. **What was left behind** — each row carries the
 outcome of the run that last used it, so a machine a failed build left in a
 strange state is visible rather than inferred, and reusable-by-fingerprint is
-exactly why that matters.
+exactly why that matters. **Is it the size it asked for** — each row carries
+the class the job declared and, under it, what the runner's daemon reported
+the VM was actually given (`GET /sandboxes/<id>`: its class name and the cpus
+and memory behind it), read back every time this app creates, claims or
+resizes the VM and stored on the row. A `xlarge` build quietly running on the
+daemon's `small` default looks exactly like a slow build, and until this
+nothing could tell the two apart; now the row says `got small (1 CPU, 2 GB)`
+in red, and the job gets a warning. A daemon too old to report sizing shows
+`size unreported`, which is a finding about the runner, not a size.
+
+**Resize** is on every idle row. It changes the VM in place — the daemon
+rewrites its cpus and memory and restarts it, disks kept — so the build cache
+survives, which editing `size_class` in the workflow would not: that is part
+of the fingerprint, and changing it retires the warm VM. Idle only, because
+the restart would kill a job mid-step; the row is held out of the pool for the
+duration and the new size is read back from the daemon rather than assumed.
+The workflow's own class is left alone: this is an override, and the next
+claim says so if the two disagree.
+
+### Idle VMs are retired by this app, on its own clock
+
+The daemon's TTL reaper skips stopped sandboxes, so a parked VM would keep its
+disks for ever without something here to say when it is no longer wanted. The
+lease loop sweeps, every tick, idle VMs on the hosts this instance serves that
+are either unused for `CI_VM_IDLE_SECS` or carry a fingerprint no job has
+touched in that window — the machine a retired `vm:` block or toolchain left
+behind, sitting beside the one that replaced it. Claimed VMs are refused in the
+query; `draining` keeps a taken VM out of circulation until the daemon confirms
+it is gone.
+
+A claim that cannot *reach* a pooled VM — the tunnel, the daemon not answering
+— hands the row back and fails the delivery so the ladder retries; discarding a
+warm cache because the runner blinked is the most expensive thing this code can
+do. A daemon that answers and does not know the VM, or cannot start it, is a
+verdict: the VM is destroyed and a fresh one built. Destroyed rather than merely
+forgotten, because a forgotten stopped VM is disk nothing will ever reclaim.
 
 ### A VM being created is on the page too
 
@@ -699,11 +749,11 @@ touched again when a VM was claimed or released. A build longer than the TTL had
 its machine reaped mid-step, surfacing as a daemon error on a job doing nothing
 wrong.
 
-Only *claimed* VMs are kept alive. An idle one in the warm pool is meant to age
-out — that is what the TTL is a backstop for, and renewing those would mean
-nothing this app creates ever expires. It works while a step is running because
-`Vm::renew_ttl` does not take the sandbox lock that `exec` holds; if it did, the
-keepalive would queue behind the build it exists to protect.
+Only *claimed* VMs are kept alive. An idle one is stopped, outside the reaper's
+reach, and retired by the idle sweep on its own clock; renewing it would be a
+round trip per pooled VM per tick for nothing. It works while a step is running
+because `Vm::renew_ttl` does not take the sandbox lock that `exec` holds; if it
+did, the keepalive would queue behind the build it exists to protect.
 
 ## Workflow objects
 

@@ -141,6 +141,14 @@ pub struct PooledVmView {
     pub runner_hd_id: String,
     pub fingerprint: String,
     pub workflow_id: String,
+    /// The class the job asked for, as spelled in its `vm:` block. `None` for
+    /// a job that named none and for rows older than the column.
+    pub size_class: Option<String>,
+    /// What the daemon reported the VM was given, the last time this app
+    /// touched it. All-`None` when never read or when the daemon reports
+    /// nothing — see [`crate::vm::VmSize`].
+    pub observed: crate::vm::VmSize,
+    pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub status: String,
     pub claimed_by_job: Option<String>,
     pub last_job: Option<String>,
@@ -236,17 +244,18 @@ impl Pool {
         runner: &str,
         fingerprint: &str,
         workflow_id: &str,
+        size_class: Option<&str>,
         lease: Lease<'_>,
     ) -> Result<String, PoolError> {
         let id = Self::building_id(job_id);
         sqlx::query(
             "INSERT INTO ci_vm_pool
-                (sandbox_id, runner_hd_id, fingerprint, workflow_id, status, claimed_by_job,
-                 last_job, leased_by, leased_until)
-             VALUES ($1,$2,$3,$4,'building',$5,$5,$6, now() + make_interval(secs => $7))
+                (sandbox_id, runner_hd_id, fingerprint, workflow_id, size_class, status,
+                 claimed_by_job, last_job, leased_by, leased_until)
+             VALUES ($1,$2,$3,$4,$8,'building',$5,$5,$6, now() + make_interval(secs => $7))
              ON CONFLICT (sandbox_id) DO UPDATE
                 SET status='building', runner_hd_id=$2, fingerprint=$3, workflow_id=$4,
-                    claimed_by_job=$5, last_job=$5, last_used_at=now(),
+                    size_class=$8, claimed_by_job=$5, last_job=$5, last_used_at=now(),
                     leased_by=$6, leased_until=now() + make_interval(secs => $7)",
         )
         .bind(&id)
@@ -256,6 +265,7 @@ impl Pool {
         .bind(job_id)
         .bind(lease.instance)
         .bind(lease.ttl.as_secs() as f64)
+        .bind(size_class)
         .execute(&self.db)
         .await
         .map_err(PoolError::sql)?;
@@ -305,16 +315,18 @@ impl Pool {
         runner: &str,
         fingerprint: &str,
         workflow_id: &str,
+        size_class: Option<&str>,
         job_id: &str,
         lease: Lease<'_>,
     ) -> Result<(), PoolError> {
         sqlx::query(
             "INSERT INTO ci_vm_pool
-                (sandbox_id, runner_hd_id, fingerprint, workflow_id, status, claimed_by_job,
-                 last_job, leased_by, leased_until)
-             VALUES ($1,$2,$3,$4,'claimed',$5,$5,$6, now() + make_interval(secs => $7))
+                (sandbox_id, runner_hd_id, fingerprint, workflow_id, size_class, status,
+                 claimed_by_job, last_job, leased_by, leased_until)
+             VALUES ($1,$2,$3,$4,$8,'claimed',$5,$5,$6, now() + make_interval(secs => $7))
              ON CONFLICT (sandbox_id) DO UPDATE
-                SET status='claimed', claimed_by_job=$5, last_job=$5, last_used_at=now(),
+                SET status='claimed', size_class=$8, claimed_by_job=$5, last_job=$5,
+                    last_used_at=now(),
                     leased_by=$6, leased_until=now() + make_interval(secs => $7)",
         )
         .bind(sandbox_id)
@@ -324,6 +336,7 @@ impl Pool {
         .bind(job_id)
         .bind(lease.instance)
         .bind(lease.ttl.as_secs() as f64)
+        .bind(size_class)
         .execute(&self.db)
         .await
         .map_err(PoolError::sql)?;
@@ -390,8 +403,10 @@ impl Pool {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            "SELECT p.sandbox_id, p.runner_hd_id, p.fingerprint, p.workflow_id, p.status,
-                    p.claimed_by_job, p.last_job, p.leased_by, p.created_at, p.last_used_at,
+            "SELECT p.sandbox_id, p.runner_hd_id, p.fingerprint, p.workflow_id, p.size_class,
+                    p.observed_size, p.observed_cpus, p.observed_memory, p.observed_at,
+                    p.status, p.claimed_by_job, p.last_job, p.leased_by, p.created_at,
+                    p.last_used_at,
                     r.id AS last_run_id, r.status AS last_run_status
                FROM ci_vm_pool p
                LEFT JOIN ci_job j ON j.id = COALESCE(p.claimed_by_job, p.last_job)
@@ -410,6 +425,13 @@ impl Pool {
                 runner_hd_id: r.get("runner_hd_id"),
                 fingerprint: r.get("fingerprint"),
                 workflow_id: r.get("workflow_id"),
+                size_class: r.get("size_class"),
+                observed: crate::vm::VmSize {
+                    size_class: r.get("observed_size"),
+                    cpus: r.get::<Option<i32>, _>("observed_cpus").map(|c| c as u32),
+                    memory: r.get::<Option<i64>, _>("observed_memory").map(|m| m as u64),
+                },
+                observed_at: r.get("observed_at"),
                 status: r.get("status"),
                 claimed_by_job: r.get("claimed_by_job"),
                 last_job: r.get("last_job"),
@@ -420,6 +442,93 @@ impl Pool {
                 last_used_at: r.get("last_used_at"),
             })
             .collect())
+    }
+
+    /// Record what the daemon said the VM was given.
+    ///
+    /// Written whenever this app reads it — creation, claim, resize — so the
+    /// page shows the last known truth without a round trip per row. An
+    /// all-`None` size is stored as such: "the daemon reported nothing" is a
+    /// fact about the runner worth keeping, and must not be mistaken for a
+    /// stale earlier reading.
+    pub async fn record_size(
+        &self,
+        sandbox_id: &str,
+        size: &crate::vm::VmSize,
+    ) -> Result<(), PoolError> {
+        sqlx::query(
+            "UPDATE ci_vm_pool
+                SET observed_size = $2, observed_cpus = $3, observed_memory = $4,
+                    observed_at = now()
+              WHERE sandbox_id = $1",
+        )
+        .bind(sandbox_id)
+        .bind(size.size_class.as_deref())
+        .bind(size.cpus.map(|c| c as i32))
+        .bind(size.memory.map(|m| m as i64))
+        .execute(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(())
+    }
+
+    /// Take an *idle* VM out of circulation for an operation that restarts it.
+    ///
+    /// The same `draining` mark the sweep uses, for the same reason — a claim
+    /// must not hand out a VM that is about to be restarted underneath it —
+    /// but idle only: a claimed VM has a job on it, a building one has no
+    /// sandbox yet, and a draining one is already spoken for. The caller puts
+    /// it back with [`Self::release`] whether or not the operation succeeded;
+    /// a VM the resize failed on is still the VM it was.
+    pub async fn take_idle(
+        &self,
+        sandbox_id: &str,
+        runners: &[String],
+    ) -> Result<Option<PooledVm>, PoolError> {
+        if runners.is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "UPDATE ci_vm_pool
+                SET status = 'draining'
+              WHERE sandbox_id = $1
+                AND runner_hd_id = ANY($2)
+                AND status = 'idle'
+             RETURNING *",
+        )
+        .bind(sandbox_id)
+        .bind(runners)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(row.as_ref().map(PooledVm::from_row))
+    }
+
+    /// Every fingerprint some VM on `runners` was claimed or released within
+    /// the last `secs` — the set the idle sweep treats as wanted.
+    ///
+    /// Read from the pool rather than from `ci_job` because `last_used_at` is
+    /// exactly the fact in question: a fingerprint is live if a job touched a
+    /// VM of it recently, whatever that job's status ended up being.
+    pub async fn recent_fingerprints(
+        &self,
+        runners: &[String],
+        secs: i64,
+    ) -> Result<Vec<String>, PoolError> {
+        if runners.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT DISTINCT fingerprint FROM ci_vm_pool
+              WHERE runner_hd_id = ANY($1)
+                AND last_used_at >= now() - make_interval(secs => $2)",
+        )
+        .bind(runners)
+        .bind(secs as f64)
+        .fetch_all(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(rows.iter().map(|r| r.get("fingerprint")).collect())
     }
 
     /// Take one idle VM out of circulation so it can be destroyed.
@@ -954,9 +1063,17 @@ mod tests {
         let (pool, _s) = test_pool().await;
         let runner = runner_id();
 
-        pool.register(&sb(&runner, "1"), &runner, "fp-a", "wf", "job-1", held())
-            .await
-            .unwrap();
+        pool.register(
+            &sb(&runner, "1"),
+            &runner,
+            "fp-a",
+            "wf",
+            None,
+            "job-1",
+            held(),
+        )
+        .await
+        .unwrap();
         // Claimed by its creator, so nobody else can take it yet.
         assert_eq!(
             pool.claim(&runner, "fp-a", "job-2", held()).await.unwrap(),
@@ -983,9 +1100,17 @@ mod tests {
     async fn a_different_fingerprint_does_not_match() {
         let (pool, _s) = test_pool().await;
         let runner = runner_id();
-        pool.register(&sb(&runner, "2"), &runner, "fp-a", "wf", "job-1", held())
-            .await
-            .unwrap();
+        pool.register(
+            &sb(&runner, "2"),
+            &runner,
+            "fp-a",
+            "wf",
+            None,
+            "job-1",
+            held(),
+        )
+        .await
+        .unwrap();
         pool.release(&sb(&runner, "2")).await.unwrap();
         assert_eq!(
             pool.claim(&runner, "fp-b", "job-2", held()).await.unwrap(),
@@ -1005,7 +1130,7 @@ mod tests {
         let (pool, _s) = test_pool().await;
         let a = runner_id();
         let b = runner_id();
-        pool.register(&sb(&a, "3"), &a, "fp-a", "wf", "job-1", held())
+        pool.register(&sb(&a, "3"), &a, "fp-a", "wf", None, "job-1", held())
             .await
             .unwrap();
         pool.release(&sb(&a, "3")).await.unwrap();
@@ -1021,7 +1146,7 @@ mod tests {
         let runner = runner_id();
         for i in 0..4 {
             let id = format!("sb-race-{i}-{}", crate::vm::new_id());
-            pool.register(&id, &runner, "fp-race", "wf", "job-0", held())
+            pool.register(&id, &runner, "fp-race", "wf", None, "job-0", held())
                 .await
                 .unwrap();
             pool.release(&id).await.unwrap();
@@ -1064,6 +1189,7 @@ mod tests {
             &runner,
             "fp-o",
             "wf",
+            None,
             "job-gone",
             lapsed("ci-previous-life"),
         )
@@ -1130,6 +1256,7 @@ mod tests {
             &runner,
             "fp-l",
             "wf",
+            None,
             &job,
             lapsed("ci-previous-life"),
         )
@@ -1165,6 +1292,7 @@ mod tests {
             &runner,
             "fp-t",
             "wf",
+            None,
             "job-theirs",
             Lease {
                 instance: "ci-other-instance",
@@ -1189,6 +1317,7 @@ mod tests {
             &runner,
             "fp-m",
             "wf",
+            None,
             "job-mine",
             lapsed(INSTANCE),
         )
@@ -1241,6 +1370,7 @@ mod tests {
             &runner,
             "fp-f",
             "wf",
+            None,
             &ids[0],
             held(),
         )
@@ -1248,9 +1378,17 @@ mod tests {
         .unwrap();
         pool.release(&sb(&runner, "failed")).await.unwrap();
         // The running one is still claimed.
-        pool.register(&sb(&runner, "busy"), &runner, "fp-b", "wf", &ids[1], held())
-            .await
-            .unwrap();
+        pool.register(
+            &sb(&runner, "busy"),
+            &runner,
+            "fp-b",
+            "wf",
+            None,
+            &ids[1],
+            held(),
+        )
+        .await
+        .unwrap();
 
         let taken = pool.take_failed_for_sweep(ours).await.unwrap();
         assert_eq!(taken.len(), 1, "only the failed run's idle VM");
@@ -1298,6 +1436,7 @@ mod tests {
             &runner,
             "fp-k",
             "wf",
+            None,
             "job-1",
             Lease {
                 instance: &me,
@@ -1311,6 +1450,7 @@ mod tests {
             &runner,
             "fp-k",
             "wf",
+            None,
             "job-2",
             Lease {
                 instance: &me,
@@ -1326,6 +1466,7 @@ mod tests {
             &runner,
             "fp-k",
             "wf",
+            None,
             "job-3",
             Lease {
                 instance: "ci-other-instance",
@@ -1356,6 +1497,7 @@ mod tests {
             &runner,
             "fp-r",
             "wf",
+            None,
             "job-1",
             lapsed(&me),
         )
@@ -1366,6 +1508,7 @@ mod tests {
             &runner,
             "fp-r",
             "wf",
+            None,
             "job-2",
             lapsed("ci-other-instance"),
         )
@@ -1399,12 +1542,28 @@ mod tests {
     async fn sweeping_takes_stale_fingerprints_out_of_circulation() {
         let (pool, _s) = test_pool().await;
         let runner = runner_id();
-        pool.register(&sb(&runner, "live"), &runner, "fp-live", "wf", "j", held())
-            .await
-            .unwrap();
-        pool.register(&sb(&runner, "dead"), &runner, "fp-dead", "wf", "j", held())
-            .await
-            .unwrap();
+        pool.register(
+            &sb(&runner, "live"),
+            &runner,
+            "fp-live",
+            "wf",
+            None,
+            "j",
+            held(),
+        )
+        .await
+        .unwrap();
+        pool.register(
+            &sb(&runner, "dead"),
+            &runner,
+            "fp-dead",
+            "wf",
+            None,
+            "j",
+            held(),
+        )
+        .await
+        .unwrap();
         pool.release(&sb(&runner, "live")).await.unwrap();
         pool.release(&sb(&runner, "dead")).await.unwrap();
 
@@ -1438,6 +1597,44 @@ mod tests {
         assert!(pool.get(&sb(&runner, "dead")).await.unwrap().is_none());
     }
 
+    /// The live set the idle sweep feeds back into `take_for_sweep`: every
+    /// fingerprint touched within the window, on these runners only.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn recent_fingerprints_are_the_ones_touched_within_the_window() {
+        let (pool, _s) = test_pool().await;
+        let runner = runner_id();
+        let other = runner_id();
+        pool.register(&sb(&runner, "a"), &runner, "fp-a", "wf", None, "j", held())
+            .await
+            .unwrap();
+        pool.register(&sb(&other, "b"), &other, "fp-b", "wf", None, "j", held())
+            .await
+            .unwrap();
+        pool.release(&sb(&runner, "a")).await.unwrap();
+
+        let live = pool
+            .recent_fingerprints(std::slice::from_ref(&runner), 3600)
+            .await
+            .unwrap();
+        assert_eq!(
+            live,
+            vec!["fp-a".to_string()],
+            "this runner's, and only this runner's"
+        );
+        // A zero window is a window nothing falls in, so the sweep it feeds
+        // treats every idle VM as unwanted — which is what the test below
+        // relies on.
+        assert!(
+            pool.recent_fingerprints(std::slice::from_ref(&runner), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        pool.forget(&sb(&runner, "a")).await.unwrap();
+        pool.forget(&sb(&other, "b")).await.unwrap();
+    }
+
     /// An idle VM nobody has wanted for a long time is swept even when its
     /// fingerprint is still current — otherwise a workflow that stops running
     /// keeps a machine's worth of VMs alive forever.
@@ -1446,9 +1643,17 @@ mod tests {
     async fn a_long_idle_vm_is_swept_even_if_its_fingerprint_is_current() {
         let (pool, _s) = test_pool().await;
         let runner = runner_id();
-        pool.register(&sb(&runner, "stale"), &runner, "fp-cur", "wf", "j", held())
-            .await
-            .unwrap();
+        pool.register(
+            &sb(&runner, "stale"),
+            &runner,
+            "fp-cur",
+            "wf",
+            None,
+            "j",
+            held(),
+        )
+        .await
+        .unwrap();
         pool.release(&sb(&runner, "stale")).await.unwrap();
 
         // Nothing swept while it is fresh.
@@ -1478,7 +1683,7 @@ mod tests {
         let ours = std::slice::from_ref(&runner);
 
         let placeholder = pool
-            .begin_build("job-1", &runner, "fp-a", "wf", held())
+            .begin_build("job-1", &runner, "fp-a", "wf", None, held())
             .await
             .unwrap();
         assert_eq!(placeholder, Pool::building_id("job-1"));
@@ -1534,7 +1739,7 @@ mod tests {
 
         // Written with a lease that has already run out, standing in for a
         // process that stopped renewing.
-        pool.begin_build("job-dead", &runner, "fp-a", "wf", lapsed(&mine))
+        pool.begin_build("job-dead", &runner, "fp-a", "wf", None, lapsed(&mine))
             .await
             .unwrap();
         // Its own instance never reclaims from itself — that is what stops a
@@ -1555,7 +1760,7 @@ mod tests {
         assert_eq!(pool.sweep_stale_builds(ours, "sibling").await.unwrap(), 0);
 
         // Stop renewing, and it goes.
-        pool.begin_build("job-dead", &runner, "fp-a", "wf", lapsed(&mine))
+        pool.begin_build("job-dead", &runner, "fp-a", "wf", None, lapsed(&mine))
             .await
             .unwrap();
         assert_eq!(pool.sweep_stale_builds(ours, "sibling").await.unwrap(), 1);

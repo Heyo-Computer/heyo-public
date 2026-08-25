@@ -1013,7 +1013,8 @@ impl Dispatcher {
                 &plan.key,
                 &serde_json::json!({
                     "status": "running", "runner": runner,
-                    "sandbox": vm.id(), "reusedVm": reused, "attempt": attempt
+                    "sandbox": vm.id(), "reusedVm": reused, "attempt": attempt,
+                    "sizeClass": plan.vm.size_class.map(|s| s.as_str())
                 }),
             )
             .await;
@@ -1323,21 +1324,55 @@ impl Dispatcher {
                 .claim(runner, fingerprint, job_id, self.lease())
                 .await?
         {
-            let vm = self.vms.open(options.clone(), sandbox_id.clone()).await?;
-            // A pooled VM may have been stopped between jobs, which is normal
-            // and recoverable; anything else means the daemon lost it, and the
-            // right move is to forget it and build a fresh one rather than fail
-            // a job over a stale row.
+            let vm = match self.vms.open(options.clone(), sandbox_id.clone()).await {
+                Ok(vm) => vm,
+                Err(e) => {
+                    // Not a verdict on the VM: the dial failed before anything
+                    // was asked of it. Hand the row back so the retry finds it.
+                    let _ = self.pool.release(&sandbox_id).await;
+                    return Err(e.into());
+                }
+            };
+            // A pooled VM is *stopped* between jobs — `release_vm` parks it
+            // that way on purpose — so starting it is the normal path here,
+            // not a recovery. What is and is not recoverable:
+            //
+            // - A transport failure (the tunnel, the daemon not answering) says
+            //   nothing about the machine. Discarding it on that would throw
+            //   away a warm cache every time the runner blinked, which is the
+            //   single most expensive thing this code can do; the row goes
+            //   back to idle and the delivery fails so the ladder retries.
+            // - Anything else — the daemon does not know the id, refuses to
+            //   start it, reports it failed — means the VM is gone or broken.
+            //   It is destroyed, not merely forgotten: a stopped VM is outside
+            //   the daemon's TTL, so a forgotten one would keep its disks for
+            //   ever with no row left to find them by.
             match vm.ensure_running(BOOT_TIMEOUT).await {
                 Ok(()) => {
                     let _ = vm.renew_ttl(self.config.heyvm.vm_ttl).await;
+                    // Re-read on every claim, not only at creation: a restart
+                    // is exactly when a daemon could bring a VM back at a
+                    // different size, and a manual resize since the last job
+                    // is what the page should show.
+                    self.observe_size(&plan.key, &vm, plan.vm.size_class).await;
                     return Ok((vm, true));
+                }
+                Err(e) if e.is_transport() => {
+                    tracing::warn!(
+                        vm = %sandbox_id,
+                        "could not reach the pooled VM; keeping it for the retry: {e}"
+                    );
+                    let _ = self.pool.release(&sandbox_id).await;
+                    return Err(e.into());
                 }
                 Err(e) => {
                     tracing::warn!(
                         vm = %sandbox_id,
-                        "pooled VM is unusable, discarding it and building a fresh one: {e}"
+                        "pooled VM is unusable; destroying it and building a fresh one: {e}"
                     );
+                    if let Err(e) = vm.destroy().await {
+                        tracing::warn!(vm = %sandbox_id, "could not destroy: {e}");
+                    }
                     let _ = self.pool.forget(&sandbox_id).await;
                 }
             }
@@ -1360,7 +1395,14 @@ impl Dispatcher {
         // for looking at.
         let building = match self
             .pool
-            .begin_build(job_id, runner, fingerprint, &plan.base_id, self.lease())
+            .begin_build(
+                job_id,
+                runner,
+                fingerprint,
+                &plan.base_id,
+                plan.vm.size_class.map(|s| s.as_str()),
+                self.lease(),
+            )
             .await
         {
             Ok(id) => Some(id),
@@ -1420,11 +1462,74 @@ impl Dispatcher {
                 runner,
                 fingerprint,
                 &plan.base_id,
+                plan.vm.size_class.map(|s| s.as_str()),
                 job_id,
                 self.lease(),
             )
             .await?;
+        self.observe_size(&plan.key, &vm, plan.vm.size_class).await;
         Ok((vm, false))
+    }
+
+    /// Read what the daemon says the VM was given, record it on the pool row,
+    /// and say so if it is not what the job declared.
+    ///
+    /// `size_class` is passed straight through `POST /sandbox-deploy`, and a
+    /// daemon that honours it sizes the VM from it — but until this nothing
+    /// here could tell, and a `xlarge` job quietly running on the daemon's
+    /// `small` default looks exactly like a slow build. The reading is the
+    /// daemon's own (`Vm::size`): the class it named, or the tier the VM's
+    /// cpus and memory match, or just the numbers from a daemon that names no
+    /// class, or nothing from one too old to report sizing at all. Each of
+    /// those is shown as such on /vms. Logged, never failed: the build is
+    /// already running on whatever it got, and a warning against the job is
+    /// what somebody debugging "why is this slow" needs to find.
+    async fn observe_size(
+        &self,
+        job: &str,
+        vm: &Vm,
+        wanted: Option<heyo_sdk::SandboxSize>,
+    ) -> Option<crate::vm::VmSize> {
+        let size = match vm.size().await {
+            Ok(size) => size,
+            Err(e) => {
+                tracing::warn!(job, vm = vm.id(), "could not read the VM's size: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = self.pool.record_size(vm.id(), &size).await {
+            tracing::warn!(job, vm = vm.id(), "could not record the VM's size: {e}");
+        }
+        let got = size.label();
+        match wanted {
+            None => tracing::info!(job, vm = vm.id(), size = %got, "VM size"),
+            Some(wanted) => match size.matches(wanted) {
+                Some(true) => {
+                    tracing::info!(job, vm = vm.id(), size = %got, "VM sized as declared")
+                }
+                Some(false) => tracing::warn!(
+                    job,
+                    vm = vm.id(),
+                    "asked for a {} VM and got {got}; the build will not run as the \
+                     workflow expects — check the runner's heyvmd, or resize it from /vms",
+                    wanted.as_str()
+                ),
+                None if size.is_reported() => tracing::warn!(
+                    job,
+                    vm = vm.id(),
+                    "asked for a {} VM; the daemon reports {got} and names no class",
+                    wanted.as_str()
+                ),
+                None => tracing::warn!(
+                    job,
+                    vm = vm.id(),
+                    "asked for a {} VM; the runner's daemon does not report sizing, so \
+                     whether it complied cannot be checked from here",
+                    wanted.as_str()
+                ),
+            },
+        }
+        Some(size)
     }
 
     /// Attach the VM's own console to the run.
@@ -1554,18 +1659,37 @@ impl Dispatcher {
             }
             return;
         }
-        // The idle TTL honors the workflow's own `ttl_seconds` when that is
-        // longer than `CI_VM_TTL_SECONDS`. A job declares a long TTL precisely
-        // because its cold build is expensive — apps.yml sets 4 hours against
-        // the 1-hour default — and repooling the VM with the *shorter* value
-        // meant the warm cache died an hour after every run. Any push more than
-        // an hour after the last one then booted a blank VM, and the cold build
-        // was exactly the one that could not fit its ceiling. The pool sweep
-        // still ages out idle VMs on its own terms; this only stops the daemon
-        // reaping them out from under it early.
+        // The TTL is what the VM boots with next time — `start` counts it from
+        // then — and it honors the workflow's own `ttl_seconds` when that is
+        // longer than `CI_VM_TTL_SECONDS`, for the reason apps.yml gives: a
+        // build longer than the default must not be reaped mid-compile by a
+        // runner whose daemon is too old to have its TTL renewed.
         let idle_ttl = idle_pool_ttl(plan.vm.ttl_seconds, self.config.heyvm.vm_ttl);
         if let Err(e) = vm.renew_ttl(idle_ttl).await {
             tracing::warn!(vm = vm.id(), "could not renew the TTL: {e}");
+        }
+        // Parked, not left running. A pooled VM used to idle *running* until
+        // the daemon's TTL reaped it, which made the warm cache a matter of
+        // cadence: the next push had to land inside the TTL — an hour by
+        // default, four for apps.yml — or it booted a blank machine and paid
+        // the full cold build. Every gap longer than that, which for a repo
+        // pushed to a few times a day is most of them, was cold. Stopped, the
+        // VM keeps its rootfs and its cache disk (the daemon removes those on
+        // `destroy` only), is outside the TTL reaper (which skips stopped
+        // sandboxes), and holds no memory or CPU on the host — an `xlarge`
+        // left running is 16 GB nobody is using. `acquire_vm` starts it again
+        // on the next claim; the idle sweep is what eventually retires it.
+        //
+        // Stopped *before* the row goes idle. The other order has a window in
+        // which a concurrent claim sees the VM running, then has it stopped
+        // out from under its first step.
+        if let Err(e) = vm.stop().await {
+            // A running idle VM is what the pool used to hold; it still works,
+            // it just costs memory until the TTL takes it.
+            tracing::warn!(
+                vm = vm.id(),
+                "could not stop the VM; leaving it running: {e}"
+            );
         }
         if let Err(e) = self.pool.release(vm.id()).await {
             tracing::warn!(vm = vm.id(), "could not release into the pool: {e}");
@@ -2902,6 +3026,57 @@ impl Dispatcher {
         }
     }
 
+    /// Resize one idle pooled VM in place, keeping its cache.
+    ///
+    /// The escape hatch for a VM that is not the size its job declared, and
+    /// the only way to change a pooled VM's size *without* a cold build:
+    /// `size_class` in the workflow is part of the fingerprint, so editing it
+    /// there retires the warm VM. Idle only — the daemon restarts the VM to
+    /// apply the change, and a job mid-step on it would die — and the row is
+    /// held `draining` for the duration so no claim lands on it in between.
+    /// Whatever the daemon answers, the row goes back to idle: a VM the
+    /// resize failed on is still the VM it was. The VM is parked again
+    /// afterwards, as `release_vm` leaves it, and the new size is read back
+    /// from the daemon rather than assumed, so the page shows what happened.
+    ///
+    /// The workflow's own `size_class` is left as it is, on the row and in the
+    /// file: this is an override, and the next claim will say so if the two
+    /// disagree.
+    pub async fn resize_pooled_vm(
+        &self,
+        sandbox_id: &str,
+        class: heyo_sdk::SandboxSize,
+    ) -> Result<String, DispatchError> {
+        let ours = self.served_runner_ids();
+        let Some(taken) = self.pool.take_idle(sandbox_id, &ours).await? else {
+            return Err(DispatchError::VmNotResizable(sandbox_id.to_string()));
+        };
+        let result = async {
+            let options = self.runners.options_for(&taken.runner_hd_id).await?;
+            let vm = self.vms.open(options, sandbox_id.to_string()).await?;
+            vm.resize(class).await?;
+            let size = self
+                .observe_size("resize", &vm, Some(class))
+                .await
+                .map(|s| s.label())
+                .unwrap_or_else(|| "a size the daemon did not report back".to_string());
+            // The daemon restarts the VM to apply the change; park it again.
+            if let Err(e) = vm.stop().await {
+                tracing::warn!(vm = sandbox_id, "resized but could not stop: {e}");
+            }
+            Ok::<_, DispatchError>(size)
+        }
+        .await;
+        if let Err(e) = self.pool.release(sandbox_id).await {
+            tracing::warn!(vm = sandbox_id, "could not return the VM to the pool: {e}");
+        }
+        let size = result?;
+        Ok(format!(
+            "{sandbox_id} resized to {}: now {size}.",
+            class.as_str()
+        ))
+    }
+
     /// Destroy every idle VM whose last run failed.
     pub async fn destroy_failed_vms(&self) -> Result<String, DispatchError> {
         let ours = self.served_runner_ids();
@@ -2952,8 +3127,51 @@ impl Dispatcher {
                 if let Err(e) = self.reclaim_pool().await {
                     tracing::warn!("could not reclaim expired VM leases: {e}");
                 }
+                self.sweep_idle_pool().await;
             }
         });
+    }
+
+    /// Retire pooled VMs nothing has wanted for `CI_VM_IDLE_SECS`.
+    ///
+    /// This is the pool's only clock now that idle VMs are stopped: the
+    /// daemon's TTL reaper skips stopped sandboxes, so without this every VM
+    /// this app ever parked would keep its rootfs and cache disk for ever.
+    /// Two things qualify, and `take_for_sweep` states both: a VM idle longer
+    /// than the window, and a VM whose fingerprint no job has touched in the
+    /// window — the machine a retired `vm:` block or toolchain left behind,
+    /// sitting beside the one that replaced it.
+    ///
+    /// Claimed VMs are refused in the query, and `draining` rows keep a VM out
+    /// of circulation until the daemon confirms it is gone, so a sweep cannot
+    /// fail a live build or forget a machine that still exists.
+    async fn sweep_idle_pool(&self) {
+        let ours = self.served_runner_ids();
+        let idle_secs = self.config.heyvm.vm_idle.as_secs() as i64;
+        let taken = async {
+            let live = self.pool.recent_fingerprints(&ours, idle_secs).await?;
+            self.pool.take_for_sweep(&ours, &live, idle_secs).await
+        }
+        .await;
+        let taken = match taken {
+            Ok(taken) if taken.is_empty() => return,
+            Ok(taken) => taken,
+            Err(e) => {
+                tracing::warn!("could not sweep the idle VM pool: {e}");
+                return;
+            }
+        };
+        let wanted = taken.len();
+        let (destroyed, failed) = self.destroy_swept(taken).await;
+        tracing::info!(
+            "idle VM sweep: {destroyed} of {wanted} destroyed after {}s unused{}",
+            idle_secs,
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!("; still draining: {}", failed.join(", "))
+            }
+        );
     }
 
     /// Push out the sandbox TTL of every VM this instance is running a job on.
@@ -2968,9 +3186,9 @@ impl Dispatcher {
     /// take the sandbox lock, unlike `exec` and `destroy`. If it did, this would
     /// queue behind the very build it is trying to keep alive.
     ///
-    /// Only claimed VMs. An idle one in the warm pool is meant to age out — that
-    /// is what the TTL is a backstop for — and renewing those would mean nothing
-    /// this app creates ever expires.
+    /// Only claimed VMs. An idle one is stopped, outside the reaper's reach, and
+    /// retired by `sweep_idle_pool` on its own clock; renewing it would be a
+    /// round trip per pooled VM per tick for nothing.
     async fn renew_vm_ttls(&self) {
         let held = match self.pool.leased_by(&self.config.instance_id).await {
             Ok(held) => held,
@@ -3098,9 +3316,11 @@ fn host_can_run(supported: Option<&[String]>, driver: &str) -> bool {
     }
 }
 
-/// How long a VM released into the warm pool may sit idle before the daemon
-/// reaps it: the longer of the instance default and the workflow's own
-/// `ttl_seconds`. See the comment at the call site in `release_vm`.
+/// The TTL a VM is parked with, and so boots with on its next claim: the longer
+/// of the instance default and the workflow's own `ttl_seconds`. It bounds a
+/// *running* VM only — a parked VM is stopped, and its lifetime is the idle
+/// sweep's — so this exists for the runner whose daemon cannot have its TTL
+/// renewed mid-job. See the comment at the call site in `release_vm`.
 fn idle_pool_ttl(spec_ttl_seconds: Option<u64>, default: Duration) -> Duration {
     Duration::from_secs(spec_ttl_seconds.unwrap_or(0).max(default.as_secs()))
 }
@@ -3188,6 +3408,8 @@ pub enum DispatchError {
     Cancelled(String),
     /// A VM cannot be swept: unknown, on another instance's host, or claimed.
     VmNotSweepable(String),
+    /// A VM cannot be resized: unknown, on another instance's host, or not idle.
+    VmNotResizable(String),
     /// A job ran past `CI_MAX_JOB_SECONDS`.
     JobTimeout {
         job: String,
@@ -3372,6 +3594,12 @@ impl std::fmt::Display for DispatchError {
                 "{id} cannot be destroyed from here. It is either unknown, on a host \
                  this orchestrator does not serve, or currently running a job — a \
                  claimed VM is left alone so cleaning up cannot fail a live build."
+            ),
+            Self::VmNotResizable(id) => write!(
+                f,
+                "{id} cannot be resized from here. It is either unknown, on a host this \
+                 orchestrator does not serve, still being created, or not idle — a \
+                 resize restarts the VM, so one with a job on it is left alone."
             ),
             Self::JobTimeout { job, after } => write!(
                 f,
