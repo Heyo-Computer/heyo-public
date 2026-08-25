@@ -21,6 +21,7 @@ mod config;
 mod deployment;
 mod disks;
 mod dns;
+mod federated;
 mod feed;
 mod guard;
 mod health;
@@ -95,6 +96,22 @@ fn config_from_env() -> LbConfig {
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         );
+    }
+    if let Ok(v) = std::env::var("APP_LB_AUTH_URL") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            cfg.auth_url = Some(v);
+        }
+    }
+    if let Ok(v) = std::env::var("APP_LB_AUTH_CACHE_SECS")
+        && let Ok(n) = v.trim().parse()
+    {
+        cfg.auth_cache_secs = n;
+    }
+    if let Ok(v) = std::env::var("APP_LB_AUTH_TIMEOUT_SECS")
+        && let Ok(n) = v.trim().parse()
+    {
+        cfg.auth_timeout_secs = n;
     }
     if let Ok(v) = std::env::var("APP_LB_DASHBOARD_AUTH") {
         cfg.dashboard_auth = matches!(
@@ -245,6 +262,17 @@ fn main() {
         panic!(
             "APP_LB_ADMIN_AUTH is set but APP_LB_DASHBOARD_PASSWORD is not; the admin \
              gate reuses the dashboard credentials, so set a password or unset APP_LB_ADMIN_AUTH"
+        );
+    }
+
+    // Federated bearers are only ever examined by the admin gate, so an auth
+    // URL with the gate off would be accepted config that checks nothing —
+    // every customer route would be open to whoever reaches the listener.
+    if cfg.auth_url.is_some() && !cfg.admin_auth {
+        panic!(
+            "APP_LB_AUTH_URL is set but APP_LB_ADMIN_AUTH is off; federated bearers are only \
+             checked by the admin gate, so set APP_LB_ADMIN_AUTH=1 (and a dashboard password) \
+             or unset APP_LB_AUTH_URL"
         );
     }
 
@@ -802,6 +830,18 @@ fn main() {
             cfg.dashboard_password.clone(),
             cfg.dashboard_auth,
             cfg.admin_auth,
+            cfg.auth_url.as_ref().map(|u| {
+                tracing::info!(
+                    auth_url = %u,
+                    cache_secs = cfg.auth_cache_secs,
+                    "federated admin auth enabled: heyo bearers are resolved to namespace grants"
+                );
+                Arc::new(crate::federated::FederatedAuth::new(
+                    u.clone(),
+                    cfg.auth_cache_secs,
+                    cfg.auth_timeout_secs,
+                ))
+            }),
             certs.clone(),
             acme_signal,
             secrets,

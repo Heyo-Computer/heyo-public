@@ -69,6 +69,9 @@ Configuration is environment-only:
 | `APP_LB_DASHBOARD_USER` | `admin` | Basic Auth username (only used when a password is set) |
 | `APP_LB_DASHBOARD_AUTH` | `true` | `0`/`false` to leave the dashboard view tier open while the password keeps gating the CRUD API — for when your own sign-in (e.g. Google) fronts the pages |
 | `APP_LB_ADMIN_AUTH` | `false` | `1`/`true` to extend the gate to the deployment CRUD API (needs a password) |
+| `APP_LB_AUTH_URL` | *(unset)* | Base URL of the Heyo auth service. **Setting it enables [federated auth](#managed-mode-federated-auth-and-namespaces)**: a bearer that is not an app-token is resolved to namespace grants by `GET /api/auth/scopes`. Needs `APP_LB_ADMIN_AUTH=1` |
+| `APP_LB_AUTH_CACHE_SECS` | `60` | How long a resolved grant is trusted before re-fetching (never past the token's own expiry). Also the ceiling on revocation latency |
+| `APP_LB_AUTH_TIMEOUT_SECS` | `5` | Timeout for one scopes lookup. An unreachable auth service fails closed |
 | `APP_LB_TLS_CERT` | *(unset)* | PEM cert path; set with `APP_LB_TLS_KEY`. The fallback cert when ACME is on |
 | `APP_LB_TLS_KEY` | *(unset)* | PEM private-key path |
 | `APP_LB_PROXY_TLS_ADDR` | `0.0.0.0:6189` | HTTPS listener (bound when ACME is on or cert+key are set) |
@@ -2507,6 +2510,74 @@ while a create is still in flight. The autoscaler therefore re-checks, after eve
 promotion, that the deployment it is working on is still the registry's — and kills any VM the
 replacement did not inherit, rather than leaving it running until its TTL. A pool-preserving
 edit (one that doesn't change the `vm` block) carries its VMs over and keeps them.
+
+## Managed mode: federated auth and namespaces
+
+Everything above assumes the operator of app-lb is the operator of what runs
+on it. A *managed* fleet is different: the machine belongs to a platform, and
+the deployments belong to its customers, who never see the Basic credential and
+should never be handed a fleet-wide token. What they have is the credential the
+Heyo auth service already gave them — a JWT, or a `heyo_api_*` key — and what
+they should reach is exactly the namespaces their account owns.
+
+Set `APP_LB_AUTH_URL` (with `APP_LB_ADMIN_AUTH=1`, since only the gate consults
+it) and the admin API accepts a third credential:
+
+| Presented as | Resolved by | Reach |
+| --- | --- | --- |
+| Basic username/password | the startup config | the fleet |
+| `Bearer applb_…` | the local token store | whatever the token was minted with |
+| `Bearer <anything else>` | `GET {APP_LB_AUTH_URL}/api/auth/scopes` | the namespaces the auth service lists |
+
+That is also the order of precedence: a local token is never sent upstream,
+and the auth service is only asked about a bearer the store does not know.
+
+### What the auth service says
+
+The scopes endpoint answers with a list of strings, and the grammar is the
+whole contract:
+
+| Scope | Meaning |
+| --- | --- |
+| `namespace:<name>:admin` | admin tier on every deployment in `<name>` — list, register, edit, scale, evict, exec, shell, build, pull |
+| `namespace:<name>:view` | view tier only — the directory, `/metrics`, `/security`, list and get |
+| `fleet:admin` | unconfined, as the Basic operator is |
+
+A bearer with two namespaces is admin in one and view in the other exactly as
+the list says; the tier is checked against the namespace of the deployment a
+route names, not against the strongest tier the caller holds anywhere. Anything
+else in the list is ignored with a debug log, so the auth service can grow new
+scopes without breaking an older app-lb. A namespace that would not validate as
+a spec's namespace is dropped rather than admitted.
+
+A federated caller is confined in every way a [namespace token](docs/namespaces.html)
+is: `GET /deployments` narrows to its namespaces (and takes `?namespace=` to
+narrow further — `/metrics` takes the same filter), `POST /deployments` refuses
+a spec naming a namespace it does not reach *and* refuses to re-register an id
+that already lives in one, `PUT` refuses to move a deployment out, and the
+fleet routes — tokens, secrets, workflows, `/jobs`, disks, block rules — are
+closed. `default` is never a customer's: the auth service reserves the name, so
+no grant contains it and unnamespaced deployments stay the operator's alone.
+
+Deployment ids stay global. Two customers cannot both register `web`; the second
+gets a 403 saying the credential cannot register that deployment, which is the
+same message an out-of-namespace attempt gets, so probing does not reveal which.
+
+### Caching, and what it costs
+
+Answers are cached by the SHA-256 of the bearer for `APP_LB_AUTH_CACHE_SECS`,
+capped by the token's own `expiresIn`, so a dashboard polling `/metrics` costs
+one upstream round trip a minute rather than one a second. Refusals are cached
+too, briefly, so a bad token cannot turn app-lb into an amplifier against the
+auth service. The price is revocation latency: a scope withdrawn upstream holds
+here until the entry expires. The auth service being unreachable is a refusal,
+not a pass — the gate fails closed, and the startup log says which URL it will
+be asking.
+
+Nothing here reaches the data plane. A deployment's own `auth` gate still takes
+the providers it always did; a customer who wants their users signed in with
+the same Heyo tokens wants the [`jwt` provider](#gating-a-deployment-with-a-jwt),
+which verifies them locally.
 
 ## Fleets of sandboxes
 

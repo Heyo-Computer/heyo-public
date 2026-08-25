@@ -78,6 +78,25 @@ only if the deployment is inside that token's namespace. The same 401 covers "wr
 secret", "expired", and "wrong namespace" — probing the gate teaches nothing about which
 it was.</div>
 
+<h2>Namespaces from the Heyo auth API</h2>
+<p>A token is one way into a namespace. On a managed fleet — where the platform runs
+app-lb and its customers own the deployments — the other is the credential the Heyo auth
+service already issued them. Set <code>APP_LB_AUTH_URL</code> (with
+<code>APP_LB_ADMIN_AUTH=1</code>) and any bearer that is not an app-token is resolved by
+<code>GET /api/auth/scopes</code> into a set of grants:</p>
+<pre><code>namespace:team-a:admin     # everything a namespace admin token can do, in team-a
+namespace:team-b:view      # directory, /metrics, list and get, in team-b
+fleet:admin                # unconfined — platform operators only</code></pre>
+<p>The wall is the same one. A federated caller lists and creates inside its namespaces,
+cannot move a deployment out, cannot capture an id that already lives elsewhere, and is
+refused every fleet-wide route. The tier is checked per namespace: a caller that is
+<code>admin</code> in <code>team-a</code> and <code>view</code> in <code>team-b</code>
+cannot scale anything in <code>team-b</code>. <code>default</code> is reserved by the
+auth service, so no grant ever reaches it.</p>
+<div class="note">Grants are cached for <code>APP_LB_AUTH_CACHE_SECS</code> (60s by default,
+never past the token's own expiry), so a revoked scope lingers for at most that long. An
+unreachable auth service is a refusal, not a pass.</div>
+
 <footer><a href="security.html">← Auth &amp; tokens</a> · next:
 <a href="feed.html">The event feed</a></footer>
 </main>

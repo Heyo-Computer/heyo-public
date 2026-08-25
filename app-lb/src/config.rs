@@ -82,6 +82,22 @@ pub struct LbConfig {
     /// `dashboard_password` to be set. `/healthz` stays open for probes.
     #[serde(default)]
     pub admin_auth: bool,
+    /// Base URL of the Heyo auth service. Setting it turns on *federated*
+    /// auth on the admin API: a bearer that is not one of app-lb's own tokens
+    /// is resolved to a set of namespace grants by `GET /api/auth/scopes`
+    /// there. Needs `admin_auth`, since only the gate consults it. See
+    /// `federated.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
+    /// How long a resolved grant is trusted before it is re-fetched. Bounded
+    /// above by the token's own expiry. Also the ceiling on revocation
+    /// latency.
+    #[serde(default = "default_auth_cache_secs")]
+    pub auth_cache_secs: u64,
+    /// Per-request timeout for the scopes lookup. An unreachable auth service
+    /// fails closed, so this is also how long a caller waits to learn that.
+    #[serde(default = "default_auth_timeout_secs")]
+    pub auth_timeout_secs: u64,
     /// HTTPS listener for the proxy data plane, bound *in addition to* the
     /// plaintext `proxy_addr`. Enabled when ACME is on or a static cert pair is
     /// configured. Upstreams stay plaintext regardless — the guest IP is on a
@@ -247,6 +263,9 @@ impl Default for LbConfig {
             dashboard_password: None,
             dashboard_auth: true,
             admin_auth: false,
+            auth_url: None,
+            auth_cache_secs: default_auth_cache_secs(),
+            auth_timeout_secs: default_auth_timeout_secs(),
             tls_addr: default_tls_addr(),
             tls_addr_explicit: false,
             tls_cert_path: None,
@@ -2306,6 +2325,14 @@ fn normalize_cookie_domain(raw: &str) -> Option<String> {
 fn default_auth_cookie_name() -> String {
     "applb_session".into()
 }
+fn default_auth_cache_secs() -> u64 {
+    60
+}
+
+fn default_auth_timeout_secs() -> u64 {
+    5
+}
+
 fn default_true() -> bool {
     true
 }

@@ -65,6 +65,27 @@ const POLL_MAX: Duration = Duration::from_secs(2);
 /// would leave the command running with nobody reading it.
 const POLL_SLACK: Duration = Duration::from_secs(30);
 
+/// How many times a request on the exec route is re-sent after a transport
+/// failure before the failure is reported.
+///
+/// Both requests this covers are safe to repeat: the POST is idempotent by
+/// `operationId` (a replay reattaches to the operation already running — see
+/// the module docs) and the GET reads a file. What they are retried *against*
+/// is a pooled keep-alive connection through the iroh tunnel that the far end
+/// has already closed: `hey-proxy` does not propagate the daemon's EOF until
+/// both directions of the stream are done, so a connection the daemon closed
+/// still looks idle-and-alive to reqwest, and the next request on it comes
+/// back as `Connection reset by peer`. Seen in the wild as a checkout dying on
+/// its second upload chunk, seconds after the same tunnel had created and
+/// booted the VM.
+///
+/// A fresh connection is a fresh iroh stream, so a reset of that kind is gone
+/// on the first retry. A tunnel that is actually dead fails every attempt the
+/// same way and is reported after the last one — the caller then evicts it
+/// (`DispatchError::is_tunnel_failure`), which retrying cannot substitute for.
+const TRANSPORT_RETRIES: u32 = 2;
+const TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// Base64 bytes per upload exec. See [`Vm::upload_bytes`] for where this number
 /// comes from — it is measured against a real guest, not chosen.
 ///
@@ -656,23 +677,14 @@ impl Vm {
         let path = format!("/sandboxes/{}/exec-operations", encode_segment(&self.id));
         // A short HTTP timeout, not the step's: this call only enqueues.
         let start: ExecOperationRecord = self
-            .sandbox
-            .client()
-            .request(
+            .daemon_request(
                 Method::POST,
                 &path,
                 Some(&body),
-                RequestOptions {
-                    timeout: Some(Duration::from_secs(30)),
-                    query: Vec::new(),
-                },
+                "starting an exec operation",
+                None,
             )
-            .await
-            .map_err(|e| VmError::Daemon {
-                sandbox: self.id.clone(),
-                what: "starting an exec operation",
-                source: e,
-            })?;
+            .await?;
 
         if start.is_terminal() {
             return self.finish(operation_id, start);
@@ -698,23 +710,14 @@ impl Vm {
             // long, which `cargo build` pays once against 3600 seconds of
             // compiling.
             let record: ExecOperationRecord = self
-                .sandbox
-                .client()
-                .request(
+                .daemon_request(
                     Method::GET,
                     &get_path,
                     None::<&()>,
-                    RequestOptions {
-                        timeout: Some(Duration::from_secs(30)),
-                        query: Vec::new(),
-                    },
+                    "polling an exec operation",
+                    Some(deadline),
                 )
-                .await
-                .map_err(|e| VmError::Daemon {
-                    sandbox: self.id.clone(),
-                    what: "polling an exec operation",
-                    source: e,
-                })?;
+                .await?;
 
             if record.is_terminal() {
                 return self.finish(operation_id, record);
@@ -736,6 +739,59 @@ impl Vm {
                     after: timeout + POLL_SLACK,
                 });
             }
+        }
+    }
+
+    /// One request on the exec route, re-sent on a transport failure up to
+    /// [`TRANSPORT_RETRIES`] times. Only for requests that are safe to repeat —
+    /// see the constant for why both of this route's are.
+    ///
+    /// `deadline` is the poll loop's: a retry that could not land before it is
+    /// not attempted, so the loop's own timeout is still the one that fires.
+    async fn daemon_request<T: serde::de::DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&(impl Serialize + ?Sized)>,
+        what: &'static str,
+        deadline: Option<Instant>,
+    ) -> Result<T, VmError> {
+        let mut attempt = 0;
+        loop {
+            let result = self
+                .sandbox
+                .client()
+                .request(
+                    method.clone(),
+                    path,
+                    body,
+                    RequestOptions {
+                        timeout: Some(Duration::from_secs(30)),
+                        query: Vec::new(),
+                    },
+                )
+                .await;
+            let e = match result {
+                Ok(v) => return Ok(v),
+                Err(e) => e,
+            };
+            let retry_lands_in_time =
+                deadline.is_none_or(|d| Instant::now() + TRANSPORT_RETRY_DELAY < d);
+            if !is_transport(&e) || attempt >= TRANSPORT_RETRIES || !retry_lands_in_time {
+                return Err(VmError::Daemon {
+                    sandbox: self.id.clone(),
+                    what,
+                    source: e,
+                });
+            }
+            attempt += 1;
+            tracing::warn!(
+                sandbox = %self.id,
+                attempt,
+                of = TRANSPORT_RETRIES,
+                "{what} hit a transport error, retrying: {e}"
+            );
+            tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
         }
     }
 
@@ -1256,6 +1312,101 @@ mod log_render_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon stand-in on a local port that answers one HTTP request per
+    /// connection: the POST with `queued`, the *first* poll with nothing —
+    /// the socket is closed after the request is read, which is what a
+    /// keep-alive connection the far end already closed looks like from
+    /// reqwest — and every later poll with `completed`. Returns the port and
+    /// a counter of connections accepted.
+    async fn flaky_daemon() -> (u16, Arc<AtomicU64>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                // Read the whole request — headers plus a `Content-Length`
+                // body — so the drop below is a clean close, not a reset
+                // with unread bytes, which is the subtler of the two cases.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let k = sock.read(&mut chunk).await.unwrap();
+                    if k == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..k]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let body = match n {
+                    0 => r#"{"status":"queued"}"#,
+                    1 => {
+                        drop(sock);
+                        continue;
+                    }
+                    _ => r#"{"status":"completed","result":{"output":"ok\n","exit_code":0}}"#,
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(response.as_bytes()).await.unwrap();
+                let _ = sock.shutdown().await;
+            }
+        });
+        (port, accepted)
+    }
+
+    /// The observed failure: a poll that dies on the transport while the
+    /// operation is still running. It is safe to ask again — the GET reads a
+    /// file, and the POST is idempotent by `operationId` — so one lost
+    /// connection must not fail the exec.
+    #[tokio::test]
+    async fn exec_survives_a_lost_connection_on_the_poll() {
+        let (port, accepted) = flaky_daemon().await;
+        let vm = Vms::new()
+            .open(
+                HeyoClientOptions {
+                    api_key: None,
+                    base_url: Some(format!("http://127.0.0.1:{port}")),
+                    timeout: None,
+                },
+                "sb-704de5df".into(),
+            )
+            .await
+            .unwrap();
+
+        let out = vm
+            .exec(
+                "01a036000dd8-00000000.app-obs.checkout.u1",
+                "true",
+                &HashMap::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the retry should have carried this: {e}"));
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            3,
+            "POST, the poll that was dropped, and the poll that answered"
+        );
+    }
 
     fn spec() -> VmSpec {
         VmSpec {

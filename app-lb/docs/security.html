@@ -122,6 +122,15 @@ heyctl token mint ops --admin admin --all-deployments</code></pre>
 <p><code>heyctl token set</code> re-scopes a token without changing its secret;
 <code>heyctl token revoke</code> takes effect on the next request.</p>
 
+<h2>Federated bearers</h2>
+<p>With <code>APP_LB_AUTH_URL</code> set, the admin API accepts a third credential: a
+bearer the Heyo auth service issued. app-lb never sees the user's password and mints
+them nothing — it asks <code>GET /api/auth/scopes</code> what the bearer may reach and
+enforces the answer with the same <a href="namespaces.html">namespace wall</a> a
+namespace token gets. Precedence is Basic, then a local <code>applb_</code> token, then
+the auth service; a local token is never sent upstream. Answers are cached by the
+bearer's hash, refusals briefly, and an unreachable auth service fails closed.</p>
+
 <h2>The admin API's two tiers</h2>
 <p>Unset, the admin listener is open (it binds loopback). Setting
 <code>APP_LB_DASHBOARD_PASSWORD</code> gates the <em>view</em> tier — the directory,

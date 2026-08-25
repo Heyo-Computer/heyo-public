@@ -188,6 +188,10 @@ struct AdminState {
     workflows: Arc<crate::workflows::WorkflowStore>,
     /// App-tokens. Verified on every gated request, so reads are lock-free.
     tokens: Arc<crate::tokens::TokenStore>,
+    /// Resolves bearers the Heyo auth service issued. `None` when
+    /// `APP_LB_AUTH_URL` is unset, in which case a foreign bearer is simply
+    /// an unknown credential.
+    federated: Option<Arc<crate::federated::FederatedAuth>>,
     /// Runs image builds and host updates, and remembers what they did.
     jobs: Arc<Jobs>,
     /// Nudges the ACME manager to issue for a newly-registered hostname instead
@@ -247,6 +251,7 @@ impl AdminApi {
         dashboard_password: Option<String>,
         gate_view: bool,
         gate_admin: bool,
+        federated: Option<Arc<crate::federated::FederatedAuth>>,
         certs: Arc<CertStore>,
         acme: Option<Arc<Notify>>,
         secrets: Arc<SecretStore>,
@@ -301,6 +306,7 @@ impl AdminApi {
                 auth,
                 gate_view,
                 gate_admin,
+                federated,
                 started_at: now_secs(),
                 certs,
                 acme,
@@ -341,13 +347,34 @@ pub(crate) enum Caller {
     Operator,
     /// An app-token, carrying its own scope.
     Token(Arc<crate::tokens::AppToken>),
+    /// A bearer the Heyo auth service vouched for, carrying the namespaces it
+    /// may reach and a tier per namespace. Confined unless the grant says
+    /// `fleet:admin`. See `federated.rs`.
+    Federated(Arc<crate::federated::Grant>),
 }
 
 impl Caller {
+    /// Tier check with no particular target. A confined grant passes when
+    /// *any* of its namespaces reaches `want`; the per-namespace answer is
+    /// [`satisfies_in`](Self::satisfies_in), used once the target is known.
     fn satisfies(&self, want: crate::tokens::AdminScope) -> bool {
         match self {
             Self::Ungated | Self::Operator => true,
             Self::Token(t) => t.admin.satisfies(want),
+            Self::Federated(g) => g.fleet || g.namespaces.values().any(|s| s.satisfies(want)),
+        }
+    }
+
+    /// Tier check against the namespace the route acts on, when the gate
+    /// knows it. A token's tier is uniform across its reach, so only a
+    /// federated grant — which may be admin in one namespace and view in
+    /// another — answers differently here.
+    fn satisfies_in(&self, want: crate::tokens::AdminScope, ns: Option<&str>) -> bool {
+        match (self, ns) {
+            (Self::Federated(g), Some(ns)) if !g.fleet => {
+                g.namespaces.get(ns).is_some_and(|s| s.satisfies(want))
+            }
+            _ => self.satisfies(want),
         }
     }
 
@@ -365,14 +392,21 @@ impl Caller {
                 // confirms or denies that the id exists.
                 (Some(_), None) => false,
             },
+            Self::Federated(g) => {
+                g.fleet || namespace.is_some_and(|ns| g.namespaces.contains_key(ns))
+            }
         }
     }
 
-    /// The namespace wall this caller is behind, if any.
-    fn namespace(&self) -> Option<&str> {
+    /// Whether this caller is behind a namespace wall — one namespace for a
+    /// token, any number for a federated grant. The routes that are about the
+    /// whole fleet are closed to a confined caller; `/deployments` narrows
+    /// itself instead.
+    fn confined(&self) -> bool {
         match self {
-            Self::Ungated | Self::Operator => None,
-            Self::Token(t) => t.namespace.as_deref(),
+            Self::Ungated | Self::Operator => false,
+            Self::Token(t) => t.namespace.is_some(),
+            Self::Federated(g) => !g.fleet,
         }
     }
 
@@ -386,6 +420,7 @@ impl Caller {
                 Some(own) => own == ns,
                 None => t.covers_fleet(),
             },
+            Self::Federated(g) => g.fleet || g.namespaces.contains_key(ns),
         }
     }
 
@@ -395,6 +430,7 @@ impl Caller {
         match self {
             Self::Ungated | Self::Operator => true,
             Self::Token(t) => t.admits(deployment, namespace),
+            Self::Federated(_) => self.reaches_namespace(namespace),
         }
     }
 
@@ -404,6 +440,7 @@ impl Caller {
         match self {
             Self::Ungated | Self::Operator => true,
             Self::Token(t) => t.covers_fleet(),
+            Self::Federated(g) => g.fleet,
         }
     }
 
@@ -415,6 +452,9 @@ impl Caller {
             Self::Ungated | Self::Operator => None,
             Self::Token(t) if t.covers_fleet() => None,
             Self::Token(t) => Some(&t.deployments),
+            // A grant names namespaces, never ids; `visible_ids` resolves it
+            // against the registry the way a namespace token is resolved.
+            Self::Federated(_) => None,
         }
     }
 }
@@ -427,7 +467,7 @@ impl Caller {
 /// a deployment-list token narrow the same way.
 fn visible_ids(state: &AdminState, caller: Option<&Caller>) -> Option<Vec<String>> {
     let caller = caller?;
-    if caller.namespace().is_some() {
+    if caller.confined() {
         return Some(
             state
                 .registry
@@ -554,15 +594,22 @@ struct Presented<'a> {
     /// exists. Resolved by [`authorize`] from the registry, so the decision
     /// itself stays a pure function.
     target_namespace: Option<&'a str>,
+    /// What the auth service said about a foreign bearer, when federation is
+    /// configured and the bearer is not a local token. Resolved by
+    /// [`authorize`] for the same reason `target_namespace` is: the lookup
+    /// is async and remote, and the decision should be neither.
+    federated: Option<Arc<crate::federated::Grant>>,
 }
 
 /// Decide whether a request gets through, and as whom.
 ///
-/// Two credentials are accepted:
+/// Three credentials are accepted, in this order of precedence:
 ///
-/// - the configured Basic username/password, which is unscoped, and
+/// - the configured Basic username/password, which is unscoped,
 /// - an app-token as `Authorization: Bearer applb_…` (or `?app_token=` on the
-///   shell route only), which carries its own scope.
+///   shell route only), which carries its own scope, and
+/// - a bearer the Heyo auth service has already resolved to a grant
+///   (`req.federated`), which is confined to the namespaces it names.
 ///
 /// `auth: None` means no gate is configured and everything is permitted.
 fn decide_access(
@@ -584,13 +631,14 @@ fn decide_access(
             .or_else(|| ws_query_token(req.matched.unwrap_or_default(), req.query))
             .and_then(|raw| tokens.verify(&raw, now))
             .map(Caller::Token)
+            .or_else(|| req.federated.clone().map(Caller::Federated))
     };
 
     let Some(caller) = caller else {
         return Verdict::Unauthorized;
     };
 
-    if !caller.satisfies(want) {
+    if !caller.satisfies_in(want, req.target_namespace) {
         return Verdict::Forbidden(
             match want {
                 crate::tokens::AdminScope::Admin => {
@@ -626,7 +674,7 @@ fn decide_access(
             // A namespace token may list and create deployments; the handlers
             // narrow the answer to its namespace (list) or refuse a spec that
             // names another one (create).
-            None if matched == "/deployments" && caller.namespace().is_some() => {}
+            None if matched == "/deployments" && caller.confined() => {}
             None if !narrows_itself(matched) && !caller.covers_fleet() => {
                 return Verdict::Forbidden(
                     "this token is scoped to specific deployments, so it cannot use a \
@@ -679,6 +727,21 @@ async fn authorize(
         .and_then(|id| state.registry.get(id))
         .map(|d| d.spec.namespace.clone());
 
+    // A foreign bearer is asked about only when federation is on, the gate is
+    // on, and the local store does not already know the token — so a local
+    // token never costs a round trip and a local token is always preferred.
+    // Header only: the `?app_token=` query is for app-lb's own tokens.
+    let now = now_secs();
+    let federated = match (state.federated.as_ref(), state.auth.as_ref(), bearer(header.as_deref())) {
+        (Some(f), Some(_), Some(raw))
+            if !raw.starts_with(crate::federated::LOCAL_TOKEN_PREFIX)
+                && state.tokens.verify(raw, now).is_none() =>
+        {
+            f.resolve(raw).await
+        }
+        _ => None,
+    };
+
     let verdict = decide_access(
         state.auth.as_deref(),
         &state.tokens,
@@ -688,9 +751,10 @@ async fn authorize(
             path: &path,
             query: query.as_deref(),
             target_namespace: target_namespace.as_deref(),
+            federated,
         },
         want,
-        now_secs(),
+        now,
     );
 
     // A rejected credential was invisible before this: the gate answered 401 or
@@ -701,6 +765,20 @@ async fn authorize(
     let scheme = crate::siem::AuthScheme::of(header.as_deref());
     match verdict {
         Verdict::Allow(caller) => {
+            // A federated caller is somebody else's user acting here; the
+            // access log should say who, the way it says which token.
+            if let Caller::Federated(g) = &caller {
+                tracing::debug!(
+                    path = %path,
+                    user = %g.subject.user_id,
+                    email = ?g.subject.email,
+                    account = ?g.subject.account_id,
+                    platform_role = ?g.subject.platform_role,
+                    fleet = g.fleet,
+                    namespaces = g.namespaces.len(),
+                    "admin API request admitted for a federated caller",
+                );
+            }
             req.extensions_mut().insert(caller);
             next.run(req).await
         }
@@ -1144,6 +1222,9 @@ struct MetricsQuery {
     /// Restrict to deployments whose id starts with this. Sandbox ids are
     /// generated with a common prefix, so this is how a tenant is scoped.
     prefix: Option<String>,
+    /// Restrict to one namespace. The customer-shaped filter: `prefix` is a
+    /// convention, this is the wall.
+    namespace: Option<String>,
     /// Drop the per-VM detail, keeping pool counts and metrics. The largest
     /// single saving: VM rows dominate the payload for a fleet at rest.
     #[serde(default)]
@@ -1258,6 +1339,7 @@ async fn metrics_snapshot(
         .filter(|d| in_scope(&d.spec.id))
         .filter(|d| q.deployment.as_ref().is_none_or(|id| &d.spec.id == id))
         .filter(|d| q.prefix.as_ref().is_none_or(|p| d.spec.id.starts_with(p)))
+        .filter(|d| q.namespace.as_ref().is_none_or(|ns| &d.spec.namespace == ns))
         .collect();
     selected.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
 
@@ -2236,15 +2318,22 @@ async fn register(
     // replace, and without that check a namespace token could capture another
     // namespace's deployment by re-registering its id. One message for both
     // refusals, so probing them apart teaches nothing about which ids exist.
-    if let Some(ns) = caller.as_ref().and_then(|c| c.0.namespace()) {
+    if let Some(c) = caller.as_ref().map(|c| &c.0).filter(|c| c.confined()) {
         let taken_elsewhere = state
             .registry
             .get(&id)
-            .is_some_and(|old| old.spec.namespace != ns);
-        if spec.namespace != ns || taken_elsewhere {
+            .is_some_and(|old| !c.reaches_namespace(&old.spec.namespace));
+        if !c.reaches_namespace(&spec.namespace)
+            || !c.satisfies_in(crate::tokens::AdminScope::Admin, Some(&spec.namespace))
+            || taken_elsewhere
+        {
             return err(
                 StatusCode::FORBIDDEN,
-                format!("this token is confined to namespace \"{ns}\" and cannot register this deployment"),
+                format!(
+                    "this credential is confined to its namespaces and cannot register a \
+                     deployment in \"{}\"",
+                    spec.namespace
+                ),
             )
             .into_response();
         }
@@ -2312,13 +2401,13 @@ async fn update(
     // it cannot see is the body. A namespace token must not *move* a
     // deployment: writing another namespace into the spec would walk it out
     // through the wall the token is behind.
-    if let Some(ns) = caller.as_ref().and_then(|c| c.0.namespace())
-        && spec.namespace != ns
+    if let Some(c) = caller.as_ref().map(|c| &c.0).filter(|c| c.confined())
+        && !c.reaches_namespace(&spec.namespace)
     {
         return err(
             StatusCode::FORBIDDEN,
             format!(
-                "this token is confined to namespace \"{ns}\" and cannot move a deployment to \
+                "this credential is confined to its namespaces and cannot move a deployment to \
                  \"{}\"",
                 spec.namespace
             ),
@@ -4783,6 +4872,7 @@ mod tests {
                     path,
                     query: None,
                     target_namespace: None,
+                federated: None,
                 },
                 want,
                 NOW,
@@ -4834,6 +4924,7 @@ mod tests {
                     path: "/deployments/web/exec",
                     query: None,
                     target_namespace: target_ns,
+                federated: None,
                 },
                 AdminScope::Admin,
                 NOW,
@@ -4866,6 +4957,7 @@ mod tests {
                         path,
                         query: None,
                         target_namespace: None,
+                    federated: None,
                     },
                     AdminScope::Admin,
                     NOW,
@@ -4880,6 +4972,149 @@ mod tests {
             assert!(matches!(at("/tokens", "/tokens"), Verdict::Forbidden(_)));
             assert!(matches!(at("/secrets", "/secrets"), Verdict::Forbidden(_)));
             assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));
+        }
+
+        fn grant(ns: &[(&str, AdminScope)], fleet: bool) -> Arc<crate::federated::Grant> {
+            Arc::new(crate::federated::Grant {
+                subject: serde_json::from_value(serde_json::json!({"userId": "u1"})).unwrap(),
+                namespaces: ns.iter().map(|(n, s)| (n.to_string(), *s)).collect(),
+                fleet,
+            })
+        }
+
+        /// A federated caller presents a bearer the local store does not know;
+        /// `authorize` will have resolved it into `Presented::federated`.
+        fn federated_at(
+            t: &TokenStore,
+            g: &Arc<crate::federated::Grant>,
+            matched: &str,
+            path: &str,
+            target_ns: Option<&str>,
+            want: AdminScope,
+        ) -> Verdict {
+            decide_access(
+                Some(&basic()),
+                t,
+                &Presented {
+                    header: Some("Bearer eyJ.heyo.jwt"),
+                    matched: Some(matched),
+                    path,
+                    query: None,
+                    target_namespace: target_ns,
+                    federated: Some(g.clone()),
+                },
+                want,
+                NOW,
+            )
+        }
+
+        #[test]
+        fn a_federated_grant_reaches_its_namespaces_and_nothing_else() {
+            let t = store();
+            let g = grant(&[("team-a", AdminScope::Admin), ("team-b", AdminScope::Admin)], false);
+            let on = |ns: Option<&str>| {
+                federated_at(&t, &g, "/deployments/:id/exec", "/deployments/web/exec", ns, AdminScope::Admin)
+            };
+            assert!(matches!(on(Some("team-a")), Verdict::Allow(Caller::Federated(_))));
+            assert!(matches!(on(Some("team-b")), Verdict::Allow(_)));
+            assert!(matches!(on(Some("team-c")), Verdict::Forbidden(_)));
+            assert!(matches!(on(Some("default")), Verdict::Forbidden(_)));
+            assert!(matches!(on(None), Verdict::Forbidden(_)));
+        }
+
+        #[test]
+        fn a_federated_grant_may_list_and_create_but_not_roam_the_fleet() {
+            let t = store();
+            let g = grant(&[("team-a", AdminScope::Admin)], false);
+            let at = |m: &str, p: &str| federated_at(&t, &g, m, p, None, AdminScope::Admin);
+            assert!(matches!(at("/deployments", "/deployments"), Verdict::Allow(_)));
+            assert!(matches!(at("/metrics", "/metrics"), Verdict::Allow(_)));
+            assert!(matches!(at("/tokens", "/tokens"), Verdict::Forbidden(_)));
+            assert!(matches!(at("/secrets", "/secrets"), Verdict::Forbidden(_)));
+            assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));
+            assert!(matches!(
+                federated_at(&t, &g, "/feeds/:namespace", "/feeds/team-a", None, AdminScope::View),
+                Verdict::Allow(_)
+            ));
+            assert!(matches!(
+                federated_at(&t, &g, "/feeds/:namespace", "/feeds/team-b", None, AdminScope::View),
+                Verdict::Forbidden(_)
+            ));
+        }
+
+        #[test]
+        fn a_view_grant_cannot_mutate_in_its_namespace() {
+            let t = store();
+            let g = grant(&[("team-a", AdminScope::View), ("team-b", AdminScope::Admin)], false);
+            let on = |ns: &str, want: AdminScope| {
+                federated_at(&t, &g, "/deployments/:id", "/deployments/web", Some(ns), want)
+            };
+            assert!(matches!(on("team-a", AdminScope::View), Verdict::Allow(_)));
+            assert!(matches!(on("team-a", AdminScope::Admin), Verdict::Forbidden(_)));
+            assert!(matches!(on("team-b", AdminScope::Admin), Verdict::Allow(_)));
+            // With no target to judge by, any admin namespace admits an admin route.
+            assert!(matches!(
+                federated_at(&t, &g, "/deployments", "/deployments", None, AdminScope::Admin),
+                Verdict::Allow(_)
+            ));
+        }
+
+        #[test]
+        fn a_fleet_grant_roams() {
+            let t = store();
+            let g = grant(&[], true);
+            let at = |m: &str, p: &str| federated_at(&t, &g, m, p, None, AdminScope::Admin);
+            assert!(matches!(at("/tokens", "/tokens"), Verdict::Allow(_)));
+            assert!(matches!(at("/secrets", "/secrets"), Verdict::Allow(_)));
+            assert!(matches!(
+                federated_at(&t, &g, "/deployments/:id", "/deployments/web", Some("anything"), AdminScope::Admin),
+                Verdict::Allow(_)
+            ));
+            assert!(!Caller::Federated(g).confined());
+        }
+
+        #[test]
+        fn a_local_token_is_preferred_over_a_grant() {
+            let t = store();
+            let hdr = format!("Bearer {}", mint_in_namespace(&t, AdminScope::Admin, "team-a"));
+            let g = grant(&[("team-b", AdminScope::Admin)], false);
+            let verdict = decide_access(
+                Some(&basic()),
+                &t,
+                &Presented {
+                    header: Some(&hdr),
+                    matched: Some("/deployments/:id"),
+                    path: "/deployments/web",
+                    query: None,
+                    target_namespace: Some("team-b"),
+                    federated: Some(g),
+                },
+                AdminScope::Admin,
+                NOW,
+            );
+            // The token, not the grant, is the caller: team-b is out of reach.
+            assert!(matches!(verdict, Verdict::Forbidden(_)));
+        }
+
+        #[test]
+        fn federation_is_ignored_when_no_gate_is_configured() {
+            let t = store();
+            let g = grant(&[("team-a", AdminScope::View)], false);
+            let verdict = decide_access(
+                None,
+                &t,
+                &Presented {
+                    header: Some("Bearer eyJ.heyo.jwt"),
+                    matched: Some("/tokens"),
+                    path: "/tokens",
+                    query: None,
+                    target_namespace: None,
+                    federated: Some(g),
+                },
+                AdminScope::Admin,
+                NOW,
+            );
+            assert!(matches!(verdict, Verdict::Allow(Caller::Ungated)));
         }
 
         #[test]
@@ -4898,6 +5133,7 @@ mod tests {
                         path,
                         query: None,
                         target_namespace: None,
+                    federated: None,
                     },
                     AdminScope::View,
                     NOW,
@@ -5162,6 +5398,7 @@ mod tests {
                     path: "/deployments/sb-1/shell",
                     query: Some(&query),
                     target_namespace: None,
+                federated: None,
                 },
                 AdminScope::Admin,
                 NOW,
@@ -5186,6 +5423,7 @@ mod tests {
                                 path,
                                 query: Some(&query),
                                 target_namespace: None,
+                            federated: None,
                             },
                             AdminScope::Admin,
                             NOW,
@@ -5212,6 +5450,7 @@ mod tests {
                         path: "/deployments/sb-2/shell",
                         query: Some(&query),
                         target_namespace: None,
+                    federated: None,
                     },
                     AdminScope::Admin,
                     NOW,
@@ -5248,6 +5487,7 @@ mod tests {
                         path: "/deployments",
                         query: None,
                         target_namespace: None,
+                    federated: None,
                     },
                     AdminScope::Admin,
                     now,

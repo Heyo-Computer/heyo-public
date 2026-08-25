@@ -1728,7 +1728,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 self.store
                     .finish_step(&sid, StepStatus::Failure, None, Some(&detail))
                     .await?;
-                Err(DispatchError::Checkout(detail))
+                Err(checkout_error(e))
             }
         }
     }
@@ -3286,6 +3286,24 @@ impl DispatchError {
     }
 }
 
+/// What a checkout that died in the VM transport reports.
+///
+/// A failure to *reach* the daemon keeps its `VmError`, because that is the
+/// only shape [`DispatchError::is_tunnel_failure`] can see: flattened to a
+/// `Checkout` string — which this used to do for every error — a dead tunnel
+/// went unnoticed by the eviction in `run_job`, the runner kept the dead port
+/// cached, and every following job on it inherited the same
+/// `Connection reset by peer` before its first step. Everything else stays a
+/// `Checkout`, which `indicates_guest_corruption` scans exactly as it scans
+/// `Vm`, so nothing is lost by the split.
+fn checkout_error(e: VmError) -> DispatchError {
+    if e.is_transport() {
+        DispatchError::Vm(e)
+    } else {
+        DispatchError::Checkout(e.to_string())
+    }
+}
+
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -4264,6 +4282,56 @@ mod tests {
         });
         assert!(!tunnel.indicates_guest_corruption());
         assert!(tunnel.is_tunnel_failure(), "still classified as transport");
+    }
+
+    /// The observed failure: a checkout's chunk poll dying with a connection
+    /// reset. It must come out of `checkout` still recognisable as a tunnel
+    /// failure, or the runner's dead tunnel is never evicted and the next job
+    /// inherits it.
+    #[test]
+    fn a_checkout_that_lost_the_tunnel_is_a_tunnel_failure() {
+        let reset = checkout_error(VmError::Daemon {
+            sandbox: "sb-704de5df".into(),
+            what: "polling an exec operation",
+            source: heyo_sdk::HeyoError::Api {
+                status: 0,
+                message: "network error calling /sandboxes/sb-704de5df/exec-operations/\
+                          01a036000dd8-00000000.app-obs.checkout.u1: error sending request: \
+                          connection error: Connection reset by peer (os error 104)"
+                    .into(),
+                body: None,
+            },
+        });
+        assert!(reset.is_tunnel_failure(), "{reset}");
+        assert!(!reset.indicates_guest_corruption(), "{reset}");
+
+        // The daemon answered — a real HTTP status — so the tunnel works and
+        // this is an ordinary checkout failure, reported as one.
+        let refused = checkout_error(VmError::Daemon {
+            sandbox: "sb-704de5df".into(),
+            what: "starting an exec operation",
+            source: heyo_sdk::HeyoError::Api {
+                status: 500,
+                message: "internal".into(),
+                body: None,
+            },
+        });
+        assert!(!refused.is_tunnel_failure(), "{refused}");
+        assert!(
+            matches!(refused, DispatchError::Checkout(_)),
+            "a non-transport error still reports as a checkout failure"
+        );
+
+        // And the guest-corruption scan still reaches a checkout's output.
+        let eio = checkout_error(VmError::UploadFailed {
+            sandbox: "sb-704de5df".into(),
+            path: "/workspace/.ci-source.tar.gz".into(),
+            chunk: 3,
+            of: 140,
+            detail: "bash: /workspace/.ci-source.tar.gz: Input/output error".into(),
+        });
+        assert!(eio.indicates_guest_corruption(), "{eio}");
+        assert!(!eio.is_tunnel_failure());
     }
 
     /// The node and the VM are one decision. Reading `target` twice is how the
