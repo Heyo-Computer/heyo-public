@@ -1224,11 +1224,105 @@ impl VmSize {
         }
     }
 
-    /// Whether the daemon's class is the one asked for. `None` when the daemon
-    /// named no class — an old daemon is not a wrong-sized VM.
-    pub fn matches(&self, wanted: SandboxSize) -> Option<bool> {
-        self.size_class.as_deref().map(|got| got == wanted.as_str())
+    /// How what the daemon gave stands against the class a job declared.
+    ///
+    /// Judged by tier when the daemon names one — `large` is more than
+    /// `medium` whatever the numbers — and by the numbers when it does not: an
+    /// explicitly sized VM, or a daemon that reports cpus and memory but no
+    /// class, is still an answer to "is this at least a `large`". Only a
+    /// daemon that reports nothing at all is [`SizeCheck::Unreported`], and
+    /// that is never read as `small`: an old daemon is not a wrong-sized VM.
+    ///
+    /// Memory gets a tenth of slack on the numeric path (`cpus` is exact). The
+    /// tiers double from one to the next, so the slack cannot confuse two of
+    /// them, and it keeps a daemon that counts in MB rather than MiB — 8 GB
+    /// reported as 8 000 000 000 — from being called short of the 8 GiB tier.
+    pub fn check(&self, wanted: SandboxSize) -> SizeCheck {
+        use std::cmp::Ordering;
+        if let Some(got) = self.size_class.as_deref().and_then(parse_size_class) {
+            return match tier_rank(got).cmp(&tier_rank(wanted)) {
+                Ordering::Less => SizeCheck::TooSmall,
+                Ordering::Equal => SizeCheck::AsDeclared,
+                Ordering::Greater => SizeCheck::Larger,
+            };
+        }
+        let (want_cpus, want_memory) = tier_resources(wanted);
+        let floor = want_memory - want_memory / 10;
+        let axes = [
+            self.cpus.map(|c| c.cmp(&want_cpus)),
+            self.memory.map(|m| {
+                if m < floor {
+                    Ordering::Less
+                } else if m > want_memory {
+                    Ordering::Greater
+                } else {
+                    Ordering::Equal
+                }
+            }),
+        ];
+        let mut reported = false;
+        let mut larger = false;
+        for axis in axes.into_iter().flatten() {
+            reported = true;
+            match axis {
+                Ordering::Less => return SizeCheck::TooSmall,
+                Ordering::Greater => larger = true,
+                Ordering::Equal => {}
+            }
+        }
+        match (reported, larger) {
+            (false, _) => SizeCheck::Unreported,
+            (true, true) => SizeCheck::Larger,
+            (true, false) => SizeCheck::AsDeclared,
+        }
     }
+}
+
+/// The verdict of [`VmSize::check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeCheck {
+    /// The daemon reported nothing the VM could be judged by.
+    Unreported,
+    /// The class asked for, or numbers that are that class.
+    AsDeclared,
+    /// More than asked for. A build runs as the workflow expects on it.
+    Larger,
+    /// Less than asked for on at least one axis. A build does not run slowly
+    /// on it; it runs out its timeout. See `Dispatcher::ensure_sized`.
+    TooSmall,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// The daemon's tiers, smallest first, and the vcpus and memory each stands
+/// for — `SizeClass::resources` in `mvm-ctrl/src/models.rs`. `micro` and
+/// `mini` are one vcpu on a CPU quota, so on the numbers they sit below
+/// `small` by memory alone; by rank they sit below it outright.
+const TIERS: [(SandboxSize, u32, u64); 6] = [
+    (SandboxSize::Micro, 1, 512 * MIB),
+    (SandboxSize::Mini, 1, 1024 * MIB),
+    (SandboxSize::Small, 1, 2048 * MIB),
+    (SandboxSize::Medium, 2, 4096 * MIB),
+    (SandboxSize::Large, 4, 8192 * MIB),
+    (SandboxSize::Xlarge, 8, 16384 * MIB),
+];
+
+/// The tier a daemon's class name stands for, if it is one this knows.
+pub fn parse_size_class(name: &str) -> Option<SandboxSize> {
+    TIERS.iter().map(|t| t.0).find(|c| c.as_str() == name)
+}
+
+fn tier_rank(class: SandboxSize) -> usize {
+    TIERS
+        .iter()
+        .position(|t| t.0 == class)
+        .expect("every SandboxSize is a tier")
+}
+
+/// `(vcpus, memory bytes)` the daemon gives a VM of this class.
+fn tier_resources(class: SandboxSize) -> (u32, u64) {
+    let t = TIERS[tier_rank(class)];
+    (t.1, t.2)
 }
 
 /// `16 GB`, `512 MB`, `1.5 GB` — bytes at the scale a size class is spoken in.
@@ -1464,25 +1558,124 @@ mod tests {
             memory: Some(16 * 1024 * 1024 * 1024),
         };
         assert_eq!(full.label(), "xlarge (8 CPU, 16 GB)");
-        assert_eq!(full.matches(SandboxSize::Xlarge), Some(true));
-        assert_eq!(full.matches(SandboxSize::Large), Some(false));
+        assert_eq!(full.check(SandboxSize::Xlarge), SizeCheck::AsDeclared);
+        assert_eq!(full.check(SandboxSize::Large), SizeCheck::Larger);
 
         // An explicitly sized VM, or a daemon that names no class: the numbers
-        // are still an answer, and "is it the class I asked for" is not one.
+        // are still an answer.
         let numbers = VmSize {
             size_class: None,
             cpus: Some(2),
             memory: Some(1536 * 1024 * 1024),
         };
         assert_eq!(numbers.label(), "2 CPU, 1.5 GB");
-        assert_eq!(numbers.matches(SandboxSize::Small), None);
+        // Short of `small`'s 2 GB however many vcpus it has; past `mini` on both.
+        assert_eq!(numbers.check(SandboxSize::Small), SizeCheck::TooSmall);
+        assert_eq!(numbers.check(SandboxSize::Mini), SizeCheck::Larger);
         assert!(numbers.is_reported());
 
         // A daemon too old to report sizing is unreported, never `small`.
         let nothing: VmSize = serde_json::from_str(r#"{"id":"sb-1","status":"stopped"}"#).unwrap();
         assert!(!nothing.is_reported());
         assert_eq!(nothing.label(), "unreported");
-        assert_eq!(nothing.matches(SandboxSize::Small), None);
+        assert_eq!(nothing.check(SandboxSize::Small), SizeCheck::Unreported);
+    }
+
+    /// The check that stops a `large` build being started on a `small` VM:
+    /// the failure that produced this was 75 minutes of timeout with nothing
+    /// to say why, because a smaller VM does not build slowly, it builds
+    /// past its deadline. What counts as too small has to be right in both
+    /// directions — a false "too small" refuses a VM that would have worked.
+    #[test]
+    fn a_vm_smaller_than_declared_is_caught_by_class_or_by_numbers() {
+        let by_class = |name: &str| VmSize {
+            size_class: Some(name.into()),
+            cpus: None,
+            memory: None,
+        };
+        // The daemon's `small` default handed to a `large` job: the case that
+        // looks exactly like a slow build.
+        assert_eq!(
+            by_class("small").check(SandboxSize::Large),
+            SizeCheck::TooSmall
+        );
+        assert_eq!(
+            by_class("medium").check(SandboxSize::Large),
+            SizeCheck::TooSmall
+        );
+        assert_eq!(
+            by_class("large").check(SandboxSize::Large),
+            SizeCheck::AsDeclared
+        );
+        // A manual resize *up* from /vms is an override worth keeping.
+        assert_eq!(
+            by_class("xlarge").check(SandboxSize::Large),
+            SizeCheck::Larger
+        );
+        // The quota tiers rank below `small` although they have its one vcpu.
+        assert_eq!(
+            by_class("mini").check(SandboxSize::Small),
+            SizeCheck::TooSmall
+        );
+        assert_eq!(
+            by_class("micro").check(SandboxSize::Mini),
+            SizeCheck::TooSmall
+        );
+
+        // A class this does not know falls through to the numbers rather
+        // than being guessed at either way.
+        let odd = VmSize {
+            size_class: Some("custom".into()),
+            cpus: Some(4),
+            memory: Some(8192 * MIB),
+        };
+        assert_eq!(odd.check(SandboxSize::Large), SizeCheck::AsDeclared);
+        let odd_and_mute = by_class("custom");
+        assert_eq!(
+            odd_and_mute.check(SandboxSize::Large),
+            SizeCheck::Unreported
+        );
+
+        // Numbers only: short on either axis is short.
+        let few_cpus = VmSize {
+            size_class: None,
+            cpus: Some(2),
+            memory: Some(8192 * MIB),
+        };
+        assert_eq!(few_cpus.check(SandboxSize::Large), SizeCheck::TooSmall);
+        let little_memory = VmSize {
+            size_class: None,
+            cpus: Some(4),
+            memory: Some(4096 * MIB),
+        };
+        assert_eq!(little_memory.check(SandboxSize::Large), SizeCheck::TooSmall);
+        // One axis is still an answer — a daemon that reports cpus only.
+        let cpus_only = VmSize {
+            size_class: None,
+            cpus: Some(1),
+            memory: None,
+        };
+        assert_eq!(cpus_only.check(SandboxSize::Large), SizeCheck::TooSmall);
+        assert_eq!(cpus_only.check(SandboxSize::Small), SizeCheck::AsDeclared);
+
+        // 8 GB counted in MB rather than MiB is a `large`, not a short one;
+        // half of it is short whichever way it is counted.
+        let decimal = VmSize {
+            size_class: None,
+            cpus: Some(4),
+            memory: Some(8_000_000_000),
+        };
+        assert_eq!(decimal.check(SandboxSize::Large), SizeCheck::AsDeclared);
+        let half = VmSize {
+            size_class: None,
+            cpus: Some(4),
+            memory: Some(4_000_000_000),
+        };
+        assert_eq!(half.check(SandboxSize::Large), SizeCheck::TooSmall);
+
+        assert_eq!(parse_size_class("xlarge"), Some(SandboxSize::Xlarge));
+        assert_eq!(parse_size_class("XLARGE"), None);
+        assert_eq!(parse_size_class(""), None);
     }
 
     use super::*;

@@ -622,10 +622,17 @@ the class the job declared and, under it, what the runner's daemon reported
 the VM was actually given (`GET /sandboxes/<id>`: its class name and the cpus
 and memory behind it), read back every time this app creates, claims or
 resizes the VM and stored on the row. A `xlarge` build quietly running on the
-daemon's `small` default looks exactly like a slow build, and until this
-nothing could tell the two apart; now the row says `got small (1 CPU, 2 GB)`
-in red, and the job gets a warning. A daemon too old to report sizing shows
-`size unreported`, which is a finding about the runner, not a size.
+daemon's `small` default does not look like a slow build — it *is* a failed
+one, 75 minutes later, with nothing to say why — so a VM the daemon reports
+as smaller than the job declared is not built on. The dispatcher resizes it
+back to the declared class once (in place, disks kept, so the cache survives)
+and, if the daemon still reports it too small, fails the job on the spot
+naming both sizes and what the resize did; the row says `got small (1 CPU,
+2 GB) — too small` in red. The VM is parked rather than destroyed, so a
+resize from this page is all a retry needs. Only smaller is refused: a VM
+resized *up* here runs the build as the workflow expects and shows `— larger`.
+A daemon too old to report sizing shows `size unreported`, which is a
+finding about the runner, not a size, and is warned about rather than refused.
 
 **Resize** is on every idle row. It changes the VM in place — the daemon
 rewrites its cpus and memory and restarts it, disks kept — so the build cache

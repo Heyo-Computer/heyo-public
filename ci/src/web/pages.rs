@@ -330,8 +330,12 @@ const SIZE_CLASSES: [&str; 6] = ["micro", "mini", "small", "medium", "large", "x
 enum SizeVerdict {
     /// The daemon named the class asked for.
     AsDeclared(String),
-    /// The daemon named a different class — the finding the cell exists for.
-    Different(String),
+    /// Less than asked for — the finding the cell exists for. The dispatcher
+    /// refuses to start a build on such a VM (after one resize attempt), so
+    /// this row is where somebody fixes it.
+    TooSmall(String),
+    /// More than asked for: a resize up from this page. Builds run on it.
+    Larger(String),
     /// The daemon gave numbers but no class name (an explicitly sized VM, or
     /// a daemon that reports cpus and memory only).
     Unclassified(String),
@@ -349,11 +353,23 @@ fn size_verdict(v: &crate::pool::PooledVmView) -> SizeVerdict {
         return SizeVerdict::Unreported;
     }
     let got = v.observed.label();
-    match (v.observed.size_class.as_deref(), v.size_class.as_deref()) {
-        (Some(o), Some(w)) if o == w => SizeVerdict::AsDeclared(got),
-        (Some(_), Some(_)) => SizeVerdict::Different(got),
-        (Some(_), None) => SizeVerdict::AsDeclared(got),
-        (None, _) => SizeVerdict::Unclassified(got),
+    let wanted = v
+        .size_class
+        .as_deref()
+        .and_then(crate::vm::parse_size_class);
+    match wanted {
+        // Nothing declared, or a class this does not know: the reading is
+        // shown, and there is nothing to hold it against.
+        None => match v.observed.size_class {
+            Some(_) => SizeVerdict::AsDeclared(got),
+            None => SizeVerdict::Unclassified(got),
+        },
+        Some(wanted) => match v.observed.check(wanted) {
+            crate::vm::SizeCheck::TooSmall => SizeVerdict::TooSmall(got),
+            crate::vm::SizeCheck::Larger => SizeVerdict::Larger(got),
+            crate::vm::SizeCheck::AsDeclared => SizeVerdict::AsDeclared(got),
+            crate::vm::SizeCheck::Unreported => SizeVerdict::Unreported,
+        },
     }
 }
 
@@ -474,7 +490,8 @@ pub fn vms_page(
                                             br;
                                             @match size_verdict(v) {
                                                 SizeVerdict::AsDeclared(got) => span .meta { "got " (got) },
-                                                SizeVerdict::Different(got) => span .pill.failure { "got " (got) },
+                                                SizeVerdict::TooSmall(got) => span .pill.failure { "got " (got) " — too small" },
+                                                SizeVerdict::Larger(got) => span .meta { "got " (got) " — larger" },
                                                 SizeVerdict::Unclassified(got) => span .meta { "got " (got) },
                                                 SizeVerdict::Unreported => span .meta { "size unreported" },
                                                 SizeVerdict::Unread => span .meta { "size not read yet" },

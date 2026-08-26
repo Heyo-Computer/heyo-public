@@ -33,7 +33,7 @@ use crate::plan::JobPlan;
 use crate::pool::Pool;
 use crate::runners::Runners;
 use crate::store::{JobStatus, RunStatus, StepStatus, Store, step_id};
-use crate::vm::{ExecOutput, Vm, VmError, Vms, sandbox_name};
+use crate::vm::{ExecOutput, SizeCheck, Vm, VmError, Vms, sandbox_name};
 use crate::workflow::{Fallback, Step};
 use async_nats::jetstream::AckKind;
 use serde_json::Value;
@@ -1350,11 +1350,17 @@ impl Dispatcher {
             match vm.ensure_running(BOOT_TIMEOUT).await {
                 Ok(()) => {
                     let _ = vm.renew_ttl(self.config.heyvm.vm_ttl).await;
-                    // Re-read on every claim, not only at creation: a restart
+                    // Checked on every claim, not only at creation: a restart
                     // is exactly when a daemon could bring a VM back at a
                     // different size, and a manual resize since the last job
-                    // is what the page should show.
-                    self.observe_size(&plan.key, &vm, plan.vm.size_class).await;
+                    // is what the page should show — and what must not start
+                    // a build that cannot finish.
+                    if let Err(e) = self.ensure_sized(plan, runner, &vm).await {
+                        // Parked, not destroyed: the cache is intact, and the
+                        // row on /vms is where somebody fixes the size.
+                        self.release_vm(plan, &vm, false).await;
+                        return Err(e);
+                    }
                     return Ok((vm, true));
                 }
                 Err(e) if e.is_transport() => {
@@ -1467,8 +1473,101 @@ impl Dispatcher {
                 self.lease(),
             )
             .await?;
-        self.observe_size(&plan.key, &vm, plan.vm.size_class).await;
+        if let Err(e) = self.ensure_sized(plan, runner, &vm).await {
+            // Parked, not destroyed, although it has never built anything: the
+            // next delivery on the ladder claims it and checks again, so a
+            // resize from /vms in between is all it takes for the retry to go
+            // through — and if the runner simply cannot size VMs, a fresh one
+            // would be no better than this one, only slower to say so.
+            self.release_vm(plan, &vm, false).await;
+            return Err(e);
+        }
         Ok((vm, false))
+    }
+
+    /// Refuse to start a job on a VM smaller than its `size_class`.
+    ///
+    /// A `large` build on a `small` VM does not run slowly; it runs out its
+    /// timeout, every time, and the 75 minutes that takes are the most
+    /// expensive way there is to learn that the runner did not size the VM —
+    /// which is what this used to cost: `observe_size` warned in the log and
+    /// the build went ahead. Now a VM the daemon reports as smaller than
+    /// declared is resized back to the declared class once — the daemon does
+    /// that in place, disks kept, so a warm cache survives — and if it is
+    /// still too small afterwards, or the resize failed, the job fails here
+    /// naming both sizes and what was tried. The caller parks the VM; a retry
+    /// on the ladder checks it again, so a resize from /vms in the meantime is
+    /// enough.
+    ///
+    /// Only *smaller* is refused. A larger VM — a manual resize up from /vms —
+    /// runs the build as the workflow expects and is left alone. A daemon
+    /// that reports no size at all cannot be checked, and is warned about as
+    /// before rather than refused: an old daemon is not a wrong-sized VM. A
+    /// resize that failed in the *transport* is not a verdict on the VM either
+    /// and is returned as the `VmError` it is, so the tunnel is evicted and the
+    /// retry redials.
+    async fn ensure_sized(
+        &self,
+        plan: &JobPlan,
+        runner: &str,
+        vm: &Vm,
+    ) -> Result<(), DispatchError> {
+        let wanted = plan.vm.size_class;
+        let Some(size) = self.observe_size(&plan.key, vm, wanted).await else {
+            return Ok(());
+        };
+        let Some(wanted) = wanted else {
+            return Ok(());
+        };
+        if size.check(wanted) != SizeCheck::TooSmall {
+            return Ok(());
+        }
+        let got = size.label();
+        tracing::warn!(
+            job = %plan.key,
+            vm = vm.id(),
+            "the VM is {got}, smaller than the {} the job declares; resizing it",
+            wanted.as_str()
+        );
+        let resized = match vm.resize(wanted, BOOT_TIMEOUT).await {
+            // An older daemon hands the VM back running; a newer one may
+            // leave it stopped. Either way it must be up for the check and
+            // the checkout that follows.
+            Ok(()) => vm.ensure_running(BOOT_TIMEOUT).await,
+            Err(e) => Err(e),
+        };
+        let then = match resized {
+            Err(e) if e.is_transport() => return Err(e.into()),
+            Err(e) => format!("the resize to {} failed: {e}", wanted.as_str()),
+            Ok(()) => match self.observe_size(&plan.key, vm, Some(wanted)).await {
+                Some(after) if after.check(wanted) != SizeCheck::TooSmall => {
+                    tracing::info!(
+                        job = %plan.key,
+                        vm = vm.id(),
+                        "resized to {}; the build can go ahead",
+                        after.label()
+                    );
+                    return Ok(());
+                }
+                Some(after) => format!(
+                    "the resize to {} did not take — the daemon still reports {}",
+                    wanted.as_str(),
+                    after.label()
+                ),
+                None => format!(
+                    "after a resize to {} its size could not be read back",
+                    wanted.as_str()
+                ),
+            },
+        };
+        Err(DispatchError::VmTooSmall(Box::new(UndersizedVm {
+            job: plan.key.clone(),
+            vm: vm.id().to_string(),
+            runner: runner.to_string(),
+            wanted: wanted.as_str(),
+            got,
+            then,
+        })))
     }
 
     /// Read what the daemon says the VM was given, record it on the pool row,
@@ -1481,9 +1580,8 @@ impl Dispatcher {
     /// daemon's own (`Vm::size`): the class it named, or the tier the VM's
     /// cpus and memory match, or just the numbers from a daemon that names no
     /// class, or nothing from one too old to report sizing at all. Each of
-    /// those is shown as such on /vms. Logged, never failed: the build is
-    /// already running on whatever it got, and a warning against the job is
-    /// what somebody debugging "why is this slow" needs to find.
+    /// those is shown as such on /vms. This reads and records only; whether
+    /// the build may start on what it got is [`Self::ensure_sized`]'s call.
     async fn observe_size(
         &self,
         job: &str,
@@ -1503,24 +1601,25 @@ impl Dispatcher {
         let got = size.label();
         match wanted {
             None => tracing::info!(job, vm = vm.id(), size = %got, "VM size"),
-            Some(wanted) => match size.matches(wanted) {
-                Some(true) => {
+            Some(wanted) => match size.check(wanted) {
+                SizeCheck::AsDeclared => {
                     tracing::info!(job, vm = vm.id(), size = %got, "VM sized as declared")
                 }
-                Some(false) => tracing::warn!(
+                SizeCheck::Larger => tracing::info!(
                     job,
                     vm = vm.id(),
-                    "asked for a {} VM and got {got}; the build will not run as the \
+                    size = %got,
+                    "VM is larger than the {} declared; fine",
+                    wanted.as_str()
+                ),
+                SizeCheck::TooSmall => tracing::warn!(
+                    job,
+                    vm = vm.id(),
+                    "asked for a {} VM and got {got}; the build would not run as the \
                      workflow expects — check the runner's heyvmd, or resize it from /vms",
                     wanted.as_str()
                 ),
-                None if size.is_reported() => tracing::warn!(
-                    job,
-                    vm = vm.id(),
-                    "asked for a {} VM; the daemon reports {got} and names no class",
-                    wanted.as_str()
-                ),
-                None => tracing::warn!(
+                SizeCheck::Unreported => tracing::warn!(
                     job,
                     vm = vm.id(),
                     "asked for a {} VM; the runner's daemon does not report sizing, so \
@@ -3412,6 +3511,11 @@ pub enum DispatchError {
     VmNotSweepable(String),
     /// A VM cannot be resized: unknown, on another instance's host, or not idle.
     VmNotResizable(String),
+    /// The runner handed the job a VM smaller than its `size_class`, and one
+    /// resize back to the declared class did not fix it. Boxed: five strings
+    /// would otherwise make this the variant that sizes every `Result` in the
+    /// module. See `Dispatcher::ensure_sized`.
+    VmTooSmall(Box<UndersizedVm>),
     /// A job ran past `CI_MAX_JOB_SECONDS`.
     JobTimeout {
         job: String,
@@ -3510,6 +3614,19 @@ impl DispatchError {
     }
 }
 
+/// The particulars of [`DispatchError::VmTooSmall`]: which VM, on which
+/// runner, what it is against what the job declared, and what the one resize
+/// attempt did (`then`).
+#[derive(Debug)]
+pub struct UndersizedVm {
+    pub job: String,
+    pub vm: String,
+    pub runner: String,
+    pub wanted: &'static str,
+    pub got: String,
+    pub then: String,
+}
+
 /// What a checkout that died in the VM transport reports.
 ///
 /// A failure to *reach* the daemon keeps its `VmError`, because that is the
@@ -3602,6 +3719,14 @@ impl std::fmt::Display for DispatchError {
                 "{id} cannot be resized from here. It is either unknown, on a host this \
                  orchestrator does not serve, still being created, or not idle — a \
                  resize restarts the VM, so one with a job on it is left alone."
+            ),
+            Self::VmTooSmall(u) => write!(
+                f,
+                "VM {} on {} is {}, smaller than the {} job {:?} declares, and {}. A \
+                 build on it would not run as the workflow expects — it would time out \
+                 rather than finish — so it was not started. Resize the VM from /vms, \
+                 or check the runner's heyvmd.",
+                u.vm, u.runner, u.got, u.wanted, u.job, u.then
             ),
             Self::JobTimeout { job, after } => write!(
                 f,
@@ -4518,6 +4643,31 @@ mod tests {
     /// reset. It must come out of `checkout` still recognisable as a tunnel
     /// failure, or the runner's dead tunnel is never evicted and the next job
     /// inherits it.
+    /// The size verdict is a finding about the runner, not about the tunnel or
+    /// the guest: it must not evict the tunnel, and it must not destroy the VM
+    /// somebody is about to resize from /vms.
+    #[test]
+    fn an_undersized_vm_is_neither_a_tunnel_failure_nor_corruption() {
+        let e = DispatchError::VmTooSmall(Box::new(UndersizedVm {
+            job: "app-lb".into(),
+            vm: "sb-0c5ddbbb".into(),
+            runner: "hd-runner".into(),
+            wanted: "large",
+            got: "small (1 CPU, 2 GB)".into(),
+            then: "the resize to large did not take — the daemon still reports small".into(),
+        }));
+        assert!(!e.is_tunnel_failure());
+        assert!(!e.indicates_guest_corruption());
+        let text = e.to_string();
+        assert!(
+            text.contains("sb-0c5ddbbb on hd-runner is small (1 CPU, 2 GB)"),
+            "{text}"
+        );
+        assert!(text.contains("smaller than the large"), "{text}");
+        assert!(text.contains("did not take"), "{text}");
+        assert!(text.contains("/vms"), "{text}");
+    }
+
     #[test]
     fn a_checkout_that_lost_the_tunnel_is_a_tunnel_failure() {
         let reset = checkout_error(VmError::Daemon {
