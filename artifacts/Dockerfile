@@ -1,6 +1,15 @@
 # Firecracker microVM rootfs for the artifacts store (`art serve`).
 #
-# Built with:  heyvm mvm build --local-only -f Dockerfile -n artifacts --size-mb 768
+# Built from the **repository root**, not this directory:
+#
+#   heyvm mvm build --local-only -f artifacts/Dockerfile -n artifacts --size-mb 768
+#
+# and an app-lb `build` block needs `"context": "."` beside
+# `"dockerfile": "artifacts/Dockerfile"` for the same reason: `src/lib.rs`
+# includes the shared UI kit as `#[path = "../../ui/ui.rs"]`, so the context
+# must hold `ui/` as well as this crate, and the crate must sit one level below
+# it in the builder for that relative path to land. Without both, the build
+# dies with `couldn't read src/../../ui/ui.rs`.
 #
 # The heyvm build pipeline is docker build -> docker export -> mke2fs, which
 # discards OCI metadata (ENTRYPOINT/CMD/ENV are NOT used). The VM boots straight
@@ -8,10 +17,12 @@
 
 # --- build stage ---
 FROM rust:1-bookworm AS builder
-WORKDIR /app
-COPY Cargo.toml Cargo.lock* ./
-COPY src ./src
-COPY tests ./tests
+WORKDIR /app/artifacts
+# The shared UI module, at the path `src/lib.rs` reaches for: /app/ui.
+COPY ui /app/ui
+COPY artifacts/Cargo.toml artifacts/Cargo.lock* ./
+COPY artifacts/src ./src
+COPY artifacts/tests ./tests
 # The `daemon` feature is on by default and is the whole point of this image;
 # without it there is no listener for app-lb to route to.
 RUN cargo build --release --locked || cargo build --release
@@ -40,8 +51,8 @@ RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d \
     && echo 'heyo:heyo' | chpasswd \
     && ssh-keygen -A
 
-COPY --from=builder /app/target/release/art /usr/local/bin/art
-COPY init.sh /init.sh
+COPY --from=builder /app/artifacts/target/release/art /usr/local/bin/art
+COPY artifacts/init.sh /init.sh
 RUN chmod +x /init.sh /usr/local/bin/art
 
 # Prove the rootfs can actually serve before it ships. From app-lb's side a

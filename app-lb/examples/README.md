@@ -410,9 +410,13 @@ microVM, and this is a **managed (`vm`) deployment** rather than a static one.
 Build the image once, on the host running heyvmd:
 
 ```sh
-cd ~/Projects/artifacts
-heyvm mvm build --local-only -f Dockerfile -n artifacts --size-mb 768
+cd ~/Projects/heyo-public
+heyvm mvm build --local-only -f artifacts/Dockerfile -n artifacts --size-mb 768
 ```
+
+From the repository root, not `artifacts/`: the crate includes the shared
+`ui/ui.rs` by relative path, so the build context has to hold both. The
+`build` block in the spec says the same thing with `"context": "."`.
 
 That writes `~/.heyo/images/firecracker/artifacts.ext4`, which is the `image`
 name the spec refers to. Then register the deployment and point a hostname at
@@ -642,8 +646,8 @@ autoscales a pool of Firecracker microVMs from a rootfs image.
 Build the rootfs image on the app-lb host from the crate's `Dockerfile`:
 
 ```sh
-cd ../../heyosecret
-heyvm mvm build --local-only -f Dockerfile -n heyosecret --size-mb 512
+cd ../..    # the repository root — the crate includes the shared `ui/ui.rs`
+heyvm mvm build --local-only -f heyosecret/Dockerfile -n heyosecret --size-mb 512
 heyvm mvm images     # expect a `heyosecret` row
 ```
 

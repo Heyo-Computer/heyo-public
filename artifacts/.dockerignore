@@ -1,6 +1,0 @@
-# target/ is multi-gigabyte and the builder stage recompiles anyway; sending it
-# as build context would dominate the build time.
-target
-.git
-examples
-README.md

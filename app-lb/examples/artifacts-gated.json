@@ -22,9 +22,10 @@
     "ttl_seconds": 3600
   },
   "build": {
-    "repo": "https://github.com/Heyo-Computer/artifacts.git",
+    "repo": "https://github.com/Heyo-Computer/heyo-public.git",
     "ref": "main",
-    "dockerfile": "Dockerfile",
+    "dockerfile": "artifacts/Dockerfile",
+    "context": ".",
     "image_size_mb": 768,
     "auth": { "secret": "github", "key": "token" }
   },

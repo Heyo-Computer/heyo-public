@@ -1,0 +1,11 @@
+# Read by docker only from the build-context root, so this lives at the
+# repository root: artifacts/Dockerfile and heyosecret/Dockerfile are built
+# with the whole repository as context (each crate includes the shared
+# `ui/ui.rs` by relative path), and a per-crate .dockerignore would never be
+# consulted.
+#
+# target/ is multi-gigabyte per crate and the builder stage recompiles anyway;
+# sending it as build context would dominate the build time.
+**/target
+.git
+**/node_modules
