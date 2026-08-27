@@ -24,9 +24,9 @@
 #
 # ## One job, and no checks yet
 #
-# `codegraph.yml`'s shape rather than `apps.yml`'s: `ci` is one buildable thing,
-# and whether it passes says nothing about the platform or about codegraph, so
-# it earns its own file and its own run page.
+# One buildable thing in one file, like every workflow here: whether `ci`
+# passes says nothing about the platform or about codegraph, so it earns its
+# own file and its own run page.
 #
 # `cargo fmt --check` and `cargo clippy` would work here — the image installs
 # both components rather than leaving a bare `--profile minimal` toolchain — and
@@ -360,7 +360,7 @@ jobs:
           cp "$src" dist/ci
           strip dist/ci
           # The supervisor config this binary is deployed under, shipped beside
-          # it exactly as apps.yml ships app-lb.conf. It is the one file a
+          # it exactly as app-lb.yml ships app-lb.conf. It is the one file a
           # person needs to run the artifact — `ci` has no flags, so this list
           # of `CI_*` variables *is* its command line — and the one most likely
           # to drift from the binary it configures.
@@ -391,7 +391,7 @@ jobs:
           branch    ${{ ci.branch }}
           run       ${{ ci.run_id }}
           EOF
-          # The migrations are summed alongside the binary, unlike apps.yml's
+          # The migrations are summed alongside the binary, unlike app-lb.yml's
           # binaries-only list: these are SQL statements that will be executed
           # against a production database, and the checksum is the cheap way to
           # prove the file applied is the file built.

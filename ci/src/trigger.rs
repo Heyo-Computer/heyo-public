@@ -111,8 +111,8 @@ pub struct SubmitRequest {
     #[serde(default)]
     pub workflow_id: Option<String>,
     /// Run only the workflow *files* these selectors name — `git submit
-    /// --only`. A selector matches a file's path (`.ci/workflows/apps.yml`),
-    /// its basename with or without the extension (`apps.yml`, `apps`), or the
+    /// --only`. A selector matches a file's path (`.ci/workflows/app-lb.yml`),
+    /// its basename with or without the extension (`app-lb.yml`, `app-lb`), or the
     /// workflow's own `name:`, case-insensitively. Empty means every file the
     /// glob finds, which is what every client sent before the field existed.
     ///

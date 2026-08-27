@@ -1,0 +1,282 @@
+# Build the `app-obs` release binaries — the collector, plus `app-obs-dump`,
+# the parquet reader — and upload them as one artifact.
+#
+# Submitted from the repository root, with an ordinary bundle:
+#
+#     git submit
+#
+# **No `--archive`**, unlike the private `heyo` monorepo. This repository's whole
+# history bundles to 2.7 MB against a 64 MB `CI_MAX_SOURCE_BYTES`, so the default
+# payload fits with room to spare — which matters twice here: `.git` exists in
+# the guest, so the version stamp below is real `git describe` output, and the
+# change set is real, so the `paths:` filter below actually filters.
+#
+# ## One job, its own file
+#
+# This and `app-lb.yml` used to be two jobs in one `apps.yml`; see the head of
+# that file for why they were split. In short: this is the slowest build in
+# the repository and the one that has needed the most debugging, and in the
+# shared file it ran *after* a 75-minute app-lb build, on a run page it shared
+# with it. On its own, `git submit --only app-obs` runs this and nothing else,
+# and the run page is this build's log and no other's.
+#
+# The image is still `.ci/image/apps/`, shared with `app-lb.yml`, and every
+# field under `vm.build` must stay equal to that file's: the image is named by
+# a hash of its inputs, and one runner should build it once, not twice.
+name: app-obs
+
+on:
+  submit:
+    paths:
+      # The crate. A lone package with no members and no path dependencies, so
+      # nothing outside its directory is a change to this build.
+      - 'app-obs/**'
+      # This workflow and the image it builds in — named precisely rather than
+      # as `.ci/**`, so adding a workflow for another crate here does not
+      # rebuild this one. The image is shared with `app-lb.yml`, so editing it
+      # rebuilds both, which is the one change that genuinely must.
+      - '.ci/workflows/app-obs.yml'
+      - '.ci/image/apps/**'
+
+jobs:
+  release:
+    # Pinned like app-lb — the warm VM, its cache disk and the image catalog
+    # live on the orchestrator's own host — and for one reason more: this is
+    # the slowest build in the repository, so a stray placement pays the full
+    # cold datafusion build.
+    #
+    # Nothing orders this after `app-lb.yml` any more; a `needs` cannot cross
+    # workflow files. A commit touching both, or the shared image, runs the two
+    # side by side on one host — 12 vCPUs and 24 GB between them, each slower
+    # than alone. Accepted, for being able to run this one by itself.
+    uses: default
+    vm:
+      driver: firecracker
+      build:
+        dockerfile: .ci/image/apps/Dockerfile
+        context: .ci/image/apps
+        # Must match `app-lb.yml` exactly. `size_mb` is part of the hash that
+        # names the image, so a different value here would build a second
+        # rootfs from byte-identical inputs and neither job would reuse the
+        # other's.
+        size_mb: 10240
+      # `xlarge` (8 CPU, 16 GB), a class up from app-lb's despite having *fewer*
+      # crates — 380 against 572. Crate count is the wrong measure here: the
+      # graph is datafusion and the whole arrow/parquet stack, whose generated
+      # code makes individual rustc invocations some of the most memory-hungry
+      # in the ecosystem. `large` is 8 GB, and there is no swap in a microVM, so
+      # a rustc that asks for more is not slow — it is OOM-killed, which surfaces
+      # as an opaque signal. The build step's `dmesg` tail is what names it if
+      # this is still not enough.
+      #
+      # `ci` refuses to start the job on a VM the daemon reports as smaller
+      # than this, after one attempt to resize it back — a build on a `large`
+      # here does not fail fast, it runs into the step ceiling. `/vms` shows
+      # what each pooled VM actually is.
+      size_class: xlarge
+      # 40 GB against a measured 4.2 GB debug target dir — the largest of any
+      # workspace here by a wide margin, again because of arrow and datafusion.
+      disk_size_gb: 40
+      # 4 hours. See `app-lb.yml` for why this is set explicitly rather than
+      # left to `CI_VM_TTL_SECONDS`, and why it says nothing about how long the
+      # parked VM lives. It matters more here: this is the longest build in the
+      # repository, so it is the one most likely to meet a stale runner's
+      # uptime cap.
+      ttl_seconds: 14400
+      # The toolchain only — see `app-lb.yml` for why the lockfile and manifest
+      # are deliberately not here. It matters most on this job: a cold
+      # datafusion build is the longest thing this repository does, and a
+      # dependency bump that busted the pool paid all of it for a version
+      # number.
+      #
+      # The workflow and job names are not in the pool fingerprint, so the
+      # warm VM built under `apps.yml` carries straight over to this file.
+      cache_key_files:
+        - app-obs/rust-toolchain.toml
+        - rust-toolchain.toml
+    env:
+      CARGO_TERM_COLOR: never
+      # Six, not the eight cores `xlarge` provides. Peak memory during a Rust
+      # build is roughly (parallel rustc jobs x the largest crate's working
+      # set), and datafusion's largest crates are big enough that eight at once
+      # can crest 16 GB. Trading two cores for ~5 GB of headroom is the cheaper
+      # side of that bet: the cost is wall-clock on a cold build, and the cost
+      # of losing it is an OOM kill an hour in.
+      #
+      # This is a precaution, not a measurement — if a cold build here proves to
+      # fit comfortably, delete this line and take the cores back.
+      CARGO_BUILD_JOBS: "6"
+    # Longer than app-lb's. datafusion from cold is the slowest thing this
+    # repository builds; a warm VM reuses /var/cache/ci and relinks in minutes.
+    #
+    # 150, raised from 120 after the 2026-08-22 run where a cold build (the
+    # cache guard had just wiped a full disk) ran the Build step into its
+    # ceiling at 105 minutes and died with nothing in the log but the timeout —
+    # the daemon discards a timed-out command's captured output. The budget now
+    # assumes the wipe-then-cold-build case is a build to finish, not a fault.
+    timeout-minutes: 150
+    steps:
+      # Identical in intent to app-lb's guard — see there for why a warm VM
+      # needs this even though init.sh runs the same check at boot.
+      - name: Guard the cache disk
+        run: |
+          df -P "$CARGO_TARGET_DIR" /
+          if [ "$(stat -c %d "$CARGO_TARGET_DIR")" = "$(stat -c %d /)" ]; then
+            echo "FATAL: $CARGO_TARGET_DIR is on the rootfs — the data disk (/dev/vdb) is not attached." >&2
+            echo "Check disk creation on the runner host." >&2
+            exit 1
+          fi
+          usage=$(df -P "$CARGO_TARGET_DIR" | awk 'NR==2 {gsub(/%/,""); print $5}')
+          if [ -n "$usage" ] && [ "$usage" -ge 85 ]; then
+            echo "cache disk at ${usage}%, wiping $CARGO_TARGET_DIR"
+            rm -rf "$CARGO_TARGET_DIR"
+          fi
+
+      # Its own step, with its own short ceiling, so a registry or network
+      # stall in the guest fails in ten minutes under its own name instead of
+      # silently eating the Build step's budget — which is indistinguishable
+      # from a slow build once the timeout has discarded the output. One retry,
+      # because a transient registry hiccup is common enough to be worth not
+      # failing the run over.
+      - name: Fetch dependencies
+        working-directory: /workspace/app-obs
+        run: |
+          cargo fetch --locked || { echo "fetch failed; retrying once"; sleep 10; cargo fetch --locked; }
+        timeout-minutes: 10
+
+      - name: Build
+        # Absolute, for the same reason as in app-lb.yml — `ci` renders
+        # `working-directory:` verbatim rather than joining it onto /workspace.
+        working-directory: /workspace/app-obs
+        # `--bins` rather than a bare `--release`: this package has two binary
+        # targets (`app-obs` from src/main.rs and `dump` from src/bin/), and
+        # both ship. No `--workspace`, because unlike app-lb this is a lone
+        # package with no members.
+        #
+        # `free -m` alongside the disk report: memory is the constraint that
+        # actually bites on this build, so the number is worth having in the log
+        # next to the CARGO_BUILD_JOBS that was chosen against it.
+        #
+        # Two rules learned from three runs that died at their ceiling with
+        # nothing to read (2026-08-22 through -24):
+        #
+        # * **Build output goes to a file, never the serial console.** A step's
+        #   stdout is the guest's serial line; ~135 minutes of cargo through it
+        #   is megabytes of console traffic — plus terminal progress redraws,
+        #   since cargo sees a tty — and a backpressured serial pipe throttles
+        #   the build it is narrating. The daemon then discards the whole
+        #   buffer if its ceiling fires, so streaming bought nothing. The file
+        #   lives on the cache disk and survives every outcome; the tail is
+        #   printed below, win or lose.
+        # * **The guest bounds the build itself**, five minutes under the
+        #   step's ceiling. GNU timeout signals the child's whole process
+        #   group, so cargo and every rustc die together, the exec's end
+        #   marker still reaches the daemon, and this step comes back as a
+        #   *failure with a log* instead of a daemon-side kill with nothing.
+        #   Exit 124 is the in-guest timeout itself.
+        run: |
+          df -P / "$CARGO_TARGET_DIR"
+          free -m || true
+          log="$CARGO_TARGET_DIR/app-obs-build.log"
+          rc=0
+          timeout -k 60 7800 env CARGO_TERM_PROGRESS_WHEN=never             cargo build --release --locked --bins > "$log" 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            if [ "$rc" -eq 124 ]; then
+              echo "=== the in-guest timeout killed the build after 7800s ==="
+            fi
+            echo "=== build failed (exit $rc); last 100 log lines ==="
+            tail -100 "$log" 2>/dev/null || echo "(no log at $log)"
+            echo "=== guest kernel log tail ==="
+            echo "(look for 'Out of memory: Killed process' — that means"
+            echo " CARGO_BUILD_JOBS is still too high for this size_class)"
+            dmesg | tail -50 || true
+            df -P / "$CARGO_TARGET_DIR"
+            exit 1
+          fi
+          tail -5 "$log"
+        # 135, raised from 105 with the job ceiling: the wipe-then-cold-build
+        # case has to fit. The in-guest 7800s above must stay under this.
+        timeout-minutes: 135
+
+      # `app-obs` takes no arguments either — it reads `APP_OBS_*` from the
+      # environment and runs until killed — so it gets the same link check that
+      # `app-lb` does rather than a real invocation.
+      #
+      # `dump` does run. With no arguments it prints its usage and exits 2,
+      # which is enough to prove the process comes up, and it is the binary
+      # where that is worth proving: it is linked against parquet and arrow, and
+      # a mismatch there is exactly the kind of fault that compiles cleanly.
+      - name: Smoke-test the binaries
+        run: |
+          set -eu
+          for b in app-obs dump; do
+            bin="$CARGO_TARGET_DIR/release/$b"
+            [ -x "$bin" ] || { echo "FATAL: $b was not built at $bin" >&2; exit 1; }
+            if ldd "$bin" | grep 'not found'; then
+              echo "FATAL: $b has unresolved shared libraries (see above)" >&2
+              exit 1
+            fi
+          done
+          out="$("$CARGO_TARGET_DIR/release/dump" 2>&1 || true)"
+          case "$out" in
+            *usage:*) echo "ok: dump starts and prints its usage" ;;
+            *) echo "FATAL: dump did not print a usage line; it said: $out" >&2; exit 1 ;;
+          esac
+          echo "ok: app-obs links cleanly"
+
+      # See app-lb.yml for why the binaries are copied into the workspace
+      # (`ci/upload-artifact` tars relative to /workspace) and stripped on the
+      # way (the tarball leaves the guest base64-encoded over the exec channel).
+      - name: Collect the binaries
+        run: |
+          set -eu
+          mkdir -p dist
+          src="$CARGO_TARGET_DIR/release/app-obs"
+          [ -f "$src" ] || { echo "FATAL: app-obs was not built at $src" >&2; exit 1; }
+          cp "$src" dist/app-obs
+          strip dist/app-obs
+          # Renamed on the way out. Cargo names this binary for its source file,
+          # `src/bin/dump.rs`, but the program calls itself `app-obs-dump` in its
+          # own usage line — and `dump` is far too generic a name to extract
+          # into somebody's PATH from a tarball. The shipped name is the one the
+          # tool answers to.
+          src="$CARGO_TARGET_DIR/release/dump"
+          [ -f "$src" ] || { echo "FATAL: dump was not built at $src" >&2; exit 1; }
+          cp "$src" dist/app-obs-dump
+          strip dist/app-obs-dump
+          cp app-obs/deploy/supervisor/app-obs.conf dist/
+          describe="$(git -C /workspace describe --tags --always --dirty 2>/dev/null || echo 'no-git')"
+          cat > dist/BUILD-INFO <<EOF
+          describe  $describe
+          commit    ${{ ci.sha }}
+          branch    ${{ ci.branch }}
+          run       ${{ ci.run_id }}
+          EOF
+          ( cd dist && sha256sum app-obs app-obs-dump > SHA256SUMS )
+          ls -la dist
+          cat dist/BUILD-INFO
+          # What the upload below has to move, measured the way it will move:
+          # the tarball, gzipped, then base64 over the exec channel. These two
+          # binaries are linked against arrow, parquet and datafusion and are
+          # the largest thing any workflow here uploads, so if the upload step
+          # fails, the number that says whether size is the reason is this
+          # one — printed here, in the step that succeeded, rather than lost
+          # with the one that did not.
+          bytes="$(tar czf - dist | wc -c)"
+          echo "upload payload: $bytes bytes gzipped, $(( bytes * 4 / 3 )) base64"
+
+      # Tagged `ci-app-obs-<run>-release-app-obs` in the store — the workflow
+      # name is in the tag, so this file's rename from `apps.yml` started a new
+      # tag series. `.ci/install.sh` knows to look under the old one until the
+      # first build under this one lands.
+      #
+      # See app-lb.yml for why `description:` is prose and why it is a label
+      # rather than a manifest annotation.
+      - uses: ci/upload-artifact
+        with:
+          name: app-obs
+          description: >-
+            The app-obs collector and the app-obs-dump reader, release binaries
+            for x86_64-linux, with the supervisor unit and SHA256SUMS.
+            Built from ${{ ci.branch }}.
+          path: dist

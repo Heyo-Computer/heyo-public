@@ -1,0 +1,311 @@
+# Build the `app-lb` release binaries — the proxy, plus `heyctl`, the CLI and
+# client SDK for its admin API — and upload them as one artifact.
+#
+# Submitted from the repository root, with an ordinary bundle:
+#
+#     git submit
+#
+# **No `--archive`**, unlike the private `heyo` monorepo. This repository's whole
+# history bundles to 2.7 MB against a 64 MB `CI_MAX_SOURCE_BYTES`, so the default
+# payload fits with room to spare — which matters twice here: `.git` exists in
+# the guest, so the version stamp below is real `git describe` output, and the
+# change set is real, so the `paths:` filter below actually filters.
+#
+# ## One job, its own file
+#
+# This and `app-obs.yml` used to be two jobs in one `apps.yml`, on the theory
+# that the load balancer and the observability service it feeds are one
+# deployed thing and "did the platform build" deserves one run page. What that
+# cost was the ability to look at either build on its own: an app-obs failure
+# sat on a run page with a 75-minute app-lb build above it, and `needs` — there
+# to keep two big builds from contending for one host's cores — meant every
+# attempt to reproduce an app-obs fault waited for app-lb first. Split, each
+# workflow is one run, one log and one answer, and `git submit --only app-obs`
+# runs only the one being chased.
+#
+# The two still share `.ci/image/apps/`, and must keep sharing it: the image
+# is named by a hash of its Dockerfile, context and `size_mb`, so identical
+# inputs here and in `app-obs.yml` mean one image built per runner, not two.
+name: app-lb
+
+on:
+  submit:
+    paths:
+      # app-lb's subtree covers `app-lb/heyctl/` too — `**` crosses segments.
+      # The workspace has no path dependency outside its own directory, so
+      # unlike the `heyo` monorepo there is no sibling crate to list here.
+      - 'app-lb/**'
+      # This workflow and the image it builds in — named precisely rather than
+      # as `.ci/**`, so adding a workflow for another crate here does not
+      # rebuild this one. The image is shared with `app-obs.yml`, so editing
+      # it rebuilds both, which is the one change that genuinely must.
+      - '.ci/workflows/app-lb.yml'
+      - '.ci/image/apps/**'
+
+jobs:
+  release:
+    # Pinned to the orchestrator's own host — the Linux CI machine. `default`
+    # rather than a spelled-out `<network>/<node>`, so the pin survives the
+    # host being renamed or the network reorganised.
+    #
+    # This used to be unpinned ("any online host"), and the 2026-08-24 run is
+    # why it no longer is: a macbook daemon joined the network and the job
+    # landed on it — a firecracker build on a host that only runs apple_*
+    # drivers. Placement filters on driver capability now, but the warm VM,
+    # its cache disk and the image catalog all live on one machine, so "any
+    # host" was never what these jobs meant; every placement elsewhere is a
+    # cold build.
+    #
+    # `app-obs.yml` is pinned to the same host, and nothing orders the two any
+    # more — a commit touching both, or the shared image, runs them side by
+    # side, asking the host for 12 vCPUs and 24 GB between them. Each then
+    # takes longer than it would alone. That was the reason the old `apps.yml`
+    # ran app-obs after app-lb; it is accepted here as the price of being able
+    # to run either one on its own.
+    uses: default
+    vm:
+      driver: firecracker
+      build:
+        dockerfile: .ci/image/apps/Dockerfile
+        # Defaulted to the Dockerfile's own directory, as `docker build -f`
+        # does; spelled out because init.sh being in it is the point.
+        context: .ci/image/apps
+        # 10 GB, matching `app-obs.yml` because both share this image and the
+        # size is part of what names it — two different values would build two
+        # rootfs images from identical bytes. Sized for the worse of the two:
+        # the rootfs holds CARGO_HOME, and the registry grows into it at
+        # runtime on top of a ~1 GB toolchain.
+        size_mb: 10240
+      # `large` (4 CPU, 8 GB). 572 crates, and three of them are C projects
+      # built from source — vendored OpenSSL, aws-lc-sys and zlib-ng — which
+      # parallelise to the cores they are given. The class is part of the pool
+      # fingerprint, so changing it retires the warm VMs of the old class on its
+      # own.
+      size_class: large
+      # Mounted at /var/cache/ci by the image's init, which is where
+      # CARGO_TARGET_DIR points — deliberately *not* /workspace, which `ci`
+      # wipes on every checkout. This disk is what makes reusing a warm VM worth
+      # anything. 30 GB against a measured 1.3 GB debug target dir; the margin
+      # is how many reuses fit before init.sh's 85% guard wipes it, since cargo
+      # never garbage-collects a `target/`.
+      disk_size_gb: 30
+      # 4 hours, comfortably past this job's 90-minute timeout.
+      #
+      # This bounds a *running* VM, and nothing else: between jobs the VM is
+      # stopped, which the daemon's reaper ignores, and `CI_VM_IDLE_SECS` (a
+      # week by default) is what retires it. Explicit because the default
+      # (`CI_VM_TTL_SECONDS`, 3600) is shorter than a cold build here, and
+      # whether the orchestrator's renewal loop actually extends it depends on
+      # the *runner's* heyvmd being new enough: the TTL used to be computed as
+      # `started_at + ttl`, an uptime cap that renewal could not move, and a
+      # build past the cap was reaped mid-compile. That is fixed in mvm-ctrl
+      # (`fix: dont truncate live disks, accurate ttl`), but this workflow
+      # cannot see which build a given runner is on. A create-time TTL is
+      # honoured either way, so this is correct against both.
+      ttl_seconds: 14400
+      # What must retire the warm VM: the toolchain. Nothing else on this list.
+      #
+      # `Cargo.lock` and the manifests used to be here, on the theory that a
+      # cache resolved against the old lockfile was stale. It is not: cargo
+      # fingerprints every unit by package id, features, profile and rustc, so
+      # a lockfile bump rebuilds the crates that moved and relinks — minutes —
+      # while busting the pool on it threw the whole `target/` away and paid
+      # the full cold build (OpenSSL, aws-lc, every dependency) for a version
+      # bump. app-lb's lockfile moved four times in the week of 2026-08-17;
+      # each was a cold run that a warm one would have finished in a fraction
+      # of the time. The whole point of the cache disk is to survive exactly
+      # this.
+      #
+      # A toolchain change is different in kind: `target/` is keyed to the
+      # rustc that wrote it, and a new one rebuilds everything anyway, so a
+      # fresh disk costs nothing extra and starts clean. The two
+      # `rust-toolchain.toml` paths are listed although neither exists — a
+      # missing file hashes to an explicit marker, so adding one later busts
+      # the pool at the moment it most needs busting. Both locations, because
+      # cargo searches upward from the working directory and would find either.
+      #
+      # Everything else that should retire a VM already does through the
+      # fingerprint: the image (its Dockerfile and context are hashed into the
+      # image name), and every field of this `vm:` block. The workflow and job
+      # names are *not* in it, so the warm VMs built under `apps.yml` carry
+      # straight over to this file.
+      cache_key_files:
+        - app-lb/rust-toolchain.toml
+        - rust-toolchain.toml
+    env:
+      CARGO_TERM_COLOR: never
+    # The job needs headroom over the sum of its steps. A cold build compiles
+    # OpenSSL and aws-lc from source before it reaches the first Rust crate that
+    # needs them; a warm VM reuses /var/cache/ci and relinks.
+    timeout-minutes: 90
+    steps:
+      # The image's init runs the same guard, but only at boot — a warm VM
+      # serves many runs between boots, and the disk fills *while* warm. Without
+      # this a pooled VM that crosses the threshold mid-lifetime fails every
+      # build with SIGBUS (rustc writes its output through mmap, and a mapped
+      # page that cannot be backed on a full filesystem kills the process) until
+      # the VM happens to be retired.
+      #
+      # It also refuses to build without the data disk at all. If /dev/vdb never
+      # attached, /var/cache/ci sits on the 10 GB rootfs alongside the toolchain
+      # and the registry, and a build that fills it dies with an unreadable
+      # SIGBUS mid-compile. Failing here names the actual problem in one line.
+      - name: Guard the cache disk
+        run: |
+          df -P "$CARGO_TARGET_DIR" /
+          if [ "$(stat -c %d "$CARGO_TARGET_DIR")" = "$(stat -c %d /)" ]; then
+            echo "FATAL: $CARGO_TARGET_DIR is on the rootfs — the data disk (/dev/vdb) is not attached." >&2
+            echo "Check disk creation on the runner host." >&2
+            exit 1
+          fi
+          usage=$(df -P "$CARGO_TARGET_DIR" | awk 'NR==2 {gsub(/%/,""); print $5}')
+          if [ -n "$usage" ] && [ "$usage" -ge 85 ]; then
+            echo "cache disk at ${usage}%, wiping $CARGO_TARGET_DIR"
+            rm -rf "$CARGO_TARGET_DIR"
+          fi
+
+      - name: Build
+        # No `. "$HOME/.cargo/env"`: the image puts cargo on PATH through
+        # /etc/profile.d, and the daemon runs every step as `sh -lc`, which is a
+        # login shell and reads it.
+        #
+        # **Absolute, not `app-lb`.** Unlike GitHub, `ci` uses
+        # `working-directory:` verbatim — it renders `cd <value> && …` and does
+        # not join it onto the workspace — so a relative value is resolved from
+        # the login shell's home directory and the step dies on `cd: no such
+        # file`. /workspace is where the source is extracted.
+        working-directory: /workspace/app-lb
+        # `--workspace --bins`, and both halves matter. Without `--workspace`,
+        # cargo builds only the root package in a workspace that has one, so
+        # `heyctl` — a member, and a shipped product in its own right — would
+        # silently not be built. Without `--bins`, the build also compiles the
+        # `[[example]]` and test targets, none of which ship.
+        #
+        # `--locked` because the VM is fingerprinted on `Cargo.lock`: resolving
+        # a different dependency set than the one the fingerprint was taken from
+        # would make the warm VM's cache a claim that is not true.
+        #
+        # `cargo fetch` first, then a df of both filesystems: the registry lands
+        # in CARGO_HOME on the *rootfs*, which the guard step's check
+        # deliberately does not fail on — so if the rootfs is what filled, the
+        # line printed here is the one that says so, adjacent to the failure
+        # rather than under a screen of compile output.
+        #
+        # On failure, the guest kernel's ring buffer is the one witness to
+        # anything the kernel did to the build — an OOM kill, a block-layer I/O
+        # error, an ext4 complaint, or a machine-check event injected from the
+        # host (delivered to the mapping process as SIGBUS). rustc dying on a
+        # signal looks identical from the outside in all four cases; this tail
+        # is what tells them apart. Printing it here is safe — step output rides
+        # the exec channel, not the serial console that carries the marker
+        # protocol.
+        run: |
+          cargo fetch --locked
+          df -P / "$CARGO_TARGET_DIR"
+          if ! cargo build --release --locked --workspace --bins; then
+            echo "=== build failed; guest kernel log tail ==="
+            dmesg | tail -100 || true
+            df -P / "$CARGO_TARGET_DIR"
+            exit 1
+          fi
+        timeout-minutes: 75
+
+      # `app-lb` itself takes no arguments — it is configured entirely from
+      # `APP_LB_*` environment variables and, run bare, binds its proxy and
+      # admin listeners and never returns. So there is no `--version` to call
+      # here the way there is for `codegraph`, and starting it to see whether it
+      # starts would mean a step that has to be killed.
+      #
+      # What is checkable without running it is that the dynamic linker can
+      # resolve it. That is a weaker claim than "it boots" — most of this binary
+      # is statically linked, including the vendored OpenSSL — but it is the
+      # failure that an image missing a runtime library would actually produce,
+      # and it costs nothing.
+      #
+      # `heyctl` is a clap CLI, so it gets the real test.
+      - name: Smoke-test the binaries
+        run: |
+          set -eu
+          for b in app-lb heyctl; do
+            bin="$CARGO_TARGET_DIR/release/$b"
+            [ -x "$bin" ] || { echo "FATAL: $b was not built at $bin" >&2; exit 1; }
+            if ldd "$bin" | grep 'not found'; then
+              echo "FATAL: $b has unresolved shared libraries (see above)" >&2
+              exit 1
+            fi
+          done
+          "$CARGO_TARGET_DIR/release/heyctl" --version
+          "$CARGO_TARGET_DIR/release/heyctl" --help > /dev/null
+          echo "ok: app-lb links cleanly, heyctl runs"
+
+      # `ci/upload-artifact` tars its `path` relative to the *job's* working
+      # directory — /workspace, the repository root — not the step's. And
+      # CARGO_TARGET_DIR is outside the workspace entirely. So the binaries are
+      # brought back in rather than the uploader taught about absolute paths.
+      #
+      # Stripped on the way: an artifact leaves the guest base64-encoded over
+      # the exec channel, so a third off the payload is a third off a transfer
+      # that is already the slowest part of a warm run. Debug symbols are not
+      # what anybody pulls these binaries for; drop `strip` here if that changes.
+      - name: Collect the binaries
+        run: |
+          set -eu
+          mkdir -p dist
+          for b in app-lb heyctl; do
+            src="$CARGO_TARGET_DIR/release/$b"
+            [ -f "$src" ] || { echo "FATAL: $b was not built at $src" >&2; exit 1; }
+            cp "$src" "dist/$b"
+            strip "dist/$b"
+          done
+          # The supervisor config each binary is deployed under, shipped beside
+          # it. It is the one file a person needs to run the artifact and the
+          # one most likely to drift from the binary it configures.
+          cp app-lb/deploy/supervisor/app-lb.conf dist/
+          # A real `git describe`, available only because this repository
+          # submits as a bundle — the checkout clones it in the guest, so
+          # /workspace is a repository with tags and history. A `--archive`
+          # submit would have neither, which is why `ci.sha` is recorded beside
+          # it rather than instead of it.
+          describe="$(git -C /workspace describe --tags --always --dirty 2>/dev/null || echo 'no-git')"
+          # `heyctl --version` reports the workspace version, which app-lb
+          # shares (`version.workspace = true`), so this one line stamps both.
+          # app-lb itself takes no arguments and cannot be asked.
+          cat > dist/BUILD-INFO <<EOF
+          version   $(dist/heyctl --version)
+          describe  $describe
+          commit    ${{ ci.sha }}
+          branch    ${{ ci.branch }}
+          run       ${{ ci.run_id }}
+          EOF
+          ( cd dist && sha256sum app-lb heyctl > SHA256SUMS )
+          ls -la dist
+          cat dist/BUILD-INFO
+
+      # Lands in whichever sink the orchestrator is configured for — `disk`
+      # (CI_ARTIFACT_DIR) by default, or the central `art serve` when
+      # CI_ARTIFACT_SINK=artifacts. The workflow does not choose; it uploads.
+      # Downloadable from the run page either way.
+      #
+      # Tagged `ci-app-lb-<run>-release-app-lb` in the store — the workflow
+      # name is in the tag, so this file's rename from `apps.yml` started a new
+      # tag series. `.ci/install.sh` knows to look under the old one until the
+      # first build under this one lands.
+      #
+      # `description:` is what the artifact store shows a person browsing it.
+      # Only the `artifacts` sink has anywhere to put it — disk and S3 store a
+      # file and a key — and it is set on the blob and the manifest as a
+      # *label*, never as a manifest annotation: a manifest is addressed by its
+      # own hash, so wording that lived in one would give two builds of
+      # identical bytes two digests the first time somebody edited this line.
+      #
+      # Worth writing as prose rather than repeating `name:`. The store lists it
+      # beside a digest, and "app-lb" next to `1b9b737b73e2` says nothing the
+      # tag did not; what a reader wants is which binaries are in the tarball.
+      - uses: ci/upload-artifact
+        with:
+          name: app-lb
+          description: >-
+            The app-lb proxy and the heyctl CLI, release binaries for
+            x86_64-linux, with the supervisor unit and SHA256SUMS.
+            Built from ${{ ci.branch }}.
+          path: dist

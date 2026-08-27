@@ -899,7 +899,7 @@ jobs:
     /// and one level up from it: since the subtree merge this crate is `ci/`
     /// inside the monorepo, while the workflows it must satisfy live at the
     /// repository root, which is the only place `ci` reads them from. So this
-    /// now checks every workflow here — `apps.yml` and `codegraph.yml` as well
+    /// now checks every workflow here — `app-lb.yml`, `app-obs.yml` and `codegraph.yml` as well
     /// as this crate's own — which is strictly more than it covered before.
     #[test]
     fn this_repositorys_own_workflows_parse_and_plan() {

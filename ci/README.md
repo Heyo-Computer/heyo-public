@@ -52,8 +52,8 @@ git submit --only apps  # run one workflow file, skip the rest
 
 `--only <workflow>` starts runs for just the workflow files it names and leaves
 every other one alone. A selector is the file's path
-(`.ci/workflows/apps.yml`), its basename with or without the extension
-(`apps.yml`, `apps`), or the workflow's own `name:`, matched
+(`.ci/workflows/app-lb.yml`), its basename with or without the extension
+(`app-lb.yml`, `app-lb`), or the workflow's own `name:`, matched
 case-insensitively; the flag repeats. Two edges are deliberate:
 
 - **A named workflow runs even when its `branches:`/`paths:` filters would have
@@ -451,7 +451,7 @@ keeps its rootfs and its cache disk; only `destroy` removes those — and starte
 again by the next job that claims it. Before this a pooled VM idled *running*
 until the daemon's TTL reaped it, which made the warm cache a matter of cadence:
 the next push had to land inside the TTL (an hour by default, four for
-`apps.yml`) or it booted a blank VM and paid the full cold build. For a
+`app-obs.yml`) or it booted a blank VM and paid the full cold build. For a
 repository pushed to a few times a day, most gaps are longer than that, so
 most builds were cold, and a `xlarge` sat on 16 GB of the host in between.
 Stopped, the VM costs disk and nothing else, the reaper ignores it, and
@@ -609,7 +609,7 @@ a lockfile bump rebuilds the crates that moved and relinks, while busting the
 pool on it throws the whole `target/` away and pays the cold build for a
 version number. A toolchain file belongs there — a new rustc rebuilds
 everything anyway — and the image and the `vm:` block are already in the
-fingerprint. `apps.yml` says the same at the site.
+fingerprint. `app-lb.yml` says the same at the site.
 
 `/vms` shows the pool and answers the two questions worth asking of it. **Is
 reuse working** — rows are grouped by host and fingerprint, and a fingerprint
@@ -860,6 +860,25 @@ returns `bash: /usr/bin/env: Argument list too long`.
 Anything reading *out* of a guest must end its output with a newline. The serial
 path frames output with newline-delimited markers, so `base64 -w0` — one
 unterminated line — hangs the operation in `running` forever.
+
+### Artifacts leave the guest the same way, in chunks
+
+`ci/upload-artifact` packs its `path` to a tarball in the guest, then reads the
+tarball out through exec and `base64` — the daemon's file routes do not reach a
+guest path in that direction either. The read is chunked (`dd … | base64`, 1 MiB
+of raw bytes per exec) because the output side has no argv limit but does have a
+clock: on firecracker every byte crosses the emulated serial console, and one
+exec for the whole tarball meets one fixed guest timeout. At a flat 600 seconds
+that held app-lb's artifact and not app-obs's, whose two binaries carry arrow and
+parquet. Chunked, each exec has its own timeout regardless of the artifact's
+size, and the whole transfer is bounded by the step's `timeout-minutes` — so a
+genuinely enormous artifact fails as the step's timeout, with the chunk count in
+the log, rather than as a daemon-side kill with a thousand lines of base64.
+
+Both directions end with a hash check. Every chunk exec exiting 0 says the shell
+ran; the sha256 says the bytes are the ones the guest holds, and a mismatch
+(`UploadCorrupted`, `DownloadCorrupted`) is treated as a corrupt guest and the VM
+destroyed rather than repooled.
 
 ### Job subjects are sharded per runner
 

@@ -1,6 +1,6 @@
 # Firecracker microVM rootfs for building `app-lb` (with `heyctl`) and `app-obs`.
 #
-# `ci` builds this itself: `.ci/workflows/apps.yml` points `vm.build.dockerfile`
+# `ci` builds this itself: `.ci/workflows/app-lb.yml` and `app-obs.yml` point `vm.build.dockerfile`
 # here, and the first job to land on a host uploads this file plus its context
 # to the daemon's `POST /images/build`, which runs the
 # `docker build -> docker export -> mke2fs` pipeline behind `heyvm mvm build`.

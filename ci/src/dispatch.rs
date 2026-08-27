@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long to wait for a VM to boot before giving up on a job.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -55,6 +55,12 @@ const CANCEL_POLL: Duration = Duration::from_secs(15);
 /// Bounded well under the job timeout so one runaway step cannot consume the
 /// whole job budget and leave later steps no time at all.
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Guest timeout for `tar -czf` of a `ci/upload-artifact` path. Packing is
+/// guest CPU against a local disk — a few seconds per hundred megabytes — and
+/// is separate from reading the result out, which is the slow part and gets
+/// the rest of the step's budget.
+const ARTIFACT_PACK_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Where the submitted tree lands, and where steps run, when the `vm:` block
 /// does not say. Matches the daemon's own default mount.
@@ -1760,7 +1766,7 @@ impl Dispatcher {
         }
         // The TTL is what the VM boots with next time — `start` counts it from
         // then — and it honors the workflow's own `ttl_seconds` when that is
-        // longer than `CI_VM_TTL_SECONDS`, for the reason apps.yml gives: a
+        // longer than `CI_VM_TTL_SECONDS`, for the reason app-obs.yml gives: a
         // build longer than the default must not be reaped mid-compile by a
         // runner whose daemon is too old to have its TTL renewed.
         let idle_ttl = idle_pool_ttl(plan.vm.ttl_seconds, self.config.heyvm.vm_ttl);
@@ -1770,7 +1776,7 @@ impl Dispatcher {
         // Parked, not left running. A pooled VM used to idle *running* until
         // the daemon's TTL reaped it, which made the warm cache a matter of
         // cadence: the next push had to land inside the TTL — an hour by
-        // default, four for apps.yml — or it booted a blank machine and paid
+        // default, four for app-obs.yml — or it booted a blank machine and paid
         // the full cold build. Every gap longer than that, which for a repo
         // pushed to a few times a day is most of them, was cold. Stopped, the
         // VM keeps its rootfs and its cache disk (the daemon removes those on
@@ -2092,11 +2098,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     .as_deref()
                     .unwrap_or(DEFAULT_WORKDIR),
             );
-            let timeout = step
-                .timeout_minutes
-                .map(|m| Duration::from_secs(m * 60))
-                .unwrap_or(DEFAULT_STEP_TIMEOUT)
-                .min(plan.timeout);
+            let timeout = step_timeout(step, plan);
 
             // The exec is raced against a cancellation watch. The boundary
             // check above stops anything *after* a cancelled step; this stops
@@ -2228,7 +2230,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
         step: &Step,
         ctx: &Context,
         sid: &str,
-        _log_path: &std::path::Path,
+        log_path: &std::path::Path,
     ) -> Result<String, DispatchError> {
         let with = |k: &str| step.with.get(k).map(|v| ctx.substitute(v));
 
@@ -2245,58 +2247,91 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 // can write `${{ ci.branch }}` into it.
                 let description = with("description").filter(|d| !d.trim().is_empty());
 
-                // Read out of the guest through exec and base64, the same way
-                // the source went in — the daemon's file routes address a
-                // host-side mount, not the VM.
+                // Packed to a file in the guest, then read out through exec
+                // and base64 the same way the source went in — the daemon's
+                // file routes address a host-side mount, not the VM. Read out
+                // in chunks, each under its own guest timeout and the whole
+                // under the step's: one exec for the whole tarball met one
+                // fixed 600-second ceiling, which the app-lb artifact fit
+                // under and the app-obs one — two binaries carrying arrow and
+                // parquet — did not. See `Vm::download_file` for the transfer
+                // and the guest-side details it has to get right.
+                //
+                // `tar` from the working directory, so the archive holds
+                // `dist/...` rather than an absolute path. The tarball is named
+                // for the step so a redelivered job overwrites its own file
+                // rather than a neighbour's, and it is removed win or lose.
                 let workdir = plan
                     .vm
                     .working_directory
                     .as_deref()
                     .unwrap_or(DEFAULT_WORKDIR);
-                // Three details, each learned the hard way against a real guest:
-                //
-                // - `base64` without `-w0`, because `-w` is GNU-only and a
-                //   busybox image would reject it. The wrapping is stripped
-                //   here instead.
-                // - **A trailing newline is mandatory.** The firecracker serial
-                //   path frames a command's output with newline-delimited
-                //   markers, so output that ends mid-line never matches the end
-                //   marker and the operation hangs in `running` forever. `-w0`
-                //   emits exactly one unterminated line, which is the worst
-                //   possible case.
-                // - `tar` from the working directory, so the archive holds
-                //   `dist/...` rather than an absolute path.
-                let script = format!(
-                    "cd {} && tar -czf - {} | base64; echo",
-                    shell_quote(workdir),
-                    shell_quote(&path)
-                );
-                let out = vm
+                let tarball = format!("/tmp/{sid}.artifact.tar.gz");
+                let budget = step_timeout(step, plan);
+                let started = Instant::now();
+                let pack = vm
                     .exec(
                         &format!("{sid}.a"),
-                        &script,
+                        &format!(
+                            "cd {} && tar -czf {} {} && wc -c < {}",
+                            shell_quote(workdir),
+                            shell_quote(&tarball),
+                            shell_quote(&path),
+                            shell_quote(&tarball)
+                        ),
                         &HashMap::new(),
-                        Duration::from_secs(600),
+                        ARTIFACT_PACK_TIMEOUT.min(budget),
                     )
                     .await?;
-                if !out.succeeded() {
+                if !pack.succeeded() {
                     return Err(DispatchError::Artifact(format!(
-                        "collecting {path:?} exited {}: {}",
-                        out.exit_code,
-                        out.combined().trim()
+                        "packing {path:?} exited {}: {}",
+                        pack.exit_code,
+                        pack.combined().trim()
                     )));
                 }
-                use base64::Engine;
-                let encoded: String = out
+                let packed: u64 = pack
                     .combined()
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect();
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(encoded.as_bytes())
-                    .map_err(|e| {
-                        DispatchError::Artifact(format!("the guest returned unreadable data: {e}"))
-                    })?;
+                    .split_whitespace()
+                    .last()
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(0);
+                self.store
+                    .append_log(
+                        sid,
+                        log_path,
+                        &format!(
+                            "[ci] packed {path:?} into {packed} bytes; reading it out of the \
+                             guest in {} chunks of up to {} bytes, with {:?} of the step's \
+                             budget left\n",
+                            packed.div_ceil(crate::vm::DOWNLOAD_CHUNK),
+                            crate::vm::DOWNLOAD_CHUNK,
+                            budget.saturating_sub(started.elapsed())
+                        ),
+                    )
+                    .await?;
+                let read = vm
+                    .download_file(
+                        &format!("{sid}.a"),
+                        &tarball,
+                        budget.saturating_sub(started.elapsed()),
+                    )
+                    .await;
+                // Cleanup is best effort and never the reported error: what
+                // matters is whether the bytes arrived.
+                if let Err(e) = vm
+                    .exec(
+                        &format!("{sid}.ar"),
+                        &format!("rm -f {}", shell_quote(&tarball)),
+                        &HashMap::new(),
+                        Duration::from_secs(60),
+                    )
+                    .await
+                {
+                    tracing::warn!(step = sid, error = %e, "could not remove the packed artifact");
+                }
+                let bytes = read?;
+                let transfer = started.elapsed();
 
                 let run = self.store.get_run(&msg.run_id).await?;
                 let aref = crate::artifacts::ArtifactRef {
@@ -2316,7 +2351,8 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     .record_artifact(&msg.run_id, &msg.job_id, &name, &stored)
                     .await?;
                 Ok(format!(
-                    "[ci] stored artifact {name:?} ({} bytes) in the {} sink as {}\n",
+                    "[ci] stored artifact {name:?} ({} bytes) in the {} sink as {} — \
+                     read out of the guest in {transfer:.0?}\n",
                     stored.size_bytes, stored.sink, stored.uri
                 ))
             }
@@ -3446,6 +3482,17 @@ fn split_outputs(out: &ExecOutput, step_id: &str) -> (String, Value) {
     (before.trim_end().to_string(), Value::Object(map))
 }
 
+/// A step's ceiling: its own `timeout-minutes`, else the default, and never
+/// past the job's. The same number bounds a `run:` step's exec and a built-in
+/// action's transfers, so a slow artifact fails as the step's timeout rather
+/// than as some constant of its own.
+fn step_timeout(step: &Step, plan: &JobPlan) -> Duration {
+    step.timeout_minutes
+        .map(|m| Duration::from_secs(m * 60))
+        .unwrap_or(DEFAULT_STEP_TIMEOUT)
+        .min(plan.timeout)
+}
+
 /// Single-quote a value for `sh`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -3603,10 +3650,12 @@ impl DispatchError {
             "Read-only file system",
             // EIO: the virtio device refused the read or write outright.
             "Input/output error",
-            // An upload whose end-to-end hash check failed: every chunk exec
+            // A transfer whose end-to-end hash check failed: every chunk exec
             // exited 0 and the assembled file still holds different bytes.
             // See `VmError::UploadCorrupted` — the guest acknowledged writes
-            // it did not keep, which no ext4 errno ever surfaces.
+            // it did not keep, which no ext4 errno ever surfaces — and its
+            // mirror `VmError::DownloadCorrupted`, a guest handing back bytes
+            // other than the ones it hashed.
             "sha256 mismatch",
         ]
         .iter()

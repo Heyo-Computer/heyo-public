@@ -107,6 +107,28 @@ const TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// against a real guest rather than an argument from arithmetic.
 const UPLOAD_CHUNK: usize = 28 * 1024;
 
+/// Raw bytes per download exec. See [`Vm::download_file`] for the shape of
+/// the transfer this sizes.
+///
+/// The bound on an upload is the guest's argv limit; a download has none of
+/// that — its payload is the exec's *output*, and nothing in the guest caps a
+/// line count. What bounds a chunk here is time: on the firecracker path every
+/// byte of output crosses the emulated serial console, and one chunk has to
+/// fit under [`DOWNLOAD_CHUNK_TIMEOUT`] on the slowest guest that is still
+/// healthy. 1 MiB raw is ~1.4 MiB of base64, ~18k wrapped lines; and it keeps
+/// a 40 MiB artifact to ~40 execs, each a POST plus a few polls over the iroh
+/// tunnel — a minute or two of overhead against a transfer that takes longer
+/// than that anyway.
+pub const DOWNLOAD_CHUNK: u64 = 1024 * 1024;
+
+/// Guest timeout for one download chunk.
+///
+/// Generous against the chunk: a chunk that needs all of it is a console
+/// moving ~5 KiB/s, which is a broken VM, not a big artifact. The point of
+/// chunking is that the artifact's *size* never meets a fixed ceiling — each
+/// exec is bounded by this, and the whole transfer by the caller's budget.
+const DOWNLOAD_CHUNK_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// One line of a VM's own log, as `GET /sandboxes/{id}/logs` returns it.
 ///
 /// Re-declared rather than imported: the daemon's `LogEntry` lives in
@@ -967,6 +989,162 @@ impl Vm {
         }
     }
 
+    /// Read a file out of the guest, in chunks, through exec and base64.
+    ///
+    /// The mirror of [`Vm::upload_bytes`], for the same reason: the daemon's
+    /// file routes address a host-side mount, not the VM, so exec is the only
+    /// channel that reaches a guest path. The bytes come back the slow way —
+    /// on firecracker each one crosses the emulated serial console — which is
+    /// why this is chunked at all. One exec for the whole file meets one fixed
+    /// guest timeout, and past some size the file simply cannot fit under it.
+    /// That was `ci/upload-artifact` at a flat 600 seconds: it held the app-lb
+    /// tarball and timed out on app-obs's, whose two binaries carry arrow and
+    /// parquet. Chunked, each exec is bounded by [`DOWNLOAD_CHUNK_TIMEOUT`]
+    /// whatever the file's size, and the whole transfer by `budget` — the
+    /// step's remaining time, so a genuinely enormous artifact fails as the
+    /// step's timeout, with the chunk count in the message, not as a
+    /// mysterious daemon-side kill.
+    ///
+    /// Three details of the guest side, each learned against a real image:
+    ///
+    /// - `dd` rather than `tail -c +N | head -c M`, because busybox `dd` takes
+    ///   `bs=`, `skip=` and `count=` exactly as coreutils does. Its byte
+    ///   statistics go to stderr, and the daemon folds stderr into the output
+    ///   stream, so they are sent to /dev/null before they can land in the
+    ///   base64.
+    /// - `base64` without `-w0`: `-w` is GNU-only, and the firecracker serial
+    ///   path frames a command's output with newline-delimited markers, so
+    ///   output that ends mid-line never matches the end marker and the
+    ///   operation hangs in `running` forever. The trailing `echo` is that
+    ///   newline; the wrapping is stripped here.
+    /// - The size and hash are taken before the first byte moves, so a file
+    ///   that changes under the transfer is caught by the final check rather
+    ///   than shipped torn.
+    ///
+    /// Every chunk is checked for length and the assembled file against the
+    /// hash the guest reports, so a corrupting channel is a named error at the
+    /// layer that caused it — [`VmError::DownloadCorrupted`] — rather than an
+    /// artifact that fails to untar on somebody else's machine.
+    pub async fn download_file(
+        &self,
+        operation_prefix: &str,
+        path: &str,
+        budget: Duration,
+    ) -> Result<Vec<u8>, VmError> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+
+        let deadline = Instant::now() + budget;
+        let quoted = shell_single_quote(path);
+        let fail = |chunk: usize, of: usize, detail: String| VmError::DownloadFailed {
+            sandbox: self.id.clone(),
+            path: path.to_string(),
+            chunk,
+            of,
+            detail,
+        };
+        // What one exec may take: its own cap, or what is left of the budget.
+        // `None` once the budget is spent, so the loop stops with a message
+        // naming the budget instead of handing the guest a one-second timeout.
+        let slice = |cap: Duration| {
+            let left = deadline.saturating_duration_since(Instant::now());
+            (left >= Duration::from_secs(1)).then(|| cap.min(left))
+        };
+
+        let Some(timeout) = slice(Duration::from_secs(120)) else {
+            return Err(fail(0, 0, format!("no time left in the {budget:?} budget")));
+        };
+        let stat = self
+            .exec(
+                &format!("{operation_prefix}.ds"),
+                &format!(
+                    "f={quoted}; [ -f \"$f\" ] || {{ echo \"$f: no such file\"; exit 1; }}; \
+                     printf 'size=%s\\n' \"$(wc -c < \"$f\" | tr -d ' ')\"; \
+                     sha256sum \"$f\" 2>/dev/null || echo 'sha256=unavailable'"
+                ),
+                &HashMap::new(),
+                timeout,
+            )
+            .await?;
+        let text = stat.combined();
+        if !stat.succeeded() {
+            return Err(fail(0, 0, format!("could not stat it: {}", text.trim())));
+        }
+        let (size, expected) = parse_download_stat(&text).map_err(|d| fail(0, 0, d))?;
+        if expected.is_none() {
+            // 127 territory: an image without coreutils. The transfer stands,
+            // unverified, as an upload does in the same image.
+            tracing::warn!(sandbox = %self.id, path, "download not verified: the guest has no sha256sum");
+        }
+
+        let of = usize::try_from(size.div_ceil(DOWNLOAD_CHUNK)).unwrap_or(usize::MAX);
+        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        for i in 0..of {
+            let want = usize::try_from((size - i as u64 * DOWNLOAD_CHUNK).min(DOWNLOAD_CHUNK))
+                .unwrap_or(usize::MAX);
+            let Some(timeout) = slice(DOWNLOAD_CHUNK_TIMEOUT) else {
+                return Err(fail(
+                    i,
+                    of,
+                    format!(
+                        "the {budget:?} budget for the transfer ran out with {} of {size} bytes read",
+                        bytes.len()
+                    ),
+                ));
+            };
+            let out = self
+                .exec(
+                    &format!("{operation_prefix}.d{i}"),
+                    &format!(
+                        "dd if={quoted} bs={DOWNLOAD_CHUNK} skip={i} count=1 2>/dev/null | base64; echo"
+                    ),
+                    &HashMap::new(),
+                    timeout,
+                )
+                .await?;
+            if !out.succeeded() {
+                return Err(fail(i, of, out.combined().trim().to_string()));
+            }
+            let encoded: String = out
+                .combined()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let chunk = base64::engine::general_purpose::STANDARD
+                .decode(encoded.as_bytes())
+                .map_err(|e| fail(i, of, format!("the guest returned unreadable data: {e}")))?;
+            if chunk.len() != want {
+                return Err(fail(
+                    i,
+                    of,
+                    format!("expected {want} bytes, the guest returned {}", chunk.len()),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+            tracing::debug!(
+                sandbox = %self.id,
+                path,
+                chunk = i + 1,
+                of,
+                read = bytes.len(),
+                "download chunk"
+            );
+        }
+
+        if let Some(expected) = expected {
+            let actual = format!("{:x}", Sha256::digest(&bytes));
+            if actual != expected {
+                return Err(VmError::DownloadCorrupted {
+                    sandbox: self.id.clone(),
+                    path: path.to_string(),
+                    expected,
+                    actual,
+                });
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Push the TTL out so a pooled VM does not expire while it is still wanted.
     /// The VM's own logs — console, stdout and stderr as the daemon collected
     /// them — rendered as text.
@@ -1392,6 +1570,27 @@ pub enum VmError {
         expected: String,
         actual: String,
     },
+    /// A chunk of a [`Vm::download_file`] did not come back: the exec failed,
+    /// the payload was not base64, or it was the wrong length. `chunk` and
+    /// `of` are both zero when it was the size-and-hash probe that failed.
+    DownloadFailed {
+        sandbox: String,
+        path: String,
+        chunk: usize,
+        of: usize,
+        detail: String,
+    },
+    /// Every chunk came back the right length and the assembled file still
+    /// hashes to something other than what the guest reported for it. The
+    /// reading is the same as [`VmError::UploadCorrupted`]'s, in the other
+    /// direction: the channel or the guest's filesystem is handing back bytes
+    /// it does not hold, and `indicates_guest_corruption` treats it the same.
+    DownloadCorrupted {
+        sandbox: String,
+        path: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl VmError {
@@ -1483,8 +1682,68 @@ impl fmt::Display for VmError {
                  guest reports {actual}) — the exec channel or the guest \
                  filesystem corrupted the data"
             ),
+            Self::DownloadFailed {
+                sandbox,
+                path,
+                chunk,
+                of,
+                detail,
+            } => {
+                if *of == 0 {
+                    write!(
+                        f,
+                        "reading {path} out of {sandbox} failed before the first chunk: {detail}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "reading {path} out of {sandbox} failed on chunk {} of {of}: {detail}",
+                        chunk + 1
+                    )
+                }
+            }
+            Self::DownloadCorrupted {
+                sandbox,
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "reading {path} out of {sandbox} completed, but the bytes received are \
+                 not the ones the guest holds (sha256 mismatch: guest reports \
+                 {expected}, received {actual}) — the exec channel or the guest \
+                 filesystem corrupted the data"
+            ),
         }
     }
+}
+
+/// The size and sha256 a [`Vm::download_file`] probe printed.
+///
+/// `size=` is the line the probe writes itself; the hash is wherever
+/// `sha256sum` put it, found by shape rather than position so a guest that
+/// prefixes its output with something (a login banner leaking through the
+/// serial path, a `dd`-style note) does not break the parse. `None` for the
+/// hash is an image without `sha256sum`, which the probe reports as
+/// `sha256=unavailable`.
+fn parse_download_stat(text: &str) -> Result<(u64, Option<String>), String> {
+    let size = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("size="))
+        .ok_or_else(|| format!("the guest reported no size: {}", text.trim()))?
+        .trim()
+        .parse::<u64>()
+        .map_err(|e| {
+            format!(
+                "the guest reported an unreadable size: {e}: {}",
+                text.trim()
+            )
+        })?;
+    let hash = text
+        .split_whitespace()
+        .find(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_string);
+    Ok((size, hash))
 }
 
 impl std::error::Error for VmError {}
@@ -2039,6 +2298,48 @@ mod tests {
     }
 
     #[test]
+    fn a_download_probe_is_read_by_shape_not_position() {
+        let (size, hash) = parse_download_stat(
+            "size=12345\n\
+             0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  /tmp/x.tar.gz\n",
+        )
+        .unwrap();
+        assert_eq!(size, 12345);
+        assert_eq!(
+            hash.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+
+        // An image without sha256sum: the size stands, the hash does not.
+        let (size, hash) = parse_download_stat("size=0\nsha256=unavailable\n").unwrap();
+        assert_eq!((size, hash), (0, None));
+
+        // Noise before the probe's own lines is not the probe's problem.
+        let (size, _) = parse_download_stat("Welcome to the guest\n size=7 \n").unwrap();
+        assert_eq!(size, 7);
+
+        assert!(parse_download_stat("/tmp/x: no such file\n").is_err());
+        assert!(parse_download_stat("size=lots\n").is_err());
+    }
+
+    /// The chunk is a time budget, not a guest limit, so what is pinned is
+    /// that it stays in the range where the per-chunk timeout is a sane
+    /// throughput floor: at 1 MiB and 300s a chunk that times out is a
+    /// console under ~5 KiB/s. Larger chunks lower that floor toward speeds a
+    /// healthy VM actually runs at; smaller ones turn a big artifact into
+    /// hundreds of round trips.
+    #[test]
+    fn the_download_chunk_keeps_its_timeout_a_sane_floor() {
+        const _: () = assert!(DOWNLOAD_CHUNK >= 256 * 1024);
+        const _: () = assert!(DOWNLOAD_CHUNK <= 4 * 1024 * 1024);
+        const _: () = assert!(DOWNLOAD_CHUNK_TIMEOUT.as_secs() >= 120);
+        // A 40 MiB artifact — app-obs with its two arrow/parquet binaries,
+        // stripped and gzipped, is in that range — in well under a hundred
+        // execs.
+        assert!((40 * 1024 * 1024u64).div_ceil(DOWNLOAD_CHUNK) <= 80);
+    }
+
+    #[test]
     fn the_upload_chunk_stays_under_the_measured_guest_limit() {
         // The chunk size is a measured limit, not a guess: 32 KiB commands
         // succeed against a real Firecracker guest and 128 KiB returns
@@ -2279,6 +2580,49 @@ mod tests {
                 "env var did not reach the guest: {:?}",
                 out.combined()
             ));
+        }
+
+        // A download that spans several chunks, with a ragged last one, comes
+        // back byte-for-byte — the hash check inside `download_file` is what
+        // proves it, and it also proves the guest has `dd`, `base64` and
+        // `sha256sum` where `ci/upload-artifact` needs them.
+        let size = 2 * DOWNLOAD_CHUNK + 12345;
+        let out = vm
+            .exec(
+                &new_id(),
+                &format!("head -c {size} /dev/urandom > /tmp/ci-selftest.bin && echo written"),
+                &env,
+                Duration::from_secs(60),
+            )
+            .await
+            .map_err(|e| format!("writing the download fixture: {e}"))?;
+        if !out.combined().contains("written") {
+            return Err(format!("could not write the fixture: {:?}", out.combined()));
+        }
+        let started = Instant::now();
+        let bytes = vm
+            .download_file(&new_id(), "/tmp/ci-selftest.bin", Duration::from_secs(600))
+            .await
+            .map_err(|e| format!("download: {e}"))?;
+        if bytes.len() as u64 != size {
+            return Err(format!("downloaded {} bytes, wanted {size}", bytes.len()));
+        }
+        println!(
+            "downloaded {size} bytes in {:?} ({} KiB/s of raw payload)",
+            started.elapsed(),
+            size / 1024 / started.elapsed().as_secs().max(1)
+        );
+        // A missing file is a named failure, not a hang or an empty artifact.
+        match vm
+            .download_file(
+                &new_id(),
+                "/tmp/ci-selftest-missing",
+                Duration::from_secs(60),
+            )
+            .await
+        {
+            Err(VmError::DownloadFailed { of: 0, .. }) => {}
+            other => return Err(format!("a missing file downloaded as {other:?}")),
         }
 
         Ok(())

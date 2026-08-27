@@ -2,14 +2,14 @@
 
 Workflows for [`ci`](https://ci.us2.heyo.work), the heyvm-backed orchestrator.
 Each file under `.ci/workflows/` is an independent run and an independent answer
-to "did this commit pass"; a file holds one job, or several when they answer that
-question together. See [One file or two?](#one-file-or-two) below.
+to "did this commit pass"; every file here holds one job. See
+[One file or two?](#one-file-or-two) below for why.
 
 | Workflow | Job | Builds | Artifact |
 | --- | --- | --- | --- |
 | `codegraph.yml` | `release` | `codegraph` | `codegraph` — binary, `SHA256SUMS`, `BUILD-INFO` |
-| `apps.yml` | `app-lb` | `app-lb`, `heyctl` | `app-lb` — both binaries, `app-lb.conf`, `SHA256SUMS`, `BUILD-INFO` |
-| `apps.yml` | `app-obs` | `app-obs`, `app-obs-dump` | `app-obs` — both binaries, `app-obs.conf`, `SHA256SUMS`, `BUILD-INFO` |
+| `app-lb.yml` | `release` | `app-lb`, `heyctl` | `app-lb` — both binaries, `app-lb.conf`, `SHA256SUMS`, `BUILD-INFO` |
+| `app-obs.yml` | `release` | `app-obs`, `app-obs-dump` | `app-obs` — both binaries, `app-obs.conf`, `SHA256SUMS`, `BUILD-INFO` |
 | `ci.yml` | `release` | `ci` | `ci` — binary, `ci.conf`, `migrations/`, `SHA256SUMS`, `BUILD-INFO` |
 
 The other six crates here (`artifacts`, `computer`, `heyosecret`,
@@ -27,37 +27,40 @@ queue, so the self-reference costs less than it looks like it should.
 
 ## One file or two?
 
-`codegraph.yml` is one buildable thing in one file. `apps.yml` is two, and the
-split is worth understanding before you copy either shape.
+One buildable thing per file, and one job per file. `app-lb.yml` and
+`app-obs.yml` used to be two jobs of one `apps.yml`, on the theory that the load
+balancer and the observability service it feeds are one deployed thing and "did
+the platform build" deserves one run page. It was the wrong trade, and the
+reasons are worth knowing before you put two jobs in one file here:
 
-Put jobs in **one file** when they answer one question. `app-lb` and `app-obs`
-are the load balancer and the observability service it feeds; "did the platform
-build" is a sentence somebody says, so one run page is the right place to read
-it. Put them in **separate files** when the answers are independent —
-`codegraph` passing or failing tells you nothing about the platform.
+- **A shared run page is a shared log.** app-obs is the slowest and most
+  fault-prone build in the repository, and every one of its failures sat on a
+  page under a 75-minute app-lb build. Debugging one thing meant scrolling past
+  another.
+- **Ordering became a tax.** The two jobs were pinned to one host, so the file
+  ran app-obs `needs: [app-lb]` to keep two big builds off the same cores at
+  once. Every attempt to reproduce an app-obs fault therefore waited for app-lb
+  first. A `needs` cannot cross files, so the split gives that ordering up —
+  a commit touching both now runs both side by side, and each is slower for
+  it — in exchange for `git submit --only app-obs` running one build alone.
+- **Two-level gating is a footgun.** A multi-job file gates on `paths:` and
+  again on each job's `if: changed(...)`, and the second list has to repeat the
+  shared image and the workflow file or editing the Dockerfile starts the
+  workflow and skips every job in it. One job per file needs only `paths:`.
 
-Sharing a file must not mean sharing a rebuild, so `apps.yml` gates twice:
+What the two files still share is `.ci/image/apps/`, because their system
+requirements are the same set, and a second Dockerfile would mean a second
+10-to-20-minute image build on every runner for byte-identical contents. Every
+field under `vm.build` — Dockerfile, context, `size_mb` — must stay equal in
+both files, because those are what the image is named by. They get separate
+warm VM pools regardless: the pool fingerprint includes `size_class`,
+`disk_size_gb` and `cache_key_files`, and those differ. The workflow and job
+names are *not* in the fingerprint, so the rename did not retire anybody's
+warm VM.
 
-- `on: submit: paths:` decides whether the workflow runs at all.
-- each job's `if: changed(...)` decides whether that job runs.
-
-A commit touching only `app-obs/` starts the workflow, skips the `app-lb` job,
-and the run still goes green — a run of nothing but skipped jobs is a success.
-`changed()` runs the same glob matcher as `paths:`, so a job's guard and the
-workflow's filter cannot disagree about what a pattern covers, and both are true
-when the change set is unknown.
-
-One thing to watch when copying this: each job's `if:` has to list the shared
-image and the workflow file alongside its own subtree. Without that, editing the
-Dockerfile starts the workflow and then skips every job in it — the one change
-that must rebuild everything.
-
-The two jobs share `.ci/image/apps/` because their system requirements are the
-same set, and a second Dockerfile would mean a second 10-to-20-minute image
-build on every runner for byte-identical contents. They still get separate warm
-VM pools: the pool fingerprint includes `cache_key_files`, and those differ.
-Both `vm.build.size_mb` values must stay equal, because that number is part of
-the hash that names the image.
+Put jobs in one file only when they genuinely answer one question *and* one
+would never be run without the other — a build and the test of that build,
+say. Independent binaries get independent files.
 
 ## Installing what these build
 
@@ -74,7 +77,7 @@ supervisor programs into `/etc/supervisor/conf.d`, and `ci`'s migrations into
 sh .ci/install.sh --list            # what the store has, and what each thing is
 sh .ci/install.sh --dry-run         # fetch and verify, install nothing
 sh .ci/install.sh app-lb            # just one
-sh .ci/install.sh --ref ci-apps-019fca…-app-lb-app-lb app-lb   # roll back
+sh .ci/install.sh --ref ci-app-lb-019fca…-release-app-lb app-lb   # roll back
 PREFIX=~/.local SUPERVISOR_DIR= sh .ci/install.sh   # unprivileged, no units
 ```
 
@@ -85,9 +88,14 @@ because the store's tag charset has no `/`:
 ci-<workflow>-<run>-<job>-<name>
 ```
 
-which for the table above is `ci-apps-<run>-app-lb-app-lb`,
-`ci-apps-<run>-app-obs-app-obs`, `ci-ci-<run>-release-ci` and
-`ci-codegraph-<run>-release-codegraph`. The run id is `%012x-%08x` — epoch
+which for the table above is `ci-app-lb-<run>-release-app-lb`,
+`ci-app-obs-<run>-release-app-obs`, `ci-ci-<run>-release-ci` and
+`ci-codegraph-<run>-release-codegraph`. The workflow name being in the tag
+means renaming a workflow starts a new series: app-lb and app-obs were built
+by `apps.yml` until 2026-08-27, and their older builds are tagged
+`ci-apps-<run>-app-lb-app-lb` and `ci-apps-<run>-app-obs-app-obs`. The script
+falls back to those only while nothing has been published under the new
+name, and `--ref` takes either. The run id is `%012x-%08x` — epoch
 milliseconds in hex, then a sequence — so it is fixed-width and zero-padded, and
 **sorting the tags lexicographically sorts them chronologically**. That is the
 one load-bearing coincidence in the whole script, so it matches the exact hex
@@ -140,8 +148,8 @@ direction, not a bug; `${{ ci.changes_reason }}` says which case a run is in.
 
 ## Adding a workflow
 
-Copy `codegraph.yml` for a standalone crate, or a job out of `apps.yml` if the
-new binary belongs with something already built here. Then change these:
+Copy `codegraph.yml`, or `app-obs.yml` if the build is big enough to need a
+log file and an in-guest timeout. Then change these:
 
 1. **`paths:`** — the crate's subtree, **plus every path dependency of it**.
    Cargo does not record a path dep's contents in the lockfile, so a sibling

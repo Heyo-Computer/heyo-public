@@ -20,7 +20,7 @@
 #               Off by default: when to bounce a running orchestrator is not a
 #               decision an installer should make.
 #   --ref TAG   Install this exact tag instead of the newest, for one app.
-#               A rollback: `--ref ci-apps-019f…-app-lb-app-lb app-lb`.
+#               A rollback: `--ref ci-app-lb-019f…-release-app-lb app-lb`.
 #
 # ## Environment
 #
@@ -41,8 +41,8 @@
 # `ci/src/artifacts.rs`), because the store's tag charset has no `/`. For the
 # four things these workflows publish that is:
 #
-#   ci-apps-<run>-app-lb-app-lb          app-lb + heyctl
-#   ci-apps-<run>-app-obs-app-obs        app-obs + app-obs-dump
+#   ci-app-lb-<run>-release-app-lb       app-lb + heyctl
+#   ci-app-obs-<run>-release-app-obs     app-obs + app-obs-dump
 #   ci-ci-<run>-release-ci               ci + its migrations
 #   ci-codegraph-<run>-release-codegraph codegraph
 #
@@ -253,8 +253,8 @@ artifact_description() {
 # `workflow job artifact-name`, matching the table in .ci/README.md.
 app_coords() {
   case "$1" in
-    app-lb)    echo "apps app-lb app-lb" ;;
-    app-obs)   echo "apps app-obs app-obs" ;;
+    app-lb)    echo "app-lb release app-lb" ;;
+    app-obs)   echo "app-obs release app-obs" ;;
     ci)        echo "ci release ci" ;;
     codegraph) echo "codegraph release codegraph" ;;
     *) return 1 ;;
@@ -273,17 +273,55 @@ app_bins() {
   esac
 }
 
+# Where an app's builds were tagged before its workflow was renamed:
+# `workflow job`, or nothing. app-lb and app-obs were two jobs of one
+# `apps.yml` until 2026-08-27, and every build from before then is under that
+# name in the store.
+legacy_coords() {
+  case "$1" in
+    app-lb)    echo "apps app-lb" ;;
+    app-obs)   echo "apps app-obs" ;;
+    *) return 1 ;;
+  esac
+}
+
 # The newest tag for an app, or empty.
 #
 # The run id's exact widths are in the pattern deliberately: they are what makes
 # `sort` chronological, so a tag that does not have them must not be considered
 # rather than silently sorting somewhere arbitrary.
+#
+# The current coordinates first, and the legacy ones only when nothing has been
+# published under the current ones yet. Not merged and sorted together: the
+# legacy series ended when the current one began, so any current build is newer
+# than every legacy one, and once one exists the fallback is never wanted.
 newest_tag() {
   wf="$1"; job="$2"; name="$3"
+  tag="$(newest_tag_at "$wf" "$job" "$name")"
+  if [ -z "$tag" ] && legacy="$(legacy_coords "$4")"; then
+    # shellcheck disable=SC2086
+    set -- $legacy "$name"
+    tag="$(newest_tag_at "$1" "$2" "$3")"
+  fi
+  printf '%s\n' "$tag"
+}
+
+newest_tag_at() {
   all_tags \
-    | grep -E "^ci-${wf}-[0-9a-f]{12}-[0-9a-f]{8}-${job}-${name}\$" \
+    | grep -E "^ci-${1}-[0-9a-f]{12}-[0-9a-f]{8}-${2}-${3}\$" \
     | sort \
     | tail -1
+}
+
+# Every tag of an app, current series and legacy alike — what `--list` counts
+# and what `--ref` may name.
+every_tag() {
+  all_tags | grep -E "^ci-${1}-[0-9a-f]{12}-[0-9a-f]{8}-${2}-${3}\$" || true
+  if legacy="$(legacy_coords "$4")"; then
+    # shellcheck disable=SC2086
+    set -- $legacy "$3"
+    all_tags | grep -E "^ci-${1}-[0-9a-f]{12}-[0-9a-f]{8}-${2}-${3}\$" || true
+  fi
 }
 
 # ---- list -------------------------------------------------------------------
@@ -299,7 +337,7 @@ if [ "$DO_LIST" = 1 ]; then
     coords="$(app_coords "$app")" || { warn "unknown app '$app'"; continue; }
     # shellcheck disable=SC2086
     set -- $coords
-    tag="$(newest_tag "$1" "$2" "$3")"
+    tag="$(newest_tag "$1" "$2" "$3" "$app")"
     if [ -z "$tag" ]; then
       printf '  %-10s %s\n' "$app" "(nothing published)" >&2
       continue
@@ -307,7 +345,7 @@ if [ "$DO_LIST" = 1 ]; then
     printf '  %-10s %s\n' "$app" "$tag" >&2
     desc="$(artifact_description "$tag" || true)"
     [ -n "$desc" ] && printf '  %-10s %s\n' "" "$desc" >&2
-    count="$(all_tags | grep -cE "^ci-${1}-[0-9a-f]{12}-[0-9a-f]{8}-${2}-${3}\$" || true)"
+    count="$(every_tag "$1" "$2" "$3" "$app" | wc -l | tr -d ' ')"
     printf '  %-10s %s\n' "" "$count build(s) kept; --ref <tag> installs an older one" >&2
   done
   exit 0
@@ -341,7 +379,7 @@ for app in $APPS; do
   if [ -n "$PIN_REF" ]; then
     tag="$PIN_REF"
   else
-    tag="$(newest_tag "$wf" "$job" "$name")"
+    tag="$(newest_tag "$wf" "$job" "$name" "$app")"
   fi
   [ -n "$tag" ] || die "no published build of $app found in $ART_URL (looked for ci-$wf-<run>-$job-$name)"
 
