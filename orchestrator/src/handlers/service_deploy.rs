@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::auth;
 use crate::cloud_client::{self, CreateDeploymentRequest, MountConfig, PortMapping};
 use crate::db;
+use crate::handlers::service_discovery;
 use crate::AppState;
 
 const DEFAULT_HEALTH_TIMEOUT_SECONDS: u64 = 180;
@@ -150,6 +151,11 @@ pub struct ServiceDeploymentState {
     pub previous_metadata: Option<serde_json::Value>,
     pub route: Option<ServiceRouteRequest>,
     pub updated_at: Option<DateTime<Utc>>,
+    /// Versioned endpoint membership consumed by app-lb. This is assembled from
+    /// the normalized discovery tables when state is read; legacy scalar fields
+    /// remain for existing service-route and maintenance consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<service_discovery::ServiceDiscoverySnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,6 +329,12 @@ async fn deploy_service_inner(
 ) -> Result<ServiceDeployResponse> {
     let service_id = sanitize_service_id(&request.service_id)?;
     let mut current_state = read_service_state(&state, &service_id).await?;
+    let previous_discovery = service_discovery::read_snapshot(&service_id).await?;
+    let excluded_backend_server_ids = if request.retire_previous {
+        Vec::new()
+    } else {
+        service_discovery::active_backend_server_ids(&service_id).await?
+    };
     let deployment_id = request
         .deployment_id
         .clone()
@@ -339,12 +351,6 @@ async fn deploy_service_inner(
     } else {
         request.ports.clone()
     };
-    let health_port = request
-        .port_mappings
-        .first()
-        .map(|mapping| mapping.container)
-        .or_else(|| ports.first().copied())
-        .unwrap_or(8080);
     let resolved_secrets = resolve_env_refs(&state, &mut request).await?;
 
     record_service_deployment_event(
@@ -409,6 +415,7 @@ async fn deploy_service_inner(
                 setup_hooks: request.setup_hooks.clone(),
                 size_class: request.size_class.clone(),
                 ttl_seconds: Some(request.ttl_seconds.unwrap_or(0)),
+                excluded_backend_server_ids,
                 metadata: request.metadata.clone(),
             },
         ),
@@ -460,6 +467,7 @@ async fn deploy_service_inner(
 
     let previous_state = current_state.clone();
     let mut route_updated = false;
+    let mut discovery_updated = false;
 
     let deployment_result = async {
         if create_response.status == "failed" {
@@ -527,8 +535,6 @@ async fn deploy_service_inner(
         let mut backend_url = resolve_candidate_backend_url(
             &state,
             &deployment_id,
-            &create_response,
-            health_port,
             request.health_timeout_seconds,
         )
         .await?;
@@ -604,6 +610,27 @@ async fn deploy_service_inner(
         let previous_deployment_id = current_state.active_deployment_id.clone();
         let previous_archive_id = current_state.active_archive_id.clone();
         let previous_metadata = Some(current_state.active_metadata.clone());
+        let mut previous_deployment_ids: Vec<String> = previous_discovery
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.deployment_id != deployment_id)
+                    .map(|endpoint| endpoint.deployment_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if previous_deployment_ids.is_empty() {
+            if let Some(previous) = previous_deployment_id
+                .as_ref()
+                .filter(|previous| *previous != &deployment_id)
+            {
+                previous_deployment_ids.push(previous.clone());
+            }
+        }
+        previous_deployment_ids.sort();
+        previous_deployment_ids.dedup();
 
         if let Some(route) = request.route.clone() {
             let effective_backend_url = route
@@ -639,6 +666,43 @@ async fn deploy_service_inner(
             .await?;
         }
 
+        record_service_deployment_event(
+            &state,
+            &deployment_id,
+            &service_id,
+            "discovery-publish",
+            "running",
+            "Publishing the healthy service endpoint set.",
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let discovery = service_discovery::publish_healthy_endpoint(
+            &service_id,
+            &deployment_id,
+            create_response.backend_server_id.as_deref(),
+            &backend_url,
+            request.retire_previous,
+        )
+        .await?;
+        discovery_updated = true;
+        record_service_deployment_event(
+            &state,
+            &deployment_id,
+            &service_id,
+            "discovery-published",
+            "running",
+            "Healthy service endpoint set published.",
+            None,
+            Some(json!({
+                "version": discovery.version,
+                "endpointCount": discovery.endpoints.len(),
+            })),
+            None,
+        )
+        .await?;
+
         current_state = ServiceDeploymentState {
             service_id: service_id.clone(),
             active_deployment_id: Some(deployment_id.clone()),
@@ -655,6 +719,7 @@ async fn deploy_service_inner(
             previous_metadata,
             route: request.route.clone(),
             updated_at: Some(Utc::now()),
+            discovery: Some(discovery),
         };
         record_service_deployment_event(
             &state,
@@ -682,30 +747,34 @@ async fn deploy_service_inner(
         )
         .await?;
 
-        let previous_retired = match (request.retire_previous, previous_deployment_id.as_deref()) {
-            (true, Some(previous)) if request.retire_previous_async => {
+        let previous_retired = if request.retire_previous && request.retire_previous_async {
+            for previous in previous_deployment_ids {
                 schedule_previous_service_deployment_retirement(
                     state.clone(),
                     service_id.clone(),
                     deployment_id.clone(),
-                    previous.to_string(),
-                    request.drain_seconds,
-                    request.delete_previous,
-                );
-                false
-            }
-            (true, Some(previous)) => {
-                retire_previous_service_deployment(
-                    &state,
-                    &service_id,
-                    &deployment_id,
                     previous,
                     request.drain_seconds,
                     request.delete_previous,
-                )
-                .await
+                );
             }
-            _ => false,
+            false
+        } else if request.retire_previous {
+            let mut retired = !previous_deployment_ids.is_empty();
+            for previous in previous_deployment_ids {
+                retired &= retire_previous_service_deployment(
+                    &state,
+                    &service_id,
+                    &deployment_id,
+                    &previous,
+                    request.drain_seconds,
+                    request.delete_previous,
+                )
+                .await;
+            }
+            retired
+        } else {
+            false
         };
 
         let response = ServiceDeployResponse {
@@ -759,6 +828,8 @@ async fn deploy_service_inner(
                 &request,
                 &previous_state,
                 route_updated,
+                discovery_updated,
+                previous_discovery.as_ref(),
             )
             .await;
             match diagnostics {
@@ -1323,6 +1394,16 @@ async fn retire_previous_service_deployment(
     drain_seconds: u64,
     delete_previous: bool,
 ) -> bool {
+    if let Err(error) =
+        service_discovery::mark_endpoint_draining(service_id, previous_deployment_id).await
+    {
+        warn!(
+            service_id,
+            previous = previous_deployment_id,
+            "failed to persist service endpoint drain intent: {error:#}"
+        );
+        return false;
+    }
     let metadata = json!({
         "previousDeploymentId": previous_deployment_id,
         "drainSeconds": drain_seconds,
@@ -1428,6 +1509,14 @@ async fn finish_previous_service_deployment_retirement(
     delete_previous: bool,
 ) -> bool {
     if !delete_previous {
+        if let Err(error) = service_discovery::remove_endpoint(service_id, previous_deployment_id).await {
+            warn!(
+                service_id,
+                previous = previous_deployment_id,
+                "previous deployment stopped but its discovery membership could not be removed: {error:#}"
+            );
+            return false;
+        }
         let _ = record_service_deployment_event(
             state,
             deployment_id,
@@ -1476,6 +1565,14 @@ async fn finish_previous_service_deployment_retirement(
             Some(error_message),
         )
         .await;
+        return false;
+    }
+    if let Err(error) = service_discovery::remove_endpoint(service_id, previous_deployment_id).await {
+        warn!(
+            service_id,
+            previous = previous_deployment_id,
+            "previous deployment deleted but its discovery membership could not be removed: {error:#}"
+        );
         return false;
     }
     let _ = record_service_deployment_event(
@@ -1842,6 +1939,8 @@ async fn compensate_failed_candidate(
     request: &ServiceDeployRequest,
     previous_state: &ServiceDeploymentState,
     route_updated: bool,
+    discovery_updated: bool,
+    previous_discovery: Option<&service_discovery::ServiceDiscoverySnapshot>,
 ) {
     warn!(
         service_id,
@@ -1849,6 +1948,19 @@ async fn compensate_failed_candidate(
         route_updated,
         "service deployment failed after candidate creation; attempting compensation"
     );
+
+    if discovery_updated {
+        if let Err(error) =
+            service_discovery::restore_snapshot(service_id, previous_discovery).await
+        {
+            warn!(
+                service_id,
+                deployment_id,
+                "failed to restore previous service discovery membership; leaving candidate running for manual recovery: {error:#}"
+            );
+            return;
+        }
+    }
 
     if route_updated {
         match (
@@ -1995,28 +2107,11 @@ async fn wait_for_backend_url(
 async fn resolve_candidate_backend_url(
     state: &AppState,
     deployment_id: &str,
-    create_response: &cloud_client::CreateDeploymentResponse,
-    health_port: u16,
     timeout_seconds: u64,
 ) -> Result<String> {
-    if let Some(backend_sandbox_id) = create_response.backend_sandbox_id.as_deref() {
-        if !state.config.backend_api_url.trim().is_empty() {
-            match cloud_client::sandbox_internal_url(state, backend_sandbox_id, health_port).await {
-                Ok(response) if !response.url.trim().is_empty() => return Ok(response.url),
-                Ok(_) => warn!(
-                    deployment_id,
-                    backend_sandbox_id,
-                    "backend internal URL response was empty; falling back to cloud proxy URL"
-                ),
-                Err(error) => warn!(
-                    deployment_id,
-                    backend_sandbox_id,
-                    "failed to resolve backend internal URL; falling back to cloud proxy URL: {error:#}"
-                ),
-            }
-        }
-    }
-
+    // Cloud owns backend placement, so it must resolve the URL through the
+    // deployment record. Calling one process-wide mvm-ctrl URL here can ask the
+    // wrong host as soon as service replicas span more than one backend.
     wait_for_backend_url(state, deployment_id, timeout_seconds).await
 }
 
@@ -2177,14 +2272,19 @@ async fn write_traefik_service_route(
 async fn read_service_state(state: &AppState, service_id: &str) -> Result<ServiceDeploymentState> {
     let service_id = sanitize_service_id(service_id)?;
 
-    if let Some(service_state) = read_service_state_from_db(&service_id).await? {
+    if let Some(mut service_state) = read_service_state_from_db(&service_id).await? {
+        service_state.discovery = service_discovery::read_snapshot(&service_id).await?;
         return Ok(service_state);
     }
 
     let path = service_state_path(state, &service_id)?;
     match tokio::fs::read(&path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse service state {}", path.display())),
+        Ok(bytes) => {
+            let mut service_state: ServiceDeploymentState = serde_json::from_slice(&bytes)
+                .with_context(|| format!("failed to parse service state {}", path.display()))?;
+            service_state.discovery = service_discovery::read_snapshot(&service_id).await?;
+            Ok(service_state)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ServiceDeploymentState {
             service_id,
             active_metadata: json!({}),
@@ -2256,6 +2356,7 @@ async fn read_service_state_from_db(service_id: &str) -> Result<Option<ServiceDe
             .transpose()
             .context("failed to parse service deployment route")?,
         updated_at: Some(updated_at.with_timezone(&Utc)),
+        discovery: None,
     }))
 }
 

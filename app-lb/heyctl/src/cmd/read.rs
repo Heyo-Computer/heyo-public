@@ -793,7 +793,11 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
         if d.spec.is_site() {
             "site (files served off disk)".to_string()
         } else if d.spec.is_static() {
-            "static (proxy_pass to fixed upstreams)".to_string()
+            if d.spec.discovery.is_some() {
+                "static (proxy_pass to discovered upstreams)".to_string()
+            } else {
+                "static (proxy_pass to fixed upstreams)".to_string()
+            }
         } else {
             let driver = d.spec.vm.as_ref().map(|v| v.driver.clone()).unwrap_or_default();
             format!("vm (managed {driver} pool)")
@@ -829,6 +833,9 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
 
     if d.spec.is_static() {
         output::section("Upstreams");
+        if let Some(discovery) = &d.spec.discovery {
+            output::field("Discovery service", &discovery.service_id);
+        }
         for u in &d.spec.upstreams {
             println!("  {u}");
         }

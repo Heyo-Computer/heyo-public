@@ -128,11 +128,18 @@ pub struct DeploymentSpec {
     pub scaling: ScalingPolicy,
     pub health: HealthCheck,
     pub upstreams: Vec<String>,
+    pub discovery: Option<DiscoverySpec>,
     pub build: Option<BuildSpec>,
     pub artifact: Option<ArtifactSpec>,
     pub update: Option<UpdateSpec>,
     pub auth: Option<AuthGate>,
     pub site: Option<SiteSpec>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DiscoverySpec {
+    pub service_id: String,
 }
 
 /// A static site: a directory on the app-lb host, served straight off disk.
@@ -150,7 +157,7 @@ impl DeploymentSpec {
     /// Forwards to fixed upstreams. **Not** true for a site, which has no
     /// backends of any kind.
     pub fn is_static(&self) -> bool {
-        !self.upstreams.is_empty()
+        !self.upstreams.is_empty() || self.discovery.is_some()
     }
 
     /// Serves files off disk rather than proxying anywhere.
@@ -179,6 +186,14 @@ impl DeploymentSpec {
             return site.root.clone();
         }
         if self.is_static() {
+            if let Some(discovery) = &self.discovery {
+                let upstreams = self.upstreams.join(",");
+                return if upstreams.is_empty() {
+                    format!("discovery:{}", discovery.service_id)
+                } else {
+                    format!("discovery:{} ({upstreams})", discovery.service_id)
+                };
+            }
             return self.upstreams.join(",");
         }
         match &self.vm {

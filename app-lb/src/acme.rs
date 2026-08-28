@@ -839,6 +839,7 @@ mod tests {
             scaling: Default::default(),
             health: Default::default(),
             upstreams: vec!["127.0.0.1:8080".into()],
+            discovery: None,
             build: None,
             artifact: None,
             site: None,

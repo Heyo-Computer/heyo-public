@@ -24,7 +24,10 @@
     "upstreams": [
       "10.0.0.4:8080",
       "10.0.0.5:8080"
-    ]
+    ],
+    "discovery": {
+      "service_id": "cloud"
+    }
   },
   "kind": "static",
   "desired_replicas": 0,

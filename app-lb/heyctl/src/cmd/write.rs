@@ -116,6 +116,10 @@ pub struct CreateDeploymentArgs {
     /// Repeatable; mutually exclusive with the VM-pool flags.
     #[arg(long = "upstream", value_name = "ADDR", help_heading = "Static upstreams")]
     pub upstreams: Vec<String>,
+    /// Orchestrator service whose healthy endpoint set supplies the upstreams.
+    /// May be combined with --upstream to provide a last-known bootstrap set.
+    #[arg(long, value_name = "SERVICE", help_heading = "Static upstreams")]
+    pub discovery_service: Option<String>,
 
     // Build source. Recording it here does not build anything — `heyctl
     // build <name>` does that — so a deployment can be created against an
@@ -274,7 +278,8 @@ fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
              by exec/shell"
         );
     }
-    if args.no_route && !args.upstreams.is_empty() {
+    let static_backend = !args.upstreams.is_empty() || args.discovery_service.is_some();
+    if args.no_route && static_backend {
         bail!(
             "--no-route leaves nothing able to reach this deployment: a static \
              (proxy_pass) deployment has no exec/shell door, so the proxy is its \
@@ -293,7 +298,7 @@ fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
         || !args.env.is_empty();
 
     if let Some(root) = &args.site_root {
-        if vm_flags_used || !args.upstreams.is_empty() {
+        if vm_flags_used || static_backend {
             bail!(
                 "--site-root makes this a static site, which has no VM template and no \
                  upstreams — it serves files off disk. Drop the other backend flags."
@@ -328,21 +333,27 @@ fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
         }
     }
 
-    if !args.upstreams.is_empty() {
+    if static_backend {
         if vm_flags_used {
             bail!(
-                "--upstream makes this a static (proxy_pass) deployment, which has no VM \
-                 template — drop the VM flags, or drop --upstream"
+                "--upstream/--discovery-service makes this a static (proxy_pass) deployment, \
+                 which has no VM template — drop the VM flags, or drop the static backend flags"
             );
         }
         spec.insert(
             "upstreams".into(),
             Value::Array(args.upstreams.iter().cloned().map(Value::String).collect()),
         );
+        if let Some(service_id) = args.discovery_service.as_deref() {
+            if service_id.trim().is_empty() {
+                bail!("--discovery-service must not be empty");
+            }
+            spec.insert("discovery".into(), serde_json::json!({ "service_id": service_id }));
+        }
     } else {
         let port = args.port.context(
             "a managed deployment needs --port (the guest port to proxy to); \
-             use --upstream instead for a static proxy_pass deployment",
+             use --upstream or --discovery-service instead for a static proxy_pass deployment",
         )?;
         let mut vm = Map::new();
         vm.insert("driver".into(), Value::String(args.driver.to_ascii_lowercase()));
@@ -387,10 +398,10 @@ fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
     }
 
     if args.repo.is_some() || args.build_store.is_some() {
-        if !args.upstreams.is_empty() {
+        if static_backend {
             bail!(
                 "--repo and --build-store build a guest image, which a static (proxy_pass) \
-                 deployment does not have — drop --upstream, or drop the build flags"
+                 deployment does not have — drop the static backend flags, or drop the build flags"
             );
         }
         let mut build = Map::new();
@@ -411,7 +422,7 @@ fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
 
     let scaling = args.scaling.patch();
     if !scaling.is_empty() {
-        if !args.upstreams.is_empty() {
+        if static_backend {
             bail!("a static (proxy_pass) deployment is not autoscaled, so the scaling flags do nothing");
         }
         spec.insert("scaling".into(), Value::Object(scaling));

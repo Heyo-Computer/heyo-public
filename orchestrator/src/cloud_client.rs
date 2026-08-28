@@ -81,6 +81,7 @@ pub(crate) struct CreateDeploymentRequest {
     pub setup_hooks: Option<Vec<String>>,
     pub size_class: String,
     pub ttl_seconds: Option<u64>,
+    pub excluded_backend_server_ids: Vec<String>,
     pub metadata: Option<Value>,
 }
 
@@ -179,6 +180,7 @@ struct CreateDeploymentHttpRequest {
     setup_hooks: Option<Vec<String>>,
     size_class: String,
     ttl_seconds: Option<u64>,
+    excluded_backend_server_ids: Vec<String>,
     metadata: Option<Value>,
 }
 
@@ -195,15 +197,6 @@ pub(crate) struct CreateDeploymentResponse {
     #[serde(default)]
     pub backend_sandbox_id: Option<String>,
     pub status: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SandboxInternalUrlResponse {
-    pub sandbox_id: String,
-    pub ip: String,
-    pub port: u16,
-    pub url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -322,6 +315,7 @@ pub(crate) async fn create_deployment(
         setup_hooks: request.setup_hooks.clone(),
         size_class: request.size_class.clone(),
         ttl_seconds: request.ttl_seconds,
+        excluded_backend_server_ids: request.excluded_backend_server_ids.clone(),
         metadata: request.metadata.clone(),
     })
     .send()
@@ -402,36 +396,6 @@ pub(crate) async fn upsert_service_route(
         .json::<UpsertServiceRouteResponse>()
         .await
         .context("Failed to parse cloud service route API response")
-}
-
-pub(crate) async fn sandbox_internal_url(
-    state: &AppState,
-    backend_sandbox_id: &str,
-    port: u16,
-) -> Result<SandboxInternalUrlResponse> {
-    let response = authorized_request(
-        state,
-        state.http_client.get(format!(
-            "{}/sandboxes/{}/internal-url?port={}",
-            state.config.backend_api_url.trim_end_matches('/'),
-            backend_sandbox_id,
-            port,
-        )),
-    )
-    .send()
-    .await
-    .context("Failed to call backend sandbox internal URL API")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Backend sandbox internal URL API returned {}: {}", status, body);
-    }
-
-    response
-        .json::<SandboxInternalUrlResponse>()
-        .await
-        .context("Failed to parse backend sandbox internal URL API response")
 }
 
 pub(crate) async fn presign_archive_upload(

@@ -19,6 +19,7 @@ mod auth;
 mod autoscale;
 mod config;
 mod deployment;
+mod discovery;
 mod disks;
 mod dns;
 mod federated;
@@ -255,6 +256,8 @@ fn main() {
     }
 
     let cfg = config_from_env();
+    let discovery_cfg = discovery::DiscoveryConfig::from_env()
+        .unwrap_or_else(|e| panic!("invalid discovery configuration: {e}"));
 
     // Fail fast on a gate that can't enforce anything: asking to protect the
     // admin API while giving it no credential would silently leave it open.
@@ -860,7 +863,7 @@ fn main() {
     let mut proxy_svc = pingora_proxy::http_proxy_service(
         &server.configuration,
         LbProxy::new(
-            registry,
+            registry.clone(),
             metrics,
             challenges,
             auth,
@@ -887,6 +890,12 @@ fn main() {
 
     let autoscaler_handle = server.add_service(autoscaler_svc);
     server.add_service(admin_svc);
+    if let Some(discovery_cfg) = discovery_cfg {
+        server.add_service(background_service(
+            "discovery",
+            discovery::DiscoveryWatcher::new(discovery_cfg, registry),
+        ));
+    }
     // Log shipping, when `APP_LB_OBS_URL` is set. Pointedly *not* a dependency of
     // the proxy handle below: whether this service is running, and whether app-obs
     // answers it, must make no difference to serving traffic.

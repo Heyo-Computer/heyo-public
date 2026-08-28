@@ -26,7 +26,8 @@ const KNOWN = {
   common: {
     DeploymentStatus: ["spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
-    DeploymentSpec: ["id", "namespace", "routes", "vm", "scaling", "health", "upstreams", "build", "artifact", "site", "update", "auth", "feed"],
+    DeploymentSpec: ["id", "namespace", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed"],
+    DiscoverySpec: ["service_id"],
     RouteRule: ["host", "host_suffix", "path_prefix"],
     VmSpec: ["driver", "image", "port", "start_command", "size_class", "disk_size_gb", "working_directory", "env_vars", "setup_hooks", "open_ports", "mounts", "ttl_seconds"],
     MountSpec: ["path", "store", "ref", "auth", "strip_components", "read_only", "digest"],

@@ -2632,6 +2632,10 @@ pub struct DeploymentSpec {
     /// Mutually exclusive with `vm`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstreams: Vec<String>,
+    /// Orchestrator service whose healthy endpoint set supplies this static
+    /// deployment's upstream membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoverySpec>,
     /// Where `vm.image` is built from: a git repo and a Dockerfile. Optional —
     /// a deployment can go on naming a prebuilt image — and only valid on a
     /// managed deployment, since a static one has no image to build.
@@ -2670,6 +2674,11 @@ pub struct DeploymentSpec {
     /// carries what a spec explicitly asked it to. See [`FeedSpec`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed: Option<FeedSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DiscoverySpec {
+    pub service_id: String,
 }
 
 /// The namespace a spec gets when it names none. One word, so an installation
@@ -2877,6 +2886,8 @@ pub enum SpecError {
     BothBackendKinds,
     /// Neither a `vm` template nor a static `upstreams` list was set.
     NoBackendKind,
+    EmptyDiscoveryServiceId,
+    DiscoveryWithOtherBackend,
     /// A static upstream address is not a valid `host:port`.
     BadUpstream(String),
     /// A static deployment declared a `build` block; there is no image to build.
@@ -3142,6 +3153,11 @@ impl std::fmt::Display for SpecError {
                 f,
                 "a deployment must set exactly one of `vm` (managed VM pool) or \
                  `upstreams` (static proxy_pass)"
+            ),
+            Self::EmptyDiscoveryServiceId => write!(f, "discovery.service_id must not be empty"),
+            Self::DiscoveryWithOtherBackend => write!(
+                f,
+                "discovery supplies a static upstream set and cannot be combined with `vm` or `site`"
             ),
             Self::BadUpstream(a) => write!(
                 f,
@@ -3517,7 +3533,7 @@ impl DeploymentSpec {
     pub fn backend(&self) -> Backend {
         if self.site.is_some() {
             Backend::Site
-        } else if !self.upstreams.is_empty() {
+        } else if !self.upstreams.is_empty() || self.discovery.is_some() {
             Backend::Upstreams
         } else {
             Backend::Vm
@@ -3600,7 +3616,7 @@ impl DeploymentSpec {
 
         // Exactly one backend kind.
         if let Some(site) = &self.site {
-            if self.vm.is_some() || !self.upstreams.is_empty() {
+            if self.vm.is_some() || !self.upstreams.is_empty() || self.discovery.is_some() {
                 return Err(SpecError::SiteWithOtherBackend);
             }
             site.validate()?;
@@ -3626,7 +3642,16 @@ impl DeploymentSpec {
             return Ok(());
         }
 
-        match (&self.vm, self.upstreams.is_empty()) {
+        if let Some(discovery) = &self.discovery {
+            if discovery.service_id.trim().is_empty() {
+                return Err(SpecError::EmptyDiscoveryServiceId);
+            }
+            if self.vm.is_some() || self.site.is_some() {
+                return Err(SpecError::DiscoveryWithOtherBackend);
+            }
+        }
+
+        match (&self.vm, self.upstreams.is_empty() && self.discovery.is_none()) {
             (Some(_), false) => return Err(SpecError::BothBackendKinds),
             (None, true) => return Err(SpecError::NoBackendKind),
             _ => {}
@@ -3851,6 +3876,7 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: vec![],
+            discovery: None,
             build: None,
             artifact: None,
             site: None,
@@ -3901,6 +3927,7 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
+            discovery: None,
             build: None,
             artifact: None,
             site: None,

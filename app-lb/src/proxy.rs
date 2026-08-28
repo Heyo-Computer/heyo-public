@@ -1094,6 +1094,7 @@ mod tests {
             scaling,
             health: HealthCheck::default(),
             upstreams: vec![],
+            discovery: None,
             build: None,
             artifact: None,
             site: None,

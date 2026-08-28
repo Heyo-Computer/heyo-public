@@ -288,6 +288,7 @@ export interface DeploymentSpec {
   scaling?: ScalingPolicy;
   health?: HealthCheck;
   upstreams?: string[];
+  discovery?: DiscoverySpec;
   build?: BuildSpec;
   artifact?: ArtifactSpec;
   site?: SiteSpec;
@@ -296,6 +297,11 @@ export interface DeploymentSpec {
   feed?: FeedSpec;
   /** Anything app-lb sent that this build has no name for. */
   [extra: string]: unknown;
+}
+
+/** Orchestrator-owned endpoint membership for a static deployment. */
+export interface DiscoverySpec {
+  service_id: string;
 }
 
 /**
