@@ -651,6 +651,8 @@ mod tests {
 
     fn deployment(scaling: ScalingPolicy) -> Deployment {
         Deployment::new(DeploymentSpec {
+            account_id: None,
+            user_id: None,
             namespace: "default".into(),
             feed: None,
             id: "demo".into(),
@@ -689,6 +691,8 @@ mod tests {
     /// A static (proxy_pass) deployment with the given upstreams.
     fn static_deployment(upstreams: &[&str]) -> Deployment {
         Deployment::new(DeploymentSpec {
+            account_id: None,
+            user_id: None,
             namespace: "default".into(),
             feed: None,
             id: "proxy".into(),

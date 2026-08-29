@@ -82,6 +82,8 @@ pub fn router(
         // Admin-only like the other state-changing routes: cancelling stops
         // somebody's build.
         .route("/runs/{run_id}/cancel", post(cancel_run))
+        .route("/runs/{run_id}/rerun", post(rerun_run))
+        .route("/runs/{run_id}/rerun-failed", post(rerun_failed_jobs))
         .route("/runs/{run_id}/jobs/{job_key}", get(job_page))
         // `/runners` was this page's name when there was one network to show.
         // Kept because it is in people's history and in the README of a running
@@ -429,9 +431,11 @@ async fn run_page(
                 }
             }
 
+            let reruns = state.store.reruns_of(&run_id).await.unwrap_or_default();
             pages::run_page(
                 &chrome(&state, &headers, who.as_ref()),
                 &run,
+                &reruns,
                 &jobs,
                 &artifacts,
                 &vm_logs,
@@ -476,6 +480,64 @@ async fn cancel_run(
     // Back to the run, which now shows what happened — rather than a flash on a
     // page the browser would re-post on refresh.
     axum::response::Redirect::to(&format!("/runs/{run_id}")).into_response()
+}
+
+/// `POST /runs/{id}/rerun` — run a finished run's source again, every job.
+///
+/// The dashboard's manual trigger. There is no "run this workflow" button
+/// with a branch picker because this service never clones: the only source it
+/// can run is one a submit already sent, and the run page is where that source
+/// is. The new run gets `rerun_of` pointing here, and the browser lands on it.
+async fn rerun_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    rerun(state, run_id, headers, false).await
+}
+
+/// `POST /runs/{id}/rerun-failed` — the same, carrying every job that succeeded
+/// over as finished and scheduling only the rest.
+async fn rerun_failed_jobs(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    rerun(state, run_id, headers, true).await
+}
+
+async fn rerun(
+    state: AppState,
+    run_id: String,
+    headers: HeaderMap,
+    failed_only: bool,
+) -> axum::response::Response {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+    match state
+        .dispatcher
+        .rerun(&run_id, failed_only, who.as_ref())
+        .await
+    {
+        Ok(submitted) => {
+            for w in &submitted.warnings {
+                tracing::info!("re-run of {run_id}: {w}");
+            }
+            // One workflow file was named, so one run came back; the redirect
+            // is to it. A `--only` that matched a file under two workflow
+            // objects' globs could start two, in which case the first is
+            // shown and the runs page lists the rest.
+            match submitted.run_ids.first() {
+                Some(new_id) => {
+                    axum::response::Redirect::to(&format!("/runs/{new_id}")).into_response()
+                }
+                None => axum::response::Redirect::to(&format!("/runs/{run_id}")).into_response(),
+            }
+        }
+        Err(e) => page_error(&state, &headers, who.as_ref(), &e.to_string()),
+    }
 }
 
 async fn job_page(

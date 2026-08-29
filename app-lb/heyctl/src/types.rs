@@ -123,6 +123,11 @@ impl VmStatus {
 #[serde(default)]
 pub struct DeploymentSpec {
     pub id: String,
+    /// The heyo account this deployment's VMs are metered to, and the user
+    /// who registered it. Set by the managed service; absent on a
+    /// self-hosted app-lb.
+    pub account_id: Option<String>,
+    pub user_id: Option<String>,
     pub routes: Vec<RouteRule>,
     pub vm: Option<VmSpec>,
     pub scaling: ScalingPolicy,

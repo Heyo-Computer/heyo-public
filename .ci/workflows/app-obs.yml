@@ -114,7 +114,17 @@ jobs:
     # ceiling at 105 minutes and died with nothing in the log but the timeout —
     # the daemon discards a timed-out command's captured output. The budget now
     # assumes the wipe-then-cold-build case is a build to finish, not a fault.
-    timeout-minutes: 150
+    #
+    # 210, raised from 150 after the 2026-08-27 run: the workflow split had
+    # touched the shared image, so the pool fingerprint changed and the build
+    # was cold on an empty cache disk (32 KB used at step start), and the
+    # in-guest 7800s ceiling fired with cargo still inside datafusion — on a VM
+    # that reported the 16 GB an `xlarge` has, with 6 jobs. The log did not
+    # say how many CPUs it had; the Build step prints that now. The cheap
+    # recovery is the run page's "Re-run failed jobs": the VM is parked with
+    # its cache disk, so the second attempt relinks what the first compiled.
+    # The budget below is for the cold case that has no first attempt.
+    timeout-minutes: 210
     steps:
       # Identical in intent to app-lb's guard — see there for why a warm VM
       # needs this even though init.sh runs the same check at boot.
@@ -177,13 +187,20 @@ jobs:
         run: |
           df -P / "$CARGO_TARGET_DIR"
           free -m || true
+          # The CPU count is the other half of CARGO_BUILD_JOBS, and a class
+          # mismatch the daemon did not report shows up here as a small number
+          # next to a long build. The load average says whether anything else
+          # — app-lb's build on the same host — was competing for them.
+          echo "cpus: $(nproc)  load: $(cat /proc/loadavg)"
           log="$CARGO_TARGET_DIR/app-obs-build.log"
           rc=0
-          timeout -k 60 7800 env CARGO_TERM_PROGRESS_WHEN=never             cargo build --release --locked --bins > "$log" 2>&1 || rc=$?
+          timeout -k 60 11400 env CARGO_TERM_PROGRESS_WHEN=never             cargo build --release --locked --bins > "$log" 2>&1 || rc=$?
           if [ "$rc" -ne 0 ]; then
             if [ "$rc" -eq 124 ]; then
-              echo "=== the in-guest timeout killed the build after 7800s ==="
+              echo "=== the in-guest timeout killed the build after 11400s ==="
+              echo "(the cache disk keeps what was compiled; 'Re-run failed jobs' on the run page continues from it)"
             fi
+            echo "cpus: $(nproc)  load: $(cat /proc/loadavg)  uptime: $(cut -d' ' -f1 /proc/uptime)s"
             echo "=== build failed (exit $rc); last 100 log lines ==="
             tail -100 "$log" 2>/dev/null || echo "(no log at $log)"
             echo "=== guest kernel log tail ==="
@@ -194,9 +211,11 @@ jobs:
             exit 1
           fi
           tail -5 "$log"
-        # 135, raised from 105 with the job ceiling: the wipe-then-cold-build
-        # case has to fit. The in-guest 7800s above must stay under this.
-        timeout-minutes: 135
+        # 195, raised from 135 with the job ceiling (see there): the
+        # wipe-then-cold-build case has to fit. The in-guest 11400s above must
+        # stay under this, and this under the job's 210 and the VM's
+        # `ttl_seconds` of 14400.
+        timeout-minutes: 195
 
       # `app-obs` takes no arguments either — it reads `APP_OBS_*` from the
       # environment and runs until killed — so it gets the same link check that

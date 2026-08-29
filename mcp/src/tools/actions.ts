@@ -32,6 +32,14 @@ export function actionTools(clients: Clients): Tool[] {
       handler: async () => json(await clients.applb({ path: "/deployments" })),
     },
     {
+      name: "applb_get_deployment",
+      description:
+        "One deployment in full: its spec, desired and ready replica counts, and every VM " +
+        "with its health. The record to read before scaling, updating or deleting it.",
+      schema: { id: z.string() },
+      handler: async (a) => json(await clients.applb({ path: `/deployments/${enc(String(a.id))}` })),
+    },
+    {
       name: "applb_metrics",
       description:
         "app-lb's live metrics: per-deployment pool counters, request stats, and create/boot " +
@@ -55,6 +63,18 @@ export function actionTools(clients: Clients): Tool[] {
     },
 
     // ---- app-lb lifecycle ---------------------------------------------
+    {
+      name: "applb_create_deployment",
+      description:
+        "Register a deployment from a full spec (`id`, `routes`, and one of `vm`, `upstreams` " +
+        "or `site`; optional `scaling`, `health`, `build`). Through the managed service the " +
+        "namespace is the configured one and need not be given. A POST whose `id` already " +
+        "exists REPLACES that deployment and recycles its VM pool — use applb_get_deployment " +
+        "first if unsure, and applb_scale for a scaling-only change.",
+      schema: { spec: z.record(z.unknown()).describe("the deployment spec app-lb expects") },
+      handler: async (a) =>
+        json(await clients.applb({ method: "POST", path: "/deployments", body: a.spec })),
+    },
     {
       name: "applb_scale",
       description:

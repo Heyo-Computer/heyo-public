@@ -283,6 +283,14 @@ export interface DeploymentSpec {
    * deployments in it, and the event feed is kept per namespace.
    */
   namespace?: string;
+  /**
+   * The heyo account this deployment's VMs are metered to, and the user who
+   * registered it. The managed service stamps both from the caller's
+   * credential (the namespace's owning account) and ignores what the body
+   * says; a self-hosted app-lb keeps what it was sent, usually nothing.
+   */
+  account_id?: string;
+  user_id?: string;
   routes: RouteRule[];
   vm?: VmSpec;
   scaling?: ScalingPolicy;
@@ -388,6 +396,8 @@ export interface AutoscaleCounts {
   cold_start_hits: number;
   cold_start_timeouts: number;
   boot_timeouts: number;
+  create_failures: number;
+  last_create_error?: string;
 }
 
 export interface DeploymentMetrics {
@@ -453,6 +463,8 @@ export interface DeploymentView {
   id: string;
   /** Absent for the default namespace. */
   namespace?: string;
+  /** The account this deployment's VMs are metered to, when app-lb knows it. */
+  account_id?: string;
   kind: DeploymentKind;
   upstreams: string[];
   /** Whether at least one data-plane route points at this deployment. */
@@ -476,6 +488,11 @@ export interface ObsStats {
   healthy: boolean;
 }
 
+export interface DaemonSnapshot {
+  reachable: boolean;
+  last_error?: string;
+}
+
 export interface MetricsResponse {
   generated_at: number;
   uptime_secs: number;
@@ -485,10 +502,92 @@ export interface MetricsResponse {
   obs?: ObsStats;
   /** Absent when `APP_LB_SIEM=0`. */
   security?: SecuritySummary;
+  daemon: DaemonSnapshot;
   deployments: DeploymentView[];
   /** How many matched before `limit`/`offset`, so you can page. */
   matched: number;
   tracked_deployments: number;
+}
+
+// -- host disks ------------------------------------------------------------
+
+export type DiskState = "running" | "stopped" | "orphan" | "unknown";
+export type DiskPartKind = "data" | "rootfs" | "mount" | "snapshot" | "other";
+export type ArchiveStatus = "running" | "succeeded" | "failed";
+
+export interface DiskPart {
+  kind: DiskPartKind;
+  path: string;
+  bytes: number;
+  apparent_bytes: number;
+  modified_at: number;
+}
+
+export interface ArchiveRecord {
+  uri: string;
+  at: number;
+  bytes: number;
+}
+
+export interface DiskInfo {
+  sandbox_id: string;
+  name?: string;
+  deployment?: string;
+  state: DiskState;
+  claimed: boolean;
+  retain: boolean;
+  note?: string;
+  bytes: number;
+  apparent_bytes: number;
+  modified_at: number;
+  expires_at?: number;
+  held_by?: string;
+  archived?: ArchiveRecord;
+  parts: DiskPart[];
+  roots: string[];
+}
+
+export interface ArchiveView {
+  id: string;
+  sandbox_id: string;
+  uri: string;
+  started_at: number;
+  finished_at?: number;
+  status: ArchiveStatus;
+  bytes: number;
+  expected_bytes: number;
+  error?: string;
+  purged?: boolean;
+}
+
+export interface DiskTotals {
+  disks: number;
+  bytes: number;
+  apparent_bytes: number;
+  running: number;
+  stopped: number;
+  orphan: number;
+  retained: number;
+  expiring_now: number;
+  reclaimable_bytes: number;
+}
+
+export interface DiskInventory {
+  complete: boolean;
+  incomplete_reason?: string;
+  data_dir: string;
+  tmp_dir: string;
+  ttl_secs: number;
+  sweep_secs: number;
+  archive_enabled: boolean;
+  archive_on_expire: boolean;
+  archive_target?: string;
+  free_bytes?: number;
+  filesystem_bytes?: number;
+  orphan_ttl_secs: number;
+  totals: DiskTotals;
+  disks: DiskInfo[];
+  archives: ArchiveView[];
 }
 
 // -- security --------------------------------------------------------------

@@ -1068,6 +1068,8 @@ mod tests {
 
     fn deployment(scaling: ScalingPolicy) -> Arc<Deployment> {
         Arc::new(Deployment::new(DeploymentSpec {
+            account_id: None,
+            user_id: None,
             namespace: "default".into(),
             feed: None,
             id: "demo".into(),

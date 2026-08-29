@@ -76,6 +76,8 @@ pre.log:empty::after { content: "(no output)"; color: var(--text-muted); }
 .repo h3 { margin: 0 0 2px; }
 .repo .head { display: flex; align-items: baseline; gap: var(--gap-2); }
 .repo .head form { margin-left: auto; }
+/* Side-by-side buttons under a run's heading: cancel, run again, re-run failed. */
+.actions { display: flex; gap: var(--gap-2); flex-wrap: wrap; align-items: center; }
 
 /* A freshly minted token, shown exactly once. Dashed and in the warning colour
    because that is the point: this is the only time anyone will see it, and the
@@ -1420,6 +1422,7 @@ pub fn runs_page(
 pub fn run_page(
     chrome: &Chrome,
     run: &Run,
+    reruns: &[Run],
     jobs: &[JobRow],
     artifacts: &[ArtifactRow],
     vm_logs: &[(String, Option<String>)],
@@ -1440,6 +1443,24 @@ pub fn run_page(
                 @if let Some(d) = run.duration() { " · " (human_duration(d)) }
                 " · " code .mono { (run.workflow_path) }
             }
+            // Lineage, both ways: what this run re-plays, and what re-played it.
+            @if let Some(of) = &run.rerun_of {
+                p .meta {
+                    "Re-run of " a href={ "/runs/" (of) } { code .mono { (of) } }
+                    @if jobs.iter().any(|j| j.carried_from.is_some()) {
+                        " — failed jobs only; the rest were carried over"
+                    }
+                }
+            }
+            @if !reruns.is_empty() {
+                p .meta {
+                    "Re-run as "
+                    @for (i, r) in reruns.iter().enumerate() {
+                        @if i > 0 { ", " }
+                        a href={ "/runs/" (r.id) } { code .mono { (r.id) } } " " (pill(&r.status))
+                    }
+                }
+            }
             @if let Some(err) = &run.error {
                 div .banner { (err) }
             }
@@ -1452,6 +1473,27 @@ pub fn run_page(
                 p .meta {
                     "Queued jobs are dropped and running ones stop after their current \
                      step — a step already executing cannot be aborted."
+                }
+            } @else {
+                // A finished run can be run again from the source its submit
+                // sent. "Re-run failed jobs" is the one people reach for, so
+                // it is not offered on a run with nothing failed to re-run.
+                div .actions {
+                    form method="post" action={ "/runs/" (run.id) "/rerun" } {
+                        button type="submit" { "Run again" }
+                    }
+                    @if run.status != "success" {
+                        form method="post" action={ "/runs/" (run.id) "/rerun-failed" } {
+                            button type="submit" { "Re-run failed jobs" }
+                        }
+                    }
+                }
+                p .meta {
+                    "A re-run is a new run of this commit from the source this submit sent; \
+                     trigger filters do not apply, as with `git submit --only`. Re-running \
+                     failed jobs carries every job that succeeded over as finished, with its \
+                     outputs, and schedules the rest afresh — on the warm VM, where a build \
+                     that timed out picks up its cache."
                 }
             }
         }
@@ -1473,7 +1515,12 @@ pub fn run_page(
                                     td { a .row href={ "/runs/" (run.id) "/jobs/" (j.job_key) } {
                                         (j.display)
                                     } }
-                                    td { (pill(&j.status)) }
+                                    td {
+                                        (pill(&j.status))
+                                        @if j.carried_from.is_some() {
+                                            " " span .meta { "carried over" }
+                                        }
+                                    }
                                     td { (j.runner_hd_id.as_deref().unwrap_or("—")) }
                                     td .mono { (j.sandbox_id.as_deref().unwrap_or("—")) }
                                     td .mono { (job_needs(j)) }
@@ -1637,6 +1684,17 @@ pub fn job_page(
             }
             @if let Some(err) = &job.error {
                 div .banner { (err) }
+            }
+            // A carried-over job has no steps of its own, and a success with
+            // an empty step list would read as a job that did nothing.
+            @if let Some(from) = &job.carried_from {
+                div .notice {
+                    "This job did not run here. Its result and outputs were carried over from "
+                    a href={ "/runs/" (from) "/jobs/" (job.job_key) } {
+                        "the same job in run " code .mono { (from) }
+                    }
+                    " when that run's failed jobs were re-run; the steps are there."
+                }
             }
         }
 
@@ -2101,6 +2159,7 @@ mod page_tests {
             actor_email: Some("sam@sarocu.com".into()),
             status: status.into(),
             error: None,
+            rerun_of: None,
             created_at: Utc::now(),
             started_at: Some(Utc::now()),
             finished_at: Some(Utc::now()),
@@ -2124,6 +2183,7 @@ mod page_tests {
             outputs: serde_json::json!({}),
             plan: serde_json::json!({ "needs": ["build"] }),
             error: None,
+            carried_from: None,
             queued_at: Some(Utc::now()),
             started_at: Some(Utc::now()),
             finished_at: Some(Utc::now()),
@@ -2236,6 +2296,7 @@ mod page_tests {
         let html = run_page(
             &chrome(),
             &run("success"),
+            &[],
             &[job("build", "success"), job("deploy", "skipped")],
             &artifacts,
             &[],
@@ -2255,7 +2316,7 @@ mod page_tests {
     fn a_job_error_is_surfaced_on_the_run_page() {
         let mut j = job("build", "failure");
         j.error = Some("step \"Build\" exited 101".into());
-        let html = run_page(&chrome(), &run("failure"), &[j], &[], &[], Some(2)).into_string();
+        let html = run_page(&chrome(), &run("failure"), &[], &[j], &[], &[], Some(2)).into_string();
         assert!(html.contains("exited 101"), "{html}");
     }
 
@@ -2354,7 +2415,7 @@ mod page_tests {
     fn a_hostile_job_name_is_escaped() {
         let mut j = job("build", "success");
         j.display = "<img src=x onerror=alert(1)>".into();
-        let html = run_page(&chrome(), &run("success"), &[j], &[], &[], Some(2)).into_string();
+        let html = run_page(&chrome(), &run("success"), &[], &[j], &[], &[], Some(2)).into_string();
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;img"));
     }
@@ -2364,7 +2425,7 @@ mod page_tests {
     fn a_running_run_can_be_cancelled_and_a_finished_one_cannot() {
         let mut r = run("success");
         r.status = "running".into();
-        let html = run_page(&chrome(), &r, &[], &[], &[], Some(2)).into_string();
+        let html = run_page(&chrome(), &r, &[], &[], &[], &[], Some(2)).into_string();
         assert!(
             html.contains(r#"action="/runs/019fca648a6e-00000000/cancel""#),
             "{html}"
@@ -2374,9 +2435,94 @@ mod page_tests {
         for finished in ["success", "failure", "cancelled"] {
             let mut r = run(finished);
             r.status = finished.into();
-            let html = run_page(&chrome(), &r, &[], &[], &[], Some(2)).into_string();
+            let html = run_page(&chrome(), &r, &[], &[], &[], &[], Some(2)).into_string();
             assert!(!html.contains("/cancel"), "{finished}: {html}");
         }
+    }
+
+    /// The two re-run buttons are the mirror image of cancel: offered once the
+    /// run is finished, and "failed jobs" only when something failed.
+    #[test]
+    fn a_finished_run_can_be_run_again_and_a_failed_one_failed_jobs_only() {
+        let mut r = run("success");
+        r.status = "running".into();
+        let html = run_page(&chrome(), &r, &[], &[], &[], &[], Some(2)).into_string();
+        assert!(
+            !html.contains("/rerun"),
+            "a running run offers no re-run: {html}"
+        );
+
+        let html = run_page(&chrome(), &run("success"), &[], &[], &[], &[], Some(2)).into_string();
+        assert!(
+            html.contains(r#"action="/runs/019fca648a6e-00000000/rerun""#),
+            "{html}"
+        );
+        assert!(
+            !html.contains("/rerun-failed"),
+            "nothing failed to re-run: {html}"
+        );
+
+        for failed in ["failure", "cancelled"] {
+            let html = run_page(&chrome(), &run(failed), &[], &[], &[], &[], Some(2)).into_string();
+            assert!(
+                html.contains(r#"action="/runs/019fca648a6e-00000000/rerun-failed""#),
+                "{failed}: {html}"
+            );
+            assert!(html.contains("Re-run failed jobs"), "{failed}: {html}");
+        }
+    }
+
+    /// Lineage is shown in both directions, and a carried-over job says so on
+    /// the run page and on its own.
+    #[test]
+    fn a_rerun_links_its_original_and_marks_carried_over_jobs() {
+        let mut later = run("running");
+        later.id = "019fca648a6e-00000009".into();
+        later.rerun_of = Some("019fca648a6e-00000000".into());
+        let mut build = job("build", "success");
+        build.carried_from = Some("019fca648a6e-00000000".into());
+        let deploy = job("deploy", "running");
+
+        let html = run_page(
+            &chrome(),
+            &later,
+            &[],
+            &[build.clone(), deploy],
+            &[],
+            &[],
+            Some(2),
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"href="/runs/019fca648a6e-00000000""#),
+            "{html}"
+        );
+        assert!(html.contains("failed jobs only"), "{html}");
+        assert!(html.contains("carried over"), "{html}");
+
+        // The original points forward at the re-run.
+        let html = run_page(
+            &chrome(),
+            &run("failure"),
+            &[later.clone()],
+            &[],
+            &[],
+            &[],
+            Some(2),
+        )
+        .into_string();
+        assert!(html.contains("Re-run as"), "{html}");
+        assert!(
+            html.contains(r#"href="/runs/019fca648a6e-00000009""#),
+            "{html}"
+        );
+
+        let html = job_page(&chrome(), &later, &build, &[], None).into_string();
+        assert!(html.contains("did not run here"), "{html}");
+        assert!(
+            html.contains(r#"href="/runs/019fca648a6e-00000000/jobs/build""#),
+            "{html}"
+        );
     }
 
     /// The VM log is the one failure with no step log to read — a machine that
@@ -2394,6 +2540,7 @@ mod page_tests {
         let html = run_page(
             &chrome(),
             &run("failure"),
+            &[],
             &[job("build", "failure")],
             &[],
             &logs,
@@ -2415,12 +2562,12 @@ mod page_tests {
     #[test]
     fn retention_is_only_mentioned_when_it_applies() {
         let logs = [("build".to_string(), Some("boot".to_string()))];
-        let html = run_page(&chrome(), &run("success"), &[], &[], &logs, None).into_string();
+        let html = run_page(&chrome(), &run("success"), &[], &[], &[], &logs, None).into_string();
         assert!(html.contains("VM logs"));
         assert!(!html.contains("Discarded after"), "{html}");
 
         // And the section is absent entirely when no job captured one.
-        let html = run_page(&chrome(), &run("success"), &[], &[], &[], Some(2)).into_string();
+        let html = run_page(&chrome(), &run("success"), &[], &[], &[], &[], Some(2)).into_string();
         assert!(!html.contains("VM logs"), "{html}");
     }
 

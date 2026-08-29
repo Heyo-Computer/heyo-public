@@ -70,6 +70,8 @@ fn golden(name: &str, value: &impl Serialize) {
 /// deployment that cannot exist.
 fn vm_spec() -> DeploymentSpec {
     DeploymentSpec {
+        account_id: None,
+        user_id: None,
         namespace: "default".into(),
         feed: None,
         id: "sandbox".into(),
@@ -178,8 +180,22 @@ fn vm_spec() -> DeploymentSpec {
     }
 }
 
+/// A managed deployment as the *managed service* stores it: registered by a
+/// heyo customer, so app-lb stamped the namespace's owning account and the
+/// registering user onto it. The shape a billing-aware client must understand.
+fn owned_vm_spec() -> DeploymentSpec {
+    let mut s = vm_spec();
+    s.id = "sandbox-owned".into();
+    s.namespace = "team-a".into();
+    s.account_id = Some("3f7c2a1e-9b4d-4c8e-a5f6-1d2e3f4a5b6c".into());
+    s.user_id = Some("7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d".into());
+    s
+}
+
 fn site_spec() -> DeploymentSpec {
     DeploymentSpec {
+        account_id: None,
+        user_id: None,
         namespace: "default".into(),
         feed: None,
         id: "docs".into(),
@@ -229,6 +245,8 @@ fn site_spec() -> DeploymentSpec {
 
 fn static_spec() -> DeploymentSpec {
     DeploymentSpec {
+        account_id: None,
+        user_id: None,
         namespace: "default".into(),
         feed: None,
         id: "legacy".into(),
@@ -395,6 +413,7 @@ fn populated_metrics() -> crate::metrics::Metrics {
 fn deployment_status_is_stable() {
     for (name, spec) in [
         ("deployment-status-vm", vm_spec()),
+        ("deployment-status-vm-owned", owned_vm_spec()),
         ("deployment-status-site", site_spec()),
         ("deployment-status-static", static_spec()),
         ("deployment-status-artifact", artifact_spec()),
@@ -488,6 +507,7 @@ fn metrics_response_is_stable() {
             deployments: vec![DeploymentView {
                 id: spec.id.clone(),
                 namespace: "default".into(),
+                account_id: None,
                 kind: "vm",
                 upstreams: vec![],
                 routed: true,
@@ -546,6 +566,7 @@ fn a_site_view_carries_its_root_and_spa_flag() {
         &DeploymentView {
             id: "docs".into(),
             namespace: "default".into(),
+            account_id: None,
             kind: "site",
             upstreams: vec![],
             routed: true,

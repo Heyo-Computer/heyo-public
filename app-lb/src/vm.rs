@@ -16,7 +16,7 @@
 //!    `mounts` array and the four defaults the SDK would have filled in are
 //!    added here. See [`sdk_create_defaults`].
 
-use crate::config::VmSpec;
+use crate::config::{DeploymentSpec, VmSpec};
 use crate::mounts::MountStore;
 use heyo_sdk::{
     CommandResult, CommandRunOptions, HeyoClient, HeyoClientOptions, RequestOptions, Sandbox,
@@ -250,6 +250,50 @@ struct CreatedSandbox {
 /// no image would silently change operating systems.
 ///
 /// Keep this in step with `augment_create_body` in the SDK.
+/// Who a VM is metered to: the deployment's owner, as stamped on its spec by
+/// the admin API (see `DeploymentSpec::account_id`).
+///
+/// Carried to the daemon as top-level `account_id` / `user_id` on the create
+/// body, which a daemon that meters honours from a trusted caller and an older
+/// one ignores. Both optional: a self-hosted app-lb stamps nothing and sends
+/// nothing, so its create bodies are byte-for-byte what they were.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmOwner {
+    pub account_id: Option<String>,
+    pub user_id: Option<String>,
+}
+
+impl VmOwner {
+    pub fn of(spec: &DeploymentSpec) -> Self {
+        Self {
+            account_id: spec.account_id.clone(),
+            user_id: spec.user_id.clone(),
+        }
+    }
+}
+
+/// The `POST /sandbox-deploy` body for one replica: the SDK's options, the
+/// defaults it would have applied, the guest mounts, and the owner. Pure, so
+/// the wire shape is tested without a daemon.
+fn create_body(
+    options: &SandboxCreateOptions,
+    mounts: Vec<Value>,
+    owner: &VmOwner,
+) -> Result<Value, VmError> {
+    let mut body = serde_json::to_value(options).map_err(|e| VmError::BadCreateBody(e.to_string()))?;
+    sdk_create_defaults(&mut body);
+    if !mounts.is_empty() {
+        body["mounts"] = Value::Array(mounts);
+    }
+    if let Some(account) = &owner.account_id {
+        body["account_id"] = json!(account);
+    }
+    if let Some(user) = &owner.user_id {
+        body["user_id"] = json!(user);
+    }
+    Ok(body)
+}
+
 fn sdk_create_defaults(body: &mut Value) {
     let Some(map) = body.as_object_mut() else {
         return;
@@ -466,11 +510,14 @@ impl VmManager {
     /// [`crate::workspace`]. It goes **last** in the mount list, writable, so
     /// its image index on the daemon is `spec.mounts.len()`; the capture path
     /// relies on that to find the image again.
+    ///
+    /// `owner` is who the VM is metered to — see [`VmOwner`].
     pub async fn create(
         &self,
         spec: &VmSpec,
         name: String,
         workspace: Option<&Path>,
+        owner: &VmOwner,
     ) -> Result<Sandbox, VmError> {
         debug_assert!(
             matches!(spec.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm),
@@ -514,12 +561,7 @@ impl VmManager {
             }));
         }
 
-        let mut body =
-            serde_json::to_value(&options).map_err(|e| VmError::BadCreateBody(e.to_string()))?;
-        sdk_create_defaults(&mut body);
-        if !mounts.is_empty() {
-            body["mounts"] = Value::Array(mounts);
-        }
+        let body = create_body(&options, mounts, owner)?;
 
         // `POST /sandbox-deploy`, which is what `Sandbox::create` posts. It
         // answers `202` with the id of a sandbox that is still provisioning;
@@ -1367,5 +1409,47 @@ mod tests {
         assert_eq!(explicit["image"], "agent-base");
         assert_eq!(explicit["size_class"], "large");
         assert_eq!(explicit["open_ports"], json!([8080]));
+    }
+
+    /// The owner rides on the create body as top-level fields, and only when
+    /// there is one: a self-hosted app-lb's body has no such keys at all, so
+    /// nothing it sends changes.
+    #[test]
+    fn the_create_body_carries_the_owner_only_when_there_is_one() {
+        let options = SandboxCreateOptions {
+            name: Some("applb-demo-01".into()),
+            ..Default::default()
+        };
+        let unowned = create_body(&options, vec![], &VmOwner::default()).unwrap();
+        assert!(unowned.get("account_id").is_none());
+        assert!(unowned.get("user_id").is_none());
+        assert_eq!(unowned["size_class"], "small", "the SDK defaults still apply");
+
+        let owner = VmOwner {
+            account_id: Some("acc-1".into()),
+            user_id: Some("u-1".into()),
+        };
+        let owned = create_body(&options, vec![json!({"host_path": "/x"})], &owner).unwrap();
+        assert_eq!(owned["account_id"], "acc-1");
+        assert_eq!(owned["user_id"], "u-1");
+        assert_eq!(owned["mounts"], json!([{"host_path": "/x"}]));
+
+        // An account with no user — the spec was stamped by hand — is fine.
+        let half = VmOwner {
+            account_id: Some("acc-1".into()),
+            user_id: None,
+        };
+        let body = create_body(&options, vec![], &half).unwrap();
+        assert_eq!(body["account_id"], "acc-1");
+        assert!(body.get("user_id").is_none());
+
+        // ...and the owner rides straight off a spec.
+        let mut spec: DeploymentSpec = serde_json::from_value(json!({
+            "id": "web", "routes": [], "upstreams": ["127.0.0.1:1"],
+        }))
+        .unwrap();
+        assert_eq!(VmOwner::of(&spec), VmOwner::default());
+        spec.account_id = Some("acc-2".into());
+        assert_eq!(VmOwner::of(&spec).account_id.as_deref(), Some("acc-2"));
     }
 }

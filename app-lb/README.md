@@ -2578,6 +2578,32 @@ Deployment ids stay global. Two customers cannot both register `web`; the second
 gets a 403 saying the credential cannot register that deployment, which is the
 same message an out-of-namespace attempt gets, so probing does not reveal which.
 
+### Who pays
+
+Beside the scopes, the auth service names the account that owns each namespace:
+
+```json
+"namespaces": [{ "name": "team-a", "accountId": "3f7c…", "scope": "admin" }]
+```
+
+Every `POST /deployments` and `PUT /deployments/{id}` by a federated caller
+stamps that account, and the caller's user id, onto the spec as `account_id`
+and `user_id` — overriding whatever the body said, so a customer cannot bill
+its namespace to somebody else. Both ride on every VM the autoscaler creates
+for the deployment (top-level `account_id` / `user_id` on the daemon's
+`POST /sandbox-deploy`), including the replacements it boots with no caller
+present, so the sandbox is metered to the namespace's owner rather than to
+app-lb's own daemon credential. The daemon honours the fields only from a
+trusted caller: on a managed fleet `APP_LB_DAEMON_API_KEY` must be the daemon's
+internal key or a platform-admin key, or every create is refused.
+
+An operator, a local token or an ungated caller keeps what the body said —
+usually nothing. A self-hosted app-lb therefore stamps nothing and sends
+nothing; its specs and create bodies are byte-for-byte what they were. An auth
+service that predates `namespaces[]` still works: the caller's own account is
+used, with a warning, which is right for a user in one account and wrong for a
+user in several.
+
 ### Caching, and what it costs
 
 Answers are cached by the SHA-256 of the bearer for `APP_LB_AUTH_CACHE_SECS`,

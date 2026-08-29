@@ -85,6 +85,27 @@ pub struct SourceArchive {
     /// than this server keeps working by saying which one it sent.
     pub format: String,
     pub content_base64: String,
+    /// The archive already decoded. Never on the wire — a re-run sets it from
+    /// the bytes a submit stored on disk, and [`materialize`] takes it over
+    /// `content_base64` so those bytes do not go through base64 and back to
+    /// arrive where they already are.
+    #[serde(skip)]
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// What a re-run carries that a submit does not. Set only in-process by
+/// [`crate::dispatch::Dispatcher::rerun`], never by a client: the field is
+/// skipped by serde, so a payload cannot claim to be one.
+#[derive(Debug, Clone)]
+pub struct Rerun {
+    /// The finished run whose source this re-plays.
+    pub of: String,
+    /// Carry the jobs that succeeded in `of` over as finished, and schedule
+    /// only the rest. `false` runs everything again.
+    pub failed_only: bool,
+    /// What `of` recorded as its commit's changes — the same commit, so the
+    /// same answer, and every `changed()` filter decides as it did then.
+    pub changes: crate::paths::Changes,
 }
 
 /// What `git submit` posts.
@@ -124,6 +145,9 @@ pub struct SubmitRequest {
     #[serde(default)]
     pub only: Vec<String>,
     pub source: SourceArchive,
+    /// See [`Rerun`]. Absent on every real submit.
+    #[serde(skip)]
+    pub rerun: Option<Rerun>,
 }
 
 /// Whether one `--only` selector names this workflow file.
@@ -292,9 +316,12 @@ pub fn materialize(
     let format = SourceFormat::parse(&source.format)
         .ok_or_else(|| TriggerError::UnsupportedFormat(source.format.clone()))?;
 
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(source.content_base64.as_bytes())
-        .map_err(|e| TriggerError::BadArchive(format!("not valid base64: {e}")))?;
+    let bytes = match &source.bytes {
+        Some(bytes) => bytes.clone(),
+        None => base64::engine::general_purpose::STANDARD
+            .decode(source.content_base64.as_bytes())
+            .map_err(|e| TriggerError::BadArchive(format!("not valid base64: {e}")))?,
+    };
     if bytes.len() > max_bytes {
         return Err(TriggerError::ArchiveTooLarge {
             bytes: bytes.len(),
@@ -961,6 +988,7 @@ mod tests {
         SourceArchive {
             format: "tar.gz".into(),
             content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            bytes: None,
         }
     }
 
@@ -1159,6 +1187,7 @@ mod tests {
         SourceArchive {
             format: "git-bundle".into(),
             content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            bytes: None,
         }
     }
 
@@ -1286,6 +1315,7 @@ mod tests {
         let s = SourceArchive {
             format: "zip".into(),
             content_base64: String::new(),
+            bytes: None,
         };
         let err = materialize(&s, &ws, 1 << 20).unwrap_err();
         assert!(matches!(err, TriggerError::UnsupportedFormat(_)), "{err:?}");
@@ -1543,9 +1573,11 @@ mod tests {
             pusher: None,
             workflow_id: None,
             only: Vec::new(),
+            rerun: None,
             source: SourceArchive {
                 format: "tar.gz".into(),
                 content_base64: String::new(),
+                bytes: None,
             },
         };
         assert_eq!(r.branch(), "feature/x");

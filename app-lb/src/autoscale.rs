@@ -1008,7 +1008,8 @@ impl Autoscaler {
 
             let name = vm::replica_name(&d.spec.id, self.next_nonce());
             let tree = seeded.as_ref().map(|s| s.tree.as_path());
-            match self.vms.create(d.spec.vm_spec(), name, tree).await {
+            let owner = vm::VmOwner::of(&d.spec);
+            match self.vms.create(d.spec.vm_spec(), name, tree, &owner).await {
                 Ok(sandbox) => {
                     let sandbox_id = sandbox.sandbox_id().to_string();
                     if let Some(seeded) = &seeded {
@@ -1929,6 +1930,8 @@ mod tests {
 
     fn spec() -> DeploymentSpec {
         DeploymentSpec {
+            account_id: None,
+            user_id: None,
             namespace: "default".into(),
             feed: None,
             id: "demo".into(),
@@ -1967,6 +1970,8 @@ mod tests {
     /// A static (proxy_pass) deployment with fixed upstreams.
     fn static_spec() -> DeploymentSpec {
         DeploymentSpec {
+            account_id: None,
+            user_id: None,
             namespace: "default".into(),
             feed: None,
             id: "proxy".into(),

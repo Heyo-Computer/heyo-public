@@ -40,8 +40,9 @@ app-lb and app-obs are ordinary bearer APIs and need no such arrangement.
 
 | Variable | Purpose |
 |---|---|
-| `APPLB_URL` | app-lb base URL |
-| `APPLB_TOKEN` | bearer token, or… |
+| `APPLB_URL` | app-lb base URL — its own admin listener, or heyo cloud (see managed mode) |
+| `APPLB_NAMESPACE` | managed mode: the namespace to reach app-lb in, through heyo cloud |
+| `APPLB_TOKEN` | bearer token (a `heyo_api_*` key in managed mode), or… |
 | `APPLB_BASIC` | `user:pass`, or a complete `Basic …` header |
 | `APP_OBS_URL` | app-obs base URL |
 | `APP_OBS_API_TOKEN` | bearer for its query routes (`/healthz` stays open) |
@@ -54,6 +55,47 @@ report themselves unconfigured. `heyo_status` says which is which.
 
 A `Basic` value is passed through byte for byte, because app-lb compares it that
 way — a re-encoded-but-equivalent header is rejected.
+
+## Managed mode
+
+Heyo runs one app-lb as a platform service. Customers do not reach its admin
+listener; they reach it through heyo cloud, per namespace, at
+`/namespaces/{ns}/lb/…`, with their ordinary `heyo_api_*` key. Cloud pins every
+request to that namespace and app-lb resolves the key into a grant, so the
+same admin API answers, walled to what the key may see.
+
+This server needs no code for that — only a different base:
+
+```bash
+APPLB_URL=https://server.heyo.computer \
+APPLB_NAMESPACE=team-a \
+APPLB_TOKEN=heyo_api_… \
+node dist/index.js
+```
+
+`APPLB_NAMESPACE` turns the base into `${APPLB_URL}/namespaces/team-a/lb`;
+every tool then appends its path as before. (Spelling the full
+`…/namespaces/team-a/lb` URL out in `APPLB_URL` works too and is not rewritten
+again.) A namespace is created once, with `POST /namespaces` on cloud or the
+SDK's `Namespaces.create`, and deployments registered through this door land
+in it whether or not the spec says so.
+
+What the door exposes: `applb_list_deployments`, `applb_get_deployment`,
+`applb_create_deployment`, `applb_scale`, `applb_start_build`,
+`applb_start_update`, `applb_deployment_jobs`, `applb_delete_deployment`,
+`applb_evict_vm`, `applb_exec` and `applb_metrics`. The fleet-wide operator
+tools — `applb_disks`, `applb_certs`, `applb_purge_disk`,
+`applb_purge_orphan_disks`, `applb_sweep_disks` — answer `404 route not exposed
+through the namespace proxy`, and `applb_request` is bounded by the same list.
+VMs a managed deployment boots are billed to the namespace's account like any
+other sandbox.
+
+A hosted instance can serve many tenants from one process: leave `APPLB_TOKEN`
+and `APPLB_BASIC` unset and, in HTTP mode, each request's own `Authorization`
+header goes upstream instead, so every caller acts under their own key and
+therefore their own namespaces. A configured token always wins over a caller's
+header — an instance deployed to act as itself must not be talked into acting
+as someone else.
 
 ## Running it
 
