@@ -546,6 +546,21 @@ fn metrics_response_is_stable() {
             }],
             matched: 3,
             tracked_deployments: 3,
+            // One sandbox app-lb did not create, so a client learns the host
+            // has tenants the pool table does not account for.
+            host_sandboxes: vec![crate::metrics::HostSandboxView {
+                sandbox_id: "sb-7f3a9c".into(),
+                name: "sam-dev".into(),
+                status: heyo_sdk::SandboxStatus::Running,
+                image: "ubuntu:24.04".into(),
+                size_class: Some("medium".into()),
+                guest_ip: Some("172.16.0.10".into()),
+                uptime_secs: 5_400,
+                cpu_percent: Some(3.5),
+                memory_bytes: Some(536_870_912),
+                account_id: Some("acc-team-a".into()),
+                created_at: Some("2024-07-31T04:26:40+00:00".into()),
+            }],
         },
     );
 }

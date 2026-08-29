@@ -274,6 +274,10 @@
   <div class="section-title">Deployments</div>
   <div class="fleet" id="fleet"></div>
   <p class="note" id="fleet-note"></p>
+  <!-- Sandboxes on the host that no deployment owns. Live from app-lb's last
+       poll, not from parquet: this is what is on the machine now. Their
+       history is the `_unmanaged` row above, keyed by sandbox. -->
+  <div id="host-sandboxes"></div>
 </section>
 
 <section class="view" id="view-detail">
@@ -329,7 +333,9 @@ const $ = (id) => document.getElementById(id);
 
 let state = {
   window: "24h",
-  route: { view: "fleet", id: null },
+  route: { view: "fleet", id: null, backend: null },
+  // A backend the route asked for, consumed by the next detail render.
+  pendingBackend: null,
   paused: false,
   tables: false,
   timer: null,
@@ -805,8 +811,10 @@ function renderFleet(data) {
   } else {
     fleet.innerHTML = data.deployments.map((d) => {
       const l = d.latest;
+      // The reserved partition is not a deployment; say what it holds.
+      const label = d.id === UNMANAGED ? `${esc(d.id)} <span class="seen" style="display:inline">· sandboxes outside any deployment</span>` : esc(d.id);
       return `<a class="card row" href="#/d/${encodeURIComponent(d.id)}">
-        <span class="id">${esc(d.id)}<span class="seen">${d.log_lines ? esc(plural(d.log_lines, "line", "lines")) : "no logs"} · ${esc(fmtAgo(lastBucketAt(d)))}</span></span>
+        <span class="id">${label}<span class="seen">${d.log_lines ? esc(plural(d.log_lines, "line", "lines")) : "no logs"} · ${esc(fmtAgo(lastBucketAt(d)))}</span></span>
         <span class="spark">${spark(d.buckets, "requests_per_sec", "var(--series-1)")}</span>
         <span class="fig"><span class="k">req/s</span><span class="v">${esc(fmtRate(l.requests_per_sec))}</span></span>
         <span class="fig"><span class="k">err/s</span><span class="v">${esc(fmtRate(l.errors_per_sec))}</span></span>
@@ -818,8 +826,64 @@ function renderFleet(data) {
   }
 
   $("fleet-note").textContent = freshnessNote(data.freshness);
+  renderHostSandboxes(data.host_sandboxes);
   renderFleetTables(data);
   stamp(data.generated_at_ms);
+}
+
+/* ---------- host sandboxes ---------- */
+
+// app-lb's reserved partition for sandboxes it reports but does not manage.
+const UNMANAGED = "_unmanaged";
+
+function fmtUptime(secs) {
+  if (secs == null) return "—";
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+  return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`;
+}
+
+// What is on the host right now outside every deployment. `null` is "no poll
+// has succeeded yet" and says so; `[]` is app-lb reporting none — or an app-lb
+// too old to report them, which it cannot tell apart, so neither can we.
+function renderHostSandboxes(list) {
+  const wrap = $("host-sandboxes");
+  if (list == null) {
+    wrap.innerHTML = "";
+    return;
+  }
+  const live = list.filter((s) => s.status === "running" || s.status === "provisioning").length;
+  const title = `<div class="section-title">Host sandboxes${list.length ? ` <span style="color:var(--muted);font-weight:400">${list.length} on host · ${live} live</span>` : ""}</div>`;
+  if (!list.length) {
+    wrap.innerHTML = `${title}<div class="card"><span style="color:var(--muted)">
+      None outside the pools — or an app-lb that does not report them.</span></div>`;
+    return;
+  }
+  const rows = list.map((s) => {
+    // Deep link into the reserved partition with this sandbox preselected as
+    // the backend filter, so one click goes from "what is this" to its logs.
+    const href = `#/d/${encodeURIComponent(UNMANAGED)}?backend=${encodeURIComponent(s.sandbox_id)}`;
+    const tailed = s.status === "running" || s.status === "provisioning";
+    return `<tr>
+      <td><a href="${href}">${esc(s.sandbox_id)}</a></td>
+      <td>${esc(s.name || "")}</td>
+      <td>${esc(s.image || "")}${s.size_class ? ` <span style="color:var(--muted)">${esc(s.size_class)}</span>` : ""}</td>
+      <td>${esc(s.status || "unknown")}${tailed ? "" : ` <span style="color:var(--muted)">(not tailed)</span>`}</td>
+      <td class="num">${tailed ? esc(fmtUptime(s.uptime_secs)) : "—"}</td>
+      <td class="num">${s.cpu_percent == null ? "—" : fmt(s.cpu_percent, 1) + "%"}</td>
+      <td class="num">${s.memory_bytes == null ? "—" : esc(fmtBytes(s.memory_bytes))}</td>
+      <td>${esc(s.account_id || "—")}</td>
+    </tr>`;
+  }).join("");
+  wrap.innerHTML = `${title}
+    <div class="card scroll-x"><table class="data">
+      <thead><tr><th>Sandbox</th><th>Name</th><th>Image</th><th>State</th>
+        <th class="num">Uptime</th><th class="num">CPU</th><th class="num">Memory</th><th>Account</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+      <p class="note">Created through <code>heyvm</code>, the cloud API or the desktop rather than by app-lb, which
+      reports them and leaves them alone. Live ones are tailed like any pool VM; their lines and usage are
+      under <code>${esc(UNMANAGED)}</code>, filtered by sandbox.</p></div>`;
 }
 
 /// Latest non-null of each measure, mirroring the server's own `latest_of` for
@@ -932,7 +996,11 @@ function renderDetail(data) {
   renderDetailTables(data);
 
   const select = $("f-backend");
-  const chosen = select.value;
+  // A backend named by the route takes the selection once, on arrival; after
+  // that the control is the operator's.
+  const arriving = state.pendingBackend;
+  state.pendingBackend = null;
+  const chosen = arriving || select.value;
   // A backend picked for a pinned range need not have logged inside the window
   // this list is built from. Keeping it listed stops the selection resetting
   // itself out from under the rows already on screen.
@@ -940,6 +1008,7 @@ function renderDetail(data) {
     ? data.backends : [chosen, ...data.backends];
   select.innerHTML = `<option value="">any backend</option>` +
     options.map((b) => `<option value="${esc(b)}"${b === chosen ? " selected" : ""}>${esc(b)}</option>`).join("");
+  if (arriving) loadLogs(false);
 
   $("log-note").textContent = freshnessNote(data.freshness);
   stamp(data.generated_at_ms);
@@ -1165,10 +1234,12 @@ $("log-rows").addEventListener("click", async (e) => {
 
 function parseRoute() {
   const hash = location.hash.replace(/^#/, "");
-  const detail = hash.match(/^\/d\/(.+)$/);
-  return detail
-    ? { view: "detail", id: decodeURIComponent(detail[1]) }
-    : { view: "fleet", id: null };
+  // `#/d/<id>` or `#/d/<id>?backend=<sandbox>` — the second form is how the
+  // host-sandbox table lands on one sandbox's logs in one click.
+  const detail = hash.match(/^\/d\/([^?]+)(?:\?(.*))?$/);
+  if (!detail) return { view: "fleet", id: null, backend: null };
+  const params = new URLSearchParams(detail[2] || "");
+  return { view: "detail", id: decodeURIComponent(detail[1]), backend: params.get("backend") };
 }
 
 function stamp(generatedMs) {
@@ -1206,8 +1277,12 @@ function show() {
   $("view-fleet").classList.toggle("on", !detail);
   $("view-detail").classList.toggle("on", detail);
   if (!detail) $("subtitle").textContent = "logs and metrics";
+  // A route that names a backend cannot pick it until the detail render has
+  // built the selector, so the log load waits for that render instead of
+  // racing it with the filter still empty.
+  state.pendingBackend = detail ? state.route.backend : null;
   refresh();
-  if (detail) loadLogs(false);
+  if (detail && !state.pendingBackend) loadLogs(false);
 }
 
 function schedule() {

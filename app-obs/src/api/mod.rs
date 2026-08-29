@@ -15,7 +15,7 @@ use crate::ingest::{Sink, token_matches};
 use crate::query::{
     Engine, HOST_DEPLOYMENT, LogBucket, LogFilter, MAX_LOG_LIMIT, MetricBucket, QueryError, Window,
 };
-use crate::sources::applb::LiveStatus;
+use crate::sources::applb::{HostSandboxView, LiveStatus};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -338,6 +338,12 @@ struct FleetResponse {
     /// "never sampled" should not look like "idle".
     host: Option<Vec<MetricBucket>>,
     deployments: Vec<FleetRow>,
+    /// Sandboxes on the host outside every deployment, live from the last
+    /// app-lb poll rather than from parquet — this is an inventory, not a
+    /// series. `None` before the first successful poll; empty when app-lb
+    /// reported none (or predates reporting them). Their history is the
+    /// `_unmanaged` row above, keyed by `backend`.
+    host_sandboxes: Option<Vec<HostSandboxView>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -430,6 +436,11 @@ async fn fleet(
             .cloned()
             .or_else(|| state.engine.has_host_data().then(Vec::new)),
         deployments,
+        host_sandboxes: state
+            .live
+            .borrow()
+            .as_ref()
+            .map(|live| live.host_sandboxes.clone()),
     }))
 }
 
@@ -893,6 +904,7 @@ mod tests {
                 cpu_percent: 10.0,
                 memory_used_bytes: 1024,
             },
+            host_sandboxes: Vec::new(),
             deployments: vec![DeploymentView {
                 id: "stage".into(),
                 kind: Some("static".into()),

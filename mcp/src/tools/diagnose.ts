@@ -50,7 +50,11 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         "The whole managed fleet in one call: app-obs's per-deployment rows with host CPU " +
         "and memory, app-lb's current topology with health and drain state, and app-obs's " +
         "ingest counters. Use this before drilling into one deployment — it is the only view " +
-        "that shows a problem affecting several at once.",
+        "that shows a problem affecting several at once. The topology also lists " +
+        "`host_sandboxes`: VMs on the host that no deployment owns (made through heyvm, the " +
+        "cloud API or the desktop). They share the host's CPU and memory with every pool, so " +
+        "a loaded host beside idle pools is usually explained there; their logs live under " +
+        "the app-obs deployment `_unmanaged`, filtered by `backend`.",
       schema: { window: z.string().optional().describe("app-obs window, e.g. '15m', '1h', '24h'") },
       handler: async (args) => {
         const window = (args.window as string) ?? "1h";

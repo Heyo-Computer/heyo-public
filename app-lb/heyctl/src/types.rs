@@ -890,6 +890,35 @@ pub struct MetricsResponse {
     /// How many deployments hold their own counters. Climbing past the number
     /// registered means retirement is not keeping up.
     pub tracked_deployments: usize,
+    /// Sandboxes on the host that no deployment owns — created through the
+    /// heyvm CLI, the cloud API or the desktop rather than by app-lb. They
+    /// share the host with every pool; absent from an older app-lb, emptied by
+    /// `summary=true`, and narrowed to the caller's own accounts for a
+    /// namespace caller.
+    #[serde(default)]
+    pub host_sandboxes: Vec<HostSandboxView>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One sandbox on the host that app-lb reports but does not manage.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct HostSandboxView {
+    pub sandbox_id: String,
+    pub name: String,
+    /// The daemon's status string: `running`, `stopped`, `provisioning`, ….
+    pub status: String,
+    pub image: String,
+    pub size_class: Option<String>,
+    pub guest_ip: Option<String>,
+    pub uptime_secs: u64,
+    pub cpu_percent: Option<f64>,
+    pub memory_bytes: Option<u64>,
+    /// The heyo account the sandbox is billed to, when the daemon knows.
+    pub account_id: Option<String>,
+    /// RFC 3339, when the daemon reports it.
+    pub created_at: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }

@@ -390,6 +390,10 @@ export interface AutoscaleCounts {
   cold_start_hits: number;
   cold_start_timeouts: number;
   boot_timeouts: number;
+  /** Creates the daemon refused or that failed client-side, since app-lb started. */
+  create_failures: number;
+  /** What the most recent failed create said, if any has failed. */
+  last_create_error?: string | null;
 }
 
 export interface DeploymentMetrics {
@@ -489,10 +493,48 @@ export interface MetricsResponse {
   obs?: ObsStats;
   /** Absent when `APP_LB_SIEM=0`. */
   security?: SecuritySummary;
+  /**
+   * Whether app-lb can reach the VM daemon. When it cannot, the autoscaler
+   * abandons every tick, so nothing scales or boots and every other number
+   * here is frozen at whatever it was when the daemon went away.
+   */
+  daemon: DaemonStatus;
   deployments: DeploymentView[];
   /** How many matched before `limit`/`offset`, so you can page. */
   matched: number;
   tracked_deployments: number;
+  /**
+   * Sandboxes on the host that no deployment owns — created through the heyvm
+   * CLI, the cloud API or the desktop rather than by app-lb. They share the
+   * host with every pool. Absent from an older app-lb, empty under
+   * `summary=true`, and narrowed to the caller's own accounts for a namespace
+   * caller.
+   */
+  host_sandboxes?: HostSandboxView[];
+}
+
+export interface DaemonStatus {
+  reachable: boolean;
+  /** What the last failed listing said; absent while it is reachable. */
+  last_error?: string;
+}
+
+/** One sandbox on the host that app-lb reports but does not manage. */
+export interface HostSandboxView {
+  sandbox_id: string;
+  name: string;
+  /** The daemon's status string: `running`, `stopped`, `provisioning`, …. */
+  status: string;
+  image: string;
+  size_class?: string;
+  guest_ip?: string;
+  uptime_secs: number;
+  cpu_percent: number | null;
+  memory_bytes: number | null;
+  /** The heyo account the sandbox is billed to, when the daemon knows. */
+  account_id?: string;
+  /** RFC 3339, when the daemon reports it. */
+  created_at?: string;
 }
 
 // -- security --------------------------------------------------------------

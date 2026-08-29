@@ -352,21 +352,27 @@ impl Autoscaler {
             .for_each_concurrent(RECONCILE_CONCURRENCY, |d| self.reconcile_static(d))
             .await;
 
-        if managed.is_empty() {
-            return; // nothing needs the daemon; don't call it at all
-        }
-
-        // Managed deployments need the fleet list; if it fails, skip the VM work
-        // this tick (the static probes above have already run).
-        let fleet = match self.vms.list().await {
-            Ok(list) => {
+        // The daemon is listed even when no deployment needs it. A host with
+        // no VM deployments is not a host with no VMs — sandboxes created
+        // through the CLI, the cloud API or the desktop live there too, and
+        // the point of `host_sandboxes` is that they show up on the dashboard
+        // whether or not app-lb has anything of its own to run. What changes
+        // when nothing is managed is the volume: a missing daemon is then a
+        // fact about the host rather than a failure of the control plane, so
+        // it is not shouted every two seconds.
+        let listing = match self.vms.list_detailed().await {
+            Ok(listing) => {
                 self.metrics.record_daemon_reachable();
-                vm::index_by_id(list)
+                listing
             }
             Err(e) => {
-                // Log explicitly: without this the loop fails silently and the
-                // pool just quietly stops updating.
-                tracing::error!(error = %e, "failed to list sandboxes; skipping VM reconcile this tick");
+                if managed.is_empty() {
+                    tracing::debug!(error = %e, "failed to list sandboxes; no VM deployments to reconcile");
+                } else {
+                    // Log explicitly: without this the loop fails silently and the
+                    // pool just quietly stops updating.
+                    tracing::error!(error = %e, "failed to list sandboxes; skipping VM reconcile this tick");
+                }
                 // And recorded, because this `return` is the widest-blast-radius
                 // branch in the file: it abandons the reconcile for *every*
                 // managed deployment, so nothing scales, nothing boots, and no
@@ -384,6 +390,14 @@ impl Autoscaler {
         // best-effort gauge: a failure here must not derail scaling, so we log
         // and carry on with an empty index (VMs keep their last sample).
         let usage = self.sample_usage().await;
+
+        self.metrics
+            .record_host_sandboxes(host_sandboxes(&listing, &usage));
+        let fleet = vm::index_by_id(listing.sandboxes);
+
+        if managed.is_empty() {
+            return; // nothing else needs the daemon this tick
+        }
 
         // Split before dispatching: a deployment sitting at its desired size
         // with nothing booting and nothing draining needs no `await` at all, and
@@ -1826,6 +1840,44 @@ impl BackgroundService for Autoscaler {
 fn hold_missing(missing_since: Option<u64>, now: u64) -> Option<u64> {
     let since = missing_since.unwrap_or(now);
     (now.saturating_sub(since) < MISSING_GRACE).then_some(since)
+}
+
+/// The sandboxes in a listing that no deployment owns, as the dashboard shows
+/// them.
+///
+/// Ownership is the name rule ([`vm::owner_of`]) — the same one adoption uses,
+/// so a sandbox is never both in a pool and in this list. Everything else the
+/// daemon reports is included, stopped ones too: a stopped sandbox still holds
+/// a disk on the host, and "what is on this machine" is the question this
+/// answers. Sorted by name so the table holds still between polls.
+fn host_sandboxes(
+    listing: &vm::Listing,
+    usage: &HashMap<String, vm::SandboxUsage>,
+) -> Vec<crate::metrics::HostSandboxView> {
+    let mut out: Vec<_> = listing
+        .sandboxes
+        .iter()
+        .filter(|info| vm::owner_of(&info.name).is_none())
+        .map(|info| {
+            let detail = listing.details.get(&info.id);
+            let sample = usage.get(&info.id);
+            crate::metrics::HostSandboxView {
+                sandbox_id: info.id.clone(),
+                name: info.name.clone(),
+                status: info.status.clone(),
+                image: info.image.clone(),
+                size_class: info.size_class.clone(),
+                guest_ip: info.guest_ip.clone(),
+                uptime_secs: info.uptime_secs,
+                cpu_percent: sample.map(|s| s.cpu_percent),
+                memory_bytes: sample.map(|s| s.memory_bytes),
+                account_id: detail.and_then(|d| d.account_id.clone()),
+                created_at: detail.and_then(|d| d.created_at.clone()),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.sandbox_id.cmp(&b.sandbox_id)));
+    out
 }
 
 /// Whether `d` needs nothing this tick beyond a usage sample.

@@ -19,6 +19,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// collide: app-lb ids in practice are slugs like `demo` or `vault-86a37f`.
 pub const HOST_DEPLOYMENT: &str = "_host";
 
+/// Reserved deployment id for sandboxes on the host that no deployment owns —
+/// created through the heyvm CLI, the cloud API or the desktop rather than by
+/// app-lb. Their logs and per-VM usage land here, keyed by `backend` (the
+/// sandbox id), so a row in this partition always names its sandbox. One
+/// partition rather than one per sandbox because sandboxes made by hand come
+/// and go by the hundred, and a partition directory per short-lived VM is the
+/// file-count problem compaction exists to avoid.
+pub const UNMANAGED_DEPLOYMENT: &str = "_unmanaged";
+
 #[derive(Debug, Clone, Deserialize)]
 struct MetricsResponse {
     /// Unix seconds. Used as the timestamp for every row in the poll so a chart
@@ -26,6 +35,49 @@ struct MetricsResponse {
     generated_at: u64,
     host: HostUsage,
     deployments: Vec<DeploymentView>,
+    /// Sandboxes on the host outside every deployment. Absent from an app-lb
+    /// that predates the field, which is then indistinguishable from a host
+    /// with none — the honest reading, since such an app-lb never looked.
+    #[serde(default)]
+    host_sandboxes: Vec<HostSandboxView>,
+}
+
+/// One sandbox app-lb reports but does not manage. Everything but the id is
+/// optional on the way in: this is decoration for a person, and a row missing
+/// its image must not cost the poll.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct HostSandboxView {
+    pub sandbox_id: String,
+    #[serde(default)]
+    pub name: String,
+    /// The daemon's word: `running`, `stopped`, `provisioning`, …
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub image: String,
+    #[serde(default)]
+    pub size_class: Option<String>,
+    #[serde(default)]
+    pub guest_ip: Option<String>,
+    #[serde(default)]
+    pub uptime_secs: u64,
+    #[serde(default)]
+    pub cpu_percent: Option<f64>,
+    #[serde(default)]
+    pub memory_bytes: Option<u64>,
+    /// The heyo account it is billed to, when the daemon knows.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+impl HostSandboxView {
+    /// Whether the guest has a console worth tailing. A stopped sandbox prints
+    /// nothing, and asking the daemon to stream it would reconnect forever.
+    fn is_live(&self) -> bool {
+        matches!(self.status.as_deref(), Some("running" | "provisioning"))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -121,6 +173,9 @@ pub(crate) struct LiveStatus {
     pub app_lb_generated_at_ms: i64,
     pub host: HostUsage,
     pub deployments: Vec<DeploymentView>,
+    /// Sandboxes on the host outside every deployment, as app-lb last saw
+    /// them. Empty from an app-lb that does not report them.
+    pub host_sandboxes: Vec<HostSandboxView>,
 }
 
 pub struct Poller {
@@ -207,6 +262,7 @@ impl Poller {
             app_lb_generated_at_ms: (snapshot.generated_at as i64).saturating_mul(1000),
             host: snapshot.host.clone(),
             deployments: snapshot.deployments.clone(),
+            host_sandboxes: snapshot.host_sandboxes.clone(),
         };
         self.live.send_replace(Some(live));
 
@@ -240,10 +296,16 @@ fn now_ms() -> i64 {
 }
 
 /// The sandboxes worth tailing daemon logs from: every backend of a VM
-/// deployment. Static deployments are excluded — their "vms" entries hold
-/// `host:port` upstreams, which the daemon has never heard of. When an older
-/// app-lb omits `kind`, the backend's shape decides: a `host:port` always
-/// contains a colon, a sandbox id never does.
+/// deployment, plus every live sandbox on the host that belongs to none.
+/// Static deployments are excluded — their "vms" entries hold `host:port`
+/// upstreams, which the daemon has never heard of. When an older app-lb omits
+/// `kind`, the backend's shape decides: a `host:port` always contains a
+/// colon, a sandbox id never does.
+///
+/// The unowned sandboxes are attributed to [`UNMANAGED_DEPLOYMENT`]: app-lb
+/// is still the authority on what is on the host, it has simply said "this
+/// one is nobody's". They are tailed while live and dropped when they stop,
+/// which is the same lifecycle a pool's VM gets.
 fn vm_targets(snapshot: &MetricsResponse) -> Vec<VmTarget> {
     let mut targets = Vec::new();
     for deployment in &snapshot.deployments {
@@ -260,6 +322,12 @@ fn vm_targets(snapshot: &MetricsResponse) -> Vec<VmTarget> {
                 });
             }
         }
+    }
+    for sandbox in snapshot.host_sandboxes.iter().filter(|s| s.is_live()) {
+        targets.push(VmTarget {
+            deployment: UNMANAGED_DEPLOYMENT.into(),
+            backend: sandbox.sandbox_id.clone(),
+        });
     }
     targets
 }
@@ -326,6 +394,43 @@ fn flatten(snapshot: &MetricsResponse) -> Vec<Record> {
         }
     }
 
+    // The sandboxes outside every deployment, under their reserved partition.
+    // A rollup row first — `ready` is how many are live, and usage is the sum
+    // of what the daemon sampled — because the fleet view reads the
+    // deployment-wide series (rows with no `backend`), and without one this
+    // partition would list on the overview as a blank. Then one row per
+    // sandbox, exactly as a pool's VMs are recorded. Nothing at all when the
+    // list is empty: an app-lb that does not report the field would otherwise
+    // write a partition that says "none" every ten seconds forever.
+    if !snapshot.host_sandboxes.is_empty() {
+        let sampled: Vec<_> = snapshot
+            .host_sandboxes
+            .iter()
+            .filter(|s| s.cpu_percent.is_some() || s.memory_bytes.is_some())
+            .collect();
+        records.push(Record::Metric(MetricRecord {
+            ts_millis,
+            deployment: UNMANAGED_DEPLOYMENT.into(),
+            backend: None,
+            cpu_percent: (!sampled.is_empty())
+                .then(|| sampled.iter().filter_map(|s| s.cpu_percent).sum()),
+            memory_bytes: (!sampled.is_empty())
+                .then(|| sampled.iter().filter_map(|s| s.memory_bytes).sum()),
+            ready: Some(snapshot.host_sandboxes.iter().filter(|s| s.is_live()).count() as u32),
+            ..Default::default()
+        }));
+        for sandbox in &snapshot.host_sandboxes {
+            records.push(Record::Metric(MetricRecord {
+                ts_millis,
+                deployment: UNMANAGED_DEPLOYMENT.into(),
+                backend: Some(sandbox.sandbox_id.clone()),
+                cpu_percent: sandbox.cpu_percent,
+                memory_bytes: sandbox.memory_bytes,
+                ..Default::default()
+            }));
+        }
+    }
+
     records
 }
 
@@ -377,7 +482,15 @@ mod tests {
                 "cold_start_s": {"count": 0, "sum": 0, "mean": 0.0, "p50": 0.0, "p90": 0.0, "p99": 0.0, "buckets": []},
                 "autoscale": {}
             }
-        }]
+        }],
+        "host_sandboxes": [
+            {"sandbox_id": "sb-hand", "name": "sam-dev", "status": "running", "image": "ubuntu:24.04",
+             "size_class": "medium", "guest_ip": "172.16.0.10", "uptime_secs": 5400,
+             "cpu_percent": 3.5, "memory_bytes": 536870912, "account_id": "acc-team-a",
+             "created_at": "2026-08-28T10:00:00+00:00"},
+            {"sandbox_id": "sb-cold", "name": "scratch", "status": "stopped", "image": "ubuntu:24.04",
+             "uptime_secs": 0, "cpu_percent": null, "memory_bytes": null}
+        ]
     }"#;
 
     fn parse() -> MetricsResponse {
@@ -403,7 +516,11 @@ mod tests {
     #[test]
     fn one_poll_yields_host_deployment_and_per_vm_rows() {
         let records = flatten(&parse());
-        assert_eq!(records.len(), 4, "1 host + 1 deployment + 2 VMs");
+        assert_eq!(
+            records.len(),
+            7,
+            "1 host + 1 deployment + 2 VMs + 1 unmanaged rollup + 2 unmanaged sandboxes"
+        );
 
         // Every row shares the snapshot's timestamp so a chart aligns them.
         for record in &records {
@@ -430,8 +547,55 @@ mod tests {
         let mut snapshot = parse();
         snapshot.host.available = false;
         let records = flatten(&snapshot);
-        assert_eq!(records.len(), 3, "host row dropped, deployment and VMs stay");
+        assert_eq!(records.len(), 6, "host row dropped, everything else stays");
         assert!(records.iter().all(|r| r.deployment() != HOST_DEPLOYMENT));
+    }
+
+    /// The sandboxes outside every deployment land under their reserved
+    /// partition: a rollup row the fleet view can read, then one row per
+    /// sandbox named by `backend`, so nothing there is ever anonymous.
+    #[test]
+    fn unmanaged_sandboxes_land_under_the_reserved_deployment() {
+        let records = flatten(&parse());
+        let rows: Vec<&MetricRecord> = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Metric(m) if m.deployment == UNMANAGED_DEPLOYMENT => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 3);
+        let rollup = rows[0];
+        assert_eq!(rollup.backend, None);
+        assert_eq!(rollup.ready, Some(1), "one of the two is live");
+        assert_eq!(rollup.cpu_percent, Some(3.5), "the sum of what was sampled");
+        assert_eq!(rollup.memory_bytes, Some(536_870_912));
+        assert_eq!(rollup.requests_total, None, "nothing is proxied to them");
+        assert_eq!(rows[1].backend.as_deref(), Some("sb-hand"));
+        assert_eq!(rows[1].cpu_percent, Some(3.5));
+        assert_eq!(rows[2].backend.as_deref(), Some("sb-cold"));
+        assert_eq!(rows[2].cpu_percent, None, "null, not 0.0");
+    }
+
+    /// An app-lb that does not report the field writes nothing under
+    /// `_unmanaged` — not a rollup saying "none" every poll forever.
+    #[test]
+    fn an_app_lb_without_host_sandboxes_writes_no_unmanaged_rows() {
+        let old = strip_host_sandboxes();
+        let snapshot: MetricsResponse = serde_json::from_str(&old).unwrap();
+        assert!(snapshot.host_sandboxes.is_empty());
+        let records = flatten(&snapshot);
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|r| r.deployment() != UNMANAGED_DEPLOYMENT));
+        assert!(vm_targets(&snapshot).iter().all(|t| t.deployment != UNMANAGED_DEPLOYMENT));
+    }
+
+    /// `SNAPSHOT` with the `host_sandboxes` array removed, as an older app-lb
+    /// would send it.
+    fn strip_host_sandboxes() -> String {
+        let start = SNAPSHOT.find(",\n        \"host_sandboxes\"").unwrap();
+        let end = SNAPSHOT.rfind(']').unwrap() + 1;
+        format!("{}{}", &SNAPSHOT[..start], &SNAPSHOT[end..])
     }
 
     #[test]
@@ -549,8 +713,29 @@ mod tests {
                     deployment: "demo".into(),
                     backend: "sb-bbb".into(),
                 },
+                // The running hand-made sandbox is tailed too, under the
+                // reserved partition; the stopped one prints nothing.
+                VmTarget {
+                    deployment: UNMANAGED_DEPLOYMENT.into(),
+                    backend: "sb-hand".into(),
+                },
             ],
         );
+    }
+
+    /// A sandbox that stops leaves the tail set, exactly as a pool VM that is
+    /// reaped does — the tailer manager then aborts its stream.
+    #[test]
+    fn a_stopped_unmanaged_sandbox_is_not_tailed() {
+        let mut snapshot = parse();
+        snapshot.host_sandboxes[0].status = Some("stopped".into());
+        assert!(vm_targets(&snapshot).iter().all(|t| t.deployment != UNMANAGED_DEPLOYMENT));
+        // …and a status this build does not know is treated as not live rather
+        // than guessed at.
+        snapshot.host_sandboxes[0].status = Some("hibernating".into());
+        assert!(vm_targets(&snapshot).iter().all(|t| t.deployment != UNMANAGED_DEPLOYMENT));
+        snapshot.host_sandboxes[0].status = None;
+        assert!(vm_targets(&snapshot).iter().all(|t| t.deployment != UNMANAGED_DEPLOYMENT));
     }
 
     #[test]
@@ -559,6 +744,7 @@ mod tests {
         // daemon to stream logs for "10.0.0.5:3000" would 404 forever.
         let mut snapshot = parse();
         snapshot.deployments[0].kind = Some("static".into());
+        snapshot.host_sandboxes.clear();
         assert!(vm_targets(&snapshot).is_empty());
     }
 
@@ -569,6 +755,7 @@ mod tests {
         let mut snapshot = parse();
         snapshot.deployments[0].kind = None;
         snapshot.deployments[0].vms[1].backend = "10.0.0.5:3000".into();
+        snapshot.host_sandboxes.clear();
         let targets = vm_targets(&snapshot);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].backend, "sb-aaa");

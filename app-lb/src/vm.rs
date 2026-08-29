@@ -487,7 +487,28 @@ impl VmManager {
     /// `Sandbox::info()` fetches this same full list and filters client-side, so
     /// per-VM polling is quadratic.
     pub async fn list(&self) -> Result<Vec<SandboxInfo>, VmError> {
-        Ok(Sandbox::list_with_client(&self.client).await?)
+        Ok(self.list_detailed().await?.sandboxes)
+    }
+
+    /// [`Self::list`], plus what the SDK's [`SandboxInfo`] does not carry.
+    ///
+    /// The daemon's listing says whose sandbox each one is (`account_id`) and
+    /// when it was created; the SDK struct predates both fields and drops them
+    /// on the floor. Rather than pin a newer SDK for two strings, the raw JSON
+    /// is read once, the SDK's own type is deserialized from it — so what the
+    /// autoscaler sees is exactly what it always saw — and the extras are
+    /// picked off beside it. One request, not two.
+    pub async fn list_detailed(&self) -> Result<Listing, VmError> {
+        let raw: Vec<Value> = self
+            .client
+            .request(
+                http::Method::GET,
+                "/deployed-sandboxes",
+                None::<&Value>,
+                RequestOptions::default(),
+            )
+            .await?;
+        Listing::from_raw(raw)
     }
 
     /// Create a VM and return immediately, without waiting for boot.
@@ -777,6 +798,60 @@ impl VmManager {
             "inactive sandbox listing did not terminate; treating it as complete",
         );
         Ok(out)
+    }
+}
+
+/// What a `/deployed-sandboxes` listing said, in both shapes app-lb needs.
+#[derive(Debug, Default)]
+pub struct Listing {
+    /// The SDK's view, exactly as [`VmManager::list`] returns it.
+    pub sandboxes: Vec<SandboxInfo>,
+    /// Sandbox id → the fields the SDK's struct does not declare.
+    pub details: HashMap<String, SandboxDetail>,
+}
+
+/// The parts of a daemon listing entry that identify a sandbox to a person
+/// rather than to the autoscaler.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct SandboxDetail {
+    /// The heyo account billed for the sandbox. Absent when the daemon runs
+    /// with auth off, or predates the field.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// RFC 3339, from the daemon's own record — unlike `uptime_secs` it does
+    /// not restart with the VM.
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+impl Listing {
+    fn from_raw(raw: Vec<Value>) -> Result<Self, VmError> {
+        // The whole array at once, so a malformed entry fails the listing the
+        // way it always did rather than silently thinning the fleet: a VM that
+        // vanishes from the list is a VM the autoscaler replaces.
+        let sandboxes: Vec<SandboxInfo> =
+            serde_json::from_value(Value::Array(raw.clone())).map_err(|e| {
+                VmError::Sdk(heyo_sdk::HeyoError::Api {
+                    status: 0,
+                    message: format!("malformed sandbox listing: {e}"),
+                    body: None,
+                })
+            })?;
+        let details = raw
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("id")?.as_str()?.to_string();
+                // Lenient on purpose: these fields are decoration, and a daemon
+                // that sends them in a shape this build does not expect should
+                // cost the row its decoration, not the fleet its listing.
+                let detail = serde_json::from_value(entry.clone()).unwrap_or_default();
+                Some((id, detail))
+            })
+            .collect();
+        Ok(Self {
+            sandboxes,
+            details,
+        })
     }
 }
 

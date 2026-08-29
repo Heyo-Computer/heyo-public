@@ -443,6 +443,9 @@ pub struct Metrics {
     /// whole control plane can be down and every number on the dashboard reads
     /// like a quiet afternoon.
     daemon: DaemonGauge,
+    /// The unowned sandboxes on the host as of the last successful listing,
+    /// whole-vector swapped so a reader never sees a half-written tick.
+    host_sandboxes: ArcSwap<Vec<HostSandboxView>>,
 }
 
 #[derive(Debug, Default)]
@@ -452,6 +455,39 @@ struct DaemonGauge {
     /// `None` in the first case and populated in the second.
     reachable: std::sync::atomic::AtomicBool,
     last_error: Mutex<Option<String>>,
+}
+
+/// One sandbox on the daemon's host that no deployment owns.
+///
+/// app-lb only ever *manages* the sandboxes it named (`applb-<deployment>-…`,
+/// see [`crate::vm::owner_of`]); everything else on the host — created through
+/// the heyvm CLI, the cloud API, the desktop — was invisible to it, and so to
+/// the dashboard and to app-obs, which take app-lb's word for what exists. But
+/// the host is one machine: those VMs share its CPU and memory with every
+/// pool, and an operator reading a loaded host off a half-empty pool table
+/// has been misled. So the reconcile tick, which lists the daemon anyway,
+/// publishes them here. Reported, never acted on: no drain, no kill, no adopt.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HostSandboxView {
+    pub sandbox_id: String,
+    pub name: String,
+    pub status: heyo_sdk::SandboxStatus,
+    pub image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guest_ip: Option<String>,
+    pub uptime_secs: u64,
+    /// Latest per-VM sample from the daemon, `None` if not yet reported.
+    pub cpu_percent: Option<f64>,
+    pub memory_bytes: Option<u64>,
+    /// The heyo account the sandbox is billed to, when the daemon knows.
+    /// This is also what a namespace-scoped caller's view is narrowed by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// RFC 3339, when the daemon reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -474,6 +510,7 @@ impl Metrics {
             retired: Mutex::new(DeploymentMetricsSnapshot::empty()),
             host: HostGauge::default(),
             daemon: DaemonGauge::default(),
+            host_sandboxes: ArcSwap::from_pointee(Vec::new()),
         }
     }
 
@@ -532,6 +569,19 @@ impl Metrics {
         if let Ok(mut last) = self.daemon.last_error.lock() {
             *last = Some(error.to_string());
         }
+    }
+
+    /// Replace the unowned-sandbox inventory with this tick's listing.
+    ///
+    /// Only ever called with a *successful* listing: when the daemon is
+    /// unreachable the previous inventory stands, exactly as every pool's
+    /// numbers do, and `daemon.reachable` is what says so.
+    pub fn record_host_sandboxes(&self, sandboxes: Vec<HostSandboxView>) {
+        self.host_sandboxes.store(Arc::new(sandboxes));
+    }
+
+    pub fn host_sandboxes(&self) -> Arc<Vec<HostSandboxView>> {
+        self.host_sandboxes.load_full()
     }
 
     pub fn daemon_snapshot(&self) -> DaemonSnapshot {

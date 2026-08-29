@@ -1599,6 +1599,36 @@ deployments passed the filter before paging, so a client can page without
 guessing. The dashboard's deployment table has a matching filter box and pager,
 which appear only when there is more than one page.
 
+### Sandboxes app-lb does not own
+
+The host is one machine, and not everything on it is a pool. Sandboxes created
+through `heyvm`, the cloud API or the desktop share its CPU and memory with
+every deployment, and until now they were invisible here — app-lb only ever
+looked at the VMs it named — so a loaded host next to a half-empty pool table
+had no explanation on the page. `GET /metrics` now carries them as
+`host_sandboxes`, and the dashboard lists them under **Host sandboxes** below
+the deployments: id, name, image, guest IP, the daemon's latest CPU and memory
+sample, uptime, the account billed for it, and its state. They are *reported,
+not managed* — no drain, no kill, no adoption; a sandbox somebody made by hand
+is not app-lb's to reap. The listing comes from the same daemon call the
+reconcile tick already makes, so it costs nothing extra, and it is taken even
+on a host with no VM deployments at all, which is exactly the host this view
+was missing.
+
+Ownership is the name rule (`applb-<deployment>-<nonce>`), so a sandbox is
+never both in a pool and in this list. Stopped sandboxes are included — they
+still hold a disk — with their state shown. `summary=true` empties the list
+like the per-VM rows; it is never paged, a host holds at most a few hundred.
+
+A host sandbox lives in no namespace, so in [managed mode](#managed-mode-federated-auth-and-namespaces)
+the wall that scopes deployments has nothing to place it by. What it has is an
+*account*: the daemon records which heyo account each sandbox is billed to, and
+a namespace caller sees the host sandboxes billed to the accounts behind its
+namespaces (through the cloud door, the one namespace the path names). A
+deployment- or namespace-scoped app-token sees none. The operator, and any
+`fleet:admin` grant, sees the host. [app-obs](../app-obs) reads the same field
+and tails the live ones' logs under a reserved `_unmanaged` partition.
+
 The page updates in place rather than redrawing. Deployment cards are keyed by
 id and reused across polls, and the distribution bars and utilization gauges are
 mutated rather than rebuilt — which is what lets their CSS transitions animate at

@@ -9,7 +9,7 @@ use crate::autoscale::{Autoscaler, EvictOutcome};
 use crate::config::DeploymentSpec;
 use crate::jobs::{Jobs, StartError};
 use crate::deployment::{UpstreamDrain, now_secs};
-use crate::metrics::{DeploymentMetricsSnapshot, HostUsageSnapshot, Metrics};
+use crate::metrics::{DeploymentMetricsSnapshot, HostSandboxView, HostUsageSnapshot, Metrics};
 use crate::registry::Registry;
 use crate::secrets::{SecretSpec, SecretStore};
 use crate::siem::AuthAction;
@@ -1150,6 +1150,14 @@ struct MetricsResponse {
     /// to the number registered; a number that climbs past it means retirement
     /// is not keeping up, which is the leak this used to have.
     tracked_deployments: usize,
+    /// Sandboxes on the daemon's host that no deployment owns — created
+    /// through the heyvm CLI, the cloud API or the desktop rather than by
+    /// app-lb. They share the host's CPU and memory with every pool above, so
+    /// a host that reads loaded against a half-empty pool table is explained
+    /// here. Scoped like `deployments` (a namespace caller sees the ones
+    /// billed to its own accounts), emptied by `summary=true` like the per-VM
+    /// rows, and never paged: a host holds at most a few hundred.
+    host_sandboxes: Vec<HostSandboxView>,
 }
 
 /// The three numbers the dashboard's alert tile needs, without the alert list.
@@ -1442,7 +1450,67 @@ async fn metrics_snapshot(
         deployments: views,
         matched,
         tracked_deployments: tracked,
+        host_sandboxes: if q.summary {
+            Vec::new()
+        } else {
+            visible_host_sandboxes(
+                &state.metrics.host_sandboxes(),
+                caller.as_ref().map(|c| &c.0),
+                q.namespace.as_deref(),
+            )
+        },
     })
+}
+
+/// The unowned sandboxes on the host that `caller` may see.
+///
+/// A host sandbox lives in no namespace, so the wall that scopes deployments
+/// has nothing to place it by. What it has is an *account* — the one the
+/// daemon bills it to — and that is what a federated caller is narrowed by:
+/// the accounts behind the namespaces they hold, or behind the one namespace
+/// a `namespace=` query names (which is how every request through the cloud
+/// door arrives). A deployment- or namespace-scoped app-token sees none: a
+/// key minted to drive one deployment has no claim on the host's other
+/// tenants. Everyone unconfined sees the whole host, which is the operator's
+/// dashboard.
+fn visible_host_sandboxes(
+    all: &[HostSandboxView],
+    caller: Option<&Caller>,
+    namespace: Option<&str>,
+) -> Vec<HostSandboxView> {
+    // `None` is "no narrowing"; `Some(set)` keeps sandboxes billed to a
+    // listed account and drops the unattributed rest.
+    let accounts: Option<std::collections::BTreeSet<&str>> = match caller {
+        None | Some(Caller::Ungated) | Some(Caller::Operator) => None,
+        Some(Caller::Token(t)) if t.covers_fleet() => None,
+        Some(Caller::Token(_)) => return Vec::new(),
+        Some(Caller::Federated(g)) => match namespace {
+            // A fleet grant is not confined; the query narrows it only when
+            // the auth service said who owns that namespace.
+            Some(ns) if g.fleet => g.accounts.get(ns).map(|a| [a.as_str()].into()),
+            Some(ns) if g.namespaces.contains_key(ns) => {
+                Some(g.account_for(ns).into_iter().collect())
+            }
+            // A namespace they do not hold: nothing, not everything.
+            Some(_) => return Vec::new(),
+            None if g.fleet => None,
+            None => Some(
+                g.accounts
+                    .values()
+                    .map(String::as_str)
+                    .chain(g.subject.account_id.as_deref())
+                    .collect(),
+            ),
+        },
+    };
+    all.iter()
+        .filter(|s| {
+            accounts.as_ref().is_none_or(|allowed| {
+                s.account_id.as_deref().is_some_and(|a| allowed.contains(a))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// The alert tile's numbers. Fleet-wide regardless of any deployment filter, as
@@ -5053,6 +5121,113 @@ mod tests {
                 stamp_owner(&mut spec, caller.as_ref());
                 assert_eq!(spec.account_id, None);
             }
+        }
+
+        fn host_sandbox(id: &str, account: Option<&str>) -> HostSandboxView {
+            HostSandboxView {
+                sandbox_id: id.into(),
+                name: id.into(),
+                status: heyo_sdk::SandboxStatus::Running,
+                image: "ubuntu:24.04".into(),
+                size_class: None,
+                guest_ip: None,
+                uptime_secs: 1,
+                cpu_percent: None,
+                memory_bytes: None,
+                account_id: account.map(str::to_string),
+                created_at: None,
+            }
+        }
+
+        fn host_ids(views: Vec<HostSandboxView>) -> Vec<String> {
+            views.into_iter().map(|v| v.sandbox_id).collect()
+        }
+
+        /// The host inventory is scoped by *account*, the one thing a sandbox
+        /// outside every namespace still has: a namespace caller sees the
+        /// sandboxes billed to the accounts behind its namespaces, the
+        /// operator sees the host, and an unattributed sandbox is the
+        /// operator's alone.
+        #[test]
+        fn host_sandboxes_are_narrowed_by_account() {
+            let all = vec![
+                host_sandbox("sb-a", Some("acc-team-a")),
+                host_sandbox("sb-b", Some("acc-team-b")),
+                host_sandbox("sb-own", Some("acc-own")),
+                host_sandbox("sb-nobody", None),
+            ];
+            let everything = vec!["sb-a", "sb-b", "sb-own", "sb-nobody"];
+            for caller in [None, Some(Caller::Operator), Some(Caller::Ungated)] {
+                assert_eq!(
+                    host_ids(visible_host_sandboxes(&all, caller.as_ref(), None)),
+                    everything
+                );
+                // The operator's `namespace=` filters the table, not the host.
+                assert_eq!(
+                    host_ids(visible_host_sandboxes(&all, caller.as_ref(), Some("team-a"))),
+                    everything
+                );
+            }
+
+            let member = Caller::Federated(grant(&[("team-a", AdminScope::View)], false));
+            // Direct to app-lb, no query: every account the grant names, and
+            // the caller's own.
+            assert_eq!(
+                host_ids(visible_host_sandboxes(&all, Some(&member), None)),
+                vec!["sb-a", "sb-own"]
+            );
+            // Through the cloud door the namespace is pinned: its owner only.
+            assert_eq!(
+                host_ids(visible_host_sandboxes(&all, Some(&member), Some("team-a"))),
+                vec!["sb-a"]
+            );
+            // A namespace they do not hold yields nothing rather than everything.
+            assert!(visible_host_sandboxes(&all, Some(&member), Some("team-b")).is_empty());
+
+            let fleet = Caller::Federated(grant(&[("team-b", AdminScope::Admin)], true));
+            assert_eq!(
+                host_ids(visible_host_sandboxes(&all, Some(&fleet), None)),
+                everything
+            );
+            assert_eq!(
+                host_ids(visible_host_sandboxes(&all, Some(&fleet), Some("team-b"))),
+                vec!["sb-b"]
+            );
+            // A namespace the auth service named no owner for cannot narrow.
+            assert_eq!(
+                host_ids(visible_host_sandboxes(&all, Some(&fleet), Some("elsewhere"))),
+                everything
+            );
+        }
+
+        /// An app-token is a key to deployments; the host's other tenants are
+        /// not behind that door unless the token is a fleet token.
+        #[test]
+        fn scoped_tokens_see_no_host_sandboxes() {
+            let all = vec![host_sandbox("sb-a", Some("acc-team-a"))];
+            let s = store();
+            let token = |namespace: Option<&str>, deployments: &[&str]| {
+                let secret = s
+                    .mint(
+                        NewToken {
+                            name: "test".into(),
+                            admin: AdminScope::Admin,
+                            namespace: namespace.map(str::to_string),
+                            deployments: deployments.iter().map(|d| d.to_string()).collect(),
+                            expires_in_secs: None,
+                        },
+                        NOW,
+                    )
+                    .unwrap()
+                    .1;
+                Caller::Token(s.verify(&secret, NOW).unwrap())
+            };
+            let scoped = token(None, &["web"]);
+            assert!(visible_host_sandboxes(&all, Some(&scoped), None).is_empty());
+            let namespaced = token(Some("team-a"), &[]);
+            assert!(visible_host_sandboxes(&all, Some(&namespaced), None).is_empty());
+            let fleet = token(None, &["*"]);
+            assert_eq!(host_ids(visible_host_sandboxes(&all, Some(&fleet), None)), vec!["sb-a"]);
         }
 
         /// A federated caller presents a bearer the local store does not know;

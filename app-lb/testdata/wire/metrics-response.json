@@ -380,5 +380,20 @@
     }
   ],
   "matched": 3,
-  "tracked_deployments": 3
+  "tracked_deployments": 3,
+  "host_sandboxes": [
+    {
+      "sandbox_id": "sb-7f3a9c",
+      "name": "sam-dev",
+      "status": "running",
+      "image": "ubuntu:24.04",
+      "size_class": "medium",
+      "guest_ip": "172.16.0.10",
+      "uptime_secs": 5400,
+      "cpu_percent": 3.5,
+      "memory_bytes": 536870912,
+      "account_id": "acc-team-a",
+      "created_at": "2024-07-31T04:26:40+00:00"
+    }
+  ]
 }

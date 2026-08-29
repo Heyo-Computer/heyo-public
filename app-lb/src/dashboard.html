@@ -366,6 +366,16 @@
   </div>
   <div id="deployments"></div>
 
+  <!-- Below Deployments and above the configuration sections: these are live
+       load on the host, so they belong with what is happening now, but app-lb
+       does not run them, so they are not the pool table. No actions on the
+       rows — drain and kill are pool operations, and a sandbox somebody made
+       by hand is not app-lb's to reap. -->
+  <div class="section-title">
+    Host sandboxes <span class="count" id="hostsb-count"></span>
+  </div>
+  <div class="card" id="host-sandboxes"></div>
+
   <div class="section-title">
     Certificates <span class="count" id="certs-count"></span>
   </div>
@@ -645,6 +655,10 @@ function render(data) {
          h.available ? `${fmtBytes(h.memory_used_bytes)} / ${fmtBytes(h.memory_total_bytes)}` : ""),
     tile("Deployments", fmt(data.fleet.deployments)),
     tile("Ready VMs", fmt(data.fleet.ready), "", `${fmt(data.fleet.pending)} pending · ${fmt(data.fleet.draining)} draining`),
+    // What else is on the machine. An older app-lb does not send the list at
+    // all, and "0" would then claim a knowledge it does not have.
+    ...(Array.isArray(data.host_sandboxes) ? [tile("Host sandboxes", fmt(data.host_sandboxes.length), "",
+         data.host_sandboxes.length ? "not managed by app-lb" : "none outside the pools")] : []),
     tile("In-flight", fmt(data.fleet.total_in_flight), "", "requests being served"),
     tile("Requests / sec", rps == null ? "—" : fmt(rps, rps < 10 ? 1 : 0)),
     tile("Avg latency", avgLat == null ? "—" : fmtMs(avgLat), "", `p99 ${fmtMs(g.latency_ms.p99)}`),
@@ -700,6 +714,7 @@ function render(data) {
   // --- per-deployment ---
   renderDeploymentPager(data.matched);
   renderDeployments(data.deployments);
+  renderHostSandboxes(data.host_sandboxes);
 
   // --- freshness ---
   $("uptime").textContent = "up " + fmtDur(data.uptime_secs);
@@ -992,6 +1007,54 @@ function renderDeployments(deps) {
   // Whatever is left was on the previous page of results, or has been
   // deregistered since.
   for (const el of existing.values()) el.remove();
+}
+
+// ---- Host sandboxes -----------------------------------------------------
+
+// The daemon's status words, as pill classes. `running` is the only one that
+// means load; the rest are here so a stopped sandbox reads as what it is
+// rather than as a broken one.
+const HOST_SB_TAG = { running: "ok", provisioning: "boot", stopped: "idle", paused: "idle", failed: "down", "cold-stored": "idle" };
+
+function renderHostSandboxes(list) {
+  const host = $("host-sandboxes");
+  // Absent means an app-lb that predates the field — say nothing rather than
+  // "none", which would be a claim about the host it has not made.
+  if (!Array.isArray(list)) {
+    $("hostsb-count").textContent = "";
+    setHTML(host, `<div class="empty">This app-lb does not report host sandboxes.</div>`);
+    return;
+  }
+  const running = list.filter(s => s.status === "running").length;
+  $("hostsb-count").textContent = list.length
+    ? `${list.length} on host · ${running} running` : "";
+  if (!list.length) {
+    setHTML(host, `<div class="empty">No sandboxes on this host outside the pools above.</div>`);
+    return;
+  }
+  const rows = list.map(s => {
+    const tag = HOST_SB_TAG[s.status] || "idle";
+    const cpuBar = s.cpu_percent == null ? 0 : Math.min(100, s.cpu_percent);
+    const who = s.account_id ? `<span class="sub" style="color:var(--muted)">${esc(s.account_id)}</span>` : "—";
+    return `<tr>
+      <td class="mono">${esc(s.sandbox_id)}</td>
+      <td>${esc(s.name || "")}</td>
+      <td class="mono">${esc(s.image || "")}${s.size_class ? ` <span class="sub" style="color:var(--muted)">${esc(s.size_class)}</span>` : ""}</td>
+      <td class="mono">${esc(s.guest_ip || "—")}</td>
+      <td><span class="vm-load"><span class="track"><span class="fill" style="width:${cpuBar}%"></span></span>${s.cpu_percent == null ? "—" : fmt(s.cpu_percent, 0) + "%"}</span></td>
+      <td>${s.memory_bytes == null ? "—" : fmtBytes(s.memory_bytes)}</td>
+      <td>${s.status === "running" ? fmtDur(s.uptime_secs) : "—"}</td>
+      <td>${who}</td>
+      <td><span class="tag ${tag}">${esc(s.status)}</span></td>
+    </tr>`;
+  }).join("");
+  setHTML(host, `<div style="overflow-x:auto"><table class="vms">
+      <thead><tr><th>sandbox</th><th>name</th><th>image</th><th>guest ip</th><th>cpu</th><th>memory</th><th>uptime</th><th>account</th><th>state</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="note">Sandboxes on this host that no deployment owns — created through <code>heyvm</code>,
+    the cloud API or the desktop. They share the host's CPU and memory with the pools above; app-lb
+    reports them and leaves them alone.</div>`);
 }
 
 // ---- Certificates -------------------------------------------------------

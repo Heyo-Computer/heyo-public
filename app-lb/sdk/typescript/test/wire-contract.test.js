@@ -49,11 +49,13 @@ const KNOWN = {
     StatusCounts: ["total", "c2xx", "c3xx", "c4xx", "c5xx", "errors"],
     Histogram: ["count", "sum", "mean", "p50", "p90", "p99", "buckets"],
     Bucket: ["le", "count"],
-    AutoscaleCounts: ["vms_created", "vms_drained", "vms_reaped", "scale_up_events", "scale_down_events", "cold_start_waits", "cold_start_hits", "cold_start_timeouts", "boot_timeouts"],
+    AutoscaleCounts: ["vms_created", "vms_drained", "vms_reaped", "scale_up_events", "scale_down_events", "cold_start_waits", "cold_start_hits", "cold_start_timeouts", "boot_timeouts", "create_failures", "last_create_error"],
     HostUsage: ["available", "cpu_count", "cpu_percent", "memory_total_bytes", "memory_used_bytes", "sampled_at_ms"],
     FleetPool: ["deployments", "ready", "draining", "pending", "total_in_flight"],
     ObsStats: ["queued", "dropped", "shipped", "failed", "healthy"],
-    MetricsResponse: ["generated_at", "uptime_secs", "host", "fleet", "global", "obs", "security", "deployments", "matched", "tracked_deployments"],
+    MetricsResponse: ["generated_at", "uptime_secs", "host", "fleet", "global", "obs", "security", "daemon", "deployments", "matched", "tracked_deployments", "host_sandboxes"],
+    DaemonStatus: ["reachable", "last_error"],
+    HostSandboxView: ["sandbox_id", "name", "status", "image", "size_class", "guest_ip", "uptime_secs", "cpu_percent", "memory_bytes", "account_id", "created_at"],
     SecuritySummary: ["open", "urgent", "dropped", "clients_at_capacity", "rules", "blocked"],
     SecurityResponse: ["generated_at", "enabled", "window_secs", "alerts", "totals", "rules", "guard", "stats"],
     // `ecs` is a free-form ECS map by design, so it has no declaration to check
@@ -142,7 +144,7 @@ const NESTED = {
 /** Which declaration governs the *elements* of an array, by its key. */
 const ELEMENTS = {
   routes: "RouteRule", vms: "VmStatus", deployments: "DeploymentView", alerts: "SecurityAlert",
-  pending_vms: "PendingVmView", buckets: "Bucket", env_from: "SecretEnv",
+  pending_vms: "PendingVmView", host_sandboxes: "HostSandboxView", buckets: "Bucket", env_from: "SecretEnv",
   actions: "SuggestedAction", rules: "RuleView",
   workflows: "WorkflowSpec",
   // `mounts` is a MountSpec on a VmSpec and a MountOutcome on a JobRecord — the

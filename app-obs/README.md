@@ -38,6 +38,18 @@ different `source` values — pick one per line.
 Metrics are polled from app-lb, which already measures everything worth
 keeping.
 
+**Sandboxes outside every deployment.** app-lb also reports the sandboxes on
+its host that it does not manage — made through `heyvm`, the cloud API or the
+desktop — as `host_sandboxes` on `/metrics`. app-obs tails the live ones
+exactly as it tails a pool's VMs, attributed to the deployment `_unmanaged`
+with `backend` set to the sandbox id, and records their CPU and memory the
+same way (a rollup row for the fleet view, then one row per sandbox). The
+fleet page lists what is on the host right now under **Host sandboxes**, each
+row linking straight to that sandbox's lines. Nothing is written under
+`_unmanaged` when the list is empty, so an app-lb that predates the field
+leaves no trace of it. Like `_host`, the name is app-obs's own — don't
+register a deployment under it.
+
 The latest successful poll also backs `GET /api/platform-status`. This is the
 live topology view: backend probe health, administrative drain state, in-flight
 requests, pool capacity, and whether the observation itself is stale. It does
