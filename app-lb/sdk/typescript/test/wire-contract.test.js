@@ -26,7 +26,8 @@ const KNOWN = {
   common: {
     DeploymentStatus: ["spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
-    DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "build", "artifact", "site", "update", "auth", "feed"],
+    DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed"],
+    DiscoverySpec: ["service_id"],
     RouteRule: ["host", "host_suffix", "path_prefix"],
     VmSpec: ["driver", "image", "port", "start_command", "size_class", "disk_size_gb", "working_directory", "env_vars", "setup_hooks", "open_ports", "mounts", "ttl_seconds"],
     MountSpec: ["path", "store", "ref", "auth", "strip_components", "read_only", "digest"],
@@ -49,11 +50,18 @@ const KNOWN = {
     StatusCounts: ["total", "c2xx", "c3xx", "c4xx", "c5xx", "errors"],
     Histogram: ["count", "sum", "mean", "p50", "p90", "p99", "buckets"],
     Bucket: ["le", "count"],
-    AutoscaleCounts: ["vms_created", "vms_drained", "vms_reaped", "scale_up_events", "scale_down_events", "cold_start_waits", "cold_start_hits", "cold_start_timeouts", "boot_timeouts"],
+    AutoscaleCounts: ["vms_created", "vms_drained", "vms_reaped", "scale_up_events", "scale_down_events", "cold_start_waits", "cold_start_hits", "cold_start_timeouts", "boot_timeouts", "create_failures", "last_create_error"],
     HostUsage: ["available", "cpu_count", "cpu_percent", "memory_total_bytes", "memory_used_bytes", "sampled_at_ms"],
     FleetPool: ["deployments", "ready", "draining", "pending", "total_in_flight"],
     ObsStats: ["queued", "dropped", "shipped", "failed", "healthy"],
-    MetricsResponse: ["generated_at", "uptime_secs", "host", "fleet", "global", "obs", "security", "deployments", "matched", "tracked_deployments"],
+    DaemonSnapshot: ["reachable", "last_error"],
+    MetricsResponse: ["generated_at", "uptime_secs", "host", "fleet", "global", "obs", "security", "daemon", "deployments", "matched", "tracked_deployments"],
+    DiskInventory: ["complete", "incomplete_reason", "data_dir", "tmp_dir", "ttl_secs", "sweep_secs", "archive_enabled", "archive_on_expire", "archive_target", "free_bytes", "filesystem_bytes", "orphan_ttl_secs", "totals", "disks", "archives"],
+    DiskTotals: ["disks", "bytes", "apparent_bytes", "running", "stopped", "orphan", "retained", "expiring_now", "reclaimable_bytes"],
+    DiskInfo: ["sandbox_id", "name", "deployment", "state", "claimed", "retain", "note", "bytes", "apparent_bytes", "modified_at", "expires_at", "held_by", "archived", "parts", "roots"],
+    DiskPart: ["kind", "path", "bytes", "apparent_bytes", "modified_at"],
+    ArchiveRecord: ["uri", "at", "bytes"],
+    ArchiveView: ["id", "sandbox_id", "uri", "started_at", "finished_at", "status", "bytes", "expected_bytes", "error", "purged"],
     SecuritySummary: ["open", "urgent", "dropped", "clients_at_capacity", "rules", "blocked"],
     SecurityResponse: ["generated_at", "enabled", "window_secs", "alerts", "totals", "rules", "guard", "stats"],
     // `ecs` is a free-form ECS map by design, so it has no declaration to check
@@ -95,6 +103,7 @@ const FIXTURES = {
   "deployment-status-jwt": "DeploymentStatus",
   "deployment-view-site": "DeploymentView",
   "metrics-response": "MetricsResponse",
+  "disks": "DiskInventory",
   "security-response": "SecurityResponse",
   "job-build": "JobRecord",
   "job-pull": "JobRecord",
@@ -122,15 +131,16 @@ const FIXTURES = {
 /** Which declaration governs a nested object, by the key that holds it. */
 const NESTED = {
   spec: "DeploymentSpec", vm: "VmSpec", scaling: "ScalingPolicy", health: "HealthCheck",
-  build: "BuildSpec", artifact: "ArtifactSpec", site: "SiteSpec", update: "UpdateSpec",
+  discovery: "DiscoverySpec", build: "BuildSpec", artifact: "ArtifactSpec", site: "SiteSpec", update: "UpdateSpec",
   auth: "AuthGate", client_secret: "SecretRef", pool: "PoolStatus", host: "HostUsage",
   // `jwt` is the gate's verification policy. Its own `secret` is a SecretRef,
   // and `require` is a free-form claim map with no declaration to check against
   // — app-lb may carry any claim name there without that being an API change.
   jwt: "JwtSpec",
   feed: "FeedSpec",
-  fleet: "FleetPool", obs: "ObsStats", metrics: "DeploymentMetrics",
+  fleet: "FleetPool", obs: "ObsStats", daemon: "DaemonSnapshot", metrics: "DeploymentMetrics",
   security: "SecuritySummary", totals: "SeverityTotals", stats: "SiemStats",
+  archived: "ArchiveRecord",
   response: "AlertResponse", guard: "GuardStats",
   // `rule` is a bare string on an alert and a whole RuleSpec on a suggested
   // action; `check` only recurses into objects, so one entry serves both.
@@ -143,6 +153,7 @@ const NESTED = {
 const ELEMENTS = {
   routes: "RouteRule", vms: "VmStatus", deployments: "DeploymentView", alerts: "SecurityAlert",
   pending_vms: "PendingVmView", buckets: "Bucket", env_from: "SecretEnv",
+  disks: "DiskInfo", archives: "ArchiveView", parts: "DiskPart",
   actions: "SuggestedAction", rules: "RuleView",
   workflows: "WorkflowSpec",
   // `mounts` is a MountSpec on a VmSpec and a MountOutcome on a JobRecord — the
@@ -173,6 +184,7 @@ function check(value, declName, path, unknown) {
       // already resolves to SecretRef.
       if (key === "auth") nested = declName === "DeploymentSpec" ? "AuthGate" : "SecretRef";
       if (key === "secret") nested = "SecretRef";
+      if (key === "totals" && declName === "DiskInventory") nested = "DiskTotals";
       // A free-form claim map: the keys are whatever the issuer sends.
       if (key === "require") nested = undefined;
       if (nested) check(child, nested, `${path}.${key}`, unknown);

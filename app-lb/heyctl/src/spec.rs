@@ -249,6 +249,7 @@ pub fn is_static(spec: &Value) -> bool {
     spec.get("upstreams")
         .and_then(Value::as_array)
         .is_some_and(|u| !u.is_empty())
+        || spec.get("discovery").is_some_and(|value| !value.is_null())
 }
 
 /// Serves files off disk. Neither `vm` nor `upstreams` applies.

@@ -409,6 +409,29 @@ mod tests {
     }
 
     #[test]
+    fn create_accepts_an_orchestrator_discovery_service() {
+        let cli = Cli::try_parse_from([
+            "heyctl",
+            "create",
+            "deployment",
+            "cloud",
+            "--host",
+            "cloud.example.com",
+            "--discovery-service",
+            "cloud",
+        ])
+        .unwrap();
+        let Command::Create {
+            cmd: CreateCmd::Deployment(args),
+        } = &cli.command
+        else {
+            panic!("expected create deployment");
+        };
+        assert_eq!(args.discovery_service.as_deref(), Some("cloud"));
+        assert_eq!(args.port, None);
+    }
+
+    #[test]
     fn create_takes_a_build_source() {
         let cli = Cli::try_parse_from([
             "heyctl",

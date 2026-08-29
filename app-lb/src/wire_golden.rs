@@ -140,6 +140,7 @@ fn vm_spec() -> DeploymentSpec {
             timeout_secs: 2,
         },
         upstreams: vec![],
+        discovery: None,
         build: Some(crate::config::BuildSpec {
             repo: Some("https://github.com/example/agent".into()),
             store: None,
@@ -207,6 +208,7 @@ fn site_spec() -> DeploymentSpec {
         scaling: crate::config::ScalingPolicy::default(),
         health: crate::config::HealthCheck::default(),
         upstreams: vec![],
+        discovery: None,
         build: None,
         artifact: None,
         site: Some(crate::config::SiteSpec {
@@ -257,6 +259,9 @@ fn static_spec() -> DeploymentSpec {
         scaling: crate::config::ScalingPolicy::default(),
         health: crate::config::HealthCheck::default(),
         upstreams: vec!["10.0.0.4:8080".into(), "10.0.0.5:8080".into()],
+        discovery: Some(crate::config::DiscoverySpec {
+            service_id: "cloud".into(),
+        }),
         build: None,
         artifact: None,
         site: None,

@@ -335,6 +335,7 @@ mod tests {
             scaling: Default::default(),
             health: Default::default(),
             upstreams: vec![],
+            discovery: None,
             build: None,
             artifact: None,
             site: None,
