@@ -12,7 +12,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 import type { Config } from "./config.js";
-import { configured } from "./config.js";
+import { configured, withForwardedAuth } from "./config.js";
 import { buildTools, createServer } from "./server.js";
 import { identityFrom, identityRequired, Unauthenticated } from "./identity.js";
 
@@ -59,7 +59,12 @@ export async function serveHttp(config: Config, port: number, host: string): Pro
     // production and "who asked for that" must be answerable afterwards.
     console.error(`[${new Date().toISOString()}] ${req.method} ${MCP_PATH} by ${who}`);
 
-    const server = createServer(config, tools);
+    // A hosted instance without an app-lb credential of its own acts as the
+    // caller: their bearer goes upstream, and the tool set is rebuilt for it.
+    // With a configured credential this is the shared config and shared tools.
+    const requestConfig = withForwardedAuth(config, req.headers);
+    const requestTools = requestConfig === config ? tools : buildTools(requestConfig);
+    const server = createServer(requestConfig, requestTools);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     // Both are per-request; without this the sockets accumulate.
     res.on("close", () => {

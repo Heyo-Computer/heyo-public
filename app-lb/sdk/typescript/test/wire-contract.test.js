@@ -26,7 +26,7 @@ const KNOWN = {
   common: {
     DeploymentStatus: ["spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
-    DeploymentSpec: ["id", "namespace", "routes", "vm", "scaling", "health", "upstreams", "build", "artifact", "site", "update", "auth", "feed"],
+    DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "build", "artifact", "site", "update", "auth", "feed"],
     RouteRule: ["host", "host_suffix", "path_prefix"],
     VmSpec: ["driver", "image", "port", "start_command", "size_class", "disk_size_gb", "working_directory", "env_vars", "setup_hooks", "open_ports", "mounts", "ttl_seconds"],
     MountSpec: ["path", "store", "ref", "auth", "strip_components", "read_only", "digest"],
@@ -40,7 +40,7 @@ const KNOWN = {
     SecretRef: ["secret", "key", "username"],
     AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity", "jwt"],
     JwtSpec: ["secret", "public_key", "jwks_url", "algorithms", "issuer", "audience", "require", "subject_claim", "email_claim", "name_claim", "leeway_secs", "cookie"],
-    DeploymentView: ["id", "namespace", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
+    DeploymentView: ["id", "namespace", "account_id", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
     UpstreamTrafficStatus: ["deployment_id", "upstream", "state", "healthy", "in_flight", "reason", "started_at"],
     PoolStatus: ["desired_replicas", "ready", "draining", "pending", "total_in_flight", "target_concurrency", "min_replicas", "max_replicas", "warm_pool", "utilization", "cpu_percent", "memory_bytes", "boot_timeout_secs", "cold_start_timeout_secs"],
     VmView: ["sandbox_id", "addr", "in_flight", "healthy", "draining", "uptime_secs", "cpu_percent", "memory_bytes"],
@@ -87,6 +87,7 @@ const KNOWN = {
 /** Which declaration each fixture is an instance of. */
 const FIXTURES = {
   "deployment-status-vm": "DeploymentStatus",
+  "deployment-status-vm-owned": "DeploymentStatus",
   "deployment-status-site": "DeploymentStatus",
   "deployment-status-static": "DeploymentStatus",
   "deployment-status-artifact": "DeploymentStatus",

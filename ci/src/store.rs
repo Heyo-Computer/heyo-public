@@ -196,6 +196,9 @@ pub struct Run {
     pub actor_email: Option<String>,
     pub status: String,
     pub error: Option<String>,
+    /// The run this one re-plays, when it was started from the dashboard's
+    /// "Run again" or "Re-run failed jobs" rather than by a submit.
+    pub rerun_of: Option<String>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -228,6 +231,9 @@ impl Run {
             actor_email: r.get("actor_email"),
             status: r.get("status"),
             error: r.get("error"),
+            // Absent on a row read before migration 012 ran; "not a re-run" is
+            // the right reading of that.
+            rerun_of: r.try_get("rerun_of").ok().flatten(),
             created_at: r.get("created_at"),
             started_at: r.get("started_at"),
             finished_at: r.get("finished_at"),
@@ -261,6 +267,10 @@ pub struct JobRow {
     /// ids, so this is what a redelivery executes.
     pub plan: serde_json::Value,
     pub error: Option<String>,
+    /// Set when this job never ran here: its run re-ran only the failed jobs of
+    /// the run named, and this one had succeeded there, so its status and
+    /// outputs were copied across to satisfy `needs:`.
+    pub carried_from: Option<String>,
     /// When the job went on the queue. Distinct from `started_at`, and the
     /// difference is the point: every timeout a job has is measured from
     /// `started_at`, the moment a consumer claimed it — never from here.
@@ -287,6 +297,7 @@ impl JobRow {
             outputs: r.get("outputs"),
             plan: r.get("plan"),
             error: r.get("error"),
+            carried_from: r.try_get("carried_from").ok().flatten(),
             // Older rows predate the column's backfill; a missing value reads
             // as "not queued" rather than taking the query down.
             queued_at: r.try_get("queued_at").ok().flatten(),
@@ -437,6 +448,8 @@ pub struct RunRequest {
     pub actor_subject: Option<String>,
     pub actor_email: Option<String>,
     pub source: String,
+    /// The run this one re-plays, for a re-run started from the dashboard.
+    pub rerun_of: Option<String>,
 }
 
 #[derive(Clone)]
@@ -697,8 +710,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO ci_run (id, workflow_id, workflow_path, workflow_name, repo_url,
                                  git_ref, sha, before_sha, actor_subject, actor_email,
-                                 source, status, repo_id, changes)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12,$13)",
+                                 source, status, repo_id, changes, rerun_of)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12,$13,$14)",
         )
         .bind(run_id)
         .bind(&req.workflow_id)
@@ -722,6 +735,7 @@ impl Store {
         .bind(serde_json::to_value(&req.changes).unwrap_or_else(|_| {
             serde_json::to_value(crate::paths::Changes::default()).unwrap_or_default()
         }))
+        .bind(&req.rerun_of)
         .execute(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
@@ -763,6 +777,24 @@ impl Store {
         .await
         .map_err(StoreError::sql)?;
         Ok(row.as_ref().map(Run::from_row))
+    }
+
+    /// Runs started from this one by the dashboard, oldest first — the other
+    /// direction of `rerun_of`, so the original's page can point at what came
+    /// after it.
+    pub async fn reruns_of(&self, run_id: &str) -> Result<Vec<Run>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT r.*, rp.name AS repo_name
+               FROM ci_run r
+               LEFT JOIN ci_repo rp ON rp.id = r.repo_id
+              WHERE r.rerun_of = $1
+              ORDER BY r.created_at",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(rows.iter().map(Run::from_row).collect())
     }
 
     /// Newest first. `repo_id` narrows to one registered repository; `None` is
@@ -1084,6 +1116,31 @@ impl Store {
               WHERE id = $1 AND status = 'queued'",
         )
         .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Give a job of a re-run the result its counterpart earned in the run
+    /// being re-run — status and outputs — so `needs:` resolves and the jobs
+    /// downstream of it can run without it running again.
+    ///
+    /// Guarded on `pending`: it only ever fills a row the scheduler has not
+    /// touched, which is every row of a run that has just been created. Returns
+    /// whether it did, so a key the new plan no longer has is a count of zero
+    /// rather than an error.
+    pub async fn carry_over_job(&self, job_id: &str, from: &JobRow) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE ci_job
+                SET status = $2, outputs = $3, carried_from = $4,
+                    started_at = now(), finished_at = now()
+              WHERE id = $1 AND status = 'pending'",
+        )
+        .bind(job_id)
+        .bind(&from.status)
+        .bind(&from.outputs)
+        .bind(&from.run_id)
         .execute(&self.pool)
         .await
         .map_err(StoreError::sql)?;
@@ -1919,6 +1976,102 @@ jobs:
         )
         .expect("workflow parses");
         Plan::build(&wf).expect("plan builds")
+    }
+
+    /// A failed-only re-run copies the succeeded jobs' results across so
+    /// `needs:` reads them, leaves the rest for the scheduler, and the two
+    /// runs point at each other.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_rerun_carries_succeeded_jobs_over_and_links_both_ways() {
+        let store = test_store().await;
+        let plan = test_plan();
+        let first = crate::vm::new_id();
+        store
+            .create_run(&first, &RunRequest::default(), &plan)
+            .await
+            .expect("run created");
+        // Both build cells succeeded with an output; deploy failed.
+        for j in store.jobs_of(&first).await.unwrap() {
+            if j.base_id == "build" {
+                store
+                    .set_job_outputs(&j.id, &serde_json::json!({"version": "1.2.3"}))
+                    .await
+                    .unwrap();
+                store
+                    .set_job_status(&j.id, JobStatus::Success, None)
+                    .await
+                    .unwrap();
+            } else {
+                store
+                    .set_job_status(&j.id, JobStatus::Failure, Some("ship broke"))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let again = crate::vm::new_id();
+        store
+            .create_run(
+                &again,
+                &RunRequest {
+                    rerun_of: Some(first.clone()),
+                    source: "rerun".into(),
+                    ..Default::default()
+                },
+                &plan,
+            )
+            .await
+            .expect("re-run created");
+        let previous = store.jobs_of(&first).await.unwrap();
+        let mut carried = 0;
+        for j in previous.iter().filter(|j| j.status == "success") {
+            if store
+                .carry_over_job(&job_id(&again, &j.job_key), j)
+                .await
+                .unwrap()
+            {
+                carried += 1;
+            }
+        }
+        assert_eq!(carried, 2, "both build cells, and not deploy");
+        // A second pass finds nothing pending to fill.
+        for j in previous.iter().filter(|j| j.status == "success") {
+            assert!(
+                !store
+                    .carry_over_job(&job_id(&again, &j.job_key), j)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        for j in store.jobs_of(&again).await.unwrap() {
+            if j.base_id == "build" {
+                assert_eq!(j.status, "success");
+                assert_eq!(j.carried_from.as_deref(), Some(first.as_str()));
+                assert_eq!(j.outputs["version"], "1.2.3");
+                assert!(j.finished_at.is_some(), "a carried job is terminal");
+            } else {
+                assert_eq!(j.status, "pending", "the failed job is the scheduler's");
+                assert!(j.carried_from.is_none());
+                assert!(j.error.is_none(), "the failure stayed with the first run");
+            }
+        }
+        // What the scheduler's `if:` guard and `${{ needs.build.outputs }}` see.
+        let needs = store.needs_context(&again).await.unwrap();
+        assert_eq!(needs["build"]["result"], "success");
+        assert_eq!(needs["build"]["outputs"]["version"], "1.2.3");
+
+        let run = store.get_run(&again).await.unwrap().expect("re-run exists");
+        assert_eq!(run.rerun_of.as_deref(), Some(first.as_str()));
+        let original = store.get_run(&first).await.unwrap().expect("first exists");
+        assert!(original.rerun_of.is_none());
+        let reruns = store.reruns_of(&first).await.unwrap();
+        assert_eq!(
+            reruns.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![again.as_str()]
+        );
+        assert!(store.reruns_of(&again).await.unwrap().is_empty());
     }
 
     /// Re-running every migration on every startup is the whole scheme, so it

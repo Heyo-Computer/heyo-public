@@ -584,6 +584,40 @@ about somebody stopping the run, so it does not convert a cancellation into a
 success — and the executor does not write `failure` over it, which would make a
 deliberate stop read as a broken build.
 
+## Re-running a run
+
+Two buttons on a finished run's page, and the routes behind them:
+
+- **Run again** — `POST /runs/{id}/rerun`. Every job, from the top.
+- **Re-run failed jobs** — `POST /runs/{id}/rerun-failed`, offered when the run
+  failed or was cancelled. Every job that *succeeded* is carried over into the
+  new run as finished, with its outputs, so `needs:` resolves and a deploy job
+  can run again without rebuilding what built; everything else — failed,
+  cancelled, skipped — is scheduled afresh. A carried-over job says so on the
+  run page and on its own page, which links to the steps it did not run.
+
+Both are the dashboard's manual trigger, and both are the answer to "the build
+timed out on a cold cache": the re-run claims the same warm VM, and with it the
+cache disk the first attempt spent its budget filling.
+
+**A re-run is a new run**, with `rerun_of` pointing at the one it re-plays and
+the original's page listing what re-played it — never a reset of the old run.
+Run and job ids name their logs and derive the step operation ids the daemon
+reattaches to, and the failed attempt is what somebody will want to read beside
+the one that passed.
+
+**What it runs is the source the submit sent.** This service never clones — it
+holds no credential to — so there is no "run this workflow on that branch" form:
+the only source it can run is one a `git submit` already delivered, and every
+submit keeps its bundle or tarball beside the workspace under `CI_WORKSPACE_DIR`
+for exactly this. A run whose stored source is gone says so and asks for a new
+submit. The re-run goes through the same path as a submit, with the run's own
+workflow file as its `--only` selector, so it is planned, routed and given
+secrets exactly as the original was. As with `--only`, the `on.submit` branch
+and path filters do not apply — and the run inherits the original's recorded
+change set, so job-level `changed()` filters decide as they did the first time.
+Same authority as cancel: `CI_ADMIN_EMAILS` through app-lb's gate, when set.
+
 ## The warm VM pool
 
 ```

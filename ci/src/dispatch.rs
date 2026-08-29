@@ -369,9 +369,12 @@ impl Dispatcher {
                 // response, so a run on an unexpected branch is never a mystery.
                 if let Err(why) = wf.on_submit.admits(req.branch(), &changes) {
                     if named {
-                        warnings.push(format!(
-                            "{path}: trigger filters bypassed by --only ({why})"
-                        ));
+                        let by = if req.rerun.is_some() {
+                            "the re-run"
+                        } else {
+                            "--only"
+                        };
+                        warnings.push(format!("{path}: trigger filters bypassed by {by} ({why})"));
                     } else {
                         tracing::info!("{path} declined this submit: {why}");
                         skipped.push(format!("{path}: {why}"));
@@ -428,23 +431,40 @@ impl Dispatcher {
                             // a build it never did. Unknown is the codebase's
                             // fail-open answer: every changed() filter admits,
                             // and the reason string says why on the run page.
-                            changes: if named {
-                                crate::paths::Changes::unknown(
+                            changes: match &req.rerun {
+                                // The same commit with the same diff: the run
+                                // being re-played already answered this, and
+                                // reusing its answer is what makes every
+                                // `changed()` filter decide exactly as it did
+                                // the first time.
+                                Some(rerun) => rerun.changes.clone(),
+                                None if named => crate::paths::Changes::unknown(
                                     "run forced by `git submit --only`; every changed() \
                                      filter admits",
-                                )
-                            } else {
-                                changes.clone()
+                                ),
+                                None => changes.clone(),
                             },
                             actor_subject: actor.map(|a| a.subject.clone()),
                             actor_email: actor
                                 .map(|a| a.email.clone())
                                 .or_else(|| req.pusher.as_ref().and_then(|p| p.email.clone())),
-                            source: "submit".to_string(),
+                            source: if req.rerun.is_some() {
+                                "rerun"
+                            } else {
+                                "submit"
+                            }
+                            .to_string(),
+                            rerun_of: req.rerun.as_ref().map(|r| r.of.clone()),
                         },
                         &plan,
                     )
                     .await?;
+                // Before the first scheduling pass, so a job whose `needs:`
+                // succeeded last time sees that result and not a `pending`
+                // row it would wait on for ever.
+                if let Some(rerun) = req.rerun.as_ref().filter(|r| r.failed_only) {
+                    self.carry_over_successes(&run_id, &rerun.of).await?;
+                }
                 self.advance_run(&run_id).await?;
                 run_ids.push(run_id);
             }
@@ -490,6 +510,138 @@ impl Dispatcher {
         // interesting question is usually why the *other* one did not.
         warnings.extend(skipped.into_iter().map(|s| format!("no run started — {s}")));
         Ok(Submitted { run_ids, warnings })
+    }
+
+    /// Start a new run from a finished one's source — the dashboard's "Run
+    /// again" and "Re-run failed jobs".
+    ///
+    /// A re-run is a *new* run, not a reset of the old one. Run and job ids
+    /// name their logs, step operation ids derive from them and the daemon
+    /// reattaches to an operation it has already seen, and the failed attempt
+    /// is the thing somebody will want to read next to the one that passed.
+    /// What the two share is the source: every submit keeps its bundle or
+    /// tarball beside the workspace, so the bytes that ran are the bytes that
+    /// run again — and no clone is needed, which matters because this service
+    /// has never held a credential for one.
+    ///
+    /// It goes through [`Self::submit`] with the original run's workflow file
+    /// as its one `--only` selector, so it is planned, routed and secreted
+    /// exactly as a submit is; the only things a re-run adds are lineage
+    /// (`rerun_of`) and, with `failed_only`, the carried-over results.
+    ///
+    /// `failed_only` copies every job that *succeeded* in the original into the
+    /// new run as a finished row with its outputs, so `needs:` resolves and a
+    /// deploy job can run again without rebuilding what already built.
+    /// Everything else — failed, cancelled, skipped — is scheduled afresh, and
+    /// a job that was skipped by its `if:` will be asked again.
+    pub async fn rerun(
+        &self,
+        run_id: &str,
+        failed_only: bool,
+        actor: Option<&crate::web::identity::Identity>,
+    ) -> Result<Submitted, DispatchError> {
+        let run = self
+            .store
+            .get_run(run_id)
+            .await?
+            .ok_or_else(|| DispatchError::Workflow(format!("no run {run_id}")))?;
+        if !matches!(run.status.as_str(), "success" | "failure" | "cancelled") {
+            return Err(DispatchError::Workflow(format!(
+                "run {run_id} is still {}; cancel it, or wait for it to finish, before \
+                 re-running it",
+                run.status
+            )));
+        }
+
+        // The registration the original ran under, when it had one — it is
+        // what decides the workflow glob, the network and the secrets prefix,
+        // and a paused one must stay paused for re-runs too.
+        let repo = match &run.repo_id {
+            Some(id) => self.store.get_repo(id).await?,
+            None => self.store.repo_by_url(&run.repo_url).await?,
+        };
+        if let Some(r) = &repo
+            && !r.enabled
+        {
+            return Err(DispatchError::Workflow(format!(
+                "{} is paused on /repos; enable it before re-running its builds",
+                r.name
+            )));
+        }
+
+        let workspace = crate::trigger::Workspace::for_run(&self.config, run_id);
+        let Some((format, path)) = workspace.stored_source() else {
+            return Err(DispatchError::Workflow(format!(
+                "the source of run {run_id} is no longer under {} — it was submitted before \
+                 this instance kept sources, or the directory was cleaned — so there is \
+                 nothing to re-run; `git submit` the commit again instead",
+                self.config.workspace_dir.display()
+            )));
+        };
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| DispatchError::Checkout(format!("{}: {e}", path.display())))?;
+
+        let req = crate::trigger::SubmitRequest {
+            repository: crate::trigger::RepositoryRef {
+                id: String::new(),
+                name: repo
+                    .as_ref()
+                    .map(|r| r.name.clone())
+                    .or_else(|| run.repo_name.clone())
+                    .unwrap_or_default(),
+                url: run.repo_url.clone(),
+                default_branch: None,
+            },
+            r#ref: run.git_ref.clone(),
+            before: run.before_sha.clone(),
+            after: run.sha.clone(),
+            dry_run: false,
+            pusher: None,
+            // Resolved by repository, as the original was; the run's own
+            // `workflow_id` may be the repository-name fallback rather than a
+            // registered object, and naming that would be refused.
+            workflow_id: None,
+            only: vec![run.workflow_path.clone()],
+            source: crate::trigger::SourceArchive {
+                format: format.as_str().to_string(),
+                content_base64: String::new(),
+                bytes: Some(bytes),
+            },
+            rerun: Some(crate::trigger::Rerun {
+                of: run_id.to_string(),
+                failed_only,
+                changes: run.changes.clone(),
+            }),
+        };
+        let submitted = self.submit(&req, actor, repo.as_ref()).await?;
+        tracing::info!(
+            "re-run of {run_id} ({}) by {}: {}",
+            if failed_only {
+                "failed jobs"
+            } else {
+                "every job"
+            },
+            actor.map(|a| a.display()).unwrap_or("anonymous"),
+            submitted.run_ids.join(", ")
+        );
+        Ok(submitted)
+    }
+
+    /// Fill a failed-only re-run's jobs with the results their counterparts
+    /// earned in `from`, for every job that succeeded there. The rest stay
+    /// `pending` for the scheduler.
+    async fn carry_over_successes(&self, run_id: &str, from: &str) -> Result<(), DispatchError> {
+        let previous = self.store.jobs_of(from).await?;
+        let mut carried = 0;
+        for job in previous.iter().filter(|j| j.status == "success") {
+            let id = crate::store::job_id(run_id, &job.job_key);
+            if self.store.carry_over_job(&id, job).await? {
+                carried += 1;
+            }
+        }
+        tracing::info!(run = %run_id, "re-run of {from}: {carried} succeeded job(s) carried over");
+        Ok(())
     }
 
     // ---- scheduling -----------------------------------------------------
@@ -2407,7 +2559,8 @@ async fn copy_tree(
         .map_err(|e| DispatchError::Checkout(e.to_string()))?;
     let source = crate::trigger::SourceArchive {
         format: format.as_str().to_string(),
-        content_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+        content_base64: String::new(),
+        bytes: Some(bytes),
     };
     crate::trigger::materialize(&source, to, usize::MAX)?;
     Ok(())
@@ -4084,6 +4237,7 @@ mod tests {
             outputs: serde_json::json!({}),
             plan: serde_json::json!({}),
             error: None,
+            carried_from: None,
             queued_at: Some(queued),
             started_at: Some(picked_up),
             finished_at: Some(done),
@@ -5057,6 +5211,7 @@ mod tests {
             &crate::trigger::SourceArchive {
                 format: "tar.gz".into(),
                 content_base64: base64::engine::general_purpose::STANDARD.encode(&gz),
+                bytes: None,
             },
             &ws,
             1 << 20,

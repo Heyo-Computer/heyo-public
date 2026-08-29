@@ -2615,6 +2615,18 @@ pub struct DeploymentSpec {
     /// that never says the word keeps behaving as one namespace.
     #[serde(default = "default_namespace", skip_serializing_if = "is_default_namespace")]
     pub namespace: String,
+    /// The heyo account that pays for this deployment's VMs, and the user who
+    /// registered it. Stamped by app-lb from the caller's federated grant (the
+    /// namespace's owning account) on every register and update, overriding
+    /// whatever the body said; an operator or local-token caller keeps what it
+    /// sent, which on a self-hosted app-lb is usually nothing. Passed to the
+    /// daemon on every VM create so the sandbox is metered to the right
+    /// account — including the replacements the autoscaler boots with no
+    /// caller present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     pub routes: Vec<RouteRule>,
     /// The VM template for a *managed* deployment: app-lb boots and autoscales a
     /// pool of microVMs. Mutually exclusive with `upstreams`; exactly one of the
@@ -3825,6 +3837,8 @@ mod tests {
 
     fn spec() -> DeploymentSpec {
         DeploymentSpec {
+            account_id: None,
+            user_id: None,
             namespace: "default".into(),
             feed: None,
             id: "demo".into(),
@@ -3889,6 +3903,8 @@ mod tests {
     /// A static (proxy_pass) deployment: `upstreams` set, no `vm`.
     fn static_spec(upstreams: &[&str]) -> DeploymentSpec {
         DeploymentSpec {
+            account_id: None,
+            user_id: None,
             namespace: "default".into(),
             feed: None,
             id: "proxy".into(),
@@ -4419,6 +4435,8 @@ mod tests {
         let ok = ["http://127.0.0.1:8080", "https://art.example.com", "/srv/artifacts"];
         for store in ok {
             let s = DeploymentSpec {
+                account_id: None,
+                user_id: None,
                 artifact: Some(ArtifactSpec { store: store.into(), ..artifact_spec() }),
                 ..spec()
             };
@@ -4429,6 +4447,8 @@ mod tests {
         // which nobody writing a spec can see; the rest are not stores at all.
         for store in ["", ".artifacts", "art.example.com", "/srv/../etc", "file:///srv/art"] {
             let s = DeploymentSpec {
+                account_id: None,
+                user_id: None,
                 artifact: Some(ArtifactSpec { store: store.into(), ..artifact_spec() }),
                 ..spec()
             };
@@ -4451,6 +4471,8 @@ mod tests {
         assert_eq!(digest.len(), 64);
         for r in ["debian-hermes", "ubuntu-24.04", "web_v2", digest.as_str()] {
             let s = DeploymentSpec {
+                account_id: None,
+                user_id: None,
                 artifact: Some(ArtifactSpec { artifact_ref: r.into(), ..artifact_spec() }),
                 ..spec()
             };
@@ -4460,6 +4482,8 @@ mod tests {
         // slash or a `..` would leave the store when pasted into a URL path.
         for r in ["", "-flag", ".hidden", "a/b", "../etc/passwd", "has space"] {
             let s = DeploymentSpec {
+                account_id: None,
+                user_id: None,
                 artifact: Some(ArtifactSpec { artifact_ref: r.into(), ..artifact_spec() }),
                 ..spec()
             };
@@ -4485,6 +4509,8 @@ mod tests {
     #[test]
     fn a_deployment_cannot_both_build_and_pull_its_image() {
         let s = DeploymentSpec {
+            account_id: None,
+            user_id: None,
             build: Some(build_spec()),
             artifact: Some(artifact_spec()),
             ..spec()
@@ -4495,6 +4521,8 @@ mod tests {
     #[test]
     fn a_static_deployment_has_no_image_to_pull_into() {
         let s = DeploymentSpec {
+            account_id: None,
+            user_id: None,
             artifact: Some(artifact_spec()),
             ..static_spec(&["127.0.0.1:9000"])
         };
@@ -4504,6 +4532,8 @@ mod tests {
     #[test]
     fn growing_to_zero_is_refused_rather_than_silently_shrinking_nothing() {
         let s = DeploymentSpec {
+            account_id: None,
+            user_id: None,
             artifact: Some(ArtifactSpec { grow_gb: Some(0), ..artifact_spec() }),
             ..spec()
         };

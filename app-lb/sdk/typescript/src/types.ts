@@ -283,6 +283,14 @@ export interface DeploymentSpec {
    * deployments in it, and the event feed is kept per namespace.
    */
   namespace?: string;
+  /**
+   * The heyo account this deployment's VMs are metered to, and the user who
+   * registered it. The managed service stamps both from the caller's
+   * credential (the namespace's owning account) and ignores what the body
+   * says; a self-hosted app-lb keeps what it was sent, usually nothing.
+   */
+  account_id?: string;
+  user_id?: string;
   routes: RouteRule[];
   vm?: VmSpec;
   scaling?: ScalingPolicy;
@@ -447,6 +455,8 @@ export interface DeploymentView {
   id: string;
   /** Absent for the default namespace. */
   namespace?: string;
+  /** The account this deployment's VMs are metered to, when app-lb knows it. */
+  account_id?: string;
   kind: DeploymentKind;
   upstreams: string[];
   /** Whether at least one data-plane route points at this deployment. */

@@ -1052,6 +1052,11 @@ struct DeploymentView {
     /// the payload is unchanged for a fleet that never uses namespaces.
     #[serde(skip_serializing_if = "is_default_namespace_str")]
     namespace: String,
+    /// The heyo account this deployment's VMs are metered to, when app-lb
+    /// knows it (see `DeploymentSpec::account_id`). Absent on a self-hosted
+    /// app-lb, so the payload is unchanged there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
     /// `"vm"` (managed pool) or `"static"` (proxy_pass). The dashboard renders
     /// the two differently — a static deployment hides scaling controls.
     kind: &'static str,
@@ -1355,6 +1360,7 @@ async fn metrics_snapshot(
             DeploymentView {
                 id: d.spec.id.clone(),
                 namespace: d.spec.namespace.clone(),
+                account_id: d.spec.account_id.clone(),
                 kind: deployment_kind(d),
                 upstreams: d.spec.upstreams.clone(),
                 routed: !d.spec.routes.is_empty(),
@@ -2299,10 +2305,25 @@ fn warn_about(spec: &DeploymentSpec) {
     }
 }
 
+/// Who pays for `spec`'s VMs, decided by the credential rather than the body.
+///
+/// A federated caller is a heyo customer, and its deployment is metered to the
+/// account that owns the namespace it lands in — the grant says which, and the
+/// body is overridden so a client cannot bill its namespace to somebody else.
+/// An operator, a local token or an ungated caller keeps what the body said:
+/// on a self-hosted app-lb there is no meter, and on the managed one those are
+/// the platform's own hands.
+pub(crate) fn stamp_owner(spec: &mut DeploymentSpec, caller: Option<&Caller>) {
+    if let Some(Caller::Federated(g)) = caller {
+        spec.account_id = g.account_for(&spec.namespace).map(str::to_string);
+        spec.user_id = Some(g.subject.user_id.clone());
+    }
+}
+
 async fn register(
     State(state): State<AdminState>,
     caller: Option<axum::Extension<Caller>>,
-    Json(spec): Json<DeploymentSpec>,
+    Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
     // Validation is the gate that keeps unroutable VMs (e.g. libvirt, which has
     // no guest_ip) from ever being booted.
@@ -2338,6 +2359,7 @@ async fn register(
             .into_response();
         }
     }
+    stamp_owner(&mut spec, caller.as_ref().map(|c| &c.0));
     // Replacing a deployment abandons its old pool; tear it down explicitly so
     // the VMs don't linger until their TTL.
     //
@@ -2415,11 +2437,13 @@ async fn update(
         .into_response();
     }
 
+    stamp_owner(&mut spec, caller.as_ref().map(|c| &c.0));
     let change = state.registry.change_guard().await;
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
 
+    // The owner is not part of the template, so a stamp never recycles a pool.
     let rebuild = old.spec.vm != spec.vm || old.spec.upstreams != spec.upstreams;
     let deployment = if rebuild {
         // The backend set changed — a managed VM *template*, or a static
@@ -4976,10 +5000,59 @@ mod tests {
 
         fn grant(ns: &[(&str, AdminScope)], fleet: bool) -> Arc<crate::federated::Grant> {
             Arc::new(crate::federated::Grant {
-                subject: serde_json::from_value(serde_json::json!({"userId": "u1"})).unwrap(),
+                subject: serde_json::from_value(
+                    serde_json::json!({"userId": "u1", "accountId": "acc-own"}),
+                )
+                .unwrap(),
                 namespaces: ns.iter().map(|(n, s)| (n.to_string(), *s)).collect(),
+                accounts: ns
+                    .iter()
+                    .map(|(n, _)| (n.to_string(), format!("acc-{n}")))
+                    .collect(),
                 fleet,
             })
+        }
+
+        fn spec_in(ns: &str, body_account: Option<&str>) -> DeploymentSpec {
+            serde_json::from_value(serde_json::json!({
+                "id": "web",
+                "namespace": ns,
+                "routes": [],
+                "upstreams": ["127.0.0.1:1"],
+                "account_id": body_account,
+            }))
+            .unwrap()
+        }
+
+        /// The owner comes from the grant, not the body: a customer cannot
+        /// bill its namespace to another account by naming one.
+        #[test]
+        fn a_federated_register_is_metered_to_the_namespace_owner() {
+            let g = grant(&[("team-a", AdminScope::Admin)], false);
+            let mut spec = spec_in("team-a", Some("acc-somebody-else"));
+            stamp_owner(&mut spec, Some(&Caller::Federated(g.clone())));
+            assert_eq!(spec.account_id.as_deref(), Some("acc-team-a"));
+            assert_eq!(spec.user_id.as_deref(), Some("u1"));
+
+            // A fleet admin deploying into a namespace it holds no grant for
+            // (its own account is the fallback) is still stamped, not skipped.
+            let mut spec = spec_in("team-b", None);
+            stamp_owner(&mut spec, Some(&Caller::Federated(g)));
+            assert_eq!(spec.account_id.as_deref(), Some("acc-own"));
+        }
+
+        /// The platform's own hands keep what they sent — including nothing.
+        #[test]
+        fn an_operator_register_keeps_the_body_owner() {
+            for caller in [None, Some(Caller::Operator), Some(Caller::Ungated)] {
+                let mut spec = spec_in("team-a", Some("acc-explicit"));
+                stamp_owner(&mut spec, caller.as_ref());
+                assert_eq!(spec.account_id.as_deref(), Some("acc-explicit"));
+                assert_eq!(spec.user_id, None);
+                let mut spec = spec_in("team-a", None);
+                stamp_owner(&mut spec, caller.as_ref());
+                assert_eq!(spec.account_id, None);
+            }
         }
 
         /// A federated caller presents a bearer the local store does not know;

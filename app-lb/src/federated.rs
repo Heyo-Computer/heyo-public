@@ -71,8 +71,36 @@ pub struct Grant {
     pub subject: Subject,
     /// Namespace → the strongest tier granted there.
     pub namespaces: BTreeMap<String, AdminScope>,
+    /// Namespace → the heyo account that owns it, from the `namespaces[]`
+    /// array beside the scopes. Kept apart from `namespaces` because the two
+    /// answer different questions: that one is *what may this caller do
+    /// here*, this one is *who pays for what is deployed here*.
+    pub accounts: BTreeMap<String, String>,
     /// `fleet:admin` was present: this caller is not behind any wall.
     pub fleet: bool,
+}
+
+impl Grant {
+    /// The account billed for deployments in `ns`.
+    ///
+    /// The namespace's owner when the auth service said who that is; otherwise
+    /// the caller's own account, which is right for a user in one account and
+    /// wrong for a user in several — hence the warning, so an auth service that
+    /// predates `namespaces[]` is noticed rather than silently billing the
+    /// wrong account.
+    pub fn account_for(&self, ns: &str) -> Option<&str> {
+        if let Some(owner) = self.accounts.get(ns) {
+            return Some(owner.as_str());
+        }
+        if self.subject.account_id.is_some() {
+            tracing::warn!(
+                namespace = %ns,
+                user = %self.subject.user_id,
+                "auth service named no owner for this namespace; billing the caller's own account",
+            );
+        }
+        self.subject.account_id.as_deref()
+    }
 }
 
 enum Entry {
@@ -108,8 +136,19 @@ struct Data {
     subject: Subject,
     #[serde(default)]
     scopes: Vec<String>,
+    /// One entry per namespace the caller reaches, with its owning account.
+    /// Optional on the wire: an older auth service sends only `scopes`.
+    #[serde(default)]
+    namespaces: Vec<NamespaceGrantWire>,
     #[serde(rename = "expiresIn", default)]
     expires_in: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct NamespaceGrantWire {
+    name: String,
+    #[serde(rename = "accountId", default)]
+    account_id: Option<String>,
 }
 
 impl FederatedAuth {
@@ -191,6 +230,11 @@ impl FederatedAuth {
             return None;
         };
         let (namespaces, fleet) = Self::parse_scopes(&data.scopes);
+        let accounts: BTreeMap<String, String> = data
+            .namespaces
+            .into_iter()
+            .filter_map(|n| n.account_id.map(|a| (n.name, a)))
+            .collect();
         let ttl = data
             .expires_in
             .map(Duration::from_secs)
@@ -205,6 +249,7 @@ impl FederatedAuth {
             Arc::new(Grant {
                 subject: data.subject,
                 namespaces,
+                accounts,
                 fleet,
             }),
             ttl,
@@ -314,9 +359,28 @@ mod tests {
             "data": {
                 "subject": {"userId": "u1", "email": "a@b", "accountId": "acc", "platformRole": "user"},
                 "scopes": ["namespace:team-a:admin"],
+                "namespaces": [{"name": "team-a", "accountId": "acc-team-a", "scope": "admin"}],
                 "expiresIn": 3600
             }
         })
+    }
+
+    #[tokio::test]
+    async fn the_namespace_owner_is_taken_from_the_grant_and_falls_back_to_the_subject() {
+        let (url, _) = serve(good_body()).await;
+        let g = FederatedAuth::new(url, 60, 5).resolve("good").await.expect("resolved");
+        assert_eq!(g.account_for("team-a"), Some("acc-team-a"));
+        // A namespace the auth service named no owner for bills the caller.
+        assert_eq!(g.account_for("team-b"), Some("acc"));
+
+        // An auth service that predates `namespaces[]` still resolves; every
+        // namespace then bills the caller's own account.
+        let mut old = good_body();
+        old["data"].as_object_mut().unwrap().remove("namespaces");
+        let (url, _) = serve(old).await;
+        let g = FederatedAuth::new(url, 60, 5).resolve("good").await.expect("resolved");
+        assert!(g.accounts.is_empty());
+        assert_eq!(g.account_for("team-a"), Some("acc"));
     }
 
     #[tokio::test]

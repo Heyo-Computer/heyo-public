@@ -96,6 +96,13 @@ auth service, so no grant ever reaches it.</p>
 <div class="note">Grants are cached for <code>APP_LB_AUTH_CACHE_SECS</code> (60s by default,
 never past the token's own expiry), so a revoked scope lingers for at most that long. An
 unreachable auth service is a refusal, not a pass.</div>
+<p>The auth service also says which account owns each namespace, and that is who pays. A
+deployment a federated caller registers or edits is stamped with the namespace's owning
+account and the caller's user (<code>account_id</code> / <code>user_id</code> on the spec,
+whatever the body said), and every VM the autoscaler boots for it carries both to the
+daemon, so the sandbox is metered to the customer rather than to app-lb's own daemon
+credential. An operator or app-token caller keeps what it sent; a self-hosted app-lb
+stamps nothing.</p>
 
 <footer><a href="security.html">← Auth &amp; tokens</a> · next:
 <a href="feed.html">The event feed</a></footer>
