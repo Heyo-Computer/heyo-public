@@ -49,6 +49,12 @@ export interface ShellOptions {
   cwd?: string;
   /** Boot or resume a VM if none is running. Default true. */
   wake?: boolean;
+  /**
+   * Open the shell in this VM of the deployment rather than whichever the
+   * pool offers. Nothing is woken when a VM is named: one that is not in the
+   * deployment is a 404, one that cannot be used yet a 409.
+   */
+  sandboxId?: string;
   signal?: AbortSignal;
 }
 
@@ -93,6 +99,7 @@ export function shellQuery(opts: ShellOptions): string {
     `wake=${(opts.wake ?? true) ? "true" : "false"}`,
   ];
   if (opts.cwd) parts.push(`cwd=${encodeURIComponent(opts.cwd)}`);
+  if (opts.sandboxId) parts.push(`sandbox_id=${encodeURIComponent(opts.sandboxId)}`);
   return parts.join("&");
 }
 

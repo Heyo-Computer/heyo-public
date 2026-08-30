@@ -61,6 +61,8 @@ test("the URL swaps scheme and carries the options", () => {
   // Only `true`/`false` parse server-side.
   assert.ok(shellQuery({ wake: false }).includes("wake=false"));
   assert.ok(shellQuery({ cwd: "/work space" }).includes("cwd=%2Fwork%20space"));
+  assert.ok(shellQuery({ sandboxId: "sb-1" }).endsWith("&sandbox_id=sb-1"));
+  assert.ok(!shellQuery({}).includes("sandbox_id"));
 });
 
 test("a deployment id is escaped into the URL", () => {

@@ -65,11 +65,32 @@ pub struct ArtifactsConfig {
     ///
     /// One, not per-host: the store is per-host and per-user (its own
     /// `examples/artifacts.json` pins it to a single replica, because "each VM
-    /// has its own disk, so N replicas are N independent stores"). The
-    /// orchestrator pulls each artifact out of the guest and pushes it here, so
-    /// runners never talk to the store and there is nothing to sync.
+    /// has its own disk, so N replicas are N independent stores"). Every
+    /// upload lands here — whether the orchestrator pushes the bytes after
+    /// reading them out of the guest, or the guest pushes them itself (see
+    /// `guest_url`) — so there is one store and nothing to sync.
     pub url: String,
     pub token: Option<String>,
+    /// The base URL a *guest* uses to reach the same store, when it differs
+    /// from `url` (`CI_ARTIFACT_GUEST_URL`).
+    ///
+    /// `ci/upload-artifact` has the guest `curl -T` its tarball straight to
+    /// the store rather than reading it out over the exec channel — which on
+    /// firecracker is the emulated serial console, tens of KiB/s, so a 40 MB
+    /// artifact took a quarter of an hour to leave the VM. The guest needs a
+    /// URL it can resolve and route to: `url` is usually that, but an
+    /// orchestrator that reaches its store as `http://localhost:…` or by a
+    /// name only its own host knows sets this to the public one. Unset means
+    /// `url`. A guest that cannot reach the store falls back to the exec
+    /// channel, so a wrong value here costs time, not the artifact.
+    pub guest_url: Option<String>,
+}
+
+impl ArtifactsConfig {
+    /// The base URL to hand a guest: `guest_url` when set, else `url`.
+    pub fn url_for_guest(&self) -> &str {
+        self.guest_url.as_deref().unwrap_or(&self.url)
+    }
 }
 
 /// Which of the account's networks this instance takes work for.
@@ -528,6 +549,9 @@ impl Config {
                     .trim_end_matches('/')
                     .to_string(),
                 token: opt("CI_ARTIFACT_TOKEN"),
+                guest_url: opt("CI_ARTIFACT_GUEST_URL")
+                    .map(|u| u.trim_end_matches('/').to_string())
+                    .filter(|u| !u.is_empty()),
             }),
             _ => None,
         };
@@ -834,6 +858,18 @@ mod tests {
             Some(ArtifactSinkKind::Artifacts)
         );
         assert_eq!(ArtifactSinkKind::parse("gcs"), None);
+    }
+
+    #[test]
+    fn a_guest_reaches_the_store_by_its_own_url_when_one_is_set() {
+        let mut c = ArtifactsConfig {
+            url: "http://localhost:9000".into(),
+            token: None,
+            guest_url: None,
+        };
+        assert_eq!(c.url_for_guest(), "http://localhost:9000");
+        c.guest_url = Some("https://art.example".into());
+        assert_eq!(c.url_for_guest(), "https://art.example");
     }
 
     #[test]

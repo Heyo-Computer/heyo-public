@@ -245,7 +245,7 @@ jobs:
 
       # See app-lb.yml for why the binaries are copied into the workspace
       # (`ci/upload-artifact` tars relative to /workspace) and stripped on the
-      # way (the tarball leaves the guest base64-encoded over the exec channel).
+      # way (the fallback transport is base64 over the serial console).
       - name: Collect the binaries
         run: |
           set -eu
@@ -274,15 +274,18 @@ jobs:
           ( cd dist && sha256sum app-obs app-obs-dump > SHA256SUMS )
           ls -la dist
           cat dist/BUILD-INFO
-          # What the upload below has to move, measured the way it will move:
-          # the tarball, gzipped, then base64 over the exec channel. These two
-          # binaries are linked against arrow, parquet and datafusion and are
-          # the largest thing any workflow here uploads, so if the upload step
-          # fails, the number that says whether size is the reason is this
-          # one — printed here, in the step that succeeded, rather than lost
-          # with the one that did not.
+          # What the upload below has to move: the tarball, gzipped, which the
+          # guest pushes to the store over its own network. The base64 figure
+          # is the fallback's — if the guest cannot reach the store, the
+          # uploader reads the tarball out over the exec channel instead,
+          # which on firecracker is the emulated serial console at tens of
+          # KiB/s: the 2026-08-29 run spent 15+ silent minutes moving 41 MB
+          # that way. These two binaries carry arrow, parquet and datafusion
+          # and are the largest thing any workflow here uploads, so if the
+          # upload step fails or crawls, the number that says whether size is
+          # the reason is this one — printed here, in the step that succeeded.
           bytes="$(tar czf - dist | wc -c)"
-          echo "upload payload: $bytes bytes gzipped, $(( bytes * 4 / 3 )) base64"
+          echo "upload payload: $bytes bytes gzipped, $(( bytes * 4 / 3 )) base64 if read out over the exec channel"
 
       # Tagged `ci-app-obs-<run>-release-app-obs` in the store — the workflow
       # name is in the tag, so this file's rename from `apps.yml` started a new

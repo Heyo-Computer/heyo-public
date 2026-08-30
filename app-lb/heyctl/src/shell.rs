@@ -64,6 +64,10 @@ pub struct ShellOptions {
     pub cwd: Option<String>,
     /// Boot or resume a VM if none is running. On by default.
     pub wake: bool,
+    /// Open the shell in this VM of the deployment rather than whichever the
+    /// pool offers. Nothing is woken when a VM is named: one that is not in
+    /// the deployment is a 404, one that cannot be used yet a 409.
+    pub sandbox_id: Option<String>,
 }
 
 impl Default for ShellOptions {
@@ -73,6 +77,7 @@ impl Default for ShellOptions {
             rows: 24,
             cwd: None,
             wake: true,
+            sandbox_id: None,
         }
     }
 }
@@ -95,6 +100,12 @@ impl ShellOptions {
         self
     }
 
+    /// Open the shell in this VM of the deployment.
+    pub fn vm(mut self, sandbox_id: impl Into<String>) -> Self {
+        self.sandbox_id = Some(sandbox_id.into());
+        self
+    }
+
     fn query(&self) -> String {
         let mut q = format!(
             "cols={}&rows={}&wake={}",
@@ -106,6 +117,10 @@ impl ShellOptions {
         if let Some(cwd) = &self.cwd {
             q.push_str("&cwd=");
             q.push_str(&urlencode(cwd));
+        }
+        if let Some(id) = &self.sandbox_id {
+            q.push_str("&sandbox_id=");
+            q.push_str(&urlencode(id));
         }
         q
     }
@@ -563,6 +578,8 @@ mod tests {
 
         // Only `true`/`false` parse server-side.
         assert!(ShellOptions::default().no_wake().query().contains("wake=false"));
+        assert!(ShellOptions::default().vm("sb-1").query().ends_with("&sandbox_id=sb-1"));
+        assert!(!ShellOptions::default().query().contains("sandbox_id"));
 
         let with_cwd = ShellOptions::default().cwd("/work space");
         assert!(with_cwd.query().contains("cwd=/work%20space"), "{}", with_cwd.query());

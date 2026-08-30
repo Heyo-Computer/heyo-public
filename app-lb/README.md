@@ -449,8 +449,36 @@ heyctl shell sb-7f3a9c
 
 | | |
 | --- | --- |
-| `POST /deployments/:id/exec` | `{command, cwd?, env?, timeout_secs?, wake?}` → `{sandbox_id, exit_code, stdout, stderr, output}` |
-| `GET /deployments/:id/shell` | WebSocket upgrade; `?cols=&rows=&cwd=&wake=` |
+| `POST /deployments/:id/exec` | `{command, cwd?, env?, timeout_secs?, wake?, sandbox_id?}` → `{sandbox_id, exit_code, stdout, stderr, output}` |
+| `GET /deployments/:id/shell` | WebSocket upgrade; `?cols=&rows=&cwd=&wake=&sandbox_id=` |
+
+**Which VM.** Without `sandbox_id` the pool chooses — a healthy backend, else
+a VM that is up but has not passed its health check, else (with `wake`) one it
+starts. With `sandbox_id` it is *that* VM or an error: `404` when the VM is
+not in the deployment, `409` when it exists but cannot be used yet (not
+started, or draining) — and nothing is woken, because naming a VM means
+wanting to look at that one, not at a replacement. `heyctl shell web --vm
+sb-7f3a9c` and the **Shell** button on a VM's row of the dashboard both use
+it.
+
+**From the dashboard.** Every VM deployment's card has a **Shell** button in
+its header (the pool picks) and one on each VM row (that VM). It opens a
+terminal in the page — a *line* terminal, built into the single self-contained
+page so it works over an SSH tunnel: prompts, commands and their output,
+`Ctrl-C`, `Ctrl-D`, arrow-key history, paste. Anything that paints the whole
+screen (vim, top) wants a real emulator, and that is `heyctl shell`. The
+socket rides the same origin as the page, so a Basic-auth or Google sign-in
+carries over; when a proxy in front only knows the page, the terminal offers
+to reconnect with an [app-token](#app-tokens) as `?app_token=`.
+
+**Through the managed service.** Cloud's namespace door forwards the shell
+too — `GET /namespaces/{ns}/lb/deployments/{id}/shell` is a WebSocket upgrade
+bridged to this route, the caller's bearer forwarded in the header, so
+`heyctl shell web` works against `server: https://server.heyo.computer/namespaces/team-a/lb`
+with a `heyo_api_…` token exactly as it does against a local app-lb, and the
+heyo SDKs expose it as `ns.deployments().shell("web")`. A federated caller
+needs `admin` on the namespace: a shell is at least as powerful as editing the
+spec that boots the VM.
 
 Both are on the CRUD tier, so `APP_LB_ADMIN_AUTH=1` covers them. It should:
 running a command in a VM is at least as powerful as editing the spec that boots

@@ -243,10 +243,13 @@ jobs:
       # CARGO_TARGET_DIR is outside the workspace entirely. So the binaries are
       # brought back in rather than the uploader taught about absolute paths.
       #
-      # Stripped on the way: an artifact leaves the guest base64-encoded over
-      # the exec channel, so a third off the payload is a third off a transfer
-      # that is already the slowest part of a warm run. Debug symbols are not
-      # what anybody pulls these binaries for; drop `strip` here if that changes.
+      # Stripped on the way. The guest pushes the artifact to the store itself
+      # (`curl -T`, network speed), but when it cannot — no route to the store,
+      # a refused upload — the uploader falls back to reading it out over the
+      # exec channel, base64 over the emulated serial console at tens of KiB/s,
+      # where a third off the payload is a third off the slowest step of the
+      # run. Debug symbols are not what anybody pulls these binaries for; drop
+      # `strip` here if that changes.
       - name: Collect the binaries
         run: |
           set -eu

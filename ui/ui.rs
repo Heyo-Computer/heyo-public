@@ -68,20 +68,23 @@ pub struct Asset {
 /// involved, so a request cannot traverse out of it, and an unknown name is a
 /// plain `None` for the caller to turn into a 404.
 pub fn asset(path: &str) -> Option<Asset> {
-    let (bytes, content_type, immutable): (&'static [u8], &'static str, bool) = match path
-        .trim_start_matches('/')
-    {
-        "heyo.css" => (CSS.as_bytes(), "text/css; charset=utf-8", false),
-        "theme.js" => (THEME_JS.as_bytes(), "text/javascript; charset=utf-8", false),
-        "fonts/ibm-plex-mono-400.woff2" => (FONT_PLEX_400, "font/woff2", true),
-        "fonts/ibm-plex-mono-500.woff2" => (FONT_PLEX_500, "font/woff2", true),
-        "fonts/ibm-plex-mono-600.woff2" => (FONT_PLEX_600, "font/woff2", true),
-        "fonts/ibm-plex-mono-700.woff2" => (FONT_PLEX_700, "font/woff2", true),
-        "fonts/silkscreen-400.woff2" => (FONT_SILK_400, "font/woff2", true),
-        "fonts/silkscreen-700.woff2" => (FONT_SILK_700, "font/woff2", true),
-        _ => return None,
-    };
-    Some(Asset { bytes, content_type, immutable })
+    let (bytes, content_type, immutable): (&'static [u8], &'static str, bool) =
+        match path.trim_start_matches('/') {
+            "heyo.css" => (CSS.as_bytes(), "text/css; charset=utf-8", false),
+            "theme.js" => (THEME_JS.as_bytes(), "text/javascript; charset=utf-8", false),
+            "fonts/ibm-plex-mono-400.woff2" => (FONT_PLEX_400, "font/woff2", true),
+            "fonts/ibm-plex-mono-500.woff2" => (FONT_PLEX_500, "font/woff2", true),
+            "fonts/ibm-plex-mono-600.woff2" => (FONT_PLEX_600, "font/woff2", true),
+            "fonts/ibm-plex-mono-700.woff2" => (FONT_PLEX_700, "font/woff2", true),
+            "fonts/silkscreen-400.woff2" => (FONT_SILK_400, "font/woff2", true),
+            "fonts/silkscreen-700.woff2" => (FONT_SILK_700, "font/woff2", true),
+            _ => return None,
+        };
+    Some(Asset {
+        bytes,
+        content_type,
+        immutable,
+    })
 }
 
 /// `Cache-Control` for an asset. Fonts are immutable for the life of the
@@ -193,7 +196,9 @@ pub fn normalize_cookie_domain(raw: &str) -> Option<String> {
             && label.len() <= 63
             && !label.starts_with('-')
             && !label.ends_with('-')
-            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
     });
     ok.then(|| d.to_ascii_lowercase())
 }
@@ -298,13 +303,20 @@ impl CookieConfig {
 
     /// The `<html>` attributes for this request.
     pub fn attrs(&self, cookie_header: Option<&str>) -> String {
-        html_attrs(self.theme(cookie_header), self.domain.as_deref(), &self.name)
+        html_attrs(
+            self.theme(cookie_header),
+            self.domain.as_deref(),
+            &self.name,
+        )
     }
 }
 
 impl Default for CookieConfig {
     fn default() -> Self {
-        Self { domain: None, name: THEME_COOKIE.to_string() }
+        Self {
+            domain: None,
+            name: THEME_COOKIE.to_string(),
+        }
     }
 }
 
@@ -404,7 +416,11 @@ pub fn topbar_html(app: &str, nav: &[(&str, &str, bool)], who: Option<&str>) -> 
         s.push_str(&format!(
             r#"<a href="{}"{}>{}</a>"#,
             escape(href),
-            if *current { r#" aria-current="page""# } else { "" },
+            if *current {
+                r#" aria-current="page""#
+            } else {
+                ""
+            },
             escape(label)
         ));
     }
@@ -476,8 +492,15 @@ mod heyo_ui_tests {
         // Type, spacing and radius are theme-independent on purpose, so they
         // are listed here rather than duplicated into the light block.
         let shared_only = [
-            "font-display", "font-body", "radius",
-            "gap-1", "gap-2", "gap-3", "gap-4", "gap-5", "gap-6",
+            "font-display",
+            "font-body",
+            "radius",
+            "gap-1",
+            "gap-2",
+            "gap-3",
+            "gap-4",
+            "gap-5",
+            "gap-6",
         ];
         for token in dark {
             if shared_only.contains(&token.as_str()) {
@@ -527,8 +550,14 @@ mod heyo_ui_tests {
 
     #[test]
     fn a_domain_that_cannot_work_is_refused_rather_than_emitted() {
-        assert_eq!(normalize_cookie_domain(".Example.COM"), Some("example.com".into()));
-        assert_eq!(normalize_cookie_domain("us2.heyo.work"), Some("us2.heyo.work".into()));
+        assert_eq!(
+            normalize_cookie_domain(".Example.COM"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            normalize_cookie_domain("us2.heyo.work"),
+            Some("us2.heyo.work".into())
+        );
         // No dot: a browser would drop the cookie, so it never reaches the page.
         assert_eq!(normalize_cookie_domain("localhost"), None);
         assert_eq!(normalize_cookie_domain(""), None);
@@ -554,7 +583,10 @@ mod heyo_ui_tests {
         let c = CookieConfig::resolve(Some(".Example.com".into()), None);
         assert_eq!(c.domain.as_deref(), Some("example.com"));
         assert_eq!(c.name, THEME_COOKIE);
-        assert!(c.attrs(Some("heyo_theme=light")).contains(r#"data-theme="light""#));
+        assert!(
+            c.attrs(Some("heyo_theme=light"))
+                .contains(r#"data-theme="light""#)
+        );
 
         // `localhost` has no dot, so a browser drops the cookie. Host-only is
         // the recoverable direction, and it is what a local run wants anyway.
@@ -565,7 +597,11 @@ mod heyo_ui_tests {
         // A per-installation name is carried into the markup so the script
         // writes the cookie the server will read back.
         let named = CookieConfig::resolve(None, Some("acme_theme".into()));
-        assert!(named.attrs(None).contains(r#"data-cookie-name="acme_theme""#));
+        assert!(
+            named
+                .attrs(None)
+                .contains(r#"data-cookie-name="acme_theme""#)
+        );
         assert_eq!(named.theme(Some("acme_theme=system")), Theme::System);
     }
 

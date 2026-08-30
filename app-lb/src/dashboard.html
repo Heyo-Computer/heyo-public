@@ -257,6 +257,24 @@
     background: var(--surface); border: 1px solid var(--border); border-radius: 0;
     width: 100%; max-width: 620px; box-shadow: 0 12px 40px rgba(0,0,0,0.3);
   }
+  .modal.wide { max-width: 1040px; }
+  /* The shell. A plain block of monospace text with the caret drawn in — not a
+     terminal emulator, so full-screen programs will not look right here; the
+     note under it says to use heyctl for those. */
+  .term {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    height: 60vh; min-height: 320px; overflow-y: auto; padding: 8px 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; line-height: 1.35;
+    outline: none; cursor: text; white-space: pre; tab-size: 8;
+  }
+  .term:focus { border-color: var(--accent); }
+  .term .caret { background: var(--text); color: var(--bg); }
+  .term.ended { opacity: 0.7; }
+  .term-bar { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 12px; color: var(--muted); }
+  .term-bar .spacer { flex: 1; }
+  .term-auth { display: none; gap: 6px; margin-top: 8px; }
+  .term-auth.show { display: flex; }
+  .term-auth input { flex: 1; }
   .modal h2 { font-size: 16px; font-weight: 650; margin: 0; padding: 18px 20px 0; }
   .modal .modal-sub { color: var(--muted); font-size: 12px; padding: 4px 20px 0; }
   .modal-body { padding: 16px 20px; }
@@ -843,10 +861,13 @@ function updateCard(el, d, fresh) {
               : `<span class="tag ok">serving</span>`;
       // CPU is percent-of-a-core; normalise the bar to one core but show the raw number.
       const cpuBar = v.cpu_percent == null ? 0 : Math.min(100, v.cpu_percent);
-      const evictBtns = v.draining
+      // Shell first: it is the one that looks rather than acts, and a row
+      // that has gone red is exactly the one somebody wants to look inside.
+      const shellBtn = `<button class="btn mini" data-act="shell" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Shell</button>`;
+      const evictBtns = shellBtn + (v.draining
         ? `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`
         : `<button class="btn mini" data-act="drain" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Drain</button>`
-          + `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`;
+          + `<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button>`);
       return `<tr>
         <td class="mono">${esc(v.sandbox_id)}</td>
         <td class="mono">${esc(v.addr)}</td>
@@ -873,7 +894,7 @@ function updateCard(el, d, fresh) {
         <td>—</td>
         <td>${fmtDur(v.age_secs)}${deadline}</td>
         <td>${st}</td>
-        <td class="rowactions"><button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button></td>
+        <td class="rowactions">${v.status === "running" ? `<button class="btn mini" data-act="shell" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Shell</button>` : ""}<button class="btn mini danger" data-act="kill" data-id="${esc(d.id)}" data-sb="${esc(v.sandbox_id)}">Kill</button></td>
       </tr>`;
     }).join("");
 
@@ -908,7 +929,8 @@ function updateCard(el, d, fresh) {
   // Static deployments can't be scaled; only Edit (to change the upstream list).
   const headActions = (isStatic || isSite
     ? `<button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`
-    : `<button class="btn mini" data-act="scale" data-id="${esc(d.id)}">Scale</button>
+    : `<button class="btn mini" data-act="shell" data-id="${esc(d.id)}">Shell</button>
+       <button class="btn mini" data-act="scale" data-id="${esc(d.id)}">Scale</button>
        <button class="btn mini" data-act="edit" data-id="${esc(d.id)}">Edit</button>`) + jobBtn;
 
   // Pool-only tiles (pending/draining/cold-start) are meaningless for a static
@@ -1485,6 +1507,291 @@ function toast(msg, isErr) {
   toastTimer = setTimeout(() => { t.className = ""; }, 2800);
 }
 
+// --- shell ---
+//
+// `GET /deployments/:id/shell` is a WebSocket carrying a PTY: binary
+// `[0x01, ...stdin]` up, `[0x02, ...stdout]` down, JSON `resize`/`ready`/
+// `exit`/`error` frames beside them. What is drawn here is a *line* terminal —
+// it understands carriage returns, backspaces, erase-to-end-of-line and a clear
+// screen, and drops every other escape sequence — which covers a prompt, a
+// command and its output, and `less`-free reading of files. Anything that
+// paints the whole screen (vim, top, htop) wants a real emulator, and that is
+// what `heyctl shell` is for. Keeping the page self-contained mattered more
+// than shipping one: it must work over an SSH tunnel with nothing else
+// reachable, which rules out a CDN.
+let termSession = null;
+
+const TERM_SCROLLBACK = 2000;
+
+// A tiny screen: lines of text and a cursor. Bytes arrive as UTF-8 and are
+// decoded in streaming mode so a multi-byte character split across two frames
+// still comes out as one.
+function makeScreen() {
+  const s = { lines: [""], row: 0, col: 0, esc: null, decoder: new TextDecoder("utf-8") };
+  function put(ch) {
+    let line = s.lines[s.row];
+    if (s.col > line.length) line = line + " ".repeat(s.col - line.length);
+    line = line.slice(0, s.col) + ch + line.slice(s.col + 1);
+    s.lines[s.row] = line;
+    s.col += 1;
+  }
+  function newline() {
+    s.row += 1;
+    if (s.row === s.lines.length) s.lines.push("");
+    if (s.lines.length > TERM_SCROLLBACK) {
+      s.lines.splice(0, s.lines.length - TERM_SCROLLBACK);
+      s.row = Math.min(s.row, s.lines.length - 1);
+    }
+  }
+  function csi(params, final) {
+    const n = parseInt(params.split(";")[0], 10);
+    const count = isNaN(n) ? 1 : Math.max(1, n);
+    switch (final) {
+      case "K": { // erase in line: 0 = to end (default), 1 = to start, 2 = all
+        const line = s.lines[s.row];
+        if (params === "1") s.lines[s.row] = " ".repeat(s.col) + line.slice(s.col);
+        else if (params === "2") s.lines[s.row] = "";
+        else s.lines[s.row] = line.slice(0, s.col);
+        break;
+      }
+      case "J": // erase in display: only "clear everything" is honoured
+        if (params === "2" || params === "3") { s.lines = [""]; s.row = 0; s.col = 0; }
+        else s.lines.splice(s.row + 1);
+        break;
+      case "H": case "f": // cursor home: treated as the top of what is kept
+        if (params === "" || params === "1;1") { s.row = 0; s.col = 0; }
+        break;
+      case "C": s.col += count; break;
+      case "D": s.col = Math.max(0, s.col - count); break;
+      case "G": s.col = Math.max(0, count - 1); break;
+      case "A": s.row = Math.max(0, s.row - count); break;
+      case "B": s.row = Math.min(s.lines.length - 1, s.row + count); break;
+      case "P": { // delete characters
+        const line = s.lines[s.row];
+        s.lines[s.row] = line.slice(0, s.col) + line.slice(s.col + count);
+        break;
+      }
+      case "@": { // insert blanks
+        const line = s.lines[s.row];
+        s.lines[s.row] = line.slice(0, s.col) + " ".repeat(count) + line.slice(s.col);
+        break;
+      }
+      default: break; // colours, modes, cursor save/restore: dropped
+    }
+  }
+  s.feed = (bytes) => {
+    const text = s.decoder.decode(bytes, { stream: true });
+    for (const ch of text) {
+      if (s.esc !== null) {
+        // Inside an escape sequence. CSI ends at a letter/@/~; OSC ends at
+        // BEL or ST; anything else is a two-character sequence.
+        if (s.esc === "") {
+          if (ch === "[") s.esc = "[";
+          else if (ch === "]") s.esc = "]";
+          else s.esc = null;
+          continue;
+        }
+        if (s.esc[0] === "[") {
+          if (/[A-Za-z@~`]/.test(ch)) { csi(s.esc.slice(1).replace(/^\?/, ""), ch); s.esc = null; }
+          else s.esc += ch;
+          continue;
+        }
+        if (ch === "\x07" || ch === "\\") s.esc = null; // OSC terminator (BEL, or the \ of ESC \)
+        continue;
+      }
+      switch (ch) {
+        case "\x1b": s.esc = ""; break;
+        case "\r": s.col = 0; break;
+        case "\n": newline(); break;
+        case "\b": s.col = Math.max(0, s.col - 1); break;
+        case "\x07": break; // bell
+        case "\t": s.col += 8 - (s.col % 8); break;
+        default:
+          if (ch < " " || ch === "\x7f") break; // other control characters
+          put(ch);
+      }
+    }
+  };
+  return s;
+}
+
+// Draw the screen into the element: text, with the caret as a highlighted
+// character (a space when the cursor sits past the end of its line).
+function drawScreen(el, s) {
+  const before = s.lines.slice(0, s.row).join("\n");
+  const line = s.lines[s.row];
+  const under = line[s.col] || " ";
+  const after = s.lines.slice(s.row + 1).join("\n");
+  el.innerHTML =
+    (before ? esc(before) + "\n" : "") +
+    esc(line.slice(0, s.col)) + `<span class="caret">${esc(under)}</span>` + esc(line.slice(s.col + 1)) +
+    (after ? "\n" + esc(after) : "");
+  el.scrollTop = el.scrollHeight;
+}
+
+// The bytes a key press means to a PTY. Returns null for keys the shell has no
+// use for (modifiers on their own, function keys).
+function keyToBytes(e) {
+  if (e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) {
+    const c = e.key.toUpperCase().charCodeAt(0);
+    if (c >= 64 && c <= 95) return String.fromCharCode(c - 64);   // ^A..^_ (^C, ^D, ^L, ^Z …)
+    if (e.key === " ") return "\x00";
+    return null;
+  }
+  if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.length === 1) return "\x1b" + e.key;
+  if (e.metaKey || e.ctrlKey) return null; // browser shortcuts stay the browser's
+  switch (e.key) {
+    case "Enter": return "\r";
+    case "Backspace": return "\x7f";
+    case "Tab": return "\t";
+    case "Escape": return "\x1b";
+    case "ArrowUp": return "\x1b[A";
+    case "ArrowDown": return "\x1b[B";
+    case "ArrowRight": return "\x1b[C";
+    case "ArrowLeft": return "\x1b[D";
+    case "Home": return "\x1b[H";
+    case "End": return "\x1b[F";
+    case "Delete": return "\x1b[3~";
+    case "PageUp": return "\x1b[5~";
+    case "PageDown": return "\x1b[6~";
+    default: return e.key.length === 1 ? e.key : null;
+  }
+}
+
+// How many columns and rows fit the box, measured off a real character so the
+// PTY's idea of the width matches what is drawn. The daemon wraps at `cols`;
+// a wrong number here is a shell that wraps a column early or late.
+function measureTerm(el) {
+  const probe = document.createElement("span");
+  probe.textContent = "M".repeat(20);
+  probe.style.visibility = "hidden";
+  el.appendChild(probe);
+  const cw = probe.getBoundingClientRect().width / 20;
+  const lh = parseFloat(getComputedStyle(el).lineHeight) || 17;
+  probe.remove();
+  return {
+    cols: Math.max(20, Math.floor((el.clientWidth - 20) / cw)),
+    rows: Math.max(5, Math.floor((el.clientHeight - 16) / lh)),
+  };
+}
+
+function openShell(id, sandboxId) {
+  const sub = sandboxId ? `VM ${sandboxId}` : "whichever VM the pool offers";
+  openModal(`Shell — ${id}`, sub, `
+    <div class="term-bar">
+      <span id="term-status">connecting…</span>
+      <span class="spacer"></span>
+      <span>Ctrl-C / Ctrl-D work · <code>heyctl shell ${esc(id)}</code> for vim, top and friends</span>
+    </div>
+    <div class="term" id="term" tabindex="0" spellcheck="false" aria-label="terminal"></div>
+    <div class="term-auth" id="term-auth">
+      <input id="term-token" class="mono" placeholder="applb_… app-token (the dashboard's sign-in did not carry to the socket)">
+      <button class="btn mini" id="term-retry" type="button">Reconnect</button>
+    </div>`, null);
+  document.querySelector(".modal").classList.add("wide");
+  connectShell(id, sandboxId, null);
+}
+
+function connectShell(id, sandboxId, appToken) {
+  if (termSession) { termSession.close(); termSession = null; }
+  const el = $("term"), status = $("term-status");
+  const screen = makeScreen();
+  el.classList.remove("ended");
+  const size = measureTerm(el);
+  const q = new URLSearchParams({ cols: size.cols, rows: size.rows });
+  if (sandboxId) q.set("sandbox_id", sandboxId);
+  // The socket rides the same origin, so a Basic-auth or cookie sign-in goes
+  // with it. When it does not — a proxy in front that only knows the page —
+  // the retry box below sends an app-token in the query, which is the one
+  // route where app-lb accepts that.
+  if (appToken) q.set("app_token", appToken);
+  const url = new URL(`deployments/${encodeURIComponent(id)}/shell?${q}`, location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+
+  let ws;
+  try { ws = new WebSocket(url); }
+  catch (e) { status.textContent = "could not open a socket: " + e.message; return; }
+  ws.binaryType = "arraybuffer";
+  let ready = false, ended = false;
+
+  const send = (text) => { if (ws.readyState === 1) {
+    const bytes = new TextEncoder().encode(text);
+    const frame = new Uint8Array(bytes.length + 1);
+    frame[0] = 0x01; frame.set(bytes, 1);
+    ws.send(frame);
+  } };
+  const resize = () => {
+    if (ws.readyState !== 1) return;
+    const s = measureTerm(el);
+    ws.send(JSON.stringify({ type: "resize", cols: s.cols, rows: s.rows }));
+  };
+  const onKey = (e) => {
+    if (ended) return;
+    const bytes = keyToBytes(e);
+    if (bytes === null) return;
+    e.preventDefault();
+    send(bytes);
+  };
+  const onPaste = (e) => {
+    const text = (e.clipboardData || window.clipboardData).getData("text");
+    if (text) { e.preventDefault(); send(text); }
+  };
+  const finish = (why) => {
+    if (ended) return;
+    ended = true;
+    el.classList.add("ended");
+    status.textContent = why;
+    if (!ready) $("term-auth").classList.add("show");
+  };
+
+  ws.onopen = () => { status.textContent = "connected, waiting for the shell…"; };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "ready") {
+        ready = true;
+        $("term-auth").classList.remove("show");
+        status.textContent = `shell on ${msg.sandbox_id}`;
+        $("modal-sub").textContent = `VM ${msg.sandbox_id}`;
+        el.focus();
+      } else if (msg.type === "exit") finish(`shell exited with code ${msg.code}`);
+      else if (msg.type === "error") status.textContent = "error: " + msg.message;
+      return;
+    }
+    const bytes = new Uint8Array(ev.data);
+    if (bytes[0] !== 0x02) return;
+    screen.feed(bytes.subarray(1));
+    drawScreen(el, screen);
+  };
+  ws.onclose = (ev) => finish(ready
+    ? `disconnected (${ev.code})`
+    : `refused before the shell opened (${ev.code}) — the deployment may have no running VM, or the socket was not authenticated`);
+  ws.onerror = () => { /* onclose follows with the code */ };
+
+  el.addEventListener("keydown", onKey);
+  el.addEventListener("paste", onPaste);
+  window.addEventListener("resize", resize);
+  drawScreen(el, screen);
+  el.focus();
+
+  termSession = {
+    close() {
+      window.removeEventListener("resize", resize);
+      el.removeEventListener("keydown", onKey);
+      el.removeEventListener("paste", onPaste);
+      try { ws.close(); } catch {}
+    },
+  };
+}
+
+$("modal-body").addEventListener("click", (e) => {
+  if (e.target.id === "term-retry") {
+    const m = $("modal-title").textContent.match(/^Shell — (.+)$/);
+    const sb = ($("modal-sub").textContent.match(/^VM (\S+)$/) || [])[1] || null;
+    if (m) connectShell(m[1], sb, $("term-token").value.trim() || null);
+  }
+});
+
 // --- modal ---
 let modalSubmit = null;
 // Cleared on close, so a read-only view that refreshes itself (the job log) stops
@@ -1507,6 +1814,8 @@ function openModal(title, sub, bodyHtml, onSubmit, okLabel) {
 }
 function closeModal() {
   $("modal-overlay").classList.remove("open");
+  document.querySelector(".modal").classList.remove("wide");
+  if (termSession) { termSession.close(); termSession = null; }
   modalSubmit = null;
   clearInterval(modalTimer);
   modalTimer = null;
@@ -1750,6 +2059,7 @@ $("deployments").addEventListener("click", (e) => {
   else if (act === "edit") openEdit(id);
   else if (act === "drain") evictVm(id, sb, false);
   else if (act === "kill") evictVm(id, sb, true);
+  else if (act === "shell") openShell(id, sb || null);
   else if (act === "build" || act === "update") startJob(id, act);
 });
 

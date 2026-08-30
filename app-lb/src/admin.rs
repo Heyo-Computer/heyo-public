@@ -3039,6 +3039,10 @@ struct ExecRequest {
     /// instead, for callers that want to know rather than wait.
     #[serde(default = "default_true")]
     wake: bool,
+    /// Run in *this* VM of the deployment rather than whichever the pool
+    /// offers. See [`hold_this_vm`].
+    #[serde(default)]
+    sandbox_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -3069,6 +3073,9 @@ struct ShellQuery {
     cwd: Option<String>,
     #[serde(default = "default_true")]
     wake: bool,
+    /// Open the shell in *this* VM of the deployment. See [`hold_this_vm`].
+    #[serde(default)]
+    sandbox_id: Option<String>,
 }
 
 /// The VM an `exec` or `shell` session runs in.
@@ -3111,7 +3118,12 @@ impl VmTarget {
 /// VM is used when the pool has nothing, and it is tried *before* waking one:
 /// a VM that already exists is the one to look at, and booting another would
 /// add a sandbox — and its disks — to a deployment that is already churning.
-async fn hold_a_vm(state: &AdminState, id: &str, wake: bool) -> Result<VmTarget, Response> {
+async fn hold_a_vm(
+    state: &AdminState,
+    id: &str,
+    wake: bool,
+    sandbox_id: Option<&str>,
+) -> Result<VmTarget, Response> {
     let Some(d) = state.registry.get(id) else {
         return Err(err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response());
     };
@@ -3126,6 +3138,10 @@ async fn hold_a_vm(state: &AdminState, id: &str, wake: bool) -> Result<VmTarget,
             format!("deployment {id:?} has no VM to run a command in — {why}"),
         )
         .into_response());
+    }
+
+    if let Some(want) = sandbox_id {
+        return hold_this_vm(&d, id, want);
     }
 
     if let Some(slot) = d.select(&[]).and_then(|backend| backend.try_hold()) {
@@ -3173,6 +3189,46 @@ async fn hold_a_vm(state: &AdminState, id: &str, wake: bool) -> Result<VmTarget,
     }
 }
 
+/// The one VM the caller named, or the reason it cannot be used.
+///
+/// Naming a VM is for looking at *that* VM — the row on the dashboard that has
+/// gone red, the sandbox a log line came from — so nothing here falls back to
+/// a sibling, and nothing wakes anything: a VM that is not in the deployment
+/// is a `404`, not a cold start. A ready backend is held the same way the
+/// pool's pick would be; a booting one is used as [`booting_vm`] would use it;
+/// one the daemon has not started yet has no guest to talk to and is a `409`,
+/// as is a backend that is draining and refuses the hold.
+fn hold_this_vm(
+    d: &std::sync::Arc<crate::deployment::Deployment>,
+    id: &str,
+    want: &str,
+) -> Result<VmTarget, Response> {
+    if let Some(backend) = d.backends().iter().find(|b| b.sandbox_id == want) {
+        return backend.try_hold().map(VmTarget::Ready).ok_or_else(|| {
+            err(
+                StatusCode::CONFLICT,
+                format!("VM {want:?} in deployment {id:?} is not accepting work"),
+            )
+            .into_response()
+        });
+    }
+    match d.pending().iter().find(|p| p.sandbox_id == want) {
+        Some(p) if p.status == Some(heyo_sdk::SandboxStatus::Running) => {
+            Ok(VmTarget::Booting(want.to_string()))
+        }
+        Some(_) => Err(err(
+            StatusCode::CONFLICT,
+            format!("VM {want:?} in deployment {id:?} has not started yet"),
+        )
+        .into_response()),
+        None => Err(err(
+            StatusCode::NOT_FOUND,
+            format!("no VM {want:?} in deployment {id:?}"),
+        )
+        .into_response()),
+    }
+}
+
 /// The oldest pending VM the daemon reports `Running`, if there is one.
 ///
 /// Oldest first: with a pool of stalled boots, the one that has been up longest
@@ -3201,7 +3257,7 @@ async fn exec(
         return err(StatusCode::BAD_REQUEST, "command must not be empty").into_response();
     }
 
-    let slot = match hold_a_vm(&state, &id, req.wake).await {
+    let slot = match hold_a_vm(&state, &id, req.wake, req.sandbox_id.as_deref()).await {
         Ok(slot) => slot,
         Err(response) => return response,
     };
@@ -3246,6 +3302,8 @@ async fn exec(
 
 /// `GET /deployments/:id/shell` — an interactive PTY, over a WebSocket.
 ///
+/// `?sandbox_id=` picks a VM; without it the pool chooses, as for `exec`.
+///
 /// Wire protocol with the client, which is the daemon's own minus the parts the
 /// SDK session already handles (sequence numbers and acks):
 ///
@@ -3264,7 +3322,7 @@ async fn shell(
     // Everything that can fail with a status code has to fail *before* the
     // upgrade: once the socket is a WebSocket, a client sees a close frame with
     // no explanation instead of a 404.
-    let slot = match hold_a_vm(&state, &id, q.wake).await {
+    let slot = match hold_a_vm(&state, &id, q.wake, q.sandbox_id.as_deref()).await {
         Ok(slot) => slot,
         Err(response) => return response,
     };
@@ -4314,6 +4372,30 @@ mod tests {
                 pending("sb-mid", 200, Some(SandboxStatus::Running)),
             ]);
             assert_eq!(booting_vm(&d).as_deref(), Some("sb-old"));
+        }
+
+        fn status_of(r: Result<VmTarget, Response>) -> Result<String, StatusCode> {
+            match r {
+                Ok(t) => Ok(t.sandbox_id().to_string()),
+                Err(resp) => Err(resp.status()),
+            }
+        }
+
+        /// A named VM is that VM or an error — never a sibling, never a wake.
+        /// The one thing a caller naming a sandbox does not want is to end up
+        /// somewhere else without being told.
+        #[test]
+        fn a_named_vm_is_that_vm_or_nothing() {
+            let d = deployment();
+            d.set_pending(vec![
+                pending("sb-boot", 100, Some(SandboxStatus::Running)),
+                pending("sb-cold", 200, Some(SandboxStatus::Provisioning)),
+                pending("sb-unknown", 300, None),
+            ]);
+            assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-boot")), Ok("sb-boot".into()));
+            assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-cold")), Err(StatusCode::CONFLICT));
+            assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-unknown")), Err(StatusCode::CONFLICT));
+            assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-nope")), Err(StatusCode::NOT_FOUND));
         }
     }
 

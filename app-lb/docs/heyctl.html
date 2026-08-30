@@ -69,7 +69,8 @@ heyctl update legacy          # static deployment: run its update commands</code
 
 <h2>Inside a VM</h2>
 <pre><code>heyctl exec web -- uname -a   # one command; guest exit code becomes heyctl's
-heyctl shell web              # interactive PTY (alias: ssh)</code></pre>
+heyctl shell web              # interactive PTY (alias: ssh)
+heyctl shell web --vm sb-7f3a9c   # …in that VM, not whichever the pool offers</code></pre>
 <p>Both go through app-lb, so they work wherever the admin API does — and they wake a
 scale-to-zero deployment that has no VM running.</p>
 

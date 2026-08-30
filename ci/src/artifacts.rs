@@ -1,14 +1,24 @@
 //! Where build artifacts go: disk, S3, or the `artifacts` store.
 //!
-//! ## The orchestrator does every upload
+//! ## One store, and who moves the bytes into it
 //!
-//! A runner never talks to an artifact store. The orchestrator pulls the file
-//! out of the guest and pushes it onward. For the `artifacts` sink that is not a
-//! preference — the store is per-host, per-user and single-replica (its own
-//! `examples/artifacts.json` pins it to one, because "each VM has its own disk,
-//! so N replicas are N independent stores"). A fleet of runners each pushing to
-//! their own local store would produce N stores that disagree. One central
-//! `art serve`, one writer.
+//! A runner never has a store of its own. The `artifacts` sink is per-host,
+//! per-user and single-replica (its own `examples/artifacts.json` pins it to
+//! one, because "each VM has its own disk, so N replicas are N independent
+//! stores"), so a fleet of runners each pushing to a local store would produce
+//! N stores that disagree. One central `art serve`.
+//!
+//! Who *moves the bytes* there is a separate question, answered by
+//! [`ArtifactSink::guest_push`]. The orchestrator's own path — read the file out
+//! of the guest, push it onward — is the only one that works for every sink,
+//! and it is slow on firecracker: the read is exec output, and exec output is
+//! the emulated serial console, tens of KiB/s. app-obs's 40 MB tarball spent a
+//! quarter of an hour leaving its VM that way. So a sink that is an HTTP store
+//! with a content-addressed blob route hands out a [`GuestPush`], the guest
+//! `curl -T`s the blob itself at network speed, and the orchestrator verifies
+//! it landed and then writes the manifest, tag and labels — the parts that
+//! name the artifact and that only it knows the coordinates for. The blob is
+//! the same bytes under the same digest whichever side sent it.
 //!
 //! ## Three constraints of the `artifacts` store shape the design
 //!
@@ -74,9 +84,49 @@ pub struct ArtifactRef {
     pub description: Option<String>,
 }
 
+/// What a guest needs to push a blob into the store itself: where, and as
+/// whom. See the module docs for why this exists.
+///
+/// The token is the sink's own write token. There is no narrower credential to
+/// hand out — the store has no scoped or short-lived keys — so it goes to the
+/// guest for the one exec that uses it, through the exec `env`, the same route
+/// every `env:` secret of a `run:` step already takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestPush {
+    /// Base URL of the store as the guest reaches it.
+    pub url: String,
+    pub token: Option<String>,
+}
+
 #[async_trait]
 pub trait ArtifactSink: Send + Sync {
+    /// Store `bytes` the orchestrator has in hand.
     async fn put(&self, r: &ArtifactRef, bytes: Vec<u8>) -> Result<StoredArtifact, ArtifactError>;
+
+    /// How a guest can push a blob into this sink directly, if it can at all.
+    /// `None` — the default — means the orchestrator reads the bytes out of the
+    /// guest and calls [`Self::put`].
+    fn guest_push(&self) -> Option<GuestPush> {
+        None
+    }
+
+    /// Finish storing a blob the guest has already pushed: verify the sink
+    /// holds `digest` at `size` bytes, then record it as `r` the way
+    /// [`Self::put`] would have. Only meaningful for a sink whose
+    /// [`Self::guest_push`] is `Some`.
+    async fn put_pushed(
+        &self,
+        r: &ArtifactRef,
+        digest: &str,
+        size: u64,
+    ) -> Result<StoredArtifact, ArtifactError> {
+        let _ = (r, size);
+        Err(ArtifactError::Misconfigured(format!(
+            "the {} sink cannot accept a blob pushed from a guest (digest {digest})",
+            self.kind()
+        )))
+    }
+
     fn kind(&self) -> &'static str;
 }
 
@@ -216,13 +266,7 @@ impl ArtifactSink for ArtifactsSink {
 
         // A 404 here is the answer "not stored yet", not a failure — the same
         // distinction serverctl's client makes.
-        let head = self
-            .auth(self.http.head(format!("{base}/blobs/{digest}")))
-            .send()
-            .await
-            .map_err(|e| ArtifactError::Transport(e.to_string()))?;
-
-        if !head.status().is_success() {
+        if self.stat_blob(&digest).await?.is_none() {
             let put = self
                 .auth(self.http.put(format!("{base}/blobs/{digest}")))
                 // Explicit, so the store's free-space guard can refuse before
@@ -236,6 +280,72 @@ impl ArtifactSink for ArtifactsSink {
             check(put, "uploading a blob").await?;
         }
 
+        self.finish(r, digest, size).await
+    }
+
+    fn guest_push(&self) -> Option<GuestPush> {
+        Some(GuestPush {
+            url: self.config.url_for_guest().to_string(),
+            token: self.config.token.clone(),
+        })
+    }
+
+    /// The guest said the store answered its `PUT /blobs/{digest}` with a 2xx.
+    /// Ask the store, not the guest: a `HEAD` for the digest, with the size the
+    /// guest measured checked against the one the store reports. Only then is
+    /// the artifact named — a manifest pointing at a blob that is not there
+    /// would be a tag that resolves to a 404 on somebody's install.
+    async fn put_pushed(
+        &self,
+        r: &ArtifactRef,
+        digest: &str,
+        size: u64,
+    ) -> Result<StoredArtifact, ArtifactError> {
+        match self.stat_blob(digest).await? {
+            None => Err(ArtifactError::NotPushed {
+                digest: digest.to_string(),
+                detail: "the store does not have it".to_string(),
+            }),
+            Some(Some(stored)) if stored != size => Err(ArtifactError::NotPushed {
+                digest: digest.to_string(),
+                detail: format!("the guest measured {size} bytes, the store holds {stored}"),
+            }),
+            Some(_) => self.finish(r, digest.to_string(), size).await,
+        }
+    }
+}
+
+impl ArtifactsSink {
+    /// `HEAD /blobs/{digest}`: `None` when the store does not have it, else the
+    /// size it reports (which a store predating `Content-Length` on HEAD may
+    /// omit, hence the inner `Option`).
+    async fn stat_blob(&self, digest: &str) -> Result<Option<Option<u64>>, ArtifactError> {
+        let base = &self.config.url;
+        let head = self
+            .auth(self.http.head(format!("{base}/blobs/{digest}")))
+            .send()
+            .await
+            .map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        if head.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let head = check(head, "checking for a blob").await?;
+        let size = head
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        Ok(Some(size))
+    }
+
+    /// Everything after the blob is in the store: manifest, tag, labels.
+    async fn finish(
+        &self,
+        r: &ArtifactRef,
+        digest: String,
+        size: u64,
+    ) -> Result<StoredArtifact, ArtifactError> {
+        let base = &self.config.url;
         let manifest = manifest_for(r, &digest, size);
         let put_manifest = self
             .auth(self.http.put(format!("{base}/manifests")))
@@ -418,6 +528,11 @@ pub enum ArtifactError {
         sink: &'static str,
         detail: String,
     },
+    /// A guest reported pushing a blob the store then could not vouch for.
+    NotPushed {
+        digest: String,
+        detail: String,
+    },
 }
 
 impl fmt::Display for ArtifactError {
@@ -454,6 +569,11 @@ impl fmt::Display for ArtifactError {
                 f,
                 "the {sink} artifact sink is not implemented yet ({detail}). Set \
                  CI_ARTIFACT_SINK=disk or =artifacts."
+            ),
+            Self::NotPushed { digest, detail } => write!(
+                f,
+                "the guest reported pushing blob {digest} to the store, but {detail}. \
+                 Is CI_ARTIFACT_GUEST_URL the same store as CI_ARTIFACT_URL?"
             ),
         }
     }
@@ -607,6 +727,177 @@ mod tests {
         assert_eq!(
             sink.key_for(&aref()),
             "ci/019fca648a6e-00000000/build-x86_64/binary.tar.gz"
+        );
+    }
+
+    /// A sink that cannot take a pushed blob says so through the trait, so
+    /// the dispatcher never has to know which sink it holds.
+    #[tokio::test]
+    async fn only_the_artifacts_sink_offers_a_guest_push() {
+        let disk = DiskSink {
+            root: std::env::temp_dir(),
+        };
+        assert!(disk.guest_push().is_none());
+        let err = disk.put_pushed(&aref(), "ab", 1).await.unwrap_err();
+        assert!(err.to_string().contains("disk"), "{err}");
+
+        let sink = ArtifactsSink::new(ArtifactsConfig {
+            url: "http://orchestrator-only:9000".into(),
+            token: Some("t".into()),
+            guest_url: None,
+        });
+        assert_eq!(
+            sink.guest_push(),
+            Some(GuestPush {
+                url: "http://orchestrator-only:9000".into(),
+                token: Some("t".into()),
+            })
+        );
+        let sink = ArtifactsSink::new(ArtifactsConfig {
+            url: "http://orchestrator-only:9000".into(),
+            token: None,
+            guest_url: Some("https://art.example".into()),
+        });
+        assert_eq!(
+            sink.guest_push().unwrap().url,
+            "https://art.example",
+            "the guest gets the URL it can reach, not the orchestrator's"
+        );
+    }
+
+    /// A fake `art serve` that answers the routes the sink uses, recording
+    /// every manifest and tag it is asked to write.
+    struct FakeStore {
+        url: String,
+        /// `HEAD /blobs/{digest}` answers: digest → size the store claims.
+        blobs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+        manifests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tags: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl FakeStore {
+        async fn start() -> Self {
+            use axum::{Router, extract::State, routing::put};
+            #[derive(Clone)]
+            struct St {
+                blobs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+                manifests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+                tags: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+            }
+            let st = St {
+                blobs: Default::default(),
+                manifests: Default::default(),
+                tags: Default::default(),
+            };
+            let app = Router::new()
+                .route(
+                    "/blobs/{digest}",
+                    axum::routing::head(
+                        |State(st): State<St>, axum::extract::Path(d): axum::extract::Path<String>| async move {
+                            match st.blobs.lock().unwrap().get(&d) {
+                                Some(size) => (
+                                    reqwest::StatusCode::OK,
+                                    [(axum::http::header::CONTENT_LENGTH, size.to_string())],
+                                )
+                                    .into_response(),
+                                None => reqwest::StatusCode::NOT_FOUND.into_response(),
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/manifests",
+                    put(
+                        |State(st): State<St>, axum::Json(m): axum::Json<serde_json::Value>| async move {
+                            st.manifests.lock().unwrap().push(m);
+                            axum::Json(serde_json::json!({ "digest": "manifest-digest" }))
+                        },
+                    ),
+                )
+                .route(
+                    "/tags/{tag}",
+                    put(
+                        |State(st): State<St>, axum::extract::Path(t): axum::extract::Path<String>, body: String| async move {
+                            st.tags.lock().unwrap().push((t, body));
+                            reqwest::StatusCode::OK
+                        },
+                    ),
+                )
+                .with_state(st.clone());
+            use axum::response::IntoResponse;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self {
+                url: format!("http://{addr}"),
+                blobs: st.blobs,
+                manifests: st.manifests,
+                tags: st.tags,
+            }
+        }
+
+        fn sink(&self) -> ArtifactsSink {
+            ArtifactsSink::new(ArtifactsConfig {
+                url: self.url.clone(),
+                token: None,
+                guest_url: None,
+            })
+        }
+    }
+
+    const DIGEST: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    /// The guest's word is not enough: a blob it says it pushed is looked up
+    /// in the store, and a missing one is an error before any manifest or
+    /// tag exists that would point at it.
+    #[tokio::test]
+    async fn a_pushed_blob_the_store_lacks_is_an_error_and_names_nothing() {
+        let store = FakeStore::start().await;
+        let err = store
+            .sink()
+            .put_pushed(&aref(), DIGEST, 3)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ArtifactError::NotPushed { .. }), "{err}");
+        assert!(err.to_string().contains(DIGEST), "{err}");
+        assert!(store.manifests.lock().unwrap().is_empty());
+        assert!(store.tags.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pushed_blob_of_the_wrong_size_is_an_error() {
+        let store = FakeStore::start().await;
+        store.blobs.lock().unwrap().insert(DIGEST.into(), 999);
+        let err = store
+            .sink()
+            .put_pushed(&aref(), DIGEST, 3)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ArtifactError::NotPushed { .. }), "{err}");
+        assert!(err.to_string().contains("999"), "{err}");
+        assert!(store.manifests.lock().unwrap().is_empty());
+    }
+
+    /// The store has it at the size the guest measured: the artifact is named
+    /// exactly as an orchestrator-side `put` would have named it.
+    #[tokio::test]
+    async fn a_pushed_blob_the_store_has_is_named_like_any_other() {
+        let store = FakeStore::start().await;
+        store.blobs.lock().unwrap().insert(DIGEST.into(), 3);
+        let stored = store.sink().put_pushed(&aref(), DIGEST, 3).await.unwrap();
+        assert_eq!(stored.sink, "artifacts");
+        assert_eq!(stored.digest.as_deref(), Some(DIGEST));
+        assert_eq!(stored.size_bytes, 3);
+        assert_eq!(stored.uri, tag_for(&aref()));
+
+        let manifests = store.manifests.lock().unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0]["entries"][0]["digest"], DIGEST);
+        assert_eq!(manifests[0]["entries"][0]["size"], 3);
+        let tags = store.tags.lock().unwrap();
+        assert_eq!(
+            tags.as_slice(),
+            &[(tag_for(&aref()), "manifest-digest".to_string())]
         );
     }
 

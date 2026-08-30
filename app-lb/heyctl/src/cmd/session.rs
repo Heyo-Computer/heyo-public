@@ -106,6 +106,11 @@ pub struct ShellArgs {
     /// Fail instead of starting a VM when the deployment has none running.
     #[arg(long)]
     pub no_wake: bool,
+
+    /// Open the shell in this VM of the deployment (a sandbox id from
+    /// `heyctl get`), rather than whichever one the pool offers.
+    #[arg(long, value_name = "SANDBOX_ID")]
+    pub vm: Option<String>,
 }
 
 /// How long to wait for guest output before looking at stdin and the window
@@ -122,6 +127,9 @@ pub fn shell(ctx: &Ctx, args: &ShellArgs) -> Result<()> {
     }
     if args.no_wake {
         opts = opts.no_wake();
+    }
+    if let Some(vm) = &args.vm {
+        opts = opts.vm(vm);
     }
 
     let mut session = ctx.client.shell(&id, &opts)?;

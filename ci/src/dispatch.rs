@@ -62,6 +62,14 @@ const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// the rest of the step's budget.
 const ARTIFACT_PACK_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Guest timeout for the guest's own push of a packed artifact to the store
+/// (`curl -T`, see [`guest_push_command`]). This is a network upload from the
+/// guest: seconds for anything a workflow here produces, a minute or two for a
+/// slow link. A push still running at this point is a guest that cannot really
+/// reach the store, and the rest of the step's budget belongs to the fallback
+/// — reading the tarball out over the exec channel — not to waiting on it.
+const ARTIFACT_GUEST_PUSH_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Where the submitted tree lands, and where steps run, when the `vm:` block
 /// does not say. Matches the daemon's own default mount.
 const DEFAULT_WORKDIR: &str = "/workspace";
@@ -2399,15 +2407,21 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 // can write `${{ ci.branch }}` into it.
                 let description = with("description").filter(|d| !d.trim().is_empty());
 
-                // Packed to a file in the guest, then read out through exec
-                // and base64 the same way the source went in — the daemon's
-                // file routes address a host-side mount, not the VM. Read out
-                // in chunks, each under its own guest timeout and the whole
-                // under the step's: one exec for the whole tarball met one
-                // fixed 600-second ceiling, which the app-lb artifact fit
-                // under and the app-obs one — two binaries carrying arrow and
-                // parquet — did not. See `Vm::download_file` for the transfer
-                // and the guest-side details it has to get right.
+                // Packed to a file in the guest. Then, for a sink that offers
+                // a `GuestPush`, the guest pushes the tarball to the store
+                // over its own network; otherwise — or if that fails — it is
+                // read out through exec and base64 the same way the source
+                // went in, because the daemon's file routes address a
+                // host-side mount, not the VM. That read is exec output, and
+                // on firecracker exec output is the emulated serial console:
+                // tens of KiB/s, which is why app-obs's 41 MB tarball spent a
+                // quarter of an hour leaving its VM before the push existed.
+                // The read is chunked, each chunk under its own guest timeout
+                // and the whole under the step's — one exec for the whole
+                // tarball met one fixed 600-second ceiling, which app-lb's
+                // artifact fit under and app-obs's did not. See
+                // `Vm::download_file` for the transfer and the guest-side
+                // details it has to get right.
                 //
                 // `tar` from the working directory, so the archive holds
                 // `dist/...` rather than an absolute path. The tarball is named
@@ -2462,13 +2476,80 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                         ),
                     )
                     .await?;
-                let read = vm
-                    .download_file(
-                        &format!("{sid}.a"),
-                        &tarball,
-                        budget.saturating_sub(started.elapsed()),
-                    )
-                    .await;
+                let run = self.store.get_run(&msg.run_id).await?;
+                let aref = crate::artifacts::ArtifactRef {
+                    run_id: msg.run_id.clone(),
+                    job_key: plan.key.clone(),
+                    workflow_id: run.map(|r| r.workflow_id).unwrap_or_default(),
+                    name: name.clone(),
+                    description,
+                };
+
+                // The fast path: the guest pushes the tarball to the store
+                // itself, over its own network, and the orchestrator only has
+                // to verify and name it. Anything that stops the guest doing
+                // that — no curl in the image, a store it cannot route to, a
+                // refused upload — is logged and then paid for the slow way,
+                // because an artifact that arrives late beats one that does not
+                // arrive; but a blob the guest says it pushed and the store
+                // says it has not got is an error, not a reason to try again.
+                let pushed = match self.artifacts.guest_push() {
+                    Some(push) => {
+                        let timeout = ARTIFACT_GUEST_PUSH_TIMEOUT
+                            .min(budget.saturating_sub(started.elapsed()));
+                        let mut env = HashMap::new();
+                        env.insert("CI_ARTIFACT_URL".to_string(), push.url.clone());
+                        if let Some(t) = &push.token {
+                            env.insert("CI_ARTIFACT_TOKEN".to_string(), t.clone());
+                        }
+                        let out = vm
+                            .exec(
+                                &format!("{sid}.ap"),
+                                &guest_push_command(&tarball, push.token.is_some(), timeout),
+                                &env,
+                                timeout,
+                            )
+                            .await?;
+                        match parse_guest_push(&out) {
+                            Ok((digest, size)) => Some(
+                                self.artifacts
+                                    .put_pushed(&aref, &digest, size)
+                                    .await
+                                    .map(Fetched::Stored)
+                                    .map_err(|e| DispatchError::Artifact(e.to_string())),
+                            ),
+                            Err(why) => {
+                                self.store
+                                    .append_log(
+                                        sid,
+                                        log_path,
+                                        &format!(
+                                            "[ci] the guest could not push the tarball to \
+                                             {} ({why}); reading it out over the exec channel \
+                                             instead, which is slow\n",
+                                            push.url
+                                        ),
+                                    )
+                                    .await?;
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+
+                let read = match pushed {
+                    Some(result) => result,
+                    None => vm
+                        .download_file(
+                            &format!("{sid}.a"),
+                            &tarball,
+                            budget.saturating_sub(started.elapsed()),
+                        )
+                        .await
+                        .map(Fetched::Bytes)
+                        .map_err(DispatchError::from),
+                };
                 // Cleanup is best effort and never the reported error: what
                 // matters is whether the bytes arrived.
                 if let Err(e) = vm
@@ -2482,29 +2563,25 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 {
                     tracing::warn!(step = sid, error = %e, "could not remove the packed artifact");
                 }
-                let bytes = read?;
-                let transfer = started.elapsed();
-
-                let run = self.store.get_run(&msg.run_id).await?;
-                let aref = crate::artifacts::ArtifactRef {
-                    run_id: msg.run_id.clone(),
-                    job_key: plan.key.clone(),
-                    workflow_id: run.map(|r| r.workflow_id).unwrap_or_default(),
-                    name: name.clone(),
-                    description,
+                let (stored, how) = match read? {
+                    Fetched::Stored(stored) => (stored, "pushed from the guest"),
+                    Fetched::Bytes(bytes) => {
+                        let stored = self
+                            .artifacts
+                            .put(&aref, bytes)
+                            .await
+                            .map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                        (stored, "read out of the guest")
+                    }
                 };
-                let stored = self
-                    .artifacts
-                    .put(&aref, bytes)
-                    .await
-                    .map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                let transfer = started.elapsed();
 
                 self.store
                     .record_artifact(&msg.run_id, &msg.job_id, &name, &stored)
                     .await?;
                 Ok(format!(
                     "[ci] stored artifact {name:?} ({} bytes) in the {} sink as {} — \
-                     read out of the guest in {transfer:.0?}\n",
+                     {how} in {transfer:.0?}\n",
                     stored.size_bytes, stored.sink, stored.uri
                 ))
             }
@@ -3646,6 +3723,113 @@ fn step_timeout(step: &Step, plan: &JobPlan) -> Duration {
         .min(plan.timeout)
 }
 
+/// How a `ci/upload-artifact` tarball left the guest: already in the sink,
+/// because the guest pushed it there itself, or in hand, read out over the
+/// exec channel and still to be `put`.
+enum Fetched {
+    Stored(crate::artifacts::StoredArtifact),
+    Bytes(Vec<u8>),
+}
+
+/// The guest-side push of a packed artifact: hash it, `curl -T` it to the
+/// store's content-addressed blob route, and report what happened in a form
+/// [`parse_guest_push`] reads.
+///
+/// The store's address and token arrive in the exec `env` as
+/// `CI_ARTIFACT_URL` and `CI_ARTIFACT_TOKEN` rather than in this string, so
+/// the token is never part of a command the orchestrator logs or stores. (The
+/// daemon inlines exec env into the guest's serial command line, so it does
+/// reach the runner host's console log — as every `env:` secret of a `run:`
+/// step does. There is no narrower credential to send: the store has no scoped
+/// or short-lived keys.) `with_token` says whether to send the header at all;
+/// a store without auth gets none.
+///
+/// Written for the guest's `sh` and the serial line it arrives over: one
+/// level of `$( )`, no backslashes, every line of output newline-terminated
+/// (the serial protocol needs the last one). Exit 127 without curl, 1 when
+/// curl or the store refused, 0 only when the store answered 2xx — and the
+/// store checks the digest against the bytes, so a 2xx is the blob stored
+/// under that name. The response body is printed on failure, so a `no_space`
+/// or `unauthorized` from the store lands in the step log by name.
+///
+/// `--max-time` sits under the exec timeout so a stalled upload comes back as
+/// curl's exit 28 with this script's output, rather than as the daemon's kill
+/// with none.
+fn guest_push_command(tarball: &str, with_token: bool, timeout: Duration) -> String {
+    let auth = if with_token {
+        " -H \"Authorization: Bearer $CI_ARTIFACT_TOKEN\""
+    } else {
+        ""
+    };
+    let max_time = timeout.as_secs().saturating_sub(10).max(5);
+    format!(
+        "f={f}; out={f}.push; \
+         command -v curl >/dev/null 2>&1 || {{ echo 'the guest has no curl'; exit 127; }}; \
+         d=$(sha256sum \"$f\" | cut -d' ' -f1) || {{ echo 'sha256sum failed'; exit 1; }}; \
+         s=$(wc -c < \"$f\" | tr -d ' '); \
+         code=$(curl -sS -o \"$out\" -w '%{{http_code}}' --connect-timeout 15 --max-time {max_time} \
+         -X PUT -H 'Content-Type: application/octet-stream'{auth} -T \"$f\" \
+         \"$CI_ARTIFACT_URL/blobs/$d\"); rc=$?; \
+         echo \"digest=$d\"; echo \"size=$s\"; echo \"http=$code\"; echo \"curl=$rc\"; \
+         if [ \"$rc\" -ne 0 ]; then head -c 600 \"$out\" 2>/dev/null; echo; rm -f \"$out\"; exit 1; fi; \
+         case \"$code\" in 2*) rm -f \"$out\"; exit 0;; esac; \
+         head -c 600 \"$out\" 2>/dev/null; echo; rm -f \"$out\"; exit 1",
+        f = shell_quote(tarball),
+    )
+}
+
+/// What [`guest_push_command`] reported: the digest and size of the blob the
+/// store accepted, or why it did not — one line for the step log, with the
+/// guest's own output folded in so the store's refusal is quoted rather than
+/// summarized.
+fn parse_guest_push(out: &crate::vm::ExecOutput) -> Result<(String, u64), String> {
+    let text = out.combined();
+    let field = |k: &str| {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(k).and_then(|v| v.strip_prefix('=')))
+            .map(str::trim)
+    };
+    if !out.succeeded() {
+        let http = field("http").filter(|h| !h.is_empty() && *h != "000");
+        let curl = field("curl").filter(|c| *c != "0");
+        let mut why = match (http, curl, out.exit_code) {
+            (Some(h), _, _) => format!("the store answered {h}"),
+            (None, Some(c), _) => format!("curl exited {c}"),
+            (None, None, 127) => "the guest has no curl".to_string(),
+            (None, None, code) => format!("exit {code}"),
+        };
+        // Everything the script printed that is not one of its own fields:
+        // curl's error, or the store's response body.
+        let detail: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| {
+                !l.is_empty()
+                    && !["digest=", "size=", "http=", "curl="]
+                        .iter()
+                        .any(|k| l.starts_with(k))
+            })
+            .collect();
+        if !detail.is_empty() {
+            why.push_str(": ");
+            why.push_str(&detail.join(" ").chars().take(400).collect::<String>());
+        }
+        return Err(why);
+    }
+    let digest = field("digest")
+        .filter(|d| {
+            d.len() == 64
+                && d.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+        .ok_or_else(|| "the guest did not report a sha256 digest".to_string())?;
+    let size = field("size")
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .ok_or_else(|| "the guest did not report the tarball's size".to_string())?;
+    Ok((digest.to_string(), size))
+}
+
 /// Single-quote a value for `sh`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -3978,6 +4162,109 @@ impl std::fmt::Display for DispatchError {
 }
 
 impl std::error::Error for DispatchError {}
+
+#[cfg(test)]
+mod guest_push_tests {
+    use super::*;
+
+    fn output(exit_code: i32, text: &str) -> crate::vm::ExecOutput {
+        crate::vm::ExecOutput {
+            output: text.to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code,
+        }
+    }
+
+    /// The token travels in the exec env, never in the command the
+    /// orchestrator logs; and a store without auth is sent no header at all.
+    #[test]
+    fn the_push_command_names_the_token_only_by_reference() {
+        let with = guest_push_command("/tmp/s.artifact.tar.gz", true, Duration::from_secs(300));
+        assert!(
+            with.contains("Authorization: Bearer $CI_ARTIFACT_TOKEN"),
+            "{with}"
+        );
+        assert!(with.contains("$CI_ARTIFACT_URL/blobs/$d"), "{with}");
+        assert!(with.starts_with("f='/tmp/s.artifact.tar.gz'; "), "{with}");
+        assert!(with.contains("-T \"$f\""), "{with}");
+        let without = guest_push_command("/tmp/s.artifact.tar.gz", false, Duration::from_secs(300));
+        assert!(!without.contains("Authorization"), "{without}");
+    }
+
+    /// What the serial line is known to mangle (see `Vm::download_file`):
+    /// backslashes, nested `$( )`, output without a final newline.
+    #[test]
+    fn the_push_command_is_written_for_the_serial_line() {
+        let cmd = guest_push_command("/tmp/s.artifact.tar.gz", true, Duration::from_secs(300));
+        assert!(!cmd.contains('\\'), "{cmd}");
+        assert!(!cmd.contains("$($("), "{cmd}");
+        assert!(cmd.contains("--max-time 290"), "{cmd}");
+        assert!(cmd.contains("'%{http_code}'"), "{cmd}");
+        // Every exit path prints a newline-terminated line last.
+        for tail in ["echo; rm -f \"$out\"; exit 1", "exit 127;", "exit 0;;"] {
+            assert!(cmd.contains(tail), "missing {tail:?} in {cmd}");
+        }
+    }
+
+    #[test]
+    fn a_stored_push_yields_its_digest_and_size() {
+        let out = output(
+            0,
+            "digest=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\n\
+             size=41237266\nhttp=201\ncurl=0\n",
+        );
+        assert_eq!(
+            parse_guest_push(&out).unwrap(),
+            (
+                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_string(),
+                41237266
+            )
+        );
+    }
+
+    #[test]
+    fn a_push_the_store_refused_quotes_the_store() {
+        let out = output(
+            1,
+            "digest=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\n\
+             size=41237266\nhttp=507\ncurl=0\n\
+             {\"error\":\"no_space\",\"message\":\"12 MB free\"}\n",
+        );
+        let why = parse_guest_push(&out).unwrap_err();
+        assert!(why.starts_with("the store answered 507"), "{why}");
+        assert!(why.contains("no_space"), "{why}");
+    }
+
+    #[test]
+    fn a_push_that_never_reached_the_store_names_curl() {
+        let out = output(
+            1,
+            "curl: (7) Failed to connect to art.internal port 443\n\
+             digest=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\n\
+             size=41237266\nhttp=000\ncurl=7\n",
+        );
+        let why = parse_guest_push(&out).unwrap_err();
+        assert!(why.starts_with("curl exited 7"), "{why}");
+        assert!(why.contains("Failed to connect"), "{why}");
+    }
+
+    #[test]
+    fn a_guest_without_curl_says_so() {
+        let why = parse_guest_push(&output(127, "the guest has no curl\n")).unwrap_err();
+        assert_eq!(why, "the guest has no curl: the guest has no curl");
+    }
+
+    /// A 2xx with a digest the store could not have accepted is a protocol
+    /// fault, and must not be handed to `put_pushed` as if it were real.
+    #[test]
+    fn a_malformed_digest_is_not_trusted() {
+        let out = output(0, "digest=DEADBEEF\nsize=3\nhttp=201\ncurl=0\n");
+        assert!(parse_guest_push(&out).unwrap_err().contains("digest"));
+        let out = output(0, "size=3\nhttp=201\ncurl=0\n");
+        assert!(parse_guest_push(&out).unwrap_err().contains("digest"));
+    }
+}
 
 #[cfg(test)]
 mod tests {
