@@ -88,6 +88,11 @@ fn vm_spec() -> DeploymentSpec {
             },
         ],
         vm: Some(crate::config::VmSpec {
+            env_from: vec![],
+            workspace_archive: None,
+            image_download_url: None,
+            image_size_bytes: None,
+            image_sha256: None,
             driver: heyo_sdk::SandboxDriver::Firecracker,
             image: Some("agent-base".into()),
             port: 8080,
@@ -110,6 +115,7 @@ fn vm_spec() -> DeploymentSpec {
                 store: "http://127.0.0.1:8080".into(),
                 artifact_ref: "corpus-2026-08".into(),
                 auth: Some(crate::secrets::SecretRef {
+                    namespace: None,
                     secret: "art-key".into(),
                     key: "token".into(),
                     username: None,
@@ -150,6 +156,7 @@ fn vm_spec() -> DeploymentSpec {
             image_name: Some("agent-base".into()),
             image_size_mb: Some(4096),
             auth: Some(crate::secrets::SecretRef {
+                namespace: None,
                 secret: "github".into(),
                 key: "token".into(),
                 username: Some("git".into()),
@@ -162,6 +169,7 @@ fn vm_spec() -> DeploymentSpec {
             provider: Default::default(),
             client_id: Some("1234.apps.googleusercontent.com".into()),
             client_secret: Some(crate::secrets::SecretRef {
+                namespace: None,
                 secret: "google-oauth".into(),
                 key: "client_secret".into(),
                 username: None,
@@ -227,11 +235,13 @@ fn site_spec() -> DeploymentSpec {
                     .collect(),
             ),
             env_from: vec![crate::config::SecretEnv {
+                namespace: None,
                 secret: "npm".into(),
                 key: "token".into(),
                 env: Some("NPM_TOKEN".into()),
             }],
             auth: Some(crate::secrets::SecretRef {
+                namespace: None,
                 secret: "github".into(),
                 key: "token".into(),
                 username: Some("git".into()),
@@ -286,6 +296,7 @@ fn jwt_spec() -> DeploymentSpec {
         provider: serde_json::from_str(r#"["google","jwt"]"#).expect("providers parse"),
         client_id: Some("1234.apps.googleusercontent.com".into()),
         client_secret: Some(crate::secrets::SecretRef {
+            namespace: None,
             secret: "google-oauth".into(),
             key: "client_secret".into(),
             username: None,
@@ -301,6 +312,7 @@ fn jwt_spec() -> DeploymentSpec {
         forward_identity: true,
         jwt: Some(crate::config::JwtSpec {
             secret: Some(crate::secrets::SecretRef {
+                namespace: None,
                 secret: "heyo-auth".into(),
                 key: "jwt_secret".into(),
                 username: None,
@@ -341,6 +353,7 @@ fn artifact_spec() -> DeploymentSpec {
         store: "http://127.0.0.1:8080".into(),
         artifact_ref: "agent-base".into(),
         auth: Some(crate::secrets::SecretRef {
+            namespace: None,
             secret: "art".into(),
             key: "api_key".into(),
             username: None,
@@ -841,6 +854,7 @@ fn the_small_responses_are_stable() {
     golden(
         "secret-summary",
         &crate::secrets::SecretSummary {
+            namespace: crate::config::DEFAULT_NAMESPACE.to_string(),
             id: "github".into(),
             description: Some("PAT for private repos".into()),
             keys: vec!["token".into(), "username".into()],
@@ -1058,6 +1072,7 @@ fn workflow_spec() -> crate::config::WorkflowSpec {
         path: ".ci/workflows/*.yml".into(),
         network: "prod-runners".into(),
         auth: Some(crate::secrets::SecretRef {
+            namespace: None,
             secret: "github".into(),
             key: "token".into(),
             username: None,

@@ -105,6 +105,11 @@ pub struct Autoscaler {
     /// it when the deployment has one, so a workspace is captured before the
     /// VM that holds it is destroyed; see [`crate::workspace`].
     workspaces: Arc<Workspaces>,
+    /// Resolves a template's `env_from` into values at create time. Held here
+    /// rather than by the VM manager so that a missing secret fails the
+    /// *create* and travels the create-failure path — counted, fed, embargoed
+    /// — instead of being discovered as a guest that boots without its token.
+    secrets: Arc<crate::secrets::SecretStore>,
 }
 
 impl Autoscaler {
@@ -115,6 +120,7 @@ impl Autoscaler {
         feed: Arc<crate::feed::Feed>,
         disk_cfg: Option<crate::disks::DiskConfig>,
         workspaces: Arc<Workspaces>,
+        secrets: Arc<crate::secrets::SecretStore>,
     ) -> Self {
         Self {
             registry,
@@ -125,7 +131,28 @@ impl Autoscaler {
             feed,
             disk_cfg,
             workspaces,
+            secrets,
         }
+    }
+
+    /// The values a template's `env_from` names, keyed by variable name.
+    ///
+    /// Resolved at create rather than at registration so rotating a secret
+    /// reaches the next replica without re-registering the deployment — the
+    /// same reason a build reads its git token when it runs.
+    fn secret_env(&self, spec: &crate::config::VmSpec) -> Result<HashMap<String, String>, vm::VmError> {
+        let mut env = HashMap::with_capacity(spec.env_from.len());
+        for from in &spec.env_from {
+            let value = self
+                .secrets
+                .resolve(&from.secret_ref())
+                .map_err(|e| vm::VmError::SecretUnresolved {
+                    env: from.env_name(),
+                    detail: e.to_string(),
+                })?;
+            env.insert(from.env_name(), value);
+        }
+        Ok(env)
     }
 
     /// The workspace store, for the admin API's status view.
@@ -1023,7 +1050,15 @@ impl Autoscaler {
             let name = vm::replica_name(&d.spec.id, self.next_nonce());
             let tree = seeded.as_ref().map(|s| s.tree.as_path());
             let owner = vm::VmOwner::of(&d.spec);
-            match self.vms.create(d.spec.vm_spec(), name, tree, &owner).await {
+            let created_vm = match self.secret_env(d.spec.vm_spec()) {
+                Ok(secret_env) => {
+                    self.vms
+                        .create(d.spec.vm_spec(), name, tree, &owner, secret_env)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            match created_vm {
                 Ok(sandbox) => {
                     let sandbox_id = sandbox.sandbox_id().to_string();
                     if let Some(seeded) = &seeded {
@@ -1056,7 +1091,8 @@ impl Autoscaler {
                         // deployment whose mounts never land is exactly the
                         // silent `ready: 0` this metric exists to explain.
                         match &e {
-                            crate::vm::VmError::MountNotPulled { .. } => {
+                            crate::vm::VmError::MountNotPulled { .. }
+                            | crate::vm::VmError::SecretUnresolved { .. } => {
                                 format!("this deployment cannot boot yet: {e}")
                             }
                             _ => format!("the VM daemon refused to create a VM: {e}"),
@@ -1993,6 +2029,11 @@ mod tests {
                 path_prefix: None,
             }],
             vm: Some(VmSpec {
+                env_from: vec![],
+                workspace_archive: None,
+                image_download_url: None,
+                image_size_bytes: None,
+                image_sha256: None,
                 driver: SandboxDriver::Firecracker,
                 image: None,
                 port: 8080,
@@ -2095,6 +2136,10 @@ mod tests {
                 // is also the production behaviour when the data dir is unknown.
                 None,
                 workspaces,
+                Arc::new(crate::secrets::SecretStore::new(
+                    dir.join("autoscaler-secrets.json"),
+                    None,
+                )),
             ),
             registry,
         )

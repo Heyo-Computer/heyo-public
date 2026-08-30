@@ -1233,6 +1233,7 @@ mod tests {
             provider: Default::default(),
             client_id: Some("cid.apps.googleusercontent.com".into()),
             client_secret: Some(SecretRef {
+                namespace: None,
                 secret: "google".into(),
                 key: "client_secret".into(),
                 username: None,
@@ -1253,6 +1254,7 @@ mod tests {
     fn auth() -> Authenticator {
         let store = Arc::new(SecretStore::new("unused.json", None));
         store.put(SecretSpec {
+            namespace: crate::config::DEFAULT_NAMESPACE.to_string(),
             id: "google".into(),
             description: None,
             data: BTreeMap::from([("client_secret".to_string(), "s3cret".to_string())]),
@@ -1493,6 +1495,7 @@ mod tests {
         fn with_secret() -> Authenticator {
             let secrets = Arc::new(SecretStore::new("/nonexistent/secrets.json", None));
             secrets.put(SecretSpec {
+                namespace: crate::config::DEFAULT_NAMESPACE.to_string(),
                 id: "heyo-auth".into(),
                 description: None,
                 data: BTreeMap::from([("jwt_secret".to_string(), SECRET.to_string())]),
@@ -1789,6 +1792,7 @@ mod tests {
         async fn rotating_the_secret_invalidates_tokens_immediately() {
             let secrets = Arc::new(SecretStore::new("/nonexistent/secrets.json", None));
             secrets.put(SecretSpec {
+                namespace: crate::config::DEFAULT_NAMESPACE.to_string(),
                 id: "heyo-auth".into(),
                 description: None,
                 data: BTreeMap::from([("jwt_secret".to_string(), SECRET.to_string())]),
@@ -1804,6 +1808,7 @@ mod tests {
             ));
 
             secrets.put(SecretSpec {
+                namespace: crate::config::DEFAULT_NAMESPACE.to_string(),
                 id: "heyo-auth".into(),
                 description: None,
                 data: BTreeMap::from([("jwt_secret".to_string(), "rotated".to_string())]),

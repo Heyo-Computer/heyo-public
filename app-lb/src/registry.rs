@@ -563,7 +563,7 @@ impl Registry {
                     continue;
                 }
             };
-            let record: StoredDeployment = match serde_json::from_slice(&bytes) {
+            let mut record: StoredDeployment = match serde_json::from_slice(&bytes) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "unparseable state file");
@@ -571,6 +571,10 @@ impl Registry {
                     continue;
                 }
             };
+            // A file written before secret references carried a namespace
+            // gets them bound to the deployment's, which is the only thing
+            // they could ever have meant.
+            record.spec.normalize();
             // Persisted state predates any validation change; skip bad entries
             // rather than refusing to start.
             if let Err(e) = record.spec.validate() {
@@ -672,6 +676,11 @@ mod tests {
             id: id.into(),
             routes,
             vm: Some(VmSpec {
+                env_from: vec![],
+                workspace_archive: None,
+                image_download_url: None,
+                image_size_bytes: None,
+                image_sha256: None,
                 driver: SandboxDriver::Firecracker,
                 image: None,
                 port: 8080,

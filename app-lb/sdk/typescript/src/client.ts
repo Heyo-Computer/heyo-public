@@ -15,6 +15,7 @@ import type {
   JobRecord,
   MetricsResponse,
   MintedToken,
+  Ingress,
   SecretSummary,
   TokenSummary,
   FeedEvent,
@@ -92,6 +93,11 @@ export interface NewToken {
 }
 
 /** Percent-encode one path segment. */
+/** `?namespace=…` for the secret routes, or nothing for the default namespace. */
+function nsQuery(namespace?: string): string {
+  return namespace ? `?namespace=${encodeURIComponent(namespace)}` : "";
+}
+
 function seg(s: string): string {
   return encodeURIComponent(s);
 }
@@ -396,17 +402,30 @@ export class Heyctl {
 
   // -- secrets --------------------------------------------------------------
 
-  secrets(signal?: AbortSignal): Promise<SecretSummary[]> {
-    return this.request("GET", "/secrets", { kind: "secret", signal });
+  /**
+   * The secrets the credential may see: one namespace when `namespace` is
+   * given, else every namespace within its reach. Secrets are walled by
+   * namespace exactly as deployments are.
+   */
+  secrets(namespace?: string, signal?: AbortSignal): Promise<SecretSummary[]> {
+    const q = namespace ? `?namespace=${encodeURIComponent(namespace)}` : "";
+    return this.request("GET", `/secrets${q}`, { kind: "secret", signal });
   }
 
-  secret(id: string, signal?: AbortSignal): Promise<SecretSummary> {
-    return this.request("GET", `/secrets/${seg(id)}`, { kind: "secret", name: id, signal });
+  secret(id: string, namespace?: string, signal?: AbortSignal): Promise<SecretSummary> {
+    return this.request("GET", `/secrets/${seg(id)}${nsQuery(namespace)}`, {
+      kind: "secret",
+      name: id,
+      signal,
+    });
   }
 
-  /** Values enter here and are never readable again. */
+  /**
+   * Values enter here and are never readable again. `namespace` defaults to
+   * `default`; a confined credential must reach it as an admin.
+   */
   putSecret(
-    spec: { id: string; description?: string; data: Record<string, string> },
+    spec: { id: string; namespace?: string; description?: string; data: Record<string, string> },
     signal?: AbortSignal,
   ): Promise<SecretSummary> {
     return this.request("POST", "/secrets", {
@@ -421,9 +440,10 @@ export class Heyctl {
   patchSecret(
     id: string,
     patch: { data?: Record<string, string | null>; description?: string },
+    namespace?: string,
     signal?: AbortSignal,
   ): Promise<SecretSummary> {
-    return this.request("PATCH", `/secrets/${seg(id)}`, {
+    return this.request("PATCH", `/secrets/${seg(id)}${nsQuery(namespace)}`, {
       body: patch,
       kind: "secret",
       name: id,
@@ -431,12 +451,25 @@ export class Heyctl {
     });
   }
 
-  async deleteSecret(id: string, force = false, signal?: AbortSignal): Promise<void> {
+  async deleteSecret(
+    id: string,
+    force = false,
+    namespace?: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const q = nsQuery(namespace);
     await this.request<void>(
       "DELETE",
-      `/secrets/${seg(id)}?force=${force ? "true" : "false"}`,
+      `/secrets/${seg(id)}${q ? `${q}&` : "?"}force=${force ? "true" : "false"}`,
       { kind: "secret", name: id, signal, expect: "nothing" },
     );
+  }
+
+  // -- ingress --------------------------------------------------------------
+
+  /** Where DNS should point a deployment's hostname — this LB's public addresses. */
+  ingress(signal?: AbortSignal): Promise<Ingress> {
+    return this.request("GET", "/ingress", { kind: "ingress", signal });
   }
 
   // -- app-tokens -----------------------------------------------------------

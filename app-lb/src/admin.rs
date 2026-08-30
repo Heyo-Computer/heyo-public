@@ -183,6 +183,8 @@ struct AdminState {
     ui_cookies: Arc<crate::heyo_ui::CookieConfig>,
     /// Stored secrets. Values enter through this API and never leave it.
     secrets: Arc<SecretStore>,
+    /// This LB's public addresses, for `GET /ingress`.
+    ingress: Arc<Ingress>,
     /// CI workflow objects. app-lb stores and serves them; the `ci`
     /// orchestrator polls them and does the building.
     workflows: Arc<crate::workflows::WorkflowStore>,
@@ -264,7 +266,9 @@ impl AdminApi {
         disks: Option<Arc<crate::disks::DiskStore>>,
         public_url: PublicUrl,
         feed: Arc<crate::feed::Feed>,
+        public_ips: &[std::net::IpAddr],
     ) -> Self {
+        let ingress = Arc::new(Ingress::from_ips(public_ips));
         // Render the display name into the page once; the placeholder appears in
         // both the <title> and the <h1>.
         let dashboard_html: Arc<str> =
@@ -311,6 +315,7 @@ impl AdminApi {
                 certs,
                 acme,
                 secrets,
+                ingress,
                 workflows,
                 tokens,
                 jobs,
@@ -489,10 +494,17 @@ fn narrows_itself(matched: &str) -> bool {
     // that narrows itself from `/security`, so a deployment-scoped token should
     // get the console rather than a 403. `/security/rules` is deliberately
     // absent — a scoped token has no business arming a fleet-wide block.
+    // `/ingress` narrows nothing, but it holds nothing to narrow: the LB's
+    // public addresses are what every hostname it routes already resolves to.
     matches!(
         matched,
-        "/" | "/metrics" | "/dashboard" | "/security" | "/siem"
+        "/" | "/metrics" | "/dashboard" | "/security" | "/siem" | "/ingress"
     )
+}
+
+/// The secret store's routes, which are walled by namespace in their handlers.
+fn is_secret_route(matched: &str) -> bool {
+    matches!(matched, "/secrets" | "/secrets/:id")
 }
 
 /// The deployment a matched route acts on, if it acts on one.
@@ -675,6 +687,11 @@ fn decide_access(
             // narrow the answer to its namespace (list) or refuse a spec that
             // names another one (create).
             None if matched == "/deployments" && caller.confined() => {}
+            // Secrets live behind the same wall as deployments. The handlers
+            // check the namespace each request names against the caller's
+            // reach — the gate cannot, because for `/secrets` the namespace is
+            // in the body or the query, not the path.
+            None if is_secret_route(matched) && caller.confined() => {}
             None if !narrows_itself(matched) && !caller.covers_fleet() => {
                 return Verdict::Forbidden(
                     "this token is scoped to specific deployments, so it cannot use a \
@@ -2393,6 +2410,9 @@ async fn register(
     caller: Option<axum::Extension<Caller>>,
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
+    // Bind secret references to the spec's namespace before anything reads
+    // them; see `DeploymentSpec::normalize`.
+    spec.normalize();
     // Validation is the gate that keeps unroutable VMs (e.g. libvirt, which has
     // no guest_ip) from ever being booted.
     if let Err(e) = spec.validate() {
@@ -2482,6 +2502,7 @@ async fn update(
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
     spec.id = id.clone();
+    spec.normalize();
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -3468,6 +3489,106 @@ async fn certs(State(state): State<AdminState>) -> impl IntoResponse {
 /// Unlike the deployment registry — where a failed write is logged and the
 /// in-memory change stands — a secret that only exists in memory is a rotation
 /// that silently un-rotates on the next restart. Better to fail the request.
+/// `GET /ingress` — where DNS should point a deployment's hostname.
+///
+/// The one thing a client cannot learn from the spec it wrote: a `routes[].host`
+/// only works once an A (or AAAA) record resolves it to this LB, and only the
+/// operator knows those addresses. Configured with `APP_LB_PUBLIC_IPS`; empty
+/// when it is unset, which a client should render as "ask your operator",
+/// not as "no DNS needed".
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Ingress {
+    pub ipv4: Vec<String>,
+    pub ipv6: Vec<String>,
+}
+
+impl Ingress {
+    pub fn from_ips(ips: &[std::net::IpAddr]) -> Self {
+        let mut out = Self {
+            ipv4: Vec::new(),
+            ipv6: Vec::new(),
+        };
+        for ip in ips {
+            match ip {
+                std::net::IpAddr::V4(v4) => out.ipv4.push(v4.to_string()),
+                std::net::IpAddr::V6(v6) => out.ipv6.push(v6.to_string()),
+            }
+        }
+        out
+    }
+}
+
+async fn ingress(State(state): State<AdminState>) -> impl IntoResponse {
+    Json((*state.ingress).clone())
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::Ingress;
+
+    #[test]
+    fn addresses_are_split_by_family_and_serialize_as_strings() {
+        let ips: Vec<std::net::IpAddr> = vec![
+            "203.0.113.10".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+            "203.0.113.11".parse().unwrap(),
+        ];
+        let i = Ingress::from_ips(&ips);
+        assert_eq!(i.ipv4, vec!["203.0.113.10", "203.0.113.11"]);
+        assert_eq!(i.ipv6, vec!["2001:db8::1"]);
+        assert_eq!(
+            serde_json::to_value(&i).unwrap(),
+            serde_json::json!({"ipv4": ["203.0.113.10", "203.0.113.11"], "ipv6": ["2001:db8::1"]})
+        );
+        let none = Ingress::from_ips(&[]);
+        assert!(none.ipv4.is_empty() && none.ipv6.is_empty());
+    }
+}
+
+/// The namespace a `/secrets` request is about, when it is not in the body.
+#[derive(Deserialize)]
+struct SecretQuery {
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+impl SecretQuery {
+    fn namespace(&self) -> &str {
+        self.namespace
+            .as_deref()
+            .map(str::trim)
+            .filter(|ns| !ns.is_empty())
+            .unwrap_or(crate::config::DEFAULT_NAMESPACE)
+    }
+}
+
+/// Whether `caller` may read (`admin == false`) or change (`admin == true`)
+/// the secrets of `ns`. An ungated or operator caller may do anything; every
+/// other kind is measured against its reach, exactly as a deployment in `ns`
+/// would be.
+fn may_use_secrets(caller: Option<&Caller>, ns: &str, admin: bool) -> Result<(), Response> {
+    let Some(caller) = caller else {
+        return Ok(());
+    };
+    if !caller.reaches_namespace(ns) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!("this credential cannot reach the \"{ns}\" namespace's secrets"),
+        )
+        .into_response());
+    }
+    if admin && !caller.satisfies_in(crate::tokens::AdminScope::Admin, Some(ns)) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!("this credential may only view the \"{ns}\" namespace, not change its secrets"),
+        )
+        .into_response());
+    }
+    Ok(())
+}
+
 fn persist_secrets(state: &AdminState) -> Result<(), (StatusCode, Json<ApiError>)> {
     state.secrets.persist().map_err(|e| {
         tracing::error!(error = %e, "failed to persist secrets");
@@ -3478,56 +3599,69 @@ fn persist_secrets(state: &AdminState) -> Result<(), (StatusCode, Json<ApiError>
     })
 }
 
-/// Deployments whose build block points at a secret. Used to keep a delete from
-/// breaking a deployment that still needs it.
-fn secret_users(state: &AdminState, id: &str) -> Vec<String> {
+/// Deployments in `ns` that refer to secret `id` anywhere in their spec — a
+/// build's git token, a gate's client secret, a replica's `env_from`. Used to
+/// keep a delete from breaking a deployment that still needs it.
+fn secret_users(state: &AdminState, ns: &str, id: &str) -> Vec<String> {
     let mut users: Vec<String> = state
         .registry
         .deployments()
         .values()
-        .filter(|d| {
-            d.spec
-                .build
-                .as_ref()
-                .and_then(|b| b.auth.as_ref())
-                .is_some_and(|a| a.secret == id)
-        })
+        .filter(|d| d.spec.namespace == ns && d.spec.secret_ids().iter().any(|s| s == id))
         .map(|d| d.spec.id.clone())
         .collect();
     users.sort();
     users
 }
 
-/// `POST /secrets` — create or replace a secret wholesale.
+/// `POST /secrets` — create or replace a secret wholesale, in the namespace
+/// the body names (`default` when it names none). A confined caller must
+/// reach that namespace as an admin; one that does not gets the same 403 a
+/// deployment registered there would.
 async fn put_secret(
     State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
     Json(spec): Json<SecretSpec>,
 ) -> impl IntoResponse {
+    store_secret(&state, caller.as_deref(), spec).await
+}
+
+async fn store_secret(state: &AdminState, caller: Option<&Caller>, spec: SecretSpec) -> Response {
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    if let Err(refused) = may_use_secrets(caller, &spec.namespace, true) {
+        return refused;
+    }
     let id = spec.id.clone();
-    let existed = state.secrets.get(&id).is_some();
+    let ns = spec.namespace.clone();
+    let existed = state.secrets.get(&ns, &id).is_some();
     state.secrets.put(spec);
-    if let Err(e) = persist_secrets(&state) {
+    if let Err(e) = persist_secrets(state) {
         return e.into_response();
     }
     // Keys, never values — the same rule the read path follows, so enabling
     // debug logging can't turn into a credential dump.
-    tracing::info!(secret = %id, replaced = existed, "secret stored");
-    let summary = state.secrets.summary(&id).expect("just stored");
+    tracing::info!(secret = %id, namespace = %ns, replaced = existed, "secret stored");
+    let summary = state.secrets.summary(&ns, &id).expect("just stored");
     let code = if existed { StatusCode::OK } else { StatusCode::CREATED };
     (code, Json(summary)).into_response()
 }
 
-/// `PUT /secrets/:id` — as `POST`, with the path id winning.
+/// `PUT /secrets/:id[?namespace=]` — as `POST`, with the path id and the query
+/// namespace winning over the body.
 async fn replace_secret(
     State(state): State<AdminState>,
     Path(id): Path<String>,
+    Query(q): Query<SecretQuery>,
+    caller: Option<axum::Extension<Caller>>,
     Json(mut spec): Json<SecretSpec>,
 ) -> impl IntoResponse {
     spec.id = id;
-    put_secret(State(state), Json(spec)).await.into_response()
+    if q.namespace.is_some() {
+        spec.namespace = q.namespace().to_string();
+    }
+    store_secret(&state, caller.as_deref(), spec).await
 }
 
 #[derive(Deserialize)]
@@ -3540,15 +3674,22 @@ struct SecretPatch {
     description: Option<String>,
 }
 
+/// `PATCH /secrets/:id[?namespace=]`.
 async fn patch_secret(
     State(state): State<AdminState>,
     Path(id): Path<String>,
+    Query(q): Query<SecretQuery>,
+    caller: Option<axum::Extension<Caller>>,
     Json(patch): Json<SecretPatch>,
 ) -> impl IntoResponse {
-    if state.secrets.get(&id).is_none() {
+    let ns = q.namespace();
+    if let Err(refused) = may_use_secrets(caller.as_deref(), ns, true) {
+        return refused;
+    }
+    if state.secrets.get(ns, &id).is_none() {
         return err(StatusCode::NOT_FOUND, format!("no secret {id:?}")).into_response();
     }
-    let updated = match state.secrets.patch(&id, patch.data) {
+    let updated = match state.secrets.patch(ns, &id, patch.data) {
         Ok(s) => s,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
@@ -3561,7 +3702,7 @@ async fn patch_secret(
         return e.into_response();
     }
     tracing::info!(secret = %id, "secret updated");
-    Json(state.secrets.summary(&id).expect("just stored")).into_response()
+    Json(state.secrets.summary(ns, &id).expect("just stored")).into_response()
 }
 
 /// `GET /workflows` — every workflow object.
@@ -3652,12 +3793,41 @@ async fn delete_workflow(
     }
 }
 
-async fn list_secrets(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.secrets.list())
+/// `GET /secrets[?namespace=]` — the secrets the caller may see: one
+/// namespace when asked for one, else every namespace within reach.
+async fn list_secrets(
+    State(state): State<AdminState>,
+    Query(q): Query<SecretQuery>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let caller = caller.as_deref();
+    if let Some(ns) = q.namespace.as_deref().map(str::trim).filter(|ns| !ns.is_empty()) {
+        if let Err(refused) = may_use_secrets(caller, ns, false) {
+            return refused;
+        }
+        return Json(state.secrets.list(Some(ns))).into_response();
+    }
+    let visible: Vec<_> = state
+        .secrets
+        .list(None)
+        .into_iter()
+        .filter(|s| caller.is_none_or(|c| c.reaches_namespace(&s.namespace)))
+        .collect();
+    Json(visible).into_response()
 }
 
-async fn get_secret(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
-    match state.secrets.summary(&id) {
+/// `GET /secrets/:id[?namespace=]`.
+async fn get_secret(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(q): Query<SecretQuery>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let ns = q.namespace();
+    if let Err(refused) = may_use_secrets(caller.as_deref(), ns, false) {
+        return refused;
+    }
+    match state.secrets.summary(ns, &id) {
         Some(s) => Json(s).into_response(),
         None => err(StatusCode::NOT_FOUND, format!("no secret {id:?}")).into_response(),
     }
@@ -3676,12 +3846,17 @@ struct ForceParams {
 async fn delete_secret(
     State(state): State<AdminState>,
     Path(id): Path<String>,
-    Query(params): Query<ForceParams>,
+    Query(params): Query<SecretQuery>,
+    caller: Option<axum::Extension<Caller>>,
 ) -> impl IntoResponse {
-    if state.secrets.get(&id).is_none() {
+    let ns = params.namespace();
+    if let Err(refused) = may_use_secrets(caller.as_deref(), ns, true) {
+        return refused;
+    }
+    if state.secrets.get(ns, &id).is_none() {
         return err(StatusCode::NOT_FOUND, format!("no secret {id:?}")).into_response();
     }
-    let users = secret_users(&state, &id);
+    let users = secret_users(&state, ns, &id);
     if !users.is_empty() && !params.force {
         return err(
             StatusCode::CONFLICT,
@@ -3693,11 +3868,11 @@ async fn delete_secret(
         )
         .into_response();
     }
-    state.secrets.remove(&id);
+    state.secrets.remove(ns, &id);
     if let Err(e) = persist_secrets(&state) {
         return e.into_response();
     }
-    tracing::info!(secret = %id, forced = params.force, "secret deleted");
+    tracing::info!(secret = %id, namespace = %ns, forced = params.force, "secret deleted");
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -3904,6 +4079,10 @@ fn router(state: AdminState) -> Router {
         .route("/disks", get(disks))
         .route("/feeds", get(feeds_index))
         .route("/feeds/:namespace", get(feed_rss))
+        // Where DNS should point. View tier: it is the answer to "what do I
+        // put in the A record", which anyone who can read the directory of
+        // hostnames may as well know.
+        .route("/ingress", get(ingress))
         .route("/storage", get(storage_console));
 
     // The deployment CRUD API — register/edit/scale/delete/evict, plus the reads
@@ -5142,10 +5321,37 @@ mod tests {
             // (create), so the gate lets it through.
             assert!(matches!(at("/deployments", "/deployments"), Verdict::Allow(_)));
             // The routes that see past a namespace stay closed: minting tokens
-            // would be an escalation, the secret store is fleet state.
+            // would be an escalation, the job history is fleet state.
             assert!(matches!(at("/tokens", "/tokens"), Verdict::Forbidden(_)));
-            assert!(matches!(at("/secrets", "/secrets"), Verdict::Forbidden(_)));
             assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));
+            // Secrets are walled in the handler, per namespace, so the gate
+            // lets a confined caller through to be measured there.
+            assert!(matches!(at("/secrets", "/secrets"), Verdict::Allow(_)));
+            assert!(matches!(at("/secrets/:id", "/secrets/github"), Verdict::Allow(_)));
+        }
+
+        /// The handler-side wall: a confined caller reaches its own
+        /// namespace's secrets at its own tier, and nothing past it.
+        #[test]
+        fn secrets_are_walled_by_namespace_in_the_handler() {
+            let t = store();
+            let raw = mint_in_namespace(&t, AdminScope::Admin, "team-a");
+            let token = Caller::Token(t.verify(&raw, NOW).unwrap());
+            assert!(may_use_secrets(Some(&token), "team-a", true).is_ok());
+            assert!(may_use_secrets(Some(&token), "team-b", false).is_err());
+            assert!(may_use_secrets(Some(&token), "default", false).is_err());
+
+            let view = grant(&[("team-a", AdminScope::View), ("team-b", AdminScope::Admin)], false);
+            let caller = Caller::Federated(view);
+            assert!(may_use_secrets(Some(&caller), "team-a", false).is_ok());
+            assert!(may_use_secrets(Some(&caller), "team-a", true).is_err());
+            assert!(may_use_secrets(Some(&caller), "team-b", true).is_ok());
+            assert!(may_use_secrets(Some(&caller), "team-c", false).is_err());
+
+            let fleet = Caller::Federated(grant(&[], true));
+            assert!(may_use_secrets(Some(&fleet), "anything", true).is_ok());
+            assert!(may_use_secrets(Some(&Caller::Operator), "anything", true).is_ok());
+            assert!(may_use_secrets(None, "anything", true).is_ok());
         }
 
         fn grant(ns: &[(&str, AdminScope)], fleet: bool) -> Arc<crate::federated::Grant> {
@@ -5360,7 +5566,8 @@ mod tests {
             assert!(matches!(at("/deployments", "/deployments"), Verdict::Allow(_)));
             assert!(matches!(at("/metrics", "/metrics"), Verdict::Allow(_)));
             assert!(matches!(at("/tokens", "/tokens"), Verdict::Forbidden(_)));
-            assert!(matches!(at("/secrets", "/secrets"), Verdict::Forbidden(_)));
+            assert!(matches!(at("/secrets", "/secrets"), Verdict::Allow(_)));
+            assert!(matches!(at("/ingress", "/ingress"), Verdict::Allow(_)));
             assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));
             assert!(matches!(
                 federated_at(&t, &g, "/feeds/:namespace", "/feeds/team-a", None, AdminScope::View),

@@ -13,6 +13,7 @@
 //! to come from somewhere, and an unavailable key would otherwise turn every
 //! restart into an outage.
 
+use crate::config::{DEFAULT_NAMESPACE, is_valid_namespace};
 use crate::deployment::now_secs;
 use crate::tls::restrict;
 use arc_swap::ArcSwap;
@@ -52,6 +53,15 @@ pub struct SecretRef {
     /// which is why this defaults rather than being asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// The namespace the secret lives in.
+    ///
+    /// Stamped from the deployment's own namespace when a spec is registered
+    /// (see `DeploymentSpec::normalize`), never taken from the client: a spec
+    /// in `team-a` resolves `team-a`'s `github`, whatever the body said, which
+    /// is the whole wall. Absent on state files written before namespaces
+    /// existed and read as [`DEFAULT_NAMESPACE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 fn default_secret_key() -> String {
@@ -63,6 +73,16 @@ impl SecretRef {
         validate_id(&self.secret)?;
         validate_key(&self.key)
     }
+
+    /// The namespace this reference resolves in.
+    pub fn namespace(&self) -> &str {
+        self.namespace.as_deref().unwrap_or(DEFAULT_NAMESPACE)
+    }
+
+    /// Bind the reference to `ns`. Overwrites, on purpose — see the field.
+    pub fn scope_to(&mut self, ns: &str) {
+        self.namespace = Some(ns.to_string());
+    }
 }
 
 /// One stored secret.
@@ -73,6 +93,12 @@ impl SecretRef {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecretSpec {
     pub id: String,
+    /// The namespace wall this secret sits behind. Two namespaces may each
+    /// hold a `github`; a deployment only ever sees its own. Omitted on the
+    /// wire (and in the file) when it is the default, so a single-tenant
+    /// app-lb's secrets look exactly as they did before namespaces.
+    #[serde(default = "default_namespace", skip_serializing_if = "is_default_namespace")]
+    pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]
@@ -91,6 +117,7 @@ pub struct SecretSpec {
 #[derive(Debug, Clone, Serialize)]
 pub struct SecretSummary {
     pub id: String,
+    pub namespace: String,
     pub description: Option<String>,
     pub keys: Vec<String>,
     pub updated_at: u64,
@@ -102,6 +129,8 @@ pub struct SecretSummary {
 pub enum SecretError {
     EmptyId,
     BadId(String),
+    /// A namespace outside the id alphabet. Same rule as a deployment's.
+    BadNamespace(String),
     BadKey(String),
     NoData,
 }
@@ -114,6 +143,10 @@ impl std::fmt::Display for SecretError {
                 f,
                 "secret id {id:?} is unusable: use up to 64 characters of \
                  [A-Za-z0-9._-] (it appears in admin API paths)"
+            ),
+            Self::BadNamespace(ns) => write!(
+                f,
+                "secret namespace {ns:?} is unusable: use characters of [A-Za-z0-9._-]"
             ),
             Self::BadKey(k) => write!(
                 f,
@@ -155,9 +188,26 @@ fn validate_key(key: &str) -> Result<(), SecretError> {
     }
 }
 
+fn default_namespace() -> String {
+    DEFAULT_NAMESPACE.to_string()
+}
+
+fn is_default_namespace(ns: &String) -> bool {
+    ns == DEFAULT_NAMESPACE
+}
+
+/// The map key: `<namespace>/<id>`. Unambiguous because neither half may
+/// contain a slash.
+fn store_key(namespace: &str, id: &str) -> String {
+    format!("{namespace}/{id}")
+}
+
 impl SecretSpec {
     pub fn validate(&self) -> Result<(), SecretError> {
         validate_id(&self.id)?;
+        if !is_valid_namespace(&self.namespace) {
+            return Err(SecretError::BadNamespace(self.namespace.clone()));
+        }
         if self.data.is_empty() {
             return Err(SecretError::NoData);
         }
@@ -170,6 +220,7 @@ impl SecretSpec {
     fn summary(&self, encrypted_at_rest: bool) -> SecretSummary {
         SecretSummary {
             id: self.id.clone(),
+            namespace: self.namespace.clone(),
             description: self.description.clone(),
             keys: self.data.keys().cloned().collect(),
             updated_at: self.updated_at,
@@ -295,15 +346,20 @@ impl SecretStore {
         self.key.is_some()
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<SecretSpec>> {
-        self.secrets.load().get(id).cloned()
+    pub fn get(&self, namespace: &str, id: &str) -> Option<Arc<SecretSpec>> {
+        self.secrets.load().get(&store_key(namespace, id)).cloned()
     }
 
-    /// Resolve a reference to its value. The only path by which a stored value
-    /// leaves this module, and it goes to the builder, never to a response.
+    /// Resolve a reference to its value, in the reference's own namespace. The
+    /// only path by which a stored value leaves this module, and it goes to the
+    /// builder, never to a response.
+    ///
+    /// A reference that was never scoped resolves in the default namespace,
+    /// which is where an un-namespaced app-lb keeps everything — so a
+    /// single-tenant install behaves exactly as before.
     pub fn resolve(&self, r: &SecretRef) -> Result<String, ResolveError> {
         let secret = self
-            .get(&r.secret)
+            .get(r.namespace(), &r.secret)
             .ok_or_else(|| ResolveError::NoSecret(r.secret.clone()))?;
         secret
             .data
@@ -312,28 +368,31 @@ impl SecretStore {
             .ok_or_else(|| ResolveError::NoKey(r.secret.clone(), r.key.clone()))
     }
 
-    pub fn list(&self) -> Vec<SecretSummary> {
+    /// Every secret, or those of one namespace, id-ordered within namespace.
+    pub fn list(&self, namespace: Option<&str>) -> Vec<SecretSummary> {
         let mut out: Vec<_> = self
             .secrets
             .load()
             .values()
+            .filter(|s| namespace.is_none_or(|ns| s.namespace == ns))
             .map(|s| s.summary(self.is_encrypted()))
             .collect();
-        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
         out
     }
 
-    pub fn summary(&self, id: &str) -> Option<SecretSummary> {
-        self.get(id).map(|s| s.summary(self.is_encrypted()))
+    pub fn summary(&self, namespace: &str, id: &str) -> Option<SecretSummary> {
+        self.get(namespace, id)
+            .map(|s| s.summary(self.is_encrypted()))
     }
 
     /// Create or replace a secret wholesale. Stamps `updated_at` server-side.
     pub fn put(&self, mut spec: SecretSpec) -> Arc<SecretSpec> {
         spec.updated_at = now_secs();
         let secret = Arc::new(spec);
-        let id = secret.id.clone();
+        let key = store_key(&secret.namespace, &secret.id);
         self.mutate(|map| {
-            map.insert(id, secret.clone());
+            map.insert(key, secret.clone());
         });
         secret
     }
@@ -345,10 +404,11 @@ impl SecretStore {
     /// read the old ones back, which is exactly what this store refuses to do.
     pub fn patch(
         &self,
+        namespace: &str,
         id: &str,
         changes: BTreeMap<String, Option<String>>,
     ) -> Result<Arc<SecretSpec>, SecretError> {
-        let Some(current) = self.get(id) else {
+        let Some(current) = self.get(namespace, id) else {
             return Err(SecretError::BadId(id.to_string()));
         };
         let mut next = (*current).clone();
@@ -369,10 +429,11 @@ impl SecretStore {
         Ok(self.put(next))
     }
 
-    pub fn remove(&self, id: &str) -> Option<Arc<SecretSpec>> {
+    pub fn remove(&self, namespace: &str, id: &str) -> Option<Arc<SecretSpec>> {
         let mut removed = None;
+        let key = store_key(namespace, id);
         self.mutate(|map| {
-            removed = map.remove(id);
+            removed = map.remove(&key);
         });
         removed
     }
@@ -390,7 +451,7 @@ impl SecretStore {
             .values()
             .map(|s| (**s).clone())
             .collect();
-        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
         out
     }
 
@@ -515,7 +576,7 @@ impl SecretStore {
         let mut map = HashMap::new();
         for spec in specs {
             spec.validate().map_err(|e| StoreError::UnknownFormat(e.to_string()))?;
-            map.insert(spec.id.clone(), Arc::new(spec));
+            map.insert(store_key(&spec.namespace, &spec.id), Arc::new(spec));
         }
         let count = map.len();
         self.secrets.store(Arc::new(map));
@@ -555,6 +616,7 @@ mod tests {
 
     fn secret(id: &str, key: &str, value: &str) -> SecretSpec {
         SecretSpec {
+            namespace: crate::config::DEFAULT_NAMESPACE.to_string(),
             id: id.into(),
             description: None,
             data: BTreeMap::from([(key.to_string(), value.to_string())]),
@@ -562,11 +624,61 @@ mod tests {
         }
     }
 
+    /// Two namespaces may each hold a `github`; a reference resolves in its
+    /// own namespace and nowhere else, and an unscoped one means `default`.
+    #[test]
+    fn namespaces_wall_secrets_off_from_each_other() {
+        let store = SecretStore::new(temp_dir("ns").join("s.json"), None);
+        store.put(secret("github", "token", "default-token"));
+        let mut b = secret("github", "token", "team-b-token");
+        b.namespace = "team-b".into();
+        store.put(b);
+
+        let r = |ns: Option<&str>| SecretRef {
+            secret: "github".into(),
+            key: "token".into(),
+            username: None,
+            namespace: ns.map(str::to_string),
+        };
+        assert_eq!(store.resolve(&r(None)).unwrap(), "default-token");
+        assert_eq!(store.resolve(&r(Some("default"))).unwrap(), "default-token");
+        assert_eq!(store.resolve(&r(Some("team-b"))).unwrap(), "team-b-token");
+        assert_eq!(
+            store.resolve(&r(Some("team-c"))),
+            Err(ResolveError::NoSecret("github".into()))
+        );
+
+        assert_eq!(store.list(None).len(), 2);
+        let only_b = store.list(Some("team-b"));
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].namespace, "team-b");
+        assert!(store.list(Some("team-c")).is_empty());
+
+        // Removing one leaves the other's alone.
+        assert!(store.remove("team-b", "github").is_some());
+        assert!(store.get("team-b", "github").is_none());
+        assert!(store.get(DEFAULT_NAMESPACE, "github").is_some());
+
+        // Round-trips through the file with the wall intact.
+        let mut c = secret("github", "token", "c");
+        c.namespace = "team-c".into();
+        store.put(c);
+        store.persist().unwrap();
+        let reopened = SecretStore::new(store.path().to_path_buf(), None);
+        assert_eq!(reopened.load().unwrap(), 2);
+        assert_eq!(reopened.resolve(&r(Some("team-c"))).unwrap(), "c");
+        assert!(reopened.get("team-c", "nope").is_none());
+
+        let mut bad = secret("x", "token", "v");
+        bad.namespace = "has/slash".into();
+        assert!(matches!(bad.validate(), Err(SecretError::BadNamespace(_))));
+    }
+
     #[test]
     fn a_summary_never_carries_a_value() {
         let store = SecretStore::new("unused.json", None);
         store.put(secret("github", "token", "ghp_supersecret"));
-        let json = serde_json::to_string(&store.list()).unwrap();
+        let json = serde_json::to_string(&store.list(None)).unwrap();
         assert!(json.contains("token"), "keys are listed");
         assert!(!json.contains("ghp_supersecret"), "values are not: {json}");
     }
@@ -577,6 +689,7 @@ mod tests {
         store.put(secret("github", "token", "ghp_1"));
 
         let r = SecretRef {
+            namespace: None,
             secret: "github".into(),
             key: "token".into(),
             username: None,
@@ -584,6 +697,7 @@ mod tests {
         assert_eq!(store.resolve(&r).unwrap(), "ghp_1");
 
         let missing_key = SecretRef {
+            namespace: None,
             key: "other".into(),
             ..r.clone()
         };
@@ -593,6 +707,7 @@ mod tests {
         );
 
         let missing_secret = SecretRef {
+            namespace: None,
             secret: "gitlab".into(),
             ..r
         };
@@ -610,8 +725,7 @@ mod tests {
         store.put(s);
 
         let updated = store
-            .patch(
-                "forge",
+            .patch(crate::config::DEFAULT_NAMESPACE, "forge",
                 BTreeMap::from([
                     ("token".to_string(), Some("new".to_string())),
                     ("username".to_string(), None),
@@ -623,7 +737,7 @@ mod tests {
 
         // Emptying a secret is a delete, and delete has its own endpoint.
         assert!(matches!(
-            store.patch("forge", BTreeMap::from([("token".to_string(), None)])),
+            store.patch(crate::config::DEFAULT_NAMESPACE, "forge", BTreeMap::from([("token".to_string(), None)])),
             Err(SecretError::NoData)
         ));
     }
@@ -642,7 +756,7 @@ mod tests {
 
         let reopened = SecretStore::new(&path, None);
         assert_eq!(reopened.load().unwrap(), 1);
-        assert_eq!(reopened.get("github").unwrap().data["token"], "ghp_1");
+        assert_eq!(reopened.get(crate::config::DEFAULT_NAMESPACE, "github").unwrap().data["token"], "ghp_1");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -664,7 +778,7 @@ mod tests {
 
         let reopened = SecretStore::new(&path, Some(key));
         assert_eq!(reopened.load().unwrap(), 1);
-        assert_eq!(reopened.get("github").unwrap().data["token"], "ghp_supersecret");
+        assert_eq!(reopened.get(crate::config::DEFAULT_NAMESPACE, "github").unwrap().data["token"], "ghp_supersecret");
 
         std::fs::remove_dir_all(&dir).ok();
     }

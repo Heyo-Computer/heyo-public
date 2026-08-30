@@ -176,6 +176,20 @@ fn config_from_env() -> LbConfig {
             .filter(|d| !d.is_empty())
             .collect();
     }
+    if let Ok(v) = std::env::var("APP_LB_PUBLIC_IPS") {
+        cfg.public_ips = v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| match s.parse::<std::net::IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(e) => {
+                    tracing::warn!(value = %s, error = %e, "APP_LB_PUBLIC_IPS entry is not an IP address; ignored");
+                    None
+                }
+            })
+            .collect();
+    }
     if let Ok(v) = std::env::var("APP_LB_ROUTE53_ZONE_ID") {
         cfg.route53_zone_id = Some(v.trim().to_string()).filter(|z| !z.is_empty());
     }
@@ -700,6 +714,7 @@ fn main() {
             event_feed.clone(),
             disk_cfg.clone(),
             workspaces.clone(),
+            secrets.clone(),
         ),
     );
     let autoscaler = autoscaler_svc.task();
@@ -857,6 +872,7 @@ fn main() {
             disks.clone(),
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
             event_feed.clone(),
+            &cfg.public_ips,
         ),
     );
 

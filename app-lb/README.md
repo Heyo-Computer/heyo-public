@@ -83,6 +83,7 @@ Configuration is environment-only:
 | `APP_LB_ACME_DIRECTORY` | LE production | ACME directory URL — point at staging for testing |
 | `APP_LB_ACME_WILDCARD` | *(unset)* | Comma-separated domains to cover with a **wildcard** cert (`sb.example.com` → also `*.sb.example.com`). Issued over DNS-01; needs the zone id below |
 | `APP_LB_ROUTE53_ZONE_ID` | *(unset)* | Route 53 hosted zone where DNS-01 challenge records are written |
+| `APP_LB_PUBLIC_IPS` | *(unset)* | Comma-separated public IPv4/IPv6 addresses of this LB, served by `GET /ingress` so a client can show the A/AAAA records a `routes[].host` needs. Informational only — app-lb never writes DNS |
 | `APP_LB_AWS_BIN` | `aws` | The AWS CLI, used for the DNS-01 challenge and for [disk archives](#archiving-a-disk-to-s3) |
 | `APP_LB_BUILD_DIR` | `/var/lib/app-lb/builds` | Git checkouts for image builds (one per deployment, `0700`) |
 | `APP_LB_HEYVM_BIN` | `heyvm` | The heyvm CLI that builds guest images |
@@ -1402,6 +1403,25 @@ in the spec, and `auth` supplies a git credential the same way a build does. A
 managed (`vm`) deployment cannot declare `update`: its backends are microVMs, and
 a directory on this host would update nothing.
 
+### Seeding `/workspace` from an archive
+
+A pool of any size can start every replica from the same snapshot with
+`vm.workspace_archive` — a gzipped tarball in the Heyo runtime object store,
+named by the archive id cloud handed out when it was uploaded (the dashboard's
+deployment form, or `POST /sandbox-archives/presign` → `PUT` → `finalize`) or
+captured from a sandbox:
+
+```json
+"vm": {"driver": "firecracker", "port": 8080, "workspace_archive": {"archive_id": "ar-1a2b3c4d"}}
+```
+
+Cloud's namespace door checks the caller owns the archive and fills in the
+object key (`s3_key`), and app-lb turns the create into the daemon's
+from-archive create (`s3_archive_key`, unpacked at `/workspace`). A spec that
+reaches app-lb with the id alone is refused — it will not guess at a key.
+Nothing is captured back; that is what `vm.workspace` above is for, and the two
+are mutually exclusive. Uploads through the cloud API are capped at 100 MiB.
+
 ### Secrets
 
 A private repo needs a credential, and a deployment spec is the wrong place for
@@ -1416,6 +1436,7 @@ curl -XPOST localhost:9090/secrets -H 'content-type: application/json' \
 
 curl localhost:9090/secrets          # ids, key *names*, and when each changed
 curl localhost:9090/secrets/github   # the same, for one secret
+curl localhost:9090/ingress          # {"ipv4": [...], "ipv6": [...]} — what to put in the A/AAAA record
 
 # Rotate one key without resending the others (`null` removes a key).
 curl -XPATCH localhost:9090/secrets/github -H 'content-type: application/json' \
@@ -1427,6 +1448,44 @@ curl -XDELETE localhost:9090/secrets/github   # 409 while a deployment still ref
 There is deliberately no endpoint that returns a value. Nothing app-lb does
 needs one: the builder resolves `build.auth` in-process, and a read-back would
 turn the admin API into a credential store with a `GET`.
+
+**Secrets are walled by namespace**, exactly as deployments are. A secret
+carries a `namespace` (`default` when unset, and then omitted on the wire), the
+same name may exist in two namespaces, and every reference in a deployment spec
+— `build.auth`, `artifact.auth`, a mount's or workspace's `auth`, a gate's
+`client_secret` or `jwt.secret`, and `env_from` — is bound to the deployment's
+own namespace when the spec is registered, whatever the body said. A
+namespace-confined credential (see *Federated auth and namespaces*) lists,
+creates and changes only the secrets of the namespaces it reaches, at the tier
+it holds there; a `view` grant reads key names, an `admin` grant rotates them.
+
+```sh
+# Store one in a namespace, then address it there. `?namespace=` is how the
+# per-id routes say which wall they mean; the list narrows to the caller's
+# reach when it is omitted.
+curl -XPOST localhost:9090/secrets -H 'content-type: application/json' \
+  -d '{"id": "db", "namespace": "team-a", "data": {"url": "postgres://…"}}'
+curl 'localhost:9090/secrets?namespace=team-a'
+curl -XPATCH 'localhost:9090/secrets/db?namespace=team-a' -H 'content-type: application/json' \
+  -d '{"data": {"url": "postgres://rotated…"}}'
+curl -XDELETE 'localhost:9090/secrets/db?namespace=team-a'
+```
+
+**Secrets reach a VM through `vm.env_from`**, never through `env_vars`:
+
+```json
+"vm": {
+  "driver": "firecracker", "port": 8080,
+  "env_vars": {"NODE_ENV": "production"},
+  "env_from": [{"secret": "db", "key": "url", "as": "DATABASE_URL"}]
+}
+```
+
+Each entry is resolved when a replica is created, so rotating the secret
+reaches the next replica without re-registering the deployment; a missing one
+fails the create (counted and fed like a missing mount) rather than booting a
+guest without its token. `as` defaults to the key upper-cased, and a secret wins
+over a literal of the same name.
 
 The token reaches git through `GIT_ASKPASS` and the child's environment, never
 through the URL or the command line — a credential in a remote URL lands in

@@ -188,6 +188,12 @@ pub struct LbConfig {
     /// Needs `route53_zone_id`: wildcards are only issued over DNS-01.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acme_wildcards: Vec<String>,
+    /// The addresses DNS should point a deployment's hostname at — this LB's
+    /// public IPs (`APP_LB_PUBLIC_IPS`). Purely informational: served by
+    /// `GET /ingress` so a client can show the A/AAAA records to add. app-lb
+    /// never writes DNS itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_ips: Vec<std::net::IpAddr>,
     /// The Route 53 hosted zone holding `acme_wildcards`, where the DNS-01
     /// challenge records are written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,6 +288,7 @@ impl Default for LbConfig {
             mount_ttl_secs: default_mount_ttl_secs(),
             aws_bin: default_aws_bin(),
             acme_wildcards: Vec::new(),
+            public_ips: Vec::new(),
             route53_zone_id: None,
             update_shell: default_update_shell(),
             build_timeout_secs: default_build_timeout_secs(),
@@ -587,6 +594,30 @@ pub struct VmSpec {
     /// supposed to inherit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceSpec>,
+    /// Secret values exported to every replica as environment variables,
+    /// resolved when the VM is created. The spec carries the reference and the
+    /// store the value, which is what keeps a token out of `GET /deployments`
+    /// and out of the state file — the reason `env_vars` is the wrong place
+    /// for one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_from: Vec<SecretEnv>,
+    /// A tarball to seed `/workspace` from on every replica boot. See
+    /// [`WorkspaceArchive`]. Unlike [`workspace`](Self::workspace) nothing is
+    /// captured back: each replica starts from the same snapshot, so this
+    /// composes with a pool of any size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_archive: Option<WorkspaceArchive>,
+    /// Where the daemon may fetch `image` from when it does not already hold
+    /// it: a public-image catalog URL, with the size and digest the daemon
+    /// verifies the download against. Filled in by cloud's namespace door
+    /// from its catalog and passed to the daemon untouched; a spec written by
+    /// hand against a local daemon leaves all three unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_download_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_sha256: Option<String>,
     /// Backstop TTL so VMs die on their own if this LB crashes and never reaps
     /// them. Renewed by the autoscaler while it is alive.
     #[serde(default = "default_vm_ttl_secs")]
@@ -595,6 +626,41 @@ pub struct VmSpec {
 
 fn default_vm_ttl_secs() -> u64 {
     3600
+}
+
+/// A workspace archive — a gzipped tarball in the runtime object store — that
+/// every replica's `/workspace` is unpacked from at boot.
+///
+/// A client names it by `archive_id`, the id cloud handed out when the archive
+/// was uploaded or captured. Cloud's namespace door owns those ids: it checks
+/// the caller owns the archive and fills in `s3_key`, which is what the daemon
+/// actually fetches (`POST /sandbox-deploy` with `s3_archive_key`). app-lb
+/// refuses a spec that reaches it with the id alone rather than guessing at
+/// a key — a wrong guess would boot a replica with someone else's files.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WorkspaceArchive {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+impl WorkspaceArchive {
+    /// The object key the daemon fetches.
+    pub fn key(&self) -> Option<&str> {
+        self.s3_key.as_deref().map(str::trim).filter(|k| !k.is_empty())
+    }
+
+    fn validate(&self) -> Result<(), SpecError> {
+        if self.key().is_none() {
+            return Err(SpecError::UnresolvedWorkspaceArchive(
+                self.archive_id.clone().unwrap_or_default(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The most guest mounts one deployment may declare.
@@ -1672,7 +1738,7 @@ impl UpdateSpec {
             }
         }
         for from in &self.env_from {
-            from.validate()?;
+            from.validate("update.env_from")?;
         }
         if let Some(auth) = &self.auth {
             auth.validate().map_err(|e| SpecError::BadSecretRef {
@@ -1697,6 +1763,10 @@ pub struct SecretEnv {
     /// "key": "ingest_token"}` arrives as `INGEST_TOKEN`.
     #[serde(default, rename = "as", skip_serializing_if = "Option::is_none")]
     pub env: Option<String>,
+    /// The namespace the secret lives in; stamped from the deployment's, see
+    /// [`SecretRef::namespace`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 fn default_env_secret_key() -> String {
@@ -1709,6 +1779,7 @@ impl SecretEnv {
             secret: self.secret.clone(),
             key: self.key.clone(),
             username: None,
+            namespace: self.namespace.clone(),
         }
     }
 
@@ -1718,11 +1789,11 @@ impl SecretEnv {
             .unwrap_or_else(|| self.key.to_ascii_uppercase())
     }
 
-    fn validate(&self) -> Result<(), SpecError> {
+    fn validate(&self, field: &'static str) -> Result<(), SpecError> {
         self.secret_ref()
             .validate()
             .map_err(|e| SpecError::BadSecretRef {
-                field: "update.env_from",
+                field,
                 detail: e.to_string(),
             })?;
         let name = self.env_name();
@@ -2912,6 +2983,11 @@ pub enum SpecError {
     /// A managed deployment declared an `update` block; its backend is a VM, not
     /// a process on this host.
     UpdateOnManagedDeployment,
+    /// `vm.workspace_archive` reached app-lb without the object key cloud
+    /// resolves from the archive id.
+    UnresolvedWorkspaceArchive(String),
+    /// Both `vm.workspace_archive` and `vm.workspace` claim `/workspace`.
+    ArchiveWithWorkspace,
     EmptyWorkingDir,
     BadWorkingDir(String),
     NoCommands,
@@ -3192,6 +3268,17 @@ impl std::fmt::Display for SpecError {
                  `vm.image` when they run, so with both there is no answer to where the \
                  running image came from. Build from git, or pull a rootfs somebody already \
                  built; to do both, build on one host and `heyctl artifact push` the result"
+            ),
+            Self::UnresolvedWorkspaceArchive(id) => write!(
+                f,
+                "vm.workspace_archive {id:?} has no storage key: name the archive by `archive_id` \
+                 through the Heyo cloud API, which resolves it, rather than posting to app-lb \
+                 directly"
+            ),
+            Self::ArchiveWithWorkspace => write!(
+                f,
+                "`vm.workspace_archive` and `vm.workspace` both claim the workspace directory; \
+                 seed from an archive or keep a persistent workspace, not both"
             ),
             Self::UpdateOnManagedDeployment => write!(
                 f,
@@ -3587,6 +3674,94 @@ impl DeploymentSpec {
     /// managed kind the driver check is load-bearing: `SandboxInfo.guest_ip` is
     /// only populated for tap-networked Firecracker/KVM on a local daemon, so a
     /// Libvirt VM would boot fine and then be unroutable.
+    /// Bind every secret reference in the spec to the spec's own namespace.
+    ///
+    /// Run before [`validate`](Self::validate) on every path a spec enters by
+    /// (register, edit, state-file load), so a resolution anywhere downstream —
+    /// a build's git token, a gate's client secret, a replica's `env_from` —
+    /// can only ever find a secret behind the same wall as the deployment.
+    /// Whatever `namespace` the client wrote on a reference is overwritten,
+    /// which is the point: naming another namespace's secret is not an error
+    /// to report, it is a thing that cannot be expressed.
+    pub fn normalize(&mut self) {
+        let ns = self.namespace.clone();
+        for r in self.secret_refs_mut() {
+            r.scope_to(&ns);
+        }
+        if let Some(vm) = &mut self.vm {
+            for e in &mut vm.env_from {
+                e.namespace = Some(ns.clone());
+            }
+        }
+        if let Some(update) = &mut self.update {
+            for e in &mut update.env_from {
+                e.namespace = Some(ns.clone());
+            }
+        }
+    }
+
+    /// Every [`SecretRef`] in the spec, mutably. `env_from` entries are not
+    /// refs and are handled beside this in [`normalize`](Self::normalize).
+    fn secret_refs_mut(&mut self) -> Vec<&mut SecretRef> {
+        let mut out: Vec<&mut SecretRef> = Vec::new();
+        if let Some(b) = &mut self.build {
+            out.extend(b.auth.as_mut());
+        }
+        if let Some(a) = &mut self.artifact {
+            out.extend(a.auth.as_mut());
+        }
+        if let Some(vm) = &mut self.vm {
+            for m in &mut vm.mounts {
+                out.extend(m.auth.as_mut());
+            }
+            if let Some(ws) = &mut vm.workspace {
+                out.extend(ws.auth.as_mut());
+            }
+        }
+        if let Some(u) = &mut self.update {
+            out.extend(u.auth.as_mut());
+        }
+        if let Some(gate) = &mut self.auth {
+            out.extend(gate.client_secret.as_mut());
+            if let Some(jwt) = &mut gate.jwt {
+                out.extend(jwt.secret.as_mut());
+            }
+        }
+        out
+    }
+
+    /// The ids of every secret the spec refers to, in its own namespace. What
+    /// a delete checks before refusing.
+    pub fn secret_ids(&self) -> Vec<String> {
+        let mut refs: Vec<Option<&SecretRef>> = vec![
+            self.build.as_ref().and_then(|b| b.auth.as_ref()),
+            self.artifact.as_ref().and_then(|a| a.auth.as_ref()),
+            self.update.as_ref().and_then(|u| u.auth.as_ref()),
+            self.auth.as_ref().and_then(|g| g.client_secret.as_ref()),
+            self.auth
+                .as_ref()
+                .and_then(|g| g.jwt.as_ref())
+                .and_then(|j| j.secret.as_ref()),
+            self.vm
+                .as_ref()
+                .and_then(|vm| vm.workspace.as_ref())
+                .and_then(|w| w.auth.as_ref()),
+        ];
+        if let Some(vm) = &self.vm {
+            refs.extend(vm.mounts.iter().map(|m| m.auth.as_ref()));
+        }
+        let mut ids: Vec<String> = refs.into_iter().flatten().map(|r| r.secret.clone()).collect();
+        if let Some(vm) = &self.vm {
+            ids.extend(vm.env_from.iter().map(|e| e.secret.clone()));
+        }
+        if let Some(u) = &self.update {
+            ids.extend(u.env_from.iter().map(|e| e.secret.clone()));
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
@@ -3680,8 +3855,20 @@ impl DeploymentSpec {
             // After the driver check, because one mount rule depends on which
             // driver this is.
             validate_mounts(&vm.mounts, vm.driver)?;
+            // Before the workspace's own checks, so two claims on `/workspace`
+            // are reported as that rather than as whichever rule the
+            // persistent workspace happens to trip first.
+            if let Some(archive) = &vm.workspace_archive {
+                if vm.workspace.is_some() {
+                    return Err(SpecError::ArchiveWithWorkspace);
+                }
+                archive.validate()?;
+            }
             if let Some(workspace) = &vm.workspace {
                 workspace.validate(vm.driver, &self.scaling, &vm.mounts)?;
+            }
+            for from in &vm.env_from {
+                from.validate("vm.env_from")?;
             }
             if self.scaling.min_replicas > self.scaling.max_replicas {
                 return Err(SpecError::BadReplicaRange {
@@ -3841,6 +4028,76 @@ impl WorkflowSpec {
 mod tests {
     use super::*;
 
+    #[test]
+    fn normalize_binds_every_secret_reference_to_the_spec_namespace() {
+        let mut spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id": "web",
+            "namespace": "team-a",
+            "routes": [{"host": "web.example.com"}],
+            "vm": {
+                "driver": "firecracker", "port": 8080,
+                "env_from": [{"secret": "db", "key": "url", "as": "DATABASE_URL", "namespace": "team-b"}],
+                "mounts": [{"path": "/data", "store": "/srv/art", "ref": "corpus",
+                             "auth": {"secret": "art-key", "namespace": "elsewhere"}}]
+            },
+            "build": {"repo": "https://github.com/acme/web", "auth": {"secret": "github"}},
+            "auth": {"provider": "google", "client_id": "cid", "allowed_emails": ["a@example.com"],
+                     "client_secret": {"secret": "google", "key": "client_secret"}}
+        }))
+        .unwrap();
+        spec.normalize();
+        let vm = spec.vm.as_ref().unwrap();
+        assert_eq!(vm.env_from[0].namespace.as_deref(), Some("team-a"));
+        assert_eq!(vm.env_from[0].secret_ref().namespace(), "team-a");
+        assert_eq!(vm.mounts[0].auth.as_ref().unwrap().namespace(), "team-a");
+        assert_eq!(spec.build.as_ref().unwrap().auth.as_ref().unwrap().namespace(), "team-a");
+        assert_eq!(
+            spec.auth.as_ref().unwrap().client_secret.as_ref().unwrap().namespace(),
+            "team-a"
+        );
+        let mut ids = spec.secret_ids();
+        ids.sort();
+        assert_eq!(ids, vec!["art-key", "db", "github", "google"]);
+        assert!(spec.validate().is_ok(), "{:?}", spec.validate());
+    }
+
+    #[test]
+    fn a_workspace_archive_needs_its_key_and_excludes_a_persistent_workspace() {
+        let mut spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id": "web", "routes": [],
+            "vm": {"driver": "firecracker", "port": 8080,
+                   "workspace_archive": {"archive_id": "ar-12345678"}}
+        }))
+        .unwrap();
+        assert!(matches!(
+            spec.validate(),
+            Err(SpecError::UnresolvedWorkspaceArchive(id)) if id == "ar-12345678"
+        ));
+        let vm = spec.vm.as_mut().unwrap();
+        vm.workspace_archive.as_mut().unwrap().s3_key = Some("users/u1/archives/ar-12345678.tar.gz".into());
+        assert!(spec.validate().is_ok());
+        let vm = spec.vm.as_mut().unwrap();
+        vm.workspace = Some(WorkspaceSpec {
+            path: None,
+            store: "s3://bucket/prefix".into(),
+            artifact_ref: None,
+            auth: None,
+        });
+        assert!(matches!(spec.validate(), Err(SpecError::ArchiveWithWorkspace)), "{:?}", spec.validate());
+    }
+
+    #[test]
+    fn vm_env_from_is_validated_like_update_env_from() {
+        let spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id": "web", "routes": [],
+            "vm": {"driver": "firecracker", "port": 8080,
+                   "env_from": [{"secret": "db", "key": "url", "as": "1BAD"}]}
+        }))
+        .unwrap();
+        assert!(matches!(spec.validate(), Err(SpecError::BadEnvName(n)) if n == "1BAD"));
+    }
+
+
     /// A deployment with the given mounts, otherwise the minimal valid one.
     fn spec_with_mounts(mounts: Vec<MountSpec>) -> DeploymentSpec {
         let mut s = spec();
@@ -3873,6 +4130,11 @@ mod tests {
                 path_prefix: None,
             }],
             vm: Some(VmSpec {
+                env_from: vec![],
+                workspace_archive: None,
+                image_download_url: None,
+                image_size_bytes: None,
+                image_sha256: None,
                 driver: SandboxDriver::Firecracker,
                 image: None,
                 port: 8080,
@@ -4308,6 +4570,7 @@ mod tests {
     #[test]
     fn secret_env_defaults_to_the_upper_cased_key_and_must_be_a_usable_name() {
         let from = SecretEnv {
+            namespace: None,
             secret: "obs".into(),
             key: "ingest_token".into(),
             env: None,
@@ -4316,6 +4579,7 @@ mod tests {
         assert_eq!(from.secret_ref().key, "ingest_token");
 
         let renamed = SecretEnv {
+            namespace: None,
             env: Some("APP_OBS_INGEST_TOKEN".into()),
             ..from.clone()
         };
@@ -4325,6 +4589,7 @@ mod tests {
         let mut s = static_spec(&["10.0.0.9:8080"]);
         s.update = Some(UpdateSpec {
             env_from: vec![SecretEnv {
+                namespace: None,
                 env: Some("2FA-TOKEN".into()),
                 ..from
             }],
@@ -4359,6 +4624,7 @@ mod tests {
         let mut s = static_spec(&["127.0.0.1:9600"]);
         s.update = Some(UpdateSpec {
             env_from: vec![SecretEnv {
+                namespace: None,
                 secret: "obs".into(),
                 key: "token".into(),
                 env: Some("APP_OBS_TOKEN".into()),
@@ -4412,6 +4678,7 @@ mod tests {
         let mut s = spec();
         s.build = Some(BuildSpec {
             auth: Some(crate::secrets::SecretRef {
+                namespace: None,
                 secret: "github".into(),
                 key: "token".into(),
                 username: None,
@@ -4425,6 +4692,7 @@ mod tests {
 
         s.build = Some(BuildSpec {
             auth: Some(crate::secrets::SecretRef {
+                namespace: None,
                 secret: "../etc".into(),
                 key: "token".into(),
                 username: None,
@@ -4589,6 +4857,7 @@ mod tests {
             provider: Default::default(),
             client_id: Some("cid.apps.googleusercontent.com".into()),
             client_secret: Some(crate::secrets::SecretRef {
+                namespace: None,
                 secret: "google".into(),
                 key: "client_secret".into(),
                 username: None,

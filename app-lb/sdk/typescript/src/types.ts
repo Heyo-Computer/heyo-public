@@ -63,7 +63,45 @@ export interface VmSpec {
    * firecracker driver.
    */
   workspace?: WorkspaceSpec;
+  /**
+   * Secret values exported to every replica as environment variables,
+   * resolved when the VM is created. The spec carries the reference and the
+   * store the value — the reason `env_vars` is the wrong place for a token.
+   * Resolved in the deployment's own namespace.
+   */
+  env_from?: SecretEnv[];
+  /**
+   * A gzipped tarball every replica's `/workspace` is unpacked from at boot.
+   * Name it by `archive_id` through the Heyo cloud API, which checks the
+   * caller owns it and fills in `s3_key`; app-lb refuses the id alone.
+   * Unlike `workspace` nothing is captured back, so it composes with a pool of
+   * any size. Mutually exclusive with `workspace`.
+   */
+  workspace_archive?: WorkspaceArchive;
+  /**
+   * Where the daemon may fetch `image` from when it does not hold it — a
+   * public-image catalog URL with the size and digest the download is
+   * verified against. Filled in by cloud from its catalog; leave unset when
+   * posting to app-lb directly against a daemon that already has the image.
+   */
+  image_download_url?: string;
+  image_size_bytes?: number;
+  image_sha256?: string;
   ttl_seconds?: number;
+}
+
+export interface WorkspaceArchive {
+  /** The cloud archive id (`ar-…`). */
+  archive_id?: string;
+  /** The object key the daemon fetches; resolved by cloud, never guessed. */
+  s3_key?: string;
+  size_bytes?: number;
+}
+
+/** `GET /ingress` — where DNS should point a deployment's hostname. Empty until `APP_LB_PUBLIC_IPS` is set. */
+export interface Ingress {
+  ipv4: string[];
+  ipv6: string[];
 }
 
 export interface WorkspaceSpec {
@@ -133,6 +171,12 @@ export interface SecretRef {
   secret: string;
   key?: string;
   username?: string;
+  /**
+   * The namespace the secret lives in. Stamped by app-lb from the
+   * deployment's own namespace on register/edit; a value sent by a client is
+   * overwritten, so a spec can only ever name secrets behind its own wall.
+   */
+  namespace?: string;
 }
 
 /**
@@ -186,6 +230,8 @@ export interface SecretEnv {
   secret: string;
   key?: string;
   as?: string;
+  /** Stamped from the deployment's namespace, as on {@link SecretRef}. */
+  namespace?: string;
 }
 
 export interface UpdateSpec {
@@ -897,6 +943,8 @@ export interface MountOutcome {
 
 export interface SecretSummary {
   id: string;
+  /** The namespace wall the secret sits behind; `default` when unset. */
+  namespace: string;
   description: string | null;
   /** Key *names*. Values never leave app-lb. */
   keys: string[];

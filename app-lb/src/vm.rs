@@ -82,6 +82,13 @@ pub enum VmError {
     /// a mount is a replica that answers health checks and then fails on the
     /// first request that needs the data, which is the failure mode this whole
     /// path exists to avoid.
+    /// A template's `env_from` names a secret (or key) the store does not
+    /// hold in the deployment's namespace. Refused before the daemon is asked,
+    /// for the same reason a missing mount is.
+    SecretUnresolved {
+        env: String,
+        detail: String,
+    },
     MountNotPulled {
         path: String,
         digest: Option<String>,
@@ -115,6 +122,10 @@ impl std::fmt::Display for VmError {
                 )
             }
             Self::BadCreateBody(e) => write!(f, "could not serialize the create request: {e}"),
+            Self::SecretUnresolved { env, detail } => write!(
+                f,
+                "env_from for {env}: {detail} — `heyctl get secrets` lists what this namespace holds"
+            ),
             Self::MountNotPulled { path, digest } => match digest {
                 Some(d) => write!(
                     f,
@@ -279,6 +290,8 @@ fn create_body(
     options: &SandboxCreateOptions,
     mounts: Vec<Value>,
     owner: &VmOwner,
+    image: &ImageSource,
+    archive: Option<&crate::config::WorkspaceArchive>,
 ) -> Result<Value, VmError> {
     let mut body = serde_json::to_value(options).map_err(|e| VmError::BadCreateBody(e.to_string()))?;
     sdk_create_defaults(&mut body);
@@ -291,7 +304,45 @@ fn create_body(
     if let Some(user) = &owner.user_id {
         body["user_id"] = json!(user);
     }
+    // Where the daemon may fetch the image from when it does not hold it. The
+    // daemon verifies the download against the size and digest; a URL alone
+    // is still accepted, it just cannot be checked.
+    if let Some(url) = &image.download_url {
+        body["image_download_url"] = json!(url);
+        if let Some(n) = image.size_bytes {
+            body["image_size_bytes"] = json!(n);
+        }
+        if let Some(sha) = &image.sha256 {
+            body["image_sha256"] = json!(sha);
+        }
+    }
+    // A workspace archive turns the create into the daemon's from-archive
+    // create: same body, plus the object key and the guest path to unpack at.
+    // `DeploymentSpec::validate` has already refused an archive with no key.
+    if let Some(key) = archive.and_then(|a| a.key()) {
+        body["s3_archive_key"] = json!(key);
+        body["sandbox_path"] = json!(crate::config::DEFAULT_WORKSPACE_PATH);
+    }
     Ok(body)
+}
+
+/// The catalog fields of a template, or none for an image the daemon must
+/// already hold.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ImageSource {
+    download_url: Option<String>,
+    size_bytes: Option<u64>,
+    sha256: Option<String>,
+}
+
+impl ImageSource {
+    fn of(spec: &VmSpec) -> Self {
+        Self {
+            download_url: spec.image_download_url.clone(),
+            size_bytes: spec.image_size_bytes,
+            sha256: spec.image_sha256.clone(),
+        }
+    }
 }
 
 fn sdk_create_defaults(body: &mut Value) {
@@ -539,6 +590,7 @@ impl VmManager {
         name: String,
         workspace: Option<&Path>,
         owner: &VmOwner,
+        secret_env: HashMap<String, String>,
     ) -> Result<Sandbox, VmError> {
         debug_assert!(
             matches!(spec.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm),
@@ -551,6 +603,16 @@ impl VmManager {
             open_ports.push(spec.port);
         }
 
+        // Literal env plus the resolved secrets, with a secret winning over a
+        // literal of the same name — the same rule `update.env_from` follows.
+        let env_vars = if secret_env.is_empty() {
+            spec.env_vars.clone()
+        } else {
+            let mut env = spec.env_vars.clone().unwrap_or_default();
+            env.extend(secret_env);
+            Some(env)
+        };
+
         let options = SandboxCreateOptions {
             name: Some(name),
             driver: Some(spec.driver),
@@ -559,7 +621,7 @@ impl VmManager {
             size_class: spec.size_class,
             disk_size_gb: spec.disk_size_gb,
             working_directory: spec.working_directory.clone(),
-            env_vars: spec.env_vars.clone(),
+            env_vars,
             setup_hooks: spec.setup_hooks.clone(),
             open_ports,
             // Backstop: if this LB dies without reaping, the VM still expires.
@@ -582,7 +644,7 @@ impl VmManager {
             }));
         }
 
-        let body = create_body(&options, mounts, owner)?;
+        let body = create_body(&options, mounts, owner, &ImageSource::of(spec), spec.workspace_archive.as_ref())?;
 
         // `POST /sandbox-deploy`, which is what `Sandbox::create` posts. It
         // answers `202` with the id of a sandbox that is still provisioning;
@@ -1099,6 +1161,11 @@ mod tests {
 
     fn spec_with(mounts: Vec<MountSpec>) -> VmSpec {
         VmSpec {
+            env_from: vec![],
+            workspace_archive: None,
+            image_download_url: None,
+            image_size_bytes: None,
+            image_sha256: None,
             driver: SandboxDriver::Firecracker,
             image: None,
             port: 8080,
@@ -1489,13 +1556,53 @@ mod tests {
     /// The owner rides on the create body as top-level fields, and only when
     /// there is one: a self-hosted app-lb's body has no such keys at all, so
     /// nothing it sends changes.
+    /// A catalog image and a workspace archive ride the create body as the
+    /// daemon's own field names, and only when the template has them.
+    #[test]
+    fn the_create_body_carries_the_image_source_and_the_archive() {
+        let options = SandboxCreateOptions {
+            name: Some("web-1".into()),
+            ..Default::default()
+        };
+        let plain = create_body(&options, vec![], &VmOwner::default(), &ImageSource::default(), None).unwrap();
+        for absent in ["image_download_url", "image_size_bytes", "image_sha256", "s3_archive_key", "sandbox_path"] {
+            assert!(plain.get(absent).is_none(), "{absent} leaked into a plain body");
+        }
+
+        let image = ImageSource {
+            download_url: Some("https://cloud.example/public-images/img-1".into()),
+            size_bytes: Some(1024),
+            sha256: Some("abc".into()),
+        };
+        let archive = crate::config::WorkspaceArchive {
+            archive_id: Some("ar-1".into()),
+            s3_key: Some("users/u1/archives/ar-1.tar.gz".into()),
+            size_bytes: Some(10),
+        };
+        let full = create_body(&options, vec![], &VmOwner::default(), &image, Some(&archive)).unwrap();
+        assert_eq!(full["image_download_url"], "https://cloud.example/public-images/img-1");
+        assert_eq!(full["image_size_bytes"], 1024);
+        assert_eq!(full["image_sha256"], "abc");
+        assert_eq!(full["s3_archive_key"], "users/u1/archives/ar-1.tar.gz");
+        assert_eq!(full["sandbox_path"], "/workspace");
+
+        // An archive whose key was never resolved is not guessed at.
+        let unresolved = crate::config::WorkspaceArchive {
+            archive_id: Some("ar-2".into()),
+            s3_key: None,
+            size_bytes: None,
+        };
+        let body = create_body(&options, vec![], &VmOwner::default(), &ImageSource::default(), Some(&unresolved)).unwrap();
+        assert!(body.get("s3_archive_key").is_none());
+    }
+
     #[test]
     fn the_create_body_carries_the_owner_only_when_there_is_one() {
         let options = SandboxCreateOptions {
             name: Some("applb-demo-01".into()),
             ..Default::default()
         };
-        let unowned = create_body(&options, vec![], &VmOwner::default()).unwrap();
+        let unowned = create_body(&options, vec![], &VmOwner::default(), &ImageSource::default(), None).unwrap();
         assert!(unowned.get("account_id").is_none());
         assert!(unowned.get("user_id").is_none());
         assert_eq!(unowned["size_class"], "small", "the SDK defaults still apply");
@@ -1504,7 +1611,7 @@ mod tests {
             account_id: Some("acc-1".into()),
             user_id: Some("u-1".into()),
         };
-        let owned = create_body(&options, vec![json!({"host_path": "/x"})], &owner).unwrap();
+        let owned = create_body(&options, vec![json!({"host_path": "/x"})], &owner, &ImageSource::default(), None).unwrap();
         assert_eq!(owned["account_id"], "acc-1");
         assert_eq!(owned["user_id"], "u-1");
         assert_eq!(owned["mounts"], json!([{"host_path": "/x"}]));
@@ -1514,7 +1621,7 @@ mod tests {
             account_id: Some("acc-1".into()),
             user_id: None,
         };
-        let body = create_body(&options, vec![], &half).unwrap();
+        let body = create_body(&options, vec![], &half, &ImageSource::default(), None).unwrap();
         assert_eq!(body["account_id"], "acc-1");
         assert!(body.get("user_id").is_none());
 

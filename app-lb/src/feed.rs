@@ -318,6 +318,11 @@ mod tests {
             id: id.into(),
             routes: vec![],
             vm: Some(crate::config::VmSpec {
+                env_from: vec![],
+                workspace_archive: None,
+                image_download_url: None,
+                image_size_bytes: None,
+                image_sha256: None,
                 driver: heyo_sdk::SandboxDriver::Firecracker,
                 image: None,
                 port: 8080,

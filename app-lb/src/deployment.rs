@@ -662,6 +662,11 @@ mod tests {
                 path_prefix: None,
             }],
             vm: Some(VmSpec {
+                env_from: vec![],
+                workspace_archive: None,
+                image_download_url: None,
+                image_size_bytes: None,
+                image_sha256: None,
                 driver: SandboxDriver::Firecracker,
                 image: None,
                 port: 8080,
