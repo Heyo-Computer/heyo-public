@@ -371,20 +371,21 @@ jobs:
               status_url=response.get("statusUrl") or f"/orchestration/services/deployments/{deployment_id}"
               if status_url.startswith("/"): status_url=endpoint+status_url
               print(f"Accepted {payload['serviceId']} deployment {deployment_id}; polling {status_url}", flush=True)
-              seen=set(); deadline=time.monotonic()+1200; progress=time.monotonic()
+              seen=set(); deadline=time.monotonic()+1200
               while time.monotonic()<deadline:
                   poll=subprocess.run(["curl","--connect-timeout","15","--max-time","30","--fail-with-body","--show-error","--silent","-H",f"Authorization: Bearer {key}",status_url], text=True, capture_output=True)
                   if poll.returncode:
-                      if time.monotonic()-progress>180: raise SystemExit(f"deployment {deployment_id} status polling stalled")
                       time.sleep(5); continue
-                  status=json.loads(poll.stdout or "{}")
+                  try:
+                      status=json.loads(poll.stdout or "{}")
+                  except json.JSONDecodeError:
+                      time.sleep(5); continue
                   for event in status.get("events") or []:
                       if event.get("id") in seen: continue
-                      seen.add(event.get("id")); progress=time.monotonic()
+                      seen.add(event.get("id"))
                       print(f"[{event.get('status')}] {event.get('phase')}: {event.get('message')}", flush=True)
                   if status.get("status") in {"passed","completed","succeeded"}: return
                   if status.get("status") in {"failed","error"}: raise SystemExit(json.dumps(status,indent=2)[-4000:])
-                  if time.monotonic()-progress>180: raise SystemExit(f"deployment {deployment_id} made no durable progress")
                   time.sleep(5)
               raise SystemExit(f"deployment {deployment_id} exceeded the workflow deadline")
 
