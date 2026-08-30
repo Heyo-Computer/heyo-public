@@ -49,11 +49,13 @@ The services are independent processes but can share one PostgreSQL database. Ea
 - **Orchestrator** never talks to the backend hypervisor directly during a request — it persists the desired state, then a reconciler loop drives `mvm-ctrl` to converge. When deploying a Heyo-managed *service* whose manifest references secrets (`envRefs`), it calls **HeyoSecret** to materialize them just-in-time using the `heyosecret-client` crate.
 - **HeyoSecret** is a small KV with versioning, audit history, and AES-GCM encryption at rest. Only the orchestrator (and other internal services) holds the `HEYOSECRET_INTERNAL_API_KEY`; tenant code never sees it.
 
+Service rollouts keep the previous healthy deployment active while the candidate converges. The controller retries Cloud state and health reads with capped backoff under one deployment deadline, probes each distinct internal and public candidate endpoint, and uses the candidate's public endpoint for stable route cutover even when an internal endpoint answers health first. Only persisted terminal state or the deadline is failure; deployment events are diagnostics, not a liveness signal.
+
 ## Layout
 
 - `src/main.rs` — boot, route table, reconciler spawn.
 - `src/config.rs` — `ORCHESTRATOR_*` env loading, per-phase agent overrides, backend capability defaults.
-- `src/handlers/` — `orchestration.rs` (threads, templates, archives, resource deployments, approvals), `service_deploy.rs` (Heyo-service blue/green deploys; resolves `envRefs` via HeyoSecret), `internal.rs` (deploy lifecycle callbacks from the backend).
+- `src/handlers/` — `orchestration.rs` (threads, templates, archives, resource deployments, approvals), `service_deploy.rs` (Heyo-service deployment and placement), `service_discovery.rs` (durable endpoint membership and drain intent), `internal.rs` (deploy lifecycle callbacks from the backend).
 - `src/orchestration/` — `runtime.rs` (step execution), `reconciler.rs` (background loop that converges desired vs. observed state), `adapters.rs` (backend / cloud / heyosecret glue).
 - `src/agent.rs` — agent phase orchestration and per-phase provider routing.
 - `src/llm.rs` — public multi-provider LLM and tool-execution adapter for Anthropic, OpenAI, Mistral, and Gemini.
@@ -115,5 +117,6 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 - `POST /orchestration/resources/deployments` — request a sandbox; reconciler converges it.
 - `POST /orchestration/resources/deployments/{id}/exec` — run a command inside.
 - `POST /orchestration/services/deployments` — blue/green deploy a Heyo-managed service; resolves `envRefs` against HeyoSecret.
+- `GET  /orchestration/services/{service_id}/discovery` — authenticated, versioned endpoint membership for app-lb. A service deploy with `retirePrevious=false` adds capacity on a different active backend; a normal deploy drains and retires the previous members.
 - `POST /internal/deployments/lifecycle` — callback from the backend reporting deploy state transitions.
 - `POST /orchestration/approvals/{approval_id}/decide` — gate an in-flight workflow.

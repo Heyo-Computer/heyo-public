@@ -276,23 +276,23 @@ impl Registry {
     /// target back into service.
     pub fn upsert(&self, spec: DeploymentSpec) -> Arc<Deployment> {
         let previous = self.get(&spec.id);
-        let previous_drains = previous.as_ref().and_then(|previous| {
-            spec.is_static().then(|| {
-                previous
-                    .state()
+        let previous_state = previous.as_ref().and_then(|previous| {
+            (spec.is_static() && previous.spec.is_static()).then(|| {
+                let mut state = (*previous.state()).clone();
+                if previous.spec.discovery.as_ref().map(|value| &value.service_id)
+                    != spec.discovery.as_ref().map(|value| &value.service_id)
+                {
+                    state.discovery_version = None;
+                }
+                state
                     .upstream_drains
-                    .iter()
-                    .filter(|drain| spec.upstreams.contains(&drain.upstream))
-                    .cloned()
-                    .collect::<Vec<_>>()
+                    .retain(|drain| spec.upstreams.contains(&drain.upstream));
+                state
             })
         });
         let deployment = Arc::new(Deployment::new(spec));
-        if let Some(upstream_drains) = previous_drains {
-            deployment.set_state(DeploymentState {
-                upstream_drains,
-                ..Default::default()
-            });
+        if let Some(state) = previous_state {
+            deployment.set_state(state);
         }
         if deployment.spec.is_static()
             && let Some(previous) = previous.filter(|previous| previous.spec.is_static())
@@ -659,7 +659,7 @@ fn state_file_name(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HealthCheck, RouteRule, ScalingPolicy, VmSpec};
+    use crate::config::{DiscoverySpec, HealthCheck, RouteRule, ScalingPolicy, VmSpec};
     use heyo_sdk::SandboxDriver;
     use std::path::Path;
 
@@ -689,6 +689,7 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: vec![],
+            discovery: None,
             build: None,
             artifact: None,
             site: None,
@@ -709,6 +710,7 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
+            discovery: None,
             build: None,
             artifact: None,
             site: None,
@@ -1163,6 +1165,7 @@ mod tests {
                     started_at: 123,
                 },
             ],
+            discovery_version: Some(7),
             ..Default::default()
         });
         r.persist_one("stage").unwrap();
@@ -1177,6 +1180,7 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(us1.is_draining(), "persisted drain must apply before routing");
+        assert_eq!(loaded.state().discovery_version, Some(7));
         us1.acquire();
 
         let replayed = reloaded.upsert(static_spec(
@@ -1191,6 +1195,7 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(replayed_us1.is_draining(), "deployment replay must keep intent");
+        assert_eq!(replayed.state().discovery_version, Some(7));
         assert!(
             Arc::ptr_eq(&us1, &replayed_us1),
             "a retained address must keep the object requests already reference",
@@ -1211,6 +1216,25 @@ mod tests {
         replayed_us1.release();
 
         std::fs::remove_dir_all(state_file.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn changing_discovery_service_resets_the_observed_version() {
+        let r = Registry::new("unused.json");
+        let mut cloud = static_spec("stage", vec![host("stage.example.com")], &[]);
+        cloud.discovery = Some(DiscoverySpec {
+            service_id: "cloud".into(),
+        });
+        let deployment = r.upsert(cloud);
+        deployment.mutate_state(|state| state.discovery_version = Some(7));
+
+        let mut auth = static_spec("stage", vec![host("stage.example.com")], &[]);
+        auth.discovery = Some(DiscoverySpec {
+            service_id: "auth".into(),
+        });
+        let deployment = r.upsert(auth);
+
+        assert_eq!(deployment.state().discovery_version, None);
     }
 
     #[test]

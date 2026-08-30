@@ -117,7 +117,7 @@ jobs:
           required = {
               "heyosecret": ["heyosecret/database-url", "heyosecret/master-key"],
               "orchestrator": ["orchestrator/database-url", "orchestrator/jwt-secret", "orchestrator/internal-api-key", "cloud/internal-api-key"],
-              "app-lb": ["app-lb/admin-password", "cloud/internal-api-key"],
+              "app-lb": ["app-lb/admin-password", "cloud/internal-api-key", "orchestrator/internal-api-key"],
               "app-obs": ["app-lb/admin-password", "app-obs/api-token"],
           }[target]
           generated = {
@@ -371,20 +371,21 @@ jobs:
               status_url=response.get("statusUrl") or f"/orchestration/services/deployments/{deployment_id}"
               if status_url.startswith("/"): status_url=endpoint+status_url
               print(f"Accepted {payload['serviceId']} deployment {deployment_id}; polling {status_url}", flush=True)
-              seen=set(); deadline=time.monotonic()+1200; progress=time.monotonic()
+              seen=set(); deadline=time.monotonic()+1200
               while time.monotonic()<deadline:
                   poll=subprocess.run(["curl","--connect-timeout","15","--max-time","30","--fail-with-body","--show-error","--silent","-H",f"Authorization: Bearer {key}",status_url], text=True, capture_output=True)
                   if poll.returncode:
-                      if time.monotonic()-progress>180: raise SystemExit(f"deployment {deployment_id} status polling stalled")
                       time.sleep(5); continue
-                  status=json.loads(poll.stdout or "{}")
+                  try:
+                      status=json.loads(poll.stdout or "{}")
+                  except json.JSONDecodeError:
+                      time.sleep(5); continue
                   for event in status.get("events") or []:
                       if event.get("id") in seen: continue
-                      seen.add(event.get("id")); progress=time.monotonic()
+                      seen.add(event.get("id"))
                       print(f"[{event.get('status')}] {event.get('phase')}: {event.get('message')}", flush=True)
                   if status.get("status") in {"passed","completed","succeeded"}: return
                   if status.get("status") in {"failed","error"}: raise SystemExit(json.dumps(status,indent=2)[-4000:])
-                  if time.monotonic()-progress>180: raise SystemExit(f"deployment {deployment_id} made no durable progress")
                   time.sleep(5)
               raise SystemExit(f"deployment {deployment_id} exceeded the workflow deadline")
 
@@ -415,8 +416,8 @@ jobs:
               payload["envRefs"]=[envref("DATABASE_URL","orchestrator/database-url"),envref("ORCHESTRATOR_DATABASE_URL","orchestrator/database-url"),envref("JWT_SECRET","orchestrator/jwt-secret"),envref("ORCHESTRATOR_JWT_SECRET","orchestrator/jwt-secret"),envref("ORCHESTRATOR_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("HEYOSECRET_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("ORCHESTRATOR_HEYOSECRET_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("CLOUD_INTERNAL_API_KEY","cloud/internal-api-key")]
           elif service=="app-lb":
               payload["healthPath"]="/healthz"
-              payload["env"]={"APP_LB_PROXY_ADDR":"0.0.0.0:8080","APP_LB_ADMIN_ADDR":"127.0.0.1:9090","APP_LB_STATE_PATH":"/workspace/state/app-lb-state.json","APP_LB_NAME":"stage-app-lb","APP_LB_DASHBOARD_USER":"admin","APP_LB_ADMIN_AUTH":"true"}
-              payload["envRefs"]=[envref("APP_LB_DASHBOARD_PASSWORD","app-lb/admin-password"),envref("APP_LB_DAEMON_API_KEY","cloud/internal-api-key")]
+              payload["env"]={"APP_LB_PROXY_ADDR":"0.0.0.0:8080","APP_LB_ADMIN_ADDR":"127.0.0.1:9090","APP_LB_STATE_PATH":"/workspace/state/app-lb-state.json","APP_LB_NAME":"stage-app-lb","APP_LB_DASHBOARD_USER":"admin","APP_LB_ADMIN_AUTH":"true","APP_LB_DISCOVERY_URL":f"https://{public_host}/orchestrator"}
+              payload["envRefs"]=[envref("APP_LB_DASHBOARD_PASSWORD","app-lb/admin-password"),envref("APP_LB_DAEMON_API_KEY","cloud/internal-api-key"),envref("APP_LB_DISCOVERY_TOKEN","orchestrator/internal-api-key")]
           elif service=="app-obs":
               payload["healthPath"]="/healthz"
               payload["env"]={"APP_OBS_DATA_DIR":"/workspace/data","APP_OBS_INGEST_ADDR":"127.0.0.1:9500","APP_OBS_SYSLOG_ADDR":"127.0.0.1:9514","APP_OBS_API_ADDR":"0.0.0.0:8080","APP_LB_URL":f"https://app-lb.{public_host}","APP_LB_USER":"admin","APP_OBS_SOURCE":"stage-edge"}

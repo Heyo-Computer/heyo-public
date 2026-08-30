@@ -324,6 +324,11 @@ pub struct DeploymentState {
     /// is explicitly removed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstream_drains: Vec<UpstreamDrain>,
+    /// Highest Orchestrator endpoint-set version applied to this deployment.
+    /// Persisting it prevents an app-lb restart from accepting a snapshot older
+    /// than the last upstream membership it routed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_version: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -674,6 +679,7 @@ mod tests {
             scaling,
             health: HealthCheck::default(),
             upstreams: vec![],
+            discovery: None,
             build: None,
             artifact: None,
             site: None,
@@ -699,6 +705,7 @@ mod tests {
             scaling: ScalingPolicy::default(),
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
+            discovery: None,
             build: None,
             artifact: None,
             site: None,

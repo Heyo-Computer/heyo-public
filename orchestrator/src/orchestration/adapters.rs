@@ -12,7 +12,7 @@ use tracing::warn;
 use super::{APP_DEPLOY_TO_HEYO_TEMPLATE_ID, APP_INTEGRATE_WITH_HEYO_TEMPLATE_ID};
 use crate::agent::{run_repo_agent, AgentTaskMode};
 use crate::cloud_client::{
-    deployment_healthcheck_url, deployment_preflight, CreateDeploymentRequest,
+    deployment_healthcheck_urls, deployment_preflight, CreateDeploymentRequest,
     DeployPreflightRequest, DeployPreflightResponse,
 };
 use crate::entities::{
@@ -3246,6 +3246,7 @@ async fn execute_heyo_deploy(
                 setup_hooks: Some(sandbox.setup_hooks.clone()),
                 size_class: sandbox.size_class.clone(),
                 ttl_seconds: sandbox.ttl_seconds,
+                excluded_backend_server_ids: Vec::new(),
                 metadata: None,
             };
             (sandbox.clone(), deployment_id, request)
@@ -3476,27 +3477,29 @@ async fn execute_heyo_healthcheck(
     let base_url = if let Some(local_url) = local_base_url {
         local_url
     } else {
-        let cloud_url = match deployment_healthcheck_url(state, &deployment_id).await {
-            Ok(Some(url)) => url,
-            Ok(None) => {
-                record_tool_call(
-                    repo,
-                    context,
-                    "cloud.deployment_healthcheck_url",
-                    json!({ "deploymentId": deployment_id }),
-                    Some(json!({ "url": Value::Null })),
-                    "completed",
-                    healthcheck_lookup_started_at,
-                    Some(chrono::Utc::now().into()),
-                )
-                .await;
-                return finalize_healthcheck_without_url(
-                    deployment_id,
-                    healthcheck_path,
-                    "Deployment is running but no public proxy endpoint is available to probe"
-                        .to_string(),
-                );
-            }
+        let cloud_url = match deployment_healthcheck_urls(state, &deployment_id).await {
+            Ok(urls) => match urls.probe_url() {
+                Some(url) => url,
+                None => {
+                    record_tool_call(
+                        repo,
+                        context,
+                        "cloud.deployment_healthcheck_url",
+                        json!({ "deploymentId": deployment_id }),
+                        Some(json!({ "url": Value::Null })),
+                        "completed",
+                        healthcheck_lookup_started_at,
+                        Some(chrono::Utc::now().into()),
+                    )
+                    .await;
+                    return finalize_healthcheck_without_url(
+                        deployment_id,
+                        healthcheck_path,
+                        "Deployment is running but no public proxy endpoint is available to probe"
+                            .to_string(),
+                    );
+                }
+            },
             Err(error) => {
                 let message = error.to_string();
                 record_tool_call(

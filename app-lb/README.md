@@ -65,6 +65,9 @@ Configuration is environment-only:
 | `APP_LB_NAME` | `app-lb` | Display name in the dashboard header and page title |
 | `APP_LB_DAEMON_URL` | *(auto: unix socket, else `http://127.0.0.1:34099`)* | heyvm daemon. Left unset, app-lb takes a unix socket when one is discoverable and alive — `HEYVM_SOCKET`, then `socket_path` in `~/.heyo/daemon.json` — and falls back to loopback TCP. Set this to name a non-default or remote daemon: an explicit address is always honoured as given, never traded for a local socket. The transport actually chosen is logged at startup |
 | `APP_LB_DAEMON_API_KEY` | `HEYO_API_KEY` | Bearer credential for an authenticated heyvm daemon; use the HeyoSecret-backed host internal API key in deployments |
+| `APP_LB_DISCOVERY_URL` | *(unset)* | Orchestrator base URL; setting it with the token enables service endpoint polling |
+| `APP_LB_DISCOVERY_TOKEN` | *(unset)* | Bearer credential for Orchestrator discovery; must be set together with `APP_LB_DISCOVERY_URL` |
+| `APP_LB_DISCOVERY_INTERVAL_SECS` | `5` | Positive interval between service endpoint snapshot polls |
 | `APP_LB_DASHBOARD_PASSWORD` | *(unset)* | Set to gate the dashboard behind HTTP Basic Auth |
 | `APP_LB_DASHBOARD_USER` | `admin` | Basic Auth username (only used when a password is set) |
 | `APP_LB_DASHBOARD_AUTH` | `true` | `0`/`false` to leave the dashboard view tier open while the password keeps gating the CRUD API — for when your own sign-in (e.g. Google) fronts the pages |
@@ -292,6 +295,18 @@ Each upstream is a `host:port` (or `ip:port`); a hostname is re-resolved per con
 change the targets, `PUT` the deployment with a new `upstreams` list (the backends are rebuilt).
 Scaling (`PATCH .../scaling`) and per-VM eviction (`DELETE .../vms/...`) do not apply to a
 static deployment and are rejected. Upstreams are proxied over **plaintext HTTP**.
+
+Orchestrator can own membership while app-lb continues to own the local daemon and static
+least-in-flight/failover behavior. A discovery-backed static spec may start empty:
+
+```json
+{"id":"cloud","routes":[{"host":"cloud.example.com"}],"upstreams":[],"discovery":{"service_id":"cloud"}}
+```
+
+Each poll atomically replaces only this spec's upstream list with healthy, non-draining
+Orchestrator endpoints and persists the last good set. Failed or stale snapshots leave it intact.
+The same deployment can be registered with
+`heyctl create deployment cloud --host cloud.example.com --discovery-service cloud`.
 
 #### Cordoning and draining a static upstream
 
