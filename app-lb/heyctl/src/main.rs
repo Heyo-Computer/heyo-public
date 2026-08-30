@@ -705,6 +705,33 @@ mod tests {
     }
 
     #[test]
+    fn login_takes_a_token_instead_of_a_pair() {
+        let cli = Cli::try_parse_from([
+            "heyctl",
+            "login",
+            "--server",
+            "https://server.heyo.computer/namespaces/team-a/lb",
+            "--token-stdin",
+            "--name",
+            "team-a",
+        ])
+        .unwrap();
+        let Command::Login(args) = &cli.command else {
+            panic!("expected login");
+        };
+        assert!(args.token_stdin);
+        assert_eq!(args.server.as_deref(), Some("https://server.heyo.computer/namespaces/team-a/lb"));
+        assert_eq!(args.name.as_deref(), Some("team-a"));
+
+        // A token and a Basic pair are alternatives on the same login.
+        assert!(Cli::try_parse_from(["heyctl", "login", "--token", "heyo_api_x", "--user", "admin"]).is_err());
+        assert!(Cli::try_parse_from(["heyctl", "login", "--token", "heyo_api_x", "--password-stdin"]).is_err());
+        // The global flag exists for one-off commands.
+        let cli = Cli::try_parse_from(["heyctl", "--token", "heyo_api_x", "get", "deployments"]).unwrap();
+        assert_eq!(cli.globals.token.as_deref(), Some("heyo_api_x"));
+    }
+
+    #[test]
     fn artifact_login_takes_a_url_and_a_key_out_of_band() {
         let cli = Cli::try_parse_from([
             "heyctl",

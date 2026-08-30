@@ -6,6 +6,12 @@
 //! The two gates it exposes are independent — `APP_LB_DASHBOARD_PASSWORD` gates
 //! the dashboard and `/metrics`, `APP_LB_ADMIN_AUTH` extends that to the
 //! deployment CRUD API — so login probes both and says which it found.
+//!
+//! A bearer token is the other way in: an app-lb app-token, or a Heyo API key
+//! against Cloud's `/namespaces/{ns}/lb` door, which only ever speaks bearer
+//! and exposes neither `/healthz` nor the gate probe — so a token login skips
+//! the probing and verifies with the one request that has to work,
+//! `GET /deployments`.
 
 use crate::cmd::GlobalOpts;
 use crate::cmd::Client;
@@ -45,6 +51,22 @@ pub struct LoginArgs {
     #[arg(long)]
     pub no_store_password: bool,
 
+    /// Log in with a bearer token instead of a Basic pair: an app-lb
+    /// app-token (`applb_…`), or a namespace-scoped Heyo API key
+    /// (`heyo_api_…`) together with `--server https://<cloud>/namespaces/<ns>/lb`.
+    /// Prefer --token-stdin: an argument is visible in `ps`.
+    #[arg(long, value_name = "TOKEN", conflicts_with_all = ["password", "password_stdin", "password_command", "user"])]
+    pub token: Option<String>,
+
+    /// Read the token from stdin (the trailing newline is stripped).
+    #[arg(long, conflicts_with_all = ["token", "password", "password_stdin", "password_command", "user"])]
+    pub token_stdin: bool,
+
+    /// Store this shell command instead of the token itself; it is run to
+    /// fetch the token on each request.
+    #[arg(long, value_name = "CMD", conflicts_with_all = ["token", "token_stdin", "password", "password_stdin", "password_command", "user"])]
+    pub token_command: Option<String>,
+
     /// Name for the stored context. Defaults to the server's host.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
@@ -76,8 +98,57 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
     let insecure = args.insecure_skip_tls_verify || globals.insecure_skip_tls_verify;
     let timeout = Duration::from_secs(globals.request_timeout);
 
+    // A token login: no gate to probe (Cloud's door has none and answers 404
+    // for `/healthz`), so the one request that must work is the verification.
+    let token = match (&args.token_command, &args.token, args.token_stdin) {
+        (Some(cmd), _, _) => Some(run_command(cmd)?),
+        (None, Some(t), _) => Some(t.clone()),
+        (None, None, true) => {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .context("reading the token from stdin")?;
+            Some(buf.trim_end_matches(['\n', '\r']).to_string())
+        }
+        (None, None, false) => globals.token.clone(),
+    };
+    if let Some(token) = token {
+        if token.is_empty() {
+            bail!("an empty token will not authenticate against anything");
+        }
+        let client = Client::connect(&server, None, None, Some(&token), insecure, timeout)?;
+        match client.status_of("/deployments")? {
+            200 => {}
+            401 => bail!("the server rejected this token"),
+            403 => bail!(
+                "the server knows this token but it may not list deployments here — a \
+                 namespace-scoped key must be used against its own namespace's door"
+            ),
+            404 => bail!(
+                "{server} has no /deployments — for a Heyo cloud, the server is \
+                 https://<cloud>/namespaces/<namespace>/lb"
+            ),
+            code => bail!("unexpected HTTP {code} from /deployments while verifying the token"),
+        }
+        println!("Logged in to {} with a token.", client.server());
+        if args.no_store_password {
+            println!("  token not stored — set HEYCTL_TOKEN for later commands");
+        }
+        return save_context(
+            &mut config,
+            &path,
+            args,
+            ContextEntry {
+                server: client.server().to_string(),
+                token: (!args.no_store_password && args.token_command.is_none()).then(|| token.clone()),
+                token_command: args.token_command.clone(),
+                insecure_skip_tls_verify: insecure,
+                ..Default::default()
+            },
+        );
+    }
+
     // Reachability first: a typo'd port should not look like a bad password.
-    let anon = Client::connect(&server, None, None, insecure, timeout)?;
+    let anon = Client::connect(&server, None, None, None, insecure, timeout)?;
     anon.healthz()
         .with_context(|| format!("cannot reach an app-lb admin API at {server}"))?;
     let gates = Client::gates_of(&anon)?;
@@ -94,10 +165,8 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
             args,
             ContextEntry {
                 server: anon.server().to_string(),
-                user: None,
-                password: None,
-                password_command: None,
                 insecure_skip_tls_verify: insecure,
+                ..Default::default()
             },
         )?;
         return Ok(());
@@ -125,7 +194,7 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
     }
 
     // Verify against whichever surface is actually gated.
-    let client = Client::connect(&server, Some(&user), Some(&password), insecure, timeout)?;
+    let client = Client::connect(&server, Some(&user), Some(&password), None, insecure, timeout)?;
     let verify_path = if gates.crud { "/deployments" } else { "/metrics" };
     match client.status_of(verify_path)? {
         200 => {}
@@ -153,6 +222,7 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
                 .then(|| password.clone()),
             password_command: args.password_command.clone(),
             insecure_skip_tls_verify: insecure,
+            ..Default::default()
         },
     )
 }
@@ -247,7 +317,9 @@ pub fn logout(globals: &GlobalOpts, args: &LogoutArgs) -> Result<()> {
     if args.keep_context {
         entry.password = None;
         entry.password_command = None;
-        println!("Cleared the stored password for context {name:?}.");
+        entry.token = None;
+        entry.token_command = None;
+        println!("Cleared the stored credentials for context {name:?}.");
     } else {
         config.contexts.remove(&name);
         if config.current_context.as_deref() == Some(name.as_str()) {
@@ -270,6 +342,7 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
         globals.server.as_deref(),
         globals.user.as_deref(),
         globals.password.as_deref(),
+        globals.token.as_deref(),
         globals.insecure_skip_tls_verify,
     )?;
 
@@ -277,8 +350,13 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
     output::field("Config file", path.display().to_string());
     output::field("Context", &endpoint.name);
     output::field("Server", &endpoint.server);
-    output::field("User", endpoint.user.as_deref().unwrap_or("admin (default)"));
-    output::field("Password", endpoint.password_source.describe());
+    if endpoint.token.is_some() {
+        output::field("Token", endpoint.token_source.describe_token());
+        output::field("Sent as", "Authorization: Bearer (the user/password are not used)");
+    } else {
+        output::field("User", endpoint.user.as_deref().unwrap_or("admin (default)"));
+        output::field("Password", endpoint.password_source.describe());
+    }
     if endpoint.insecure_skip_tls_verify {
         output::field("TLS", "certificate verification disabled");
     }
@@ -330,12 +408,28 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
         &endpoint.server,
         endpoint.user.as_deref(),
         endpoint.password.as_deref(),
+        endpoint.token.as_deref(),
         endpoint.insecure_skip_tls_verify,
         Duration::from_secs(globals.request_timeout),
     )?;
 
     output::section("Server");
     if let Err(e) = client.healthz() {
+        // Cloud's namespace door has no `/healthz`; for a token context the
+        // deployment list is the reachability probe that matters.
+        if endpoint.token.is_some() {
+            return match client.status_of("/deployments")? {
+                200 => {
+                    output::field("Reachable", "yes (GET /deployments)");
+                    output::field("Deployment API", "allowed");
+                    Ok(())
+                }
+                code => {
+                    output::field("Reachable", format!("yes, but GET /deployments answered HTTP {code}"));
+                    Ok(())
+                }
+            };
+        }
         output::field("Reachable", format!("no — {e:#}"));
         return Ok(());
     }

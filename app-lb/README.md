@@ -2652,6 +2652,15 @@ should never be handed a fleet-wide token. What they have is the credential the
 Heyo auth service already gave them — a JWT, or a `heyo_api_*` key — and what
 they should reach is exactly the namespaces their account owns.
 
+**A namespace-scoped key** is the credential to hand a CI job or a teammate's
+`heyctl`: a `heyo_api_*` key the Heyo dashboard mints on a namespace's page
+(`POST /api/api-keys` with `namespace` and `scope: admin|view`). The auth
+service answers `GET /api/auth/scopes` for it with that one namespace at that
+tier and never `fleet:admin`, whoever minted it, so app-lb sees a confined
+grant; Cloud refuses the key anywhere but that namespace's door. Nothing in
+app-lb tells the two apart — a wall is a wall — which is why revoking the key
+in the dashboard is the whole revocation, bounded by `APP_LB_AUTH_CACHE_SECS`.
+
 Set `APP_LB_AUTH_URL` (with `APP_LB_ADMIN_AUTH=1`, since only the gate consults
 it) and the admin API accepts a third credential:
 

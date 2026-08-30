@@ -34,8 +34,9 @@
 heyctl whoami                 # which server, as whom, allowed to do what
 heyctl config get-contexts    # manage saved contexts
 heyctl logout</code></pre>
-<p>Credentials are the Basic pair or an app-token (<code>--token</code>, or
-<code>APP_LB_TOKEN</code>). Machine output is everywhere: <code>-o json</code>,
+<p>Credentials are the Basic pair or a bearer token (<code>--token</code>,
+<code>HEYCTL_TOKEN</code>, or <code>heyctl login --token-stdin</code>) — an app-token, or a
+namespace-scoped Heyo API key against Cloud's <code>/namespaces/{ns}/lb</code> door. Machine output is everywhere: <code>-o json</code>,
 <code>-o yaml</code>, <code>-o name</code>.</p>
 
 <h2>Reading the fleet</h2>

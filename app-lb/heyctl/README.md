@@ -201,6 +201,25 @@ heyctl login --server lb.example.com:9090 --password-command 'pass show app-lb/a
 heyctl login --server lb.example.com:9090 --no-store-password   # then export HEYCTL_PASSWORD
 ```
 
+### Tokens
+
+The other way in is a bearer token — an app-lb app-token (`applb_…`, see the app-lb README), or a
+**namespace-scoped Heyo API key** (`heyo_api_…`, minted on a namespace's page in the Heyo dashboard)
+used against Cloud's namespace door. That door speaks only bearer, has no `/healthz` and no gate to
+probe, so a token login verifies with `GET /deployments` and stores the token in the context:
+
+```sh
+heyctl login --server https://server.heyo.computer/namespaces/team-a/lb --token-stdin <<< "$HEYO_KEY"
+heyctl get deployments
+heyctl shell web
+```
+
+A token outranks a stored user/password on the same context. The same ladder as passwords applies —
+`--token` / `HEYCTL_TOKEN`, then the context's `token_command`, then its stored `token` — and
+`--no-store-password` keeps it out of the file. A namespace-scoped key reaches exactly that namespace,
+at the tier it was minted with (`view` lists and watches; `admin` also creates, edits and shells), and
+nothing else on the cloud; `whoami` says which credential the next request will send.
+
 ### Contexts
 
 Several load balancers, kubeconfig-style:
@@ -213,8 +232,12 @@ heyctl --context staging get deployments      # one-off, without switching
 heyctl logout --keep-context                  # forget just the password
 ```
 
-`HEYCTL_CONFIG`, `HEYCTL_CONTEXT`, `HEYCTL_SERVER`, `HEYCTL_USER` and
-`HEYCTL_PASSWORD` override the file for scripts and CI.
+`HEYCTL_CONFIG`, `HEYCTL_CONTEXT`, `HEYCTL_SERVER`, `HEYCTL_USER`, `HEYCTL_PASSWORD` and
+`HEYCTL_TOKEN` override the file for scripts and CI:
+
+```sh
+HEYCTL_SERVER=https://server.heyo.computer/namespaces/team-a/lb HEYCTL_TOKEN=heyo_api_… heyctl get deployments
+```
 
 ## Commands
 

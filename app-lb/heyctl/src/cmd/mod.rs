@@ -68,6 +68,20 @@ pub struct GlobalOpts {
     )]
     pub password: Option<String>,
 
+    /// Bearer token, overriding the context: an app-lb app-token (`applb_…`)
+    /// or a Heyo API key (`heyo_api_…`) for Cloud's `/namespaces/{ns}/lb`
+    /// door. Prefer HEYCTL_TOKEN or `heyctl login --token` — an argument is
+    /// visible in `ps`. Outranks --user/--password when both are given.
+    #[arg(
+        long,
+        global = true,
+        env = "HEYCTL_TOKEN",
+        value_name = "TOKEN",
+        hide_env_values = true,
+        help_heading = "Global options"
+    )]
+    pub token: Option<String>,
+
     /// Accept any TLS certificate from the server.
     #[arg(long, global = true, help_heading = "Global options")]
     pub insecure_skip_tls_verify: bool,
@@ -93,12 +107,14 @@ impl Ctx {
             globals.server.as_deref(),
             globals.user.as_deref(),
             globals.password.as_deref(),
+            globals.token.as_deref(),
             globals.insecure_skip_tls_verify,
         )?;
         let client = Client::connect(
             &endpoint.server,
             endpoint.user.as_deref(),
             endpoint.password.as_deref(),
+            endpoint.token.as_deref(),
             endpoint.insecure_skip_tls_verify,
             Duration::from_secs(globals.request_timeout),
         )?;

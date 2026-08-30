@@ -59,6 +59,16 @@ pub struct ContextEntry {
     /// stored `password`; run via `sh -c` on every request that needs auth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_command: Option<String>,
+    /// A bearer token — an app-lb app-token (`applb_…`) or a Heyo API key
+    /// (`heyo_api_…`, which is how a namespace-scoped credential reaches
+    /// Cloud's `/namespaces/{ns}/lb` door). When set, it is the credential:
+    /// a user/password on the same context is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// A shell command whose stdout is the token; takes precedence over a
+    /// stored `token`, like `password_command` does for a password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_command: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub insecure_skip_tls_verify: bool,
 }
@@ -99,6 +109,16 @@ impl PasswordSource {
             Self::Stored => "stored in the config file",
         }
     }
+
+    /// The same question for a bearer token.
+    pub fn describe_token(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Flag => "--token / HEYCTL_TOKEN",
+            Self::Command => "token_command",
+            Self::Stored => "stored in the config file",
+        }
+    }
 }
 
 /// A context resolved against the command line: what this invocation will use.
@@ -111,6 +131,9 @@ pub struct Endpoint {
     pub user: Option<String>,
     pub password: Option<String>,
     pub password_source: PasswordSource,
+    /// A bearer, which outranks the Basic pair when both are present.
+    pub token: Option<String>,
+    pub token_source: PasswordSource,
     pub insecure_skip_tls_verify: bool,
 }
 
@@ -282,6 +305,7 @@ pub fn resolve_endpoint(
     server: Option<&str>,
     user: Option<&str>,
     password: Option<&str>,
+    token: Option<&str>,
     insecure: bool,
 ) -> Result<Endpoint> {
     let resolved = config.resolve(context)?;
@@ -304,6 +328,19 @@ pub fn resolve_endpoint(
         },
     };
 
+    // The same ladder for a bearer. Resolved independently of the password so
+    // `whoami` can say which of the two the next request will actually send.
+    let (token, token_source) = match token {
+        Some(t) => (Some(t.to_string()), PasswordSource::Flag),
+        None => match &entry.token_command {
+            Some(cmd) => (Some(run_password_command(cmd)?), PasswordSource::Command),
+            None => match &entry.token {
+                Some(t) => (Some(t.clone()), PasswordSource::Stored),
+                None => (None, PasswordSource::None),
+            },
+        },
+    };
+
     Ok(Endpoint {
         name,
         server: server
@@ -313,6 +350,8 @@ pub fn resolve_endpoint(
         user: user.map(str::to_string).or(entry.user),
         password,
         password_source,
+        token,
+        token_source,
         insecure_skip_tls_verify: insecure || entry.insecure_skip_tls_verify,
     })
 }
@@ -370,6 +409,30 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_token_outranks_the_pair_and_follows_the_same_ladder() {
+        let mut cfg = cfg_with(&["lb"], None);
+        cfg.contexts.get_mut("lb").unwrap().token = Some("heyo_api_stored".into());
+        let ep = resolve_endpoint(&cfg, None, None, None, None, None, false).unwrap();
+        assert_eq!(ep.token.as_deref(), Some("heyo_api_stored"));
+        assert_eq!(ep.token_source, PasswordSource::Stored);
+        // The pair is still resolved — whoami reports both — but the token wins.
+        assert_eq!(ep.password.as_deref(), Some("pw"));
+
+        let ep = resolve_endpoint(&cfg, None, None, None, None, Some("heyo_api_flag"), false).unwrap();
+        assert_eq!(ep.token.as_deref(), Some("heyo_api_flag"));
+        assert_eq!(ep.token_source, PasswordSource::Flag);
+
+        cfg.contexts.get_mut("lb").unwrap().token_command = Some("printf heyo_api_cmd".into());
+        let ep = resolve_endpoint(&cfg, None, None, None, None, None, false).unwrap();
+        assert_eq!(ep.token.as_deref(), Some("heyo_api_cmd"));
+        assert_eq!(ep.token_source, PasswordSource::Command);
+
+        let ep = resolve_endpoint(&Config::default(), None, None, None, None, None, false).unwrap();
+        assert!(ep.token.is_none());
+        assert_eq!(ep.token_source, PasswordSource::None);
     }
 
     fn cfg_with_registries(names: &[&str], current: Option<&str>) -> Config {
@@ -457,7 +520,7 @@ mod tests {
     #[test]
     fn flags_outrank_the_stored_context() {
         let cfg = cfg_with(&["prod"], Some("prod"));
-        let ep = resolve_endpoint(&cfg, None, Some("http://other:1"), None, Some("flag"), false)
+        let ep = resolve_endpoint(&cfg, None, Some("http://other:1"), None, Some("flag"), None, false)
             .unwrap();
         assert_eq!(ep.server, "http://other:1");
         assert_eq!(ep.password.as_deref(), Some("flag"));
@@ -467,7 +530,7 @@ mod tests {
 
     #[test]
     fn no_config_at_all_still_points_at_a_local_app_lb() {
-        let ep = resolve_endpoint(&Config::default(), None, None, None, None, false).unwrap();
+        let ep = resolve_endpoint(&Config::default(), None, None, None, None, None, false).unwrap();
         assert_eq!(ep.server, crate::cmd::DEFAULT_SERVER);
         assert_eq!(ep.password_source, PasswordSource::None);
     }
