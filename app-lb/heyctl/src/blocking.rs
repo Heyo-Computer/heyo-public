@@ -109,11 +109,15 @@ impl Client {
         server: &str,
         user: Option<&str>,
         password: Option<&str>,
+        token: Option<&str>,
         insecure: bool,
         timeout: Duration,
     ) -> Result<Self> {
-        let auth = match (user, password) {
-            (Some(u), Some(p)) => Auth::Basic {
+        let auth = match (token, user, password) {
+            // A bearer outranks the pair: it is the only credential Cloud's
+            // namespace door accepts, and a context that has one meant it.
+            (Some(t), _, _) => Auth::Token(t.to_string()),
+            (None, Some(u), Some(p)) => Auth::Basic {
                 user: u.to_string(),
                 password: p.to_string(),
             },
