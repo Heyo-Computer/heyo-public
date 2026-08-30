@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install app-lb, app-obs and ci from the artifact store the workflows push to.
+# Install app-lb, app-obs, ci and art from the artifact store the workflows
+# push to.
 #
 #   ART_URL=https://art.example.com ART_API_KEY=… sh .ci/install.sh
 #   curl -fsSL https://…/install.sh | ART_URL=… ART_API_KEY=… sh
@@ -32,19 +33,25 @@
 #                    in the shipped ci.conf points at.
 #   SUPERVISOR_DIR   Where supervisor program files go. Default
 #                    /etc/supervisor/conf.d. Set empty to skip them entirely.
-#   APPS             Which to install. Default "app-lb app-obs ci".
+#   APPS             Which to install. Default "app-lb app-obs ci art".
 #                    `codegraph` is also published and installable by name.
+#                    `art` is in the default set because app-lb needs it on
+#                    the same host: a deployment whose `vm.workspace.store`
+#                    is a local path is restored and captured by app-lb
+#                    running `art` (`APP_LB_ART_BIN`), and a host without it
+#                    holds that deployment's pool at zero replicas.
 #
 # ## How an artifact is found
 #
 # `ci` tags every upload `ci-<workflow>-<run>-<job>-<name>` (see
 # `ci/src/artifacts.rs`), because the store's tag charset has no `/`. For the
-# four things these workflows publish that is:
+# five things these workflows publish that is:
 #
 #   ci-app-lb-<run>-release-app-lb       app-lb + heyctl
 #   ci-app-obs-<run>-release-app-obs     app-obs + app-obs-dump
 #   ci-ci-<run>-release-ci               ci + its migrations
 #   ci-codegraph-<run>-release-codegraph codegraph
+#   ci-art-<run>-release-art             art
 #
 # The run id is `%012x-%08x` — epoch milliseconds in hex, then a sequence — so
 # it is fixed-width and zero-padded, and **sorting the tags lexicographically
@@ -80,7 +87,7 @@ STATE_ROOT="${STATE_ROOT:-/var/lib}"
 # Unset and empty mean different things: unset takes the default, empty skips
 # supervisor files. `${X-default}` (no colon) is what tells them apart.
 SUPERVISOR_DIR="${SUPERVISOR_DIR-/etc/supervisor/conf.d}"
-APPS="${APPS:-app-lb app-obs ci}"
+APPS="${APPS:-app-lb app-obs ci art}"
 
 BINDIR="$PREFIX/bin"
 DO_LIST=0
@@ -257,6 +264,7 @@ app_coords() {
     app-obs)   echo "app-obs release app-obs" ;;
     ci)        echo "ci release ci" ;;
     codegraph) echo "codegraph release codegraph" ;;
+    art)       echo "art release art" ;;
     *) return 1 ;;
   esac
 }
@@ -270,6 +278,7 @@ app_bins() {
     app-obs)   echo "app-obs app-obs-dump" ;;
     ci)        echo "ci" ;;
     codegraph) echo "codegraph" ;;
+    art)       echo "art" ;;
   esac
 }
 
@@ -371,7 +380,7 @@ installed=""
 skipped_confs=""
 
 for app in $APPS; do
-  coords="$(app_coords "$app")" || die "unknown app '$app' (known: app-lb app-obs ci codegraph)"
+  coords="$(app_coords "$app")" || die "unknown app '$app' (known: app-lb app-obs ci codegraph art)"
   # shellcheck disable=SC2086
   set -- $coords
   wf="$1"; job="$2"; name="$3"

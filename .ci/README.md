@@ -11,6 +11,7 @@ to "did this commit pass"; every file here holds one job. See
 | `app-lb.yml` | `release` | `app-lb`, `heyctl` | `app-lb` — both binaries, `app-lb.conf`, `SHA256SUMS`, `BUILD-INFO` |
 | `app-obs.yml` | `release` | `app-obs`, `app-obs-dump` | `app-obs` — both binaries, `app-obs.conf`, `SHA256SUMS`, `BUILD-INFO` |
 | `ci.yml` | `release` | `ci` | `ci` — binary, `ci.conf`, `migrations/`, `SHA256SUMS`, `BUILD-INFO` |
+| `art.yml` | `release` | `art` | `art` — binary, `SHA256SUMS`, `BUILD-INFO` |
 
 The other six crates here (`artifacts`, `computer`, `heyosecret`,
 `heyosecret-client`, `orchestrator`, `printer`) have no workflow yet. Adding one
@@ -68,10 +69,16 @@ say. Independent binaries get independent files.
 ART_URL=https://art.us2.heyo.work ART_API_KEY=… sh .ci/install.sh
 ```
 
-That installs `app-lb`, `app-obs` and `ci` — binaries into `/usr/local/bin`,
-supervisor programs into `/etc/supervisor/conf.d`, and `ci`'s migrations into
-`/var/lib/ci/migrations`, which is where the shipped `ci.conf` points
-`CI_MIGRATIONS_DIR`. Nothing is restarted unless you pass `--restart`.
+That installs `app-lb`, `app-obs`, `ci` and `art` — binaries into
+`/usr/local/bin`, supervisor programs into `/etc/supervisor/conf.d`, and `ci`'s
+migrations into `/var/lib/ci/migrations`, which is where the shipped `ci.conf`
+points `CI_MIGRATIONS_DIR`. Nothing is restarted unless you pass `--restart`.
+
+`art` is there because app-lb needs it beside itself: a deployment whose
+`vm.workspace.store` is a local path is restored and captured by app-lb running
+`art` as a subprocess, found through `APP_LB_ART_BIN` — set that to
+`/usr/local/bin/art` in `app-lb.conf`. Without it the deployment's pool holds
+at zero replicas with "workspace restore pending: could not run art".
 
 ```sh
 sh .ci/install.sh --list            # what the store has, and what each thing is
@@ -89,8 +96,8 @@ ci-<workflow>-<run>-<job>-<name>
 ```
 
 which for the table above is `ci-app-lb-<run>-release-app-lb`,
-`ci-app-obs-<run>-release-app-obs`, `ci-ci-<run>-release-ci` and
-`ci-codegraph-<run>-release-codegraph`. The workflow name being in the tag
+`ci-app-obs-<run>-release-app-obs`, `ci-ci-<run>-release-ci`,
+`ci-codegraph-<run>-release-codegraph` and `ci-art-<run>-release-art`. The workflow name being in the tag
 means renaming a workflow starts a new series: app-lb and app-obs were built
 by `apps.yml` until 2026-08-27, and their older builds are tagged
 `ci-apps-<run>-app-lb-app-lb` and `ci-apps-<run>-app-obs-app-obs`. The script
