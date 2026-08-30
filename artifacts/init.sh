@@ -44,24 +44,46 @@ if ! ip addr show eth0 2>/dev/null | grep -q "inet "; then
     done
 fi
 
-# Persistent data disk: app-lb attaches /dev/vdb when disk_size_gb is set. It is
-# blank on first boot (format it) and reused on later boots. The store lives
-# here — the base rootfs is re-copied from the image on every cold boot, so a
-# store on the rootfs would silently lose every blob on restart.
+# /dev/vdb is one of two things, and only one of them is ours to mount:
+#
+#  - **A persistent data disk** (`vm.disk_size_gb`): heyvmd attaches it blank
+#    and leaves mounting to the guest. Format it on first boot, reuse it on
+#    later ones. The store lives here — the base rootfs is re-copied from the
+#    image on every cold boot, so a store on the rootfs would silently lose
+#    every blob on restart.
+#  - **A heyvmd guest mount** (`vm.workspace`, or a `mounts[]` entry): app-lb
+#    hands heyvmd a host directory, heyvmd builds an ext4 image from it with
+#    `mke2fs -L mount<N>`, attaches it, and **mounts it itself** after this
+#    script has printed HEYVM_READY. Mounting it here made heyvmd's own
+#    `mount -t ext4 /dev/vdb /workspace` fail with "already mounted" — reported
+#    as an empty "Firecracker failed to mount /dev/vdb at /workspace: " — and
+#    the `artifacts` deployment on us2 failed every boot on 2026-08-30 for it.
+#    heyvmd's data disk never carries that label (it arrives blank and is
+#    formatted `artifacts` below), so the label is what tells them apart.
 #
 # mkfs.ext4 without -O ^has_journal and with the defaults: the store's own
 # durability ordering (fdatasync before linkat) assumes a journalled ext4, which
 # is what makes a crash leave either a correct blob or no blob at all.
 if [ -b /dev/vdb ]; then
-    if ! blkid /dev/vdb >/dev/null 2>&1; then
-        echo "init: formatting blank data disk /dev/vdb"
-        mkfs.ext4 -q -L artifacts /dev/vdb
-    fi
-    mkdir -p /workspace
-    mount /dev/vdb /workspace 2>/dev/null
+    label="$(blkid -s LABEL -o value /dev/vdb 2>/dev/null || true)"
+    case "$label" in
+        mount[0-9]*)
+            echo "init: /dev/vdb is a heyvmd guest mount ($label); leaving it for heyvmd to mount at /workspace"
+            ;;
+        *)
+            if ! blkid /dev/vdb >/dev/null 2>&1; then
+                echo "init: formatting blank data disk /dev/vdb"
+                mkfs.ext4 -q -L artifacts /dev/vdb
+            fi
+            mkdir -p /workspace
+            mount /dev/vdb /workspace 2>/dev/null
+            ;;
+    esac
 fi
 # Created whether or not a data disk was attached, so `art serve` always starts.
-# Without /dev/vdb this is on the rootfs and does not survive a cold boot.
+# Without /dev/vdb this is on the rootfs and does not survive a cold boot. Under
+# a heyvmd guest mount this lands on the rootfs too and is shadowed once heyvmd
+# mounts /workspace; `art serve` creates its root inside the mounted tree.
 mkdir -p /workspace/store
 
 # sshd for `heyvm exec` / `heyvm sh`. Log to a file, never to the serial
