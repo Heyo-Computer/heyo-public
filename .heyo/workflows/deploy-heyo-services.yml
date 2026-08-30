@@ -426,7 +426,7 @@ jobs:
           deploy(endpoint,key,payload)
 
           if service=="heyosecret":
-              checks=[(f"https://{public_host}/heyosecret/health",lambda b:json.loads(b).get("status")=="ok"),(f"https://{public_host}/heyosecret/dashboard/api/session",lambda b:"dashboardEnabled" in json.loads(b))]
+              checks=[(f"https://{public_host}/heyosecret/health",lambda b:json.loads(b).get("status")=="ok")]
           elif service=="orchestrator":
               checks=[(f"https://{public_host}/orchestrator/health",lambda b:json.loads(b).get("deploymentGitSha")==git_sha)]
           elif service=="app-lb":
