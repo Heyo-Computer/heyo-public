@@ -548,7 +548,7 @@ async fn deploy_service_inner(
         .await?;
         let health_deadline = tokio::time::Instant::now()
             + Duration::from_secs(request.health_timeout_seconds.max(1));
-        let (backend_url, health_url) = wait_for_candidate_health(
+        let (backend_url, route_backend_url, health_url) = wait_for_candidate_health(
             &state,
             &service_id,
             &deployment_id,
@@ -564,7 +564,11 @@ async fn deploy_service_inner(
             "running",
             "Service deployment candidate health check passed.",
             None,
-            Some(json!({ "backendUrl": backend_url, "healthUrl": health_url })),
+            Some(json!({
+                "backendUrl": backend_url,
+                "routeBackendUrl": route_backend_url,
+                "healthUrl": health_url,
+            })),
             None,
         )
         .await?;
@@ -606,7 +610,7 @@ async fn deploy_service_inner(
             let effective_backend_url = route
                 .backend_url
                 .clone()
-                .unwrap_or_else(|| backend_url.clone());
+                .unwrap_or_else(|| route_backend_url.clone());
             route_updated = true;
             record_service_deployment_event(
                 &state,
@@ -2047,7 +2051,7 @@ async fn wait_for_candidate_health(
     deployment_id: &str,
     health_path: &str,
     deadline: tokio::time::Instant,
-) -> Result<(String, String)> {
+) -> Result<(String, String, String)> {
     let mut backend_urls = Vec::new();
     let mut route_backend_url = None;
     let mut attempts: u64 = 0;
@@ -2102,10 +2106,13 @@ async fn wait_for_candidate_health(
 
             match request.send().await {
                 Ok(response) if response.status().is_success() => {
+                    let (discovery_url, route_url) = candidate_endpoint_urls(
+                        backend_url,
+                        route_backend_url.as_deref(),
+                    );
                     return Ok((
-                        route_backend_url
-                            .clone()
-                            .unwrap_or_else(|| backend_url.clone()),
+                        discovery_url,
+                        route_url,
                         health_url,
                     ));
                 }
@@ -2148,6 +2155,18 @@ async fn wait_for_candidate_health(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         sleep(retry_delay.min(remaining)).await;
     }
+}
+
+fn candidate_endpoint_urls(
+    healthy_backend_url: &str,
+    preferred_route_url: Option<&str>,
+) -> (String, String) {
+    (
+        healthy_backend_url.to_string(),
+        preferred_route_url
+            .unwrap_or(healthy_backend_url)
+            .to_string(),
+    )
 }
 
 fn service_backend_api_url(state: &AppState) -> String {
@@ -2637,10 +2656,24 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_env_ref, parse_ls_remote_revision, parse_secret_ref, proxy_subdomain_and_path,
-        validate_revision_ref, validate_revision_repository_url, validate_revision_sha,
-        SecretVersionSelector, ServiceDeployRequest,
+        candidate_endpoint_urls, parse_env_ref, parse_ls_remote_revision, parse_secret_ref,
+        proxy_subdomain_and_path, validate_revision_ref, validate_revision_repository_url,
+        validate_revision_sha, SecretVersionSelector, ServiceDeployRequest,
     };
+
+    #[test]
+    fn keeps_discovery_internal_and_routes_public() {
+        assert_eq!(
+            candidate_endpoint_urls(
+                "http://eu1.internal:2238",
+                Some("https://aqorah.stage.heyo.computer"),
+            ),
+            (
+                "http://eu1.internal:2238".to_string(),
+                "https://aqorah.stage.heyo.computer".to_string(),
+            )
+        );
+    }
 
     #[test]
     fn parses_env_secret_refs() {
