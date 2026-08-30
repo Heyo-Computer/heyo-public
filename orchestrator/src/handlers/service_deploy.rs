@@ -2049,6 +2049,7 @@ async fn wait_for_candidate_health(
     deadline: tokio::time::Instant,
 ) -> Result<(String, String)> {
     let mut backend_urls = Vec::new();
+    let mut route_backend_url = None;
     let mut attempts: u64 = 0;
     let mut retry_delay = Duration::from_secs(1);
     let mut last_error = "candidate endpoint is not available yet".to_string();
@@ -2075,6 +2076,9 @@ async fn wait_for_candidate_health(
         let previous_url_count = backend_urls.len();
         match cloud_client::deployment_healthcheck_urls(state, deployment_id).await {
             Ok(urls) => {
+                if let Some(url) = urls.probe_url() {
+                    route_backend_url = Some(url);
+                }
                 for url in urls.candidates() {
                     if !backend_urls.contains(&url) {
                         backend_urls.push(url);
@@ -2098,7 +2102,12 @@ async fn wait_for_candidate_health(
 
             match request.send().await {
                 Ok(response) if response.status().is_success() => {
-                    return Ok((backend_url.clone(), health_url));
+                    return Ok((
+                        route_backend_url
+                            .clone()
+                            .unwrap_or_else(|| backend_url.clone()),
+                        health_url,
+                    ));
                 }
                 Ok(response) => {
                     last_error = format!("{} returned HTTP {}", health_url, response.status());
