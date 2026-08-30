@@ -49,6 +49,8 @@ The services are independent processes but can share one PostgreSQL database. Ea
 - **Orchestrator** never talks to the backend hypervisor directly during a request — it persists the desired state, then a reconciler loop drives `mvm-ctrl` to converge. When deploying a Heyo-managed *service* whose manifest references secrets (`envRefs`), it calls **HeyoSecret** to materialize them just-in-time using the `heyosecret-client` crate.
 - **HeyoSecret** is a small KV with versioning, audit history, and AES-GCM encryption at rest. Only the orchestrator (and other internal services) holds the `HEYOSECRET_INTERNAL_API_KEY`; tenant code never sees it.
 
+Service rollouts keep the previous healthy deployment active while the candidate converges. The controller retries Cloud state and health reads with capped backoff under one deployment deadline, probes each distinct internal and public candidate endpoint, and treats only persisted terminal state or the deadline as failure. Deployment events are diagnostics, not a liveness signal.
+
 ## Layout
 
 - `src/main.rs` — boot, route table, reconciler spawn.

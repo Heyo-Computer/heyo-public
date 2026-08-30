@@ -36,6 +36,8 @@ const CANDIDATE_DIAGNOSTIC_TIMEOUT_SECONDS: u64 = 20;
 const CANDIDATE_DIAGNOSTIC_MAX_BYTES: usize = 12 * 1024;
 const SERVICE_CANDIDATE_EVENT_SUBSCRIBE_TIMEOUT_SECONDS: u64 = 10;
 const SERVICE_CANDIDATE_STATUS_POLL_INTERVAL_SECONDS: u64 = 5;
+const SERVICE_HEALTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
+const SERVICE_HEALTH_MAX_BACKOFF_SECONDS: u64 = 10;
 const SERVICE_REVISION_CHECK_TIMEOUT_SECONDS: u64 = 30;
 const SERVICE_RETIREMENT_RECONCILE_INTERVAL_SECONDS: u64 = 15;
 const DEFAULT_GIT_AUTH_TOKEN_SECRET_PATH: &str = "cicd/git-auth-token";
@@ -532,13 +534,6 @@ async fn deploy_service_inner(
             None,
         )
         .await?;
-        let mut backend_url = resolve_candidate_backend_url(
-            &state,
-            &deployment_id,
-            request.health_timeout_seconds,
-        )
-        .await?;
-        let mut health_url = join_url_path(&backend_url, &request.health_path);
         record_service_deployment_event(
             &state,
             &deployment_id,
@@ -547,45 +542,20 @@ async fn deploy_service_inner(
             "running",
             "Checking service deployment candidate health.",
             None,
-            Some(json!({ "healthUrl": health_url })),
+            None,
             None,
         )
         .await?;
-        if let Err(error) = wait_for_http_health(
+        let health_deadline = tokio::time::Instant::now()
+            + Duration::from_secs(request.health_timeout_seconds.max(1));
+        let (backend_url, health_url) = wait_for_candidate_health(
             &state,
             &service_id,
             &deployment_id,
-            &health_url,
-            request.health_timeout_seconds,
+            &request.health_path,
+            health_deadline,
         )
-        .await
-        {
-            warn!(
-                deployment_id,
-                health_url,
-                "candidate health check failed; trying cloud proxy URL fallback: {error:#}"
-            );
-            let fallback_backend_url = wait_for_backend_url(
-                &state,
-                &deployment_id,
-                request.health_timeout_seconds,
-            )
-            .await?;
-            if fallback_backend_url == backend_url {
-                return Err(error);
-            }
-            let fallback_health_url = join_url_path(&fallback_backend_url, &request.health_path);
-            wait_for_http_health(
-                &state,
-                &service_id,
-                &deployment_id,
-                &fallback_health_url,
-                request.health_timeout_seconds,
-            )
-            .await?;
-            backend_url = fallback_backend_url;
-            health_url = fallback_health_url;
-        }
+        .await?;
         record_service_deployment_event(
             &state,
             &deployment_id,
@@ -1807,19 +1777,6 @@ async fn candidate_deployment_status_is_ready(deployment_id: &str) -> Result<boo
     }
 }
 
-async fn candidate_deployment_status_is_not_failed(deployment_id: &str) -> Result<()> {
-    if let Some((status, error_message)) = current_candidate_deployment_status(deployment_id).await?
-    {
-        if status == "failed" {
-            anyhow::bail!(
-                "deployment {deployment_id} is marked failed: {}",
-                error_message.unwrap_or_else(|| "no error message recorded".to_string())
-            );
-        }
-    }
-    Ok(())
-}
-
 async fn current_candidate_deployment_status(
     deployment_id: &str,
 ) -> Result<Option<(String, Option<String>)>> {
@@ -2084,123 +2041,104 @@ async fn load_archive_bytes(state: &AppState, request: &ServiceDeployRequest) ->
     }
 }
 
-async fn wait_for_backend_url(
-    state: &AppState,
-    deployment_id: &str,
-    timeout_seconds: u64,
-) -> Result<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds.max(1));
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for deployment {deployment_id} proxy URL");
-        }
-        candidate_deployment_status_is_not_failed(deployment_id).await?;
-        match cloud_client::deployment_healthcheck_url(state, deployment_id).await {
-            Ok(Some(url)) if !url.trim().is_empty() => return Ok(url),
-            Ok(_) => {}
-            Err(error) => warn!(deployment_id, "candidate health URL not ready: {error:#}"),
-        }
-        sleep(Duration::from_secs(2)).await;
-    }
-}
-
-async fn resolve_candidate_backend_url(
-    state: &AppState,
-    deployment_id: &str,
-    timeout_seconds: u64,
-) -> Result<String> {
-    // Cloud owns backend placement, so it must resolve the URL through the
-    // deployment record. Calling one process-wide mvm-ctrl URL here can ask the
-    // wrong host as soon as service replicas span more than one backend.
-    wait_for_backend_url(state, deployment_id, timeout_seconds).await
-}
-
-async fn wait_for_http_health(
+async fn wait_for_candidate_health(
     state: &AppState,
     service_id: &str,
     deployment_id: &str,
-    health_url: &str,
-    timeout_seconds: u64,
-) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds.max(1));
-    let proxied = backend_proxy_health_request(state, health_url);
+    health_path: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(String, String)> {
+    let mut backend_urls = Vec::new();
     let mut attempts: u64 = 0;
+    let mut retry_delay = Duration::from_secs(1);
+    let mut last_error = "candidate endpoint is not available yet".to_string();
+
     loop {
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for healthy response from {health_url}");
+            anyhow::bail!("timed out waiting for healthy deployment {deployment_id}: {last_error}");
         }
-        attempts += 1;
-        let request = if let Some((url, subdomain)) = &proxied {
-            state
-                .http_client
-                .get(url)
-                .header("X-Heyo-Subdomain", subdomain)
-        } else {
-            state.http_client.get(health_url)
-        };
-        match request.send().await {
-            Ok(response) if response.status().is_success() => return Ok(()),
-            Ok(response) => {
-                let status = response.status();
-                warn!(
-                    health_url,
-                    status = %status,
-                    "candidate health check returned non-success"
+
+        match current_candidate_deployment_status(deployment_id).await {
+            Ok(Some((status, error_message))) if status == "failed" => {
+                anyhow::bail!(
+                    "deployment {deployment_id} is marked failed: {}",
+                    error_message.unwrap_or_else(|| "no error message recorded".to_string())
                 );
-                if attempts == 1 || attempts % 15 == 0 {
-                    let _ = record_service_deployment_event(
-                        state,
-                        deployment_id,
-                        service_id,
-                        "health-check",
-                        "running",
-                        "Waiting for service deployment candidate health.",
-                        None,
-                        Some(json!({
-                            "healthUrl": health_url,
-                            "attempt": attempts,
-                            "httpStatus": status.as_u16(),
-                        })),
-                        None,
-                    )
-                    .await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                last_error = format!("candidate status is temporarily unavailable: {error:#}");
+                warn!(deployment_id, "{last_error}");
+            }
+        }
+
+        let previous_url_count = backend_urls.len();
+        match cloud_client::deployment_healthcheck_urls(state, deployment_id).await {
+            Ok(urls) => {
+                for url in urls.candidates() {
+                    if !backend_urls.contains(&url) {
+                        backend_urls.push(url);
+                    }
                 }
             }
             Err(error) => {
-                warn!(health_url, "candidate health check failed: {error}");
-                if attempts == 1 || attempts % 15 == 0 {
-                    let _ = record_service_deployment_event(
-                        state,
-                        deployment_id,
-                        service_id,
-                        "health-check",
-                        "running",
-                        "Waiting for service deployment candidate health.",
-                        None,
-                        Some(json!({
-                            "healthUrl": health_url,
-                            "attempt": attempts,
-                            "error": error.to_string(),
-                        })),
-                        None,
-                    )
-                    .await;
+                last_error =
+                    format!("candidate health endpoints are temporarily unavailable: {error:#}");
+                warn!(deployment_id, "{last_error}");
+            }
+        }
+
+        attempts += 1;
+        for backend_url in &backend_urls {
+            let health_url = join_url_path(backend_url, health_path);
+            let request = state
+                .http_client
+                .get(&health_url)
+                .timeout(Duration::from_secs(SERVICE_HEALTH_REQUEST_TIMEOUT_SECONDS));
+
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    return Ok((backend_url.clone(), health_url));
+                }
+                Ok(response) => {
+                    last_error = format!("{} returned HTTP {}", health_url, response.status());
+                    warn!(health_url, status = %response.status(), "candidate health check returned non-success");
+                }
+                Err(error) => {
+                    last_error = format!("{health_url} could not be reached: {error}");
+                    warn!(health_url, "candidate health check failed: {error}");
                 }
             }
         }
-        sleep(Duration::from_secs(2)).await;
-    }
-}
 
-fn backend_proxy_health_request(state: &AppState, health_url: &str) -> Option<(String, String)> {
-    let backend = service_backend_api_url(state);
-    let backend = backend.trim().trim_end_matches('/');
-    if backend.is_empty() {
-        return None;
+        if attempts == 1 || attempts % 15 == 0 {
+            let _ = record_service_deployment_event(
+                state,
+                deployment_id,
+                service_id,
+                "health-check",
+                "running",
+                "Waiting for service deployment candidate health.",
+                None,
+                Some(json!({
+                    "attempt": attempts,
+                    "backendUrls": backend_urls,
+                    "lastError": last_error,
+                })),
+                None,
+            )
+            .await;
+        }
+
+        if backend_urls.len() > previous_url_count {
+            retry_delay = Duration::from_secs(1);
+        } else {
+            retry_delay =
+                (retry_delay * 2).min(Duration::from_secs(SERVICE_HEALTH_MAX_BACKOFF_SECONDS));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        sleep(retry_delay.min(remaining)).await;
     }
-    let (subdomain, path) =
-        proxy_subdomain_and_path(health_url, &state.config.proxy_base_domains)?;
-    Some((format!("{backend}{path}"), subdomain))
 }
 
 fn service_backend_api_url(state: &AppState) -> String {

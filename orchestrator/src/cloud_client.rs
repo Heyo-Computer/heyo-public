@@ -216,10 +216,40 @@ pub(crate) struct CreateArchiveResponse {
     pub size_bytes: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct HealthcheckUrlResponse {
+pub(crate) struct DeploymentHealthcheckUrls {
+    #[serde(default)]
     url: Option<String>,
+    #[serde(default)]
+    internal_url: Option<String>,
+    #[serde(default)]
+    public_url: Option<String>,
+}
+
+impl DeploymentHealthcheckUrls {
+    pub(crate) fn probe_url(&self) -> Option<String> {
+        [&self.public_url, &self.url, &self.internal_url]
+            .into_iter()
+            .flatten()
+            .map(|url| url.trim())
+            .find(|url| !url.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    pub(crate) fn candidates(&self) -> Vec<String> {
+        let mut candidates = Vec::new();
+        for url in [&self.internal_url, &self.public_url, &self.url]
+            .into_iter()
+            .flatten()
+        {
+            let url = url.trim();
+            if !url.is_empty() && !candidates.iter().any(|candidate| candidate == url) {
+                candidates.push(url.to_string());
+            }
+        }
+        candidates
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -641,10 +671,10 @@ pub(crate) async fn reconcile_deployment_hosts(
     Ok(())
 }
 
-pub(crate) async fn deployment_healthcheck_url(
+pub(crate) async fn deployment_healthcheck_urls(
     state: &AppState,
     deployment_id: &str,
-) -> Result<Option<String>> {
+) -> Result<DeploymentHealthcheckUrls> {
     let response = authorized_request(
         state,
         state.http_client.get(format!(
@@ -666,10 +696,10 @@ pub(crate) async fn deployment_healthcheck_url(
         anyhow::bail!("Cloud healthcheck URL API returned {}: {}", status, body);
     }
 
-    let payload: HealthcheckUrlResponse = response.json().await.with_context(|| {
+    let payload: DeploymentHealthcheckUrls = response.json().await.with_context(|| {
         format!("Failed to parse cloud healthcheck URL response for {deployment_id}")
     })?;
-    Ok(payload.url)
+    Ok(payload)
 }
 
 pub(crate) async fn exec_in_deployment(
@@ -817,4 +847,44 @@ fn authorized_request(
         reqwest::header::AUTHORIZATION,
         format!("Bearer {}", state.config.internal_api_key),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeploymentHealthcheckUrls;
+
+    #[test]
+    fn preserves_distinct_internal_and_public_healthcheck_urls() {
+        let urls: DeploymentHealthcheckUrls = serde_json::from_value(serde_json::json!({
+            "url": "http://10.88.0.1:2238",
+            "internalUrl": "http://10.88.0.1:2238",
+            "publicUrl": "https://candidate.stage.heyo.computer"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            urls.candidates(),
+            vec![
+                "http://10.88.0.1:2238".to_string(),
+                "https://candidate.stage.heyo.computer".to_string(),
+            ]
+        );
+        assert_eq!(
+            urls.probe_url().as_deref(),
+            Some("https://candidate.stage.heyo.computer")
+        );
+    }
+
+    #[test]
+    fn supports_legacy_healthcheck_url_responses() {
+        let urls: DeploymentHealthcheckUrls = serde_json::from_value(serde_json::json!({
+            "url": "https://candidate.stage.heyo.computer"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            urls.candidates(),
+            vec!["https://candidate.stage.heyo.computer".to_string()]
+        );
+    }
 }
