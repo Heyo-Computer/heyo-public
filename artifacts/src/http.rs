@@ -159,7 +159,6 @@ pub fn router(state: ServeState) -> Router {
     let rest = Router::new()
         .route("/blobs/{digest}", get(get_blob).head(head_blob))
         .route("/manifests/{reference}", get(get_manifest))
-
         .route("/tags", get(list_tags))
         .route("/tags/{name}", get(get_tag).put(put_tag).delete(delete_tag))
         .route("/blobs", get(list_blobs))
@@ -167,6 +166,10 @@ pub fn router(state: ServeState) -> Router {
         .route(
             "/labels/{reference}",
             get(get_label).put(put_label).delete(delete_label),
+        )
+        .route(
+            "/public/{reference}",
+            get(get_public).put(put_public).delete(delete_public),
         )
         .route("/usage", get(get_usage))
         .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT))
@@ -258,6 +261,14 @@ async fn require_dashboard_auth(
 }
 
 /// Constant-time API-key check over `Authorization: Bearer` or `X-Api-Key`.
+///
+/// One carve-out: a request with **no credential at all** may `GET`/`HEAD` a
+/// blob that has been marked public (`PUT /public/{ref}`) — that is the whole
+/// meaning of public. The carve-out is download-only and anonymous-only:
+/// every other method and path still needs the key, and a *presented* wrong
+/// key is still rejected even for a public blob — a client sending a stale
+/// credential has a configuration error, and masking it behind the public
+/// flag would hide the day the key rotated.
 async fn authorize(State(st): State<ServeState>, req: Request, next: Next) -> Response {
     let Some(expected) = &st.api_key else {
         return next.run(req).await;
@@ -268,6 +279,15 @@ async fn authorize(State(st): State<ServeState>, req: Request, next: Next) -> Re
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     });
+
+    if presented.is_none()
+        && (req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD)
+        && let Some(digest) = req.uri().path().strip_prefix("/blobs/")
+        && let Ok(d) = Digest::parse(digest)
+        && st.store.is_public(&d).await.unwrap_or(false)
+    {
+        return next.run(req).await;
+    }
 
     let ok = match presented {
         Some(p) => {
@@ -477,10 +497,7 @@ async fn list_manifests(State(st): State<ServeState>) -> Result<Response, ApiErr
     Ok(Json(body).into_response())
 }
 
-fn tag_names(
-    tags: &std::collections::HashMap<Digest, Vec<TagName>>,
-    d: &Digest,
-) -> Vec<String> {
+fn tag_names(tags: &std::collections::HashMap<Digest, Vec<TagName>>, d: &Digest) -> Vec<String> {
     tags.get(d)
         .map(|ts| ts.iter().map(|t| t.as_str().to_string()).collect())
         .unwrap_or_default()
@@ -540,6 +557,50 @@ async fn delete_label(
     let r = Ref::parse(&reference).map_err(Error::from)?;
     let d = st.store.resolve(&r).await?;
     let removed = st.store.remove_label(&d).await?;
+    Ok(Json(serde_json::json!({"digest": d.as_str(), "removed": removed})).into_response())
+}
+
+/// Whether a blob may be downloaded without a credential. Takes a reference
+/// like the label routes, resolved to the blob it names.
+async fn get_public(
+    State(st): State<ServeState>,
+    Path(reference): Path<String>,
+) -> Result<Response, ApiError> {
+    let r = Ref::parse(&reference).map_err(Error::from)?;
+    let d = st.store.resolve_blob(&r).await?;
+    let public = st.store.is_public(&d).await?;
+    Ok(Json(serde_json::json!({"digest": d.as_str(), "public": public})).into_response())
+}
+
+/// Mark a blob public — anonymously downloadable, and nothing more. Resolved
+/// with `resolve_blob`, so a tag or single-entry manifest reference marks the
+/// bytes it names; a multi-entry manifest is ambiguous and refused, because
+/// "make this public" must not quietly pick one of its entries.
+async fn put_public(
+    State(st): State<ServeState>,
+    Path(reference): Path<String>,
+) -> Result<Response, ApiError> {
+    st.writable()?;
+    let r = Ref::parse(&reference).map_err(Error::from)?;
+    let d = st.store.resolve_blob(&r).await?;
+    st.store.set_public(&d).await?;
+    Ok(Json(serde_json::json!({
+        "digest": d.as_str(),
+        "public": true,
+        // The one thing a caller does next: hand this path out.
+        "url": format!("/blobs/{}", d.as_str()),
+    }))
+    .into_response())
+}
+
+async fn delete_public(
+    State(st): State<ServeState>,
+    Path(reference): Path<String>,
+) -> Result<Response, ApiError> {
+    st.writable()?;
+    let r = Ref::parse(&reference).map_err(Error::from)?;
+    let d = st.store.resolve_blob(&r).await?;
+    let removed = st.store.remove_public(&d).await?;
     Ok(Json(serde_json::json!({"digest": d.as_str(), "removed": removed})).into_response())
 }
 
@@ -646,10 +707,9 @@ impl IntoResponse for ApiError {
             // a better key would not help.
             Error::ReadOnly => StatusCode::FORBIDDEN,
             Error::NotFound(_) | Error::TagNotFound(_) => StatusCode::NOT_FOUND,
-            Error::Digest(_)
-            | Error::TagName(_)
-            | Error::Label(_)
-            | Error::ManifestVersion(_) => StatusCode::BAD_REQUEST,
+            Error::Digest(_) | Error::TagName(_) | Error::Label(_) | Error::ManifestVersion(_) => {
+                StatusCode::BAD_REQUEST
+            }
             Error::AmbiguousManifest { .. } => StatusCode::CONFLICT,
             Error::DigestMismatch { .. } => StatusCode::CONFLICT,
             Error::NoSpace { .. } => StatusCode::INSUFFICIENT_STORAGE,
@@ -722,8 +782,8 @@ async fn shutdown() {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use base64::Engine as _;
     use axum::http::Request as HttpRequest;
+    use base64::Engine as _;
     use std::path::PathBuf;
     use std::time::Duration;
     use tower::ServiceExt;
@@ -779,10 +839,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            r.headers().get(header::WWW_AUTHENTICATE).unwrap(),
-            "Bearer"
-        );
+        assert_eq!(r.headers().get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
 
         // Both accepted spellings work.
         for req in [
@@ -798,6 +855,138 @@ mod tests {
             let r = app.clone().oneshot(req).await.unwrap();
             assert_eq!(r.status(), StatusCode::OK);
         }
+    }
+
+    /// The whole meaning of `PUT /public/{ref}`: an anonymous download of that
+    /// one blob works, and nothing else about the store opens with it.
+    #[tokio::test]
+    async fn a_public_blob_downloads_anonymously_and_exempts_nothing_else() {
+        let d = tmpdir();
+        let (app, store) = app(&d, Some("secret"), false);
+        let data = b"shareable bytes".to_vec();
+        let info = store.insert_bytes(data.clone()).await.unwrap();
+        let digest = info.digest.as_str().to_string();
+
+        // Before: anonymous download is refused.
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/blobs/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+        // Marking public needs the key…
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::put(format!("/public/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::UNAUTHORIZED,
+            "anonymous PUT /public must fail"
+        );
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::put(format!("/public/{digest}"))
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = body_string(r).await;
+        assert!(body.contains(&format!("/blobs/{digest}")), "{body}");
+
+        // …and after it, anonymous GET and HEAD answer.
+        for method in ["GET", "HEAD"] {
+            let r = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri(format!("/blobs/{digest}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{method}");
+        }
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/blobs/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let got = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(got.as_ref(), data.as_slice());
+
+        // Download-only: the same digest's mutating route, another blob's GET,
+        // the listings, and a *presented* wrong key all still refuse.
+        let other = store.insert_bytes(b"private".to_vec()).await.unwrap();
+        for req in [
+            HttpRequest::put(format!("/blobs/{digest}"))
+                .body(Body::from(data.clone()))
+                .unwrap(),
+            HttpRequest::get(format!("/blobs/{}", other.digest))
+                .body(Body::empty())
+                .unwrap(),
+            HttpRequest::get("/blobs").body(Body::empty()).unwrap(),
+            HttpRequest::get(format!("/blobs/{digest}"))
+                .header("authorization", "Bearer wrong")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let (parts, _) = app.clone().oneshot(req).await.unwrap().into_parts();
+            assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+        }
+
+        // GET /public reflects the state; DELETE closes it again.
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/public/{digest}"))
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(body_string(r).await.contains("\"public\":true"));
+        let r = app
+            .clone()
+            .oneshot(
+                HttpRequest::delete(format!("/public/{digest}"))
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = app
+            .oneshot(
+                HttpRequest::get(format!("/blobs/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "private again");
     }
 
     #[tokio::test]
@@ -992,14 +1181,22 @@ mod tests {
 
         let r = app
             .clone()
-            .oneshot(HttpRequest::get("/tags/absent").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::get("/tags/absent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
 
         // A name the store would never write is a bad request, not a 404.
         let r = app
-            .oneshot(HttpRequest::get("/tags/.hidden").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::get("/tags/.hidden")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
@@ -1036,11 +1233,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::CREATED);
-        let digest = serde_json::from_str::<serde_json::Value>(&body_string(r).await).unwrap()
-            ["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let digest =
+            serde_json::from_str::<serde_json::Value>(&body_string(r).await).unwrap()["digest"]
+                .as_str()
+                .unwrap()
+                .to_string();
 
         app.clone()
             .oneshot(
@@ -1091,11 +1288,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::CREATED);
-        let digest = serde_json::from_str::<serde_json::Value>(&body_string(r).await).unwrap()
-            ["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let digest =
+            serde_json::from_str::<serde_json::Value>(&body_string(r).await).unwrap()["digest"]
+                .as_str()
+                .unwrap()
+                .to_string();
 
         app.clone()
             .oneshot(
@@ -1241,7 +1438,10 @@ mod tests {
             .await
             .unwrap();
         let html = body_string(r).await;
-        assert!(!html.contains("sign out"), "sign-out button on open dashboard");
+        assert!(
+            !html.contains("sign out"),
+            "sign-out button on open dashboard"
+        );
         assert!(!html.contains("/logout"), "logout form on open dashboard");
     }
 
@@ -1361,9 +1561,19 @@ mod tests {
         // it — the theme itself is stamped on `<html>` server-side, every link
         // is an anchor and every action is a form. With scripting off, the page
         // renders in the right palette and everything works except the toggle.
-        assert_eq!(html.matches("<script").count(), 1, "one script, the theme toggle");
-        assert!(html.contains(r#"<script defer src="/__ui/theme.js">"#), "{html}");
-        assert!(html.contains("data-theme="), "the theme is server-rendered, not scripted");
+        assert_eq!(
+            html.matches("<script").count(),
+            1,
+            "one script, the theme toggle"
+        );
+        assert!(
+            html.contains(r#"<script defer src="/__ui/theme.js">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-theme="),
+            "the theme is server-rendered, not scripted"
+        );
     }
 
     #[tokio::test]
@@ -1427,8 +1637,11 @@ mod tests {
         let d = tmpdir();
         let (app, store) = app(&d, None, false);
         let blob = store.insert_bytes(b"rootfs".to_vec()).await.unwrap();
-        let m = crate::Manifest::new(crate::KIND_GENERIC)
-            .with_entry("rootfs.ext4", blob.digest.clone(), blob.size);
+        let m = crate::Manifest::new(crate::KIND_GENERIC).with_entry(
+            "rootfs.ext4",
+            blob.digest.clone(),
+            blob.size,
+        );
         let md = store.put_manifest(&m).await.unwrap();
         store
             .set_tag(&TagName::parse("web-v2").unwrap(), &md)
@@ -1437,15 +1650,22 @@ mod tests {
         store
             .set_label(
                 &blob.digest,
-                &crate::Label::new(Some("the web rootfs".into()), Some("debian + hermes".into()))
-                    .unwrap(),
+                &crate::Label::new(
+                    Some("the web rootfs".into()),
+                    Some("debian + hermes".into()),
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
 
         let r = app
             .clone()
-            .oneshot(HttpRequest::get("/blobs").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::get("/blobs")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
@@ -1458,7 +1678,11 @@ mod tests {
 
         let r = app
             .clone()
-            .oneshot(HttpRequest::get("/manifests").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::get("/manifests")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let rows: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
@@ -1476,8 +1700,11 @@ mod tests {
         let d = tmpdir();
         let (app, store) = app(&d, None, false);
         let blob = store.insert_bytes(b"x".to_vec()).await.unwrap();
-        let m = crate::Manifest::new(crate::KIND_GENERIC)
-            .with_entry("x", blob.digest.clone(), blob.size);
+        let m = crate::Manifest::new(crate::KIND_GENERIC).with_entry(
+            "x",
+            blob.digest.clone(),
+            blob.size,
+        );
 
         let r = app
             .oneshot(
@@ -1576,7 +1803,10 @@ mod tests {
 
         for body in [
             r#"{}"#.to_string(),
-            format!(r#"{{"name":"{}"}}"#, "x".repeat(crate::labels::MAX_NAME + 1)),
+            format!(
+                r#"{{"name":"{}"}}"#,
+                "x".repeat(crate::labels::MAX_NAME + 1)
+            ),
             r#"{"name":"two\nlines"}"#.to_string(),
         ] {
             let r = app
@@ -1602,7 +1832,10 @@ mod tests {
         let (app, store) = app(&d, None, true);
         let blob = store.insert_bytes(b"x".to_vec()).await.unwrap();
         store
-            .set_label(&blob.digest, &crate::Label::new(Some("x".into()), None).unwrap())
+            .set_label(
+                &blob.digest,
+                &crate::Label::new(Some("x".into()), None).unwrap(),
+            )
             .await
             .unwrap();
 

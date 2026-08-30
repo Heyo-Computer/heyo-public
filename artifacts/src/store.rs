@@ -139,7 +139,7 @@ impl Store {
         // All 256 shards up front. They cost 256 inodes each for blobs and
         // manifests, and their existence removes any mkdir race from the insert
         // path.
-        for sub in ["blobs", "manifests", "labels"] {
+        for sub in ["blobs", "manifests", "labels", "public"] {
             for i in 0u16..256 {
                 let d = root.join(sub).join(format!("{i:02x}"));
                 std::fs::create_dir_all(&d).ctx(format!("create {}", d.display()))?;
@@ -361,6 +361,52 @@ impl Store {
         blocking(move || sparse::unlink_if_present(&inner.label_path(&d))).await
     }
 
+    // -- public ------------------------------------------------------------
+
+    /// Mark a blob as public: downloadable (`GET`/`HEAD /blobs/{digest}`)
+    /// without a credential. Nothing else about it becomes public — it does
+    /// not appear in any listing without auth, and no mutating route is ever
+    /// exempt.
+    ///
+    /// Blobs only, deliberately. A manifest made public would leak the names
+    /// and digests of everything it references, which is a listing, not a
+    /// download; and public exists for exactly one use — handing someone a
+    /// link to bytes.
+    ///
+    /// Stored as a marker file beside the content (`public/<aa>/<64-hex>`),
+    /// the same shape as a label: keyed by digest, load-bearing for nothing
+    /// but the auth exemption, swept by GC when its subject goes. Refuses a
+    /// digest the store holds no blob for — a public flag on nothing would
+    /// exempt a 404.
+    pub async fn set_public(&self, d: &Digest) -> Result<()> {
+        let inner = self.inner.clone();
+        let d = d.clone();
+        blocking(move || {
+            if !inner.blob_exists(&d) {
+                return Err(Error::NotFound(d));
+            }
+            inner.set_public(&d)
+        })
+        .await
+    }
+
+    /// Make a blob private again. `false` if it was not public.
+    pub async fn remove_public(&self, d: &Digest) -> Result<bool> {
+        let inner = self.inner.clone();
+        let d = d.clone();
+        blocking(move || sparse::unlink_if_present(&inner.public_path(&d))).await
+    }
+
+    /// Whether this digest may be downloaded without a credential.
+    ///
+    /// On the request path of every unauthenticated download, so it is one
+    /// `access(2)` and nothing more.
+    pub async fn is_public(&self, d: &Digest) -> Result<bool> {
+        let inner = self.inner.clone();
+        let d = d.clone();
+        blocking(move || Ok(inner.public_path(&d).exists())).await
+    }
+
     /// Every label in the store, digest-ordered.
     ///
     /// One `readdir` of 256 shards rather than a `stat` per row: a listing page
@@ -505,6 +551,25 @@ impl Inner {
 
     fn label_path(&self, d: &Digest) -> PathBuf {
         self.root.join("labels").join(d.shard()).join(d.as_str())
+    }
+
+    fn public_path(&self, d: &Digest) -> PathBuf {
+        self.root.join("public").join(d.shard()).join(d.as_str())
+    }
+
+    /// Create the public marker. An empty file whose existence is the whole
+    /// message: there is no content to tear, so no tmp-and-rename dance — a
+    /// crash leaves either a marker or none, both valid states.
+    fn set_public(&self, d: &Digest) -> Result<()> {
+        let dir = self.root.join("public").join(d.shard());
+        let p = self.public_path(d);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&p)
+            .ctx(format!("create {}", p.display()))?;
+        space::fsync_dir(&dir)
     }
 
     fn tmp_dir(&self) -> PathBuf {
@@ -777,11 +842,7 @@ impl Inner {
     fn set_tag(&self, t: &TagName, d: &Digest) -> Result<()> {
         let dir = self.root.join("tags");
         let final_path = self.tag_path(t);
-        let tmp = dir.join(format!(
-            ".{}.{}.tmp",
-            t.as_str(),
-            std::process::id()
-        ));
+        let tmp = dir.join(format!(".{}.{}.tmp", t.as_str(), std::process::id()));
 
         let body = format!("{d}\n");
         let write = (|| -> Result<()> {
@@ -943,7 +1004,9 @@ impl Inner {
         for i in 0u16..256 {
             let shard = format!("{i:02x}");
             for (name, _) in self.shard_entries("blobs", &shard)? {
-                let Ok(d) = Digest::parse(&name) else { continue };
+                let Ok(d) = Digest::parse(&name) else {
+                    continue;
+                };
                 match self.stat(&d) {
                     Ok(info) => out.push(info),
                     // Raced with a sweep; not an error for a listing.
@@ -1008,6 +1071,14 @@ impl Inner {
 
     pub(crate) fn label_path_of(&self, d: &Digest) -> PathBuf {
         self.label_path(d)
+    }
+
+    pub(crate) fn public_digests(&self) -> Result<Vec<Digest>> {
+        self.list_digests("public")
+    }
+
+    pub(crate) fn public_path_of(&self, d: &Digest) -> PathBuf {
+        self.public_path(d)
     }
 
     /// Whether a digest still names a blob. A plain existence check — the
@@ -1139,7 +1210,10 @@ mod tests {
         let s = store_in(&d);
         let info = s.insert_bytes(b"sealed".to_vec()).await.unwrap();
         let p = s.blob_path(&info.digest);
-        let e = std::fs::OpenOptions::new().write(true).open(&p).unwrap_err();
+        let e = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
@@ -1350,6 +1424,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_is_a_per_blob_flag_that_round_trips() {
+        let d = tmpdir();
+        let s = store_in(&d);
+        let a = s.insert_bytes(b"shareable".to_vec()).await.unwrap();
+
+        assert!(!s.is_public(&a.digest).await.unwrap(), "private by default");
+        s.set_public(&a.digest).await.unwrap();
+        assert!(s.is_public(&a.digest).await.unwrap());
+        // Idempotent: marking twice is not an error and changes nothing.
+        s.set_public(&a.digest).await.unwrap();
+        assert!(s.is_public(&a.digest).await.unwrap());
+
+        assert!(s.remove_public(&a.digest).await.unwrap());
+        assert!(
+            !s.remove_public(&a.digest).await.unwrap(),
+            "second removal reports none"
+        );
+        assert!(!s.is_public(&a.digest).await.unwrap());
+    }
+
+    /// A public flag on nothing would exempt a 404 from auth; a public flag on
+    /// a manifest would leak a listing. Both are refused where labels allow
+    /// the second, because public is a property of downloadable bytes only.
+    #[tokio::test]
+    async fn public_refuses_absent_digests_and_manifests() {
+        let d = tmpdir();
+        let s = store_in(&d);
+
+        let absent = Digest::parse(&hex::encode([9u8; 32])).unwrap();
+        assert!(matches!(
+            s.set_public(&absent).await.unwrap_err(),
+            Error::NotFound(_)
+        ));
+
+        let blob = s.insert_bytes(b"member".to_vec()).await.unwrap();
+        let m = Manifest::new(KIND_GENERIC).with_entry("member", blob.digest.clone(), blob.size);
+        let md = s.put_manifest(&m).await.unwrap();
+        assert!(matches!(
+            s.set_public(&md).await.unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn tags_resolve_and_are_replaceable() {
         let d = tmpdir();
         let s = store_in(&d);
@@ -1363,10 +1481,7 @@ mod tests {
         s.set_tag(&t, &b.digest).await.unwrap();
         assert_eq!(s.get_tag(&t).await.unwrap(), b.digest);
 
-        assert_eq!(
-            s.resolve(&Ref::Tag(t.clone())).await.unwrap(),
-            b.digest
-        );
+        assert_eq!(s.resolve(&Ref::Tag(t.clone())).await.unwrap(), b.digest);
         assert_eq!(
             s.resolve(&Ref::Digest(a.digest.clone())).await.unwrap(),
             a.digest
@@ -1439,11 +1554,8 @@ mod tests {
         let d = tmpdir();
         let s = store_in(&d);
         let blob = s.insert_bytes(b"rootfs bytes".to_vec()).await.unwrap();
-        let m = Manifest::new(KIND_GENERIC).with_entry(
-            "rootfs.ext4",
-            blob.digest.clone(),
-            blob.size,
-        );
+        let m =
+            Manifest::new(KIND_GENERIC).with_entry("rootfs.ext4", blob.digest.clone(), blob.size);
         let md = s.put_manifest(&m).await.unwrap();
         let tag = TagName::parse("debian").unwrap();
         s.set_tag(&tag, &md).await.unwrap();
@@ -1476,7 +1588,10 @@ mod tests {
         let e = s.resolve_blob(&Ref::Digest(md)).await.unwrap_err();
         match &e {
             Error::AmbiguousManifest { entries, .. } => {
-                assert_eq!(entries, &["rootfs.ext4".to_string(), "data.ext4".to_string()]);
+                assert_eq!(
+                    entries,
+                    &["rootfs.ext4".to_string(), "data.ext4".to_string()]
+                );
             }
             other => panic!("expected AmbiguousManifest, got {other:?}"),
         }
@@ -1691,7 +1806,10 @@ mod tests {
         // store is asked whether the digest exists, so the error names the thing
         // the caller can actually fix.
         let info = s.insert_bytes(b"real".to_vec()).await.unwrap();
-        let err = s.set_label(&info.digest, &Label::default()).await.unwrap_err();
+        let err = s
+            .set_label(&info.digest, &Label::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Label(_)), "{err}");
     }
 
@@ -1724,12 +1842,20 @@ mod tests {
 
         // Corrupt one, and drop a temp file beside it of the kind an
         // interrupted write leaves behind.
-        let path = s.root().join("labels").join(b.digest.shard()).join(b.digest.as_str());
+        let path = s
+            .root()
+            .join("labels")
+            .join(b.digest.shard())
+            .join(b.digest.as_str());
         std::fs::write(&path, b"{not json").unwrap();
         std::fs::write(path.with_file_name(format!(".{}.99.tmp", b.digest)), b"{}").unwrap();
 
         let listed = s.list_labels().await.unwrap();
-        assert_eq!(listed.len(), 1, "a broken label costs its own row and no more");
+        assert_eq!(
+            listed.len(),
+            1,
+            "a broken label costs its own row and no more"
+        );
         assert_eq!(listed[0].digest, a.digest);
 
         // And the map a listing page builds agrees with it.
@@ -1747,13 +1873,19 @@ mod tests {
         let other = s.insert_bytes(b"lonely".to_vec()).await.unwrap();
 
         for name in ["latest", "web-v2"] {
-            s.set_tag(&TagName::parse(name).unwrap(), &info.digest).await.unwrap();
+            s.set_tag(&TagName::parse(name).unwrap(), &info.digest)
+                .await
+                .unwrap();
         }
 
         let by_digest = s.tags_by_digest().await.unwrap();
         let mut names: Vec<&str> = by_digest[&info.digest].iter().map(|t| t.as_str()).collect();
         names.sort();
-        assert_eq!(names, ["latest", "web-v2"], "several tags can name one digest");
+        assert_eq!(
+            names,
+            ["latest", "web-v2"],
+            "several tags can name one digest"
+        );
         assert!(!by_digest.contains_key(&other.digest));
     }
 
@@ -1764,7 +1896,11 @@ mod tests {
         let d = tmpdir();
         let s = store_in(&d);
         let info = s.insert_bytes(b"hello".to_vec()).await.unwrap();
-        let path = s.root().join("labels").join(info.digest.shard()).join(info.digest.as_str());
+        let path = s
+            .root()
+            .join("labels")
+            .join(info.digest.shard())
+            .join(info.digest.as_str());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"garbage").unwrap();
 

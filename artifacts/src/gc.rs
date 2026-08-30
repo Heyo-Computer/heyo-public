@@ -90,6 +90,8 @@ pub struct GcReport {
     /// Labels whose digest no longer names anything. See the sweep below for
     /// why they are counted rather than listed.
     pub labels_removed: u64,
+    /// Public markers whose blob is gone, removed on the same terms as labels.
+    pub publics_removed: u64,
 }
 
 impl GcReport {
@@ -209,6 +211,24 @@ pub async fn collect(store: &Store, policy: GcPolicy) -> Result<GcReport> {
             report.labels_removed += 1;
         }
 
+        // Public markers are swept on the same reasoning as labels, with one
+        // difference in the test: a marker's subject can only ever be a blob
+        // (`set_public` refuses everything else), so a manifest by the same
+        // digest keeps nothing. A marker outliving its blob is worse than an
+        // orphaned label — it is a standing auth exemption for whatever those
+        // bytes are if they are ever re-inserted — so it goes the moment its
+        // subject does, with no grace window.
+        for digest in inner.public_digests()? {
+            let gone = swept.contains(&digest) || !inner.blob_exists(&digest);
+            if !gone {
+                continue;
+            }
+            if !policy.dry_run {
+                sparse::unlink_if_present(&inner.public_path_of(&digest))?;
+            }
+            report.publics_removed += 1;
+        }
+
         tracing::info!(
             scanned = report.scanned,
             removed = report.removed.len(),
@@ -322,11 +342,8 @@ mod tests {
         let s = store_in(&d);
         let member = s.insert_bytes(b"member".to_vec()).await.unwrap();
         let orphan = s.insert_bytes(b"orphan".to_vec()).await.unwrap();
-        let m = Manifest::new(KIND_GENERIC).with_entry(
-            "member",
-            member.digest.clone(),
-            member.size,
-        );
+        let m =
+            Manifest::new(KIND_GENERIC).with_entry("member", member.digest.clone(), member.size);
         let md = s.put_manifest(&m).await.unwrap();
         s.set_tag(&TagName::parse("bundle").unwrap(), &md)
             .await
@@ -344,11 +361,8 @@ mod tests {
         let d = tmpdir();
         let s = store_in(&d);
         let member = s.insert_bytes(b"member".to_vec()).await.unwrap();
-        let m = Manifest::new(KIND_GENERIC).with_entry(
-            "member",
-            member.digest.clone(),
-            member.size,
-        );
+        let m =
+            Manifest::new(KIND_GENERIC).with_entry("member", member.digest.clone(), member.size);
         let md = s.put_manifest(&m).await.unwrap();
 
         let r = collect(&s, now_policy()).await.unwrap();
@@ -477,6 +491,35 @@ mod tests {
         assert!(r.bytes_freed >= 200_000, "freed {}", r.bytes_freed);
     }
 
+    /// A public marker outliving its blob is a standing auth exemption for
+    /// whatever bytes are re-inserted under that digest later. It goes the
+    /// moment its subject does, and a marker whose subject survived does not.
+    #[tokio::test]
+    async fn public_markers_outliving_their_blob_are_swept() {
+        let d = tmpdir();
+        let s = store_in(&d);
+
+        let kept = s.insert_bytes(b"kept".to_vec()).await.unwrap();
+        let doomed = s.insert_bytes(b"doomed".to_vec()).await.unwrap();
+        s.set_tag(&TagName::parse("keep").unwrap(), &kept.digest)
+            .await
+            .unwrap();
+        s.set_public(&kept.digest).await.unwrap();
+        s.set_public(&doomed.digest).await.unwrap();
+
+        let report = collect(&s, now_policy()).await.unwrap();
+        assert_eq!(report.removed, vec![doomed.digest.clone()]);
+        assert_eq!(
+            report.publics_removed, 1,
+            "the orphaned marker goes with its blob"
+        );
+        assert!(
+            s.is_public(&kept.digest).await.unwrap(),
+            "a marker whose subject survived is untouched",
+        );
+        assert!(!s.is_public(&doomed.digest).await.unwrap());
+    }
+
     #[test]
     fn find_hint_names_the_blob_path() {
         let p = Pin {
@@ -507,9 +550,14 @@ mod tests {
 
         let kept = s.insert_bytes(b"kept".to_vec()).await.unwrap();
         let doomed = s.insert_bytes(b"doomed".to_vec()).await.unwrap();
-        s.set_tag(&TagName::parse("keep").unwrap(), &kept.digest).await.unwrap();
+        s.set_tag(&TagName::parse("keep").unwrap(), &kept.digest)
+            .await
+            .unwrap();
 
-        for (digest, name) in [(&kept.digest, "the kept one"), (&doomed.digest, "the doomed one")] {
+        for (digest, name) in [
+            (&kept.digest, "the kept one"),
+            (&doomed.digest, "the doomed one"),
+        ] {
             s.set_label(digest, &crate::Label::new(Some(name.into()), None).unwrap())
                 .await
                 .unwrap();
@@ -517,7 +565,10 @@ mod tests {
 
         let report = collect(&s, now_policy()).await.unwrap();
         assert_eq!(report.removed, vec![doomed.digest.clone()]);
-        assert_eq!(report.labels_removed, 1, "the orphaned label goes with its blob");
+        assert_eq!(
+            report.labels_removed, 1,
+            "the orphaned label goes with its blob"
+        );
 
         assert!(
             s.get_label(&kept.digest).await.unwrap().is_some(),
@@ -533,9 +584,12 @@ mod tests {
         let d = tmpdir();
         let s = store_in(&d);
         let doomed = s.insert_bytes(b"doomed".to_vec()).await.unwrap();
-        s.set_label(&doomed.digest, &crate::Label::new(Some("x".into()), None).unwrap())
-            .await
-            .unwrap();
+        s.set_label(
+            &doomed.digest,
+            &crate::Label::new(Some("x".into()), None).unwrap(),
+        )
+        .await
+        .unwrap();
 
         let report = collect(
             &s,
@@ -560,10 +614,15 @@ mod tests {
         let blob = s.insert_bytes(b"entry".to_vec()).await.unwrap();
         let m = crate::Manifest::new(KIND_GENERIC).with_entry("f", blob.digest.clone(), blob.size);
         let md = s.put_manifest(&m).await.unwrap();
-        s.set_tag(&TagName::parse("bundle").unwrap(), &md).await.unwrap();
-        s.set_label(&md, &crate::Label::new(Some("a bundle".into()), None).unwrap())
+        s.set_tag(&TagName::parse("bundle").unwrap(), &md)
             .await
             .unwrap();
+        s.set_label(
+            &md,
+            &crate::Label::new(Some("a bundle".into()), None).unwrap(),
+        )
+        .await
+        .unwrap();
 
         let report = collect(&s, now_policy()).await.unwrap();
         assert_eq!(report.labels_removed, 0);
