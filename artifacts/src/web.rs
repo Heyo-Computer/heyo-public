@@ -88,17 +88,23 @@ impl Default for Shell {
     /// explanation. Every page rendered from a real request stamps the theme
     /// server-side and does not flash at all.
     fn default() -> Self {
-        Shell { attrs: String::new(), who: None, signout: false }
+        Shell {
+            attrs: String::new(),
+            who: None,
+            signout: false,
+        }
     }
 }
 
 pub fn shell(st: &WebState, headers: &header::HeaderMap) -> Shell {
-    let cookies = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok());
+    let cookies = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
     Shell {
         attrs: st.ui.attrs(cookies),
-        who: if st.gate { forwarded_identity(headers).map(|i| i.display().to_string()) } else { None },
+        who: if st.gate {
+            forwarded_identity(headers).map(|i| i.display().to_string())
+        } else {
+            None
+        },
         signout: st.auth.is_some(),
     }
 }
@@ -312,6 +318,7 @@ pub async fn blob_page(
     let d = Digest::parse(&digest).map_err(crate::Error::from)?;
     let info = st.store.stat(&d).await?;
     let label = st.store.get_label(&d).await?;
+    let public = st.store.is_public(&d).await?;
 
     // Which tags and manifests point here. Both lists are small enough to scan
     // directly; an index would be a second source of truth for something the
@@ -351,6 +358,9 @@ pub async fn blob_page(
                     (tile("Links", &info.nlink.to_string(),
                           Some(if info.nlink > 1 { "pinned by a materialization" }
                                else { "store entry only" })))
+                    (tile("Access", if public { "public" } else { "key required" },
+                          Some(if public { "anyone may GET this blob" }
+                               else { "downloads need the API key" })))
                 }
                 (sparsity_bar(&info, true))
             }
@@ -744,7 +754,11 @@ fn page(shell: &Shell, title: &str, active: &str, body: Markup) -> Markup {
     let nav: Vec<(&str, &str, bool)> = vec![
         ("Overview", "/dashboard", active == "/dashboard"),
         ("Blobs", "/dashboard/blobs", active == "/dashboard/blobs"),
-        ("Manifests", "/dashboard/manifests", active == "/dashboard/manifests"),
+        (
+            "Manifests",
+            "/dashboard/manifests",
+            active == "/dashboard/manifests",
+        ),
     ];
     html! {
         (DOCTYPE)
@@ -811,7 +825,6 @@ fn login_body(failed: bool) -> Markup {
         }
     }
 }
-
 
 /// What is specific to the artifacts dashboard, layered on `ui/heyo.css`.
 ///
@@ -981,7 +994,11 @@ mod tests {
     /// The shell these tests render against: default theme, nobody signed in
     /// by a gate, sign-out offered (the password dashboard's shape).
     fn test_shell() -> Shell {
-        Shell { attrs: r#"data-theme="dark""#.into(), who: None, signout: true }
+        Shell {
+            attrs: r#"data-theme="dark""#.into(),
+            who: None,
+            signout: true,
+        }
     }
 
     fn usage(logical: u64, allocated: u64, avail: u64, total: u64) -> Usage {
@@ -1016,7 +1033,10 @@ mod tests {
             // what a colourblind or forced-colors reader relies on.
             assert!(html.contains(word), "missing status word {word}");
             assert!(html.contains("% used"), "missing written percentage");
-            assert!(html.contains("aria-label"), "meter needs an accessible name");
+            assert!(
+                html.contains("aria-label"),
+                "meter needs an accessible name"
+            );
         }
     }
 
@@ -1041,14 +1061,26 @@ mod tests {
         assert!(html.contains("10%"));
 
         // A zero-length blob must not divide by zero or overflow the track.
-        let empty = BlobInfo { size: 0, allocated: 0, ..b.clone() };
+        let empty = BlobInfo {
+            size: 0,
+            allocated: 0,
+            ..b.clone()
+        };
         let html = sparsity_bar(&empty, false).into_string();
         assert!(html.contains("width:1.0%"), "{html}");
 
         // Allocation above logical size (a dense small file with metadata
         // overhead) must clamp rather than run past 100%.
-        let over = BlobInfo { size: 100, allocated: 4096, ..b.clone() };
-        assert!(sparsity_bar(&over, false).into_string().contains("width:100.0%"));
+        let over = BlobInfo {
+            size: 100,
+            allocated: 4096,
+            ..b.clone()
+        };
+        assert!(
+            sparsity_bar(&over, false)
+                .into_string()
+                .contains("width:100.0%")
+        );
     }
 
     #[test]
@@ -1080,7 +1112,10 @@ mod tests {
         // The shared top bar marks the current page with `aria-current`, which
         // is also what the stylesheet selects on — one signal, read by both a
         // screen reader and the border under the tab.
-        assert!(html.contains(r#"<a href="/dashboard" aria-current="page">Overview</a>"#), "{html}");
+        assert!(
+            html.contains(r#"<a href="/dashboard" aria-current="page">Overview</a>"#),
+            "{html}"
+        );
         assert!(html.contains("/dashboard/blobs"));
         assert!(html.contains(r#"data-theme="dark""#));
     }
@@ -1111,14 +1146,20 @@ mod tests {
         // `#rrggbb` here is a colour that will not follow the theme.
         for line in STYLE.lines() {
             let code = line.split("/*").next().unwrap_or("");
-            assert!(!code.contains('#'), "hard-coded colour in the local sheet: {line}");
+            assert!(
+                !code.contains('#'),
+                "hard-coded colour in the local sheet: {line}"
+            );
         }
     }
 
     #[tokio::test]
     async fn overview_renders_on_an_empty_store() {
         let (st, _dir) = state();
-        let html = overview(State(st), Default::default()).await.unwrap().into_string();
+        let html = overview(State(st), Default::default())
+            .await
+            .unwrap()
+            .into_string();
         assert!(html.contains("No blobs yet"));
         assert!(html.contains("effective capacity"));
     }
@@ -1299,7 +1340,10 @@ mod tests {
             .await
             .unwrap();
         st.store
-            .set_label(&md, &Label::new(Some("the nightly bundle".into()), None).unwrap())
+            .set_label(
+                &md,
+                &Label::new(Some("the nightly bundle".into()), None).unwrap(),
+            )
             .await
             .unwrap();
 
@@ -1312,7 +1356,10 @@ mod tests {
         .unwrap()
         .into_string();
         assert!(html.contains("<h2>the nightly bundle</h2>"), "{html}");
-        assert!(html.contains("bundle-v1"), "a manifest's tags belong on its page");
+        assert!(
+            html.contains("bundle-v1"),
+            "a manifest's tags belong on its page"
+        );
 
         // And it appears in the listing with both.
         let html = manifests_page(State(st), Default::default())
@@ -1334,11 +1381,17 @@ mod tests {
             .await
             .unwrap();
         st.store
-            .set_label(&blob.digest, &Label::new(Some("the web rootfs".into()), None).unwrap())
+            .set_label(
+                &blob.digest,
+                &Label::new(Some("the web rootfs".into()), None).unwrap(),
+            )
             .await
             .unwrap();
 
-        let html = overview(State(st), Default::default()).await.unwrap().into_string();
+        let html = overview(State(st), Default::default())
+            .await
+            .unwrap()
+            .into_string();
         assert!(html.contains("What it is"));
         assert!(html.contains("the web rootfs"));
     }
@@ -1362,7 +1415,10 @@ mod tests {
             .unwrap();
 
         for html in [
-            blobs_page(State(st.clone()), Default::default()).await.unwrap().into_string(),
+            blobs_page(State(st.clone()), Default::default())
+                .await
+                .unwrap()
+                .into_string(),
             blob_page(
                 State(st.clone()),
                 Default::default(),
@@ -1374,7 +1430,10 @@ mod tests {
         ] {
             assert!(!html.contains("<script>alert(1)</script>"), "{html}");
             assert!(!html.contains("<img src=x"), "{html}");
-            assert!(html.contains("&lt;script&gt;"), "escaped rather than dropped");
+            assert!(
+                html.contains("&lt;script&gt;"),
+                "escaped rather than dropped"
+            );
         }
     }
 }

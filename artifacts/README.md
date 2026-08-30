@@ -253,6 +253,7 @@ GET    /manifests            the manifests, with labels and tags
 PUT    /manifests            returns the manifest's digest
 GET    /tags                 GET|PUT|DELETE /tags/{name}
 GET    /labels/{ref}         GET|PUT|DELETE — a name and description by ref
+GET    /public/{ref}         GET|PUT|DELETE — anonymous-download flag by ref
 GET    /usage
 ```
 
@@ -273,6 +274,16 @@ Everything except `/healthz` sits behind `ART_API_KEY` when one is set
 so the comparison cannot leak the key's length). `/healthz` stays open on
 purpose: a readiness probe carries no credentials, and a health endpoint behind
 auth reports the service unhealthy the day the key rotates.
+
+One more thing may be open, and only ever on purpose: a blob marked public
+(`PUT /public/{ref}`, or `art public <ref>`) answers anonymous `GET`/`HEAD
+/blobs/{digest}` — download only. The flag is per-blob and resolves through
+tags the way labels do, but it exempts nothing else: listings, manifests and
+every mutating route still need the key, and a request that *presents* a wrong
+key is rejected even for a public blob, so a stale credential fails loudly
+instead of silently downgrading to anonymous. `art public --off <ref>` (or
+`DELETE /public/{ref}`) closes it again, and GC removes a marker the moment
+its blob is swept — a re-inserted blob starts private.
 
 There is deliberately **no `materialize` route and no `gc` route**. A hardlink
 cannot cross a wire, so asking for materialization remotely can only ever mean

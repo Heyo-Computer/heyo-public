@@ -109,6 +109,17 @@ pub enum Command {
         #[arg(long, conflicts_with_all = ["name", "description"])]
         clear: bool,
     },
+    /// Make a blob downloadable without a credential, or private again.
+    ///
+    /// Public means exactly one thing: `GET /blobs/{digest}` (and `HEAD`)
+    /// answers an anonymous request. Listings, manifests, tags and every
+    /// mutating route still require the API key.
+    Public {
+        reference: String,
+        /// Make it private again.
+        #[arg(long)]
+        off: bool,
+    },
     /// Point a tag at a digest.
     Tag { name: String, reference: String },
     /// Remove a tag. The blob it named becomes collectable.
@@ -302,8 +313,8 @@ pub fn exit_code(e: &Error) -> i32 {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let config = Config::resolve(cli.root.clone(), cli.min_free_bytes, None)
-        .map_err(|m| Error::Io {
+    let config =
+        Config::resolve(cli.root.clone(), cli.min_free_bytes, None).map_err(|m| Error::Io {
             context: m,
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad configuration"),
         })?;
@@ -388,7 +399,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("size       {} ({})", info.size, human(info.size));
                 println!("allocated  {} ({})", info.allocated, human(info.allocated));
                 println!("links      {}", info.nlink);
-                println!("outstanding materializations {}", info.nlink.saturating_sub(1));
+                println!(
+                    "outstanding materializations {}",
+                    info.nlink.saturating_sub(1)
+                );
             }
         }
 
@@ -456,6 +470,33 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        Command::Public { reference, off } => {
+            // `resolve_blob`, not `resolve`: public is a property of bytes
+            // someone will download, so a tag or single-entry manifest marks
+            // the blob it names, and a multi-entry manifest is refused as
+            // ambiguous rather than half-published.
+            let d = store.resolve_blob(&parse_ref(&reference)?).await?;
+            if off {
+                let removed = store.remove_public(&d).await?;
+                if json {
+                    print_json(
+                        &serde_json::json!({"digest": d.as_str(), "public": false, "removed": removed}),
+                    );
+                } else if removed {
+                    println!("{d} is private again");
+                } else {
+                    println!("{d} was not public");
+                }
+            } else {
+                store.set_public(&d).await?;
+                if json {
+                    print_json(&serde_json::json!({"digest": d.as_str(), "public": true}));
+                } else {
+                    println!("{d} is public: GET /blobs/{d} now needs no credential");
+                }
+            }
+        }
+
         Command::Tag { name, reference } => {
             let t = TagName::parse(&name)?;
             let d = store.resolve(&parse_ref(&reference)?).await?;
@@ -492,11 +533,19 @@ pub async fn run(cli: Cli) -> Result<()> {
 
         Command::Verify { reference, all } => {
             let targets: Vec<Digest> = if all {
-                store.list_blobs().await?.into_iter().map(|b| b.digest).collect()
+                store
+                    .list_blobs()
+                    .await?
+                    .into_iter()
+                    .map(|b| b.digest)
+                    .collect()
             } else {
                 let r = reference.ok_or_else(|| Error::Io {
                     context: "verify needs a reference or --all".into(),
-                    source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing argument"),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "missing argument",
+                    ),
                 })?;
                 vec![store.resolve_blob(&parse_ref(&r)?).await?]
             };
@@ -564,20 +613,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             dashboard_open,
             dashboard_gate,
         } => {
-            let dashboard =
-                crate::config::DashboardAccess::resolve(
-                    admin_password,
-                    admin_user,
-                    dashboard_open,
-                    dashboard_gate,
-                )
-                    .map_err(|m| Error::Io {
-                        context: m,
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "bad configuration",
-                        ),
-                    })?;
+            let dashboard = crate::config::DashboardAccess::resolve(
+                admin_password,
+                admin_user,
+                dashboard_open,
+                dashboard_gate,
+            )
+            .map_err(|m| Error::Io {
+                context: m,
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad configuration"),
+            })?;
             // `Store::open` above already created the layout, so the daemon
             // starts against a store that exists.
             crate::http::serve(
@@ -842,10 +887,7 @@ async fn list(store: &Store, what: &LsWhat, json: bool) -> Result<()> {
                     .await
                     .map(|m| m.kind)
                     .unwrap_or_else(|_| "?".into());
-                println!(
-                    "{d}  {kind}  {}",
-                    describe_row(labels.get(&d), &tags, &d)
-                );
+                println!("{d}  {kind}  {}", describe_row(labels.get(&d), &tags, &d));
             }
         }
     } else {
@@ -884,10 +926,7 @@ fn read_stdin_string() -> Result<String> {
 }
 
 /// The tag names pointing at a digest.
-fn tag_names(
-    tags: &std::collections::HashMap<Digest, Vec<TagName>>,
-    d: &Digest,
-) -> Vec<String> {
+fn tag_names(tags: &std::collections::HashMap<Digest, Vec<TagName>>, d: &Digest) -> Vec<String> {
     tags.get(d)
         .map(|ts| ts.iter().map(|t| t.as_str().to_string()).collect())
         .unwrap_or_default()
@@ -914,12 +953,7 @@ fn describe_row(
     parts.join("  ")
 }
 
-async fn run_heyvm(
-    store: &Store,
-    config: &Config,
-    cmd: HeyvmCommand,
-    json: bool,
-) -> Result<()> {
+async fn run_heyvm(store: &Store, config: &Config, cmd: HeyvmCommand, json: bool) -> Result<()> {
     match cmd {
         HeyvmCommand::Sparsify {
             names,
@@ -1218,7 +1252,14 @@ mod tests {
     #[test]
     fn parses_a_representative_command_line() {
         let cli = Cli::try_parse_from([
-            "art", "--json", "--root", "/srv/art", "gc", "--dry-run", "--min-age", "2h",
+            "art",
+            "--json",
+            "--root",
+            "/srv/art",
+            "gc",
+            "--dry-run",
+            "--min-age",
+            "2h",
         ])
         .unwrap();
         assert!(cli.json);
@@ -1234,12 +1275,10 @@ mod tests {
 
     #[test]
     fn heyvm_subcommands_parse() {
-        let cli =
-            Cli::try_parse_from(["art", "heyvm", "sparsify", "--dry-run", "debian-hermes"]).unwrap();
+        let cli = Cli::try_parse_from(["art", "heyvm", "sparsify", "--dry-run", "debian-hermes"])
+            .unwrap();
         match cli.command {
-            Command::Heyvm(HeyvmCommand::Sparsify {
-                names, dry_run, ..
-            }) => {
+            Command::Heyvm(HeyvmCommand::Sparsify { names, dry_run, .. }) => {
                 assert!(dry_run);
                 assert_eq!(names, vec!["debian-hermes".to_string()]);
             }
@@ -1296,8 +1335,8 @@ mod tests {
             other => panic!("expected Dockerfile Put, got {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["art", "dockerfile", "export", "web-rootfs", "/tmp/b"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["art", "dockerfile", "export", "web-rootfs", "/tmp/b"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Dockerfile(DockerfileCommand::Export { .. })
@@ -1346,10 +1385,7 @@ mod tests {
             }),
             EXIT_NO_SPACE
         );
-        assert_eq!(
-            exit_code(&Error::TagNotFound("x".into())),
-            EXIT_FAILURE
-        );
+        assert_eq!(exit_code(&Error::TagNotFound("x".into())), EXIT_FAILURE);
         assert_eq!(
             exit_code(&Error::Digest(crate::digest::DigestError::BadChar)),
             EXIT_USAGE
