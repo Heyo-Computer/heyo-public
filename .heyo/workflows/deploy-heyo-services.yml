@@ -282,7 +282,16 @@ jobs:
           #!/usr/bin/env sh
           set -eu
           : "${APP_LB_STATE_PATH:=/workspace/state/app-lb-state.json}"
-          export APP_LB_STATE_PATH
+          : "${APP_LB_SECRETS_PATH:=/workspace/state/app-lb-secrets.json}"
+          : "${APP_LB_TOKENS_PATH:=/workspace/state/app-lb-tokens.json}"
+          : "${APP_LB_GUARD_PATH:=/workspace/state/app-lb-guard.json}"
+          : "${APP_LB_AUTH_KEY:=/workspace/state/app-lb-auth-key}"
+          : "${APP_LB_ACME_DIR:=/workspace/state/acme}"
+          : "${APP_LB_BUILD_DIR:=/workspace/state/builds}"
+          : "${APP_LB_MOUNTS_DIR:=/workspace/state/mounts}"
+          : "${APP_LB_WORKSPACES_DIR:=/workspace/state/workspaces}"
+          export APP_LB_STATE_PATH APP_LB_SECRETS_PATH APP_LB_TOKENS_PATH APP_LB_GUARD_PATH
+          export APP_LB_AUTH_KEY APP_LB_ACME_DIR APP_LB_BUILD_DIR APP_LB_MOUNTS_DIR APP_LB_WORKSPACES_DIR
           if [ -z "${APP_LB_DAEMON_URL:-}" ]; then
             host_gateway="$(ip -4 route show default | awk 'NR == 1 { print $3 }')"
             if [ -z "$host_gateway" ]; then
@@ -292,14 +301,11 @@ jobs:
             APP_LB_DAEMON_URL="http://${host_gateway}:3000"
             export APP_LB_DAEMON_URL
           fi
-          mkdir -p "$(dirname "$APP_LB_STATE_PATH")"
+          mkdir -p "$(dirname "$APP_LB_STATE_PATH")" "$APP_LB_ACME_DIR" "$APP_LB_BUILD_DIR" "$APP_LB_MOUNTS_DIR" "$APP_LB_WORKSPACES_DIR"
           state_dir="${APP_LB_STATE_PATH%.*}.d"
           if [ ! -e "$APP_LB_STATE_PATH" ] && [ ! -d "$state_dir" ]; then
             cp /workspace/bootstrap-state.json "$APP_LB_STATE_PATH"
           fi
-          : "${HEYO_SERVICE_LOG:=/workspace/service.log}"
-          touch "$HEYO_SERVICE_LOG" 2>/dev/null || true
-          exec >>"$HEYO_SERVICE_LOG" 2>&1
           exec ./app-lb
           EOF
               ;;
