@@ -2053,6 +2053,7 @@ async fn wait_for_candidate_health(
     deadline: tokio::time::Instant,
 ) -> Result<(String, String, String)> {
     let mut backend_urls = Vec::new();
+    let mut discovery_backend_url = None;
     let mut route_backend_url = None;
     let mut attempts: u64 = 0;
     let mut retry_delay = Duration::from_secs(1);
@@ -2081,21 +2082,24 @@ async fn wait_for_candidate_health(
         match cloud_client::deployment_healthcheck_urls(state, deployment_id).await {
             Ok(urls) => {
                 if let Some(url) = urls.probe_url() {
-                    route_backend_url = Some(url);
+                    route_backend_url = Some(url.clone());
+                    backend_urls.clear();
+                    backend_urls.push(url);
                 }
                 match urls.internal_url() {
                     Some(url) => match service_discovery::validate_endpoint_url(&url) {
                         Ok(()) => {
-                            backend_urls.clear();
-                            backend_urls.push(url);
+                            discovery_backend_url = Some(url);
                         }
                         Err(error) => {
+                            discovery_backend_url = None;
                             last_error = format!(
                                 "candidate internal endpoint is not suitable for service discovery: {error}"
                             );
                         }
                     },
                     None => {
+                        discovery_backend_url = None;
                         last_error =
                             "candidate internal service endpoint is not available yet".to_string();
                     }
@@ -2114,23 +2118,36 @@ async fn wait_for_candidate_health(
             let request = state
                 .http_client
                 .get(&health_url)
+                .header(reqwest::header::ACCEPT, "application/json")
                 .timeout(Duration::from_secs(SERVICE_HEALTH_REQUEST_TIMEOUT_SECONDS));
 
             match request.send().await {
-                Ok(response) if response.status().is_success() => {
-                    let (discovery_url, route_url) = candidate_endpoint_urls(
-                        backend_url,
-                        route_backend_url.as_deref(),
-                    );
-                    return Ok((
-                        discovery_url,
-                        route_url,
-                        health_url,
-                    ));
-                }
                 Ok(response) => {
-                    last_error = format!("{} returned HTTP {}", health_url, response.status());
-                    warn!(health_url, status = %response.status(), "candidate health check returned non-success");
+                    let booting = response
+                        .headers()
+                        .get("x-heyo-boot")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("starting");
+                    if response.status().is_success() && !booting {
+                        let Some(discovery_backend_url) = discovery_backend_url.as_deref() else {
+                            last_error =
+                                "candidate is healthy but its internal service endpoint is not available yet"
+                                    .to_string();
+                            continue;
+                        };
+                        let (discovery_url, route_url) = candidate_endpoint_urls(
+                            discovery_backend_url,
+                            route_backend_url.as_deref(),
+                        );
+                        return Ok((discovery_url, route_url, health_url));
+                    }
+                    if booting {
+                        last_error =
+                            format!("{health_url} reported that the sandbox is still starting");
+                    } else {
+                        last_error = format!("{} returned HTTP {}", health_url, response.status());
+                    }
+                    warn!(health_url, status = %response.status(), booting, "candidate health check returned non-success");
                 }
                 Err(error) => {
                     last_error = format!("{health_url} could not be reached: {error}");
