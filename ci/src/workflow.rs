@@ -169,6 +169,38 @@ pub enum Fallback {
     Any,
 }
 
+/// `with:` values as text, whatever scalar the author wrote them as. A bare
+/// `true`, `3` or `1.5` becomes its YAML spelling; `~`/null becomes the empty
+/// string, which every consumer already treats as unset; a list or a mapping
+/// is refused, since there is no one string it could mean.
+fn with_scalars<'de, D>(d: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: BTreeMap<String, serde_yaml::Value> = Deserialize::deserialize(d)?;
+    raw.into_iter()
+        .map(|(k, v)| {
+            let text = match v {
+                serde_yaml::Value::String(s) => s,
+                serde_yaml::Value::Bool(b) => b.to_string(),
+                serde_yaml::Value::Number(n) => n.to_string(),
+                serde_yaml::Value::Null => String::new(),
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "`with.{k}` must be a scalar, not {}",
+                        match other {
+                            serde_yaml::Value::Sequence(_) => "a list",
+                            serde_yaml::Value::Mapping(_) => "a mapping",
+                            _ => "a tagged value",
+                        }
+                    )));
+                }
+            };
+            Ok((k, text))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -180,7 +212,14 @@ pub struct Step {
     pub condition: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uses: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// Inputs to `uses:`. Strings, so they can be substituted — but taken
+    /// from any YAML scalar, because an author writes `public: true` and
+    /// `retries: 3` as the bare values they are, not `"true"` and `"3"`.
+    #[serde(
+        default,
+        deserialize_with = "with_scalars",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub with: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
@@ -805,6 +844,39 @@ impl std::error::Error for WorkflowError {}
 #[cfg(test)]
 mod repo_workflow_files {
     /// The workflows this repository actually runs must stay parseable by the
+    /// `with:` values are strings so they can be substituted, and a YAML
+    /// author writes `public: true` as a bare boolean. serde_yaml hands a
+    /// plain scalar to a `String` field as its text — this pins that, because
+    /// the alternative is every upload step having to quote `"true"`.
+    #[test]
+    fn a_bare_yaml_boolean_in_with_arrives_as_its_text() {
+        fn with_block(extra: &str) -> String {
+            format!(
+                "name: w\njobs:\n  build:\n    vm:\n      driver: kvm\n      image: ubuntu:24.04\n    steps:\n      - uses: ci/upload-artifact\n        with:\n          name: dist\n          {extra}\n"
+            )
+        }
+        let wf = super::Workflow::parse("w.yml", &with_block("path: dist\n          public: true"))
+            .unwrap();
+        let step = &wf.jobs[0].1.steps[0];
+        assert_eq!(step.with.get("public").map(String::as_str), Some("true"));
+
+        // Numbers and nulls likewise; a list is the one thing with no text.
+        let wf = super::Workflow::parse(
+            "w.yml",
+            &with_block("path: dist\n          retries: 3\n          description: ~"),
+        )
+        .unwrap();
+        let with = &wf.jobs[0].1.steps[0].with;
+        assert_eq!(with.get("retries").map(String::as_str), Some("3"));
+        assert_eq!(with.get("description").map(String::as_str), Some(""));
+        let err = super::Workflow::parse("w.yml", &with_block("path: [a, b]")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`with.path` must be a scalar, not a list"),
+            "{err}"
+        );
+    }
+
     /// parser that runs them. A syntax slip in `.ci/workflows/*.yml` otherwise
     /// surfaces as a run that never starts, on the server, after the push.
     #[test]

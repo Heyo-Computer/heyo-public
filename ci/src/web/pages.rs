@@ -1580,7 +1580,7 @@ pub fn run_page(
                 h2 { "Artifacts" }
                 div .scroll {
                     table {
-                        thead { tr { th { "Name" } th { "Sink" } th { "Size" } th { "Location" } } }
+                        thead { tr { th { "Name" } th { "Sink" } th { "Size" } th { "Location" } th { "Public link" } } }
                         tbody {
                             @for a in artifacts {
                                 tr {
@@ -1588,6 +1588,15 @@ pub fn run_page(
                                     td { (a.sink) }
                                     td { (human_bytes(a.size_bytes)) }
                                     td .mono { (a.uri) }
+                                    // The one thing a person comes to this
+                                    // table for when the upload was public:
+                                    // the URL, as a link, ready to copy.
+                                    td .mono {
+                                        @match &a.public_url {
+                                            Some(url) => a href=(url) { (url) },
+                                            None => "—",
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2292,6 +2301,7 @@ mod page_tests {
             digest: None,
             size_bytes: 4096,
             uri: "/var/lib/ci/dist".into(),
+            public_url: None,
         }];
         let html = run_page(
             &chrome(),

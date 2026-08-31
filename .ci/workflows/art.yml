@@ -195,3 +195,10 @@ jobs:
             release binary for x86_64-linux, with SHA256SUMS. What
             APP_LB_ART_BIN names on an app-lb host. Built from ${{ ci.branch }}.
           path: dist
+          # Fetchable by link with no ART_API_KEY once stored: the store marks
+          # the tarball's blob public, and the step log and the run page carry
+          # the `{store}/blobs/{digest}` URL. Download-only — the tag, the
+          # manifest and the store's listings stay behind the key, so
+          # `.ci/install.sh` (which resolves tags) still needs one; this is
+          # for a host or a person that was handed the link.
+          public: true

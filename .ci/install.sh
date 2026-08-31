@@ -27,6 +27,8 @@
 #
 #   ART_URL          Base URL of the `art serve` (required).
 #   ART_API_KEY      Bearer token for it (required unless the store is open).
+#                    Needed even though the tarballs are public: this script
+#                    resolves *tags*, and only the blobs behind them are open.
 #   PREFIX           Binaries go in $PREFIX/bin. Default /usr/local.
 #   STATE_ROOT       Per-service state. Default /var/lib. `ci`'s migrations land
 #                    in $STATE_ROOT/ci/migrations, which is what CI_MIGRATIONS_DIR
@@ -131,7 +133,7 @@ done
 ART_URL="${ART_URL%/}"
 
 if [ -z "$ART_API_KEY" ]; then
-  warn "ART_API_KEY is unset; this only works against a store started without ART_API_KEY"
+  warn "ART_API_KEY is unset; this only works against a store started without ART_API_KEY (the blobs are public, the tags this resolves are not)"
 fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/art-install.XXXXXX")"

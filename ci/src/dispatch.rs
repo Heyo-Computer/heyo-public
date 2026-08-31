@@ -2406,6 +2406,20 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 // it. Substituted like every other `with:` value, so a workflow
                 // can write `${{ ci.branch }}` into it.
                 let description = with("description").filter(|d| !d.trim().is_empty());
+                // Optional. YAML's `true` arrives as the string "true", since
+                // `with:` values are strings so they can be substituted. Only
+                // the two spellings a person would write are accepted; a
+                // typo must not silently mean "private".
+                let public = match with("public").as_deref().map(str::trim) {
+                    None | Some("") | Some("false") => false,
+                    Some("true") => true,
+                    Some(other) => {
+                        return Err(DispatchError::Artifact(format!(
+                            "ci/upload-artifact `with.public` must be `true` or `false`, \
+                             not {other:?}"
+                        )));
+                    }
+                };
 
                 // Packed to a file in the guest. Then, for a sink that offers
                 // a `GuestPush`, the guest pushes the tarball to the store
@@ -2483,6 +2497,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     workflow_id: run.map(|r| r.workflow_id).unwrap_or_default(),
                     name: name.clone(),
                     description,
+                    public,
                 };
 
                 // The fast path: the guest pushes the tarball to the store
@@ -2579,9 +2594,21 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 self.store
                     .record_artifact(&msg.run_id, &msg.job_id, &name, &stored)
                     .await?;
+                // The link is the point of `public: true`, so it goes in the
+                // log where a person reading the run will find it. A sink
+                // that has no such thing says so in the same place rather
+                // than dropping the request on the floor.
+                let public = match (&stored.public_url, public) {
+                    (Some(url), _) => format!("\n[ci] public link: {url}"),
+                    (None, true) => format!(
+                        "\n[ci] `public: true` was ignored: the {} sink has no public links",
+                        stored.sink
+                    ),
+                    (None, false) => String::new(),
+                };
                 Ok(format!(
                     "[ci] stored artifact {name:?} ({} bytes) in the {} sink as {} — \
-                     {how} in {transfer:.0?}\n",
+                     {how} in {transfer:.0?}{public}\n",
                     stored.size_bytes, stored.sink, stored.uri
                 ))
             }

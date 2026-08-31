@@ -80,6 +80,13 @@ points `CI_MIGRATIONS_DIR`. Nothing is restarted unless you pass `--restart`.
 `/usr/local/bin/art` in `app-lb.conf`. Without it the deployment's pool holds
 at zero replicas with "workspace restore pending: could not run art".
 
+Every upload above is `public: true`, so the tarball itself — not the tag — is
+fetchable by link with no key: the step log ends with `[ci] public link:
+https://art.us2.heyo.work/blobs/<digest>`, and the run page lists it. That is the
+URL to hand a host that should not hold `ART_API_KEY`. `install.sh` still needs
+the key, because it resolves tags to find the newest build and tags stay
+private; a public blob is a download, not a listing.
+
 ```sh
 sh .ci/install.sh --list            # what the store has, and what each thing is
 sh .ci/install.sh --dry-run         # fetch and verify, install nothing

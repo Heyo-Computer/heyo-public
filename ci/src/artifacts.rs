@@ -46,6 +46,19 @@
 //! `description:` said. A store fronted by `art serve` then lists "app-lb — the
 //! proxy and heyctl, release build" rather than twelve hex characters.
 //!
+//! ## Public links
+//!
+//! A workflow that says `public: true` on its upload wants the tarball
+//! fetchable by link — an install script on a fresh host, a download in a
+//! README — with no `ART_API_KEY` in hand. The store's `PUT /public/{digest}`
+//! is exactly that and no more: it opens anonymous `GET`/`HEAD /blobs/{digest}`
+//! for that one blob, while the tag, the manifest, every listing and every
+//! write stay behind the key. So the push flags the blob after naming it and
+//! reports the resulting `{store}/blobs/{digest}` as the artifact's public
+//! link. Refused rather than skipped when the store cannot do it: a build that
+//! promised a public link and produced a 401 has failed, however green the
+//! rest of it was.
+//!
 //! The push sequence is lifted from `app-lb/serverctl/src/artifact.rs`: hash,
 //! `HEAD /blobs/{digest}` (a 404 is an answer, not an error), `PUT
 //! /blobs/{digest}` with an explicit `Content-Length` so the store's free-space
@@ -66,6 +79,12 @@ pub struct StoredArtifact {
     pub size_bytes: u64,
     /// How to get it back — a path, an `s3://` URL, or a tag.
     pub uri: String,
+    /// Where anyone can fetch it with no credential, when the workflow asked
+    /// for that (`with.public: true`) and the sink could grant it. Only the
+    /// `artifacts` sink can — a blob it has marked public answers `GET
+    /// /blobs/{digest}` anonymously — so this is `None` for disk and S3
+    /// whatever the workflow said.
+    pub public_url: Option<String>,
 }
 
 /// Which run and job an artifact belongs to.
@@ -82,6 +101,11 @@ pub struct ArtifactRef {
     /// string: absent means "the workflow said nothing", and a sink with no
     /// concept of a description ignores it either way.
     pub description: Option<String>,
+    /// The workflow's `public: true`: once stored, the tarball should be
+    /// fetchable by anyone who has its link. Download-only — the store's
+    /// public flag opens `GET /blobs/{digest}` for that one digest and nothing
+    /// else, so the tag, the manifest and every listing stay behind the key.
+    pub public: bool,
 }
 
 /// What a guest needs to push a blob into the store itself: where, and as
@@ -185,6 +209,7 @@ impl ArtifactSink for DiskSink {
             digest: None,
             size_bytes: size,
             uri: path.to_string_lossy().into_owned(),
+            public_url: None,
         })
     }
 }
@@ -375,6 +400,17 @@ impl ArtifactsSink {
             .map_err(|e| ArtifactError::Transport(e.to_string()))?;
         check(put_tag, "setting a tag").await?;
 
+        // The public flag goes on the blob, by digest, after it is named and
+        // before the labels: a failure here must fail the upload — a workflow
+        // that asked for a public link and got a build that 401s on it has
+        // been lied to — but the tag is already set, so what a re-run sees
+        // is a store that dedups the bytes and only the flag to redo.
+        let public_url = if r.public {
+            Some(self.make_public(&digest).await?)
+        } else {
+            None
+        };
+
         // Both objects get a label, and they say different things: the blob is
         // the tarball, the manifest is the artifact. Which matters on the blob
         // page, where the only other thing on offer is a size.
@@ -397,7 +433,40 @@ impl ArtifactsSink {
             digest: Some(digest),
             size_bytes: size,
             uri: tag,
+            public_url,
         })
+    }
+
+    /// `PUT /public/{digest}`: open anonymous `GET /blobs/{digest}` for this
+    /// one blob. Returns the link to hand out — the store's answer carries a
+    /// path, and the base is the URL the orchestrator reaches the store by,
+    /// which is the one people reach it by too (`CI_ARTIFACT_GUEST_URL` is a
+    /// guest-only alias and never the link).
+    async fn make_public(&self, digest: &str) -> Result<String, ArtifactError> {
+        let base = &self.config.url;
+        let put = self
+            .auth(self.http.put(format!("{base}/public/{digest}")))
+            .send()
+            .await
+            .map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        // A store predating public downloads has no such route, and its 404
+        // looks exactly like "no such blob" — which cannot be, the blob was
+        // HEADed and tagged moments ago. Say what to do rather than "not
+        // found".
+        if put.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ArtifactError::Store {
+                what: "making the blob public".to_string(),
+                status: 404,
+                slug: "no_public_route".to_string(),
+                message: format!(
+                    "{base} answered 404 to PUT /public/{digest}; it predates public \
+                     downloads. Upgrade the store, or drop `public: true` from the \
+                     upload step"
+                ),
+            });
+        }
+        check(put, "making the blob public").await?;
+        Ok(format!("{base}/blobs/{digest}"))
     }
 }
 
@@ -594,6 +663,7 @@ mod tests {
             workflow_id: "myapp".into(),
             name: "binary.tar.gz".into(),
             description: None,
+            public: false,
         }
     }
 
@@ -639,6 +709,7 @@ mod tests {
             workflow_id: "..".into(),
             name: "..".into(),
             description: None,
+            public: false,
         };
         let tag = tag_for(&r);
         assert!(!tag.is_empty());
@@ -773,22 +844,43 @@ mod tests {
         blobs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
         manifests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         tags: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        /// Digests `PUT /public/{digest}` was called for.
+        publics: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl FakeStore {
         async fn start() -> Self {
+            Self::start_with(true).await
+        }
+
+        /// `public_route: false` plays a store from before public downloads
+        /// existed: `PUT /public/…` is an unknown route and 404s bare.
+        async fn start_with(public_route: bool) -> Self {
             use axum::{Router, extract::State, routing::put};
             #[derive(Clone)]
             struct St {
                 blobs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
                 manifests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
                 tags: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+                publics: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
             }
             let st = St {
                 blobs: Default::default(),
                 manifests: Default::default(),
                 tags: Default::default(),
+                publics: Default::default(),
             };
+            let public = Router::new().route(
+                "/public/{digest}",
+                put(
+                    |State(st): State<St>, axum::extract::Path(d): axum::extract::Path<String>| async move {
+                        st.publics.lock().unwrap().push(d.clone());
+                        axum::Json(serde_json::json!({
+                            "digest": d, "public": true, "url": format!("/blobs/{d}")
+                        }))
+                    },
+                ),
+            );
             let app = Router::new()
                 .route(
                     "/blobs/{digest}",
@@ -823,6 +915,7 @@ mod tests {
                         },
                     ),
                 )
+                .merge(if public_route { public } else { Router::new() })
                 .with_state(st.clone());
             use axum::response::IntoResponse;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -833,6 +926,7 @@ mod tests {
                 blobs: st.blobs,
                 manifests: st.manifests,
                 tags: st.tags,
+                publics: st.publics,
             }
         }
 
@@ -899,6 +993,57 @@ mod tests {
             tags.as_slice(),
             &[(tag_for(&aref()), "manifest-digest".to_string())]
         );
+        assert!(
+            store.publics.lock().unwrap().is_empty(),
+            "an artifact is private unless the workflow says otherwise"
+        );
+        assert_eq!(stored.public_url, None);
+    }
+
+    /// `public: true` flags the *blob* — the bytes a link fetches — and the
+    /// link it returns is the store's own `/blobs/{digest}`, absolute, under
+    /// the URL the orchestrator was configured with.
+    #[tokio::test]
+    async fn a_public_artifact_is_flagged_by_digest_and_returns_its_link() {
+        let store = FakeStore::start().await;
+        store.blobs.lock().unwrap().insert(DIGEST.into(), 3);
+        let r = ArtifactRef {
+            public: true,
+            ..aref()
+        };
+        let stored = store.sink().put_pushed(&r, DIGEST, 3).await.unwrap();
+        assert_eq!(
+            store.publics.lock().unwrap().as_slice(),
+            &[DIGEST.to_string()],
+            "the flag goes on the blob, not the manifest"
+        );
+        assert_eq!(
+            stored.public_url.as_deref(),
+            Some(format!("{}/blobs/{DIGEST}", store.url).as_str())
+        );
+        // The rest of the upload is unchanged by the flag.
+        assert_eq!(stored.uri, tag_for(&r));
+        assert_eq!(store.tags.lock().unwrap().len(), 1);
+    }
+
+    /// The flag is the last thing that changes the manifest's meaning to a
+    /// reader, so it must not be dropped quietly: a store without the route
+    /// fails the upload with the fix in the message, and the tag it had
+    /// already set is left in place for the re-run to dedup against.
+    #[tokio::test]
+    async fn a_store_without_public_downloads_fails_the_upload_loudly() {
+        let store = FakeStore::start_with(false).await;
+        store.blobs.lock().unwrap().insert(DIGEST.into(), 3);
+        let r = ArtifactRef {
+            public: true,
+            ..aref()
+        };
+        let err = store.sink().put_pushed(&r, DIGEST, 3).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("making the blob public"), "{text}");
+        assert!(text.contains("predates public downloads"), "{text}");
+        assert!(text.contains("public: true"), "{text}");
+        assert_eq!(store.tags.lock().unwrap().len(), 1, "named before flagged");
     }
 
     /// The store's slugs are machine-readable; the error turns them into what to

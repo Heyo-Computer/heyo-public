@@ -359,6 +359,9 @@ pub struct ArtifactRow {
     pub digest: Option<String>,
     pub size_bytes: i64,
     pub uri: String,
+    /// The credential-free download link, for an artifact uploaded with
+    /// `public: true` to a sink that could grant it.
+    pub public_url: Option<String>,
 }
 
 /// A registered repository.
@@ -1373,8 +1376,8 @@ impl Store {
         stored: &crate::artifacts::StoredArtifact,
     ) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO ci_artifact (id, run_id, job_id, name, sink, digest, size_bytes, uri)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "INSERT INTO ci_artifact (id, run_id, job_id, name, sink, digest, size_bytes, uri, public_url)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
         )
         .bind(crate::vm::new_id())
         .bind(run_id)
@@ -1384,6 +1387,7 @@ impl Store {
         .bind(&stored.digest)
         .bind(stored.size_bytes as i64)
         .bind(&stored.uri)
+        .bind(&stored.public_url)
         .execute(&self.pool)
         .await
         .map_err(StoreError::sql)?;
@@ -1404,6 +1408,7 @@ impl Store {
                 digest: r.get("digest"),
                 size_bytes: r.get("size_bytes"),
                 uri: r.get("uri"),
+                public_url: r.get("public_url"),
             })
             .collect())
     }

@@ -174,6 +174,11 @@ jobs:
           # manifest is addressed by its own hash, so wording in one would give
           # two builds of identical bytes two digests as soon as it changed.
           description: The app binary for ${{ matrix.target }}, release build.
+          # Optional; `artifacts` sink only. Marks the stored blob public so
+          # `{store}/blobs/{digest}` downloads with no credential — the link
+          # is printed in the step log and shown on the run page. Nothing
+          # else opens: tags, manifests and listings still need the key.
+          public: true
 
   deploy:
     uses: prod-runners              # any online host in that network
@@ -908,6 +913,17 @@ parquet. Chunked, each exec has its own timeout regardless of the artifact's
 size, and the whole transfer is bounded by the step's `timeout-minutes` — so a
 genuinely enormous artifact fails as the step's timeout, with the chunk count in
 the log, rather than as a daemon-side kill with a thousand lines of base64.
+
+`public: true` on the step asks the `artifacts` sink to mark the blob public
+once it is named: `PUT /public/{digest}`, which opens anonymous `GET`/`HEAD
+/blobs/{digest}` for that digest and nothing else. The resulting
+`{CI_ARTIFACT_URL}/blobs/{digest}` is logged as `[ci] public link: …`, recorded
+in `ci_artifact.public_url`, and shown on the run page. A store too old to have
+the route fails the step with the fix in the message rather than storing a
+private artifact under a workflow that promised a public one; the disk and S3
+sinks have no public links and say so in the log instead. Note that
+`.ci/install.sh` resolves *tags*, which stay behind the key — the public link is
+for whoever was handed it.
 
 Both directions end with a hash check. Every chunk exec exiting 0 says the shell
 ran; the sha256 says the bytes are the ones the guest holds, and a mismatch
