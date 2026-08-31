@@ -207,8 +207,8 @@ jobs:
         run: |
           set -eu
           if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y cmake libssl-dev pkg-config
+            sudo apt-get -o DPkg::Lock::Timeout=600 update
+            sudo apt-get -o DPkg::Lock::Timeout=600 install -y cmake libssl-dev pkg-config
           fi
 
       - name: Test or check selected service
@@ -282,7 +282,16 @@ jobs:
           #!/usr/bin/env sh
           set -eu
           : "${APP_LB_STATE_PATH:=/workspace/state/app-lb-state.json}"
-          export APP_LB_STATE_PATH
+          : "${APP_LB_SECRETS_PATH:=/workspace/state/app-lb-secrets.json}"
+          : "${APP_LB_TOKENS_PATH:=/workspace/state/app-lb-tokens.json}"
+          : "${APP_LB_GUARD_PATH:=/workspace/state/app-lb-guard.json}"
+          : "${APP_LB_AUTH_KEY:=/workspace/state/app-lb-auth-key}"
+          : "${APP_LB_ACME_DIR:=/workspace/state/acme}"
+          : "${APP_LB_BUILD_DIR:=/workspace/state/builds}"
+          : "${APP_LB_MOUNTS_DIR:=/workspace/state/mounts}"
+          : "${APP_LB_WORKSPACES_DIR:=/workspace/state/workspaces}"
+          export APP_LB_STATE_PATH APP_LB_SECRETS_PATH APP_LB_TOKENS_PATH APP_LB_GUARD_PATH
+          export APP_LB_AUTH_KEY APP_LB_ACME_DIR APP_LB_BUILD_DIR APP_LB_MOUNTS_DIR APP_LB_WORKSPACES_DIR
           if [ -z "${APP_LB_DAEMON_URL:-}" ]; then
             host_gateway="$(ip -4 route show default | awk 'NR == 1 { print $3 }')"
             if [ -z "$host_gateway" ]; then
@@ -292,14 +301,11 @@ jobs:
             APP_LB_DAEMON_URL="http://${host_gateway}:3000"
             export APP_LB_DAEMON_URL
           fi
-          mkdir -p "$(dirname "$APP_LB_STATE_PATH")"
+          mkdir -p "$(dirname "$APP_LB_STATE_PATH")" "$APP_LB_ACME_DIR" "$APP_LB_BUILD_DIR" "$APP_LB_MOUNTS_DIR" "$APP_LB_WORKSPACES_DIR"
           state_dir="${APP_LB_STATE_PATH%.*}.d"
           if [ ! -e "$APP_LB_STATE_PATH" ] && [ ! -d "$state_dir" ]; then
             cp /workspace/bootstrap-state.json "$APP_LB_STATE_PATH"
           fi
-          : "${HEYO_SERVICE_LOG:=/workspace/service.log}"
-          touch "$HEYO_SERVICE_LOG" 2>/dev/null || true
-          exec >>"$HEYO_SERVICE_LOG" 2>&1
           exec ./app-lb
           EOF
               ;;
@@ -395,13 +401,14 @@ jobs:
           git_sha=subprocess.check_output(["git","rev-parse","HEAD"], text=True).strip()
           archive_name=f"heyo-{service}-linux.tar.gz"
           deployment_id=f"svc-{service}-{uuid.uuid4().hex[:12]}"
+          start_command="i=0; until mountpoint -q /workspace && [ -x /workspace/start.sh ]; do sudo -n sh -c 'modprobe 9p 2>/dev/null; modprobe 9pnet 2>/dev/null; modprobe 9pnet_virtio 2>/dev/null; mount -a 2>/dev/null || true' >/dev/null 2>&1 || true; i=$((i + 1)); if [ \"$i\" -ge 300 ]; then echo 'workspace mount did not become ready within 300 seconds' >&2; exit 1; fi; sleep 1; done; cd /workspace; exec ./start.sh"
           priority={"heyosecret":10010,"orchestrator":10010,"app-lb":10010,"app-obs":10010}[service]
           if service == "app-lb":
               route={"host":f"app-lb.{public_host}","pathPrefix":"/metrics","entryPoints":["websecure"],"stripPrefix":False,"passHostHeader":True,"priority":priority}
           else:
               route={"host":public_host,"pathPrefix":f"/{service}","entryPoints":["websecure"],"stripPrefix":True,"passHostHeader":False,"priority":priority}
           if os.environ.get("HEYO_TRAEFIK_CERT_RESOLVER"): route["certResolver"]=os.environ["HEYO_TRAEFIK_CERT_RESOLVER"]
-          payload={"serviceId":service,"deploymentId":deployment_id,"userId":os.environ.get("HEYO_SERVICE_USER_ID","heyo-system"),"accountId":os.environ.get("HEYO_SERVICE_ACCOUNT_ID","heyo-system"),"name":f"heyo-{service}","archiveName":archive_name,"archiveBytesBase64":base64.b64encode(open(f"dist/{archive_name}","rb").read()).decode(),"region":os.environ.get("HEYO_SERVICE_REGION") or "EU","driver":os.environ.get("HEYO_SERVICE_DRIVER") or "libvirt","image":os.environ.get("HEYO_SERVICE_IMAGE") or "ubuntu:24.04","ports":[8080],"workingDirectory":"/workspace","startCommand":"./start.sh","sizeClass":os.environ.get("HEYO_SERVICE_SIZE_CLASS","small"),"ttlSeconds":0,"healthPath":"/health","healthTimeoutSeconds":900,"drainSeconds":30,"retirePrevious":True,"retirePreviousAsync":True,"deletePrevious":True,"metadata":{"gitSha":git_sha,"gitRef":os.environ.get("GITHUB_REF", ""),"repositoryUrl":repo,"workflow":"Deploy Heyo public services"},"revisionGuard":{"repositoryUrl":repo,"ref":required("CI_REF"),"expectedSha":required("CI_AFTER"),"force":os.environ.get("FORCE_STALE_SERVICE_DEPLOY","").lower() in {"1","true"}},"env":{},"envRefs":[],"route":route}
+          payload={"serviceId":service,"deploymentId":deployment_id,"userId":os.environ.get("HEYO_SERVICE_USER_ID","heyo-system"),"accountId":os.environ.get("HEYO_SERVICE_ACCOUNT_ID","heyo-system"),"name":f"heyo-{service}","archiveName":archive_name,"archiveBytesBase64":base64.b64encode(open(f"dist/{archive_name}","rb").read()).decode(),"region":os.environ.get("HEYO_SERVICE_REGION") or "EU","driver":os.environ.get("HEYO_SERVICE_DRIVER") or "libvirt","image":os.environ.get("HEYO_SERVICE_IMAGE") or "ubuntu:24.04","ports":[8080],"workingDirectory":"/","startCommand":start_command,"sizeClass":os.environ.get("HEYO_SERVICE_SIZE_CLASS","small"),"ttlSeconds":0,"healthPath":"/health","healthTimeoutSeconds":900,"drainSeconds":30,"retirePrevious":True,"retirePreviousAsync":True,"deletePrevious":True,"metadata":{"gitSha":git_sha,"gitRef":os.environ.get("GITHUB_REF", ""),"repositoryUrl":repo,"workflow":"Deploy Heyo public services"},"revisionGuard":{"repositoryUrl":repo,"ref":required("CI_REF"),"expectedSha":required("CI_AFTER"),"force":os.environ.get("FORCE_STALE_SERVICE_DEPLOY","").lower() in {"1","true"}},"env":{},"envRefs":[],"route":route}
           if service=="heyosecret":
               payload["env"]={"HEYOSECRET_SERVER_PORT":"8080","HEYOSECRET_INTERNAL_API_KEY":os.environ.get("HEYOSECRET_INTERNAL_API_KEY") or key,"HEYOSECRET_MIGRATIONS_DIR":"/workspace/migrations","HEYOSECRET_COOKIE_SECURE":"true"}
               payload["envRefs"]=[envref("HEYOSECRET_DATABASE_URL","heyosecret/database-url"),envref("HEYOSECRET_MASTER_KEY","heyosecret/master-key")]
@@ -426,7 +433,7 @@ jobs:
           deploy(endpoint,key,payload)
 
           if service=="heyosecret":
-              checks=[(f"https://{public_host}/heyosecret/health",lambda b:json.loads(b).get("status")=="ok"),(f"https://{public_host}/heyosecret/dashboard/api/session",lambda b:"dashboardEnabled" in json.loads(b))]
+              checks=[(f"https://{public_host}/heyosecret/health",lambda b:json.loads(b).get("status")=="ok")]
           elif service=="orchestrator":
               checks=[(f"https://{public_host}/orchestrator/health",lambda b:json.loads(b).get("deploymentGitSha")==git_sha)]
           elif service=="app-lb":

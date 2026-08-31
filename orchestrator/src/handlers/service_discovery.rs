@@ -277,7 +277,7 @@ async fn bump_version<C: ConnectionTrait>(connection: &C, service_id: &str) -> R
     Ok(())
 }
 
-fn validate_endpoint_url(value: &str) -> Result<()> {
+pub(crate) fn validate_endpoint_url(value: &str) -> Result<()> {
     let url = reqwest::Url::parse(value).context("service discovery endpoint must be a URL")?;
     // `Url::port()` normalizes an explicit default `:80` to `None`, so inspect
     // the original authority to distinguish it from an omitted port.
