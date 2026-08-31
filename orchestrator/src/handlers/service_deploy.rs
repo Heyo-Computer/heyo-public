@@ -2083,9 +2083,21 @@ async fn wait_for_candidate_health(
                 if let Some(url) = urls.probe_url() {
                     route_backend_url = Some(url);
                 }
-                for url in urls.candidates() {
-                    if !backend_urls.contains(&url) {
-                        backend_urls.push(url);
+                match urls.internal_url() {
+                    Some(url) => match service_discovery::validate_endpoint_url(&url) {
+                        Ok(()) => {
+                            backend_urls.clear();
+                            backend_urls.push(url);
+                        }
+                        Err(error) => {
+                            last_error = format!(
+                                "candidate internal endpoint is not suitable for service discovery: {error}"
+                            );
+                        }
+                    },
+                    None => {
+                        last_error =
+                            "candidate internal service endpoint is not available yet".to_string();
                     }
                 }
             }

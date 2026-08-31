@@ -237,18 +237,12 @@ impl DeploymentHealthcheckUrls {
             .map(ToOwned::to_owned)
     }
 
-    pub(crate) fn candidates(&self) -> Vec<String> {
-        let mut candidates = Vec::new();
-        for url in [&self.internal_url, &self.public_url, &self.url]
-            .into_iter()
-            .flatten()
-        {
-            let url = url.trim();
-            if !url.is_empty() && !candidates.iter().any(|candidate| candidate == url) {
-                candidates.push(url.to_string());
-            }
-        }
-        candidates
+    pub(crate) fn internal_url(&self) -> Option<String> {
+        self.internal_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(ToOwned::to_owned)
     }
 }
 
@@ -863,11 +857,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            urls.candidates(),
-            vec![
-                "http://10.88.0.1:2238".to_string(),
-                "https://candidate.stage.heyo.computer".to_string(),
-            ]
+            urls.internal_url().as_deref(),
+            Some("http://10.88.0.1:2238")
         );
         assert_eq!(
             urls.probe_url().as_deref(),
@@ -882,9 +873,10 @@ mod tests {
         }))
         .unwrap();
 
+        assert_eq!(urls.internal_url(), None);
         assert_eq!(
-            urls.candidates(),
-            vec!["https://candidate.stage.heyo.computer".to_string()]
+            urls.probe_url().as_deref(),
+            Some("https://candidate.stage.heyo.computer")
         );
     }
 }
