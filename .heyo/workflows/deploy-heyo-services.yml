@@ -207,8 +207,8 @@ jobs:
         run: |
           set -eu
           if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get -o DPkg::Lock::Timeout=120 update
-            sudo apt-get -o DPkg::Lock::Timeout=120 install -y cmake libssl-dev pkg-config
+            sudo apt-get -o DPkg::Lock::Timeout=600 update
+            sudo apt-get -o DPkg::Lock::Timeout=600 install -y cmake libssl-dev pkg-config
           fi
 
       - name: Test or check selected service
