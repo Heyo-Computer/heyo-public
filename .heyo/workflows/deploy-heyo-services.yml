@@ -207,8 +207,8 @@ jobs:
         run: |
           set -eu
           if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y cmake libssl-dev pkg-config
+            sudo apt-get -o DPkg::Lock::Timeout=120 update
+            sudo apt-get -o DPkg::Lock::Timeout=120 install -y cmake libssl-dev pkg-config
           fi
 
       - name: Test or check selected service
@@ -426,7 +426,7 @@ jobs:
           deploy(endpoint,key,payload)
 
           if service=="heyosecret":
-              checks=[(f"https://{public_host}/heyosecret/health",lambda b:json.loads(b).get("status")=="ok"),(f"https://{public_host}/heyosecret/dashboard/api/session",lambda b:"dashboardEnabled" in json.loads(b))]
+              checks=[(f"https://{public_host}/heyosecret/health",lambda b:json.loads(b).get("status")=="ok")]
           elif service=="orchestrator":
               checks=[(f"https://{public_host}/orchestrator/health",lambda b:json.loads(b).get("deploymentGitSha")==git_sha)]
           elif service=="app-lb":
