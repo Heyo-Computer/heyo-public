@@ -61,6 +61,8 @@ jobs:
       ORCHESTRATOR_TARGET_OS: ${{ secrets.ORCHESTRATOR_TARGET_OS }}
       ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS: ${{ secrets.ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS }}
       ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS: ${{ secrets.ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS }}
+      ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES: ${{ secrets.ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES }}
+      HEYO_SERVICE_REPLICAS: ${{ secrets.HEYO_SERVICE_REPLICAS }}
       ORCHESTRATOR_NATS_URL: ${{ secrets.ORCHESTRATOR_NATS_URL }}
       ORCHESTRATOR_NATS_ENABLED: ${{ secrets.ORCHESTRATOR_NATS_ENABLED }}
       TARGET_HEYO_SERVICE: ${{ matrix.target }}
@@ -409,6 +411,27 @@ jobs:
               route={"host":public_host,"pathPrefix":f"/{service}","entryPoints":["websecure"],"stripPrefix":True,"passHostHeader":False,"priority":priority}
           if os.environ.get("HEYO_TRAEFIK_CERT_RESOLVER"): route["certResolver"]=os.environ["HEYO_TRAEFIK_CERT_RESOLVER"]
           payload={"serviceId":service,"deploymentId":deployment_id,"userId":os.environ.get("HEYO_SERVICE_USER_ID","heyo-system"),"accountId":os.environ.get("HEYO_SERVICE_ACCOUNT_ID","heyo-system"),"name":f"heyo-{service}","archiveName":archive_name,"archiveBytesBase64":base64.b64encode(open(f"dist/{archive_name}","rb").read()).decode(),"region":os.environ.get("HEYO_SERVICE_REGION") or "EU","driver":os.environ.get("HEYO_SERVICE_DRIVER") or "libvirt","image":os.environ.get("HEYO_SERVICE_IMAGE") or "ubuntu:24.04","ports":[8080],"workingDirectory":"/","startCommand":start_command,"sizeClass":os.environ.get("HEYO_SERVICE_SIZE_CLASS","small"),"ttlSeconds":0,"healthPath":"/health","healthTimeoutSeconds":900,"drainSeconds":30,"retirePrevious":True,"retirePreviousAsync":True,"deletePrevious":True,"metadata":{"gitSha":git_sha,"gitRef":os.environ.get("GITHUB_REF", ""),"repositoryUrl":repo,"workflow":"Deploy Heyo public services"},"revisionGuard":{"repositoryUrl":repo,"ref":required("CI_REF"),"expectedSha":required("CI_AFTER"),"force":os.environ.get("FORCE_STALE_SERVICE_DEPLOY","").lower() in {"1","true"}},"env":{},"envRefs":[],"route":route}
+          discovery_routed={item.strip() for item in os.environ.get("ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES","").split(",") if item.strip()}
+          replica_config=os.environ.get("HEYO_SERVICE_REPLICAS","").strip()
+          replicas=replica_config
+          if "=" in replica_config:
+              replica_map={}
+              for entry in replica_config.split(","):
+                  name, separator, count=entry.partition("=")
+                  if not separator or not name.strip() or not count.strip(): raise SystemExit("HEYO_SERVICE_REPLICAS entries must use service=count")
+                  replica_map[name.strip()]=count.strip()
+              replicas=replica_map.get(service,"")
+          elif service not in discovery_routed:
+              replicas=""
+          if service == "app-lb" and service in discovery_routed:
+              raise SystemExit("app-lb cannot use its own discovery membership for traffic management")
+          if replicas:
+              if service not in discovery_routed: raise SystemExit(f"{service} must be listed in ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES before HEYO_SERVICE_REPLICAS is set")
+              try: payload["desiredReplicas"]=int(replicas)
+              except ValueError: raise SystemExit("HEYO_SERVICE_REPLICAS must be an integer")
+              payload.pop("route")
+          elif service in discovery_routed:
+              payload.pop("route")
           if service=="heyosecret":
               payload["env"]={"HEYOSECRET_SERVER_PORT":"8080","HEYOSECRET_INTERNAL_API_KEY":os.environ.get("HEYOSECRET_INTERNAL_API_KEY") or key,"HEYOSECRET_MIGRATIONS_DIR":"/workspace/migrations","HEYOSECRET_COOKIE_SECURE":"true"}
               payload["envRefs"]=[envref("HEYOSECRET_DATABASE_URL","heyosecret/database-url"),envref("HEYOSECRET_MASTER_KEY","heyosecret/master-key")]
@@ -418,7 +441,7 @@ jobs:
               proxy_base_domains=os.environ.get("ORCHESTRATOR_PROXY_BASE_DOMAINS","").strip() or f"{public_host},heyo.computer"
               payload["env"]={"ORCHESTRATOR_SERVER_PORT":"8080","ORCHESTRATOR_MIGRATIONS_DIR":"/workspace/migrations","ORCHESTRATOR_TRAEFIK_DYNAMIC_CONFIG_DIR":"/opt/heyo-deploy/orchestrator/traefik-dynamic.d","ORCHESTRATOR_SERVICE_STATE_DIR":"/opt/heyo-deploy/orchestrator/service-state","ORCHESTRATOR_REPOSITORY_CLONE_ROOT":"/workspace/repos","ORCHESTRATOR_PUBLIC_URL":f"https://{public_host}/orchestrator","ORCHESTRATOR_PROXY_BASE_DOMAINS":proxy_base_domains,"CLOUD_INTERNAL_URL":f"https://{public_host}/cloud","ORCHESTRATOR_CLOUD_INTERNAL_URL":f"https://{public_host}/cloud","ORCHESTRATOR_HEYOSECRET_URL":f"https://{public_host}/heyosecret","HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA":git_sha,"ORCHESTRATOR_NATS_ENABLED":str(nats_enabled).lower()}
               if nats_enabled: payload["env"]["ORCHESTRATOR_NATS_URL"]=nats_url
-              for name in ["ORCHESTRATOR_BACKEND_API_URL", "ORCHESTRATOR_TARGET_OS", "ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS", "ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS"]:
+              for name in ["ORCHESTRATOR_BACKEND_API_URL", "ORCHESTRATOR_TARGET_OS", "ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS", "ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS", "ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES"]:
                   if os.environ.get(name): payload["env"][name]=os.environ[name]
               payload["envRefs"]=[envref("DATABASE_URL","orchestrator/database-url"),envref("ORCHESTRATOR_DATABASE_URL","orchestrator/database-url"),envref("JWT_SECRET","orchestrator/jwt-secret"),envref("ORCHESTRATOR_JWT_SECRET","orchestrator/jwt-secret"),envref("ORCHESTRATOR_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("HEYOSECRET_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("ORCHESTRATOR_HEYOSECRET_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("CLOUD_INTERNAL_API_KEY","cloud/internal-api-key")]
           elif service=="app-lb":

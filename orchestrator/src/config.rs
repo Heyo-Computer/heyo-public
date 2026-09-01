@@ -104,6 +104,11 @@ pub struct Config {
     #[serde(default = "default_service_state_dir")]
     pub service_state_dir: String,
 
+    /// Comma-separated service ids whose ingress is owned by app-lb discovery
+    /// rather than a direct Traefik route to one deployment candidate.
+    #[serde(default)]
+    pub discovery_routed_services: String,
+
     #[serde(default)]
     pub nats: NatsConfig,
 }
@@ -129,6 +134,12 @@ impl Config {
     pub fn supports_repo_archive_overlay(&self, driver: &str) -> bool {
         self.supports_archive_deploy_driver(driver)
             || matches!(driver, "firecracker" | "firecracker_containerd")
+    }
+
+    pub fn service_uses_discovery_routing(&self, service_id: &str) -> bool {
+        self.discovery_routed_services
+            .split(',')
+            .any(|configured| configured.trim() == service_id)
     }
 }
 
@@ -340,6 +351,7 @@ impl Config {
             .set_default("proxy_base_domains", "")?
             .set_default("traefik_dynamic_config_dir", "")?
             .set_default("service_state_dir", default_service_state_dir())?
+            .set_default("discovery_routed_services", "")?
             .set_default("nats.enabled", false)?
             .set_default("nats.url", default_nats_url())?;
 
@@ -402,6 +414,10 @@ impl Config {
         if orchestrator_config.traefik_dynamic_config_dir.is_empty() {
             orchestrator_config.traefik_dynamic_config_dir =
                 env::var("ORCHESTRATOR_TRAEFIK_DYNAMIC_CONFIG_DIR").unwrap_or_default();
+        }
+        if orchestrator_config.discovery_routed_services.is_empty() {
+            orchestrator_config.discovery_routed_services =
+                env::var("ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES").unwrap_or_default();
         }
         if let Ok(service_state_dir) = env::var("ORCHESTRATOR_SERVICE_STATE_DIR") {
             if !service_state_dir.is_empty()

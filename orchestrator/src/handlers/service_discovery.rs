@@ -17,6 +17,8 @@ pub struct ServiceDiscoveryEndpoint {
     pub deployment_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_server_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     pub url: String,
     pub health_status: String,
     pub draining: bool,
@@ -75,7 +77,7 @@ pub async fn read_snapshot(service_id: &str) -> Result<Option<ServiceDiscoverySn
     let rows = db
         .query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT deployment_id, backend_server_id, backend_url, health_status, draining
+            "SELECT deployment_id, backend_server_id, revision, backend_url, health_status, draining
              FROM service_discovery_endpoints
              WHERE service_id = $1
              ORDER BY deployment_id ASC",
@@ -89,6 +91,7 @@ pub async fn read_snapshot(service_id: &str) -> Result<Option<ServiceDiscoverySn
             Ok(ServiceDiscoveryEndpoint {
                 deployment_id: row.try_get("", "deployment_id")?,
                 backend_server_id: row.try_get("", "backend_server_id")?,
+                revision: row.try_get("", "revision")?,
                 url: row.try_get("", "backend_url")?,
                 health_status: row.try_get("", "health_status")?,
                 draining: row.try_get("", "draining")?,
@@ -125,6 +128,7 @@ pub async fn publish_healthy_endpoint(
     service_id: &str,
     deployment_id: &str,
     backend_server_id: Option<&str>,
+    revision: Option<&str>,
     backend_url: &str,
     replace_existing: bool,
 ) -> Result<ServiceDiscoverySnapshot> {
@@ -147,11 +151,12 @@ pub async fn publish_healthy_endpoint(
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "INSERT INTO service_discovery_endpoints (
-                service_id, deployment_id, backend_server_id, backend_url,
-                health_status, draining, observed_at, updated_at
-             ) VALUES ($1, $2, $3, $4, 'healthy', FALSE, NOW(), NOW())
+                service_id, deployment_id, backend_server_id, revision,
+                backend_url, health_status, draining, observed_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, 'healthy', FALSE, NOW(), NOW())
              ON CONFLICT (service_id, deployment_id) DO UPDATE SET
                 backend_server_id = EXCLUDED.backend_server_id,
+                revision = EXCLUDED.revision,
                 backend_url = EXCLUDED.backend_url,
                 health_status = 'healthy',
                 draining = FALSE,
@@ -161,6 +166,7 @@ pub async fn publish_healthy_endpoint(
                 service_id.into(),
                 deployment_id.into(),
                 backend_server_id.map(str::to_string).into(),
+                revision.map(str::to_string).into(),
                 backend_url.into(),
             ],
         ))
@@ -232,13 +238,14 @@ pub async fn restore_snapshot(
                 .execute(Statement::from_sql_and_values(
                     DbBackend::Postgres,
                     "INSERT INTO service_discovery_endpoints (
-                        service_id, deployment_id, backend_server_id, backend_url,
-                        health_status, draining, observed_at, updated_at
-                     ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())",
+                        service_id, deployment_id, backend_server_id, revision,
+                        backend_url, health_status, draining, observed_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())",
                     vec![
                         service_id.into(),
                         endpoint.deployment_id.clone().into(),
                         endpoint.backend_server_id.clone().into(),
+                        endpoint.revision.clone().into(),
                         endpoint.url.clone().into(),
                         endpoint.health_status.clone().into(),
                         endpoint.draining.into(),

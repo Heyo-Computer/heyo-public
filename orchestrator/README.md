@@ -83,6 +83,10 @@ Fill in at least:
 
 Set `ORCHESTRATOR_PROXY_BASE_DOMAINS` to a comma-separated list of wildcard proxy base domains when backend deployment URLs must be probed through `ORCHESTRATOR_BACKEND_API_URL` instead of public DNS.
 
+Rolling replicas are an explicit discovery-routed traffic mode. Before setting `desiredReplicas`, configure `ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES` with a comma-separated allowlist, register that service with app-lb, move its public ingress to app-lb, and clear any persisted direct-route ownership. A replicated request that still includes `route`, targets `app-lb` itself, or has not completed that ingress migration is rejected before a candidate is created. The public-service workflow reads `HEYO_SERVICE_REPLICAS` as either one replica count for all allowlisted services or a comma-separated map such as `heyosecret=2,orchestrator=2`.
+
+Bootstrap the mode in order: first deploy this Orchestrator version through the existing singleton path. Then register and move ingress for each target to app-lb. With `ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES` configured but `HEYO_SERVICE_REPLICAS` unset, workflow-dispatch each non-Orchestrator target first and Orchestrator last; these one-candidate deployments omit `route`, clear persisted direct-route ownership, and install the allowlist in the new Orchestrator. Finally enable `HEYO_SERVICE_REPLICAS`. Once the allowlist is active, the API rejects omitted `desiredReplicas` for those services even if a workflow is misconfigured. Never include `app-lb` itself in the allowlist.
+
 If you plan to deploy services with `envRefs`, also set:
 
 - `ORCHESTRATOR_HEYOSECRET_URL` (or `HEYOSECRET_URL`)
@@ -116,7 +120,7 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 - `GET  /orchestration/resources/archives/{archive_id}` — stream an archive back (used by CICD to fetch debug artifacts).
 - `POST /orchestration/resources/deployments` — request a sandbox; reconciler converges it.
 - `POST /orchestration/resources/deployments/{id}/exec` — run a command inside.
-- `POST /orchestration/services/deployments` — blue/green deploy a Heyo-managed service; resolves `envRefs` against HeyoSecret.
-- `GET  /orchestration/services/{service_id}/discovery` — authenticated, versioned endpoint membership for app-lb. A service deploy with `retirePrevious=false` adds capacity on a different active backend; a normal deploy drains and retires the previous members.
+- `POST /orchestration/services/deployments` — deploy a Heyo-managed service; resolves `envRefs` against HeyoSecret. Set `desiredReplicas` (1–16) for an allowlisted discovery-routed service to converge a revision with one-at-a-time rolling replacement. Without it, the legacy direct-route single-candidate behavior is preserved.
+- `GET  /orchestration/services/{service_id}/discovery` — authenticated, versioned endpoint membership for app-lb. Rolling deploys publish and health-gate one candidate, drain one old replica, and repeat. A failed candidate leaves the remaining healthy set serving. `retirePrevious=false` only adds capacity up to `desiredReplicas`.
 - `POST /internal/deployments/lifecycle` — callback from the backend reporting deploy state transitions.
 - `POST /orchestration/approvals/{approval_id}/decide` — gate an in-flight workflow.
