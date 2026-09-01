@@ -460,7 +460,7 @@ jobs:
           elif service=="orchestrator":
               checks=[(f"https://{public_host}/orchestrator/health",lambda b:json.loads(b).get("deploymentGitSha")==git_sha)]
           elif service=="app-lb":
-              checks=[(f"https://app-lb.{public_host}/metrics",lambda _:True,401),(f"https://app-lb.{public_host}/",lambda _:True,404)]
+              checks=[(f"https://app-lb.{public_host}/metrics",lambda b:b=="authentication required\n",401)]
           else:
               checks=[(f"https://{public_host}/app-obs/healthz",lambda b:b.strip()=="ok",200)]
           if service in {"heyosecret","orchestrator"}:
