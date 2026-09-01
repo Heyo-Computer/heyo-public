@@ -369,6 +369,24 @@ jobs:
               if url.startswith("ssh://git@github.com/"): return "https://github.com/" + url.removeprefix("ssh://git@github.com/")
               return url
           def envref(name, path): return f"{name}=heyosecret://{path}@active"
+          def upload_service_archive(endpoint, key, payload, archive_path):
+              headers=["-H",f"Authorization: Bearer {key}","-H","Content-Type: application/json"]
+              presign=subprocess.run(["curl","--connect-timeout","15","--max-time","30","--fail-with-body","--show-error","--silent","-X","POST",*headers,"--data-binary","@-",f"{endpoint}/orchestration/services/archives/presign"],input=json.dumps({"userId":payload["userId"]}),text=True,capture_output=True)
+              if presign.returncode:
+                  print(presign.stdout); print(presign.stderr,file=sys.stderr); raise SystemExit(presign.returncode)
+              slot=json.loads(presign.stdout or "{}")
+              archive_id=slot.get("archiveId"); upload_url=slot.get("uploadUrl")
+              if not archive_id or not upload_url: raise SystemExit("orchestrator returned an invalid service archive upload slot")
+              upload=subprocess.run(["curl","--connect-timeout","15","--max-time","420","--fail-with-body","--show-error","--silent","-X","PUT","--upload-file",archive_path,upload_url],text=True,capture_output=True)
+              if upload.returncode:
+                  print(upload.stdout); print(upload.stderr,file=sys.stderr); raise SystemExit(upload.returncode)
+              finalize_body={"archiveId":archive_id,"userId":payload["userId"],"deploymentId":payload["deploymentId"],"archiveName":payload["archiveName"]}
+              finalize=subprocess.run(["curl","--connect-timeout","15","--max-time","30","--fail-with-body","--show-error","--silent","-X","POST",*headers,"--data-binary","@-",f"{endpoint}/orchestration/services/archives/finalize"],input=json.dumps(finalize_body),text=True,capture_output=True)
+              if finalize.returncode:
+                  print(finalize.stdout); print(finalize.stderr,file=sys.stderr); raise SystemExit(finalize.returncode)
+              finalized=json.loads(finalize.stdout or "{}")
+              if finalized.get("archiveId") != archive_id: raise SystemExit("orchestrator finalized an unexpected service archive")
+              return archive_id
           def deploy(endpoint, key, payload):
               payload["async"] = True
               result = subprocess.run(["curl","--connect-timeout","15","--max-time","420","--fail-with-body","--show-error","--silent","-X","POST","-H",f"Authorization: Bearer {key}","-H","Content-Type: application/json","--data-binary","@-",f"{endpoint}/orchestration/services/deployments"], input=json.dumps(payload), text=True, capture_output=True)
@@ -411,7 +429,7 @@ jobs:
           else:
               route={"host":public_host,"pathPrefix":f"/{service}","entryPoints":["websecure"],"stripPrefix":True,"passHostHeader":False,"priority":priority}
           if os.environ.get("HEYO_TRAEFIK_CERT_RESOLVER"): route["certResolver"]=os.environ["HEYO_TRAEFIK_CERT_RESOLVER"]
-          payload={"serviceId":service,"deploymentId":deployment_id,"userId":os.environ.get("HEYO_SERVICE_USER_ID","heyo-system"),"accountId":os.environ.get("HEYO_SERVICE_ACCOUNT_ID","heyo-system"),"name":f"heyo-{service}","archiveName":archive_name,"archiveBytesBase64":base64.b64encode(open(f"dist/{archive_name}","rb").read()).decode(),"region":os.environ.get("HEYO_SERVICE_REGION") or "EU","driver":os.environ.get("HEYO_SERVICE_DRIVER") or "libvirt","image":os.environ.get("HEYO_SERVICE_IMAGE") or "ubuntu:24.04","ports":[8080],"workingDirectory":"/","startCommand":start_command,"sizeClass":os.environ.get("HEYO_SERVICE_SIZE_CLASS","small"),"ttlSeconds":0,"healthPath":"/health","healthTimeoutSeconds":900,"drainSeconds":30,"retirePrevious":True,"retirePreviousAsync":True,"deletePrevious":True,"metadata":{"gitSha":git_sha,"gitRef":os.environ.get("GITHUB_REF", ""),"repositoryUrl":repo,"workflow":"Deploy Heyo public services"},"revisionGuard":{"repositoryUrl":repo,"ref":required("CI_REF"),"expectedSha":required("CI_AFTER"),"force":os.environ.get("FORCE_STALE_SERVICE_DEPLOY","").lower() in {"1","true"}},"env":{},"envRefs":[],"route":route}
+          payload={"serviceId":service,"deploymentId":deployment_id,"userId":os.environ.get("HEYO_SERVICE_USER_ID","heyo-system"),"accountId":os.environ.get("HEYO_SERVICE_ACCOUNT_ID","heyo-system"),"name":f"heyo-{service}","archiveName":archive_name,"region":os.environ.get("HEYO_SERVICE_REGION") or "EU","driver":os.environ.get("HEYO_SERVICE_DRIVER") or "libvirt","image":os.environ.get("HEYO_SERVICE_IMAGE") or "ubuntu:24.04","ports":[8080],"workingDirectory":"/","startCommand":start_command,"sizeClass":os.environ.get("HEYO_SERVICE_SIZE_CLASS","small"),"ttlSeconds":0,"healthPath":"/health","healthTimeoutSeconds":900,"drainSeconds":30,"retirePrevious":True,"retirePreviousAsync":True,"deletePrevious":True,"metadata":{"gitSha":git_sha,"gitRef":os.environ.get("GITHUB_REF", ""),"repositoryUrl":repo,"workflow":"Deploy Heyo public services"},"revisionGuard":{"repositoryUrl":repo,"ref":required("CI_REF"),"expectedSha":required("CI_AFTER"),"force":os.environ.get("FORCE_STALE_SERVICE_DEPLOY","").lower() in {"1","true"}},"env":{},"envRefs":[],"route":route}
           discovery_routed={item.strip() for item in os.environ.get("ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES","").split(",") if item.strip()}
           replica_config=os.environ.get("HEYO_SERVICE_REPLICAS","").strip()
           replicas=replica_config
@@ -453,6 +471,12 @@ jobs:
               payload["healthPath"]="/healthz"
               payload["env"]={"APP_OBS_DATA_DIR":"/workspace/data","APP_OBS_INGEST_ADDR":"127.0.0.1:9500","APP_OBS_SYSLOG_ADDR":"127.0.0.1:9514","APP_OBS_API_ADDR":"0.0.0.0:8080","APP_LB_URL":f"https://app-lb.{public_host}","APP_LB_USER":"admin","APP_OBS_SOURCE":"stage-edge"}
               payload["envRefs"]=[envref("APP_LB_PASSWORD","app-lb/admin-password"),envref("APP_OBS_API_TOKEN","app-obs/api-token")]
+          archive_path=f"dist/{archive_name}"
+          # Keep smaller archives inline so this workflow can bootstrap an orchestrator that predates direct uploads.
+          if os.path.getsize(archive_path) > 20 * 1024 * 1024:
+              payload["archiveId"]=upload_service_archive(endpoint,key,payload,archive_path)
+          else:
+              payload["archiveBytesBase64"]=base64.b64encode(open(archive_path,"rb").read()).decode()
           print("::heyo-cleanup-target::"+json.dumps({"deploymentId":deployment_id,"serviceId":service,"name":f"heyo-{service}","resourceType":"service-candidate","reason":f"{service} deploy failed before the candidate became active"}), flush=True)
           deploy(endpoint,key,payload)
 

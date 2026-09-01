@@ -645,6 +645,7 @@ pub async fn create_resource_deployment(
         name: req.name,
         slug: req.slug,
         target: req.target,
+        archive_id: None,
         archive_name: req.archive_name,
         archive_bytes,
         region: req.region,
