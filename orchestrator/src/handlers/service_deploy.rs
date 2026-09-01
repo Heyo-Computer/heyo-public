@@ -113,6 +113,22 @@ pub struct ServiceDeployRequest {
     pub revision_guard: Option<ServiceRevisionGuard>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceArchivePresignRequest {
+    pub user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceArchiveFinalizeRequest {
+    pub archive_id: String,
+    pub user_id: String,
+    pub deployment_id: String,
+    #[serde(default)]
+    pub archive_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceRevisionGuard {
@@ -196,6 +212,86 @@ struct SandboxLifecyclePayload {
     status: String,
     #[serde(default)]
     error: Option<String>,
+}
+
+pub async fn presign_service_archive(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<ServiceArchivePresignRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(status) = auth::require_internal_api_key(&headers, &state.config.internal_api_key) {
+        return (status, Json(json!({ "error": "Unauthorized" })));
+    }
+    if request.user_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "userId is required" })),
+        );
+    }
+
+    match cloud_client::presign_archive_upload(&state, &request.user_id, None).await {
+        Ok(slot) => (
+            StatusCode::OK,
+            Json(json!({
+                "archiveId": slot.archive_id,
+                "uploadUrl": slot.upload_url,
+            })),
+        ),
+        Err(error) => {
+            warn!("failed to prepare service archive upload: {error:#}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": error.to_string() })),
+            )
+        }
+    }
+}
+
+pub async fn finalize_service_archive(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<ServiceArchiveFinalizeRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(status) = auth::require_internal_api_key(&headers, &state.config.internal_api_key) {
+        return (status, Json(json!({ "error": "Unauthorized" })));
+    }
+    if request.archive_id.trim().is_empty()
+        || request.user_id.trim().is_empty()
+        || request.deployment_id.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "archiveId, userId, and deploymentId are required"
+            })),
+        );
+    }
+
+    match cloud_client::finalize_archive_upload(
+        &state,
+        &request.archive_id,
+        &request.user_id,
+        &request.deployment_id,
+        request.archive_name,
+        None,
+    )
+    .await
+    {
+        Ok(archive) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "archiveId": archive.id,
+                "sizeBytes": archive.size_bytes,
+            })),
+        ),
+        Err(error) => {
+            warn!(archive_id = request.archive_id, "failed to finalize service archive upload: {error:#}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": error.to_string() })),
+            )
+        }
+    }
 }
 
 pub async fn deploy_service(
@@ -961,6 +1057,11 @@ async fn deploy_service_candidate(
 
     let archive_bytes = load_archive_bytes(&state, &request).await?;
     let archive_sha256 = format!("{:x}", Sha256::digest(&archive_bytes));
+    let archive_bytes = if request.archive_id.is_some() && request.archive_bytes_base64.is_none() {
+        Vec::new()
+    } else {
+        archive_bytes
+    };
     let account_id = request
         .account_id
         .clone()
@@ -1019,6 +1120,7 @@ async fn deploy_service_candidate(
                     .unwrap_or_else(|| format!("service-{service_id}")),
                 slug: Some(format!("{service_id}-candidate")),
                 target: "service".to_string(),
+                archive_id: request.archive_id.clone(),
                 archive_name: request.archive_name.clone(),
                 archive_bytes,
                 region: request.region.clone(),

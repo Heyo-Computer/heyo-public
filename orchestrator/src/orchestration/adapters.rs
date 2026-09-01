@@ -3216,6 +3216,7 @@ async fn execute_heyo_deploy(
                     Some(sandbox.key.clone())
                 },
                 target: context.workflow_run.target.clone(),
+                archive_id: None,
                 archive_name: if supports_repo_archive_overlay(&sandbox.driver) {
                     Some(format!("{} release", app_name))
                 } else {

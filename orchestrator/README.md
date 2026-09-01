@@ -120,6 +120,7 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 - `GET  /orchestration/resources/archives/{archive_id}` — stream an archive back (used by CICD to fetch debug artifacts).
 - `POST /orchestration/resources/deployments` — request a sandbox; reconciler converges it.
 - `POST /orchestration/resources/deployments/{id}/exec` — run a command inside.
+- `POST /orchestration/services/archives/presign` (and `/finalize`) — authenticated direct upload for large Heyo-managed service archives; pass the finalized `archiveId` to the service deployment request.
 - `POST /orchestration/services/deployments` — deploy a Heyo-managed service; resolves `envRefs` against HeyoSecret. Set `desiredReplicas` (1–16) for an allowlisted discovery-routed service to converge a revision with one-at-a-time rolling replacement. Without it, the legacy direct-route single-candidate behavior is preserved.
 - `GET  /orchestration/services/{service_id}/discovery` — authenticated, versioned endpoint membership for app-lb. Rolling deploys publish and health-gate one candidate, drain one old replica, and repeat. A failed candidate leaves the remaining healthy set serving. `retirePrevious=false` only adds capacity up to `desiredReplicas`.
 - `POST /internal/deployments/lifecycle` — callback from the backend reporting deploy state transitions.

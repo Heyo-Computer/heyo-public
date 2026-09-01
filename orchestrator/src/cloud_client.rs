@@ -66,6 +66,7 @@ pub(crate) struct CreateDeploymentRequest {
     /// injection so multi-sandbox plans can address each other by plan key.
     pub slug: Option<String>,
     pub target: String,
+    pub archive_id: Option<String>,
     pub archive_name: Option<String>,
     pub archive_bytes: Vec<u8>,
     pub region: String,
@@ -164,6 +165,8 @@ struct CreateDeploymentHttpRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     slug: Option<String>,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_id: Option<String>,
     archive_name: Option<String>,
     archive_bytes_base64: String,
     region: String,
@@ -309,6 +312,10 @@ pub(crate) async fn create_deployment(
     state: &AppState,
     request: &CreateDeploymentRequest,
 ) -> Result<CreateDeploymentResponse> {
+    let archive_id = request
+        .archive_id
+        .clone()
+        .filter(|_| request.archive_bytes.is_empty());
     let response = authorized_request(
         state,
         state.http_client.post(format!(
@@ -323,9 +330,13 @@ pub(crate) async fn create_deployment(
         name: request.name.clone(),
         slug: request.slug.clone(),
         target: request.target.clone(),
+        archive_id: archive_id.clone(),
         archive_name: request.archive_name.clone(),
-        archive_bytes_base64: base64::engine::general_purpose::STANDARD
-            .encode(&request.archive_bytes),
+        archive_bytes_base64: if archive_id.is_some() {
+            String::new()
+        } else {
+            base64::engine::general_purpose::STANDARD.encode(&request.archive_bytes)
+        },
         region: request.region.clone(),
         backend_type: request.backend_type.clone(),
         image: request.image.clone(),
