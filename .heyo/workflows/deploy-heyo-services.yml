@@ -403,7 +403,8 @@ jobs:
           git_sha=subprocess.check_output(["git","rev-parse","HEAD"], text=True).strip()
           archive_name=f"heyo-{service}-linux.tar.gz"
           deployment_id=f"svc-{service}-{uuid.uuid4().hex[:12]}"
-          start_command="i=0; until mountpoint -q /workspace && [ -x /workspace/start.sh ]; do sudo -n sh -c 'modprobe 9p 2>/dev/null; modprobe 9pnet 2>/dev/null; modprobe 9pnet_virtio 2>/dev/null; mount -a 2>/dev/null || true' >/dev/null 2>&1 || true; i=$((i + 1)); if [ \"$i\" -ge 300 ]; then echo 'workspace mount did not become ready within 300 seconds' >&2; exit 1; fi; sleep 1; done; cd /workspace; exec ./start.sh"
+          # Keep this free of single quotes while heyvm embeds env-bearing commands in a single-quoted sh -c wrapper.
+          start_command="i=0; until mountpoint -q /workspace && [ -x /workspace/start.sh ]; do sudo -n modprobe 9p 2>/dev/null || true; sudo -n modprobe 9pnet 2>/dev/null || true; sudo -n modprobe 9pnet_virtio 2>/dev/null || true; sudo -n mount -a 2>/dev/null || true; i=$((i + 1)); if [ \"$i\" -ge 300 ]; then echo \"workspace mount did not become ready within 300 seconds\" >&2; exit 1; fi; sleep 1; done; cd /workspace; exec ./start.sh"
           priority={"heyosecret":10010,"orchestrator":10010,"app-lb":10010,"app-obs":10010}[service]
           if service == "app-lb":
               route={"host":f"app-lb.{public_host}","pathPrefix":"/metrics","entryPoints":["websecure"],"stripPrefix":False,"passHostHeader":True,"priority":priority}
