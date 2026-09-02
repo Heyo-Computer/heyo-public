@@ -217,6 +217,7 @@ pub struct RouteRule {
     pub host: Option<String>,
     pub host_suffix: Option<String>,
     pub path_prefix: Option<String>,
+    pub strip_prefix: bool,
 }
 
 impl RouteRule {

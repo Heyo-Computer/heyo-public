@@ -333,6 +333,10 @@ pub struct RouteRule {
     /// Path prefix match, e.g. `/api`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
+    /// Remove `path_prefix` before forwarding to the upstream. Off by default,
+    /// preserving the original pass-through behavior for existing specs.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strip_prefix: bool,
 }
 
 impl RouteRule {
@@ -399,6 +403,10 @@ fn host_in_domain(host: &str, suffix: &str) -> bool {
 
 fn default_target_concurrency() -> u32 {
     10
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 fn default_max_replicas() -> u32 {
     5
@@ -2937,6 +2945,7 @@ pub enum SpecError {
     /// see [`DeploymentSpec::validate`].
     NoRoutes,
     EmptyRoute,
+    StripPrefixWithoutPath,
     /// A sign-in gate on a deployment with no routes. The gate only ever runs
     /// on a proxied request, and an unrouted deployment receives none.
     AuthWithoutRoutes,
@@ -3222,6 +3231,10 @@ impl std::fmt::Display for SpecError {
                     "a route must set at least one of `host` or `path_prefix`"
                 )
             }
+            Self::StripPrefixWithoutPath => write!(
+                f,
+                "route.strip_prefix requires route.path_prefix"
+            ),
             Self::UnsupportedDriver(d) => write!(
                 f,
                 "driver {d:?} is not supported: app-lb routes directly to the guest IP, \
@@ -3775,6 +3788,13 @@ impl DeploymentSpec {
         if self.routes.iter().any(RouteRule::is_empty) {
             return Err(SpecError::EmptyRoute);
         }
+        if self
+            .routes
+            .iter()
+            .any(|route| route.strip_prefix && route.path_prefix.is_none())
+        {
+            return Err(SpecError::StripPrefixWithoutPath);
+        }
         // No routes means no ingress. For a *managed* deployment that is a
         // legitimate shape — an agent sandbox reached only through `exec` and
         // `shell`, never over HTTP — and it is the common one at fleet scale,
@@ -4128,6 +4148,7 @@ mod tests {
                 host: Some("demo.local".into()),
                 host_suffix: None,
                 path_prefix: None,
+                strip_prefix: false,
             }],
             vm: Some(VmSpec {
                 env_from: vec![],
@@ -4200,6 +4221,7 @@ mod tests {
                 host: None,
                 host_suffix: None,
                 path_prefix: Some("/legacy".into()),
+                strip_prefix: false,
             }],
             vm: None,
             scaling: ScalingPolicy::default(),
@@ -4957,6 +4979,7 @@ mod tests {
             host: None,
             host_suffix: None,
             path_prefix: Some("/app".into()),
+            strip_prefix: false,
         }];
         s.auth = Some(auth_gate());
         assert_eq!(
@@ -5141,7 +5164,12 @@ mod tests {
         .unwrap();
         assert!(gate.accepts_google());
         assert!(gate.accepts_app_token());
-        gate.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]).unwrap();
+        gate.validate(&[RouteRule {
+            host: Some("app.example.com".into()),
+            host_suffix: None,
+            path_prefix: None,
+            strip_prefix: false,
+        }]).unwrap();
 
         let json = serde_json::to_string(&gate).unwrap();
         assert!(json.contains(r#""provider":["google","app-token"]"#), "{json}");
@@ -5157,7 +5185,12 @@ mod tests {
         assert!(gate.google_credentials().is_none());
         // No client_id, no allow-list, and still valid: neither describes a
         // credential issued to a program.
-        gate.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]).unwrap();
+        gate.validate(&[RouteRule {
+            host: Some("app.example.com".into()),
+            host_suffix: None,
+            path_prefix: None,
+            strip_prefix: false,
+        }]).unwrap();
     }
 
     #[test]
@@ -5169,7 +5202,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            gate.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]),
+            gate.validate(&[RouteRule {
+                host: Some("app.example.com".into()),
+                host_suffix: None,
+                path_prefix: None,
+                strip_prefix: false,
+            }]),
             Err(SpecError::OauthWithoutGoogle)
         );
     }
@@ -5178,7 +5216,12 @@ mod tests {
     fn a_gate_that_admits_nobody_is_refused() {
         let gate: AuthGate = serde_json::from_str(r#"{"provider":[]}"#).unwrap();
         assert_eq!(
-            gate.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]),
+            gate.validate(&[RouteRule {
+                host: Some("app.example.com".into()),
+                host_suffix: None,
+                path_prefix: None,
+                strip_prefix: false,
+            }]),
             Err(SpecError::NoAuthProvider)
         );
     }
@@ -5187,7 +5230,12 @@ mod tests {
     fn a_google_gate_still_demands_its_credentials_and_an_allow_list() {
         let missing: AuthGate = serde_json::from_str(r#"{"provider":"google"}"#).unwrap();
         assert_eq!(
-            missing.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]),
+            missing.validate(&[RouteRule {
+                host: Some("app.example.com".into()),
+                host_suffix: None,
+                path_prefix: None,
+                strip_prefix: false,
+            }]),
             Err(SpecError::EmptyClientId)
         );
 
@@ -5196,7 +5244,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            no_list.validate(&[RouteRule { host: Some("app.example.com".into()), host_suffix: None, path_prefix: None }]),
+            no_list.validate(&[RouteRule {
+                host: Some("app.example.com".into()),
+                host_suffix: None,
+                path_prefix: None,
+                strip_prefix: false,
+            }]),
             Err(SpecError::EmptyAllowList)
         );
     }
@@ -5328,6 +5381,19 @@ mod tests {
         let mut s = spec();
         s.vm.as_mut().unwrap().port = 0;
         assert_eq!(s.validate(), Err(SpecError::ZeroPort));
+    }
+
+    #[test]
+    fn strip_prefix_requires_and_serializes_its_route_prefix() {
+        let mut s = static_spec(&["127.0.0.1:9000"]);
+        s.routes[0].strip_prefix = true;
+        assert_eq!(s.validate(), Ok(()));
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""strip_prefix":true"#), "{json}");
+
+        s.routes[0].path_prefix = None;
+        s.routes[0].host = Some("example.com".to_string());
+        assert_eq!(s.validate(), Err(SpecError::StripPrefixWithoutPath));
     }
 
     /// `destroy` is the historical behaviour, so a spec written before
@@ -5582,6 +5648,7 @@ mod tests {
             host: Some("Demo.Local".into()),
             host_suffix: None,
             path_prefix: None,
+            strip_prefix: false,
         };
         assert!(r.matches(Some("demo.local"), "/"));
         assert!(r.matches(Some("DEMO.LOCAL"), "/"));
@@ -5595,6 +5662,7 @@ mod tests {
             host: Some("demo.local".into()),
             host_suffix: None,
             path_prefix: Some("/api".into()),
+            strip_prefix: false,
         };
         assert!(r.matches(Some("demo.local"), "/api/v1"));
         assert!(!r.matches(Some("demo.local"), "/web"));
@@ -5607,6 +5675,7 @@ mod tests {
             host: None,
             host_suffix: Some("apps.example.com".into()),
             path_prefix: None,
+            strip_prefix: false,
         };
         // Apex and any depth of subdomain.
         assert!(r.matches(Some("apps.example.com"), "/"));
@@ -5627,6 +5696,7 @@ mod tests {
             host: None,
             host_suffix: Some(".example.com".into()),
             path_prefix: None,
+            strip_prefix: false,
         };
         assert!(r.matches(Some("a.example.com"), "/"));
         assert!(r.matches(Some("example.com"), "/"));
@@ -5638,6 +5708,7 @@ mod tests {
             host: None,
             host_suffix: Some("example.com".into()),
             path_prefix: Some("/api".into()),
+            strip_prefix: false,
         };
         assert!(r.matches(Some("a.example.com"), "/api/v1"));
         assert!(!r.matches(Some("a.example.com"), "/web"));
@@ -5650,21 +5721,25 @@ mod tests {
             host: Some("a.example.com".into()),
             host_suffix: None,
             path_prefix: None,
+            strip_prefix: false,
         };
         let wild = RouteRule {
             host: None,
             host_suffix: Some("example.com".into()),
             path_prefix: None,
+            strip_prefix: false,
         };
         let long_wild = RouteRule {
             host: None,
             host_suffix: Some("apps.example.com".into()),
             path_prefix: None,
+            strip_prefix: false,
         };
         let path_only = RouteRule {
             host: None,
             host_suffix: None,
             path_prefix: Some("/some/long/path".into()),
+            strip_prefix: false,
         };
         assert!(exact.specificity() > long_wild.specificity());
         assert!(long_wild.specificity() > wild.specificity(), "longer suffix wins");
@@ -5678,6 +5753,7 @@ mod tests {
             host: None,
             host_suffix: Some(".".into()),
             path_prefix: None,
+            strip_prefix: false,
         };
         assert!(!dot.is_empty(), "a suffix field is set");
         assert!(!dot.matches(Some("example.com"), "/"), "but it matches nothing");
@@ -5689,16 +5765,19 @@ mod tests {
             host: Some("a".into()),
             host_suffix: None,
             path_prefix: None,
+            strip_prefix: false,
         };
         let long_path = RouteRule {
             host: None,
             host_suffix: None,
             path_prefix: Some("/a/very/long/prefix".into()),
+            strip_prefix: false,
         };
         let short_path = RouteRule {
             host: None,
             host_suffix: None,
             path_prefix: Some("/a".into()),
+            strip_prefix: false,
         };
         assert!(host_only.specificity() > long_path.specificity());
         assert!(long_path.specificity() > short_path.specificity());

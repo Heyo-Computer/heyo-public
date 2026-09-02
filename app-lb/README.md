@@ -1530,7 +1530,8 @@ A rule may set any combination of three fields:
 | --- | --- | --- |
 | `host` | exact hostname | case-insensitive, port stripped |
 | `host_suffix` | a domain and its subdomains | anchored at a label boundary |
-| `path_prefix` | a leading path segment, e.g. `/api` | prefix, not exact; not stripped |
+| `path_prefix` | a leading path segment, e.g. `/api` | prefix, not exact |
+| `strip_prefix` | `true` or `false` | removes this rule's path prefix before proxying; defaults to `false` |
 
 - **`host`** — exact hostname match, e.g. `{"host": "demo.local"}` matches only
   `demo.local` (any port).
@@ -1540,9 +1541,9 @@ A rule may set any combination of three fields:
   `notapps.example.com` does **not** match. A leading dot is accepted and ignored.
 - **`path_prefix`** — the request path *starts with* this string, e.g.
   `{"path_prefix": "/api"}` matches `/api`, `/api/v1`, and also `/apidocs` (it is
-  a raw string prefix, not a path-segment match). The prefix is **not stripped** —
-  the upstream sees the full original path, so front apps that serve their routes
-  at the root by `host`/`host_suffix`, not a prefix.
+  a raw string prefix, not a path-segment match). The upstream sees the full
+  original path by default. Set `"strip_prefix": true` when the upstream serves
+  that route at `/`; `/api/x?full=1` is then forwarded as `/x?full=1`.
 
 Fields combine within a rule. `{"host": "demo.local", "path_prefix": "/api"}`
 matches only requests that are *both* for `demo.local` *and* under `/api`. Use

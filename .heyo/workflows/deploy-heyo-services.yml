@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: false
+      bootstrapDiscoveryRouting:
+        description: "Install discovery routing in Orchestrator before the first replicated rollout"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: deploy-heyo-public-services
@@ -38,14 +43,14 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - target: heyosecret
-            paths: heyosecret
-          - target: orchestrator
-            paths: orchestrator|heyosecret-client
           - target: app-lb
             paths: app-lb
           - target: app-obs
             paths: app-obs
+          - target: heyosecret
+            paths: heyosecret
+          - target: orchestrator
+            paths: orchestrator|heyosecret-client
     runs-on: namespace-profile-default
     env:
       ORCHESTRATOR_URL: ${{ secrets.HEYO_ORCHESTRATOR_URL }}
@@ -63,12 +68,14 @@ jobs:
       ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS: ${{ secrets.ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS }}
       ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES: ${{ secrets.ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES }}
       HEYO_SERVICE_REPLICAS: ${{ secrets.HEYO_SERVICE_REPLICAS }}
+      HEYO_SERVICE_REPLICA_REGIONS: ${{ secrets.HEYO_SERVICE_REPLICA_REGIONS }}
       ORCHESTRATOR_NATS_URL: ${{ secrets.ORCHESTRATOR_NATS_URL }}
       ORCHESTRATOR_NATS_ENABLED: ${{ secrets.ORCHESTRATOR_NATS_ENABLED }}
       TARGET_HEYO_SERVICE: ${{ matrix.target }}
       TARGET_HEYO_SERVICE_PATHS: ${{ matrix.paths }}
       REQUESTED_HEYO_SERVICE: ${{ inputs.service }}
       FORCE_STALE_SERVICE_DEPLOY: ${{ inputs.forceStaleDeploy }}
+      BOOTSTRAP_DISCOVERY_ROUTING: ${{ inputs.bootstrapDiscoveryRouting }}
       VALIDATED_SERVICE_ARTIFACTS_AVAILABLE: ${{ inputs.validatedServiceArtifactsAvailable }}
     steps:
       - name: Checkout repository
@@ -85,6 +92,10 @@ jobs:
             heyosecret|orchestrator|app-lb|app-obs) ;;
             *) echo "Unsupported requested public service: $requested" >&2; exit 1 ;;
           esac
+          if [ "${BOOTSTRAP_DISCOVERY_ROUTING:-false}" = true ] && [ "$requested" != orchestrator ]; then
+            echo "bootstrapDiscoveryRouting requires service=orchestrator" >&2
+            exit 1
+          fi
           if [ -n "$requested" ]; then
             if [ "$requested" = all ] || [ "$requested" = "$target" ]; then selected=1; fi
           else
@@ -273,6 +284,27 @@ jobs:
               cat > "$package/bootstrap-state.json" <<'EOF'
           [
             {
+              "id": "heyosecret",
+              "routes": [{"path_prefix": "/heyosecret", "strip_prefix": true}],
+              "upstreams": [],
+              "discovery": {"service_id": "heyosecret"},
+              "health": {"path": "/health", "timeout_secs": 2}
+            },
+            {
+              "id": "orchestrator",
+              "routes": [{"path_prefix": "/orchestrator", "strip_prefix": true}],
+              "upstreams": [],
+              "discovery": {"service_id": "orchestrator"},
+              "health": {"path": "/health", "timeout_secs": 2}
+            },
+            {
+              "id": "app-obs",
+              "routes": [{"path_prefix": "/app-obs", "strip_prefix": true}],
+              "upstreams": [],
+              "discovery": {"service_id": "app-obs"},
+              "health": {"path": "/healthz", "timeout_secs": 2}
+            },
+            {
               "id": "app-lb-admin",
               "routes": [{"path_prefix": "/"}],
               "upstreams": ["127.0.0.1:9090"],
@@ -442,15 +474,30 @@ jobs:
               replicas=replica_map.get(service,"")
           elif service not in discovery_routed:
               replicas=""
+          configured_regions=[region.strip() for region in os.environ.get("HEYO_SERVICE_REPLICA_REGIONS","").split(",") if region.strip()]
+          replica_regions=configured_regions if service in discovery_routed else []
+          bootstrap_discovery=os.environ.get("BOOTSTRAP_DISCOVERY_ROUTING","").lower() in {"1","true","yes"}
+          if bootstrap_discovery and service != "orchestrator":
+              raise SystemExit("bootstrapDiscoveryRouting requires service=orchestrator")
           if service == "app-lb" and service in discovery_routed:
               raise SystemExit("app-lb cannot use its own discovery membership for traffic management")
-          if replicas:
-              if service not in discovery_routed: raise SystemExit(f"{service} must be listed in ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES before HEYO_SERVICE_REPLICAS is set")
-              try: payload["desiredReplicas"]=int(replicas)
-              except ValueError: raise SystemExit("HEYO_SERVICE_REPLICAS must be an integer")
-              payload.pop("route")
-          elif service in discovery_routed:
-              payload.pop("route")
+          if service in discovery_routed and not bootstrap_discovery:
+              if replica_regions:
+                  payload["replicaRegions"]=replica_regions
+                  payload["desiredReplicas"]=len(replica_regions)
+                  if replicas:
+                      try: configured_replicas=int(replicas)
+                      except ValueError: raise SystemExit("HEYO_SERVICE_REPLICAS must be an integer")
+                      if configured_replicas != len(replica_regions):
+                          raise SystemExit(f"HEYO_SERVICE_REPLICAS={configured_replicas} does not match {len(replica_regions)} configured replica regions")
+              elif replicas:
+                  try: payload["desiredReplicas"]=int(replicas)
+                  except ValueError: raise SystemExit("HEYO_SERVICE_REPLICAS must be an integer")
+              else:
+                  raise SystemExit(f"{service} is discovery-routed but neither HEYO_SERVICE_REPLICA_REGIONS nor HEYO_SERVICE_REPLICAS is configured")
+              route["stripPrefix"]=False
+          elif replicas and service not in discovery_routed:
+              raise SystemExit(f"{service} must be listed in ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES before HEYO_SERVICE_REPLICAS is set")
           if service=="heyosecret":
               payload["env"]={"HEYOSECRET_SERVER_PORT":"8080","HEYOSECRET_INTERNAL_API_KEY":os.environ.get("HEYOSECRET_INTERNAL_API_KEY") or key,"HEYOSECRET_MIGRATIONS_DIR":"/workspace/migrations","HEYOSECRET_COOKIE_SECURE":"true"}
               payload["envRefs"]=[envref("HEYOSECRET_DATABASE_URL","heyosecret/database-url"),envref("HEYOSECRET_MASTER_KEY","heyosecret/master-key")]

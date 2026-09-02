@@ -2027,6 +2027,7 @@ mod tests {
                 host: Some("demo.local".into()),
                 host_suffix: None,
                 path_prefix: None,
+                strip_prefix: false,
             }],
             vm: Some(VmSpec {
                 env_from: vec![],
@@ -2072,6 +2073,7 @@ mod tests {
                 host: None,
                 host_suffix: None,
                 path_prefix: Some("/legacy".into()),
+                strip_prefix: false,
             }],
             vm: None,
             scaling: ScalingPolicy::default(),

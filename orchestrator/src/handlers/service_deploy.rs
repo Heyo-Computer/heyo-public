@@ -97,6 +97,10 @@ pub struct ServiceDeployRequest {
     /// rolling replacement.
     #[serde(default)]
     pub desired_replicas: Option<u16>,
+    /// Optional region for each desired replica. When populated its length
+    /// must equal `desiredReplicas`; rolling replacement preserves each slot.
+    #[serde(default)]
+    pub replica_regions: Vec<String>,
     #[serde(default = "default_true")]
     pub retire_previous: bool,
     #[serde(default)]
@@ -175,13 +179,26 @@ pub struct ServiceDeploymentState {
     pub previous_metadata: Option<serde_json::Value>,
     #[serde(default = "default_desired_replicas")]
     pub desired_replicas: u16,
+    #[serde(default)]
+    pub replica_regions: Vec<String>,
     pub route: Option<ServiceRouteRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_backend_url: Option<String>,
     pub updated_at: Option<DateTime<Utc>>,
     /// Versioned endpoint membership consumed by app-lb. This is assembled from
     /// the normalized discovery tables when state is read; legacy scalar fields
     /// remain for existing service-route and maintenance consumers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery: Option<service_discovery::ServiceDiscoverySnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveryRoutedServiceRoute {
+    service_id: String,
+    route: ServiceRouteRequest,
+    previous_route: ServiceRouteRequest,
+    previous_backend_url: String,
+    health_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -489,23 +506,46 @@ async fn validate_service_deployment_request(
         discovery_routed,
     )?;
 
-    if request.desired_replicas.is_some() {
-        let persisted_state = read_service_state(state, &service_id)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to verify existing service route ownership: {error:#}"),
-                )
-            })?;
-        if persisted_state.route.is_some() {
+    if let Some(desired_replicas) = request.desired_replicas {
+        if !request.replica_regions.is_empty()
+            && request.replica_regions.len() != usize::from(desired_replicas)
+        {
             return Err((
-                StatusCode::CONFLICT,
+                StatusCode::BAD_REQUEST,
                 format!(
-                    "service {service_id} still owns a direct route; move ingress to app-lb and clear the persisted route before enabling rolling replicas"
+                    "replicaRegions must contain exactly {desired_replicas} entries when provided"
                 ),
             ));
         }
+        if request
+            .replica_regions
+            .iter()
+            .any(|region| region.trim().is_empty())
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "replicaRegions entries must not be empty".to_string(),
+            ));
+        }
+        let route = request.route.as_ref().expect("traffic mode requires route");
+        if route.path_prefix.as_deref().is_none_or(str::is_empty) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "discovery-routed service ingress requires route.pathPrefix".to_string(),
+            ));
+        }
+        if route.strip_prefix {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "discovery-routed service ingress must preserve its prefix for app-lb"
+                    .to_string(),
+            ));
+        }
+    } else if !request.replica_regions.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "replicaRegions requires desiredReplicas".to_string(),
+        ));
     }
 
     Ok(())
@@ -514,7 +554,7 @@ async fn validate_service_deployment_request(
 fn validate_service_traffic_mode(
     service_id: &str,
     desired_replicas: Option<u16>,
-    has_direct_route: bool,
+    has_ingress_route: bool,
     discovery_routed: bool,
 ) -> std::result::Result<(), (StatusCode, String)> {
     match desired_replicas {
@@ -536,9 +576,9 @@ fn validate_service_traffic_mode(
                 "service {service_id} is not configured in ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES"
             ),
         )),
-        Some(_) if has_direct_route => Err((
+        Some(_) if !has_ingress_route => Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            "desiredReplicas uses discovery membership; route must be omitted because a direct route targets only one candidate"
+            "desiredReplicas requires the stable ingress route that Orchestrator will move to app-lb"
                 .to_string(),
         )),
         None if discovery_routed => Err((
@@ -652,6 +692,16 @@ async fn deploy_service_rollout(
     let target_revision = format!("{:x}", Sha256::digest(&archive_bytes));
     drop(archive_bytes);
 
+    let rollout_state = read_service_state(&state, &service_id).await?;
+    if let (Some(deployment_id), Some(region)) = (
+        rollout_state.active_deployment_id.as_deref(),
+        rollout_state
+            .active_metadata
+            .pointer("/runtime/region")
+            .and_then(serde_json::Value::as_str),
+    ) {
+        service_discovery::set_endpoint_region(&service_id, deployment_id, region).await?;
+    }
     let initial_snapshot = service_discovery::read_snapshot(&service_id).await?;
     let initial_previous_ids = rollout_old_endpoints(
         initial_snapshot.as_ref(),
@@ -675,30 +725,68 @@ async fn deploy_service_rollout(
             "trafficManagement": "discovery-membership",
             "targetRevision": target_revision,
             "observedReplicas": active_endpoint_count(initial_snapshot.as_ref()),
+            "replicaRegions": request.replica_regions,
         })),
         None,
     )
     .await?;
 
-    let candidates_needed = rollout_candidates_needed(
-        initial_snapshot.as_ref(),
-        &target_revision,
-        desired_replicas,
-        request.retire_previous,
-    );
+    let candidate_regions = if request.replica_regions.is_empty() {
+        vec![
+            request.region.clone();
+            rollout_candidates_needed(
+                initial_snapshot.as_ref(),
+                &target_revision,
+                desired_replicas,
+                request.retire_previous,
+            )
+        ]
+    } else {
+        rollout_candidate_regions(
+            initial_snapshot.as_ref(),
+            &target_revision,
+            &request.replica_regions,
+            request.retire_previous,
+        )
+    };
+    let candidates_needed = candidate_regions.len();
+    let mut route_updated = false;
+    let mut ingress_backend_url = rollout_state.ingress_backend_url.clone();
+    if active_endpoint_count(initial_snapshot.as_ref()) > 0 {
+        ingress_backend_url = Some(cutover_service_ingress_to_app_lb(
+            &state,
+            &service_id,
+            &rollout_id,
+            request.route.as_ref().expect("validated discovery route"),
+            &request.health_path,
+            request.health_timeout_seconds,
+        )
+        .await?);
+        route_updated = true;
+    }
     let mut last_candidate = None;
 
-    for candidate_index in 0..candidates_needed {
+    for (candidate_index, candidate_region) in candidate_regions.into_iter().enumerate() {
         let snapshot = service_discovery::read_snapshot(&service_id).await?;
         let replacement = if request.retire_previous
             && active_endpoint_count(snapshot.as_ref()) >= usize::from(desired_replicas)
         {
-            rollout_old_endpoints(snapshot.as_ref(), &target_revision)
-                .into_iter()
-                .find(|endpoint| {
-                    endpoint.health_status == "healthy" && !endpoint.draining
-                })
-                .cloned()
+            if request.replica_regions.is_empty() {
+                rollout_old_endpoints(snapshot.as_ref(), &target_revision)
+                    .into_iter()
+                    .find(|endpoint| {
+                        endpoint.health_status == "healthy" && !endpoint.draining
+                    })
+                    .cloned()
+            } else {
+                rollout_replacement(
+                    snapshot.as_ref(),
+                    &target_revision,
+                    &candidate_region,
+                    &request.replica_regions,
+                    desired_replicas,
+                )
+            }
         } else {
             None
         };
@@ -719,6 +807,7 @@ async fn deploy_service_rollout(
                 "candidateDeploymentId": candidate_id,
                 "candidateNumber": candidate_index + 1,
                 "candidateCount": candidates_needed,
+                "candidateRegion": candidate_region,
                 "replacementDeploymentId": replacement.as_ref().map(|endpoint| &endpoint.deployment_id),
                 "excludedBackendServerIds": placement_exclusions.clone(),
             })),
@@ -730,10 +819,11 @@ async fn deploy_service_rollout(
         let mut candidate_request = request.clone();
         candidate_request.deployment_id = Some(candidate_id.clone());
         candidate_request.archive_bytes_base64 = archive_bytes_base64;
+        candidate_request.region = candidate_region;
         candidate_request.retire_previous = false;
         candidate_request.retire_previous_async = false;
         candidate_request.route = None;
-        let candidate = deploy_service_candidate(
+        let mut candidate = deploy_service_candidate(
             state.clone(),
             candidate_request,
             Some(placement_exclusions),
@@ -745,6 +835,11 @@ async fn deploy_service_rollout(
             )
         })?;
         request.archive_id = candidate.archive_id.clone().or(request.archive_id);
+        candidate.state.desired_replicas = desired_replicas;
+        candidate.state.replica_regions = request.replica_regions.clone();
+        candidate.state.route = request.route.clone();
+        candidate.state.ingress_backend_url = ingress_backend_url.clone();
+        write_service_state(&state, &candidate.state).await?;
         record_service_deployment_event(
             &state,
             &rollout_id,
@@ -777,6 +872,31 @@ async fn deploy_service_rollout(
         }
     }
 
+    let candidate_snapshot = service_discovery::read_snapshot(&service_id).await?;
+    if !request.replica_regions.is_empty()
+        && !target_regions_covered(
+            candidate_snapshot.as_ref(),
+            &target_revision,
+            &request.replica_regions,
+        )
+    {
+        anyhow::bail!(
+            "service rollout did not establish the requested regional replica placement"
+        );
+    }
+    if !route_updated {
+        ingress_backend_url = Some(cutover_service_ingress_to_app_lb(
+            &state,
+            &service_id,
+            &rollout_id,
+            request.route.as_ref().expect("validated discovery route"),
+            &request.health_path,
+            request.health_timeout_seconds,
+        )
+        .await?);
+        route_updated = true;
+    }
+
     if request.retire_previous {
         for endpoint in rollout_old_endpoints(
             service_discovery::read_snapshot(&service_id).await?.as_ref(),
@@ -793,20 +913,34 @@ async fn deploy_service_rollout(
             .await?;
         }
 
-        let snapshot = service_discovery::read_snapshot(&service_id).await?;
-        let mut excess_targets = rollout_target_endpoints(snapshot.as_ref(), &target_revision);
         let current_state = read_service_state(&state, &service_id).await?;
-        excess_targets.sort_by_key(|endpoint| {
-            (
-                current_state.active_deployment_id.as_deref()
-                    == Some(endpoint.deployment_id.as_str()),
-                endpoint.deployment_id.clone(),
+        let snapshot = service_discovery::read_snapshot(&service_id).await?;
+        let excess_targets = if request.replica_regions.is_empty() {
+            let mut endpoints = rollout_target_endpoints(snapshot.as_ref(), &target_revision);
+            endpoints.sort_by_key(|endpoint| {
+                (
+                    current_state.active_deployment_id.as_deref()
+                        == Some(endpoint.deployment_id.as_str()),
+                    endpoint.deployment_id.clone(),
+                )
+            });
+            let excess = endpoints
+                .len()
+                .saturating_sub(usize::from(desired_replicas));
+            endpoints
+                .into_iter()
+                .take(excess)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            excess_target_endpoints(
+                snapshot.as_ref(),
+                &target_revision,
+                &request.replica_regions,
+                current_state.active_deployment_id.as_deref(),
             )
-        });
-        let excess = excess_targets
-            .len()
-            .saturating_sub(usize::from(desired_replicas));
-        for endpoint in excess_targets.into_iter().take(excess) {
+        };
+        for endpoint in excess_targets {
             retire_rollout_endpoint(
                 &state,
                 &service_id,
@@ -824,6 +958,12 @@ async fn deploy_service_rollout(
     let target_replicas = target_endpoint_count(final_snapshot.as_ref(), &target_revision);
     if ready_replicas < usize::from(desired_replicas)
         || (request.retire_previous && target_replicas != usize::from(desired_replicas))
+        || (!request.replica_regions.is_empty()
+            && !target_regions_ready(
+                final_snapshot.as_ref(),
+                &target_revision,
+                &request.replica_regions,
+            ))
     {
         anyhow::bail!(
             "service rollout ended with {ready_replicas} ready replicas ({target_replicas} at the target revision); {desired_replicas} required"
@@ -852,15 +992,17 @@ async fn deploy_service_rollout(
         current_state.active_backend_url = Some(retained.url.clone());
     }
     current_state.desired_replicas = desired_replicas;
+    current_state.replica_regions = request.replica_regions.clone();
+    current_state.route = request.route.clone();
+    current_state.ingress_backend_url = ingress_backend_url;
     current_state.discovery = final_snapshot;
     write_service_state(&state, &current_state).await?;
 
-    let (archive_id, backend_url, health_url, route_updated) = match last_candidate {
+    let (archive_id, backend_url, health_url) = match last_candidate {
         Some(candidate) => (
             candidate.archive_id,
             candidate.backend_url,
             candidate.health_url,
-            candidate.route_updated,
         ),
         None => {
             let backend_url = current_state
@@ -871,7 +1013,6 @@ async fn deploy_service_rollout(
                 current_state.active_archive_id.clone(),
                 backend_url.clone(),
                 join_url_path(&backend_url, &request.health_path),
-                false,
             )
         }
     };
@@ -978,6 +1119,63 @@ fn rollout_candidates_needed(
     usize::from(desired_replicas).saturating_sub(observed)
 }
 
+fn rollout_candidate_regions(
+    snapshot: Option<&service_discovery::ServiceDiscoverySnapshot>,
+    target_revision: &str,
+    desired_regions: &[String],
+    replace_previous: bool,
+) -> Vec<String> {
+    let mut desired_counts = HashMap::<&str, usize>::new();
+    let mut region_order = Vec::<&str>::new();
+    for region in desired_regions {
+        if !desired_counts.contains_key(region.as_str()) {
+            region_order.push(region);
+        }
+        *desired_counts.entry(region).or_default() += 1;
+    }
+
+    let mut active_counts = HashMap::<&str, usize>::new();
+    let mut target_counts = HashMap::<&str, usize>::new();
+    if let Some(snapshot) = snapshot {
+        for endpoint in snapshot.endpoints.iter().filter(|endpoint| {
+            endpoint.health_status == "healthy" && !endpoint.draining
+        }) {
+            let Some(region) = endpoint.region.as_deref() else {
+                continue;
+            };
+            *active_counts.entry(region).or_default() += 1;
+            if endpoint.revision.as_deref() == Some(target_revision) {
+                *target_counts.entry(region).or_default() += 1;
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for region in &region_order {
+        let region = *region;
+        let desired = desired_counts[region];
+        let active = active_counts.get(region).copied().unwrap_or_default();
+        for _ in 0..desired.saturating_sub(active) {
+            candidates.push(region.to_string());
+        }
+    }
+    if replace_previous {
+        for region in region_order {
+            let desired = desired_counts[region];
+            let active = active_counts.get(region).copied().unwrap_or_default();
+            let target = target_counts.get(region).copied().unwrap_or_default();
+            let capacity_candidates = desired.saturating_sub(active);
+            for _ in 0..desired
+                .saturating_sub(target)
+                .saturating_sub(capacity_candidates)
+            {
+                candidates.push(region.to_string());
+            }
+        }
+    }
+    candidates
+}
+
 fn rollout_target_endpoints<'a>(
     snapshot: Option<&'a service_discovery::ServiceDiscoverySnapshot>,
     target_revision: &str,
@@ -1035,6 +1233,113 @@ fn rolling_placement_exclusions(
     exclusions.sort();
     exclusions.dedup();
     exclusions
+}
+
+fn rollout_replacement(
+    snapshot: Option<&service_discovery::ServiceDiscoverySnapshot>,
+    target_revision: &str,
+    candidate_region: &str,
+    desired_regions: &[String],
+    desired_replicas: u16,
+) -> Option<service_discovery::ServiceDiscoveryEndpoint> {
+    let snapshot = snapshot?;
+    let mut active = snapshot
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.health_status == "healthy" && !endpoint.draining)
+        .collect::<Vec<_>>();
+    if active.len() < usize::from(desired_replicas) {
+        return None;
+    }
+    active.sort_by(|left, right| left.deployment_id.cmp(&right.deployment_id));
+
+    if let Some(endpoint) = active.iter().find(|endpoint| {
+        endpoint.region.as_deref() == Some(candidate_region)
+            && endpoint.revision.as_deref() != Some(target_revision)
+    }) {
+        return Some((**endpoint).clone());
+    }
+
+    let mut desired_counts = HashMap::<&str, usize>::new();
+    for region in desired_regions {
+        *desired_counts.entry(region).or_default() += 1;
+    }
+    let mut active_counts = HashMap::<&str, usize>::new();
+    for endpoint in &active {
+        if let Some(region) = endpoint.region.as_deref() {
+            *active_counts.entry(region).or_default() += 1;
+        }
+    }
+    if let Some(endpoint) = active.iter().find(|endpoint| {
+        endpoint.region.as_deref().is_some_and(|region| {
+            active_counts.get(region).copied().unwrap_or_default()
+                > desired_counts.get(region).copied().unwrap_or_default()
+        })
+    }) {
+        return Some((**endpoint).clone());
+    }
+
+    active
+        .into_iter()
+        .find(|endpoint| endpoint.region.is_none())
+        .cloned()
+}
+
+fn target_regions_ready(
+    snapshot: Option<&service_discovery::ServiceDiscoverySnapshot>,
+    target_revision: &str,
+    desired_regions: &[String],
+) -> bool {
+    target_regions_covered(snapshot, target_revision, desired_regions)
+        && target_endpoint_count(snapshot, target_revision) == desired_regions.len()
+}
+
+fn target_regions_covered(
+    snapshot: Option<&service_discovery::ServiceDiscoverySnapshot>,
+    target_revision: &str,
+    desired_regions: &[String],
+) -> bool {
+    rollout_candidate_regions(snapshot, target_revision, desired_regions, true).is_empty()
+}
+
+fn excess_target_endpoints(
+    snapshot: Option<&service_discovery::ServiceDiscoverySnapshot>,
+    target_revision: &str,
+    desired_regions: &[String],
+    active_deployment_id: Option<&str>,
+) -> Vec<service_discovery::ServiceDiscoveryEndpoint> {
+    let mut desired_counts = HashMap::<&str, usize>::new();
+    for region in desired_regions {
+        *desired_counts.entry(region).or_default() += 1;
+    }
+    let mut retained_counts = HashMap::<String, usize>::new();
+    let mut endpoints = rollout_target_endpoints(snapshot, target_revision);
+    endpoints.sort_by_key(|endpoint| {
+        (
+            active_deployment_id == Some(endpoint.deployment_id.as_str()),
+            endpoint.deployment_id.clone(),
+        )
+    });
+    endpoints
+        .into_iter()
+        .filter_map(|endpoint| {
+            let region = endpoint.region.as_deref()?;
+            let retained = retained_counts.entry(region.to_string()).or_default();
+            let desired = desired_counts.get(region).copied().unwrap_or_default();
+            if *retained < desired {
+                *retained += 1;
+                None
+            } else {
+                Some(endpoint.clone())
+            }
+        })
+        .chain(
+            rollout_target_endpoints(snapshot, target_revision)
+                .into_iter()
+                .filter(|endpoint| endpoint.region.is_none())
+                .cloned(),
+        )
+        .collect()
 }
 
 async fn deploy_service_candidate(
@@ -1189,6 +1494,8 @@ async fn deploy_service_candidate(
     let previous_state = current_state.clone();
     let mut route_updated = false;
     let mut discovery_updated = false;
+    let mut dependent_routes_updated = Vec::new();
+    let mut ingress_backend_url = None;
 
     let deployment_result = async {
         if create_response.status == "failed" {
@@ -1345,6 +1652,7 @@ async fn deploy_service_candidate(
             .await?;
             write_traefik_service_route(&state, &service_id, &route, &effective_backend_url)
                 .await?;
+            ingress_backend_url = Some(effective_backend_url.clone());
             record_service_deployment_event(
                 &state,
                 &deployment_id,
@@ -1357,6 +1665,17 @@ async fn deploy_service_candidate(
                 None,
             )
             .await?;
+
+            if service_id == "app-lb" {
+                rewire_discovery_routes_to_app_lb_candidate(
+                    &state,
+                    &deployment_id,
+                    &route_backend_url,
+                    request.health_timeout_seconds,
+                    &mut dependent_routes_updated,
+                )
+                .await?;
+            }
         }
 
         record_service_deployment_event(
@@ -1375,6 +1694,7 @@ async fn deploy_service_candidate(
             &service_id,
             &deployment_id,
             create_response.backend_server_id.as_deref(),
+            Some(&request.region),
             Some(&archive_sha256),
             &backend_url,
             request.retire_previous,
@@ -1412,7 +1732,9 @@ async fn deploy_service_candidate(
             ),
             previous_metadata,
             desired_replicas: request.desired_replicas.unwrap_or(1),
+            replica_regions: request.replica_regions.clone(),
             route: request.route.clone(),
+            ingress_backend_url,
             updated_at: Some(Utc::now()),
             discovery: Some(discovery),
         };
@@ -1529,6 +1851,7 @@ async fn deploy_service_candidate(
                 &previous_state,
                 route_updated,
                 discovery_updated,
+                &dependent_routes_updated,
                 previous_discovery.as_ref(),
             )
             .await;
@@ -1578,6 +1901,7 @@ fn service_deployment_request_metadata(request: &ServiceDeployRequest) -> serde_
         "healthPath": request.health_path,
         "healthTimeoutSeconds": request.health_timeout_seconds,
         "desiredReplicas": request.desired_replicas,
+        "replicaRegions": request.replica_regions,
         "trafficManagement": if request.desired_replicas.is_some() {
             "discovery-membership"
         } else {
@@ -2662,6 +2986,7 @@ async fn compensate_failed_candidate(
     previous_state: &ServiceDeploymentState,
     route_updated: bool,
     discovery_updated: bool,
+    dependent_routes_updated: &[DiscoveryRoutedServiceRoute],
     previous_discovery: Option<&service_discovery::ServiceDiscoverySnapshot>,
 ) {
     warn!(
@@ -2681,6 +3006,43 @@ async fn compensate_failed_candidate(
                 "failed to restore previous service discovery membership; leaving candidate running for manual recovery: {error:#}"
             );
             return;
+        }
+    }
+
+    if !dependent_routes_updated.is_empty() {
+        for dependent in dependent_routes_updated {
+            if let Err(error) = write_traefik_service_route(
+                state,
+                &dependent.service_id,
+                &dependent.previous_route,
+                &dependent.previous_backend_url,
+            )
+            .await
+            {
+                warn!(
+                    service_id,
+                    deployment_id,
+                    dependent_service_id = dependent.service_id,
+                    previous_backend_url = dependent.previous_backend_url,
+                    "failed to restore dependent service route; leaving candidate running for manual recovery: {error:#}"
+                );
+                return;
+            }
+            if let Err(error) = persist_service_ingress_target(
+                &dependent.service_id,
+                &dependent.previous_route,
+                &dependent.previous_backend_url,
+            )
+            .await
+            {
+                warn!(
+                    service_id,
+                    deployment_id,
+                    dependent_service_id = dependent.service_id,
+                    "restored dependent service route but failed to persist its previous target; leaving candidate running for manual recovery: {error:#}"
+                );
+                return;
+            }
         }
     }
 
@@ -2969,6 +3331,320 @@ fn service_backend_api_url(state: &AppState) -> String {
         .unwrap_or_default()
 }
 
+fn app_lb_route_health_url(
+    app_lb_url: &str,
+    route: &ServiceRouteRequest,
+    health_path: &str,
+) -> Result<String> {
+    let prefix = route
+        .path_prefix
+        .as_deref()
+        .filter(|prefix| !prefix.is_empty())
+        .context("discovery-routed service ingress requires route.pathPrefix")?;
+    Ok(join_url_path(
+        &join_url_path(app_lb_url, prefix),
+        health_path,
+    ))
+}
+
+async fn wait_for_app_lb_route_health(
+    state: &AppState,
+    app_lb_url: &str,
+    route: &ServiceRouteRequest,
+    health_path: &str,
+    timeout_seconds: u64,
+) -> Result<String> {
+    let health_url = app_lb_route_health_url(app_lb_url, route, health_path)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds.max(1));
+    let mut last_error = "app-lb discovery route has not been checked".to_string();
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for app-lb route {health_url}: {last_error}");
+        }
+        match state
+            .http_client
+            .get(&health_url)
+            .timeout(Duration::from_secs(SERVICE_HEALTH_REQUEST_TIMEOUT_SECONDS))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return Ok(health_url),
+            Ok(response) => {
+                last_error = format!("received HTTP {}", response.status());
+            }
+            Err(error) => {
+                last_error = error.to_string();
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        sleep(retry_delay.min(remaining)).await;
+        retry_delay =
+            (retry_delay * 2).min(Duration::from_secs(SERVICE_HEALTH_MAX_BACKOFF_SECONDS));
+    }
+}
+
+async fn list_discovery_routed_service_routes(
+    state: &AppState,
+) -> Result<Vec<DiscoveryRoutedServiceRoute>> {
+    let db = db::get_db()?;
+    let rows = db
+        .query_all(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT service_id, active_backend_url, active_metadata, route, ingress_backend_url
+             FROM service_deployment_states
+             WHERE service_id <> 'app-lb' AND route IS NOT NULL
+             ORDER BY service_id"
+                .to_string(),
+        ))
+        .await
+        .context("failed to list discovery-routed service routes")?;
+
+    rows.into_iter()
+        .filter_map(|row| {
+            let service_id = match row.try_get::<String>("", "service_id") {
+                Ok(service_id) if state.config.service_uses_discovery_routing(&service_id) => {
+                    service_id
+                }
+                Ok(_) => return None,
+                Err(error) => return Some(Err(error.into())),
+            };
+            Some((|| {
+                let active_metadata: serde_json::Value = row
+                    .try_get("", "active_metadata")
+                    .context("failed to read active service deployment metadata")?;
+                let health_path = active_metadata
+                    .pointer("/runtime/healthPath")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .with_context(|| {
+                        format!("service {service_id} has no persisted runtime health path")
+                    })?
+                    .to_string();
+                let previous_route: ServiceRouteRequest = serde_json::from_value(
+                    row.try_get("", "route")
+                        .context("failed to read service deployment route")?,
+                )
+                .with_context(|| format!("failed to parse route for service {service_id}"))?;
+                let previous_backend_url = row
+                    .try_get::<Option<String>>("", "ingress_backend_url")
+                    .context("failed to read service ingress backend")?
+                    .or(row
+                        .try_get::<Option<String>>("", "active_backend_url")
+                        .context("failed to read active service backend")?)
+                    .with_context(|| {
+                        format!("service {service_id} has no previous ingress backend")
+                    })?;
+                let mut route = previous_route.clone();
+                route.strip_prefix = false;
+                Ok(DiscoveryRoutedServiceRoute {
+                    service_id,
+                    route,
+                    previous_route,
+                    previous_backend_url,
+                    health_path,
+                })
+            })())
+        })
+        .collect()
+}
+
+async fn rewire_discovery_routes_to_app_lb_candidate(
+    state: &AppState,
+    deployment_id: &str,
+    candidate_backend_url: &str,
+    timeout_seconds: u64,
+    updated_routes: &mut Vec<DiscoveryRoutedServiceRoute>,
+) -> Result<()> {
+    let routes = list_discovery_routed_service_routes(state).await?;
+    if routes.is_empty() {
+        return Ok(());
+    }
+
+    record_service_deployment_event(
+        state,
+        deployment_id,
+        "app-lb",
+        "dependent-routes-check",
+        "running",
+        "Verifying discovery-routed services through the new app-lb candidate.",
+        None,
+        Some(json!({
+            "dependentServices": routes
+                .iter()
+                .map(|route| route.service_id.as_str())
+                .collect::<Vec<_>>(),
+        })),
+        None,
+    )
+    .await?;
+
+    for dependent in &routes {
+        wait_for_app_lb_route_health(
+            state,
+            candidate_backend_url,
+            &dependent.route,
+            &dependent.health_path,
+            timeout_seconds,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "service {} was not healthy through the new app-lb candidate",
+                dependent.service_id
+            )
+        })?;
+    }
+
+    for dependent in routes {
+        write_traefik_service_route(
+            state,
+            &dependent.service_id,
+            &dependent.route,
+            candidate_backend_url,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to move service {} ingress to the new app-lb candidate",
+                dependent.service_id
+            )
+        })?;
+        updated_routes.push(dependent);
+        let updated = updated_routes.last().expect("just pushed dependent route");
+        persist_service_ingress_target(
+            &updated.service_id,
+            &updated.route,
+            candidate_backend_url,
+        )
+        .await?;
+    }
+
+    record_service_deployment_event(
+        state,
+        deployment_id,
+        "app-lb",
+        "dependent-routes-updated",
+        "running",
+        "Discovery-routed service ingress now targets the new app-lb candidate.",
+        None,
+        Some(json!({
+            "appLbBackendUrl": candidate_backend_url,
+            "dependentServices": updated_routes
+                .iter()
+                .map(|route| route.service_id.as_str())
+                .collect::<Vec<_>>(),
+        })),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn persist_service_ingress_target(
+    service_id: &str,
+    route: &ServiceRouteRequest,
+    backend_url: &str,
+) -> Result<()> {
+    let db = db::get_db()?;
+    let route = serde_json::to_value(route).context("failed to serialize service route")?;
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE service_deployment_states
+             SET route = $2, ingress_backend_url = $3, updated_at = NOW()
+             WHERE service_id = $1",
+            vec![
+                service_id.into(),
+                SeaValue::Json(Some(Box::new(route))),
+                backend_url.into(),
+            ],
+        ))
+        .await
+        .with_context(|| format!("failed to persist ingress target for service {service_id}"))?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("service {service_id} has no deployment state for its ingress target");
+    }
+    Ok(())
+}
+
+async fn cutover_service_ingress_to_app_lb(
+    state: &AppState,
+    service_id: &str,
+    rollout_id: &str,
+    route: &ServiceRouteRequest,
+    health_path: &str,
+    timeout_seconds: u64,
+) -> Result<String> {
+    let app_lb_state = read_service_state(state, "app-lb").await?;
+    let app_lb_backend_url = app_lb_state
+        .active_backend_url
+        .as_deref()
+        .context("app-lb has no active backend for discovery-routed ingress")?;
+    let previous_state = read_service_state(state, service_id).await?;
+    let previous_route = previous_state.route.as_ref().unwrap_or(route);
+    let previous_backend_url = previous_state
+        .ingress_backend_url
+        .as_deref()
+        .or(previous_state.active_backend_url.as_deref())
+        .context("service has no existing ingress backend to restore if cutover fails")?;
+    record_service_deployment_event(
+        state,
+        rollout_id,
+        service_id,
+        "app-lb-ingress-check",
+        "running",
+        "Verifying service health through app-lb before ingress cutover.",
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let health_url = wait_for_app_lb_route_health(
+        state,
+        app_lb_backend_url,
+        route,
+        health_path,
+        timeout_seconds,
+    )
+    .await?;
+    write_traefik_service_route(state, service_id, route, app_lb_backend_url).await?;
+    if let Err(persist_error) =
+        persist_service_ingress_target(service_id, route, app_lb_backend_url).await
+    {
+        if let Err(restore_error) = write_traefik_service_route(
+            state,
+            service_id,
+            previous_route,
+            previous_backend_url,
+        )
+        .await
+        {
+            anyhow::bail!(
+                "failed to persist app-lb ingress cutover: {persist_error:#}; also failed to restore the previous ingress route: {restore_error:#}"
+            );
+        }
+        return Err(persist_error).context("failed to persist app-lb ingress cutover; restored previous ingress route");
+    }
+    record_service_deployment_event(
+        state,
+        rollout_id,
+        service_id,
+        "app-lb-ingress-active",
+        "running",
+        "Stable service ingress now targets the healthy app-lb backend.",
+        None,
+        Some(json!({
+            "appLbBackendUrl": app_lb_backend_url,
+            "healthUrl": health_url,
+            "route": route,
+        })),
+        None,
+    )
+    .await?;
+    Ok(app_lb_backend_url.to_string())
+}
+
 async fn write_traefik_service_route(
     state: &AppState,
     service_id: &str,
@@ -3063,7 +3739,7 @@ async fn read_service_state_from_db(service_id: &str) -> Result<Option<ServiceDe
             DbBackend::Postgres,
             "SELECT service_id, active_deployment_id, active_archive_id, active_backend_url, \
              previous_deployment_id, previous_archive_id, active_metadata, previous_metadata, \
-             desired_replicas, route, updated_at \
+             desired_replicas, replica_regions, route, ingress_backend_url, updated_at \
              FROM service_deployment_states WHERE service_id = $1 LIMIT 1",
             [service_id.into()],
         ))
@@ -3113,10 +3789,18 @@ async fn read_service_state_from_db(service_id: &str) -> Result<Option<ServiceDe
                 .context("failed to read desired_replicas")?,
         )
         .context("desired_replicas is outside the supported range")?,
+        replica_regions: serde_json::from_value(
+            row.try_get("", "replica_regions")
+                .context("failed to read replica_regions")?,
+        )
+        .context("failed to parse replica_regions")?,
         route: route_value
             .map(serde_json::from_value)
             .transpose()
             .context("failed to parse service deployment route")?,
+        ingress_backend_url: row
+            .try_get("", "ingress_backend_url")
+            .context("failed to read ingress_backend_url")?,
         updated_at: Some(updated_at.with_timezone(&Utc)),
         discovery: None,
     }))
@@ -3139,14 +3823,15 @@ async fn write_service_state_to_db(service_state: &ServiceDeploymentState) -> Re
         Some(value) => SeaValue::Json(Some(Box::new(value))),
         None => SeaValue::Json(None),
     };
+    let replica_regions = SeaValue::Json(Some(Box::new(json!(service_state.replica_regions))));
 
     db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "INSERT INTO service_deployment_states (
             service_id, active_deployment_id, active_archive_id, active_backend_url,
             previous_deployment_id, previous_archive_id, active_metadata, previous_metadata,
-            desired_replicas, route, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            desired_replicas, replica_regions, route, ingress_backend_url, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
         ON CONFLICT (service_id) DO UPDATE SET
             active_deployment_id = EXCLUDED.active_deployment_id,
             active_archive_id = EXCLUDED.active_archive_id,
@@ -3156,7 +3841,9 @@ async fn write_service_state_to_db(service_state: &ServiceDeploymentState) -> Re
             active_metadata = EXCLUDED.active_metadata,
             previous_metadata = EXCLUDED.previous_metadata,
             desired_replicas = EXCLUDED.desired_replicas,
+            replica_regions = EXCLUDED.replica_regions,
             route = EXCLUDED.route,
+            ingress_backend_url = EXCLUDED.ingress_backend_url,
             updated_at = NOW()",
         vec![
             service_state.service_id.clone().into(),
@@ -3168,7 +3855,9 @@ async fn write_service_state_to_db(service_state: &ServiceDeploymentState) -> Re
             active_metadata,
             previous_metadata,
             i32::from(service_state.desired_replicas).into(),
+            replica_regions,
             route_value,
+            service_state.ingress_backend_url.clone().into(),
         ],
     ))
     .await
@@ -3213,6 +3902,7 @@ fn build_deployment_metadata(
             "workingDirectory": request.working_directory,
             "startCommand": request.start_command,
             "healthPath": request.health_path,
+            "replicaRegions": request.replica_regions,
         },
         "environment": {
             "envKeys": env_keys,
@@ -3458,12 +4148,14 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_endpoint_count, candidate_endpoint_urls, deployment_run_status, parse_env_ref,
-        parse_ls_remote_revision, parse_secret_ref, proxy_subdomain_and_path,
-        rolling_placement_exclusions, rollout_candidates_needed, rollout_old_endpoints,
-        target_endpoint_count, validate_revision_ref, validate_revision_repository_url,
-        validate_revision_sha, validate_service_traffic_mode, SecretVersionSelector,
-        ServiceDeployRequest,
+        active_endpoint_count, app_lb_route_health_url, candidate_endpoint_urls,
+        deployment_run_status, parse_env_ref, parse_ls_remote_revision, parse_secret_ref,
+        proxy_subdomain_and_path,
+        rolling_placement_exclusions, rollout_candidate_regions, rollout_candidates_needed,
+        rollout_old_endpoints, rollout_replacement, target_endpoint_count,
+        target_regions_covered, target_regions_ready, validate_revision_ref,
+        validate_revision_repository_url, validate_revision_sha, validate_service_traffic_mode,
+        SecretVersionSelector, ServiceDeployRequest, ServiceRouteRequest,
     };
     use crate::handlers::service_discovery::{
         ServiceDiscoveryEndpoint, ServiceDiscoverySnapshot,
@@ -3478,6 +4170,7 @@ mod tests {
                 ServiceDiscoveryEndpoint {
                     deployment_id: "old-us2".to_string(),
                     backend_server_id: Some("us2".to_string()),
+                    region: Some("EU".to_string()),
                     revision: Some("old".to_string()),
                     url: "http://us2.internal:24001".to_string(),
                     health_status: "healthy".to_string(),
@@ -3486,6 +4179,7 @@ mod tests {
                 ServiceDiscoveryEndpoint {
                     deployment_id: "new-us3".to_string(),
                     backend_server_id: Some("us3".to_string()),
+                    region: Some("US".to_string()),
                     revision: Some("new".to_string()),
                     url: "http://us3.internal:24002".to_string(),
                     health_status: "healthy".to_string(),
@@ -3494,6 +4188,7 @@ mod tests {
                 ServiceDiscoveryEndpoint {
                     deployment_id: "draining-us4".to_string(),
                     backend_server_id: Some("us4".to_string()),
+                    region: Some("US".to_string()),
                     revision: Some("old".to_string()),
                     url: "http://us4.internal:24003".to_string(),
                     health_status: "healthy".to_string(),
@@ -3515,6 +4210,25 @@ mod tests {
                 "http://eu1.internal:2238".to_string(),
                 "https://aqorah.stage.heyo.computer".to_string(),
             )
+        );
+    }
+
+    #[test]
+    fn builds_health_url_against_the_selected_app_lb() {
+        let route = ServiceRouteRequest {
+            host: "stage.example.com".to_string(),
+            path_prefix: Some("/orchestrator".to_string()),
+            backend_url: None,
+            entry_points: None,
+            cert_resolver: None,
+            priority: None,
+            strip_prefix: false,
+            pass_host_header: false,
+        };
+        assert_eq!(
+            app_lb_route_health_url("http://candidate.internal:8080", &route, "/health")
+                .unwrap(),
+            "http://candidate.internal:8080/orchestrator/health"
         );
     }
 
@@ -3554,6 +4268,46 @@ mod tests {
     }
 
     #[test]
+    fn regional_rollout_adds_missing_capacity_before_replacing_a_region() {
+        let mut snapshot = discovery_snapshot();
+        snapshot.endpoints.truncate(1);
+        let regions = vec!["EU".to_string(), "US".to_string()];
+        assert_eq!(
+            rollout_candidate_regions(Some(&snapshot), "new", &regions, true),
+            ["US", "EU"]
+        );
+
+        snapshot.endpoints.push(ServiceDiscoveryEndpoint {
+            deployment_id: "new-us3".to_string(),
+            backend_server_id: Some("us3".to_string()),
+            region: Some("US".to_string()),
+            revision: Some("new".to_string()),
+            url: "http://us3.internal:24002".to_string(),
+            health_status: "healthy".to_string(),
+            draining: false,
+        });
+        assert_eq!(
+            rollout_replacement(Some(&snapshot), "new", "EU", &regions, 2)
+                .map(|endpoint| endpoint.deployment_id),
+            Some("old-us2".to_string())
+        );
+        snapshot.endpoints[0].revision = Some("new".to_string());
+        assert!(target_regions_ready(Some(&snapshot), "new", &regions));
+
+        snapshot.endpoints.push(ServiceDiscoveryEndpoint {
+            deployment_id: "extra-eu".to_string(),
+            backend_server_id: Some("eu2".to_string()),
+            region: Some("EU".to_string()),
+            revision: Some("new".to_string()),
+            url: "http://eu2.internal:24003".to_string(),
+            health_status: "healthy".to_string(),
+            draining: false,
+        });
+        assert!(target_regions_covered(Some(&snapshot), "new", &regions));
+        assert!(!target_regions_ready(Some(&snapshot), "new", &regions));
+    }
+
+    #[test]
     fn retirement_events_do_not_complete_the_parent_rollout() {
         assert_eq!(deployment_run_status("previous-deleted", "passed"), "running");
         assert_eq!(deployment_run_status("rollout-candidate-healthy", "running"), "running");
@@ -3564,12 +4318,12 @@ mod tests {
     #[test]
     fn keeps_direct_and_discovery_traffic_modes_distinct() {
         assert!(validate_service_traffic_mode("cloud", None, true, false).is_ok());
-        assert!(validate_service_traffic_mode("cloud", Some(2), false, true).is_ok());
+        assert!(validate_service_traffic_mode("cloud", Some(2), true, true).is_ok());
 
         assert!(validate_service_traffic_mode("cloud", None, false, true).is_err());
         assert!(validate_service_traffic_mode("cloud", Some(2), false, false).is_err());
-        assert!(validate_service_traffic_mode("cloud", Some(2), true, true).is_err());
-        assert!(validate_service_traffic_mode("app-lb", Some(2), false, true).is_err());
+        assert!(validate_service_traffic_mode("cloud", Some(2), false, true).is_err());
+        assert!(validate_service_traffic_mode("app-lb", Some(2), true, true).is_err());
         assert!(validate_service_traffic_mode("cloud", Some(0), false, true).is_err());
         assert!(validate_service_traffic_mode("cloud", Some(17), false, true).is_err());
     }
