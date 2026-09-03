@@ -1,13 +1,57 @@
 # heyo-mcp
 
-An MCP server over the three services that answer operational questions about
-this fleet: [app-lb](../app-lb) (deployments and VM pools), [app-obs](../app-obs)
-(logs and metrics) and [ci](../ci) (builds).
+An MCP server over heyo: **heyo cloud** for sandboxes — boot a microVM, run a
+command in it, get files in and out — and the three services that answer
+operational questions about a fleet, [app-lb](../app-lb) (deployments and VM
+pools), [app-obs](../app-obs) (logs and metrics) and [ci](../ci) (builds).
 
-It exists because those questions span all three. "Why is nothing running" is
-app-lb's topology *and* app-obs's logs *and* ci's queue, and a tool per endpoint
-leaves that join to be redone by hand every time. The diagnostic tools below do
-the join and carry what it cost to learn which endpoint answers what.
+The sandbox half is the API an agent runs work on. The operational half exists
+because its questions span three services: "why is nothing running" is app-lb's
+topology *and* app-obs's logs *and* ci's queue, and a tool per endpoint leaves
+that join to be redone by hand every time. The diagnostic tools below do the
+join and carry what it cost to learn which endpoint answers what.
+
+## Two API keys and nothing else
+
+```bash
+HEYO_API_KEY=heyo_api_…      # heyo cloud: sandboxes
+APPLB_TOKEN=heyo_api_…       # the managed app-lb, through cloud's namespace door
+```
+
+That is a complete configuration. Cloud's base defaults to
+`https://server.heyo.computer`; app-lb defaults to the same base and discovers
+its namespace from the key on first use — one namespace is the answer, several
+is ambiguous and names them, none says how to create one. Through that door the
+app-lb credential *is* a heyo API key, so a lone `HEYO_API_KEY` configures both;
+the second variable exists for a deployment that wants them separate, and for a
+self-hosted app-lb where they genuinely differ.
+
+Everything below is for the cases that need more: a self-hosted app-lb, app-obs,
+ci, or a cloud that is not the public one.
+
+## Configuration
+
+| Variable | Purpose |
+|---|---|
+| `HEYO_API_KEY` | heyo cloud API key — the sandbox tools, and app-lb's default credential |
+| `HEYO_BASE_URL` | cloud base URL; defaults to `https://server.heyo.computer` |
+| `APPLB_URL` | app-lb base URL — its own admin listener, or heyo cloud (see managed mode). Unset means the managed door at cloud's base |
+| `APPLB_NAMESPACE` | managed mode: the namespace to reach app-lb in, through heyo cloud |
+| `APPLB_TOKEN` | bearer token (a `heyo_api_*` key in managed mode), or… |
+| `APPLB_BASIC` | `user:pass`, or a complete `Basic …` header |
+| `APP_OBS_URL` | app-obs base URL |
+| `APP_OBS_API_TOKEN` | bearer for its query routes (`/healthz` stays open) |
+| `CI_URL` | ci's **own** listener — see above |
+| `CI_TOKEN` | bearer, if ci is reached somewhere that wants one |
+| `HEYO_MCP_TIMEOUT_MS` | per-request bound, default 30000 |
+
+Each service is independent: configure one and its tools work while the others
+report themselves unconfigured. `heyo_status` says which is which — and its
+app-lb probe is also what resolves the managed namespace, so an ambiguous one
+surfaces there rather than inside some later call.
+
+A `Basic` value is passed through byte for byte, because app-lb compares it that
+way — a re-encoded-but-equivalent header is rejected.
 
 ## ci needs a direct URL, and no token changes that
 
@@ -36,25 +80,64 @@ bare 401, because a token hunt is the wrong response to it.
 
 app-lb and app-obs are ordinary bearer APIs and need no such arrangement.
 
-## Configuration
+## Sandboxes
 
-| Variable | Purpose |
-|---|---|
-| `APPLB_URL` | app-lb base URL — its own admin listener, or heyo cloud (see managed mode) |
-| `APPLB_NAMESPACE` | managed mode: the namespace to reach app-lb in, through heyo cloud |
-| `APPLB_TOKEN` | bearer token (a `heyo_api_*` key in managed mode), or… |
-| `APPLB_BASIC` | `user:pass`, or a complete `Basic …` header |
-| `APP_OBS_URL` | app-obs base URL |
-| `APP_OBS_API_TOKEN` | bearer for its query routes (`/healthz` stays open) |
-| `CI_URL` | ci's **own** listener — see above |
-| `CI_TOKEN` | bearer, if ci is reached somewhere that wants one |
-| `HEYO_MCP_TIMEOUT_MS` | per-request bound, default 30000 |
+`sandbox_create` boots a microVM and returns its id; every other sandbox tool
+names that id. There is **one endpoint for every sandbox** — no per-sandbox
+connection, nothing to re-establish after a restart, and `sandbox_list` recovers
+an id that was lost. A sandbox outlives the call that made it: it is a VM with a
+TTL, not a request scope.
 
-Each service is independent: configure one and its tools work while the others
-report themselves unconfigured. `heyo_status` says which is which.
+```
+sandbox_create → id
+sandbox_exec / sandbox_read_file / sandbox_write_file
+sandbox_set_ttl        keep it alive across a conversation
+sandbox_stop / start   park it: disk kept, TTL clock stopped
+sandbox_kill           destroy it and its disk
+```
 
-A `Basic` value is passed through byte for byte, because app-lb compares it that
-way — a re-encoded-but-equivalent header is rejected.
+### The 1 MB body, and the way around it
+
+Cloud's JSON API caps a request body at 1 MB, and file writes cross it base64,
+so ~768 KB of payload is already `413 Request Entity Too Large` — 512 KB
+succeeds, measured against the live API. MCP inherits that limit because it is
+the same API underneath; a photograph from a phone routinely exceeds it.
+
+The archive route is not subject to it, because the bytes never enter a JSON
+body:
+
+```
+sandbox_upload_url        → { archive_id, upload_url }
+PUT the tar.gz to upload_url   ← Content-Type: application/gzip, NO Authorization
+sandbox_finalize_upload   → the archive is now usable
+sandbox_create { archive_id }  or  sandbox_attach_archive { id, archive_id }
+```
+
+The presigned URL belongs to the object store, so its ceiling is the store's,
+not the API's — hundreds of megabytes, which is the case it exists for. The
+signature is the credential; sending a bearer alongside it is what makes some
+stores refuse. `sandbox_attach_archive` is what makes this usable
+mid-conversation: it mounts an archive onto a sandbox that is already running,
+so a large file reaches an existing sandbox without booting a new one to carry
+it.
+
+`sandbox_write_file` refuses more than 512 KiB rather than spending a round trip
+to be told 413, and the refusal names this route.
+
+### 503 is capacity, not a fault
+
+`ApiError(503): No available backend in region US supports libvirt` means no
+host in that region runs that driver with room to spare. Retrying immediately
+fails identically; retrying with backoff does not. So `sandbox_create` retries
+exactly that status — three attempts by default, doubling from 2s, `retries: 0`
+to disable — and retries nothing else, because a rejected spec only gets
+rejected again. Naming a driver the region actually runs (`firecracker`) or the
+other region often succeeds where the default did not.
+
+`heyo_capacity` is the pre-flight, and is honest about its reach: it lists the
+daemons *this key* has registered, online or not, plus every sandbox already
+running. Cloud publishes no per-region or per-driver free capacity, so for
+heyo-hosted regions a 503 on create remains the first signal.
 
 ## Managed mode
 
@@ -180,7 +263,23 @@ telling them they had bypassed the gate.
 Every call is logged to stderr with the caller's identity, so "who asked for
 that" stays answerable after a destructive tool runs.
 
-`HEYO_MCP_REQUIRE_IDENTITY=0` disables the check, for local testing only.
+`HEYO_MCP_REQUIRE_IDENTITY=0` disables the check.
+
+**An app-token gate is the one shape that needs it off.** app-lb admits
+`Authorization: Bearer applb_…` with no `Identity` at all — deliberately: "a
+token is not a person, and forwarding `x-auth-request-email` for one would put a
+name upstream that belongs to nobody" — so nothing is forwarded and the check
+above refuses every request that gate admits. A machine client (an agent, a
+daemon, anything holding a static bearer) therefore wants either
+
+- `provider: ["app_token"]` on the deployment **and**
+  `HEYO_MCP_REQUIRE_IDENTITY=0` here — safe because the gate in front is doing
+  exactly the work this check stands in for, and the port is still loopback; or
+- `provider: ["jwt"]`, where the caller's own token carries a subject and the
+  check keeps working as written.
+
+Pick deliberately. Turning the check off *without* a gate in front leaves an
+unauthenticated hole into a process that can delete a deployment.
 
 ## Tools
 
@@ -195,6 +294,35 @@ that" stays answerable after a destructive tool runs.
 | `diagnose_empty_pool` | why a pool is empty or will not fill |
 | `diagnose_ci_job` | why a ci job is not running |
 
+**Sandboxes** — heyo cloud:
+
+| Tool | Does |
+|---|---|
+| `sandbox_create` | boot one and wait for it; `archive_id` seeds `/workspace` |
+| `sandbox_list` / `sandbox_info` | find one again; poll readiness |
+| `sandbox_exec` | run a command, buffered, with its exit code |
+| `sandbox_read_file` / `sandbox_write_file` | small files inline; the write refuses what 413 would |
+| `sandbox_upload_url` / `sandbox_finalize_upload` / `sandbox_attach_archive` | the route past the 1 MB body |
+| `sandbox_set_ttl` | keep a sandbox alive across a conversation |
+| `sandbox_stop` / `sandbox_start` / `sandbox_restart` | park and resume; the disk survives all three |
+| `sandbox_kill` | DESTRUCTIVE — the VM and its disk |
+| `heyo_capacity` | your daemons and your running sandboxes, before booting more |
+
+**The event feed** — app-lb's per-namespace RSS, as data:
+
+| Tool | Answers |
+|---|---|
+| `applb_feeds` | which namespaces have events |
+| `applb_feed` | deployment lifecycle and issues, newest first, since a cursor |
+
+The feed is **polled, never pushed**, and no subscription state exists anywhere:
+app-lb tracks no per-reader watermark, so `applb_feed` takes `since_id` and
+returns `latest_id` for the caller to keep. The ring is in memory, so an app-lb
+restart empties it and ids begin again — a cursor from before that reads as
+ahead of everything, and the tool says "feed reset" and returns the lot rather
+than reporting nothing new for ever. Nothing publishes unless a deployment's
+spec opts in with `feed.announce` or `feed.issues`.
+
 **Actions** — app-lb reads and lifecycle, ci run control, and `*_request` raw
 tools covering everything without a dedicated tool.
 
@@ -207,8 +335,10 @@ with `DESTRUCTIVE`. Folding them into a generic request tool would hide a
 `DELETE` inside a parameter, where it is invisible in a transcript and in an
 approval prompt.
 
-The raw `applb_request` / `obs_request` / `ci_request` tools reach the rest of
-each API, including destructive methods. Prefer a named tool when one exists —
+`sandbox_kill` is named the same way, for the same reason.
+
+The raw `heyo_request` / `applb_request` / `obs_request` / `ci_request` tools
+reach the rest of each API, including destructive methods. Prefer a named tool when one exists —
 the raw one's intent cannot be read without reading its arguments.
 
 `applb_purge_orphan_disks` deserves particular care: *orphaned* is app-lb's

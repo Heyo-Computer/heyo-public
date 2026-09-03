@@ -26,17 +26,21 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
     {
       name: "heyo_status",
       description:
-        "Which of app-lb, app-obs and ci this server can reach, and what each says about " +
-        "its own health. Start here when a tool fails with a connection or auth error — it " +
-        "distinguishes 'not configured' from 'configured and refusing'.",
+        "Which of heyo cloud, app-lb, app-obs and ci this server can reach, and what each " +
+        "says about itself. Start here when a tool fails with a connection or auth error — " +
+        "it distinguishes 'not configured' from 'configured and refusing'. The cloud probe " +
+        "doubles as an API-key check, and the app-lb one resolves the managed namespace, so " +
+        "a namespace that cannot be worked out surfaces here rather than inside a later call.",
       schema: {},
       handler: async () => {
         const r = await settle({
+          cloud: clients.cloud({ path: "/me/daemons" }),
           applb: clients.applb({ path: "/metrics" }),
           obs: clients.obs({ path: "/healthz" }),
           ci: clients.ci({ path: "/healthz" }),
         });
         return report(`Configured: ${configured(config).join(", ") || "nothing"}`, [
+          section("heyo cloud /me/daemons — reachable, and the key is good", r.cloud),
           section("app-lb /metrics", r.applb),
           section("app-obs /healthz", r.obs),
           section("ci /healthz", r.ci),
