@@ -70,6 +70,7 @@ fn golden(name: &str, value: &impl Serialize) {
 /// deployment that cannot exist.
 fn vm_spec() -> DeploymentSpec {
     DeploymentSpec {
+        ingress: None,
         account_id: None,
         user_id: None,
         namespace: "default".into(),
@@ -204,6 +205,7 @@ fn owned_vm_spec() -> DeploymentSpec {
 
 fn site_spec() -> DeploymentSpec {
     DeploymentSpec {
+        ingress: None,
         account_id: None,
         user_id: None,
         namespace: "default".into(),
@@ -258,6 +260,7 @@ fn site_spec() -> DeploymentSpec {
 
 fn static_spec() -> DeploymentSpec {
     DeploymentSpec {
+        ingress: None,
         account_id: None,
         user_id: None,
         namespace: "default".into(),
@@ -558,6 +561,7 @@ fn metrics_response_is_stable() {
                     uptime_secs: 3_600,
                     cpu_percent: Some(41.25),
                     memory_bytes: Some(1_073_741_824),
+                    subdomain: None,
                 }],
                 pending_vms: vec![PendingVmView {
                     sandbox_id: "applb-sandbox-d4e5f6".into(),

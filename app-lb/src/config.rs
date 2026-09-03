@@ -2765,6 +2765,47 @@ pub struct DeploymentSpec {
     /// carries what a spec explicitly asked it to. See [`FeedSpec`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed: Option<FeedSpec>,
+    /// A second way in, beside `routes`: a URL on the Heyo cloud's domain
+    /// that reaches the pool through the daemon rather than through this
+    /// proxy. See [`IngressSpec`]. Managed deployments only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<IngressSpec>,
+}
+
+/// How a managed deployment is reached from the Heyo cloud.
+///
+/// `routes` are this proxy's business: a hostname the operator points at
+/// `APP_LB_PUBLIC_IPS`. A machine with no public address — a laptop, a box
+/// behind NAT — has nothing to point a hostname at, and that is what this
+/// is for. With `cloud` set, app-lb binds every *ready* replica's `vm.port`
+/// on the daemon as a proxy endpoint tagged with this deployment, and
+/// unbinds it when the replica drains. The daemon carries those binds to the
+/// cloud, and the cloud issues one URL for the deployment that fans out to
+/// whichever binds exist at the moment — so the URL survives autoscaling,
+/// replacement and a pool roll.
+///
+/// Traffic on that URL never passes through this proxy: no `routes` match,
+/// no `auth` gate, no guard rule and no SIEM record. `public: false` puts
+/// the cloud's own account gate in front of it instead.
+///
+/// Not part of [`VmSpec`], so toggling it edits nothing about the VMs and
+/// never recycles the pool.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IngressSpec {
+    /// Ask the Heyo cloud for a URL, and keep the pool bound behind it.
+    #[serde(default)]
+    pub cloud: bool,
+    /// Whether that URL is reachable by anyone (the default) or only by the
+    /// owning account, signed in to the cloud.
+    #[serde(default = "default_true")]
+    pub public: bool,
+}
+
+impl IngressSpec {
+    /// Whether the pool's replicas should be bound on the daemon right now.
+    pub fn wants_cloud(spec: Option<&IngressSpec>) -> bool {
+        spec.is_some_and(|i| i.cloud)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -2935,6 +2976,8 @@ pub enum SpecError {
     BadFeedExpose(String),
     /// A `feed.expose` on a deployment with no routes to serve it from.
     FeedExposeWithoutRoutes,
+    /// `ingress.cloud` on a deployment with no VM pool to bind.
+    IngressWithoutVm,
     /// Workflow ids are interpolated into NATS subjects and VM names unescaped.
     BadWorkflowId(String),
     EmptyWorkflowRepo,
@@ -3160,6 +3203,11 @@ impl std::fmt::Display for SpecError {
                 f,
                 "feed.expose serves the feed on this deployment's routes, and this \
                  deployment has none"
+            ),
+            Self::IngressWithoutVm => write!(
+                f,
+                "ingress.cloud binds a VM's port on the daemon, and this deployment \
+                 has no VM pool — only a managed (`vm`) deployment can have a cloud URL"
             ),
             Self::BadWorkflowId(id) => write!(
                 f,
@@ -3795,6 +3843,11 @@ impl DeploymentSpec {
         {
             return Err(SpecError::StripPrefixWithoutPath);
         }
+        // A cloud URL is a bind on a VM's port. A static deployment's
+        // upstreams and a site's files are not on any daemon to bind.
+        if IngressSpec::wants_cloud(self.ingress.as_ref()) && self.vm.is_none() {
+            return Err(SpecError::IngressWithoutVm);
+        }
         // No routes means no ingress. For a *managed* deployment that is a
         // legitimate shape — an agent sandbox reached only through `exec` and
         // `shell`, never over HTTP — and it is the common one at fleet scale,
@@ -4048,6 +4101,48 @@ impl WorkflowSpec {
 mod tests {
     use super::*;
 
+    /// `ingress.cloud` is a bind on a VM port, so only a managed deployment
+    /// may ask for it; it is off the wire unless set, and public by default.
+    mod cloud_ingress {
+        use super::*;
+
+        #[test]
+        fn a_cloud_url_needs_a_vm_pool() {
+            let mut s = static_spec(&["10.0.0.9:8080"]);
+            s.ingress = Some(IngressSpec { cloud: true, public: true });
+            assert!(matches!(s.validate(), Err(SpecError::IngressWithoutVm)));
+
+            let mut s = spec();
+            s.ingress = Some(IngressSpec { cloud: true, public: false });
+            assert!(s.validate().is_ok());
+
+            // `cloud: false` asks for nothing, so it is harmless anywhere.
+            let mut s = static_spec(&["10.0.0.9:8080"]);
+            s.ingress = Some(IngressSpec { cloud: false, public: true });
+            assert!(s.validate().is_ok());
+        }
+
+        #[test]
+        fn absent_from_the_wire_unless_set_and_public_by_default() {
+            let v = serde_json::to_value(spec()).unwrap();
+            assert!(v.get("ingress").is_none());
+
+            let parsed: DeploymentSpec = serde_json::from_value(serde_json::json!({
+                "id": "web", "routes": [],
+                "vm": {"driver": "firecracker", "port": 8080},
+                "ingress": {"cloud": true}
+            }))
+            .unwrap();
+            assert_eq!(parsed.ingress, Some(IngressSpec { cloud: true, public: true }));
+            assert!(IngressSpec::wants_cloud(parsed.ingress.as_ref()));
+            assert!(!IngressSpec::wants_cloud(None));
+            assert!(!IngressSpec::wants_cloud(Some(&IngressSpec { cloud: false, public: true })));
+
+            let back = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(back["ingress"], serde_json::json!({"cloud": true, "public": true}));
+        }
+    }
+
     #[test]
     fn normalize_binds_every_secret_reference_to_the_spec_namespace() {
         let mut spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
@@ -4139,6 +4234,7 @@ mod tests {
 
     fn spec() -> DeploymentSpec {
         DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             namespace: "default".into(),
@@ -4212,6 +4308,7 @@ mod tests {
     /// A static (proxy_pass) deployment: `upstreams` set, no `vm`.
     fn static_spec(upstreams: &[&str]) -> DeploymentSpec {
         DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             namespace: "default".into(),
@@ -4752,6 +4849,7 @@ mod tests {
         let ok = ["http://127.0.0.1:8080", "https://art.example.com", "/srv/artifacts"];
         for store in ok {
             let s = DeploymentSpec {
+                ingress: None,
                 account_id: None,
                 user_id: None,
                 artifact: Some(ArtifactSpec { store: store.into(), ..artifact_spec() }),
@@ -4764,6 +4862,7 @@ mod tests {
         // which nobody writing a spec can see; the rest are not stores at all.
         for store in ["", ".artifacts", "art.example.com", "/srv/../etc", "file:///srv/art"] {
             let s = DeploymentSpec {
+                ingress: None,
                 account_id: None,
                 user_id: None,
                 artifact: Some(ArtifactSpec { store: store.into(), ..artifact_spec() }),
@@ -4788,6 +4887,7 @@ mod tests {
         assert_eq!(digest.len(), 64);
         for r in ["debian-hermes", "ubuntu-24.04", "web_v2", digest.as_str()] {
             let s = DeploymentSpec {
+                ingress: None,
                 account_id: None,
                 user_id: None,
                 artifact: Some(ArtifactSpec { artifact_ref: r.into(), ..artifact_spec() }),
@@ -4799,6 +4899,7 @@ mod tests {
         // slash or a `..` would leave the store when pasted into a URL path.
         for r in ["", "-flag", ".hidden", "a/b", "../etc/passwd", "has space"] {
             let s = DeploymentSpec {
+                ingress: None,
                 account_id: None,
                 user_id: None,
                 artifact: Some(ArtifactSpec { artifact_ref: r.into(), ..artifact_spec() }),
@@ -4826,6 +4927,7 @@ mod tests {
     #[test]
     fn a_deployment_cannot_both_build_and_pull_its_image() {
         let s = DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             build: Some(build_spec()),
@@ -4838,6 +4940,7 @@ mod tests {
     #[test]
     fn a_static_deployment_has_no_image_to_pull_into() {
         let s = DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             artifact: Some(artifact_spec()),
@@ -4849,6 +4952,7 @@ mod tests {
     #[test]
     fn growing_to_zero_is_refused_rather_than_silently_shrinking_nothing() {
         let s = DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             artifact: Some(ArtifactSpec { grow_gb: Some(0), ..artifact_spec() }),

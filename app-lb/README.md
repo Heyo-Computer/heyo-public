@@ -88,15 +88,13 @@ Configuration is environment-only:
 | `APP_LB_BUILD_DIR` | `/var/lib/app-lb/builds` | Git checkouts for image builds (one per deployment, `0700`) |
 | `APP_LB_HEYVM_BIN` | `heyvm` | The heyvm CLI that builds guest images |
 | `APP_LB_ART_BIN` | `art` | The `art` CLI that materializes a rootfs from a **local** artifact store; unused when `artifact.store` is a URL |
-| `APP_LB_IMAGES_DIR` | `$MVM_DATA_DIR/images/firecracker`, else `<home>/.heyo/images/firecracker` | Where a pulled rootfs is written. Must be the directory heyvmd resolves image names in |
+| `APP_LB_IMAGES_DIR` | `/var/lib/app-lb/images` | app-lb's own scratch for images on their way to the daemon: a pull is fetched here and a build writes here, then the result is uploaded into the daemon's catalog (`PUT /images/:name`) and removed. Nothing the daemon reads |
 | `APP_LB_GIT_BIN` | `git` | The git binary used for checkouts |
-| `APP_LB_MOUNTS_DIR` | `/var/lib/app-lb/mounts` | Where a [guest mount](#mounting-a-directory-into-the-guests)'s tree is unpacked. heyvmd reads it, so it must be readable by the daemon's user |
+| `APP_LB_MOUNTS_DIR` | `/var/lib/app-lb/mounts` | Where a [guest mount](#mounting-a-directory-into-the-guests)'s tree is unpacked before it is uploaded to the daemon as a tree (`PUT /trees/:id`). app-lb's own directory |
 | `APP_LB_MOUNT_TTL_SECS` | `86400` (1 day) | How long a mount tree no deployment names survives. **`0` turns reclamation off** |
 | `APP_LB_UPDATE_SHELL` | `/bin/sh` | Shell a static deployment's `update.commands` run through |
 | `APP_LB_BUILD_TIMEOUT_SECS` | `1800` | Ceiling on one build step or update command, after which the child is killed |
-| `APP_LB_HEYVM_HOME` | *(unset)* | `HOME` for the heyvm child — set it when app-lb and heyvmd run as different users |
-| `APP_LB_VM_DATA_DIR` | `$MVM_DATA_DIR`, else `<home>/.heyo` | The daemon's data directory, where per-sandbox disks live. Disk management is disabled if this cannot be resolved |
-| `APP_LB_VM_TMP_DIR` | `/tmp` | Where the Firecracker driver writes its per-boot rootfs copy |
+| `APP_LB_HEYVM_HOME` | *(unset)* | `HOME` for the `heyvm` and `art` children (their own config), when it should differ from app-lb's. A build's output no longer depends on it: `MVM_DATA_DIR` is pointed at `APP_LB_IMAGES_DIR` for the build and the image is uploaded from there |
 | `APP_LB_DISKS_PATH` | `app-lb-disks.json` | Where retention decisions persist |
 | `APP_LB_DISK_TTL_SECS` | `604800` (7 days) | How long an unclaimed disk survives. **`0` turns expiry off** |
 | `APP_LB_DISK_SWEEP_SECS` | `3600` | Gap between expiry sweeps (floor 60) |
@@ -105,7 +103,7 @@ Configuration is environment-only:
 | `APP_LB_DISK_ARCHIVE_ENDPOINT` | *(unset)* | `--endpoint-url` for an S3-compatible store |
 | `APP_LB_DISK_ARCHIVE_ON_EXPIRE` | `false` | `1` to archive an expiring disk before reclaiming it |
 | `APP_LB_DISK_ARCHIVE_TIMEOUT_SECS` | `7200` | Ceiling on one archive, after which `tar` and `aws` are killed |
-| `APP_LB_TAR_BIN` | `tar` | The `tar` used to stream a disk into the uploader. Needs GNU `--sparse` |
+| `APP_LB_TAR_BIN` | `tar` | The `tar` used to unpack a workspace capture and restore a bundle on this host. The daemon produces disk archives and workspace exports itself |
 | `APP_LB_OBS_URL` | *(unset)* | Where app-obs listens (e.g. `127.0.0.1:9500`); **setting it enables log shipping** |
 | `APP_LB_OBS_TOKEN` | *(unset)* | Bearer token for app-obs's `/ingest` — must match its `APP_OBS_INGEST_TOKEN` |
 | `APP_LB_OBS_HOST` | `/etc/hostname` | Machine name stamped on every batch |
@@ -816,12 +814,13 @@ global cap is a race and not a policy — one deployment pulling images in a loo
 would evict everybody else's history, and the job you came to investigate is the
 one already gone.
 
-**Where it runs.** On the app-lb host, because heyvm has no build API: turning a
-Dockerfile into an ext4 rootfs needs a local `docker`, `mke2fs` (e2fsprogs) and
-`fakeroot`. The image lands in `$HOME/.heyo/images/firecracker/<name>.ext4`, and
-the daemon only looks under *its own* home — so app-lb should run as the same
-user as `heyvmd`, or be given `APP_LB_HEYVM_HOME`. Otherwise the build succeeds
-and then nothing boots.
+**Where it runs.** On the app-lb host: turning a Dockerfile into an ext4
+rootfs needs a local `docker`, `mke2fs` (e2fsprogs) and `fakeroot`, and the
+daemon's own build route has no live log. `heyvm mvm build` is run with
+`MVM_DATA_DIR` pointed at `APP_LB_IMAGES_DIR`, so the image lands in app-lb's
+scratch rather than anywhere the daemon reads; app-lb then uploads it into the
+daemon's catalog (`PUT /images/<name>`) and removes the local copy. Nothing
+about where the daemon keeps its images is assumed.
 
 **Builds need the `docker` group.** `heyvm mvm build` shells out to `docker`,
 whose socket is `root:docker` at `0660`, and the
@@ -858,9 +857,8 @@ and warns `neither MVM_DATA_DIR nor HOME is set`.
 Either give the user a real home
 (`install -d -o app-lb -g app-lb /home/app-lb`) or set `APP_LB_HEYVM_HOME`,
 which app-lb passes to the heyvm child as an explicit `HOME` and docker prefers
-over the passwd lookup. Prefer the latter where possible: it is the same
-variable the image-placement problem above wants set, and pointing it at
-heyvmd's home settles both at once.
+over the passwd lookup. It affects only the child's own configuration; the
+built image is placed by `MVM_DATA_DIR`, as above, and uploaded.
 
 **Image names carry the commit.** Each build produces `<name>-<short sha>`
 (`<name>` defaults to the deployment id, override with `build.image_name`), so
@@ -1020,11 +1018,12 @@ disk until the guest writes; heyvm runs the `resize2fs` that lets the guest
 filesystem use the room. Set it when the image was built small and the workload
 needs space on `/`.
 
-**Where it lands.** `APP_LB_IMAGES_DIR`, defaulting to
-`$MVM_DATA_DIR/images/firecracker` and then to
-`<home>/.heyo/images/firecracker` — where `<home>` honours `APP_LB_HEYVM_HOME`,
-because the daemon only finds images under its own home. If none of those can be
-worked out, app-lb still starts and warns; only pulls fail.
+**Where it lands.** In the daemon's catalog, by upload: the blob is fetched
+into `APP_LB_IMAGES_DIR` (app-lb's own scratch, default
+`/var/lib/app-lb/images`), sent to the daemon as `PUT /images/<name>` — grown
+there when `grow_gb` asks — and removed. Whether a pull is needed at all is
+the daemon's answer too (`GET /images/<name>`), so a catalog on another host
+is as good as one on this one.
 
 **`build` and `artifact` are mutually exclusive.** Both rewrite `vm.image` when
 they run, so a deployment holding both would have no answer to where the running
@@ -1152,10 +1151,13 @@ fetched once per host and shared by every deployment that names it.
 
 **How it reaches the guest.** app-lb resolves the reference, verifies the blob
 against its digest and unpacks it into a directory named after that digest under
-`APP_LB_MOUNTS_DIR`. heyvmd is given the *directory*: at boot it builds each VM
-its own ext4 image from it (`mke2fs -d`) and attaches it as a virtio-blk device
-the guest mounts at `path`. So the disk is per VM — no guest sees another's
-writes — and the tree itself is only ever read.
+`APP_LB_MOUNTS_DIR`, then uploads that tree to the daemon once
+(`PUT /trees/<digest>`; the id is the content, so a second upload is a no-op).
+The create body names the tree: at boot heyvmd builds each VM its own ext4
+image from it (`mke2fs -d`) and attaches it as a virtio-blk device the guest
+mounts at `path`. So the disk is per VM — no guest sees another's writes —
+and the tree itself is only ever read. A tree the mount sweep reclaims here is
+reclaimed on the daemon too.
 
 **A mount is attached at boot, so `mounts` lives in the VM template.** Editing
 the list recycles the pool, exactly as changing `image` or `size_class` does.
@@ -1270,9 +1272,10 @@ What happens:
   the real snapshot.
 - **Capture.** When the replica retires for any reason — drained by a rollout,
   evicted, torn down by an edit or `delete`, suspended by `idle_action:
-  retain` — app-lb runs `sync` in the guest, stops the VM, replays the image's
-  journal (`e2fsck -p`), extracts it (`debugfs rdump`), and points the
-  deployment at the new tree. **The replacement is not created until that has
+  retain` — app-lb runs `sync` in the guest, stops the VM, asks the daemon
+  for the mount's contents (`GET /sandboxes/:id/mounts/export`: the daemon
+  replays the image's journal with `e2fsck -p`, extracts it with `debugfs
+  rdump` and streams a tarball), and points the deployment at the new tree. **The replacement is not created until that has
   landed.** That is the guarantee, and it is also the cost: a rollout of a
   workspace deployment has a gap of drain + capture + boot, which for a few
   gigabytes of repositories is a minute or two.
@@ -1325,12 +1328,12 @@ above imply:
   image. Purge it there once you have looked.
 - The host keeps the current snapshot and the one before it under
   `APP_LB_WORKSPACES_DIR` (default `/var/lib/app-lb/workspaces/<id>/`), plus
-  any bundle not yet pushed. heyvmd must be able to read that directory, as
-  with `APP_LB_MOUNTS_DIR`. `e2fsprogs` (`debugfs`, `e2fsck`, already required
-  by heyvmd for `mke2fs`) must be installed; `/usr/sbin` and `/sbin` are
-  searched when they are not on app-lb's `PATH`, or set
-  `APP_LB_DEBUGFS_BIN` / `APP_LB_E2FSCK_BIN`. `APP_LB_WORKSPACE_TIMEOUT_SECS`
-  (default 3600) bounds one capture, push or restore.
+  any bundle not yet pushed. app-lb's own directory: a replica is seeded from
+  it by uploading the snapshot tree to the daemon (`PUT /trees/ws-<digest>`,
+  once per snapshot) and naming it in the create body, and a capture comes
+  back as the daemon's export stream. `e2fsprogs` is the daemon's business.
+  `APP_LB_WORKSPACE_TIMEOUT_SECS` (default 3600) bounds one capture, push or
+  restore.
 - Deregistering the deployment captures and pushes its final state and leaves
   the host directory in place; registering it again restores from it.
 
@@ -1607,6 +1610,55 @@ in, so an unrouted one would be unreachable by anything, and it is rejected at
 registration. A sign-in gate on an unrouted deployment is rejected too: `auth`
 runs on a proxied request, and there are none.
 
+### Cloud URLs — a deployment on a machine with no public address
+
+`routes` are this proxy's way in: a hostname the operator points at
+`APP_LB_PUBLIC_IPS`. A laptop, an on-prem box or a cloud-lite fleet behind
+NAT has nothing to point a hostname at. For those, a managed deployment can
+ask the Heyo cloud for a URL instead:
+
+```jsonc
+{
+  "id": "web",
+  "routes": [],                       // or keep your own routes too
+  "vm": { "image": "ubuntu-24.04-dev", "port": 8080 },
+  "ingress": { "cloud": true, "public": true }
+}
+```
+
+Registered through the cloud's namespace door (`/namespaces/{ns}/lb/…` — the
+way the dashboard, the SDKs and a namespace-scoped `heyctl` reach a managed
+app-lb), the answer carries the URL:
+
+```jsonc
+{ "spec": { "id": "web", … }, "url": "https://web-k3x9p2.heyo.computer", … }
+```
+
+Three parties each hold one end of it, and none of them holds another's:
+
+| | in charge of | what it does |
+| --- | --- | --- |
+| **app-lb** | the VM | binds every *ready* replica's `vm.port` on the daemon (`POST /sandboxes/{id}/proxy`, tagged `{namespace, id}`) and withdraws the bind the moment the replica starts draining — before it is killed, so the URL never sends a request to a VM on its way out |
+| **the daemon** | traffic | carries each bind exactly as it carries a single VM's URL, and reports it to the cloud with the tag attached |
+| **the cloud** | routing | owns the deployment's subdomain and, per request, picks one of the current member binds to forward to — so the URL survives autoscaling, a replacement and a pool roll |
+
+Nothing on that URL passes through this proxy: no `routes` match, no `auth`
+gate, no block rule and no SIEM record — the request goes cloud → daemon →
+VM. `"public": false` puts the cloud's own sign-in in front of it (the
+namespace's owning account). Editing `ingress` is not a template change and
+never recycles the pool; dropping it withdraws every bind and the URL.
+
+A deployment scaled to zero, or whose replicas are still booting, has no
+member behind the URL and the cloud answers 503 (a retrying page, for a
+browser) until the first replica is ready. `GET /deployments/{id}` shows each
+VM's bind as `vms[].subdomain` while it is in place.
+
+Only a managed (`vm`) deployment can have one — a static deployment's
+upstreams and a site's files are on no daemon to bind — and the spec is
+rejected otherwise. On a self-hosted app-lb registered directly (not through
+the cloud) the binds are still made, but no URL is minted; the daemon must be
+registered with the cloud (`heyvmd`) for the binds to reach it.
+
 ## Directory
 
 `http://<admin-addr>/` (default `http://127.0.0.1:9090/`) is a landing page: one
@@ -1854,10 +1906,13 @@ revisited, and a host still running an older daemon keeps making more. The rest
 is what a host looks like after months of VMs that did not all exit cleanly —
 nothing was ever going to come back for it, which is what the sweep below is for.
 
-app-lb can do this despite not owning those paths because it is *required* to run beside a
-local daemon — `guest_ip` exists nowhere else — so it shares the filesystem. It already writes
-into the daemon's image directory for artifact pulls. What it adds is the one thing the daemon
-cannot know: which sandboxes a deployment still expects to resume.
+app-lb never touches those paths itself. The daemon inventories its own directories
+(`GET /storage`: every file under `run/<id>` and `kvm/<id>` plus the tmp scratch, with
+allocated sizes), removes what it is asked to (`DELETE /storage/sandboxes/:id?parts=all|rootfs`,
+refused while the sandbox is live) and streams an archive of a sandbox's state
+(`GET /storage/sandboxes/:id/archive`). What app-lb adds is the one thing the daemon cannot
+know: which sandboxes a deployment still expects to resume — and the retention policy, the
+sweep and the S3 upload that hang off it.
 
 Sizes are **allocated blocks**, not nominal size. A data disk is created sparse at its full
 size, so 8 GiB of `data.ext4` is usually a few hundred MiB on the host; the page shows both.

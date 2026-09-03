@@ -19,14 +19,14 @@
 use crate::config::{DeploymentSpec, VmSpec};
 use crate::mounts::MountStore;
 use heyo_sdk::{
-    CommandResult, CommandRunOptions, HeyoClient, HeyoClientOptions, RequestOptions, Sandbox,
-    SandboxCreateOptions, SandboxDriver, SandboxInfo, SandboxStatus, ShellOptions, ShellSession,
+    BindRequest, CommandResult, CommandRunOptions, Daemon, DaemonCreateRequest, DaemonMount,
+    HeyoClient, HeyoClientOptions, ImageInfo, ImageUploadOptions, InactiveSandbox, LogEntry,
+    LogsQuery, PurgeOutcome, PurgeParts, Sandbox, SandboxDriver, SandboxInfo, SandboxStatus,
+    ShellOptions, ShellSession, StorageInventory, TreeInfo, UploadStream,
 };
-use serde::Deserialize;
-use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Marks a sandbox as ours and records which deployment owns it, so VMs can be
@@ -72,11 +72,6 @@ pub enum VmError {
         sandbox_id: String,
         value: String,
     },
-    /// The create body could not be serialized. Structurally impossible with the
-    /// types involved — every map key is a `String` and no field is a float —
-    /// but the alternative to a variant here is a panic on the autoscaler's
-    /// reconcile tick.
-    BadCreateBody(String),
     /// A guest mount has no tree on this host, so the VM would boot without the
     /// data its spec says it has. Refused rather than created: a replica missing
     /// a mount is a replica that answers health checks and then fails on the
@@ -121,7 +116,6 @@ impl std::fmt::Display for VmError {
                     "sandbox {sandbox_id} reported unparseable guest_ip {value:?}"
                 )
             }
-            Self::BadCreateBody(e) => write!(f, "could not serialize the create request: {e}"),
             Self::SecretUnresolved { env, detail } => write!(
                 f,
                 "env_from for {env}: {detail} — `heyctl get secrets` lists what this namespace holds"
@@ -151,59 +145,14 @@ impl From<heyo_sdk::HeyoError> for VmError {
     }
 }
 
-/// Live host + per-sandbox resource usage from the daemon's `GET /system/usage`.
-///
-/// The daemon serves this from a background poller (~5s) sampling the host
-/// processes that back each VM, so it is cheap to fetch — a cache read, not a
-/// per-VM probe — and safe to poll on the reconcile tick. Only backends with a
-/// local host process are reported, which for app-lb (Firecracker/KVM on a local
-/// daemon) is all of them. Disk and network throughput are not exposed.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SystemUsage {
-    /// False while the poller is still warming up; `snapshot` is then absent.
-    #[serde(default)]
-    pub available: bool,
-    #[serde(default)]
-    pub snapshot: Option<UsageSnapshot>,
-}
+/// A daemon-side proxy bind of a VM port and the deployment it belongs to,
+/// as the SDK types them.
+pub use heyo_sdk::{ProxyBind, ProxyDeployment};
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageSnapshot {
-    pub host: HostUsage,
-    #[serde(default)]
-    pub sampled_at_ms: u64,
-    #[serde(default)]
-    pub sandboxes: Vec<SandboxUsage>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostUsage {
-    #[serde(default)]
-    pub cpu_count: u32,
-    /// Whole-host CPU utilisation, 0–100.
-    #[serde(default)]
-    pub cpu_percent: f64,
-    #[serde(default)]
-    pub memory_total_bytes: u64,
-    #[serde(default)]
-    pub memory_used_bytes: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SandboxUsage {
-    #[serde(default)]
-    pub sandbox_id: String,
-    /// `top`-style CPU: percent of a *single* core, so a busy multi-vCPU VM can
-    /// exceed 100.
-    #[serde(default)]
-    pub cpu_percent: f64,
-    /// Resident set size of the backing host process(es).
-    #[serde(default)]
-    pub memory_bytes: u64,
-}
+/// Live host + per-sandbox resource usage from the daemon's `GET /system/usage`,
+/// as the SDK types it. Cheap to fetch — a cache read, not a per-VM probe —
+/// and safe to poll on the reconcile tick.
+pub use heyo_sdk::{SandboxUsage, SystemUsage};
 
 /// How long to wait on the daemon for a guest's captured output.
 ///
@@ -218,33 +167,6 @@ const GUEST_LOG_TIMEOUT: Duration = Duration::from_secs(3);
 /// must not turn one diagnostic into a megabyte.
 const GUEST_LOG_MAX_CHARS: usize = 2000;
 
-/// `GET /sandboxes/:id/logs`, as much of it as this needs.
-///
-/// Deliberately loose: `source` is read as a string rather than the daemon's
-/// `LogSource` enum, and every field is optional. This is a diagnostic on a
-/// failure path, so a daemon that adds a variant or renames a field must
-/// degrade to a thinner message, never to no message.
-#[derive(Deserialize)]
-struct GuestLogs {
-    #[serde(default)]
-    logs: Vec<GuestLogLine>,
-}
-
-#[derive(Deserialize)]
-struct GuestLogLine {
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    message: String,
-}
-
-/// `POST /sandbox-deploy`'s answer, which is the id of a sandbox that is still
-/// provisioning. The SDK's own `CreateResponse` is private, and this is the only
-/// field either of them needs.
-#[derive(Deserialize)]
-struct CreatedSandbox {
-    id: String,
-}
 
 /// The defaults `heyo_sdk::Sandbox::create` fills in before posting, applied
 /// here because this posts the body itself.
@@ -283,80 +205,112 @@ impl VmOwner {
     }
 }
 
-/// The `POST /sandbox-deploy` body for one replica: the SDK's options, the
-/// defaults it would have applied, the guest mounts, and the owner. Pure, so
-/// the wire shape is tested without a daemon.
-fn create_body(
-    options: &SandboxCreateOptions,
-    mounts: Vec<Value>,
+/// The daemon's create body for one replica: the template, the mounts as
+/// trees the daemon holds, the owner, and — when the template names them —
+/// the catalog image source and the workspace archive. Everything the SDK
+/// types; the defaults every SDK create applies (`size_class: small` above
+/// all — without it a Firecracker guest boots at 1 vCPU and 128 MB) are
+/// [`Daemon::create`]'s to add.
+fn create_request(
+    spec: &VmSpec,
+    name: String,
+    open_ports: Vec<u16>,
+    env_vars: Option<HashMap<String, String>>,
+    mounts: Vec<DaemonMount>,
     owner: &VmOwner,
-    image: &ImageSource,
-    archive: Option<&crate::config::WorkspaceArchive>,
-) -> Result<Value, VmError> {
-    let mut body = serde_json::to_value(options).map_err(|e| VmError::BadCreateBody(e.to_string()))?;
-    sdk_create_defaults(&mut body);
-    if !mounts.is_empty() {
-        body["mounts"] = Value::Array(mounts);
-    }
-    if let Some(account) = &owner.account_id {
-        body["account_id"] = json!(account);
-    }
-    if let Some(user) = &owner.user_id {
-        body["user_id"] = json!(user);
-    }
-    // Where the daemon may fetch the image from when it does not hold it. The
-    // daemon verifies the download against the size and digest; a URL alone
-    // is still accepted, it just cannot be checked.
-    if let Some(url) = &image.download_url {
-        body["image_download_url"] = json!(url);
-        if let Some(n) = image.size_bytes {
-            body["image_size_bytes"] = json!(n);
-        }
-        if let Some(sha) = &image.sha256 {
-            body["image_sha256"] = json!(sha);
-        }
-    }
+) -> DaemonCreateRequest {
     // A workspace archive turns the create into the daemon's from-archive
     // create: same body, plus the object key and the guest path to unpack at.
     // `DeploymentSpec::validate` has already refused an archive with no key.
-    if let Some(key) = archive.and_then(|a| a.key()) {
-        body["s3_archive_key"] = json!(key);
-        body["sandbox_path"] = json!(crate::config::DEFAULT_WORKSPACE_PATH);
+    let archive_key = spec.workspace_archive.as_ref().and_then(|a| a.key().map(str::to_string));
+    DaemonCreateRequest {
+        name,
+        driver: Some(spec.driver),
+        image: spec.image.clone(),
+        start_command: spec.start_command.clone(),
+        size_class: spec.size_class.map(|s| serde_json::to_value(s).ok()).flatten().and_then(|v| v.as_str().map(str::to_string)),
+        disk_size_gb: spec.disk_size_gb.map(u64::from),
+        working_directory: spec.working_directory.clone(),
+        env_vars,
+        setup_hooks: spec.setup_hooks.clone(),
+        open_ports,
+        // Backstop: if this LB dies without reaping, the VM still expires.
+        ttl_seconds: Some(spec.ttl_seconds),
+        mounts,
+        account_id: owner.account_id.clone(),
+        user_id: owner.user_id.clone(),
+        // Where the daemon may fetch the image from when it does not hold it.
+        // The daemon verifies the download against the size and digest; a
+        // URL alone is still accepted, it just cannot be checked.
+        image_download_url: spec.image_download_url.clone(),
+        image_size_bytes: spec.image_download_url.as_ref().and(spec.image_size_bytes),
+        image_sha256: spec.image_download_url.as_ref().and(spec.image_sha256.clone()),
+        sandbox_path: archive_key.as_ref().map(|_| crate::config::DEFAULT_WORKSPACE_PATH.to_string()),
+        s3_archive_key: archive_key,
+        ..DaemonCreateRequest::default()
     }
-    Ok(body)
 }
 
-/// The catalog fields of a template, or none for an image the daemon must
-/// already hold.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct ImageSource {
-    download_url: Option<String>,
-    size_bytes: Option<u64>,
-    sha256: Option<String>,
+/// A guest mount, resolved: the tree on this host, the id it is known to
+/// the daemon by, and the mount the create body carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedMount {
+    tree_id: String,
+    tree: PathBuf,
+    mount: DaemonMount,
 }
 
-impl ImageSource {
-    fn of(spec: &VmSpec) -> Self {
-        Self {
-            download_url: spec.image_download_url.clone(),
-            size_bytes: spec.image_size_bytes,
-            sha256: spec.image_sha256.clone(),
+/// A workspace tree to seed a replica from: where it is on this host, and
+/// the id the daemon holds it under. See `workspace::Workspaces::seed_for_create`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSeed {
+    pub tree_id: String,
+    pub tree: PathBuf,
+}
+
+/// The daemon-side id of a tree on this host: its directory name, which the
+/// mount store already makes content-addressed (`<digest>[-s<strip>]`).
+fn tree_id_of(tree: &Path) -> String {
+    tree.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// A directory as a `tar.gz` stream, produced on a blocking thread as the
+/// upload reads it. Symlinks are kept as symlinks — a workspace has them.
+pub fn tar_gz_stream(dir: PathBuf) -> UploadStream {
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
+    tokio::task::spawn_blocking(move || {
+        struct ChannelWriter(tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>);
+        impl std::io::Write for ChannelWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .blocking_send(Ok(bytes::Bytes::copy_from_slice(buf)))
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "upload closed"))?;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-    }
-}
-
-fn sdk_create_defaults(body: &mut Value) {
-    let Some(map) = body.as_object_mut() else {
-        return;
-    };
-    for (key, value) in [
-        ("region", json!("US")),
-        ("image", json!("ubuntu:24.04")),
-        ("size_class", json!("small")),
-        ("open_ports", json!([])),
-    ] {
-        map.entry(key).or_insert(value);
-    }
+        let result = (|| -> std::io::Result<()> {
+            let writer = std::io::BufWriter::with_capacity(1 << 20, ChannelWriter(tx.clone()));
+            let gz = flate2::write::GzEncoder::new(writer, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(gz);
+            tar.follow_symlinks(false);
+            tar.append_dir_all(".", &dir)?;
+            let gz = tar.into_inner()?;
+            let mut writer = gz.finish()?;
+            std::io::Write::flush(&mut writer)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = tx.blocking_send(Err(e));
+        }
+    });
+    Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
 }
 
 /// The last `lines` of guest output on one line, bounded.
@@ -366,7 +320,7 @@ fn sdk_create_defaults(body: &mut Value) {
 /// is kept because which one a message came out of is most of the diagnosis: a
 /// server announcing its port on stdout and a stack trace on stderr mean
 /// opposite things about the same boot.
-fn render_guest_log(logs: &[GuestLogLine], lines: usize) -> String {
+fn render_guest_log(logs: &[LogEntry], lines: usize) -> String {
     let start = logs.len().saturating_sub(lines);
     let mut out = String::new();
     for entry in &logs[start..] {
@@ -377,8 +331,8 @@ fn render_guest_log(logs: &[GuestLogLine], lines: usize) -> String {
         if !out.is_empty() {
             out.push_str(" | ");
         }
-        if let Some(source) = entry.source.as_deref() {
-            out.push_str(source);
+        if !entry.source.is_empty() {
+            out.push_str(&entry.source);
             out.push_str(": ");
         }
         out.push_str(text);
@@ -408,6 +362,8 @@ pub struct VmManager {
     /// routes the SDK does not wrap used to carry their own copy of the key,
     /// which is a 401 on the diagnostics the moment the two drift apart.
     client: HeyoClient,
+    /// The same client, as the daemon's typed routes.
+    daemon: Daemon,
     /// What `client` ended up dialing, for the startup log. `base_url` cannot
     /// answer it — a socket client reports `http://localhost`.
     transport: String,
@@ -465,6 +421,7 @@ impl VmManager {
             None => client.base_url().to_string(),
         };
         Ok(Self {
+            daemon: Daemon::new(client.clone()),
             client,
             transport,
             mounts,
@@ -501,30 +458,21 @@ impl VmManager {
         if !crate::disks::valid_sandbox_id(sandbox_id) {
             return None;
         }
-        let response = self
-            .client
-            .raw_request(
-                http::Method::GET,
-                &format!("/sandboxes/{sandbox_id}/logs"),
-                None::<&serde_json::Value>,
-                RequestOptions {
-                    timeout: Some(GUEST_LOG_TIMEOUT),
-                    query: vec![("limit".to_string(), lines.to_string())],
-                },
-            )
-            .await;
-
-        let body: GuestLogs = match response {
-            Ok(r) if r.status().is_success() => r.json().await.ok()?,
+        let query = LogsQuery {
+            limit: Some(lines),
+            ..LogsQuery::default()
+        };
+        let body = match tokio::time::timeout(GUEST_LOG_TIMEOUT, self.daemon.logs(sandbox_id, &query)).await {
+            Ok(Ok(body)) => body,
             // Both are ordinary here — an older daemon has no such route, and a
             // sandbox killed between the decision and this call is gone. Debug,
             // not warn: the caller's own error line is the event.
-            Ok(r) => {
-                tracing::debug!(sandbox = %sandbox_id, status = %r.status(), "no guest logs");
+            Ok(Err(e)) => {
+                tracing::debug!(sandbox = %sandbox_id, error = %e, "no guest logs");
                 return None;
             }
-            Err(e) => {
-                tracing::debug!(sandbox = %sandbox_id, error = %e, "could not fetch guest logs");
+            Err(_) => {
+                tracing::debug!(sandbox = %sandbox_id, "guest log fetch timed out");
                 return None;
             }
         };
@@ -550,16 +498,7 @@ impl VmManager {
     /// autoscaler sees is exactly what it always saw — and the extras are
     /// picked off beside it. One request, not two.
     pub async fn list_detailed(&self) -> Result<Listing, VmError> {
-        let raw: Vec<Value> = self
-            .client
-            .request(
-                http::Method::GET,
-                "/deployed-sandboxes",
-                None::<&Value>,
-                RequestOptions::default(),
-            )
-            .await?;
-        Listing::from_raw(raw)
+        Ok(Listing::from_infos(self.daemon.list().await?))
     }
 
     /// Create a VM and return immediately, without waiting for boot.
@@ -588,7 +527,7 @@ impl VmManager {
         &self,
         spec: &VmSpec,
         name: String,
-        workspace: Option<&Path>,
+        workspace: Option<&WorkspaceSeed>,
         owner: &VmOwner,
         secret_env: HashMap<String, String>,
     ) -> Result<Sandbox, VmError> {
@@ -613,53 +552,30 @@ impl VmManager {
             Some(env)
         };
 
-        let options = SandboxCreateOptions {
-            name: Some(name),
-            driver: Some(spec.driver),
-            image: spec.image.clone(),
-            start_command: spec.start_command.clone(),
-            size_class: spec.size_class,
-            disk_size_gb: spec.disk_size_gb,
-            working_directory: spec.working_directory.clone(),
-            env_vars,
-            setup_hooks: spec.setup_hooks.clone(),
-            open_ports,
-            // Backstop: if this LB dies without reaping, the VM still expires.
-            ttl_seconds: Some(spec.ttl_seconds),
-            // Unused on this path — `Sandbox::create` is what reads it, and the
-            // wait it describes (none) is what this method does anyway.
-            wait_for_ready: Some(Duration::ZERO),
-            region: None,
-            archive_id: None,
-        };
-
         // Resolved before the request, so a deployment whose mounts have not
         // been pulled fails without asking the daemon for anything.
-        let mut mounts = self.guest_mounts(spec)?;
-        if let (Some(tree), Some(ws)) = (workspace, spec.workspace.as_ref()) {
-            mounts.push(json!({
-                "host_path": tree.to_string_lossy(),
-                "sandbox_path": ws.guest_path(),
-                "read_only": false,
-            }));
+        let mut resolved = self.guest_mounts(spec)?;
+        if let (Some(seed), Some(ws)) = (workspace, spec.workspace.as_ref()) {
+            resolved.push(ResolvedMount {
+                tree_id: seed.tree_id.clone(),
+                tree: seed.tree.clone(),
+                mount: DaemonMount::from_tree(seed.tree_id.clone(), ws.guest_path(), false),
+            });
         }
+        // Every tree the daemon does not hold yet goes up first. Content-
+        // addressed ids make the check cheap and the upload one-time.
+        for m in &resolved {
+            self.ensure_tree(&m.tree_id, &m.tree).await?;
+        }
+        let mounts: Vec<DaemonMount> = resolved.into_iter().map(|m| m.mount).collect();
 
-        let body = create_body(&options, mounts, owner, &ImageSource::of(spec), spec.workspace_archive.as_ref())?;
+        let req = create_request(spec, name, open_ports, env_vars, mounts, owner);
 
-        // `POST /sandbox-deploy`, which is what `Sandbox::create` posts. It
-        // answers `202` with the id of a sandbox that is still provisioning;
-        // readiness is tracked across reconcile ticks either way.
-        let client = &self.client;
-        let created: CreatedSandbox = client
-            .request(
-                http::Method::POST,
-                "/sandbox-deploy",
-                Some(&body),
-                RequestOptions::default(),
-            )
-            .await?;
-
-        Ok(Sandbox::connect_with_client(self.client.clone(), created.id))
+        // `POST /sandbox-deploy`. It answers `202` with the id of a sandbox
+        // that is still provisioning; readiness is tracked across reconcile
+        // ticks either way.
+        let created = self.daemon.create(&req).await?;
+        Ok(self.daemon.sandbox(&created.id))
     }
 
     /// The daemon's `mounts` array for a spec: one host directory per guest
@@ -669,7 +585,7 @@ impl VmManager {
     /// … in exactly this order and mounts them in it, so two mounts swapping
     /// places between one create and the next would hand a restarted replica a
     /// different filesystem under the same path.
-    fn guest_mounts(&self, spec: &VmSpec) -> Result<Vec<Value>, VmError> {
+    fn guest_mounts(&self, spec: &VmSpec) -> Result<Vec<ResolvedMount>, VmError> {
         spec.mounts
             .iter()
             .map(|mount| {
@@ -680,11 +596,12 @@ impl VmManager {
                             path: mount.guest_path().to_string(),
                             digest: mount.digest.clone(),
                         })?;
-                Ok(json!({
-                    "host_path": tree.to_string_lossy(),
-                    "sandbox_path": mount.guest_path(),
-                    "read_only": mount.read_only,
-                }))
+                let tree_id = tree_id_of(&tree);
+                Ok(ResolvedMount {
+                    mount: DaemonMount::from_tree(tree_id.clone(), mount.guest_path(), mount.read_only),
+                    tree_id,
+                    tree,
+                })
             })
             .collect()
     }
@@ -700,16 +617,107 @@ impl VmManager {
     /// its cache. There is no typed SDK method for it, so we go through the
     /// client's generic request helper.
     pub async fn system_usage(&self) -> Result<SystemUsage, VmError> {
-        let client = &self.client;
-        let usage = client
-            .request::<SystemUsage>(
-                http::Method::GET,
-                "/system/usage",
-                None::<&serde_json::Value>,
-                RequestOptions::default(),
+        Ok(self.daemon.system_usage().await?)
+    }
+
+    /// `GET /storage`: the daemon's disk inventory and free space.
+    pub async fn storage(&self) -> Result<StorageInventory, VmError> {
+        Ok(self.daemon.storage().await?)
+    }
+
+    /// `DELETE /storage/sandboxes/:id?parts=`: remove a stopped sandbox's
+    /// disks on the daemon. A sandbox with nothing on disk is a no-op.
+    pub async fn purge_disks(&self, sandbox_id: &str, parts: PurgeParts) -> Result<PurgeOutcome, VmError> {
+        Ok(self.daemon.purge_disks(sandbox_id, parts).await?)
+    }
+
+    /// `GET /storage/sandboxes/:id/archive`: the sandbox's state as a
+    /// `tar.gz` stream, for the archive pipe.
+    pub async fn archive_disks(&self, sandbox_id: &str) -> Result<reqwest::Response, VmError> {
+        Ok(self.daemon.archive_disks(sandbox_id).await?)
+    }
+
+    /// `GET /sandboxes/:id/mounts/export`: the contents of a stopped
+    /// sandbox's mount as a `tar.gz` stream, for a workspace capture.
+    pub async fn export_mount(&self, sandbox_id: &str, sandbox_path: &str) -> Result<reqwest::Response, VmError> {
+        Ok(self.daemon.export_mount(sandbox_id, sandbox_path).await?)
+    }
+
+    /// Put a directory on the daemon as a tree, unless it already has one
+    /// by that id. Content-addressed ids make this a cheap check most of the
+    /// time and a one-time upload the rest.
+    pub async fn ensure_tree(&self, id: &str, dir: &Path) -> Result<TreeInfo, VmError> {
+        if let Some(existing) = self.daemon.tree(id).await? {
+            return Ok(existing);
+        }
+        let stream = tar_gz_stream(dir.to_path_buf());
+        Ok(self.daemon.upload_tree(id, stream).await?)
+    }
+
+    /// `DELETE /trees/:id`.
+    pub async fn delete_tree(&self, id: &str) -> Result<(), VmError> {
+        Ok(self.daemon.delete_tree(id).await?)
+    }
+
+    /// The daemon's catalog entry for an image, if it has one.
+    pub async fn image(&self, name: &str) -> Result<Option<ImageInfo>, VmError> {
+        Ok(self.daemon.image(name).await?)
+    }
+
+    /// Put an ext4 rootfs on this host into the daemon's catalog as `name`.
+    pub async fn upload_image(&self, name: &str, path: &Path, opts: &ImageUploadOptions) -> Result<ImageInfo, VmError> {
+        let stream = heyo_sdk::file_stream(path).await?;
+        Ok(self.daemon.upload_image(name, stream, opts).await?)
+    }
+
+    /// The daemon-side proxy binds of a VM: `GET /sandboxes/{id}/proxy`.
+    pub async fn binds(&self, sandbox_id: &str) -> Result<Vec<ProxyBind>, VmError> {
+        Ok(self.daemon.list_binds(sandbox_id).await?)
+    }
+
+    /// Bind a VM's port on the daemon as a proxy endpoint that is a member of
+    /// `deployment`, and return the subdomain the daemon minted for it.
+    ///
+    /// The daemon carries the bind to the cloud; the cloud's URL for the
+    /// deployment fans out to every member bind. This is app-lb's whole part
+    /// in a cloud URL — see [`crate::config::IngressSpec`].
+    ///
+    /// Idempotent: a bind for the same port and deployment that the daemon
+    /// already holds — from before an app-lb restart, say — is reused rather
+    /// than doubled, since the daemon mints a fresh subdomain per call.
+    pub async fn bind(
+        &self,
+        sandbox_id: &str,
+        port: u16,
+        public: bool,
+        deployment: &ProxyDeployment,
+    ) -> Result<String, VmError> {
+        if let Some(existing) = self
+            .binds(sandbox_id)
+            .await?
+            .into_iter()
+            .find(|b| b.port == port && b.deployment.as_ref() == Some(deployment))
+        {
+            return Ok(existing.subdomain);
+        }
+        let created = self
+            .daemon
+            .bind(
+                sandbox_id,
+                &BindRequest {
+                    port,
+                    is_public: public,
+                    deployment: Some(deployment.clone()),
+                },
             )
             .await?;
-        Ok(usage)
+        Ok(created.subdomain)
+    }
+
+    /// Withdraw a bind. A bind (or VM) the daemon has already forgotten
+    /// counts as withdrawn.
+    pub async fn unbind(&self, sandbox_id: &str, subdomain: &str) -> Result<(), VmError> {
+        Ok(self.daemon.unbind(sandbox_id, subdomain).await?)
     }
 
     /// Destroy a VM. A VM the daemon has already forgotten counts as killed.
@@ -830,23 +838,11 @@ impl VmManager {
         const PAGE: usize = 200;
         const MAX_PAGES: usize = 200;
 
-        let client = &self.client;
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
 
         for _ in 0..MAX_PAGES {
-            let path = match &cursor {
-                Some(c) => format!("/sandboxes/inactive?count={PAGE}&cursor={c}"),
-                None => format!("/sandboxes/inactive?count={PAGE}"),
-            };
-            let page = client
-                .request::<InactivePage>(
-                    http::Method::GET,
-                    &path,
-                    None::<&serde_json::Value>,
-                    RequestOptions::default(),
-                )
-                .await?;
+            let page = self.daemon.list_inactive(PAGE, cursor.as_deref()).await?;
             let empty = page.sandboxes.is_empty();
             out.extend(page.sandboxes.into_iter().map(InactiveSandbox::into_info));
             match page.next_cursor {
@@ -863,148 +859,37 @@ impl VmManager {
     }
 }
 
-/// What a `/deployed-sandboxes` listing said, in both shapes app-lb needs.
+/// `GET /deployed-sandboxes`, as the autoscaler consumes it: the SDK's
+/// `SandboxInfo` per VM, plus the two host-only fields the dashboard scopes
+/// and dates by. Both now ride on `SandboxInfo` itself; `details` remains
+/// so callers that index by id keep their shape.
 #[derive(Debug, Default)]
 pub struct Listing {
-    /// The SDK's view, exactly as [`VmManager::list`] returns it.
     pub sandboxes: Vec<SandboxInfo>,
-    /// Sandbox id → the fields the SDK's struct does not declare.
     pub details: HashMap<String, SandboxDetail>,
 }
 
-/// The parts of a daemon listing entry that identify a sandbox to a person
-/// rather than to the autoscaler.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxDetail {
-    /// The heyo account billed for the sandbox. Absent when the daemon runs
-    /// with auth off, or predates the field.
-    #[serde(default)]
     pub account_id: Option<String>,
-    /// RFC 3339, from the daemon's own record — unlike `uptime_secs` it does
-    /// not restart with the VM.
-    #[serde(default)]
     pub created_at: Option<String>,
 }
 
 impl Listing {
-    fn from_raw(raw: Vec<Value>) -> Result<Self, VmError> {
-        // The whole array at once, so a malformed entry fails the listing the
-        // way it always did rather than silently thinning the fleet: a VM that
-        // vanishes from the list is a VM the autoscaler replaces.
-        let sandboxes: Vec<SandboxInfo> =
-            serde_json::from_value(Value::Array(raw.clone())).map_err(|e| {
-                VmError::Sdk(heyo_sdk::HeyoError::Api {
-                    status: 0,
-                    message: format!("malformed sandbox listing: {e}"),
-                    body: None,
-                })
-            })?;
-        let details = raw
+    fn from_infos(sandboxes: Vec<SandboxInfo>) -> Self {
+        let details = sandboxes
             .iter()
-            .filter_map(|entry| {
-                let id = entry.get("id")?.as_str()?.to_string();
-                // Lenient on purpose: these fields are decoration, and a daemon
-                // that sends them in a shape this build does not expect should
-                // cost the row its decoration, not the fleet its listing.
-                let detail = serde_json::from_value(entry.clone()).unwrap_or_default();
-                Some((id, detail))
+            .map(|info| {
+                (
+                    info.id.clone(),
+                    SandboxDetail {
+                        account_id: info.account_id.clone(),
+                        created_at: info.created_at.clone(),
+                    },
+                )
             })
             .collect();
-        Ok(Self {
-            sandboxes,
-            details,
-        })
-    }
-}
-
-/// One page of `GET /sandboxes/inactive`.
-#[derive(Debug, Deserialize)]
-struct InactivePage {
-    #[serde(default)]
-    sandboxes: Vec<InactiveSandbox>,
-    #[serde(default)]
-    next_cursor: Option<String>,
-}
-
-/// One sandbox as the *inactive* listing reports it.
-///
-/// Parsed here rather than straight into the SDK's [`SandboxInfo`], because the
-/// two are not the same wire format and never were. mvm-ctrl serves two families
-/// of route: the **compat** ones the SDK is built for (`/deployed-sandboxes`),
-/// which go through its `compat_sandbox_json` shim and synthesize the
-/// `status_changed_at` the SDK requires, and the **native** ones
-/// (`/sandboxes/inactive`), which serialize the daemon's own model — a model with
-/// no such field. `SandboxInfo` declares `status_changed_at` as the single field
-/// without `#[serde(default)]`, so pointing it at the native route fails the
-/// *entire page* on a string that was never promised.
-///
-/// That is app-lb's error and not the daemon's: the SDK has no `list_inactive`,
-/// so this call was written here against a route the SDK does not cover. It cost
-/// real damage before it was understood — a failed page takes down both callers
-/// (the suspended-VM backstop in `autoscale` and disk reclamation in `disks`),
-/// and both then decline to act, silently.
-///
-/// So: `id` is required, because a record without one is not addressable and
-/// acting on a page containing it would be guesswork. Everything else defaults.
-/// That keeps a genuinely malformed page an error — which is what makes the
-/// inventory report `complete: false` and hold every disk — while a merely
-/// *sparse* one, which is what the daemon actually sends, goes through.
-#[derive(Debug, Deserialize)]
-struct InactiveSandbox {
-    id: String,
-    #[serde(default)]
-    name: String,
-    /// `SandboxStatus` has a `#[serde(other)]` fallback, so an unrecognised
-    /// state degrades to `Unknown` rather than failing the page.
-    #[serde(default = "unknown_status")]
-    status: SandboxStatus,
-    #[serde(default)]
-    image: String,
-    #[serde(default)]
-    ttl_seconds: Option<u64>,
-    #[serde(default)]
-    error_message: Option<String>,
-    #[serde(default)]
-    status_changed_at: String,
-    #[serde(default)]
-    guest_ip: Option<String>,
-}
-
-fn unknown_status() -> SandboxStatus {
-    SandboxStatus::Unknown
-}
-
-impl InactiveSandbox {
-    /// Widen to the shape the rest of app-lb reads.
-    ///
-    /// Only `id`, `name` and `status` are ever consulted for a sandbox from this
-    /// listing — it exists to answer "does the daemon still know about this?" —
-    /// so the remaining fields are filled with the same defaults `SandboxInfo`
-    /// would have used. Nothing routes to an inactive sandbox, by definition.
-    fn into_info(self) -> SandboxInfo {
-        SandboxInfo {
-            id: self.id,
-            name: self.name,
-            status: self.status,
-            image: self.image,
-            region: None,
-            start_command: None,
-            working_directory: None,
-            size_class: None,
-            // Added to `SandboxInfo` after 0.1.6; unset for the same
-            // reason the rest of these are — nothing here reads it.
-            disk_size_gb: None,
-            env_vars: None,
-            setup_hooks: None,
-            uptime_secs: 0,
-            ttl_seconds: self.ttl_seconds,
-            is_deployed: false,
-            error_message: self.error_message,
-            status_changed_at: self.status_changed_at,
-            urls: vec![],
-            guest_ip: self.guest_ip,
-            metadata: None,
-        }
+        Self { sandboxes, details }
     }
 }
 
@@ -1056,9 +941,11 @@ pub fn index_by_id(infos: Vec<SandboxInfo>) -> HashMap<String, SandboxInfo> {
 mod guest_log_tests {
     use super::*;
 
-    fn line(source: Option<&str>, message: &str) -> GuestLogLine {
-        GuestLogLine {
-            source: source.map(str::to_string),
+    fn line(source: Option<&str>, message: &str) -> LogEntry {
+        LogEntry {
+            timestamp: 0,
+            source: source.unwrap_or_default().to_string(),
+            level: None,
             message: message.into(),
         }
     }
@@ -1139,6 +1026,7 @@ mod guest_log_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use crate::config::MountSpec;
 
     /// A mount store over a directory that does not exist, which is all the
@@ -1205,6 +1093,11 @@ mod tests {
             urls: vec![],
             guest_ip: guest_ip.map(Into::into),
             metadata: None,
+            account_id: None,
+            created_at: None,
+            cpus: None,
+            memory: None,
+            backend_type: None,
         }
     }
 
@@ -1325,96 +1218,6 @@ mod tests {
         assert_eq!(owner_of("applb-demo"), None);
     }
 
-    /// The daemon's two listings do not agree on their own schema, and the
-    /// SDK's `SandboxInfo` cannot parse the inactive one.
-    ///
-    /// This payload is copied verbatim from a live `GET /sandboxes/inactive`:
-    /// note the complete absence of `status_changed_at`, plus an `uptime` object
-    /// where the SDK expects `uptime_secs`. Deserializing it as `SandboxInfo`
-    /// fails the whole page, which took disk reclamation and the suspended-VM
-    /// backstop down with it.
-    mod inactive_listing {
-        use super::*;
-
-        /// Verbatim from heyvmd 2026-08-03, trimmed to two records.
-        const LIVE: &str = r#"{"cursor":null,"next_cursor":"sb-067cf381","sandboxes":[
-            {"backend_type":"libvirt","cpu_usage":null,"id":"sb-000fcf7c",
-             "image":"/home/u/.heyo/images/todo-agent-base.qcow2","memory_usage":null,
-             "mounts":[{"host_path":"/home/u/.todo","read_only":false,"sandbox_path":"/data"}],
-             "name":"e2e-test","remotely_accessible":false,"sandbox_type":"shell",
-             "status":"stopped","ttl_seconds":3600,"uptime":{"nanos":8225,"secs":0}},
-            {"backend_type":"firecracker","cpu_usage":null,"guest_ip":"172.21.94.166",
-             "id":"sb-066157a9","image":"ubuntu","memory_usage":null,"name":"applb-demo-000000000001",
-             "remotely_accessible":false,"sandbox_type":"shell","status":"stopped",
-             "tap_device":"tap-fc-066157a9","ttl_seconds":900,"uptime":{"nanos":1379056,"secs":0}}]}"#;
-
-        /// Not a daemon bug: `/sandboxes/inactive` is a *native* route and
-        /// `SandboxInfo` is the *compat* shape. This pins the mismatch so that a
-        /// future SDK that does cover this route makes the local parser
-        /// obviously redundant rather than quietly redundant.
-        #[test]
-        fn the_sdk_type_cannot_parse_what_the_daemon_sends() {
-            #[derive(Debug, Deserialize)]
-            struct StrictPage {
-                #[allow(dead_code)]
-                sandboxes: Vec<SandboxInfo>,
-            }
-            let e = serde_json::from_str::<StrictPage>(LIVE).unwrap_err().to_string();
-            assert!(
-                e.contains("status_changed_at"),
-                "if the SDK ever defaults this field, our own parser can go: {e}",
-            );
-        }
-
-        #[test]
-        fn our_parser_reads_it() {
-            let page: InactivePage = serde_json::from_str(LIVE).unwrap();
-            assert_eq!(page.sandboxes.len(), 2);
-            assert_eq!(page.next_cursor.as_deref(), Some("sb-067cf381"));
-
-            let infos: Vec<SandboxInfo> = page
-                .sandboxes
-                .into_iter()
-                .map(InactiveSandbox::into_info)
-                .collect();
-            assert_eq!(infos[0].id, "sb-000fcf7c");
-            assert_eq!(infos[0].status, SandboxStatus::Stopped);
-            assert_eq!(infos[0].status_changed_at, "", "absent, and that is fine");
-            // The name is what maps a sandbox back to its deployment, so it is
-            // the one field besides the id that must survive.
-            assert_eq!(owner_of(&infos[1].name), Some("demo"));
-            assert_eq!(infos[1].guest_ip.as_deref(), Some("172.21.94.166"));
-        }
-
-        /// Only the id is load-bearing. A record without one cannot be acted on,
-        /// and failing the page is what makes the disk inventory report
-        /// `complete: false` and hold every disk rather than guess.
-        #[test]
-        fn a_record_with_no_id_still_fails_the_page() {
-            let bad = r#"{"sandboxes":[{"name":"nameless","status":"stopped"}]}"#;
-            assert!(serde_json::from_str::<InactivePage>(bad).is_err());
-        }
-
-        /// Everything else is optional, including the status.
-        #[test]
-        fn an_almost_empty_record_is_accepted() {
-            let sparse = r#"{"sandboxes":[{"id":"sb-1"}]}"#;
-            let page: InactivePage = serde_json::from_str(sparse).unwrap();
-            let info = page.sandboxes.into_iter().next().unwrap().into_info();
-            assert_eq!(info.id, "sb-1");
-            assert_eq!(info.status, SandboxStatus::Unknown);
-        }
-
-        /// An unrecognised status must not fail the page either — the SDK enum
-        /// has a `#[serde(other)]` arm and this pins that we rely on it.
-        #[test]
-        fn an_unknown_status_degrades_rather_than_failing() {
-            let odd = r#"{"sandboxes":[{"id":"sb-1","status":"hibernating"}]}"#;
-            let page: InactivePage = serde_json::from_str(odd).unwrap();
-            assert_eq!(page.sandboxes[0].status, SandboxStatus::Unknown);
-        }
-    }
-
     #[test]
     fn index_by_id_builds_a_lookup() {
         let idx = index_by_id(vec![
@@ -1489,6 +1292,7 @@ mod tests {
         let (root, store) = store_holding(&[(D1, 0), (D2, 0)]);
         let tree_one = store.tree_path(D1, 0);
         let tree_two = store.tree_path(D2, 0);
+        let stripped = store.tree_path(D1, 2);
         let manager = VmManager::new(None, None, store).unwrap();
 
         let writable = MountSpec {
@@ -1502,19 +1306,22 @@ mod tests {
         assert_eq!(
             mounts,
             vec![
-                json!({
-                    "host_path": tree_one.to_string_lossy(),
-                    "sandbox_path": "/data",
-                    "read_only": true,
-                }),
-                json!({
-                    "host_path": tree_two.to_string_lossy(),
-                    "sandbox_path": "/scratch",
-                    "read_only": false,
-                }),
+                ResolvedMount {
+                    tree_id: D1.to_string(),
+                    tree: tree_one.clone(),
+                    mount: DaemonMount::from_tree(D1, "/data", true),
+                },
+                ResolvedMount {
+                    tree_id: D2.to_string(),
+                    tree: tree_two.clone(),
+                    mount: DaemonMount::from_tree(D2, "/scratch", false),
+                },
             ],
             "order is load-bearing: heyvmd letters /dev/vdb, /dev/vdc in this order",
         );
+        // The daemon's id for a tree is its directory name — content-addressed
+        // by the store, with the strip suffix when there is one.
+        assert_eq!(tree_id_of(&stripped), format!("{D1}-s2"));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1529,99 +1336,82 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Posting the create body ourselves means the SDK's defaults are ours to
-    /// apply. `size_class` is the one that matters: without it the daemon boots
-    /// a Firecracker guest at 1 vCPU and 128 MB.
-    #[test]
-    fn the_sdk_defaults_are_applied_to_a_hand_built_body() {
-        let mut body = json!({ "name": "applb-demo-01" });
-        sdk_create_defaults(&mut body);
-        assert_eq!(body["size_class"], "small");
-        assert_eq!(body["image"], "ubuntu:24.04");
-        assert_eq!(body["region"], "US");
-        assert_eq!(body["open_ports"], json!([]));
-
-        // ...and never over a value the spec set.
-        let mut explicit = json!({
-            "image": "agent-base",
-            "size_class": "large",
-            "open_ports": [8080],
-        });
-        sdk_create_defaults(&mut explicit);
-        assert_eq!(explicit["image"], "agent-base");
-        assert_eq!(explicit["size_class"], "large");
-        assert_eq!(explicit["open_ports"], json!([8080]));
+    fn template() -> VmSpec {
+        spec_with(vec![])
     }
 
-    /// The owner rides on the create body as top-level fields, and only when
-    /// there is one: a self-hosted app-lb's body has no such keys at all, so
-    /// nothing it sends changes.
-    /// A catalog image and a workspace archive ride the create body as the
-    /// daemon's own field names, and only when the template has them.
+    /// The daemon's own field names, in a body the SDK types: the owner,
+    /// the image source and the workspace archive ride only when the
+    /// template has them, so a plain self-hosted body is what it always was.
     #[test]
-    fn the_create_body_carries_the_image_source_and_the_archive() {
-        let options = SandboxCreateOptions {
-            name: Some("web-1".into()),
-            ..Default::default()
-        };
-        let plain = create_body(&options, vec![], &VmOwner::default(), &ImageSource::default(), None).unwrap();
-        for absent in ["image_download_url", "image_size_bytes", "image_sha256", "s3_archive_key", "sandbox_path"] {
-            assert!(plain.get(absent).is_none(), "{absent} leaked into a plain body");
+    fn the_create_request_carries_the_image_source_and_the_archive() {
+        let plain = serde_json::to_value(create_request(
+            &template(), "web-1".into(), vec![8080], None, vec![], &VmOwner::default(),
+        ))
+        .unwrap();
+        for absent in ["image_download_url", "image_size_bytes", "image_sha256", "s3_archive_key", "sandbox_path", "account_id", "user_id", "mounts"] {
+            assert!(plain.get(absent).is_none(), "{absent} leaked into a plain body: {plain}");
         }
+        assert_eq!(plain["name"], "web-1");
+        assert_eq!(plain["driver"], "firecracker");
+        assert_eq!(plain["open_ports"], json!([8080]));
+        assert_eq!(plain["ttl_seconds"], template().ttl_seconds);
 
-        let image = ImageSource {
-            download_url: Some("https://cloud.example/public-images/img-1".into()),
-            size_bytes: Some(1024),
-            sha256: Some("abc".into()),
-        };
-        let archive = crate::config::WorkspaceArchive {
+        let mut full = template();
+        full.image_download_url = Some("https://cloud.example/public-images/img-1".into());
+        full.image_size_bytes = Some(1024);
+        full.image_sha256 = Some("abc".into());
+        full.workspace_archive = Some(crate::config::WorkspaceArchive {
             archive_id: Some("ar-1".into()),
             s3_key: Some("users/u1/archives/ar-1.tar.gz".into()),
             size_bytes: Some(10),
-        };
-        let full = create_body(&options, vec![], &VmOwner::default(), &image, Some(&archive)).unwrap();
-        assert_eq!(full["image_download_url"], "https://cloud.example/public-images/img-1");
-        assert_eq!(full["image_size_bytes"], 1024);
-        assert_eq!(full["image_sha256"], "abc");
-        assert_eq!(full["s3_archive_key"], "users/u1/archives/ar-1.tar.gz");
-        assert_eq!(full["sandbox_path"], "/workspace");
+        });
+        let body = serde_json::to_value(create_request(
+            &full, "web-1".into(), vec![], None, vec![], &VmOwner::default(),
+        ))
+        .unwrap();
+        assert_eq!(body["image_download_url"], "https://cloud.example/public-images/img-1");
+        assert_eq!(body["image_size_bytes"], 1024);
+        assert_eq!(body["image_sha256"], "abc");
+        assert_eq!(body["s3_archive_key"], "users/u1/archives/ar-1.tar.gz");
+        assert_eq!(body["sandbox_path"], "/workspace");
 
         // An archive whose key was never resolved is not guessed at.
-        let unresolved = crate::config::WorkspaceArchive {
+        let mut unresolved = template();
+        unresolved.workspace_archive = Some(crate::config::WorkspaceArchive {
             archive_id: Some("ar-2".into()),
             s3_key: None,
             size_bytes: None,
-        };
-        let body = create_body(&options, vec![], &VmOwner::default(), &ImageSource::default(), Some(&unresolved)).unwrap();
+        });
+        let body = serde_json::to_value(create_request(
+            &unresolved, "web-1".into(), vec![], None, vec![], &VmOwner::default(),
+        ))
+        .unwrap();
         assert!(body.get("s3_archive_key").is_none());
+        assert!(body.get("sandbox_path").is_none());
     }
 
     #[test]
-    fn the_create_body_carries_the_owner_only_when_there_is_one() {
-        let options = SandboxCreateOptions {
-            name: Some("applb-demo-01".into()),
-            ..Default::default()
-        };
-        let unowned = create_body(&options, vec![], &VmOwner::default(), &ImageSource::default(), None).unwrap();
-        assert!(unowned.get("account_id").is_none());
-        assert!(unowned.get("user_id").is_none());
-        assert_eq!(unowned["size_class"], "small", "the SDK defaults still apply");
-
+    fn the_create_request_carries_the_owner_and_the_mounts_only_when_there_are_any() {
         let owner = VmOwner {
             account_id: Some("acc-1".into()),
             user_id: Some("u-1".into()),
         };
-        let owned = create_body(&options, vec![json!({"host_path": "/x"})], &owner, &ImageSource::default(), None).unwrap();
+        let owned = serde_json::to_value(create_request(
+            &template(), "applb-demo-01".into(), vec![], None,
+            vec![DaemonMount::from_tree("abc", "/data", true)], &owner,
+        ))
+        .unwrap();
         assert_eq!(owned["account_id"], "acc-1");
         assert_eq!(owned["user_id"], "u-1");
-        assert_eq!(owned["mounts"], json!([{"host_path": "/x"}]));
+        assert_eq!(owned["mounts"], json!([{"tree_id": "abc", "sandbox_path": "/data", "read_only": true}]));
 
         // An account with no user — the spec was stamped by hand — is fine.
         let half = VmOwner {
             account_id: Some("acc-1".into()),
             user_id: None,
         };
-        let body = create_body(&options, vec![], &half, &ImageSource::default(), None).unwrap();
+        let body = serde_json::to_value(create_request(&template(), "x".into(), vec![], None, vec![], &half)).unwrap();
         assert_eq!(body["account_id"], "acc-1");
         assert!(body.get("user_id").is_none());
 
@@ -1634,4 +1424,34 @@ mod tests {
         spec.account_id = Some("acc-2".into());
         assert_eq!(VmOwner::of(&spec).account_id.as_deref(), Some("acc-2"));
     }
+
+    /// A directory streams as a tarball the daemon can unpack, symlinks and
+    /// all — this is what carries a workspace or a mount tree to a daemon
+    /// that does not share this host's filesystem.
+    #[tokio::test]
+    async fn a_directory_streams_as_a_tarball() {
+        use futures::StreamExt;
+        let (root, _store) = store_holding(&[]);
+        let dir = root.join("tree");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/file.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink("sub/file.txt", dir.join("link")).unwrap();
+
+        let mut stream = tar_gz_stream(dir.clone());
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(std::io::Cursor::new(bytes)));
+        let mut seen = std::collections::BTreeMap::new();
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            seen.insert(path.trim_start_matches("./").to_string(), entry.header().entry_type());
+        }
+        assert_eq!(seen.get("sub/file.txt"), Some(&tar::EntryType::Regular), "{seen:?}");
+        assert_eq!(seen.get("link"), Some(&tar::EntryType::Symlink), "{seen:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
 }

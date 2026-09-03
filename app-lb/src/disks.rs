@@ -45,7 +45,7 @@ use crate::config::LbConfig;
 use crate::deployment::now_secs;
 use crate::registry::Registry;
 use crate::vm::VmManager;
-use heyo_sdk::{SandboxInfo, SandboxStatus};
+use heyo_sdk::{PurgeParts, SandboxInfo, SandboxStatus, StorageInventory};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -87,10 +87,6 @@ pub const DEFAULT_ORPHAN_TTL_SECS: u64 = 15 * 60;
 /// app-lb knows how to ask.
 const DEFAULT_SWEEP_SECS: u64 = 3600;
 
-/// Read size when pumping the archive stream. Large enough that the syscall rate
-/// stays irrelevant next to gzip, small enough that progress is reported at a
-/// useful granularity.
-const CHUNK: usize = 1024 * 1024;
 
 /// Archive records kept in memory. Bounded for the same reason the job history
 /// is: this is an operator's recent-activity view, not an audit log.
@@ -125,10 +121,6 @@ const DISK_ROOTS: [&str; 2] = ["run", "kvm"];
 
 #[derive(Debug, Clone)]
 pub struct DiskConfig {
-    /// The daemon's data directory — `$MVM_DATA_DIR`, else `<home>/.heyo`.
-    pub data_dir: PathBuf,
-    /// Where the Firecracker driver writes its per-boot rootfs copy.
-    pub tmp_dir: PathBuf,
     /// Where retention decisions persist.
     pub state_path: PathBuf,
     /// How long an unclaimed disk survives. `0` disables expiry entirely; the
@@ -136,7 +128,6 @@ pub struct DiskConfig {
     pub ttl_secs: u64,
     pub sweep_secs: u64,
     pub aws_bin: String,
-    pub tar_bin: String,
     /// Archive destination. Without a bucket the archive routes answer 501 and
     /// `archive_on_expire` is ignored.
     pub bucket: Option<String>,
@@ -166,15 +157,15 @@ impl DiskConfig {
     /// warns and runs without disk management rather than refusing to start —
     /// the same trade `images_dir` makes.
     pub fn from_env(cfg: &LbConfig) -> Result<Self, String> {
-        let data_dir = match std::env::var("APP_LB_VM_DATA_DIR") {
-            Ok(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
-            _ => default_data_dir(cfg.heyvm_home.as_deref())?,
-        };
-        let tmp_dir = std::env::var("APP_LB_VM_TMP_DIR")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map(|v| PathBuf::from(v.trim()))
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        for gone in ["APP_LB_VM_DATA_DIR", "APP_LB_VM_TMP_DIR", "APP_LB_TAR_BIN"] {
+            if std::env::var(gone).is_ok_and(|v| !v.trim().is_empty()) {
+                tracing::warn!(
+                    "{gone} is set but no longer read: the daemon inventories and reclaims \
+                     its own disks (GET /storage), so app-lb needs neither its data directory \
+                     nor a tar binary"
+                );
+            }
+        }
 
         let state_path = std::env::var("APP_LB_DISKS_PATH")
             .ok()
@@ -190,16 +181,10 @@ impl DiskConfig {
             parse_secs("APP_LB_DISK_ORPHAN_TTL_SECS", DEFAULT_ORPHAN_TTL_SECS)?;
 
         Ok(Self {
-            data_dir,
-            tmp_dir,
             state_path,
             ttl_secs,
             sweep_secs,
             aws_bin: cfg.aws_bin.clone(),
-            tar_bin: std::env::var("APP_LB_TAR_BIN")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "tar".into()),
             bucket: std::env::var("APP_LB_DISK_ARCHIVE_BUCKET")
                 .ok()
                 .map(|v| v.trim().to_string())
@@ -220,62 +205,6 @@ impl DiskConfig {
     }
 }
 
-/// Free and total bytes on the filesystem holding `path`, or `None` if it
-/// cannot be interrogated.
-///
-/// `statvfs` rather than a `df` subprocess: this runs on the sweep timer and in
-/// the inventory, and shelling out to parse a locale-dependent table for two
-/// integers is a worse dependency than one libc call.
-///
-/// `f_bavail`, deliberately, not `f_bfree`: the kernel reserves a percentage of
-/// every ext4 filesystem for root, and `f_bfree` counts that reserve. The
-/// daemon does not run as root, so the reserve is space it can see and cannot
-/// use — reporting it as free is how a host reads "8 GiB available" while every
-/// `fallocate` returns ENOSPC.
-///
-/// `None` on failure rather than zero, and every caller treats it as "unknown"
-/// rather than "full": a failed syscall must not trigger a reclamation.
-pub fn free_bytes(path: &Path) -> Option<(u64, u64)> {
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
-    // SAFETY: `stat` is a valid uninitialised `statvfs` for the duration of the
-    // call, and `c_path` is a NUL-terminated string that outlives it. `statvfs`
-    // writes the struct on success and touches nothing else.
-    let stat = unsafe {
-        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        if libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) != 0 {
-            return None;
-        }
-        stat.assume_init()
-    };
-    let unit = stat.f_frsize as u64;
-    Some((
-        stat.f_bavail as u64 * unit,
-        stat.f_blocks as u64 * unit,
-    ))
-}
-
-/// Where heyvmd keeps its state, resolved the way mvm-ctrl's
-/// `get_heyo_data_dir()` does.
-///
-/// `heyvm_home` wins over the process `HOME` for the same reason it does for the
-/// image directory: it names the *daemon's* home, and the daemon is the only
-/// process whose view of these paths matters.
-fn default_data_dir(heyvm_home: Option<&str>) -> Result<PathBuf, String> {
-    if let Ok(dir) = std::env::var("MVM_DATA_DIR")
-        && !dir.trim().is_empty()
-    {
-        return Ok(PathBuf::from(dir));
-    }
-    let home = heyvm_home
-        .map(str::to_string)
-        .or_else(|| std::env::var("HOME").ok())
-        .filter(|h| !h.trim().is_empty())
-        .ok_or(
-            "cannot tell where heyvm keeps its per-sandbox disks: neither MVM_DATA_DIR nor HOME \
-             is set. Set APP_LB_VM_DATA_DIR to the daemon's data directory",
-        )?;
-    Ok(PathBuf::from(home).join(".heyo"))
-}
 
 fn parse_secs(var: &str, default: u64) -> Result<u64, String> {
     match std::env::var(var) {
@@ -761,27 +690,25 @@ impl DiskStore {
     /// The full picture: what is on disk, what the daemon knows, what app-lb
     /// claims.
     pub async fn inventory(&self) -> Inventory {
-        let cfg = self.cfg.clone();
-        // A host with a few thousand sandboxes is a few thousand `stat` calls.
-        // Off the runtime, so a slow or cold page cache cannot stall the admin
-        // listener while somebody is looking at the dashboard.
-        let mut groups = tokio::task::spawn_blocking(move || scan(&cfg))
-            .await
-            .unwrap_or_default();
-
-        // Both listings, for the reason `Autoscaler::sweep_suspended` documents:
-        // a stopped KVM sandbox appears in the fleet list with a terminal status
-        // while a stopped Firecracker one appears only in the inactive listing.
+        // The daemon walks its own directories (`GET /storage`); this only
+        // regroups what it reports and joins it with the two listings, for
+        // the reason `Autoscaler::sweep_suspended` documents: a stopped KVM
+        // sandbox appears in the fleet list with a terminal status while a
+        // stopped Firecracker one appears only in the inactive listing.
         // Reading one would classify half the fleet's stopped disks as orphans.
+        let storage = self.vms.storage().await;
         let fleet = self.vms.list().await;
         let inactive = self.vms.list_inactive().await;
 
-        let incomplete_reason = match (&fleet, &inactive) {
-            (Err(e), _) => Some(format!("the daemon's sandbox list is unavailable: {e}")),
-            (_, Err(e)) => Some(format!("the daemon's inactive listing is unavailable: {e}")),
+        let incomplete_reason = match (&storage, &fleet, &inactive) {
+            (Err(e), _, _) => Some(format!("the daemon's storage inventory is unavailable: {e}")),
+            (_, Err(e), _) => Some(format!("the daemon's sandbox list is unavailable: {e}")),
+            (_, _, Err(e)) => Some(format!("the daemon's inactive listing is unavailable: {e}")),
             _ => None,
         };
         let complete = incomplete_reason.is_none();
+        let storage = storage.ok();
+        let mut groups = storage.as_ref().map(groups_from).unwrap_or_default();
 
         let mut known: HashMap<String, SandboxInfo> = HashMap::new();
         for info in fleet.into_iter().flatten() {
@@ -804,10 +731,8 @@ impl DiskStore {
 
         // Reported so "why is this host full" is answerable from the inventory
         // itself rather than by shelling into the box.
-        let (free_bytes, filesystem_bytes) = match free_bytes(&self.cfg.data_dir) {
-            Some((free, total)) => (Some(free), Some(total)),
-            None => (None, None),
-        };
+        let free_bytes = storage.as_ref().map(|s| s.free_bytes);
+        let filesystem_bytes = storage.as_ref().map(|s| s.total_bytes);
 
         let mut disks: Vec<DiskInfo> = Vec::with_capacity(groups.len());
         for (sandbox_id, group) in groups.drain() {
@@ -850,7 +775,7 @@ impl DiskStore {
                 held_by,
                 archived: policy.archived,
                 parts: group.parts,
-                roots: group.roots.iter().map(|p| p.display().to_string()).collect(),
+                roots: group.roots,
             });
         }
 
@@ -882,8 +807,8 @@ impl DiskStore {
         Inventory {
             complete,
             incomplete_reason,
-            data_dir: self.cfg.data_dir.display().to_string(),
-            tmp_dir: self.cfg.tmp_dir.display().to_string(),
+            data_dir: storage.as_ref().map(|s| s.data_dir.clone()).unwrap_or_else(|| "unknown".into()),
+            tmp_dir: storage.as_ref().map(|s| s.tmp_dir.clone()).unwrap_or_else(|| "unknown".into()),
             ttl_secs: self.cfg.ttl_secs,
             sweep_secs: self.cfg.sweep_secs,
             archive_enabled: self.cfg.bucket.is_some(),
@@ -912,8 +837,14 @@ impl DiskStore {
     /// An **upper bound**, deliberately. Without the daemon's listings this
     /// cannot tell a running sandbox from residue, so it counts every disk old
     /// enough to be a candidate. The sweep itself never acts on this number.
-    pub fn expiry_preview(&self) -> (usize, usize, u64) {
-        let groups = scan(&self.cfg);
+    pub async fn expiry_preview(&self) -> (usize, usize, u64) {
+        let groups = match self.vms.storage().await {
+            Ok(inv) => groups_from(&inv),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not preview disk expiry: the daemon's storage inventory is unavailable");
+                return (0, 0, 0);
+            }
+        };
         let total = groups.len();
         if self.cfg.ttl_secs == 0 {
             return (total, 0, 0);
@@ -1080,11 +1011,7 @@ impl DiskStore {
             DiskState::Running => unreachable!("refused above"),
         };
 
-        let cfg = self.cfg.clone();
-        let id = disk.sandbox_id.clone();
-        let (removed, failed) = tokio::task::spawn_blocking(move || remove_all(&cfg, &id))
-            .await
-            .unwrap_or_else(|e| (Vec::new(), vec![format!("purge task failed: {e}")]));
+        let (removed, failed, bytes) = purge_on_daemon(&self.vms, &disk.sandbox_id, PurgeParts::All).await;
 
         // Nothing went. Reported as an error rather than as a purge that freed
         // zero bytes, because the two are not the same claim and only one of
@@ -1153,7 +1080,7 @@ impl DiskStore {
         Ok(PurgeOutcome {
             sandbox_id: disk.sandbox_id,
             killed,
-            bytes: freed(&disk.parts, &removed),
+            bytes,
             removed,
             failed,
         })
@@ -1211,8 +1138,7 @@ impl DiskStore {
         // Only the durable directories are worth uploading. A sandbox whose
         // only trace is a `/tmp` rootfs copy has nothing an archive could
         // restore — that file is a copy of a base image plus one boot's writes.
-        let relative = self.relative_roots(&disk.sandbox_id);
-        if relative.is_empty() {
+        if disk.roots.is_empty() {
             return Err(DiskError::NothingToArchive(disk.sandbox_id));
         }
 
@@ -1284,7 +1210,7 @@ impl DiskStore {
             // the operator asked for this one too. The job reads `running` with
             // zero bytes sent while it waits, which is what is happening.
             let _slot = store.archive_slots.acquire().await;
-            let result = store.run_archive(&relative, &uri, disk.apparent_bytes, &sent).await;
+            let result = store.run_archive(&sandbox, &uri, disk.apparent_bytes, &sent).await;
             let (status, error) = match &result {
                 Ok(()) => (ArchiveStatus::Succeeded, None),
                 Err(e) => (ArchiveStatus::Failed, Some(e.clone())),
@@ -1335,51 +1261,33 @@ impl DiskStore {
     /// Relative because `tar -C <data_dir> run/<id>` stores them that way, which
     /// is what makes an archive restorable by untarring it back into a data
     /// directory without rewriting any paths.
-    fn relative_roots(&self, sandbox_id: &str) -> Vec<String> {
-        DISK_ROOTS
-            .iter()
-            .filter(|root| self.cfg.data_dir.join(root).join(sandbox_id).is_dir())
-            .map(|root| format!("{root}/{sandbox_id}"))
-            .collect()
-    }
-
-    /// `tar … | aws s3 cp -`, with app-lb holding the pipe.
+    /// The daemon's archive stream | `aws s3 cp -`, with app-lb holding the pipe.
     ///
-    /// app-lb sits in the middle rather than letting the shell join the two, for
-    /// three reasons: there is no shell to quote things into, the byte count for
-    /// the progress bar has to come from somewhere, and a `tar` that outlives a
-    /// failed upload has to be killed rather than left blocked on a full pipe.
-    ///
-    /// `--sparse` is what makes this affordable. A `data.ext4` is created at its
-    /// full nominal size with holes; without `-S`, `tar` reads and compresses
-    /// every zero byte of it.
+    /// The daemon produces the tarball (`GET /storage/sandboxes/:id/archive`:
+    /// `tar --sparse --gzip` over its own state directories, paths relative
+    /// to its data dir so the archive restores with `tar -C`). app-lb still
+    /// sits in the middle rather than handing the daemon the bucket: the byte
+    /// count for the progress bar has to come from somewhere, the S3
+    /// credentials are app-lb's, and an upload that fails must drop the
+    /// stream rather than leave the daemon writing into a dead pipe.
     async fn run_archive(
         &self,
-        relative_roots: &[String],
+        sandbox_id: &str,
         uri: &str,
         expected: u64,
         sent: &Arc<AtomicU64>,
     ) -> Result<(), String> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
         use std::process::Stdio;
 
-        let mut tar = Command::new(&self.cfg.tar_bin);
-        tar.arg("--create")
-            .arg("--sparse")
-            .arg("--gzip")
-            .arg("--directory")
-            .arg(&self.cfg.data_dir)
-            .args(relative_roots)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            // Without this a failed upload leaves `tar` blocked forever on a
-            // pipe nobody is reading.
-            .kill_on_drop(true);
-        let mut tar = tar
-            .spawn()
-            .map_err(|e| format!("could not run {}: {e}", self.cfg.tar_bin))?;
+        let response = self
+            .vms
+            .archive_disks(sandbox_id)
+            .await
+            .map_err(|e| format!("could not start the daemon's archive stream: {e}"))?;
+        let mut archive = response.bytes_stream();
 
         let mut aws = Command::new(&self.cfg.aws_bin);
         aws.arg("s3")
@@ -1405,32 +1313,17 @@ impl DiskStore {
             .spawn()
             .map_err(|e| format!("could not run {}: {e}", self.cfg.aws_bin))?;
 
-        let mut tar_out = tar.stdout.take().ok_or("tar produced no stdout")?;
-        let tar_err = tar.stderr.take();
         let mut aws_in = aws.stdin.take().ok_or("aws would not accept stdin")?;
 
         let pump = async {
-            let mut buf = vec![0u8; CHUNK];
-            loop {
-                let n = tar_out
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| format!("reading the archive stream: {e}"))?;
-                if n == 0 {
-                    break;
-                }
+            while let Some(chunk) = archive.next().await {
+                let chunk = chunk.map_err(|e| format!("reading the daemon's archive stream: {e}"))?;
                 aws_in
-                    .write_all(&buf[..n])
+                    .write_all(&chunk)
                     .await
-                    // A broken pipe here means `aws` died; its stderr is the
-                    // real diagnosis, so this reports the symptom and the wait
-                    // below supplies the cause.
                     .map_err(|e| format!("writing to the uploader: {e}"))?;
-                sent.fetch_add(n as u64, Ordering::Relaxed);
+                sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             }
-            // Closing stdin is what tells `aws` the object is complete. Without
-            // it the upload never finalizes and the wait below hangs until the
-            // timeout.
             aws_in
                 .shutdown()
                 .await
@@ -1441,35 +1334,12 @@ impl DiskStore {
 
         let work = async {
             let pumped = pump.await;
-            // Both are waited on even when the pump failed: their exit statuses
-            // and stderr are the only explanation of *why* it failed.
-            let aws_out = aws.wait_with_output().await;
-            let tar_status = tar.wait().await;
-            let tar_stderr = match tar_err {
-                Some(mut e) => {
-                    let mut s = String::new();
-                    let _ = e.read_to_string(&mut s).await;
-                    s
-                }
-                None => String::new(),
-            };
-
-            match aws_out {
+            match aws.wait_with_output().await {
                 Ok(out) if !out.status.success() => {
                     let msg = String::from_utf8_lossy(&out.stderr);
                     return Err(format!("aws s3 cp failed ({}): {}", out.status, tail(&msg)));
                 }
                 Err(e) => return Err(format!("waiting for aws: {e}")),
-                Ok(_) => {}
-            }
-            match tar_status {
-                // tar exits 1 for "file changed as we read it", which is a
-                // warning about a live file rather than a failed archive. 2 is
-                // a real error.
-                Ok(s) if !s.success() && s.code() != Some(1) => {
-                    return Err(format!("tar failed ({s}): {}", tail(&tar_stderr)));
-                }
-                Err(e) => return Err(format!("waiting for tar: {e}")),
                 Ok(_) => {}
             }
             pumped
@@ -1478,8 +1348,8 @@ impl DiskStore {
         match tokio::time::timeout(self.cfg.archive_timeout, work).await {
             Ok(r) => r,
             Err(_) => Err(format!(
-                "archive exceeded APP_LB_DISK_ARCHIVE_TIMEOUT_SECS ({}s); both children were \
-                 killed and the multipart upload was abandoned. It may leave incomplete parts \
+                "archive exceeded APP_LB_DISK_ARCHIVE_TIMEOUT_SECS ({}s); the daemon's stream \
+                 was dropped, the uploader killed and the multipart upload abandoned. It may leave incomplete parts \
                  in the bucket — a lifecycle rule on `AbortIncompleteMultipartUpload` is the \
                  usual way to clean those up",
                 self.cfg.archive_timeout.as_secs()
@@ -1707,6 +1577,46 @@ fn tail(s: &str) -> String {
     lines[start..].join("; ")
 }
 
+/// Ask the daemon to remove a sandbox's disks, as `(removed, failed, bytes)`.
+///
+/// A daemon that cannot be reached, or that refuses because the sandbox is
+/// running, is one failure and nothing removed — which is what every caller
+/// treats as "the disks are still there". The daemon's own partial-failure
+/// report (a path it could not unlink) comes through path by path.
+pub async fn purge_on_daemon(
+    vms: &VmManager,
+    sandbox_id: &str,
+    parts: PurgeParts,
+) -> (Vec<String>, Vec<String>, u64) {
+    match vms.purge_disks(sandbox_id, parts).await {
+        Ok(outcome) => (
+            outcome.removed,
+            outcome
+                .failed
+                .into_iter()
+                .map(|f| format!("{}: {}", f.path, f.error))
+                .collect(),
+            outcome.bytes,
+        ),
+        Err(e) => (Vec::new(), vec![format!("the daemon would not purge: {e}")], 0),
+    }
+}
+
+/// Reclaim everything a VM that never came up left behind, data disk
+/// included. The daemon refuses while the sandbox is live.
+pub async fn discard_failed_boot(vms: &VmManager, sandbox_id: &str) -> (Vec<String>, Vec<String>) {
+    let (removed, failed, _) = purge_on_daemon(vms, sandbox_id, PurgeParts::All).await;
+    (removed, failed)
+}
+
+/// Drop a suspended VM's rootfs copies and nothing else: the daemon rebuilds
+/// the copy from the base image on resume, and the data disk, mount images
+/// and snapshots stay.
+pub async fn discard_rootfs(vms: &VmManager, sandbox_id: &str) -> (Vec<String>, Vec<String>) {
+    let (removed, failed, _) = purge_on_daemon(vms, sandbox_id, PurgeParts::Rootfs).await;
+    (removed, failed)
+}
+
 /// The background service that runs [`DiskStore::sweep`].
 pub struct DiskSweeper {
     store: Arc<DiskStore>,
@@ -1733,6 +1643,28 @@ impl pingora_core::services::background::BackgroundService for DiskSweeper {
         // stopped VM back into a claimed one — and a disk purged in that window
         // is one the fleet was about to resume.
         tick.tick().await;
+        // Counted here rather than left for the first sweep to discover,
+        // because on a host that has been booting VMs for months the honest
+        // answer is "most of them" — and an operator who never opens
+        // /storage should still learn that from the log before it happens.
+        // An upper bound: without the daemon this cannot tell a running
+        // sandbox from residue.
+        if self.store.cfg.ttl_secs > 0 {
+            let (total, due, bytes) = self.store.expiry_preview().await;
+            tracing::warn!(
+                ttl_secs = self.store.cfg.ttl_secs,
+                sweep_secs = self.store.cfg.sweep_secs,
+                archive = self.store.cfg.bucket.is_some(),
+                disks = total,
+                eligible = due,
+                gib = bytes / (1 << 30),
+                "disk expiry is ON: up to {due} of {total} sandbox disks on the daemon's host \
+                 are already older than the retention window and will be reclaimed by the \
+                 first sweep, in {}s. Open /storage to review them, mark the ones to keep as \
+                 retained, or set APP_LB_DISK_TTL_SECS=0 to turn expiry off",
+                self.store.cfg.sweep_secs,
+            );
+        }
         loop {
             tokio::select! {
                 _ = tick.tick() => { self.store.sweep().await; }
@@ -1753,74 +1685,57 @@ impl pingora_core::services::background::BackgroundService for DiskSweeper {
 #[derive(Debug, Default)]
 struct Group {
     parts: Vec<DiskPart>,
-    /// Directories to remove on purge. Loose files in `/tmp` are not roots —
-    /// they are listed individually in `parts` and removed by name.
-    roots: Vec<PathBuf>,
+    /// The durable state directories the daemon holds for this sandbox,
+    /// relative to its data dir (`run/<id>`, `kvm/<id>`). Tmp scratch is not
+    /// a root: it is listed in `parts` and has nothing an archive could restore.
+    roots: Vec<String>,
     bytes: u64,
     apparent_bytes: u64,
     modified_at: u64,
 }
 
-/// Walk the daemon's disk directories and group what is there by sandbox.
+/// Group the daemon's storage inventory by sandbox.
 ///
-/// Blocking, and called from `spawn_blocking`. Errors are logged and skipped
-/// rather than propagated: a directory that cannot be read should cost its own
-/// entries, not the whole inventory.
-fn scan(cfg: &DiskConfig) -> HashMap<String, Group> {
+/// The daemon walks its own directories (`GET /storage`) and reports every
+/// file with its allocated size; this only regroups. A `Tmp` part is a
+/// per-boot scratch file the daemon found under its tmp dir, classified here
+/// by name the way its state-dir siblings are.
+fn groups_from(inventory: &StorageInventory) -> HashMap<String, Group> {
     let mut groups: HashMap<String, Group> = HashMap::new();
-
-    for root in DISK_ROOTS {
-        let dir = cfg.data_dir.join(root);
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                tracing::warn!(dir = %dir.display(), error = %e, "cannot read sandbox disk directory");
-                continue;
-            }
-        };
-        for entry in entries.flatten() {
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
+    for sandbox in &inventory.sandboxes {
+        let group = groups.entry(sandbox.sandbox_id.clone()).or_default();
+        for part in &sandbox.parts {
+            let kind = match part.kind {
+                heyo_sdk::DiskPartKind::Data => PartKind::Data,
+                heyo_sdk::DiskPartKind::Rootfs => PartKind::Rootfs,
+                heyo_sdk::DiskPartKind::Mount => PartKind::Mount,
+                heyo_sdk::DiskPartKind::Snapshot => PartKind::Snapshot,
+                heyo_sdk::DiskPartKind::Tmp if part.path.ends_with("-rootfs.ext4") => PartKind::Rootfs,
+                heyo_sdk::DiskPartKind::Tmp if part.path.contains("-mount") => PartKind::Mount,
+                heyo_sdk::DiskPartKind::Tmp | heyo_sdk::DiskPartKind::Other => PartKind::Other,
             };
-            if !valid_sandbox_id(&name) {
-                continue;
-            }
-            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-                continue;
-            }
-            let path = entry.path();
-            let group = groups.entry(name).or_default();
-            group.roots.push(path.clone());
-            walk_into(&path, group);
-        }
-    }
-
-    // The Firecracker per-boot rootfs copy. Present only when the hypervisor
-    // died without running its cleanup, which is why it is worth listing: these
-    // are pure waste, and they are the largest single files on a busy host.
-    match std::fs::read_dir(&cfg.tmp_dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let Ok(name) = entry.file_name().into_string() else {
-                    continue;
-                };
-                let Some(id) = tmp_sandbox_id(&name) else {
-                    continue;
-                };
-                let Ok(meta) = entry.metadata() else { continue };
-                if !meta.is_file() {
-                    continue;
+            group.push(DiskPart {
+                kind,
+                path: part.path.clone(),
+                bytes: part.bytes,
+                apparent_bytes: part.apparent_bytes,
+                modified_at: part.modified_at,
+            });
+            // The durable roots, relative to the daemon's data dir, in the
+            // form an archive names them. Tmp scratch is not a root.
+            for root in DISK_ROOTS {
+                let prefix = format!("{root}/{}/", sandbox.sandbox_id);
+                if part.path.starts_with(&prefix) {
+                    let name = format!("{root}/{}", sandbox.sandbox_id);
+                    if !group.roots.contains(&name) {
+                        group.roots.push(name);
+                    }
                 }
-                let part = part_of(&entry.path(), &meta, PartKind::Rootfs);
-                groups.entry(id.to_string()).or_default().push(part);
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!(dir = %cfg.tmp_dir.display(), error = %e, "cannot read tmp dir"),
     }
-
     for group in groups.values_mut() {
+        group.roots.sort();
         group.recompute();
     }
     groups
@@ -1842,302 +1757,6 @@ impl Group {
     }
 }
 
-/// Recursively account for everything under one sandbox directory.
-///
-/// Depth is bounded by the daemon's own layout (`<id>/snapshot/<file>`), so this
-/// recurses without a depth guard on directories but never follows symlinks —
-/// `read_dir` reports the link itself and `symlink_metadata` keeps it that way,
-/// so a link planted in the run directory cannot walk the scan out of it.
-fn walk_into(dir: &Path, group: &mut Group) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if meta.is_dir() {
-            walk_into(&path, group);
-        } else if meta.is_file() {
-            group.push(part_of(&path, &meta, classify(&path)));
-        }
-    }
-}
-
-/// What a file under a sandbox directory is, from its name and location.
-fn classify(path: &Path) -> PartKind {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    let in_snapshot = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        == Some("snapshot");
-
-    if in_snapshot {
-        return PartKind::Snapshot;
-    }
-    match name {
-        "data.ext4" => PartKind::Data,
-        "rootfs.ext4" => PartKind::Rootfs,
-        n if n.starts_with("mount") && n.ends_with(".ext4") => PartKind::Mount,
-        _ => PartKind::Other,
-    }
-}
-
-fn part_of(path: &Path, meta: &std::fs::Metadata, kind: PartKind) -> DiskPart {
-    use std::os::unix::fs::MetadataExt;
-    DiskPart {
-        kind,
-        path: path.display().to_string(),
-        // `blocks()` is in 512-byte units by POSIX definition, regardless of the
-        // filesystem's block size. This is what makes a sparse 8 GiB data disk
-        // report the 200 MiB it actually occupies.
-        bytes: meta.blocks().saturating_mul(512),
-        apparent_bytes: meta.len(),
-        modified_at: mtime_secs(meta),
-    }
-}
-
-fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Prefixes both drivers use for their per-boot scratch in `tmp_dir`.
-const TMP_PREFIXES: [&str; 2] = ["firecracker-", "kvm-"];
-
-/// The sandbox a `/tmp` **disk image** belongs to, if it is one.
-///
-/// `firecracker-<id>-rootfs.ext4`, `kvm-<id>-rootfs.ext4`, `kvm-<id>-mount0.ext4`.
-/// Only the images: the `.socket` and `-vmm.log` siblings are removed by
-/// [`remove_all`] but are not worth a row of their own — one is zero bytes and
-/// the other a few hundred. `heyvm prune` matches the same two prefixes.
-fn tmp_sandbox_id(file_name: &str) -> Option<&str> {
-    let rest = TMP_PREFIXES
-        .iter()
-        .find_map(|p| file_name.strip_prefix(p))?;
-    let stem = rest.strip_suffix(".ext4")?;
-    let (id, tail) = stem.rsplit_once('-')?;
-    let is_image = tail == "rootfs"
-        || tail
-            .strip_prefix("mount")
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-    (is_image && valid_sandbox_id(id)).then_some(id)
-}
-
-/// Whether a `/tmp` file is scratch belonging to `sandbox_id` — image, socket,
-/// log or config alike.
-///
-/// Broader than [`tmp_sandbox_id`], because a purge must take the siblings too.
-/// The boundary check is what keeps `sb-1` from claiming `sb-12`'s files.
-fn tmp_belongs_to(file_name: &str, sandbox_id: &str) -> bool {
-    TMP_PREFIXES.iter().any(|p| {
-        file_name
-            .strip_prefix(p)
-            .and_then(|rest| rest.strip_prefix(sandbox_id))
-            .is_some_and(|tail| tail.is_empty() || tail.starts_with(['-', '.']))
-    })
-}
-
-/// What a purge actually freed: the parts that were under a path it removed.
-///
-/// Not simply `disk.bytes`, which is what the sandbox occupied *before* — the
-/// two agree on a clean purge and differ on a partial one, and it is exactly
-/// the partial one where an operator is trying to work out how much is left.
-/// Reporting the size of something still on disk as freed is the same mistake
-/// as reporting a failed purge as a success, one level down.
-fn freed(parts: &[DiskPart], removed: &[String]) -> u64 {
-    parts
-        .iter()
-        .filter(|p| {
-            removed.iter().any(|r| {
-                // A removed directory covers everything beneath it; a removed
-                // file is only itself. The separator check is what stops
-                // `run/sb-1` from claiming `run/sb-12`'s bytes.
-                p.path == *r || p.path.strip_prefix(r.as_str()).is_some_and(|t| t.starts_with('/'))
-            })
-        })
-        .map(|p| p.bytes)
-        .sum()
-}
-
-/// Remove a directory tree, naming the path that actually stopped it.
-///
-/// `std::fs::remove_dir_all` returns a bare `io::Error` with no path attached,
-/// so every failure anywhere under a sandbox directory was reported against the
-/// sandbox directory itself. That is the wrong path on the host this feature
-/// exists for: heyvmd creates the files, app-lb usually owns only the directory
-/// above them, so the denial is a level or two down and the message named a
-/// directory app-lb could already write. An operator following it `chown`s that
-/// directory, sweeps again, gets the identical line, and reasonably concludes
-/// the sweep is broken rather than the permissions.
-///
-/// `Ok(true)` if something was there and is now gone, `Ok(false)` if there was
-/// nothing to remove, `Err` with the first path that could not be — first, and
-/// not all of them, because this stops where `remove_dir_all` stops and one
-/// accurate path is the whole diagnosis. Every file under a directory nobody
-/// can write into is the same fact repeated.
-fn remove_tree(path: &Path) -> Result<bool, String> {
-    // `symlink_metadata`, so a symlink is unlinked as itself and never
-    // followed: nothing under these roots is supposed to be one, and a purge
-    // that walked through one would delete outside the two directories this
-    // module manages.
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-
-    if !meta.is_dir() {
-        return unlinked(std::fs::remove_file(path), path);
-    }
-
-    // Read errors name this directory, which is correct: not being able to list
-    // it is what stopped the removal.
-    let entries = std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("{}: {e}", path.display()))?;
-        remove_tree(&entry.path())?;
-    }
-    unlinked(std::fs::remove_dir(path), path)
-}
-
-/// One unlink, with the path attached to whatever it returns.
-fn unlinked(result: std::io::Result<()>, path: &Path) -> Result<bool, String> {
-    match result {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
-}
-
-/// Remove every path this module associates with a sandbox.
-///
-/// Every path is *constructed* from the validated id and the configured roots,
-/// never taken from the inventory — so even a stale or hand-edited inventory
-/// cannot direct a delete outside the two directories app-lb manages.
-fn remove_all(cfg: &DiskConfig, sandbox_id: &str) -> (Vec<String>, Vec<String>) {
-    debug_assert!(valid_sandbox_id(sandbox_id), "purge with an unvalidated id");
-    let mut removed = Vec::new();
-    let mut failed = Vec::new();
-
-    for root in DISK_ROOTS {
-        let dir = cfg.data_dir.join(root).join(sandbox_id);
-        match remove_tree(&dir) {
-            Ok(true) => removed.push(dir.display().to_string()),
-            // Already gone: a purge racing the daemon's own cleanup is a purge
-            // with nothing left to do, not a failure.
-            Ok(false) => {}
-            Err(e) => failed.push(e),
-        }
-    }
-
-    // Enumerated rather than guessed by name: the KVM driver's mount disks are
-    // numbered without an upper bound, so a fixed list would leave whatever it
-    // did not think of behind. Each candidate is a direct child of `tmp_dir`
-    // from `read_dir`, so joining it cannot leave that directory, and
-    // `tmp_belongs_to` is what confines the match to this sandbox.
-    match std::fs::read_dir(&cfg.tmp_dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let Ok(name) = entry.file_name().into_string() else {
-                    continue;
-                };
-                if !tmp_belongs_to(&name, sandbox_id) {
-                    continue;
-                }
-                let path = cfg.tmp_dir.join(&name);
-                match std::fs::remove_file(&path) {
-                    Ok(()) => removed.push(path.display().to_string()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => failed.push(format!("{}: {e}", path.display())),
-                }
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => failed.push(format!("{}: {e}", cfg.tmp_dir.display())),
-    }
-
-    (removed, failed)
-}
-
-/// Reclaim everything belonging to a sandbox whose boot never finished.
-///
-/// The give-up-path counterpart of [`discard_rootfs`], and the more aggressive
-/// of the two: this removes the `/workspace` data disk as well, which
-/// [`discard_rootfs`] deliberately preserves. That is safe *only* under the
-/// condition the caller is required to establish — that the sandbox was created
-/// for this boot and never became healthy — because then its data disk was
-/// `fallocate`d minutes ago and holds nothing but what the guest wrote while
-/// failing. A resumed replica fails that condition and must never be passed
-/// here; see [`BootOrigin`](crate::deployment::BootOrigin).
-///
-/// Without this, a deployment that can never boot — a bad `start_command`, an
-/// image with no server in it — leaves a full set of disks per attempt. At
-/// `disk_size_gb: 60` and a preallocated data disk that is 60 GB per failed
-/// boot, held until the seven-day sweep, on a host that is still trying.
-///
-/// Ordering matters and belongs to the caller: the VM must be gone before this
-/// runs, or the disks are pulled out from under a live hypervisor.
-///
-/// Best-effort and non-fatal, like every other reclamation path here. The
-/// returned `(removed, failed)` are paths, for the log line the caller writes.
-pub fn discard_failed_boot(cfg: &DiskConfig, sandbox_id: &str) -> (Vec<String>, Vec<String>) {
-    if !valid_sandbox_id(sandbox_id) {
-        return (
-            Vec::new(),
-            vec![format!("{sandbox_id:?} is not a sandbox id")],
-        );
-    }
-    remove_all(cfg, sandbox_id)
-}
-
-/// Remove only the rootfs copies of one sandbox, leaving everything else.
-///
-/// The suspend-path counterpart of [`remove_all`], for the autoscaler: a
-/// replica spun to zero keeps its record and its `/workspace` data disk, but
-/// its rootfs copy is rebuilt from the base image on the next boot — the KVM
-/// driver reuses a persisted `kvm/<id>/rootfs.ext4` *only if it still exists*,
-/// and recopies from the base image when it does not, so removing it here is a
-/// space decision, not a correctness one. The Firecracker per-boot copy in
-/// `tmp_dir` is normally gone after a clean stop; it is matched anyway for the
-/// stop that was not clean.
-///
-/// Deliberately untouched: `data.ext4` (the state being retained), `mount*.ext4`
-/// (archive mounts the daemon re-attaches by path), snapshots, and the sandbox
-/// directories themselves. Paths are constructed from the validated id and the
-/// configured roots, exactly as `remove_all`'s are.
-pub fn discard_rootfs(cfg: &DiskConfig, sandbox_id: &str) -> (Vec<String>, Vec<String>) {
-    let mut removed = Vec::new();
-    let mut failed = Vec::new();
-    if !valid_sandbox_id(sandbox_id) {
-        failed.push(format!("{sandbox_id:?} is not a sandbox id"));
-        return (removed, failed);
-    }
-
-    let mut candidates = vec![cfg.data_dir.join("kvm").join(sandbox_id).join("rootfs.ext4")];
-    for prefix in TMP_PREFIXES {
-        candidates.push(cfg.tmp_dir.join(format!("{prefix}{sandbox_id}-rootfs.ext4")));
-    }
-
-    for path in candidates {
-        match std::fs::remove_file(&path) {
-            Ok(()) => removed.push(path.display().to_string()),
-            // The usual case for most of the list: a Firecracker sandbox has no
-            // kvm/ dir, a cleanly-stopped one has no /tmp copy.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => failed.push(format!("{}: {e}", path.display())),
-        }
-    }
-    (removed, failed)
-}
 
 #[cfg(test)]
 mod tests {
@@ -2152,13 +1771,10 @@ mod tests {
 
     fn cfg_at(root: &Path) -> DiskConfig {
         DiskConfig {
-            data_dir: root.join("heyo"),
-            tmp_dir: root.join("tmp"),
             state_path: root.join("disks.json"),
             ttl_secs: DEFAULT_TTL_SECS,
             sweep_secs: 3600,
             aws_bin: "aws".into(),
-            tar_bin: "tar".into(),
             bucket: None,
             prefix: "app-lb/disks".into(),
             endpoint: None,
@@ -2166,12 +1782,6 @@ mod tests {
             archive_timeout: Duration::from_secs(60),
             orphan_ttl_secs: DEFAULT_ORPHAN_TTL_SECS,
         }
-    }
-
-    fn write(path: &Path, len: u64) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let f = std::fs::File::create(path).unwrap();
-        f.set_len(len).unwrap();
     }
 
     fn disk(state: DiskState, claimed: bool, retain: bool, modified_at: u64) -> DiskInfo {
@@ -2330,370 +1940,6 @@ mod tests {
         }
     }
 
-    mod scanning {
-        use super::*;
-
-        #[test]
-        fn groups_a_sandbox_across_every_directory_that_holds_it() {
-            let root = scratch("group");
-            let cfg = cfg_at(&root);
-            std::fs::create_dir_all(&cfg.tmp_dir).unwrap();
-
-            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 4096);
-            write(&cfg.data_dir.join("run/sb-1/snapshot/state"), 512);
-            write(&cfg.data_dir.join("kvm/sb-1/rootfs.ext4"), 8192);
-            write(&cfg.data_dir.join("kvm/sb-1/mount0.ext4"), 2048);
-            write(&cfg.tmp_dir.join("firecracker-sb-1-rootfs.ext4"), 1024);
-            write(&cfg.data_dir.join("run/sb-2/data.ext4"), 4096);
-            // A neighbour whose id shares sb-1's prefix. It must land in its
-            // own group, not sb-1's.
-            write(&cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4"), 64);
-
-            let groups = scan(&cfg);
-            assert_eq!(groups.len(), 3, "one group per sandbox");
-            assert_eq!(groups["sb-12"].parts.len(), 1, "sb-1 must not absorb sb-12");
-
-            let one = &groups["sb-1"];
-            assert_eq!(one.parts.len(), 5);
-            assert_eq!(one.apparent_bytes, 4096 + 512 + 8192 + 2048 + 1024);
-            // Both directories are purge roots; the /tmp file is not — it is
-            // removed by name.
-            assert_eq!(one.roots.len(), 2);
-
-            let kinds: HashSet<PartKind> = one.parts.iter().map(|p| p.kind).collect();
-            assert!(kinds.contains(&PartKind::Data));
-            assert!(kinds.contains(&PartKind::Rootfs));
-            assert!(kinds.contains(&PartKind::Mount));
-            assert!(kinds.contains(&PartKind::Snapshot));
-        }
-
-        /// A sparse file is the normal case here — the daemon creates every data
-        /// disk at its full nominal size — so reporting `len()` would tell an
-        /// operator 8 GiB is recoverable when 200 MiB is.
-        #[test]
-        fn sizes_are_allocated_blocks_not_nominal_length() {
-            let root = scratch("sparse");
-            let cfg = cfg_at(&root);
-            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 64 * 1024 * 1024);
-
-            let groups = scan(&cfg);
-            let g = &groups["sb-1"];
-            assert_eq!(g.apparent_bytes, 64 * 1024 * 1024);
-            assert!(
-                g.bytes < g.apparent_bytes / 2,
-                "a hole was counted as occupied: {} of {}",
-                g.bytes,
-                g.apparent_bytes
-            );
-        }
-
-        #[test]
-        fn foreign_directories_and_files_are_ignored() {
-            let root = scratch("foreign");
-            let cfg = cfg_at(&root);
-            std::fs::create_dir_all(&cfg.tmp_dir).unwrap();
-            // Not a valid id, so not a sandbox directory.
-            write(&cfg.data_dir.join("run/../stray.ext4"), 16);
-            std::fs::create_dir_all(cfg.data_dir.join("run/not.a.sandbox")).unwrap();
-            // Somebody else's file in /tmp.
-            write(&cfg.tmp_dir.join("firecracker-something-else.log"), 16);
-            write(&cfg.tmp_dir.join("qemu-sb-1-rootfs.ext4"), 16);
-
-            assert!(scan(&cfg).is_empty());
-        }
-
-        #[test]
-        fn a_missing_data_directory_is_not_an_error() {
-            let root = scratch("missing");
-            let cfg = cfg_at(&root);
-            assert!(scan(&cfg).is_empty());
-        }
-
-        /// Both drivers' scratch, matching the two prefixes `heyvm prune` uses.
-        #[test]
-        fn tmp_image_names_round_trip() {
-            assert_eq!(
-                tmp_sandbox_id("firecracker-sb-19d69295-rootfs.ext4"),
-                Some("sb-19d69295")
-            );
-            assert_eq!(tmp_sandbox_id("kvm-sb-1-rootfs.ext4"), Some("sb-1"));
-            assert_eq!(tmp_sandbox_id("kvm-sb-1-mount0.ext4"), Some("sb-1"));
-            assert_eq!(tmp_sandbox_id("kvm-sb-1-mount12.ext4"), Some("sb-1"));
-
-            // Not images: listed nowhere, though a purge still removes them.
-            assert_eq!(tmp_sandbox_id("firecracker-sb-1-vmm.log"), None);
-            assert_eq!(tmp_sandbox_id("firecracker-sb-1.socket"), None);
-            assert_eq!(tmp_sandbox_id("kvm-sb-1-mount.ext4"), None);
-            assert_eq!(tmp_sandbox_id("firecracker--rootfs.ext4"), None);
-            // Somebody else's file.
-            assert_eq!(tmp_sandbox_id("qemu-sb-1-rootfs.ext4"), None);
-            // The id inside the name is validated too, so a crafted filename
-            // cannot smuggle a traversal in through the /tmp scan.
-            assert_eq!(tmp_sandbox_id("firecracker-../../etc-rootfs.ext4"), None);
-        }
-
-        /// The purge matcher is broader than the listing one, and must not let
-        /// one sandbox's purge take another's files.
-        #[test]
-        fn tmp_ownership_stops_at_a_name_boundary() {
-            for name in [
-                "firecracker-sb-1-rootfs.ext4",
-                "firecracker-sb-1-vmm.log",
-                "firecracker-sb-1.socket",
-                "kvm-sb-1-mount3.ext4",
-            ] {
-                assert!(tmp_belongs_to(name, "sb-1"), "{name} should be sb-1's");
-            }
-            // The prefix-collision case: sb-1 must not claim sb-12's disks.
-            for name in [
-                "firecracker-sb-12-rootfs.ext4",
-                "kvm-sb-1x-rootfs.ext4",
-                "firecracker-sb-10.socket",
-            ] {
-                assert!(!tmp_belongs_to(name, "sb-1"), "{name} is not sb-1's");
-            }
-            assert!(!tmp_belongs_to("qemu-sb-1-rootfs.ext4", "sb-1"));
-        }
-    }
-
-    mod removal {
-        use super::*;
-
-        #[test]
-        fn removes_both_roots_and_the_tmp_scratch() {
-            let root = scratch("remove");
-            let cfg = cfg_at(&root);
-            std::fs::create_dir_all(&cfg.tmp_dir).unwrap();
-            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
-            write(&cfg.data_dir.join("run/sb-1/snapshot/mem"), 32);
-            write(&cfg.data_dir.join("kvm/sb-1/rootfs.ext4"), 32);
-            write(&cfg.tmp_dir.join("firecracker-sb-1-rootfs.ext4"), 32);
-            write(&cfg.tmp_dir.join("firecracker-sb-1-vmm.log"), 32);
-            write(&cfg.tmp_dir.join("firecracker-sb-1.socket"), 0);
-            // The KVM driver's mount disks are numbered without an upper bound,
-            // so they have to be enumerated rather than guessed by name.
-            write(&cfg.tmp_dir.join("kvm-sb-1-mount7.ext4"), 32);
-            // Neighbours that must survive, including a prefix collision.
-            write(&cfg.data_dir.join("run/sb-2/data.ext4"), 32);
-            write(&cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4"), 32);
-
-            let (removed, failed) = remove_all(&cfg, "sb-1");
-            assert!(failed.is_empty(), "{failed:?}");
-            // Two directories plus all four `/tmp` files.
-            assert_eq!(removed.len(), 6, "{removed:?}");
-            assert!(!cfg.data_dir.join("run/sb-1").exists());
-            assert!(!cfg.data_dir.join("kvm/sb-1").exists());
-            assert!(cfg.data_dir.join("run/sb-2/data.ext4").exists());
-            assert!(
-                cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4").exists(),
-                "purging sb-1 must not take sb-12's scratch",
-            );
-            assert!(scan(&cfg).contains_key("sb-2"));
-        }
-
-        /// The suspend path takes only what the next boot rebuilds. Everything
-        /// that *is* the sandbox's state — the data disk, the mounts, the
-        /// snapshots, the directories themselves — has to survive, or a
-        /// scale-to-zero would quietly become the data loss `retain` exists to
-        /// prevent.
-        #[test]
-        fn discard_rootfs_takes_the_copies_and_nothing_else() {
-            let root = scratch("discard");
-            let cfg = cfg_at(&root);
-            std::fs::create_dir_all(&cfg.tmp_dir).unwrap();
-            write(&cfg.data_dir.join("kvm/sb-1/rootfs.ext4"), 64);
-            write(&cfg.data_dir.join("kvm/sb-1/mount0.ext4"), 32);
-            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
-            write(&cfg.data_dir.join("run/sb-1/snapshot/mem"), 32);
-            // A dirty stop's leftover, and a neighbour that must not be matched.
-            write(&cfg.tmp_dir.join("firecracker-sb-1-rootfs.ext4"), 32);
-            write(&cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4"), 32);
-
-            let (removed, failed) = discard_rootfs(&cfg, "sb-1");
-            assert!(failed.is_empty(), "{failed:?}");
-            assert_eq!(removed.len(), 2, "{removed:?}");
-            assert!(!cfg.data_dir.join("kvm/sb-1/rootfs.ext4").exists());
-            assert!(!cfg.tmp_dir.join("firecracker-sb-1-rootfs.ext4").exists());
-
-            assert!(cfg.data_dir.join("kvm/sb-1/mount0.ext4").exists());
-            assert!(cfg.data_dir.join("run/sb-1/data.ext4").exists(), "the retained state");
-            assert!(cfg.data_dir.join("run/sb-1/snapshot/mem").exists());
-            assert!(cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4").exists());
-
-            // Nothing left to discard is a no-op, not an error — the common
-            // case for a cleanly-stopped Firecracker sandbox.
-            let (removed, failed) = discard_rootfs(&cfg, "sb-1");
-            assert!(removed.is_empty() && failed.is_empty());
-
-            // The id joins paths, so the same charset rule as every other entry
-            // point; refused ids remove nothing.
-            let (removed, failed) = discard_rootfs(&cfg, "../etc");
-            assert!(removed.is_empty());
-            assert_eq!(failed.len(), 1);
-        }
-
-        /// The give-up path is the opposite bargain from the suspend path: a VM
-        /// that never came up has no state worth keeping, so the data disk goes
-        /// too. This is the assertion that separates the two functions, and the
-        /// one that would make a wrong call expensive — `discard_failed_boot`
-        /// running where `discard_rootfs` belonged is the data loss `retain`
-        /// exists to prevent, which is why the origin gate lives in the caller.
-        #[test]
-        fn discard_failed_boot_takes_the_data_disk_too() {
-            let root = scratch("failed-boot");
-            let cfg = cfg_at(&root);
-            std::fs::create_dir_all(&cfg.tmp_dir).unwrap();
-            write(&cfg.data_dir.join("kvm/sb-1/rootfs.ext4"), 64);
-            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
-            write(&cfg.data_dir.join("run/sb-1/snapshot/mem"), 32);
-            write(&cfg.tmp_dir.join("firecracker-sb-1-rootfs.ext4"), 32);
-            // The neighbour whose id shares a prefix — the case a `starts_with`
-            // match would eat.
-            write(&cfg.data_dir.join("run/sb-12/data.ext4"), 32);
-            write(&cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4"), 32);
-
-            let (removed, failed) = discard_failed_boot(&cfg, "sb-1");
-            assert!(failed.is_empty(), "{failed:?}");
-            assert!(!removed.is_empty(), "{removed:?}");
-
-            // Gone: both per-sandbox directories, wholesale, plus the scratch.
-            assert!(!cfg.data_dir.join("run/sb-1").exists(), "the data disk is the point");
-            assert!(!cfg.data_dir.join("kvm/sb-1").exists());
-            assert!(!cfg.tmp_dir.join("firecracker-sb-1-rootfs.ext4").exists());
-
-            // Untouched: the neighbour, in both roots.
-            assert!(cfg.data_dir.join("run/sb-12/data.ext4").exists());
-            assert!(cfg.tmp_dir.join("firecracker-sb-12-rootfs.ext4").exists());
-
-            // Reclaiming twice is a no-op: the daemon's own delete may already
-            // have removed all of this, and racing it is not a failure.
-            let (removed, failed) = discard_failed_boot(&cfg, "sb-1");
-            assert!(removed.is_empty() && failed.is_empty(), "{removed:?} {failed:?}");
-
-            // Same charset rule as every other entry point that joins an id to a
-            // path — and it is checked *before* `remove_all`, whose debug assert
-            // would otherwise be the only thing standing in the way.
-            let (removed, failed) = discard_failed_boot(&cfg, "../etc");
-            assert!(removed.is_empty());
-            assert_eq!(failed.len(), 1);
-        }
-
-        /// A sandbox that only ever existed in one of the two directories is the
-        /// common case, and the absent half must not read as a failure.
-        #[test]
-        fn absent_paths_are_not_failures() {
-            let root = scratch("absent");
-            let cfg = cfg_at(&root);
-            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
-
-            let (removed, failed) = remove_all(&cfg, "sb-1");
-            assert_eq!(removed.len(), 1);
-            assert!(failed.is_empty());
-        }
-
-        /// The shape that made a fleet's worth of residue look reclaimed: the
-        /// disks are readable, so the inventory lists them and reports their
-        /// size, but the directory holding them is not writable, so nothing can
-        /// be unlinked. This is what a host where heyvmd runs as one user and
-        /// app-lb as another looks like from inside `remove_all`.
-        ///
-        /// Skipped under root, which ignores the permission bits entirely.
-        #[test]
-        fn an_undeletable_directory_is_a_failure_not_a_silent_no_op() {
-            use std::os::unix::fs::PermissionsExt;
-
-            let root = scratch("denied");
-            let cfg = cfg_at(&root);
-            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
-
-            // Unlinking a file needs write on its *parent*, so this is the
-            // directory the purge cannot modify.
-            let dir = cfg.data_dir.join("run/sb-1");
-            let original = std::fs::metadata(&dir).unwrap().permissions();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-            let (removed, failed) = remove_all(&cfg, "sb-1");
-            std::fs::set_permissions(&dir, original).unwrap();
-
-            // Detected by outcome rather than by uid: if the unlink went through
-            // despite the bits, this is running as root and there is nothing
-            // here to assert.
-            if failed.is_empty() {
-                eprintln!("skipped: the removal succeeded, so this is running as root");
-                return;
-            }
-
-            assert!(removed.is_empty(), "nothing could be removed: {removed:?}");
-            assert_eq!(failed.len(), 1, "and that has to be reported: {failed:?}");
-            // The *file*, not the directory holding it. Unlinking needs write on
-            // the parent, so the parent is what has to change — but an operator
-            // reading this needs to be told which path the kernel refused, and
-            // `remove_dir_all` would have named `run/sb-1` here whatever went
-            // wrong inside it. See `remove_tree`.
-            assert!(failed[0].contains("run/sb-1/data.ext4"), "{failed:?}");
-            // Still there, still counted, still taking the space — which is why
-            // `purge_resolved` turns exactly this pair into an error rather than
-            // a purge that happened to free nothing.
-            assert!(dir.join("data.ext4").exists());
-            assert!(scan(&cfg).contains_key("sb-1"));
-        }
-
-        /// The us2 shape, and the reason `remove_tree` exists: the sandbox
-        /// directory is app-lb's and perfectly writable, and the denial is a
-        /// level down in the directory heyvmd made inside it. `remove_dir_all`
-        /// reported this as a failure on `run/sb-1` — a directory the operator
-        /// then owns, chowns, and watches fail again identically.
-        ///
-        /// Skipped under root, which ignores the permission bits entirely.
-        #[test]
-        fn a_failure_inside_the_sandbox_directory_names_the_path_inside() {
-            use std::os::unix::fs::PermissionsExt;
-
-            let root = scratch("denied-nested");
-            let cfg = cfg_at(&root);
-            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
-            write(&cfg.data_dir.join("run/sb-1/snapshot/mem"), 32);
-
-            let inner = cfg.data_dir.join("run/sb-1/snapshot");
-            let original = std::fs::metadata(&inner).unwrap().permissions();
-            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-            let (removed, failed) = remove_all(&cfg, "sb-1");
-            std::fs::set_permissions(&inner, original).unwrap();
-
-            if failed.is_empty() {
-                eprintln!("skipped: the removal succeeded, so this is running as root");
-                return;
-            }
-
-            assert!(removed.is_empty(), "the sandbox dir survives: {removed:?}");
-            assert_eq!(failed.len(), 1, "{failed:?}");
-            assert!(
-                failed[0].contains("run/sb-1/snapshot/mem"),
-                "the path that was actually refused, not the one two levels up: {failed:?}",
-            );
-        }
-
-        /// Every path is rebuilt from the roots and the validated id, so nothing
-        /// a caller supplies can steer a delete. `remove_all` is only ever
-        /// reached through `purge`, which validates first; this pins the
-        /// construction itself.
-        #[test]
-        fn paths_are_confined_to_the_configured_roots() {
-            let root = scratch("confined");
-            let cfg = cfg_at(&root);
-            let outside = root.join("outside");
-            std::fs::create_dir_all(&outside).unwrap();
-            write(&outside.join("precious"), 32);
-
-            // Even if this reached `remove_all`, the joins keep it under the
-            // roots — where no such directory exists — rather than escaping.
-            let (removed, _) = remove_all(&cfg, "sb-nonexistent");
-            assert!(removed.is_empty());
-            assert!(outside.join("precious").exists());
-        }
-    }
-
     mod policy {
         use super::*;
 
@@ -2740,44 +1986,46 @@ mod tests {
             assert!(!p["sb-1"].retain);
         }
 
-        /// A partial purge reports what it reclaimed, not what was there.
-        ///
-        /// The counterpart of the failed-purge case below, one level down: an
-        /// operator looking at a purge that could not remove everything is
-        /// trying to work out how much is left, and the pre-purge total is the
-        /// one number that cannot tell them.
-        #[test]
-        fn freed_bytes_count_only_what_was_removed() {
-            let parts = |paths: &[(&str, u64)]| -> Vec<DiskPart> {
-                paths
-                    .iter()
-                    .map(|(path, bytes)| DiskPart {
-                        kind: PartKind::Data,
-                        path: (*path).to_string(),
-                        bytes: *bytes,
-                        apparent_bytes: *bytes,
-                        modified_at: 0,
-                    })
-                    .collect()
-            };
-            let all = parts(&[
-                ("/d/run/sb-1/data.ext4", 100),
-                ("/d/kvm/sb-1/rootfs.ext4", 200),
-                ("/tmp/firecracker-sb-1-rootfs.ext4", 30),
-            ]);
 
-            // A clean purge: every root went, so this is the whole sandbox.
-            assert_eq!(
-                freed(&all, &["/d/run/sb-1".into(), "/d/kvm/sb-1".into(),
-                              "/tmp/firecracker-sb-1-rootfs.ext4".into()]),
-                330,
-            );
-            // A partial one: only the directory that could be removed counts.
-            assert_eq!(freed(&all, &["/d/run/sb-1".into()]), 100);
-            assert_eq!(freed(&all, &[]), 0);
-            // And a prefix must not claim a neighbour's bytes.
-            let neighbour = parts(&[("/d/run/sb-12/data.ext4", 999)]);
-            assert_eq!(freed(&neighbour, &["/d/run/sb-1".into()]), 0);
+        /// The daemon's part of a purge, faked over `GET /storage` and
+        /// `DELETE /storage/sandboxes/:id`: an inventory with one orphan whose
+        /// removal the daemon reports as failed path by path.
+        async fn fake_daemon(purge: serde_json::Value) -> String {
+            use axum::extract::Path as AxPath;
+            use axum::routing::{delete, get};
+            use axum::{Json, Router};
+            let purge = std::sync::Arc::new(purge);
+            let app = Router::new()
+                .route(
+                    "/storage",
+                    get(|| async {
+                        Json(serde_json::json!({
+                            "data_dir": "/data", "tmp_dir": "/tmp", "free_bytes": 10, "total_bytes": 20,
+                            "sandboxes": [{"sandbox_id": "sb-1", "parts": [
+                                {"kind": "data", "path": "run/sb-1/data.ext4", "bytes": 4096,
+                                 "apparent_bytes": 32, "modified_at": 1}
+                            ]}]
+                        }))
+                    }),
+                )
+                .route("/deployed-sandboxes", get(|| async { Json(serde_json::json!([])) }))
+                .route(
+                    "/sandboxes/inactive",
+                    get(|| async { Json(serde_json::json!({"sandboxes": [], "next_cursor": null})) }),
+                )
+                .route(
+                    "/storage/sandboxes/:id",
+                    delete(move |AxPath(_id): AxPath<String>| {
+                        let purge = purge.clone();
+                        async move { Json((*purge).clone()) }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            format!("http://{addr}")
         }
 
         /// The whole failed-purge path, end to end.
@@ -2790,25 +2038,29 @@ mod tests {
         /// operation to complete.
         #[tokio::test]
         async fn a_purge_that_removes_nothing_is_an_error_and_keeps_its_policy() {
-            use std::os::unix::fs::PermissionsExt;
-
+            let url = fake_daemon(serde_json::json!({
+                "removed": [],
+                "failed": [{"path": "/data/run/sb-1", "error": "Permission denied (os error 13)"}],
+                "bytes": 0,
+            }))
+            .await;
             let root = scratch("purge-denied");
-            let s = store(&root);
-            let cfg = cfg_at(&root);
-            write(&cfg.data_dir.join("run/sb-1/data.ext4"), 32);
+            let vms = VmManager::new(
+                Some(url),
+                None,
+                crate::mounts::MountStore::new(root.join("mounts"), 0),
+            )
+            .unwrap();
+            let s = DiskStore::new(
+                cfg_at(&root),
+                vms,
+                Arc::new(Registry::new(root.join("state.json"))),
+            );
             s.set_policy("sb-1", Some(true), Some(Some("still needed".into())))
                 .unwrap();
 
-            let dir = cfg.data_dir.join("run/sb-1");
-            let original = std::fs::metadata(&dir).unwrap().permissions();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-            // Forced, because this harness points at a dead daemon port, which
-            // makes every disk `Unknown` and therefore held.
-            let outcome = s.purge("sb-1", true).await;
-            std::fs::set_permissions(&dir, original).unwrap();
-
-            match outcome {
+            // Forced, because the disk is retained and therefore held.
+            match s.purge("sb-1", true).await {
                 Err(DiskError::PurgeFailed { sandbox_id, failed }) => {
                     assert_eq!(sandbox_id, "sb-1");
                     assert!(failed.iter().any(|f| f.contains("run/sb-1")), "{failed:?}");
@@ -2820,20 +2072,14 @@ mod tests {
                     }
                     .to_string();
                     assert!(shown.contains("nothing was reclaimed"), "{shown}");
-                    assert!(shown.contains("ownership"), "{shown}");
                 }
-                Ok(_) => {
-                    eprintln!("skipped: the removal succeeded, so this is running as root");
-                    return;
-                }
-                Err(e) => panic!("wrong error: {e}"),
+                other => panic!("expected PurgeFailed, got {other:?}"),
             }
 
-            assert!(dir.join("data.ext4").exists(), "the disk is still there");
-            assert!(
-                s.policies.lock().unwrap()["sb-1"].retain,
-                "a retain flag must survive a purge that failed to delete anything",
-            );
+            let p = s.policies.lock().unwrap().clone();
+            assert!(p["sb-1"].retain, "the policy survives a purge that reclaimed nothing");
+            assert_eq!(p["sb-1"].note.as_deref(), Some("still needed"));
+            let _ = std::fs::remove_dir_all(&root);
         }
 
         /// An entry that says nothing is dropped, so the file tracks decisions

@@ -197,16 +197,13 @@ pub struct FetchedDockerfile {
 pub struct Puller {
     /// The `art` CLI, for the local-store path.
     art_bin: String,
-    /// heyvm's Firecracker image directory. Everything is written here — both
-    /// the temporary file and the final image — so the rename is same-filesystem
-    /// and therefore atomic.
-    ///
-    /// A `Result` because resolving it can fail (see [`default_images_dir`]) and
-    /// the failure must not stop app-lb from starting: an LB whose deployments
-    /// all name prebuilt images has no use for this directory and should not
-    /// refuse to boot over it. Carried this far so the error surfaces on the
-    /// pull that needed it, with its own message intact.
-    images_dir: Result<PathBuf, String>,
+    /// app-lb's own scratch for an image on its way to the daemon: the blob
+    /// is fetched or materialized here, then uploaded (`PUT /images/:name`)
+    /// into the daemon's catalog and removed. Nothing here is where the
+    /// daemon looks.
+    scratch: PathBuf,
+    /// The daemon, for the upload and for the "already there" check.
+    vms: crate::vm::VmManager,
     /// `HOME` for the `art` child, when app-lb and heyvmd run as different
     /// users. `art` does not read `$HOME` for the store root (that comes from
     /// `--root`), but it does for `~/.artifacts` defaults and for anything the
@@ -217,10 +214,11 @@ pub struct Puller {
 }
 
 impl Puller {
-    pub fn new(art_bin: String, images_dir: Result<PathBuf, String>, home: Option<String>) -> Self {
+    pub fn new(art_bin: String, scratch: PathBuf, home: Option<String>, vms: crate::vm::VmManager) -> Self {
         Self {
             art_bin,
-            images_dir,
+            scratch,
+            vms,
             home,
             http: reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
@@ -228,10 +226,6 @@ impl Puller {
                 .build()
                 .unwrap_or_default(),
         }
-    }
-
-    pub fn images_dir(&self) -> Result<&Path, String> {
-        self.images_dir.as_deref().map_err(String::clone)
     }
 
     /// Resolve `spec.artifact_ref`, put the rootfs behind it in the image
@@ -251,7 +245,7 @@ impl Puller {
         force: bool,
         log: &mut (dyn FnMut(String) + Send),
     ) -> Result<Pulled, String> {
-        let dir = self.images_dir()?;
+        let dir = self.scratch.as_path();
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
@@ -800,19 +794,18 @@ impl Puller {
         ));
 
         let image = spec.image_for(deployment_id, &digest);
-        let dest = dir.join(format!("{image}.ext4"));
 
         if !force
-            && let Some(size) = usable_existing(&dest, expected_size, spec.grow_gb).await
+            && let Some((path, size)) = self.usable_on_daemon(&image, expected_size, spec.grow_gb).await?
         {
             log(format!(
-                "{} is already on disk with this digest; nothing to fetch",
-                dest.display()
+                "{} is already in the daemon's catalog with this digest; nothing to fetch",
+                path.display()
             ));
             return Ok(Pulled {
                 digest,
                 image,
-                path: dest,
+                path,
                 size,
                 bytes_written: 0,
                 reused: true,
@@ -823,12 +816,12 @@ impl Puller {
         let written = self
             .fetch_blob(base, &digest, api_key, tmp.path(), expected_size, log)
             .await?;
-        let size = self.finish(tmp, &dest, spec.grow_gb, log).await?;
+        let (path, size) = self.upload(tmp, &image, spec.grow_gb, log).await?;
 
         Ok(Pulled {
             digest,
             image,
-            path: dest,
+            path,
             size,
             bytes_written: written,
             reused: false,
@@ -1051,18 +1044,17 @@ impl Puller {
                     human(size)
                 ));
                 let image = spec.image_for(deployment_id, &digest);
-                let dest = dir.join(format!("{image}.ext4"));
                 if !force
-                    && let Some(size) = usable_existing(&dest, size, spec.grow_gb).await
+                    && let Some((path, size)) = self.usable_on_daemon(&image, size, spec.grow_gb).await?
                 {
                     log(format!(
-                        "{} is already on disk with this digest; nothing to materialize",
-                        dest.display()
+                        "{} is already in the daemon's catalog with this digest; nothing to materialize",
+                        path.display()
                     ));
                     return Ok(Pulled {
                         digest,
                         image,
-                        path: dest,
+                        path,
                         size,
                         bytes_written: 0,
                         reused: true,
@@ -1082,7 +1074,6 @@ impl Puller {
         let tmp = TempImage::new(dir, &format!("pull-{}", sanitize(deployment_id)));
         let out = self.materialize(root, spec, tmp.path()).await?;
         let image = spec.image_for(deployment_id, &out.digest);
-        let dest = dir.join(format!("{image}.ext4"));
         log(format!(
             "materialized {} ({} written, {})",
             out.digest,
@@ -1091,12 +1082,12 @@ impl Puller {
         ));
 
         // Growth is `art`'s job on this path — it was passed --grow-gb — so the
-        // rename is all that is left.
-        let size = self.finish(tmp, &dest, None, log).await?;
+        // upload is all that is left.
+        let (path, size) = self.upload(tmp, &image, None, log).await?;
         Ok(Pulled {
             digest: out.digest,
             image,
-            path: dest,
+            path,
             size,
             bytes_written: out.bytes_written,
             reused: false,
@@ -1198,41 +1189,57 @@ impl Puller {
     // -- shared ------------------------------------------------------------
 
     /// Grow if asked, then rename into place. Returns the final size.
-    async fn finish(
+    /// Whether the daemon already holds `image` at (at least) the size this
+    /// pull would produce. The daemon's answer, so a catalog on another host
+    /// is as good as one on this one.
+    async fn usable_on_daemon(
+        &self,
+        image: &str,
+        expected_size: u64,
+        grow_gb: Option<u64>,
+    ) -> Result<Option<(PathBuf, u64)>, String> {
+        let Some(info) = self
+            .vms
+            .image(image)
+            .await
+            .map_err(|e| format!("could not ask the daemon about {image}: {e}"))?
+        else {
+            return Ok(None);
+        };
+        Ok(image_is_usable(info.size_bytes, expected_size, grow_gb)
+            .then(|| (PathBuf::from(info.path), info.size_bytes)))
+    }
+
+    /// Put a fetched or materialized image into the daemon's catalog under
+    /// `image`, growing it there when asked (`?grow_gb=` — the daemon
+    /// resizes the filesystem, not just the file). The scratch copy is
+    /// removed either way; the daemon's path and size come back.
+    async fn upload(
         &self,
         tmp: TempImage,
-        dest: &Path,
+        image: &str,
         grow_gb: Option<u64>,
         log: &mut (dyn FnMut(String) + Send),
-    ) -> Result<u64, String> {
-        if let Some(gb) = grow_gb {
-            let target = gb * 1024 * 1024 * 1024;
-            let current = tokio::fs::metadata(tmp.path())
-                .await
-                .map_err(|e| format!("stat {}: {e}", tmp.path().display()))?
-                .len();
-            if target > current {
-                // Sparse: `set_len` is ftruncate, so the extra length costs no
-                // blocks until something writes to them. heyvm runs the
-                // `resize2fs` that lets the guest filesystem use the room.
-                let f = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(tmp.path())
-                    .await
-                    .map_err(|e| format!("open {} to grow: {e}", tmp.path().display()))?;
-                f.set_len(target)
-                    .await
-                    .map_err(|e| format!("growing {} to {gb} GiB: {e}", tmp.path().display()))?;
-                log(format!("grown from {} to {gb} GiB", human(current)));
-            }
-        }
-
-        let size = tokio::fs::metadata(tmp.path())
+    ) -> Result<(PathBuf, u64), String> {
+        let local = tokio::fs::metadata(tmp.path())
             .await
             .map_err(|e| format!("stat {}: {e}", tmp.path().display()))?
             .len();
-        tmp.commit(dest).await?;
-        Ok(size)
+        log(format!("uploading {} to the daemon as {image}", human(local)));
+        let opts = heyo_sdk::ImageUploadOptions {
+            sha256: None,
+            grow_gb,
+        };
+        let info = self
+            .vms
+            .upload_image(image, tmp.path(), &opts)
+            .await
+            .map_err(|e| format!("could not upload {image} to the daemon: {e}"))?;
+        if info.size_bytes > local {
+            log(format!("grown on the daemon from {} to {}", human(local), human(info.size_bytes)));
+        }
+        drop(tmp);
+        Ok((PathBuf::from(info.path), info.size_bytes))
     }
 
     async fn get(&self, url: &str, api_key: Option<&str>) -> reqwest::Result<reqwest::Response> {
@@ -1395,28 +1402,6 @@ fn blob_entry(m: &Manifest, reference: &str, expected: Option<&str>) -> Result<(
     }
 }
 
-/// Whether an image already on disk can stand in for a fetch.
-///
-/// The filename carries the digest, so the file existing is already strong
-/// evidence about its *content*. What the name cannot describe is its length,
-/// and two things make that matter:
-///
-/// * A previous pull that died mid-write leaves a file shorter than its blob.
-/// * `grow_gb` is not part of the name — it is about the guest, not the content
-///   — so a spec that gains one would otherwise keep reusing the ungrown image
-///   and silently give the guest none of the room it asked for.
-///
-/// So the bar is the larger of the blob and the grow target, and anything under
-/// it is re-fetched (and then grown) rather than accepted.
-async fn usable_existing(dest: &Path, expected_size: u64, grow_gb: Option<u64>) -> Option<u64> {
-    let meta = tokio::fs::metadata(dest).await.ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let required = expected_size.max(grow_gb.map(|gb| gb * 1024 * 1024 * 1024).unwrap_or(0));
-    let size = meta.len();
-    (required == 0 || size >= required).then_some(size)
-}
 
 /// A partial image, removed unless it is committed.
 ///
@@ -1426,16 +1411,25 @@ async fn usable_existing(dest: &Path, expected_size: u64, grow_gb: Option<u64>) 
 /// is in the image directory rather than `/tmp` so the commit is a rename on one
 /// filesystem — across filesystems it would be a second full copy of a rootfs,
 /// and a non-atomic one.
+/// Whether an image already in the catalog can stand in for this pull: at
+/// least the blob's length (a shorter one is the remains of a failed write),
+/// and at least the size a `grow_gb` asks for — `grow_gb` is about the guest,
+/// not the content, so it is not in the image's name, and without this an
+/// image would keep being reused at its old length while the guest silently
+/// got none of the room the spec now asks for.
+fn image_is_usable(size: u64, expected_size: u64, grow_gb: Option<u64>) -> bool {
+    let required = expected_size.max(grow_gb.map(|gb| gb * 1024 * 1024 * 1024).unwrap_or(0));
+    required == 0 || size >= required
+}
+
 struct TempImage {
     path: PathBuf,
-    committed: bool,
 }
 
 impl TempImage {
     fn new(dir: &Path, stem: &str) -> Self {
         Self {
             path: dir.join(format!(".{stem}.{}.ext4.part", std::process::id())),
-            committed: false,
         }
     }
 
@@ -1443,23 +1437,14 @@ impl TempImage {
         &self.path
     }
 
-    async fn commit(mut self, dest: &Path) -> Result<(), String> {
-        tokio::fs::rename(&self.path, dest).await.map_err(|e| {
-            format!("could not move {} into place at {}: {e}", self.path.display(), dest.display())
-        })?;
-        self.committed = true;
-        Ok(())
-    }
 }
 
 impl Drop for TempImage {
     fn drop(&mut self) {
-        if !self.committed {
-            // Synchronous on purpose: `Drop` cannot await, and leaving a
-            // multi-gigabyte partial file behind to be tidied up "later" means
-            // the next pull on a full disk fails for the wrong reason.
-            let _ = std::fs::remove_file(&self.path);
-        }
+        // Synchronous on purpose: `Drop` cannot await, and leaving a
+        // multi-gigabyte partial file behind to be tidied up "later" means
+        // the next pull on a full disk fails for the wrong reason.
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1567,32 +1552,6 @@ async fn verify_file(path: &Path, digest: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Where a pulled image is written, resolved the way mvm-ctrl resolves it.
-///
-/// `$MVM_DATA_DIR` first, then `<home>/.heyo` — and `home` is the *daemon's*
-/// home, which is why `APP_LB_HEYVM_HOME` feeds it. The daemon looks for
-/// `<data dir>/images/firecracker/<name>.ext4` and nowhere else, so a pull that
-/// writes under app-lb's home when the daemon runs as another user succeeds and
-/// then boots nothing.
-pub fn default_images_dir(heyvm_home: Option<&str>) -> Result<PathBuf, String> {
-    if let Ok(dir) = std::env::var("MVM_DATA_DIR")
-        && !dir.trim().is_empty()
-    {
-        return Ok(PathBuf::from(dir).join("images").join("firecracker"));
-    }
-    let home = heyvm_home
-        .map(str::to_string)
-        .or_else(|| std::env::var("HOME").ok())
-        .filter(|h| !h.trim().is_empty())
-        .ok_or(
-            "cannot tell where heyvm keeps its images: neither MVM_DATA_DIR nor HOME is set. \
-             Set APP_LB_IMAGES_DIR to the daemon's images/firecracker directory",
-        )?;
-    Ok(PathBuf::from(home)
-        .join(".heyo")
-        .join("images")
-        .join("firecracker"))
-}
 
 fn is_digest(s: &str) -> bool {
     s.len() == DIGEST_HEX_LEN
@@ -1854,64 +1813,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[tokio::test]
-    async fn a_committed_temp_image_lands_under_its_final_name() {
-        let dir = std::env::temp_dir().join(format!("applb-art-commit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("web-c74abee2ce84.ext4");
-        let tmp = TempImage::new(&dir, "web");
-        std::fs::write(tmp.path(), b"rootfs").unwrap();
-        let tmp_path = tmp.path().to_path_buf();
-        tmp.commit(&dest).await.unwrap();
-        assert!(dest.exists());
-        assert!(!tmp_path.exists());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn an_image_shorter_than_its_blob_is_not_reused() {
-        let dir = std::env::temp_dir().join(format!("applb-art-reuse-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("web.ext4");
-        std::fs::write(&path, b"truncated").unwrap();
-
-        assert_eq!(usable_existing(&path, 9, None).await, Some(9));
+    /// The catalog's answer decides a reuse: at least the blob's length, and
+    /// at least what a `grow_gb` asks for.
+    #[test]
+    fn an_image_shorter_than_its_blob_or_its_grow_gb_is_not_reused() {
+        assert!(image_is_usable(9, 9, None));
         // A grown image is longer than the blob and still usable.
-        assert_eq!(usable_existing(&path, 4, None).await, Some(9));
+        assert!(image_is_usable(9, 4, None));
         // A short one is the remains of a failed write.
-        assert_eq!(usable_existing(&path, 4096, None).await, None);
-        assert_eq!(usable_existing(&dir.join("absent.ext4"), 1, None).await, None);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn an_image_that_predates_a_grow_gb_is_not_reused() {
-        // `grow_gb` is about the guest, not the content, so it is not in the
-        // image's name. Without this the image would keep being reused at its
-        // old length and the guest would silently get none of the room the
-        // spec now asks for.
-        let dir = std::env::temp_dir().join(format!("applb-art-grow-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("web.ext4");
-        std::fs::write(&path, vec![0u8; 4096]).unwrap();
-
-        assert_eq!(usable_existing(&path, 4096, None).await, Some(4096));
-        assert_eq!(
-            usable_existing(&path, 4096, Some(1)).await,
-            None,
+        assert!(!image_is_usable(9, 4096, None));
+        assert!(image_is_usable(4096, 4096, None));
+        assert!(
+            !image_is_usable(4096, 4096, Some(1)),
             "a 4 KiB image cannot stand in for one asked to be 1 GiB"
         );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn the_images_dir_follows_the_daemons_home_not_app_lbs() {
-        // Only meaningful when MVM_DATA_DIR is unset, which is the normal case.
-        if std::env::var("MVM_DATA_DIR").is_ok() {
-            return;
-        }
-        let dir = default_images_dir(Some("/home/heyo")).unwrap();
-        assert_eq!(dir, PathBuf::from("/home/heyo/.heyo/images/firecracker"));
+        assert!(image_is_usable(1 << 30, 4096, Some(1)));
+        assert!(image_is_usable(0, 0, None), "an unknown size cannot refuse");
     }
 
     #[test]
@@ -1956,8 +1873,14 @@ mod tests {
         let key = std::env::var("APP_LB_TEST_ART_KEY").ok();
         let puller = Puller::new(
             std::env::var("APP_LB_TEST_ART_BIN").unwrap_or_else(|_| "art".into()),
-            Err("not needed for a recipe fetch".into()),
+            std::env::temp_dir().join("applb-df-test-scratch"),
             None,
+            crate::vm::VmManager::new(
+                Some("http://127.0.0.1:1".into()),
+                None,
+                crate::mounts::MountStore::new(std::env::temp_dir().join("applb-df-test-mounts"), 0),
+            )
+            .unwrap(),
         );
 
         let scratch = std::env::temp_dir().join(format!("applb-df-test-{}", std::process::id()));

@@ -831,6 +831,7 @@ mod tests {
     fn registry_with(routes: Vec<RouteRule>) -> Arc<Registry> {
         let registry = Arc::new(Registry::new("/dev/null"));
         registry.upsert(DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             namespace: "default".into(),

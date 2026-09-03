@@ -8,7 +8,7 @@
 //! All VM creation happens here and never in a proxy filter, so a slow boot can
 //! never stall request handling.
 
-use crate::config::IdleAction;
+use crate::config::{IdleAction, IngressSpec};
 use crate::deployment::{BootOrigin, Deployment, PendingVm, VmBackend, now_secs};
 use crate::health;
 use crate::metrics::Metrics;
@@ -96,11 +96,6 @@ pub struct Autoscaler {
     /// [`Feed::issue`](crate::feed::Feed::issue) — so calls are unconditional
     /// here and the feed itself decides whether anyone hears about it.
     feed: Arc<crate::feed::Feed>,
-    /// Where the daemon keeps per-sandbox disks, when that could be resolved.
-    /// Only used to discard a suspended replica's rootfs copy — see
-    /// [`discard_rootfs_of`](Self::discard_rootfs_of); `None` degrades to
-    /// leaving the copy in place, exactly the pre-existing behaviour.
-    disk_cfg: Option<crate::disks::DiskConfig>,
     /// Deployment-owned workspaces. Every path that retires a VM goes through
     /// it when the deployment has one, so a workspace is captured before the
     /// VM that holds it is destroyed; see [`crate::workspace`].
@@ -118,7 +113,6 @@ impl Autoscaler {
         vms: VmManager,
         metrics: Arc<Metrics>,
         feed: Arc<crate::feed::Feed>,
-        disk_cfg: Option<crate::disks::DiskConfig>,
         workspaces: Arc<Workspaces>,
         secrets: Arc<crate::secrets::SecretStore>,
     ) -> Self {
@@ -129,7 +123,6 @@ impl Autoscaler {
             nonce: AtomicU64::new(now_secs()),
             creates: tokio::sync::Semaphore::new(CREATE_CONCURRENCY),
             feed,
-            disk_cfg,
             workspaces,
             secrets,
         }
@@ -552,9 +545,82 @@ impl Autoscaler {
             self.scale_down(d, ready - desired as usize).await;
         }
 
+        // After promotion and drain marking, before reaping: a replica is
+        // bound the tick it becomes ready and unbound the tick it starts
+        // draining, so the cloud stops sending it new requests before the
+        // kill rather than after.
+        self.reconcile_ingress(d).await;
+
         self.reap_drained(d).await;
         self.renew_ttls(d, fleet).await;
         self.apply_usage(d, usage);
+    }
+
+    /// Keep the daemon-side binds in step with `ingress.cloud`: every ready,
+    /// non-draining backend bound when the spec asks for a cloud URL, none
+    /// bound when it does not. A bind that fails is retried next tick; the
+    /// VM keeps serving the proxy's own routes meanwhile.
+    async fn reconcile_ingress(&self, d: &Arc<Deployment>) {
+        let want = IngressSpec::wants_cloud(d.spec.ingress.as_ref());
+        let public = d.spec.ingress.as_ref().is_none_or(|i| i.public);
+        let port = d.spec.vm_spec().port;
+        let tag = vm::ProxyDeployment {
+            namespace: d.spec.namespace.clone(),
+            id: d.spec.id.clone(),
+        };
+        for b in d.backends().iter() {
+            match (want && !b.is_draining(), b.bind()) {
+                (true, None) => match self.vms.bind(&b.sandbox_id, port, public, &tag).await {
+                    Ok(subdomain) => {
+                        tracing::info!(
+                            deployment = %d.spec.id,
+                            sandbox = %b.sandbox_id,
+                            %subdomain,
+                            port,
+                            "bound VM port on the daemon for the cloud URL",
+                        );
+                        b.set_bind(Some(subdomain));
+                    }
+                    Err(e) => tracing::warn!(
+                        deployment = %d.spec.id,
+                        sandbox = %b.sandbox_id,
+                        error = %e,
+                        "could not bind VM port on the daemon; will retry next tick",
+                    ),
+                },
+                (false, Some(_)) => self.unbind(d, b).await,
+                _ => {}
+            }
+        }
+    }
+
+    /// Withdraw a VM's bind so the cloud stops routing the deployment's URL to
+    /// it. Nothing to do for a VM that has none.
+    async fn unbind(&self, d: &Arc<Deployment>, b: &VmBackend) {
+        let Some(subdomain) = b.bind() else {
+            return;
+        };
+        match self.vms.unbind(&b.sandbox_id, &subdomain).await {
+            Ok(()) => {
+                tracing::info!(
+                    deployment = %d.spec.id,
+                    sandbox = %b.sandbox_id,
+                    %subdomain,
+                    "unbound VM port on the daemon",
+                );
+                b.set_bind(None);
+            }
+            // Kept as bound and retried: the daemon drops every bind of a
+            // sandbox it deletes anyway, so a VM on its way out cannot leak
+            // one — this only matters for a VM that stays.
+            Err(e) => tracing::warn!(
+                deployment = %d.spec.id,
+                sandbox = %b.sandbox_id,
+                %subdomain,
+                error = %e,
+                "could not unbind VM port on the daemon",
+            ),
+        }
     }
 
     /// Health-re-probe the fixed upstreams of a static (proxy_pass) deployment.
@@ -1048,12 +1114,12 @@ impl Autoscaler {
             }
 
             let name = vm::replica_name(&d.spec.id, self.next_nonce());
-            let tree = seeded.as_ref().map(|s| s.tree.as_path());
+            let seed = seeded.as_ref().map(|s| s.seed());
             let owner = vm::VmOwner::of(&d.spec);
             let created_vm = match self.secret_env(d.spec.vm_spec()) {
                 Ok(secret_env) => {
                     self.vms
-                        .create(d.spec.vm_spec(), name, tree, &owner, secret_env)
+                        .create(d.spec.vm_spec(), name, seed.as_ref(), &owner, secret_env)
                         .await
                 }
                 Err(e) => Err(e),
@@ -1189,6 +1255,9 @@ impl Autoscaler {
         let retain = d.spec.scaling.idle_action == IdleAction::Retain;
         let mut suspended = Vec::new();
         for b in done {
+            // Normally already withdrawn by `reconcile_ingress` the tick the
+            // drain began; this is for a VM drained and reaped in one tick.
+            self.unbind(d, &b).await;
             if Self::has_workspace(d) {
                 // Stopped and queued for capture. What happens afterwards —
                 // kept suspended for `retain`, or destroyed — is the worker's
@@ -1264,14 +1333,7 @@ impl Autoscaler {
     /// what happened before this existed, and the resume path does not care
     /// either way.
     async fn discard_rootfs_of(&self, d: &Arc<Deployment>, sandbox_id: &str) {
-        let Some(cfg) = self.disk_cfg.clone() else {
-            return;
-        };
-        let id = sandbox_id.to_string();
-        let (removed, failed) =
-            tokio::task::spawn_blocking(move || crate::disks::discard_rootfs(&cfg, &id))
-                .await
-                .unwrap_or_else(|e| (Vec::new(), vec![format!("discard task failed: {e}")]));
+        let (removed, failed) = crate::disks::discard_rootfs(&self.vms, sandbox_id).await;
         if !removed.is_empty() {
             tracing::info!(
                 deployment = %d.spec.id,
@@ -1326,14 +1388,7 @@ impl Autoscaler {
             );
             return;
         }
-        let Some(cfg) = self.disk_cfg.clone() else {
-            return;
-        };
-        let id = sandbox_id.to_string();
-        let (removed, failed) =
-            tokio::task::spawn_blocking(move || crate::disks::discard_failed_boot(&cfg, &id))
-                .await
-                .unwrap_or_else(|e| (Vec::new(), vec![format!("discard task failed: {e}")]));
+        let (removed, failed) = crate::disks::discard_failed_boot(&self.vms, sandbox_id).await;
         if !removed.is_empty() {
             tracing::info!(
                 deployment = %d.spec.id,
@@ -1674,6 +1729,7 @@ impl Autoscaler {
         let workspace = Self::has_workspace(d);
         for b in d.backends().iter() {
             b.set_draining(true);
+            self.unbind(d, b).await;
             self.kill_or_capture(d, &b.sandbox_id, "VM").await;
         }
         for p in d.pending().iter() {
@@ -1740,8 +1796,10 @@ impl Autoscaler {
             .cloned()
         {
             // Stop new traffic regardless of mode; a draining VM is skipped by
-            // `select`, so no request is routed to it after this point.
+            // `select`, so no request is routed to it after this point — and
+            // the cloud's URL stops picking it once its bind is gone.
             b.set_draining(true);
+            self.unbind(d, &b).await;
 
             if !force {
                 tracing::info!(
@@ -2018,6 +2076,7 @@ mod tests {
 
     fn spec() -> DeploymentSpec {
         DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             namespace: "default".into(),
@@ -2064,6 +2123,7 @@ mod tests {
     /// A static (proxy_pass) deployment with fixed upstreams.
     fn static_spec() -> DeploymentSpec {
         DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             namespace: "default".into(),
@@ -2092,6 +2152,14 @@ mod tests {
     /// bookkeeping persists on every change, so this must not be the CWD — and
     /// must not be shared, since tests run in parallel against the same id.
     fn autoscaler() -> (Autoscaler, Arc<Registry>) {
+        // A daemon URL nothing listens on: fine, because the graceful and
+        // not-found paths never call it.
+        autoscaler_against("http://127.0.0.1:1", spec())
+    }
+
+    /// An autoscaler over one registered deployment, talking to the daemon
+    /// at `daemon_url`.
+    fn autoscaler_against(daemon_url: &str, initial: DeploymentSpec) -> (Autoscaler, Arc<Registry>) {
         static N: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "app-lb-as-{}-{}",
@@ -2099,11 +2167,9 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed),
         ));
         let registry = Arc::new(Registry::new(dir.join("state.json")));
-        registry.upsert(spec());
-        // A daemon URL nothing listens on: fine, because the graceful and
-        // not-found paths never call it.
+        registry.upsert(initial);
         let vms = VmManager::new(
-            Some("http://127.0.0.1:1".into()),
+            Some(daemon_url.into()),
             None,
             crate::mounts::MountStore::new(dir.join("mounts"), 0),
         )
@@ -2111,12 +2177,9 @@ mod tests {
         let workspaces = Arc::new(crate::workspace::Workspaces::new(
             crate::workspace::WorkspaceConfig {
                 root: dir.join("workspaces"),
-                data_dir: dir.clone(),
                 tar_bin: "tar".into(),
                 aws_bin: "aws".into(),
                 art_bin: "art".into(),
-                debugfs_bin: "debugfs".into(),
-                e2fsck_bin: "e2fsck".into(),
                 s3_endpoint: None,
                 home: None,
                 timeout: Duration::from_secs(60),
@@ -2134,9 +2197,6 @@ mod tests {
                 vms,
                 Arc::new(Metrics::new()),
                 Arc::new(crate::feed::Feed::new()),
-                // No disk config: rootfs discarding quietly stands down, which
-                // is also the production behaviour when the data dir is unknown.
-                None,
                 workspaces,
                 Arc::new(crate::secrets::SecretStore::new(
                     dir.join("autoscaler-secrets.json"),
@@ -2145,6 +2205,208 @@ mod tests {
             ),
             registry,
         )
+    }
+
+    /// app-lb's part of a cloud URL: bind a ready replica's port on the
+    /// daemon, tagged with the deployment; withdraw it when the replica
+    /// drains. The daemon is faked over its three `/sandboxes/:id/proxy`
+    /// verbs, holding the bind list in memory so what app-lb asked for can
+    /// be read back.
+    mod cloud_ingress {
+        use super::*;
+        use crate::config::IngressSpec;
+        use axum::extract::{Path, Query, State};
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use serde_json::{Value, json};
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Clone, Default)]
+        struct FakeDaemon {
+            binds: Arc<Mutex<Vec<Value>>>,
+            posts: Arc<AtomicUsize>,
+        }
+
+        async fn serve(daemon: FakeDaemon) -> String {
+            let app = Router::new()
+                .route("/sandboxes/:id/proxy", get(list).post(create).delete(remove))
+                .with_state(daemon);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+
+        async fn list(State(d): State<FakeDaemon>, Path(id): Path<String>) -> Json<Value> {
+            let proxies: Vec<Value> = d
+                .binds
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b["sandbox_id"] == id)
+                .cloned()
+                .collect();
+            Json(json!({ "proxies": proxies }))
+        }
+
+        async fn create(
+            State(d): State<FakeDaemon>,
+            Path(id): Path<String>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let n = d.posts.fetch_add(1, Ordering::Relaxed);
+            let bind = json!({
+                "sandbox_id": id,
+                "subdomain": format!("bind{n}"),
+                "hostname": format!("bind{n}.localhost"),
+                "port": body["port"],
+                "is_public": body["is_public"],
+                "deployment": body["deployment"],
+            });
+            d.binds.lock().unwrap().push(bind.clone());
+            (StatusCode::CREATED, Json(bind))
+        }
+
+        async fn remove(
+            State(d): State<FakeDaemon>,
+            Path(id): Path<String>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> StatusCode {
+            let sub = q.get("subdomain").cloned().unwrap_or_default();
+            let mut binds = d.binds.lock().unwrap();
+            let before = binds.len();
+            binds.retain(|b| !(b["sandbox_id"] == id && b["subdomain"] == sub));
+            if binds.len() == before {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::NO_CONTENT
+            }
+        }
+
+        fn ready_backend(id: &str) -> Arc<VmBackend> {
+            Arc::new(VmBackend::new(id.into(), "10.0.0.2:8080".parse().unwrap()))
+        }
+
+        fn cloud_spec(public: bool) -> DeploymentSpec {
+            let mut s = spec();
+            s.ingress = Some(IngressSpec { cloud: true, public });
+            s
+        }
+
+        #[tokio::test]
+        async fn binds_ready_replicas_and_unbinds_them_when_they_drain() {
+            let daemon = FakeDaemon::default();
+            let url = serve(daemon.clone()).await;
+            let (a, reg) = autoscaler_against(&url, cloud_spec(false));
+            let d = reg.get("demo").unwrap();
+            let b = ready_backend("sb-1");
+            d.set_backends(vec![b.clone()]);
+
+            a.reconcile_ingress(&d).await;
+            assert_eq!(b.bind().as_deref(), Some("bind0"));
+            let binds = daemon.binds.lock().unwrap().clone();
+            assert_eq!(binds.len(), 1);
+            assert_eq!(binds[0]["port"], 8080, "the spec's vm.port is what gets bound");
+            assert_eq!(binds[0]["is_public"], false, "ingress.public rides the bind");
+            assert_eq!(
+                binds[0]["deployment"],
+                json!({"namespace": "default", "id": "demo"}),
+                "the bind is tagged with the deployment so the cloud can group it",
+            );
+
+            // Settled: another tick asks the daemon for nothing new.
+            a.reconcile_ingress(&d).await;
+            assert_eq!(daemon.posts.load(Ordering::Relaxed), 1);
+
+            b.set_draining(true);
+            a.reconcile_ingress(&d).await;
+            assert_eq!(b.bind(), None, "a draining replica is withdrawn");
+            assert!(daemon.binds.lock().unwrap().is_empty());
+        }
+
+        /// After a restart app-lb has forgotten its binds; the daemon has
+        /// not. The one it finds is reused, not doubled — the daemon mints a
+        /// fresh subdomain per create.
+        #[tokio::test]
+        async fn reuses_the_bind_the_daemon_already_holds() {
+            let daemon = FakeDaemon::default();
+            daemon.binds.lock().unwrap().push(json!({
+                "sandbox_id": "sb-1", "subdomain": "kept", "port": 8080, "is_public": true,
+                "deployment": {"namespace": "default", "id": "demo"},
+            }));
+            let url = serve(daemon.clone()).await;
+            let (a, reg) = autoscaler_against(&url, cloud_spec(true));
+            let d = reg.get("demo").unwrap();
+            let b = ready_backend("sb-1");
+            d.set_backends(vec![b.clone()]);
+
+            a.reconcile_ingress(&d).await;
+            assert_eq!(b.bind().as_deref(), Some("kept"));
+            assert_eq!(daemon.posts.load(Ordering::Relaxed), 0);
+        }
+
+        /// A bind for another deployment, or another port, is not this one's.
+        #[tokio::test]
+        async fn does_not_adopt_a_bind_that_is_not_its_own() {
+            let daemon = FakeDaemon::default();
+            daemon.binds.lock().unwrap().push(json!({
+                "sandbox_id": "sb-1", "subdomain": "theirs", "port": 8080, "is_public": true,
+                "deployment": {"namespace": "default", "id": "other"},
+            }));
+            daemon.binds.lock().unwrap().push(json!({
+                "sandbox_id": "sb-1", "subdomain": "debug", "port": 9229, "is_public": true,
+                "deployment": {"namespace": "default", "id": "demo"},
+            }));
+            let url = serve(daemon.clone()).await;
+            let (a, reg) = autoscaler_against(&url, cloud_spec(true));
+            let d = reg.get("demo").unwrap();
+            let b = ready_backend("sb-1");
+            d.set_backends(vec![b.clone()]);
+
+            a.reconcile_ingress(&d).await;
+            assert_eq!(b.bind().as_deref(), Some("bind0"));
+            assert_eq!(daemon.posts.load(Ordering::Relaxed), 1);
+        }
+
+        /// A spec that no longer asks for a cloud URL withdraws every bind,
+        /// and a spec that never did asks the daemon for nothing.
+        #[tokio::test]
+        async fn withdraws_binds_when_the_spec_stops_asking() {
+            let daemon = FakeDaemon::default();
+            daemon.binds.lock().unwrap().push(json!({
+                "sandbox_id": "sb-1", "subdomain": "old", "port": 8080, "is_public": true,
+                "deployment": {"namespace": "default", "id": "demo"},
+            }));
+            let url = serve(daemon.clone()).await;
+            let (a, reg) = autoscaler_against(&url, spec());
+            let d = reg.get("demo").unwrap();
+            let b = ready_backend("sb-1");
+            b.set_bind(Some("old".into()));
+            d.set_backends(vec![b.clone()]);
+
+            a.reconcile_ingress(&d).await;
+            assert_eq!(b.bind(), None);
+            assert!(daemon.binds.lock().unwrap().is_empty());
+            assert_eq!(daemon.posts.load(Ordering::Relaxed), 0);
+        }
+
+        /// A daemon that cannot be reached costs nothing but a retry: the
+        /// replica keeps serving the proxy's own routes.
+        #[tokio::test]
+        async fn a_failed_bind_is_retried_next_tick_not_fatal() {
+            let (a, reg) = autoscaler_against("http://127.0.0.1:1", cloud_spec(true));
+            let d = reg.get("demo").unwrap();
+            let b = ready_backend("sb-1");
+            d.set_backends(vec![b.clone()]);
+
+            a.reconcile_ingress(&d).await;
+            assert_eq!(b.bind(), None);
+            assert!(d.backends().iter().any(|x| x.sandbox_id == "sb-1"), "still in the pool");
+        }
     }
 
     /// The record of a suspended sandbox is the *only* record: mvm-ctrl drops a
@@ -2468,6 +2730,11 @@ mod tests {
             urls: vec![],
             guest_ip: guest_ip.map(Into::into),
             metadata: None,
+            account_id: None,
+            created_at: None,
+            cpus: None,
+            memory: None,
+            backend_type: None,
         }
     }
 

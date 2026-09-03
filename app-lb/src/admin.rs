@@ -1060,6 +1060,12 @@ struct VmView {
     /// Latest per-VM sample from the daemon, `None` if not yet reported.
     cpu_percent: Option<f64>,
     memory_bytes: Option<u64>,
+    /// The daemon-side proxy bind of this VM's port, when the deployment has
+    /// `ingress.cloud` and the bind is in place: the subdomain the cloud's
+    /// deployment URL fans out to. Absent otherwise, so the payload is
+    /// unchanged for a deployment with no cloud URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subdomain: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1424,6 +1430,7 @@ async fn metrics_snapshot(
                                 uptime_secs: b.uptime_secs(),
                                 cpu_percent: usage.map(|(c, _)| c),
                                 memory_bytes: usage.map(|(_, m)| m),
+                                subdomain: b.bind(),
                             }
                         })
                         .collect()

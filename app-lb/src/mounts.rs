@@ -180,28 +180,39 @@ impl MountStore {
     /// came from was rolled. See [`DEFAULT_TTL_SECS`] for what that window is
     /// really protecting, which is narrower than "trees get a day to come back".
     pub fn sweep(&self, referenced: &HashSet<String>) -> (usize, u64) {
-        self.sweep_at(referenced, crate::deployment::now_secs())
+        let (removed, freed) = self.sweep_named(referenced, crate::deployment::now_secs());
+        (removed.len(), freed)
     }
 
     /// [`sweep`](Self::sweep) against a given clock, which is what makes the
     /// retention window testable without waiting a day or rewriting mtimes.
+    #[cfg(test)]
     fn sweep_at(&self, referenced: &HashSet<String>, now: u64) -> (usize, u64) {
+        let (removed, freed) = self.sweep_named(referenced, now);
+        (removed.len(), freed)
+    }
+
+    /// As [`sweep`](Self::sweep), naming the trees that went — so the same
+    /// trees can be reclaimed on the daemon, which holds an uploaded copy of
+    /// each. A stale staging directory is named too; the daemon never had
+    /// it, and a delete of what is not there is a no-op.
+    pub fn sweep_named(&self, referenced: &HashSet<String>, now: u64) -> (Vec<String>, u64) {
         if self.ttl_secs == 0 {
-            return (0, 0);
+            return (Vec::new(), 0);
         }
-        let mut removed = 0usize;
+        let mut removed = Vec::new();
         let mut freed = 0u64;
 
         let entries = match std::fs::read_dir(&self.root) {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), 0),
             Err(e) => {
                 tracing::warn!(
                     dir = %self.root.display(),
                     error = %e,
                     "cannot read the mount directory; nothing reclaimed this sweep",
                 );
-                return (0, 0);
+                return (Vec::new(), 0);
             }
         };
 
@@ -230,7 +241,7 @@ impl MountStore {
             let bytes = dir_bytes(&path);
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => {
-                    removed += 1;
+                    removed.push(name.to_string());
                     freed += bytes;
                     tracing::info!(
                         tree = %name,
@@ -332,14 +343,23 @@ pub struct MountSweeper {
     store: MountStore,
     registry: Arc<Registry>,
     period: Duration,
+    /// The daemon holds an uploaded copy of every tree a replica was built
+    /// from; a tree reclaimed here is reclaimed there too.
+    vms: crate::vm::VmManager,
 }
 
 impl MountSweeper {
-    pub fn new(store: MountStore, registry: Arc<Registry>, sweep_secs: u64) -> Self {
+    pub fn new(
+        store: MountStore,
+        registry: Arc<Registry>,
+        sweep_secs: u64,
+        vms: crate::vm::VmManager,
+    ) -> Self {
         Self {
             store,
             registry,
             period: Duration::from_secs(sweep_secs.max(60)),
+            vms,
         }
     }
 }
@@ -359,16 +379,30 @@ impl pingora_core::services::background::BackgroundService for MountSweeper {
                 _ = tick.tick() => {
                     let referenced = referenced_trees(&self.registry);
                     let store = self.store.clone();
+                    let now = crate::deployment::now_secs();
                     // Walks a directory tree and unlinks gigabytes: not work for
                     // the runtime's async threads.
-                    let swept = tokio::task::spawn_blocking(move || store.sweep(&referenced)).await;
+                    let swept = tokio::task::spawn_blocking(move || store.sweep_named(&referenced, now)).await;
                     match swept {
-                        Ok((0, _)) => {}
-                        Ok((trees, bytes)) => tracing::info!(
-                            trees,
-                            bytes,
-                            "reclaimed mount trees no deployment names",
-                        ),
+                        Ok((removed, _)) if removed.is_empty() => {}
+                        Ok((removed, bytes)) => {
+                            tracing::info!(
+                                trees = removed.len(),
+                                bytes,
+                                "reclaimed mount trees no deployment names",
+                            );
+                            // The daemon holds an uploaded copy of each; a
+                            // staging dir it never had is skipped.
+                            for tree in removed.iter().filter(|t| !t.starts_with(STAGING_PREFIX)) {
+                                if let Err(e) = self.vms.delete_tree(tree).await {
+                                    tracing::warn!(
+                                        tree = %tree,
+                                        error = %e,
+                                        "reclaimed here but not on the daemon; it stays there until an operator removes it",
+                                    );
+                                }
+                            }
+                        }
                         Err(e) => tracing::warn!(error = %e, "the mount sweep did not finish"),
                     }
                 }

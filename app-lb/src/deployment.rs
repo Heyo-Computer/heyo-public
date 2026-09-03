@@ -48,6 +48,11 @@ pub struct VmBackend {
     cpu_percent_bits: AtomicU64,
     mem_bytes: AtomicU64,
     has_usage: AtomicBool,
+    /// The daemon-side proxy bind of this VM's port, when the deployment has
+    /// `ingress.cloud`: the subdomain the daemon minted, which is what the
+    /// cloud routes the deployment's URL to. `None` until bound, and again
+    /// once unbound on drain. See [`crate::config::IngressSpec`].
+    bind: Mutex<Option<String>>,
 }
 
 impl VmBackend {
@@ -76,7 +81,18 @@ impl VmBackend {
             cpu_percent_bits: AtomicU64::new(0),
             mem_bytes: AtomicU64::new(0),
             has_usage: AtomicBool::new(false),
+            bind: Mutex::new(None),
         }
+    }
+
+    /// The daemon-side bind of this VM's port, if it has one.
+    pub fn bind(&self) -> Option<String> {
+        self.bind.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Record (or forget) the daemon-side bind.
+    pub fn set_bind(&self, subdomain: Option<String>) {
+        *self.bind.lock().unwrap_or_else(|e| e.into_inner()) = subdomain;
     }
 
     /// Seconds this VM has been in the pool.
@@ -651,6 +667,7 @@ mod tests {
 
     fn deployment(scaling: ScalingPolicy) -> Deployment {
         Deployment::new(DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             namespace: "default".into(),
@@ -697,6 +714,7 @@ mod tests {
     /// A static (proxy_pass) deployment with the given upstreams.
     fn static_deployment(upstreams: &[&str]) -> Deployment {
         Deployment::new(DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             namespace: "default".into(),

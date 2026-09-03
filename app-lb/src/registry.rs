@@ -669,6 +669,7 @@ mod tests {
 
     fn spec(id: &str, routes: Vec<RouteRule>) -> DeploymentSpec {
         DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             namespace: "default".into(),
@@ -709,6 +710,7 @@ mod tests {
 
     fn static_spec(id: &str, routes: Vec<RouteRule>, upstreams: &[&str]) -> DeploymentSpec {
         DeploymentSpec {
+            ingress: None,
             account_id: None,
             user_id: None,
             namespace: "default".into(),

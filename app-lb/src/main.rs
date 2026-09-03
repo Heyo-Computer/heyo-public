@@ -665,38 +665,24 @@ fn main() {
     // feed a deployment exposes). In-memory; a restart starts it empty.
     let event_feed = std::sync::Arc::new(feed::Feed::new());
 
-    // Resolved before the autoscaler because both want it: the disk console
-    // inventories these paths, and the autoscaler discards a suspended
-    // replica's rootfs copy under them. Optional in exactly one way: without a
-    // resolvable daemon data directory there is nothing to inventory, and an LB
-    // whose host keeps its VMs elsewhere should not refuse to start over it.
-    // The disk routes then answer 503 and say why.
+    // Disk management rides the daemon's own routes (`GET /storage`, purge,
+    // archive), so there is no data directory to resolve and nothing here
+    // can fail but a malformed number in the environment.
     let disk_cfg = match disks::DiskConfig::from_env(&cfg) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            tracing::warn!("{e}. Disk management is disabled");
-            None
-        }
+        Ok(c) => c,
+        Err(e) => panic!("{e}"),
     };
 
-    // Deployment-owned workspaces (`vm.workspace`). Needs the daemon's data
-    // directory to find a stopped VM's workspace image; without one, the same
-    // as without disk management, a workspace deployment cannot be served and
-    // the create path says so.
+    // Deployment-owned workspaces (`vm.workspace`). Captures come from the
+    // daemon's mount export, so app-lb needs only its own workspace root.
     let workspaces = Arc::new(workspace::Workspaces::new(
-        workspace::WorkspaceConfig::from_env(
-            &cfg,
-            disk_cfg
-                .as_ref()
-                .map(|c| c.data_dir.clone())
-                .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent")),
-        ),
+        workspace::WorkspaceConfig::from_env(&cfg),
         vms.clone(),
         registry.clone(),
         secrets.clone(),
     ));
     if let Err(e) = workspaces.ensure_root() {
-        panic!("{e}. Set APP_LB_WORKSPACES_DIR to a directory app-lb can write and heyvmd can read");
+        panic!("{e}. Set APP_LB_WORKSPACES_DIR to a directory app-lb can write");
     }
     match workspaces.load() {
         0 => {}
@@ -712,79 +698,56 @@ fn main() {
             vms.clone(),
             metrics.clone(),
             event_feed.clone(),
-            disk_cfg.clone(),
             workspaces.clone(),
             secrets.clone(),
         ),
     );
     let autoscaler = autoscaler_svc.task();
 
-    let disks = match disk_cfg {
-        Some(disk_cfg) => {
-            let store = Arc::new(disks::DiskStore::new(
-                disk_cfg,
-                vms,
-                registry.clone(),
-            ));
-            match store.load() {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(count = n, "loaded disk retention policies"),
-                // Not fatal, unlike the secret store: the worst case is that a
-                // `retain` flag is missed, and the sweep's other four guards
-                // (running, claimed, age, daemon reachable) still hold.
-                Err(e) => tracing::error!(
-                    error = %e,
-                    "cannot read disk retention policies; every disk will be treated as \
-                     unretained until this is fixed",
-                ),
-            }
-            let c = store.config();
-            if c.ttl_secs == 0 {
-                tracing::info!(
-                    data_dir = %c.data_dir.display(),
-                    "disk expiry is off (APP_LB_DISK_TTL_SECS=0); disks are listed and can be \
-                     purged by hand, but nothing is reclaimed automatically",
-                );
-            } else {
-                // Counted here rather than left for the first sweep to
-                // discover, because on a host that has been booting VMs for
-                // months the honest answer is "most of them" — and an operator
-                // who never opens /storage should still learn that from the log
-                // before it happens rather than after. An upper bound: without
-                // the daemon this cannot tell a running sandbox from residue.
-                let (total, due, bytes) = store.expiry_preview();
-                tracing::warn!(
-                    data_dir = %c.data_dir.display(),
-                    ttl_secs = c.ttl_secs,
-                    sweep_secs = c.sweep_secs,
-                    archive = c.bucket.is_some(),
-                    disks = total,
-                    eligible = due,
-                    gib = bytes / (1 << 30),
-                    "disk expiry is ON: up to {due} of {total} sandbox disks on this host are \
-                     already older than the retention window and will be reclaimed by the \
-                     first sweep, in {}s. Open /storage to review them, mark the ones to keep \
-                     as retained, or set APP_LB_DISK_TTL_SECS=0 to turn expiry off",
-                    c.sweep_secs,
-                );
-            }
-            Some(store)
+    let disks = {
+        let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()));
+        match store.load() {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "loaded disk retention policies"),
+            // Not fatal, unlike the secret store: the worst case is that a
+            // `retain` flag is missed, and the sweep's other four guards
+            // (running, claimed, age, daemon reachable) still hold.
+            Err(e) => tracing::error!(
+                error = %e,
+                "cannot read disk retention policies; every disk will be treated as \
+                 unretained until this is fixed",
+            ),
         }
-        None => None,
+        let c = store.config();
+        if c.ttl_secs == 0 {
+            tracing::info!(
+                "disk expiry is off (APP_LB_DISK_TTL_SECS=0); disks are listed and can be \
+                 purged by hand, but nothing is reclaimed automatically",
+            );
+        } else {
+            // The count of what is already due is logged by the sweeper on its
+            // first tick, once the daemon has been asked.
+            tracing::info!(
+                ttl_secs = c.ttl_secs,
+                sweep_secs = c.sweep_secs,
+                archive = c.bucket.is_some(),
+                "disk expiry is ON; the first sweep runs in {}s and reclaims every unretained \
+                 disk older than the retention window. Open /storage to review them first, or \
+                 set APP_LB_DISK_TTL_SECS=0 to turn expiry off",
+                c.sweep_secs,
+            );
+        }
+        Some(store)
     };
 
-    // Where an artifact pull writes a rootfs. Resolved once, and kept as a
-    // `Result` rather than unwrapped: without `HOME` or `MVM_DATA_DIR` there is
-    // no way to know where heyvmd looks, but an LB whose deployments all name
-    // prebuilt images never needs to know, and it should not refuse to start
-    // over a directory it will not use. The error travels to the pull instead.
-    let images_dir = match &cfg.images_dir {
-        Some(dir) => Ok(std::path::PathBuf::from(dir)),
-        None => artifact::default_images_dir(cfg.heyvm_home.as_deref()),
-    };
-    if let Err(e) = &images_dir {
-        tracing::warn!("{e}. Artifact pulls will fail until APP_LB_IMAGES_DIR is set");
-    }
+    // app-lb's own scratch for images on their way to the daemon (pulls land
+    // here, builds write here), uploaded into the daemon's catalog and
+    // removed. Nothing the daemon reads, so nothing to align with its home.
+    let images_dir = std::path::PathBuf::from(
+        cfg.images_dir
+            .clone()
+            .unwrap_or_else(|| "/var/lib/app-lb/images".to_string()),
+    );
 
     // The job runner is not a service: it has no loop of its own, it runs a task
     // per job. It needs the autoscaler because finishing an image build means
@@ -944,6 +907,7 @@ fn main() {
                 mount_store,
                 mount_registry,
                 mounts::DEFAULT_SWEEP_SECS,
+                vms.clone(),
             ),
         ));
     }
