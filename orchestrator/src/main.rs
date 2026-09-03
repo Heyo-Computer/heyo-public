@@ -217,6 +217,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(handlers::service_deploy::get_service_deployment_run),
         )
         .route(
+            "/orchestration/services/archives/presign",
+            post(handlers::service_deploy::presign_service_archive),
+        )
+        .route(
+            "/orchestration/services/archives/finalize",
+            post(handlers::service_deploy::finalize_service_archive),
+        )
+        .route(
             "/orchestration/services/{service_id}",
             get(handlers::service_deploy::get_service_deployment),
         )

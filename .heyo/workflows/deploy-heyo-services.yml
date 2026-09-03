@@ -61,6 +61,8 @@ jobs:
       ORCHESTRATOR_TARGET_OS: ${{ secrets.ORCHESTRATOR_TARGET_OS }}
       ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS: ${{ secrets.ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS }}
       ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS: ${{ secrets.ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS }}
+      ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES: ${{ secrets.ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES }}
+      HEYO_SERVICE_REPLICAS: ${{ secrets.HEYO_SERVICE_REPLICAS }}
       ORCHESTRATOR_NATS_URL: ${{ secrets.ORCHESTRATOR_NATS_URL }}
       ORCHESTRATOR_NATS_ENABLED: ${{ secrets.ORCHESTRATOR_NATS_ENABLED }}
       TARGET_HEYO_SERVICE: ${{ matrix.target }}
@@ -367,6 +369,24 @@ jobs:
               if url.startswith("ssh://git@github.com/"): return "https://github.com/" + url.removeprefix("ssh://git@github.com/")
               return url
           def envref(name, path): return f"{name}=heyosecret://{path}@active"
+          def upload_service_archive(endpoint, key, payload, archive_path):
+              headers=["-H",f"Authorization: Bearer {key}","-H","Content-Type: application/json"]
+              presign=subprocess.run(["curl","--connect-timeout","15","--max-time","30","--fail-with-body","--show-error","--silent","-X","POST",*headers,"--data-binary","@-",f"{endpoint}/orchestration/services/archives/presign"],input=json.dumps({"userId":payload["userId"]}),text=True,capture_output=True)
+              if presign.returncode:
+                  print(presign.stdout); print(presign.stderr,file=sys.stderr); raise SystemExit(presign.returncode)
+              slot=json.loads(presign.stdout or "{}")
+              archive_id=slot.get("archiveId"); upload_url=slot.get("uploadUrl")
+              if not archive_id or not upload_url: raise SystemExit("orchestrator returned an invalid service archive upload slot")
+              upload=subprocess.run(["curl","--connect-timeout","15","--max-time","420","--fail-with-body","--show-error","--silent","-X","PUT","--upload-file",archive_path,upload_url],text=True,capture_output=True)
+              if upload.returncode:
+                  print(upload.stdout); print(upload.stderr,file=sys.stderr); raise SystemExit(upload.returncode)
+              finalize_body={"archiveId":archive_id,"userId":payload["userId"],"deploymentId":payload["deploymentId"],"archiveName":payload["archiveName"]}
+              finalize=subprocess.run(["curl","--connect-timeout","15","--max-time","30","--fail-with-body","--show-error","--silent","-X","POST",*headers,"--data-binary","@-",f"{endpoint}/orchestration/services/archives/finalize"],input=json.dumps(finalize_body),text=True,capture_output=True)
+              if finalize.returncode:
+                  print(finalize.stdout); print(finalize.stderr,file=sys.stderr); raise SystemExit(finalize.returncode)
+              finalized=json.loads(finalize.stdout or "{}")
+              if finalized.get("archiveId") != archive_id: raise SystemExit("orchestrator finalized an unexpected service archive")
+              return archive_id
           def deploy(endpoint, key, payload):
               payload["async"] = True
               result = subprocess.run(["curl","--connect-timeout","15","--max-time","420","--fail-with-body","--show-error","--silent","-X","POST","-H",f"Authorization: Bearer {key}","-H","Content-Type: application/json","--data-binary","@-",f"{endpoint}/orchestration/services/deployments"], input=json.dumps(payload), text=True, capture_output=True)
@@ -401,14 +421,36 @@ jobs:
           git_sha=subprocess.check_output(["git","rev-parse","HEAD"], text=True).strip()
           archive_name=f"heyo-{service}-linux.tar.gz"
           deployment_id=f"svc-{service}-{uuid.uuid4().hex[:12]}"
-          start_command="i=0; until mountpoint -q /workspace && [ -x /workspace/start.sh ]; do sudo -n sh -c 'modprobe 9p 2>/dev/null; modprobe 9pnet 2>/dev/null; modprobe 9pnet_virtio 2>/dev/null; mount -a 2>/dev/null || true' >/dev/null 2>&1 || true; i=$((i + 1)); if [ \"$i\" -ge 300 ]; then echo 'workspace mount did not become ready within 300 seconds' >&2; exit 1; fi; sleep 1; done; cd /workspace; exec ./start.sh"
+          # Keep this free of single quotes while heyvm embeds env-bearing commands in a single-quoted sh -c wrapper.
+          start_command="i=0; until mountpoint -q /workspace && [ -x /workspace/start.sh ]; do sudo -n modprobe 9p 2>/dev/null || true; sudo -n modprobe 9pnet 2>/dev/null || true; sudo -n modprobe 9pnet_virtio 2>/dev/null || true; sudo -n mount -a 2>/dev/null || true; i=$((i + 1)); if [ \"$i\" -ge 300 ]; then echo \"workspace mount did not become ready within 300 seconds\" >&2; exit 1; fi; sleep 1; done; cd /workspace; exec ./start.sh"
           priority={"heyosecret":10010,"orchestrator":10010,"app-lb":10010,"app-obs":10010}[service]
           if service == "app-lb":
               route={"host":f"app-lb.{public_host}","pathPrefix":"/metrics","entryPoints":["websecure"],"stripPrefix":False,"passHostHeader":True,"priority":priority}
           else:
               route={"host":public_host,"pathPrefix":f"/{service}","entryPoints":["websecure"],"stripPrefix":True,"passHostHeader":False,"priority":priority}
           if os.environ.get("HEYO_TRAEFIK_CERT_RESOLVER"): route["certResolver"]=os.environ["HEYO_TRAEFIK_CERT_RESOLVER"]
-          payload={"serviceId":service,"deploymentId":deployment_id,"userId":os.environ.get("HEYO_SERVICE_USER_ID","heyo-system"),"accountId":os.environ.get("HEYO_SERVICE_ACCOUNT_ID","heyo-system"),"name":f"heyo-{service}","archiveName":archive_name,"archiveBytesBase64":base64.b64encode(open(f"dist/{archive_name}","rb").read()).decode(),"region":os.environ.get("HEYO_SERVICE_REGION") or "EU","driver":os.environ.get("HEYO_SERVICE_DRIVER") or "libvirt","image":os.environ.get("HEYO_SERVICE_IMAGE") or "ubuntu:24.04","ports":[8080],"workingDirectory":"/","startCommand":start_command,"sizeClass":os.environ.get("HEYO_SERVICE_SIZE_CLASS","small"),"ttlSeconds":0,"healthPath":"/health","healthTimeoutSeconds":900,"drainSeconds":30,"retirePrevious":True,"retirePreviousAsync":True,"deletePrevious":True,"metadata":{"gitSha":git_sha,"gitRef":os.environ.get("GITHUB_REF", ""),"repositoryUrl":repo,"workflow":"Deploy Heyo public services"},"revisionGuard":{"repositoryUrl":repo,"ref":required("CI_REF"),"expectedSha":required("CI_AFTER"),"force":os.environ.get("FORCE_STALE_SERVICE_DEPLOY","").lower() in {"1","true"}},"env":{},"envRefs":[],"route":route}
+          payload={"serviceId":service,"deploymentId":deployment_id,"userId":os.environ.get("HEYO_SERVICE_USER_ID","heyo-system"),"accountId":os.environ.get("HEYO_SERVICE_ACCOUNT_ID","heyo-system"),"name":f"heyo-{service}","archiveName":archive_name,"region":os.environ.get("HEYO_SERVICE_REGION") or "EU","driver":os.environ.get("HEYO_SERVICE_DRIVER") or "libvirt","image":os.environ.get("HEYO_SERVICE_IMAGE") or "ubuntu:24.04","ports":[8080],"workingDirectory":"/","startCommand":start_command,"sizeClass":os.environ.get("HEYO_SERVICE_SIZE_CLASS","small"),"ttlSeconds":0,"healthPath":"/health","healthTimeoutSeconds":900,"drainSeconds":30,"retirePrevious":True,"retirePreviousAsync":True,"deletePrevious":True,"metadata":{"gitSha":git_sha,"gitRef":os.environ.get("GITHUB_REF", ""),"repositoryUrl":repo,"workflow":"Deploy Heyo public services"},"revisionGuard":{"repositoryUrl":repo,"ref":required("CI_REF"),"expectedSha":required("CI_AFTER"),"force":os.environ.get("FORCE_STALE_SERVICE_DEPLOY","").lower() in {"1","true"}},"env":{},"envRefs":[],"route":route}
+          discovery_routed={item.strip() for item in os.environ.get("ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES","").split(",") if item.strip()}
+          replica_config=os.environ.get("HEYO_SERVICE_REPLICAS","").strip()
+          replicas=replica_config
+          if "=" in replica_config:
+              replica_map={}
+              for entry in replica_config.split(","):
+                  name, separator, count=entry.partition("=")
+                  if not separator or not name.strip() or not count.strip(): raise SystemExit("HEYO_SERVICE_REPLICAS entries must use service=count")
+                  replica_map[name.strip()]=count.strip()
+              replicas=replica_map.get(service,"")
+          elif service not in discovery_routed:
+              replicas=""
+          if service == "app-lb" and service in discovery_routed:
+              raise SystemExit("app-lb cannot use its own discovery membership for traffic management")
+          if replicas:
+              if service not in discovery_routed: raise SystemExit(f"{service} must be listed in ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES before HEYO_SERVICE_REPLICAS is set")
+              try: payload["desiredReplicas"]=int(replicas)
+              except ValueError: raise SystemExit("HEYO_SERVICE_REPLICAS must be an integer")
+              payload.pop("route")
+          elif service in discovery_routed:
+              payload.pop("route")
           if service=="heyosecret":
               payload["env"]={"HEYOSECRET_SERVER_PORT":"8080","HEYOSECRET_INTERNAL_API_KEY":os.environ.get("HEYOSECRET_INTERNAL_API_KEY") or key,"HEYOSECRET_MIGRATIONS_DIR":"/workspace/migrations","HEYOSECRET_COOKIE_SECURE":"true"}
               payload["envRefs"]=[envref("HEYOSECRET_DATABASE_URL","heyosecret/database-url"),envref("HEYOSECRET_MASTER_KEY","heyosecret/master-key")]
@@ -418,7 +460,7 @@ jobs:
               proxy_base_domains=os.environ.get("ORCHESTRATOR_PROXY_BASE_DOMAINS","").strip() or f"{public_host},heyo.computer"
               payload["env"]={"ORCHESTRATOR_SERVER_PORT":"8080","ORCHESTRATOR_MIGRATIONS_DIR":"/workspace/migrations","ORCHESTRATOR_TRAEFIK_DYNAMIC_CONFIG_DIR":"/opt/heyo-deploy/orchestrator/traefik-dynamic.d","ORCHESTRATOR_SERVICE_STATE_DIR":"/opt/heyo-deploy/orchestrator/service-state","ORCHESTRATOR_REPOSITORY_CLONE_ROOT":"/workspace/repos","ORCHESTRATOR_PUBLIC_URL":f"https://{public_host}/orchestrator","ORCHESTRATOR_PROXY_BASE_DOMAINS":proxy_base_domains,"CLOUD_INTERNAL_URL":f"https://{public_host}/cloud","ORCHESTRATOR_CLOUD_INTERNAL_URL":f"https://{public_host}/cloud","ORCHESTRATOR_HEYOSECRET_URL":f"https://{public_host}/heyosecret","HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA":git_sha,"ORCHESTRATOR_NATS_ENABLED":str(nats_enabled).lower()}
               if nats_enabled: payload["env"]["ORCHESTRATOR_NATS_URL"]=nats_url
-              for name in ["ORCHESTRATOR_BACKEND_API_URL", "ORCHESTRATOR_TARGET_OS", "ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS", "ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS"]:
+              for name in ["ORCHESTRATOR_BACKEND_API_URL", "ORCHESTRATOR_TARGET_OS", "ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS", "ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS", "ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES"]:
                   if os.environ.get(name): payload["env"][name]=os.environ[name]
               payload["envRefs"]=[envref("DATABASE_URL","orchestrator/database-url"),envref("ORCHESTRATOR_DATABASE_URL","orchestrator/database-url"),envref("JWT_SECRET","orchestrator/jwt-secret"),envref("ORCHESTRATOR_JWT_SECRET","orchestrator/jwt-secret"),envref("ORCHESTRATOR_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("HEYOSECRET_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("ORCHESTRATOR_HEYOSECRET_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("CLOUD_INTERNAL_API_KEY","cloud/internal-api-key")]
           elif service=="app-lb":
@@ -429,6 +471,12 @@ jobs:
               payload["healthPath"]="/healthz"
               payload["env"]={"APP_OBS_DATA_DIR":"/workspace/data","APP_OBS_INGEST_ADDR":"127.0.0.1:9500","APP_OBS_SYSLOG_ADDR":"127.0.0.1:9514","APP_OBS_API_ADDR":"0.0.0.0:8080","APP_LB_URL":f"https://app-lb.{public_host}","APP_LB_USER":"admin","APP_OBS_SOURCE":"stage-edge"}
               payload["envRefs"]=[envref("APP_LB_PASSWORD","app-lb/admin-password"),envref("APP_OBS_API_TOKEN","app-obs/api-token")]
+          archive_path=f"dist/{archive_name}"
+          # Keep smaller archives inline so this workflow can bootstrap an orchestrator that predates direct uploads.
+          if os.path.getsize(archive_path) > 20 * 1024 * 1024:
+              payload["archiveId"]=upload_service_archive(endpoint,key,payload,archive_path)
+          else:
+              payload["archiveBytesBase64"]=base64.b64encode(open(archive_path,"rb").read()).decode()
           print("::heyo-cleanup-target::"+json.dumps({"deploymentId":deployment_id,"serviceId":service,"name":f"heyo-{service}","resourceType":"service-candidate","reason":f"{service} deploy failed before the candidate became active"}), flush=True)
           deploy(endpoint,key,payload)
 
@@ -437,7 +485,7 @@ jobs:
           elif service=="orchestrator":
               checks=[(f"https://{public_host}/orchestrator/health",lambda b:json.loads(b).get("deploymentGitSha")==git_sha)]
           elif service=="app-lb":
-              checks=[(f"https://app-lb.{public_host}/metrics",lambda _:True,401),(f"https://app-lb.{public_host}/",lambda _:True,404)]
+              checks=[(f"https://app-lb.{public_host}/metrics",lambda b:b=="authentication required\n",401)]
           else:
               checks=[(f"https://{public_host}/app-obs/healthz",lambda b:b.strip()=="ok",200)]
           if service in {"heyosecret","orchestrator"}:
