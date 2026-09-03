@@ -151,6 +151,43 @@ impl From<heyo_sdk::HeyoError> for VmError {
     }
 }
 
+/// `{namespace, id}` of the deployment a bind belongs to, as the daemon
+/// stores and echoes it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct ProxyDeployment {
+    pub namespace: String,
+    pub id: String,
+}
+
+/// A daemon-side proxy bind of a VM port, as `POST`/`GET /sandboxes/{id}/proxy`
+/// describe one. Only what app-lb reads; the daemon says more.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProxyBind {
+    pub subdomain: String,
+    pub port: u16,
+    #[serde(default)]
+    pub deployment: Option<ProxyDeployment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyBindList {
+    #[serde(default)]
+    proxies: Vec<ProxyBind>,
+}
+
+/// A sandbox id as one URL path segment. Ids are `sb-` + hex today, but the
+/// daemon's list is the source of truth, and a name is not a path.
+fn encode_segment(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for b in id.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Live host + per-sandbox resource usage from the daemon's `GET /system/usage`.
 ///
 /// The daemon serves this from a background poller (~5s) sampling the host
@@ -710,6 +747,84 @@ impl VmManager {
             )
             .await?;
         Ok(usage)
+    }
+
+    /// The daemon-side proxy binds of a VM: `GET /sandboxes/{id}/proxy`.
+    pub async fn binds(&self, sandbox_id: &str) -> Result<Vec<ProxyBind>, VmError> {
+        let list: ProxyBindList = self
+            .client
+            .request(
+                http::Method::GET,
+                &format!("/sandboxes/{}/proxy", encode_segment(sandbox_id)),
+                None::<&Value>,
+                RequestOptions::default(),
+            )
+            .await?;
+        Ok(list.proxies)
+    }
+
+    /// Bind a VM's port on the daemon as a proxy endpoint that is a member of
+    /// `deployment`, and return the subdomain the daemon minted for it.
+    ///
+    /// The daemon carries the bind to the cloud; the cloud's URL for the
+    /// deployment fans out to every member bind. This is app-lb's whole part
+    /// in a cloud URL — see [`crate::config::IngressSpec`].
+    ///
+    /// Idempotent: a bind for the same port and deployment that the daemon
+    /// already holds — from before an app-lb restart, say — is reused rather
+    /// than doubled, since the daemon mints a fresh subdomain per call.
+    pub async fn bind(
+        &self,
+        sandbox_id: &str,
+        port: u16,
+        public: bool,
+        deployment: &ProxyDeployment,
+    ) -> Result<String, VmError> {
+        if let Some(existing) = self
+            .binds(sandbox_id)
+            .await?
+            .into_iter()
+            .find(|b| b.port == port && b.deployment.as_ref() == Some(deployment))
+        {
+            return Ok(existing.subdomain);
+        }
+        let created: ProxyBind = self
+            .client
+            .request(
+                http::Method::POST,
+                &format!("/sandboxes/{}/proxy", encode_segment(sandbox_id)),
+                Some(&json!({
+                    "port": port,
+                    "is_public": public,
+                    "deployment": deployment,
+                })),
+                RequestOptions::default(),
+            )
+            .await?;
+        Ok(created.subdomain)
+    }
+
+    /// Withdraw a bind. A bind (or VM) the daemon has already forgotten
+    /// counts as withdrawn.
+    pub async fn unbind(&self, sandbox_id: &str, subdomain: &str) -> Result<(), VmError> {
+        let opts = RequestOptions {
+            query: vec![("subdomain".to_string(), subdomain.to_string())],
+            ..RequestOptions::default()
+        };
+        match self
+            .client
+            .request::<Value>(
+                http::Method::DELETE,
+                &format!("/sandboxes/{}/proxy", encode_segment(sandbox_id)),
+                None::<&Value>,
+                opts,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(heyo_sdk::HeyoError::NotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Destroy a VM. A VM the daemon has already forgotten counts as killed.

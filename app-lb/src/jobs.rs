@@ -577,6 +577,7 @@ impl Jobs {
             // This is also what refuses a git ref on a store source and vice
             // versa: the two have different rules and the same field.
             let probe = crate::config::DeploymentSpec {
+                ingress: None,
                 account_id: None,
                 user_id: None,
                 build: Some(spec.clone()),
@@ -635,6 +636,7 @@ impl Jobs {
             spec.artifact_ref = r;
             // The stored spec was validated on registration; an override was not.
             let probe = crate::config::DeploymentSpec {
+                ingress: None,
                 account_id: None,
                 user_id: None,
                 artifact: Some(spec.clone()),

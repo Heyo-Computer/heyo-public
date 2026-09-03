@@ -1606,6 +1606,55 @@ in, so an unrouted one would be unreachable by anything, and it is rejected at
 registration. A sign-in gate on an unrouted deployment is rejected too: `auth`
 runs on a proxied request, and there are none.
 
+### Cloud URLs — a deployment on a machine with no public address
+
+`routes` are this proxy's way in: a hostname the operator points at
+`APP_LB_PUBLIC_IPS`. A laptop, an on-prem box or a cloud-lite fleet behind
+NAT has nothing to point a hostname at. For those, a managed deployment can
+ask the Heyo cloud for a URL instead:
+
+```jsonc
+{
+  "id": "web",
+  "routes": [],                       // or keep your own routes too
+  "vm": { "image": "ubuntu-24.04-dev", "port": 8080 },
+  "ingress": { "cloud": true, "public": true }
+}
+```
+
+Registered through the cloud's namespace door (`/namespaces/{ns}/lb/…` — the
+way the dashboard, the SDKs and a namespace-scoped `heyctl` reach a managed
+app-lb), the answer carries the URL:
+
+```jsonc
+{ "spec": { "id": "web", … }, "url": "https://web-k3x9p2.heyo.computer", … }
+```
+
+Three parties each hold one end of it, and none of them holds another's:
+
+| | in charge of | what it does |
+| --- | --- | --- |
+| **app-lb** | the VM | binds every *ready* replica's `vm.port` on the daemon (`POST /sandboxes/{id}/proxy`, tagged `{namespace, id}`) and withdraws the bind the moment the replica starts draining — before it is killed, so the URL never sends a request to a VM on its way out |
+| **the daemon** | traffic | carries each bind exactly as it carries a single VM's URL, and reports it to the cloud with the tag attached |
+| **the cloud** | routing | owns the deployment's subdomain and, per request, picks one of the current member binds to forward to — so the URL survives autoscaling, a replacement and a pool roll |
+
+Nothing on that URL passes through this proxy: no `routes` match, no `auth`
+gate, no block rule and no SIEM record — the request goes cloud → daemon →
+VM. `"public": false` puts the cloud's own sign-in in front of it (the
+namespace's owning account). Editing `ingress` is not a template change and
+never recycles the pool; dropping it withdraws every bind and the URL.
+
+A deployment scaled to zero, or whose replicas are still booting, has no
+member behind the URL and the cloud answers 503 (a retrying page, for a
+browser) until the first replica is ready. `GET /deployments/{id}` shows each
+VM's bind as `vms[].subdomain` while it is in place.
+
+Only a managed (`vm`) deployment can have one — a static deployment's
+upstreams and a site's files are on no daemon to bind — and the spec is
+rejected otherwise. On a self-hosted app-lb registered directly (not through
+the cloud) the binds are still made, but no URL is minted; the daemon must be
+registered with the cloud (`heyvmd`) for the binds to reach it.
+
 ## Directory
 
 `http://<admin-addr>/` (default `http://127.0.0.1:9090/`) is a landing page: one
