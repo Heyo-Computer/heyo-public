@@ -532,12 +532,6 @@ async fn validate_service_deployment_request(
     )?;
 
     if let Some(desired_replicas) = request.desired_replicas {
-        if request.placement_pool.is_none() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "placementPool is required when desiredReplicas is set".to_string(),
-            ));
-        }
         if !request.replica_regions.is_empty()
             && request.replica_regions.len() != usize::from(desired_replicas)
         {
@@ -1531,6 +1525,11 @@ async fn deploy_service_candidate(
     let mut ingress_backend_url = None;
 
     let deployment_result = async {
+        verify_applied_placement(
+            request.placement_pool.as_deref(),
+            &request.region,
+            &create_response,
+        )?;
         if create_response.status == "failed" {
             anyhow::bail!("service deployment candidate {deployment_id} failed during creation");
         }
@@ -1896,6 +1895,31 @@ async fn deploy_service_candidate(
             }
         }
     }
+}
+
+fn verify_applied_placement(
+    requested_pool: Option<&str>,
+    requested_region: &str,
+    response: &cloud_client::CreateDeploymentResponse,
+) -> Result<()> {
+    let Some(requested_pool) = requested_pool.map(str::trim) else {
+        return Ok(());
+    };
+    let placement = response.placement.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cloud did not confirm requested placement pool {requested_pool}; refusing an unscoped deployment"
+        )
+    })?;
+    if placement.placement_pool != requested_pool || placement.region != requested_region {
+        anyhow::bail!(
+            "Cloud applied placement pool {} in region {}, but the deployment requested pool {} in region {}",
+            placement.placement_pool,
+            placement.region,
+            requested_pool,
+            requested_region,
+        );
+    }
+    Ok(())
 }
 
 fn service_deployment_request_metadata(request: &ServiceDeployRequest) -> serde_json::Value {
@@ -4190,8 +4214,9 @@ mod tests {
         rollout_old_endpoints, rollout_replacement, target_endpoint_count,
         target_regions_covered, target_regions_ready, validate_revision_ref,
         validate_revision_repository_url, validate_revision_sha, validate_service_traffic_mode,
-        SecretVersionSelector, ServiceDeployRequest, ServiceRouteRequest,
+        verify_applied_placement, SecretVersionSelector, ServiceDeployRequest, ServiceRouteRequest,
     };
+    use crate::cloud_client::CreateDeploymentResponse;
     use crate::handlers::service_discovery::{
         ServiceDiscoveryEndpoint, ServiceDiscoverySnapshot,
     };
@@ -4361,6 +4386,31 @@ mod tests {
         assert!(validate_service_traffic_mode("app-lb", Some(2), true, true).is_err());
         assert!(validate_service_traffic_mode("cloud", Some(0), false, true).is_err());
         assert!(validate_service_traffic_mode("cloud", Some(17), false, true).is_err());
+    }
+
+    #[test]
+    fn requires_cloud_to_confirm_scoped_placement() {
+        let confirmed: CreateDeploymentResponse = serde_json::from_value(serde_json::json!({
+            "deploymentId": "dep-1",
+            "placement": {
+                "deploymentEnvironment": "staging",
+                "nodeId": "eu1",
+                "placementPool": "platform",
+                "region": "EU"
+            },
+            "status": "running"
+        }))
+        .unwrap();
+        assert!(verify_applied_placement(Some("platform"), "EU", &confirmed).is_ok());
+        assert!(verify_applied_placement(Some("platform"), "US", &confirmed).is_err());
+
+        let legacy: CreateDeploymentResponse = serde_json::from_value(serde_json::json!({
+            "deploymentId": "dep-2",
+            "status": "running"
+        }))
+        .unwrap();
+        assert!(verify_applied_placement(None, "US", &legacy).is_ok());
+        assert!(verify_applied_placement(Some("platform"), "US", &legacy).is_err());
     }
 
     #[test]

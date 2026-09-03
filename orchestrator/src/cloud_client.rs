@@ -192,6 +192,15 @@ struct CreateDeploymentHttpRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct DeploymentPlacement {
+    pub deployment_environment: String,
+    pub node_id: String,
+    pub placement_pool: String,
+    pub region: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct CreateDeploymentResponse {
     pub deployment_id: String,
     #[serde(default)]
@@ -202,6 +211,8 @@ pub(crate) struct CreateDeploymentResponse {
     pub backend_server_hostname: Option<String>,
     #[serde(default)]
     pub backend_sandbox_id: Option<String>,
+    #[serde(default)]
+    pub placement: Option<DeploymentPlacement>,
     pub status: String,
 }
 
