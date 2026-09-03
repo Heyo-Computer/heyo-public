@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -38,6 +38,7 @@ const SERVICE_CANDIDATE_EVENT_SUBSCRIBE_TIMEOUT_SECONDS: u64 = 10;
 const SERVICE_CANDIDATE_STATUS_POLL_INTERVAL_SECONDS: u64 = 5;
 const SERVICE_HEALTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 const SERVICE_HEALTH_MAX_BACKOFF_SECONDS: u64 = 10;
+const SERVICE_HEALTH_STABILIZATION_SECONDS: u64 = 10;
 const SERVICE_REVISION_CHECK_TIMEOUT_SECONDS: u64 = 30;
 const SERVICE_RETIREMENT_RECONCILE_INTERVAL_SECONDS: u64 = 15;
 const MAX_SERVICE_REPLICAS: u16 = 16;
@@ -791,6 +792,7 @@ async fn deploy_service_rollout(
         route_updated = true;
     }
     let mut last_candidate = None;
+    let mut retirement_started = HashSet::new();
 
     for (candidate_index, candidate_region) in candidate_regions.into_iter().enumerate() {
         let snapshot = service_discovery::read_snapshot(&service_id).await?;
@@ -893,8 +895,10 @@ async fn deploy_service_rollout(
                 &replacement.deployment_id,
                 request.drain_seconds,
                 request.delete_previous,
+                request.retire_previous_async,
             )
             .await?;
+            retirement_started.insert(replacement.deployment_id);
         }
     }
 
@@ -928,6 +932,9 @@ async fn deploy_service_rollout(
             service_discovery::read_snapshot(&service_id).await?.as_ref(),
             &target_revision,
         ) {
+            if retirement_started.contains(&endpoint.deployment_id) {
+                continue;
+            }
             retire_rollout_endpoint(
                 &state,
                 &service_id,
@@ -935,6 +942,7 @@ async fn deploy_service_rollout(
                 &endpoint.deployment_id,
                 request.drain_seconds,
                 request.delete_previous,
+                request.retire_previous_async,
             )
             .await?;
         }
@@ -974,6 +982,7 @@ async fn deploy_service_rollout(
                 &endpoint.deployment_id,
                 request.drain_seconds,
                 request.delete_previous,
+                request.retire_previous_async,
             )
             .await?;
         }
@@ -1050,7 +1059,9 @@ async fn deploy_service_rollout(
         backend_url,
         health_url,
         previous_deployment_id,
-        previous_retired: request.retire_previous && !initial_previous_ids.is_empty(),
+        previous_retired: request.retire_previous
+            && !request.retire_previous_async
+            && !initial_previous_ids.is_empty(),
         route_updated,
         state: current_state,
     };
@@ -1076,6 +1087,7 @@ async fn retire_rollout_endpoint(
     deployment_id: &str,
     drain_seconds: u64,
     delete_previous: bool,
+    retire_async: bool,
 ) -> Result<()> {
     record_service_deployment_event(
         state,
@@ -1089,18 +1101,30 @@ async fn retire_rollout_endpoint(
         None,
     )
     .await?;
-    if !retire_previous_service_deployment(
-        state,
-        service_id,
-        rollout_id,
-        deployment_id,
-        drain_seconds,
-        delete_previous,
-    )
-    .await
-    {
+    let retired = if retire_async {
+        begin_previous_service_deployment_retirement(
+            state,
+            service_id,
+            rollout_id,
+            deployment_id,
+            drain_seconds,
+            delete_previous,
+        )
+        .await
+    } else {
+        retire_previous_service_deployment(
+            state,
+            service_id,
+            rollout_id,
+            deployment_id,
+            drain_seconds,
+            delete_previous,
+        )
+        .await
+    };
+    if !retired {
         anyhow::bail!(
-            "failed to retire previous service replica {deployment_id}; rollout stopped with healthy replacements still serving"
+            "failed to schedule retirement of previous service replica {deployment_id}; rollout stopped with healthy replacements still serving"
         );
     }
     Ok(())
@@ -1799,13 +1823,14 @@ async fn deploy_service_candidate(
         let previous_retired = if request.retire_previous && request.retire_previous_async {
             for previous in previous_deployment_ids {
                 schedule_previous_service_deployment_retirement(
-                    state.clone(),
-                    service_id.clone(),
-                    deployment_id.clone(),
-                    previous,
+                    &state,
+                    &service_id,
+                    &deployment_id,
+                    &previous,
                     request.drain_seconds,
                     request.delete_previous,
-                );
+                )
+                .await;
             }
             false
         } else if request.retire_previous {
@@ -2432,6 +2457,19 @@ async fn list_pending_service_retirements() -> Result<Vec<PendingServiceRetireme
             FROM retirement_intents intent
             WHERE intent.created_at
                     + GREATEST(intent.drain_seconds, 0) * INTERVAL '1 second' <= NOW()
+                AND EXISTS (
+                    SELECT 1
+                    FROM service_deployment_events rollout_completed
+                    WHERE rollout_completed.deployment_id = intent.deployment_id
+                        AND rollout_completed.phase = 'completed'
+                        AND rollout_completed.status = 'passed'
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM service_rollouts rollout
+                    WHERE rollout.rollout_id = intent.deployment_id
+                        AND rollout.status <> 'passed'
+                )
                 AND NOT EXISTS (
                     SELECT 1
                     FROM service_deployment_states state
@@ -2474,36 +2512,69 @@ async fn list_pending_service_retirements() -> Result<Vec<PendingServiceRetireme
         .collect()
 }
 
-fn schedule_previous_service_deployment_retirement(
-    state: AppState,
-    service_id: String,
-    deployment_id: String,
-    previous_deployment_id: String,
+async fn schedule_previous_service_deployment_retirement(
+    state: &AppState,
+    service_id: &str,
+    deployment_id: &str,
+    previous_deployment_id: &str,
     drain_seconds: u64,
     delete_previous: bool,
 ) {
-    tokio::spawn(async move {
-        let retired = retire_previous_service_deployment(
-            &state,
-            &service_id,
-            &deployment_id,
-            &previous_deployment_id,
-            drain_seconds,
-            delete_previous,
-        )
-        .await;
-        if !retired {
-            warn!(
-                service_id,
-                deployment_id,
-                previous = previous_deployment_id,
-                "async previous service deployment retirement did not complete successfully"
-            );
-        }
-    });
+    if !begin_previous_service_deployment_retirement(
+        state,
+        service_id,
+        deployment_id,
+        previous_deployment_id,
+        drain_seconds,
+        delete_previous,
+    )
+    .await
+    {
+        warn!(
+            service_id,
+            deployment_id,
+            previous = previous_deployment_id,
+            "async previous service deployment retirement could not be scheduled"
+        );
+    }
 }
 
 async fn retire_previous_service_deployment(
+    state: &AppState,
+    service_id: &str,
+    deployment_id: &str,
+    previous_deployment_id: &str,
+    drain_seconds: u64,
+    delete_previous: bool,
+) -> bool {
+    if !begin_previous_service_deployment_retirement(
+        state,
+        service_id,
+        deployment_id,
+        previous_deployment_id,
+        drain_seconds,
+        delete_previous,
+    )
+    .await
+    {
+        return false;
+    }
+
+    if drain_seconds > 0 {
+        sleep(Duration::from_secs(drain_seconds)).await;
+    }
+
+    stop_previous_service_deployment(
+        state,
+        service_id,
+        deployment_id,
+        previous_deployment_id,
+        delete_previous,
+    )
+    .await
+}
+
+async fn begin_previous_service_deployment_retirement(
     state: &AppState,
     service_id: &str,
     deployment_id: &str,
@@ -2526,7 +2597,7 @@ async fn retire_previous_service_deployment(
         "drainSeconds": drain_seconds,
         "deletePrevious": delete_previous,
     });
-    let _ = record_service_deployment_event(
+    if let Err(error) = record_service_deployment_event(
         state,
         deployment_id,
         service_id,
@@ -2537,20 +2608,27 @@ async fn retire_previous_service_deployment(
         Some(metadata),
         None,
     )
-    .await;
-
-    if drain_seconds > 0 {
-        sleep(Duration::from_secs(drain_seconds)).await;
-    }
-
-    stop_previous_service_deployment(
-        state,
-        service_id,
-        deployment_id,
-        previous_deployment_id,
-        delete_previous,
-    )
     .await
+    {
+        warn!(
+            service_id,
+            deployment_id,
+            previous = previous_deployment_id,
+            "failed to persist service retirement intent: {error:#}"
+        );
+        if let Err(restore_error) =
+            service_discovery::mark_endpoint_active(service_id, previous_deployment_id).await
+        {
+            warn!(
+                service_id,
+                deployment_id,
+                previous = previous_deployment_id,
+                "failed to restore endpoint after retirement intent persistence failed: {restore_error:#}"
+            );
+        }
+        return false;
+    }
+    true
 }
 
 async fn stop_previous_service_deployment(
@@ -3239,6 +3317,7 @@ async fn wait_for_candidate_health(
     let mut attempts: u64 = 0;
     let mut retry_delay = Duration::from_secs(1);
     let mut last_error = "candidate endpoint is not available yet".to_string();
+    let mut healthy_since = None;
 
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -3294,6 +3373,7 @@ async fn wait_for_candidate_health(
         }
 
         attempts += 1;
+        let mut probe_succeeded = false;
         for backend_url in &backend_urls {
             let health_url = join_url_path(backend_url, health_path);
             let request = state
@@ -3311,17 +3391,31 @@ async fn wait_for_candidate_health(
                         == Some("starting");
                     if response.status().is_success() && !booting {
                         let Some(discovery_backend_url) = discovery_backend_url.as_deref() else {
+                            healthy_since = None;
                             last_error =
                                 "candidate is healthy but its internal service endpoint is not available yet"
                                     .to_string();
                             continue;
                         };
+                        let now = tokio::time::Instant::now();
+                        probe_succeeded = true;
+                        if !health_observation_is_stable(
+                            &mut healthy_since,
+                            &health_url,
+                            now,
+                        ) {
+                            last_error = format!(
+                                "{health_url} is healthy but has not remained healthy for {SERVICE_HEALTH_STABILIZATION_SECONDS}s"
+                            );
+                            continue;
+                        }
                         let (discovery_url, route_url) = candidate_endpoint_urls(
                             discovery_backend_url,
                             route_backend_url.as_deref(),
                         );
                         return Ok((discovery_url, route_url, health_url));
                     }
+                    healthy_since = None;
                     if booting {
                         last_error =
                             format!("{health_url} reported that the sandbox is still starting");
@@ -3331,6 +3425,7 @@ async fn wait_for_candidate_health(
                     warn!(health_url, status = %response.status(), booting, "candidate health check returned non-success");
                 }
                 Err(error) => {
+                    healthy_since = None;
                     last_error = format!("{health_url} could not be reached: {error}");
                     warn!(health_url, "candidate health check failed: {error}");
                 }
@@ -3356,7 +3451,7 @@ async fn wait_for_candidate_health(
             .await;
         }
 
-        if backend_urls.len() > previous_url_count {
+        if probe_succeeded || backend_urls.len() > previous_url_count {
             retry_delay = Duration::from_secs(1);
         } else {
             retry_delay =
@@ -3365,6 +3460,21 @@ async fn wait_for_candidate_health(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         sleep(retry_delay.min(remaining)).await;
     }
+}
+
+fn health_observation_is_stable(
+    healthy_since: &mut Option<(String, tokio::time::Instant)>,
+    health_url: &str,
+    now: tokio::time::Instant,
+) -> bool {
+    let since = match healthy_since {
+        Some((observed_url, since)) if observed_url == health_url => *since,
+        _ => {
+            *healthy_since = Some((health_url.to_string(), now));
+            now
+        }
+    };
+    now.duration_since(since) >= Duration::from_secs(SERVICE_HEALTH_STABILIZATION_SECONDS)
 }
 
 fn candidate_endpoint_urls(
@@ -3416,6 +3526,7 @@ async fn wait_for_app_lb_route_health(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds.max(1));
     let mut last_error = "app-lb discovery route has not been checked".to_string();
     let mut retry_delay = Duration::from_secs(1);
+    let mut healthy_since = None;
     loop {
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("timed out waiting for app-lb route {health_url}: {last_error}");
@@ -3427,18 +3538,34 @@ async fn wait_for_app_lb_route_health(
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => return Ok(health_url),
+            Ok(response) if response.status().is_success() => {
+                if health_observation_is_stable(
+                    &mut healthy_since,
+                    &health_url,
+                    tokio::time::Instant::now(),
+                ) {
+                    return Ok(health_url);
+                }
+                last_error = format!(
+                    "route is healthy but has not remained healthy for {SERVICE_HEALTH_STABILIZATION_SECONDS}s"
+                );
+                retry_delay = Duration::from_secs(1);
+            }
             Ok(response) => {
+                healthy_since = None;
                 last_error = format!("received HTTP {}", response.status());
             }
             Err(error) => {
+                healthy_since = None;
                 last_error = error.to_string();
             }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         sleep(retry_delay.min(remaining)).await;
-        retry_delay =
-            (retry_delay * 2).min(Duration::from_secs(SERVICE_HEALTH_MAX_BACKOFF_SECONDS));
+        if healthy_since.is_none() {
+            retry_delay =
+                (retry_delay * 2).min(Duration::from_secs(SERVICE_HEALTH_MAX_BACKOFF_SECONDS));
+        }
     }
 }
 
@@ -4208,8 +4335,8 @@ fn default_true() -> bool {
 mod tests {
     use super::{
         active_endpoint_count, app_lb_route_health_url, candidate_endpoint_urls,
-        deployment_run_status, parse_env_ref, parse_ls_remote_revision, parse_secret_ref,
-        proxy_subdomain_and_path,
+        deployment_run_status, health_observation_is_stable, parse_env_ref,
+        parse_ls_remote_revision, parse_secret_ref, proxy_subdomain_and_path,
         rolling_placement_exclusions, rollout_candidate_regions, rollout_candidates_needed,
         rollout_old_endpoints, rollout_replacement, target_endpoint_count,
         target_regions_covered, target_regions_ready, validate_revision_ref,
@@ -4290,6 +4417,32 @@ mod tests {
                 .unwrap(),
             "http://candidate.internal:8080/orchestrator/health"
         );
+    }
+
+    #[test]
+    fn health_must_remain_stable_before_cutover() {
+        let start = tokio::time::Instant::now();
+        let mut healthy_since = None;
+        assert!(!health_observation_is_stable(
+            &mut healthy_since,
+            "http://candidate/health",
+            start,
+        ));
+        assert!(!health_observation_is_stable(
+            &mut healthy_since,
+            "http://candidate/health",
+            start + std::time::Duration::from_secs(9),
+        ));
+        assert!(health_observation_is_stable(
+            &mut healthy_since,
+            "http://candidate/health",
+            start + std::time::Duration::from_secs(10),
+        ));
+        assert!(!health_observation_is_stable(
+            &mut healthy_since,
+            "http://replacement/health",
+            start + std::time::Duration::from_secs(11),
+        ));
     }
 
     #[test]

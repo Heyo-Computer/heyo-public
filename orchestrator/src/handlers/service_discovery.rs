@@ -226,6 +226,25 @@ pub async fn mark_endpoint_draining(service_id: &str, deployment_id: &str) -> Re
     Ok(())
 }
 
+pub async fn mark_endpoint_active(service_id: &str, deployment_id: &str) -> Result<()> {
+    let db = db::get_db()?;
+    let transaction = db.begin().await?;
+    let result = transaction
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE service_discovery_endpoints
+             SET draining = FALSE, updated_at = NOW()
+             WHERE service_id = $1 AND deployment_id = $2 AND draining = TRUE",
+            [service_id.into(), deployment_id.into()],
+        ))
+        .await?;
+    if result.rows_affected() > 0 {
+        bump_version(&transaction, service_id).await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 pub async fn remove_endpoint(service_id: &str, deployment_id: &str) -> Result<()> {
     let db = db::get_db()?;
     let transaction = db.begin().await?;
