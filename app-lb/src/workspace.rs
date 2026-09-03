@@ -65,7 +65,7 @@ use crate::vm::VmManager;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -99,13 +99,9 @@ const KEEP_PREVIOUS: usize = 1;
 pub struct WorkspaceConfig {
     /// Root of the layout above. `APP_LB_WORKSPACES_DIR`.
     pub root: PathBuf,
-    /// The daemon's data directory, where `kvm/<id>/mount<n>.ext4` lives.
-    pub data_dir: PathBuf,
     pub tar_bin: String,
     pub aws_bin: String,
     pub art_bin: String,
-    pub debugfs_bin: String,
-    pub e2fsck_bin: String,
     /// `--endpoint-url` for an S3-compatible store.
     pub s3_endpoint: Option<String>,
     /// `HOME` for `art`, when app-lb and heyvmd run as different users.
@@ -115,18 +111,23 @@ pub struct WorkspaceConfig {
 }
 
 impl WorkspaceConfig {
-    pub fn from_env(cfg: &crate::config::LbConfig, data_dir: PathBuf) -> Self {
+    pub fn from_env(cfg: &crate::config::LbConfig) -> Self {
         let env = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        for gone in ["APP_LB_DEBUGFS_BIN", "APP_LB_E2FSCK_BIN"] {
+            if env(gone).is_some() {
+                tracing::warn!(
+                    "{gone} is set but no longer read: the daemon replays and extracts a \
+                     workspace image itself (GET /sandboxes/:id/mounts/export)"
+                );
+            }
+        }
         Self {
             root: env("APP_LB_WORKSPACES_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/var/lib/app-lb/workspaces")),
-            data_dir,
             tar_bin: env("APP_LB_TAR_BIN").unwrap_or_else(|| "tar".into()),
             aws_bin: cfg.aws_bin.clone(),
             art_bin: cfg.art_bin.clone(),
-            debugfs_bin: env("APP_LB_DEBUGFS_BIN").unwrap_or_else(|| "debugfs".into()),
-            e2fsck_bin: env("APP_LB_E2FSCK_BIN").unwrap_or_else(|| "e2fsck".into()),
             s3_endpoint: env("APP_LB_DISK_ARCHIVE_ENDPOINT"),
             home: cfg.heyvm_home.clone(),
             timeout: Duration::from_secs(
@@ -138,27 +139,6 @@ impl WorkspaceConfig {
     }
 }
 
-/// e2fsprogs lives in `/usr/sbin` on most distributions, which a service
-/// user's `PATH` often lacks. A bare name is tried on `PATH` first and then in
-/// the two sbin directories, so the default configuration works on a stock
-/// host without anyone setting `APP_LB_DEBUGFS_BIN`.
-fn sbin_fallback(bin: &str) -> PathBuf {
-    if bin.contains('/') {
-        return PathBuf::from(bin);
-    }
-    let on_path = std::env::var_os("PATH")
-        .is_some_and(|p| std::env::split_paths(&p).any(|dir| dir.join(bin).is_file()));
-    if on_path {
-        return PathBuf::from(bin);
-    }
-    for dir in ["/usr/sbin", "/sbin", "/usr/local/sbin"] {
-        let candidate = Path::new(dir).join(bin);
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    PathBuf::from(bin)
-}
 
 // ---------------------------------------------------------------------------
 // persisted state
@@ -285,6 +265,22 @@ pub struct Seeded {
     pub digest: Option<String>,
 }
 
+impl Seeded {
+    /// What the create body carries: the tree, under the id the daemon holds
+    /// it by. A snapshot is named by its digest, so every replica of the
+    /// same snapshot shares one upload; the empty seed is one shared tree
+    /// too, because empty is empty.
+    pub fn seed(&self) -> crate::vm::WorkspaceSeed {
+        crate::vm::WorkspaceSeed {
+            tree_id: match &self.digest {
+                Some(digest) => format!("ws-{digest}"),
+                None => "ws-empty".to_string(),
+            },
+            tree: self.tree.clone(),
+        }
+    }
+}
+
 pub struct Workspaces {
     cfg: WorkspaceConfig,
     vms: VmManager,
@@ -404,31 +400,6 @@ impl Workspaces {
         self.dir(deployment_id).join(format!("staging-{token}"))
     }
 
-    /// Where heyvmd put the workspace image of a sandbox: the workspace is the
-    /// last mount in the create body, so its index is the number of declared
-    /// mounts — in the spec that created the VM, which the seed records; the
-    /// current spec is the fallback for a VM adopted from before that was
-    /// written down. See [`VmManager::create`].
-    fn image_path(
-        &self,
-        spec: &DeploymentSpec,
-        sandbox_id: &str,
-        seed: Option<&Seed>,
-    ) -> Option<PathBuf> {
-        if !crate::disks::valid_sandbox_id(sandbox_id) {
-            return None;
-        }
-        let index = seed
-            .and_then(|s| s.mount_index)
-            .unwrap_or(spec.vm.as_ref()?.mounts.len());
-        Some(
-            self.cfg
-                .data_dir
-                .join("kvm")
-                .join(sandbox_id)
-                .join(format!("mount{index}.ext4")),
-        )
-    }
 
     // -- records -------------------------------------------------------------
 
@@ -991,17 +962,19 @@ impl Workspaces {
             ),
         }
 
-        let image = self
-            .image_path(spec, &sandbox_id, seed.as_ref())
-            .ok_or_else(|| CaptureError::Gone(format!("{sandbox_id} is not a sandbox id")))?;
-        if !image.is_file() {
-            return Err(CaptureError::Gone(format!(
-                "no workspace image at {}",
-                image.display()
-            )));
+        if !crate::disks::valid_sandbox_id(&sandbox_id) {
+            return Err(CaptureError::Gone(format!("{sandbox_id} is not a sandbox id")));
         }
+        let guest_path = spec
+            .vm
+            .as_ref()
+            .and_then(|vm| vm.workspace.as_ref())
+            .map(|ws| ws.guest_path().to_string())
+            .unwrap_or_else(|| crate::config::DEFAULT_WORKSPACE_PATH.to_string());
 
-        // The one check that matters: the image must not be in use.
+        // The one check that matters: the image must not be in use. The
+        // daemon refuses an export of a live sandbox too, but stopping it
+        // here is what makes the retry succeed.
         match self.vms.list().await {
             Ok(fleet) => {
                 if fleet
@@ -1028,16 +1001,13 @@ impl Workspaces {
         let dir = self.dir(&id);
         let staging = self.staging_path(&id);
         let timeout = cfg.timeout;
-        let work =
-            tokio::task::spawn_blocking(move || capture_blocking(&cfg, &dir, &image, &staging));
-        let result = match tokio::time::timeout(timeout, work).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => Err(format!("capture task died: {e}")),
-            Err(_) => Err(format!("capture exceeded {}s", timeout.as_secs())),
+        let result = match tokio::time::timeout(timeout, self.capture_via_daemon(&cfg, &dir, &sandbox_id, &guest_path, &staging)).await {
+            Ok(r) => r,
+            Err(_) => Err(CaptureError::Retry(format!("capture exceeded {}s", timeout.as_secs()))),
         };
         self.set_phase(&id, None);
 
-        let captured = result.map_err(CaptureError::Retry)?;
+        let captured = result?;
         tracing::info!(
             deployment = %id,
             sandbox = %sandbox_id,
@@ -1071,6 +1041,57 @@ impl Workspaces {
         Ok(())
     }
 
+    /// The daemon replays the image's journal and extracts it
+    /// (`GET /sandboxes/:id/mounts/export`); what arrives here is a tarball.
+    /// It is hashed as it lands, so the digest names the bundle as written,
+    /// then unpacked beside it into the snapshot tree the next replica is
+    /// seeded from.
+    async fn capture_via_daemon(
+        &self,
+        cfg: &WorkspaceConfig,
+        dir: &Path,
+        sandbox_id: &str,
+        guest_path: &str,
+        staging: &Path,
+    ) -> Result<Captured, CaptureError> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let response = match self.vms.export_mount(sandbox_id, guest_path).await {
+            Ok(r) => r,
+            Err(crate::vm::VmError::Sdk(heyo_sdk::HeyoError::NotFound(m))) => {
+                return Err(CaptureError::Gone(format!("the daemon has no workspace image to export: {m}")));
+            }
+            Err(e) => return Err(CaptureError::Retry(format!("the daemon would not export the workspace: {e}"))),
+        };
+
+        std::fs::create_dir_all(dir.join("bundles")).map_err(|e| CaptureError::Retry(e.to_string()))?;
+        let bundle_tmp = staging.with_extension("tar.gz");
+        let guard = RemoveOnDrop(bundle_tmp.clone());
+        let mut file = tokio::fs::File::create(&bundle_tmp)
+            .await
+            .map_err(|e| CaptureError::Retry(format!("{}: {e}", bundle_tmp.display())))?;
+        let mut hasher = Sha256::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| CaptureError::Retry(format!("reading the daemon's export: {e}")))?;
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| CaptureError::Retry(format!("{}: {e}", bundle_tmp.display())))?;
+        }
+        file.sync_all().await.map_err(|e| CaptureError::Retry(e.to_string()))?;
+        drop(file);
+        let digest = hex(&hasher.finalize());
+
+        let (cfg, dir, staging, bundle) = (cfg.clone(), dir.to_path_buf(), staging.to_path_buf(), bundle_tmp.clone());
+        let installed = tokio::task::spawn_blocking(move || install_capture(&cfg, &dir, &bundle, &staging, &digest))
+            .await
+            .map_err(|e| CaptureError::Retry(format!("capture task died: {e}")))?;
+        std::mem::forget(guard);
+        installed.map_err(CaptureError::Retry)
+    }
+
     /// Keep the current snapshot, the one before it, and anything a live
     /// sandbox was seeded from; remove the rest, with their bundles once
     /// pushed.
@@ -1086,6 +1107,15 @@ impl Workspaces {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if !keep.contains(&name) {
                     let _ = std::fs::remove_dir_all(entry.path());
+                    // The daemon holds the tree replicas were seeded from
+                    // (`ws-<digest>`); let it go there too. Best-effort.
+                    let vms = self.vms.clone();
+                    let tree = format!("ws-{name}");
+                    tokio::spawn(async move {
+                        if let Err(e) = vms.delete_tree(&tree).await {
+                            tracing::debug!(tree = %tree, error = %e, "could not remove the pruned snapshot's tree on the daemon");
+                        }
+                    });
                 }
             }
         }
@@ -1591,124 +1621,55 @@ struct Captured {
     bytes: u64,
 }
 
-/// The blocking half of a capture: journal replay, extraction, bundling.
-fn capture_blocking(
+/// The blocking half of a capture: unpack the daemon's export beside the
+/// bundle it came from, and publish both under the digest.
+fn install_capture(
     cfg: &WorkspaceConfig,
     dir: &Path,
-    image: &Path,
+    bundle_tmp: &Path,
     staging: &Path,
+    digest: &str,
 ) -> Result<Captured, String> {
     let _guard = RemoveOnDrop(staging.to_path_buf());
-    let bundle_tmp = staging.with_extension("tar.gz");
-    let _guard2 = RemoveOnDrop(bundle_tmp.clone());
+    let _guard2 = RemoveOnDrop(bundle_tmp.to_path_buf());
     std::fs::create_dir_all(dir.join("snapshots")).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dir.join("bundles")).map_err(|e| e.to_string())?;
 
-    // heyvmd stops a VM by killing it, so the journal is dirty. `-p` replays
-    // it and fixes what is safe to fix; 0, 1 and 2 are all "the filesystem is
-    // now clean". The image is the VM's own, so modifying it is fine — it is
-    // exactly what the guest kernel would do on the next mount.
-    let e2fsck = sbin_fallback(&cfg.e2fsck_bin);
-    let out = std::process::Command::new(&e2fsck)
-        .arg("-p")
-        .arg(image)
-        .output()
-        .map_err(|e| {
-            format!(
-                "could not run {}: {e} (e2fsprogs is required)",
-                e2fsck.display()
-            )
-        })?;
-    match out.status.code() {
-        Some(0..=2) => {}
-        code => {
-            return Err(format!(
-                "e2fsck on {} exited {:?}: {}",
-                image.display(),
-                code,
-                tail(&String::from_utf8_lossy(&out.stderr))
-            ));
-        }
-    }
-
     std::fs::create_dir_all(staging).map_err(|e| format!("{}: {e}", staging.display()))?;
-    let debugfs = sbin_fallback(&cfg.debugfs_bin);
-    let out = std::process::Command::new(&debugfs)
-        .arg("-R")
-        .arg(format!("rdump / {}", staging.display()))
-        .arg(image)
+    // System tar rather than the in-process unpacker: a workspace legitimately
+    // holds symlinks, which the bundle unpacker refuses for the untrusted
+    // input it was written for. This tarball came from the daemon.
+    let out = std::process::Command::new(&cfg.tar_bin)
+        .arg("--extract")
+        .arg("--gzip")
+        .arg("--no-same-owner")
+        .arg("--file")
+        .arg(bundle_tmp)
+        .arg("--directory")
+        .arg(staging)
         .output()
-        .map_err(|e| {
-            format!(
-                "could not run {}: {e} (e2fsprogs is required)",
-                debugfs.display()
-            )
-        })?;
+        .map_err(|e| format!("could not run {}: {e}", cfg.tar_bin))?;
     if !out.status.success() {
         return Err(format!(
-            "debugfs rdump of {} exited {}: {}",
-            image.display(),
+            "tar exited {}: {}",
             out.status.code().unwrap_or(-1),
             tail(&String::from_utf8_lossy(&out.stderr))
         ));
     }
-    // Every ext4 has one; the next mke2fs makes its own.
+    // Every ext4 has one; the daemon drops it, and the next mke2fs makes its own.
     let _ = std::fs::remove_dir_all(staging.join("lost+found"));
     let (files, bytes) = tree_stats(staging);
 
-    // Bundle while hashing, so the digest names the file as written.
-    let mut tar = std::process::Command::new(&cfg.tar_bin)
-        .arg("--create")
-        .arg("--gzip")
-        .arg("--directory")
-        .arg(staging)
-        .arg(".")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not run {}: {e}", cfg.tar_bin))?;
-    let mut stdout = tar.stdout.take().ok_or("tar produced no stdout")?;
-    let mut file =
-        std::fs::File::create(&bundle_tmp).map_err(|e| format!("{}: {e}", bundle_tmp.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        let n = stdout
-            .read(&mut buf)
-            .map_err(|e| format!("reading tar: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        file.write_all(&buf[..n])
-            .map_err(|e| format!("{}: {e}", bundle_tmp.display()))?;
-    }
-    file.sync_all().map_err(|e| e.to_string())?;
-    drop(file);
-    let status = tar.wait().map_err(|e| format!("tar: {e}"))?;
-    if !status.success() {
-        let mut err = String::new();
-        if let Some(mut e) = tar.stderr.take() {
-            let _ = e.read_to_string(&mut err);
-        }
-        return Err(format!(
-            "tar exited {}: {}",
-            status.code().unwrap_or(-1),
-            tail(&err)
-        ));
-    }
-    let digest = hex(&hasher.finalize());
-
-    let tree = dir.join("snapshots").join(&digest);
+    let tree = dir.join("snapshots").join(digest);
     if tree.exists() {
         let _ = std::fs::remove_dir_all(&tree);
     }
     std::fs::rename(staging, &tree)
         .map_err(|e| format!("{} -> {}: {e}", staging.display(), tree.display()))?;
     let bundle = dir.join("bundles").join(format!("{digest}.tar.gz"));
-    std::fs::rename(&bundle_tmp, &bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
+    std::fs::rename(bundle_tmp, &bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
     Ok(Captured {
-        digest,
+        digest: digest.to_string(),
         files,
         bytes,
     })
@@ -1929,12 +1890,9 @@ mod tests {
         let ws = Arc::new(Workspaces::new(
             WorkspaceConfig {
                 root: dir.join("workspaces"),
-                data_dir: dir.clone(),
                 tar_bin: "tar".into(),
                 aws_bin: "aws".into(),
                 art_bin: "art".into(),
-                debugfs_bin: "debugfs".into(),
-                e2fsck_bin: "e2fsck".into(),
                 s3_endpoint: None,
                 home: None,
                 timeout: Duration::from_secs(5),
@@ -2043,80 +2001,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The whole capture path against a real image: a tree becomes an ext4
-    /// via `mke2fs -d` (what heyvmd does), is extracted via debugfs, bundled,
-    /// and comes back out of the bundle the same. Skipped where e2fsprogs is
-    /// not installed.
+    /// The capture path from the daemon's export: a tarball of the tree
+    /// (symlinks and all) lands as a bundle named by its digest and a
+    /// snapshot tree beside it, and comes back out of the bundle the same.
     #[test]
-    fn capture_round_trips_a_tree() {
-        let have = |b: &str| {
-            std::process::Command::new(sbin_fallback(b))
-                .arg("-V")
-                .output()
-                .is_ok()
-        };
-        if !have("mke2fs") || !have("debugfs") || !have("e2fsck") {
-            eprintln!("skipping: e2fsprogs not installed");
-            return;
-        }
+    fn a_daemon_export_installs_as_a_snapshot_and_a_bundle() {
         let temp = std::env::temp_dir().join(format!("app-lb-workspace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
-        let src = temp.join("src");
-        std::fs::create_dir_all(src.join("repo/.git")).unwrap();
-        std::fs::write(src.join("a.txt"), "hello").unwrap();
-        std::fs::write(src.join("repo/.git/config"), "[core]").unwrap();
-        std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
-        let image = temp.join("mount0.ext4");
-        let ok = std::process::Command::new(sbin_fallback("mke2fs"))
-            .args(["-q", "-t", "ext4", "-d"])
-            .arg(&src)
-            .arg(&image)
-            .arg("16M")
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "mke2fs");
+
+        // What the daemon streams: `tar --create --gzip` of the extracted tree.
+        let export = temp.join("export.tar.gz");
+        {
+            let file = std::fs::File::create(&export).unwrap();
+            let enc = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(enc);
+            let mut add = |path: &str, body: &[u8]| {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append_data(&mut header, path, body).unwrap();
+            };
+            add("./a.txt", b"hello");
+            add("./repo/.git/config", b"[core]");
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            link.set_cksum();
+            tar.append_link(&mut link, "./link", "a.txt").unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let digest = {
+            let bytes = std::fs::read(&export).unwrap();
+            hex(&Sha256::digest(&bytes))
+        };
 
         let cfg = WorkspaceConfig {
             root: temp.join("ws"),
-            data_dir: temp.clone(),
             tar_bin: "tar".into(),
             aws_bin: "aws".into(),
             art_bin: "art".into(),
-            debugfs_bin: "debugfs".into(),
-            e2fsck_bin: "e2fsck".into(),
             s3_endpoint: None,
             home: None,
             timeout: Duration::from_secs(60),
         };
         let dir = cfg.root.join("dep");
-        let captured = capture_blocking(&cfg, &dir, &image, &dir.join("staging-1")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle_tmp = dir.join("staging-1.tar.gz");
+        std::fs::copy(&export, &bundle_tmp).unwrap();
+        let captured = install_capture(&cfg, &dir, &bundle_tmp, &dir.join("staging-1"), &digest).unwrap();
+        assert_eq!(captured.digest, digest, "the digest names the bundle as the daemon sent it");
         assert_eq!(captured.files, 2);
         let tree = dir.join("snapshots").join(&captured.digest);
-        assert_eq!(
-            std::fs::read_to_string(tree.join("a.txt")).unwrap(),
-            "hello"
-        );
+        assert_eq!(std::fs::read_to_string(tree.join("a.txt")).unwrap(), "hello");
         assert!(tree.join("link").is_symlink());
-        assert!(!tree.join("lost+found").exists());
-        assert!(
-            !dir.join("staging-1").exists(),
-            "staging is renamed, not copied"
-        );
+        assert!(!dir.join("staging-1").exists(), "staging is renamed, not copied");
+        let bundle = dir.join("bundles").join(format!("{}.tar.gz", captured.digest));
+        assert!(bundle.is_file());
+        assert!(!bundle_tmp.exists(), "the temp bundle is renamed, not copied");
 
-        let bundle = dir
-            .join("bundles")
-            .join(format!("{}.tar.gz", captured.digest));
-        assert!(verify_file(&bundle, &captured.digest).unwrap());
-        let out = dir.join("restored");
-        let (files, _) = extract_bundle(&cfg, &bundle, &dir.join("staging-2"), &out).unwrap();
-        assert_eq!(files, 2);
-        assert_eq!(
-            std::fs::read_to_string(out.join("repo/.git/config")).unwrap(),
-            "[core]"
-        );
-        assert!(out.join("link").is_symlink());
+        // ...and out of the bundle the same.
+        let restored = dir.join("restored");
+        let stats = extract_bundle(&cfg, &bundle, &dir.join("staging-2"), &restored).unwrap();
+        assert_eq!(stats.0, 2);
+        assert_eq!(std::fs::read_to_string(restored.join("repo/.git/config")).unwrap(), "[core]");
         let _ = std::fs::remove_dir_all(&temp);
     }
 }

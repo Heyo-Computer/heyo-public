@@ -96,11 +96,6 @@ pub struct Autoscaler {
     /// [`Feed::issue`](crate::feed::Feed::issue) — so calls are unconditional
     /// here and the feed itself decides whether anyone hears about it.
     feed: Arc<crate::feed::Feed>,
-    /// Where the daemon keeps per-sandbox disks, when that could be resolved.
-    /// Only used to discard a suspended replica's rootfs copy — see
-    /// [`discard_rootfs_of`](Self::discard_rootfs_of); `None` degrades to
-    /// leaving the copy in place, exactly the pre-existing behaviour.
-    disk_cfg: Option<crate::disks::DiskConfig>,
     /// Deployment-owned workspaces. Every path that retires a VM goes through
     /// it when the deployment has one, so a workspace is captured before the
     /// VM that holds it is destroyed; see [`crate::workspace`].
@@ -118,7 +113,6 @@ impl Autoscaler {
         vms: VmManager,
         metrics: Arc<Metrics>,
         feed: Arc<crate::feed::Feed>,
-        disk_cfg: Option<crate::disks::DiskConfig>,
         workspaces: Arc<Workspaces>,
         secrets: Arc<crate::secrets::SecretStore>,
     ) -> Self {
@@ -129,7 +123,6 @@ impl Autoscaler {
             nonce: AtomicU64::new(now_secs()),
             creates: tokio::sync::Semaphore::new(CREATE_CONCURRENCY),
             feed,
-            disk_cfg,
             workspaces,
             secrets,
         }
@@ -1121,12 +1114,12 @@ impl Autoscaler {
             }
 
             let name = vm::replica_name(&d.spec.id, self.next_nonce());
-            let tree = seeded.as_ref().map(|s| s.tree.as_path());
+            let seed = seeded.as_ref().map(|s| s.seed());
             let owner = vm::VmOwner::of(&d.spec);
             let created_vm = match self.secret_env(d.spec.vm_spec()) {
                 Ok(secret_env) => {
                     self.vms
-                        .create(d.spec.vm_spec(), name, tree, &owner, secret_env)
+                        .create(d.spec.vm_spec(), name, seed.as_ref(), &owner, secret_env)
                         .await
                 }
                 Err(e) => Err(e),
@@ -1340,14 +1333,7 @@ impl Autoscaler {
     /// what happened before this existed, and the resume path does not care
     /// either way.
     async fn discard_rootfs_of(&self, d: &Arc<Deployment>, sandbox_id: &str) {
-        let Some(cfg) = self.disk_cfg.clone() else {
-            return;
-        };
-        let id = sandbox_id.to_string();
-        let (removed, failed) =
-            tokio::task::spawn_blocking(move || crate::disks::discard_rootfs(&cfg, &id))
-                .await
-                .unwrap_or_else(|e| (Vec::new(), vec![format!("discard task failed: {e}")]));
+        let (removed, failed) = crate::disks::discard_rootfs(&self.vms, sandbox_id).await;
         if !removed.is_empty() {
             tracing::info!(
                 deployment = %d.spec.id,
@@ -1402,14 +1388,7 @@ impl Autoscaler {
             );
             return;
         }
-        let Some(cfg) = self.disk_cfg.clone() else {
-            return;
-        };
-        let id = sandbox_id.to_string();
-        let (removed, failed) =
-            tokio::task::spawn_blocking(move || crate::disks::discard_failed_boot(&cfg, &id))
-                .await
-                .unwrap_or_else(|e| (Vec::new(), vec![format!("discard task failed: {e}")]));
+        let (removed, failed) = crate::disks::discard_failed_boot(&self.vms, sandbox_id).await;
         if !removed.is_empty() {
             tracing::info!(
                 deployment = %d.spec.id,
@@ -2196,12 +2175,9 @@ mod tests {
         let workspaces = Arc::new(crate::workspace::Workspaces::new(
             crate::workspace::WorkspaceConfig {
                 root: dir.join("workspaces"),
-                data_dir: dir.clone(),
                 tar_bin: "tar".into(),
                 aws_bin: "aws".into(),
                 art_bin: "art".into(),
-                debugfs_bin: "debugfs".into(),
-                e2fsck_bin: "e2fsck".into(),
                 s3_endpoint: None,
                 home: None,
                 timeout: Duration::from_secs(60),
@@ -2219,9 +2195,6 @@ mod tests {
                 vms,
                 Arc::new(Metrics::new()),
                 Arc::new(crate::feed::Feed::new()),
-                // No disk config: rootfs discarding quietly stands down, which
-                // is also the production behaviour when the data dir is unknown.
-                None,
                 workspaces,
                 Arc::new(crate::secrets::SecretStore::new(
                     dir.join("autoscaler-secrets.json"),
@@ -2755,6 +2728,11 @@ mod tests {
             urls: vec![],
             guest_ip: guest_ip.map(Into::into),
             metadata: None,
+            account_id: None,
+            created_at: None,
+            cpus: None,
+            memory: None,
+            backend_type: None,
         }
     }
 

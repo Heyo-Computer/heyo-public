@@ -474,10 +474,11 @@ pub struct JobConfig {
     pub heyvm_bin: String,
     /// The `art` CLI, for pulling from a store on this host.
     pub art_bin: String,
-    /// Where a pulled rootfs is written, which must be the directory heyvmd
-    /// resolves image names in. `Err` when it could not be worked out at
-    /// startup; see [`crate::artifact::Puller`] for why that is not fatal.
-    pub images_dir: Result<PathBuf, String>,
+    /// app-lb's own scratch for images on their way to the daemon: a pull
+    /// fetches here and a build (`heyvm mvm build` with `MVM_DATA_DIR` set
+    /// to it) writes here, then the result is uploaded into the daemon's
+    /// catalog (`PUT /images/:name`) and removed. Nothing the daemon reads.
+    pub images_dir: PathBuf,
     pub git_bin: String,
     /// Where guest mount trees are unpacked. Unlike `images_dir` this is not a
     /// `Result`: it is app-lb's own directory and it was created at startup, so
@@ -519,6 +520,7 @@ impl Jobs {
                 cfg.art_bin.clone(),
                 cfg.images_dir.clone(),
                 cfg.home.clone(),
+                autoscaler.vms().clone(),
             ),
             cfg,
             registry,
@@ -944,7 +946,37 @@ impl Jobs {
         if let Some(home) = &self.cfg.home {
             cmd.env("HOME", home);
         }
+        // The CLI installs its result under `$MVM_DATA_DIR/images/firecracker`.
+        // Pointed at app-lb's own scratch, not the daemon's data directory:
+        // the image reaches the daemon by upload, not by sharing a filesystem.
+        cmd.env("MVM_DATA_DIR", &self.cfg.images_dir);
         self.step(job_id, "heyvm", cmd, self.cfg.timeout).await?;
+
+        // -- upload ----------------------------------------------------------
+        let built = self
+            .cfg
+            .images_dir
+            .join("images")
+            .join("firecracker")
+            .join(format!("{image}.ext4"));
+        let size = tokio::fs::metadata(&built)
+            .await
+            .map_err(|e| {
+                format!(
+                    "heyvm mvm build reported success but left no image at {}: {e}",
+                    built.display()
+                )
+            })?
+            .len();
+        self.log(job_id, format!("uploading {} ({size} bytes) to the daemon", built.display()));
+        let installed = self
+            .autoscaler
+            .vms()
+            .upload_image(&image, &built, &heyo_sdk::ImageUploadOptions::default())
+            .await
+            .map_err(|e| format!("could not upload {image} to the daemon: {e}"))?;
+        let _ = tokio::fs::remove_file(&built).await;
+        self.log(job_id, format!("installed as {} on the daemon", installed.path));
 
         // -- roll out --------------------------------------------------------
         self.roll_out(job_id, deployment_id, &image).await?;
