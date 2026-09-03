@@ -3247,6 +3247,7 @@ async fn execute_heyo_deploy(
                 setup_hooks: Some(sandbox.setup_hooks.clone()),
                 size_class: sandbox.size_class.clone(),
                 ttl_seconds: sandbox.ttl_seconds,
+                placement_pool: None,
                 excluded_backend_server_ids: Vec::new(),
                 metadata: None,
             };

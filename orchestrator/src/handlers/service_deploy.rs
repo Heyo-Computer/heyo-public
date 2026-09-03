@@ -64,6 +64,10 @@ pub struct ServiceDeployRequest {
     pub archive_bytes_base64: Option<String>,
     #[serde(default = "default_region")]
     pub region: String,
+    /// Optional Cloud placement pool. Cloud pairs it with its own deployment
+    /// environment, so callers select a workload class rather than host IDs.
+    #[serde(default)]
+    pub placement_pool: Option<String>,
     #[serde(default = "default_driver")]
     pub driver: String,
     #[serde(default = "default_image")]
@@ -499,6 +503,27 @@ async fn validate_service_deployment_request(
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let discovery_routed = state.config.service_uses_discovery_routing(&service_id);
 
+    if request
+        .placement_pool
+        .as_deref()
+        .is_some_and(|pool| pool.trim().is_empty())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "placementPool must not be empty".to_string(),
+        ));
+    }
+    if request
+        .placement_pool
+        .as_deref()
+        .is_some_and(|pool| pool.trim().chars().count() > 64)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "placementPool must be at most 64 characters".to_string(),
+        ));
+    }
+
     validate_service_traffic_mode(
         &service_id,
         request.desired_replicas,
@@ -507,6 +532,12 @@ async fn validate_service_deployment_request(
     )?;
 
     if let Some(desired_replicas) = request.desired_replicas {
+        if request.placement_pool.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "placementPool is required when desiredReplicas is set".to_string(),
+            ));
+        }
         if !request.replica_regions.is_empty()
             && request.replica_regions.len() != usize::from(desired_replicas)
         {
@@ -726,6 +757,7 @@ async fn deploy_service_rollout(
             "targetRevision": target_revision,
             "observedReplicas": active_endpoint_count(initial_snapshot.as_ref()),
             "replicaRegions": request.replica_regions,
+            "placementPool": request.placement_pool,
         })),
         None,
     )
@@ -1441,6 +1473,7 @@ async fn deploy_service_candidate(
                 setup_hooks: request.setup_hooks.clone(),
                 size_class: request.size_class.clone(),
                 ttl_seconds: Some(request.ttl_seconds.unwrap_or(0)),
+                placement_pool: request.placement_pool.clone(),
                 excluded_backend_server_ids,
                 metadata: request.metadata.clone(),
             },
@@ -1886,6 +1919,7 @@ fn service_deployment_request_metadata(request: &ServiceDeployRequest) -> serde_
         "archiveName": request.archive_name,
         "archiveBytesBase64Length": request.archive_bytes_base64.as_ref().map(|value| value.len()),
         "region": request.region,
+        "placementPool": request.placement_pool,
         "driver": request.driver,
         "image": request.image,
         "ports": request.ports,
@@ -3903,6 +3937,7 @@ fn build_deployment_metadata(
             "startCommand": request.start_command,
             "healthPath": request.health_path,
             "replicaRegions": request.replica_regions,
+            "placementPool": request.placement_pool,
         },
         "environment": {
             "envKeys": env_keys,
@@ -4382,6 +4417,7 @@ mod tests {
         let request: ServiceDeployRequest = serde_json::from_value(serde_json::json!({
             "serviceId": "cloud",
             "userId": "heyo-system",
+            "placementPool": "platform",
             "revisionGuard": {
                 "repositoryUrl": "https://github.com/example/acme-service.git",
                 "ref": "refs/heads/main",
@@ -4389,6 +4425,7 @@ mod tests {
             }
         }))
         .unwrap();
+        assert_eq!(request.placement_pool.as_deref(), Some("platform"));
         let guard = request.revision_guard.unwrap();
         assert_eq!(guard.git_ref, "refs/heads/main");
         assert!(!guard.force);
