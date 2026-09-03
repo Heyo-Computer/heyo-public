@@ -1961,7 +1961,7 @@ mod tests {
     }
 
     fn workspace_spec() -> DeploymentSpec {
-        let mut s: DeploymentSpec = serde_json::from_value(serde_json::json!({
+        let s: DeploymentSpec = serde_json::from_value(serde_json::json!({
             "id": "demo",
             "routes": [{"host": "demo.example.com"}],
             "vm": {
