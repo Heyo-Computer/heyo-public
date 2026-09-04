@@ -18,10 +18,17 @@ import type { Config } from "./config.js";
 import { makeClients } from "./clients/index.js";
 import { diagnosticTools, type Tool } from "./tools/diagnose.js";
 import { actionTools } from "./tools/actions.js";
+import { sandboxTools } from "./tools/sandbox.js";
+import { feedTools } from "./tools/feed.js";
 
 export function buildTools(config: Config): Tool[] {
   const clients = makeClients(config);
-  return [...diagnosticTools(clients, config), ...actionTools(clients)];
+  return [
+    ...diagnosticTools(clients, config),
+    ...sandboxTools(clients),
+    ...feedTools(clients),
+    ...actionTools(clients),
+  ];
 }
 
 /**

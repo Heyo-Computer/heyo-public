@@ -61,7 +61,14 @@ export function identityFrom(headers: Record<string, string | string[] | undefin
       "No x-auth-request-user or -email on this request, so it did not arrive through " +
         "app-lb's gate. This process binds loopback and expects app-lb in front of it: " +
         "check that the deployment's auth block is present and that this path is not in " +
-        "public_paths. Set HEYO_MCP_REQUIRE_IDENTITY=0 only for local testing.",
+        "public_paths.\n\n" +
+        "One gate produces no identity by design: an **app-token** one. app-lb admits " +
+        "`Authorization: Bearer applb_…` with `Decision::Allow(None)` — 'a token is not a " +
+        "person' — so nothing is forwarded and this check refuses every request that gate " +
+        "lets through. A machine client behind an app-token gate therefore needs " +
+        "HEYO_MCP_REQUIRE_IDENTITY=0, and that is safe *only* because the gate in front is " +
+        "doing the work this check stands in for; on a JWT or Google gate, leave it on. " +
+        "Otherwise gate with `jwt` and the caller's token carries its own subject.",
     );
   }
   return { who, user, email, name: one("x-auth-request-name") };

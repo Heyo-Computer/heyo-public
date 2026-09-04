@@ -48,7 +48,7 @@ use crate::vm::VmManager;
 use heyo_sdk::{PurgeParts, SandboxInfo, SandboxStatus, StorageInventory};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1761,6 +1761,7 @@ impl Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("app-lb-disks-{tag}-{}", std::process::id()));

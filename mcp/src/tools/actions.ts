@@ -224,13 +224,19 @@ export function actionTools(clients: Clients): Tool[] {
     },
 
     // ---- raw, for everything not named above ---------------------------
-    ...(["applb", "obs", "ci"] as const).map((svc) => ({
-      name: `${svc}_request`,
+    ...(
+      [
+        { key: "cloud", tool: "heyo_request", label: "heyo cloud" },
+        { key: "applb", tool: "applb_request", label: "app-lb" },
+        { key: "obs", tool: "obs_request", label: "app-obs" },
+        { key: "ci", tool: "ci_request", label: "ci" },
+      ] as const
+    ).map(({ key, tool, label }) => ({
+      name: tool,
       description:
-        `Raw HTTP against ${svc === "applb" ? "app-lb" : svc === "obs" ? "app-obs" : "ci"}, for ` +
-        "endpoints without a dedicated tool above. Full surface, including methods that " +
-        "destroy things — prefer a named tool when one exists, because this one's intent is " +
-        "invisible until the arguments are read.",
+        `Raw HTTP against ${label}, for endpoints without a dedicated tool above. Full ` +
+        "surface, including methods that destroy things — prefer a named tool when one " +
+        "exists, because this one's intent is invisible until the arguments are read.",
       schema: {
         method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
         path: z.string().describe("path beginning with '/'"),
@@ -239,7 +245,7 @@ export function actionTools(clients: Clients): Tool[] {
       },
       handler: async (a: Record<string, unknown>) =>
         json(
-          await clients[svc === "applb" ? "applb" : svc]({
+          await clients[key]({
             method: (a.method as string) ?? "GET",
             path: String(a.path),
             query: a.query as Record<string, string> | undefined,

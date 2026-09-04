@@ -254,6 +254,9 @@ struct Runtime {
     phase: Option<&'static str>,
     /// A restore has been asked for and not yet done.
     restore_wanted: bool,
+    /// The last record mutation could not be written to state.json; the
+    /// in-memory record is ahead of the disk and must be persisted again.
+    persist_failed: bool,
     /// Do not retry the store before this instant.
     backoff_until: Option<u64>,
 }
@@ -411,6 +414,12 @@ impl Workspaces {
         drop(records);
         if let Err(e) = self.persist(deployment_id, &snapshot) {
             tracing::error!(deployment = %deployment_id, error = %e, "failed to persist workspace state");
+            self.runtime
+                .lock()
+                .unwrap()
+                .entry(deployment_id.to_string())
+                .or_default()
+                .persist_failed = true;
         }
         out
     }
@@ -422,6 +431,31 @@ impl Workspaces {
             .get(deployment_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Try again to write the in-memory record to state.json after a persist
+    /// failure. Returns true once the disk has caught up. The worker calls
+    /// this each pass so a transient failure (a full disk, a permissions
+    /// hiccup) self-heals without silently stranding the record ahead of the
+    /// disk, which is what a restart would otherwise surface as a leftover or
+    /// a "snapshot this host has never seen" mismatch.
+    fn re_persist(&self, deployment_id: &str) -> bool {
+        let snapshot = self.record(deployment_id);
+        match self.persist(deployment_id, &snapshot) {
+            Ok(()) => {
+                self.runtime
+                    .lock()
+                    .unwrap()
+                    .entry(deployment_id.to_string())
+                    .or_default()
+                    .persist_failed = false;
+                true
+            }
+            Err(e) => {
+                tracing::error!(deployment = %deployment_id, error = %e, "retry failed to persist workspace state");
+                false
+            }
+        }
     }
 
     fn persist(&self, deployment_id: &str, record: &WorkspaceRecord) -> Result<(), String> {
@@ -449,6 +483,17 @@ impl Workspaces {
             Some(r) => (r.phase, r.restore_wanted, r.backoff_until),
             None => (None, false, None),
         }
+    }
+
+    /// Whether the last record mutation failed to reach state.json and still
+    /// needs writing.
+    fn persist_failed(&self, deployment_id: &str) -> bool {
+        self.runtime
+            .lock()
+            .unwrap()
+            .get(deployment_id)
+            .map(|r| r.persist_failed)
+            .unwrap_or(false)
     }
 
     fn note_error(&self, deployment_id: &str, error: String) {
@@ -491,6 +536,9 @@ impl Workspaces {
                     String::new()
                 }
             ));
+        }
+        if self.persist_failed(id) {
+            return Some("workspace state could not be written to disk; check the workspace store".into());
         }
         if restore_wanted || !record.initialized {
             return Some(match &record.last_error {
@@ -761,7 +809,7 @@ impl Workspaces {
                 .map(|(id, _)| id.clone())
                 .chain(
                     rt.iter()
-                        .filter(|(_, r)| r.restore_wanted)
+                        .filter(|(_, r)| r.restore_wanted || r.persist_failed)
                         .map(|(id, _)| id.clone()),
                 )
                 .collect();
@@ -790,6 +838,14 @@ impl Workspaces {
             }
             let (_, _, backoff) = self.runtime(&id);
             let in_backoff = backoff.is_some_and(|until| now_secs() < until);
+
+            // If the last mutation could not reach state.json, get the disk
+            // back in sync with the in-memory record before deciding anything
+            // else, so a restart can never re-discover a stale record as a
+            // "snapshot this host has never seen" mismatch.
+            if self.persist_failed(&id) {
+                self.re_persist(&id);
+            }
 
             self.drain_captures(&id, &d.spec).await;
 
@@ -1905,7 +1961,7 @@ mod tests {
     }
 
     fn workspace_spec() -> DeploymentSpec {
-        let mut s: DeploymentSpec = serde_json::from_value(serde_json::json!({
+        let s: DeploymentSpec = serde_json::from_value(serde_json::json!({
             "id": "demo",
             "routes": [{"host": "demo.example.com"}],
             "vm": {

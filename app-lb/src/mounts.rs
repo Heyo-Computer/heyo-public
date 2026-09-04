@@ -179,7 +179,8 @@ impl MountStore {
     /// the window starts when the tree became usable, not when the tarball it
     /// came from was rolled. See [`DEFAULT_TTL_SECS`] for what that window is
     /// really protecting, which is narrower than "trees get a day to come back".
-    pub fn sweep(&self, referenced: &HashSet<String>) -> (usize, u64) {
+    #[cfg(test)]
+    fn sweep(&self, referenced: &HashSet<String>) -> (usize, u64) {
         let (removed, freed) = self.sweep_named(referenced, crate::deployment::now_secs());
         (removed.len(), freed)
     }
