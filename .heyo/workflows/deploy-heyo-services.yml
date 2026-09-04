@@ -32,6 +32,26 @@ on:
         required: false
         type: boolean
         default: false
+      discoveryRoutedServices:
+        description: "Comma-separated services routed through app-lb discovery"
+        required: false
+        type: string
+        default: ""
+      replicaRegions:
+        description: "Comma-separated replica regions for discovery-routed services"
+        required: false
+        type: string
+        default: ""
+      placementPool:
+        description: "Placement pool for discovery-routed services"
+        required: false
+        type: string
+        default: ""
+      serviceDriver:
+        description: "Sandbox driver override for this deployment"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: deploy-heyo-public-services
@@ -59,17 +79,17 @@ jobs:
       HEYO_PUBLIC_HOST: ${{ secrets.HEYO_PUBLIC_HOST || 'stage.heyo.computer' }}
       HEYO_TRAEFIK_CERT_RESOLVER: ${{ secrets.HEYO_TRAEFIK_CERT_RESOLVER || 'letsencrypt-http' }}
       HEYO_SERVICE_REGION: ${{ secrets.HEYO_SERVICE_REGION }}
-      HEYO_SERVICE_DRIVER: ${{ secrets.HEYO_SERVICE_DRIVER }}
+      HEYO_SERVICE_DRIVER: ${{ inputs.serviceDriver || secrets.HEYO_SERVICE_DRIVER }}
       HEYO_SERVICE_IMAGE: ${{ secrets.HEYO_SERVICE_IMAGE }}
       ORCHESTRATOR_BACKEND_API_URL: ${{ secrets.ORCHESTRATOR_BACKEND_API_URL }}
       ORCHESTRATOR_PROXY_BASE_DOMAINS: ${{ secrets.ORCHESTRATOR_PROXY_BASE_DOMAINS }}
       ORCHESTRATOR_TARGET_OS: ${{ secrets.ORCHESTRATOR_TARGET_OS }}
       ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS: ${{ secrets.ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS }}
       ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS: ${{ secrets.ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS }}
-      ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES: ${{ secrets.ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES }}
+      ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES: ${{ inputs.discoveryRoutedServices || secrets.ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES }}
       HEYO_SERVICE_REPLICAS: ${{ secrets.HEYO_SERVICE_REPLICAS }}
-      HEYO_SERVICE_REPLICA_REGIONS: ${{ secrets.HEYO_SERVICE_REPLICA_REGIONS }}
-      HEYO_SERVICE_PLACEMENT_POOL: ${{ secrets.HEYO_SERVICE_PLACEMENT_POOL }}
+      HEYO_SERVICE_REPLICA_REGIONS: ${{ inputs.replicaRegions || secrets.HEYO_SERVICE_REPLICA_REGIONS }}
+      HEYO_SERVICE_PLACEMENT_POOL: ${{ inputs.placementPool || secrets.HEYO_SERVICE_PLACEMENT_POOL }}
       ORCHESTRATOR_NATS_URL: ${{ secrets.ORCHESTRATOR_NATS_URL }}
       ORCHESTRATOR_NATS_ENABLED: ${{ secrets.ORCHESTRATOR_NATS_ENABLED }}
       TARGET_HEYO_SERVICE: ${{ matrix.target }}
