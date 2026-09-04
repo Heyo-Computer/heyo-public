@@ -17,6 +17,7 @@ export interface RouteRule {
   host?: string;
   host_suffix?: string;
   path_prefix?: string;
+  strip_prefix?: boolean;
 }
 
 export interface ScalingPolicy {

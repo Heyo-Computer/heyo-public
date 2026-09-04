@@ -904,17 +904,20 @@ mod tests {
                 host: Some("sb-1.sb.example.com".into()),
                 host_suffix: None,
                 path_prefix: None,
+                strip_prefix: false,
             },
             RouteRule {
                 host: Some("sb-2.sb.example.com".into()),
                 host_suffix: None,
                 path_prefix: None,
+                strip_prefix: false,
             },
             // A different domain: not covered, so it still gets its own.
             RouteRule {
                 host: Some("web.example.com".into()),
                 host_suffix: None,
                 path_prefix: None,
+                strip_prefix: false,
             },
         ]);
         let manager = manager_with_wildcards(&dir, registry, vec!["sb.example.com".into()]);
@@ -937,11 +940,13 @@ mod tests {
                 host: Some("a.sb.example.com".into()),
                 host_suffix: None,
                 path_prefix: None,
+                strip_prefix: false,
             },
             RouteRule {
                 host: Some("a.b.sb.example.com".into()),
                 host_suffix: None,
                 path_prefix: None,
+                strip_prefix: false,
             },
         ]);
         let manager = manager_with_wildcards(&dir, registry, vec!["sb.example.com".into()]);
@@ -963,6 +968,7 @@ mod tests {
             host: None,
             host_suffix: Some("sb.example.com".into()),
             path_prefix: None,
+            strip_prefix: false,
         }]);
         let manager = manager_with_wildcards(&dir, registry, vec!["sb.example.com".into()]);
 
@@ -980,23 +986,27 @@ mod tests {
                 host: Some("A.example.com".into()),
                 host_suffix: None,
                 path_prefix: None,
+                strip_prefix: false,
             },
             RouteRule {
                 host: Some("b.example.com".into()),
                 host_suffix: None,
                 path_prefix: None,
+                strip_prefix: false,
             },
             // Wildcards need DNS-01; must not appear.
             RouteRule {
                 host: None,
                 host_suffix: Some("apps.example.com".into()),
                 path_prefix: None,
+                strip_prefix: false,
             },
             // Path-only routes have no hostname to certify.
             RouteRule {
                 host: None,
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
+                strip_prefix: false,
             },
         ]));
 
@@ -1013,6 +1023,7 @@ mod tests {
             host: None,
             host_suffix: Some("apps.example.com".into()),
             path_prefix: None,
+            strip_prefix: false,
         }]));
 
         manager.desired_hosts();

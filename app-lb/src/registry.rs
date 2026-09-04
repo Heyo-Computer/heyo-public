@@ -735,6 +735,7 @@ mod tests {
             host: Some(h.into()),
             host_suffix: None,
             path_prefix: None,
+            strip_prefix: false,
         }
     }
 
@@ -743,6 +744,7 @@ mod tests {
             host: None,
             host_suffix: None,
             path_prefix: Some(p.into()),
+            strip_prefix: false,
         }
     }
 
@@ -751,6 +753,7 @@ mod tests {
             host: None,
             host_suffix: Some(s.into()),
             path_prefix: None,
+            strip_prefix: false,
         }
     }
 
@@ -833,6 +836,7 @@ mod tests {
                 host: Some("a.local".into()),
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
+                strip_prefix: false,
             }],
         ));
         assert_eq!(r.route(Some("a.local"), "/").unwrap().spec.id, "site");
@@ -867,6 +871,7 @@ mod tests {
                 host: Some("a.local".into()),
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
+                strip_prefix: false,
             }],
         ));
 
@@ -887,6 +892,7 @@ mod tests {
                 host: Some("a.example.com".into()),
                 host_suffix: Some("example.com".into()),
                 path_prefix: None,
+                strip_prefix: false,
             }],
         ));
         r.upsert(spec(
@@ -895,6 +901,7 @@ mod tests {
                 host: Some("a.other.com".into()),
                 host_suffix: Some("example.com".into()),
                 path_prefix: None,
+                strip_prefix: false,
             }],
         ));
 
@@ -922,6 +929,7 @@ mod tests {
                 host: Some("a.local".into()),
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
+                strip_prefix: false,
             }],
             vec![suffix("apps.example.com")],
             vec![path("/legacy")],

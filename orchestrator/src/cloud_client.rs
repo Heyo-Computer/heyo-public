@@ -82,6 +82,7 @@ pub(crate) struct CreateDeploymentRequest {
     pub setup_hooks: Option<Vec<String>>,
     pub size_class: String,
     pub ttl_seconds: Option<u64>,
+    pub placement_pool: Option<String>,
     pub excluded_backend_server_ids: Vec<String>,
     pub metadata: Option<Value>,
 }
@@ -183,8 +184,19 @@ struct CreateDeploymentHttpRequest {
     setup_hooks: Option<Vec<String>>,
     size_class: String,
     ttl_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement_pool: Option<String>,
     excluded_backend_server_ids: Vec<String>,
     metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeploymentPlacement {
+    pub deployment_environment: String,
+    pub node_id: String,
+    pub placement_pool: String,
+    pub region: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -199,6 +211,8 @@ pub(crate) struct CreateDeploymentResponse {
     pub backend_server_hostname: Option<String>,
     #[serde(default)]
     pub backend_sandbox_id: Option<String>,
+    #[serde(default)]
+    pub placement: Option<DeploymentPlacement>,
     pub status: String,
 }
 
@@ -350,6 +364,7 @@ pub(crate) async fn create_deployment(
         setup_hooks: request.setup_hooks.clone(),
         size_class: request.size_class.clone(),
         ttl_seconds: request.ttl_seconds,
+        placement_pool: request.placement_pool.clone(),
         excluded_backend_server_ids: request.excluded_backend_server_ids.clone(),
         metadata: request.metadata.clone(),
     })

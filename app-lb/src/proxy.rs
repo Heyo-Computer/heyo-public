@@ -45,6 +45,9 @@ pub struct Ctx {
     /// `request_filter` and applied to the upstream request later, so the gate
     /// runs once per request rather than once per upstream attempt.
     identity: Option<Identity>,
+    /// The matched route prefix when that route opted into removing it before
+    /// proxying. Routing happens before Pingora builds the upstream request.
+    route_prefix: Option<String>,
 }
 
 impl Ctx {
@@ -228,6 +231,36 @@ async fn resolve_peer(peer: &str) -> Option<SocketAddr> {
 /// exact token is genuinely in flight. Everything else falls through to routing.
 fn acme_challenge_response(challenges: &ChallengeTable, path: &str) -> Option<String> {
     challenges.get(path.strip_prefix(ACME_CHALLENGE_PREFIX)?)
+}
+
+fn matched_strip_prefix(
+    deployment: &Deployment,
+    host: Option<&str>,
+    path: &str,
+) -> Option<String> {
+    deployment
+        .spec
+        .routes
+        .iter()
+        .filter(|route| route.strip_prefix && route.matches(host, path))
+        .max_by_key(|route| route.specificity())
+        .and_then(|route| route.path_prefix.clone())
+}
+
+fn strip_uri_prefix(uri: &http::Uri, prefix: &str) -> String {
+    let suffix = uri.path().strip_prefix(prefix).unwrap_or(uri.path());
+    let mut rewritten = if suffix.is_empty() {
+        "/".to_string()
+    } else if suffix.starts_with('/') {
+        suffix.to_string()
+    } else {
+        format!("/{suffix}")
+    };
+    if let Some(query) = uri.query() {
+        rewritten.push('?');
+        rewritten.push_str(query);
+    }
+    rewritten
 }
 
 async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<()> {
@@ -563,6 +596,8 @@ impl ProxyHttp for LbProxy {
             return Ok(true); // response already written; stop proxying
         };
 
+        ctx.route_prefix = matched_strip_prefix(&deployment, host.as_deref(), &path);
+
         // The sign-in gate, for the deployments that declare one. It runs after
         // routing (the gate is the deployment's own configuration) and before
         // anything touches a backend — including the cold-start wait, so an
@@ -639,6 +674,23 @@ impl ProxyHttp for LbProxy {
         upstream: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        if let Some(prefix) = ctx.route_prefix.as_deref() {
+            let rewritten = strip_uri_prefix(&upstream.uri, prefix);
+            let mut parts = upstream.uri.clone().into_parts();
+            parts.path_and_query = Some(rewritten.parse().map_err(|error| {
+                Error::explain(
+                    ErrorType::InternalError,
+                    format!("failed to rewrite upstream path: {error}"),
+                )
+            })?);
+            upstream.set_uri(http::Uri::from_parts(parts).map_err(|error| {
+                Error::explain(
+                    ErrorType::InternalError,
+                    format!("failed to build rewritten upstream URI: {error}"),
+                )
+            })?);
+        }
+
         let Some(gate) = ctx.deployment.as_ref().and_then(|d| d.spec.auth.as_ref()) else {
             return Ok(());
         };
@@ -1066,6 +1118,17 @@ mod tests {
         assert_eq!(request_host(&h).as_deref(), Some("demo.local"));
     }
 
+    #[test]
+    fn route_prefix_rewrite_preserves_root_and_query() {
+        let prefixed: http::Uri = "/heyosecret/v1/read?path=a%2Fb".parse().unwrap();
+        assert_eq!(
+            strip_uri_prefix(&prefixed, "/heyosecret"),
+            "/v1/read?path=a%2Fb"
+        );
+        let root: http::Uri = "/heyosecret".parse().unwrap();
+        assert_eq!(strip_uri_prefix(&root, "/heyosecret"), "/");
+    }
+
     fn deployment(scaling: ScalingPolicy) -> Arc<Deployment> {
         Arc::new(Deployment::new(DeploymentSpec {
             ingress: None,
@@ -1078,6 +1141,7 @@ mod tests {
                 host: Some("demo.local".into()),
                 host_suffix: None,
                 path_prefix: None,
+                strip_prefix: false,
             }],
             vm: Some(VmSpec {
                 env_from: vec![],
