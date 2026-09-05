@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install app-lb, app-obs, ci and art from the artifact store the workflows
-# push to.
+# push to. `codegraph` and `queue` are published too and installable by name.
 #
 #   ART_URL=https://art.example.com ART_API_KEY=… sh .ci/install.sh
 #   curl -fsSL https://…/install.sh | ART_URL=… ART_API_KEY=… sh
@@ -36,7 +36,11 @@
 #   SUPERVISOR_DIR   Where supervisor program files go. Default
 #                    /etc/supervisor/conf.d. Set empty to skip them entirely.
 #   APPS             Which to install. Default "app-lb app-obs ci art".
-#                    `codegraph` is also published and installable by name.
+#                    `codegraph` and `queue` are also published and installable
+#                    by name. `queue` is out of the default set on purpose: it
+#                    is a dashboard for a NATS server, so it belongs only on the
+#                    host running one, and installing it elsewhere would leave a
+#                    supervisor program failing its scrape forever.
 #                    `art` is in the default set because app-lb needs it on
 #                    the same host: a deployment whose `vm.workspace.store`
 #                    is a local path is restored and captured by app-lb
@@ -47,13 +51,14 @@
 #
 # `ci` tags every upload `ci-<workflow>-<run>-<job>-<name>` (see
 # `ci/src/artifacts.rs`), because the store's tag charset has no `/`. For the
-# five things these workflows publish that is:
+# six things these workflows publish that is:
 #
 #   ci-app-lb-<run>-release-app-lb       app-lb + heyctl
 #   ci-app-obs-<run>-release-app-obs     app-obs + app-obs-dump
 #   ci-ci-<run>-release-ci               ci + its migrations
 #   ci-codegraph-<run>-release-codegraph codegraph
 #   ci-art-<run>-release-art             art
+#   ci-queue-<run>-release-queue         queue
 #
 # The run id is `%012x-%08x` — epoch milliseconds in hex, then a sequence — so
 # it is fixed-width and zero-padded, and **sorting the tags lexicographically
@@ -267,6 +272,7 @@ app_coords() {
     ci)        echo "ci release ci" ;;
     codegraph) echo "codegraph release codegraph" ;;
     art)       echo "art release art" ;;
+    queue)     echo "queue release queue" ;;
     *) return 1 ;;
   esac
 }
@@ -281,6 +287,7 @@ app_bins() {
     ci)        echo "ci" ;;
     codegraph) echo "codegraph" ;;
     art)       echo "art" ;;
+    queue)     echo "queue" ;;
   esac
 }
 
@@ -382,7 +389,7 @@ installed=""
 skipped_confs=""
 
 for app in $APPS; do
-  coords="$(app_coords "$app")" || die "unknown app '$app' (known: app-lb app-obs ci codegraph art)"
+  coords="$(app_coords "$app")" || die "unknown app '$app' (known: app-lb app-obs ci codegraph art queue)"
   # shellcheck disable=SC2086
   set -- $coords
   wf="$1"; job="$2"; name="$3"

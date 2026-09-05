@@ -1,0 +1,16 @@
+{
+  "id": "queue",
+  "routes": [
+    { "host": "queue.example.com" }
+  ],
+  "upstreams": ["127.0.0.1:9700"],
+  "health": { "path": "/healthz", "timeout_secs": 2 },
+  "auth": {
+    "client_id": "REPLACE.apps.googleusercontent.com",
+    "client_secret": { "secret": "google", "key": "client_secret" },
+    "allowed_domains": ["example.com"],
+    "public_paths": ["/healthz", "/__ui/"],
+    "cookie_domain": "example.com",
+    "forward_identity": true
+  }
+}

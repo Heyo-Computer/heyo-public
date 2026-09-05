@@ -1,0 +1,20 @@
+[package]
+name = "queue"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.9"
+# Timestamps only: the monitoring endpoints answer in RFC3339 and nats-server
+# writes its log lines in the host's local time. Nothing here schedules on a
+# clock, so `chrono` is a parser and a formatter and not much else.
+chrono = "0.4.45"
+# rustls rather than the system OpenSSL: the monitoring port is plain HTTP on
+# loopback in every deployment we run, but a remote one over TLS should not
+# need a build dependency the other platform services do not have.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "fs", "io-util"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

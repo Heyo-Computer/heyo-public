@@ -12,10 +12,18 @@ to "did this commit pass"; every file here holds one job. See
 | `app-obs.yml` | `release` | `app-obs`, `app-obs-dump` | `app-obs` — both binaries, `app-obs.conf`, `SHA256SUMS`, `BUILD-INFO` |
 | `ci.yml` | `release` | `ci` | `ci` — binary, `ci.conf`, `migrations/`, `SHA256SUMS`, `BUILD-INFO` |
 | `art.yml` | `release` | `art` | `art` — binary, `SHA256SUMS`, `BUILD-INFO` |
+| `queue.yml` | `release` | `queue` | `queue` — binary, `queue.conf`, an app-lb deployment template, `SHA256SUMS`, `BUILD-INFO` |
 
 The other six crates here (`artifacts`, `computer`, `heyosecret`,
 `heyosecret-client`, `orchestrator`, `printer`) have no workflow yet. Adding one
 is the recipe at the bottom.
+
+Six crates pull `ui/ui.rs` in with `#[path]` and embed the stylesheet, the theme
+script and six fonts through `include_bytes!`, so a change under `ui/` is a
+change to each of their binaries even though the lockfile cannot see it. Only
+`art.yml` and `queue.yml` list `ui/**` in their `paths:`. `app-lb.yml`,
+`app-obs.yml` and `ci.yml` do not, so a stylesheet change does not rebuild them
+— worth closing next time one of those files is touched.
 
 [`install.sh`](install.sh) is the other end of that table: it pulls the newest
 of each back out of the store and installs it. See
@@ -87,6 +95,10 @@ URL to hand a host that should not hold `ART_API_KEY`. `install.sh` still needs
 the key, because it resolves tags to find the newest build and tags stay
 private; a public blob is a download, not a listing.
 
+`queue` is deliberately not in that default set: it is a dashboard for a NATS
+server, so it belongs on the host running one and nowhere else. Ask for it by
+name — `sh .ci/install.sh queue` — on the box that has `nats-server` on it.
+
 ```sh
 sh .ci/install.sh --list            # what the store has, and what each thing is
 sh .ci/install.sh --dry-run         # fetch and verify, install nothing
@@ -104,7 +116,8 @@ ci-<workflow>-<run>-<job>-<name>
 
 which for the table above is `ci-app-lb-<run>-release-app-lb`,
 `ci-app-obs-<run>-release-app-obs`, `ci-ci-<run>-release-ci`,
-`ci-codegraph-<run>-release-codegraph` and `ci-art-<run>-release-art`. The workflow name being in the tag
+`ci-codegraph-<run>-release-codegraph`, `ci-art-<run>-release-art` and
+`ci-queue-<run>-release-queue`. The workflow name being in the tag
 means renaming a workflow starts a new series: app-lb and app-obs were built
 by `apps.yml` until 2026-08-27, and their older builds are tagged
 `ci-apps-<run>-app-lb-app-lb` and `ci-apps-<run>-app-obs-app-obs`. The script
