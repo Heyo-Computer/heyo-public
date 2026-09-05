@@ -1,0 +1,674 @@
+<!doctype html>
+<html lang="en" {{HTML_ATTRS}}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>queue</title>
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
+<style>
+  /* ------------------------------------------------------------------------
+     queue, layered on ui/heyo.css.
+
+     This block declares no palette: no tokens, no media query, no hex. Every
+     colour below is a var(--token) from the shared stylesheet, so the theme
+     toggle in the top bar moves this page with the rest of the fleet. A test
+     in `api/mod.rs` fails if a raw colour appears here.
+     ------------------------------------------------------------------------ */
+
+  /* One control row above everything it scopes, never inside a card. */
+  .controls { display: flex; align-items: center; flex-wrap: wrap; gap: var(--gap-2); margin-bottom: var(--gap-3); }
+  .controls input, .controls select { width: auto; }
+  .controls .lbl {
+    display: inline; margin: 0;
+    font-family: var(--font-display); font-size: 9px; letter-spacing: 0.8px;
+    text-transform: uppercase; color: var(--text-muted);
+  }
+
+  .section {
+    font-family: var(--font-display); font-size: 9px; letter-spacing: 0.8px;
+    text-transform: uppercase; color: var(--text-muted);
+    margin: var(--gap-6) 0 var(--gap-3);
+  }
+
+  /* Tiles are the shared .stat; only the grid around them is local. */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--gap-3); }
+  .stat-value .unit { font-size: 12px; font-weight: 500; color: var(--text-secondary); margin-left: 3px; }
+  .stat-value.bad { color: var(--danger); }
+  .stat-value.warn { color: var(--warning); }
+  .stat-sub { margin-top: var(--gap-1); font-size: 11px; color: var(--text-muted); }
+
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--gap-4); }
+  .chart svg { display: block; width: 100%; height: 120px; }
+  .chart-title {
+    font-family: var(--font-display); font-size: 9px; letter-spacing: 0.8px;
+    text-transform: uppercase; color: var(--text-muted); margin-bottom: var(--gap-2);
+  }
+  .series-1-line { fill: none; stroke: var(--series-1); stroke-width: 1.5; }
+  .series-2-line { fill: none; stroke: var(--series-2); stroke-width: 1.5; }
+
+  /* Rows are grouped by account by suppressing the repeat, so the eye gets the
+     grouping without an expand/collapse idiom this page has no other use for. */
+  td.group { color: var(--text-primary); }
+  td.dim, .dim { color: var(--text-muted); }
+  td.bad { color: var(--danger); }
+  tr.spacer td { border-bottom: 0; padding: var(--gap-2) 0 0; }
+  .subjects { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+
+  .log-line { display: flex; gap: var(--gap-3); }
+  .log-line .ts { color: var(--text-muted); white-space: nowrap; }
+  .log-line .lvl { width: 3.2em; flex: 0 0 auto; text-transform: uppercase; font-size: 10px; padding-top: 2px; }
+  .log-line .msg { flex: 1 1 auto; min-width: 0; }
+  .lvl-warn { color: var(--warning); }
+  .lvl-error, .lvl-fatal { color: var(--danger); }
+  .lvl-debug, .lvl-trace { color: var(--text-muted); }
+  .lvl-info { color: var(--text-secondary); }
+
+  .dot { display: inline-block; width: 7px; height: 7px; background: var(--success); }
+  .dot.stale { background: var(--warning); }
+  .dot.dead { background: var(--danger); }
+
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <a class="topbar-brand" href="/dashboard"><span>heyo</span><span class="topbar-app">queue</span></a>
+  <nav class="topbar-nav">
+    <span class="meta" id="server-line">connecting…</span>
+  </nav>
+  <div class="topbar-right">
+    <span class="pill"><span class="dot" id="livedot"></span> <span id="updated">loading…</span></span>
+    <!-- Filled server-side from the identity app-lb forwards; empty on an
+         ungated deployment, which has nobody to name. -->
+    <span class="topbar-user">{{WHO}}</span>
+    <button class="btn btn-sm" id="pause" aria-pressed="false">pause</button>
+    <!-- The shared toggle: writes the fleet-wide theme cookie, so a choice made
+         here is the one app-lb and app-obs open with. -->
+    <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
+  </div>
+</header>
+
+<div class="wrap wrap-wide">
+
+  <div class="banner banner-warn" id="banner" hidden></div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="section">Throughput</div>
+  <div class="charts">
+    <div class="chart">
+      <div class="chart-title">Messages per second</div>
+      <div id="chart-msgs"></div>
+      <div class="legend">
+        <span><span class="legend-swatch series-1"></span>in</span>
+        <span><span class="legend-swatch series-2"></span>out</span>
+      </div>
+    </div>
+    <div class="chart">
+      <div class="chart-title">Queue depth</div>
+      <div id="chart-depth"></div>
+      <div class="legend">
+        <span><span class="legend-swatch series-1"></span>held in streams</span>
+        <span><span class="legend-swatch series-2"></span>pending to a consumer</span>
+      </div>
+    </div>
+  </div>
+  <p class="meta" id="chart-meta"></p>
+
+  <div class="section">Streams and consumers</div>
+  <div class="card">
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Account</th>
+            <th>Stream</th>
+            <th>Retention</th>
+            <th class="num">Depth</th>
+            <th class="num">In/s</th>
+            <th>Consumer</th>
+            <th class="num">Pending</th>
+            <th class="num">In flight</th>
+            <th class="num">Redelivered</th>
+            <th class="num">Acked/s</th>
+            <th>Last message</th>
+          </tr>
+        </thead>
+        <tbody id="streams-body"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="streams-empty" hidden>
+      No JetStream streams on this server. One appears here as soon as something
+      calls <code>$JS.API.STREAM.CREATE</code>.
+    </div>
+    <p class="meta" id="streams-meta"></p>
+  </div>
+
+  <div class="section">Connected clients</div>
+  <div class="card">
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th class="num">CID</th>
+            <th>Name</th>
+            <th>Account</th>
+            <th>Address</th>
+            <th>Client</th>
+            <th>Uptime</th>
+            <th>Idle</th>
+            <th>RTT</th>
+            <th class="num">Subs</th>
+            <th class="num">In</th>
+            <th class="num">Out</th>
+            <th class="num">Pending</th>
+          </tr>
+        </thead>
+        <tbody id="clients-body"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="clients-empty" hidden>
+      Nothing is connected to this server.
+    </div>
+    <p class="meta" id="clients-meta"></p>
+  </div>
+
+  <div class="section">Server log</div>
+  <div class="controls">
+    <label class="lbl" for="log-level">Level</label>
+    <select id="log-level">
+      <option value="">all</option>
+      <option value="debug">debug and above</option>
+      <option value="info">info and above</option>
+      <option value="warn">warn and above</option>
+      <option value="error">error and above</option>
+    </select>
+    <label class="lbl sr-only" for="log-search">Search</label>
+    <input id="log-search" type="search" placeholder="filter…" style="min-width:220px">
+    <button class="btn btn-sm" id="log-follow" aria-pressed="true">following</button>
+  </div>
+  <div class="log" id="log-lines"></div>
+  <div class="empty" id="log-empty" hidden></div>
+  <p class="meta" id="log-meta"></p>
+
+</div>
+
+<script>
+// The whole page: two polls, a few formatters, four renderers. No framework and
+// no build step, matching the other dashboards in this repository.
+//
+// Every value written into the DOM goes through `esc`. Almost all of it comes
+// from a NATS server the operator runs — but stream names, consumer names,
+// subjects and client names are strings somebody else chose, and an operations
+// dashboard is exactly where an injected one would pay off.
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// --- formatters ------------------------------------------------------------
+
+const DASH = "—";
+
+function fmt(n) {
+  if (n == null || Number.isNaN(n)) return DASH;
+  return Number(n).toLocaleString();
+}
+
+// A rate is shown to a precision that means something: 0.4/s is a real reading,
+// 4123/s does not need a decimal, and neither wants six.
+function fmtRate(n) {
+  if (n == null || Number.isNaN(n)) return DASH;
+  if (n === 0) return "0";
+  if (n < 1) return n.toFixed(2);
+  if (n < 100) return n.toFixed(1);
+  return Math.round(n).toLocaleString();
+}
+
+function fmtBytes(n) {
+  if (n == null || Number.isNaN(n)) return DASH;
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let v = Number(n), i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+  return (i === 0 ? v : v.toFixed(v < 10 ? 1 : 0)) + " " + units[i];
+}
+
+function fmtDur(ms) {
+  if (ms == null || Number.isNaN(ms)) return DASH;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "d";
+}
+
+function fmtAgo(ms) {
+  if (ms == null) return DASH;
+  const delta = Date.now() - ms;
+  if (delta < 1500) return "just now";
+  return fmtDur(delta) + " ago";
+}
+
+// --- charts ----------------------------------------------------------------
+
+// An SVG line chart built as markup rather than through createElementNS, which
+// would need a namespace URL — and this page deliberately names no absolute URL
+// at all, so it renders on a host with no route off the machine.
+//
+// A null in `values` is a gap, not a zero: it is what a counter reset leaves
+// behind, and joining across it would draw a line through a moment the server
+// was not running.
+function lineChart(el, series, opts) {
+  const W = 600, H = 120, PAD_L = 46, PAD_R = 6, PAD_T = 8, PAD_B = 14;
+  const points = Math.max(0, ...series.map((s) => s.values.length));
+  if (points < 2) {
+    el.innerHTML = '<svg viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none"></svg>';
+    return;
+  }
+  let max = 0;
+  for (const s of series) for (const v of s.values) if (v != null && v > max) max = v;
+  // A flat-zero chart still needs a scale, or every point lands on the axis and
+  // the panel reads as broken rather than quiet.
+  if (max <= 0) max = 1;
+
+  const x = (i) => PAD_L + (i / (points - 1)) * (W - PAD_L - PAD_R);
+  const y = (v) => PAD_T + (1 - v / max) * (H - PAD_T - PAD_B);
+  const label = (v) => (opts && opts.bytes ? fmtBytes(v) : fmtRate(v));
+
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" role="img">';
+  for (let g = 0; g <= 2; g += 1) {
+    const gy = PAD_T + (g / 2) * (H - PAD_T - PAD_B);
+    svg += '<line class="chart-grid" x1="' + PAD_L + '" y1="' + gy +
+      '" x2="' + (W - PAD_R) + '" y2="' + gy + '" />';
+    svg += '<text class="chart-label" x="0" y="' + (gy + 3) + '">' +
+      esc(label(max * (1 - g / 2))) + "</text>";
+  }
+  for (const s of series) {
+    // Break the path at every gap so a null draws as a discontinuity.
+    let d = "", pen = false;
+    for (let i = 0; i < s.values.length; i += 1) {
+      const v = s.values[i];
+      if (v == null) { pen = false; continue; }
+      d += (pen ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1) + " ";
+      pen = true;
+    }
+    if (d) svg += '<path class="' + s.cls + '" d="' + d.trim() + '" />';
+  }
+  svg += "</svg>";
+  el.innerHTML = svg;
+}
+
+// --- render ----------------------------------------------------------------
+
+let paused = false;
+let following = true;
+let logCursor = 0;
+let logFilterKey = null;
+
+function tile(label, value, opts) {
+  const o = opts || {};
+  const cls = o.state ? " " + o.state : "";
+  const unit = o.unit ? '<span class="unit">' + esc(o.unit) + "</span>" : "";
+  const sub = o.sub ? '<div class="stat-sub">' + esc(o.sub) + "</div>" : "";
+  return '<div class="stat"><div class="stat-value' + cls + '">' + esc(value) + unit +
+    '</div><div class="stat-label">' + esc(label) + "</div>" + sub + "</div>";
+}
+
+function renderHeader(d) {
+  const s = d.server;
+  $("server-line").textContent = s
+    ? s.name + " · nats " + s.version + " · up " + s.uptime
+    : "no reading from " + d.monitor_url;
+
+  const age = d.polled_at_ms == null ? null : Date.now() - d.polled_at_ms;
+  const stale = age != null && age > Math.max(d.poll_secs * 3000, 20000);
+  $("livedot").className = "dot" + (!d.connected ? " dead" : stale ? " stale" : "");
+  $("updated").textContent = paused ? "paused" : fmtAgo(d.polled_at_ms);
+
+  // The failure and the stale reading are shown together on purpose: the last
+  // good numbers are the evidence somebody diagnosing the outage has, and
+  // blanking them to prove the poll failed would take that away.
+  const banner = $("banner");
+  if (d.error) {
+    banner.className = "banner banner-error";
+    banner.textContent = "Cannot reach " + d.monitor_url + ": " + d.error +
+      (d.server ? " — showing the last reading, from " + fmtAgo(d.polled_at_ms) + "." : "");
+    banner.hidden = false;
+    return;
+  }
+
+  const warnings = [];
+  if (d.totals.orphaned_streams > 0) {
+    warnings.push(d.totals.orphaned_streams +
+      " stream(s) delete on ack but have no consumer — nothing will drain them");
+  }
+  if (d.totals.stalled_consumers > 0) {
+    warnings.push(d.totals.stalled_consumers +
+      " consumer(s) hold work and have not acked within their redelivery window");
+  }
+  if (warnings.length > 0) {
+    banner.className = "banner banner-warn";
+    banner.textContent = warnings.join("; ") + ".";
+    banner.hidden = false;
+  } else {
+    banner.hidden = true;
+  }
+}
+
+function renderTiles(d) {
+  const s = d.server || {};
+  const t = d.totals;
+  const rate = d.throughput || {};
+  $("tiles").innerHTML = [
+    tile("Queue depth", fmt(t.depth), {
+      sub: fmtBytes(t.bytes) + " across " + t.streams + " stream(s)",
+    }),
+    tile("Pending to a consumer", fmt(t.pending), {
+      state: t.stalled_consumers > 0 ? "warn" : "",
+      sub: fmt(t.ack_pending) + " in flight · " + fmt(t.redelivered) + " redelivered",
+    }),
+    tile("Messages in", fmtRate(rate.in_msgs_per_sec), {
+      unit: "/s",
+      sub: fmtBytes(rate.in_bytes_per_sec) + "/s",
+    }),
+    tile("Messages out", fmtRate(rate.out_msgs_per_sec), {
+      unit: "/s",
+      sub: fmtBytes(rate.out_bytes_per_sec) + "/s",
+    }),
+    tile("Clients", fmt(s.connections), {
+      sub: fmt(s.subscriptions) + " subscription(s) · " + fmt(s.total_connections) + " since start",
+    }),
+    tile("Slow consumers", fmt(s.slow_consumers), {
+      state: s.slow_consumers > 0 ? "bad" : "",
+      sub: "cumulative since the server started",
+    }),
+    tile("JetStream storage", fmtBytes(s.js_storage_bytes), {
+      sub: s.js_max_storage_bytes ? "of " + fmtBytes(s.js_max_storage_bytes) : "",
+    }),
+    tile("JetStream API errors", fmt(s.api_errors), {
+      state: s.api_errors > 0 ? "warn" : "",
+      sub: fmt(s.api_total) + " call(s)",
+    }),
+  ].join("");
+}
+
+function renderCharts(d) {
+  const h = d.history;
+  lineChart($("chart-msgs"), [
+    { values: h.map((p) => p.in_msgs_per_sec), cls: "series-1-line" },
+    { values: h.map((p) => p.out_msgs_per_sec), cls: "series-2-line" },
+  ], {});
+  lineChart($("chart-depth"), [
+    { values: h.map((p) => p.depth), cls: "series-1-line" },
+    { values: h.map((p) => p.pending), cls: "series-2-line" },
+  ], {});
+
+  if (h.length < 2) {
+    $("chart-meta").textContent =
+      "Collecting. Throughput is the difference between two scrapes, so the first point " +
+      "takes " + d.poll_secs + "s and the chart fills in from there.";
+  } else {
+    const span = h[h.length - 1].at_ms - h[0].at_ms;
+    $("chart-meta").textContent = h.length + " samples over " + fmtDur(span) + ", one every " +
+      d.poll_secs + "s. History is held in memory only and starts over when this app restarts.";
+  }
+}
+
+function renderStreams(d) {
+  const rows = [];
+  let lastAccount = null;
+  let count = 0;
+
+  for (const account of d.accounts) {
+    for (const st of account.streams) {
+      // Repeated-value suppression rather than nesting: the account is a
+      // grouping the eye can follow without an expand/collapse idiom.
+      const newGroup = account.name !== lastAccount;
+      if (newGroup && lastAccount !== null) {
+        rows.push('<tr class="spacer"><td colspan="11"></td></tr>');
+      }
+      const acct = newGroup ? esc(account.name) : "";
+      lastAccount = account.name;
+
+      const orphan = st.orphaned ? ' <span class="pill pill-warn">no consumer</span>' : "";
+      const head =
+        '<td class="group">' + acct + "</td>" +
+        '<td class="group">' + esc(st.name) + orphan +
+        '<div class="subjects">' + esc(st.subjects.join(", ")) + "</div></td>" +
+        "<td>" + esc(st.retention) + " · " + esc(st.storage) + "</td>" +
+        '<td class="num">' + fmt(st.messages) + "</td>" +
+        '<td class="num">' + fmtRate(st.published_per_sec) + "</td>";
+      const tail = "<td>" + esc(st.last_message_ms ? fmtAgo(st.last_message_ms) : DASH) + "</td>";
+
+      if (st.consumers.length === 0) {
+        rows.push("<tr>" + head + '<td class="dim" colspan="5">' +
+          (st.orphaned ? "nothing is draining this stream" : "no consumers") +
+          "</td>" + tail + "</tr>");
+        count += 1;
+        continue;
+      }
+
+      let first = true;
+      for (const c of st.consumers) {
+        // Second and later consumers on one stream repeat only the name, dimmed,
+        // so the gauges line up under the stream they belong to.
+        const cells = first
+          ? head
+          : '<td></td><td class="dim">' + esc(st.name) +
+            "</td><td></td><td></td><td></td>";
+        first = false;
+        const stalled = c.stalled
+          ? ' <span class="pill pill-warn">stalled ' + esc(fmtDur(c.idle_ms)) + "</span>"
+          : "";
+        rows.push("<tr>" + cells +
+          "<td>" + esc(c.name) + stalled +
+          '<div class="subjects">' + esc(c.filter_subject || "(all subjects)") + "</div></td>" +
+          '<td class="num">' + fmt(c.num_pending) + "</td>" +
+          '<td class="num">' + fmt(c.num_ack_pending) + "</td>" +
+          '<td class="num' + (c.num_redelivered > 0 ? " bad" : "") + '">' +
+            fmt(c.num_redelivered) + "</td>" +
+          '<td class="num">' + fmtRate(c.acked_per_sec) + "</td>" +
+          tail + "</tr>");
+        count += 1;
+      }
+    }
+  }
+
+  $("streams-body").innerHTML = rows.join("");
+  $("streams-empty").hidden = count > 0;
+  $("streams-meta").textContent = d.totals.streams + " stream(s), " + d.totals.consumers +
+    " consumer(s) across " + d.totals.accounts + " account(s). Depth is what a stream holds " +
+    "right now; In/s comes from its sequence, which is the only number that moves on a work " +
+    "queue that is keeping up.";
+}
+
+function renderClients(d) {
+  const rows = d.clients.rows.map((c) =>
+    "<tr>" +
+    '<td class="num">' + fmt(c.cid) + "</td>" +
+    "<td>" + (c.name ? esc(c.name) : '<span class="dim">(unnamed)</span>') + "</td>" +
+    "<td>" + esc(c.account || DASH) + "</td>" +
+    '<td class="mono">' + esc(c.address) + "</td>" +
+    "<td>" + esc([c.lang, c.version].filter(Boolean).join(" ") || DASH) + "</td>" +
+    "<td>" + esc(c.uptime || DASH) + "</td>" +
+    "<td>" + esc(c.idle || DASH) + "</td>" +
+    "<td>" + esc(c.rtt || DASH) + "</td>" +
+    '<td class="num" title="' + esc(c.subjects.join(", ")) + '">' + fmt(c.subscriptions) + "</td>" +
+    '<td class="num">' + fmt(c.in_msgs) + "</td>" +
+    '<td class="num">' + fmt(c.out_msgs) + "</td>" +
+    '<td class="num' + (c.pending_bytes > 0 ? " bad" : "") + '">' + fmtBytes(c.pending_bytes) +
+      "</td>" +
+    "</tr>"
+  );
+  $("clients-body").innerHTML = rows.join("");
+  $("clients-empty").hidden = rows.length > 0;
+  $("clients-meta").textContent = d.clients.total + " connection(s)" +
+    (d.clients.truncated ? ", showing the " + rows.length + " most recently active" : "") +
+    ". Hover a subscription count for the subjects that client is bound to. A client with no " +
+    "name did not set one in its CONNECT, which is why every service in this fleet does.";
+}
+
+function renderLogs(payload, replace) {
+  const box = $("log-lines");
+  const empty = $("log-empty");
+
+  if (!payload.enabled) {
+    box.hidden = true;
+    empty.hidden = false;
+    empty.innerHTML = "Log collection is off. Set <code>QUEUE_NATS_LOG_FILE</code> to " +
+      "nats-server's log file to fill this panel. It has to be a file this process can read, " +
+      "so unlike the rest of the page it works only where this app and nats-server share a " +
+      "filesystem.";
+    $("log-meta").textContent = "";
+    return;
+  }
+  if (payload.error) {
+    box.hidden = true;
+    empty.hidden = false;
+    empty.textContent = payload.error;
+    $("log-meta").textContent = "";
+    return;
+  }
+
+  const html = payload.lines.map((l) =>
+    '<div class="log-line">' +
+    '<span class="ts">' + esc(l.ts || DASH) + "</span>" +
+    '<span class="lvl lvl-' + esc(l.level || "info") + '">' + esc(l.level || "") + "</span>" +
+    '<span class="msg">' + esc(l.text) + "</span>" +
+    "</div>"
+  ).join("");
+
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  if (replace) box.innerHTML = html;
+  else if (html) box.insertAdjacentHTML("beforeend", html);
+
+  // Trim the DOM to what the server is willing to hold. Without this, a page
+  // left open grows one node per line forever.
+  while (box.childElementCount > payload.capacity) box.removeChild(box.firstElementChild);
+
+  box.hidden = false;
+  empty.hidden = box.childElementCount > 0;
+  if (box.childElementCount === 0) {
+    empty.textContent = "No lines match. nats-server is quiet when it is healthy — an idle " +
+      "server can go hours without saying anything.";
+  }
+  // Only follow when the reader is already at the bottom, so scrolling back to
+  // read something does not get yanked away by the next poll.
+  if (following && (replace || atBottom)) box.scrollTop = box.scrollHeight;
+
+  $("log-meta").textContent = payload.file + " · " + payload.lines_held + " line(s) held" +
+    (payload.dropped > 0 ? ", " + payload.dropped + " dropped as the buffer wrapped" : "") +
+    ". This is a live tail held in memory, not a log store.";
+}
+
+// --- polling ---------------------------------------------------------------
+
+async function pollOverview() {
+  const response = await fetch("/api/overview", { headers: { accept: "application/json" } });
+  if (!response.ok) throw new Error("overview: " + response.status);
+  const d = await response.json();
+  renderHeader(d);
+  renderTiles(d);
+  renderCharts(d);
+  renderStreams(d);
+  renderClients(d);
+  return d;
+}
+
+async function pollLogs(status) {
+  if (!status.enabled || status.error) { renderLogs(status, true); return; }
+
+  const level = $("log-level").value;
+  const search = $("log-search").value.trim();
+  const key = level + " " + search;
+  // A changed filter means the lines on screen are the wrong set, so the cursor
+  // is abandoned and the window refetched whole.
+  const replace = key !== logFilterKey;
+  if (replace) { logFilterKey = key; logCursor = 0; }
+
+  const params = new URLSearchParams();
+  if (level) params.set("level", level);
+  if (search) params.set("q", search);
+  if (!replace && logCursor) params.set("since", String(logCursor));
+  params.set("limit", "400");
+
+  const response = await fetch("/api/logs?" + params.toString(), {
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) throw new Error("logs: " + response.status);
+  const payload = await response.json();
+  if (payload.lines.length > 0) {
+    logCursor = payload.lines[payload.lines.length - 1].seq;
+  } else {
+    // Nothing matched, but the cursor still has to advance past what exists, or
+    // every later poll would re-offer the lines this filter rejected.
+    logCursor = payload.latest_seq;
+  }
+  renderLogs(payload, replace);
+}
+
+let timer = null;
+
+async function tick() {
+  if (paused) return;
+  try {
+    const d = await pollOverview();
+    await pollLogs(d.logs);
+  } catch (e) {
+    // A failed fetch is this page's problem, not the server's. Say so, rather
+    // than leaving a clock that quietly stopped.
+    const banner = $("banner");
+    banner.className = "banner banner-error";
+    banner.textContent = "The dashboard could not reach its own API: " + e.message;
+    banner.hidden = false;
+  }
+}
+
+$("pause").addEventListener("click", () => {
+  paused = !paused;
+  $("pause").setAttribute("aria-pressed", String(paused));
+  $("pause").textContent = paused ? "resume" : "pause";
+  if (!paused) tick();
+});
+
+$("log-follow").addEventListener("click", () => {
+  following = !following;
+  $("log-follow").setAttribute("aria-pressed", String(following));
+  $("log-follow").textContent = following ? "following" : "follow";
+});
+
+$("log-level").addEventListener("change", () => { if (!paused) tick(); });
+
+let searchTimer = null;
+$("log-search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { if (!paused) tick(); }, 250);
+});
+
+// Poll on the server's own interval: refreshing faster than the scrape behind
+// it only redraws the same numbers. The interval is set from the first
+// response rather than hard-coded, so changing QUEUE_POLL_SECS moves both.
+(async () => {
+  await tick();
+  let seconds = 5;
+  try {
+    const d = await (await fetch("/api/overview")).json();
+    seconds = d.poll_secs;
+  } catch (e) {
+    // Keep the default and let `tick` report the failure in the banner.
+  }
+  timer = setInterval(tick, Math.max(2, seconds) * 1000);
+})();
+</script>
+</body>
+</html>
