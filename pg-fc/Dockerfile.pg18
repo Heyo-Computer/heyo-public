@@ -1,0 +1,54 @@
+# Postgres 18 variant of the Firecracker rootfs image. Identical recipe to
+# ./Dockerfile (the Postgres 16 image) except PG_MAJOR defaults to 18 — the
+# base Dockerfile is already fully parameterized on PG_MAJOR, and init.sh is
+# version-agnostic (it prepends every installed /usr/lib/postgresql/*/bin to
+# PATH). Kept as a separate file so both majors can be built side by side:
+#
+#   heyvm mvm build --local-only -f Dockerfile.pg18 --name pg18
+#
+# See ./Dockerfile for the full commentary on how the image boots under
+# Firecracker; comments here are trimmed to what differs.
+#
+# NOTE: a data volume initdb'd by one major cannot be opened by the other —
+# point Postgres 18 VMs at fresh volumes (or pg_upgrade/dump+restore).
+
+FROM debian:bookworm-slim
+
+ARG PG_MAJOR=18
+ENV DEBIAN_FRONTEND=noninteractive \
+    PGDATA=/workspace/pgdata \
+    PG_MAJOR=${PG_MAJOR}
+
+# Postgres 18 isn't in Debian bookworm's stock repos either, so pull from the
+# PostgreSQL project's own apt repo (PGDG), pinned by its signing key.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl gnupg ca-certificates \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        postgresql-${PG_MAJOR} \
+        postgresql-client-${PG_MAJOR} \
+        e2fsprogs \
+        util-linux \
+        mount \
+        gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Put the versioned Postgres binaries on PATH so init.sh stays version-agnostic.
+ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
+
+# Mount point for the persistent data volume.
+RUN mkdir -p /workspace \
+    && chown postgres:postgres /workspace
+
+# The heyvm/Firecracker builder boots with a fixed kernel arg `init=/init.sh`,
+# so the script must live at the rootfs root.
+COPY init.sh /init.sh
+RUN chmod +x /init.sh
+
+# Ignored on the Firecracker boot path, kept for plain-container runs.
+ENTRYPOINT ["/init.sh"]

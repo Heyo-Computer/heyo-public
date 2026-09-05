@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+#
+# reclaim-disks.sh — return stranded free space from idle VM data disks.
+#
+# Each per-schema VM has a sparse `data.ext4` (provisioned at
+# PG_VM_POOL_DATA_DISK_GB, mostly holes). When Postgres frees blocks inside the
+# guest — recycled WAL, vacuumed heap, dropped temp/tables, a reinitialised
+# cluster — ext4 marks them free, but with no TRIM/discard reaching the host the
+# blocks are never punched out of the backing file. So a disk ratchets toward its
+# full provisioned size and never shrinks, even though the live database is tiny
+# (we've seen 1.1 GB of data pinning 51 GB on disk).
+#
+# This offline-reclaims every data disk whose VM is NOT currently running:
+# recover the journal left dirty by an unclean VM kill (`e2fsck -fp`), then
+# punch every free block and unused inode-table block out of the backing file
+# with `e2fsck -fp -E discard`. Both operate on the image file directly — no
+# loop device, no mount, no fstrim. (An earlier version went
+# loop-mount+fstrim; that path silently stopped punching holes on at least one
+# production host — fstrim errors were swallowed and runs "reclaimed" ~0B from
+# hundreds of GB of slack — while file-level discard keeps working, since it's
+# a plain fallocate(PUNCH_HOLE) on the file.)
+#
+# SAFETY: a disk a live Firecracker still has open is skipped — writing to a
+# filesystem a running guest has mounted would corrupt it. Everything else is
+# best-effort per disk: one failure never aborts the run.
+#
+# SHRINK=1 additionally *shrinks the filesystem* toward its used size before
+# trimming. Legacy disks were formatted across the whole device, so even after
+# an fstrim their next growth ratchets straight back toward the full
+# provisioned size, and the ~1GB of full-device ext4 metadata stays allocated
+# forever. Shrinking retro-fits the thin-provisioning cap the image now applies
+# at first format (see init.sh): target = used * 1.25, floored at MIN_FS_MB
+# (default 2048, matching init.sh's initial size); the guest's grow watcher
+# re-extends the filesystem online if the database needs more. Blocks past the
+# new filesystem end are hole-punched out of the backing file directly (fstrim
+# can't reach past the fs). The shrunk fs is re-fscked before anything mounts
+# it; a disk that fails that check is reported and left unmounted.
+#
+# EXCLUSION: the caller (normally pg-vm-pool) must keep VM boots and this script
+# off the same disk — the in-use scan below is a snapshot taken at pass start,
+# so a VM booted mid-pass would be invisible to it and its filesystem could be
+# fscked underneath the running guest.
+#
+# PER-DISK LOCKS are how that is enforced. Both sides flock a file per sandbox,
+# "$LOCK_DIR/<id>.lock": the pooler holds it across the VM's start(), this
+# script holds it across one disk's whole pipeline and SKIPS any disk it cannot
+# lock (a boot owns it). A boot of a VM this pass isn't touching then costs
+# nothing at all, and the pass keeps running through cold starts and warm-spare
+# restarts instead of losing its progress to them.
+#
+# The lock alone is not enough, because the pooler drops it the moment start()
+# returns — a VM that booted mid-pass holds its disk open but is invisible to a
+# snapshot taken before it existed. So the in-use question is asked twice: once
+# against the snapshot (free, catches everything already running at pass start)
+# and, for whatever survives that, once live while holding the disk's lock,
+# which is the only moment the answer is guaranteed to stay true. See
+# disk_in_use_live.
+#
+# The pooler cannot tell by inspection whether the script it invokes implements
+# this, so it is declared: this script writes $LOCK_PROTOCOL into $LOCK_MARKER
+# at every pass start, and the pooler deletes that marker before each run and
+# re-reads it after. No marker means an older script, and the pooler falls back
+# to blocking every boot for the whole run. Keep $LOCK_PROTOCOL in step with
+# the constant of the same name in the pooler's src/reclaim.rs: a mismatched
+# pair must degrade to the slow path, never to a shared disk.
+#
+# YIELDING is the second half, and still applies under either scheme: when a
+# boot is waiting the pooler creates $STOP_FILE ("$RUN_DIR/.reclaim-stop"), and
+# this script finishes the disk it is on, records where it stopped in
+# $CURSOR_FILE, and exits; the next run resumes after that disk. Stopping
+# between disks (never inside one) is the only safe point, and cooperation is
+# the only safe mechanism — the script runs under sudo, so a caller that
+# "killed" it would only reap the shell while the root e2fsck kept writing.
+#
+# Usage:
+#   sudo ./reclaim-disks.sh [RUN_DIR]        # default RUN_DIR: ~/.heyo/run
+#   sudo DRY_RUN=1 ./reclaim-disks.sh [DIR]  # report candidates, change nothing
+#   sudo SHRINK=1 ./reclaim-disks.sh [DIR]   # also shrink filesystems (slower)
+#   sudo PRUNE_SWAP=1 ./reclaim-disks.sh [DIR]  # also delete guest swapfiles
+#
+# PRUNE_SWAP=1 deletes each stopped VM's /swapfile (via debugfs, no mount —
+# but only AFTER the journal-recovery fsck: debugfs surgery under a dirty
+# journal gets overwritten by the replay and strands the swapfile as an
+# "Unattached inode" preen can't fix; the script also auto-repairs disks
+# damaged that way by an earlier version). Swap contents are dead the moment a VM stops
+# (swap never survives a boot), and init.sh recreates the file — sized to the
+# filesystem — on the next boot, so this is pure reclaim: the swapfile is
+# fully allocated (fallocate/dd, not sparse), up to 2GB per VM on large-RAM
+# fleets, and a plain free-block discard can never touch it because it's a
+# live file.
+#
+set -uo pipefail
+
+RUN_DIR="${1:-${HOME}/.heyo/run}"
+DRY_RUN="${DRY_RUN:-0}"
+SHRINK="${SHRINK:-0}"
+MIN_FS_MB="${MIN_FS_MB:-2048}"
+PRUNE_SWAP="${PRUNE_SWAP:-0}"
+# Cooperative early stop. A pass over a big fleet takes minutes, and the pooler
+# must not boot a VM while this script might fsck its disk — so it blocks boots
+# for the whole run. When a boot is waiting, the pooler creates STOP_FILE and
+# this script yields at its NEXT SAFE POINT and exits: between disks, at stage
+# boundaries inside a disk (each stage leaves the filesystem clean), and even
+# mid-discard — the discard e2fsck runs on a just-verified-clean filesystem
+# where it only punches free blocks, so it is killed outright (partially
+# punched free space is simply re-trimmed next pass). The only waits that must
+# run to completion are a single journal-recovery fsck or an in-progress
+# shrink, so a boot's worst case is one fsck/resize2fs on the largest disk,
+# not a whole per-disk pipeline. A disk yielded mid-way is NOT recorded in the
+# cursor, so the next pass redoes it from the top (every stage is idempotent).
+# The pooler can't just kill this script: it runs under sudo, so the pooler
+# can only signal the shell it spawned while the root e2fsck under it keeps
+# writing — which is exactly the corruption the mutual exclusion prevents.
+# Killing our OWN child mid-discard is different: we are the root process that
+# owns it, and the discard stage is the one provably safe to interrupt.
+STOP_FILE="${STOP_FILE:-$RUN_DIR/.reclaim-stop}"
+# Where a stopped pass left off, so the next one resumes after that disk instead
+# of re-walking the same prefix forever. On a host that yields often, this is
+# what makes fleet-wide progress possible at all.
+CURSOR_FILE="${CURSOR_FILE:-$RUN_DIR/.reclaim-cursor}"
+# Per-disk boot locks, and the marker declaring that this script takes them.
+# See EXCLUSION above; LOCK_PROTOCOL must match the pooler's constant.
+LOCK_DIR="${LOCK_DIR:-$RUN_DIR/.reclaim-locks}"
+LOCK_MARKER="$LOCK_DIR/.protocol"
+LOCK_PROTOCOL="perdisk-1"
+# Set below once the lock dir and the flock(1) binary are both known good.
+PER_DISK_LOCKS=0
+
+die() { echo "error: $*" >&2; exit 1; }
+human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
+# Actual on-disk bytes (allocated blocks), not the sparse apparent size.
+allocated() { du -B1 "$1" 2>/dev/null | cut -f1; }
+
+# Flags may also be passed as arguments after RUN_DIR (equivalent to the env
+# vars). This exists for `sudo -n` callers behind a pinned sudoers entry —
+# sudoers can pin an exact argument list, while env assignments are silently
+# refused without a SETENV tag (a trap that has produced "did nothing" runs).
+[ $# -gt 0 ] && shift
+for arg in "$@"; do
+    case "$arg" in
+        --shrink) SHRINK=1 ;;
+        --prune-swap) PRUNE_SWAP=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        *) die "unknown argument: $arg (expected --shrink, --prune-swap, --dry-run)" ;;
+    esac
+done
+
+if [ "$(id -u)" != 0 ]; then
+    # A dry run only reads, so allow it — but warn: without root the /proc scan
+    # can't see other users' open files, so the in-use check may under-report.
+    [ "$DRY_RUN" = 1 ] || die "must run as root (needs the full /proc scan + write access to the disks)"
+    echo "warning: not root — dry-run in-use detection may be incomplete" >&2
+fi
+[ -d "$RUN_DIR" ] || die "run dir not found: $RUN_DIR"
+for tool in e2fsck dumpe2fs find stat du numfmt; do
+    command -v "$tool" >/dev/null || die "missing required tool: $tool"
+done
+if [ "$SHRINK" = 1 ]; then
+    for tool in resize2fs fallocate; do
+        command -v "$tool" >/dev/null || die "missing required tool for SHRINK=1: $tool"
+    done
+fi
+if [ "$PRUNE_SWAP" = 1 ]; then
+    command -v debugfs >/dev/null || die "missing required tool for PRUNE_SWAP=1: debugfs"
+fi
+
+# Declare per-disk boot locking to the caller (see EXCLUSION at the top).
+# Everything here is best effort: if flock(1) is missing, or the lock dir can't
+# be made writable by both this root script and a non-root pooler, we simply
+# don't claim support — the pooler then keeps every VM boot on the host blocked
+# for this whole run, which is slower but equally safe. 0777/0666 because the
+# two sides normally run as different users and either may create a file first.
+if command -v flock >/dev/null && mkdir -p "$LOCK_DIR" 2>/dev/null; then
+    chmod 0777 "$LOCK_DIR" 2>/dev/null || true
+    if printf '%s\n' "$LOCK_PROTOCOL" >"$LOCK_MARKER" 2>/dev/null; then
+        chmod 0666 "$LOCK_MARKER" 2>/dev/null || true
+        PER_DISK_LOCKS=1
+    fi
+fi
+if [ "$PER_DISK_LOCKS" != 1 ]; then
+    echo "warning: per-disk boot locks unavailable (need flock(1) and a writable" \
+         "$LOCK_DIR) — the caller must block every VM boot for this whole run" >&2
+fi
+
+# Point-in-time set of every file held open by any process, keyed by
+# device:inode. A live Firecracker keeps its data disk open as a plain fd under
+# /proc/<pid>/fd — but Firecracker usually runs under *jailer*, which chroots the
+# VM, so the fd's path is relative to that chroot and will NOT equal the host
+# path. Matching by path therefore silently misses running VMs and trims them
+# (corrupting a disk the guest has mounted RW). device:inode is the same file
+# object regardless of chroot, bind mount, or mount namespace, so it is the
+# safe identity to compare.
+#
+# Built once (a single `find | stat` over all fds) rather than re-scanning /proc
+# per disk, which is O(disks x fds) and does not finish on a busy host. Root sees
+# every process's fds; without it some are unreadable and silently skipped (hence
+# the not-root warning above).
+#
+# Still a snapshot: a VM that *starts* mid-run won't be seen — run during low
+# traffic. The blast radius of a miss is one disk.
+declare -A OPEN_INODES=()
+snapshot_open_files() {
+    local key path pid
+    while read -r key path; do
+        [ -n "$key" ] || continue
+        # Remember (one of) the holding PIDs so a skip can say *who* — the
+        # difference between "that VM is running" and "something unexpected
+        # holds every disk" is the whole diagnosis.
+        pid="${path#/proc/}"
+        pid="${pid%%/*}"
+        OPEN_INODES["$key"]="${OPEN_INODES[$key]:-$pid}"
+    done < <(find /proc/[0-9]*/fd -maxdepth 1 -type l -exec stat -L -c '%d:%i %n' {} + 2>/dev/null)
+}
+
+# In use if some process holds this exact file (device:inode) open. Fails closed:
+# if the disk can't be stat'd we treat it as in use and skip it.
+disk_in_use() {
+    local key
+    key=$(stat -c '%d:%i' "$1" 2>/dev/null) || return 0
+    [ -n "${OPEN_INODES[$key]:-}" ]
+}
+
+# Same question, asked NOW instead of against the pass-start snapshot, for one
+# disk. Only sound — and only called — while this pass holds that disk's lock.
+#
+# Per-disk locks let VMs boot during a pass, and the pooler releases a disk's
+# lock as soon as start() returns, so by the time we take that lock the VM is
+# running and holding its disk open while the snapshot still predates it.
+# Trusting the snapshot there would fsck a live guest's filesystem. Holding the
+# lock is what turns this second scan into a decision rather than a guess: no
+# new boot can claim this disk while we have it, so what it sees stays true for
+# as long as we need it to.
+#
+# Costs one /proc walk per candidate disk, which is why it is not the primary
+# check: the snapshot filters the disks that were already running at pass start
+# for free, and only what survives that pays for a live scan. Under the global
+# gate it is never called at all — no VM can boot during a pass in the first
+# place. Fails closed, like disk_in_use.
+disk_in_use_live() {
+    local key
+    key=$(stat -c '%d:%i' "$1" 2>/dev/null) || return 0
+    find /proc/[0-9]*/fd -maxdepth 1 -type l -exec stat -L -c '%d:%i' {} + 2>/dev/null \
+        | grep -qxF "$key"
+}
+
+shopt -s nullglob
+disks=("$RUN_DIR"/sb-*/data.ext4)
+[ "${#disks[@]}" -gt 0 ] || die "no sb-*/data.ext4 disks under $RUN_DIR"
+
+# Resume after the disk the last (stopped) pass finished. The glob order is
+# stable, so rotating the list is enough — no state beyond one path.
+resume_from=""
+[ "$DRY_RUN" = 1 ] || resume_from=$(cat "$CURSOR_FILE" 2>/dev/null || true)
+if [ -n "$resume_from" ]; then
+    for i in "${!disks[@]}"; do
+        if [ "${disks[$i]}" = "$resume_from" ]; then
+            start=$(( (i + 1) % ${#disks[@]} ))
+            [ "$start" -gt 0 ] && disks=("${disks[@]:$start}" "${disks[@]:0:$start}")
+            echo "resuming after $resume_from"
+            break
+        fi
+    done
+fi
+
+reclaimed=0 trimmed=0 skipped=0 failed=0 shrunk=0 dry_reclaimable=0
+
+# SHRINK=1: shrink the (freshly fsck'd) filesystem inside image file $1 toward
+# its used size, then hole-punch the backing file past the new fs end (blocks
+# there are dead — old metadata/data from the full-size format that a
+# free-block discard can't reach, since they're outside the fs). Everything
+# operates on the file directly. Returns: 0 = shrunk (counted) or nothing to
+# do, 1 = shrink failed (fs untouched — reclaim may proceed), 2 = post-shrink
+# fsck failed (leave the disk alone and report).
+shrink_fs() {
+    local disk="$1" geom bs blocks free used target floor_blk
+    geom=$(dumpe2fs -h "$disk" 2>/dev/null) || return 1
+    bs=$(awk -F: '/^Block size:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+    blocks=$(awk -F: '/^Block count:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+    free=$(awk -F: '/^Free blocks:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+    { [ -n "$bs" ] && [ -n "$blocks" ] && [ -n "$free" ]; } || return 1
+    used=$((blocks - free))
+    target=$((used + used / 4))
+    floor_blk=$((MIN_FS_MB * 1024 * 1024 / bs))
+    [ "$target" -lt "$floor_blk" ] && target=$floor_blk
+    # Not worth a slow, block-moving resize unless it retires at least 256MB
+    # of future ratchet room.
+    [ "$blocks" -le $((target + 268435456 / bs)) ] && return 0
+    resize2fs "$disk" "$target" >/dev/null 2>&1 || return 1
+    # A shrink relocates data; verify the result before going further.
+    e2fsck -fp "$disk" >/dev/null 2>&1
+    [ $? -ge 4 ] && return 2
+    local fs_bytes=$((target * bs)) file_bytes
+    file_bytes=$(stat -c %s "$disk" 2>/dev/null || echo 0)
+    if [ "$file_bytes" -gt "$fs_bytes" ]; then
+        fallocate -p -o "$fs_bytes" -l $((file_bytes - fs_bytes)) "$disk" 2>/dev/null
+    fi
+    shrunk=$((shrunk + 1))
+    return 0
+}
+
+# Trim one disk with fully local cleanup. Returns non-zero on any failure but the
+# caller keeps going — a single bad disk must not stop the sweep.
+trim_one() {
+    local disk="$1"
+    # Guard: never touch a disk a running VM has open. Name the holder — an
+    # expected skip is a firecracker/jailer PID; anything else (or *every*
+    # disk skipped) points at a process unexpectedly pinning the fleet.
+    if disk_in_use "$disk"; then
+        local key pid comm="?"
+        key=$(stat -c '%d:%i' "$disk" 2>/dev/null)
+        pid="${OPEN_INODES[${key:-none}]:-?}"
+        [ -r "/proc/$pid/comm" ] && comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+        echo "skip  (in use by pid $pid/$comm)  $disk"
+        skipped=$((skipped + 1))
+        return 0
+    fi
+    # A VM that booted after the snapshot was taken (see disk_in_use_live).
+    # LOCK_HELD, not PER_DISK_LOCKS: the answer is only trustworthy while this
+    # pass holds the disk's lock, so the caller says whether it does.
+    if [ "${LOCK_HELD:-0}" = 1 ] && disk_in_use_live "$disk"; then
+        echo "skip  (booted during this pass)  $disk"
+        skipped=$((skipped + 1))
+        return 0
+    fi
+
+    local before after
+    before=$(allocated "$disk")
+
+    if [ "$DRY_RUN" = 1 ]; then
+        # Estimate what a trim would actually free: allocated bytes minus the
+        # filesystem's used bytes. Without this, "would-trim" reads as savings
+        # when it's only candidacy — an already-lean disk would-trims ~0B.
+        local est=""
+        if command -v dumpe2fs >/dev/null; then
+            local geom bs total_b free_b
+            geom=$(dumpe2fs -h "$disk" 2>/dev/null)
+            bs=$(awk -F: '/^Block size:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+            total_b=$(awk -F: '/^Block count:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+            free_b=$(awk -F: '/^Free blocks:/ {gsub(/ /,"",$2); print $2}' <<<"$geom")
+            if [ -n "$bs" ] && [ -n "$total_b" ] && [ -n "$free_b" ]; then
+                local gain=$((before - (total_b - free_b) * bs))
+                [ "$gain" -lt 0 ] && gain=0
+                est="  ~$(human "$gain") reclaimable"
+                dry_reclaimable=$((dry_reclaimable + gain))
+            fi
+        fi
+        echo "would-trim$([ "$SHRINK" = 1 ] && echo ' (+shrink)')  $disk  ($(human "$before") allocated$est)"
+        return 0
+    fi
+
+    # Recover the journal FIRST (VMs are killed uncleanly, so it's usually
+    # dirty) — before any debugfs surgery. An earlier version pruned the
+    # swapfile before this fsck; the journal replay then overwrote the
+    # modified metadata and left an "Unattached inode 12" (the swapfile) that
+    # preen refuses to fix, FAILing the whole fleet. -p auto-fixes and exits 1
+    # when it did — expected, not a failure. Only a code >= 4 means the
+    # filesystem is still bad. Output is captured and surfaced on failure: a
+    # whole fleet FAILing for one systemic reason (host e2fsck too old for the
+    # guest's ext4 features, OOM, permissions) is undiagnosable from a bare
+    # exit code.
+    local fsck_out
+    fsck_out=$(e2fsck -fp "$disk" 2>&1)
+    local fsck_rc=$?
+
+    # Remediate the damage that old ordering left behind: preen reports
+    # "Unattached inode N" and gives up. Strictly NAMELESS inodes (no dirent
+    # anywhere — ncheck prints nothing) are unreachable dead weight, i.e. the
+    # ex-swapfile; kill_file frees their blocks, clri zeroes the inode so
+    # nothing resurrects it, and a re-preen leaves a clean filesystem. An
+    # unattached inode that still has a name anywhere is a real file and is
+    # never touched (the FAIL stands, for badfs/manual recovery).
+    if [ "$fsck_rc" -ge 4 ] && echo "$fsck_out" | grep -q "Unattached inode"; then
+        local ino killed=0
+        for ino in $(echo "$fsck_out" | grep -oE 'Unattached (zero-length )?inode [0-9]+' \
+                     | grep -oE '[0-9]+$' | sort -un); do
+            if ! debugfs -R "ncheck $ino" "$disk" 2>/dev/null \
+                 | awk 'NR>1 && NF>=2 {f=1} END {exit !f}'; then
+                debugfs -w -R "kill_file <$ino>" "$disk" >/dev/null 2>&1
+                debugfs -w -R "clri <$ino>" "$disk" >/dev/null 2>&1
+                killed=$((killed + 1))
+            fi
+        done
+        if [ "$killed" -gt 0 ]; then
+            fsck_out=$(e2fsck -fp "$disk" 2>&1)
+            fsck_rc=$?
+            [ "$fsck_rc" -lt 4 ] \
+                && echo "note  (freed $killed nameless unattached inode(s): stale pruned swap)  $disk"
+        fi
+    fi
+
+    if [ "$fsck_rc" -ge 4 ]; then
+        echo "FAIL  (fsck=$fsck_rc)     $disk"
+        [ -n "$fsck_out" ] && echo "$fsck_out" | grep -v '^$' | head -n 2 | sed 's/^/      /'
+        case "$fsck_out" in
+            *"unsupported feature"*|*"Get a newer version"*|*"unknown ROCOMPAT"*|*"unknown INCOMPAT"*)
+                echo "      hint: the guest's mkfs enabled ext4 features this host's e2fsprogs" \
+                     "($(e2fsck -V 2>&1 | head -n1)) doesn't know — upgrade e2fsprogs on the host" ;;
+        esac
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    # A boot is waiting: yield now. The journal is recovered and the
+    # filesystem verified clean, so leaving prune/shrink/trim for the next
+    # pass costs nothing but this disk's not-yet-reclaimed bytes.
+    if [ -e "$STOP_FILE" ]; then
+        echo "yield (boot waiting; disk clean, re-trimmed next pass)  $disk"
+        return 3
+    fi
+
+    # Drop the dead swapfile — only now, on a recovered journal (see above).
+    # On a clean filesystem debugfs's rm fully deallocates (1.47+); older
+    # debugfs leaves a zero-dtime deleted inode, which the preen right after
+    # (and the discard fsck below) auto-fix.
+    if [ "$PRUNE_SWAP" = 1 ] \
+        && debugfs -R "stat /swapfile" "$disk" >/dev/null 2>&1; then
+        debugfs -w -R "rm /swapfile" "$disk" >/dev/null 2>&1
+        e2fsck -fp "$disk" >/dev/null 2>&1
+        if [ $? -ge 4 ]; then
+            echo "FAIL  (fsck after swap prune)  $disk"
+            failed=$((failed + 1))
+            return 1
+        fi
+    fi
+
+    # Same yield before committing to a shrink — resize2fs relocates data
+    # and must never be interrupted, so don't start one with a boot waiting.
+    if [ -e "$STOP_FILE" ]; then
+        echo "yield (boot waiting; disk clean, re-trimmed next pass)  $disk"
+        return 3
+    fi
+
+    # Optional filesystem shrink (see shrink_fs).
+    if [ "$SHRINK" = 1 ]; then
+        shrink_fs "$disk"
+        case $? in
+            1) echo "note  (shrink failed, reclaim only)  $disk" ;;
+            2)
+                echo "FAIL  (fsck after shrink)  $disk"
+                failed=$((failed + 1))
+                return 1
+                ;;
+        esac
+    fi
+
+    # The reclaim itself: punch every free block and unused inode-table block
+    # out of the backing file. File-level fallocate(PUNCH_HOLE) — works even
+    # where loop-device discard doesn't.
+    #
+    # This is the long stage on a large disk, so it runs killably: the
+    # filesystem was verified clean immediately above, and on a clean fs
+    # -E discard only punches FREE blocks — interrupting it leaves some
+    # punched and the rest for the next pass, never an inconsistent
+    # filesystem. Poll for the stop file while it runs.
+    local dfsck_out_f dfsck_pid
+    dfsck_out_f=$(mktemp)
+    e2fsck -fp -E discard "$disk" >"$dfsck_out_f" 2>&1 &
+    dfsck_pid=$!
+    while kill -0 "$dfsck_pid" 2>/dev/null; do
+        if [ -e "$STOP_FILE" ]; then
+            kill "$dfsck_pid" 2>/dev/null
+            wait "$dfsck_pid" 2>/dev/null
+            rm -f "$dfsck_out_f"
+            echo "yield (boot waiting, stopped mid-discard; disk clean, re-trimmed next pass)  $disk"
+            return 3
+        fi
+        # 100ms, not seconds: this is both how fast a waiting boot is noticed
+        # and how much dead time every disk pays after its discard finishes.
+        # The loop is two syscalls (a signal probe and a stat), so 10Hz is free
+        # next to the fsck it is watching.
+        sleep 0.1
+    done
+    wait "$dfsck_pid"
+    local dfsck_rc=$?
+    fsck_out=$(cat "$dfsck_out_f")
+    rm -f "$dfsck_out_f"
+    if [ "$dfsck_rc" -ge 4 ]; then
+        echo "FAIL  (discard fsck)  $disk"
+        [ -n "$fsck_out" ] && echo "$fsck_out" | grep -v '^$' | head -n 2 | sed 's/^/      /'
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    after=$(allocated "$disk")
+    local freed=$((before - after))
+    [ "$freed" -lt 0 ] && freed=0
+    reclaimed=$((reclaimed + freed))
+    trimmed=$((trimmed + 1))
+    printf 'trim  %-12s %s\n' "-$(human "$freed")" "$disk"
+    return 0
+}
+
+# Run trim_one under this disk's boot lock, so a VM boot and this pass can never
+# be working on the same data.ext4 — the exact hazard the caller's old
+# block-every-boot rule was paying for fleet-wide.
+#
+# Non-blocking on purpose: a disk whose lock is held is one a VM is booting
+# right now, so the next pass will find it stopped anyway. Waiting would trade
+# this pass's progress for a disk we are about to be told to leave alone.
+#
+# The lock rides fd 9 on a brace group, NOT `exec`: a brace group runs in this
+# same shell (so trim_one's counter updates survive, which a subshell would
+# discard) and a redirection that fails merely fails the group, where a failed
+# `exec` redirection would silently exit the whole script.
+run_locked() {
+    local disk="$1" lock lock_rc
+    if [ "$PER_DISK_LOCKS" != 1 ] || [ "$DRY_RUN" = 1 ]; then
+        LOCK_HELD=0
+        trim_one "$disk"
+        return $?
+    fi
+    lock="$LOCK_DIR/$(basename "$(dirname "$disk")").lock"
+    : >>"$lock" 2>/dev/null && chmod 0666 "$lock" 2>/dev/null
+
+    # 100/101 are out of trim_one's range (0, 1, 3), so the three outcomes stay
+    # distinguishable after the group closes fd 9 and releases the lock.
+    lock_rc=100
+    {
+        if flock -n 9; then
+            LOCK_HELD=1
+            trim_one "$disk"
+            lock_rc=$?
+            LOCK_HELD=0
+        else
+            lock_rc=101
+        fi
+    } 9>>"$lock"
+
+    case "$lock_rc" in
+        100)
+            echo "skip  (lock file unusable: $lock)  $disk"
+            skipped=$((skipped + 1))
+            return 0
+            ;;
+        101)
+            echo "skip  (a VM boot holds the disk lock)  $disk"
+            skipped=$((skipped + 1))
+            return 0
+            ;;
+        *) return "$lock_rc" ;;
+    esac
+}
+
+# Announce the active flags: env vars silently stripped by sudo's env_reset
+# (`SHRINK=1 sudo …` instead of `sudo SHRINK=1 …`) have twice produced runs
+# that "did nothing" — make a flagless run visible in the first line.
+echo "reclaim-disks: ${#disks[@]} disk(s) under $RUN_DIR (dry-run=$DRY_RUN shrink=$SHRINK prune-swap=$PRUNE_SWAP per-disk-locks=$PER_DISK_LOCKS; $(e2fsck -V 2>&1 | head -n1))"
+snapshot_open_files
+stopped_early=0 done_count=0 last_done=""
+for disk in "${disks[@]}"; do
+    # Cheapest stop point: before even starting the next disk. trim_one has
+    # its own within-disk yield points for stops that land mid-pipeline.
+    if [ -e "$STOP_FILE" ]; then
+        stopped_early=1
+        break
+    fi
+    run_locked "$disk"
+    if [ $? -eq 3 ]; then
+        # Yielded mid-disk: not recorded as done, so the next pass redoes this
+        # disk from the top (every stage is idempotent).
+        stopped_early=1
+        break
+    fi
+    done_count=$((done_count + 1))
+    last_done="$disk"
+done
+if [ "$DRY_RUN" != 1 ]; then
+    if [ "$stopped_early" = 1 ] && [ -n "$last_done" ]; then
+        printf '%s\n' "$last_done" >"$CURSOR_FILE" 2>/dev/null || true
+    else
+        # A complete pass has no remainder to resume from.
+        rm -f "$CURSOR_FILE" 2>/dev/null || true
+    fi
+fi
+
+echo "----"
+if [ "$DRY_RUN" = 1 ]; then
+    echo "dry-run: $((${#disks[@]} - skipped)) candidate(s), ~$(human "$dry_reclaimable") reclaimable by trim, $skipped in use (skipped)"
+else
+    shrink_note=""
+    [ "$SHRINK" = 1 ] && shrink_note=" ($shrunk filesystem(s) shrunk)"
+    stop_note=""
+    [ "$stopped_early" = 1 ] && stop_note=" — stopped early after $done_count/${#disks[@]} disk(s) (a VM needed to boot); next run resumes here"
+    echo "trimmed $trimmed disk(s), reclaimed $(human "$reclaimed")$shrink_note; $skipped in use, $failed failed$stop_note"
+fi
