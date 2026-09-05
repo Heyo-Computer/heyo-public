@@ -16,6 +16,7 @@ supporting CLIs, plugins, examples, docs, and reusable agent skills.
 - `app-obs/` — logs, metrics, retention, query API, and dashboard for deployments managed by app-lb.
 - `artifacts/` — content-addressed artifact store for ext4, wired into heyvm. Ships as a library, the `art` CLI, and a daemon.
 - `ci/` — heyvm-backed CI orchestrator and dashboard, with NATS JetStream as the job queue. Runs this repository's own `.ci/` workflows.
+- `pg-fc/` — Firecracker Postgres image, database pooler, and provisioning dashboard. See [`pg-fc/README.md`](pg-fc/README.md) for setup and import history.
 - `ui/` — the shared dashboard UI: tokens, the theme cookie, forwarded identity and the fonts. app-lb, app-obs, ci, heyosecret and artifacts all serve it, so the five read as one product. See [`ui/README.md`](ui/README.md).
 - `plugins/` — printer plugins for agent integrations, codegraph, heyvm, and related tooling.
 - `skills/` — reusable public agent skills. The top-level catalog is intentionally small: `heyvm` and `git-submit`.
@@ -42,6 +43,7 @@ cargo test --locked --manifest-path app-lb/heyctl/Cargo.toml
 cargo test --locked --manifest-path app-obs/Cargo.toml
 cargo test --locked --manifest-path artifacts/Cargo.toml
 cargo test --locked --manifest-path ci/Cargo.toml
+cargo test --locked --manifest-path pg-fc/Cargo.toml
 ```
 
 See [`orchestrator/README.md`](orchestrator/README.md) for configuration, local

@@ -7,6 +7,31 @@ endpoint — one VM per schema, created and stopped/restarted on demand. The
 Firecracker image is the unit the pooler manages; the pooler is what a real
 client actually connects to.
 
+## Monorepo import
+
+Imported from [Heyo-Computer/pg-fc](https://github.com/Heyo-Computer/pg-fc)
+at [3168714](https://github.com/Heyo-Computer/pg-fc/commit/3168714ec1c7be2e3e702cb5b062d119cfb39be1)
+using `git subtree add --prefix=pg-fc` without `--squash`. All 100 source
+commits retain their original IDs, authors, and parent relationships. Before
+the import, their file paths are repository-relative (for example `src/vm.rs`,
+not `pg-fc/src/vm.rs`). To inspect that history:
+
+```sh
+git log 3168714ec1c7be2e3e702cb5b062d119cfb39be1 -- src/vm.rs
+```
+
+Merge this import with a **merge commit**, not a squash/rebase or a patch-only
+submission, to retain the source history on the monorepo's main branch.
+The import does not deploy the pooler, change VM runtimes, or migrate databases.
+The accidentally tracked source registry is removed from the imported working
+tree; runtime state must come from the configured state directory, never Git.
+
+Unless otherwise noted, commands below run from `pg-fc/`. From the monorepo
+root, build with `cargo build --locked --manifest-path pg-fc/Cargo.toml` and
+test with `cargo test --locked --manifest-path pg-fc/Cargo.toml`. Linux/KVM is
+required for VM integration tests and image builds. Supervisor configurations
+are examples with host-specific paths; adapt them before use.
+
 ## Prerequisites
 
 Linux only — Firecracker needs KVM, so there's no macOS host support.
