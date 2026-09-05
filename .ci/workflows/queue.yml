@@ -1,0 +1,297 @@
+# Build the `queue` release binary — the NATS dashboard — and upload it as an
+# artifact for `.ci/install.sh` to pull onto a host.
+#
+# Submitted from the repository root, with an ordinary bundle:
+#
+#     git submit
+#
+# **No `--archive`**, unlike the private `heyo` monorepo. This repository's
+# whole history bundles to a few megabytes against a 64 MB
+# `CI_MAX_SOURCE_BYTES`, so the default payload fits — which matters twice:
+# `.git` exists in the guest, so the version stamp below is real `git describe`
+# output, and the change set is real, so the `paths:` filter actually filters.
+name: queue
+
+on:
+  submit:
+    paths:
+      # The crate. A lone package: no workspace members, no cargo path
+      # dependencies.
+      - 'queue/**'
+      # **The shared UI is a real input to this binary.** `queue/src/main.rs`
+      # pulls `ui/ui.rs` in with `#[path]`, and that module embeds `heyo.css`,
+      # `theme.js` and six font files with `include_str!`/`include_bytes!`. None
+      # of that is a cargo dependency, so the lockfile says nothing about it —
+      # but a change to any of those bytes is a different binary, exactly the
+      # way a path dependency is (see "Adding a workflow", item 1, in
+      # `.ci/README.md`).
+      #
+      # `art.yml` lists it for the same reason and says so in the same words.
+      # `app-lb.yml`, `app-obs.yml` and `ci.yml` include the module too and do
+      # not, so a stylesheet change does not rebuild those three — a gap in
+      # them rather than an argument against this line.
+      - 'ui/**'
+      # This workflow and the image it builds in — named precisely rather than
+      # as `.ci/**`, so adding a workflow for another crate here does not
+      # rebuild this one. The image is shared with `app-lb.yml` and
+      # `app-obs.yml`, so editing it rebuilds all three, which is the one change
+      # that genuinely must.
+      - '.ci/workflows/queue.yml'
+      - '.ci/image/apps/**'
+
+jobs:
+  release:
+    # Pinned to the orchestrator's own host, like `app-lb.yml` and
+    # `app-obs.yml`: the warm VM, its cache disk and the image catalog all live
+    # on one machine, so every placement elsewhere is a cold build. `default`
+    # rather than a spelled-out `<network>/<node>`, so the pin survives the host
+    # being renamed.
+    uses: default
+    vm:
+      driver: firecracker
+      build:
+        dockerfile: .ci/image/apps/Dockerfile
+        context: .ci/image/apps
+        # Must equal `app-lb.yml` and `app-obs.yml` exactly. The image is named
+        # by a hash of the Dockerfile, its context and this number, so a
+        # different value here would build a second rootfs from byte-identical
+        # inputs and none of the three jobs would reuse the others'.
+        size_mb: 10240
+      # `large` (4 CPU, 8 GB) for 191 crates, which looks generous next to
+      # `codegraph`'s `medium` for 109 — but the README's rule is to pick on
+      # memory and on what actually compiles, not on crate count.
+      #
+      # What decides it is `aws-lc-sys`. `reqwest 0.13`'s rustls stack reaches
+      # it, so this build compiles the same C project `app-lb` does on `large`,
+      # with cmake. `medium` (2 CPU, 4 GB) would very likely work — nothing here
+      # is datafusion — but there is no swap in a microVM, so being wrong is an
+      # OOM kill that surfaces as an opaque signal rather than a slow build, and
+      # the two extra cores also halve a cold compile. Drop to `medium` if
+      # placement ever becomes the constraint; the class is part of the pool
+      # fingerprint, so changing it retires the old pool on its own.
+      size_class: large
+      # Mounted at /var/cache/ci by the image's init, which is where
+      # CARGO_TARGET_DIR points — deliberately *not* /workspace, which `ci`
+      # wipes on every checkout. This disk is what makes reusing a warm VM worth
+      # anything.
+      #
+      # 20 GB against a measured 1.0 GB debug target dir. The margin is not
+      # generosity: cargo never garbage-collects a `target/`, so what matters is
+      # how many reuses fit before init.sh's 85% guard wipes it.
+      disk_size_gb: 20
+      # The lockfile *is* listed here, unlike in `app-lb.yml` and `app-obs.yml`.
+      # Those two exclude it deliberately, and their reasoning is sound for
+      # them: busting the pool on a dependency bump throws `target/` away and
+      # pays a full cold build, which for datafusion or vendored OpenSSL is over
+      # an hour. This graph is 191 crates and its cold build is minutes, so that
+      # trade runs the other way — the correctness the README's checklist asks
+      # for costs almost nothing here.
+      #
+      # `rust-toolchain.toml` is listed although the crate has none: a missing
+      # file hashes to an explicit marker, so adding one later busts the pool at
+      # the moment it most needs busting. This crate is edition 2024, so a pin
+      # would be a real constraint rather than a formality.
+      #
+      # `ui/` is deliberately *not* here. It changes the binary but not the
+      # dependency graph, and cargo tracks `include_str!`/`include_bytes!`
+      # inputs in its own dep-info — so a warm VM rebuilds the crate correctly
+      # without the pool being retired for it.
+      cache_key_files:
+        - queue/Cargo.lock
+        - queue/rust-toolchain.toml
+    env:
+      CARGO_TERM_COLOR: never
+    # Headroom over the sum of the steps. A cold build of 191 crates plus
+    # aws-lc-sys is minutes, not the hour a large workspace takes; a warm VM
+    # reuses /var/cache/ci and relinks. Under 60, so no `ttl_seconds` is needed
+    # — see `.ci/README.md` on why anything longer must set one.
+    timeout-minutes: 45
+    steps:
+      # The image's init runs the same guard, but only at boot — a warm VM
+      # serves many runs between boots, and the disk fills *while* warm. Without
+      # this a pooled VM that crosses the threshold mid-lifetime fails every
+      # build with SIGBUS (rustc writes its output through mmap, and a mapped
+      # page that cannot be backed on a full filesystem kills the process) until
+      # the VM happens to be retired.
+      - name: Guard the cache disk
+        run: |
+          df -P "$CARGO_TARGET_DIR" /
+          if [ "$(stat -c %d "$CARGO_TARGET_DIR")" = "$(stat -c %d /)" ]; then
+            echo "FATAL: $CARGO_TARGET_DIR is on the rootfs — the data disk (/dev/vdb) is not attached." >&2
+            exit 1
+          fi
+          usage=$(df -P "$CARGO_TARGET_DIR" | awk 'NR==2 {gsub(/%/,""); print $5}')
+          if [ -n "$usage" ] && [ "$usage" -ge 85 ]; then
+            echo "cache disk at ${usage}%, wiping $CARGO_TARGET_DIR"
+            rm -rf "$CARGO_TARGET_DIR"
+          fi
+
+      # Its own step with its own short ceiling, so a registry stall fails in
+      # ten minutes under its own name instead of silently eating the build
+      # step's budget. One retry, because a transient registry hiccup is common
+      # enough not to fail a run over.
+      - name: Fetch dependencies
+        working-directory: /workspace/queue
+        run: |
+          cargo fetch --locked || { echo "fetch failed; retrying once"; sleep 10; cargo fetch --locked; }
+        timeout-minutes: 10
+
+      - name: Build
+        # Absolute: `ci` renders `working-directory:` verbatim rather than
+        # joining it onto /workspace, so a bare `queue` would resolve against
+        # the login shell's home directory.
+        working-directory: /workspace/queue
+        # `--locked`, because the VM's fingerprint is a claim about the
+        # lockfile. `--bins` to skip test and example targets. No `--workspace`:
+        # this is a lone package with no members.
+        run: |
+          df -P / "$CARGO_TARGET_DIR"
+          free -m || true
+          echo "cpus: $(nproc)  load: $(cat /proc/loadavg)"
+          log="$CARGO_TARGET_DIR/queue-build.log"
+          rc=0
+          # Output to a file rather than the serial console, and bounded in the
+          # guest five minutes under the step's ceiling — both lessons from
+          # app-obs.yml. GNU timeout signals the whole process group, so cargo
+          # and every rustc die together and the step comes back as a failure
+          # *with a log* rather than a daemon-side kill with nothing. Exit 124
+          # is the in-guest timeout itself.
+          timeout -k 60 1800 env CARGO_TERM_PROGRESS_WHEN=never \
+            cargo build --release --locked --bins > "$log" 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            [ "$rc" -eq 124 ] && echo "=== the in-guest timeout killed the build after 1800s ==="
+            echo "=== build failed (exit $rc); last 100 log lines ==="
+            tail -100 "$log" 2>/dev/null || echo "(no log at $log)"
+            echo "=== guest kernel log tail ==="
+            echo "(look for 'Out of memory: Killed process' — that means size_class is too small)"
+            dmesg | tail -50 || true
+            df -P / "$CARGO_TARGET_DIR"
+            exit 1
+          fi
+          tail -5 "$log"
+        timeout-minutes: 35
+
+      # A real invocation, not the link check `app-lb` and `app-obs` settle for.
+      #
+      # Those two take no arguments and run until killed, so there is nothing to
+      # run that proves anything. This one is a server that binds a port and
+      # serves an embedded page, and that page is assembled at compile time from
+      # files in a *different directory* — `ui/heyo.css`, `theme.js` and six
+      # fonts, reached by `include_bytes!` through a `#[path]` module. A broken
+      # include is a compile error, but a stale asset name is not: `ui.rs` has
+      # its own test for that, and this proves the bytes actually ship in this
+      # binary.
+      #
+      # Pointed at a monitoring port that cannot exist, deliberately. The
+      # degraded path is the one worth exercising in CI: it proves the process
+      # comes up and serves when NATS is *absent*, which is how it will start on
+      # a host where nats-server has not booted yet.
+      - name: Smoke-test the binary
+        run: |
+          set -eu
+          bin="$CARGO_TARGET_DIR/release/queue"
+          [ -x "$bin" ] || { echo "FATAL: queue was not built at $bin" >&2; exit 1; }
+          if ldd "$bin" | grep 'not found'; then
+            echo "FATAL: queue has unresolved shared libraries (see above)" >&2
+            exit 1
+          fi
+
+          QUEUE_API_ADDR=127.0.0.1:9700 \
+          QUEUE_NATS_MONITOR_URL=http://127.0.0.1:1 \
+          QUEUE_POLL_SECS=1 \
+            "$bin" > /tmp/queue-smoke.log 2>&1 &
+          pid=$!
+          # shellcheck disable=SC2064
+          trap "kill $pid 2>/dev/null || true" EXIT
+
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:9700/healthz; then ready=1; break; fi
+            sleep 0.5
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "FATAL: queue never answered /healthz; its log said:" >&2
+            cat /tmp/queue-smoke.log >&2
+            exit 1
+          fi
+          echo "ok: binds and answers /healthz"
+
+          # The embedded UI. A 404 here means the assets did not make it into
+          # this binary, which no amount of `ldd` would have caught.
+          for asset in heyo.css theme.js fonts/silkscreen-400.woff2; do
+            curl -sf -o /dev/null "http://127.0.0.1:9700/__ui/$asset" \
+              || { echo "FATAL: /__ui/$asset is not served by this binary" >&2; exit 1; }
+          done
+          echo "ok: the shared stylesheet, theme script and fonts are embedded"
+
+          page="$(curl -sf http://127.0.0.1:9700/dashboard)"
+          case "$page" in
+            *"{{"*) echo "FATAL: the dashboard shipped with an unsubstituted placeholder" >&2; exit 1 ;;
+          esac
+          case "$page" in
+            *"<title>queue</title>"*) echo "ok: the dashboard renders" ;;
+            *) echo "FATAL: /dashboard did not return the page" >&2; exit 1 ;;
+          esac
+
+          # And the degraded path: no monitoring port, so this must report a
+          # failed scrape rather than crash or hang.
+          overview="$(curl -sf http://127.0.0.1:9700/api/overview)"
+          case "$overview" in
+            *'"connected":false'*) echo "ok: reports an unreachable NATS instead of failing" ;;
+            *) echo "FATAL: /api/overview did not report the unreachable monitoring port: $overview" >&2; exit 1 ;;
+          esac
+
+      # The binary is copied back into the workspace because
+      # `ci/upload-artifact` tars relative to /workspace, and CARGO_TARGET_DIR
+      # is outside it entirely. Stripped on the way: the guest pushes to the
+      # store over its own network, but when it cannot, the uploader falls back
+      # to base64 over the emulated serial console at tens of KiB/s, where a
+      # third off the payload is a third off the slowest step of the run.
+      - name: Collect the binary
+        run: |
+          set -eu
+          mkdir -p dist
+          src="$CARGO_TARGET_DIR/release/queue"
+          [ -f "$src" ] || { echo "FATAL: queue was not built at $src" >&2; exit 1; }
+          cp "$src" dist/queue
+          strip dist/queue
+          # The supervisor unit it is deployed under, shipped beside it: the one
+          # file a person needs to run this artifact, and the one most likely to
+          # drift from the binary it configures. `.ci/install.sh` looks for
+          # exactly this name.
+          cp queue/deploy/supervisor/queue.conf dist/
+          # The app-lb deployment spec too. Unlike the supervisor unit this is
+          # not something install.sh acts on — it is a template a person edits
+          # and registers — but it is the other half of "deploy this", and
+          # shipping it with the binary keeps the two in step.
+          cp queue/examples/queue.json dist/queue.deployment.example.json
+          describe="$(git -C /workspace describe --tags --always --dirty 2>/dev/null || echo 'no-git')"
+          cat > dist/BUILD-INFO <<EOF
+          describe  $describe
+          commit    ${{ ci.sha }}
+          branch    ${{ ci.branch }}
+          run       ${{ ci.run_id }}
+          EOF
+          ( cd dist && sha256sum queue > SHA256SUMS )
+          ls -la dist
+          cat dist/BUILD-INFO
+          bytes="$(tar czf - dist | wc -c)"
+          echo "upload payload: $bytes bytes gzipped, $(( bytes * 4 / 3 )) base64 if read out over the exec channel"
+
+      # Tagged `ci-queue-<run>-release-queue` in the store. `.ci/install.sh`
+      # resolves that series; there is no legacy series to fall back to, since
+      # this workflow has never been named anything else.
+      - uses: ci/upload-artifact
+        with:
+          name: queue
+          description: >-
+            The queue NATS dashboard, release binary for x86_64-linux, with the
+            supervisor unit, an app-lb deployment template and SHA256SUMS.
+            Built from ${{ ci.branch }}.
+          path: dist
+          # Fetchable by link with no ART_API_KEY once stored: the store marks
+          # the tarball's blob public, and the step log and the run page carry
+          # the `{store}/blobs/{digest}` URL. Download-only — the tag, the
+          # manifest and the store's listings stay behind the key, so
+          # `.ci/install.sh` (which resolves tags) still needs one.
+          public: true
