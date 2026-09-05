@@ -1,0 +1,50 @@
+[package]
+name = "pg-vm-pool"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+deadpool-postgres = "0.14.1"
+tokio-postgres = "0.7"
+heyo-sdk = "0.1.5"
+tokio = { version = "1", features = ["full"] }
+# TCP keepalive (and TCP_USER_TIMEOUT on Linux) on both legs of a splice —
+# tokio's TcpStream exposes only TCP_NODELAY. Already resolved in Cargo.lock
+# via the hyper/reqwest stack, so this adds no new compilation; the `all`
+# feature only unlocks API surface (TCP_KEEPCNT, TCP_USER_TIMEOUT).
+socket2 = { version = "0.6", features = ["all"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+futures = "0.3.32"
+# pre_exec deprioritization (nice 19 + ioprio best-effort-lowest) of the
+# offload path's zstd/e2fsck children, so background reaping never outbids a
+# client for CPU or disk. Already resolved in Cargo.lock via tokio/socket2.
+libc = "0.2"
+# Client-facing TLS (SSLRequest upgrade). Both crates are already in the tree
+# via heyo-sdk's reqwest stack with the `ring` provider — default features are
+# off so we don't drag in the aws-lc-rs provider on top.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = "1"
+# Admin dashboard: axum for the HTTP surface, maud for server-side-rendered
+# HTML (its `axum` feature makes `Markup: IntoResponse`), base64 for decoding
+# the HTTP Basic auth header. The hyper/http/tower stack axum 0.8 pulls is
+# already resolved in Cargo.lock via heyo-sdk's reqwest, so no version conflict.
+axum = "0.8"
+maud = { version = "0.27", features = ["axum"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+# S3 cold-storage tier: hand-rolled SigV4 query-string presigning so the guest
+# can stream pg_dump/pg_restore straight to/from S3 via curl, with the secret
+# key never leaving the pooler. Pure-Rust, tiny; avoids the aws-sdk-s3 tree.
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+# HEAD the archived object from the pooler to confirm a dump really landed in S3
+# before the source VM's disk is reclaimed. Same version/features heyo-sdk
+# already resolves (rustls + ring + webpki roots), so this adds no new
+# compilation — it just makes the existing dependency direct.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+serde_json = "1"
