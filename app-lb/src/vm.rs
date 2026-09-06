@@ -7,9 +7,9 @@
 //!    usable — its match has a `_ => return Ok(info)` arm, so `Stopped`,
 //!    `Paused`, and `ColdStored` all come back `Ok`. Against a local daemon a
 //!    broken VM surfaces as `Stopped`, never `Failed`. Always check the status.
-//! 2. `guest_ip` is only populated for tap-networked Firecracker/KVM on a local
-//!    daemon. It is the only address we can route to, so its absence is a hard
-//!    error, not something to retry.
+//! 2. Older daemons omit `guest_ip` for libvirt. Resolve it through the daemon's
+//!    internal-address API, never by guessing a subnet or proxying to localhost.
+//!    DHCP/address discovery can lag boot, so retry it within the boot deadline.
 //! 3. `SandboxCreateOptions` cannot express guest mounts, so [`VmManager::create`]
 //!    posts the create body itself rather than calling `Sandbox::create`. The
 //!    body is still the SDK's own serialization of that struct — only the
@@ -72,6 +72,11 @@ pub enum VmError {
         sandbox_id: String,
         value: String,
     },
+    /// Libvirt guest addressing is not ready or cannot be resolved safely.
+    AddressPending {
+        sandbox_id: String,
+        reason: String,
+    },
     /// A guest mount has no tree on this host, so the VM would boot without the
     /// data its spec says it has. Refused rather than created: a replica missing
     /// a mount is a replica that answers health checks and then fails on the
@@ -107,14 +112,16 @@ impl std::fmt::Display for VmError {
             }
             Self::NoGuestIp { sandbox_id } => write!(
                 f,
-                "sandbox {sandbox_id} has no guest_ip; the daemon only exposes one for \
-                 tap-networked firecracker/kvm backends running locally"
+                "sandbox {sandbox_id} has no routable guest_ip"
             ),
             Self::BadGuestIp { sandbox_id, value } => {
                 write!(
                     f,
                     "sandbox {sandbox_id} reported unparseable guest_ip {value:?}"
                 )
+            }
+            Self::AddressPending { sandbox_id, reason } => {
+                write!(f, "sandbox {sandbox_id}: waiting for libvirt guest address: {reason}")
             }
             Self::SecretUnresolved { env, detail } => write!(
                 f,
@@ -501,6 +508,54 @@ impl VmManager {
         Ok(Listing::from_infos(self.daemon.list().await?))
     }
 
+    /// Resolve libvirt through the same authenticated daemon transport used by
+    /// lifecycle operations. Only guest-network addresses are accepted: SLIRP's
+    /// loopback fallback is not a guest, and a forwarded port cannot stand in
+    /// for a guest address when a deployment uses a separate health-check port.
+    pub async fn routable_addr(
+        &self,
+        info: &SandboxInfo,
+        port: u16,
+        driver: SandboxDriver,
+    ) -> Result<SocketAddr, VmError> {
+        let direct = routable_addr(info, port);
+        if driver != SandboxDriver::Libvirt || info.status != SandboxStatus::Running {
+            return direct;
+        }
+        if let Ok(addr) = direct {
+            return libvirt_guest_addr(&info.id, addr, port);
+        }
+        if !crate::disks::valid_sandbox_id(&info.id) {
+            return Err(VmError::AddressPending {
+                sandbox_id: info.id.clone(),
+                reason: "invalid sandbox id".into(),
+            });
+        }
+        #[derive(serde::Deserialize)]
+        struct InternalAddress {
+            ip: IpAddr,
+            port: u16,
+        }
+        let path = format!("/sandboxes/{}/internal-url?port={port}", info.id);
+        let request = self.client.request::<InternalAddress>(
+            reqwest::Method::GET,
+            &path,
+            None::<&serde_json::Value>,
+            heyo_sdk::RequestOptions::default(),
+        );
+        let address = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .map_err(|_| VmError::AddressPending {
+                sandbox_id: info.id.clone(),
+                reason: "daemon address lookup timed out".into(),
+            })?
+            .map_err(|e| VmError::AddressPending {
+                sandbox_id: info.id.clone(),
+                reason: e.to_string(),
+            })?;
+        libvirt_guest_addr(&info.id, SocketAddr::new(address.ip, address.port), port)
+    }
+
     /// Create a VM and return immediately, without waiting for boot.
     ///
     /// Returning immediately is deliberate: the autoscaler must not block its
@@ -532,7 +587,7 @@ impl VmManager {
         secret_env: HashMap<String, String>,
     ) -> Result<Sandbox, VmError> {
         debug_assert!(
-            matches!(spec.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm),
+            matches!(spec.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm | SandboxDriver::Libvirt),
             "DeploymentSpec::validate must reject other drivers before reaching here",
         );
 
@@ -782,6 +837,8 @@ impl VmManager {
     /// autoscaler discards that copy right after a successful suspend (see
     /// [`crate::disks::discard_rootfs`]), so a replica behaves the same on both
     /// drivers and a scaled-to-zero pool is not parking a gigabyte per VM.
+    /// Libvirt instead resumes its qcow2 disk in place, so that root disk is
+    /// retained and is not sent through the disposable-rootfs purge path.
     ///
     /// **A stopped sandbox disappears from [`list`](Self::list).** mvm-ctrl's
     /// `stop` removes it from the in-memory map that backs `GET /sandboxes`, so
@@ -893,10 +950,22 @@ impl Listing {
     }
 }
 
-/// Extract the routable address, rejecting anything we could not proxy to.
-///
-/// This is where the two SDK traps are enforced together: a VM is only routable
-/// if it is *actually* `Running` and *actually* has a `guest_ip`.
+/// Reject the daemon's host fallback and forwarded ports: only a real guest
+/// network supports routing both the service port and an optional health port.
+fn libvirt_guest_addr(id: &str, addr: SocketAddr, guest_port: u16) -> Result<SocketAddr, VmError> {
+    let ip = addr.ip().to_canonical();
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
+        || addr.port() == 0 || addr.port() != guest_port
+    {
+        return Err(VmError::AddressPending {
+            sandbox_id: id.into(),
+            reason: format!("{addr} is not a guest-network address; configure HEYO_VIRT_NETWORK on heyvmd"),
+        });
+    }
+    Ok(addr)
+}
+
+/// Extract an address only when the VM is actually Running and has a guest IP.
 pub fn routable_addr(info: &SandboxInfo, port: u16) -> Result<SocketAddr, VmError> {
     if info.status != SandboxStatus::Running {
         return Err(VmError::NotRunning {
@@ -1132,6 +1201,52 @@ mod tests {
     }
 
     #[test]
+    fn libvirt_requires_a_guest_network_not_a_host_forward() {
+        for address in ["127.0.0.1:8080", "[::1]:8080", "[::ffff:127.0.0.1]:8080", "0.0.0.0:8080", "224.0.0.1:8080", "10.88.0.1:32000"] {
+            assert!(matches!(
+                libvirt_guest_addr("sb-1", address.parse().unwrap(), 8080),
+                Err(VmError::AddressPending { .. })
+            ), "{address}");
+        }
+        for address in ["10.88.0.12:8080", "[fd00::12]:8080"] {
+            assert_eq!(libvirt_guest_addr("sb-1", address.parse().unwrap(), 8080).unwrap(), address.parse::<SocketAddr>().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn libvirt_address_lookup_is_authenticated_and_retries_without_recreating() {
+        use axum::{Json, Router, routing::get, response::IntoResponse};
+        use axum::http::{HeaderMap, StatusCode, Uri};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = Router::new().route("/sandboxes/sb-1/internal-url", get(move |headers: HeaderMap, uri: Uri| {
+            let call = observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer test-token");
+                assert_eq!(uri.query(), Some("port=8080"));
+                if call == 0 {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                } else {
+                    Json(json!({"ip":"10.88.0.12", "port":8080})).into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let manager = VmManager::new(Some(url), Some("test-token".into()), test_mounts()).unwrap();
+        let running = info("sb-1", SandboxStatus::Running, None);
+        assert!(matches!(manager.routable_addr(&running, 8080, SandboxDriver::Libvirt).await, Err(VmError::AddressPending { .. })));
+        assert_eq!(manager.routable_addr(&running, 8080, SandboxDriver::Libvirt).await.unwrap(), "10.88.0.12:8080".parse::<SocketAddr>().unwrap());
+        assert!(matches!(manager.routable_addr(&running, 8080, SandboxDriver::Firecracker).await, Err(VmError::NoGuestIp { .. })));
+        let stopped = info("sb-1", SandboxStatus::Stopped, None);
+        assert!(matches!(manager.routable_addr(&stopped, 8080, SandboxDriver::Libvirt).await, Err(VmError::NotRunning { .. })));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[test]
     fn routable_addr_accepts_running_vm_with_guest_ip() {
         let i = info("sb-1", SandboxStatus::Running, Some("172.16.0.2"));
         assert_eq!(
@@ -1338,6 +1453,21 @@ mod tests {
 
     fn template() -> VmSpec {
         spec_with(vec![])
+    }
+
+    #[test]
+    fn libvirt_create_preserves_the_driver_image_and_start_command() {
+        let mut spec = template();
+        spec.driver = SandboxDriver::Libvirt;
+        spec.image = Some("ubuntu:24.04".into());
+        spec.start_command = Some("python3 -m http.server 8080 --bind 0.0.0.0".into());
+        let body = serde_json::to_value(create_request(
+            &spec, "web-1".into(), vec![8080], None, vec![], &VmOwner::default(),
+        )).unwrap();
+        assert_eq!(body["driver"], "libvirt");
+        assert_eq!(body["image"], "ubuntu:24.04");
+        assert_eq!(body["start_command"], spec.start_command.unwrap());
+        assert_eq!(body["open_ports"], json!([8080]));
     }
 
     /// The daemon's own field names, in a body the SDK types: the owner,

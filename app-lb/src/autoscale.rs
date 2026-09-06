@@ -825,10 +825,17 @@ impl Autoscaler {
             };
             let age = p.age_secs();
 
-            let addr = match vm::routable_addr(info, d.spec.vm_spec().port) {
+            let template = d.spec.vm_spec();
+            let addr = match self.vms.routable_addr(info, template.port, template.driver).await {
                 Ok(addr) => health::probe(addr, &d.spec.health).await.then_some(addr),
                 // Provisioning, or a status the daemon hasn't classified yet.
                 Err(vm::VmError::NotRunning { status, .. }) if !vm::is_terminal(&status) => None,
+                Err(vm::VmError::AddressPending { reason, .. }) => {
+                    if age.saturating_sub(p.reported_at_secs) >= BOOT_HEARTBEAT {
+                        tracing::warn!(sandbox = %p.sandbox_id, %reason, "waiting for libvirt guest networking");
+                    }
+                    None
+                }
                 Err(e) => {
                     // Terminal, or unroutable (no guest_ip). Either way it will
                     // never serve, so stop waiting on it and reclaim the slot.
@@ -1333,6 +1340,11 @@ impl Autoscaler {
     /// what happened before this existed, and the resume path does not care
     /// either way.
     async fn discard_rootfs_of(&self, d: &Arc<Deployment>, sandbox_id: &str) {
+        // Libvirt resumes its existing qcow2 disk, unlike the tap drivers'
+        // disposable rootfs copies. Removing it would destroy retained state.
+        if d.spec.vm_spec().driver == heyo_sdk::SandboxDriver::Libvirt {
+            return;
+        }
         let (removed, failed) = crate::disks::discard_rootfs(&self.vms, sandbox_id).await;
         if !removed.is_empty() {
             tracing::info!(
@@ -1684,6 +1696,20 @@ impl Autoscaler {
                     sandbox = %info.id,
                     "leaving a suspended VM stopped; it will be resumed on demand",
                 );
+                continue;
+            }
+            if d.spec.vm_spec().driver == heyo_sdk::SandboxDriver::Libvirt
+                && !vm::is_terminal(&info.status)
+            {
+                // Address discovery/health may lag daemon or LB startup. Keep
+                // the replica's slot and use the normal boot deadline rather
+                // than deleting it as an orphan on a transient lookup failure.
+                // Existing disks must also survive a failed adoption.
+                let mut pending = d.pending().as_ref().clone();
+                if !pending.iter().any(|p| p.sandbox_id == info.id) {
+                    pending.push(PendingVm::resumed(info.id.clone()));
+                    d.set_pending(pending);
+                }
                 continue;
             }
             match vm::routable_addr(info, d.spec.vm_spec().port) {
@@ -2736,6 +2762,50 @@ mod tests {
             memory: None,
             backend_type: None,
         }
+    }
+
+    #[tokio::test]
+    async fn libvirt_adoption_and_address_failure_preserve_the_replica_and_its_root_disk() {
+        use axum::{Json, Router, routing::get};
+        use axum::http::StatusCode;
+        let unexpected = Arc::new(AtomicU64::new(0));
+        let observed = unexpected.clone();
+        let app = Router::new()
+            .route("/deployed-sandboxes", get(|| async {
+                Json(serde_json::json!([{
+                    "id": "sb-1", "name": "applb-demo-000000000001",
+                    "status": "running", "image": "ubuntu:24.04", "guest_ip": null,
+                    "uptime_secs": 0, "is_deployed": false, "status_changed_at": "", "urls": []
+                }]))
+            }))
+            .route("/sandboxes/sb-1/internal-url", get(|| async {
+                StatusCode::SERVICE_UNAVAILABLE
+            }))
+            .fallback(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                async { StatusCode::NOT_FOUND }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut template = spec();
+        template.vm.as_mut().unwrap().driver = SandboxDriver::Libvirt;
+        let (scaler, registry) = autoscaler_against(&url, template);
+        let deployment = registry.get("demo").unwrap();
+        assert_eq!(scaler.vms.list().await.unwrap().len(), 1);
+        scaler.adopt_existing().await;
+        assert_eq!(deployment.pending().len(), 1);
+        assert_eq!(deployment.pending()[0].origin, BootOrigin::Resumed);
+        // Repeating adoption must not duplicate the slot.
+        scaler.adopt_existing().await;
+        assert_eq!(deployment.pending().len(), 1);
+        let fleet = vm::index_by_id(vec![info(heyo_sdk::SandboxStatus::Running, None)]);
+        scaler.promote_pending(&deployment, &fleet).await;
+        assert_eq!(deployment.pending().len(), 1);
+        assert!(deployment.backends().is_empty());
+        scaler.discard_rootfs_of(&deployment, "sb-1").await;
+        assert_eq!(unexpected.load(Ordering::Relaxed), 0, "no delete, create, or rootfs purge request");
+        server.abort();
     }
 
     /// `at_rest` decides whether a deployment is skipped for the tick, so every

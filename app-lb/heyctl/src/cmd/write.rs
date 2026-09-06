@@ -63,8 +63,8 @@ pub struct CreateDeploymentArgs {
     /// Guest port traffic is proxied to. Required for a managed deployment.
     #[arg(long, value_name = "PORT", help_heading = "VM pool")]
     pub port: Option<u16>,
-    /// Hypervisor driver. libvirt is rejected: app-lb routes to the guest IP,
-    /// which only tap-networked firecracker/kvm expose.
+    /// Hypervisor driver: firecracker, kvm, or libvirt. Libvirt requires a
+    /// host-reachable guest network configured on heyvmd.
     #[arg(long, value_name = "DRIVER", default_value = "firecracker", help_heading = "VM pool")]
     pub driver: String,
     /// Command the guest runs at boot.
@@ -74,8 +74,8 @@ pub struct CreateDeploymentArgs {
     #[arg(long, value_name = "CLASS", help_heading = "VM pool")]
     pub size: Option<String>,
     /// Size of the guest's persistent data disk, mounted at /workspace. This is
-    /// the *only* storage that survives a stop — the root filesystem is recopied
-    /// from the image on every boot — so a sandbox that keeps state needs it.
+    /// persistent storage for Firecracker/KVM, whose root filesystem is reset
+    /// on boot. A retained libvirt VM also keeps its qcow2 root disk.
     #[arg(long, value_name = "GB", help_heading = "VM pool")]
     pub disk_gb: Option<u32>,
     #[arg(long, value_name = "DIR", help_heading = "VM pool")]
