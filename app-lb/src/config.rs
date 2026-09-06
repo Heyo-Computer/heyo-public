@@ -443,6 +443,8 @@ fn default_boot_timeout_secs() -> u64 {
 /// suspend rather than parking a gigabyte per idle replica. A `Retain`
 /// deployment with no data disk therefore saves boot time and nothing else.
 /// Persistent state has to live under `/workspace`.
+/// Libvirt is different: its qcow2 root disk also survives `Retain` and must
+/// not be discarded, because the daemon resumes that disk in place.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IdleAction {
@@ -562,7 +564,7 @@ impl Default for HealthCheck {
 /// `VmSpec`s to decide whether the VMs must be rebuilt.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct VmSpec {
-    /// Must be `firecracker` or `kvm`; `libvirt` is rejected at registration.
+    /// `firecracker`, `kvm`, or `libvirt` with a host-reachable guest network.
     pub driver: SandboxDriver,
     /// Defaults to `ubuntu:24.04` daemon-side when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2993,6 +2995,7 @@ pub enum SpecError {
     /// on a proxied request, and an unrouted deployment receives none.
     AuthWithoutRoutes,
     UnsupportedDriver(SandboxDriver),
+    LibvirtImagePipeline,
     BadReplicaRange { min: u32, max: u32 },
     ZeroTargetConcurrency,
     ZeroPort,
@@ -3285,8 +3288,11 @@ impl std::fmt::Display for SpecError {
             ),
             Self::UnsupportedDriver(d) => write!(
                 f,
-                "driver {d:?} is not supported: app-lb routes directly to the guest IP, \
-                 which the daemon only exposes for tap-networked firecracker/kvm backends"
+                "driver {d:?} is not supported: managed pools require firecracker, kvm, or libvirt"
+            ),
+            Self::LibvirtImagePipeline => write!(
+                f,
+                "libvirt requires a daemon-supported vm.image; build and artifact produce raw ext4 images, not libvirt disks"
             ),
             Self::BadReplicaRange { min, max } => {
                 write!(f, "min_replicas ({min}) exceeds max_replicas ({max})")
@@ -3732,9 +3738,8 @@ impl DeploymentSpec {
     ///
     /// A deployment is either *managed* (a `vm` template, autoscaled) or *static*
     /// (a fixed `upstreams` list, proxy_pass); exactly one must be set. For the
-    /// managed kind the driver check is load-bearing: `SandboxInfo.guest_ip` is
-    /// only populated for tap-networked Firecracker/KVM on a local daemon, so a
-    /// Libvirt VM would boot fine and then be unroutable.
+    /// managed kind requires a supported VM driver and a reachable guest
+    /// network. Libvirt addressing is resolved through the local daemon.
     /// Bind every secret reference in the spec to the spec's own namespace.
     ///
     /// Run before [`validate`](Self::validate) on every path a spec enters by
@@ -3919,8 +3924,11 @@ impl DeploymentSpec {
 
         if let Some(vm) = &self.vm {
             // Managed: validate the VM template and scaling policy.
-            if !matches!(vm.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm) {
+            if !matches!(vm.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm | SandboxDriver::Libvirt) {
                 return Err(SpecError::UnsupportedDriver(vm.driver));
+            }
+            if vm.driver == SandboxDriver::Libvirt && (self.build.is_some() || self.artifact.is_some()) {
+                return Err(SpecError::LibvirtImagePipeline);
             }
             if vm.port == 0 {
                 return Err(SpecError::ZeroPort);
@@ -5415,16 +5423,19 @@ mod tests {
         assert!(s.validate().is_ok());
         s.vm.as_mut().unwrap().driver = SandboxDriver::Kvm;
         assert!(s.validate().is_ok());
+        s.vm.as_mut().unwrap().driver = SandboxDriver::Libvirt;
+        assert!(s.validate().is_ok());
     }
 
     #[test]
-    fn rejects_libvirt_because_it_has_no_guest_ip() {
+    fn libvirt_rejects_ext4_image_pipelines() {
         let mut s = spec();
         s.vm.as_mut().unwrap().driver = SandboxDriver::Libvirt;
-        assert_eq!(
-            s.validate(),
-            Err(SpecError::UnsupportedDriver(SandboxDriver::Libvirt))
-        );
+        s.build = Some(build_spec());
+        assert_eq!(s.validate(), Err(SpecError::LibvirtImagePipeline));
+        s.build = None;
+        s.artifact = Some(artifact_spec());
+        assert_eq!(s.validate(), Err(SpecError::LibvirtImagePipeline));
     }
 
     #[test]
