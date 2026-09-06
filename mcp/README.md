@@ -33,7 +33,7 @@ ci, or a cloud that is not the public one.
 
 | Variable | Purpose |
 |---|---|
-| `HEYO_API_KEY` | heyo cloud API key — the sandbox tools, and app-lb's default credential |
+| `HEYO_API_KEY` | heyo cloud API key — the sandbox tools, and app-lb's default credential. Unset, the sandbox tools are not listed at all |
 | `HEYO_BASE_URL` | cloud base URL; defaults to `https://server.heyo.computer` |
 | `APPLB_URL` | app-lb base URL — its own admin listener, or heyo cloud (see managed mode). Unset means the managed door at cloud's base |
 | `APPLB_NAMESPACE` | managed mode: the namespace to reach app-lb in, through heyo cloud |
@@ -196,12 +196,24 @@ as they were. Nor is preferring the caller's token an escalation the other way
 — it is a credential they already hold, and app-lb re-checks its scope whoever
 relayed it.
 
-Cloud is deliberately outside this. An `applb_…` token is not a cloud
-credential, so the sandbox tools keep using `HEYO_API_KEY` and every caller an
-app-token gate admits shares that one cloud account. There is no per-user cloud
-counterpart to switch to; the alternative is not narrower sandboxes but none.
-**Mint tokens with the `deployments` scope the caller should actually have, and
-treat sandbox reach as shared.**
+Cloud is outside this, and outside the borrow-when-empty rule too. An
+`applb_…` token is not a cloud credential — cloud has never heard of it — so it
+is never substituted for one. That leaves two honest configurations and no
+third:
+
+- **`HEYO_API_KEY` set.** The sandbox tools work, and every caller an app-token
+  gate admits shares that one cloud account. There is no per-user cloud
+  counterpart to switch to, so **treat sandbox reach as shared** and mint tokens
+  with the `deployments` scope the caller should actually have.
+- **`HEYO_API_KEY` unset.** Cloud stays unconfigured and `buildTools` lists no
+  sandbox tools at all. This is the fleet-operations shape — app-lb, app-obs, ci
+  and the feed, and nothing that needs a credential the gate cannot supply. See
+  `deploy/vm.md`.
+
+The gate is on the credential rather than a switch, so a hosted instance
+carrying no key of its own still hands the sandbox tools to a caller who
+presents a `heyo_api_*` key, per request. That is what keeps managed mode
+multi-tenant.
 
 And know what `admin` buys, because it is coarser than it sounds. `none` passes
 the gate and reaches no admin route; `view` covers `/metrics`, `/disks`,

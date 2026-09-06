@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { loadConfig } from "./config.js";
+import { loadConfig, withForwardedAuth } from "./config.js";
 import { buildTools } from "./server.js";
 import type { Tool } from "./tools/diagnose.js";
 
@@ -203,4 +203,39 @@ test("the feed cursor is the caller's, and one from before a restart reads as a 
   } finally {
     stub.restore();
   }
+});
+
+test("a fleet-operations instance lists no sandbox tools at all", () => {
+  // Behind an app-token gate there is no cloud credential and no way to acquire
+  // one, so the sandbox tools are not missing — they are not part of this
+  // deployment. Listing them would advertise sixteen operations whose only
+  // possible outcome is an auth error.
+  const withCloud = buildTools(
+    loadConfig({ APPLB_URL: "http://127.0.0.1:8080", HEYO_API_KEY: "heyo_api_x" }),
+  );
+  const fleetOps = buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:8080" }));
+
+  const names = (tools: Tool[]) => tools.map((t) => t.name);
+  assert.ok(names(withCloud).includes("sandbox_create"));
+  assert.ok(!names(fleetOps).includes("sandbox_create"));
+  assert.ok(!names(fleetOps).includes("heyo_capacity"));
+  assert.equal(names(fleetOps).filter((n) => n.startsWith("sandbox_")).length, 0);
+
+  // Everything else survives, including the app-lb tools this instance exists
+  // for and `heyo_status` — which is what keeps "why are there no sandbox
+  // tools" an answerable question rather than a silent gap.
+  assert.ok(names(fleetOps).includes("applb_list_deployments"));
+  assert.ok(names(fleetOps).includes("heyo_status"));
+  const dropped = names(withCloud).filter((n) => !names(fleetOps).includes(n));
+  assert.equal(dropped.length, withCloud.length - fleetOps.length);
+  assert.ok(dropped.length > 0, "the cloud-keyed set must be the larger one");
+
+  // A caller's own cloud key restores them per request, which is what keeps this
+  // gate on the credential rather than on a deployment-wide switch.
+  const hosted = loadConfig({ APPLB_URL: "http://127.0.0.1:8080" });
+  const asCaller = withForwardedAuth(hosted, { authorization: "Bearer heyo_api_caller" });
+  assert.ok(names(buildTools(asCaller)).includes("sandbox_create"));
+  // But an app-lb token does not conjure them: cloud cannot consume it.
+  const asToken = withForwardedAuth(hosted, { authorization: "Bearer applb_abc123_secret" });
+  assert.ok(!names(buildTools(asToken)).includes("sandbox_create"));
 });

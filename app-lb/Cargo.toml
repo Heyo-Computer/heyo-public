@@ -144,6 +144,39 @@ flate2 = "1"
 # a dependency line rather than a new build.
 libc = "0.2"
 
+# Speaking Incus's REST API over its unix socket (`src/incus.rs`), for `lxc`
+# deployments. reqwest cannot dial a unix socket, so this drops to hyper — one
+# `http1::handshake` per request over a `tokio::net::UnixStream`, with no
+# connector and no pool. That is enough: the listing is one call per reconcile
+# tick and a create is rarer still, so a connection per request costs less than
+# the pool machinery would.
+#
+# Not the `incus` CLI, which was the first instinct given `heyvm mvm build` and
+# `art` both shell out. Three things ruled it out: `incus launch` blocks until
+# the instance is started, and `VmManager::create` returns *before* boot by
+# design (see `vm.rs`) while holding a fleet-wide create permit; the interactive
+# shell needs a control channel for window-resize that `incus exec -t` does not
+# expose; and remotes are client-side config in `~/.config/incus`, which a
+# non-root `app-lb` user would have to own — over REST the registry is just a
+# field in the create body.
+#
+# All three are already in the lock file via heyo-sdk, which uses the same
+# pattern for heyvmd's socket, so this is a dependency line rather than a new
+# build.
+hyper = { version = "1", features = ["client", "http1"] }
+# `client-legacy` is the connection *pool*, and it is not optional here. A
+# connection per request looked simpler and was wrong: closing the socket the
+# instant the response is read cancels the Go request context behind it, and
+# Incus ties an in-flight operation to that context — so roughly half of all
+# creates were accepted with a 202 and then silently cancelled, leaving a
+# container that never appeared. Keeping connections alive is what makes an
+# accepted create actually happen.
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+# The `Service` impl a custom hyper connector has to provide, so the pool can
+# dial a unix socket instead of a TCP address.
+tower-service = "0.3"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

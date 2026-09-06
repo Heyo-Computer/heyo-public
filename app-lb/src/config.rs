@@ -169,6 +169,10 @@ pub struct LbConfig {
     /// [`crate::mounts::DEFAULT_TTL_SECS`].
     #[serde(default = "default_mount_ttl_secs")]
     pub mount_ttl_secs: u64,
+    /// How to reach Incus. Only consulted for `driver: lxc` deployments; a
+    /// fleet of microVMs never touches it.
+    #[serde(default)]
+    pub lxc: LxcConfig,
     #[serde(default = "default_git_bin")]
     pub git_bin: String,
     /// The `aws` CLI, used for the DNS-01 challenge. Only reached when
@@ -283,6 +287,7 @@ impl Default for LbConfig {
             heyvm_bin: default_heyvm_bin(),
             art_bin: default_art_bin(),
             images_dir: None,
+            lxc: LxcConfig::default(),
             git_bin: default_git_bin(),
             mounts_dir: default_mounts_dir(),
             mount_ttl_secs: default_mount_ttl_secs(),
@@ -455,6 +460,128 @@ pub enum IdleAction {
     Retain,
 }
 
+/// Which runtime boots a deployment's replicas.
+///
+/// app-lb's own enum rather than [`heyo_sdk::SandboxDriver`], because not every
+/// driver is a heyvm one: `lxc` is a system container app-lb creates on this
+/// host through Incus, and the SDK has no name for it. The spellings are
+/// deliberately identical to the SDK's, so a spec written against either
+/// deserializes the same and the wire fixtures are unchanged.
+///
+/// `Libvirt` and `FirecrackerContainerd` exist here only so that a spec naming
+/// one still *deserializes* and is then refused by
+/// [`DeploymentSpec::validate`] with an explanation. Dropping the variants
+/// would turn a good error message into an opaque serde failure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Driver {
+    #[default]
+    Firecracker,
+    Kvm,
+    /// A system container under Incus, booted from an OCI image. Not a heyvm
+    /// driver: app-lb talks to Incus itself, so [`Driver::heyvm`] is `None`.
+    Lxc,
+    Libvirt,
+    #[serde(rename = "firecracker_containerd")]
+    FirecrackerContainerd,
+}
+
+impl Driver {
+    /// The SDK's name for this driver, or `None` when the daemon has none —
+    /// which is what makes "can heyvmd boot this?" a compile-time question at
+    /// every call site rather than a string comparison.
+    pub fn heyvm(self) -> Option<SandboxDriver> {
+        match self {
+            Self::Firecracker => Some(SandboxDriver::Firecracker),
+            Self::Kvm => Some(SandboxDriver::Kvm),
+            Self::Lxc | Self::Libvirt | Self::FirecrackerContainerd => None,
+        }
+    }
+
+    pub fn is_lxc(self) -> bool {
+        matches!(self, Self::Lxc)
+    }
+
+    /// The wire spelling, which is also what an error message should print.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Firecracker => "firecracker",
+            Self::Kvm => "kvm",
+            Self::Lxc => "lxc",
+            Self::Libvirt => "libvirt",
+            Self::FirecrackerContainerd => "firecracker_containerd",
+        }
+    }
+}
+
+impl std::fmt::Display for Driver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How app-lb reaches Incus, for `driver: lxc` deployments.
+///
+/// Every field has a working default, because the common case is a host where
+/// Incus is installed the ordinary way. What has no default is *permission*:
+/// see `project`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LxcConfig {
+    /// Whether `driver: lxc` may be used at all. Off explicitly disables it
+    /// even on a host that has Incus; on is not a promise that Incus works,
+    /// only that app-lb should try.
+    pub enabled: bool,
+    /// Incus's API socket. Its absence is how app-lb decides this host has no
+    /// Incus, so pointing it somewhere wrong disables `lxc` rather than failing
+    /// loudly — which is why the startup log names the path it tried.
+    pub socket: std::path::PathBuf,
+    /// The Incus project every request is scoped to.
+    ///
+    /// **This is the security boundary, not a tenancy convenience.** app-lb's
+    /// user should be in the `incus` group rather than `incus-admin`: the former
+    /// is confined to a project and, in Incus's own words, "prevents users from
+    /// gaining root access", while the latter can attach arbitrary host paths to
+    /// an instance and is root by another name. The project needs
+    /// `restricted.devices.disk=allow` plus `restricted.devices.disk.paths`
+    /// pinned to `mounts_dir` before guest mounts will work — deliberately, so
+    /// app-lb can bind-mount its own trees and nothing else.
+    pub project: String,
+    /// OCI registries a `vm.image` may name, as `name -> server URL`. An image
+    /// with no `remote:` prefix uses `default_remote`.
+    ///
+    /// Host config rather than a spec field on purpose: which registries this
+    /// host will pull from is not a decision a deployment's author should make.
+    pub remotes: std::collections::BTreeMap<String, String>,
+    pub default_remote: String,
+    /// Profiles applied to every container. Empty means Incus's own default.
+    pub profiles: Vec<String>,
+    /// Which interface to read the container's address from. Unset means the
+    /// first non-`lo` interface with a global IPv4 — right on a host with one
+    /// bridge, and worth setting on a host with two.
+    pub network_nic: Option<String>,
+    /// Stamped on every container as `user.app-lb.instance`, so two app-lb
+    /// processes on one host do not adopt each other's containers. Defaults to
+    /// [`LbConfig::name`].
+    pub instance: String,
+}
+
+impl Default for LxcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            socket: std::path::PathBuf::from("/var/lib/incus/unix.socket"),
+            project: "default".into(),
+            remotes: [("docker".to_string(), "https://docker.io".to_string())]
+                .into_iter()
+                .collect(),
+            default_remote: "docker".into(),
+            profiles: Vec::new(),
+            network_nic: None,
+            instance: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScalingPolicy {
     #[serde(default)]
@@ -562,8 +689,10 @@ impl Default for HealthCheck {
 /// `VmSpec`s to decide whether the VMs must be rebuilt.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct VmSpec {
-    /// Must be `firecracker` or `kvm`; `libvirt` is rejected at registration.
-    pub driver: SandboxDriver,
+    /// `firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system
+    /// container from an OCI image). `libvirt` and `firecracker_containerd`
+    /// are rejected at registration.
+    pub driver: Driver,
     /// Defaults to `ubuntu:24.04` daemon-side when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -680,6 +809,16 @@ impl WorkspaceArchive {
 /// is refused at registration beats one discovered as a guest that boots with
 /// its last mount silently missing.
 pub const MAX_MOUNTS: usize = 8;
+
+/// Longest deployment id a `driver: lxc` deployment may have.
+///
+/// A replica is named `applb-<id>-<12 hex nonce>` (see `vm::replica_name`), so
+/// the id gets whatever is left of Incus's 63-character instance-name limit
+/// after the 19 characters of prefix, separator and nonce. Checked at
+/// registration rather than at create time: an id that can never name a
+/// container should be refused while someone is still looking at the spec, not
+/// on the first scale-up.
+pub const MAX_LXC_DEPLOYMENT_ID: usize = crate::incus::MAX_NAME_LEN - 19;
 
 /// Guest paths a mount may not take, because something else already owns them.
 ///
@@ -819,7 +958,7 @@ impl MountSpec {
     /// Rejects a mount the pull could not satisfy or the guest could not boot
     /// with. `driver` is a parameter because one rule genuinely depends on it:
     /// see [`read_only`](Self::read_only).
-    fn validate(&self, driver: SandboxDriver) -> Result<(), SpecError> {
+    fn validate(&self, driver: Driver) -> Result<(), SpecError> {
         if let Some(why) = mount_path_problem(&self.path) {
             return Err(SpecError::BadMountPath {
                 path: self.path.clone(),
@@ -852,7 +991,7 @@ impl MountSpec {
                 digest: digest.clone(),
             });
         }
-        if !self.read_only && driver == SandboxDriver::Kvm {
+        if !self.read_only && driver == Driver::Kvm {
             return Err(SpecError::WritableMountOnKvm(self.guest_path().to_string()));
         }
         Ok(())
@@ -1000,11 +1139,11 @@ impl WorkspaceSpec {
 
     fn validate(
         &self,
-        driver: SandboxDriver,
+        driver: Driver,
         scaling: &ScalingPolicy,
         mounts: &[MountSpec],
     ) -> Result<(), SpecError> {
-        if driver != SandboxDriver::Firecracker {
+        if driver != Driver::Firecracker {
             return Err(SpecError::WorkspaceDriver(driver));
         }
         if let Some(path) = &self.path
@@ -1114,7 +1253,7 @@ fn mount_path_problem(path: &str) -> Option<&'static str> {
 }
 
 /// Rejects a *set* of mounts: the rules one mount cannot see on its own.
-fn validate_mounts(mounts: &[MountSpec], driver: SandboxDriver) -> Result<(), SpecError> {
+fn validate_mounts(mounts: &[MountSpec], driver: Driver) -> Result<(), SpecError> {
     if mounts.len() > MAX_MOUNTS {
         return Err(SpecError::TooManyMounts {
             count: mounts.len(),
@@ -2992,7 +3131,21 @@ pub enum SpecError {
     /// A sign-in gate on a deployment with no routes. The gate only ever runs
     /// on a proxied request, and an unrouted deployment receives none.
     AuthWithoutRoutes,
-    UnsupportedDriver(SandboxDriver),
+    UnsupportedDriver(Driver),
+    /// A `driver: lxc` spec naming a block that only means something on heyvm.
+    /// Carries the field, because "this is not supported" without saying which
+    /// of eight blocks is the problem is not an error anyone can act on.
+    NotForLxc(&'static str),
+    /// A block that will work on `lxc` eventually but does not yet. A separate
+    /// variant from [`Self::NotForLxc`] so the message can say "not yet" rather
+    /// than "never" — the two send an operator to different places.
+    LxcNotYet(&'static str),
+    /// `driver: lxc` with no image. Unlike heyvm there is no catalog default to
+    /// fall back to.
+    LxcNeedsImage,
+    LxcBadImage(String),
+    /// A deployment id that cannot produce a legal Incus instance name.
+    BadLxcId { id: String, why: &'static str },
     BadReplicaRange { min: u32, max: u32 },
     ZeroTargetConcurrency,
     ZeroPort,
@@ -3166,7 +3319,7 @@ pub enum SpecError {
         detail: String,
     },
     /// A workspace on a driver other than `firecracker`. See [`WorkspaceSpec`].
-    WorkspaceDriver(SandboxDriver),
+    WorkspaceDriver(Driver),
     BadWorkspacePath {
         path: String,
         why: &'static str,
@@ -3285,8 +3438,34 @@ impl std::fmt::Display for SpecError {
             ),
             Self::UnsupportedDriver(d) => write!(
                 f,
-                "driver {d:?} is not supported: app-lb routes directly to the guest IP, \
+                "driver {d} is not supported: app-lb routes directly to the guest IP, \
                  which the daemon only exposes for tap-networked firecracker/kvm backends"
+            ),
+            Self::NotForLxc(field) => write!(
+                f,
+                "{field} is not supported on driver lxc: it describes something only the heyvm \
+                 daemon does, and an Incus container has no equivalent"
+            ),
+            Self::LxcNotYet(field) => write!(
+                f,
+                "{field} is not supported on driver lxc yet"
+            ),
+            Self::LxcNeedsImage => write!(
+                f,
+                "driver lxc needs vm.image: an OCI reference such as `nginx:1.27` or \
+                 `ghcr.io/org/app:v1`. There is no default — heyvm's `ubuntu:24.04` is a \
+                 catalog name, not a registry reference"
+            ),
+            Self::LxcBadImage(image) => write!(
+                f,
+                "vm.image {image:?} is not a usable OCI reference"
+            ),
+            Self::BadLxcId { id, why } => write!(
+                f,
+                "deployment id {id:?} cannot name an Incus container: {why}. Container names \
+                 become DNS labels, so a `driver: lxc` deployment needs an id of at most \
+                 {MAX_LXC_DEPLOYMENT_ID} characters made of lowercase letters, digits and \
+                 dashes, starting with a letter or digit and not ending in a dash"
             ),
             Self::BadReplicaRange { min, max } => {
                 write!(f, "min_replicas ({min}) exceeds max_replicas ({max})")
@@ -3644,7 +3823,7 @@ impl std::fmt::Display for SpecError {
             }
             Self::WorkspaceDriver(d) => write!(
                 f,
-                "vm.workspace needs the firecracker driver, got {d:?}: the kvm driver syncs a \
+                "vm.workspace needs the firecracker driver, got {d}: the kvm driver syncs a \
                  writable mount back into the host tree itself when the VM stops, which is not \
                  the capture this feature performs"
             ),
@@ -3722,6 +3901,16 @@ impl DeploymentSpec {
     /// deployment — the VM-lifecycle code (autoscaler) only reaches this after
     /// confirming the deployment is managed, and `validate` guarantees a managed
     /// spec has a `vm`.
+    /// Which runtime this deployment's replicas run on, or `None` when it has
+    /// no replicas at all (a static or site deployment).
+    ///
+    /// The non-panicking counterpart to [`Self::vm_spec`], for the paths that
+    /// need only the driver and should not have to prove the deployment is
+    /// managed first.
+    pub fn driver(&self) -> Option<Driver> {
+        self.vm.as_ref().map(|vm| vm.driver)
+    }
+
     pub fn vm_spec(&self) -> &VmSpec {
         self.vm
             .as_ref()
@@ -3823,6 +4012,107 @@ impl DeploymentSpec {
         ids
     }
 
+    /// The rules that only apply to a container.
+    ///
+    /// Every rejection here is a block that means something specific on heyvmd
+    /// and nothing on Incus. Refusing them is deliberate over accepting and
+    /// ignoring: a spec that silently does not do what it says is worse than one
+    /// that will not register, and `open_ports` in particular is a *security*
+    /// field — see its arm below.
+    fn validate_lxc(&self, vm: &VmSpec) -> Result<(), SpecError> {
+        // An OCI reference, and there is no default to fall back to.
+        let image = vm.image.as_deref().map(str::trim).unwrap_or_default();
+        if image.is_empty() {
+            return Err(SpecError::LxcNeedsImage);
+        }
+        if image.len() > 255
+            || image.bytes().any(|b| b.is_ascii_whitespace())
+            || !image
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._/:@-".contains(&b))
+        {
+            return Err(SpecError::LxcBadImage(image.to_string()));
+        }
+
+        // The id has to be able to name a container. `vm::owner_of` parses the
+        // deployment back out of the instance name, so this cannot be solved by
+        // hashing the id into something legal — an operator running `incus list`
+        // has to be able to see what a container belongs to.
+        let id = self.id.trim();
+        if id.len() > MAX_LXC_DEPLOYMENT_ID {
+            return Err(SpecError::BadLxcId {
+                id: id.to_string(),
+                why: "too long",
+            });
+        }
+        if !id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            return Err(SpecError::BadLxcId {
+                id: id.to_string(),
+                why: "contains something other than a lowercase letter, a digit or a dash",
+            });
+        }
+        if id.ends_with('-') {
+            return Err(SpecError::BadLxcId {
+                id: id.to_string(),
+                why: "ends with a dash",
+            });
+        }
+        // The checks above exist to say *which* rule was broken. This one is the
+        // authority: it asks Incus's own predicate about the name app-lb would
+        // actually create, so the two can never drift apart. A failure here
+        // means a rule above is missing rather than that this id is unusual.
+        if !crate::incus::is_legal_name(&crate::vm::replica_name(id, 0)) {
+            return Err(SpecError::BadLxcId {
+                id: id.to_string(),
+                why: "cannot form a legal container name",
+            });
+        }
+
+        // Blocks that describe heyvmd doing something Incus has no equivalent
+        // for. Each is refused by name.
+        if vm.workspace_archive.is_some() {
+            return Err(SpecError::NotForLxc("vm.workspace_archive"));
+        }
+        if vm.image_download_url.is_some()
+            || vm.image_size_bytes.is_some()
+            || vm.image_sha256.is_some()
+        {
+            return Err(SpecError::NotForLxc("vm.image_download_url"));
+        }
+        // heyvmd runs these inside the guest before the start command. A
+        // container has no such hook point, and running them after start would
+        // race the health probe.
+        if vm.setup_hooks.as_ref().is_some_and(|h| !h.is_empty()) {
+            return Err(SpecError::NotForLxc("vm.setup_hooks"));
+        }
+        // A *security* field that would silently do nothing. app-lb routes
+        // straight to the container's address on the bridge, so every port is
+        // reachable whatever this says — and a spec that believes it has closed
+        // a port it has not is worse than one that will not register. Accepting
+        // it later stays backward-compatible; removing it later would not.
+        if !vm.open_ports.is_empty() {
+            return Err(SpecError::NotForLxc("vm.open_ports"));
+        }
+        // `build` and `artifact` both produce an ext4 rootfs, which is not a
+        // thing a container boots.
+        if self.build.is_some() {
+            return Err(SpecError::NotForLxc("build"));
+        }
+        if self.artifact.is_some() {
+            return Err(SpecError::NotForLxc("artifact"));
+        }
+        // Cloud URLs are daemon-side proxy binds, which belong to heyvmd.
+        if self.ingress.is_some() {
+            return Err(SpecError::NotForLxc("ingress"));
+        }
+
+        // Staged, not refused forever — the message says so.
+        if !vm.mounts.is_empty() {
+            return Err(SpecError::LxcNotYet("vm.mounts"));
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
@@ -3919,8 +4209,12 @@ impl DeploymentSpec {
 
         if let Some(vm) = &self.vm {
             // Managed: validate the VM template and scaling policy.
-            if !matches!(vm.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm) {
-                return Err(SpecError::UnsupportedDriver(vm.driver));
+            match vm.driver {
+                Driver::Firecracker | Driver::Kvm => {}
+                Driver::Lxc => self.validate_lxc(vm)?,
+                d @ (Driver::Libvirt | Driver::FirecrackerContainerd) => {
+                    return Err(SpecError::UnsupportedDriver(d));
+                }
             }
             if vm.port == 0 {
                 return Err(SpecError::ZeroPort);
@@ -4252,7 +4546,7 @@ mod tests {
                 image_download_url: None,
                 image_size_bytes: None,
                 image_sha256: None,
-                driver: SandboxDriver::Firecracker,
+                driver: Driver::Firecracker,
                 image: None,
                 port: 8080,
                 start_command: None,
@@ -5411,20 +5705,180 @@ mod tests {
     #[test]
     fn accepts_supported_drivers() {
         let mut s = spec();
-        s.vm.as_mut().unwrap().driver = SandboxDriver::Firecracker;
+        s.vm.as_mut().unwrap().driver = Driver::Firecracker;
         assert!(s.validate().is_ok());
-        s.vm.as_mut().unwrap().driver = SandboxDriver::Kvm;
+        s.vm.as_mut().unwrap().driver = Driver::Kvm;
         assert!(s.validate().is_ok());
     }
 
     #[test]
     fn rejects_libvirt_because_it_has_no_guest_ip() {
         let mut s = spec();
-        s.vm.as_mut().unwrap().driver = SandboxDriver::Libvirt;
+        s.vm.as_mut().unwrap().driver = Driver::Libvirt;
         assert_eq!(
             s.validate(),
-            Err(SpecError::UnsupportedDriver(SandboxDriver::Libvirt))
+            Err(SpecError::UnsupportedDriver(Driver::Libvirt))
         );
+    }
+
+    /// The whole reason `Driver` is app-lb's own enum and not the SDK's: it has
+    /// to spell every driver the same way on the wire, or 30 golden fixtures and
+    /// every persisted deployment change meaning under an in-place upgrade.
+    #[test]
+    fn driver_spellings_are_the_wire_contract() {
+        for (json, driver) in [
+            ("firecracker", Driver::Firecracker),
+            ("kvm", Driver::Kvm),
+            ("lxc", Driver::Lxc),
+            ("libvirt", Driver::Libvirt),
+            ("firecracker_containerd", Driver::FirecrackerContainerd),
+        ] {
+            let quoted = format!("\"{json}\"");
+            assert_eq!(
+                serde_json::from_str::<Driver>(&quoted).unwrap(),
+                driver,
+                "{json} must deserialize",
+            );
+            assert_eq!(
+                serde_json::to_string(&driver).unwrap(),
+                quoted,
+                "{driver:?} must serialize back to the same string",
+            );
+            // What an error message prints, and what `heyctl --driver` accepts.
+            assert_eq!(driver.to_string(), json);
+        }
+    }
+
+    /// A driver the daemon cannot boot must still *parse*, so the spec reaches
+    /// `validate` and the caller gets an explanation instead of a serde error
+    /// pointing at a byte offset.
+    #[test]
+    fn an_unbootable_driver_is_refused_by_validate_not_by_serde() {
+        for (json, expected) in [
+            ("libvirt", SpecError::UnsupportedDriver(Driver::Libvirt)),
+            (
+                "firecracker_containerd",
+                SpecError::UnsupportedDriver(Driver::FirecrackerContainerd),
+            ),
+        ] {
+            let mut s = spec();
+            s.vm.as_mut().unwrap().driver = serde_json::from_str(&format!("\"{json}\"")).unwrap();
+            assert_eq!(s.validate(), Err(expected), "driver {json}");
+        }
+    }
+
+    /// ...but a driver that is not a driver at all is still a parse failure.
+    /// `Driver` has no `#[serde(other)]`, deliberately: a typo should not
+    /// silently become a deployment that boots the default runtime.
+    #[test]
+    fn an_unknown_driver_is_still_a_serde_error() {
+        assert!(serde_json::from_str::<Driver>("\"firecraker\"").is_err());
+        assert!(serde_json::from_str::<Driver>("\"docker\"").is_err());
+        assert!(serde_json::from_str::<Driver>("\"\"").is_err());
+    }
+
+    /// A container spec needs an image, and the message has to say so without
+    /// sending the reader to heyvm's catalog default — which is a catalog
+    /// *name*, not a registry reference, and would not work here.
+    #[test]
+    fn lxc_needs_an_image_and_says_what_kind() {
+        let mut s = spec();
+        let vm = s.vm.as_mut().unwrap();
+        vm.driver = Driver::Lxc;
+        vm.image = None;
+        assert_eq!(s.validate(), Err(SpecError::LxcNeedsImage));
+
+        let refusal = SpecError::LxcNeedsImage.to_string();
+        assert!(refusal.contains("vm.image"), "{refusal}");
+        assert!(refusal.contains("nginx:1.27"), "names a usable example: {refusal}");
+    }
+
+    /// The blocks that mean something on heyvmd and nothing on Incus are each
+    /// refused *by name*. "Not supported" without saying which of eight blocks
+    /// is the problem is not an error anyone can act on.
+    #[test]
+    fn lxc_refuses_heyvm_only_blocks_by_name() {
+        let base = || {
+            let mut s = spec();
+            let vm = s.vm.as_mut().unwrap();
+            vm.driver = Driver::Lxc;
+            vm.image = Some("nginx:1.27".into());
+            vm.open_ports = vec![];
+            s
+        };
+        // The clean spec registers, so every failure below is the field under
+        // test rather than something the fixture already tripped.
+        assert!(base().validate().is_ok(), "{:?}", base().validate());
+
+        let mut s = base();
+        s.vm.as_mut().unwrap().setup_hooks = Some(vec!["apt-get update".into()]);
+        assert_eq!(s.validate(), Err(SpecError::NotForLxc("vm.setup_hooks")));
+
+        let mut s = base();
+        s.vm.as_mut().unwrap().image_download_url = Some("https://example/img".into());
+        assert_eq!(s.validate(), Err(SpecError::NotForLxc("vm.image_download_url")));
+
+        let mut s = base();
+        s.vm.as_mut().unwrap().workspace_archive = Some(WorkspaceArchive {
+            archive_id: Some("ar-1".into()),
+            s3_key: Some("k".into()),
+            size_bytes: None,
+        });
+        assert_eq!(s.validate(), Err(SpecError::NotForLxc("vm.workspace_archive")));
+    }
+
+    /// `open_ports` is a *security* field. On a bridged container every port is
+    /// reachable whatever it says, so accepting and ignoring it would leave a
+    /// spec believing it had closed a port it had not.
+    #[test]
+    fn lxc_refuses_open_ports_rather_than_ignoring_them() {
+        let mut s = spec();
+        let vm = s.vm.as_mut().unwrap();
+        vm.driver = Driver::Lxc;
+        vm.image = Some("nginx:1.27".into());
+        vm.open_ports = vec![9000];
+        assert_eq!(s.validate(), Err(SpecError::NotForLxc("vm.open_ports")));
+    }
+
+    /// A deployment id has to be able to name a container. Incus names are DNS
+    /// labels, and app-lb ids are only checked for non-empty — so this is the
+    /// one rule `driver: lxc` adds that no other deployment kind has.
+    #[test]
+    fn lxc_refuses_an_id_that_cannot_name_a_container() {
+        let with_id = |id: &str| {
+            let mut s = spec();
+            s.id = id.to_string();
+            let vm = s.vm.as_mut().unwrap();
+            vm.driver = Driver::Lxc;
+            vm.image = Some("nginx:1.27".into());
+            vm.open_ports = vec![];
+            s
+        };
+        assert!(with_id("web").validate().is_ok());
+        assert!(with_id("web-v2").validate().is_ok());
+
+        // Legal as an app-lb id, illegal as a DNS label.
+        for bad in ["my_app", "web.v2", "Web", "web-"] {
+            assert!(
+                matches!(with_id(bad).validate(), Err(SpecError::BadLxcId { .. })),
+                "{bad} should be refused",
+            );
+        }
+
+        // The budget is Incus's 63 minus the 19 characters of
+        // `applb-` + `-` + a 12-hex nonce that `vm::replica_name` adds.
+        let longest = "a".repeat(MAX_LXC_DEPLOYMENT_ID);
+        assert!(with_id(&longest).validate().is_ok(), "{MAX_LXC_DEPLOYMENT_ID} must fit");
+        assert!(crate::incus::is_legal_name(&crate::vm::replica_name(&longest, 0)));
+
+        let too_long = "a".repeat(MAX_LXC_DEPLOYMENT_ID + 1);
+        assert!(matches!(
+            with_id(&too_long).validate(),
+            Err(SpecError::BadLxcId { .. })
+        ));
+        // ...and the rule is not arbitrary: one more character genuinely
+        // overflows the name Incus would have to accept.
+        assert!(!crate::incus::is_legal_name(&crate::vm::replica_name(&too_long, 0)));
     }
 
     #[test]
@@ -6038,7 +6492,7 @@ mod tests {
         };
 
         let mut on_kvm = spec_with_mounts(vec![writable.clone()]);
-        on_kvm.vm.as_mut().unwrap().driver = SandboxDriver::Kvm;
+        on_kvm.vm.as_mut().unwrap().driver = Driver::Kvm;
         let err = on_kvm.validate().unwrap_err();
         assert_eq!(err, SpecError::WritableMountOnKvm("/scratch".into()));
         let message = err.to_string();
@@ -6048,7 +6502,7 @@ mod tests {
 
         // Read-only is fine on both.
         let mut ro_on_kvm = spec_with_mounts(vec![a_mount("/data")]);
-        ro_on_kvm.vm.as_mut().unwrap().driver = SandboxDriver::Kvm;
+        ro_on_kvm.vm.as_mut().unwrap().driver = Driver::Kvm;
         ro_on_kvm.validate().unwrap();
     }
 
@@ -6192,7 +6646,7 @@ mod tests {
             assert!(matches!(s.validate(), Err(SpecError::WorkspaceWarmPool(1))));
 
             let mut s = with_workspace(serde_json::json!({"store": "s3://b"}));
-            s.vm.as_mut().unwrap().driver = SandboxDriver::Kvm;
+            s.vm.as_mut().unwrap().driver = Driver::Kvm;
             assert!(matches!(s.validate(), Err(SpecError::WorkspaceDriver(_))));
         }
 

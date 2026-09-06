@@ -26,6 +26,7 @@ mod federated;
 mod feed;
 mod guard;
 mod health;
+mod incus;
 mod jobs;
 mod jwt;
 mod metrics;
@@ -33,6 +34,7 @@ mod mounts;
 mod obs;
 mod proxy;
 mod registry;
+mod runtime;
 mod secrets;
 mod siem;
 mod site;
@@ -141,6 +143,53 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_BUILD_DIR") {
         cfg.build_dir = v;
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_ENABLED") {
+        cfg.lxc.enabled = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_SOCKET") {
+        cfg.lxc.socket = v.trim().into();
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_PROJECT") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            cfg.lxc.project = v;
+        }
+    }
+    // `name=url,name=url`. Replaces the default rather than adding to it, so a
+    // host that names its own registries is not silently still pulling from
+    // Docker Hub.
+    if let Ok(v) = std::env::var("APP_LB_LXC_REMOTES") {
+        let remotes: std::collections::BTreeMap<String, String> = v
+            .split(',')
+            .filter_map(|entry| entry.trim().split_once('='))
+            .map(|(name, url)| (name.trim().to_string(), url.trim().to_string()))
+            .filter(|(name, url)| !name.is_empty() && !url.is_empty())
+            .collect();
+        if !remotes.is_empty() {
+            cfg.lxc.remotes = remotes;
+        }
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_DEFAULT_REMOTE") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            cfg.lxc.default_remote = v;
+        }
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_PROFILES") {
+        cfg.lxc.profiles = v
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_NETWORK_NIC") {
+        let v = v.trim().to_string();
+        cfg.lxc.network_nic = (!v.is_empty()).then_some(v);
     }
     if let Ok(v) = std::env::var("APP_LB_HEYVM_BIN") {
         cfg.heyvm_bin = v;
@@ -269,7 +318,14 @@ fn main() {
         tracing::debug!("rustls crypto provider was already installed");
     }
 
-    let cfg = config_from_env();
+    let mut cfg = config_from_env();
+    // Stamped on every container so two app-lb processes on one host do not
+    // adopt each other's. Defaults to the LB's own name rather than being a
+    // separate setting nobody would remember to set.
+    if cfg.lxc.instance.is_empty() {
+        cfg.lxc.instance = cfg.name.clone();
+    }
+    let cfg = cfg;
     let discovery_cfg = discovery::DiscoveryConfig::from_env()
         .unwrap_or_else(|e| panic!("invalid discovery configuration: {e}"));
 
@@ -605,6 +661,11 @@ fn main() {
     // socket client reports `http://localhost` as its base URL, and the choice
     // is made from the environment rather than from app-lb's own config.
     tracing::info!(transport = %vms.transport(), "heyvm daemon transport");
+    // Both runtimes. Building this cannot fail and does no I/O: whether Incus is
+    // actually usable is asked once from the autoscaler's background service,
+    // where there is a runtime to await on. A host with no Incus is a fact about
+    // the host, not a misconfiguration — a fleet of microVMs never notices.
+    let runtime = runtime::Runtime::new(vms.clone(), cfg.lxc.clone());
     // Kept for the sweeper, which is built after the last move of `registry`.
     let mount_registry = registry.clone();
 
@@ -695,7 +756,7 @@ fn main() {
         "autoscaler",
         Autoscaler::new(
             registry.clone(),
-            vms.clone(),
+            runtime,
             metrics.clone(),
             event_feed.clone(),
             workspaces.clone(),

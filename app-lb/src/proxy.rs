@@ -1007,7 +1007,7 @@ mod tests {
     use super::*;
     use crate::config::{DeploymentSpec, HealthCheck, RouteRule, ScalingPolicy, VmSpec};
     use crate::deployment::PendingVm;
-    use heyo_sdk::SandboxDriver;
+    use crate::config::Driver;
 
     #[test]
     fn acme_challenge_answers_only_outstanding_tokens() {
@@ -1149,7 +1149,7 @@ mod tests {
                 image_download_url: None,
                 image_size_bytes: None,
                 image_sha256: None,
-                driver: SandboxDriver::Firecracker,
+                driver: Driver::Firecracker,
                 image: None,
                 port: 8080,
                 start_command: None,

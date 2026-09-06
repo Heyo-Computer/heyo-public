@@ -21,7 +21,7 @@ use crate::mounts::MountStore;
 use heyo_sdk::{
     BindRequest, CommandResult, CommandRunOptions, Daemon, DaemonCreateRequest, DaemonMount,
     HeyoClient, HeyoClientOptions, ImageInfo, ImageUploadOptions, InactiveSandbox, LogEntry,
-    LogsQuery, PurgeOutcome, PurgeParts, Sandbox, SandboxDriver, SandboxInfo, SandboxStatus,
+    LogsQuery, PurgeOutcome, PurgeParts, Sandbox, SandboxInfo, SandboxStatus,
     ShellOptions, ShellSession, StorageInventory, TreeInfo, UploadStream,
 };
 use std::collections::HashMap;
@@ -88,6 +88,23 @@ pub enum VmError {
         path: String,
         digest: Option<String>,
     },
+    /// A spec whose driver this manager cannot boot reached it anyway. heyvmd
+    /// has no name for `lxc`, so the create body could not even be addressed.
+    WrongRuntime {
+        driver: String,
+    },
+    /// The runtime a deployment names exists, but not on this host — an `lxc`
+    /// deployment on a host with no Incus. Distinct from [`Self::Runtime`],
+    /// which is that runtime saying no: this one is fixed by the *operator*,
+    /// not by the spec.
+    RuntimeUnavailable {
+        driver: String,
+        detail: String,
+    },
+    /// A runtime other than heyvmd failed. Carried as a string because the
+    /// error is that runtime's own type and nothing here can act on it beyond
+    /// reporting it.
+    Runtime(String),
 }
 
 impl std::fmt::Display for VmError {
@@ -119,6 +136,16 @@ impl std::fmt::Display for VmError {
             Self::SecretUnresolved { env, detail } => write!(
                 f,
                 "env_from for {env}: {detail} — `heyctl get secrets` lists what this namespace holds"
+            ),
+            Self::RuntimeUnavailable { driver, detail } => write!(
+                f,
+                "no {driver} runtime on this host: {detail}"
+            ),
+            Self::Runtime(detail) => write!(f, "{detail}"),
+            Self::WrongRuntime { driver } => write!(
+                f,
+                "driver {driver} is not a heyvm driver; this sandbox cannot be created \
+                 through the daemon"
             ),
             Self::MountNotPulled { path, digest } => match digest {
                 Some(d) => write!(
@@ -225,7 +252,7 @@ fn create_request(
     let archive_key = spec.workspace_archive.as_ref().and_then(|a| a.key().map(str::to_string));
     DaemonCreateRequest {
         name,
-        driver: Some(spec.driver),
+        driver: spec.driver.heyvm(),
         image: spec.image.clone(),
         start_command: spec.start_command.clone(),
         size_class: spec.size_class.map(|s| serde_json::to_value(s).ok()).flatten().and_then(|v| v.as_str().map(str::to_string)),
@@ -531,10 +558,15 @@ impl VmManager {
         owner: &VmOwner,
         secret_env: HashMap<String, String>,
     ) -> Result<Sandbox, VmError> {
-        debug_assert!(
-            matches!(spec.driver, SandboxDriver::Firecracker | SandboxDriver::Kvm),
-            "DeploymentSpec::validate must reject other drivers before reaching here",
-        );
+        // `validate` refuses these at registration, so this is unreachable in
+        // practice — but it was a `debug_assert` before, which compiled out in
+        // release. Now that the type can say it, say it for real: creating a
+        // container's worth of VM on the wrong daemon is not a debug concern.
+        if spec.driver.heyvm().is_none() {
+            return Err(VmError::WrongRuntime {
+                driver: spec.driver.to_string(),
+            });
+        }
 
         // The proxied port must be open, plus whatever else the spec asks for.
         let mut open_ports = spec.open_ports.clone();
@@ -876,7 +908,7 @@ pub struct SandboxDetail {
 }
 
 impl Listing {
-    fn from_infos(sandboxes: Vec<SandboxInfo>) -> Self {
+    pub fn from_infos(sandboxes: Vec<SandboxInfo>) -> Self {
         let details = sandboxes
             .iter()
             .map(|info| {
@@ -1027,7 +1059,7 @@ mod guest_log_tests {
 mod tests {
     use super::*;
     use serde_json::json;
-    use crate::config::MountSpec;
+    use crate::config::{Driver, MountSpec};
 
     /// A mount store over a directory that does not exist, which is all the
     /// tests that never resolve a mount need.
@@ -1054,7 +1086,7 @@ mod tests {
             image_download_url: None,
             image_size_bytes: None,
             image_sha256: None,
-            driver: SandboxDriver::Firecracker,
+            driver: Driver::Firecracker,
             image: None,
             port: 8080,
             start_command: None,

@@ -84,7 +84,10 @@ const SUSPENDED_SWEEP: Duration = Duration::from_secs(300);
 
 pub struct Autoscaler {
     registry: Arc<Registry>,
-    vms: VmManager,
+    /// Both runtimes: heyvmd for microVMs, Incus for containers. See
+    /// [`crate::runtime`] for why this is an enum-shaped struct rather than a
+    /// trait object.
+    runtime: crate::runtime::Runtime,
     metrics: Arc<Metrics>,
     /// Monotonic source for replica-name nonces. Not for addressing — the
     /// daemon assigns sandbox ids — just to keep our names unique.
@@ -110,7 +113,7 @@ pub struct Autoscaler {
 impl Autoscaler {
     pub fn new(
         registry: Arc<Registry>,
-        vms: VmManager,
+        runtime: crate::runtime::Runtime,
         metrics: Arc<Metrics>,
         feed: Arc<crate::feed::Feed>,
         workspaces: Arc<Workspaces>,
@@ -118,7 +121,7 @@ impl Autoscaler {
     ) -> Self {
         Self {
             registry,
-            vms,
+            runtime,
             metrics,
             nonce: AtomicU64::new(now_secs()),
             creates: tokio::sync::Semaphore::new(CREATE_CONCURRENCY),
@@ -179,15 +182,26 @@ impl Autoscaler {
             }
             return;
         }
-        if let Err(e) = self.vms.kill(sandbox_id).await {
+        if let Err(e) = self.kill_vm(d, sandbox_id).await {
             tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill {what}");
         }
     }
 
-    /// The daemon client, for callers that need to talk to a VM the autoscaler
-    /// owns — `exec` and `shell` in the admin API.
+    /// The heyvm daemon client, for callers that need the heyvm-only surface —
+    /// trees, catalog images, proxy binds, disks. Kept as its own accessor so
+    /// those callers say which runtime they mean rather than discovering it.
     pub fn vms(&self) -> &VmManager {
-        &self.vms
+        self.runtime.heyvm()
+    }
+
+    /// Destroy one of `d`'s replicas, on whichever runtime `d` runs on.
+    ///
+    /// Every kill that still has its deployment in hand goes through here. The
+    /// two that do not — the orphan sweeps, where the deployment is already
+    /// gone — use [`crate::runtime::Runtime::kill_unknown`] instead.
+    async fn kill_vm(&self, d: &Arc<Deployment>, sandbox_id: &str) -> Result<(), vm::VmError> {
+        let driver = d.spec.driver().unwrap_or_default();
+        self.runtime.kill(driver, sandbox_id).await
     }
 
     fn next_nonce(&self) -> u64 {
@@ -380,31 +394,45 @@ impl Autoscaler {
         // when nothing is managed is the volume: a missing daemon is then a
         // fact about the host rather than a failure of the control plane, so
         // it is not shouted every two seconds.
-        let listing = match self.vms.list_detailed().await {
-            Ok(listing) => {
-                self.metrics.record_daemon_reachable();
-                listing
-            }
+        let listing = self.runtime.list().await;
+
+        // Each runtime is judged on its own. Folding them together would let an
+        // unreachable heyvmd strand every container deployment — and a briefly
+        // restarting Incus strand every microVM — for as long as the other one
+        // was down.
+        match &listing.heyvm {
+            Ok(()) => self.metrics.record_daemon_reachable(),
             Err(e) => {
                 if managed.is_empty() {
                     tracing::debug!(error = %e, "failed to list sandboxes; no VM deployments to reconcile");
                 } else {
-                    // Log explicitly: without this the loop fails silently and the
-                    // pool just quietly stops updating.
-                    tracing::error!(error = %e, "failed to list sandboxes; skipping VM reconcile this tick");
+                    tracing::error!(error = %e, "failed to list sandboxes from heyvmd");
                 }
-                // And recorded, because this `return` is the widest-blast-radius
-                // branch in the file: it abandons the reconcile for *every*
-                // managed deployment, so nothing scales, nothing boots, and no
-                // per-deployment counter moves — not even `create_failures`,
-                // since `scale_up` is never reached. Every pool then reads
-                // `ready: 0` with a row of zeroes beside it, which is
-                // indistinguishable from an idle fleet unless something says the
-                // daemon is the thing that is missing.
-                self.metrics.record_daemon_unreachable(&e.to_string());
-                return;
+                // Recorded because every pool then reads `ready: 0` with a row
+                // of zeroes beside it, which is indistinguishable from an idle
+                // fleet unless something says the daemon is the thing missing.
+                self.metrics.record_daemon_unreachable(e);
             }
-        };
+        }
+        if let Some(Err(e)) = &listing.lxc {
+            // Same volume rule the heyvm branch follows, for the same reason: on
+            // a host whose deployments are all microVMs, a broken Incus is a
+            // fact about the host and not a failure of anything app-lb is doing.
+            // Shouting it every two seconds would bury the log that matters.
+            if managed.iter().any(|d| d.spec.driver().is_some_and(|dr| dr.is_lxc())) {
+                tracing::error!(error = %e, "failed to list containers from incus");
+            } else {
+                tracing::debug!(error = %e, "failed to list containers; no lxc deployments to reconcile");
+            }
+        }
+
+        // Only when *nothing* answered is there nothing to reconcile. This
+        // `return` abandons the tick for every managed deployment, so it is
+        // reached on a total outage and not a partial one.
+        if listing.total_outage() {
+            return;
+        }
+        let listing = vm::Listing::from_infos(listing.sandboxes);
 
         // Fetch host + per-VM resource usage alongside the fleet list. It is a
         // best-effort gauge: a failure here must not derail scaling, so we log
@@ -463,7 +491,7 @@ impl Autoscaler {
     /// Read the daemon's cached usage snapshot, push the host figures into the
     /// metrics gauge, and return a per-sandbox index for `apply_usage`.
     async fn sample_usage(&self) -> HashMap<String, vm::SandboxUsage> {
-        let usage = match self.vms.system_usage().await {
+        let usage = match self.vms().system_usage().await {
             Ok(u) => u,
             Err(e) => {
                 tracing::debug!(error = %e, "failed to fetch system usage; skipping this tick");
@@ -570,7 +598,7 @@ impl Autoscaler {
         };
         for b in d.backends().iter() {
             match (want && !b.is_draining(), b.bind()) {
-                (true, None) => match self.vms.bind(&b.sandbox_id, port, public, &tag).await {
+                (true, None) => match self.vms().bind(&b.sandbox_id, port, public, &tag).await {
                     Ok(subdomain) => {
                         tracing::info!(
                             deployment = %d.spec.id,
@@ -600,7 +628,7 @@ impl Autoscaler {
         let Some(subdomain) = b.bind() else {
             return;
         };
-        match self.vms.unbind(&b.sandbox_id, &subdomain).await {
+        match self.vms().unbind(&b.sandbox_id, &subdomain).await {
             Ok(()) => {
                 tracing::info!(
                     deployment = %d.spec.id,
@@ -699,7 +727,7 @@ impl Autoscaler {
             if info.uptime_secs < remaining / 2 {
                 continue;
             }
-            if let Err(e) = self.vms.renew_ttl(&b.sandbox_id, ttl).await {
+            if let Err(e) = self.vms().renew_ttl(&b.sandbox_id, ttl).await {
                 tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to renew TTL");
             }
         }
@@ -875,7 +903,7 @@ impl Autoscaler {
                 // reason the server never answered was sitting in a ring buffer
                 // that app-lb then threw away with the VM.
                 let guest_log = self
-                    .vms
+                    .vms()
                     .guest_log_tail(&p.sandbox_id, GUEST_LOG_LINES)
                     .await;
                 tracing::error!(
@@ -959,7 +987,7 @@ impl Autoscaler {
                     continue;
                 }
             }
-            match self.vms.kill(&id).await {
+            match self.kill_vm(d, &id).await {
                 // The kill is what makes reclamation safe: the disks below are
                 // only unlinked once the daemon says the hypervisor holding
                 // them is gone.
@@ -1081,7 +1109,7 @@ impl Autoscaler {
             // while one sits stopped would strand that VM's `/workspace` disk
             // and hand the caller an empty sandbox in its place.
             if let Some(sandbox_id) = self.take_suspended(d) {
-                match self.vms.resume(&sandbox_id).await {
+                match self.vms().resume(&sandbox_id).await {
                     Ok(_) => {
                         tracing::info!(
                             deployment = %d.spec.id,
@@ -1106,7 +1134,7 @@ impl Autoscaler {
                             error = %e,
                             "failed to resume suspended VM; destroying it and booting a fresh one",
                         );
-                        if let Err(e) = self.vms.kill(&sandbox_id).await {
+                        if let Err(e) = self.kill_vm(d, &sandbox_id).await {
                             tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill VM");
                         }
                     }
@@ -1118,15 +1146,14 @@ impl Autoscaler {
             let owner = vm::VmOwner::of(&d.spec);
             let created_vm = match self.secret_env(d.spec.vm_spec()) {
                 Ok(secret_env) => {
-                    self.vms
+                    self.runtime
                         .create(d.spec.vm_spec(), name, seed.as_ref(), &owner, secret_env)
                         .await
                 }
                 Err(e) => Err(e),
             };
             match created_vm {
-                Ok(sandbox) => {
-                    let sandbox_id = sandbox.sandbox_id().to_string();
+                Ok(sandbox_id) => {
                     if let Some(seeded) = &seeded {
                         self.workspaces.note_seeded(
                             &d.spec.id,
@@ -1283,7 +1310,7 @@ impl Autoscaler {
             }
             if retain {
                 tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "suspending VM");
-                match self.vms.suspend(&b.sandbox_id).await {
+                match self.vms().suspend(&b.sandbox_id).await {
                     // Recorded only on success. A sandbox we failed to stop is
                     // still running and still in the fleet list, so recording it
                     // as suspended would make the next tick skip a live VM.
@@ -1304,14 +1331,14 @@ impl Autoscaler {
                             error = %e,
                             "failed to suspend VM; killing it instead so it cannot leak",
                         );
-                        if let Err(e) = self.vms.kill(&b.sandbox_id).await {
+                        if let Err(e) = self.kill_vm(d, &b.sandbox_id).await {
                             tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to kill VM");
                         }
                     }
                 }
             } else {
                 tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "killing VM");
-                if let Err(e) = self.vms.kill(&b.sandbox_id).await {
+                if let Err(e) = self.kill_vm(d, &b.sandbox_id).await {
                     tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to kill VM");
                 }
             }
@@ -1333,7 +1360,7 @@ impl Autoscaler {
     /// what happened before this existed, and the resume path does not care
     /// either way.
     async fn discard_rootfs_of(&self, d: &Arc<Deployment>, sandbox_id: &str) {
-        let (removed, failed) = crate::disks::discard_rootfs(&self.vms, sandbox_id).await;
+        let (removed, failed) = crate::disks::discard_rootfs(self.vms(), sandbox_id).await;
         if !removed.is_empty() {
             tracing::info!(
                 deployment = %d.spec.id,
@@ -1388,7 +1415,7 @@ impl Autoscaler {
             );
             return;
         }
-        let (removed, failed) = crate::disks::discard_failed_boot(&self.vms, sandbox_id).await;
+        let (removed, failed) = crate::disks::discard_failed_boot(self.vms(), sandbox_id).await;
         if !removed.is_empty() {
             tracing::info!(
                 deployment = %d.spec.id,
@@ -1497,14 +1524,14 @@ impl Autoscaler {
         // **Firecracker** sandbox is the other way round: absent from the fleet
         // list, present in the inactive one. Reading only one would sweep half
         // the fleet and silently ignore the other.
-        let fleet = match self.vms.list().await {
+        let fleet = match self.vms().list().await {
             Ok(list) => list,
             Err(e) => {
                 tracing::debug!(error = %e, "no fleet list; skipping the suspended sweep");
                 return;
             }
         };
-        let inactive = match self.vms.list_inactive().await {
+        let inactive = match self.vms().list_inactive().await {
             Ok(list) => list,
             Err(e) => {
                 // `warn`, not `debug`: this is the only backstop for a stopped
@@ -1603,7 +1630,7 @@ impl Autoscaler {
 
         for (sandbox_id, owner) in &orphans {
             tracing::warn!(deployment = %owner, sandbox = %sandbox_id, "destroying unclaimed suspended VM");
-            if let Err(e) = self.vms.kill(sandbox_id).await {
+            if let Err(e) = self.runtime.kill_unknown(sandbox_id).await {
                 tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill suspended VM");
             }
         }
@@ -1641,7 +1668,7 @@ impl Autoscaler {
     /// Without this, a restart would leave old VMs running while booting a fresh
     /// set — the orphans would only die when their TTL expired.
     pub async fn adopt_existing(&self) {
-        let fleet = match self.vms.list().await {
+        let fleet = match self.vms().list().await {
             Ok(list) => list,
             Err(e) => {
                 tracing::error!(error = %e, "could not list sandboxes for adoption");
@@ -1711,7 +1738,7 @@ impl Autoscaler {
 
         for id in orphans {
             tracing::info!(sandbox = %id, "killing orphaned VM from a previous run");
-            if let Err(e) = self.vms.kill(&id).await {
+            if let Err(e) = self.runtime.kill_unknown(&id).await {
                 tracing::warn!(sandbox = %id, error = %e, "failed to kill orphan");
             }
         }
@@ -1740,7 +1767,7 @@ impl Autoscaler {
             }
             if workspace && p.origin != BootOrigin::Created {
                 self.kill_or_capture(d, &p.sandbox_id, "pending VM").await;
-            } else if let Err(e) = self.vms.kill(&p.sandbox_id).await {
+            } else if let Err(e) = self.kill_vm(d, &p.sandbox_id).await {
                 tracing::warn!(sandbox = %p.sandbox_id, error = %e, "failed to kill pending VM");
             }
         }
@@ -1761,7 +1788,7 @@ impl Autoscaler {
                 }
                 continue;
             }
-            if let Err(e) = self.vms.kill(sandbox_id).await {
+            if let Err(e) = self.kill_vm(d, sandbox_id).await {
                 tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill suspended VM");
             }
         }
@@ -1830,7 +1857,7 @@ impl Autoscaler {
                     Err(e) => EvictOutcome::KillFailed(e),
                 };
             }
-            if let Err(e) = self.vms.kill(sandbox_id).await {
+            if let Err(e) = self.kill_vm(d, sandbox_id).await {
                 tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill evicted VM");
                 return EvictOutcome::KillFailed(e.to_string());
             }
@@ -1849,7 +1876,7 @@ impl Autoscaler {
                 sandbox = %sandbox_id,
                 "evicting pending VM",
             );
-            if let Err(e) = self.vms.kill(sandbox_id).await {
+            if let Err(e) = self.kill_vm(d, sandbox_id).await {
                 tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill evicted pending VM");
                 return EvictOutcome::KillFailed(e.to_string());
             }
@@ -1878,6 +1905,31 @@ pub enum EvictOutcome {
 impl BackgroundService for Autoscaler {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         tracing::info!("autoscaler starting");
+
+        // Ask Incus whether it is there and whether it trusts us, once. Not a
+        // gate — a later call fails on its own with the same explanation — but
+        // the two failure modes here are the ones an operator cannot guess:
+        // a socket at a path app-lb was never told about, and a group
+        // membership app-lb's user does not have.
+        //
+        // Volume follows the same rule the daemon listing uses: on a host with
+        // no container deployments, a missing Incus is a fact about the host
+        // rather than a problem, and is not worth a warning every restart.
+        if let Some(result) = self.runtime.probe_lxc().await {
+            let wanted = self
+                .registry
+                .deployments()
+                .values()
+                .any(|d| d.spec.driver().is_some_and(|dr| dr.is_lxc()));
+            match result {
+                Ok(version) => tracing::info!(version = %version, "incus ready"),
+                Err(e) if wanted => {
+                    tracing::error!(error = %e, "incus is not usable; `driver: lxc` deployments cannot scale")
+                }
+                Err(e) => tracing::debug!(error = %e, "no usable incus (no lxc deployments)"),
+            }
+        }
+
         self.adopt_existing().await;
 
         let mut ticker = tokio::time::interval(TICK);
@@ -2072,7 +2124,7 @@ mod tests {
     use crate::config::{DeploymentSpec, HealthCheck, RouteRule, ScalingPolicy, VmSpec};
     use crate::deployment::VmBackend;
     use crate::metrics::Metrics;
-    use heyo_sdk::SandboxDriver;
+    use crate::config::Driver;
 
     fn spec() -> DeploymentSpec {
         DeploymentSpec {
@@ -2094,7 +2146,7 @@ mod tests {
                 image_download_url: None,
                 image_size_bytes: None,
                 image_sha256: None,
-                driver: SandboxDriver::Firecracker,
+                driver: Driver::Firecracker,
                 image: None,
                 port: 8080,
                 start_command: None,
@@ -2194,7 +2246,16 @@ mod tests {
         (
             Autoscaler::new(
                 registry.clone(),
-                vms,
+                // Incus off: these tests are about the autoscaler's own logic,
+                // and a host running them may or may not have Incus on it. The
+                // seam still dispatches, it just has one runtime to dispatch to.
+                crate::runtime::Runtime::new(
+                    vms,
+                    crate::config::LxcConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                ),
                 Arc::new(Metrics::new()),
                 Arc::new(crate::feed::Feed::new()),
                 workspaces,

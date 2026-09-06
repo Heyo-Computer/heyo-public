@@ -664,7 +664,7 @@ fn state_file_name(id: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{DiscoverySpec, HealthCheck, RouteRule, ScalingPolicy, VmSpec};
-    use heyo_sdk::SandboxDriver;
+    use crate::config::Driver;
     use std::path::Path;
 
     fn spec(id: &str, routes: Vec<RouteRule>) -> DeploymentSpec {
@@ -682,7 +682,7 @@ mod tests {
                 image_download_url: None,
                 image_size_bytes: None,
                 image_sha256: None,
-                driver: SandboxDriver::Firecracker,
+                driver: Driver::Firecracker,
                 image: None,
                 port: 8080,
                 start_command: None,

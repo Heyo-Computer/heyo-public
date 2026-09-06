@@ -324,7 +324,7 @@ mod tests {
                 image_download_url: None,
                 image_size_bytes: None,
                 image_sha256: None,
-                driver: heyo_sdk::SandboxDriver::Firecracker,
+                driver: crate::config::Driver::Firecracker,
                 image: None,
                 port: 8080,
                 start_command: None,

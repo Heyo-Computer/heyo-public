@@ -205,11 +205,17 @@ function isApplbToken(header: string): boolean {
  * credential they already hold, and app-lb re-checks its scope regardless of
  * who relayed it.
  *
- * Cloud is deliberately left out of this. An `applb_…` token is not a cloud
- * credential, so the sandbox tools keep using `HEYO_API_KEY` and every caller
- * admitted by an app-token gate shares that one cloud account. App-lb tokens
- * have no per-user cloud counterpart to switch to; the alternative is not
- * finer-grained sandboxes but no sandboxes at all.
+ * Cloud is left out of the second rule and, for an app-lb token, out of the
+ * first one too. An `applb_…` token is not a cloud credential: cloud has never
+ * heard of it, so forwarding one could only produce a 401 on every sandbox call.
+ * So a configured `HEYO_API_KEY` is kept (every caller admitted by an app-token
+ * gate shares that one cloud account), and where there is no key the caller's
+ * app-lb token is *not* substituted for one — cloud stays unconfigured, and
+ * `buildTools` lists no sandbox tools rather than sixteen that always fail.
+ *
+ * Only that prefix is excluded. A `heyo_api_*` key is exactly what cloud wants
+ * and is still forwarded, which is what makes managed mode multi-tenant; a JWT
+ * is left alone as before.
  *
  * Returns the same object when nothing applies, so the per-process tool set can
  * be reused.
@@ -222,7 +228,9 @@ export function withForwardedAuth(
   const value = Array.isArray(raw) ? raw[0] : raw;
   if (!value || !value.trim()) return config;
 
-  const needsCloud = Boolean(config.cloud && !config.cloud.auth);
+  // An app-lb token is the one bearer that must not stand in for a cloud key:
+  // see above. Every other credential keeps the borrow-when-empty rule.
+  const needsCloud = Boolean(config.cloud && !config.cloud.auth && !isApplbToken(value));
   // Either app-lb has nothing of its own, or the caller presented a credential
   // that carries its own scope and must not be traded up for this one's.
   const needsApplb = Boolean(config.applb && (!config.applb.auth || isApplbToken(value)));

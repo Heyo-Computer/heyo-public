@@ -21,11 +21,36 @@ import { actionTools } from "./tools/actions.js";
 import { sandboxTools } from "./tools/sandbox.js";
 import { feedTools } from "./tools/feed.js";
 
+/**
+ * The tools this configuration can actually serve.
+ *
+ * Every group but one is unconditional: an unreachable app-lb, app-obs or ci
+ * still gets its tools listed, because `bind` turns the absence into a
+ * `NotConfigured` error naming the variable to set, and that is a better answer
+ * than a tool that silently does not exist.
+ *
+ * The sandbox tools are the exception, and the reason is that their absence is
+ * a *deployment shape* rather than a misconfiguration. An instance behind an
+ * app-token gate has no cloud credential to act with and no way to get one — the
+ * gate admits `applb_…` tokens, which cloud cannot consume — so listing sixteen
+ * sandbox tools there advertises capability the caller can never reach. A
+ * fleet-operations instance is a complete thing, not a broken one.
+ *
+ * Gated on the credential rather than on a switch of its own, because that is
+ * exactly the condition: `makeClients` treats a cloud without one as absent for
+ * the same reason. And because {@link withForwardedAuth} may supply it
+ * per-request, this stays correct for a hosted instance carrying no key of its
+ * own — a caller presenting a `heyo_api_*` key gets the sandbox tools, and one
+ * presenting an app-lb token does not.
+ *
+ * `heyo_status` still reports cloud either way, so "this server has no sandbox
+ * tools" remains an answerable question rather than a silent gap.
+ */
 export function buildTools(config: Config): Tool[] {
   const clients = makeClients(config);
   return [
     ...diagnosticTools(clients, config),
-    ...sandboxTools(clients),
+    ...(config.cloud?.auth ? sandboxTools(clients) : []),
     ...feedTools(clients),
     ...actionTools(clients),
   ];

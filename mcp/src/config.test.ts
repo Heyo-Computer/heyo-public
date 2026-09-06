@@ -182,3 +182,41 @@ test("no credential at all configures nothing", () => {
   assert.equal(config.applb, undefined);
   assert.deepEqual(configured(config), []);
 });
+
+test("an app-lb token is never substituted for a cloud key", () => {
+  // The fleet-operations shape: an app-token gate in front, no HEYO_API_KEY, and
+  // callers who by definition present `applb_…`. Cloud has never heard of that
+  // credential, so borrowing it under the "no credential of its own" rule would
+  // turn every sandbox tool into a guaranteed 401 — capability advertised and
+  // unreachable. Cloud stays unconfigured instead, and `buildTools` lists none.
+  const fleetOps = loadConfig({ APPLB_URL: "http://127.0.0.1:8080" });
+  assert.equal(fleetOps.cloud?.auth, undefined);
+
+  const asCaller = withForwardedAuth(fleetOps, { authorization: "Bearer applb_abc123_secret" });
+  assert.equal(asCaller.applb?.auth, "Bearer applb_abc123_secret");
+  assert.equal(asCaller.cloud?.auth, undefined);
+
+  // Only that prefix. A cloud key is exactly what cloud wants and is still
+  // borrowed — this is the rule that makes managed mode multi-tenant, and
+  // narrowing it would have cost every hosted instance its sandboxes.
+  assert.equal(
+    withForwardedAuth(fleetOps, { authorization: "Bearer heyo_api_caller" }).cloud?.auth,
+    "Bearer heyo_api_caller",
+  );
+  // A JWT likewise: some other gate issued it, and this is not the place to
+  // decide cloud will refuse it.
+  assert.equal(
+    withForwardedAuth(fleetOps, { authorization: "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x" }).cloud?.auth,
+    "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x",
+  );
+
+  // And with nothing to give either service, the same object comes back rather
+  // than a copy that changed nothing.
+  assert.equal(
+    withForwardedAuth(
+      loadConfig({ APPLB_URL: "http://127.0.0.1:8080", APPLB_TOKEN: "applb_fleet_wide" }),
+      { authorization: "Bearer heyo_api_caller" },
+    ).cloud?.auth,
+    "Bearer heyo_api_caller",
+  );
+});

@@ -659,7 +659,7 @@ impl Drop for WaiterGuard {
 mod tests {
     use super::*;
     use crate::config::{HealthCheck, RouteRule, ScalingPolicy, VmSpec};
-    use heyo_sdk::SandboxDriver;
+    use crate::config::Driver;
 
     fn backend(addr: &str) -> Arc<VmBackend> {
         Arc::new(VmBackend::new(format!("sb-{addr}"), addr.parse().unwrap()))
@@ -685,7 +685,7 @@ mod tests {
                 image_download_url: None,
                 image_size_bytes: None,
                 image_sha256: None,
-                driver: SandboxDriver::Firecracker,
+                driver: Driver::Firecracker,
                 image: None,
                 port: 8080,
                 start_command: None,
