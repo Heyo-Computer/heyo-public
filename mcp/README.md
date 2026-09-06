@@ -176,9 +176,44 @@ other sandbox.
 A hosted instance can serve many tenants from one process: leave `APPLB_TOKEN`
 and `APPLB_BASIC` unset and, in HTTP mode, each request's own `Authorization`
 header goes upstream instead, so every caller acts under their own key and
-therefore their own namespaces. A configured token always wins over a caller's
-header — an instance deployed to act as itself must not be talked into acting
-as someone else.
+therefore their own namespaces. A configured token otherwise wins over a
+caller's header — an instance deployed to act as itself must not be talked into
+acting as someone else.
+
+**One credential overrides that, and must: a token app-lb minted itself.** A
+caller presenting `Authorization: Bearer applb_…` reaches app-lb with *that*
+token, whether or not this process has one of its own. An app-token carries a
+scope — an `admin` level and a `deployments` list — which app-lb enforces per
+route, so substituting the operator's fleet-wide `APPLB_TOKEN` for it would
+hand a token scoped to one deployment the reach of a credential scoped to all
+of them. The gate in front authenticated a narrow principal; acting for it with
+broad authority is a confused deputy, and this is the shape that closes it.
+
+The rule keys on the `applb_` prefix, so nothing else changes: a `heyo_api_*`
+key or a JWT means nothing to app-lb's admin API and still falls to the
+configured credential, leaving managed mode and JWT-gated deployments exactly
+as they were. Nor is preferring the caller's token an escalation the other way
+— it is a credential they already hold, and app-lb re-checks its scope whoever
+relayed it.
+
+Cloud is deliberately outside this. An `applb_…` token is not a cloud
+credential, so the sandbox tools keep using `HEYO_API_KEY` and every caller an
+app-token gate admits shares that one cloud account. There is no per-user cloud
+counterpart to switch to; the alternative is not narrower sandboxes but none.
+**Mint tokens with the `deployments` scope the caller should actually have, and
+treat sandbox reach as shared.**
+
+And know what `admin` buys, because it is coarser than it sounds. `none` passes
+the gate and reaches no admin route; `view` covers `/metrics`, `/disks`,
+`/feeds`, `/security`, `/ingress` and `/storage` — which is `applb_metrics`,
+`applb_disks` and the feed tools, and nothing else; `admin` is everything.
+There is **no read-only tier for deployment routes**: `GET /deployments` and
+`GET /deployments/:id` are CRUD-tier, because a spec's env vars can hold
+secrets, so `applb_list_deployments`, `applb_get_deployment` and
+`applb_deployment_jobs` all require `admin` — the same scope that deletes a
+deployment and execs in its VMs. A token that can read one can delete it. For a
+caller who needs deployment reads, the `deployments` list and `namespace` are
+the only narrowing that exists.
 
 ## Running it
 
@@ -272,7 +307,7 @@ name upstream that belongs to nobody" — so nothing is forwarded and the check
 above refuses every request that gate admits. A machine client (an agent, a
 daemon, anything holding a static bearer) therefore wants either
 
-- `provider: ["app_token"]` on the deployment **and**
+- `provider: ["app-token"]` on the deployment **and**
   `HEYO_MCP_REQUIRE_IDENTITY=0` here — safe because the gate in front is doing
   exactly the work this check stands in for, and the port is still loopback; or
 - `provider: ["jwt"]`, where the caller's own token carries a subject and the

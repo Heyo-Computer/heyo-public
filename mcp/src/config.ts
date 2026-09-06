@@ -148,26 +148,86 @@ export function applbService(
 }
 
 /**
+ * Prefix on a token app-lb minted for itself (`applb_<id>_<secret>`).
+ *
+ * The prefix is load-bearing, not cosmetic: it is what distinguishes a
+ * credential **app-lb issued and will scope-check** from every other bearer a
+ * caller might present — a `heyo_api_*` cloud key, or a JWT from some other
+ * issuer. See {@link withForwardedAuth}.
+ */
+const APPLB_TOKEN_PREFIX = "applb_";
+
+/**
+ * The bearer's value, without the scheme, or undefined if it isn't a bearer.
+ *
+ * Looser than app-lb's own `strip_prefix("Bearer ")` — case-insensitive, any
+ * run of spaces — on purpose. The two ways of being wrong here are not
+ * symmetric: a header this accepts that app-lb will not parse ends in a 401,
+ * while one app-lb would accept and this missed falls back to the configured
+ * credential, which is exactly the escalation {@link withForwardedAuth} exists
+ * to prevent. So the detector errs wide and the strict parser downstream
+ * decides.
+ */
+function bearerToken(header: string): string | undefined {
+  const match = /^Bearer[ \t]+(\S.*)$/i.exec(header.trim());
+  return match?.[1]?.trim();
+}
+
+/** Whether the caller presented a token app-lb minted. */
+function isApplbToken(header: string): boolean {
+  return bearerToken(header)?.startsWith(APPLB_TOKEN_PREFIX) ?? false;
+}
+
+/**
  * The config to serve one HTTP request with.
  *
- * When cloud or app-lb is configured without a credential of its own, the
- * caller's `Authorization` header is forwarded instead — so one hosted instance
- * serves every tenant, each under their own key and therefore their own
- * sandboxes and namespace grant. A configured key always wins: that instance
- * was deployed to act as itself, and a caller's header must not be able to
- * change who it acts as. Returns the same object when nothing applies, so the
- * per-process tool set can be reused.
+ * Two rules, and the second one exists because the first is not sufficient.
+ *
+ * **A service with no credential of its own borrows the caller's.** That is
+ * what lets one hosted instance serve every tenant, each under their own key
+ * and therefore their own sandboxes and namespace grant.
+ *
+ * **An app-lb-minted token always speaks for itself, configured credential or
+ * not.** A token carries a scope — an `admin` level and a `deployments` list —
+ * and app-lb enforces it on every route. Falling back to this process's own
+ * `APPLB_TOKEN` for a caller who presented one would hand a token scoped to a
+ * single deployment the reach of whatever fleet-wide credential the operator
+ * configured. That is a confused deputy: the gate in front authenticated a
+ * narrow principal and the process would then act for it with broad authority.
+ * The caller's token is therefore preferred over the configured one whenever it
+ * is app-lb's own kind, so a scope is never widened by passing through here.
+ *
+ * The prefix test is what keeps that from breaking the other gate shapes. A
+ * `heyo_api_*` key or a JWT is not an app-lb token — it means nothing to
+ * app-lb's admin API — so those still fall to the configured credential and a
+ * JWT-gated deployment behaves exactly as before. And preferring a caller's
+ * `applb_…` is never an escalation in the other direction either: it is a
+ * credential they already hold, and app-lb re-checks its scope regardless of
+ * who relayed it.
+ *
+ * Cloud is deliberately left out of this. An `applb_…` token is not a cloud
+ * credential, so the sandbox tools keep using `HEYO_API_KEY` and every caller
+ * admitted by an app-token gate shares that one cloud account. App-lb tokens
+ * have no per-user cloud counterpart to switch to; the alternative is not
+ * finer-grained sandboxes but no sandboxes at all.
+ *
+ * Returns the same object when nothing applies, so the per-process tool set can
+ * be reused.
  */
 export function withForwardedAuth(
   config: Config,
   headers: Record<string, string | string[] | undefined>,
 ): Config {
-  const needsCloud = config.cloud && !config.cloud.auth;
-  const needsApplb = config.applb && !config.applb.auth;
-  if (!needsCloud && !needsApplb) return config;
   const raw = headers["authorization"];
   const value = Array.isArray(raw) ? raw[0] : raw;
   if (!value || !value.trim()) return config;
+
+  const needsCloud = Boolean(config.cloud && !config.cloud.auth);
+  // Either app-lb has nothing of its own, or the caller presented a credential
+  // that carries its own scope and must not be traded up for this one's.
+  const needsApplb = Boolean(config.applb && (!config.applb.auth || isApplbToken(value)));
+  if (!needsCloud && !needsApplb) return config;
+
   return {
     ...config,
     cloud: needsCloud ? { ...config.cloud!, auth: value } : config.cloud,
