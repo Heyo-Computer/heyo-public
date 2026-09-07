@@ -237,6 +237,10 @@
       <option value="low">Low and above</option>
     </select>
     <select id="f-rule"><option value="">Any rule</option></select>
+    <!-- Populated from /namespaces, which narrows itself to what this
+         credential can already see — so the options are never a list of rooms
+         the reader cannot open. -->
+    <select id="f-namespace"><option value="">Any namespace</option></select>
     <input type="text" id="f-deployment" placeholder="deployment" size="14">
     <span class="spacer"></span>
     <button class="act" id="refresh" type="button">Refresh</button>
@@ -570,9 +574,30 @@ function query() {
   const p = new URLSearchParams();
   if ($("f-severity").value) p.set("severity", $("f-severity").value);
   if ($("f-rule").value) p.set("rule", $("f-rule").value);
+  if ($("f-namespace").value) p.set("namespace", $("f-namespace").value);
   if ($("f-deployment").value.trim()) p.set("deployment", $("f-deployment").value.trim());
   const s = p.toString();
   return "/security" + (s ? "?" + s : "");
+}
+
+// The namespace options come from their own endpoint rather than from the
+// alerts on screen: filtering by a namespace that currently has no findings is
+// exactly the check somebody wants to be able to make, and a list built from
+// the results could never offer it. Fetched once — namespaces are created by
+// hand, not by traffic, and a reload picks up a new one.
+async function namespaceOptions() {
+  const r = await api("GET", "/namespaces");
+  if (!r.ok) return;
+  const sel = $("f-namespace");
+  const names = (r.data || []).map(n => n.namespace);
+  if (names.length < 2 && names[0] === "default") { sel.hidden = true; return; }
+  const want = ['<option value="">Any namespace</option>']
+    .concat(names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`)).join("");
+  if (sel.dataset.built === want) return;
+  const keep = sel.value;
+  sel.dataset.built = want;
+  sel.innerHTML = want;
+  sel.value = keep;
 }
 
 async function load() {
@@ -709,7 +734,7 @@ function schedule() {
   if ($("auto").checked) timer = setInterval(load, 10000);
 }
 
-["f-severity", "f-rule", "f-deployment"].forEach(id =>
+["f-severity", "f-rule", "f-namespace", "f-deployment"].forEach(id =>
   $(id).addEventListener("change", load));
 $("f-deployment").addEventListener("input", () => {
   clearTimeout($("f-deployment").debounce);
@@ -721,6 +746,7 @@ $("auto").addEventListener("change", schedule);
 // cookie scoped to the parent domain, so the choice follows a person to every
 // Heyo app instead of stopping at this origin.
 
+namespaceOptions();
 load();
 schedule();
 </script>

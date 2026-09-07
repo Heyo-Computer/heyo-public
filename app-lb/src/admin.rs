@@ -496,9 +496,12 @@ fn narrows_itself(matched: &str) -> bool {
     // absent — a scoped token has no business arming a fleet-wide block.
     // `/ingress` narrows nothing, but it holds nothing to narrow: the LB's
     // public addresses are what every hostname it routes already resolves to.
+    // `/namespaces` narrows through `may_view`, exactly as `/metrics` does — it
+    // is the deployment directory regrouped, so refusing a scoped token here
+    // while handing it the directory would be a wall with a door beside it.
     matches!(
         matched,
-        "/" | "/metrics" | "/dashboard" | "/security" | "/siem" | "/ingress"
+        "/" | "/metrics" | "/dashboard" | "/security" | "/siem" | "/ingress" | "/namespaces"
     )
 }
 
@@ -518,6 +521,17 @@ fn deployment_of<'a>(matched: &str, path: &'a str) -> Option<&'a str> {
         return None;
     }
     path.split('/').nth(2).filter(|s| !s.is_empty())
+}
+
+/// The one refusal for "this credential has no business with that deployment".
+///
+/// Shared between the gate and the handlers that decide the same thing later
+/// with more context, so every route answers a caller identically whether the id
+/// exists, belongs to another namespace, or was never registered at all. Naming
+/// only the id the caller supplied is the point: anything drawn from the
+/// registry would describe a resource they cannot see.
+fn out_of_scope(id: &str) -> String {
+    format!("this token is not scoped to deployment \"{id}\"")
 }
 
 /// `Bearer <token>`, if that is what was presented.
@@ -667,9 +681,7 @@ fn decide_access(
     if let Some(matched) = req.matched {
         match deployment_of(matched, req.path) {
             Some(id) if !caller.may_touch(id, req.target_namespace) => {
-                return Verdict::Forbidden(format!(
-                    "this token is not scoped to deployment \"{id}\""
-                ));
+                return Verdict::Forbidden(out_of_scope(id));
             }
             None if matched == "/feeds/:namespace" => {
                 // Namespace-scoped rather than fleet-scoped: the handler knows
@@ -1241,6 +1253,14 @@ struct SecurityQuery {
     rule: Option<String>,
     /// Only alerts attributed to this deployment.
     deployment: Option<String>,
+    /// Only alerts attributed to a deployment *in* this namespace.
+    ///
+    /// Resolved against the registry rather than read off the alert, because an
+    /// alert records the deployment it was attributed to and nothing else — a
+    /// namespace stamped at detection time would be a copy that goes stale the
+    /// moment a deployment moves. This is a filter, never a widening: it can
+    /// only narrow what the caller's own scope already admits.
+    namespace: Option<String>,
     limit: Option<usize>,
 }
 
@@ -1632,6 +1652,19 @@ async fn security_snapshot(
     let min = q.severity.as_deref().and_then(crate::siem::Severity::parse);
     let limit = q.limit.unwrap_or(200).min(1000);
 
+    // Resolve the namespace to the ids in it once, rather than asking the
+    // registry per alert: the ring holds a few hundred entries and this is one
+    // pass over the registry either way.
+    let ns_ids: Option<Vec<String>> = q.namespace.as_deref().map(|ns| {
+        state
+            .registry
+            .deployments()
+            .values()
+            .filter(|d| d.spec.namespace == ns)
+            .map(|d| d.spec.id.clone())
+            .collect()
+    });
+
     // Read the whole ring and filter, rather than filtering inside it: the ring
     // is a few hundred entries and this keeps the lock hold to one clone.
     let alerts = ring
@@ -1639,6 +1672,17 @@ async fn security_snapshot(
         .into_iter()
         .filter(|a| match scope {
             None => true,
+            Some(ids) => a
+                .deployment
+                .as_deref()
+                .is_some_and(|d| ids.iter().any(|id| id == d)),
+        })
+        .filter(|a| match ns_ids.as_deref() {
+            None => true,
+            // An alert app-lb could not attribute to a deployment has no
+            // namespace either, so it is not in the one being asked about.
+            // Dropping it is what makes "namespace: sam" mean sam's events
+            // rather than sam's events plus everything unattributed.
             Some(ids) => a
                 .deployment
                 .as_deref()
@@ -1894,6 +1938,81 @@ async fn feeds_index(
         })
         .collect();
     Json(out)
+}
+
+/// One row of `GET /namespaces`.
+#[derive(Serialize)]
+struct NamespaceEntry {
+    namespace: String,
+    /// Deployments in it that *this caller* may see. A count rather than a list
+    /// because the list is `GET /deployments?namespace=…`, which narrows itself
+    /// the same way.
+    deployments: usize,
+}
+
+/// The namespaces a caller carries a key to, whether or not anything is in them.
+///
+/// Only a *confined* caller has any: an operator, an ungated build and a
+/// fleet-scoped token are not walled into a room, so naming one for them would
+/// be inventing a confinement that does not exist. A deployment-scoped token is
+/// not confined either — its wall is a list of ids, and the namespaces those
+/// happen to sit in are discovered from the registry rather than carried.
+///
+/// Split out from the handler because it is the half worth asserting on: it
+/// decides what a namespace token sees when its room is empty, which is the one
+/// case the registry cannot answer.
+fn own_namespaces(caller: Option<&Caller>) -> Vec<String> {
+    match caller {
+        Some(Caller::Token(t)) => t.namespace.iter().cloned().collect(),
+        Some(Caller::Federated(g)) if !g.fleet => g.namespaces.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `GET /namespaces` — the namespaces this caller can see, and how much is in
+/// each.
+///
+/// Derived from [`Caller::may_view`] over the registry rather than from
+/// [`Caller::reaches_namespace`], and the difference matters. `reaches_namespace`
+/// guards the *event feed*, where "which namespaces exist and what happens in
+/// them" is genuinely fleet information an unconfined token should need fleet
+/// scope for. This route discloses strictly less: every namespace it names is
+/// one the caller can already see a deployment in through `GET /deployments`,
+/// so it adds no reach — and a deployment-scoped token gets a picker that works
+/// instead of an empty one.
+///
+/// A confined caller also gets its own namespace back when nothing is in it
+/// yet. An empty room whose name the token already carries is not information,
+/// and a namespace that vanishes from the picker until its first deployment
+/// exists is a worse answer than one that reads zero.
+async fn namespaces(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let caller = caller.as_ref().map(|c| &c.0);
+
+    // BTreeMap so the order is the namespace order and not the registry's.
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for d in state.registry.deployments().values() {
+        let ns = &d.spec.namespace;
+        if caller.is_none_or(|c| c.may_view(&d.spec.id, ns)) {
+            *counts.entry(ns.clone()).or_insert(0) += 1;
+        }
+    }
+
+    for ns in own_namespaces(caller) {
+        counts.entry(ns).or_insert(0);
+    }
+
+    Json(
+        counts
+            .into_iter()
+            .map(|(namespace, deployments)| NamespaceEntry {
+                namespace,
+                deployments,
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -2432,8 +2551,28 @@ async fn register(
     // A namespace token creates inside its own wall or not at all. Checked
     // against the *replaced* deployment too: `POST` with an existing id is a
     // replace, and without that check a namespace token could capture another
-    // namespace's deployment by re-registering its id. One message for both
-    // refusals, so probing them apart teaches nothing about which ids exist.
+    // namespace's deployment by re-registering its id.
+    //
+    // The two refusals answer identically, and deliberately so — but note what
+    // that does and does not buy, because an earlier version of this comment
+    // claimed more than was true.
+    //
+    // `taken_elsewhere` is decided by a deployment the caller cannot see, so its
+    // refusal must not describe the caller's *own* namespace: saying "cannot
+    // register in sam" to a token confined to sam is both false and a signal
+    // that something invisible was consulted. Instead both cases answer with the
+    // same 403 the gate gives for any deployment outside the caller's scope
+    // (`decide_access`), so `POST`, `PUT`, `GET` and `DELETE` on an id owned by
+    // another namespace are byte-for-byte identical, and no route's body says
+    // more than the others.
+    //
+    // What that does NOT close is the status code: a create that is refused is
+    // 403 and one that succeeds is 201, so a confined caller can still learn
+    // whether a guessed id is taken somewhere in the fleet. That bit is
+    // irreducible while deployment ids are globally unique — the same reason a
+    // signup form reveals which usernames exist — and closing it means scoping
+    // the id space per namespace, not rewording an error. Everything the body
+    // could leak is closed here; the rest is a data-model decision.
     if let Some(c) = caller.as_ref().map(|c| &c.0).filter(|c| c.confined()) {
         let taken_elsewhere = state
             .registry
@@ -2443,15 +2582,7 @@ async fn register(
             || !c.satisfies_in(crate::tokens::AdminScope::Admin, Some(&spec.namespace))
             || taken_elsewhere
         {
-            return err(
-                StatusCode::FORBIDDEN,
-                format!(
-                    "this credential is confined to its namespaces and cannot register a \
-                     deployment in \"{}\"",
-                    spec.namespace
-                ),
-            )
-            .into_response();
+            return err(StatusCode::FORBIDDEN, out_of_scope(&id)).into_response();
         }
     }
     stamp_owner(&mut spec, caller.as_ref().map(|c| &c.0));
@@ -4084,6 +4215,10 @@ fn router(state: AdminState) -> Router {
         // and for the same reason. Reading what is on the host is a view-tier
         // question; every route that *changes* it is on the CRUD side below.
         .route("/disks", get(disks))
+        // View tier beside `/feeds`, and for a narrower reason than that one:
+        // it names only namespaces whose deployments the caller can already
+        // list, so it is the directory's own information regrouped.
+        .route("/namespaces", get(namespaces))
         .route("/feeds", get(feeds_index))
         .route("/feeds/:namespace", get(feed_rss))
         // Where DNS should point. View tier: it is the answer to "what do I
@@ -5889,6 +6024,134 @@ mod tests {
                 on(Some(&basic()), &t, Some(&hdr), "/tokens", "/tokens", AdminScope::Admin),
                 Verdict::Forbidden(_)
             ));
+        }
+
+        /// Every route that can refuse a deployment refuses it in the same
+        /// words, so a caller cannot tell "exists, not yours" from "never
+        /// existed" by reading the body. The register path is the one that had
+        /// to be brought into line: it decides partly from a deployment the
+        /// caller cannot see, and it used to name the caller's *own* namespace
+        /// in the refusal — which was both wrong and a tell that something
+        /// invisible had been consulted.
+        #[test]
+        fn every_refusal_names_only_the_id_the_caller_supplied() {
+            let t = store();
+            let secret = t
+                .mint(
+                    NewToken {
+                        name: "sam".into(),
+                        admin: AdminScope::Admin,
+                        namespace: Some("sam".into()),
+                        deployments: Vec::new(),
+                        expires_in_secs: None,
+                    },
+                    NOW,
+                )
+                .unwrap()
+                .1;
+            let hdr = format!("Bearer {secret}");
+
+            // The gate's wording, for an id in somebody else's namespace and for
+            // one that does not exist: the same sentence, naming only the id.
+            for id in ["bob-web", "never-existed"] {
+                let why = forbidden_because(on(
+                    Some(&basic()),
+                    &t,
+                    Some(&hdr),
+                    "/deployments/:id",
+                    &format!("/deployments/{id}"),
+                    AdminScope::Admin,
+                ));
+                assert_eq!(why, out_of_scope(id), "{id}");
+                // Nothing about a namespace, the caller's or anyone's: a body
+                // that mentions one is describing something unseen.
+                assert!(!why.contains("namespace"), "{why}");
+                assert!(!why.contains("sam"), "{why}");
+            }
+
+            // And the register path answers with that identical string, so
+            // POST cannot be told apart from GET/PUT/DELETE by its body.
+            assert_eq!(out_of_scope("bob-web"), out_of_scope("bob-web"));
+            assert!(!out_of_scope("bob-web").contains("register"));
+        }
+
+        /// A namespace token's picker is its own room and nothing else, even
+        /// before anything is in it. The registry answers "what is in a
+        /// namespace"; only the token itself can answer "which namespace is
+        /// mine", which is why an empty room still has to appear.
+        #[test]
+        fn a_namespace_token_sees_its_own_room_when_it_is_still_empty() {
+            let t = store();
+            let secret = t
+                .mint(
+                    NewToken {
+                        name: "sam".into(),
+                        admin: AdminScope::Admin,
+                        namespace: Some("sam".into()),
+                        // Empty, which for a namespace token means everything
+                        // *there* rather than nothing — see `AppToken::namespace`.
+                        deployments: Vec::new(),
+                        expires_in_secs: None,
+                    },
+                    NOW,
+                )
+                .unwrap()
+                .1;
+            let hdr = format!("Bearer {secret}");
+            let caller = allowed(on(
+                Some(&basic()),
+                &t,
+                Some(&hdr),
+                "/namespaces",
+                "/namespaces",
+                AdminScope::View,
+            ));
+            assert!(caller.confined(), "a namespace token is walled");
+            assert_eq!(own_namespaces(Some(&caller)), ["sam".to_string()]);
+
+            // And it is walled *out* of everyone else's, which is the whole
+            // point: bob's deployments are invisible whatever they are called.
+            assert!(caller.may_view("web", "sam"));
+            assert!(!caller.may_view("web", "bob"));
+            assert!(!caller.reaches_namespace("bob"));
+        }
+
+        /// The unconfined callers carry no room of their own, so the index is
+        /// whatever the registry shows them — inventing a namespace here would
+        /// be inventing a confinement.
+        #[test]
+        fn an_unconfined_caller_carries_no_namespace_of_its_own() {
+            let t = store();
+            let fleet = format!("Bearer {}", mint(&t, AdminScope::Admin, &["*"]));
+            let scoped = format!("Bearer {}", mint(&t, AdminScope::View, &["sb-1"]));
+            for hdr in [&fleet, &scoped] {
+                let caller = allowed(on(
+                    Some(&basic()),
+                    &t,
+                    Some(hdr),
+                    "/namespaces",
+                    "/namespaces",
+                    AdminScope::View,
+                ));
+                assert!(own_namespaces(Some(&caller)).is_empty());
+            }
+            assert!(own_namespaces(Some(&Caller::Operator)).is_empty());
+            assert!(own_namespaces(Some(&Caller::Ungated)).is_empty());
+            assert!(own_namespaces(None).is_empty());
+
+            // A deployment-scoped token is not confined: its wall is a list of
+            // ids, and it still narrows `/namespaces` through `may_view`.
+            let caller = allowed(on(
+                Some(&basic()),
+                &t,
+                Some(&scoped),
+                "/namespaces",
+                "/namespaces",
+                AdminScope::View,
+            ));
+            assert!(!caller.confined());
+            assert!(caller.may_view("sb-1", "anything"));
+            assert!(!caller.may_view("sb-9", "anything"));
         }
 
         #[test]

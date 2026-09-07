@@ -24,9 +24,14 @@ listener stays on 127.0.0.1:9090, untouched.
 
 ## The credential posture, which is the point
 
-**`APPLB_TOKEN` is deliberately absent from the spec.** With no app-lb
-credential of its own, `withForwardedAuth` (`src/config.ts`) hands every app-lb
-call the caller's own `applb_…` token, and app-lb scope-checks it *twice*:
+**This deployment holds no credentials.** No `APPLB_TOKEN`, no `HEYO_API_KEY`,
+no service tokens for app-obs or ci — `env_vars` is three URLs and four
+switches, and there is no `env_from` at all. Every call it makes runs as the
+caller who asked for it.
+
+`withForwardedAuth` (`src/config.ts`) hands each app-lb, app-obs and ci call the
+caller's own `applb_…` token, and app-lb scope-checks it *twice* on the app-lb
+path:
 
 1. the gate on the admin deployment (`auth.rs:315-330`, `token.admits(...)`), and
 2. the admin listener itself, which accepts `Authorization: Bearer applb_…`
@@ -35,7 +40,16 @@ call the caller's own `applb_…` token, and app-lb scope-checks it *twice*:
 
 One credential, two enforcement points, no conflict — the proxy forwards
 `Authorization` unchanged, stripping only `IDENTITY_HEADERS`
-(`app-lb/src/proxy.rs:700-702`).
+(`app-lb/src/proxy.rs:700-702`). For app-obs and ci there is one enforcement
+point, their own gate, and it is the same token being checked.
+
+The rule that makes this safe to ship without breaking the loopback deployment
+is that app-obs and ci yield to a caller's token only when what is configured
+for them is *nothing*, or *another app-lb token* — either of which says app-lb
+is the authenticator. A service's own token (`APP_OBS_API_TOKEN` against a
+loopback listener) is left alone, because an `applb_…` bearer means nothing to
+app-obs's own auth and forwarding one would 401 every tool on a deployment that
+was working.
 
 This is also what makes the VM's `0.0.0.0` bind acceptable. See below.
 
@@ -55,23 +69,27 @@ This is also what makes the VM's `0.0.0.0` bind acceptable. See below.
    it the way ci already does: let the gate be the authenticator. app-obs's
    listener stays on `127.0.0.1:9600`, so this is not an exposure.
 
-4. **Populate the `mcp` secret** with two keys, both minted `applb_` tokens
-   that exist only to clear a gate — `admin: none`, one deployment each:
-   - `obs_gate_token` — `deployments: ["app-obs"]`
-   - `ci_gate_token` — `deployments: ["ci"]`
-
-   There is deliberately no cloud key here. See below.
+4. **Nothing else.** There is no `mcp` secret and no fourth step: this spec
+   carries no credentials at all. See below.
 
 ## Minting caller tokens
 
 A caller's reach is their token's scope, and going through the front door adds
-one requirement: **the token must also admit the admin deployment**, because
-`admits()` is checked against the deployment the *gate* belongs to before the
-admin listener ever sees the request. So either
+one requirement: **the token must admit every deployment whose gate it has to
+clear**, because `admits()` is checked against the deployment the *gate* belongs
+to before anything behind it sees the request. With no credentials of its own,
+this server can clear no gate the caller cannot. So a token needs the admin
+deployment for the app-lb tools, `app-obs` for `applb_metrics` and friends, and
+`ci` for the ci tools — each one it is expected to use. Either
 
-- list it alongside the targets: `deployments: ["app-lb-admin", "fastcar"]`, or
+- list them alongside the targets:
+  `deployments: ["app-lb-admin", "app-obs", "ci", "fastcar"]`, or
 - confine by namespace with an empty `deployments` list, which admits everything
-  in that namespace (`app-lb/src/tokens.rs:155-163`).
+  in that namespace (`app-lb/src/tokens.rs:155-163`) and is the simpler answer
+  for anyone who needs more than one.
+
+A token that omits one of them does not get a degraded server — it gets a 401
+from that gate and working tools everywhere else, which is the intended shape.
 
 The `admin` axis is unchanged and still coarser than it sounds: `view` reaches
 only `/metrics`, `/disks`, `/feeds`, `/security`, `/ingress`, `/storage`. There
@@ -114,10 +132,10 @@ close.
 
 Two things close it, in this order:
 
-1. **Nothing worth stealing.** No `APPLB_TOKEN`, so a peer VM reaching :9650
-   directly gets a server that acts as whoever called — and it has no app-lb
-   credential to act with. The `obs`/`ci` tokens it *does* hold are `admin: none`
-   and scoped to one deployment each.
+1. **Nothing to steal.** The VM holds no credentials, so a peer reaching :9650
+   directly gets a server that acts as whoever called — with no credential of
+   its own to act with, for any of the four services. An unauthenticated request
+   reaches an unauthenticated server.
 2. **`init.sh` firewalls INPUT** to the host end of the /30 (tcp/9650 and
    tcp/22). Best-effort and logged if unavailable, because a boot that cannot
    firewall itself is not worth wedging — it is the second layer, not the first.
@@ -144,10 +162,10 @@ The `build` block pairs `"dockerfile": "mcp/deploy/image/Dockerfile"` with
 `"context": "mcp"`, keeping the context to this subtree. There is no `update`
 block: a VM deployment ships a new image, it does not `git pull` in place.
 
-## Known gap
+## Rollback
 
-`withForwardedAuth` forwards a caller's `applb_` token to `applb` only — `obs`
-and `ci` are not in it (`src/config.ts`). That is why this spec still holds two
-static gate tokens, and they are now the *only* credentials in the VM. Extending
-the same rule to obs and ci would let those calls run as the caller too and take
-the VM to zero. Worth doing; not done here.
+The host-process shape is still supported and unchanged: `deploy/heyo-mcp.json`
+plus `deploy/supervisor/heyo-mcp.conf`, reaching all three services on loopback
+with their own tokens. Nothing in this change altered how that behaves — the
+`applb_`-prefix test on the configured credential is what keeps the two shapes
+apart, and `config.test.ts` guards it directly.

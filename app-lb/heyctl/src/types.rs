@@ -1735,6 +1735,26 @@ impl TokenSummary {
     }
 }
 
+// -- namespaces -------------------------------------------------------------
+
+/// One namespace, from `GET /namespaces`.
+///
+/// Distinct from [`FeedIndexEntry`], which answers a narrower question: that one
+/// lists namespaces with *feed events*, this one lists namespaces with
+/// deployments the caller can see. A namespace appears here the moment
+/// something is registered in it and disappears when the last thing leaves —
+/// there is no namespace object to create or delete.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct NamespaceEntry {
+    pub namespace: String,
+    /// Deployments in it that *this credential* may see. Narrowed server-side,
+    /// so a scoped token sees its own arithmetic rather than the fleet's.
+    pub deployments: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 // -- the event feed ---------------------------------------------------------
 
 /// One namespace that has feed events, from `GET /feeds`.

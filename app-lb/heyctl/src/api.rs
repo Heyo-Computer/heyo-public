@@ -538,6 +538,19 @@ impl Client {
             .await
     }
 
+    // -- namespaces ----------------------------------------------------------
+
+    /// The namespaces this credential can see, with how many of their
+    /// deployments it may view.
+    ///
+    /// Narrowed server-side to what `GET /deployments` would already show, so
+    /// this never names a room the caller cannot open. A credential confined to
+    /// one namespace gets that one back even when nothing is in it yet.
+    pub async fn namespaces(&self) -> Result<Vec<NamespaceEntry>> {
+        self.read(Request::new(Method::Get, "/namespaces"), "namespace", "")
+            .await
+    }
+
     // -- the event feed ------------------------------------------------------
 
     /// The namespaces that have feed events, narrowed to what this credential
@@ -790,7 +803,24 @@ impl Raw<'_> {
         certs       => "certificate", "/certs";
         workflows   => "workflow",   "/workflows";
         feeds       => "feed",       "/feeds";
+        namespaces  => "namespace",  "/namespaces";
         disks       => "disk",       "/disks";
+    }
+
+    /// Deployments in one namespace, as app-lb sent them.
+    ///
+    /// A separate method rather than an argument on `deployments()` because the
+    /// unfiltered listing is the overwhelmingly common call and threading an
+    /// `Option` through the `raw_list!` macro for it would cost every other
+    /// resource a parameter none of them have.
+    pub async fn deployments_in(&self, namespace: &str) -> Result<Value> {
+        self.0
+            .read(
+                Request::new(Method::Get, format!("/deployments?namespace={}", seg(namespace))),
+                "deployment",
+                "",
+            )
+            .await
     }
 
     /// A namespace's feed events as app-lb sent them.

@@ -29,6 +29,14 @@ pub struct CreateDeploymentArgs {
     #[arg(value_name = "NAME")]
     pub name: String,
 
+    /// The namespace this deployment belongs to. Omitted means "default".
+    ///
+    /// A namespace is not created first — naming one here is what brings it
+    /// into existence. It is also the wall a namespace-scoped token is confined
+    /// to: see `heyctl token mint --namespace`.
+    #[arg(long, short = 'n', value_name = "NAMESPACE")]
+    pub namespace: Option<String>,
+
     // Routing. The three shorthand flags describe one rule together; --route
     // adds further rules.
     /// Exact hostname to route, e.g. `secrets.local`.
@@ -289,6 +297,12 @@ fn build_spec(args: &CreateDeploymentArgs) -> Result<Value> {
 
     let mut spec = Map::new();
     spec.insert("id".into(), Value::String(args.name.clone()));
+    // Omitted when unset rather than sent as "default": app-lb defaults it and
+    // skips it on the way back out, so writing it explicitly would put a field
+    // in every spec that means nothing.
+    if let Some(ns) = &args.namespace {
+        spec.insert("namespace".into(), Value::String(ns.clone()));
+    }
     spec.insert("routes".into(), Value::Array(routes));
 
     let vm_flags_used = args.image.is_some()
@@ -2298,6 +2312,12 @@ pub fn delete(ctx: &Ctx, args: &DeleteArgs) -> Result<()> {
             "disks are not deleted through `delete` — `get disks` shows what is on the host \
              and why each one is held; reclaiming is `DELETE /disks/<sandbox>` or \
              `POST /disks/sweep` on the admin API, which delete gigabytes with no undo"
+        ),
+        Resource::Namespace => bail!(
+            "a namespace is not an object, so there is nothing to delete: it exists \
+             for as long as a deployment names it and is gone when the last one \
+             leaves. Move or delete the deployments in it instead — \
+             `heyctl get deployments --namespace <NS>` lists them"
         ),
         Resource::All => bail!("`delete all` is not supported — name the deployments, or use --all"),
     }

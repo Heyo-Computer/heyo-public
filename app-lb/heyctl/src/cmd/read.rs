@@ -4,7 +4,7 @@ use super::{Ctx, Resource, now_secs, parse_ref};
 use crate::output::{self, OutputFormat, Table};
 use crate::types::{
     CertStatus, DeploymentStatus, DiskInfo, DiskInventory, JobRecord, MetricsResponse,
-    SecretSummary, WorkflowList, WorkflowView,
+    NamespaceEntry, SecretSummary, WorkflowList, WorkflowView,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -21,6 +21,11 @@ pub struct GetArgs {
     /// Only show VMs, jobs or disks belonging to this deployment.
     #[arg(long, short = 'd', value_name = "NAME")]
     pub deployment: Option<String>,
+
+    /// Only show deployments in this namespace. Applied by app-lb, not here, so
+    /// the listing is narrowed before it is sent.
+    #[arg(long, short = 'n', value_name = "NAMESPACE")]
+    pub namespace: Option<String>,
 
     /// Re-render every --interval seconds until interrupted.
     #[arg(long, short = 'w')]
@@ -45,15 +50,16 @@ pub fn get(ctx: &Ctx, args: &GetArgs) -> Result<()> {
 
 fn get_once(ctx: &Ctx, kind: Resource, names: &[String], args: &GetArgs) -> Result<()> {
     match kind {
-        Resource::Deployment => get_deployments(ctx, names),
+        Resource::Deployment => get_deployments(ctx, names, args.namespace.as_deref()),
         Resource::Vm => get_vms(ctx, names, args.deployment.as_deref()),
         Resource::Cert => get_certs(ctx),
         Resource::Secret => get_secrets(ctx, names),
         Resource::Workflow => get_workflows(ctx, names),
         Resource::Job => get_jobs(ctx, names, args.deployment.as_deref()),
         Resource::Disk => get_disks(ctx, names, args.deployment.as_deref()),
+        Resource::Namespace => get_namespaces(ctx),
         Resource::All => {
-            get_deployments(ctx, &[])?;
+            get_deployments(ctx, &[], args.namespace.as_deref())?;
             println!();
             get_vms(ctx, &[], None)
         }
@@ -62,9 +68,19 @@ fn get_once(ctx: &Ctx, kind: Resource, names: &[String], args: &GetArgs) -> Resu
 
 /// Fetch either the whole list or the named subset, as raw JSON plus the parsed
 /// view. Both are kept: `-o json` must print the server's own bytes.
-fn fetch_deployments(ctx: &Ctx, names: &[String]) -> Result<(Value, Vec<DeploymentStatus>)> {
+fn fetch_deployments(
+    ctx: &Ctx,
+    names: &[String],
+    namespace: Option<&str>,
+) -> Result<(Value, Vec<DeploymentStatus>)> {
     let raw = if names.is_empty() {
-        ctx.client.raw().deployments()?
+        match namespace {
+            // Server-side: app-lb filters before it serialises, which on a fleet
+            // of thousands of sandboxes is the difference the query parameter
+            // exists to make.
+            Some(ns) => ctx.client.raw().deployments_in(ns)?,
+            None => ctx.client.raw().deployments()?,
+        }
     } else {
         let mut out = Vec::new();
         for name in names {
@@ -95,8 +111,8 @@ fn fetch_deployments(ctx: &Ctx, names: &[String]) -> Result<(Value, Vec<Deployme
     Ok((raw, parsed))
 }
 
-fn get_deployments(ctx: &Ctx, names: &[String]) -> Result<()> {
-    let (raw, deployments) = fetch_deployments(ctx, names)?;
+fn get_deployments(ctx: &Ctx, names: &[String], namespace: Option<&str>) -> Result<()> {
+    let (raw, deployments) = fetch_deployments(ctx, names, namespace)?;
 
     if ctx.out.is_machine() {
         let names: Vec<String> = deployments
@@ -107,7 +123,13 @@ fn get_deployments(ctx: &Ctx, names: &[String]) -> Result<()> {
     }
 
     if deployments.is_empty() {
-        println!("No deployments registered.");
+        match namespace {
+            // Naming the filter matters: an empty list and a namespace nothing
+            // is in are the same output otherwise, and the second one is the
+            // answer to a question the reader actually asked.
+            Some(ns) => println!("No deployments in namespace {ns:?}."),
+            None => println!("No deployments registered."),
+        }
         return Ok(());
     }
 
@@ -175,7 +197,9 @@ fn get_deployments(ctx: &Ctx, names: &[String]) -> Result<()> {
 
 fn get_vms(ctx: &Ctx, names: &[String], filter: Option<&str>) -> Result<()> {
     let scope: Vec<String> = filter.into_iter().map(str::to_string).collect();
-    let (_, deployments) = fetch_deployments(ctx, &scope)?;
+    // No namespace here: `get vms` is already scoped by deployment, and a VM
+    // listing narrowed twice would need both filters to agree to show anything.
+    let (_, deployments) = fetch_deployments(ctx, &scope, None)?;
 
     let wanted = |id: &str| names.is_empty() || names.iter().any(|n| n == id);
 
@@ -213,6 +237,44 @@ fn get_vms(ctx: &Ctx, names: &[String], filter: Option<&str>) -> Result<()> {
     if table.is_empty() {
         println!("No VMs in the pool. (`heyctl top vms` shows resource usage for running VMs.)");
         return Ok(());
+    }
+    table.print();
+    Ok(())
+}
+
+/// `heyctl get namespaces` — which namespaces exist, and how much is in each.
+///
+/// "Exist" is doing real work in that sentence: a namespace is not an object,
+/// so this is the set of names the deployments currently mention, narrowed to
+/// the ones this credential can see. Nothing here can be created or deleted —
+/// a namespace begins when a deployment declares it and ends when the last one
+/// stops.
+fn get_namespaces(ctx: &Ctx) -> Result<()> {
+    let raw = ctx.client.raw().namespaces()?;
+    let namespaces: Vec<NamespaceEntry> =
+        serde_json::from_value(raw.clone()).context("parsing the namespace list")?;
+
+    if ctx.out.is_machine() {
+        let names: Vec<String> = namespaces
+            .iter()
+            .map(|n| format!("namespace/{}", n.namespace))
+            .collect();
+        return output::emit(&raw, ctx.out, &names);
+    }
+
+    if namespaces.is_empty() {
+        println!(
+            "No namespaces. Every deployment is in \"default\" until one says \
+             otherwise — put a deployment in a namespace with \
+             `heyctl create deployment <NAME> --namespace <NS>`, or a \
+             `\"namespace\"` field in a spec passed to `heyctl apply`."
+        );
+        return Ok(());
+    }
+
+    let mut table = Table::new(["NAMESPACE", "DEPLOYMENTS"]);
+    for n in &namespaces {
+        table.row([n.namespace.clone(), n.deployments.to_string()]);
     }
     table.print();
     Ok(())

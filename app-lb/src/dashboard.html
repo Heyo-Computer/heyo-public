@@ -158,6 +158,12 @@
   }
   .dep-head .dep-link::after { content: " ↗"; opacity: .6; }
   .dep-head .dep-link:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  /* A namespace reads as a wall, not as another statistic, so it borrows the
+     accent the way a link does rather than the neutral badge border. */
+  .dep-head .badge.ns, .chip.ns {
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    color: var(--accent);
+  }
   .dep-head .badge {
     font-size: 11px; padding: 2px 8px; border-radius: 0;
     border: 1px solid var(--border); color: var(--text-2);
@@ -378,6 +384,13 @@
        are how the table stays usable, and how the poll stays small. -->
   <div class="dep-controls" id="dep-controls">
     <input id="dep-filter" type="search" placeholder="filter by id prefix" autocomplete="off" spellcheck="false">
+    <!-- One control, three surfaces: it narrows the deployment list, the
+         metrics behind it and the security feed together, because "show me
+         this namespace" is one question and answering it in three places
+         separately is how the three drift apart. -->
+    <select id="ns-filter" title="Show one namespace across deployments, metrics and security">
+      <option value="">all namespaces</option>
+    </select>
     <span class="dep-range" id="dep-range"></span>
     <button class="btn mini" id="dep-prev" type="button">Prev</button>
     <button class="btn mini" id="dep-next" type="button">Next</button>
@@ -454,6 +467,8 @@ let depsById = {};   // id -> latest deployment view, for form prefills
 const DEP_PAGE = 50;
 let depOffset = 0;   // first deployment on the current page
 let depPrefix = "";  // id-prefix filter, sent to the server, not applied here
+let depNamespace = ""; // namespace filter, likewise server-side; "" is all of them
+let knownNamespaces = []; // last seen from GET /namespaces, for the mint form
 
 const $ = (id) => document.getElementById(id);
 const fmt = (n, d = 0) => (n == null || !isFinite(n)) ? "—" :
@@ -908,14 +923,19 @@ function updateCard(el, d, fresh) {
     ? `<tr><th>upstream</th><th>in-flight</th><th>uptime</th><th>state</th></tr>`
     : `<tr><th>sandbox</th><th>addr</th><th>in-flight</th><th>CPU</th><th>memory</th><th>uptime</th><th>state</th><th>actions</th></tr>`;
 
-  const headBadges = isSite
+  // `default` is not shown: every deployment is in it until somebody says
+  // otherwise, so a badge on all of them would be noise on every card and
+  // would stop meaning anything on the ones that matter.
+  const nsBadge = d.namespace && d.namespace !== "default"
+    ? `<span class="badge ns">${esc(d.namespace)}</span>` : "";
+  const headBadges = nsBadge + (isSite
     ? `<span class="badge">static site</span>
        <span class="badge">${d.site_spa ? "SPA" : "files"}</span>`
     : isStatic
     ? `<span class="badge">static · proxy_pass</span>
        <span class="badge">${d.upstreams.length} upstream${d.upstreams.length === 1 ? "" : "s"}</span>`
     : `<span class="badge">${p.ready}/${p.max_replicas} replicas · want ${p.desired_replicas}</span>
-       <span class="badge">min ${p.min_replicas} · warm ${p.warm_pool} · target ${p.target_concurrency}</span>`;
+       <span class="badge">min ${p.min_replicas} · warm ${p.warm_pool} · target ${p.target_concurrency}</span>`);
 
   // A redeploy button only where there is something to redeploy: `build` needs a
   // repo in the spec, `update` needs a command list, and a deployment with
@@ -999,8 +1019,11 @@ function renderDeployments(deps) {
   const host = $("deployments");
 
   if (!deps.length) {
+    const inNs = depNamespace ? ` in namespace ${esc(depNamespace)}` : "";
     const msg = depPrefix
-      ? `No deployment id starts with ${esc(depPrefix)}.`
+      ? `No deployment id starts with ${esc(depPrefix)}${inNs}.`
+      : depNamespace
+      ? `Nothing in namespace ${esc(depNamespace)}.`
       : "No deployments registered.";
     setHTML(host, `<div class="card empty">${msg}</div>`);
     return;
@@ -1276,7 +1299,18 @@ function tokenScope(t) {
   const admin = t.admin || "none";
   const bits = [`<span class="tag ${ADMIN_TAG[admin] || "idle"}">${esc(admin)}</span>`];
   const deps = t.deployments || [];
-  if (!deps.length) bits.push(`<span class="tag idle">no deployments</span>`);
+  // A namespace inverts what an empty `deployments` list means: inside a wall
+  // it is "everything in this room", not "nothing" (see `AppToken::namespace`).
+  // Rendering it as "no deployments" — correct for an unconfined token — would
+  // describe a namespace-wide credential as one that reaches nothing, which is
+  // the worst direction to be wrong in on a screen people revoke from.
+  if (t.namespace) {
+    bits.push(`<span class="chip ns">namespace ${esc(t.namespace)}</span>`);
+    // `["*"]` behind a wall means every deployment *there*, not the fleet.
+    bits.push(!deps.length || deps.includes("*")
+      ? `<span class="chip">all of it</span>`
+      : deps.map(d => `<span class="chip">${esc(d)}</span>`).join(""));
+  } else if (!deps.length) bits.push(`<span class="tag idle">no deployments</span>`);
   else if (deps.includes("*")) bits.push(`<span class="chip">all deployments</span>`);
   else bits.push(deps.map(d => `<span class="chip">${esc(d)}</span>`).join(""));
   return `<div class="chips">${bits.join("")}</div>`;
@@ -1339,15 +1373,42 @@ function tokenForm() {
         <option value="admin">admin — full CRUD</option>
       </select>
     </label>
+    <label>Namespace (blank for none)
+      <input id="tk-ns" list="tk-ns-list" placeholder="sam" autocomplete="off"
+             spellcheck="false">
+    </label>
+    <datalist id="tk-ns-list">
+      ${knownNamespaces.map(n => `<option value="${esc(n)}"></option>`).join("")}
+    </datalist>
     <label>Deployments
       <select id="tk-scope">
         <option value="">all deployments (*)</option>
         ${options}
       </select>
     </label>
+    <!-- Free text rather than a picker: a namespace is a name, not a record, so
+         one can be walled off before anything is in it. The datalist offers the
+         ones that already exist without refusing a new one. -->
+    <div class="note" id="tk-ns-note"></div>
     <label>Expires in (hours, blank for never)
       <input id="tk-ttl" placeholder="" inputmode="numeric" autocomplete="off">
     </label>`;
+}
+
+// What the two scope fields mean together, said before it is minted rather
+// than discovered afterwards — the empty-list inversion is not guessable.
+function tokenScopeNote() {
+  const el = $("tk-ns-note");
+  if (!el) return;
+  const ns = $("tk-ns").value.trim();
+  const scope = $("tk-scope").value;
+  el.textContent = ns
+    ? (scope
+       ? `Reaches ${scope} only, and only while it is in ${ns}. Nothing outside ${ns} — creating there is refused too.`
+       : `Reaches everything in ${ns}, including deployments made later, and nothing outside it.`)
+    : (scope
+       ? `Reaches ${scope} in any namespace.`
+       : "Fleet-wide: every deployment in every namespace.");
 }
 
 function openNewToken() {
@@ -1359,11 +1420,17 @@ function openNewToken() {
       const name = $("tk-name").value.trim();
       if (!name) return modalErr("A token needs a name — it is how you know what to revoke.");
       const scope = $("tk-scope").value;
+      const ns = $("tk-ns").value.trim();
       const body = {
         name,
         admin: $("tk-admin").value,
-        deployments: scope ? [scope] : ["*"],
+        // Behind a namespace wall an empty list means the whole namespace, so
+        // the "all deployments" choice must send *nothing* rather than ["*"] —
+        // both are accepted, but an empty list keeps meaning "everything here"
+        // as deployments come and go, which is what a room key is for.
+        deployments: scope ? [scope] : (ns ? [] : ["*"]),
       };
+      if (ns) body.namespace = ns;
       const ttl = $("tk-ttl").value.trim();
       if (ttl) {
         const hours = parseInt(ttl, 10);
@@ -1376,6 +1443,13 @@ function openNewToken() {
     },
     "Mint",
   );
+  // The form is in the DOM once openModal returns, so the note can be wired and
+  // shown for the default selection rather than only after the first keystroke.
+  ["tk-ns", "tk-scope"].forEach(id => {
+    const el = $(id);
+    if (el) el.addEventListener("input", tokenScopeNote);
+  });
+  tokenScopeNote();
 }
 
 // The one screen in the dashboard that shows a secret. Deliberately a dead end:
@@ -1388,7 +1462,12 @@ function showMintedToken(t) {
     "Copy it now. This is the only time it is shown — only its hash is stored.",
     `<div class="note" style="margin-bottom:10px">
        <strong>${esc(t.name)}</strong> · ${esc(t.admin)} ·
-       ${(t.deployments || []).includes("*") ? "all deployments" : esc((t.deployments || []).join(", "))}
+       ${t.namespace
+          ? `namespace ${esc(t.namespace)} · ${(t.deployments || []).length
+              ? esc((t.deployments || []).join(", ")) : "all of it"}`
+          : (t.deployments || []).includes("*")
+          ? "all deployments"
+          : esc((t.deployments || []).join(", "))}
      </div>
      <input id="tk-secret" class="mono" readonly value="${esc(t.token)}"
             style="width:100%" onclick="this.select()">
@@ -2093,12 +2172,54 @@ $("dep-filter").addEventListener("input", (e) => {
     repage(0); // a new filter starts at the top; the old offset means nothing
   }, 200);
 });
+// Rebuild the picker in place, preserving the selection. A namespace that has
+// gone away while selected keeps its option — removing it would silently widen
+// the view to the whole fleet, and an empty result the operator can see the
+// cause of beats a full one they cannot.
+function renderNamespaces(list) {
+  knownNamespaces = list.map(n => n.namespace);
+  const sel = $("ns-filter");
+  const names = list.map(n => n.namespace);
+  const counts = new Map(list.map(n => [n.namespace, n.deployments]));
+  if (depNamespace && !counts.has(depNamespace)) {
+    names.push(depNamespace);
+    counts.set(depNamespace, 0);
+  }
+  // One namespace and it is `default` means nobody is using them: a picker with
+  // a single choice is furniture, so it stays hidden until there is a decision
+  // to make.
+  const meaningful = names.length > 1 || (names.length === 1 && names[0] !== "default");
+  sel.hidden = !meaningful;
+  if (!meaningful) return;
+
+  const want = ['<option value="">all namespaces</option>']
+    .concat(names.map(n =>
+      `<option value="${esc(n)}">${esc(n)} (${counts.get(n)})</option>`)).join("");
+  // Only touch the DOM when the options actually changed: rewriting them on
+  // every slow poll would close the dropdown under anyone using it.
+  if (sel.dataset.sig !== want) {
+    sel.dataset.sig = want;
+    sel.innerHTML = want;
+  }
+  sel.value = depNamespace;
+}
+
+$("ns-filter").addEventListener("change", (e) => {
+  depNamespace = e.target.value;
+  // Back to the first page: the offset described a different result set, and
+  // keeping it lands on an empty page of a namespace that has fewer rows.
+  depOffset = 0;
+  poll();
+  pollSlow();
+});
+
 $("dep-prev").addEventListener("click", () => repage(Math.max(0, depOffset - DEP_PAGE)));
 $("dep-next").addEventListener("click", () => repage(depOffset + DEP_PAGE));
 
 function metricsUrl() {
   const q = new URLSearchParams({ limit: DEP_PAGE, offset: depOffset });
   if (depPrefix) q.set("prefix", depPrefix);
+  if (depNamespace) q.set("namespace", depNamespace);
   return "metrics?" + q;
 }
 
@@ -2124,7 +2245,7 @@ async function pollSlow() {
   clearTimeout(slowTimer);
   let interval = SLOW_REFRESH_MS;
   try {
-    const [certs, secrets, tokens, jobs, security] = await Promise.all([
+    const [certs, secrets, tokens, jobs, security, namespaces] = await Promise.all([
       api("GET", "certs"),
       api("GET", "secrets"),
       api("GET", "tokens"),
@@ -2133,7 +2254,10 @@ async function pollSlow() {
       // window measured in minutes, so a faster poll would spend a request per
       // tick on a list that has not moved. The stat tile is on the fast poll for
       // the case where latency matters.
-      api("GET", "security"),
+      api("GET", depNamespace
+        ? "security?namespace=" + encodeURIComponent(depNamespace)
+        : "security"),
+      api("GET", "namespaces"),
     ]);
     // Each renders independently: gating them all on one failing endpoint would
     // blank the sections that are working.
@@ -2141,6 +2265,9 @@ async function pollSlow() {
     if (secrets.ok) renderSecrets(secrets.data || []);
     if (tokens.ok) renderTokens(tokens.data || []);
     if (security.ok) renderSecurity(security.data || { enabled: false, alerts: [] });
+    // Before the pager, so a namespace that disappeared while selected is
+    // noticed on the same tick that reports what is left.
+    if (namespaces.ok) renderNamespaces(namespaces.data || []);
     if (jobs.ok) {
       const list = jobs.data || [];
       renderJobs(list);
