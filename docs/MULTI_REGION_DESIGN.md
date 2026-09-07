@@ -13,6 +13,63 @@ scheduler and do not build a second service registry beside Orchestrator discove
 The design has two paths: a control loop that places capacity and assigns traffic,
 and a request path that continues without a control-plane call per request.
 
+### Operator experience: one concise JSON service file
+
+Adopt the style of [app-lb deployment files](../app-lb/examples/README.md): one
+declarative file with `id`, `routes`, `vm`, `scaling` and `health`. Extend it with
+regional overrides instead of exposing separate operator-managed placement,
+discovery and traffic-assignment documents. This is a proposed authoring format,
+not an assertion that existing app-lb accepts the new fields.
+
+Illustrative fragment (images are placeholders; application routes, launch settings
+and secret references are omitted):
+
+```json
+{
+  "id": "cloud",
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 2,
+    "target_concurrency": 32
+  },
+  "health": { "path": "/health" },
+  "regions": {
+    "EU": { "vm": { "driver": "libvirt", "image": "cloud-libvirt-release" } },
+    "US": { "vm": { "driver": "firecracker", "image": "cloud-fc-release" } }
+  },
+  "traffic": { "weights": { "EU": 50, "US": 50 } }
+}
+```
+
+For a regional service, common settings apply to each listed region. Here the
+minimum is one replica **per region**, not one replica shared across both; the
+maximum is two per region. Region-specific `vm` and `scaling` fields override common
+fields individually. Arrays replace rather than append, and ambiguous/unknown
+regional fields are rejected. Only replica/resource/runtime settings can vary by
+region initially; routes and application identity remain common. Driver and image
+must be a compatible pair for each region.
+
+Weights describe explicit relative traffic shares; they are not replica counts or
+host resource percentages. `target_concurrency` retains app-lb's meaning of target
+in-flight requests per instance, not a measured hard safety limit. Feedback-based
+weighting and admission budgets remain Phase 2 work. Do not inherit legacy forced
+VM termination on drain timeout into the regional maintenance safety barrier.
+
+Orchestrator validates and applies this file as desired state, using its existing
+deployment machinery. It derives Cloud allocation requests and app-lb routing
+snapshots; operators do not write those generated objects. Resource observations,
+deployment IDs, health, pending reservations and controller ownership remain runtime
+state, not fields operators must maintain in Git. Applying unchanged intent must
+not restart healthy replicas. Omitting a region from an updated file requests an
+explicit reviewed drain/removal, never immediate deletion.
+
+Use the file as the sole editable service intent for an opted-in deployment;
+generated app-lb configuration is not independently editable. Existing legacy
+deployments keep their current input format and behavior. Adoption means reusing
+app-lb's familiar vocabulary, not importing every local lifecycle feature or
+rewriting Cloud/Orchestrator around a second configuration engine. Exact field
+validation and serialization will be settled in the implementation contract.
+
 ```diagram
                          Operator's service intent
                        “Cloud in both EU and US”
@@ -152,7 +209,7 @@ not an app-lb forwarding patch.
 
 | Part | Concrete change |
 | --- | --- |
-| Desired state | Persist each service's required regional replica slots and regional runtime/resource requirements, reusing `replicaRegions` rather than introducing a second placement list |
+| Desired state | Accept the concise service JSON, expand its regional intent into the existing `replicaRegions` placement representation, and persist regional runtime/resource requirements; operators do not maintain both forms |
 | Reconciliation | Compare ready and pending replicas against those slots; request only missing capacity in the required region through Cloud; use existing rolling-deployment ownership for retries |
 | Observed state | Derive a region-grouped view from existing service discovery; show missing capacity separately from ready capacity |
 | Routing output | Compile explicit operator weights and eligible regional membership into one versioned decision; never route to merely planned capacity |
@@ -168,8 +225,9 @@ EU libvirt and US Firecracker without assuming one global driver/image.
 
 The next slice makes app-lb consume this shared regional decision and implements
 the cross-region request path. Phase 2 then changes how weights and extra replicas
-are calculated, without replacing the ownership model. Detailed schema and endpoint
-design follows agreement on these boundaries; it is not specified in this document.
+are calculated, without replacing the ownership model. The JSON fragment specifies
+the proposed authoring experience, not a complete wire schema. Detailed schema and
+endpoint design follows agreement on these boundaries.
 
 ## Scope and deployment constraints
 
