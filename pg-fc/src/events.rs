@@ -477,13 +477,32 @@ mod tests {
         assert_eq!(Event::parse("from_the_future"), None);
     }
 
-    /// The global log is shared across tests in one binary, so tests use
-    /// far-apart timestamp ranges instead of clearing it. `DIR` is never
-    /// initialized in tests, so `record_at` stays memory-only; the file layer
-    /// is tested through its helpers.
+    /// `LOG` is a process-global that every test in this binary shares, and
+    /// [`push_mem`] prunes by timestamp — so far-apart timestamp ranges do not
+    /// isolate these tests, they are precisely what breaks them: whichever of
+    /// the three runs last with the *highest* base evicts the others' entries.
+    /// That raced silently until enough tests existed elsewhere in the binary
+    /// to change the scheduling. Serialize them and start each from a clean
+    /// log instead.
+    ///
+    /// `DIR` is never initialized in tests, so `record_at` stays memory-only;
+    /// the file layer is tested through its helpers.
+    static LOG_TESTS: Mutex<()> = Mutex::new(());
+
+    /// Take the shared-log lock and empty the log. Returns the guard, which
+    /// the caller must hold for the body of the test.
+    fn exclusive_log() -> std::sync::MutexGuard<'static, ()> {
+        // A poisoned lock only means some other test panicked; the log is
+        // cleared below either way, so recover rather than cascade.
+        let g = LOG_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        LOG.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        g
+    }
+
     #[test]
     fn buckets_align_to_hours_and_count_per_kind() {
-        let base = 1_000_000 * 3600; // exact hour boundary, far from other tests
+        let _g = exclusive_log();
+        let base = 1_000_000 * 3600; // exact hour boundary
         let now = base + 3 * 3600 + 120; // 3 buckets later, 2 min in
         record_at(Event::RestoreS3, base + 10);
         record_at(Event::RestoreS3, base + 3599);
@@ -503,6 +522,7 @@ mod tests {
 
     #[test]
     fn events_before_the_window_are_ignored() {
+        let _g = exclusive_log();
         let base = 2_000_000 * 3600;
         record_at(Event::VmCreated, base - 3600); // one hour before the window
         record_at(Event::VmCreated, base + 5);
@@ -512,6 +532,7 @@ mod tests {
 
     #[test]
     fn old_events_are_pruned_on_write() {
+        let _g = exclusive_log();
         let base = 3_000_000 * 3600;
         record_at(Event::VmCreated, base);
         // A write RETAIN_HOURS+1h later prunes the first event.

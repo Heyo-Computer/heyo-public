@@ -40,6 +40,7 @@ mod history;
 mod host;
 mod logs;
 mod model;
+mod replication;
 mod router;
 mod state;
 mod views;

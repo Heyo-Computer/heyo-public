@@ -83,6 +83,24 @@ pub struct Config {
     /// `PG_VM_POOL_DEDICATED_FILE`; defaults to `dedicated.tsv` next to the
     /// state file.
     pub dedicated_file: PathBuf,
+    /// Where the trusted-peer records live — another pg-fc node's dashboard
+    /// URL, its Basic-auth credentials, and the pooler address a guest on
+    /// *this* host dials to reach it. Holds another node's admin password, so
+    /// it is written `0600`. Env `PG_VM_POOL_PEERS_FILE`; defaults to
+    /// `peers.tsv` next to the state file. See [`crate::peers`].
+    pub peers_file: PathBuf,
+    /// Where replication pairings persist (`database → role + peer + state`).
+    /// Loaded regardless of whether [`Self::replication`] is enabled: this
+    /// file holds the pin that keeps a replicating VM off the idle reaper and
+    /// the offload ladder, and dropping that because a flag was turned off
+    /// would break live pairings silently. Env `PG_VM_POOL_REPLICATION_FILE`;
+    /// defaults to `replication.tsv` next to the state file. See
+    /// [`crate::replication`].
+    pub replication_file: PathBuf,
+    /// Cross-host logical replication settings. `None` (the default) hides
+    /// the dashboard routes and refuses new pairings; existing records still
+    /// load and still pin their VMs.
+    pub replication: Option<ReplicationConfig>,
     /// Where the monitoring event metrics keep their daily partition files
     /// (`events-YYYY-MM-DD.tsv`), so the restore/create charts survive
     /// restarts. Env `PG_VM_POOL_METRICS_DIR`; defaults to `metrics/` next to
@@ -576,6 +594,180 @@ impl PressureConfig {
     }
 }
 
+/// Settings for cross-host logical replication. Present (`Some`) only when
+/// `PG_VM_POOL_REPLICATION` is truthy — that env var is the on/off switch.
+///
+/// Note what this gates and what it does not. Turning it off hides the
+/// dashboard routes and refuses *new* pairings; it deliberately does **not**
+/// stop the peers and replication stores from loading, because those hold the
+/// pin that keeps an already-replicating VM off the idle reaper and the
+/// offload ladder. A feature flag that silently un-pinned live pairings would
+/// break them on the next restart with nothing in the log to say why.
+#[derive(Clone)]
+pub struct ReplicationConfig {
+    /// This node's name in a peering. Sent in the handshake so a node can
+    /// refuse to peer with itself, and used as the subscriber's
+    /// `application_name` so it is identifiable in the primary's
+    /// `pg_stat_replication`. Env `PG_VM_POOL_NODE_NAME`; defaults to the
+    /// hostname.
+    pub node_name: String,
+    /// Host or IPv4 literal that a *peer's guest VMs* dial to reach this
+    /// node's `PG_VM_POOL_LISTEN`. Required before this node can act as a
+    /// replication primary, and deliberately separate from `listen_addr`,
+    /// which is frequently `0.0.0.0` or a private address that means nothing
+    /// to another host. Env `PG_VM_POOL_ADVERTISE_PG_HOST`.
+    pub advertise_host: Option<String>,
+    /// The port that goes with it. Env `PG_VM_POOL_ADVERTISE_PG_PORT`;
+    /// defaults to `PG_VM_POOL_LISTEN`'s port.
+    pub advertise_port: u16,
+    /// libpq `sslmode` for the replication link. `require` by default:
+    /// it encrypts the one hop that leaves the host. It does not
+    /// *authenticate* the server — `verify-full` cannot work against a bare
+    /// IP, and the guests carry no pinned CA.
+    pub sslmode: String,
+    /// Permit an `sslmode` weaker than `require`, and permit acting as a
+    /// primary with no TLS configured. Lab escape hatch; off by default,
+    /// because the replication login's password crosses the network on this
+    /// link. Env `PG_VM_POOL_REPL_ALLOW_INSECURE`.
+    pub allow_insecure: bool,
+    /// Per-request bound on any call to a peer's dashboard API. Env
+    /// `PG_VM_POOL_REPL_PEER_TIMEOUT_SECS` (default 20).
+    pub peer_timeout: Duration,
+    /// Bound on the in-guest schema-copy job. This is a `pg_dump` across a WAN
+    /// link plus a `psql` replaying it, so it is sized like the archive
+    /// deadline rather than like an exec. Env `PG_VM_POOL_REPL_SETUP_SECS`
+    /// (default 3600).
+    pub setup_deadline: Duration,
+    /// How often the background sampler refreshes each pairing's lag and
+    /// health. `None` (`0`) disables it — the dashboard then shows only what
+    /// a page load fetches. Env `PG_VM_POOL_REPL_MONITOR_SECS` (default 60).
+    pub monitor_interval: Option<Duration>,
+    /// How long a replication slot may sit inactive before the monitor says
+    /// so loudly. An inactive slot pins WAL on the primary's data disk, and a
+    /// full data disk is a cluster-wide PANIC — this is the warning before
+    /// the guest's own `max_slot_wal_keep_size` invalidates the slot. Env
+    /// `PG_VM_POOL_REPL_SLOT_STALE_SECS` (default 3600).
+    pub slot_stale: Duration,
+    /// Retained-WAL figure above which a pairing is reported as lagging. Env
+    /// `PG_VM_POOL_REPL_LAG_WARN_BYTES` (default 256MiB).
+    pub lag_warn_bytes: u64,
+    /// Re-seed column-owned sequences during a promote. Logical replication
+    /// carries no sequence values, so without this the first insert after a
+    /// promote collides with a replicated row. Env
+    /// `PG_VM_POOL_REPL_FIX_SEQUENCES` (default on).
+    pub fix_sequences: bool,
+}
+
+impl ReplicationConfig {
+    fn from_env(listen_addr: SocketAddr) -> anyhow::Result<Option<Self>> {
+        let on = std::env::var("PG_VM_POOL_REPLICATION")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no"))
+            .unwrap_or(false);
+        if !on {
+            return Ok(None);
+        }
+        let node_name = std::env::var("PG_VM_POOL_NODE_NAME")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(default_node_name);
+        // The name is embedded in replication slot names, which are narrower
+        // than Postgres identifiers — refuse a bad one at startup rather than
+        // at the first pairing.
+        crate::dedicated::validate_identifier(&node_name, "node name")?;
+
+        let advertise_host = std::env::var("PG_VM_POOL_ADVERTISE_PG_HOST")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let advertise_port = match std::env::var("PG_VM_POOL_ADVERTISE_PG_PORT") {
+            Ok(v) => v
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("PG_VM_POOL_ADVERTISE_PG_PORT must be a port number"))?,
+            Err(_) => listen_addr.port(),
+        };
+        let allow_insecure = std::env::var("PG_VM_POOL_REPL_ALLOW_INSECURE")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let sslmode = std::env::var("PG_VM_POOL_REPL_SSLMODE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "require".to_string());
+        const WEAK: &[&str] = &["disable", "allow", "prefer"];
+        if WEAK.contains(&sslmode.as_str()) && !allow_insecure {
+            anyhow::bail!(
+                "PG_VM_POOL_REPL_SSLMODE={sslmode} would send the replication login's \
+                 password across the network in cleartext; use `require` (or set \
+                 PG_VM_POOL_REPL_ALLOW_INSECURE=1 if both nodes share a trusted link)"
+            );
+        }
+        const VALID: &[&str] = &[
+            "disable", "allow", "prefer", "require", "verify-ca", "verify-full",
+        ];
+        if !VALID.contains(&sslmode.as_str()) {
+            anyhow::bail!("PG_VM_POOL_REPL_SSLMODE={sslmode} is not a libpq sslmode");
+        }
+
+        let secs = |name: &str, default: u64| -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(default)
+        };
+        let monitor = secs("PG_VM_POOL_REPL_MONITOR_SECS", 60);
+        Ok(Some(Self {
+            node_name,
+            advertise_host,
+            advertise_port,
+            sslmode,
+            allow_insecure,
+            peer_timeout: Duration::from_secs(secs("PG_VM_POOL_REPL_PEER_TIMEOUT_SECS", 20).max(1)),
+            setup_deadline: Duration::from_secs(secs("PG_VM_POOL_REPL_SETUP_SECS", 3600).max(60)),
+            monitor_interval: (monitor > 0).then(|| Duration::from_secs(monitor.max(5))),
+            slot_stale: Duration::from_secs(secs("PG_VM_POOL_REPL_SLOT_STALE_SECS", 3600).max(60)),
+            lag_warn_bytes: std::env::var("PG_VM_POOL_REPL_LAG_WARN_BYTES")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(256 * 1024 * 1024),
+            fix_sequences: std::env::var("PG_VM_POOL_REPL_FIX_SEQUENCES")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
+        }))
+    }
+}
+
+/// The machine's hostname, lowercased and with anything outside the
+/// identifier charset mapped to `_`, so the default node name is usable in a
+/// replication slot without the operator having to think about it.
+fn default_node_name() -> String {
+    let raw = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_default();
+    let cleaned: String = raw
+        .trim()
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Must start with a lowercase letter to pass `validate_identifier`.
+    match cleaned.chars().next() {
+        Some(c) if c.is_ascii_lowercase() => cleaned,
+        Some(_) => format!("node_{cleaned}"),
+        None => "node".to_string(),
+    }
+}
+
 /// Settings for the optional server-side-rendered admin dashboard. Present
 /// (`Some`) only when `PG_VM_POOL_DASHBOARD_LISTEN` is set — that env var is the
 /// on/off switch.
@@ -671,6 +863,30 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_S3_ACCESS_KEY_ID",
     "PG_VM_POOL_S3_SECRET_ACCESS_KEY",
     "PG_VM_POOL_DAEMON_URL",
+    // Read by `CompactConfig::from_env` and `vm.rs`, set by the shipped
+    // supervisor conf, but historically missing here — so a correctly
+    // configured production host logged five "ignoring unknown env var"
+    // warnings at every start.
+    "PG_VM_POOL_COMPACT_AFTER_SECS",
+    "PG_VM_POOL_COMPACT_SWEEP_SECS",
+    "PG_VM_POOL_COMPACT_DIR",
+    "PG_VM_POOL_MAX_CONCURRENT_BRINGUPS",
+    "PG_VM_POOL_ARCHIVE_VIA_GUEST",
+    // Cross-host logical replication (see `crate::replication`).
+    "PG_VM_POOL_REPLICATION",
+    "PG_VM_POOL_NODE_NAME",
+    "PG_VM_POOL_PEERS_FILE",
+    "PG_VM_POOL_REPLICATION_FILE",
+    "PG_VM_POOL_ADVERTISE_PG_HOST",
+    "PG_VM_POOL_ADVERTISE_PG_PORT",
+    "PG_VM_POOL_REPL_SSLMODE",
+    "PG_VM_POOL_REPL_ALLOW_INSECURE",
+    "PG_VM_POOL_REPL_PEER_TIMEOUT_SECS",
+    "PG_VM_POOL_REPL_SETUP_SECS",
+    "PG_VM_POOL_REPL_MONITOR_SECS",
+    "PG_VM_POOL_REPL_SLOT_STALE_SECS",
+    "PG_VM_POOL_REPL_LAG_WARN_BYTES",
+    "PG_VM_POOL_REPL_FIX_SEQUENCES",
 ];
 
 impl Config {
@@ -752,6 +968,22 @@ impl Config {
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .join("dedicated.tsv")
             });
+        // Peer and replication records live beside the state file too — same
+        // directory, same lifecycle as the registry they key into.
+        let sibling = |var: &str, name: &str| -> PathBuf {
+            std::env::var(var)
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    state_file
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join(name)
+                })
+        };
+        let peers_file = sibling("PG_VM_POOL_PEERS_FILE", "peers.tsv");
+        let replication_file = sibling("PG_VM_POOL_REPLICATION_FILE", "replication.tsv");
         // Daily-partitioned event metrics live beside the state file unless
         // pointed elsewhere.
         let metrics_dir = std::env::var("PG_VM_POOL_METRICS_DIR")
@@ -790,6 +1022,38 @@ impl Config {
             .collect();
 
         let dashboard = DashboardConfig::from_env()?;
+        let replication = ReplicationConfig::from_env(listen_addr)?;
+        // Acting as a primary means a peer's guests dial this listener, so it
+        // has to be reachable and it has to be encrypted — the replication
+        // login's password crosses that hop. Both are warnings rather than
+        // errors: a node can legitimately run as replica-only, where neither
+        // applies, and that is not knowable until a pairing is attempted.
+        if let Some(r) = replication.as_ref() {
+            if r.advertise_host.is_none() {
+                tracing::info!(
+                    "replication enabled without PG_VM_POOL_ADVERTISE_PG_HOST — this node \
+                     can host replicas but cannot be a primary (a peer's guests would have \
+                     no address to dial)"
+                );
+            }
+            if tls_cert.is_none() && !r.allow_insecure {
+                tracing::warn!(
+                    "replication is enabled but TLS is not (PG_VM_POOL_TLS_CERT/KEY) — a \
+                     replica's connection carries its password in cleartext, so acting as a \
+                     primary will be refused; set the cert pair or \
+                     PG_VM_POOL_REPL_ALLOW_INSECURE=1"
+                );
+            }
+            if listen_addr.ip().is_loopback() && r.advertise_host.is_some() {
+                tracing::warn!(
+                    "replication advertises {}:{} but PG_VM_POOL_LISTEN is loopback ({}) — \
+                     a peer's guests cannot reach it; bind 0.0.0.0",
+                    r.advertise_host.as_deref().unwrap_or(""),
+                    r.advertise_port,
+                    listen_addr
+                );
+            }
+        }
         let archive = ArchiveConfig::from_env()?;
         // Pressure eviction archives to S3, so it's meaningless without the
         // tier — a set path with the tier off is a config mistake, fail fast.
@@ -932,6 +1196,9 @@ impl Config {
             direct_connect,
             state_file,
             dedicated_file,
+            peers_file,
+            replication_file,
+            replication,
             metrics_dir,
             disk_grow: DiskGrowConfig::from_env()?,
             tls_cert,

@@ -890,6 +890,206 @@ Notes:
   routing — which is also how an operator gets at the data afterwards. Reclaim
   the storage with the existing reap/purge controls.
 
+### Cross-host replication
+
+A dedicated database on one pg-fc host can be replicated, continuously, to a
+second pg-fc host. The flow is: provision the database on node A as usual, add
+node B as a **peer**, then start replication from node A's `/replication` page.
+Node B builds a VM for the same database, seeds it, and follows.
+
+```
+node A (primary)                              node B (replica)
+  pg-acme VM, wal_level=logical                 pg-acme VM
+  PUBLICATION pgfc_pub_acme                     SUBSCRIPTION pgfc_sub_acme
+  role acme_pgfcrepl (REPLICATION)                      │
+             ▲                                          │
+             └──── A's pooler :6432 ◄──── walreceiver ───┘
+```
+
+It is **logical** replication, not a physical standby, and that choice has
+consequences worth reading before you rely on it — see "What it does not
+carry" below.
+
+Nothing in the proxy path needed changing to carry the stream. The replica's
+walreceiver connects to node A's ordinary pooler listener like any other
+client: the pooler challenges it for the replication login's password, the
+`dbname` routes it to the right VM, and the raw StartupMessage (including
+`replication=database`) is replayed upstream verbatim. So the only network
+requirement is that node A's `PG_VM_POOL_LISTEN` is reachable from node B.
+
+#### Setting it up
+
+On **both** nodes:
+
+```
+PG_VM_POOL_REPLICATION=1
+PG_VM_POOL_NODE_NAME=node-a              # must differ between the two
+PG_VM_POOL_DASHBOARD_LISTEN=0.0.0.0:34199   # the peer drives this
+PG_VM_POOL_DASHBOARD_USER=admin
+PG_VM_POOL_DASHBOARD_PASSWORD=...
+```
+
+On whichever node will be a **primary**, additionally:
+
+```
+PG_VM_POOL_LISTEN=0.0.0.0:6432           # the replica's guest dials this
+PG_VM_POOL_ADVERTISE_PG_HOST=203.0.113.10   # what a PEER's guest dials to reach it
+PG_VM_POOL_TLS_CERT=/path/fullchain.pem     # required: the login crosses the network
+PG_VM_POOL_TLS_KEY=/path/privkey.pem
+```
+
+`PG_VM_POOL_ADVERTISE_PG_HOST` is deliberately separate from
+`PG_VM_POOL_LISTEN`: the listener is usually `0.0.0.0`, which means nothing to
+another host. It is resolved to an IPv4 address **on the host** before it ever
+reaches a guest, because the microVMs ship with an empty `/etc/resolv.conf` —
+the same reason the S3 path pins IPs with `curl --resolve`.
+
+Then, on node A's dashboard: add node B under **peers** (its dashboard URL and
+Basic credentials, plus the host and port a guest on node A would dial to reach
+node B's pooler), pick the database and the peer, and press **start
+replicating**. Or over the API:
+
+```sh
+curl -u admin:secret -X POST http://127.0.0.1:34199/api/peers \
+     -H 'content-type: application/json' \
+     -d '{"name":"node_b","base_url":"https://b.example:34199","user":"admin",
+          "password":"...","pg_host":"198.51.100.20","pg_port":6432}'
+
+curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication \
+     -H 'content-type: application/json' -d '{"database":"acme","peer":"node_b"}'
+
+curl -u admin:secret http://127.0.0.1:34199/api/replication/acme   # state + lag
+```
+
+What that does, in order — each step durable before the thing it describes
+exists, so a crash leaves a retryable row rather than an object nothing names:
+
+1. records the pairing, then switches node A's `pg-acme` VM to
+   `wal_level = logical`. That needs a Postgres restart, which is cheap here
+   because Postgres is not PID 1 on this image — `pg_ctl restart` bounces the
+   database without touching the VM or its disk;
+2. creates a `REPLICATION` login, `acme_pgfcrepl`, **separate from the
+   tenant's own role** (a `REPLICATION` role can create logical slots, and an
+   orphaned slot pins WAL until the disk fills — that must stay outside what a
+   leaked tenant password can reach);
+3. creates `PUBLICATION pgfc_pub_acme FOR ALL TABLES`, and warns about any
+   table with no primary key and no `REPLICA IDENTITY`;
+4. asks node B to build the replica. Node B mirrors the *tenant's* credential
+   too, so the same connection string works against either node after a
+   promote — which is what makes failover a DNS change;
+5. node B copies the schema from node A (a detached in-guest
+   `pg_dump --schema-only | psql`) and then `CREATE SUBSCRIPTION`, whose
+   `create_slot = true` is what actually creates the slot on node A. Until
+   that moment node A holds nothing that pins WAL, so a setup that dies
+   halfway leaves no disk hazard.
+
+The `/replication` page then shows each pairing's state and, for a primary, how
+much WAL its slot is holding.
+
+#### Promoting
+
+**promote** on node B disables and drops the subscription, then re-seeds every
+column-owned sequence from the data that arrived (logical replication carries no
+sequence values, so without this the first insert after a promote collides).
+The database is then an ordinary dedicated database on node B, reachable with
+the credentials it already had.
+
+The drop is ordered `DISABLE` → `SET (slot_name = NONE)` → `DROP SUBSCRIPTION`
+specifically so it works when node A is **gone**: without the middle statement
+`DROP SUBSCRIPTION` tries to drop the slot on the primary and hangs, which is
+exactly the failover case.
+
+**detach** on node A drops the publication, the replication login and the slot.
+Dropping the slot is the step that must not be skipped.
+
+#### What it does not carry
+
+Logical replication is not a byte-for-byte standby. All of these are real:
+
+- **DDL is not replicated.** A `FOR ALL TABLES` publication picks up new tables
+  automatically, but the table must also be created on the replica and pulled
+  in with the **refresh** button (`ALTER SUBSCRIPTION … REFRESH PUBLICATION`).
+  Column changes must be applied on both nodes by hand. Schema migrations are a
+  two-node operation.
+- **Sequence values are not replicated.** Promote re-seeds them; an unplanned
+  failover does not.
+- **A table with no primary key** needs `REPLICA IDENTITY FULL`, or its
+  `UPDATE`s and `DELETE`s error at the publisher. Setup warns; it cannot choose
+  an identity on the tenant's behalf.
+- **Large objects are not replicated.**
+
+#### The hazard: WAL retention
+
+This is the one to understand before turning it on. A replication slot pins WAL
+on the primary until its subscriber consumes it. A subscriber that goes away
+leaves an *inactive* slot pinning WAL **forever**, and on these VMs a full data
+disk is a cluster-wide PANIC with no way back in — even booting to fix it needs
+disk.
+
+Three things guard it, in order of who acts:
+
+1. `max_slot_wal_keep_size` in the guest (sized from the live filesystem, the
+   same `disk/8` budget as `max_wal_size`). Postgres invalidates the slot
+   rather than filling the disk. That forces a re-seed of the replica, which is
+   strictly the better failure: lose the replica, keep the primary.
+2. The monitor warns first — once per outage, on the events page and in the
+   log — when a slot has had no subscriber for
+   `PG_VM_POOL_REPL_SLOT_STALE_SECS` or is holding more than
+   `PG_VM_POOL_REPL_LAG_WARN_BYTES`.
+3. A replicating VM is never stopped in the first place (below).
+
+If a replica is gone for good, **detach the pairing**. Do not just delete it.
+
+#### Interaction with the storage tiers
+
+A database in a live pairing is **pinned**: it is excluded from idle stopping,
+compaction, freezing, S3 archiving, purging, disk-pressure eviction and the
+dashboard's per-VM stop/reboot/reap buttons, on both nodes. Stopping a primary
+drops its walsender and leaves an inactive slot; stopping a replica stops it
+consuming, so the primary's slot backs up instead. Both are recoverable only by
+a full re-seed.
+
+The practical cost: **a replicated database holds RAM and disk on both hosts,
+permanently**. It never ages out. Pinned VMs are also warmed at pooler startup,
+before the untracked-VM reaper's first pass could stop them.
+
+#### Configuration
+
+| var | default | meaning |
+|-----|---------|---------|
+| `PG_VM_POOL_REPLICATION` | off | `1` enables the feature, its dashboard page and its routes. Turning it **off** does not un-pin existing pairings — those records still protect their VMs |
+| `PG_VM_POOL_NODE_NAME` | hostname | this node's name in a pairing; must differ from the peer's (self-peering is refused) and is embedded in slot names |
+| `PG_VM_POOL_PEERS_FILE` | `<state dir>/peers.tsv` | peer records. Mode `0600` — it holds another node's admin password |
+| `PG_VM_POOL_REPLICATION_FILE` | `<state dir>/replication.tsv` | pairings. Mode `0600` — it holds the replication login's password |
+| `PG_VM_POOL_ADVERTISE_PG_HOST` | unset | host/IP a **peer's guests** dial to reach this node's pooler. Required to act as a primary |
+| `PG_VM_POOL_ADVERTISE_PG_PORT` | `PG_VM_POOL_LISTEN`'s port | ditto |
+| `PG_VM_POOL_REPL_SSLMODE` | `require` | libpq sslmode for the replication link. `require` encrypts but does not authenticate the server — `verify-full` cannot work against a bare IP |
+| `PG_VM_POOL_REPL_ALLOW_INSECURE` | off | permit a weaker sslmode, and permit acting as a primary with no TLS. Lab only: the login's password crosses the network on this link |
+| `PG_VM_POOL_REPL_PEER_TIMEOUT_SECS` | `20` | bound on any call to a peer's API |
+| `PG_VM_POOL_REPL_SETUP_SECS` | `3600` | bound on the in-guest schema copy |
+| `PG_VM_POOL_REPL_MONITOR_SECS` | `60` | how often lag and slot health are sampled; `0` disables (the page then shows nothing) |
+| `PG_VM_POOL_REPL_SLOT_STALE_SECS` | `3600` | warn once when a slot has had no subscriber this long |
+| `PG_VM_POOL_REPL_LAG_WARN_BYTES` | `268435456` | warn once when an inactive slot holds more than this |
+| `PG_VM_POOL_REPL_FIX_SEQUENCES` | on | re-seed column-owned sequences during a promote |
+
+#### Security notes
+
+- **Peering is a full trust relationship.** `peers.tsv` holds the peer's
+  dashboard Basic password, and that credential can already stop and resize
+  every VM on the peer. There is no narrower peer token, for the same reason
+  the admin API has none: a second secret to rotate would buy no isolation.
+- **The replication login's password reaches further than a tenant's.** It
+  lives in `replication.tsv` on both nodes (`0600`), in
+  `pg_subscription.subconninfo` on the replica (superuser-readable), and in the
+  replica guest's `PGPASSWORD` during the schema copy. It never lands in a file
+  on the guest's disk or in any argv, and it is per-database and independently
+  revocable — but it is a durable credential, not a short-lived one.
+- **TLS terminates at the pooler.** The pooler→VM hop stays plaintext over the
+  host-local tap, which is the same boundary every other client has.
+- **No automatic failover**, no fencing, no quorum. The replica is writable
+  throughout, so writing to it before a promote is invisible to the primary and
+  will conflict. Promoting is an operator's decision.
+
 ### TLS
 
 TLS is **off by default** and fully optional: without it the pooler answers the
@@ -970,6 +1170,11 @@ What it gives you (browse to the listen address):
   is provisioned, and revoke. The same operations are available as JSON at
   `/api/databases` on this listener, behind the same Basic auth — see
   "Dedicated databases" above.
+- **Replication** (`/replication`) — cross-host logical replication: trusted
+  peer nodes, every pairing this node is part of with its state and lag, and
+  the controls to start one, refresh it, promote a replica or detach. Same
+  operations as JSON at `/api/replication` and `/api/peers` — see
+  "Cross-host replication" above.
 - **Logs** — tail the pooler log (`/logs/pooler`), the heyvmd log
   (`/logs/heyvmd`), and any VM's in-guest Postgres log (`/logs/vm/<id>`).
 - **Controls** — stop / start / reboot / resize any VM from its detail page.
@@ -1041,12 +1246,26 @@ routing, daemon VM create/stop/restart, and per-VM persistent disks.
   to prove concurrent VMs don't cross-wire and the pooler restarts them all in
   parallel.
 
+- `e2e_replication.rs` needs **two** nodes, because the thing under test is
+  the pairing between them: it provisions a dedicated database on node A,
+  starts replication to node B, and asserts the initial copy, streaming, the
+  promote (including the sequence re-seed) and that detach leaves no
+  replication slot behind. It also asserts what replication does *not* do —
+  a column added on A must not appear on B — so the documented DDL limitation
+  cannot quietly change under the README.
+
 Prereqs: a running pooler (`target/release/pg-vm-pool`, default
 `127.0.0.1:6432`) and a running local heyvmd daemon. Then:
 
 ```sh
 cargo run --release --example e2e
 cargo run --release --example e2e_concurrent
+
+# two nodes, both with replication enabled and their dashboards reachable
+A_DASH=https://a.example:34199 A_USER=admin A_PASS=... A_PG=a.example:6432 \
+B_DASH=https://b.example:34199 B_USER=admin B_PASS=... B_PG=b.example:6432 \
+PEER_PG_HOST=198.51.100.20 \
+    cargo run --release --example e2e_replication
 ```
 
 Useful env vars: `E2E_ROWS`, `E2E_CYCLES` (e2e.rs), `E2E_VMS` (e2e_concurrent.rs),
