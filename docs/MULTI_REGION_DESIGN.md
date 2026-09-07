@@ -4,6 +4,173 @@ Status: proposed; documentation only. This document defines the replacement
 rollout plan for coordinated multi-region application serving. It does not claim
 that installing gateways or registering two backends completes any serving phase.
 
+## Proposed architecture
+
+**Keep app-lb as a regional data plane. Add the global service view and decision
+loop to Orchestrator, using Cloud for host allocation.** Do not turn app-lb into a
+scheduler and do not build a second service registry beside Orchestrator discovery.
+
+The design has two paths: a control loop that places capacity and assigns traffic,
+and a request path that continues without a control-plane call per request.
+
+```diagram
+                         Operator's service intent
+                       “Cloud in both EU and US”
+                                    │
+                                    ▼
+                     ┌────────────────────────────┐
+                     │ Orchestrator               │
+                     │ Regional service plan      │
+                     │ Observed service discovery │
+                     │ Traffic distribution       │
+                     └──────┬─────────────┬───────┘
+                            │             │
+                   Place in region        │ Routing assignments
+                            ▼             ▼
+                     ┌─────────────┐ ┌───────────────────┐
+                     │ Cloud       │ │ eu1 / us3 app-lbs │
+                     │ Host choice │ │ Route and measure │
+                     │ Reservation │ └─────────┬─────────┘
+                     └──────┬──────┘           │
+                            │                  │ Service load feedback
+                            ▼                  └──────▶ Orchestrator
+                     ┌─────────────┐
+                     │ heyvm       │──Host resources──▶ Cloud
+                     │ Execute VM  │
+                     └─────────────┘
+```
+
+The boxes are responsibilities in existing services, not new standalone services.
+Multiple Cloud or Orchestrator instances share authoritative state; they do not
+each run an independent global scheduler. A single active owner reconciles a given
+service at a time, with durable ownership that rejects a former owner's writes.
+
+### Decision A: where must this service run?
+
+Orchestrator owns a regional service plan: required presence in EU and US, runtime
+and resource requirements for each region, and limits on additional capacity.
+It compares the plan with ready deployments in its service discovery.
+
+For each missing regional replica, Orchestrator asks Cloud for capacity **in that
+region**. Cloud filters hosts by eligibility and resource fit, reserves resources,
+and provisions through heyvm. It reports the resulting deployment back; Orchestrator
+publishes it as serving capacity only after readiness and dependency checks.
+
+Cloud owns host selection and reservations because all VM allocations must compete
+against the same resource inventory. Orchestrator owns regional coverage because
+only it knows that a second US replica cannot replace a required EU replica.
+Insufficient EU capacity leaves the plan visibly unsatisfied; it does not change
+the requested topology. Hostnames are inventory, not placement policy.
+
+### Decision B: how much traffic should each region receive?
+
+Orchestrator computes distribution **per service**, not per host. It uses three
+inputs with different meanings:
+
+| Input | Source | Meaning |
+| --- | --- | --- |
+| Ready service instances and configured serving budgets | Orchestrator discovery and service plan | Capacity actually available for this service |
+| Active work, queueing, latency, errors and rejections | Destination app-lb | Whether that service is approaching its serving limit |
+| Available resources and host pressure | heyvm through Cloud | Whether co-located workloads constrain that capacity or another replica can fit |
+
+Begin with explicit weights. Once feedback control is introduced, derive the
+capacity-balanced target from each region's usable serving budget, excluding
+unready/draining capacity and retaining configured headroom. Apply bounded changes
+toward that target rather than chasing every sample. Missing reports freeze automatic
+increases; they do not mean the region is idle. Local health and admission limits
+protect the service between controller updates.
+
+Do not use “remaining idle request slots” alone as the weight: directing traffic to
+an idle region would immediately make it look less attractive and cause oscillation.
+Use a stable tested capacity baseline, sustained pressure to adjust it, and a slower
+replica-scaling loop. When both regions are saturated, add ready capacity if possible
+or reject excess work; moving the same overload between regions does not solve it.
+
+### Worked example: eu1 has 100 VMs; us3 has 2
+
+1. The Cloud service plan requires EU >= 1 and US >= 1. Orchestrator requests one
+   replica in each region. The global VM-count difference does not change this.
+2. Cloud checks actual reserved/available resources in each region. If eu1 cannot
+   fit its replica, the EU requirement remains blocked. If it can, both replicas start.
+3. Suppose measured safe Cloud-serving budgets, after headroom, are 40 concurrent
+   requests in EU and 120 in US. A capacity-balanced policy targets 25% EU / 75% US.
+   These are illustrative service budgets, not measurements of the current hosts.
+4. If both Cloud instances instead have the same usable budget, that policy targets
+   50% / 50%, despite the 100-versus-2 VM count. A locality-preferred policy is a
+   separate explicit choice, not an undocumented override of those weights.
+5. More replicas may fit in US, but adding them cannot erase EU's minimum. Before
+   EU maintenance, US must demonstrate enough capacity for the entire affected
+   service demand; simply changing its weight to 100% is insufficient.
+
+### Decision C: where does this request go?
+
+```diagram
+Client → stage.heyo.computer → eu1 app-lb
+                                   │
+                         Assigned regional selection
+                            ┌──────┴──────┐
+                            ▼             ▼
+                      EU instance    us3.heyo.computer
+                                          │
+                                      us3 app-lb
+                                      Local-only selection
+                                          │
+                                          ▼
+                                      US instance
+```
+
+app-lb reads the latest valid assignment from memory. It selects a region, then
+either a local instance or that region's authenticated gateway. The remote gateway
+selects only a local instance; it cannot forward the same request back across regions.
+Both entry points use the same authoritative policy. Regional forwarding does not
+require exposing each VM's private address across servers.
+
+The ingress records offered service demand; the destination records execution load.
+These are not added together as two requests. Existing streams stay on their selected
+instance until completion or an explicitly defined termination policy. Changing
+weights changes new assignments, not the location of existing work.
+
+### Discovery and control-plane availability
+
+Cloud's registry answers “which hosts can run this VM?” Orchestrator's discovery
+answers “which ready instances serve this application?” Service discovery is updated
+by deployment/readiness reconciliation; app-lb observations supplement it but cannot
+create an authoritative deployment by reporting an arbitrary endpoint.
+
+Gateways use local snapshots during control-plane outages, subject to health and
+admission checks. New global policy, placement and maintenance decisions stop when
+their authority is unavailable. Replacing Cloud or Orchestrator itself uses the
+existing healthy instance to create its replacement, then verifies the replacement
+before removing the old instance. Shared durable state and exclusive operation
+ownership are prerequisites to active replicas, not consequences of adding a gateway.
+
+## First implementation change: Orchestrator's regional service plan
+
+**Extend the existing regional replica placement and discovery into one reconciled
+service plan.** This is the first implementation slice, not the whole Phase 1 and
+not an app-lb forwarding patch.
+
+| Part | Concrete change |
+| --- | --- |
+| Desired state | Persist each service's required regional replica slots and regional runtime/resource requirements, reusing `replicaRegions` rather than introducing a second placement list |
+| Reconciliation | Compare ready and pending replicas against those slots; request only missing capacity in the required region through Cloud; use existing rolling-deployment ownership for retries |
+| Observed state | Derive a region-grouped view from existing service discovery; show missing capacity separately from ready capacity |
+| Routing output | Compile explicit operator weights and eligible regional membership into one versioned decision; never route to merely planned capacity |
+| Incomplete topology | Preserve the coverage failure visibly. Traffic can use other ready regions only when the service's explicit failover policy allows it; do not silently renormalize a missing required region |
+| Compatibility | Existing single-region deployments keep their behavior; nothing consumes the new regional decision until explicitly enabled |
+
+Primary owning modules are Orchestrator's existing service deployment and discovery
+modules. The first slice adds no automatic capacity balancing, no app-lb VM creation,
+and no runtime update. Its tests prove that EU/US intent cannot produce two US
+placements, repeated reconciliation does not duplicate pending replicas, and only
+ready endpoints appear in routing output. Runtime/profile selection must support
+EU libvirt and US Firecracker without assuming one global driver/image.
+
+The next slice makes app-lb consume this shared regional decision and implements
+the cross-region request path. Phase 2 then changes how weights and extra replicas
+are calculated, without replacing the ownership model. Detailed schema and endpoint
+design follows agreement on these boundaries; it is not specified in this document.
+
 ## Scope and deployment constraints
 
 - Initial staging topology: eu1 and us3. Production/us1 is out of scope.
@@ -55,29 +222,15 @@ discovers service endpoints. app-lb consumes the latter. Gateways do not replica
 their local JSON stores to one another. Multiple Cloud/Orchestrator processes
 coordinate through durable operation ownership, not process-local locks alone.
 
-## Shared contracts
+## Consistency and security boundaries
 
-Names below are proposed logical contracts, not existing wire APIs. Reuse existing
-service/deployment IDs and authorization boundaries. All records are scoped by
-tenant/project and environment. Node IDs, region IDs and gateway IDs are distinct;
-eu1/us3 are inventory entries, never branches in routing code.
+Reuse existing service/deployment identities and authorization boundaries. Keep
+tenant/project and environment isolation. Node, region and gateway identities are
+distinct. These are behavioral requirements, not a proposed schema or endpoint list.
 
-| Contract | Minimum fields and semantics |
-| --- | --- |
-| Backend observation (heyvm → Cloud) | Node/region, runtime capabilities, total/allocatable/reserved resources, available memory, CPU and I/O pressure, observation sequence and timestamp |
-| Regional service intent (operator → Orchestrator) | Service/revision, per-region replica minimum/maximum, resource request, pool/runtime constraints, dependencies, serving budget and failover headroom policy |
-| Allocation (Orchestrator → Cloud) | Stable idempotency key, service replica slot, region, resources, exclusions; result includes reservation/deployment/node identity or explicit insufficient-capacity error |
-| Service membership (Orchestrator) | Endpoint/deployment/node/region/revision, local URL, readiness observation and drain state; existence alone is not readiness |
-| Gateway registration (gateway → Orchestrator) | Gateway ID, region, HTTPS address, authenticated identity, boot ID, supported protocol version; registered addresses are validated against deployment/network policy |
-| Routing snapshot (Orchestrator → app-lb) | Service, generation, schema version, discovery version, gateway directory, eligible regional weights, permitted failover order and maintenance exclusions |
-| Gateway observation (app-lb → Orchestrator) | Gateway/boot ID, report sequence/window, applied generation, per-service/region request counts, latency/error/queue statistics, active requests/streams and drain observations |
-
-### API and consistency rules
-
-- Extend the existing authenticated service discovery path with a versioned
-  regional representation; retain its legacy representation. Add authenticated
-  gateway registration/reporting and traffic-policy update operations under
-  Orchestrator ownership. Freeze exact routes and serialization in Phase 1 tests.
+- Extend Orchestrator's existing service discovery ownership while preserving legacy
+  consumers. Introduce regional decisions and authenticated observations only through
+  explicit opt-in; do not make old app-lbs guess the meaning of regional membership.
 - Policy mutations carry an expected generation; conflicting writes fail rather
   than overwrite a newer decision. Publish a complete routing snapshot atomically,
   referencing compatible discovery membership. Do not expose half-updated weights
