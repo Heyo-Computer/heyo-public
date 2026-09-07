@@ -139,6 +139,10 @@ struct Daemon {
     /// heyvmd) or ignores the query and serves the full inventory (an old
     /// one). Default true; flip off to model the fallback.
     supports_name_filter: StdMutex<bool>,
+    /// `disk_size_gb` from the most recent deploy body. The pooler asking for
+    /// the right data device is a wire-level fact, and the only place it can
+    /// be observed is here.
+    last_deploy_disk_gb: StdMutex<Option<u64>>,
 }
 
 impl Daemon {
@@ -227,10 +231,14 @@ async fn get_one(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<String>) -> im
 /// visible and `running` — so the harness measures the pooler's cost of asking,
 /// with the daemon's own build cost set to zero.
 async fn deploy(State(d): State<Arc<Daemon>>, body: String) -> impl IntoResponse {
-    let name = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
+    let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let name = parsed
+        .as_ref()
         .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
         .unwrap_or_default();
+    *d.last_deploy_disk_gb.lock().unwrap() = parsed
+        .as_ref()
+        .and_then(|v| v.get("disk_size_gb").and_then(serde_json::Value::as_u64));
     let id = format!("sb-new-{:06}", d.next_id.fetch_add(1, Ordering::Relaxed));
     d.vms.lock().unwrap().insert(
         id.clone(),
@@ -299,6 +307,7 @@ fn daemon() -> &'static Arc<Daemon> {
             list_serial: StdMutex::new(false),
             list_gate: tokio::sync::Mutex::const_new(()),
             supports_name_filter: StdMutex::new(true),
+            last_deploy_disk_gb: StdMutex::new(None),
         });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding daemon stub");
         listener.set_nonblocking(true).unwrap();
@@ -556,6 +565,7 @@ async fn resolve_cell(
                 false,
                 known_id.as_deref(),
                 Some((&spares, &bound)),
+                cfg.data_disk_gb,
             )
             .await;
             t.elapsed()
@@ -704,7 +714,7 @@ async fn by_name_lookup_finds_without_pulling_inventory() {
     daemon().metrics.reset();
 
     let name = format!("pg-{}", seed_schema(42));
-    let (sb, provenance) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None)
+    let (sb, provenance) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None, cfg.data_disk_gb)
         .await
         .expect("resolving a daemon-known schema");
     assert_eq!(sb.sandbox_id(), seed_id(42));
@@ -728,6 +738,45 @@ async fn by_name_lookup_finds_without_pulling_inventory() {
     );
 }
 
+/// A bring-up that has to build a VM must ask for the data device the schema
+/// actually needs, not the configured starting size.
+///
+/// The failure without it is silent and expensive: `PG_VM_POOL_DATA_DISK_GB`
+/// is where a *new* schema starts, and device growth is offline-only, so a
+/// schema that grew and was then dump-archived comes back into a device too
+/// small to hold it. Its VM boots, Postgres starts, and `pg_restore` fills the
+/// disk — `No space left on device`, a half-loaded cluster, and a broken VM
+/// that looks like a daemon fault. The size travels in the deploy body, so
+/// that body is what this asserts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_creates_its_vm_at_the_size_the_schema_needs() {
+    let _exclusive = exclusive().await;
+    let cfg = config_for(0, 0);
+    daemon().seed(0);
+
+    // The stub has no Postgres, so every create ends in a readiness failure —
+    // irrelevant here. The deploy has already been sent by then, and the
+    // request it carried is the whole question.
+    *daemon().last_deploy_disk_gb.lock().unwrap() = None;
+    let _ = crate::vm::resolve_sandbox(&cfg, "pg-grown", false, None, None, 16).await;
+    assert_eq!(
+        *daemon().last_deploy_disk_gb.lock().unwrap(),
+        Some(16),
+        "a restore that needs 16GiB must be built at 16GiB, not the {}GiB default",
+        cfg.data_disk_gb
+    );
+
+    // ...and an ordinary bring-up still starts small: the point is a device
+    // sized to the schema, in both directions.
+    *daemon().last_deploy_disk_gb.lock().unwrap() = None;
+    let _ = crate::vm::resolve_sandbox(&cfg, "pg-fresh", false, None, None, cfg.data_disk_gb).await;
+    assert_eq!(
+        *daemon().last_deploy_disk_gb.lock().unwrap(),
+        Some(u64::from(cfg.data_disk_gb)),
+        "a schema with no history must still start at the configured size"
+    );
+}
+
 /// The duplicate-VM guard behind the positive-only cache design: a VM the
 /// daemon knows about but the cache doesn't (pooler restarted, cache cold, no
 /// registry row) must be found by the authoritative by-name call and
@@ -741,13 +790,13 @@ async fn existing_vm_absent_from_cache_is_reattached_not_recreated() {
     // Warm the cache with one resolve, then wipe it — the "restarted pooler"
     // state, with the VM still very much alive daemon-side.
     let name = format!("pg-{}", seed_schema(7));
-    crate::vm::resolve_sandbox(&cfg, &name, false, None, None)
+    crate::vm::resolve_sandbox(&cfg, &name, false, None, None, cfg.data_disk_gb)
         .await
         .expect("first resolve");
     crate::inventory::reset();
     daemon().metrics.reset();
 
-    let (sb, _) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None)
+    let (sb, _) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None, cfg.data_disk_gb)
         .await
         .expect("resolving after a cache wipe");
     assert_eq!(sb.sandbox_id(), seed_id(7), "the same VM, not a duplicate");
@@ -778,7 +827,7 @@ async fn old_daemon_full_list_fallback_still_resolves() {
     daemon().metrics.reset();
 
     let name = format!("pg-{}", seed_schema(3));
-    let (sb, _) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None)
+    let (sb, _) = crate::vm::resolve_sandbox(&cfg, &name, false, None, None, cfg.data_disk_gb)
         .await
         .expect("resolving against an old daemon");
     assert_eq!(sb.sandbox_id(), seed_id(3));
@@ -793,7 +842,7 @@ async fn old_daemon_full_list_fallback_still_resolves() {
     // The absorbed full list covers every seeded name — the next cold resolve
     // is a cache hit and never lists.
     let other = format!("pg-{}", seed_schema(90));
-    let (sb, _) = crate::vm::resolve_sandbox(&cfg, &other, false, None, None)
+    let (sb, _) = crate::vm::resolve_sandbox(&cfg, &other, false, None, None, cfg.data_disk_gb)
         .await
         .expect("second resolve");
     assert_eq!(sb.sandbox_id(), seed_id(90));

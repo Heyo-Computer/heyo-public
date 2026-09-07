@@ -876,6 +876,10 @@ impl SchemaRegistry {
                         schema,
                         known_id.as_deref(),
                         restore.as_ref(),
+                        // How big this schema's data device was when it was
+                        // last seen. Only a restore that has to build the VM
+                        // reads it, and only there does it matter.
+                        record.as_ref().map(|r| r.disk_gb).filter(|gb| *gb > 0),
                         self.spares.as_deref().map(|p| (p, &*bound)),
                         owner.as_ref(),
                     )
@@ -1189,7 +1193,7 @@ impl SchemaRegistry {
     /// return. The excess stays warm one more tick.
     ///
     /// Returns how many VMs were stopped, for the supervisor's heartbeat.
-    async fn reap_idle(&self, timeout: Duration) -> usize {
+    async fn reap_idle(self: &Arc<Self>, timeout: Duration) -> usize {
         let mut victims: Vec<(String, Arc<SchemaEntry>)> = Vec::new();
         let deferred;
         {
@@ -1231,14 +1235,22 @@ impl SchemaRegistry {
             info!("idle-stopping VM for schema {schema} (no connections for >= {timeout:?})");
             if let Some(gc) = self.cfg.disk_grow
                 && let Some((fs, dev)) = sample_disk(&entry).await
-                && let Some(target) = grow_target_gb(fs, dev, &gc)
             {
-                info!(
-                    "schema {schema}: data fs is >= {:.0}% full and spans its device — \
-                     queueing offline device grow to {target}GiB",
-                    gc.pct
-                );
-                grow.push((schema.clone(), entry.sandbox_id(), target));
+                // Note the device size while the VM is still up to answer the
+                // question. Once the offload ladder deletes that VM, the
+                // registry row is the only thing left that knows how big a
+                // restore has to build its replacement (see
+                // `Store::set_disk_gb`), and a stale value corrects itself
+                // here on the next idle-stop.
+                self.store.set_disk_gb(&schema, device_gb(dev));
+                if let Some(target) = grow_target_gb(fs, dev, &gc) {
+                    info!(
+                        "schema {schema}: data fs is >= {:.0}% full and spans its device — \
+                         queueing offline device grow to {target}GiB",
+                        gc.pct
+                    );
+                    grow.push((schema.clone(), entry.sandbox_id(), target));
+                }
             }
             checkpoint_and_stop(&entry, &schema).await;
             // Dropping the last Arc here tears down the tunnel + pool. Data on
@@ -1259,12 +1271,17 @@ impl SchemaRegistry {
         // which must never interleave with a reclaim pass fsck'ing the same
         // file (see reclaim::BOOT_GATE).
         if !grow.is_empty() {
+            let registry = self.clone();
             tokio::spawn(async move {
                 for (schema, id, target) in grow {
                     let _permit = crate::reclaim::boot_permit(&id).await;
                     match vm::resize_disk(&id, target).await {
                         Ok(()) => {
                             info!("schema {schema}: data device grown to {target}GiB");
+                            // The new size, recorded the moment it is real: a
+                            // schema archived before its next idle-stop would
+                            // otherwise be restored into the pre-grow device.
+                            registry.store.set_disk_gb(&schema, target as u32);
                             crate::events::journal_info(
                                 "disk-grow",
                                 format!("schema {schema}: device grown to {target}GiB ({id})"),
@@ -1353,6 +1370,18 @@ impl SchemaRegistry {
     ///   - backpressure pauses NEW dispatch only — in-flight jobs always run
     ///     to completion (they hold per-schema claims, not host-wide locks).
     ///
+    /// With one bound on the yielding, because "wait for quiet" is not the
+    /// same promise as "eventually run". A host whose bring-up queue is never
+    /// empty for a whole tick starves the pacer completely, and the work does
+    /// not go away: it piles up until the host goes quiet (or the disk-pressure
+    /// watchdog fires) and then lands as the single burst this design exists to
+    /// avoid, against a disk already near the high-water mark. So after
+    /// `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` of continuous *client*
+    /// backpressure the pacer dispatches anyway — one job at a time, no-boot
+    /// kinds only, and only that gate overridden (see [`Backpressure`]). It
+    /// keeps trickling for as long as the host stays busy, so the same total
+    /// work is spread across the busy hours instead of stacking up for them.
+    ///
     /// Each dispatch re-picks against a fresh view of the host, excluding
     /// schemas already in flight here or claimed elsewhere (dashboard buttons,
     /// the pressure pass). The total work done is the same; it is spread thin
@@ -1400,11 +1429,21 @@ impl SchemaRegistry {
         let idle_rescan = self.offload_idle_rescan();
         let workers = self.cfg.offload_workers;
         let load_max = self.cfg.offload_load_max;
+        let max_holdoff = self.cfg.offload_max_holdoff;
         info!(
             "offload pacer: {} — up to {workers} concurrent job(s), at most one that boots a VM, \
              extras only while load/core < {load_max} (tick {OFFLOAD_TICK:?}, rescan \
-             {idle_rescan:?} when there is nothing to do)",
+             {idle_rescan:?} when there is nothing to do); {}",
             tiers.join(", "),
+            match max_holdoff {
+                Some(d) => format!(
+                    "after {d:?} held off by queued clients it trickles one no-boot job at a \
+                     time anyway"
+                ),
+                None => "it yields to queued clients indefinitely \
+                         (PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS=0)"
+                    .to_string(),
+            }
         );
 
         let registry = self.clone();
@@ -1413,6 +1452,11 @@ impl SchemaRegistry {
             // When the last scan found nothing, don't scan again until this.
             let mut hold_until: Option<Instant> = None;
             let mut quiet_since: Option<Instant> = None;
+            // When the current unbroken stretch of backpressure began. Cleared
+            // only when the host actually goes quiet — deliberately NOT by a
+            // forced dispatch, so a host that stays busy keeps getting one
+            // no-boot job at a time instead of one per holdoff window.
+            let mut held_since: Option<Instant> = None;
             // In-flight jobs, each in its own JoinSet task so a panic inside
             // one offload is contained — the pacer must outlive any single
             // schema. The side map keys by task id so a job's label survives
@@ -1462,23 +1506,41 @@ impl SchemaRegistry {
                 if jobs.len() >= workers {
                     continue;
                 }
-                if let Some(reason) = registry.dispatch_backpressure() {
-                    // Log the first deferral of each busy stretch only: this
-                    // loop runs 86 400 times a day and a busy host would
-                    // otherwise fill the log with it.
-                    if quiet_since.take().is_some() {
-                        debug!("offload pacer: holding off — {reason}");
+                // How long this dispatch has been owed, when it is the
+                // starvation escape hatch rather than a normal quiet-host one.
+                let mut forced: Option<Duration> = None;
+                match registry.dispatch_backpressure() {
+                    None => {
+                        held_since = None;
+                        quiet_since.get_or_insert_with(Instant::now);
                     }
-                    continue;
+                    Some(bp) => {
+                        let held = held_since.get_or_insert_with(Instant::now).elapsed();
+                        if forced_dispatch(bp, held, jobs.is_empty(), max_holdoff) {
+                            forced = Some(held);
+                        } else {
+                            // Log the first deferral of each busy stretch only: this
+                            // loop runs 86 400 times a day and a busy host would
+                            // otherwise fill the log with it.
+                            if quiet_since.take().is_some() {
+                                debug!("offload pacer: holding off — {}", bp.reason());
+                            }
+                            continue;
+                        }
+                    }
                 }
-                quiet_since.get_or_insert_with(Instant::now);
-                if !dispatch_allowance(jobs.len(), workers, normalized_load(), load_max) {
+                if forced.is_none()
+                    && !dispatch_allowance(jobs.len(), workers, normalized_load(), load_max)
+                {
                     continue;
                 }
                 let mut policy = registry.offload_policy();
                 // At most one boot-kind job in flight: those compete with
-                // waiting clients for the FIFO bring-up gate.
-                policy.no_boot = in_flight.values().any(|(_, kind, _)| kind.boots());
+                // waiting clients for the FIFO bring-up gate — and a forced
+                // job must boot nothing at all, since the clients it is
+                // stepping in front of are queued for exactly that gate.
+                policy.no_boot =
+                    forced.is_some() || in_flight.values().any(|(_, kind, _)| kind.boots());
                 let excluded: HashSet<String> =
                     in_flight.values().map(|(schema, ..)| schema.clone()).collect();
                 let Some(job) = registry.next_offload_job(policy, &excluded).await else {
@@ -1494,11 +1556,22 @@ impl SchemaRegistry {
                 hold_until = None;
                 let r = registry.clone();
                 let (schema, kind) = (job.schema.clone(), job.kind);
-                info!(
-                    "offload dispatch: {} {schema} ({}/{workers} in flight)",
-                    kind.as_str(),
-                    jobs.len() + 1
-                );
+                match forced {
+                    // Worth a line of its own at info: a pacer starved this
+                    // long is invisible otherwise (the holdoff itself only
+                    // logs at debug), and this is the log that explains why
+                    // housekeeping is running during peak traffic.
+                    Some(held) => info!(
+                        "offload dispatch: {} {schema} single-file — held off {held:?} by \
+                         queued client bring-ups (PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS)",
+                        kind.as_str()
+                    ),
+                    None => info!(
+                        "offload dispatch: {} {schema} ({}/{workers} in flight)",
+                        kind.as_str(),
+                        jobs.len() + 1
+                    ),
+                }
                 let task_id = jobs
                     .spawn(async move {
                         let _ = r.run_offload_job(job).await;
@@ -1519,18 +1592,23 @@ impl SchemaRegistry {
     /// between offloads themselves is the dispatcher's business (worker cap +
     /// load gate + pick-time exclusion), not this function's — dashboard and
     /// pressure-pass claims are excluded at pick time via `is_archiving`.
-    fn dispatch_backpressure(&self) -> Option<&'static str> {
+    ///
+    /// The distinction between the variants is what the starvation escape
+    /// hatch keys on: politeness may be overridden after a long enough
+    /// holdoff, a conflict over the same disks never may. See
+    /// [`Backpressure`].
+    fn dispatch_backpressure(&self) -> Option<Backpressure> {
         if crate::vm::bringups_waiting() > 0 {
-            return Some("client bring-ups are queued");
+            return Some(Backpressure::ClientsQueued);
         }
         // A pass holds the boot gate; an offload that boots a VM to dump it
         // would make it yield and lose that pass's progress.
         if crate::reclaim::pass_running() {
-            return Some("a disk-reclaim pass is running");
+            return Some(Backpressure::ReclaimPass);
         }
         // A manual batch sweep from the dashboard.
         if self.sweeping.load(Ordering::SeqCst) {
-            return Some("a manual sweep is running");
+            return Some(Backpressure::Sweeping);
         }
         None
     }
@@ -2352,6 +2430,7 @@ impl SchemaRegistry {
             known_id.as_deref(),
             None,
             None,
+            None,
             self.owner_of(schema).as_ref(),
         )
         .await {
@@ -2373,6 +2452,17 @@ impl SchemaRegistry {
                     .await;
             }
         };
+
+        // Note the data device's size while the VM that has it is still up.
+        // The dump routes delete that VM, and a dump carries no trace of the
+        // device it came off — so this row is the only thing that later stops
+        // the restore from rebuilding the schema into a default-size device
+        // and filling it mid-`pg_restore` (see `Store::set_disk_gb`). Recorded
+        // before `set_tier`, whose durable write is what carries it to disk
+        // ahead of the kill.
+        if let Some((_, dev)) = sample_disk(&entry).await {
+            self.store.set_disk_gb(schema, device_gb(dev));
+        }
 
         // On dump failure, stop the VM this attempt booted before propagating.
         // Without this every failed archive leaks a running VM — nothing else
@@ -2982,6 +3072,7 @@ impl SchemaRegistry {
             known_id.as_deref(),
             None,
             None,
+            None,
             self.owner_of(schema).as_ref(),
         )
         .await {
@@ -2993,6 +3084,17 @@ impl SchemaRegistry {
                     .with_context(|| format!("bringing up VM for schema {schema} to freeze it"));
             }
         };
+
+        // Note the data device's size while the VM that has it is still up.
+        // The dump routes delete that VM, and a dump carries no trace of the
+        // device it came off — so this row is the only thing that later stops
+        // the restore from rebuilding the schema into a default-size device
+        // and filling it mid-`pg_restore` (see `Store::set_disk_gb`). Recorded
+        // before `set_tier`, whose durable write is what carries it to disk
+        // ahead of the kill.
+        if let Some((_, dev)) = sample_disk(&entry).await {
+            self.store.set_disk_gb(schema, device_gb(dev));
+        }
 
         // Same leak guard as archive_schema_inner: a failed dump must not
         // leave the VM it booted running and unowned.
@@ -3682,6 +3784,13 @@ async fn sample_disk(entry: &SchemaEntry) -> Option<((u64, u64, u64), u64)> {
     tokio::time::timeout(STATS_TIMEOUT, query).await.ok()?
 }
 
+/// A data device's size in whole GiB, rounded up — the unit both the daemon's
+/// create and its resize speak, and the unit the registry records. Never 0: a
+/// device that exists is at least 1GiB to anything that has to rebuild it.
+fn device_gb(device_bytes: u64) -> u32 {
+    device_bytes.div_ceil(GIB).max(1).min(u32::MAX as u64) as u32
+}
+
 /// Decide whether (and to what) an idle-stopping VM's data device should
 /// grow. `fs` is the guest data filesystem's (total, used, avail) and
 /// `device_bytes` its backing device size.
@@ -4059,10 +4168,59 @@ fn normalized_load() -> Option<f64> {
     Some(load1 / cores)
 }
 
+/// Why the offload pacer is not dispatching (see
+/// [`SchemaRegistry::dispatch_backpressure`]). Split by *kind* because only
+/// one of them is negotiable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backpressure {
+    /// A client is parked waiting for a bring-up slot. Pure politeness: a job
+    /// that boots no VM takes nothing that client is queued for, so a pacer
+    /// starved this way past `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` may
+    /// dispatch one no-boot job at a time anyway rather than let the backlog
+    /// (and the disk) grow until the host happens to go quiet.
+    ClientsQueued,
+    /// A reclaim pass holds the boot gate and is fsck'ing/shrinking the very
+    /// disks an offload would read. A genuine conflict over the same files,
+    /// not politeness — never overridden.
+    ReclaimPass,
+    /// A manual or disk-pressure sweep is already draining through the same
+    /// picker. Overriding it would only double-dispatch against the claims it
+    /// already holds.
+    Sweeping,
+}
+
+impl Backpressure {
+    fn reason(self) -> &'static str {
+        match self {
+            Backpressure::ClientsQueued => "client bring-ups are queued",
+            Backpressure::ReclaimPass => "a disk-reclaim pass is running",
+            Backpressure::Sweeping => "a manual sweep is running",
+        }
+    }
+}
+
 /// May the dispatcher start another offload job right now? The first job is
 /// always allowed (parity with the classic single pacer, which had no load
 /// gate); every extra one requires both a free worker slot and known load
 /// headroom — an unreadable load means no extras, never a stampede.
+/// The starvation escape hatch: may the pacer dispatch a job even though
+/// `bp` says the host is busy? `held` is how long the current unbroken stretch
+/// of backpressure has run and `idle` whether the pacer has nothing in flight.
+///
+/// Three conditions, each load-bearing: only the client gate is politeness
+/// (the others are conflicts over the same disks), only a pacer with nothing
+/// in flight may force one (so the override can never stack), and only past
+/// the operator's holdoff — `None` keeps the historical behavior of yielding
+/// to clients forever.
+fn forced_dispatch(
+    bp: Backpressure,
+    held: Duration,
+    idle: bool,
+    max_holdoff: Option<Duration>,
+) -> bool {
+    bp == Backpressure::ClientsQueued && idle && max_holdoff.is_some_and(|limit| held >= limit)
+}
+
 fn dispatch_allowance(in_flight: usize, workers: usize, load: Option<f64>, load_max: f64) -> bool {
     if in_flight >= workers {
         return false;
@@ -4328,6 +4486,7 @@ mod archive_tests {
             sandbox_id: "sb-x".into(),
             last_active,
             tier: if archived { Tier::Archived } else { Tier::Live },
+            disk_gb: 0,
         }
     }
 
@@ -4394,6 +4553,7 @@ mod archive_tests {
             sandbox_id: "sb-x".into(),
             last_active: NOW - idle,
             tier,
+            disk_gb: 0,
         }
     }
 
@@ -4514,6 +4674,33 @@ mod archive_tests {
         assert!(!dispatch_allowance(1, 4, Some(0.75), 0.75));
         assert!(!dispatch_allowance(1, 4, Some(2.0), 0.75));
         assert!(!dispatch_allowance(1, 4, None, 0.75));
+    }
+
+    /// The starvation escape hatch. The failure it exists for is a pacer that
+    /// dispatches nothing for hours because the bring-up queue is never empty
+    /// for a whole tick, then drains the whole backlog in one burst against a
+    /// disk already near the pressure line.
+    #[test]
+    fn forced_dispatch_overrides_only_client_politeness() {
+        let limit = Some(Duration::from_secs(300));
+        let (under, over) = (Duration::from_secs(299), Duration::from_secs(300));
+
+        // The case it exists for: starved on queued clients, nothing running.
+        assert!(forced_dispatch(Backpressure::ClientsQueued, over, true, limit));
+        // ...but not one second early.
+        assert!(!forced_dispatch(Backpressure::ClientsQueued, under, true, limit));
+        // ...and never stacked: a forced job runs strictly single-file.
+        assert!(!forced_dispatch(Backpressure::ClientsQueued, over, false, limit));
+
+        // A reclaim pass or a sweep is a conflict over the same disks, not
+        // politeness — no holdoff, however long, may override those.
+        let forever = Duration::from_secs(86_400);
+        assert!(!forced_dispatch(Backpressure::ReclaimPass, forever, true, limit));
+        assert!(!forced_dispatch(Backpressure::Sweeping, forever, true, limit));
+
+        // Disabled (PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS=0) keeps the strict
+        // yield-to-every-client behavior.
+        assert!(!forced_dispatch(Backpressure::ClientsQueued, forever, true, None));
     }
 
     /// Kind ⇒ boot is exact: only the dump-based kinds take the bring-up gate,
