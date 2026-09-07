@@ -398,6 +398,25 @@ pub struct SchemaRegistry {
     // client may route here at all) and on every bring-up (so the owning role
     // exists inside the VM). Empty unless an operator has provisioned one.
     dedicated: Arc<Credentials>,
+    // Trusted peer nodes: how to reach another pooler's admin API, and the
+    // address a guest on this host dials to reach its pooler. Empty unless an
+    // operator has recorded one.
+    peers: Arc<crate::peers::PeerStore>,
+    // When each pairing's slot was first seen with no subscriber attached, and
+    // whether that has already been reported. Edge-triggered like the
+    // dashboard's webhook alerts: an inactive slot is a standing condition, so
+    // warning every tick would bury the journal instead of informing it.
+    repl_inactive: StdMutex<HashMap<String, (Instant, bool)>>,
+    // Last replication status sample per database, refreshed by
+    // `spawn_replication_monitor`. The dashboard renders from this rather than
+    // querying a VM, so a page load never disturbs what it is showing and a
+    // wedged VM cannot hang a render.
+    repl_status: StdMutex<HashMap<String, crate::replication::wire::StatusJson>>,
+    // Replication pairings, `database → (role, peer, state)`. Loaded even when
+    // the feature is disabled, because this is what holds the pin that keeps a
+    // replicating VM off the idle reaper and the offload ladder — see
+    // [`Self::pinned`].
+    replication: Arc<crate::replication::ReplStore>,
 }
 
 impl SchemaRegistry {
@@ -417,6 +436,10 @@ impl SchemaRegistry {
         let dumps = (cfg.freeze.is_some() || cfg.archive.is_some())
             .then(|| Arc::new(DumpServer::new(cfg.dump_net.dump_dir.clone())));
         let dedicated = Arc::new(Credentials::load(cfg.dedicated_file.clone()));
+        let peers = Arc::new(crate::peers::PeerStore::load(cfg.peers_file.clone()));
+        let replication = Arc::new(crate::replication::ReplStore::load(
+            cfg.replication_file.clone(),
+        ));
         Self {
             cfg,
             entries: Mutex::new(HashMap::new()),
@@ -431,7 +454,69 @@ impl SchemaRegistry {
             bringup_breaker: BringupBreaker::default(),
             purging: AtomicBool::new(false),
             dedicated,
+            peers,
+            replication,
+            repl_status: StdMutex::new(HashMap::new()),
+            repl_inactive: StdMutex::new(HashMap::new()),
         }
+    }
+
+    /// The trusted peer nodes — what the replication API and dashboard mutate.
+    pub fn peers(&self) -> &Arc<crate::peers::PeerStore> {
+        &self.peers
+    }
+
+    /// The replication pairings this node is part of.
+    pub fn replication(&self) -> &Arc<crate::replication::ReplStore> {
+        &self.replication
+    }
+
+    /// Whether replication is enabled on this node (`PG_VM_POOL_REPLICATION`).
+    /// Gates the routes and new pairings only — existing records still pin.
+    pub fn replication_cfg(&self) -> Option<&crate::config::ReplicationConfig> {
+        self.cfg.replication.as_ref()
+    }
+
+    /// True when nothing may stop, compact, freeze, archive or purge this
+    /// schema's VM.
+    ///
+    /// The union of the operator's static `PG_VM_POOL_KEEPALIVE_SCHEMAS` pin
+    /// and the *dynamic* replication pin, and it replaces every bare
+    /// `cfg.is_keepalive` call on a lifecycle path. Stopping a replicated VM
+    /// costs more than the usual cold start: on a primary it drops the
+    /// walsender and leaves an inactive slot pinning WAL (which, unbounded,
+    /// fills the data disk — a cluster-wide PANIC), and on a replica it stops
+    /// consuming so the primary's slot backs up instead. Both are recoverable
+    /// only by a full re-seed, which is why this outranks every storage tier
+    /// including emergency disk-pressure eviction.
+    pub fn pinned(&self, schema: &str) -> bool {
+        self.cfg.is_keepalive(schema) || self.replication.is_pinned(schema)
+    }
+
+    /// [`Self::pin_reason`] for whichever schema currently binds VM `id`, so a
+    /// dashboard action keyed on a sandbox id can refuse without the caller
+    /// having to resolve the schema itself. `None` when the VM backs nothing
+    /// pinned.
+    pub fn pin_reason_for_vm(&self, id: &str) -> Option<String> {
+        self.store_records()
+            .into_iter()
+            .find(|(_, r)| r.sandbox_id == id && r.tier == Tier::Live)
+            .and_then(|(schema, _)| self.pin_reason(&schema))
+    }
+
+    /// Why `schema` is pinned, for a dashboard refusal that tells the operator
+    /// what to do about it. `None` when it isn't.
+    pub fn pin_reason(&self, schema: &str) -> Option<String> {
+        if let Some(rec) = self.replication.get(schema).filter(|r| r.state.pins()) {
+            return Some(format!(
+                "{schema} is replicating ({} with peer {}); detach or promote it first",
+                rec.role.as_str(),
+                rec.peer
+            ));
+        }
+        self.cfg
+            .is_keepalive(schema)
+            .then(|| format!("{schema} is in PG_VM_POOL_KEEPALIVE_SCHEMAS"))
     }
 
     /// The provisioned dedicated-database credentials — the auth path's lookup
@@ -457,6 +542,49 @@ impl SchemaRegistry {
     /// this does; the VM is built by the first checkout, exactly like any other
     /// schema (callers that want it warm up front can follow with
     /// [`Self::spawn_provision`]).
+    /// Assemble everything a bring-up needs to know about `schema` that
+    /// [`Config`] cannot answer: the pin, the owning role, and the schema's
+    /// replication role and login.
+    ///
+    /// One place, so a new per-schema fact never has to be threaded through
+    /// `ensure_vm`'s callers again.
+    fn bring_up_for<'a>(
+        &self,
+        schema: &str,
+        owner: Option<&'a Credential>,
+        repl_login: Option<&'a Credential>,
+    ) -> vm::BringUp<'a> {
+        vm::BringUp {
+            pinned: self.pinned(schema),
+            owner,
+            replication: self
+                .replication
+                .get(schema)
+                .filter(|r| r.state.pins())
+                .map(|r| r.role),
+            repl_login,
+        }
+    }
+
+    /// The `REPLICATION` login that must exist inside `schema`'s VM, as a
+    /// [`Credential`] so it reuses `vm::ensure_role`'s create/align path.
+    ///
+    /// Only a **primary** has one: it is the credential a replica
+    /// authenticates *with*, so on the replica's own VM there is nothing for
+    /// it to log into. Returned owned; the caller holds it for the borrow that
+    /// [`Self::bring_up_for`] takes.
+    fn repl_login_for(&self, schema: &str) -> Option<Credential> {
+        self.replication
+            .get(schema)
+            .filter(|r| r.state.pins() && r.role == crate::replication::Role::Primary)
+            .map(|r| Credential {
+                database: r.database.clone(),
+                role: r.repl_role.clone(),
+                password: r.repl_password.clone(),
+                created_at: r.created_at,
+            })
+    }
+
     pub fn create_dedicated(
         &self,
         database: &str,
@@ -493,6 +621,285 @@ impl SchemaRegistry {
         });
     }
 
+    /// The pooler's configuration, for the replication flows that have to
+    /// build guest commands and per-database connections themselves.
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// Whether this node terminates client TLS. A primary refuses to hand a
+    /// replica a credential it would then send in cleartext.
+    pub fn tls_enabled(&self) -> bool {
+        self.cfg.tls_cert.is_some()
+    }
+
+    /// A superuser connection to `schema`'s **own** database, bringing its VM
+    /// up first if it isn't warm.
+    ///
+    /// The returned [`ConnGuard`] must be held for the length of the
+    /// operation: it is what keeps the idle reaper off the VM while the
+    /// caller is talking to it. `SchemaEntry::pool` cannot be used directly
+    /// for this — it is pinned to `postgres` — and publications,
+    /// subscriptions, grants and the replication status views are all
+    /// per-database objects.
+    pub async fn db_client(
+        self: &Arc<Self>,
+        schema: &str,
+    ) -> Result<(ConnGuard, deadpool_postgres::Object)> {
+        let guard = self.checkout(schema).await?;
+        let client = vm::db_client(&self.cfg, &guard.entry().target, schema)
+            .await
+            .with_context(|| format!("connecting to database {schema}"))?;
+        Ok((guard, client))
+    }
+
+    /// Make `schema`'s running VM match the replication role now recorded for
+    /// it — planting the durable marker and, when the WAL level has to change,
+    /// restarting Postgres inside the guest.
+    ///
+    /// The bring-up path already does this ([`vm::ensure_vm`] calls
+    /// `ensure_replication_mode`), but that only runs on a *cold* start. A
+    /// pairing is set up against a database that is normally already warm, so
+    /// without this the primary would keep serving at `wal_level = minimal`
+    /// until something happened to evict it — and `CREATE PUBLICATION` would
+    /// succeed while nothing could ever stream from it.
+    ///
+    /// Implemented as evict-then-checkout rather than a bespoke path, so the
+    /// mode is applied by exactly the same code a cold start uses. The
+    /// `archiving` claim is held throughout for the reason every other
+    /// multi-step VM operation holds it: it is what stops the offload pacer,
+    /// the pressure pass and the dashboard's buttons from picking this schema
+    /// out from under a half-finished restart.
+    pub async fn apply_replication_mode(self: &Arc<Self>, schema: &str) -> Result<()> {
+        let _claim = ArchivingGuard::claim(&self.archiving, schema)
+            .with_context(|| format!("schema {schema} is busy with another offload or restart"))?;
+        // Drop the warm entry so the next checkout re-runs the full bring-up
+        // (which reattaches to the same VM by id — nothing is stopped here).
+        let cell = self.entries.lock().await.get(schema).cloned();
+        if let Some(cell) = cell {
+            self.evict(schema, &cell).await;
+        }
+        let _guard = self
+            .checkout(schema)
+            .await
+            .with_context(|| format!("bringing schema {schema} up in its new replication mode"))?;
+        Ok(())
+    }
+
+    /// The last status sample for `database`, or `None` if it has not been
+    /// sampled yet.
+    pub fn replication_status_cached(
+        &self,
+        database: &str,
+    ) -> Option<crate::replication::wire::StatusJson> {
+        self.repl_status.lock().unwrap().get(database).cloned()
+    }
+
+    /// Sample one pairing now: this node's own side over its VM, plus the
+    /// peer's side over its admin API.
+    ///
+    /// Neither half is allowed to fail the whole sample. A primary whose peer
+    /// is unreachable still reports its own slot — which is precisely the
+    /// situation where the slot's retained WAL is the number that matters.
+    pub async fn sample_replication(
+        self: &Arc<Self>,
+        rec: &crate::replication::ReplRecord,
+    ) -> crate::replication::wire::StatusJson {
+        let mut out = crate::replication::wire::StatusJson {
+            record: rec.into(),
+            primary: None,
+            replica: None,
+            peer_error: None,
+        };
+        match crate::replication::orchestrate::local_status(self, rec).await {
+            Ok((p, r)) => {
+                out.primary = p;
+                out.replica = r;
+            }
+            Err(e) => out.peer_error = Some(format!("local: {e:#}")),
+        }
+        // The peer's half, best-effort and timeout-bounded.
+        if let (Some(peer), Some(cfg)) = (self.peers.get(&rec.peer), self.cfg.replication.as_ref())
+            && let Ok(client) =
+                crate::replication::peer::PeerClient::new(peer, cfg.peer_timeout)
+        {
+            match client.status(&rec.database).await {
+                Ok(remote) => {
+                    // Fill in whichever side we are not.
+                    if out.primary.is_none() {
+                        out.primary = remote.primary;
+                    }
+                    if out.replica.is_none() {
+                        out.replica = remote.replica;
+                    }
+                }
+                Err(e) => out.peer_error = Some(format!("peer {}: {e:#}", rec.peer)),
+            }
+        }
+        self.repl_status
+            .lock()
+            .unwrap()
+            .insert(rec.database.clone(), out.clone());
+        out
+    }
+
+    /// Background sampler for every live pairing.
+    ///
+    /// Besides feeding the dashboard, this is the thing that shouts before a
+    /// replication slot becomes a disk-full PANIC. An inactive slot pins WAL
+    /// on the primary's data disk indefinitely; the guest's
+    /// `max_slot_wal_keep_size` is the hard backstop (it invalidates the slot
+    /// instead of filling the disk), and this is the warning that arrives
+    /// first, while the pairing is still savable.
+    ///
+    /// No-op when nothing is replicating or `PG_VM_POOL_REPL_MONITOR_SECS=0`.
+    pub fn spawn_replication_monitor(self: &Arc<Self>) {
+        let Some(interval) = self.cfg.replication.as_ref().and_then(|c| c.monitor_interval) else {
+            return;
+        };
+        let registry = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                registry.replication_pass().await;
+            }
+        });
+    }
+
+    async fn replication_pass(self: &Arc<Self>) {
+        let Some(cfg) = self.cfg.replication.as_ref() else {
+            return;
+        };
+        for rec in self.replication.list() {
+            if !rec.state.pins() {
+                continue;
+            }
+            let s = self.sample_replication(&rec).await;
+
+            // Promote Syncing -> Active once the initial copy has finished.
+            if let Some(r) = s.replica.as_ref()
+                && rec.state == crate::replication::State::Syncing
+                && r.worker_running
+                && (r.tables_total == 0 || r.tables_ready == r.tables_total)
+            {
+                let _ = self.replication.set_state(
+                    &rec.database,
+                    crate::replication::State::Active,
+                    "streaming",
+                );
+            }
+
+            let Some(p) = s.primary.as_ref() else { continue };
+            // `wal_status` leaving `reserved` means WAL the subscriber still
+            // needs is at risk; `lost` means it is already gone and the
+            // replica has to be rebuilt from scratch.
+            if let Some(w) = p.wal_status.as_deref()
+                && w != "reserved"
+            {
+                let msg = format!(
+                    "{}: replication slot {} is {w} — {}",
+                    rec.database,
+                    rec.slot,
+                    if w == "lost" {
+                        "WAL the replica needed has been removed; it must be re-seeded"
+                    } else {
+                        "the slot is retaining WAL past max_wal_size"
+                    }
+                );
+                warn!("{msg}");
+                crate::events::journal_error("replication", msg);
+                if w == "lost" {
+                    let _ = self.replication.set_state(
+                        &rec.database,
+                        crate::replication::State::Failed,
+                        "the replication slot was invalidated (wal_status=lost)",
+                    );
+                }
+            }
+            self.note_slot_activity(&rec, p, cfg);
+        }
+    }
+
+    /// Track how long a slot has had no subscriber, and say so once when that
+    /// becomes worth acting on.
+    ///
+    /// This is the warning that arrives *before* the guest's
+    /// `max_slot_wal_keep_size` fires. Two independent triggers, because they
+    /// catch different failures: a slot pinning a lot of WAL is the one about
+    /// to fill the data disk, while a slot that has simply been unattached for
+    /// a long time is a replica that has quietly gone away and will pin WAL
+    /// eventually. Edge-triggered — reported once per outage and re-armed when
+    /// a subscriber comes back — so a standing condition informs the journal
+    /// rather than burying it.
+    fn note_slot_activity(
+        &self,
+        rec: &crate::replication::ReplRecord,
+        p: &crate::replication::wire::PrimaryStatus,
+        cfg: &crate::config::ReplicationConfig,
+    ) {
+        let mut seen = self.repl_inactive.lock().unwrap();
+        if p.slot_active {
+            if seen.remove(&rec.database).is_some() {
+                info!("{}: a subscriber is attached to slot {} again", rec.database, rec.slot);
+            }
+            return;
+        }
+        let now = Instant::now();
+        let (since, warned) = seen
+            .entry(rec.database.clone())
+            .or_insert_with(|| (now, false));
+        if *warned {
+            return;
+        }
+        let idle = now.duration_since(*since);
+        let behind = p.behind_bytes.unwrap_or(0).max(0) as u64;
+        let reason = if behind >= cfg.lag_warn_bytes {
+            format!("it is pinning {} of WAL", crate::orphans::human_iec(behind))
+        } else if idle >= cfg.slot_stale {
+            format!("it has had none for {} minutes", idle.as_secs() / 60)
+        } else {
+            return;
+        };
+        *warned = true;
+        drop(seen);
+        let msg = format!(
+            "{}: no subscriber is attached to replication slot {} and {reason}. An inactive \
+             slot retains WAL on this VM's data disk indefinitely, and a full data disk is a \
+             cluster-wide PANIC — max_slot_wal_keep_size will invalidate the slot (forcing a \
+             re-seed) before that happens. Detach the pairing if the replica is gone for good.",
+            rec.database, rec.slot
+        );
+        warn!("{msg}");
+        crate::events::journal_error("replication", msg);
+    }
+
+    /// Warm every VM a replication pairing depends on, once, at startup.
+    ///
+    /// Two things need this. The obvious one: a pairing only replicates while
+    /// both VMs are up, and after a pooler restart nothing has checked them
+    /// out. The subtler one: `reap_untracked` classifies a running VM with no
+    /// warm entry as untracked and stops it, so until a pinned schema is in
+    /// the entry map it is a stop waiting to happen — the pin there is a
+    /// guard, this is what makes it unnecessary.
+    ///
+    /// Each is an ordinary background checkout through the same gates as a
+    /// client's, so this cannot storm the daemon; a failure is logged and left
+    /// for the next attempt, exactly like [`Self::spawn_provision`].
+    pub fn spawn_replication_pinner(self: &Arc<Self>) {
+        let pinned = self.replication.pinned_databases();
+        if pinned.is_empty() {
+            return;
+        }
+        info!(
+            "replication: warming {} pinned VM(s): {}",
+            pinned.len(),
+            pinned.join(", ")
+        );
+        for schema in pinned {
+            self.spawn_provision(&schema);
+        }
+    }
+
     /// Sandbox ids currently bound to a schema — the exclusion set that keeps
     /// the spare pool from handing out a VM some schema already owns (a spare
     /// keeps its `spare-pg-*` name after being claimed, so the name alone
@@ -501,10 +908,34 @@ impl SchemaRegistry {
         self.store.bound_ids()
     }
 
-    /// Password clients must present before the pooler proxies them anywhere;
-    /// `None` if `PG_VM_POOL_PASSWORD` is unset (no client auth gate).
-    pub fn client_password(&self) -> Option<&str> {
-        self.cfg.pg_password.as_deref()
+    /// Which password this client must prove, decided from its **role**
+    /// alone — the property [`Credentials::challenge_password`] exists to
+    /// preserve, extended to cover replication logins.
+    ///
+    /// Order: a replication login is challenged with its own password, then a
+    /// dedicated one with its own, then everyone else with the shared
+    /// `PG_VM_POOL_PASSWORD` (`None` = no gate). Keeping the requested
+    /// database out of this step is what makes the handshake look identical
+    /// whatever was asked for, so a prober cannot enumerate provisioned names
+    /// by watching which connections get challenged.
+    pub fn challenge_password_for(&self, role: &str) -> Option<String> {
+        challenge_password_in(
+            &self.replication,
+            &self.dedicated,
+            self.cfg.pg_password.as_deref(),
+            role,
+        )
+    }
+
+    /// Whether an *authenticated* client may route to `database`.
+    ///
+    /// A replication login is pinned to its own database exactly as a
+    /// dedicated one is — and it has to be resolved **first**, because
+    /// `Credentials::authorize` would otherwise reject it under the "this
+    /// database is dedicated, only its own role may open it" rule, which is
+    /// precisely the database it is trying to reach.
+    pub fn authorize_route(&self, role: &str, database: &str) -> Result<(), String> {
+        authorize_route_in(&self.replication, &self.dedicated, role, database)
     }
 
     /// The configured idle-reaping timeout (`None` when reaping is disabled), so
@@ -869,6 +1300,8 @@ impl SchemaRegistry {
             // VM serves it — including one a restore has just rebuilt from
             // scratch, which carries the data but no roles.
             let owner = self.owner_of(schema);
+            let repl_login = self.repl_login_for(schema);
+            let up = self.bring_up_for(schema, owner.as_ref(), repl_login.as_ref());
             match cell
                 .get_or_try_init(|| {
                     vm::ensure_vm(
@@ -881,7 +1314,7 @@ impl SchemaRegistry {
                         // reads it, and only there does it matter.
                         record.as_ref().map(|r| r.disk_gb).filter(|gb| *gb > 0),
                         self.spares.as_deref().map(|p| (p, &*bound)),
-                        owner.as_ref(),
+                        &up,
                     )
                 })
                 .await
@@ -1105,6 +1538,17 @@ impl SchemaRegistry {
                 continue;
             }
             if self.is_archiving(schema) || crate::pending::get(schema).as_deref() == Some(&info.id) {
+                continue;
+            }
+            // A pinned schema's VM must stay up even when nothing has checked
+            // it out yet. This is the exclusion that actually bites: after a
+            // pooler restart the warm-entry map is empty until the first
+            // client connects, so a replicating VM looks "untracked" and would
+            // be stopped here — breaking the pairing on every restart, with
+            // only a routine idle-stop line in the log to explain it.
+            // `spawn_replication_pinner` warms these at startup so this is a
+            // belt-and-braces guard, not the only one.
+            if !superseded && self.pinned(schema) {
                 continue;
             }
             if superseded {
@@ -1662,7 +2106,11 @@ impl SchemaRegistry {
             &records,
             &live,
             policy,
-            &|schema| self.cfg.is_keepalive(schema),
+            // `pinned`, not `is_keepalive`: a replicated schema must never be
+            // offloaded, and this closure is what the routine pacer, the
+            // emergency pressure pass and the dashboard's TTL sweep all pick
+            // through.
+            &|schema| self.pinned(schema),
             &|schema| {
                 in_flight.contains(schema)
                     || self.is_archiving(schema)
@@ -2196,7 +2644,7 @@ impl SchemaRegistry {
         let (mut refreshed, mut keepalive, mut already, mut not_idle) = (0usize, 0usize, 0usize, 0usize);
         for (schema, rec) in self.store_records() {
             total += 1;
-            let ka = self.cfg.is_keepalive(&schema);
+            let ka = self.pinned(&schema);
             if rec.tier == Tier::Frozen || rec.tier == Tier::Compacted {
                 if !ka && now.saturating_sub(rec.last_active) >= threshold_secs {
                     if rec.tier == Tier::Frozen {
@@ -2424,6 +2872,8 @@ impl SchemaRegistry {
         let known_id = self.store.record(schema).map(|r| r.sandbox_id);
         // No spare pool here: this bring-up exists to dump an *existing* VM's
         // data — a fresh spare would have nothing to dump.
+        let owner = self.owner_of(schema);
+        let repl_login = self.repl_login_for(schema);
         let entry = match vm::ensure_vm(
             &self.cfg,
             schema,
@@ -2431,7 +2881,7 @@ impl SchemaRegistry {
             None,
             None,
             None,
-            self.owner_of(schema).as_ref(),
+            &self.bring_up_for(schema, owner.as_ref(), repl_login.as_ref()),
         )
         .await {
             Ok(entry) => entry,
@@ -2897,6 +3347,21 @@ impl SchemaRegistry {
             if rec.tier == Tier::Live {
                 continue;
             }
+            // Defensive: a pinned schema is always `Live`, so the check above
+            // already covers it — but this loop *deletes VMs*, and a record
+            // that somehow carried an offloaded tier while a pairing still
+            // depended on it would destroy the only copy of a primary.
+            if self.pinned(&schema) {
+                crate::events::journal_error(
+                    "purge",
+                    format!(
+                        "schema {schema} is tiered {} but is pinned by a replication \
+                         pairing or keepalive — refusing to delete its VM",
+                        rec.tier.as_str()
+                    ),
+                );
+                continue;
+            }
             if !live_ids.contains(&rec.sandbox_id) {
                 probed += 1;
                 if probed % 500 == 0 {
@@ -3066,6 +3531,8 @@ impl SchemaRegistry {
         }
 
         let known_id = self.store.record(schema).map(|r| r.sandbox_id);
+        let owner = self.owner_of(schema);
+        let repl_login = self.repl_login_for(schema);
         let entry = match vm::ensure_vm(
             &self.cfg,
             schema,
@@ -3073,7 +3540,7 @@ impl SchemaRegistry {
             None,
             None,
             None,
-            self.owner_of(schema).as_ref(),
+            &self.bring_up_for(schema, owner.as_ref(), repl_login.as_ref()),
         )
         .await {
             Ok(entry) => entry,
@@ -4229,6 +4696,110 @@ fn dispatch_allowance(in_flight: usize, workers: usize, load: Option<f64>, load_
         return true;
     }
     load.is_some_and(|l| l < load_max)
+}
+
+/// The password to challenge `role` with, composing the two credential
+/// stores. Free-standing so the ordering can be tested without a registry.
+fn challenge_password_in(
+    repl: &crate::replication::ReplStore,
+    ded: &Credentials,
+    shared: Option<&str>,
+    role: &str,
+) -> Option<String> {
+    repl.repl_password(role)
+        .or_else(|| ded.password_for_role(role))
+        .or_else(|| shared.map(str::to_string))
+}
+
+/// Whether `role` may route to `database`, composing the two stores.
+///
+/// The replication lookup must come **first**. A replication login's database
+/// is by definition a dedicated one, so delegating first would have
+/// `Credentials::authorize` reject it under "this database is dedicated and
+/// can only be opened by its own role" — which is the one database it exists
+/// to reach.
+fn authorize_route_in(
+    repl: &crate::replication::ReplStore,
+    ded: &Credentials,
+    role: &str,
+    database: &str,
+) -> Result<(), String> {
+    if let Some(rec) = repl.by_repl_role(role) {
+        return if rec.database == database {
+            Ok(())
+        } else {
+            Err(format!(
+                "role \"{role}\" is a replication login for database \"{}\" only \
+                 and cannot open any other database",
+                rec.database
+            ))
+        };
+    }
+    ded.authorize(role, database)
+}
+
+#[cfg(test)]
+mod auth_composition_tests {
+    use super::*;
+    use crate::replication::{ReplRecord, ReplStore, Role, State};
+
+    fn stores(tag: &str) -> (ReplStore, Credentials) {
+        let dir = std::env::temp_dir();
+        let stamp = format!("{}-{:?}-{tag}", std::process::id(), std::thread::current().id());
+        let rp = dir.join(format!("pgvmpool-authrepl-{stamp}.tsv"));
+        let dp = dir.join(format!("pgvmpool-authded-{stamp}.tsv"));
+        let _ = std::fs::remove_file(&rp);
+        let _ = std::fs::remove_file(&dp);
+        let repl = ReplStore::load(rp);
+        let ded = Credentials::load(dp);
+        ded.create("acme", "acme", "tenantpassword").unwrap();
+        let mut rec = ReplRecord::new("acme", Role::Primary, "node_b", "replpassword12");
+        rec.state = State::Active;
+        repl.create(rec, &|r| ded.by_role(r).is_some()).unwrap();
+        (repl, ded)
+    }
+
+    #[test]
+    fn each_login_is_challenged_with_its_own_password() {
+        let (repl, ded) = stores("challenge");
+        let shared = Some("sharedpassword");
+        assert_eq!(
+            challenge_password_in(&repl, &ded, shared, "acme_pgfcrepl").as_deref(),
+            Some("replpassword12")
+        );
+        assert_eq!(
+            challenge_password_in(&repl, &ded, shared, "acme").as_deref(),
+            Some("tenantpassword")
+        );
+        assert_eq!(
+            challenge_password_in(&repl, &ded, shared, "postgres").as_deref(),
+            Some("sharedpassword")
+        );
+        // No shared password configured is the loopback default: no gate for
+        // an unknown role, but a replication login is still challenged, so
+        // enabling replication adds a gate where there was none.
+        assert_eq!(challenge_password_in(&repl, &ded, None, "postgres"), None);
+        assert_eq!(
+            challenge_password_in(&repl, &ded, None, "acme_pgfcrepl").as_deref(),
+            Some("replpassword12")
+        );
+    }
+
+    #[test]
+    fn a_replication_login_reaches_its_own_dedicated_database_and_nothing_else() {
+        let (repl, ded) = stores("authorize");
+        // The regression this ordering exists to prevent: `acme` IS a
+        // dedicated database, so delegating to `Credentials::authorize` first
+        // would reject the very login that has to reach it.
+        assert!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", "acme").is_ok());
+        let err = authorize_route_in(&repl, &ded, "acme_pgfcrepl", "other").unwrap_err();
+        assert!(err.contains("replication login"), "{err}");
+        // Everything the dedicated rules already guaranteed still holds.
+        assert!(authorize_route_in(&repl, &ded, "acme", "acme").is_ok());
+        assert!(authorize_route_in(&repl, &ded, "acme", "other").is_err());
+        assert!(authorize_route_in(&repl, &ded, "postgres", "acme").is_err());
+        assert!(authorize_route_in(&repl, &ded, "postgres", "tenant1").is_ok());
+    }
 }
 
 fn now_unix() -> u64 {

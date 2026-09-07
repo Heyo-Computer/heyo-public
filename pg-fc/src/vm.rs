@@ -30,6 +30,11 @@ const VM_PG_PORT: u16 = 5432;
 /// couple of seconds of HEYVM_READY — only a crashed/absent postmaster stays
 /// silent this long.
 const PG_PROBE_WINDOW: Duration = Duration::from_secs(15);
+/// How long to wait for the postmaster after an in-guest restart (the
+/// replication WAL-level switch). Longer than [`PG_PROBE_WINDOW`] because a
+/// `pg_ctl -m fast restart` on a busy cluster includes a shutdown checkpoint,
+/// and much shorter than a boot because nothing is rebooting.
+const PG_RESTART_WINDOW: Duration = Duration::from_secs(60);
 
 /// Poll interval while waiting for Postgres to come up, two-speed. init.sh
 /// signals HEYVM_READY ~1s *before* the postmaster binds 5432, so nearly
@@ -481,6 +486,33 @@ pub enum RestoreSource {
     },
 }
 
+/// What the registry knows about a schema that a bring-up needs but cannot
+/// derive from [`Config`] alone.
+///
+/// Bundled rather than passed as four more positional parameters: every one of
+/// these is looked up from a different store on the registry, and threading
+/// them individually through `ensure_vm` → `resolve_sandbox` →
+/// `claim_restore_vehicle` made the arity grow with each feature.
+pub struct BringUp<'a> {
+    /// Nothing may idle-stop this VM — a `PG_VM_POOL_KEEPALIVE_SCHEMAS`
+    /// schema, or one whose replication pairing depends on it staying up.
+    /// See `SchemaRegistry::pinned`.
+    pub pinned: bool,
+    /// The dedicated database's owning role, if this is one. Re-applied on
+    /// every bring-up because a restore rebuilds the cluster from a dump that
+    /// carries no roles.
+    pub owner: Option<&'a crate::dedicated::Credential>,
+    /// This VM's replication role, if any. Decides the durable marker on the
+    /// data disk and therefore the guest's WAL level — see
+    /// [`ensure_replication_mode`].
+    pub replication: Option<crate::replication::Role>,
+    /// The `REPLICATION` login a replica uses to reach this primary,
+    /// deliberately separate from `owner`: `REPLICATION` lets a role create
+    /// logical slots, and an orphaned slot pins WAL until the disk fills, so
+    /// it must stay outside what a leaked tenant password can reach.
+    pub repl_login: Option<&'a crate::dedicated::Credential>,
+}
+
 /// `disk_gb` is the data-device size this schema is known to need — the
 /// registry's `disk_gb`, `None` when it was never observed. It is consulted
 /// only where this bring-up has to *build* a VM: a reattach keeps the device
@@ -495,7 +527,7 @@ pub async fn ensure_vm(
     restore: Option<&RestoreSource>,
     disk_gb: Option<u32>,
     spares: Option<(&crate::spares::SparePool, &std::collections::HashSet<String>)>,
-    owner: Option<&crate::dedicated::Credential>,
+    up: &BringUp<'_>,
 ) -> Result<Arc<SchemaEntry>> {
     // Bound the number of concurrent bring-ups before any daemon traffic. A
     // burst beyond the cap queues here (each waiter is one parked client
@@ -505,7 +537,7 @@ pub async fn ensure_vm(
     let _admission = admission_slot(schema).await;
     let admission_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
     let name = format!("pg-{schema}");
-    let keepalive = cfg.is_keepalive(schema);
+    let keepalive = up.pinned;
     // Floored at the configured starting size (a smaller recorded value is a
     // schema that has since shrunk — never a reason to build below the
     // default) and capped at what the daemon will accept.
@@ -530,12 +562,12 @@ pub async fn ensure_vm(
         // dispose of the VM — a claimed spare must be released through the
         // pool, never killed behind its back.
         Some(RestoreSource::S3Image(s3)) => {
-            crate::imgarchive::materialize_from_image(cfg, schema, s3, spares)
+            crate::imgarchive::materialize_from_image(cfg, schema, s3, spares, up.pinned)
                 .await
                 .with_context(|| format!("restoring schema {schema} from its S3 disk image"))?
         }
         Some(RestoreSource::LocalImage(path)) => {
-            crate::imgarchive::materialize_from_local_image(cfg, schema, path, spares)
+            crate::imgarchive::materialize_from_local_image(cfg, schema, path, spares, up.pinned)
                 .await
                 .with_context(|| format!("thawing schema {schema} from its compacted image"))?
         }
@@ -564,18 +596,29 @@ pub async fn ensure_vm(
 
         let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
         let pg_ready_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
-        ensure_database(&pool, schema, owner).await?;
+        ensure_database(&pool, schema, up.owner, up.repl_login).await?;
+        // The replication login can only stream what it can read, and it owns
+        // nothing. These grants are per-database, so they need a connection to
+        // the tenant database rather than the bootstrap pool's `postgres`.
+        if let Some(cred) = up.repl_login {
+            grant_repl_reads(cfg, &target, schema, &cred.role).await?;
+        }
+        // Durable per-VM replication marker, and the Postgres restart that
+        // makes init.sh regenerate the WAL level from it. Before the restore
+        // below, so a restored database lands in a cluster already configured
+        // for its role.
+        ensure_replication_mode(cfg, &sandbox, &pool, schema, up.replication).await?;
         let create_db_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
 
         // Restore into the freshly-created, empty database before the entry is
         // handed to any client. A failure here must abort the bring-up: serving
         // an empty DB in place of a restored one would look like silent data loss.
         match restore {
-            Some(RestoreSource::S3(s3)) => restore_from_s3(cfg, &sandbox, schema, s3, owner)
+            Some(RestoreSource::S3(s3)) => restore_from_s3(cfg, &sandbox, schema, s3, up.owner)
                 .await
                 .with_context(|| format!("restoring schema {schema} from S3"))?,
             Some(RestoreSource::Local { srv, port }) => {
-                restore_from_local(cfg, &sandbox, schema, srv, *port, owner)
+                restore_from_local(cfg, &sandbox, schema, srv, *port, up.owner)
                     .await
                     .with_context(|| format!("restoring schema {schema} from the local dump"))?
             }
@@ -752,6 +795,12 @@ struct DetachedJob {
     script: &'static str,
     done: &'static str,
     log: &'static str,
+    /// How long [`await_detached_job`] waits for the sentinel. Per-job rather
+    /// than one shared constant because the schema copy is a `pg_dump` across
+    /// a WAN link plus a `psql` replaying it — a different cost profile from a
+    /// local dump-and-upload, and one an operator sizes with
+    /// `PG_VM_POOL_REPL_SETUP_SECS`.
+    deadline: Duration,
 }
 
 const ARCHIVE_JOB: DetachedJob = DetachedJob {
@@ -759,6 +808,7 @@ const ARCHIVE_JOB: DetachedJob = DetachedJob {
     script: "/workspace/_archive.job.sh",
     done: "/workspace/_archive.done",
     log: "/workspace/_archive.log",
+    deadline: ARCHIVE_DEADLINE,
 };
 
 const RESTORE_JOB: DetachedJob = DetachedJob {
@@ -766,6 +816,25 @@ const RESTORE_JOB: DetachedJob = DetachedJob {
     script: "/workspace/_restore.job.sh",
     done: "/workspace/_restore.done",
     log: "/workspace/_restore.log",
+    deadline: ARCHIVE_DEADLINE,
+};
+
+/// tmpfs marker recording that the *producer* of the schema-copy pipeline
+/// failed. POSIX `sh` has no `pipefail`, so `pg_dump | psql` reports only
+/// psql's status — and a psql that successfully replays nothing exits 0, which
+/// would turn "the primary was unreachable" into "the replica is seeded and
+/// empty". Same device as [`STREAM_FAIL_MARK`], and on tmpfs for the same
+/// reason: touching it never allocates a data-disk block.
+const SCHEMA_COPY_FAIL_MARK: &str = "/tmp/_replinit.failed";
+
+/// The schema copy that seeds a replica before its subscription starts.
+/// `deadline` is replaced per call from `PG_VM_POOL_REPL_SETUP_SECS`.
+const SCHEMA_COPY_JOB: DetachedJob = DetachedJob {
+    what: "schema copy",
+    script: "/workspace/_replinit.job.sh",
+    done: "/workspace/_replinit.done",
+    log: "/workspace/_replinit.log",
+    deadline: Duration::from_secs(3600),
 };
 
 /// Dump `schema`'s database to S3 using the guest's own `pg_dump` + `curl`
@@ -1266,15 +1335,30 @@ impl DetachedJob {
         job: &str,
         scratch: &str,
     ) -> Result<()> {
+        self.launch_with_env(cfg, sandbox, job, scratch, None).await
+    }
+
+    /// As [`Self::launch`], but with an explicit environment for the launch
+    /// exec — which the detached child inherits.
+    ///
+    /// This is how the schema copy receives the *primary's* password: in
+    /// `PGPASSWORD`, so it is in neither the planted script (which sits on the
+    /// data disk) nor any argv. `None` keeps the historical behaviour of
+    /// passing this pooler's own `PG_VM_POOL_PASSWORD`.
+    async fn launch_with_env(
+        &self,
+        cfg: &Config,
+        sandbox: &Sandbox,
+        job: &str,
+        scratch: &str,
+        env: Option<HashMap<String, String>>,
+    ) -> Result<()> {
         let what = self.what;
-        let res = exec_guest(
-            cfg,
-            sandbox,
-            &self.launch_script(job, scratch),
-            true,
-            &format!("{what} job (launch)"),
-        )
-        .await?;
+        let script = self.launch_script(job, scratch);
+        let res = match env {
+            Some(env) => exec_guest_env(cfg, sandbox, &script, Some(env), &format!("{what} job (launch)")).await?,
+            None => exec_guest(cfg, sandbox, &script, true, &format!("{what} job (launch)")).await?,
+        };
         if res.exit_code != 0 {
             bail!(
                 "launching detached {what} failed (exit {}): {}",
@@ -1746,7 +1830,7 @@ async fn restore_from_s3(
 /// Probe failures are tolerated — they describe the exec channel, not the job —
 /// but not indefinitely: with nothing else to ask, a channel that never comes
 /// back means we can never confirm the job, and reporting failure is the honest
-/// answer. Bounded by [`ARCHIVE_DEADLINE`] either way.
+/// answer. Bounded by the job's own `deadline` either way.
 async fn await_detached_job(
     cfg: &Config,
     sandbox: &Sandbox,
@@ -1754,7 +1838,7 @@ async fn await_detached_job(
     job: DetachedJob,
 ) -> Result<()> {
     let what = job.what;
-    let deadline = Instant::now() + ARCHIVE_DEADLINE;
+    let deadline = Instant::now() + job.deadline;
     let mut probe_failures: u32 = 0;
     loop {
         sleep(ARCHIVE_POLL_INTERVAL).await;
@@ -1785,7 +1869,8 @@ async fn await_detached_job(
         }
         if Instant::now() >= deadline {
             bail!(
-                "detached {what} job for schema {schema} did not finish within {ARCHIVE_DEADLINE:?}"
+                "detached {what} job for schema {schema} did not finish within {:?}",
+                job.deadline
             );
         }
     }
@@ -1877,6 +1962,18 @@ async fn exec_guest(
     } else {
         None
     };
+    exec_guest_env(cfg, sandbox, command, env, what).await
+}
+
+/// [`exec_guest`] with a caller-supplied environment, so a job can be handed a
+/// credential out of band instead of having it interpolated into the command.
+async fn exec_guest_env(
+    _cfg: &Config,
+    sandbox: &Sandbox,
+    command: &str,
+    env: Option<HashMap<String, String>>,
+    what: &str,
+) -> Result<CommandResult> {
     let opts = CommandRunOptions {
         timeout: Some(GUEST_EXEC_HTTP_TIMEOUT),
         env,
@@ -2399,6 +2496,7 @@ pub(crate) async fn claim_restore_vehicle(
     cfg: &Config,
     schema: &str,
     spares: Spares<'_>,
+    pinned: bool,
 ) -> Result<(Sandbox, Provenance)> {
     if let Some((pool, bound)) = spares
         && let Some(sb) = pool.take(bound).await
@@ -2413,7 +2511,7 @@ pub(crate) async fn claim_restore_vehicle(
     // The default size is right here whatever the schema's device used to be:
     // an image restore swaps the archived disk in under this VM, so the disk
     // it is created with is scratch that never sees the data.
-    create_vm(cfg, &name, cfg.is_keepalive(schema), cfg.data_disk_gb)
+    create_vm(cfg, &name, pinned, cfg.data_disk_gb)
         .await
         .map(|sb| (sb, Provenance::Created))
 }
@@ -2889,6 +2987,59 @@ mod tests {
     /// by stubs on PATH — and assert the file that lands is byte-identical to
     /// the job we asked for. A quoting slip here is invisible until an archive
     /// silently uploads nothing.
+    fn schema_copy_conninfo() -> crate::replication::sql::Conninfo {
+        crate::replication::sql::Conninfo {
+            hostaddr: "203.0.113.10".parse().unwrap(),
+            port: 6432,
+            dbname: "acme".into(),
+            user: "acme_pgfcrepl".into(),
+            password: "s3cr3tpassword".into(),
+            sslmode: "require".into(),
+            application_name: "pgfc_node_b".into(),
+        }
+    }
+
+    /// The primary's password is a durable credential — there is no
+    /// presigned-URL-style expiry to fall back on — so the mitigation is that
+    /// it never touches the guest's disk or process table. Pin both halves:
+    /// the body carries no password, and the script deletes itself before it
+    /// signals completion so even the rest of the conninfo does not linger.
+    #[test]
+    fn schema_copy_body_carries_no_password_and_self_deletes() {
+        let c = schema_copy_conninfo();
+        let body = schema_copy_job_body(
+            &shell_squote("postgres"),
+            &shell_squote("acme"),
+            &shell_squote(&c.without_password()),
+        );
+        assert!(!body.contains("s3cr3tpassword"), "{body}");
+        assert!(!body.contains("PGPASSWORD"), "it arrives via the exec env: {body}");
+        assert!(body.contains("acme_pgfcrepl"), "the role is still there: {body}");
+        assert!(body.contains(r#"rm -f "$0""#), "{body}");
+        // Same sentinel discipline as every other detached job: written to a
+        // temp name and renamed, so a torn write is never read as a result.
+        assert!(body.contains(".tmp && mv "), "{body}");
+    }
+
+    /// `sh` has no `pipefail`, so `pg_dump | psql` reports only psql's status
+    /// — and a psql that replays an empty stream exits 0. Without the marker,
+    /// an unreachable primary would look like a successfully seeded (empty)
+    /// replica, and the subscription would then sync nothing.
+    #[test]
+    fn schema_copy_body_records_a_producer_failure() {
+        let body = schema_copy_job_body("'postgres'", "'acme'", "'x'");
+        assert!(body.contains(SCHEMA_COPY_FAIL_MARK), "{body}");
+        assert!(body.contains("ec=1"), "{body}");
+        // Schema only: the rows come from the subscription's own copy_data,
+        // under the slot's snapshot. A dump of the data would not line up with
+        // the change stream that follows.
+        assert!(body.contains("--schema-only"), "{body}");
+        // A publication or subscription copied from the primary would make the
+        // replica try to publish or subscribe on its own behalf.
+        assert!(body.contains("--no-publications") && body.contains("--no-subscriptions"), "{body}");
+        assert!(body.contains("ON_ERROR_STOP=1") && body.contains(" -1 "), "{body}");
+    }
+
     #[test]
     fn launch_script_plants_the_job_verbatim() {
         let url = "https://wb.s3.us-east-2.amazonaws.com/x.dump?X-Amz-Algorithm=AWS4-HMAC-SHA256\
@@ -3590,7 +3741,7 @@ mod tests {
             password: "hunter2hunter2".into(),
             created_at: 0,
         };
-        let create = role_ddl(&cred, false);
+        let create = role_ddl(&cred, false, false);
         assert!(create.starts_with("CREATE ROLE \"acme_app\" WITH LOGIN "), "{create}");
         for attr in ["NOSUPERUSER", "NOCREATEDB", "NOCREATEROLE"] {
             assert!(create.contains(attr), "{attr} missing from: {create}");
@@ -3598,7 +3749,15 @@ mod tests {
         assert!(create.contains("PASSWORD 'hunter2hunter2'"), "{create}");
         // An existing role is realigned rather than re-created, so a restore
         // into a fresh VM and a plain restart both converge on the same shape.
-        assert!(role_ddl(&cred, true).starts_with("ALTER ROLE \"acme_app\" WITH LOGIN "));
+        assert!(role_ddl(&cred, true, false).starts_with("ALTER ROLE \"acme_app\" WITH LOGIN "));
+        // A tenant's role never gets REPLICATION; the separate `<db>_pgfcrepl`
+        // login is the only thing that does. A REPLICATION login can create
+        // logical slots, and an orphaned slot pins WAL until the data disk
+        // fills — an unrecoverable PANIC on this image — so it must stay
+        // outside what a leaked tenant password can reach.
+        assert!(create.contains(" NOREPLICATION "), "{create}");
+        assert!(role_ddl(&cred, false, true).contains(" REPLICATION "));
+        assert!(!role_ddl(&cred, false, true).contains("NOREPLICATION"));
 
         // Quoting: identifiers double their quotes, password literals double
         // theirs. `dedicated`'s validation rejects both shapes, so this is
@@ -3609,7 +3768,7 @@ mod tests {
             password: "it's-fine".into(),
             created_at: 0,
         };
-        let ddl = role_ddl(&odd, false);
+        let ddl = role_ddl(&odd, false, false);
         assert!(ddl.contains(r#"ROLE "we""ird" WITH"#), "{ddl}");
         assert!(ddl.contains("PASSWORD 'it''s-fine'"), "{ddl}");
     }
@@ -3653,6 +3812,263 @@ mod tests {
     }
 }
 
+/// The schema-copy job body: stream the primary's *schema* straight into this
+/// (already created, empty) database.
+///
+/// Schema only, never data. The rows come from the subscription's own
+/// `copy_data`, which takes them under the replication slot's snapshot and is
+/// therefore consistent with the change stream that follows; a `pg_dump` of
+/// the data would not be, and would leave a gap or an overlap at the seam.
+///
+/// Detached for the same reason as [`restore_from_s3`]: a `pg_dump` across a
+/// WAN link plus a `psql` replaying it easily outlasts the guest exec
+/// channel's hard 30s server-side cap, and the SDK cannot raise it.
+///
+/// `psql -1 -v ON_ERROR_STOP=1` is deliberate. A *partial* schema is worse
+/// than none: the subscription would sync the tables that exist and error
+/// forever on the rest, which reads as "replication is broken" rather than
+/// "setup failed". One transaction means a failure leaves the database exactly
+/// as it was and the job is simply retryable.
+///
+/// `conninfo` arrives already shell-quoted and already password-free — the
+/// password rides `PGPASSWORD` on the launch exec (see
+/// [`DetachedJob::launch_with_env`]), so it is in neither this script, which
+/// sits on the data disk, nor any argv. The script removes itself before
+/// writing its sentinel so the rest of the conninfo does not linger either.
+fn schema_copy_job_body(user: &str, db: &str, conninfo: &str) -> String {
+    let done = SCHEMA_COPY_JOB.done;
+    format!(
+        "ec=0\n\
+         rm -f {SCHEMA_COPY_FAIL_MARK}\n\
+         {{ pg_dump --schema-only --no-publications --no-subscriptions \
+         --no-security-labels --no-owner --no-privileges -d {conninfo} \
+         || echo 1 > {SCHEMA_COPY_FAIL_MARK}; }} \
+         | psql -h 127.0.0.1 -U {user} -d {db} -v ON_ERROR_STOP=1 -1 -q || ec=$?\n\
+         if [ -f {SCHEMA_COPY_FAIL_MARK} ]; then\n\
+         \techo 'pg_dump of the primary failed before the stream ended' >&2\n\
+         \tec=1\n\
+         fi\n\
+         rm -f \"$0\"\n\
+         printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n"
+    )
+}
+
+/// Copy the primary's schema into this replica's (empty) database, and wait
+/// for it.
+pub(crate) async fn copy_schema_from_primary(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    conninfo: &crate::replication::sql::Conninfo,
+    deadline: Duration,
+) -> Result<()> {
+    let db = shell_squote(schema);
+    let user = shell_squote(&cfg.pg_user);
+    // Shell-quoted as one argument to `pg_dump -d`, and password-free: libpq
+    // parses it as a keyword/value string, and the credential arrives in the
+    // environment instead.
+    let conn = shell_squote(&conninfo.without_password());
+    let mut env = HashMap::new();
+    env.insert("PGPASSWORD".to_string(), conninfo.password.clone());
+
+    let job = DetachedJob { deadline, ..SCHEMA_COPY_JOB };
+    info!(
+        "schema {schema}: copying the schema from the primary at {}",
+        conninfo.redacted()
+    );
+    job.launch_with_env(
+        cfg,
+        sandbox,
+        &schema_copy_job_body(&user, &db, &conn),
+        SCHEMA_COPY_JOB.script,
+        Some(env),
+    )
+    .await?;
+    await_detached_job(cfg, sandbox, schema, job).await
+}
+
+/// The durable per-VM replication marker `init.sh` reads to decide this
+/// cluster's WAL level. On the data disk, not the rootfs and not the kernel
+/// cmdline (the SDK exposes no way to set one), so it survives every reboot,
+/// resize and restore.
+const REPL_MARKER: &str = "/workspace/heyvm-replication";
+
+/// A superuser connection to one *schema's own* database.
+///
+/// [`SchemaEntry::pool`] is deliberately pinned to `postgres` — it exists to
+/// probe readiness and to `CREATE DATABASE` — but publications, subscriptions,
+/// grants and every replication status view are per-database objects, so they
+/// need their own connection. Built fresh per call rather than pooled: these
+/// are operator-paced actions and a monitor tick, not a hot path.
+pub(crate) async fn db_client(
+    cfg: &Config,
+    target: &SocketAddr,
+    dbname: &str,
+) -> Result<deadpool_postgres::Object> {
+    let pool = build_pool(
+        &target.ip().to_string(),
+        target.port(),
+        dbname,
+        &cfg.pg_user,
+        cfg.pg_password.as_deref(),
+    )?;
+    pool.get()
+        .await
+        .with_context(|| format!("connecting to database {dbname} on {target}"))
+}
+
+/// Give the replication login the reads it needs. `pg_read_all_data` is a
+/// predefined role (PG 14+); the schema `USAGE` grant is what makes those
+/// tables reachable by name. Both are per-database, hence [`db_client`].
+async fn grant_repl_reads(
+    cfg: &Config,
+    target: &SocketAddr,
+    schema: &str,
+    role: &str,
+) -> Result<()> {
+    let client = db_client(cfg, target, schema).await?;
+    for stmt in crate::replication::sql::grant_repl_reads(role) {
+        client
+            .batch_execute(&stmt)
+            .await
+            .with_context(|| format!("granting replication reads to {role} on {schema}"))?;
+    }
+    Ok(())
+}
+
+/// Reconcile this VM's durable replication marker with `want`, and restart
+/// Postgres if the running cluster's WAL level doesn't match what the marker
+/// now implies.
+///
+/// # Why a restart, and why it is safe here
+///
+/// `wal_level` is not SIGHUP-reloadable, so there is no way to raise it
+/// without bouncing the postmaster. What makes that cheap on this image is
+/// that Postgres is **not** PID 1: `init.sh` backgrounds it and PID 1 `exec`s
+/// a shell on the serial console, so `pg_ctl restart` bounces the database
+/// without touching the VM, its disk, or the pooler's binding to it. Compared
+/// with stopping and starting the VM this skips a full boot and, more
+/// importantly, avoids the reclaim-lock and orphan-sweep interactions a stop
+/// would drag in.
+///
+/// Idempotent, and deliberately cheap in the common case: a VM with no
+/// pairing and a cluster already at `minimal` costs one `SHOW`.
+async fn ensure_replication_mode(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    pool: &Pool,
+    schema: &str,
+    want: Option<crate::replication::Role>,
+) -> Result<()> {
+    // What the running cluster is actually at, which is the only thing worth
+    // reconciling against — the marker says what the NEXT start will do.
+    let client = pool.get().await.context("checkout for wal_level check")?;
+    let have: String = client
+        .query_one("SELECT current_setting('wal_level')", &[])
+        .await
+        .context("reading wal_level")?
+        .get(0);
+    drop(client);
+    let want_level = match want {
+        // A publisher needs `logical`. A subscriber only applies changes, so
+        // it keeps the cheap `minimal` profile — what it needs from init.sh is
+        // slots and apply workers, which are not visible here.
+        Some(crate::replication::Role::Primary) => "logical",
+        Some(crate::replication::Role::Replica) | None => "minimal",
+    };
+
+    write_replication_marker(cfg, sandbox, schema, want.map(|r| r.as_str())).await?;
+
+    // A replica's WAL level is unchanged, so only the marker mattered — but it
+    // still has to be planted before the next boot picks up its worker budget.
+    if have == want_level {
+        return Ok(());
+    }
+    info!(
+        "schema {schema}: wal_level is {have}, replication needs {want_level} — \
+         restarting Postgres in-guest"
+    );
+    // `$PGDATA` is the guest's own environment (init.sh exports it), so let
+    // the guest shell expand it and fall back to the image's default rather
+    // than baking a path the image could change.
+    let restart = "gosu postgres pg_ctl -D \"${PGDATA:-/workspace/pgdata}\" \
+                   -m fast -w -t 60 restart >/dev/null 2>&1"
+        .to_string();
+    let res = exec_guest(cfg, sandbox, &restart, false, "restarting Postgres").await?;
+    if res.exit_code != 0 {
+        bail!(
+            "restarting Postgres in schema {schema}'s VM failed (exit {}): {}",
+            res.exit_code,
+            truncate(exec_detail(&res), 400)
+        );
+    }
+    // The restart is only believed once the postmaster answers again AND
+    // reports the level we asked for: `pg_ctl` returning 0 says the process
+    // started, not that it started with this configuration (a bad tuning file
+    // would leave it at the old level, or down).
+    match probe_pg_window(pool, PG_RESTART_WINDOW).await {
+        PgProbe::Ready => {}
+        other => bail!(
+            "schema {schema}: Postgres did not come back after the replication restart: {}",
+            match other {
+                PgProbe::Responding(e) => format!("still starting up ({e})"),
+                PgProbe::Stalled(e) => format!("no answer within {PG_RESTART_WINDOW:?} ({e})"),
+                PgProbe::Unreachable(e) => format!("nothing listening ({e})"),
+                PgProbe::Ready => unreachable!(),
+            }
+        ),
+    }
+    let client = pool.get().await.context("checkout after restart")?;
+    let now: String = client
+        .query_one("SELECT current_setting('wal_level')", &[])
+        .await
+        .context("re-reading wal_level")?
+        .get(0);
+    if now != want_level {
+        bail!(
+            "schema {schema}: Postgres restarted but wal_level is {now}, not {want_level} — \
+             the guest image predates replication support (rebuild it from init.sh)"
+        );
+    }
+    info!("schema {schema}: wal_level is now {now}");
+    Ok(())
+}
+
+/// Plant or remove [`REPL_MARKER`] on the data disk.
+///
+/// Written temp-then-rename and `sync`ed for exactly the reason `init.sh`'s
+/// `heal_line` documents: the pooler stops VMs with an unclean kill, and ext4
+/// delayed allocation can leave an un-fsynced write as NUL bytes. A marker
+/// eaten that way would boot the VM back at `wal_level = minimal` with a live
+/// subscriber still attached — the failure that reports itself only as a
+/// replica falling quietly behind.
+///
+/// One short foreground exec: a `printf`, a rename and a `sync`, trivially
+/// inside the guest exec channel's hard 30s cap.
+async fn write_replication_marker(
+    cfg: &Config,
+    sandbox: &Sandbox,
+    schema: &str,
+    role: Option<&str>,
+) -> Result<()> {
+    let cmd = match role {
+        Some(r) => format!(
+            "printf %s\\n {} > {REPL_MARKER}.tmp && mv {REPL_MARKER}.tmp {REPL_MARKER} && sync && echo ok",
+            shell_squote(r)
+        ),
+        None => format!("rm -f {REPL_MARKER} {REPL_MARKER}.tmp && sync && echo ok"),
+    };
+    let res = exec_guest(cfg, sandbox, &cmd, false, "writing the replication marker").await?;
+    if res.exit_code != 0 {
+        bail!(
+            "schema {schema}: writing {REPL_MARKER} failed (exit {}): {}",
+            res.exit_code,
+            truncate(exec_detail(&res), 400)
+        );
+    }
+    Ok(())
+}
+
 /// `CREATE DATABASE` has no `IF NOT EXISTS`, so check the catalog first. The
 /// schema name is client-supplied — it's already validated in main, and we
 /// double-quote-escape it here as defense in depth (identifiers can't be bound
@@ -3666,14 +4082,22 @@ mod tests {
 /// frozen or archived tier materializes a *fresh* cluster — `pg_dump` of a
 /// single database carries no roles, so without this the restored VM would
 /// have the data but no role able to log into it.
+///
+/// `repl_login` is the separate `REPLICATION` role a replica uses to reach
+/// this primary. Re-applied on every bring-up for exactly the same reason as
+/// the owner role, and kept distinct from it deliberately — see [`role_ddl`].
 async fn ensure_database(
     pool: &Pool,
     schema: &str,
     owner: Option<&crate::dedicated::Credential>,
+    repl_login: Option<&crate::dedicated::Credential>,
 ) -> Result<()> {
     let client = pool.get().await.context("checkout for db bootstrap")?;
     if let Some(cred) = owner {
-        ensure_role(&client, cred).await?;
+        ensure_role(&client, cred, false).await?;
+    }
+    if let Some(cred) = repl_login {
+        ensure_role(&client, cred, true).await?;
     }
     let exists = client
         .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&schema])
@@ -3739,6 +4163,7 @@ async fn ensure_database(
 async fn ensure_role(
     client: &deadpool_postgres::Object,
     cred: &crate::dedicated::Credential,
+    replication: bool,
 ) -> Result<()> {
     let exists = client
         .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&cred.role])
@@ -3746,7 +4171,7 @@ async fn ensure_role(
         .context("checking pg_roles")?
         .is_some();
     client
-        .batch_execute(&role_ddl(cred, exists))
+        .batch_execute(&role_ddl(cred, exists, replication))
         .await
         .with_context(|| format!("provisioning role {}", cred.role))?;
     if !exists {
@@ -3762,14 +4187,18 @@ async fn ensure_role(
 /// from [`ensure_role`] so the attribute set — the thing that decides how much
 /// the credential can do inside its own VM — and the quoting are testable
 /// without a live server.
-fn role_ddl(cred: &crate::dedicated::Credential, exists: bool) -> String {
+fn role_ddl(cred: &crate::dedicated::Credential, exists: bool, replication: bool) -> String {
     let verb = if exists { "ALTER" } else { "CREATE" };
-    // The password is validated to printable, space-free ASCII, so the only
-    // character that can end the literal is a quote — double it, and rely on
-    // standard_conforming_strings (on by default) for backslashes.
+    // `REPLICATION` is set only for the `<db>_pgfcrepl` login a replica uses
+    // to reach this primary — never for a tenant's own role. It lets a login
+    // create logical slots, and an orphaned slot pins WAL until the data disk
+    // fills, which on this image is an unrecoverable cluster-wide PANIC. That
+    // has to stay outside what a leaked tenant password can reach, which is
+    // what the rest of this attribute list is for.
+    let repl = if replication { "REPLICATION " } else { "NOREPLICATION " };
     let literal = cred.password.replace('\'', "''");
     format!(
-        "{verb} ROLE {} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{literal}'",
+        "{verb} ROLE {} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE {repl}PASSWORD '{literal}'",
         quote_ident(&cred.role)
     )
 }
