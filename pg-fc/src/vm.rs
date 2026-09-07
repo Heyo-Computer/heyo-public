@@ -156,10 +156,12 @@ pub(crate) async fn bringup_slot(what: &str) -> Option<SemaphorePermit<'static>>
 /// for a bring-up slot, i.e. work that has a client parked behind it.
 ///
 /// Read by background work (the offload pacer) as backpressure: moving a cold
-/// schema to S3 is never worth making a client wait longer, so that work only
-/// runs while this is zero. Counted rather than derived from
-/// `Semaphore::available_permits`, which says how many slots are taken but not
-/// whether anyone is queued behind them.
+/// schema to S3 is never worth making a client wait longer, so that work waits
+/// for this to be zero — with one bounded exception, a pacer starved past
+/// `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS`, which then trickles jobs that take
+/// no bring-up slot at all (see `registry::Backpressure`). Counted rather than
+/// derived from `Semaphore::available_permits`, which says how many slots are
+/// taken but not whether anyone is queued behind them.
 static BRINGUPS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn bringups_waiting() -> usize {
@@ -511,11 +513,19 @@ pub struct BringUp<'a> {
     pub repl_login: Option<&'a crate::dedicated::Credential>,
 }
 
+/// `disk_gb` is the data-device size this schema is known to need — the
+/// registry's `disk_gb`, `None` when it was never observed. It is consulted
+/// only where this bring-up has to *build* a VM: a reattach keeps the device
+/// its VM already has, and an image restore brings its own. It exists for the
+/// dump tiers, which delete the VM they came from: restoring one of those into
+/// the default-size device is how a schema that had grown comes back into a
+/// device too small for it and dies mid-`pg_restore`.
 pub async fn ensure_vm(
     cfg: &Config,
     schema: &str,
     known_id: Option<&str>,
     restore: Option<&RestoreSource>,
+    disk_gb: Option<u32>,
     spares: Option<(&crate::spares::SparePool, &std::collections::HashSet<String>)>,
     up: &BringUp<'_>,
 ) -> Result<Arc<SchemaEntry>> {
@@ -528,6 +538,13 @@ pub async fn ensure_vm(
     let admission_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
     let name = format!("pg-{schema}");
     let keepalive = up.pinned;
+    // Floored at the configured starting size (a smaller recorded value is a
+    // schema that has since shrunk — never a reason to build below the
+    // default) and capped at what the daemon will accept.
+    let disk_gb = disk_gb
+        .unwrap_or(0)
+        .max(cfg.data_disk_gb)
+        .min(DAEMON_MAX_DISK_GB);
 
     // An archived schema's VM was killed, so its stored id is dead — never try
     // to reattach by id. Note this does NOT guarantee a clean disk: the
@@ -554,7 +571,7 @@ pub async fn ensure_vm(
                 .await
                 .with_context(|| format!("thawing schema {schema} from its compacted image"))?
         }
-        _ => resolve_sandbox(cfg, &name, keepalive, known_id, spares).await?,
+        _ => resolve_sandbox(cfg, &name, keepalive, known_id, spares, disk_gb).await?,
     };
 
     let resolve_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
@@ -2388,6 +2405,7 @@ pub(crate) async fn resolve_sandbox(
     keepalive: bool,
     known_id: Option<&str>,
     spares: Option<(&crate::spares::SparePool, &std::collections::HashSet<String>)>,
+    disk_gb: u32,
 ) -> Result<(Sandbox, Provenance)> {
     // 1. Reattach to the VM we last used for this schema, by id.
     if let Some(id) = known_id {
@@ -2430,7 +2448,19 @@ pub(crate) async fn resolve_sandbox(
     //    on successful bring-up) is what binds it to the schema. The `true`
     //    tells `ensure_vm` this sandbox is a claim it must release (kill)
     //    if the rest of the bring-up fails.
-    if let Some((pool, bound)) = spares
+    //
+    //    Unless this bring-up needs a bigger data device than a spare has.
+    //    Spares are minted at the default size before anyone knows which
+    //    schema will claim one, so a restore of a schema whose device had
+    //    grown cannot use one: the dump would fill it and leave a half-loaded
+    //    cluster. Paying the create is the cheap half of that trade.
+    if !spare_can_serve(disk_gb, cfg.data_disk_gb) {
+        info!(
+            "{name}: needs a {disk_gb}GiB data device, larger than a warm spare's \
+             {}GiB — creating a right-sized VM instead of claiming one",
+            cfg.data_disk_gb
+        );
+    } else if let Some((pool, bound)) = spares
         && let Some(sb) = pool.take(bound).await
     {
         info!("claiming warm spare {} for {name}", sb.sandbox_id());
@@ -2438,7 +2468,7 @@ pub(crate) async fn resolve_sandbox(
     }
 
     // 4. No spare: create from scratch.
-    create_vm(cfg, name, keepalive)
+    create_vm(cfg, name, keepalive, disk_gb)
         .await
         .map(|sb| (sb, Provenance::Created))
 }
@@ -2478,10 +2508,32 @@ pub(crate) async fn claim_restore_vehicle(
         return Ok((sb, Provenance::Spare));
     }
     let name = format!("pg-{schema}");
-    create_vm(cfg, &name, pinned)
+    // The default size is right here whatever the schema's device used to be:
+    // an image restore swaps the archived disk in under this VM, so the disk
+    // it is created with is scratch that never sees the data.
+    create_vm(cfg, &name, pinned, cfg.data_disk_gb)
         .await
         .map(|sb| (sb, Provenance::Created))
 }
+
+/// May a warm spare serve a bring-up that needs a `disk_gb` data device?
+///
+/// Spares are minted at `PG_VM_POOL_DATA_DISK_GB` before anyone knows which
+/// schema will claim one, so the answer is no as soon as the bring-up needs
+/// more than that. It matters because the alternative is silent: a restore
+/// that claims a default-size spare gets a VM that boots fine, serves fine,
+/// and dies in the middle of `pg_restore` with `No space left on device` —
+/// the schema's data does not fit in the device it was handed. Paying a
+/// create is the cheap half of that trade.
+fn spare_can_serve(disk_gb: u32, default_gb: u32) -> bool {
+    disk_gb <= default_gb
+}
+
+/// The largest data device heyvmd will create or resize to. A recorded size
+/// beyond it is clamped rather than refused: a too-small device is a broken
+/// restore, a clamped one is at worst the same failure the daemon would have
+/// given anyway, arrived at with a log line naming the cap.
+pub(crate) const DAEMON_MAX_DISK_GB: u32 = 250;
 
 /// Grow a sandbox's persistent data device to `target_gb` through the
 /// daemon's offline workspace resize (`POST /deployed-sandboxes/{id}/resize`
@@ -2505,8 +2557,8 @@ pub(crate) async fn resize_disk(sandbox_id: &str, target_gb: u64) -> Result<()> 
 /// can exercise the real HTTP round-trip against an in-process server.
 async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Result<()> {
     anyhow::ensure!(
-        (1..=250).contains(&target_gb),
-        "disk_size_gb must be within 1–250 GiB (daemon limit)"
+        (1..=u64::from(DAEMON_MAX_DISK_GB)).contains(&target_gb),
+        "disk_size_gb must be within 1–{DAEMON_MAX_DISK_GB} GiB (daemon limit)"
     );
     let url = format!("{base_url}/deployed-sandboxes/{sandbox_id}/resize");
     let client = reqwest::Client::builder()
@@ -2589,7 +2641,17 @@ pub(crate) async fn stop_after_failed_bringup(schema: &str, known_id: Option<&st
 /// image, size class, thin data disk, TTL 0 — just parked with an empty
 /// cluster until claimed.
 pub(crate) async fn create_spare(cfg: &Config, name: &str) -> Result<Sandbox> {
-    create_vm_within(cfg, name, false, cfg.ready_timeout.min(SPARE_READY_TIMEOUT)).await
+    // Always the default size: a spare is claimed before anyone knows which
+    // schema it will serve, and an oversized-restore claim is refused in
+    // `resolve_sandbox` rather than guessed at here.
+    create_vm_within(
+        cfg,
+        name,
+        false,
+        cfg.ready_timeout.min(SPARE_READY_TIMEOUT),
+        cfg.data_disk_gb,
+    )
+    .await
 }
 
 /// Is this VM's Postgres accepting connections? A plain TCP connect to the
@@ -2655,11 +2717,16 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
     Ok(Some(sb))
 }
 
-/// Create a brand-new VM for a schema (with its persistent data disk).
+/// Create a brand-new VM for a schema, with a `disk_gb` persistent data disk.
 /// `pub(crate)` for the image-restore path, which creates the VM itself and
 /// swaps the restored disk in under it before first use.
-pub(crate) async fn create_vm(cfg: &Config, name: &str, keepalive: bool) -> Result<Sandbox> {
-    create_vm_within(cfg, name, keepalive, cfg.ready_timeout).await
+pub(crate) async fn create_vm(
+    cfg: &Config,
+    name: &str,
+    keepalive: bool,
+    disk_gb: u32,
+) -> Result<Sandbox> {
+    create_vm_within(cfg, name, keepalive, cfg.ready_timeout, disk_gb).await
 }
 
 /// [`create_vm`] with an explicit readiness budget — warm spares get a shorter
@@ -2669,10 +2736,16 @@ async fn create_vm_within(
     name: &str,
     keepalive: bool,
     ready_timeout: Duration,
+    disk_gb: u32,
 ) -> Result<Sandbox> {
     info!(
-        "creating VM {name}{}",
-        if keepalive { " (keep-alive)" } else { "" }
+        "creating VM {name}{}{}",
+        if keepalive { " (keep-alive)" } else { "" },
+        if disk_gb == cfg.data_disk_gb {
+            String::new()
+        } else {
+            format!(" with a {disk_gb}GiB data device (default is {}GiB)", cfg.data_disk_gb)
+        }
     );
     let sandbox = {
         let _slot = bringup_slot(name).await;
@@ -2684,8 +2757,12 @@ async fn create_vm_within(
                 open_ports: vec![VM_PG_PORT],
                 size_class: Some(cfg.size_class),
                 // Persistent data disk → /dev/vdb → /workspace → PGDATA, so the
-                // schema's data survives VM stop/start/restart.
-                disk_size_gb: Some(cfg.data_disk_gb),
+                // schema's data survives VM stop/start/restart. Normally
+                // `cfg.data_disk_gb`, but a restore of a schema whose device
+                // had grown asks for the size it actually needs — building it
+                // right is the only chance, since growth is an offline
+                // operation and `pg_restore` is about to run.
+                disk_size_gb: Some(disk_gb),
                 // Always 0: the pooler owns VM lifecycle. Keep-alive schemas stay up;
                 // others are stopped by the pooler's idle reaper, which tracks
                 // connections — something the daemon's absolute TTL can't do.
@@ -3610,6 +3687,19 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(axum::serve(listener, app).into_future());
         (base, seen)
+    }
+
+    /// The spare pool is sized for the common case, and the uncommon one must
+    /// not quietly borrow from it: a schema whose device had grown needs a
+    /// bigger VM than any spare on the shelf.
+    #[test]
+    fn a_bigger_restore_never_claims_a_default_sized_spare() {
+        // The ordinary bring-up: a spare is exactly what it wants.
+        assert!(spare_can_serve(2, 2));
+        assert!(spare_can_serve(1, 2), "a shrunken schema still fits a default spare");
+        // The restore this exists for.
+        assert!(!spare_can_serve(4, 2));
+        assert!(!spare_can_serve(DAEMON_MAX_DISK_GB, 2));
     }
 
     #[tokio::test]

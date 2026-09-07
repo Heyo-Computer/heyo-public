@@ -192,6 +192,29 @@ pub struct Config {
     /// under disk saturation as well as CPU. Env
     /// `PG_VM_POOL_OFFLOAD_LOAD_MAX` (default 0.75).
     pub offload_load_max: f64,
+    /// How long the pacer may be held off by *client* backpressure before it
+    /// starts dispatching anyway, single-file and no-boot only. `None`
+    /// (`PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS=0`) restores the strict
+    /// yield-to-every-client behavior.
+    ///
+    /// Without this the gate is all-or-nothing: on a host whose bring-up queue
+    /// is never empty for a whole tick — the steady state once enough schemas
+    /// are offloaded, since every cold connect is then a thaw — the pacer
+    /// dispatches *nothing* for hours, the disk climbs toward the pressure
+    /// high-water mark, and the whole backlog then drains in one burst the
+    /// moment the host finally goes quiet. That sawtooth is what this bounds:
+    /// past the holdoff the pacer keeps trickling one job at a time until the
+    /// host is quiet again, so the same total work is spread across the busy
+    /// hours instead of landing against the 85% line.
+    ///
+    /// Only the client gate is overridable, and only by jobs that boot no VM
+    /// (compact / image-archive / promote): those take no bring-up slot, so
+    /// nothing a client is queued for moves behind them — they cost host disk
+    /// I/O, which the nice-19 children and the single-file cap bound. A
+    /// reclaim pass or a running sweep is a real conflict over the same disks,
+    /// never politeness, and is never overridden. Env
+    /// `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` (default 300).
+    pub offload_max_holdoff: Option<Duration>,
 }
 
 /// Settings for automatic disk-slack reclamation. Present (`Some`) only when
@@ -823,6 +846,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_ORPHAN_SWEEP_SECS",
     "PG_VM_POOL_OFFLOAD_WORKERS",
     "PG_VM_POOL_OFFLOAD_LOAD_MAX",
+    "PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS",
     "PG_VM_POOL_WARM_SPARES",
     "PG_VM_POOL_FREEZE_AFTER_SECS",
     "PG_VM_POOL_FREEZE_SWEEP_SECS",
@@ -1063,6 +1087,20 @@ impl Config {
             },
             Err(_) => 0.75,
         };
+        // `0` is the explicit "never override the client gate" opt-out, not a
+        // zero-second holdoff — a holdoff of 0 would dispatch through every
+        // waiting client, which is the one thing the gate exists to prevent.
+        let offload_max_holdoff = match std::env::var("PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS") {
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(n) => Some(Duration::from_secs(n)),
+                Err(_) => anyhow::bail!(
+                    "invalid PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS {v:?}: expected whole seconds \
+                     (0 disables)"
+                ),
+            },
+            Err(_) => Some(Duration::from_secs(300)),
+        };
         let freeze = FreezeConfig::from_env()?;
         // Explicit run dir, else reuse the pressure path (same directory: the
         // heyvmd run dir holding every VM's sb-<id>/). `None` means kill
@@ -1177,6 +1215,7 @@ impl Config {
             orphan_sweep,
             offload_workers,
             offload_load_max,
+            offload_max_holdoff,
         })
     }
 }

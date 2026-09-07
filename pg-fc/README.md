@@ -198,6 +198,7 @@ Config via env (all optional):
 | `PG_VM_POOL_ARCHIVE_SWEEP_SECS` | `3600` | how long the offload pacer waits before re-scanning **after a scan that found nothing** (clamped to 5–60s). It no longer paces the work itself — see "Offload pacer" |
 | `PG_VM_POOL_OFFLOAD_WORKERS` | `1` | how many offload jobs the pacer may run concurrently (1–16). `1` keeps the classic one-schema-at-a-time pacing; higher values let no-boot jobs (compact/promote) overlap on a backlogged host. At most ONE in-flight job may boot a VM regardless, and jobs beyond the first are dispatched only under `PG_VM_POOL_OFFLOAD_LOAD_MAX` — see "Offload pacer" |
 | `PG_VM_POOL_OFFLOAD_LOAD_MAX` | `0.75` | normalized host load (1-min loadavg / cores; on Linux this includes tasks blocked on disk I/O) at or above which the pacer stops adding jobs beyond the first — aggressive with headroom, single file without |
+| `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` | `300` | how long queued client bring-ups may hold the pacer off before it dispatches anyway — single-file, no-boot kinds only. Bounds the sawtooth on a host whose bring-up queue is never empty; `0` yields to clients indefinitely — see "Offload pacer" |
 | `PG_VM_POOL_S3_BUCKET` | unset | S3 bucket for dumps (required when eviction is on) |
 | `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the object per schema is `{prefix}{schema}.dump` |
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
@@ -275,6 +276,23 @@ Before dispatching every job it checks, and defers while any of these hold
   the disk the pass is on and make it yield — losing its progress for work
   nobody is waiting on);
 - all `PG_VM_POOL_OFFLOAD_WORKERS` slots are taken.
+
+**One bound on the yielding.** "Wait for quiet" is not the same promise as
+"eventually run", and on a busy host the difference shows up as a sawtooth:
+once enough schemas are offloaded every cold connect is a thaw, the bring-up
+queue is never empty for a whole tick, and the pacer dispatches *nothing* for
+hours while the disk climbs toward the pressure high-water mark — then the
+whole backlog drains in one burst the moment the host finally goes quiet. So
+after `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` (default 300) of *continuous*
+client backpressure the pacer dispatches anyway: one job at a time, no-boot
+kinds only (compact / image-archive / promote — those take no bring-up slot,
+so nothing a client is queued for moves behind them), and it keeps trickling
+for as long as the host stays busy. Only the client gate is overridable this
+way; a reclaim pass or a running sweep is a conflict over the same disks, not
+politeness. Set it to `0` to restore the strict yield-to-every-client
+behavior. Forced dispatches log at `info` with how long the pacer had been
+held off — the deferral itself only logs at `debug`, which is what made this
+starvation invisible.
 
 With workers > 1, three brakes keep the extra concurrency from outbidding
 clients: every job **beyond the first** is dispatched only while normalized
@@ -377,6 +395,21 @@ Measured on a real pool disk: a 183MB-allocated idle disk became a 7MB image
 (~26x) in under 3 seconds. Thawing decompresses the image onto a fresh VM's
 disk (sparse) and boots on the real data — no `pg_restore`, no index
 rebuilds; the crash-recovery path a normal VM restart takes.
+
+**Restores are sized to the schema, not to the default.** The dump tiers
+(frozen, and the S3 dump archive) delete the VM they came from, and a dump
+carries no trace of the device it came off — so the pooler notes that device's
+size in the registry (a fifth `disk_gb` column, written at idle-stop and again
+just before a dump-offload kills the VM) and builds the restore's VM at that
+size, floored at `PG_VM_POOL_DATA_DISK_GB` and capped at the daemon's 250GiB.
+A restore that needs more than a warm spare has skips the pool and pays a
+create; spares are minted at the default size before anyone knows which schema
+will claim one. Without this a schema whose device had grown comes back into
+the *starting* size — device growth is offline-only, so `pg_restore` cannot
+grow its way out — fills it, and leaves a half-loaded cluster behind
+`No space left on device`. Image restores are unaffected: they swap the
+archived disk in, so it arrives at whatever size it was archived at. Rows
+written before this column existed read as "unknown" and take the default.
 
 Freeze vs. compact: a dump is smaller than an image and version-independent,
 but freezing must boot each candidate to `pg_dump` it, and thawing pays a
