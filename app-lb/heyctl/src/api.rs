@@ -538,6 +538,47 @@ impl Client {
             .await
     }
 
+    // -- namespaces ----------------------------------------------------------
+
+    /// The namespaces this credential can see, with how many of their
+    /// deployments it may view.
+    ///
+    /// Narrowed server-side to what `GET /deployments` would already show, so
+    /// this never names a room the caller cannot open. A credential confined to
+    /// one namespace gets that one back even when nothing is in it yet.
+    pub async fn namespaces(&self) -> Result<Vec<NamespaceEntry>> {
+        self.read(Request::new(Method::Get, "/namespaces"), "namespace", "")
+            .await
+    }
+
+    /// Declare a namespace. Idempotent: re-declaring updates the description
+    /// and keeps the original `created_at`.
+    ///
+    /// Fleet-scoped and `admin` server-side — a credential confined to one
+    /// namespace cannot mint another. Takes the spec as a `Value` for the same
+    /// reason `create_deployment` does: `apply` reads objects from a file and
+    /// must send what was written, not a round-trip through this build's idea
+    /// of the shape.
+    pub async fn create_namespace(&self, spec: &Value) -> Result<Value> {
+        let name = spec.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+        self.read(
+            Request::new(Method::Post, "/namespaces").json(spec.clone()),
+            "namespace",
+            &name,
+        )
+        .await
+    }
+
+    /// Undeclare a namespace. Refused while deployments are still in it.
+    pub async fn delete_namespace(&self, name: &str) -> Result<()> {
+        self.unit(
+            Request::new(Method::Delete, format!("/namespaces/{}", seg(name))),
+            "namespace",
+            name,
+        )
+        .await
+    }
+
     // -- the event feed ------------------------------------------------------
 
     /// The namespaces that have feed events, narrowed to what this credential
@@ -790,7 +831,24 @@ impl Raw<'_> {
         certs       => "certificate", "/certs";
         workflows   => "workflow",   "/workflows";
         feeds       => "feed",       "/feeds";
+        namespaces  => "namespace",  "/namespaces";
         disks       => "disk",       "/disks";
+    }
+
+    /// Deployments in one namespace, as app-lb sent them.
+    ///
+    /// A separate method rather than an argument on `deployments()` because the
+    /// unfiltered listing is the overwhelmingly common call and threading an
+    /// `Option` through the `raw_list!` macro for it would cost every other
+    /// resource a parameter none of them have.
+    pub async fn deployments_in(&self, namespace: &str) -> Result<Value> {
+        self.0
+            .read(
+                Request::new(Method::Get, format!("/deployments?namespace={}", seg(namespace))),
+                "deployment",
+                "",
+            )
+            .await
     }
 
     /// A namespace's feed events as app-lb sent them.

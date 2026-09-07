@@ -196,6 +196,21 @@ as they were. Nor is preferring the caller's token an escalation the other way
 — it is a credential they already hold, and app-lb re-checks its scope whoever
 relayed it.
 
+**app-obs and ci follow the same rule when app-lb is what gates them.** Reached
+directly on loopback they authenticate themselves: `APP_OBS_API_TOKEN` and
+`CI_TOKEN` are their *own* service tokens, an `applb_…` bearer means nothing to
+either, and forwarding one would 401 every obs and ci tool on a deployment that
+was working. Reached at a hostname behind an app-lb gate the credential *is* an
+app-lb token, and then the caller's must win — a caller whose scope omits
+`app-obs` must not read app-obs on this process's ticket.
+
+What separates the two is the shape of what is configured, so there is no new
+switch: nothing at all, or another `applb_…`, both mean the gate authenticates
+and the caller's token is used; a service's own token means it does not, and is
+left alone. Configure neither and the process holds no credential for any of
+the four services — every call runs as whoever asked. That is the shape
+`deploy/vm.md` deploys.
+
 Cloud is outside this, and outside the borrow-when-empty rule too. An
 `applb_…` token is not a cloud credential — cloud has never heard of it — so it
 is never substituted for one. That leaves two honest configurations and no

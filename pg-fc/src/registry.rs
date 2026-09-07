@@ -12,10 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use deadpool_postgres::Pool;
 use heyo_sdk::{HeyoError, P2pTunnel, Sandbox};
+use futures::StreamExt;
 use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, DiskGrowConfig, PressureConfig};
+use crate::config::{Config, PressureConfig};
 use crate::dedicated::{Credential, Credentials};
 use crate::dumpsrv::DumpServer;
 use crate::reclaim::{POST_STOP_RECLAIM_DELAY, RECLAIM_FIRST_DELAY, Reclaimer};
@@ -239,6 +240,22 @@ impl SchemaEntry {
 /// worse than a few extra minutes of warm RAM.
 const IDLE_MAX_STOPS_PER_PASS: usize = 24;
 
+/// How often the urgent device-grow watcher samples the warm set. It exists
+/// to beat a filling disk, not to catch it the instant it crosses — a minute
+/// of ENOSPC is survivable, a guest query per warm VM every few seconds is
+/// not. See [`SchemaRegistry::spawn_disk_grower`].
+const URGENT_GROW_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Cap on devices the urgent grower resizes in one pass. Each one drops a
+/// schema's live sessions, so a pass that finds many trickles instead of
+/// restarting the whole warm set at once.
+const URGENT_GROW_MAX_PER_PASS: usize = 4;
+
+/// How many warm schemas the urgent grower samples at once. Each sample uses
+/// its own schema's housekeeping pool, so this bounds pooler-side concurrency
+/// only — it never puts two queries on one VM.
+const URGENT_GROW_SAMPLE_CONCURRENCY: usize = 8;
+
 /// Per-schema idle-timeout jitter: a deterministic factor in [0.85, 1.15)
 /// derived from the schema name. Clients that arrive (and go quiet) together
 /// would otherwise expire together and stop as one wave; spreading each
@@ -389,6 +406,12 @@ pub struct SchemaRegistry {
     // Per-schema failure memory so the sweeps skip recently-failed offloads
     // instead of burning a ready-timeout on the same sick schemas every pass.
     offload_backoff: OffloadBackoff,
+    // Per-schema failure memory for the *urgent* device-grow path, kept
+    // separate from `offload_backoff` on purpose: a schema whose grow keeps
+    // failing must not thereby become un-offloadable, and vice versa. Also
+    // doubles as the rate limiter for the "at the cap, cannot help" complaint,
+    // which would otherwise repeat every pass forever.
+    grow_backoff: OffloadBackoff,
     /// Per-schema bring-up circuit breaker — see [`BringupBreaker`].
     bringup_breaker: BringupBreaker,
     // Single-flights the dashboard's purge action.
@@ -451,6 +474,7 @@ impl SchemaRegistry {
             spares,
             dumps,
             offload_backoff: OffloadBackoff::new(),
+            grow_backoff: OffloadBackoff::new(),
             bringup_breaker: BringupBreaker::default(),
             purging: AtomicBool::new(false),
             dedicated,
@@ -1687,7 +1711,7 @@ impl SchemaRegistry {
                 // `Store::set_disk_gb`), and a stale value corrects itself
                 // here on the next idle-stop.
                 self.store.set_disk_gb(&schema, device_gb(dev));
-                if let Some(target) = grow_target_gb(fs, dev, &gc) {
+                if let GrowVerdict::Grow(target) = grow_verdict(fs, dev, gc.pct, gc.max_gb) {
                     info!(
                         "schema {schema}: data fs is >= {:.0}% full and spans its device — \
                          queueing offline device grow to {target}GiB",
@@ -2222,6 +2246,261 @@ impl SchemaRegistry {
     /// emergency-archive the oldest-idle schemas — TTL ignored — until it
     /// drops below the low-water mark. The backstop against the disk-full
     /// outage where VM creates, Postgres, and the dumps themselves all fail.
+    /// Spawn the urgent device-grow watcher — the only path that can grow a
+    /// **warm** VM's data device.
+    ///
+    /// Why it has to exist. Growth has two halves and neither one covers a
+    /// busy schema on its own. Inside the guest, `init.sh`'s watcher extends
+    /// the *filesystem* online as it fills, and then retires
+    /// (`filesystem spans $DATA_DEV; watcher done`) — from that moment the
+    /// *device* is the binding constraint. Growing the device is offline-only
+    /// (the daemon fscks and cold-boots the disk to do it), and its one
+    /// trigger was the idle-stop path in [`Self::reap_idle`]. A schema under
+    /// continuous write load never goes idle, so it never reaches that
+    /// trigger: it fills its device, Postgres starts failing writes with
+    /// `No space left on device`, and it stays that way until its traffic
+    /// happens to pause for a whole idle timeout. The busiest schemas were
+    /// precisely the ones that could not grow.
+    ///
+    /// So this loop trades the idle-stop path's patience for a stop it
+    /// schedules itself, and pays for that with a much higher threshold
+    /// ([`crate::config::DiskGrowConfig::urgent_pct`], default 95% vs. 85%):
+    /// the cheap path keeps handling everything that does go idle, and this
+    /// one only touches schemas that are actually at the wall.
+    pub fn spawn_disk_grower(self: &Arc<Self>) {
+        let Some(gc) = self.cfg.disk_grow else {
+            // `spawn_reaper` already logs that growth is off entirely.
+            return;
+        };
+        let Some(urgent) = gc.urgent_pct else {
+            info!(
+                "urgent device growth disabled (PG_VM_POOL_DISK_GROW_URGENT_PCT=0) — a schema \
+                 whose write load never pauses for a full idle timeout cannot grow its device \
+                 and will wedge on ENOSPC once its filesystem spans it"
+            );
+            return;
+        };
+        info!(
+            "urgent device growth: a warm VM whose data fs is >= {urgent:.0}% full and spans \
+             its device is stopped, resized (doubling, cap {}GiB) and left for the next \
+             connect to boot — checked every {:?}, at most {} per pass",
+            gc.max_gb, URGENT_GROW_CHECK_INTERVAL, URGENT_GROW_MAX_PER_PASS
+        );
+        let registry = self.clone();
+        tokio::spawn(supervise(
+            "disk-grow",
+            URGENT_GROW_CHECK_INTERVAL,
+            URGENT_GROW_CHECK_INTERVAL,
+            move || {
+                let registry = registry.clone();
+                async move { registry.urgent_grow_pass().await }
+            },
+        ));
+    }
+
+    /// One pass of the urgent device-grow watcher: sample every warm schema's
+    /// data filesystem and grow the devices that are at the wall. Returns how
+    /// many were grown.
+    async fn urgent_grow_pass(&self) -> usize {
+        let Some(gc) = self.cfg.disk_grow else {
+            return 0;
+        };
+        let Some(urgent) = gc.urgent_pct else {
+            return 0;
+        };
+
+        // Warm, initialized entries that no offload has claimed and that are
+        // not inside a grow-backoff window. Snapshotted under the lock and
+        // then released: the sampling below talks to guests, which must never
+        // happen with the map lock held.
+        let now = Instant::now();
+        let candidates: Vec<(String, Arc<SchemaEntry>)> = {
+            let map = self.entries.lock().await;
+            map.iter()
+                .filter_map(|(schema, cell)| cell.get().map(|e| (schema.clone(), e.clone())))
+                .filter(|(schema, _)| !self.is_archiving(schema))
+                .filter(|(schema, _)| self.grow_backoff.active(schema, now).is_none())
+                .collect()
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Sample concurrently. Each read goes over its own schema's
+        // housekeeping pool, so schemas never contend with each other, and a
+        // wedged VM costs one bounded `STATS_TIMEOUT` instead of stalling
+        // every schema queued behind it.
+        let samples: Vec<(String, Option<DiskSample>)> =
+            futures::stream::iter(candidates.into_iter().map(|(schema, entry)| async move {
+                (schema, sample_disk(&entry).await)
+            }))
+            .buffer_unordered(URGENT_GROW_SAMPLE_CONCURRENCY)
+            .collect()
+            .await;
+
+        let mut grown = 0usize;
+        for (schema, sample) in samples {
+            let Some((fs, dev)) = sample else { continue };
+            // The sample already answers the question `disk_gb` exists to
+            // answer, so bank it here too rather than only at idle-stop: a
+            // warm schema offloaded before it ever idles would otherwise be
+            // restored into a stale — or entirely unknown — device size.
+            self.store.set_disk_gb(&schema, device_gb(dev));
+            match grow_verdict(fs, dev, urgent, gc.max_gb) {
+                GrowVerdict::NotNeeded => {}
+                GrowVerdict::AtCap { current_gb } => {
+                    // Growth is the only lever this pooler has and it is
+                    // spent. Say so at error level with the fix in the
+                    // message — silence here reads as "the pooler is fine"
+                    // while the database fails every write. Recorded as a
+                    // failure purely to rate-limit the complaint.
+                    error!(
+                        "schema {schema}: data fs is >= {urgent:.0}% full and spans its \
+                         {current_gb}GiB device, which is already at PG_VM_POOL_DISK_MAX_GB \
+                         ({}GiB) — the pooler cannot grow it any further and Postgres will \
+                         fail writes with `No space left on device`. Raise \
+                         PG_VM_POOL_DISK_MAX_GB, or move this schema off the pool",
+                        gc.max_gb
+                    );
+                    crate::events::journal_error(
+                        "disk-grow",
+                        format!(
+                            "schema {schema}: device at the {}GiB cap and full — raise \
+                             PG_VM_POOL_DISK_MAX_GB",
+                            gc.max_gb
+                        ),
+                    );
+                    self.grow_backoff.record_failure(&schema, Instant::now());
+                }
+                GrowVerdict::Grow(target) => {
+                    // Bound the blast radius: each grow drops a schema's live
+                    // sessions, so a pass that found many of them trickles
+                    // rather than restarting the whole warm set at once.
+                    if grown >= URGENT_GROW_MAX_PER_PASS {
+                        continue;
+                    }
+                    match self.grow_device_now(&schema, target).await {
+                        Ok(true) => {
+                            grown += 1;
+                            self.grow_backoff.clear(&schema);
+                        }
+                        // Lost a race to an offload, or the schema went cold
+                        // under us. Neither is this schema's fault, so it
+                        // keeps its clean backoff record.
+                        Ok(false) => {}
+                        Err(e) => {
+                            let (n, hold) =
+                                self.grow_backoff.record_failure(&schema, Instant::now());
+                            warn!(
+                                "schema {schema}: urgent device grow to {target}GiB failed \
+                                 ({n} consecutive); holding off for {hold:?}: {e:#}"
+                            );
+                            crate::events::journal_error(
+                                "disk-grow",
+                                format!(
+                                    "schema {schema}: urgent grow to {target}GiB failed: {e:#}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        grown
+    }
+
+    /// Grow one warm schema's data device now: claim it, stop it, resize, and
+    /// leave it for the next connect to boot.
+    ///
+    /// Unlike every other exclusive operation in this file, this one does
+    /// **not** refuse when the entry has live sessions. A schema that never
+    /// goes idle is exactly the one this path exists for, and by the time it
+    /// qualifies its database cannot write another byte — those sessions are
+    /// already failing. Breaking them costs a reconnect; leaving them costs
+    /// the database.
+    ///
+    /// The VM is deliberately left stopped rather than restarted here. The
+    /// clients are reconnecting anyway, and `checkout`'s cold path already
+    /// knows how to reattach by id and boot it — routing through that one path
+    /// keeps the bring-up gate, the pending ledger and the failure bookkeeping
+    /// in charge of the boot instead of duplicating all three here.
+    /// `Ok(true)` grew the device; `Ok(false)` means this schema was not this
+    /// pass's to touch after all (an offload claimed it, or it went cold
+    /// between the sample and here) — a race, not a failure, so the caller
+    /// must not put it in a backoff window for it. `Err` is a real failure.
+    async fn grow_device_now(&self, schema: &str, target: u64) -> Result<bool> {
+        // The same claim an offload takes. `checkout` waits on this set, so a
+        // client arriving mid-resize queues at the front door instead of
+        // racing the stop/start — and no offload can pick this schema while
+        // its VM is halfway through a resize.
+        let Some(_guard) = ArchivingGuard::claim(&self.archiving, schema) else {
+            debug!("schema {schema}: an offload claimed it first; skipping this grow");
+            return Ok(false);
+        };
+
+        // Take the entry out of the map, but only once it is actually
+        // initialized: removing a cell whose bring-up is still in flight would
+        // orphan that bring-up — it completes, hands back an entry, and
+        // nothing is left holding it.
+        let entry = {
+            let mut map = self.entries.lock().await;
+            let initialized = match map.get(schema) {
+                Some(cell) => cell.get().cloned(),
+                None => None,
+            };
+            match initialized {
+                Some(entry) => {
+                    map.remove(schema);
+                    entry
+                }
+                None => {
+                    debug!(
+                        "schema {schema} is no longer warm (gone cold, or a bring-up is in \
+                         flight); leaving its device to the next pass"
+                    );
+                    return Ok(false);
+                }
+            }
+        };
+
+        let id = entry.sandbox_id();
+        let sessions = entry.active_count();
+        warn!(
+            "schema {schema}: data filesystem is full and spans its device — growing it to \
+             {target}GiB now rather than waiting for an idle stop a schema under load never \
+             reaches. Stopping VM {id} and dropping {sessions} live session(s); the next \
+             connect boots it with room"
+        );
+
+        checkpoint_and_stop(&entry, schema).await;
+        // Drop the last handle before the resize: it owns the tunnel and the
+        // housekeeping pool, both now pointed at a stopped VM.
+        drop(entry);
+
+        // Same interlock as the idle-stop grow: the daemon's resize fscks and
+        // cold-boots the stopped disk, which must never interleave with a
+        // reclaim pass fsck'ing the same file (see `reclaim::BOOT_GATE`).
+        let _permit = crate::reclaim::boot_permit(&id).await;
+        vm::resize_disk(&id, target)
+            .await
+            .with_context(|| format!("growing schema {schema}'s data device to {target}GiB"))?;
+        // Recorded the moment it is real: a schema offloaded before its next
+        // idle stop would otherwise be restored into the pre-grow device.
+        self.store.set_disk_gb(schema, target as u32);
+        info!(
+            "schema {schema}: data device grown to {target}GiB; next connect boots {id} \
+             ({sessions} session(s) were dropped to do it)"
+        );
+        crate::events::journal_info(
+            "disk-grow",
+            format!(
+                "schema {schema}: urgent device grow to {target}GiB ({id}); \
+                 {sessions} session(s) dropped"
+            ),
+        );
+        Ok(true)
+    }
+
     pub fn spawn_pressure_reaper(self: &Arc<Self>) {
         let Some(pressure) = self.cfg.archive.as_ref().and_then(|a| a.pressure.clone()) else {
             info!("disk-pressure eviction disabled (PG_VM_POOL_PRESSURE_PATH unset)");
@@ -4231,7 +4510,11 @@ fn fmt_backoff(d: Duration) -> String {
 /// count × 512 via `pg_read_file` — the same source the daemon's own resize
 /// verification reads in-guest). `None` when either read fails within the
 /// stats timeout; the caller just skips growth this cycle.
-async fn sample_disk(entry: &SchemaEntry) -> Option<((u64, u64, u64), u64)> {
+/// One [`sample_disk`] reading: the guest data filesystem's
+/// `(total, used, avail)` in bytes, and the size of the device backing it.
+type DiskSample = ((u64, u64, u64), u64);
+
+async fn sample_disk(entry: &SchemaEntry) -> Option<DiskSample> {
     let query = async {
         let mut client = entry.pool.get().await.ok()?;
         // Explicit (offset, length): sysfs files stat as 0 bytes, so the
@@ -4258,9 +4541,26 @@ fn device_gb(device_bytes: u64) -> u32 {
     device_bytes.div_ceil(GIB).max(1).min(u32::MAX as u64) as u32
 }
 
-/// Decide whether (and to what) an idle-stopping VM's data device should
-/// grow. `fs` is the guest data filesystem's (total, used, avail) and
-/// `device_bytes` its backing device size.
+/// What should happen to a VM's data device, given how full its guest
+/// filesystem is. See [`grow_verdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrowVerdict {
+    /// Below the trigger, or the filesystem has room left inside its device.
+    NotNeeded,
+    /// Grow the device to this many GiB.
+    Grow(u64),
+    /// The filesystem is at the trigger and spans a device already at
+    /// `max_gb`. Nothing the pooler can do — growth is the only lever it has,
+    /// and it is spent. Distinguished from `NotNeeded` so the caller can say
+    /// so out loud instead of silently declining to act on a schema that is
+    /// about to fail every write.
+    AtCap { current_gb: u64 },
+}
+
+/// Decide whether (and to what) a VM's data device should grow. `fs` is the
+/// guest data filesystem's (total, used, avail), `device_bytes` its backing
+/// device size, `pct` the used% trigger to judge against, and `max_gb` the
+/// ceiling.
 ///
 /// Grows only when BOTH hold:
 /// - used% (df semantics: used / (used + avail)) is at/above the trigger, and
@@ -4270,20 +4570,29 @@ fn device_gb(device_bytes: u64) -> u32 {
 ///   has nowhere left to grow inside it.
 ///
 /// The step doubles the device (whole GiB, current size rounded up), capped
-/// at `cfg.max_gb` — the same amortization policy as the guest fs watcher.
-fn grow_target_gb(fs: (u64, u64, u64), device_bytes: u64, cfg: &DiskGrowConfig) -> Option<u64> {
+/// at `max_gb` — the same amortization policy as the guest fs watcher.
+///
+/// `pct` is a parameter rather than read off the config because there are two
+/// callers with two different prices: the idle-stop path grows a VM that is
+/// stopping anyway (cheap, fires at `DiskGrowConfig::pct`), and the urgent
+/// path stops a live one to do it (expensive, fires at
+/// `DiskGrowConfig::urgent_pct`).
+fn grow_verdict(fs: (u64, u64, u64), device_bytes: u64, pct: f64, max_gb: u64) -> GrowVerdict {
     let (total, used, avail) = fs;
-    if used_pct(used, avail)? < cfg.pct {
-        return None;
+    let Some(used_pct) = used_pct(used, avail) else {
+        return GrowVerdict::NotNeeded;
+    };
+    if used_pct < pct {
+        return GrowVerdict::NotNeeded;
     }
     if total < device_bytes.saturating_mul(9) / 10 {
-        return None;
+        return GrowVerdict::NotNeeded;
     }
     let current_gb = device_bytes.div_ceil(GIB).max(1);
-    if current_gb >= cfg.max_gb {
-        return None;
+    if current_gb >= max_gb {
+        return GrowVerdict::AtCap { current_gb };
     }
-    Some((current_gb * 2).min(cfg.max_gb))
+    GrowVerdict::Grow((current_gb * 2).min(max_gb))
 }
 
 /// Permanently delete sandbox `id` (kill = sandbox + disk; the SDK treats an
@@ -5729,36 +6038,62 @@ mod tests {
 
     #[test]
     fn grow_target_doubles_capped_and_gates_correctly() {
-        let cfg = DiskGrowConfig { pct: 80.0, max_gb: 100 };
+        let (pct, max_gb) = (80.0, 100);
         let gib = |n: u64| n * GIB;
 
         // 4GiB device, fs spans it, 90% used → double to 8.
         assert_eq!(
-            grow_target_gb((gib(4), gib(4) * 9 / 10, gib(4) / 10), gib(4), &cfg),
-            Some(8)
+            grow_verdict((gib(4), gib(4) * 9 / 10, gib(4) / 10), gib(4), pct, max_gb),
+            GrowVerdict::Grow(8)
         );
         // Below the trigger → no growth.
         assert_eq!(
-            grow_target_gb((gib(4), gib(2), gib(2)), gib(4), &cfg),
-            None
+            grow_verdict((gib(4), gib(2), gib(2)), gib(4), pct, max_gb),
+            GrowVerdict::NotNeeded
         );
         // Full fs but THIN under a bigger device → the guest watcher's job.
         assert_eq!(
-            grow_target_gb((gib(4), gib(4) * 9 / 10, gib(4) / 10), gib(16), &cfg),
-            None
+            grow_verdict((gib(4), gib(4) * 9 / 10, gib(4) / 10), gib(16), pct, max_gb),
+            GrowVerdict::NotNeeded
         );
         // Doubling past the cap clamps to it.
         assert_eq!(
-            grow_target_gb((gib(64), gib(60), gib(4)), gib(64), &cfg),
-            Some(100)
+            grow_verdict((gib(64), gib(60), gib(4)), gib(64), pct, max_gb),
+            GrowVerdict::Grow(100)
         );
-        // Already at the cap → never grows.
+        // Already at the cap → `AtCap`, NOT `NotNeeded`. The distinction is
+        // the whole point: this schema is full and the pooler has no lever
+        // left, which the urgent grower reports at error level instead of
+        // quietly declining to act.
         assert_eq!(
-            grow_target_gb((gib(100), gib(95), gib(5)), gib(100), &cfg),
-            None
+            grow_verdict((gib(100), gib(95), gib(5)), gib(100), pct, max_gb),
+            GrowVerdict::AtCap { current_gb: 100 }
         );
         // Unreadable df (0/0) → no decision.
-        assert_eq!(grow_target_gb((0, 0, 0), gib(4), &cfg), None);
+        assert_eq!(
+            grow_verdict((0, 0, 0), gib(4), pct, max_gb),
+            GrowVerdict::NotNeeded
+        );
+    }
+
+    /// The urgent threshold has to be strictly later than the idle-stop one:
+    /// the cheap path must keep catching everything that does go idle, and the
+    /// expensive path (which drops live sessions) must only fire on what it
+    /// misses. Same filesystem, two thresholds, two answers.
+    #[test]
+    fn the_urgent_threshold_fires_later_than_the_idle_stop_one() {
+        let gib = |n: u64| n * GIB;
+        // 88% full on a device the fs spans: past the idle-stop trigger (85),
+        // short of the urgent one (95).
+        let fs = (gib(8), gib(8) * 88 / 100, gib(8) * 12 / 100);
+        assert_eq!(grow_verdict(fs, gib(8), 85.0, 100), GrowVerdict::Grow(16));
+        assert_eq!(grow_verdict(fs, gib(8), 95.0, 100), GrowVerdict::NotNeeded);
+
+        // 96% full: both agree, and both pick the same target — the urgent
+        // path is a different *trigger*, never a different growth policy.
+        let full = (gib(8), gib(8) * 96 / 100, gib(8) * 4 / 100);
+        assert_eq!(grow_verdict(full, gib(8), 85.0, 100), GrowVerdict::Grow(16));
+        assert_eq!(grow_verdict(full, gib(8), 95.0, 100), GrowVerdict::Grow(16));
     }
 
     #[test]

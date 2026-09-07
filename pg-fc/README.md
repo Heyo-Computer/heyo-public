@@ -180,6 +180,9 @@ Config via env (all optional):
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
 | `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
+| `PG_VM_POOL_DISK_GROW_PCT` | unset (off) | guest-filesystem used% at or above which a schema's data **device** is grown (doubled, offline). Setting it is the on/off switch for device growth — see "Growing the device" |
+| `PG_VM_POOL_DISK_GROW_URGENT_PCT` | `95` | used% at or above which a **warm** VM's device is grown without waiting for it to go idle — stop, resize, and let the next connect boot it, dropping the sessions it had. Must be >= `PG_VM_POOL_DISK_GROW_PCT`; `0` disables the online path. Without it a schema whose write load never pauses can never grow — see "Growing the device" |
+| `PG_VM_POOL_DISK_MAX_GB` | `100` | ceiling device growth never passes (the daemon itself caps at 250) |
 | `PG_VM_POOL_ADMIT_TIMEOUT_SECS` | `30` | how long a client waits for a free connection slot on its schema's VM before the pooler errors it; `0` fails immediately when full |
 | `PG_VM_POOL_MAX_CONCURRENT_BRINGUPS` | `3` | max VM deploys/boots in flight against heyvmd; the excess queues FIFO in the pooler (an unbounded burst can wedge the daemon, whose watchdog restart then kills every running VM); `0` disables |
 | `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
@@ -529,6 +532,45 @@ host allocation can never ratchet past the *current filesystem* size: the
 provisioned max is a cap, not the de-facto footprint. The disk-derived Postgres
 knobs (`max_wal_size`, `temp_file_limit`, swap sizing) key off the live
 filesystem size and are recomputed + reloaded on each growth step.
+
+**Growing the device (second line of defense).** The guest watcher above grows
+the *filesystem* inside the device and then retires — it logs
+`[grow] filesystem spans $DATA_DEV; watcher done` and exits. From that moment
+the **device** is the binding constraint, and only the host can grow it. That
+is what `PG_VM_POOL_DISK_GROW_PCT` enables, and it has two triggers because one
+is not enough:
+
+- **At idle-stop** (`PG_VM_POOL_DISK_GROW_PCT`, e.g. 85). The reaper is
+  stopping the VM anyway, so the offline resize is free: no client is
+  disturbed. This handles every schema that goes quiet.
+- **While warm** (`PG_VM_POOL_DISK_GROW_URGENT_PCT`, default 95). The pooler
+  stops the VM *itself*, resizes, and leaves it for the next connect to boot —
+  dropping whatever sessions it had.
+
+The second trigger exists because the first one cannot reach the schemas that
+need it most. Growing a device is offline-only (the daemon fscks and cold-boots
+the disk to do it), so for a long time the only trigger was an idle stop — and
+a schema under continuous write load never goes idle. It would fill its
+filesystem, the guest watcher would grow that to span the device and retire,
+and then Postgres would start failing writes with `No space left on device`
+and *stay* that way until its traffic happened to pause for a whole
+`PG_VM_POOL_IDLE_TIMEOUT_SECS`. The busiest schemas were precisely the ones
+that could not grow.
+
+Hence the higher threshold on the online path: the free idle-stop grow keeps
+handling everything that does go idle, and the expensive one only fires on what
+it misses — a filesystem genuinely at the wall. It samples the warm set once a
+minute, resizes at most 4 devices per pass (each costs a schema its live
+sessions, so a busy pass trickles rather than restarting everything at once),
+and backs off per-schema on failure. It claims the schema the same way an
+offload does, so clients arriving mid-resize queue at the pooler instead of
+racing the stop/start, and it logs the stop at `warn` with the session count.
+
+When a full filesystem already spans a device at `PG_VM_POOL_DISK_MAX_GB`,
+growth has nothing left to give: that is logged at **error** level (and to the
+events journal) naming the cap, because the alternative — declining to act and
+saying nothing — reads as a healthy pooler while the database fails every
+write. Raise `PG_VM_POOL_DISK_MAX_GB`, or move the schema off the pool.
 
 Eviction reclaims the whole disk once a schema is *long* idle; `reclaim-disks.sh`
 reclaims the **slack** from disks whose VMs are merely stopped, without deleting

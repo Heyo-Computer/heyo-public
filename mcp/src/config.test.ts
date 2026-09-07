@@ -220,3 +220,78 @@ test("an app-lb token is never substituted for a cloud key", () => {
     "Bearer heyo_api_caller",
   );
 });
+
+test("app-obs and ci act as the caller when app-lb is what gates them", () => {
+  // The VM shape: obs and ci are reached at their public hostnames, behind
+  // app-lb gates, so the credential is an app-lb token and nothing is
+  // configured here. Each caller's own token clears each gate, which is what
+  // makes a caller whose scope omits app-obs unable to read app-obs.
+  const gated = loadConfig({
+    APPLB_URL: "https://admin.us2.heyo.work",
+    APP_OBS_URL: "https://obs.us2.heyo.work",
+    CI_URL: "https://ci.us2.heyo.work",
+  });
+  assert.equal(gated.obs?.auth, undefined);
+  const asCaller = withForwardedAuth(gated, { authorization: "Bearer applb_abc123_secret" });
+  assert.equal(asCaller.applb?.auth, "Bearer applb_abc123_secret");
+  assert.equal(asCaller.obs?.auth, "Bearer applb_abc123_secret");
+  assert.equal(asCaller.ci?.auth, "Bearer applb_abc123_secret");
+  assert.equal(asCaller.obs?.baseUrl, gated.obs?.baseUrl);
+
+  // A configured fallback that is itself an app-lb token is still only a
+  // fallback: it says "the gate authenticates here", not "act as me".
+  const withFallback = loadConfig({
+    APP_OBS_URL: "https://obs.us2.heyo.work",
+    APP_OBS_API_TOKEN: "applb_svc_fallback",
+    CI_URL: "https://ci.us2.heyo.work",
+    CI_TOKEN: "applb_svc_fallback",
+  });
+  const overridden = withForwardedAuth(withFallback, {
+    authorization: "Bearer applb_abc123_secret",
+  });
+  assert.equal(overridden.obs?.auth, "Bearer applb_abc123_secret");
+  assert.equal(overridden.ci?.auth, "Bearer applb_abc123_secret");
+});
+
+test("app-obs and ci reached directly keep their own service tokens", () => {
+  // The regression this guards: the loopback deployment, where APP_OBS_API_TOKEN
+  // is app-obs's *own* token and app-obs compares it to what it was configured
+  // with. An app-lb token means nothing there, so forwarding one would 401 every
+  // obs and ci tool on a deployment that was working. The shape of what is
+  // configured is what tells the two apart — no `applb_` prefix, no gate.
+  const loopback = loadConfig({
+    APPLB_URL: "http://127.0.0.1:8080",
+    APP_OBS_URL: "http://127.0.0.1:9600",
+    APP_OBS_API_TOKEN: "obs_service_secret",
+    CI_URL: "http://127.0.0.1:9555",
+    CI_TOKEN: "ci_service_secret",
+  });
+  const called = withForwardedAuth(loopback, { authorization: "Bearer applb_abc123_secret" });
+  assert.equal(called.obs?.auth, "Bearer obs_service_secret");
+  assert.equal(called.ci?.auth, "Bearer ci_service_secret");
+  // app-lb itself still yields, because app-lb is always its own authenticator.
+  assert.equal(called.applb?.auth, "Bearer applb_abc123_secret");
+
+  // And only an app-lb token reaches obs and ci at all. A cloud key or a JWT is
+  // not a credential either of them has any use for, gated or not.
+  const gated = loadConfig({
+    APP_OBS_URL: "https://obs.us2.heyo.work",
+    CI_URL: "https://ci.us2.heyo.work",
+  });
+  for (const bearer of ["Bearer heyo_api_caller", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x"]) {
+    const out = withForwardedAuth(gated, { authorization: bearer });
+    assert.equal(out.obs?.auth, undefined, bearer);
+    assert.equal(out.ci?.auth, undefined, bearer);
+  }
+
+  // Nothing to change on any of the four: the same object comes back and the
+  // per-process tool set is reused.
+  const settled = loadConfig({
+    APPLB_URL: "http://127.0.0.1:8080",
+    APPLB_TOKEN: "applb_fleet_wide",
+    HEYO_API_KEY: "heyo_api_server",
+    APP_OBS_URL: "http://127.0.0.1:9600",
+    APP_OBS_API_TOKEN: "obs_service_secret",
+  });
+  assert.equal(withForwardedAuth(settled, { authorization: "Bearer heyo_api_caller" }), settled);
+});

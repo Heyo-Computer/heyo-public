@@ -181,26 +181,42 @@ function isApplbToken(header: string): boolean {
 /**
  * The config to serve one HTTP request with.
  *
- * Two rules, and the second one exists because the first is not sufficient.
+ * Three rules. Each exists because the one before it is not sufficient.
  *
  * **A service with no credential of its own borrows the caller's.** That is
  * what lets one hosted instance serve every tenant, each under their own key
  * and therefore their own sandboxes and namespace grant.
  *
- * **An app-lb-minted token always speaks for itself, configured credential or
- * not.** A token carries a scope — an `admin` level and a `deployments` list —
- * and app-lb enforces it on every route. Falling back to this process's own
- * `APPLB_TOKEN` for a caller who presented one would hand a token scoped to a
- * single deployment the reach of whatever fleet-wide credential the operator
- * configured. That is a confused deputy: the gate in front authenticated a
- * narrow principal and the process would then act for it with broad authority.
- * The caller's token is therefore preferred over the configured one whenever it
- * is app-lb's own kind, so a scope is never widened by passing through here.
+ * **An app-lb-minted token always speaks for itself at app-lb, configured
+ * credential or not.** A token carries a scope — an `admin` level and a
+ * `deployments` list — and app-lb enforces it on every route. Falling back to
+ * this process's own `APPLB_TOKEN` for a caller who presented one would hand a
+ * token scoped to a single deployment the reach of whatever fleet-wide
+ * credential the operator configured. That is a confused deputy: the gate in
+ * front authenticated a narrow principal and the process would then act for it
+ * with broad authority. The caller's token is therefore preferred over the
+ * configured one whenever it is app-lb's own kind, so a scope is never widened
+ * by passing through here. Unconditional for app-lb because app-lb is always
+ * the authenticator for app-lb: its admin listener verifies an `applb_…` bearer
+ * against the same store the gate does, whatever else is configured — including
+ * `APPLB_BASIC`, which is unscoped and is exactly what must not be borrowed.
  *
- * The prefix test is what keeps that from breaking the other gate shapes. A
- * `heyo_api_*` key or a JWT is not an app-lb token — it means nothing to
- * app-lb's admin API — so those still fall to the configured credential and a
- * JWT-gated deployment behaves exactly as before. And preferring a caller's
+ * **app-obs and ci follow the same rule, but only when app-lb is what stands in
+ * front of them.** Reached directly on loopback they authenticate themselves,
+ * with their own service tokens, and an `applb_…` bearer means nothing to them
+ * — forwarding one there would turn every working deployment's obs and ci tools
+ * into 401s. Reached through an app-lb gate the credential *is* an app-lb
+ * token, and then the caller's must win for the same reason it does at app-lb:
+ * a caller whose token does not admit `app-obs` must not read app-obs on this
+ * process's ticket. What separates the two shapes is the shape of what is
+ * configured — an `applb_…` value means the gate is the authenticator — so no
+ * new switch is needed to tell them apart, and an instance that configures
+ * nothing for them acts purely as the caller.
+ *
+ * The prefix test is what keeps all of this from breaking the other gate
+ * shapes. A `heyo_api_*` key or a JWT is not an app-lb token — it means nothing
+ * to app-lb's admin API — so those still fall to the configured credential and
+ * a JWT-gated deployment behaves exactly as before. And preferring a caller's
  * `applb_…` is never an escalation in the other direction either: it is a
  * credential they already hold, and app-lb re-checks its scope regardless of
  * who relayed it.
@@ -228,18 +244,37 @@ export function withForwardedAuth(
   const value = Array.isArray(raw) ? raw[0] : raw;
   if (!value || !value.trim()) return config;
 
+  const fromApplb = isApplbToken(value);
+
+  /**
+   * Whether a service behind an app-lb gate should be reached as the caller.
+   *
+   * Deliberately narrower than the rule for app-lb itself: an app-lb token is
+   * the *only* credential that can mean anything to app-obs or ci other than
+   * their own, so a caller presenting anything else leaves them untouched. What
+   * is configured then decides — nothing at all, or another `applb_…`, both of
+   * which say the gate is doing the authenticating; a service's own token says
+   * it is not, and is left alone.
+   */
+  const gated = (service?: ServiceConfig): boolean =>
+    Boolean(service && fromApplb && (!service.auth || isApplbToken(service.auth)));
+
   // An app-lb token is the one bearer that must not stand in for a cloud key:
   // see above. Every other credential keeps the borrow-when-empty rule.
-  const needsCloud = Boolean(config.cloud && !config.cloud.auth && !isApplbToken(value));
+  const needsCloud = Boolean(config.cloud && !config.cloud.auth && !fromApplb);
   // Either app-lb has nothing of its own, or the caller presented a credential
   // that carries its own scope and must not be traded up for this one's.
-  const needsApplb = Boolean(config.applb && (!config.applb.auth || isApplbToken(value)));
-  if (!needsCloud && !needsApplb) return config;
+  const needsApplb = Boolean(config.applb && (!config.applb.auth || fromApplb));
+  const needsObs = gated(config.obs);
+  const needsCi = gated(config.ci);
+  if (!needsCloud && !needsApplb && !needsObs && !needsCi) return config;
 
   return {
     ...config,
     cloud: needsCloud ? { ...config.cloud!, auth: value } : config.cloud,
     applb: needsApplb ? { ...config.applb!, auth: value } : config.applb,
+    obs: needsObs ? { ...config.obs!, auth: value } : config.obs,
+    ci: needsCi ? { ...config.ci!, auth: value } : config.ci,
   };
 }
 

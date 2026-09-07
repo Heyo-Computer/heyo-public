@@ -2966,8 +2966,17 @@ fn is_default_namespace(ns: &String) -> bool {
 
 /// A namespace name a spec or a token may carry: the same alphabet as a
 /// deployment id, so it can appear in a URL path and a filename unescaped.
+///
+/// `.` and `..` are excluded by name rather than by alphabet. A dot is
+/// legitimate inside a namespace (`v1.2`, `team.eu`) and banning it would be
+/// worse than the problem, but those two spellings are the only ones that mean
+/// something to a filesystem — and "unescaped in a filename" is exactly the
+/// promise this function makes. `namespaces.rs` re-encodes on the way to disk
+/// regardless, so this is the outer of two doors, not the only one.
 pub fn is_valid_namespace(ns: &str) -> bool {
     !ns.is_empty()
+        && ns != "."
+        && ns != ".."
         && ns
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
@@ -3109,6 +3118,10 @@ impl SiteSpec {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpecError {
     EmptyId,
+    /// `default` cannot be declared: it is where everything unnamespaced lives.
+    ReservedNamespace,
+    /// A namespace description long enough to be a document.
+    DescriptionTooLong,
     /// A namespace outside the id alphabet; it appears in URLs and filenames.
     BadNamespace(String),
     /// A `feed.expose` path that is not an absolute, traversal-free path.
@@ -3342,6 +3355,14 @@ impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyId => write!(f, "deployment id must not be empty"),
+            Self::ReservedNamespace => write!(
+                f,
+                "\"default\" cannot be declared: it is where every deployment that names \
+                 no namespace already lives, so it exists whether or not anything says so"
+            ),
+            Self::DescriptionTooLong => {
+                write!(f, "a namespace description must be 400 characters or fewer")
+            }
             Self::BadNamespace(ns) => write!(
                 f,
                 "namespace {ns:?} must contain only letters, digits, '-', '_' and '.' — \
@@ -4310,6 +4331,54 @@ fn is_valid_host_port(s: &str) -> bool {
     matches!(port.parse::<u16>(), Ok(p) if p > 0)
 }
 
+// ---- namespace objects --------------------------------------------------
+
+/// A declared namespace.
+///
+/// Namespaces began as a *field*: a deployment named one and that was the whole
+/// of their existence, so a namespace appeared when the first deployment in it
+/// was registered and vanished with the last. That is still true of any name a
+/// deployment mentions — an undeclared namespace is not an error — but it made
+/// two ordinary things impossible: creating a room before putting anything in
+/// it, and saying what a room is *for*.
+///
+/// So this object is additive, not a replacement. Declaring `sam` and having a
+/// deployment in `sam` are independent facts, and `GET /namespaces` reports the
+/// union with `declared` saying which is which. Nothing about deployment
+/// validation changed: naming an undeclared namespace still works, because
+/// requiring declaration first would break every spec already written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceSpec {
+    /// The namespace's name, and its identity: there is nothing else to key on.
+    pub name: String,
+    /// Free text for whoever finds it later. A namespace with no description is
+    /// a room with no label on the door, which is fine until there are twenty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Stamped by app-lb when the object is created, never read from the body —
+    /// a client-supplied creation time is a client-supplied lie.
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+impl NamespaceSpec {
+    pub fn validate(&self) -> Result<(), SpecError> {
+        if !is_valid_namespace(&self.name) {
+            return Err(SpecError::BadNamespace(self.name.clone()));
+        }
+        // `default` is where every deployment that never named a namespace
+        // lives. It exists whether or not anything declares it, so declaring it
+        // would create an object whose deletion could not mean anything.
+        if self.name == DEFAULT_NAMESPACE {
+            return Err(SpecError::ReservedNamespace);
+        }
+        if self.description.as_ref().is_some_and(|d| d.len() > 400) {
+            return Err(SpecError::DescriptionTooLong);
+        }
+        Ok(())
+    }
+}
+
 // ---- workflow objects ---------------------------------------------------
 
 /// A CI workflow: which repository to build, and on which heyvm network.
@@ -4322,7 +4391,7 @@ fn is_valid_host_port(s: &str) -> bool {
 /// The object names a repository and a path *glob*, not a workflow body. A
 /// workflow lives in the repository it builds, versioned with the code, so the
 /// object is a pointer rather than a copy that can drift.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorkflowSpec {
     pub id: String,
     /// Clone URL. Only ever compared and displayed by app-lb; the orchestrator
@@ -4394,6 +4463,69 @@ impl WorkflowSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A declared namespace is an object with a name and very little else, so
+    /// validation is where all of its rules live.
+    mod namespace_objects {
+        use super::*;
+
+        fn ns(name: &str) -> NamespaceSpec {
+            NamespaceSpec { name: name.into(), description: None, created_at: 0 }
+        }
+
+        #[test]
+        fn a_name_must_survive_a_url_and_a_filename() {
+            // The same alphabet a deployment's `namespace` field takes, because
+            // they are the same namespace — one declared, one merely named.
+            assert!(ns("sam").validate().is_ok());
+            assert!(ns("team-a").validate().is_ok());
+            assert!(ns("v1.2_x").validate().is_ok());
+            // `.` and `..` are legal under the alphabet and meaningless as
+            // directories, which is the one place a namespace lands unescaped.
+            // A dot elsewhere is fine — `v1.2` above — so they are excluded by
+            // name, not by banning the character.
+            for bad in ["", "has spaces", "slash/es", "unicodé", ".", "..", "../etc"] {
+                assert!(
+                    matches!(ns(bad).validate(), Err(SpecError::BadNamespace(_))),
+                    "{bad:?} should be refused",
+                );
+            }
+        }
+
+        #[test]
+        fn default_cannot_be_declared() {
+            // It is where every deployment that names no namespace already
+            // lives, so an object for it could never be deleted meaningfully —
+            // the namespace would carry on existing regardless.
+            assert!(matches!(
+                ns(DEFAULT_NAMESPACE).validate(),
+                Err(SpecError::ReservedNamespace)
+            ));
+            let msg = SpecError::ReservedNamespace.to_string();
+            assert!(msg.contains("default"), "{msg}");
+        }
+
+        #[test]
+        fn a_description_is_a_label_not_a_document() {
+            let ok = NamespaceSpec { description: Some("x".repeat(400)), ..ns("sam") };
+            assert!(ok.validate().is_ok());
+            let too_long = NamespaceSpec { description: Some("x".repeat(401)), ..ns("sam") };
+            assert!(matches!(
+                too_long.validate(),
+                Err(SpecError::DescriptionTooLong)
+            ));
+        }
+
+        #[test]
+        fn declaring_one_changes_nothing_about_naming_one() {
+            // The compatibility promise: a deployment may still name a namespace
+            // no object exists for. Requiring declaration first would invalidate
+            // every spec written before this existed.
+            let mut d = static_spec(&["10.0.0.9:8080"]);
+            d.namespace = "never-declared".into();
+            assert!(d.validate().is_ok());
+        }
+    }
 
     /// `ingress.cloud` is a bind on a VM port, so only a managed deployment
     /// may ask for it; it is off the wire unless set, and public by default.

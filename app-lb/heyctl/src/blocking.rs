@@ -329,6 +329,18 @@ impl Client {
 
     // -- the event feed ------------------------------------------------------
 
+    pub fn namespaces(&self) -> Result<Vec<NamespaceEntry>> {
+        run!(self, self.inner.namespaces())
+    }
+
+    pub fn create_namespace(&self, spec: &Value) -> Result<Value> {
+        run!(self, self.inner.create_namespace(spec))
+    }
+
+    pub fn delete_namespace(&self, name: &str) -> Result<()> {
+        run!(self, self.inner.delete_namespace(name))
+    }
+
     pub fn feeds(&self) -> Result<Vec<FeedIndexEntry>> {
         run!(self, self.inner.feeds())
     }
@@ -594,7 +606,12 @@ macro_rules! raw_blocking_id {
 }
 
 impl Raw<'_> {
-    raw_blocking!(deployments, secrets, tokens, jobs, certs, workflows, feeds, disks);
+    raw_blocking!(deployments, secrets, tokens, jobs, certs, workflows, feeds, disks, namespaces);
+
+    /// Deployments in one namespace. See [`crate::api::Raw::deployments_in`].
+    pub fn deployments_in(&self, namespace: &str) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().deployments_in(namespace))?
+    }
     raw_blocking_id!(deployment, secret, token, job, deployment_jobs, spec, workflow);
 
     pub fn metrics(&self, query: &MetricsQuery) -> Result<Value> {

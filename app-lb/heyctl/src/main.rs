@@ -198,6 +198,14 @@ enum CreateCmd {
     /// and on which heyvm network.
     #[command(visible_aliases = ["wf", "flow"])]
     Workflow(cmd::write::CreateWorkflowArgs),
+
+    /// Declare a namespace, so it exists before anything is in it.
+    ///
+    /// Deployments may name a namespace that was never declared — that keeps
+    /// working. Declaring one lets you make the room first and say what it is
+    /// for. Fleet-scoped admin only.
+    #[command(visible_alias = "ns")]
+    Namespace(cmd::write::CreateNamespaceArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -301,6 +309,7 @@ fn run(cli: &Cli) -> Result<()> {
             CreateCmd::Deployment(args) => cmd::write::create(&Ctx::new(g)?, args),
             CreateCmd::Secret(args) => cmd::write::create_secret(&Ctx::new(g)?, args),
             CreateCmd::Workflow(args) => cmd::write::create_workflow(&Ctx::new(g)?, args),
+            CreateCmd::Namespace(args) => cmd::write::create_namespace(&Ctx::new(g)?, args),
         },
         Command::Build(args) => cmd::write::build(&Ctx::new(g)?, args),
         Command::Pull(args) => cmd::write::pull(&Ctx::new(g)?, args),
