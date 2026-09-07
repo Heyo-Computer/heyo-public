@@ -248,6 +248,52 @@ impl ScalingFlags {
     }
 }
 
+#[derive(Args, Debug)]
+pub struct CreateNamespaceArgs {
+    /// The namespace's name. Letters, digits, `-`, `_` and `.` — it appears in
+    /// URLs and filenames unescaped.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// What the namespace is for. A room with no label is fine until there are
+    /// twenty of them.
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+
+    /// Print what would be sent, and send nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+pub fn create_namespace(ctx: &Ctx, args: &CreateNamespaceArgs) -> Result<()> {
+    let mut spec = Map::new();
+    spec.insert("name".into(), Value::String(args.name.clone()));
+    if let Some(d) = &args.description {
+        spec.insert("description".into(), Value::String(d.clone()));
+    }
+    let spec = Value::Object(spec);
+    if args.dry_run {
+        return print_spec(ctx, &spec);
+    }
+    let created = ctx.client.create_namespace(&spec)?;
+    // Not `report_write`: that one emits `deployment/<id>` and parses a
+    // DeploymentStatus, so a namespace would be announced as a deployment in
+    // `-o json` and print nothing useful in a table.
+    if ctx.out.is_machine() {
+        return output::emit(&created, ctx.out, &[format!("namespace/{}", args.name)]);
+    }
+    println!("namespace/{} created", args.name);
+    {
+        println!(
+            "\nNothing is in it yet. Put a deployment there with \
+             `heyctl create deployment <NAME> --namespace {}`, or mint a token \
+             confined to it with `heyctl token mint <NAME> --namespace {}`.",
+            args.name, args.name,
+        );
+    }
+    Ok(())
+}
+
 pub fn create(ctx: &Ctx, args: &CreateDeploymentArgs) -> Result<()> {
     let spec = build_spec(args)?;
     if args.dry_run {
@@ -1644,6 +1690,21 @@ pub fn apply(ctx: &Ctx, args: &ApplyArgs) -> Result<()> {
     }
 
     for s in &specs {
+        // `kind` decides what an object is, and its absence means "deployment".
+        // Defaulting that way rather than requiring the field is what keeps
+        // every spec file written before namespaces existed working untouched —
+        // there are a lot of them, and none of them say `kind: deployment`.
+        let kind = s.get("kind").and_then(Value::as_str).unwrap_or("deployment");
+        if kind == "namespace" || kind == "Namespace" {
+            apply_namespace(ctx, s, args.dry_run)?;
+            continue;
+        }
+        if kind != "deployment" && kind != "Deployment" {
+            bail!(
+                "unknown kind {kind:?} — `apply` understands \"deployment\" and \"namespace\", \
+                 and an object with no `kind` is a deployment"
+            );
+        }
         let id = spec::spec_id(s)
             .context("a spec in the input has no `id` field")?
             .to_string();
@@ -1662,6 +1723,35 @@ pub fn apply(ctx: &Ctx, args: &ApplyArgs) -> Result<()> {
         };
         report_write(ctx, &result, &id, if existed { "configured" } else { "created" })?;
     }
+    Ok(())
+}
+
+/// One `kind: namespace` object from an `apply` input.
+///
+/// `POST /namespaces` is already an upsert that keeps the original `created_at`,
+/// so unlike a deployment there is no create-or-replace decision to make here
+/// and nothing to look up first.
+fn apply_namespace(ctx: &Ctx, spec: &Value, dry_run: bool) -> Result<()> {
+    let name = spec
+        .get("name")
+        .and_then(Value::as_str)
+        .context("a `kind: namespace` object needs a `name`")?
+        .to_string();
+    if dry_run {
+        return print_spec(ctx, spec);
+    }
+    // `kind` is heyctl's own dispatch key, not part of app-lb's object, so it
+    // is stripped rather than sent — the server would reject the unknown field
+    // or, worse, quietly keep it in the stored spec.
+    let mut body = spec.clone();
+    if let Some(o) = body.as_object_mut() {
+        o.remove("kind");
+    }
+    let applied = ctx.client.create_namespace(&body)?;
+    if ctx.out.is_machine() {
+        return output::emit(&applied, ctx.out, &[format!("namespace/{name}")]);
+    }
+    println!("namespace/{name} configured");
     Ok(())
 }
 
@@ -2313,12 +2403,7 @@ pub fn delete(ctx: &Ctx, args: &DeleteArgs) -> Result<()> {
              and why each one is held; reclaiming is `DELETE /disks/<sandbox>` or \
              `POST /disks/sweep` on the admin API, which delete gigabytes with no undo"
         ),
-        Resource::Namespace => bail!(
-            "a namespace is not an object, so there is nothing to delete: it exists \
-             for as long as a deployment names it and is gone when the last one \
-             leaves. Move or delete the deployments in it instead — \
-             `heyctl get deployments --namespace <NS>` lists them"
-        ),
+        Resource::Namespace => delete_namespaces(ctx, &names),
         Resource::All => bail!("`delete all` is not supported — name the deployments, or use --all"),
     }
 }
@@ -2408,6 +2493,25 @@ fn delete_workflows(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()
             .delete_workflow(id)
             .with_context(|| format!("deleting workflow {id:?}"))?;
         println!("workflow/{id} deleted");
+    }
+    Ok(())
+}
+
+/// `heyctl delete namespace <NAME>` — undeclare it.
+///
+/// No `--all`, deliberately. The other bulk deletes remove things that can be
+/// recreated from a spec file; a sweep over namespaces would be a sweep over
+/// the walls other credentials are scoped against, and the blast radius is not
+/// the objects it removes but every token that pointed at them.
+fn delete_namespaces(ctx: &Ctx, names: &[String]) -> Result<()> {
+    if names.is_empty() {
+        bail!("delete namespace needs a name");
+    }
+    for name in names {
+        ctx.client
+            .delete_namespace(name)
+            .with_context(|| format!("deleting namespace {name:?}"))?;
+        println!("namespace/{name} deleted");
     }
     Ok(())
 }

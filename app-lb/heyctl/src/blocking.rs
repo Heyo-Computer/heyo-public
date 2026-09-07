@@ -333,6 +333,14 @@ impl Client {
         run!(self, self.inner.namespaces())
     }
 
+    pub fn create_namespace(&self, spec: &Value) -> Result<Value> {
+        run!(self, self.inner.create_namespace(spec))
+    }
+
+    pub fn delete_namespace(&self, name: &str) -> Result<()> {
+        run!(self, self.inner.delete_namespace(name))
+    }
+
     pub fn feeds(&self) -> Result<Vec<FeedIndexEntry>> {
         run!(self, self.inner.feeds())
     }
