@@ -110,6 +110,12 @@ async fn main() -> Result<()> {
     // high-water mark, archive oldest-idle schemas (TTL overridden) until it
     // recovers. No-op unless PG_VM_POOL_PRESSURE_PATH is configured.
     registry.spawn_pressure_reaper();
+    // Urgent device growth: the only path that grows a *warm* VM's data
+    // device. The idle-stop grow can't help a schema whose write load never
+    // pauses, and once the guest's filesystem spans its device that schema
+    // wedges on ENOSPC. No-op unless PG_VM_POOL_DISK_GROW_PCT is set (and
+    // PG_VM_POOL_DISK_GROW_URGENT_PCT is not 0).
+    registry.spawn_disk_grower();
     // Warm-spare pool: pre-booted empty VMs that cold bring-ups (notably S3
     // restores) claim instead of paying create + boot + initdb. No-op unless
     // PG_VM_POOL_WARM_SPARES > 0.

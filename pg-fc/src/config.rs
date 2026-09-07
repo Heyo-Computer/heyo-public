@@ -491,6 +491,12 @@ impl ImageArchiveConfig {
     }
 }
 
+/// Default for `PG_VM_POOL_DISK_GROW_URGENT_PCT` — see
+/// [`DiskGrowConfig::urgent_pct`]. High on purpose: this path costs live
+/// sessions, so it is a last resort ahead of `No space left on device`, not a
+/// second routine trigger.
+const DEFAULT_DISK_GROW_URGENT_PCT: f64 = 95.0;
+
 /// Settings for automatic data-device growth (see `Config::disk_grow`).
 #[derive(Clone, Copy)]
 pub struct DiskGrowConfig {
@@ -498,6 +504,28 @@ pub struct DiskGrowConfig {
     /// next idle stop. Env `PG_VM_POOL_DISK_GROW_PCT` — setting it (> 0) is
     /// the on/off switch; sensible range 50–95.
     pub pct: f64,
+    /// Guest-filesystem used% at or above which a **warm** VM's device is
+    /// grown without waiting for it to go idle — stop, resize, start, dropping
+    /// whatever sessions it had.
+    ///
+    /// Why a second, higher threshold rather than reusing [`Self::pct`]: the
+    /// idle-stop grow is free (the VM is stopping anyway), so it can afford to
+    /// fire early. This one costs every live session on the schema, so it must
+    /// fire late — only once the filesystem is genuinely at the wall.
+    ///
+    /// Without it a schema under continuous write load can never grow at all.
+    /// The guest's own watcher extends the filesystem *inside* the device and
+    /// then exits ("filesystem spans $DATA_DEV; watcher done"); past that only
+    /// a host-side device resize helps, the resize is offline-only, and the
+    /// one trigger for it was an idle stop that a busy schema never reaches.
+    /// The database wedges on `No space left on device` and stays wedged until
+    /// its traffic happens to pause for a whole idle timeout.
+    ///
+    /// Env `PG_VM_POOL_DISK_GROW_URGENT_PCT` (default 95); `0` disables the
+    /// online path, restoring idle-stop-only growth. Never below
+    /// [`Self::pct`] — a lower value would preempt the free path with the
+    /// expensive one.
+    pub urgent_pct: Option<f64>,
     /// Ceiling the device is never grown past, in GiB. Env
     /// `PG_VM_POOL_DISK_MAX_GB` (default 100; the daemon caps at 250).
     pub max_gb: u64,
@@ -525,7 +553,32 @@ impl DiskGrowConfig {
             (1..=250).contains(&max_gb),
             "PG_VM_POOL_DISK_MAX_GB ({max_gb}) must be within 1–250 (daemon limit)"
         );
-        Ok(Some(Self { pct, max_gb }))
+        let urgent_pct = match std::env::var("PG_VM_POOL_DISK_GROW_URGENT_PCT") {
+            Ok(v) => match v.trim().parse::<f64>() {
+                Ok(p) if p > 0.0 => Some(p),
+                // An explicit 0 is the documented off switch, not an error.
+                Ok(_) => None,
+                Err(_) => anyhow::bail!("invalid PG_VM_POOL_DISK_GROW_URGENT_PCT: {v:?}"),
+            },
+            Err(_) => Some(DEFAULT_DISK_GROW_URGENT_PCT),
+        };
+        if let Some(u) = urgent_pct {
+            anyhow::ensure!(
+                (1.0..=99.0).contains(&u),
+                "PG_VM_POOL_DISK_GROW_URGENT_PCT ({u}) must be within 1–99"
+            );
+            anyhow::ensure!(
+                u >= pct,
+                "PG_VM_POOL_DISK_GROW_URGENT_PCT ({u}) must be >= \
+                 PG_VM_POOL_DISK_GROW_PCT ({pct}) — the urgent path stops a live VM and \
+                 drops its sessions, so it must never fire before the free idle-stop grow"
+            );
+        }
+        Ok(Some(Self {
+            pct,
+            urgent_pct,
+            max_gb,
+        }))
     }
 }
 
@@ -825,6 +878,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_DEDICATED_FILE",
     "PG_VM_POOL_METRICS_DIR",
     "PG_VM_POOL_DISK_GROW_PCT",
+    "PG_VM_POOL_DISK_GROW_URGENT_PCT",
     "PG_VM_POOL_DISK_MAX_GB",
     "PG_VM_POOL_TLS_CERT",
     "PG_VM_POOL_TLS_KEY",
