@@ -44,6 +44,7 @@ fn shell_with_head(title: &str, extra_head: Markup, body: Markup) -> Markup {
                     nav {
                         a href="/" { "Databases" }
                         a href="/dedicated" { "dedicated" }
+                        a href="/replication" { "replication" }
                         a href="/monitoring" { "monitoring" }
                         a href="/archives" { "archives" }
                         a href="/events" { "events" }
@@ -1864,6 +1865,246 @@ fn human_secs(s: u64) -> String {
         format!("{m}m {sec}s")
     } else {
         format!("{sec}s")
+    }
+}
+
+/// One row of the replication table: the durable record plus whatever the
+/// last status sample saw.
+pub struct ReplRow {
+    pub rec: crate::replication::ReplRecord,
+    pub primary: Option<crate::replication::wire::PrimaryStatus>,
+    pub replica: Option<crate::replication::wire::ReplicaStatus>,
+    pub error: Option<String>,
+}
+
+/// The replication page: peers, live pairings, and the form that starts one.
+///
+/// Everything here reads the monitor's cached sample rather than querying a
+/// VM, for the reason `dashboard::mod`'s header states about the browsable
+/// pages: viewing a page must never disturb the thing it is showing, and one
+/// wedged VM must not hang the render.
+pub fn replication_page(
+    st: &DashState,
+    rows: &[ReplRow],
+    peers: &[crate::peers::PeerInfo],
+    candidates: &[String],
+    b: &Banner,
+) -> Markup {
+    let enabled = st.registry.replication_cfg().is_some();
+    shell(
+        "Replication",
+        html! {
+            div.pagehead {
+                h1 { "Replication" }
+                div.pagehead-actions { a.button-link href="/replication" { "↻ refresh" } }
+            }
+            (banner(b))
+            @if !enabled {
+                div.banner.err {
+                    "replication is disabled on this node — set PG_VM_POOL_REPLICATION=1 "
+                    "(and PG_VM_POOL_ADVERTISE_PG_HOST to act as a primary) and restart. "
+                    "Existing pairings below still keep their VMs pinned."
+                }
+            }
+
+            section.controls {
+                h2 { "peers" }
+                @if peers.is_empty() {
+                    p.note { "No peers yet. A peer is another pg-fc node: its dashboard URL and "
+                             "Basic-auth credentials (how this node drives it), plus the address "
+                             "and port a guest VM on THIS host dials to reach its pooler." }
+                } @else {
+                    table.dedicated {
+                        thead { tr {
+                            th { "name" } th { "dashboard" } th { "pg endpoint" }
+                            th { "added" } th {}
+                        } }
+                        tbody {
+                            @for p in peers {
+                                tr {
+                                    td { code { (p.name) } }
+                                    td { code { (p.base_url) } }
+                                    td { code { (p.pg_host) ":" (p.pg_port) } }
+                                    td.dim { (fmt_age(p.created_at)) }
+                                    td {
+                                        form method="post" action={ "/peers/" (p.name) "/delete" } {
+                                            button.danger type="submit" { "remove" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                form.alert-add method="post" action="/peers" {
+                    label { "name" input type="text" name="name" pattern="[a-z][a-z0-9_]*"
+                            maxlength="63" placeholder="node_b" required; }
+                    label { "dashboard URL" input type="text" name="base_url"
+                            placeholder="https://b.example:34199" required; }
+                    label { "dashboard user" input type="text" name="user" required; }
+                    label { "dashboard password" input type="password" name="password" required; }
+                    label { "pg host" input type="text" name="pg_host"
+                            placeholder="10.0.0.2" required; }
+                    label { "pg port" input type="number" name="pg_port" value="6432" required; }
+                    button type="submit" { "add peer" }
+                }
+            }
+
+            section {
+                h2 { "replicated databases" }
+                @if rows.is_empty() {
+                    p.note { "Nothing is replicating from or to this node." }
+                } @else {
+                    table.dedicated {
+                        thead { tr {
+                            th { "database" } th { "role" } th { "peer" } th { "state" }
+                            th { "progress" } th { "slot" } th {}
+                        } }
+                        tbody {
+                            @for r in rows { (repl_row(r)) }
+                        }
+                    }
+                }
+            }
+
+            section.controls {
+                h2 { "replicate a database" }
+                @if candidates.is_empty() {
+                    p.note { "Every dedicated database is already paired — or none is "
+                             "provisioned yet. Replication mirrors a dedicated database's "
+                             "role and password onto the replica, so provision one on "
+                             (PreEscaped("<a href=\"/dedicated\">dedicated</a>")) " first." }
+                } @else if peers.is_empty() {
+                    p.note { "Add a peer above first." }
+                } @else {
+                    form.alert-add method="post" action="/replication/enable" {
+                        label { "database"
+                            select name="database" required {
+                                @for c in candidates { option value=(c) { (c) } }
+                            }
+                        }
+                        label { "peer"
+                            select name="peer" required {
+                                @for p in peers { option value=(p.name) { (p.name) } }
+                            }
+                        }
+                        button type="submit" { "start replicating" }
+                    }
+                    p.note {
+                        "This restarts the database's Postgres to raise its WAL level, creates a "
+                        "publication and a replication login, and asks the peer to build the "
+                        "replica. Note what logical replication does NOT carry: schema changes, "
+                        "sequence values, or large objects — and a table with no primary key "
+                        "needs a REPLICA IDENTITY before its UPDATEs and DELETEs will replicate."
+                    }
+                }
+            }
+
+            section.controls {
+                h2 { "API" }
+                pre.log {
+r#"GET    /api/replication                    list pairings
+POST   /api/replication                    {"database":"acme","peer":"node_b"}
+GET    /api/replication/{database}         record + live status (?fresh=1 to sample now)
+POST   /api/replication/{database}/promote cut a replica loose (irreversible)
+POST   /api/replication/{database}/refresh pick up newly published tables
+POST   /api/replication/{database}/detach  tear down this node's half
+DELETE /api/replication/{database}         forget the record only
+GET    /api/peers                          list peers (no passwords)
+POST   /api/peers                          {"name":...,"base_url":...,"user":...,
+                                            "password":...,"pg_host":...,"pg_port":6432}
+DELETE /api/peers/{name}                   forget a peer"#
+                }
+            }
+        },
+    )
+}
+
+fn repl_row(r: &ReplRow) -> Markup {
+    let rec = &r.rec;
+    let is_replica = rec.role == crate::replication::Role::Replica;
+    html! {
+        tr {
+            td { code { (rec.database) } }
+            td { span.pill { (rec.role.as_str()) } }
+            td { code { (rec.peer) } }
+            td {
+                span.pill.(state_class(rec.state)) { (rec.state.as_str()) }
+                @if !rec.message.is_empty() {
+                    div.note { (rec.message) }
+                }
+            }
+            td { (progress(r)) }
+            td { code.small { (rec.slot) } }
+            td {
+                @if rec.state.pins() {
+                    @if is_replica {
+                        form method="post" action={ "/replication/" (rec.database) "/promote" }
+                             onsubmit="return confirm('Promote this replica? It stops following the primary, its sequences are re-seeded, and this cannot be undone.')" {
+                            button type="submit" { "promote" }
+                        }
+                        form method="post" action={ "/replication/" (rec.database) "/refresh" } {
+                            button type="submit" { "refresh" }
+                        }
+                    }
+                    form method="post" action={ "/replication/" (rec.database) "/detach" }
+                         onsubmit="return confirm('Detach? This drops the replication slot and publication on this node.')" {
+                        button.danger type="submit" { "detach" }
+                    }
+                } @else {
+                    form method="post" action={ "/replication/" (rec.database) "/delete" } {
+                        button.danger type="submit" { "remove" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The one number an operator actually watches. On a primary that is how much
+/// WAL the slot is holding — the figure that eventually fills the data disk if
+/// the subscriber never comes back. On a replica it is initial-copy progress,
+/// then how recently anything arrived.
+fn progress(r: &ReplRow) -> Markup {
+    html! {
+        @if let Some(e) = &r.error {
+            span.warn { (e) }
+        } @else if let Some(p) = &r.primary {
+            @if !p.slot_active {
+                span.warn { "no subscriber attached" }
+                @if let Some(b) = p.behind_bytes { " — " (human_bytes(b.max(0) as u64)) " of WAL retained" }
+            } @else {
+                @if let Some(b) = p.behind_bytes { (human_bytes(b.max(0) as u64)) " behind" }
+                @if let Some(l) = p.flush_lag_s { " · " (format!("{l:.3}s flush")) }
+            }
+            @if let Some(w) = &p.wal_status {
+                @if w != "reserved" {
+                    div.warn { "wal_status=" (w)
+                        @if w == "lost" { " — the replica must be re-seeded" } }
+                }
+            }
+        } @else if let Some(s) = &r.replica {
+            @if s.tables_total > 0 && s.tables_ready < s.tables_total {
+                (s.tables_ready) " / " (s.tables_total) " tables copied"
+            } @else if !s.worker_running {
+                span.warn { "apply worker is not running" }
+            } @else if let Some(a) = s.last_msg_age_s {
+                (format!("{a:.1}s")) " since the last change"
+            } @else { "streaming" }
+            @if !s.enabled { div.warn { "subscription is disabled" } }
+        } @else {
+            span.note { "—" }
+        }
+    }
+}
+
+fn state_class(s: crate::replication::State) -> &'static str {
+    use crate::replication::State::*;
+    match s {
+        Active => "ok",
+        Syncing | Pending => "warn",
+        Failed => "err",
+        Promoted | Detached => "muted",
     }
 }
 

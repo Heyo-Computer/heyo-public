@@ -364,12 +364,46 @@ pub async fn action_start(Path(id): Path<String>, Form(f): Form<NextForm>) -> Re
     redirect(&id, r, "started", f.dest())
 }
 
-pub async fn action_stop(Path(id): Path<String>, Form(f): Form<NextForm>) -> Redirect {
+/// Stopping a VM a replication pairing depends on breaks the pairing — on a
+/// primary it leaves an inactive slot pinning WAL, on a replica it stops
+/// consuming — and neither is recoverable without a re-seed. The offload
+/// picker already excludes pinned schemas, but these buttons bypass it
+/// entirely, so each one asks separately.
+fn refuse_if_pinned(st: &DashState, id: &str, dest: Option<&str>) -> Option<Redirect> {
+    let why = st.registry.pin_reason_for_vm(id)?;
+    Some(match dest {
+        Some(n) => {
+            let sep = if n.contains('?') { '&' } else { '?' };
+            Redirect::to(&format!("{n}{sep}err={}", qenc(&why)))
+        }
+        None => Redirect::to(&format!("/vm/{id}?err={}", qenc(&why))),
+    })
+}
+
+pub async fn action_stop(
+    State(st): State<DashState>,
+    Path(id): Path<String>,
+    Form(f): Form<NextForm>,
+) -> Redirect {
+    if let Some(r) = refuse_if_pinned(&st, &id, f.dest()) {
+        return r;
+    }
     let r = run_lifecycle(&id, Lifecycle::Stop).await;
     redirect(&id, r, "stopped", f.dest())
 }
 
-pub async fn action_reboot(Path(id): Path<String>, Form(f): Form<NextForm>) -> Redirect {
+pub async fn action_reboot(
+    State(st): State<DashState>,
+    Path(id): Path<String>,
+    Form(f): Form<NextForm>,
+) -> Redirect {
+    // A reboot is a stop plus a start, so it is survivable for a pairing —
+    // but it drops the walsender and every table-sync worker mid-copy, and
+    // the replica reconnects into whatever state that left. Make it a
+    // deliberate act via detach rather than a one-click one.
+    if let Some(r) = refuse_if_pinned(&st, &id, f.dest()) {
+        return r;
+    }
     let r = run_lifecycle(&id, Lifecycle::Reboot).await;
     redirect(&id, r, "rebooting", f.dest())
 }
@@ -397,7 +431,14 @@ pub async fn action_stop_idle(State(st): State<DashState>) -> Redirect {
             // stopping it just orphans it (the replenisher only counts
             // running spares) and defeats the pre-boot it exists for.
             let stoppable = r.pool_managed || (r.name.starts_with("spare-pg-") && r.schema.is_some());
-            if !r.is_running() || r.keepalive || r.live_sessions.unwrap_or(0) > 0 || !stoppable {
+            // `r.keepalive` is read off the warm entry, so it is false for a
+            // schema with no entry yet — which is exactly the state a pinned
+            // VM is in right after a pooler restart. Ask the registry too.
+            let pinned = r
+                .schema
+                .as_deref()
+                .is_some_and(|schema| st.registry.pinned(schema));
+            if !r.is_running() || r.keepalive || pinned || r.live_sessions.unwrap_or(0) > 0 || !stoppable {
                 continue;
             }
             let res = async {
@@ -482,6 +523,9 @@ pub async fn action_reap(
             None => Redirect::to(&format!("/vm/{id}?{query}")),
         }
     };
+    if let Some(r) = refuse_if_pinned(&st, &id, f.dest()) {
+        return r;
+    }
     if !st.registry.archive_enabled() {
         return back(format!(
             "err={}",
@@ -536,6 +580,9 @@ pub async fn action_restore(
             None => Redirect::to(&format!("/vm/{id}?{query}")),
         }
     };
+    if let Some(r) = refuse_if_pinned(&st, &id, f.dest()) {
+        return r;
+    }
     let row = match model::find_row(&st, &id).await {
         Ok(row) => row,
         Err(e) => return back(format!("err={}", qenc(&e.to_string()))),
@@ -597,6 +644,9 @@ pub async fn action_archive_image(
             None => Redirect::to(&format!("/vm/{id}?{query}")),
         }
     };
+    if let Some(r) = refuse_if_pinned(&st, &id, f.dest()) {
+        return r;
+    }
     if !st.registry.image_archive_enabled() {
         return back(format!(
             "err={}",

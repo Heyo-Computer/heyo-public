@@ -19,10 +19,12 @@ mod inventory;
 #[cfg(test)]
 mod loadtest;
 mod orphans;
+mod peers;
 mod pending;
 mod proxy;
 mod reclaim;
 mod registry;
+mod replication;
 mod s3;
 mod spares;
 mod startup;
@@ -126,6 +128,14 @@ async fn main() -> Result<()> {
     // kill it acked but didn't act on), reclaiming the stranded disk. No-op
     // unless PG_VM_POOL_ORPHAN_SWEEP_SECS (and PG_VM_POOL_RUN_DIR) are set.
     registry.spawn_orphan_reaper();
+    // Bring up every VM a replication pairing depends on. Must run before the
+    // untracked reaper's first pass, which classifies a running VM with no
+    // warm entry as untracked. No-op when nothing is replicating.
+    registry.spawn_replication_pinner();
+    // Samples each pairing's lag and slot health for the dashboard, and warns
+    // when an inactive slot starts pinning WAL. No-op when nothing is
+    // replicating.
+    registry.spawn_replication_monitor();
     // Delete VMs whose bring-up handed out an id but never reached a registry
     // binding — the "stuck in provisioning, bound to nothing" leak no other
     // sweep covers. Always on; idle when the pending ledger is empty.
@@ -195,19 +205,19 @@ async fn handle_conn(
     tls: Option<Arc<TlsReloader>>,
 ) -> Result<()> {
     let (mut client, info) = startup::read_startup(client, tls.as_deref()).await?;
-    let creds = registry.dedicated();
     // Which password this client must prove, decided from its *role* alone: a
-    // provisioned role is challenged with its own, everyone else with the
-    // shared `PG_VM_POOL_PASSWORD`. Keeping the requested database out of this
-    // step means the handshake looks the same either way, so the challenge
-    // can't be used to enumerate which database names are dedicated.
-    if let Some(password) = creds.challenge_password(&info.user, registry.client_password()) {
+    // replication or dedicated login is challenged with its own, everyone else
+    // with the shared `PG_VM_POOL_PASSWORD`. Keeping the requested database
+    // out of this step means the handshake looks the same either way, so the
+    // challenge can't be used to enumerate which database names are dedicated.
+    if let Some(password) = registry.challenge_password_for(&info.user) {
         auth::require_password(&mut client, &password).await?;
     }
     // Authenticated — now, may this client route where it asked? A dedicated
     // credential may open only its own database (so it can never provision a
-    // second VM), and a shared-password client may not open a dedicated one.
-    if let Err(reason) = creds.authorize(&info.user, &info.database) {
+    // second VM), a shared-password client may not open a dedicated one, and a
+    // replication login may open only the database it replicates.
+    if let Err(reason) = registry.authorize_route(&info.user, &info.database) {
         // Tell the client why rather than dropping the socket: "cannot open any
         // other database" is exactly the feedback that stops someone retrying a
         // typo'd database name forever.
