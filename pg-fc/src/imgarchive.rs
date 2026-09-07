@@ -591,6 +591,11 @@ pub(crate) async fn materialize_from_image(
     schema: &str,
     s3: &S3Config,
     spares: crate::vm::Spares<'_>,
+    // Whether this schema's VM must never be idle-stopped (a keepalive schema,
+    // or a live replication pairing). Carried down to `create_vm` so a restored
+    // VM is created pinned rather than acquiring the pin only on its next
+    // bring-up.
+    pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     let run_dir = cfg
         .run_dir
@@ -644,7 +649,10 @@ pub(crate) async fn materialize_from_image(
         );
     }
 
-    let res = materialize_inner(cfg, schema, s3, &key, &http, expect_len, &zst, &raw, spares).await;
+    let res = materialize_inner(
+        cfg, schema, s3, &key, &http, expect_len, &zst, &raw, spares, pinned,
+    )
+    .await;
     let _ = tokio::fs::remove_file(&zst).await;
     let _ = tokio::fs::remove_file(&raw).await;
     res
@@ -661,6 +669,11 @@ pub(crate) async fn materialize_from_local_image(
     schema: &str,
     src: &Path,
     spares: crate::vm::Spares<'_>,
+    // Whether this schema's VM must never be idle-stopped (a keepalive schema,
+    // or a live replication pairing). Carried down to `create_vm` so a restored
+    // VM is created pinned rather than acquiring the pin only on its next
+    // bring-up.
+    pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     let run_dir = cfg
         .run_dir
@@ -700,7 +713,7 @@ pub(crate) async fn materialize_from_local_image(
             crate::orphans::human_iec(len),
         );
     }
-    let res = adopt_zst_image(cfg, schema, src, &raw, spares).await;
+    let res = adopt_zst_image(cfg, schema, src, &raw, spares, pinned).await;
     let _ = tokio::fs::remove_file(&raw).await;
     res
 }
@@ -716,9 +729,14 @@ async fn materialize_inner(
     zst: &Path,
     raw: &Path,
     spares: crate::vm::Spares<'_>,
+    // Whether this schema's VM must never be idle-stopped (a keepalive schema,
+    // or a live replication pairing). Carried down to `create_vm` so a restored
+    // VM is created pinned rather than acquiring the pin only on its next
+    // bring-up.
+    pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     download(s3, http, key, expect_len, zst).await?;
-    adopt_zst_image(cfg, schema, zst, raw, spares).await
+    adopt_zst_image(cfg, schema, zst, raw, spares, pinned).await
 }
 
 /// The shared tail of every image restore: decompress `zst` into `raw`,
@@ -735,6 +753,8 @@ async fn adopt_zst_image(
     zst: &Path,
     raw: &Path,
     spares: crate::vm::Spares<'_>,
+    // Whether this schema's VM must never be idle-stopped — see the callers.
+    pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     run_ok(
         Command::new("zstd").args(["-q", "-d", "-f", "--sparse", "-o"]).arg(raw).arg(zst),
@@ -764,7 +784,8 @@ async fn adopt_zst_image(
     // The readopt maneuver: a booted, ready VM — a warm spare whenever the
     // pool has one — stopped, its empty disk overwritten in place with the
     // image, then booted on the real data.
-    let (sandbox, provenance) = crate::vm::claim_restore_vehicle(cfg, schema, spares).await?;
+    let (sandbox, provenance) =
+        crate::vm::claim_restore_vehicle(cfg, schema, spares, pinned).await?;
     if let Err(e) = swap_and_boot(cfg, &sandbox, schema, raw).await {
         // The half-adopted VM must not survive at all: merely *stopping* it
         // leaves a sandbox holding an empty-or-torn database that a later

@@ -170,22 +170,19 @@ impl Credentials {
         self.by_database.lock().unwrap().contains_key(database)
     }
 
-    /// The password the pooler must challenge this client for, resolved
-    /// **before** anything about the requested database is considered.
+    /// The password for `role`, if it is a provisioned dedicated login.
     ///
-    /// A dedicated role is challenged with its own password; everyone else with
-    /// the shared `PG_VM_POOL_PASSWORD` (`None` = no gate, the loopback
-    /// default). Deliberately keyed on the *role* alone: doing it this way
-    /// means the handshake looks identical whether or not the requested
-    /// database happens to be dedicated, so a prober can't enumerate the
-    /// provisioned names by watching which connections get challenged.
-    /// [`Self::authorize`] is what applies the routing rule, after the password
-    /// has already been proven.
-    pub fn challenge_password(&self, role: &str, shared: Option<&str>) -> Option<String> {
-        match self.by_role(role) {
-            Some(c) => Some(c.password),
-            None => shared.map(str::to_string),
-        }
+    /// Deliberately keyed on the **role** alone: doing it this way means the
+    /// handshake looks identical whether or not the requested database happens
+    /// to be dedicated, so a prober cannot enumerate the provisioned names by
+    /// watching which connections get challenged. [`Self::authorize`] is what
+    /// applies the routing rule, after the password has already been proven.
+    ///
+    /// The shared-password fallback lives one level up, in
+    /// `SchemaRegistry::challenge_password_for`, which composes this with the
+    /// replication logins so all three live in one ordering.
+    pub fn password_for_role(&self, role: &str) -> Option<String> {
+        self.by_role(role).map(|c| c.password)
     }
 
     /// Decide whether an *authenticated* client may route to `database`. This
@@ -322,6 +319,11 @@ pub fn generate_password() -> Result<String> {
 
 /// Shared shape check for a database or role name.
 ///
+/// Also used by [`crate::peers`] for a peer's name and by
+/// [`crate::replication`] for a replication login, because every one of those
+/// becomes a Postgres identifier, a replication slot name, or both — and a
+/// second copy of these rules would drift.
+///
 /// Much stricter than [`crate::is_valid_schema`] (which has to keep accepting
 /// whatever existing clients already send): these names are chosen by an
 /// operator at provisioning time, and each one becomes a Postgres identifier, a
@@ -329,7 +331,7 @@ pub fn generate_password() -> Result<String> {
 /// only, because an unquoted identifier folds to lowercase in Postgres and a
 /// name that changes case between the client and the catalog is a support
 /// ticket waiting to happen.
-fn validate_identifier(s: &str, what: &str) -> Result<String> {
+pub(crate) fn validate_identifier(s: &str, what: &str) -> Result<String> {
     let s = s.trim();
     if s.is_empty() {
         bail!("{what} name is required");
@@ -362,7 +364,7 @@ fn validate_identifier(s: &str, what: &str) -> Result<String> {
 /// cleartext PasswordMessage — so: printable ASCII, no whitespace, no control
 /// characters. That rules out a tab or newline corrupting the store by
 /// construction, which is why nothing in this module escapes anything.
-fn validate_password(p: &str) -> Result<()> {
+pub(crate) fn validate_password(p: &str) -> Result<()> {
     if p.len() < MIN_PASSWORD_LEN {
         bail!("password must be at least {MIN_PASSWORD_LEN} characters");
     }
@@ -537,26 +539,14 @@ mod tests {
     }
 
     #[test]
-    fn challenge_uses_the_records_own_password_not_the_shared_one() {
+    fn a_dedicated_record_resolves_to_its_own_password() {
         let s = store();
         s.create("acme", "acme_app", "hunter2hunter2").unwrap();
-        assert_eq!(
-            s.challenge_password("acme_app", Some("shared")).as_deref(),
-            Some("hunter2hunter2")
-        );
-        // Unknown roles fall through to the shared password...
-        assert_eq!(
-            s.challenge_password("postgres", Some("shared")).as_deref(),
-            Some("shared")
-        );
-        // ...including "no gate configured", the loopback default.
-        assert_eq!(s.challenge_password("postgres", None), None);
-        // A dedicated role is challenged even when there is no shared password,
-        // so enabling this feature adds a gate where there was none.
-        assert_eq!(
-            s.challenge_password("acme_app", None).as_deref(),
-            Some("hunter2hunter2")
-        );
+        assert_eq!(s.password_for_role("acme_app").as_deref(), Some("hunter2hunter2"));
+        // An unknown role resolves to nothing *here*; the shared-password
+        // fallback is composed one level up, in the registry, together with the
+        // replication logins — see `registry::auth_composition_tests`.
+        assert_eq!(s.password_for_role("postgres"), None);
         let _ = std::fs::remove_file(&s.path);
     }
 
