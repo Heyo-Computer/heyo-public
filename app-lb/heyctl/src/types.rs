@@ -1751,6 +1751,13 @@ pub struct NamespaceEntry {
     /// Deployments in it that *this credential* may see. Narrowed server-side,
     /// so a scoped token sees its own arithmetic rather than the fleet's.
     pub deployments: u64,
+    /// Whether a namespace *object* exists, as opposed to the name being one a
+    /// deployment happens to mention. Both scope identically; the difference is
+    /// whether there is anything to delete or describe.
+    pub declared: bool,
+    pub description: Option<String>,
+    /// Present only when `declared`.
+    pub created_at: Option<u64>,
     #[serde(flatten)]
     pub extra: Extra,
 }

@@ -188,6 +188,10 @@ struct AdminState {
     /// CI workflow objects. app-lb stores and serves them; the `ci`
     /// orchestrator polls them and does the building.
     workflows: Arc<crate::workflows::WorkflowStore>,
+    /// Namespaces somebody declared on purpose. The ones deployments merely
+    /// mention are not in here — `GET /namespaces` reports the union, and
+    /// `declared` on each row is what tells them apart.
+    namespaces: Arc<crate::namespaces::NamespaceStore>,
     /// App-tokens. Verified on every gated request, so reads are lock-free.
     tokens: Arc<crate::tokens::TokenStore>,
     /// Resolves bearers the Heyo auth service issued. `None` when
@@ -258,6 +262,7 @@ impl AdminApi {
         acme: Option<Arc<Notify>>,
         secrets: Arc<SecretStore>,
         workflows: Arc<crate::workflows::WorkflowStore>,
+        namespaces: Arc<crate::namespaces::NamespaceStore>,
         tokens: Arc<crate::tokens::TokenStore>,
         jobs: Arc<Jobs>,
         obs: Option<Arc<crate::obs::Stats>>,
@@ -317,6 +322,7 @@ impl AdminApi {
                 secrets,
                 ingress,
                 workflows,
+                namespaces,
                 tokens,
                 jobs,
                 obs,
@@ -1948,6 +1954,15 @@ struct NamespaceEntry {
     /// because the list is `GET /deployments?namespace=…`, which narrows itself
     /// the same way.
     deployments: usize,
+    /// Whether a namespace *object* exists, as opposed to the name being one a
+    /// deployment happens to mention. Both are real namespaces and behave
+    /// identically for scoping; the difference is only whether anything can be
+    /// deleted, and whether there is anywhere to hang a description.
+    declared: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<u64>,
 }
 
 /// The namespaces a caller carries a key to, whether or not anything is in them.
@@ -2004,15 +2019,129 @@ async fn namespaces(
         counts.entry(ns).or_insert(0);
     }
 
+    // Declared namespaces, whether or not anything is in them — that is the
+    // point of declaring one.
+    //
+    // A *stronger* predicate than the counts above, and deliberately: a
+    // namespace holding a deployment the caller can see is already implied by
+    // `GET /deployments`, so listing it discloses nothing new. An empty declared
+    // one is not implied by anything, so it takes `reaches_namespace` — the same
+    // bar the event feed uses for "which namespaces exist is fleet information".
+    for ns in state.namespaces.list() {
+        if caller.is_none_or(|c| c.reaches_namespace(&ns.name)) {
+            counts.entry(ns.name.clone()).or_insert(0);
+        }
+    }
+
     Json(
         counts
             .into_iter()
-            .map(|(namespace, deployments)| NamespaceEntry {
-                namespace,
-                deployments,
+            .map(|(namespace, deployments)| {
+                let declared = state.namespaces.get(&namespace);
+                NamespaceEntry {
+                    deployments,
+                    declared: declared.is_some(),
+                    description: declared.as_ref().and_then(|d| d.description.clone()),
+                    created_at: declared.as_ref().map(|d| d.created_at),
+                    namespace,
+                }
             })
             .collect::<Vec<_>>(),
     )
+}
+
+/// `POST /namespaces` — declare one.
+///
+/// Fleet-scoped and `admin`, deliberately: a namespace is the wall other scopes
+/// are defined against, so minting rooms is not something a credential confined
+/// to one room may do. `covers_fleet` is checked here rather than at the gate
+/// because `/namespaces` is a route that *narrows itself* on `GET` — the gate
+/// cannot tell the two methods apart, so the write side states its own rule.
+async fn create_namespace(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+    Json(mut spec): Json<crate::config::NamespaceSpec>,
+) -> Response {
+    if let Some(c) = caller.as_ref().map(|c| &c.0)
+        && !c.covers_fleet()
+    {
+        return err(
+            StatusCode::FORBIDDEN,
+            "declaring a namespace is a fleet-wide act, so it needs a fleet-scoped admin \
+             credential — a token confined to a namespace cannot create another",
+        )
+        .into_response();
+    }
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    // Stamped here, never taken from the body: a client-supplied creation time
+    // is a client-supplied claim. Re-declaring keeps the original, so `apply`
+    // is idempotent and does not reset the clock on every run.
+    spec.created_at = match state.namespaces.get(&spec.name) {
+        Some(existing) => existing.created_at,
+        None => now_secs(),
+    };
+    let existed = state.namespaces.contains(&spec.name);
+    match state.namespaces.upsert(spec) {
+        Ok(ns) => (
+            if existed { StatusCode::OK } else { StatusCode::CREATED },
+            Json(ns),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "namespace write failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "could not persist the namespace").into_response()
+        }
+    }
+}
+
+/// `DELETE /namespaces/:name` — undeclare one.
+///
+/// Refuses while deployments are still in it. Removing the object would
+/// otherwise "succeed" and change nothing observable — the namespace would stay
+/// alive as an undeclared one, still scoping every token pointed at it — which
+/// is the kind of success that gets read as "it is gone".
+async fn delete_namespace(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    caller: Option<axum::Extension<Caller>>,
+) -> Response {
+    if let Some(c) = caller.as_ref().map(|c| &c.0)
+        && !c.covers_fleet()
+    {
+        return err(
+            StatusCode::FORBIDDEN,
+            "removing a namespace is a fleet-wide act, so it needs a fleet-scoped admin \
+             credential",
+        )
+        .into_response();
+    }
+    let occupied = state
+        .registry
+        .deployments()
+        .values()
+        .filter(|d| d.spec.namespace == name)
+        .count();
+    if occupied > 0 {
+        return err(
+            StatusCode::CONFLICT,
+            format!(
+                "namespace {name:?} still holds {occupied} deployment(s); move or delete them \
+                 first — undeclaring it would leave them exactly where they are"
+            ),
+        )
+        .into_response();
+    }
+    match state.namespaces.remove(&name) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, format!("no declared namespace {name:?}"))
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "namespace delete failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "could not remove the namespace").into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -4293,6 +4422,12 @@ fn router(state: AdminState) -> Router {
         // App-tokens. Firmly CRUD-tier: minting one is minting a credential, so
         // the route that does it must be at least as protected as the things the
         // credential can reach.
+        // Declaring and undeclaring namespaces. CRUD tier; the handlers add the
+        // fleet-scope requirement the gate cannot express, because `GET
+        // /namespaces` is a view-tier route that narrows itself and the gate
+        // matches on path, not method.
+        .route("/namespaces", post(create_namespace))
+        .route("/namespaces/:name", delete(delete_namespace))
         .route("/tokens", post(mint_token).get(list_tokens))
         .route(
             "/tokens/:id",

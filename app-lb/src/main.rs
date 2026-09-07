@@ -31,6 +31,7 @@ mod jobs;
 mod jwt;
 mod metrics;
 mod mounts;
+mod namespaces;
 mod obs;
 mod proxy;
 mod registry;
@@ -471,6 +472,21 @@ fn main() {
             "restored CI workflows; some objects were unreadable and were left on disk"
         ),
     }
+    // Beside the others, same derivation: `app-lb-state.json` gives
+    // `app-lb-namespaces.d/`.
+    let namespaces = Arc::new(crate::namespaces::NamespaceStore::new(
+        crate::namespaces::namespace_dir(&cfg.state_path),
+    ));
+    match namespaces.load() {
+        (0, 0) => tracing::debug!(dir = %namespaces.dir().display(), "no declared namespaces"),
+        (n, 0) => tracing::info!(count = n, "restored declared namespaces"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %namespaces.dir().display(),
+            "restored declared namespaces; some objects were unreadable and were left on disk"
+        ),
+    }
     // A deregistration whose file removal failed would otherwise resurrect the
     // deployment on this start. Declines to run if the load above skipped
     // anything, so it can never delete a spec it merely failed to understand.
@@ -888,6 +904,7 @@ fn main() {
             acme_signal,
             secrets,
             workflows,
+            namespaces,
             tokens,
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),

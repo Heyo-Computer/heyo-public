@@ -288,6 +288,23 @@ mod tests {
         assert_eq!(Resource::Namespace.singular(), "namespace");
     }
 
+    /// `apply` dispatches on `kind`, and its absence has to keep meaning
+    /// "deployment" — every spec file written before namespaces existed says
+    /// nothing about kind, and there are a lot of them.
+    #[test]
+    fn an_object_with_no_kind_is_still_a_deployment() {
+        use serde_json::json;
+        let kind_of = |v: &serde_json::Value| {
+            v.get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("deployment")
+                .to_string()
+        };
+        assert_eq!(kind_of(&json!({"id": "web", "routes": []})), "deployment");
+        assert_eq!(kind_of(&json!({"kind": "namespace", "name": "sam"})), "namespace");
+        assert_eq!(kind_of(&json!({"kind": "deployment", "id": "web"})), "deployment");
+    }
+
     #[test]
     fn a_bare_name_needs_a_default_kind() {
         assert!(parse_ref(&args(&["web"]), None).is_err());

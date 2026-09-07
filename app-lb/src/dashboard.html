@@ -419,6 +419,15 @@
   </div>
   <div class="card" id="secrets"></div>
 
+  <!-- Above App-tokens on purpose: a namespace is the wall a token is scoped
+       against, so the list of walls should be read before the list of keys. -->
+  <div class="section-title">
+    Namespaces <span class="count" id="ns-count"></span>
+    <span class="spacer"></span>
+    <button class="btn mini" id="ns-new">New namespace</button>
+  </div>
+  <div class="card" id="namespaces"></div>
+
   <div class="section-title">
     App-tokens <span class="count" id="tokens-count"></span>
     <span class="spacer"></span>
@@ -1287,6 +1296,93 @@ function renderSecrets(secrets) {
     <div class="note">Values never leave app-lb — only key names are readable, so a rotation
       sets new values rather than editing existing ones.</div>`;
 }
+
+// ---- Namespaces ---------------------------------------------------------
+
+// Renders the same union `GET /namespaces` returns: rooms somebody declared,
+// and rooms that exist only because a deployment names them. The distinction is
+// the point of the table — an undeclared namespace has nothing to delete and
+// nowhere to write down what it is for, and a declared empty one is not an
+// accident waiting to be cleaned up.
+function renderNamespaces_card(list) {
+  $("ns-count").textContent = list.length ? `${list.length}` : "";
+  if (!list.length) {
+    $("namespaces").innerHTML =
+      `<div class="empty">No namespaces. Everything is in <code>default</code>.
+       A namespace walls off deployments, secrets and the event feed, and is what
+       a token is confined to — <code>heyctl token mint … --namespace &lt;NS&gt;</code>.</div>`;
+    return;
+  }
+  const now = nowSecs();
+  const rows = list.map(n => {
+    const declared = n.declared
+      ? `<span class="tag ok">declared</span>`
+      : `<span class="tag idle" title="Exists only because deployments name it">implied</span>`;
+    // Only a declared, empty namespace can be removed: undeclaring an occupied
+    // one would change nothing, and there is no object behind an implied one.
+    const del = n.declared && !n.deployments
+      ? `<button class="btn mini danger" data-nsact="delete" data-ns="${esc(n.namespace)}">Delete</button>`
+      : "";
+    return `<tr>
+      <td class="mono">${esc(n.namespace)}</td>
+      <td>${declared}</td>
+      <td>${n.deployments}</td>
+      <td>${n.created_at ? fmtDur(Math.max(0, now - n.created_at)) + " ago" : `<span style="color:var(--muted)">—</span>`}</td>
+      <td>${n.description ? esc(n.description) : `<span style="color:var(--muted)">—</span>`}</td>
+      <td class="rowactions">${del}</td>
+    </tr>`;
+  }).join("");
+  $("namespaces").innerHTML = `<div style="overflow-x:auto"><table class="vms">
+      <thead><tr><th>namespace</th><th>state</th><th>deployments</th><th>created</th>
+        <th>description</th><th>actions</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="note">A deployment may name a namespace that was never declared; that
+      keeps working. Declaring one lets it exist before anything is in it, and gives it
+      a description. Only a declared, empty namespace can be deleted.</div>`;
+}
+
+function openNewNamespace() {
+  openModal(
+    "New namespace",
+    "A wall for deployments, secrets and the event feed — and what a token is confined to. It can be empty.",
+    `<label>Name
+       <input id="ns-name" placeholder="sam" autocomplete="off" spellcheck="false">
+     </label>
+     <label>Description (optional)
+       <input id="ns-desc" placeholder="Sam's things" autocomplete="off">
+     </label>
+     <div class="note">Letters, digits, <code>-</code>, <code>_</code> and <code>.</code> —
+       it appears in URLs and filenames unescaped. Declaring a namespace is fleet-wide,
+       so it needs a fleet-scoped admin credential.</div>`,
+    async () => {
+      const name = $("ns-name").value.trim();
+      if (!name) return modalErr("A namespace needs a name.");
+      const body = { name };
+      const desc = $("ns-desc").value.trim();
+      if (desc) body.description = desc;
+      const res = await api("POST", "namespaces", body);
+      if (!res.ok) return modalErr(errMsg(res));
+      closeModal();
+      toast(`namespace/${name} created`);
+      pollSlow();
+    },
+    "Create",
+  );
+}
+
+$("ns-new").addEventListener("click", openNewNamespace);
+
+$("namespaces").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-nsact]");
+  if (!b) return;
+  const name = b.dataset.ns;
+  if (!confirm(`Undeclare namespace "${name}"? Nothing is in it, so nothing moves.`)) return;
+  const res = await api("DELETE", "namespaces/" + encodeURIComponent(name));
+  if (!res.ok) return toast(errMsg(res), true);
+  toast(`namespace/${name} deleted`);
+  pollSlow();
+});
 
 // ---- App-tokens ---------------------------------------------------------
 
@@ -2267,7 +2363,10 @@ async function pollSlow() {
     if (security.ok) renderSecurity(security.data || { enabled: false, alerts: [] });
     // Before the pager, so a namespace that disappeared while selected is
     // noticed on the same tick that reports what is left.
-    if (namespaces.ok) renderNamespaces(namespaces.data || []);
+    if (namespaces.ok) {
+      renderNamespaces(namespaces.data || []);
+      renderNamespaces_card(namespaces.data || []);
+    }
     if (jobs.ok) {
       const list = jobs.data || [];
       renderJobs(list);

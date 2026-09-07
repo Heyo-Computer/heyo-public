@@ -551,6 +551,34 @@ impl Client {
             .await
     }
 
+    /// Declare a namespace. Idempotent: re-declaring updates the description
+    /// and keeps the original `created_at`.
+    ///
+    /// Fleet-scoped and `admin` server-side — a credential confined to one
+    /// namespace cannot mint another. Takes the spec as a `Value` for the same
+    /// reason `create_deployment` does: `apply` reads objects from a file and
+    /// must send what was written, not a round-trip through this build's idea
+    /// of the shape.
+    pub async fn create_namespace(&self, spec: &Value) -> Result<Value> {
+        let name = spec.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+        self.read(
+            Request::new(Method::Post, "/namespaces").json(spec.clone()),
+            "namespace",
+            &name,
+        )
+        .await
+    }
+
+    /// Undeclare a namespace. Refused while deployments are still in it.
+    pub async fn delete_namespace(&self, name: &str) -> Result<()> {
+        self.unit(
+            Request::new(Method::Delete, format!("/namespaces/{}", seg(name))),
+            "namespace",
+            name,
+        )
+        .await
+    }
+
     // -- the event feed ------------------------------------------------------
 
     /// The namespaces that have feed events, narrowed to what this credential

@@ -272,11 +272,38 @@ fn get_namespaces(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    let mut table = Table::new(["NAMESPACE", "DEPLOYMENTS"]);
+    // DECLARED is the column that earns its place: a namespace with zero
+    // deployments and no object is a name nothing mentions any more, while one
+    // with an object is somewhere waiting to be used. Same row, opposite
+    // meanings, and only this column separates them.
+    let mut table = if ctx.out.is_wide() {
+        Table::new(["NAMESPACE", "DEPLOYMENTS", "DECLARED", "CREATED", "DESCRIPTION"])
+    } else {
+        Table::new(["NAMESPACE", "DEPLOYMENTS", "DECLARED"])
+    };
+    let now = now_secs();
     for n in &namespaces {
-        table.row([n.namespace.clone(), n.deployments.to_string()]);
+        let mut row = vec![
+            n.namespace.clone(),
+            n.deployments.to_string(),
+            if n.declared { "yes".into() } else { "—".to_string() },
+        ];
+        if ctx.out.is_wide() {
+            row.push(match n.created_at {
+                Some(t) => format!("{} ago", output::duration(now.saturating_sub(t))),
+                None => "—".into(),
+            });
+            row.push(n.description.clone().unwrap_or_else(|| "—".into()));
+        }
+        table.row(row);
     }
     table.print();
+    if !namespaces.iter().any(|n| n.declared) {
+        println!(
+            "\nNone of these are declared — they exist because deployments name them. \
+             `heyctl create namespace <NAME>` makes one that stands on its own."
+        );
+    }
     Ok(())
 }
 
