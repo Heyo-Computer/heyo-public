@@ -130,10 +130,10 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 
 ### Service deployment files
 
-This receiver introduces the JSON contract below. The subsequent caller migration
-adds `.heyo/services` files and a workflow that loads a file, fills in the build
-artifact, target host/region and revision, then submits it. This receiver-only
-change deliberately leaves the deployment workflow unchanged for self-upgrade.
+Service configuration lives in [`.heyo/services`](../.heyo/services). The workflow
+loads a file, fills in the build artifact, target host/region and revision, then
+submits it. Install the receiver-only upgrade before activating this workflow;
+see the breaking-change rollout below.
 Application environment variables remain application settings; there is no change
 to Orchestrator's own process-config loader.
 
@@ -183,5 +183,8 @@ still serves; do not advance the callers. After cutover, use the new callers.
 No deployment or infrastructure change is performed by preparing these PRs.
 
 Receiver validation: `cargo test --locked --manifest-path orchestrator/Cargo.toml`.
-The caller migration supplies offline workflow tests and synthetic payloads for
-the optional `SERVICE_SPEC_FIXTURE_DIR` Rust contract test.
+Offline validation: `python3 .heyo/services/test_service_specs.py` executes the
+workflow with mocked network/build calls. `SERVICE_SPEC_BASELINE_REF` optionally
+compares against an old-workflow Git revision. `SERVICE_SPEC_FIXTURE_DIR` exports
+synthetic payloads; use the same directory for the private caller tests and the
+Rust contract test to validate all seven service requests.
