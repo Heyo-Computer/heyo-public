@@ -97,6 +97,8 @@ pub struct ServiceDeployRequest {
     pub health_path: String,
     #[serde(default = "default_health_timeout_seconds")]
     pub health_timeout_seconds: u64,
+    #[serde(default = "default_health_probe_timeout_seconds")]
+    pub health_probe_timeout_seconds: u64,
     /// Desired healthy endpoint count. Omitting this field preserves the
     /// legacy single-candidate deploy behavior; setting it enables convergent
     /// rolling replacement.
@@ -319,11 +321,16 @@ pub async fn finalize_service_archive(
 pub async fn deploy_service(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(mut request): Json<ServiceDeployRequest>,
+    Json(spec): Json<super::service_spec::ServiceSpecRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if let Err(status) = auth::require_internal_api_key(&headers, &state.config.internal_api_key) {
         return (status, Json(json!({ "error": "Unauthorized" })));
     }
+
+    let mut request = match spec.into_internal() {
+        Ok(request) => request,
+        Err(message) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))),
+    };
 
     if let Err((status, message)) = validate_service_deployment_request(&state, &request).await {
         return (status, Json(json!({ "error": message })));
@@ -1635,6 +1642,7 @@ async fn deploy_service_candidate(
             &service_id,
             &deployment_id,
             &request.health_path,
+            request.health_probe_timeout_seconds,
             health_deadline,
         )
         .await?;
@@ -3309,6 +3317,7 @@ async fn wait_for_candidate_health(
     service_id: &str,
     deployment_id: &str,
     health_path: &str,
+    probe_timeout_seconds: u64,
     deadline: tokio::time::Instant,
 ) -> Result<(String, String, String)> {
     let mut backend_urls = Vec::new();
@@ -3380,7 +3389,7 @@ async fn wait_for_candidate_health(
                 .http_client
                 .get(&health_url)
                 .header(reqwest::header::ACCEPT, "application/json")
-                .timeout(Duration::from_secs(SERVICE_HEALTH_REQUEST_TIMEOUT_SECONDS));
+                .timeout(Duration::from_secs(probe_timeout_seconds));
 
             match request.send().await {
                 Ok(response) => {
@@ -4309,6 +4318,10 @@ fn default_image() -> String {
 
 fn default_size_class() -> String {
     "small".to_string()
+}
+
+fn default_health_probe_timeout_seconds() -> u64 {
+    SERVICE_HEALTH_REQUEST_TIMEOUT_SECONDS
 }
 
 fn default_health_path() -> String {

@@ -123,7 +123,65 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 - `POST /orchestration/resources/deployments` — request a sandbox; reconciler converges it.
 - `POST /orchestration/resources/deployments/{id}/exec` — run a command inside.
 - `POST /orchestration/services/archives/presign` (and `/finalize`) — authenticated direct upload for large Heyo-managed service archives; pass the finalized `archiveId` to the service deployment request.
-- `POST /orchestration/services/deployments` — deploy a Heyo-managed service; resolves `envRefs` against HeyoSecret. Set `desiredReplicas` (1–16), optionally `replicaRegions`, and a Cloud `placementPool` for an allowlisted discovery-routed service to converge a revision with health-gated, one-at-a-time rolling replacement. Without them, the legacy direct-route single-candidate behavior is preserved.
+- `POST /orchestration/services/deployments` — deploy a Heyo-managed service using the snake_case app-lb-style service format described below. **Breaking change:** old flat camelCase requests are rejected, not converted or accepted through aliases.
 - `GET  /orchestration/services/{service_id}/discovery` — authenticated, versioned endpoint membership for app-lb, including each endpoint's region when known. Rolling deploys publish and health-gate one candidate, drain one old replica, and repeat. A failed candidate leaves the remaining healthy set serving. `retirePrevious=false` only adds capacity up to `desiredReplicas`.
 - `POST /internal/deployments/lifecycle` — callback from the backend reporting deploy state transitions.
 - `POST /orchestration/approvals/{approval_id}/decide` — gate an in-flight workflow.
+
+### Service deployment files
+
+This receiver introduces the JSON contract below. The subsequent caller migration
+adds `.heyo/services` files and a workflow that loads a file, fills in the build
+artifact, target host/region and revision, then submits it. This receiver-only
+change deliberately leaves the deployment workflow unchanged for self-upgrade.
+Application environment variables remain application settings; there is no change
+to Orchestrator's own process-config loader.
+
+The request has `{ id, user_id, account_id?, vm, routes?, health?, scaling?, deploy }`.
+It uses app-lb's field names with an Orchestrator-only `deploy` operation section.
+It is a supported subset, not a promise that every app-lb lifecycle feature works
+through Orchestrator. Unknown fields and unsupported features fail explicitly.
+
+| Section | Supported behavior |
+| --- | --- |
+| `vm` | Required `driver`, `image`, primary `port`; optional `open_ports`, `start_command`, `working_directory`, `setup_hooks`, `size_class` (default `small`), `ttl_seconds`, `env_vars`, `env_from` |
+| `vm.env_from` | `{ "secret": "orchestrator", "key": "database-url", "as": "DATABASE_URL" }` resolves active HeyoSecret path `orchestrator/database-url`. Default key is `token`, default environment name is uppercased key. Secrets override matching `env_vars` literals, as in app-lb. Explicit namespaces and duplicate secret target names are rejected. No secret values in the file. |
+| `routes` | Zero or one exact `host` with optional `path_prefix` and `strip_prefix` (default false). Existing Traefik renderer cannot represent wildcard/hostless/multiple routes, so these are rejected. |
+| `health` | HTTP `path` (default `/`), same port as the VM, positive `timeout_secs` (default 2) for each candidate probe. Templates specify 5 to preserve existing deployments. TCP and a different health port are unsupported. |
+| `scaling` | Fixed `min_replicas == max_replicas`, 1–16. Omit for direct single-candidate execution. Dynamic autoscaling options are rejected, not silently ignored. |
+| `deploy` | Operation metadata: `deployment_id`, `name`, `async`, `archive_id` / `archive_bytes_base64`, `archive_name`, `region` (default `local`), `placement_pool`, `replica_regions`, overall `health_timeout_seconds` (default 180), retirement flags, `drain_seconds` (default 10), `metadata`, `revision_guard` |
+| `deploy.ingress` | Traefik-specific `entry_points`, `cert_resolver`, `priority`, `pass_host_header`, `backend_url`; requires a route |
+| `deploy.host_mounts` | Existing host bindings `{ host_path, sandbox_path, read_only }`, with absolute, traversal-free paths. CICD's persistent run directory uses this. These are not app-lb's artifact-backed `vm.mounts`, which remain unsupported. |
+
+`deploy.revision_guard` uses `repository_url`, `ref`, `expected_sha`, and optional
+`force`. `deploy.retire_previous` defaults to true; `retire_previous_async` and
+`delete_previous` default to false. Secrets continue to resolve through HeyoSecret;
+Cloud's internal VM allocation protocol and deployment response/status formats are
+unchanged. `health.timeout_secs` is not the overall rollout deadline and does not
+change the separate post-cutover route health check.
+
+### Breaking-change rollout
+
+Both public and private service-deployment workflows must move with this interface.
+The public workflow covers HeyoSecret, Orchestrator, app-lb and app-obs; the private
+companion covers Cloud, CICD and Retail. No dual-format server is provided.
+
+1. Submit the receiver-only change first. Its unchanged workflow sends the old
+   request to the running old receiver, which deploys the new Orchestrator binary.
+   Only `orchestrator/` changes, so the workflow selects only Orchestrator. The
+   resource allocation API used by CICD and deployment status responses are unchanged.
+2. Wait for that deployment to finish and the public Orchestrator health endpoint
+   to report the new revision. Do not run unrelated service deployments during
+   this transition: old callers cannot deploy to the new receiver.
+3. Submit the public caller migration, then the private caller migration. Both
+   require the new receiver. Do not resubmit the receiver-only revision after
+   cutover; further Orchestrator deployments must use the migrated caller.
+
+This is a coordinated breaking cutover, not a dual-format compatibility period.
+If the first deployment fails before cutover, diagnose it while the old receiver
+still serves; do not advance the callers. After cutover, use the new callers.
+No deployment or infrastructure change is performed by preparing these PRs.
+
+Receiver validation: `cargo test --locked --manifest-path orchestrator/Cargo.toml`.
+The caller migration supplies offline workflow tests and synthetic payloads for
+the optional `SERVICE_SPEC_FIXTURE_DIR` Rust contract test.
