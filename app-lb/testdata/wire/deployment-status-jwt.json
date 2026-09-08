@@ -73,7 +73,10 @@
         "example.com"
       ],
       "public_paths": [
-        "/healthz"
+        {
+          "path": "/healthz",
+          "scope": "admin"
+        }
       ],
       "base_path": "/__applb/auth",
       "session_ttl_secs": 43200,

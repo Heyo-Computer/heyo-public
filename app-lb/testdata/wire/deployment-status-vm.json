@@ -86,8 +86,16 @@
         "someone@other.example"
       ],
       "public_paths": [
-        "/healthz"
+        {
+          "path": "/healthz",
+          "scope": "public"
+        },
+        {
+          "path": "/api/",
+          "scope": "view"
+        }
       ],
+      "session_scope": "admin",
       "base_path": "/__applb/auth",
       "session_ttl_secs": 43200,
       "cookie_name": "applb_session",

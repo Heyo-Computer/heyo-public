@@ -701,6 +701,21 @@ impl ProxyHttp for LbProxy {
             upstream.remove_header(name);
         }
 
+        // The session's own credential, when the gate minted one. Separate from
+        // `forward_identity`, and deliberately: that switch says whether the
+        // upstream is told *who* this is, while this says whether it is handed
+        // something it can verify. An API that authenticates for itself needs
+        // the second and may not care about the first.
+        //
+        // Replaces whatever the client sent rather than deferring to it. By the
+        // time a session admits a request, `decide` has already tried and
+        // rejected any bearer in the hand — so anything still in the header is
+        // a credential app-lb declined, and forwarding that instead would be
+        // handing the upstream a rejected one.
+        if let Some(token) = ctx.identity.as_ref().and_then(|i| i.session_token.as_deref()) {
+            upstream.insert_header(http::header::AUTHORIZATION, format!("Bearer {token}"))?;
+        }
+
         if let (true, Some(identity)) = (gate.forward_identity, ctx.identity.as_ref()) {
             upstream.insert_header("x-auth-request-user", crate::auth::header_safe(&identity.subject))?;
             // Omitted rather than sent empty. A Google identity always has an

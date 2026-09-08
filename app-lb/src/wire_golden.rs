@@ -179,7 +179,19 @@ fn vm_spec() -> DeploymentSpec {
             }),
             allowed_domains: vec!["example.com".into()],
             allowed_emails: vec!["someone@other.example".into()],
-            public_paths: vec!["/healthz".into()],
+            // Set here because this fixture is where a client author learns the
+            // field exists; most gates leave it unset and mint nothing.
+            session_scope: Some(crate::tokens::AdminScope::Admin),
+            // Both spellings, because the golden is where a client author
+            // learns the shape: one path genuinely open, one outside the
+            // sign-in gate but still requiring a scope.
+            public_paths: vec![
+                crate::config::PublicPath::public("/healthz"),
+                crate::config::PublicPath {
+                    path: "/api/".into(),
+                    scope: crate::config::PathScope::View,
+                },
+            ],
             base_path: "/__applb/auth".into(),
             session_ttl_secs: 43200,
             cookie_name: "applb_session".into(),
@@ -310,6 +322,7 @@ fn jwt_spec() -> DeploymentSpec {
         }),
         allowed_domains: vec!["example.com".into()],
         allowed_emails: vec![],
+        session_scope: None,
         public_paths: vec!["/healthz".into()],
         base_path: "/__applb/auth".into(),
         session_ttl_secs: 43200,
