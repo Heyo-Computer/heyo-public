@@ -1,0 +1,6 @@
+{
+  "stage.heyo.computer": {
+    "ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES": "heyosecret,orchestrator",
+    "HEYO_SERVICE_REPLICAS": "heyosecret=1,orchestrator=1"
+  }
+}

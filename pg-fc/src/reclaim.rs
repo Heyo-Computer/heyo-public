@@ -128,6 +128,19 @@ const RECLAIM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// guard skips it and the periodic run catches it later.
 pub const POST_STOP_RECLAIM_DELAY: Duration = Duration::from_secs(30);
 
+/// Minimum quiet time between one triggered run ending and the next starting.
+///
+/// The post-stop trigger fires after every reaper pass that stopped anything,
+/// and the reaper now stops VMs far more often than it used to (a short idle
+/// timeout for cheap-to-restart VMs, plus a backlog re-arm). Without a floor
+/// those triggers chain: each pass ends, 30s later the next reap's trigger
+/// starts another, and the host runs `e2fsck` over the whole stopped fleet
+/// continuously — burning the I/O the clients need and, worse, keeping
+/// `pass_running()` true, which is what stands the offload pacer down. Slack
+/// is worth having back promptly, not constantly; the periodic run is still
+/// the backstop, and disk pressure has its own path that ignores all of this.
+pub const RECLAIM_TRIGGER_COOLDOWN: Duration = Duration::from_secs(300);
+
 /// Delay before the first periodic run after startup — long enough to let the
 /// pooler finish coming up and restore any warm VMs, short enough that frequent
 /// redeploys can't starve reclamation (see `registry::supervise`).
@@ -365,6 +378,57 @@ pub async fn boot_permit(sandbox_id: &str) -> BootPermit {
     }
 }
 
+/// The same exclusion, taken **without ever waiting and without asking a pass
+/// to yield**. `None` means a reclaim pass owns this disk (per-disk mode) or is
+/// running at all (the gate fallback) and the caller must leave it alone.
+///
+/// This is the variant for *background* disk work — the offload ladder's
+/// compact and image-archive jobs, which `e2fsck -E discard` and read a stopped
+/// VM's `data.ext4` exactly like the script does. They need the same exclusion
+/// a boot needs, but they must take it on the opposite terms: a boot has a
+/// client behind it and is entitled to preempt a pass, while an offload job has
+/// nobody waiting and would be trading the pass's whole progress for work that
+/// can just as well happen on the next scan. So it never registers in
+/// [`BOOTS_WAITING`] and never polls — it either has the disk or moves on.
+///
+/// It is what lets the offload pacer keep running *during* a reclaim pass
+/// instead of standing down host-wide for up to [`RECLAIM_TIMEOUT`]: the
+/// collision is settled per disk, at the disk, by whoever gets there first.
+/// It also closes a race the fd scans on either side never quite did — both
+/// can read "nobody has it open" in the same instant and then both open it —
+/// so this is worth taking even where the pacer would have deferred anyway.
+///
+/// One asymmetry in the **gate fallback** (an old script that does not honour
+/// per-disk locks): the read guard this hands back holds off the *next* reclaim
+/// pass for as long as the caller keeps it, which for a large disk's fsck +
+/// compress is minutes. VM boots are unaffected — they take the read side too.
+/// The lock is fair, so a queued pass makes subsequent calls here return `None`
+/// rather than queueing behind it, and no pass can be starved.
+pub fn try_disk_permit(sandbox_id: &str) -> Option<BootPermit> {
+    if per_disk_locks()
+        && let Some(path) = lock_path(sandbox_id)
+    {
+        match open_lock(&path).and_then(|f| Ok((try_flock(&f)?, f))) {
+            Ok((true, f)) => return Some(BootPermit::Disk { _lock: f }),
+            Ok((false, _)) => return None,
+            // Never touch the disk unprotected: an unusable lock file means we
+            // cannot tell what the script is doing. Fall through to the gate,
+            // which needs nothing from the filesystem.
+            Err(e) => warn!(
+                "disk reclaim: per-disk lock {} unusable ({e}) — falling back to the global \
+                 boot gate for {sandbox_id}",
+                path.display()
+            ),
+        }
+    }
+    // `try_read` also fails while a pass is merely QUEUED on the fair lock,
+    // which is the answer we want: that pass is about to start.
+    BOOT_GATE
+        .try_read()
+        .ok()
+        .map(|gate| BootPermit::Gate { _gate: gate })
+}
+
 /// [`boot_permit`] that gives up after `limit` instead of waiting indefinitely.
 /// `None` means the permit was NOT taken and the caller must not boot — for
 /// background work that would rather retry on its next pass than block it (see
@@ -482,6 +546,8 @@ pub struct Reclaimer {
     /// impossible anyway.
     marker: Option<PathBuf>,
     running: AtomicBool,
+    /// When the last run ended, for [`Self::spawn_soon`]'s cooldown.
+    last_end: std::sync::Mutex<Option<Instant>>,
 }
 
 impl Reclaimer {
@@ -491,6 +557,7 @@ impl Reclaimer {
             stop_file: run_dir.as_ref().map(|d| d.join(STOP_FILE)),
             marker: run_dir.map(|d| d.join(LOCK_DIR).join(LOCK_MARKER)),
             running: AtomicBool::new(false),
+            last_end: std::sync::Mutex::new(None),
         }
     }
 
@@ -538,7 +605,7 @@ impl Reclaimer {
             info!("disk reclaim: a run is already in progress; skipping");
             return 0;
         }
-        let _guard = RunningGuard(&self.running);
+        let _guard = RunningGuard(&self.running, &self.last_end);
 
         // Exclusive with VM boots for the whole run — see BOOT_GATE. In
         // per-disk mode nothing takes the read side, so this is uncontended;
@@ -705,6 +772,20 @@ impl Reclaimer {
         if self.running.load(Ordering::SeqCst) {
             return;
         }
+        // Rate-limit the trigger, not just the run — see
+        // [`RECLAIM_TRIGGER_COOLDOWN`]. Checked here rather than after the
+        // sleep so a burst of reaper passes costs one spawned task, not one
+        // per pass all waking to find each other.
+        if let Some(end) = *self.last_end.lock().unwrap()
+            && end.elapsed() < RECLAIM_TRIGGER_COOLDOWN
+        {
+            debug!(
+                "disk reclaim: a pass finished {:?} ago; leaving the freshly stopped disks \
+                 to the next trigger (cooldown {RECLAIM_TRIGGER_COOLDOWN:?})",
+                end.elapsed()
+            );
+            return;
+        }
         let this = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
@@ -730,10 +811,14 @@ impl Reclaimer {
 
 /// Clears the single-flight flag on drop, so an early return (timeout, launch
 /// failure) or panic can't leave the reclaimer permanently "running".
-struct RunningGuard<'a>(&'a AtomicBool);
+struct RunningGuard<'a>(&'a AtomicBool, &'a std::sync::Mutex<Option<Instant>>);
 
 impl Drop for RunningGuard<'_> {
     fn drop(&mut self) {
+        // Stamp the end BEFORE clearing the flag, so a `spawn_soon` that sees
+        // `running == false` always sees a fresh `last_end` with it and can
+        // never slip a triggered run into the cooldown it just earned.
+        *self.1.lock().unwrap() = Some(Instant::now());
         self.0.store(false, Ordering::SeqCst);
     }
 }
@@ -775,6 +860,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The offload ladder's disk jobs (compact, image-archive) need the same
+    /// exclusion a boot needs — they `e2fsck -E discard` the same file — but
+    /// must take it on opposite terms. A boot has a client behind it and is
+    /// entitled to make a pass yield; an offload job has nobody waiting, so
+    /// asking a pass to give up its progress for it is a bad trade. It looks,
+    /// and moves on.
+    #[tokio::test]
+    async fn try_disk_permit_never_waits_and_never_preempts() {
+        let _serial = serial().await;
+        use_gate_mode();
+
+        // Nothing running: it hands out the exclusion like any boot would.
+        assert!(try_disk_permit("sb-free").is_some());
+        assert!(!boots_waiting());
+
+        // A pass holds the gate. The answer is "no", returned immediately
+        // rather than waited for...
+        let pass = BOOT_GATE.write().await;
+        assert!(try_disk_permit("sb-busy").is_none());
+        // ...and — the whole point — it left no yield request behind, so the
+        // pass runs on undisturbed. `boot_permit` would have raised one here.
+        assert!(!boots_waiting(), "a background job must never preempt a pass");
+        drop(pass);
+
+        assert!(try_disk_permit("sb-after").is_some());
+    }
+
+    /// The post-stop trigger fires after every reaper pass that stopped
+    /// anything, and the reaper stops VMs far more often than it used to. Left
+    /// unbounded those triggers chain into a continuously-running `e2fsck`
+    /// sweep — which both burns the clients' I/O and keeps `pass_running()`
+    /// true, standing the offload pacer down for as long as it lasts.
+    #[tokio::test]
+    async fn the_post_stop_trigger_is_rate_limited_but_the_operator_is_not() {
+        let _serial = serial().await;
+        use_gate_mode();
+        let dir = scratch("cooldown");
+        let log = dir.join("runs");
+        let r = Arc::new(Reclaimer::new(
+            format!("echo run >> {}", log.display()),
+            Some(dir.clone()),
+        ));
+        let runs = || {
+            std::fs::read_to_string(&log)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+
+        r.run_once().await;
+        assert_eq!(runs(), 1);
+
+        // The reaper stops more VMs and triggers again right away. Inside the
+        // cooldown that trigger is dropped — the periodic run is the backstop.
+        r.spawn_soon(Duration::ZERO);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(runs(), 1, "a triggered run inside the cooldown must not start");
+
+        // An operator asking for the disk back now is never rate-limited.
+        r.spawn_now().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while runs() < 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(runs(), 2, "the dashboard's reclaim-now bypasses the cooldown");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -176,7 +176,9 @@ Config via env (all optional):
 | `PG_VM_POOL_DAEMON_URL` | `http://127.0.0.1:34099` | base URL of the heyvmd daemon every VM operation addresses. Read once at first use. Set it when the daemon listens on a non-default port; the cold-start load harness (`src/loadtest.rs`) also uses it to aim the pooler at an in-process daemon stub |
 | `PG_VM_POOL_SIZE_CLASS` | `micro` | VM resource tier for every schema's VM: `micro` (0.25 CPU, 512MB), `mini` (0.5 CPU, 1GB), `small` (1 CPU, 2GB), `medium` (2 CPU, 4GB), `large` (4 CPU, 8GB) |
 | `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
-| `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables. The effective timeout is jittered ±15% per schema and at most 24 VMs stop per reaper pass (oldest-idle first) — so a cohort of VMs that went idle together drains as a slope, not a cliff, instead of mass-stopping into a reclaim pass + synchronized cold-start storm |
+| `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables. Applies to VMs that were *expensive* to bring up — see `PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS` for the rest. The effective timeout is jittered ±15% per schema and at most 24 VMs stop per reaper pass (oldest-idle first), 8 at a time — so a cohort of VMs that went idle together drains as a slope, not a cliff, instead of mass-stopping into a reclaim pass + synchronized cold-start storm. A pass that hits the cap with victims left re-arms in 10s rather than waiting out the tick, so the cap smooths the drain without capping its rate |
+| `PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS` | `60` | the *short* idle timeout, applied to a VM the pooler measured as cheap to bring back (see below); `0` disables the two-speed reaper. Clamped to `PG_VM_POOL_IDLE_TIMEOUT_SECS` — it can only pull a stop earlier, never push it out — see "Two-speed idle reaping" |
+| `PG_VM_POOL_FAST_BRINGUP_SECS` | `5` | how fast a bring-up must have been for its VM to be reaped on the short timeout. Measured per entry, not assumed from whether the VM already existed, so a loaded host where restarts have gone slow falls back to the long timeout on its own |
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
 | `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
@@ -201,7 +203,7 @@ Config via env (all optional):
 | `PG_VM_POOL_ARCHIVE_SWEEP_SECS` | `3600` | how long the offload pacer waits before re-scanning **after a scan that found nothing** (clamped to 5–60s). It no longer paces the work itself — see "Offload pacer" |
 | `PG_VM_POOL_OFFLOAD_WORKERS` | `1` | how many offload jobs the pacer may run concurrently (1–16). `1` keeps the classic one-schema-at-a-time pacing; higher values let no-boot jobs (compact/promote) overlap on a backlogged host. At most ONE in-flight job may boot a VM regardless, and jobs beyond the first are dispatched only under `PG_VM_POOL_OFFLOAD_LOAD_MAX` — see "Offload pacer" |
 | `PG_VM_POOL_OFFLOAD_LOAD_MAX` | `0.75` | normalized host load (1-min loadavg / cores; on Linux this includes tasks blocked on disk I/O) at or above which the pacer stops adding jobs beyond the first — aggressive with headroom, single file without |
-| `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` | `300` | how long queued client bring-ups may hold the pacer off before it dispatches anyway — single-file, no-boot kinds only. Bounds the sawtooth on a host whose bring-up queue is never empty; `0` yields to clients indefinitely — see "Offload pacer" |
+| `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` | `300` | how long queued client bring-ups **or a running reclaim pass** may hold the pacer off before it dispatches anyway — single-file, no-boot kinds only. Bounds the sawtooth on a host whose bring-up queue is never empty and whose reaper keeps re-triggering reclaim; `0` yields indefinitely — see "Offload pacer" |
 | `PG_VM_POOL_S3_BUCKET` | unset | S3 bucket for dumps (required when eviction is on) |
 | `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the object per schema is `{prefix}{schema}.dump` |
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
@@ -218,7 +220,7 @@ Config via env (all optional):
 | `PG_VM_POOL_PRESSURE_HIGH_PCT` / `PG_VM_POOL_PRESSURE_LOW_PCT` | `85` / `75` | start emergency-archiving oldest-idle schemas at/above high; stop below low |
 | `PG_VM_POOL_PRESSURE_CHECK_SECS` | `60` | how often the pressure watchdog reads disk usage |
 | `PG_VM_POOL_RECLAIM_CMD` | unset (off) | shell command that offline-trims stopped VMs' disks (normally `sudo -n .../reclaim-disks.sh <run-dir>`); setting it enables automatic disk reclamation — see "Reclaiming disk slack" |
-| `PG_VM_POOL_RECLAIM_INTERVAL_SECS` | `3600` | how often the periodic reclaim run fires (extra runs also fire right after idle reaps) |
+| `PG_VM_POOL_RECLAIM_INTERVAL_SECS` | `3600` | how often the periodic reclaim run fires. Extra runs fire 30s after an idle reap that stopped anything, but at most one per 5 minutes: the reaper stops VMs often enough that an unthrottled trigger would keep `e2fsck` running continuously — burning client I/O and, because a running pass defers the offload pacer, starving the ladder. The dashboard's "reclaim now" is never throttled |
 | `PG_VM_POOL_RUN_DIR` | falls back to `PG_VM_POOL_PRESSURE_PATH` | the heyvmd run dir (holds each VM's `sb-<id>/`). Used to verify a killed VM's disk directory is actually gone after archive/freeze, and to locate orphaned directories for the sweep below. When a kill leaves the directory behind (stranding the disk) the pooler logs it loudly instead of reporting "disk reclaimed". Unset ⇒ that removal is left unverified and the orphan sweep is disabled |
 | `PG_VM_POOL_ORPHAN_SWEEP_SECS` | unset (off) | how often to sweep the run dir for **orphaned** disk directories — an `sb-<id>/` heyvmd has forgotten (a kill it acked but didn't act on). Requires `PG_VM_POOL_RUN_DIR`. Deletes only directories the daemon confirms gone (per-id 404) that are also not held open and belong to an offloaded/unreferenced schema; a `live` schema whose VM vanished is logged as a data-loss orphan and never deleted. When a pass hits its per-pass cap (100 deletions) with a backlog remaining, it re-arms after ~20s instead of waiting the whole interval — but only while no client bring-up is queued — so a large backlog drains in minutes without ever growing the per-pass blast radius — see "Reclaiming disk slack" |
 
@@ -252,6 +254,44 @@ lower latency, faster bring-up. It falls back to a tunnel automatically if the
 daemon reports no `guest_ip`. Set `PG_VM_POOL_DIRECT_CONNECT=0` to force the
 tunnel path (e.g. if the pooler ever runs on a different machine than the VMs).
 
+### Two-speed idle reaping
+
+The idle timeout is a bet on the *next* bring-up: keeping a VM warm buys the
+next client whatever bringing it back would have cost. Those costs are not
+remotely alike. A schema whose VM still exists on disk comes back with a daemon
+`start()` and a Postgres restart — a fraction of a second on a healthy host —
+while a schema being built from scratch pays create + boot + `initdb`, tens of
+seconds. One timeout for both prices the cheap case like the expensive one, and
+the fleet fills up with running VMs nobody is using: RAM held, and disks neither
+the reclaim pass nor the offload ladder can touch, because both need the VM
+stopped.
+
+So the reaper runs two timeouts. Every entry records what its own bring-up
+actually cost — everything after the admission queue, which measures how many
+other clients arrived at once rather than anything about this VM — and is
+reaped on `PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS` (default 60) if that was at or
+under `PG_VM_POOL_FAST_BRINGUP_SECS` (default 5), on the full
+`PG_VM_POOL_IDLE_TIMEOUT_SECS` otherwise. In practice a schema's first connect
+creates its VM and earns the long hold; every reconnect after that is a restart
+and gets the short one.
+
+**Why measured rather than "was this VM already on disk".** The number that
+matters is what the host can do *right now*. When heyvmd is saturated, a
+restart that is normally 200ms takes seconds — and that is exactly the moment a
+short timeout does damage, feeding stop/start work to a daemon already behind.
+Bring-ups that slow down fail the threshold on their own, so the reaper eases
+off under load with no load signal to calibrate and no extra knob. Set
+`PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS=0` for the old single-timeout behavior.
+
+The reaper is paced off the shortest budget in play, stops up to 8 VMs
+concurrently (a stop is almost all waiting — a guest `df`, a `CHECKPOINT`, the
+daemon's stop — so serially a full pass cost the sum of every victim's worst
+case and ran longer than the tick that scheduled it), and bounds each stop at
+30s so one wedged VM cannot park the pass. A pass that hits its 24-VM cap with
+victims still queued re-arms in 10s instead of waiting a full tick: the cap is
+there to turn a mass expiry into a slope, not to put a ceiling of 24 stops per
+tick on how fast the fleet can drain.
+
 ### Offload pacer
 
 The three offload tiers below (compact, freeze, S3) don't have three timers.
@@ -275,27 +315,40 @@ Before dispatching every job it checks, and defers while any of these hold
 (in-flight jobs always run to completion — deferral only pauses NEW work):
 
 - a client bring-up is queued (waiting for an admission or bring-up slot);
-- a disk-reclaim pass is running (an offload boots VMs, and may collide with
-  the disk the pass is on and make it yield — losing its progress for work
-  nobody is waiting on);
+- a disk-reclaim pass is running (an offload may want the disk the pass is on
+  and make it yield — losing its progress for work nobody is waiting on);
 - all `PG_VM_POOL_OFFLOAD_WORKERS` slots are taken.
+
+Deferring on a reclaim pass is a *progress* choice, not a safety one. The
+compact and image-archive jobs `e2fsck -E discard` and read a stopped VM's
+`data.ext4` exactly as the script does, so they take the same per-disk
+exclusion a VM boot takes — but non-preemptively: they look, and if the pass
+holds that disk they skip the schema and pick it up on a later scan. A boot has
+a client behind it and is entitled to make a pass yield; an offload job has
+nobody waiting and is not.
 
 **One bound on the yielding.** "Wait for quiet" is not the same promise as
 "eventually run", and on a busy host the difference shows up as a sawtooth:
 once enough schemas are offloaded every cold connect is a thaw, the bring-up
 queue is never empty for a whole tick, and the pacer dispatches *nothing* for
 hours while the disk climbs toward the pressure high-water mark — then the
-whole backlog drains in one burst the moment the host finally goes quiet. So
-after `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` (default 300) of *continuous*
-client backpressure the pacer dispatches anyway: one job at a time, no-boot
-kinds only (compact / image-archive / promote — those take no bring-up slot,
-so nothing a client is queued for moves behind them), and it keeps trickling
-for as long as the host stays busy. Only the client gate is overridable this
-way; a reclaim pass or a running sweep is a conflict over the same disks, not
-politeness. Set it to `0` to restore the strict yield-to-every-client
-behavior. Forced dispatches log at `info` with how long the pacer had been
-held off — the deferral itself only logs at `debug`, which is what made this
-starvation invisible.
+whole backlog drains in one burst the moment the host finally goes quiet. A
+reclaim pass does the same thing and does it harder: a pass may run for up to
+half an hour and another is triggered after every idle reap, so on a churning
+host "later" is very nearly never.
+
+So after `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` (default 300) of *continuous*
+backpressure — client or reclaim, counted on one clock, because they alternate
+and a clock that reset on the changeover would never reach the limit at all —
+the pacer dispatches anyway: one job at a time, no-boot kinds only (compact /
+image-archive / promote — those take no bring-up slot, so nothing a client is
+queued for moves behind them), and it keeps trickling for as long as the host
+stays busy. A running **sweep** is the one deferral no holdoff overrides: it
+drains through this same picker and already holds per-schema claims, so forcing
+past it would only double-dispatch. Set the var to `0` to restore the strict
+yield-to-everything behavior. Forced dispatches log at `info` with how long the
+pacer had been held off and by what — the deferral itself only logs at `debug`,
+which is what made this starvation invisible.
 
 With workers > 1, three brakes keep the extra concurrency from outbidding
 clients: every job **beyond the first** is dispatched only while normalized
@@ -612,10 +665,15 @@ reclaim path, so the pooler automates it.
 **Automatic reclamation:** set `PG_VM_POOL_RECLAIM_CMD` and the pooler runs it
 itself — every `PG_VM_POOL_RECLAIM_INTERVAL_SECS` (default hourly), **plus a run
 ~30 s after the idle reaper stops VMs**, so a just-reaped VM's slack returns
-within a minute instead of waiting for a human or the next interval. Runs are
-single-flighted and time-bounded (30 min), the output summary lands in the
-pooler log, and the dashboard's monitoring page gets a **"reclaim disk slack
-now"** button. The command needs root for loop-setup/mount, so a non-root pooler
+within a minute instead of waiting for a human or the next interval. That
+trigger is rate-limited to one run per 5 minutes: with two-speed reaping the
+reaper stops VMs often, and unthrottled the triggers chain into an `e2fsck`
+sweep that never stops — which costs the clients I/O and, because a running pass
+defers the offload pacer, starves the ladder that frees far more disk than a
+trim does. The periodic run is the backstop, and the dashboard button is never
+throttled. Runs are single-flighted and time-bounded (30 min), the output
+summary lands in the pooler log, and the dashboard's monitoring page gets a
+**"reclaim disk slack now"** button. The command needs root for loop-setup/mount, so a non-root pooler
 invokes the script through a `NOPASSWD` sudoers entry:
 
 ```
@@ -1202,7 +1260,9 @@ What it gives you (browse to the listen address):
   runs alongside heyvmd), each shown as a color-banded meter. Below that,
   pooler-fleet aggregates (running VMs, warm/queueing, live sessions, allocated
   vCPU/RAM, guest CPU) rolled up from the same inventory the overview uses —
-  still no guest access. This page also configures **webhook alerts** (below).
+  still no guest access. Then per-hour activity charts, and beside the "VMs
+  created" chart the **create-latency percentiles** (below). This page also
+  configures **webhook alerts** (below).
 - **Detail page** — full daemon config (size class + resources, image, region,
   guest IP, TTL, status) plus live **database size and backend count**, read
   over the pooler's own warm Postgres connection (a normal query, not a guest
@@ -1236,6 +1296,40 @@ prefer a loopback/private `PG_VM_POOL_DASHBOARD_LISTEN`; binding it to a
 non-loopback address without Basic auth logs a startup warning. The two log
 paths default to the supervisord locations above and are overridable with
 `PG_VM_POOL_POOLER_LOG` / `PG_VM_POOL_HEYVMD_LOG`.
+
+#### VM create latency (p50 / p95 / p99)
+
+Next to the "VMs created" chart the monitoring page reports how long a create
+actually took over the same trailing 24 hours: p50, p95, p99, the slowest
+sample, and — as prominently — how many creates those came from. Sample count
+is part of the reading, not a footnote: a p99 over four creates is the slowest
+of four creates, and the tile says "too few samples" below the threshold where
+nearest-rank can separate that percentile from the maximum (20 samples for p95,
+100 for p99).
+
+What is measured is the daemon accepting the deploy through the VM reporting
+ready. Two deliberate exclusions:
+
+- **The wait for a bring-up slot.** That measures how many creates are already
+  in flight (`PG_VM_POOL_MAX_CONCURRENT_BRINGUPS`), so folding it in would make
+  the percentiles a function of concurrency rather than of how fast heyvmd
+  builds a VM. Queue depth already has its own tile ("bring-ups queued").
+- **Failed creates.** A create that times out is bounded by
+  `PG_VM_POOL_READY_TIMEOUT_SECS`, not by the daemon's speed, so counting it
+  would drag every percentile toward that ceiling and hide what a working
+  create costs. Successes only, paired 1:1 with the chart above.
+
+Percentiles are **nearest-rank**, so every figure shown is a create that
+actually happened rather than an interpolated value no create ever took.
+
+Samples land in `timings-YYYY-MM-DD.tsv` under the metrics dir — a third
+partitioned series alongside `events-*.tsv` and `journal-*.tsv`, same daily
+rotation and same retention — and are reloaded at startup, so the percentiles
+survive a pooler restart. They are kept in their own files rather than as an
+extra column on the event lines so the event format is unchanged: roll back to
+an older binary and it still reads its charts, simply ignoring the timing
+files. The same numbers are also in the pooler log, one line per create
+(`created VM pg-<schema> in …`).
 
 #### Webhook alerts
 

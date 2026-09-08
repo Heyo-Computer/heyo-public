@@ -220,6 +220,12 @@ pub async fn archive_disk(
         .await
         .with_context(|| format!("schema {schema}: no data disk at {}", disk.display()))?;
 
+    // Exclusive with the reclaim script for as long as this reads the disk —
+    // both sides `e2fsck -E discard` it, and two of those on one filesystem is
+    // corruption. Non-preempting: a pass already on this disk keeps it, and
+    // the schema comes back around on the next scan.
+    let disk_lock = reclaim_lock(schema, sandbox_id, "archive")?;
+
     wait_disk_released(&disk).await?;
 
     let pg_version = pg_version_of(&disk).await;
@@ -256,7 +262,7 @@ pub async fn archive_disk(
     }
 
     let spool = img_cfg.spool_dir.join(format!("{schema}.img.zst"));
-    let res = archive_via_spool(s3, schema, &disk, &spool).await;
+    let res = archive_via_spool(s3, schema, &disk, &spool, Some(disk_lock)).await;
     // The spool file is scratch either way; a failed upload's remnant would
     // only mislead the next attempt's free-space math.
     let _ = tokio::fs::remove_file(&spool).await;
@@ -283,6 +289,9 @@ pub async fn compact_disk(
     let md = tokio::fs::metadata(&disk)
         .await
         .with_context(|| format!("schema {schema}: no data disk at {}", disk.display()))?;
+
+    // See `archive_disk`: same disk, same `e2fsck -E discard`, same exclusion.
+    let disk_lock = reclaim_lock(schema, sandbox_id, "compact")?;
 
     wait_disk_released(&disk).await?;
 
@@ -313,23 +322,55 @@ pub async fn compact_disk(
 
     let dest = compact.compact_path(schema);
     let tmp = compact.compact_dir.join(format!("{schema}.img.zst.tmp"));
-    let res = compact_via_tmp(schema, &disk, &tmp, &dest).await;
+    let res = compact_via_tmp(schema, &disk, &tmp, &dest, Some(disk_lock)).await;
     if res.is_err() {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     res
 }
 
+/// Take the reclaim exclusion for a stopped VM's disk, or fail this offload
+/// with a message that says why. `what` names the caller for the error.
+///
+/// An `Err` here is not a defect — it is the reclaim script holding the disk
+/// this second. It surfaces as a normal offload failure, which puts the schema
+/// into the per-schema backoff and picks it up again later, by which time the
+/// pass has moved on. That is the whole point of settling the collision per
+/// disk instead of standing the pacer down host-wide while any pass runs.
+fn reclaim_lock(
+    schema: &str,
+    sandbox_id: &str,
+    what: &str,
+) -> Result<crate::reclaim::BootPermit> {
+    crate::reclaim::try_disk_permit(sandbox_id).with_context(|| {
+        format!(
+            "schema {schema}: a disk-reclaim pass holds {sandbox_id}'s disk — \
+             not {what}ing it now; the next scan retries"
+        )
+    })
+}
+
 /// compress → verify → rename. Split out so `compact_disk` can clean the tmp
 /// file on every failure path; the rename is what makes a compact file at its
 /// final path always a verified-complete image.
-async fn compact_via_tmp(schema: &str, disk: &Path, tmp: &Path, dest: &Path) -> Result<u64> {
-    run_ok(
+async fn compact_via_tmp(
+    schema: &str,
+    disk: &Path,
+    tmp: &Path,
+    dest: &Path,
+    // As `archive_via_spool`: held until the compression has read `disk`.
+    disk_lock: Option<crate::reclaim::BootPermit>,
+) -> Result<u64> {
+    let compressed = run_ok(
         deprioritize(Command::new("zstd").args(["-q", "-f", "-3", zstd_threads(), "-o"]).arg(tmp).arg(disk)),
         "compressing the disk image (is zstd installed?)",
         ZSTD_TIMEOUT,
     )
-    .await?;
+    .await;
+    // Last read of the disk — see `archive_via_spool`. Verification and the
+    // rename below touch only the tmp file.
+    drop(disk_lock);
+    compressed?;
     let len = tokio::fs::metadata(tmp)
         .await
         .with_context(|| format!("statting compact tmp {}", tmp.display()))?
@@ -416,15 +457,26 @@ async fn archive_via_spool(
     schema: &str,
     disk: &Path,
     spool: &Path,
+    // Exclusion on `disk`, held until the compression below has read it.
+    // `None` only in tests, which have no reclaim script to exclude.
+    disk_lock: Option<crate::reclaim::BootPermit>,
 ) -> Result<u64> {
     // -3 is zstd's default level: the bulk of these images is zeros and
     // page-structured data where higher levels buy little for a lot of CPU.
-    run_ok(
+    let compressed = run_ok(
         deprioritize(Command::new("zstd").args(["-q", "-f", "-3", zstd_threads(), "-o"]).arg(spool).arg(disk)),
         "compressing the disk image (is zstd installed?)",
         ZSTD_TIMEOUT,
     )
-    .await?;
+    .await;
+    // Last read of the disk: everything below works on the spool file. Release
+    // the reclaim exclusion here rather than at the end of the function — the
+    // upload is minutes of network, and holding a disk (or, in the gate
+    // fallback, every disk) across it is what would turn this exclusion into
+    // the stall it exists to avoid. Dropped before the `?` so a failed
+    // compression releases it too.
+    drop(disk_lock);
+    compressed?;
     let len = tokio::fs::metadata(spool)
         .await
         .with_context(|| format!("statting spool file {}", spool.display()))?
@@ -1312,7 +1364,7 @@ mod tests {
 
         let tmp = dir.join("s.img.zst.tmp");
         let dest = dir.join("s.img.zst");
-        let len = compact_via_tmp("s", &disk, &tmp, &dest).await.unwrap();
+        let len = compact_via_tmp("s", &disk, &tmp, &dest, None).await.unwrap();
         assert!(dest.exists(), "verified image landed at its final path");
         assert!(!tmp.exists(), "tmp renamed away");
         assert_eq!(std::fs::metadata(&dest).unwrap().len(), len);
@@ -1322,7 +1374,7 @@ mod tests {
         std::fs::write(&bogus, vec![1u8; 64 * 1024]).unwrap();
         let tmp2 = dir.join("b.img.zst.tmp");
         let dest2 = dir.join("b.img.zst");
-        assert!(compact_via_tmp("b", &bogus, &tmp2, &dest2).await.is_err());
+        assert!(compact_via_tmp("b", &bogus, &tmp2, &dest2, None).await.is_err());
         assert!(!dest2.exists(), "unverified image must not land");
 
         let _ = std::fs::remove_dir_all(&dir);
