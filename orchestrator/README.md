@@ -162,6 +162,21 @@ change the separate post-cutover route health check.
 
 ### Breaking-change rollout
 
+The deployment workflow loads host-keyed defaults from
+`.heyo/deployment-environments.json` before constructing requests. Staging's
+verified existing policy is `heyosecret,orchestrator`, one replica each, with no
+explicit replica-region list or placement pool. Nonempty dispatch/CI settings
+override these defaults. A pool is optional; when absent, Cloud uses its existing
+regional allocation policy. The same discovery-service list is passed into the
+replacement Orchestrator, so the upgrade does not silently disable discovery.
+Other hosts receive no staging defaults. No server IDs are selected by this file.
+
+The receiver-only deployment failed before cutover because CI supplied empty
+discovery settings. Deploy the corrective workflow while the old receiver still
+serves. A workflow change selects all public service targets; Orchestrator is last
+in the serial matrix, so all preceding requests still reach the old receiver.
+Run `python3 .heyo/test_deployment_environment.py` for offline regression checks.
+
 Both public and private service-deployment workflows must move with this interface.
 The public workflow covers HeyoSecret, Orchestrator, app-lb and app-obs; the private
 companion covers Cloud, CICD and Retail. No dual-format server is provided.
