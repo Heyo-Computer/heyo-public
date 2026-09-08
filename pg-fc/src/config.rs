@@ -14,6 +14,13 @@ use heyo_sdk::SandboxSize;
 /// and offload ladders can finally work on.
 const DEFAULT_IDLE_TIMEOUT_FAST: Duration = Duration::from_secs(60);
 
+/// Default for [`Config::idle_drain_window`]: the minimum time in which the
+/// idle reaper may stop the whole live fleet. Ten minutes is long enough that
+/// a fleet-wide expiry reads as a ramp on a chart (and on the host's disk and
+/// CPU) rather than a cliff, and short enough that a cohort's stragglers are
+/// not left running for an hour past their budget.
+const DEFAULT_IDLE_DRAIN_WINDOW: Duration = Duration::from_secs(600);
+
 /// Default for [`Config::fast_bringup`]. Deliberately far above a healthy
 /// restart (~0.2–1s) and far below a create or a thaw (tens of seconds to
 /// minutes), so it separates the two populations without needing to be tuned.
@@ -87,6 +94,35 @@ pub struct Config {
     ///
     /// Env `PG_VM_POOL_FAST_BRINGUP_SECS` (default 5).
     pub fast_bringup: Duration,
+    /// The shortest time in which the idle reaper may stop the *entire* live
+    /// fleet — the knob that turns a synchronized expiry into a slope.
+    ///
+    /// Idle reaping is deadline-driven, so a workload that arrives in a burst
+    /// goes idle in a burst and every one of its VMs comes due inside the same
+    /// few seconds (the per-schema jitter is ±15%, which on a 60s budget is a
+    /// spread of only ~18s). Left to run flat out, the reaper answers that by
+    /// stopping hundreds of VMs a minute: the fleet falls off a cliff, the
+    /// disks all get trimmed at once, and the schemas all come back cold
+    /// together. That is the sawtooth.
+    ///
+    /// This bounds the *rate of change* instead. Each pass may stop at most
+    /// `live_schemas × tick / window` VMs (clamped to
+    /// [`crate::registry`]'s per-pass floor and ceiling), so however
+    /// synchronized the expiry, the fleet drains along a straight line of
+    /// known gradient. Sized off the live-tier schema count rather than the
+    /// warm count because stopping a VM does not change its tier: the divisor
+    /// holds still while a cohort drains, which is what keeps the slope
+    /// constant instead of decaying into a long tail.
+    ///
+    /// The trade is explicit: in a large synchronized expiry a VM can stop
+    /// well after its own idle budget. That lateness is bounded by this
+    /// window, and it buys a fleet that does not swing.
+    ///
+    /// `None` disables the rate limit — every pass may stop up to the flat
+    /// per-pass ceiling, which is the pre-window behavior.
+    ///
+    /// Env `PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS` (default 600); `0` disables.
+    pub idle_drain_window: Option<Duration>,
     /// How long to wait for a VM (and then Postgres) to become ready.
     pub ready_timeout: Duration,
     /// Cap on the iroh tunnel handshake (`expose_tcp` + `P2pTunnel::connect`).
@@ -920,6 +956,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_IDLE_TIMEOUT_SECS",
     "PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS",
     "PG_VM_POOL_FAST_BRINGUP_SECS",
+    "PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS",
     "PG_VM_POOL_READY_TIMEOUT_SECS",
     "PG_VM_POOL_CONNECT_TIMEOUT_SECS",
     "PG_VM_POOL_ADMIT_TIMEOUT_SECS",
@@ -1048,6 +1085,14 @@ impl Config {
             Some(normal) => fast.min(normal),
             None => fast,
         });
+        let idle_drain_window = match std::env::var("PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS") {
+            Ok(v) => match v.parse::<u64>() {
+                Ok(0) => None,
+                Ok(secs) => Some(Duration::from_secs(secs)),
+                Err(_) => Some(DEFAULT_IDLE_DRAIN_WINDOW),
+            },
+            Err(_) => Some(DEFAULT_IDLE_DRAIN_WINDOW),
+        };
         let fast_bringup = std::env::var("PG_VM_POOL_FAST_BRINGUP_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1316,6 +1361,7 @@ impl Config {
             idle_timeout,
             idle_timeout_fast,
             fast_bringup,
+            idle_drain_window,
             ready_timeout: Duration::from_secs(ready_secs),
             connect_timeout: Duration::from_secs(connect_secs),
             admit_timeout: Duration::from_secs(admit_secs),

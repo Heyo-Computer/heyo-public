@@ -349,6 +349,19 @@ pub fn monitoring_page(
         .iter()
         .filter(|r| r.live_sessions.is_none() && !r.name.starts_with(crate::spares::SPARE_PREFIX))
         .count();
+    // Warm VMs already past their own idle budget: the idle reaper's backlog.
+    //
+    // Smoothing the drain means a synchronized expiry is stopped over minutes
+    // rather than at once, so *some* backlog during one is normal and healthy
+    // — it is the ramp. A number that never returns to zero is the signal that
+    // matters: it means VMs are going idle faster than
+    // PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS lets the reaper stop them, and the
+    // smoothing has turned into a permanent lag. Without this tile that trade
+    // is invisible: the cliff on the chart is simply replaced by nothing.
+    let past_budget = rows
+        .iter()
+        .filter(|r| matches!((r.idle_secs, r.idle_budget_secs), (Some(i), Some(b)) if i >= b))
+        .count();
     let queued_bringups = crate::vm::bringups_waiting();
     let reclaim_running = crate::reclaim::pass_running();
     let spare_depth = st.registry.spare_pool_depth();
@@ -442,6 +455,12 @@ pub fn monitoring_page(
                 }
                 (stat("running, untracked", &untracked.to_string(),
                     if untracked > 0 { Some("no warm entry — reaper stops these in ≤2 passes") } else { None }))
+                (stat("past idle budget", &past_budget.to_string(),
+                    if past_budget == 0 {
+                        None
+                    } else {
+                        Some("draining on a ramp — persistent = drain window too slow")
+                    }))
                 (stat("bring-ups queued", &queued_bringups.to_string(),
                     if queued_bringups > 0 { Some("clients waiting for a VM") } else { None }))
                 (stat("reclaim pass", if reclaim_running { "running" } else { "idle" },

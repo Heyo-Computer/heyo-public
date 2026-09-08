@@ -287,9 +287,12 @@ fn idle_budget(
     }
 }
 
-/// Cap on VMs the idle reaper stops in one pass (oldest-idle first; the rest
-/// wait a tick). See [`SchemaRegistry::reap_idle`] for why mass stops are
-/// worse than a few extra minutes of warm RAM.
+/// Hard ceiling on one pass's stop allowance, above whatever the drain window
+/// asks for. This is daemon protection rather than smoothing — 24 stops, 8 at
+/// a time, is about as much as one heyvmd should be asked to absorb in a tick
+/// while it is also serving bring-ups. On a fleet big enough for the window to
+/// ask for more, this binds and the fleet simply drains over longer than the
+/// window, which is the safe direction to err.
 const IDLE_MAX_STOPS_PER_PASS: usize = 24;
 
 /// How many idle-stops run concurrently within one reaper pass.
@@ -305,17 +308,13 @@ const IDLE_MAX_STOPS_PER_PASS: usize = 24;
 /// stays well under what a bring-up burst already asks of the daemon.
 const IDLE_STOP_CONCURRENCY: usize = 8;
 
-/// How soon the reaper re-runs after a pass that hit
-/// [`IDLE_MAX_STOPS_PER_PASS`] with victims still queued.
+/// Floor on one pass's stop allowance, whatever the drain window works out to.
 ///
-/// The cap exists to turn a mass expiry into a slope, but on its own it is
-/// also a hard ceiling of 24 stops per tick — and a fleet that goes idle
-/// faster than that never catches up, so every VM's real stop time drifts
-/// further past its own idle timeout for as long as the load lasts. Re-arming
-/// keeps the slope but removes the ceiling. Long enough that the daemon sees
-/// batches rather than a continuous stream, short enough that a backlog drains
-/// in minutes instead of hours.
-const IDLE_BACKLOG_REARM: Duration = Duration::from_secs(10);
+/// Without it a small fleet computes a fractional allowance and the reaper
+/// would take many passes to stop a handful of VMs — smoothing something that
+/// was never going to be a swing. Four per pass clears a small backlog in
+/// seconds and is far below any rate that shows up on a chart.
+const IDLE_MIN_STOPS_PER_PASS: usize = 4;
 
 /// Bound on the daemon's stop call for one idle-stopped VM.
 ///
@@ -325,6 +324,9 @@ const IDLE_BACKLOG_REARM: Duration = Duration::from_secs(10);
 /// parked the pass, and with it every other stop, indefinitely. Matches the
 /// untracked reaper's bound, which always had one.
 const IDLE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The same bound for the untracked reaper's stops, which always had one.
+const UNTRACKED_STOP_TIMEOUT: Duration = IDLE_STOP_TIMEOUT;
 
 /// How often the urgent device-grow watcher samples the warm set. It exists
 /// to beat a filling disk, not to catch it the instant it crosses — a minute
@@ -354,6 +356,41 @@ fn jittered_timeout(schema: &str, timeout: Duration) -> Duration {
     schema.hash(&mut h);
     let unit = (h.finish() % 1000) as f64 / 1000.0;
     timeout.mul_f64(0.85 + 0.30 * unit)
+}
+
+/// How many VMs one reaper pass may stop, given the live-tier fleet size.
+///
+/// This is the whole answer to the sawtooth. Idle reaping is deadline-driven,
+/// so a burst workload goes idle in a burst: with a 60s budget the ±15%
+/// per-schema jitter spreads a cohort's deadlines over about eighteen seconds,
+/// and every VM in it is due at once. What the reaper does with that backlog
+/// decides whether the fleet ramps down or falls off a cliff — and a flat
+/// per-pass cap does not decide it, because a cohort larger than the cap keeps
+/// the reaper saturated at cap-per-tick regardless of how the deadlines
+/// spread. Widening the jitter cannot fix that; only bounding the rate can.
+///
+/// So the allowance is `live × tick / window`: at most one window's worth of
+/// the fleet per window, i.e. a straight line of known gradient however
+/// synchronized the expiry. `live` is the live-tier schema count rather than
+/// the warm/running count on purpose — stopping a VM does not change its tier,
+/// so the divisor holds still for the length of a drain and the slope stays
+/// constant. Sizing off the running count instead makes the allowance shrink
+/// as the drain proceeds, which decays into a long tail: the last VMs of a
+/// 600-VM cohort would wait half an hour past a 60s budget.
+///
+/// Clamped both ways. [`IDLE_MIN_STOPS_PER_PASS`] keeps a small fleet from
+/// smoothing something that was never a swing; [`IDLE_MAX_STOPS_PER_PASS`] is
+/// the daemon's protection and binds on a fleet big enough to ask for more,
+/// which just means the drain takes longer than the window.
+///
+/// `window` of `None` disables the rate limit (the flat ceiling, as before).
+fn drain_allowance(live: usize, tick: Duration, window: Option<Duration>) -> usize {
+    let Some(window) = window.filter(|w| !w.is_zero()) else {
+        return IDLE_MAX_STOPS_PER_PASS;
+    };
+    // Rounded up so the allowance is never zero while any window is set.
+    let per_pass = (live as u128 * tick.as_millis()).div_ceil(window.as_millis().max(1)) as usize;
+    per_pass.clamp(IDLE_MIN_STOPS_PER_PASS, IDLE_MAX_STOPS_PER_PASS)
 }
 
 /// RAII marker for one in-flight client connection. Bumps the entry's active
@@ -1585,7 +1622,12 @@ impl SchemaRegistry {
     /// lands between the listing and the map check is never stopped
     /// mid-flight. Unbound running VMs (no live registry row) are left
     /// alone: the purge owns offloaded-tier leftovers and anything else is
-    /// not the pooler's to stop. Same cadence as the idle reaper.
+    /// not the pooler's to stop. Same cadence as the idle reaper, and the same
+    /// [`drain_allowance`] rate limit — this pass needs it even more than the
+    /// idle reaper does, because after a pooler restart its population is the
+    /// *entire running fleet* at once (the warm map starts empty, so every
+    /// running VM is untracked by definition). Uncapped, that made every
+    /// deploy stop the whole fleet about two passes later.
     pub fn spawn_untracked_reaper(self: &Arc<Self>) {
         let Some(timeout) = self.cfg.idle_timeout else {
             return; // idle reaping off ⇒ the operator wants VMs left running
@@ -1598,14 +1640,14 @@ impl SchemaRegistry {
             let suspects = suspects.clone();
             async move {
                 let mut suspects = suspects.lock().await;
-                registry.reap_untracked(&mut suspects).await
+                registry.reap_untracked(&mut suspects, tick).await
             }
         }));
     }
 
     /// One reconciler pass — see [`Self::spawn_untracked_reaper`]. Returns
     /// how many VMs were stopped.
-    async fn reap_untracked(&self, suspects: &mut HashSet<String>) -> usize {
+    async fn reap_untracked(&self, suspects: &mut HashSet<String>, tick: Duration) -> usize {
         let infos = match vm::list_with_retry().await {
             Ok(l) => l,
             Err(e) => {
@@ -1628,6 +1670,12 @@ impl SchemaRegistry {
         let mut seen_now: HashSet<String> = HashSet::new();
         let mut stopped = 0usize;
         let mut superseded_seen = 0usize;
+        // `(id, schema, superseded)` for every VM confirmed untracked on two
+        // consecutive passes — collected first, then rate-limited and stopped
+        // below rather than stopped inline, which is what made this pass a
+        // fleet-wide cliff.
+        let mut confirmed: Vec<(String, String, bool)> = Vec::new();
+        let allowance = drain_allowance(self.store.live_count(), tick, self.cfg.idle_drain_window);
         for info in infos
             .iter()
             .filter(|i| i.status == heyo_sdk::SandboxStatus::Running)
@@ -1677,31 +1725,69 @@ impl SchemaRegistry {
             if superseded {
                 superseded_seen += 1;
             }
+            // Every current suspect is recorded, including any this pass will
+            // not get to: that is what keeps a deferred VM *confirmed* rather
+            // than restarting its two-pass clock every time the allowance
+            // runs out.
             seen_now.insert(info.id.clone());
             if !suspects.contains(&info.id) {
                 continue; // first sighting: confirm next pass
             }
+            confirmed.push((info.id.clone(), schema.to_string(), superseded));
+        }
+        // Rate-limited exactly like the idle reaper, for a sharper version of
+        // the same reason. This pass's whole population appears at once after a
+        // pooler restart — the warm map starts empty, so every running VM is
+        // untracked by definition — and stopping all of them was a fleet-wide
+        // cliff two passes (~2.5 min) after every deploy. Oldest-first has no
+        // meaning here, so the daemon's own listing order decides; the excess
+        // stays confirmed and goes next pass.
+        let deferred = confirmed.len().saturating_sub(allowance);
+        confirmed.truncate(allowance);
+        if deferred > 0 {
             info!(
-                "untracked-reaper: VM {} (schema {schema}{}) is running with no warm entry \
-                 and no bring-up in flight on two consecutive passes — stopping it so the \
-                 idle/offload ladder can reclaim it",
-                info.id,
-                if superseded { ", superseded duplicate" } else { "" }
+                "untracked-reaper: stopping {} untracked VM(s) this pass, deferring \
+                 {deferred} to keep the fleet ramping down instead of falling off a cliff \
+                 (PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS)",
+                confirmed.len()
             );
-            match heyo_sdk::Sandbox::connect(info.id.clone(), vm::local_opts()) {
-                Ok(sb) => match tokio::time::timeout(Duration::from_secs(30), sb.stop()).await {
-                    Ok(Ok(())) => {
-                        stopped += 1;
-                        crate::events::journal_info(
-                            "untracked",
-                            format!("schema {schema}: stopped untracked running VM {}", info.id),
-                        );
+        }
+        let mut stops = futures::stream::iter(confirmed.into_iter().map(
+            |(id, schema, superseded)| async move {
+                info!(
+                    "untracked-reaper: VM {id} (schema {schema}{}) is running with no warm \
+                     entry and no bring-up in flight on two consecutive passes — stopping it \
+                     so the idle/offload ladder can reclaim it",
+                    if superseded { ", superseded duplicate" } else { "" }
+                );
+                match heyo_sdk::Sandbox::connect(id.clone(), vm::local_opts()) {
+                    Ok(sb) => {
+                        match tokio::time::timeout(UNTRACKED_STOP_TIMEOUT, sb.stop()).await {
+                            Ok(Ok(())) => {
+                                crate::events::journal_info(
+                                    "untracked",
+                                    format!(
+                                        "schema {schema}: stopped untracked running VM {id}"
+                                    ),
+                                );
+                                return true;
+                            }
+                            Ok(Err(e)) => {
+                                warn!("untracked-reaper: stopping {id} failed: {e:#}")
+                            }
+                            Err(_) => warn!("untracked-reaper: stopping {id} timed out"),
+                        }
                     }
-                    Ok(Err(e)) => warn!("untracked-reaper: stopping {} failed: {e:#}", info.id),
-                    Err(_) => warn!("untracked-reaper: stopping {} timed out", info.id),
-                },
-                Err(e) => warn!("untracked-reaper: connecting to {} failed: {e:#}", info.id),
-            }
+                    Err(e) => warn!("untracked-reaper: connecting to {id} failed: {e:#}"),
+                }
+                false
+            },
+        ))
+        // Serially these cost up to UNTRACKED_STOP_TIMEOUT each, so a full
+        // allowance could outlast several ticks and pile passes up behind it.
+        .buffer_unordered(IDLE_STOP_CONCURRENCY);
+        while let Some(ok) = stops.next().await {
+            stopped += usize::from(ok);
         }
         if !seen_now.is_empty() && stopped == 0 {
             info!(
@@ -1754,55 +1840,54 @@ impl SchemaRegistry {
         // more than the deadline itself.
         let shortest = self.cfg.idle_timeout_fast.unwrap_or(timeout).min(timeout);
         let tick = (shortest / 4).max(Duration::from_secs(5));
-        // Backlog re-arm: a pass that hit IDLE_MAX_STOPS_PER_PASS with victims
-        // left over notifies this, so the next pass starts after
-        // IDLE_BACKLOG_REARM rather than a full tick. Without it the cap is a
-        // hard throughput ceiling — 24 stops per tick — and a fleet going idle
-        // faster than that drifts permanently past its own idle timeout, which
-        // is precisely the "VMs stay up long past the limit under load"
-        // failure. The floor keeps the re-arm from becoming a spin.
-        let wake = Arc::new(tokio::sync::Notify::new());
-        let signal = wake.clone();
+        match self.cfg.idle_drain_window {
+            Some(w) => info!(
+                "idle reaper: draining at most the whole live fleet per {w:?} \
+                 ({IDLE_MIN_STOPS_PER_PASS}–{IDLE_MAX_STOPS_PER_PASS} VMs per {tick:?} pass) — \
+                 a synchronized expiry ramps down instead of falling off a cliff \
+                 (PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS)"
+            ),
+            None => info!(
+                "idle reaper: drain rate limit disabled — up to \
+                 {IDLE_MAX_STOPS_PER_PASS} VMs stop per {tick:?} pass \
+                 (PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS=0)"
+            ),
+        }
         // Reaper `tick` is already short, so first pass and steady state match.
-        tokio::spawn(supervise_with_wake(
-            "idle-reaper",
-            tick,
-            tick,
-            Some(wake),
-            IDLE_BACKLOG_REARM,
-            move || {
-                let registry = registry.clone();
-                let signal = signal.clone();
-                async move { registry.reap_idle(timeout, &signal).await }
-            },
-        ));
+        tokio::spawn(supervise("idle-reaper", tick, tick, move || {
+            let registry = registry.clone();
+            async move { registry.reap_idle(timeout, tick).await }
+        }));
     }
 
-    /// Evict and stop idle VMs — at most [`IDLE_MAX_STOPS_PER_PASS`] per
-    /// pass, oldest-idle first. Eviction (removing the map cell) happens
-    /// under the lock so a concurrent `checkout` either sees the entry before
-    /// eviction (and bumps `active`, sparing it) or misses it and brings up a
-    /// fresh VM. The actual stop happens after the lock is released.
+    /// Evict and stop idle VMs — at most [`drain_allowance`] of them per pass,
+    /// oldest-idle first. Eviction (removing the map cell) happens under the
+    /// lock so a concurrent `checkout` either sees the entry before eviction
+    /// (and bumps `active`, sparing it) or misses it and brings up a fresh VM.
+    /// The actual stop happens after the lock is released.
     ///
     /// Each entry is judged against its own budget — see [`idle_budget`] — so
     /// a VM that is cheap to restart expires on the short timeout while one
     /// that cost a create or a thaw keeps the full warm hold.
     ///
-    /// The cap plus the per-schema timeout jitter (see [`jittered_timeout`])
-    /// keep a cohort of VMs that went idle together — clients that arrived in
-    /// one burst — from all stopping in one pass: an uncapped mass stop reads
-    /// as "the fleet fell off a cliff" on the dashboard, floods the post-stop
-    /// reclaim trigger with hundreds of disks at once, and converts into a
-    /// synchronized cold-start (and spare-claim) storm when those schemas
-    /// return. The excess does NOT wait out a whole tick, though: a capped
-    /// pass asks for the next one in [`IDLE_BACKLOG_REARM`], because a cap
-    /// that also throttles the drain rate is how a fleet ends up permanently
-    /// past its own idle timeout (see [`Self::spawn_reaper`]).
+    /// The per-pass allowance is what keeps a *synchronized* expiry from
+    /// becoming a cliff. Clients arrive in bursts and go idle in bursts, and
+    /// the per-schema jitter (see [`jittered_timeout`]) only spreads a
+    /// cohort's deadlines by ±15% — eighteen seconds on a 60s budget. Stopping
+    /// all of them as fast as the daemon will take them reads as "the fleet
+    /// fell off a cliff" on the dashboard, hands the post-stop reclaim trigger
+    /// hundreds of disks at once, and converts into a synchronized cold-start
+    /// (and spare-claim) storm when those schemas come back. The allowance
+    /// turns it into a ramp of known gradient; the excess waits a tick and is
+    /// picked up oldest-first, so nothing is forgotten, only paced.
     ///
     /// Returns how many VMs were stopped, for the supervisor's heartbeat.
-    async fn reap_idle(self: &Arc<Self>, timeout: Duration, backlog: &tokio::sync::Notify) -> usize {
+    async fn reap_idle(self: &Arc<Self>, timeout: Duration, tick: Duration) -> usize {
         let fast = self.cfg.idle_timeout_fast;
         let fast_bringup = self.cfg.fast_bringup;
+        // Sized from the durable live-tier count, not the warm map: see
+        // [`drain_allowance`] for why the divisor must not shrink mid-drain.
+        let allowance = drain_allowance(self.store.live_count(), tick, self.cfg.idle_drain_window);
         let mut victims: Vec<(String, Arc<SchemaEntry>)> = Vec::new();
         let deferred;
         {
@@ -1823,8 +1908,8 @@ impl SchemaRegistry {
                 })
                 .collect();
             expired.sort_by_key(|(_, idle)| std::cmp::Reverse(*idle));
-            deferred = expired.len().saturating_sub(IDLE_MAX_STOPS_PER_PASS);
-            for (schema, _) in expired.into_iter().take(IDLE_MAX_STOPS_PER_PASS) {
+            deferred = expired.len().saturating_sub(allowance);
+            for (schema, _) in expired.into_iter().take(allowance) {
                 if let Some(entry) = map.get(&schema).and_then(|cell| cell.get()).cloned() {
                     map.remove(&schema);
                     victims.push((schema, entry));
@@ -1834,14 +1919,10 @@ impl SchemaRegistry {
         if deferred > 0 {
             info!(
                 "idle reaper: stopping {} oldest-idle VM(s) this pass, deferring {deferred} \
-                 (cap {IDLE_MAX_STOPS_PER_PASS}/pass smooths mass expiries); re-arming in \
-                 {IDLE_BACKLOG_REARM:?} instead of waiting out the tick",
+                 — draining a synchronized expiry at {allowance}/pass so the fleet ramps \
+                 down instead of falling off a cliff (PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS)",
                 victims.len()
             );
-            // The cap is there to break a mass expiry into a slope, not to put
-            // a ceiling on how fast the fleet can drain. Ask for the next pass
-            // now so the slope stays steep enough to keep up with arrivals.
-            backlog.notify_one();
         }
         let stopped = victims.len();
         // Device-growth candidates discovered while stopping: (schema, id,
@@ -5722,6 +5803,132 @@ mod archive_tests {
 
         // Disabled: one timeout for everything, whatever the bring-up cost.
         assert_eq!(idle_budget(Duration::from_millis(200), normal, None, threshold), normal);
+    }
+
+    /// The sawtooth fix. A flat per-pass cap does not decide the drain shape:
+    /// any cohort bigger than the cap keeps the reaper saturated at
+    /// cap-per-tick regardless of how the deadlines spread, which is why
+    /// widening the jitter cannot fix a mass expiry and bounding the rate can.
+    #[test]
+    fn drain_allowance_is_a_constant_slope_bounded_both_ways() {
+        let tick = Duration::from_secs(15);
+        let window = Some(Duration::from_secs(600));
+        let a = |live| drain_allowance(live, tick, window);
+
+        // live * tick / window, so the whole fleet takes one window to drain.
+        assert_eq!(a(600), 15, "600 live over 600s at a 15s tick");
+        assert_eq!(a(400), 10);
+
+        // Floored: a small fleet is not a swing, so don't smooth it into one.
+        assert_eq!(a(0), IDLE_MIN_STOPS_PER_PASS);
+        assert_eq!(a(10), IDLE_MIN_STOPS_PER_PASS);
+
+        // Ceilinged: the daemon's protection wins over the window, and a fleet
+        // that big just drains over longer than the window.
+        assert_eq!(a(100_000), IDLE_MAX_STOPS_PER_PASS);
+
+        // Never zero while a window is set — a fractional allowance rounds up,
+        // or the reaper would stall entirely on a tiny fleet.
+        assert!(drain_allowance(1, Duration::from_secs(1), Some(Duration::from_secs(86_400))) >= 1);
+
+        // Disabled: the flat ceiling, i.e. the pre-window behaviour.
+        assert_eq!(drain_allowance(10_000, tick, None), IDLE_MAX_STOPS_PER_PASS);
+        assert_eq!(
+            drain_allowance(10_000, tick, Some(Duration::ZERO)),
+            IDLE_MAX_STOPS_PER_PASS
+        );
+    }
+
+    /// The property that actually matters to an operator watching a chart:
+    /// draining a synchronized cohort must be a straight line, not a spike
+    /// followed by a tail. That is why the allowance is sized off the
+    /// live-tier count (which a stop does not change) and not the warm count
+    /// (which shrinks under it, decaying the slope).
+    #[test]
+    fn a_synchronized_cohort_drains_as_a_ramp_not_a_cliff() {
+        let tick = Duration::from_secs(15);
+        let window = Some(Duration::from_secs(600));
+        let live = 600;
+
+        // Constant divisor ⇒ every pass of the drain gets the same allowance.
+        let rates: Vec<usize> = (0..=live)
+            // The point of the constant case: how many have already stopped
+            // does not enter into it.
+            .step_by(15)
+            .map(|_stopped| drain_allowance(live, tick, window))
+            .collect();
+        assert!(
+            rates.windows(2).all(|w| w[0] == w[1]),
+            "the slope must not change as the cohort drains: {rates:?}"
+        );
+
+        // Had it been sized off the shrinking warm count, the rate would decay
+        // — this is the shape being rejected, asserted so nobody reintroduces
+        // it thinking the two are equivalent.
+        let decaying: Vec<usize> = (0..=live)
+            .step_by(15)
+            .map(|stopped| drain_allowance(live - stopped, tick, window))
+            .collect();
+        assert!(
+            decaying.first() > decaying.last(),
+            "sanity: warm-count sizing really does decay: {decaying:?}"
+        );
+
+        // And the ramp is long enough to read as one: a full drain takes about
+        // the window, never a handful of passes.
+        let passes = live.div_ceil(drain_allowance(live, tick, window));
+        let secs = passes as u64 * tick.as_secs();
+        assert!((540..=660).contains(&secs), "drain took {secs}s, want ~600s");
+    }
+
+    /// End-to-end drain shape through the real `drain_allowance`, not a model
+    /// of it: a cohort that all comes due at once must leave the fleet on a
+    /// straight line whose per-minute peak is close to its median. The old
+    /// flat cap is run alongside on the same cohort so the regression this
+    /// fixes stays visible if anyone reverts the policy.
+    #[test]
+    fn a_mass_expiry_leaves_at_a_steady_rate() {
+        let tick = Duration::from_secs(15);
+        let live = 600usize;
+
+        /// Drain `n` VMs, `per_pass` at a time, returning stops per minute.
+        fn per_minute(n: usize, per_pass: usize, tick: Duration) -> Vec<usize> {
+            let passes_per_min = (60 / tick.as_secs().max(1)) as usize;
+            let mut left = n;
+            let mut out = Vec::new();
+            while left > 0 {
+                let mut minute = 0;
+                for _ in 0..passes_per_min {
+                    let take = per_pass.min(left);
+                    left -= take;
+                    minute += take;
+                }
+                out.push(minute);
+            }
+            out
+        }
+
+        let limited = per_minute(
+            live,
+            drain_allowance(live, tick, Some(Duration::from_secs(600))),
+            tick,
+        );
+        let flat = per_minute(live, drain_allowance(live, tick, None), tick);
+
+        let peak = *limited.iter().max().unwrap();
+        // Every full minute of the ramp moves the same number of VMs, so peak
+        // and median coincide — that is what "a ramp, not a cliff" means.
+        assert_eq!(peak, 60, "600 live / 600s window = 60 VMs a minute");
+        assert!(limited.len() >= 9, "drain spans ~10 minutes, got {}", limited.len());
+
+        // The policy this replaces runs every fleet at the ceiling regardless
+        // of its size, which is the cliff. At 600 live the gap is 96 vs 60 a
+        // minute; the gap widens as the fleet gets smaller, because the flat
+        // cap does not scale down and the window does.
+        assert_eq!(*flat.iter().max().unwrap(), 96);
+        assert!(peak < *flat.iter().max().unwrap());
+        let small = drain_allowance(120, tick, Some(Duration::from_secs(600)));
+        assert_eq!(small * 4, 16, "120 live drains at 16/min, not the flat 96");
     }
 
     #[test]

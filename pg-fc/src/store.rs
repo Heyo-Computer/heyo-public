@@ -201,6 +201,25 @@ impl Store {
         self.map.lock().unwrap().get(schema).map(Rec::view)
     }
 
+    /// How many schemas are on the live tier — data on a VM disk rather than
+    /// offloaded to a dump, a compacted image or S3.
+    ///
+    /// Counted under the lock without cloning, because the idle reaper reads
+    /// it every pass to size its drain rate ([`crate::registry`]'s
+    /// `drain_allowance`) and [`Self::records`] would clone the whole map for
+    /// a number. Deliberately *not* "how many VMs are running": stopping a VM
+    /// does not change its tier, so this stays constant while a cohort drains
+    /// — which is exactly what makes the drain a constant slope instead of a
+    /// decaying one.
+    pub fn live_count(&self) -> usize {
+        self.map
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.tier == Tier::Live)
+            .count()
+    }
+
     /// Every `(schema, record)` known to the store — the durable list of schemas
     /// the pooler has backed, including those whose VM is stopped or archived.
     pub fn records(&self) -> Vec<(String, StoreRecord)> {
