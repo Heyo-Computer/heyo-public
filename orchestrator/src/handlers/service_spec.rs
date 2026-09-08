@@ -427,21 +427,6 @@ mod tests {
         assert!(serde_json::from_value::<ServiceSpecRequest>(value).unwrap().into_internal().is_err());
     }
 
-    #[test]
-    fn accepts_authored_public_service_files() {
-        for spec in [
-            include_str!("../../../.heyo/services/orchestrator.json"),
-            include_str!("../../../.heyo/services/heyosecret.json"),
-            include_str!("../../../.heyo/services/app-lb.json"),
-            include_str!("../../../.heyo/services/app-obs.json"),
-        ] {
-            let internal = serde_json::from_str::<ServiceSpecRequest>(spec).unwrap().into_internal().unwrap();
-            assert_eq!(internal.health_probe_timeout_seconds, 5);
-            assert_eq!(internal.ports, [8080]);
-            assert_eq!(internal.ttl_seconds, Some(0));
-        }
-    }
-
     /// Integration with the offline workflow harness in both repositories.
     #[test]
     fn accepts_generated_workflow_payloads_when_supplied() {

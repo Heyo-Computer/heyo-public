@@ -130,10 +130,12 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 
 ### Service deployment files
 
-Service configuration lives in [`.heyo/services`](../.heyo/services). The deployment
-workflow loads one JSON file, fills in the build artifact, target host/region and
-revision, then submits it. Application environment variables remain application
-settings; there is no change to Orchestrator's own process-config loader.
+This receiver introduces the JSON contract below. The subsequent caller migration
+adds `.heyo/services` files and a workflow that loads a file, fills in the build
+artifact, target host/region and revision, then submits it. This receiver-only
+change deliberately leaves the deployment workflow unchanged for self-upgrade.
+Application environment variables remain application settings; there is no change
+to Orchestrator's own process-config loader.
 
 The request has `{ id, user_id, account_id?, vm, routes?, health?, scaling?, deploy }`.
 It uses app-lb's field names with an Orchestrator-only `deploy` operation section.
@@ -164,16 +166,22 @@ Both public and private service-deployment workflows must move with this interfa
 The public workflow covers HeyoSecret, Orchestrator, app-lb and app-obs; the private
 companion covers Cloud, CICD and Retail. No dual-format server is provided.
 
-Upgrade the Orchestrator receiver before enabling the migrated callers. For
-self-deployment, the transition operation must use the previous workflow/client
-against the old receiver to deploy the new Orchestrator artifact, then switch to
-the new callers. Running the new workflow against the old receiver cannot bootstrap
-this breaking change. Coordinate that transition explicitly; this PR performs no
-deployment, workflow activation or infrastructure change.
+1. Submit the receiver-only change first. Its unchanged workflow sends the old
+   request to the running old receiver, which deploys the new Orchestrator binary.
+   Only `orchestrator/` changes, so the workflow selects only Orchestrator. The
+   resource allocation API used by CICD and deployment status responses are unchanged.
+2. Wait for that deployment to finish and the public Orchestrator health endpoint
+   to report the new revision. Do not run unrelated service deployments during
+   this transition: old callers cannot deploy to the new receiver.
+3. Submit the public caller migration, then the private caller migration. Both
+   require the new receiver. Do not resubmit the receiver-only revision after
+   cutover; further Orchestrator deployments must use the migrated caller.
 
-Offline validation: `python3 .heyo/services/test_service_specs.py` from the repository
-root executes embedded workflow Python with network/build calls mocked. During
-migration, `SERVICE_SPEC_BASELINE_REF=origin/main` additionally compares payload
-semantics against the previous workflow. `SERVICE_SPEC_FIXTURE_DIR` exports test
-payloads for the Rust contract tests; use the same directory for the private companion
-test to exercise all seven services through Orchestrator's actual parser.
+This is a coordinated breaking cutover, not a dual-format compatibility period.
+If the first deployment fails before cutover, diagnose it while the old receiver
+still serves; do not advance the callers. After cutover, use the new callers.
+No deployment or infrastructure change is performed by preparing these PRs.
+
+Receiver validation: `cargo test --locked --manifest-path orchestrator/Cargo.toml`.
+The caller migration supplies offline workflow tests and synthetic payloads for
+the optional `SERVICE_SPEC_FIXTURE_DIR` Rust contract test.
