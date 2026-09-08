@@ -473,6 +473,7 @@ fn request_info<'a>(
     host: &'a str,
     path: &'a str,
     secure: bool,
+    fronts_admin_api: bool,
 ) -> RequestInfo<'a> {
     let req = session.req_header();
     let cookies = req
@@ -508,6 +509,7 @@ fn request_info<'a>(
         cookies,
         secure,
         wants_html,
+        fronts_admin_api,
         bearer,
         // The socket peer, for the SIEM's per-source sign-in rules. Never an
         // `X-Forwarded-For`: keying a detector on a client-supplied header is an
@@ -619,7 +621,13 @@ impl ProxyHttp for LbProxy {
             };
 
             let secure = is_secure_request(session);
-            let info = request_info(session, host, &path, secure);
+            let info = request_info(
+                session,
+                host,
+                &path,
+                secure,
+                self.auth.fronts_admin_api(&deployment.spec),
+            );
             match self.auth.decide(&gate, &deployment.spec.id, &deployment.spec.namespace, &info).await {
                 Decision::Allow(identity) => ctx.identity = *identity,
                 Decision::Answered(response) => {

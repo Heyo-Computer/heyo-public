@@ -761,11 +761,26 @@ impl Client {
     /// Every other method turns a non-2xx into an [`Error`], which is right for
     /// a request you meant and wrong for a question you are asking.
     pub async fn probe(&self, path: &str) -> Result<u16> {
-        Ok(self
+        Ok(self.probe_detail(path).await?.0)
+    }
+
+    /// The status *and* whatever the server said about it.
+    ///
+    /// A refusal from app-lb names the actual reason — which token, which
+    /// scope, which deployment it does not admit — and a caller that keeps only
+    /// the status has to guess at all of it. `login` guessed wrong twice: a
+    /// namespace-confined token was reported as an unrecognised one, and the
+    /// operator went looking at the token instead of the gate.
+    pub async fn probe_detail(&self, path: &str) -> Result<(u16, Option<String>)> {
+        let r = self
             .transport
             .send(Request::new(Method::Get, path.to_string()))
-            .await?
-            .status)
+            .await?;
+        let detail = serde_json::from_str::<serde_json::Value>(&r.body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+            .filter(|d| !d.is_empty());
+        Ok((r.status, detail))
     }
 
     /// The base URL, when this client was built from one.

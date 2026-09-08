@@ -643,12 +643,13 @@ fn main() {
             .unwrap_or_else(|| Arc::from(obs::LB_DEPLOYMENT)),
     );
 
-    let auth = Arc::new(Authenticator::new(
+    let auth = Arc::new(Authenticator::with_admin_addr(
         Authenticator::load_key(&auth_key_path)
             .unwrap_or_else(|e| panic!("cannot read or create {}: {e}", auth_key_path.display())),
         secrets.clone(),
         Some(tokens.clone()),
         siem.as_ref().map(|s| s.sink.clone()),
+        Some(cfg.admin_addr.clone()),
     ));
 
     let daemon_api_key = ["APP_LB_DAEMON_API_KEY", "HEYO_API_KEY"]

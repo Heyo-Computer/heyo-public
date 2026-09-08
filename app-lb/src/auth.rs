@@ -156,6 +156,11 @@ pub struct RequestInfo<'a> {
     /// True when the caller looks like a browser navigating, which is what makes
     /// a redirect the right answer instead of a 401.
     pub wants_html: bool,
+    /// Whether this deployment's upstream is app-lb's own admin listener. When
+    /// it is, the gate checks a scoped public path's *tier* and leaves
+    /// deployment and namespace scoping to the admin API, which does it better.
+    /// See [`Authenticator::fronts_admin_api`].
+    pub fronts_admin_api: bool,
     /// The value of an `Authorization: Bearer …` header, if there was one. An
     /// app-token gate checks this; a Google gate ignores it.
     pub bearer: Option<String>,
@@ -178,12 +183,35 @@ pub struct Authenticator {
     /// Queues rejected sign-ins for analysis. `None` when `APP_LB_SIEM=0`, and in
     /// tests.
     security: Option<crate::siem::SecuritySink>,
+    /// This process's admin listener address, so a deployment fronting it can
+    /// be recognised. `None` in tests and anywhere the gate stands only in
+    /// front of ordinary applications.
+    admin_addr: Option<String>,
     /// Issuer key sets for `jwks_url` gates. One cache for the whole LB, so two
     /// deployments behind the same issuer fetch its keys once between them.
     jwks: crate::jwt::JwksCache,
 }
 
 impl Authenticator {
+    /// Whether this deployment's upstream is app-lb's own admin listener.
+    ///
+    /// The one upstream that authorizes *better* than the gate in front of it
+    /// can. Every other upstream is an application with no idea what an
+    /// app-token's namespace means, so the gate has to answer "may this
+    /// credential touch this deployment" on its behalf. The admin API answers a
+    /// finer question — may this credential touch this *deployment it is being
+    /// asked about* — and asking the coarse one first can only ever refuse
+    /// callers the fine one would have admitted.
+    ///
+    /// Best-effort, and matched as a string: an alias (`localhost` against
+    /// `127.0.0.1`) reads as a different address and falls back to the strict
+    /// check, which refuses rather than admits. Wrong in the safe direction.
+    pub fn fronts_admin_api(&self, spec: &crate::config::DeploymentSpec) -> bool {
+        self.admin_addr
+            .as_deref()
+            .is_some_and(|addr| spec.upstreams.iter().any(|u| u == addr))
+    }
+
     /// Queue one refused sign-in for analysis.
     ///
     /// Never carries a token or a code — only which step refused, and for the
@@ -229,11 +257,24 @@ impl Authenticator {
         tokens: Option<Arc<crate::tokens::TokenStore>>,
         security: Option<crate::siem::SecuritySink>,
     ) -> Self {
+        Self::with_admin_addr(key, secrets, tokens, security, None)
+    }
+
+    /// As [`new`](Self::new), plus the address of this process's own admin
+    /// listener — so the gate can recognise a deployment that fronts it.
+    pub fn with_admin_addr(
+        key: Vec<u8>,
+        secrets: Arc<SecretStore>,
+        tokens: Option<Arc<crate::tokens::TokenStore>>,
+        security: Option<crate::siem::SecuritySink>,
+        admin_addr: Option<String>,
+    ) -> Self {
         Self {
             key,
             secrets,
             tokens,
             security,
+            admin_addr,
             http: reqwest::Client::builder()
                 .timeout(TOKEN_TIMEOUT)
                 // A login is a person waiting; there is no retry that helps.
@@ -434,10 +475,23 @@ impl Authenticator {
         req: &RequestInfo<'_>,
         want: crate::tokens::AdminScope,
     ) -> Decision {
+        // `admits` asks "may this credential touch *this deployment*", which is
+        // the right question for an ordinary application: the upstream has no
+        // idea what a namespace is, so the gate answers on its behalf.
+        //
+        // It is the wrong question in front of app-lb's own admin API. A caller
+        // there is not acting on the deployment that fronts it — they are acting
+        // on whatever the admin API routes to, and the admin API scope-checks
+        // that per request, per deployment, per namespace. Asking the coarse
+        // question first can only refuse callers the fine one would admit: a
+        // token confined to a namespace admits no deployment outside it, so it
+        // could never pass a gate on a fronting deployment sitting in
+        // `default` — and would then be refused for a namespace it never asked
+        // about.
         if let Some(presented) = &req.bearer
             && let Some(tokens) = &self.tokens
             && let Some(token) = tokens.verify(presented, now_secs())
-            && token.admits(deployment_id, deployment_namespace)
+            && (req.fronts_admin_api || token.admits(deployment_id, deployment_namespace))
             && token.admin.satisfies(want)
         {
             tracing::debug!(
@@ -460,6 +514,21 @@ impl Authenticator {
             return Decision::Allow(Box::new(Some(identity)));
         }
 
+        // A token this store knows, that simply does not satisfy this path, is a
+        // *different answer* from a token nothing recognises — and conflating
+        // them costs an afternoon, because the fixes have nothing in common.
+        // One means "mint a wider token"; the other means "your token is not
+        // from this server, or something in front answered before app-lb did".
+        //
+        // 403 discloses nothing here that the caller does not already hold: it
+        // is their own token, and they reached this deployment by name. The
+        // admin listener behind answers exactly this way for exactly this
+        // situation (`decide_access`), so the two layers now agree.
+        let known = req
+            .bearer
+            .as_ref()
+            .and_then(|b| self.tokens.as_ref().and_then(|t| t.verify(b, now_secs())));
+
         if req.bearer.is_some() {
             self.observe_auth(deployment_id, req, crate::siem::AuthAction::GateToken, None);
         }
@@ -467,8 +536,39 @@ impl Authenticator {
             deployment = %deployment_id,
             path = %req.path,
             scope = ?want,
+            recognised = known.is_some(),
             "refused a scoped public path",
         );
+
+        if let Some(token) = known {
+            let why = if !token.admin.satisfies(want) {
+                format!(
+                    "this token's admin scope is '{}', and this path needs '{}' or higher",
+                    token.admin.as_str(),
+                    want.as_str(),
+                )
+            } else {
+                format!(
+                    "this token does not admit deployment \"{deployment_id}\" — a token \
+                     confined to a namespace admits only deployments in that namespace, so \
+                     it cannot pass a gate on one outside it",
+                )
+            };
+            debug_assert!(
+                !req.fronts_admin_api || !token.admin.satisfies(want),
+                "in front of the admin API only the tier is checked, so a refusal here \
+                 can only ever be about the tier",
+            );
+            return Decision::Answered(Response::json(
+                403,
+                format!(
+                    "{{\"error\":\"{}\",\"scope\":\"{}\"}}\n",
+                    why.replace('"', "\\\""),
+                    want.as_str(),
+                ),
+            ));
+        }
+
         Decision::Answered(Response::json(
             401,
             format!(
@@ -1464,6 +1564,9 @@ mod tests {
             cookies,
             secure: true,
             wants_html: true,
+            // The ordinary case: a gate in front of an application, where the
+            // deployment check is the gate's to make.
+            fronts_admin_api: false,
             bearer: None,
             client: None,
         }
@@ -2437,6 +2540,131 @@ mod tests {
                 a.decide(&g, "web", "default", &req("/healthz", vec![])).await,
                 Decision::Allow(_)
             ));
+        }
+
+        /// 401 and 403 are different answers with different fixes, and the
+        /// gate used to give 401 for both. That cost real time: a
+        /// namespace-confined token was reported as one the server did not
+        /// recognise, which sends you to look at the token instead of the gate.
+        #[tokio::test]
+        async fn a_known_token_is_refused_differently_from_an_unknown_one() {
+            let (a, tokens) = with_tokens();
+            let mut g = gate();
+            g.public_paths = vec![scoped("/deployments", PathScope::Admin)];
+
+            // Known, right tier, but confined to a namespace this deployment is
+            // not in — `admits` fails, and the reason is worth saying.
+            let confined = tokens
+                .mint(
+                    NewToken {
+                        name: "ns".into(),
+                        admin: AdminScope::Admin,
+                        namespace: Some("samcurrie".into()),
+                        deployments: Vec::new(),
+                        expires_in_secs: None,
+                    },
+                    now_secs(),
+                )
+                .unwrap()
+                .1;
+            let Decision::Answered(r) =
+                a.decide(&g, "app-lb-admin", "default", &bearer("/deployments", &confined)).await
+            else {
+                panic!("a namespace token cannot pass a gate outside its namespace");
+            };
+            assert_eq!(r.status, 403, "known but not admitted is a 403");
+            assert!(r.body.contains("does not admit"), "{}", r.body);
+            assert!(r.body.contains("app-lb-admin"), "{}", r.body);
+
+            // Known, wrong tier: also 403, and says which tier.
+            let low = admin_token(&tokens, &["app-lb-admin"], AdminScope::View);
+            let Decision::Answered(r) =
+                a.decide(&g, "app-lb-admin", "default", &bearer("/deployments", &low)).await
+            else {
+                panic!("view does not reach admin");
+            };
+            assert_eq!(r.status, 403);
+            assert!(r.body.contains("'view'") && r.body.contains("'admin'"), "{}", r.body);
+
+            // Not known at all: 401, because nothing verified it — a different
+            // problem with a different fix.
+            let Decision::Answered(r) = a
+                .decide(&g, "app-lb-admin", "default", &bearer("/deployments", "applb_dead_nope"))
+                .await
+            else {
+                panic!("an unknown token is refused");
+            };
+            assert_eq!(r.status, 401, "unrecognised is a 401");
+        }
+
+        /// In front of app-lb's own admin API the gate checks the tier and
+        /// nothing else, because the API behind it scope-checks better than the
+        /// gate can. Without this a namespace-confined token could not reach
+        /// the admin API at all through its hostname — it admits no deployment
+        /// outside its namespace, and the fronting deployment lives in
+        /// `default`.
+        #[tokio::test]
+        async fn the_admin_api_does_its_own_scoping_so_the_gate_does_not_double_check() {
+            let (a, tokens) = with_tokens();
+            let mut g = gate();
+            g.public_paths = vec![scoped("/deployments", PathScope::Admin)];
+
+            let confined = tokens
+                .mint(
+                    NewToken {
+                        name: "ns".into(),
+                        admin: AdminScope::Admin,
+                        namespace: Some("samcurrie".into()),
+                        deployments: Vec::new(),
+                        expires_in_secs: None,
+                    },
+                    now_secs(),
+                )
+                .unwrap()
+                .1;
+
+            // The fronting deployment is in `default`; the token is walled into
+            // `samcurrie`. `admits` says no, and for an ordinary app that is the
+            // right answer.
+            let mut ordinary = bearer("/deployments", &confined);
+            ordinary.fronts_admin_api = false;
+            assert!(matches!(
+                a.decide(&g, "app-lb-admin", "default", &ordinary).await,
+                Decision::Answered(_)
+            ));
+
+            // In front of the admin API it is the wrong question, and is not
+            // asked. The tier still is.
+            let mut fronting = bearer("/deployments", &confined);
+            fronting.fronts_admin_api = true;
+            assert!(matches!(
+                a.decide(&g, "app-lb-admin", "default", &fronting).await,
+                Decision::Allow(_)
+            ));
+
+            // Tier is still enforced here — skipping `admits` is not skipping
+            // authorization, and a `view` token gets no further than before.
+            let low = tokens
+                .mint(
+                    NewToken {
+                        name: "low".into(),
+                        admin: AdminScope::View,
+                        namespace: Some("samcurrie".into()),
+                        deployments: Vec::new(),
+                        expires_in_secs: None,
+                    },
+                    now_secs(),
+                )
+                .unwrap()
+                .1;
+            let mut low_req = bearer("/deployments", &low);
+            low_req.fronts_admin_api = true;
+            let Decision::Answered(r) = a.decide(&g, "app-lb-admin", "default", &low_req).await
+            else {
+                panic!("view does not reach admin, wherever the gate stands");
+            };
+            assert_eq!(r.status, 403);
+            assert!(r.body.contains("'view'"), "{}", r.body);
         }
 
         /// A token admitted at a scoped path forwards no identity, exactly as

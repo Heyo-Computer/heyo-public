@@ -159,6 +159,11 @@ impl Client {
         run!(self, self.inner.probe(path))
     }
 
+    /// The status and the server's own explanation, when it gave one.
+    pub fn status_detail_of(&self, path: &str) -> Result<(u16, Option<String>)> {
+        run!(self, self.inner.probe_detail(path))
+    }
+
     pub fn healthz(&self) -> Result<()> {
         run!(self, self.inner.healthz())
     }
