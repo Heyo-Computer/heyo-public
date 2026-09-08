@@ -51,6 +51,22 @@ The services are independent processes but can share one PostgreSQL database. Ea
 
 Service rollouts keep the previous healthy deployment active while the candidate converges. The controller retries Cloud state and health reads with capped backoff under one deployment deadline, requires candidate and app-lb route health to remain successful for 10 seconds, and uses the candidate's public endpoint for stable route cutover even when an internal endpoint answers health first. Only persisted terminal state or the deadline is failure; deployment events are diagnostics, not a liveness signal.
 
+## Public service deployment boundary
+
+The public VM workflow deploys only Orchestrator, HeyoSecret and app-obs.
+app-lb runs on the host and is not a VM deployment target, including for
+`service=all`. app-obs still connects to the existing app-lb admin endpoint.
+Automatic selection requires a change under the service's source paths;
+shared workflow/environment edits and empty change lists select no services.
+Use an explicit service dispatch when only shared deployment settings change.
+
+For the pending JSON receiver upgrade, this README change selects Orchestrator
+alone. Keep the flat deployment request in this workflow until the running
+receiver upgrades; then submit the separate JSON caller changes. Before any
+receiver rollout, ensure host app-lb discovery does not depend on the retiring
+Orchestrator VM's port. Verify discovery through a stable endpoint and preserve
+the existing host proxy; do not recreate app-lb to upgrade the receiver.
+
 ## Layout
 
 - `src/main.rs` — boot, route table, reconciler spawn.
