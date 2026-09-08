@@ -536,6 +536,11 @@ pub async fn ensure_vm(
     let mut phase = Instant::now();
     let _admission = admission_slot(schema).await;
     let admission_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
+    // Everything from here to a serving Postgres is what this VM costs to
+    // bring back, and therefore what the reaper's warm hold is buying (see
+    // `SchemaEntry::idle_budget`). The admission wait above is excluded: it
+    // measures how many other clients arrived at once, not this VM.
+    let bringup_started = phase;
     let name = format!("pg-{schema}");
     let keepalive = up.pinned;
     // Floored at the configured starting size (a smaller recorded value is a
@@ -651,7 +656,13 @@ pub async fn ensure_vm(
         );
 
         Ok(Arc::new(SchemaEntry::new(
-            sandbox, target, tunnel, pool, keepalive, slots,
+            sandbox,
+            target,
+            tunnel,
+            pool,
+            keepalive,
+            slots,
+            bringup_started.elapsed(),
         )))
     }
     .await;
@@ -2747,9 +2758,15 @@ async fn create_vm_within(
             format!(" with a {disk_gb}GiB data device (default is {}GiB)", cfg.data_disk_gb)
         }
     );
-    let sandbox = {
+    let (sandbox, create_started) = {
         let _slot = bringup_slot(name).await;
-        Sandbox::create(
+        // The clock for the VmCreate timing starts once the daemon is actually
+        // ours to talk to. The wait for a bring-up slot above measures how many
+        // other creates are already in flight — a queue depth, not a cost of
+        // this create — and folding it in would make the percentiles a
+        // function of concurrency rather than of how fast the daemon builds.
+        let started = Instant::now();
+        let sandbox = Sandbox::create(
             SandboxCreateOptions {
                 name: Some(name.to_string()),
                 image: Some(cfg.image.clone()),
@@ -2779,7 +2796,8 @@ async fn create_vm_within(
             },
         )
         .await
-        .with_context(|| format!("creating VM {name}"))?
+        .with_context(|| format!("creating VM {name}"))?;
+        (sandbox, started)
     };
     // The daemon 202-accepts deploys, so this id exists (with a daemon-side
     // record behind it) long before the VM is usable — and until the registry
@@ -2820,7 +2838,14 @@ async fn create_vm_within(
         }
         return Err(e).with_context(|| format!("waiting for created VM {name}"));
     }
+    let took = create_started.elapsed();
+    // Success only, and paired with the event so the "VMs created" chart and
+    // these percentiles always describe the same set of creates. A failed
+    // create is bounded by `ready_timeout` rather than by how fast the daemon
+    // works, so counting it would pull every percentile toward that ceiling.
+    info!("created VM {name} in {took:?}");
     crate::events::record(crate::events::Event::VmCreated);
+    crate::events::record_timing(crate::events::Timing::VmCreate, took);
     Ok(sandbox)
 }
 

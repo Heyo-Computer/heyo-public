@@ -291,8 +291,10 @@ fn credential_panel(cred: &Credential, port: u16) -> Markup {
     }
 }
 
-/// Per-hour event series for the monitoring page's activity charts, each as
-/// oldest-first `(hour_start_unix, count)` buckets from `crate::events`.
+/// What the monitoring page's activity section reads from `crate::events`:
+/// per-hour counts for the charts, each as oldest-first
+/// `(hour_start_unix, count)` buckets, plus the timing distributions that go
+/// beside them.
 pub struct ActivitySeries {
     pub restores_s3: Vec<(u64, u32)>,
     pub restores_local: Vec<(u64, u32)>,
@@ -300,6 +302,10 @@ pub struct ActivitySeries {
     pub offloads_done: Vec<(u64, u32)>,
     pub vms_deleted: Vec<(u64, u32)>,
     pub spares_claimed: Vec<(u64, u32)>,
+    /// How long creating a new VM took over the same window. `None` when
+    /// nothing was created in it — which is not the same as "creates are
+    /// instant", so the page says which it is.
+    pub vm_create: Option<crate::events::TimingStats>,
 }
 
 /// The monitoring view: whole-host CPU/memory/disk saturation plus pooler-fleet
@@ -472,6 +478,7 @@ pub fn monitoring_page(
 
             h3.sub-head { "VMs created" }
             (hourly_bar_chart(&activity.vms_created, "VM"))
+            (timing_stats_block(activity.vm_create.as_ref()))
 
             h3.sub-head { "warm spares claimed" }
             (hourly_bar_chart(&activity.spares_claimed, "claim"))
@@ -1264,6 +1271,45 @@ fn meter_level(frac: f64) -> &'static str {
 }
 
 /// A compact aggregate stat card: a number, a label, and an optional caption.
+/// Create-latency percentiles beside the create-rate chart: how long a new VM
+/// actually takes to build, over the same 24h window the chart covers.
+///
+/// The sample count is shown as prominently as the percentiles, and a window
+/// with too few samples to support a p99 says so rather than printing a figure
+/// that is really just "the slowest of the four creates we saw". `None` —
+/// nothing created at all — is its own message, because a blank or zeroed
+/// latency block reads as "creates are instant", which is the opposite of what
+/// an empty window means.
+fn timing_stats_block(stats: Option<&crate::events::TimingStats>) -> Markup {
+    let Some(s) = stats else {
+        return html! {
+            p.note { "No VMs were created in the last 24h — no create latency to report." }
+        };
+    };
+    // Nearest-rank needs at least this many samples for the percentile to be
+    // distinguishable from the maximum (rank ceil(p/100 * n) < n).
+    let thin = |p: u32| (100 / (100 - p)) as usize;
+    html! {
+        div.stats {
+            (stat("create p50", &human_ms(s.p50_ms as u128), Some("median")))
+            (stat("create p95", &human_ms(s.p95_ms as u128),
+                if s.count >= thin(95) { None } else { Some("too few samples") }))
+            (stat("create p99", &human_ms(s.p99_ms as u128),
+                if s.count >= thin(99) { None } else { Some("too few samples") }))
+            (stat("slowest create", &human_ms(s.max_ms as u128), None))
+            (stat("creates measured", &s.count.to_string(), Some("last 24h")))
+        }
+        p.note {
+            "Time from the daemon accepting the deploy to the VM reporting ready — the "
+            "wait for a bring-up slot is excluded, since that measures how many creates "
+            "are already in flight rather than what this one costs. Successful creates "
+            "only: a failed one is bounded by " code { "PG_VM_POOL_READY_TIMEOUT_SECS" }
+            " and would drag every percentile toward that ceiling. Percentiles are "
+            "nearest-rank, so each figure is a create that actually happened."
+        }
+    }
+}
+
 fn stat(label: &str, value: &str, sub: Option<&str>) -> Markup {
     html! {
         div.stat {
@@ -1422,9 +1468,21 @@ pub fn vm_detail_page(
                     dt { "idle for" }
                     dd {
                         (human_secs(idle))
-                        @if let Some(t) = st.registry.idle_timeout() {
+                        // The budget is per-VM, so show THIS VM's — and the
+                        // bring-up time that chose it, which is the whole
+                        // answer to "why did that one stop after a minute".
+                        @if let Some(budget) = r.idle_budget_secs {
+                            span.dim { " (reaped after " (human_secs(budget)) ")" }
+                        } @else if let Some(t) = st.registry.idle_timeout() {
                             span.dim { " (reaped after " (human_secs(t.as_secs())) ")" }
                         }
+                    }
+                }
+                @if let Some(ms) = r.bringup_ms {
+                    dt { "bring-up took" }
+                    dd {
+                        (human_ms(ms))
+                        span.dim { " — what the idle budget above is priced off" }
                     }
                 }
                 @if let Some(s) = db {
@@ -1852,6 +1910,20 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
+/// A bring-up duration. Sub-second is the interesting case here — that is
+/// what a restart of a VM still on disk looks like, and what earns the short
+/// idle budget — so it keeps millisecond resolution below a second and hands
+/// anything longer to [`human_secs`].
+fn human_ms(ms: u128) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 10_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        human_secs((ms / 1000) as u64)
+    }
+}
+
 fn human_secs(s: u64) -> String {
     let d = s / 86_400;
     let h = (s % 86_400) / 3_600;
@@ -2111,6 +2183,48 @@ fn state_class(s: crate::replication::State) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::TimingStats;
+
+    /// An empty window and a populated one are different statements, and the
+    /// difference has to survive into the rendered page: a blank or zeroed
+    /// latency block reads as "creates are instant", which is the opposite of
+    /// "nothing was created".
+    #[test]
+    fn create_latency_block_distinguishes_empty_from_fast() {
+        let empty = timing_stats_block(None).into_string();
+        assert!(empty.contains("No VMs were created"), "{empty}");
+        assert!(!empty.contains("p50"), "an empty window must not print percentiles");
+
+        // 4 samples: enough for a median, nowhere near enough for a p95/p99,
+        // and the tiles must say so rather than quietly printing the max three
+        // times as if it were three percentiles.
+        let thin = timing_stats_block(Some(&TimingStats {
+            count: 4,
+            p50_ms: 21_500,
+            p95_ms: 40_000,
+            p99_ms: 40_000,
+            max_ms: 40_000,
+        }))
+        .into_string();
+        // Tens of seconds render as whole seconds — the precision that matters
+        // is sub-second (a restart) versus tens of seconds (a create).
+        assert!(thin.contains("21s"), "{thin}");
+        assert_eq!(thin.matches("too few samples").count(), 2, "p95 and p99 flagged");
+
+        // 200 samples supports every percentile shown, so nothing is flagged.
+        let full = timing_stats_block(Some(&TimingStats {
+            count: 200,
+            p50_ms: 800,
+            p95_ms: 30_000,
+            p99_ms: 95_000,
+            max_ms: 120_000,
+        }))
+        .into_string();
+        assert!(!full.contains("too few samples"), "{full}");
+        assert!(full.contains("800ms"), "sub-second p50 stays in ms: {full}");
+        assert!(full.contains("1m 35s"), "p99 reads as clock time: {full}");
+        assert!(full.contains("200"), "the sample count is shown");
+    }
 
     /// A row shaped like the ones `model::build_rows` produces, with the
     /// offload tier under test. `offload: Some(_)` is the synthetic row spliced
@@ -2138,6 +2252,8 @@ mod tests {
             live_sessions: None,
             client_slots: None,
             idle_secs: None,
+            idle_budget_secs: None,
+            bringup_ms: None,
             keepalive: false,
             target: None,
             tunneled: None,

@@ -82,6 +82,9 @@ pub async fn monitoring(
         offloads_done: crate::events::hourly_counts(crate::events::Event::OffloadDone, 24),
         vms_deleted: crate::events::hourly_counts(crate::events::Event::VmDeleted, 24),
         spares_claimed: crate::events::hourly_counts(crate::events::Event::SpareClaimed, 24),
+        // Same 24h window as the charts, so the create rate above and the
+        // create latency below describe exactly the same set of creates.
+        vm_create: crate::events::timing_stats(crate::events::Timing::VmCreate, 24),
     };
     Ok(views::monitoring_page(
         &st,

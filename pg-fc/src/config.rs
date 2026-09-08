@@ -7,6 +7,18 @@ use std::time::Duration;
 
 use heyo_sdk::SandboxSize;
 
+/// Default for [`Config::idle_timeout_fast`]: a VM the pooler can bring back in
+/// well under a second does not earn a multi-minute warm hold. 60s still
+/// absorbs the common "client reconnects between statements" pattern while
+/// cutting the standing warm fleet — and every VM it stops is one the reclaim
+/// and offload ladders can finally work on.
+const DEFAULT_IDLE_TIMEOUT_FAST: Duration = Duration::from_secs(60);
+
+/// Default for [`Config::fast_bringup`]. Deliberately far above a healthy
+/// restart (~0.2–1s) and far below a create or a thaw (tens of seconds to
+/// minutes), so it separates the two populations without needing to be tuned.
+const DEFAULT_FAST_BRINGUP: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 pub struct Config {
     /// Where the pooler listens for Postgres clients.
@@ -37,6 +49,44 @@ pub struct Config {
     /// the daemon's own TTL can't, since it's absolute from VM boot and the
     /// daemon doesn't see connections. Keep-alive schemas are exempt.
     pub idle_timeout: Option<Duration>,
+    /// The *short* inactivity timeout, applied to a VM the pooler measured as
+    /// cheap to bring back — see [`Self::fast_bringup`]. `None` disables the
+    /// two-speed reaper (every VM waits out [`Self::idle_timeout`]).
+    ///
+    /// Why two timeouts at all: [`Self::idle_timeout`] is really a bet on the
+    /// *next* bring-up. Keeping a VM warm buys the next client whatever that
+    /// bring-up would have cost, and for a schema whose VM still exists on
+    /// disk that is a daemon `start()` plus a Postgres restart — a fraction of
+    /// a second on a healthy host, against the ~40s create+`initdb` the same
+    /// number has to cover for a schema being built from scratch. One timeout
+    /// for both means the cheap case is priced like the expensive one, and the
+    /// fleet fills up with running VMs nobody is using: RAM held, and disks
+    /// the reclaim and offload ladders cannot touch (both need the VM stopped).
+    ///
+    /// Clamped to `<= idle_timeout` at parse time — a "fast" timeout longer
+    /// than the normal one would silently keep VMs up *longer* than the
+    /// operator's own setting.
+    ///
+    /// Env `PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS` (default 60); `0` disables.
+    pub idle_timeout_fast: Option<Duration>,
+    /// How fast a bring-up has to have been for its VM to be reaped on
+    /// [`Self::idle_timeout_fast`] instead of [`Self::idle_timeout`].
+    ///
+    /// Measured, not assumed — the entry records what its own bring-up
+    /// actually cost (everything after the admission queue: resolve/boot,
+    /// Postgres readiness, database setup), and the reaper compares that. A
+    /// warm restart on an idle host lands ~0.2–1s; a create, a spare claim
+    /// that still has to `initdb`, or any thaw lands far above this.
+    ///
+    /// The point of measuring rather than keying on "was this VM already on
+    /// disk" is the loaded host. When heyvmd is saturated, a restart that
+    /// normally takes 200ms takes seconds — and that is exactly when a short
+    /// timeout would be most harmful, churning stop/start work into a daemon
+    /// already behind. Pricing the timeout off the observed cost backs the
+    /// reaper off automatically, with no extra knob.
+    ///
+    /// Env `PG_VM_POOL_FAST_BRINGUP_SECS` (default 5).
+    pub fast_bringup: Duration,
     /// How long to wait for a VM (and then Postgres) to become ready.
     pub ready_timeout: Duration,
     /// Cap on the iroh tunnel handshake (`expose_tcp` + `P2pTunnel::connect`).
@@ -868,6 +918,8 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_USER",
     "PG_VM_POOL_PASSWORD",
     "PG_VM_POOL_IDLE_TIMEOUT_SECS",
+    "PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS",
+    "PG_VM_POOL_FAST_BRINGUP_SECS",
     "PG_VM_POOL_READY_TIMEOUT_SECS",
     "PG_VM_POOL_CONNECT_TIMEOUT_SECS",
     "PG_VM_POOL_ADMIT_TIMEOUT_SECS",
@@ -981,6 +1033,26 @@ impl Config {
             },
             Err(_) => Some(Duration::from_secs(900)),
         };
+        // The short timeout for cheap-to-restart VMs; `0` disables the
+        // two-speed reaper. Clamped to `idle_timeout` so it can only ever pull
+        // a stop *earlier* than the operator's own setting, never push it out.
+        let idle_timeout_fast = match std::env::var("PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS") {
+            Ok(v) => match v.parse::<u64>() {
+                Ok(0) => None,
+                Ok(secs) => Some(Duration::from_secs(secs)),
+                Err(_) => Some(DEFAULT_IDLE_TIMEOUT_FAST),
+            },
+            Err(_) => Some(DEFAULT_IDLE_TIMEOUT_FAST),
+        }
+        .map(|fast| match idle_timeout {
+            Some(normal) => fast.min(normal),
+            None => fast,
+        });
+        let fast_bringup = std::env::var("PG_VM_POOL_FAST_BRINGUP_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_FAST_BRINGUP);
         let ready_secs = std::env::var("PG_VM_POOL_READY_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1242,6 +1314,8 @@ impl Config {
             pg_user,
             pg_password,
             idle_timeout,
+            idle_timeout_fast,
+            fast_bringup,
             ready_timeout: Duration::from_secs(ready_secs),
             connect_timeout: Duration::from_secs(connect_secs),
             admit_timeout: Duration::from_secs(admit_secs),

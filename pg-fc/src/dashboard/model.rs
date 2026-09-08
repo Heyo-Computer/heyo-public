@@ -180,6 +180,12 @@ pub struct VmRow {
     /// rather than being refused by the database.
     pub client_slots: Option<(usize, usize)>,
     pub idle_secs: Option<u64>,
+    /// The idle timeout that actually applies to this VM. Per-VM, not the one
+    /// configured number: a VM the pooler measured as cheap to bring back is
+    /// reaped on the short timeout (see the registry's `idle_budget`).
+    pub idle_budget_secs: Option<u64>,
+    /// What this VM's bring-up cost — the measurement that chose that budget.
+    pub bringup_ms: Option<u128>,
     pub keepalive: bool,
     /// Where the pooler splices client bytes (warm entries only).
     pub target: Option<std::net::SocketAddr>,
@@ -582,6 +588,8 @@ fn join_row(
         live_sessions: entry.map(|e| e.active),
         client_slots: entry.map(|e| (e.free_slots, e.slot_limit)),
         idle_secs: entry.map(|e| e.idle_secs),
+        idle_budget_secs: entry.and_then(|e| e.idle_budget_secs),
+        bringup_ms: entry.map(|e| e.bringup_ms),
         keepalive: entry.map(|e| e.keepalive).unwrap_or(false),
         target: entry.map(|e| e.target),
         tunneled: entry.map(|e| e.tunneled),

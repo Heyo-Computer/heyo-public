@@ -166,6 +166,15 @@ pub struct SchemaEntry {
     /// `last_active` is what marks the VM idle. Refreshed at checkout so an
     /// entry handed out but not yet counted in `active` isn't reaped mid-race.
     last_active: StdMutex<Instant>,
+    /// What this entry's own bring-up cost, measured from the moment it
+    /// cleared the admission queue to the moment Postgres was serving (see
+    /// `vm::ensure_vm`). The queue wait is excluded on purpose: it is a
+    /// function of how many other clients arrived at once, not of what this
+    /// VM costs to bring back.
+    ///
+    /// This is the price of *not* keeping the VM warm, so it is what the
+    /// reaper prices the idle timeout off — see [`Self::idle_budget`].
+    bringup_took: Duration,
 }
 
 impl SchemaEntry {
@@ -176,6 +185,7 @@ impl SchemaEntry {
         pool: Pool,
         keepalive: bool,
         slots: usize,
+        bringup_took: Duration,
     ) -> Self {
         Self {
             sandbox,
@@ -187,6 +197,7 @@ impl SchemaEntry {
             slot_limit: slots,
             active: AtomicUsize::new(0),
             last_active: StdMutex::new(Instant::now()),
+            bringup_took,
         }
     }
 
@@ -233,12 +244,87 @@ impl SchemaEntry {
             && self.last_active.lock().unwrap().elapsed() >= timeout
     }
 
+    /// How long this particular VM may sit idle before the reaper stops it —
+    /// see [`idle_budget`], which this hands its measured bring-up cost to.
+    fn idle_budget(
+        &self,
+        normal: Duration,
+        fast: Option<Duration>,
+        fast_bringup: Duration,
+    ) -> Duration {
+        idle_budget(self.bringup_took, normal, fast, fast_bringup)
+    }
+}
+
+/// Which idle timeout applies to a VM whose own bring-up took `bringup_took`.
+///
+/// The warm hold exists to spare the next client the bring-up, so it is priced
+/// off what that bring-up actually cost: a VM that came back in under
+/// `fast_bringup` — the daemon `start()` of a VM still on disk — gets `fast`,
+/// and everything else (a create, a spare claim that still had to `initdb`,
+/// any thaw) keeps the full `normal` budget. `fast` of `None` disables the
+/// two-speed behavior entirely.
+///
+/// Measured rather than inferred from whether the VM already existed, because
+/// the number that matters is what the *host* can do right now. When heyvmd is
+/// saturated a restart that is normally 200ms takes seconds — and that is
+/// exactly when a short timeout does damage, feeding stop/start work to a
+/// daemon already behind. Those bring-ups fail this test on their own and fall
+/// back to `normal`, so the reaper eases off under load with no extra knob and
+/// no load signal to calibrate.
+///
+/// Free-standing so the policy can be tested without building a `SchemaEntry`
+/// (which needs a live sandbox, tunnel and pool).
+fn idle_budget(
+    bringup_took: Duration,
+    normal: Duration,
+    fast: Option<Duration>,
+    fast_bringup: Duration,
+) -> Duration {
+    match fast {
+        Some(fast) if bringup_took <= fast_bringup => fast,
+        _ => normal,
+    }
 }
 
 /// Cap on VMs the idle reaper stops in one pass (oldest-idle first; the rest
 /// wait a tick). See [`SchemaRegistry::reap_idle`] for why mass stops are
 /// worse than a few extra minutes of warm RAM.
 const IDLE_MAX_STOPS_PER_PASS: usize = 24;
+
+/// How many idle-stops run concurrently within one reaper pass.
+///
+/// A stop is almost entirely waiting — a guest `df`, a CHECKPOINT, the
+/// daemon's stop call — so serializing them made a pass cost the sum of every
+/// victim's worst case (tens of seconds each) and let one slow VM push the
+/// whole fleet past its idle deadline. Bounded rather than unleashed because
+/// the far end is one heyvmd, whose sandbox manager goes lock-contended before
+/// anything else does: a mass expiry must not become a burst of stop calls
+/// against the same daemon the clients are queued on. Eight finishes a full
+/// capped pass in three rounds even if every stop hits its worst case, and
+/// stays well under what a bring-up burst already asks of the daemon.
+const IDLE_STOP_CONCURRENCY: usize = 8;
+
+/// How soon the reaper re-runs after a pass that hit
+/// [`IDLE_MAX_STOPS_PER_PASS`] with victims still queued.
+///
+/// The cap exists to turn a mass expiry into a slope, but on its own it is
+/// also a hard ceiling of 24 stops per tick — and a fleet that goes idle
+/// faster than that never catches up, so every VM's real stop time drifts
+/// further past its own idle timeout for as long as the load lasts. Re-arming
+/// keeps the slope but removes the ceiling. Long enough that the daemon sees
+/// batches rather than a continuous stream, short enough that a backlog drains
+/// in minutes instead of hours.
+const IDLE_BACKLOG_REARM: Duration = Duration::from_secs(10);
+
+/// Bound on the daemon's stop call for one idle-stopped VM.
+///
+/// The reaper used to await `Sandbox::stop()` with no timeout at all, so a
+/// single VM whose stop never returned (a lock-contended or wedged heyvmd —
+/// the exact condition under which the pooler most needs to be shedding VMs)
+/// parked the pass, and with it every other stop, indefinitely. Matches the
+/// untracked reaper's bound, which always had one.
+const IDLE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often the urgent device-grow watcher samples the warm set. It exists
 /// to beat a filling disk, not to catch it the instant it crosses — a minute
@@ -362,6 +448,14 @@ pub struct EntrySnapshot {
     pub free_slots: usize,
     pub slot_limit: usize,
     pub idle_secs: u64,
+    /// The idle timeout that actually applies to this entry, which with
+    /// two-speed reaping is per-VM rather than the one configured number —
+    /// see [`idle_budget`]. `None` when idle reaping is off.
+    pub idle_budget_secs: Option<u64>,
+    /// What this entry's own bring-up cost, the input that chose that budget.
+    /// Surfaced so "why did this VM stop after a minute" is answerable from
+    /// the dashboard instead of the log.
+    pub bringup_ms: u128,
     pub keepalive: bool,
     pub tunneled: bool,
 }
@@ -1094,6 +1188,11 @@ impl SchemaRegistry {
                     free_slots: e.free_slots(),
                     slot_limit: e.slot_limit(),
                     idle_secs: e.idle_for().as_secs(),
+                    idle_budget_secs: self.cfg.idle_timeout.map(|t| {
+                        e.idle_budget(t, self.cfg.idle_timeout_fast, self.cfg.fast_bringup)
+                            .as_secs()
+                    }),
+                    bringup_ms: e.bringup_took.as_millis(),
                     keepalive: e.keepalive,
                     tunneled: e.is_tunneled(),
                 })
@@ -1626,7 +1725,19 @@ impl SchemaRegistry {
             info!("idle reaping disabled (PG_VM_POOL_IDLE_TIMEOUT_SECS=0)");
             return;
         };
-        info!("idle reaper: stopping VMs after {timeout:?} without connections");
+        match self.cfg.idle_timeout_fast {
+            Some(fast) => info!(
+                "idle reaper: stopping VMs after {timeout:?} without connections, or {fast:?} \
+                 for a VM whose own bring-up took <= {:?} (a restart of a VM still on disk — \
+                 keeping one of those warm buys the next client almost nothing)",
+                self.cfg.fast_bringup
+            ),
+            None => info!(
+                "idle reaper: stopping VMs after {timeout:?} without connections \
+                 (PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS=0: no short timeout for \
+                 cheap-to-restart VMs)"
+            ),
+        }
         match self.cfg.disk_grow {
             Some(g) => info!(
                 "disk growth: at idle-stop, devices spanned by a >= {:.0}%-full data fs \
@@ -1637,13 +1748,34 @@ impl SchemaRegistry {
         }
         let registry = self.clone();
         // Check a few times per timeout window so shutdown lands close to the
-        // deadline, but not so often it busies the daemon.
-        let tick = (timeout / 4).max(Duration::from_secs(5));
+        // deadline, but not so often it busies the daemon. Paced off the
+        // SHORTEST budget in play: with a 60s fast timeout under a 900s normal
+        // one, a 225s tick would let every cheap VM overshoot its deadline by
+        // more than the deadline itself.
+        let shortest = self.cfg.idle_timeout_fast.unwrap_or(timeout).min(timeout);
+        let tick = (shortest / 4).max(Duration::from_secs(5));
+        // Backlog re-arm: a pass that hit IDLE_MAX_STOPS_PER_PASS with victims
+        // left over notifies this, so the next pass starts after
+        // IDLE_BACKLOG_REARM rather than a full tick. Without it the cap is a
+        // hard throughput ceiling — 24 stops per tick — and a fleet going idle
+        // faster than that drifts permanently past its own idle timeout, which
+        // is precisely the "VMs stay up long past the limit under load"
+        // failure. The floor keeps the re-arm from becoming a spin.
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let signal = wake.clone();
         // Reaper `tick` is already short, so first pass and steady state match.
-        tokio::spawn(supervise("idle-reaper", tick, tick, move || {
-            let registry = registry.clone();
-            async move { registry.reap_idle(timeout).await }
-        }));
+        tokio::spawn(supervise_with_wake(
+            "idle-reaper",
+            tick,
+            tick,
+            Some(wake),
+            IDLE_BACKLOG_REARM,
+            move || {
+                let registry = registry.clone();
+                let signal = signal.clone();
+                async move { registry.reap_idle(timeout, &signal).await }
+            },
+        ));
     }
 
     /// Evict and stop idle VMs — at most [`IDLE_MAX_STOPS_PER_PASS`] per
@@ -1652,28 +1784,41 @@ impl SchemaRegistry {
     /// eviction (and bumps `active`, sparing it) or misses it and brings up a
     /// fresh VM. The actual stop happens after the lock is released.
     ///
+    /// Each entry is judged against its own budget — see [`idle_budget`] — so
+    /// a VM that is cheap to restart expires on the short timeout while one
+    /// that cost a create or a thaw keeps the full warm hold.
+    ///
     /// The cap plus the per-schema timeout jitter (see [`jittered_timeout`])
     /// keep a cohort of VMs that went idle together — clients that arrived in
     /// one burst — from all stopping in one pass: an uncapped mass stop reads
     /// as "the fleet fell off a cliff" on the dashboard, floods the post-stop
     /// reclaim trigger with hundreds of disks at once, and converts into a
     /// synchronized cold-start (and spare-claim) storm when those schemas
-    /// return. The excess stays warm one more tick.
+    /// return. The excess does NOT wait out a whole tick, though: a capped
+    /// pass asks for the next one in [`IDLE_BACKLOG_REARM`], because a cap
+    /// that also throttles the drain rate is how a fleet ends up permanently
+    /// past its own idle timeout (see [`Self::spawn_reaper`]).
     ///
     /// Returns how many VMs were stopped, for the supervisor's heartbeat.
-    async fn reap_idle(self: &Arc<Self>, timeout: Duration) -> usize {
+    async fn reap_idle(self: &Arc<Self>, timeout: Duration, backlog: &tokio::sync::Notify) -> usize {
+        let fast = self.cfg.idle_timeout_fast;
+        let fast_bringup = self.cfg.fast_bringup;
         let mut victims: Vec<(String, Arc<SchemaEntry>)> = Vec::new();
         let deferred;
         {
             let mut map = self.entries.lock().await;
             // Collect every expired entry with its idle age, then take only
-            // the oldest-idle CAP of them out of the map.
+            // the oldest-idle CAP of them out of the map. Each entry is judged
+            // against its OWN budget (see `SchemaEntry::idle_budget`), so a
+            // cheap-to-restart VM expires on the short timeout while one that
+            // cost a create or a thaw keeps the full warm hold.
             let mut expired: Vec<(String, Duration)> = map
                 .iter()
                 .filter_map(|(schema, cell)| {
                     let entry = cell.get()?;
+                    let budget = entry.idle_budget(timeout, fast, fast_bringup);
                     entry
-                        .is_idle(jittered_timeout(schema, timeout))
+                        .is_idle(jittered_timeout(schema, budget))
                         .then(|| (schema.clone(), entry.idle_for()))
                 })
                 .collect();
@@ -1688,9 +1833,15 @@ impl SchemaRegistry {
         }
         if deferred > 0 {
             info!(
-                "idle reaper: stopping {} oldest-idle VM(s) this pass, deferring {deferred}                  (cap {IDLE_MAX_STOPS_PER_PASS}/pass smooths mass expiries)",
+                "idle reaper: stopping {} oldest-idle VM(s) this pass, deferring {deferred} \
+                 (cap {IDLE_MAX_STOPS_PER_PASS}/pass smooths mass expiries); re-arming in \
+                 {IDLE_BACKLOG_REARM:?} instead of waiting out the tick",
                 victims.len()
             );
+            // The cap is there to break a mass expiry into a slope, not to put
+            // a ceiling on how fast the fleet can drain. Ask for the next pass
+            // now so the slope stays steep enough to keep up with arrivals.
+            backlog.notify_one();
         }
         let stopped = victims.len();
         // Device-growth candidates discovered while stopping: (schema, id,
@@ -1699,30 +1850,51 @@ impl SchemaRegistry {
         // the resize is cheapest exactly then (the daemon's resize is offline;
         // on an already-stopped VM it costs no client disruption at all).
         let mut grow: Vec<(String, String, u64)> = Vec::new();
-        for (schema, entry) in victims {
-            info!("idle-stopping VM for schema {schema} (no connections for >= {timeout:?})");
-            if let Some(gc) = self.cfg.disk_grow
-                && let Some((fs, dev)) = sample_disk(&entry).await
-            {
-                // Note the device size while the VM is still up to answer the
-                // question. Once the offload ladder deletes that VM, the
-                // registry row is the only thing left that knows how big a
-                // restore has to build its replacement (see
-                // `Store::set_disk_gb`), and a stale value corrects itself
-                // here on the next idle-stop.
-                self.store.set_disk_gb(&schema, device_gb(dev));
-                if let GrowVerdict::Grow(target) = grow_verdict(fs, dev, gc.pct, gc.max_gb) {
-                    info!(
-                        "schema {schema}: data fs is >= {:.0}% full and spans its device — \
-                         queueing offline device grow to {target}GiB",
-                        gc.pct
-                    );
-                    grow.push((schema.clone(), entry.sandbox_id(), target));
+        // Victims stop concurrently, bounded by IDLE_STOP_CONCURRENCY. Each
+        // stop is a sequence of waits on things outside this process — a guest
+        // `df`, a CHECKPOINT on a micro VM, then the daemon's stop — so one at
+        // a time a pass costs the SUM of them, tens of seconds apiece, which
+        // on a busy host runs longer than the tick that scheduled it. No cap
+        // can fix that; the work is per-VM-independent and the only reason it
+        // was serial is that it was written as a loop.
+        let mut stops = futures::stream::iter(victims.into_iter().map(|(schema, entry)| {
+            let registry = self.clone();
+            async move {
+                info!(
+                    "idle-stopping VM for schema {schema} (no connections for >= {:?}; \
+                     its bring-up took {:?})",
+                    entry.idle_budget(timeout, fast, fast_bringup),
+                    entry.bringup_took,
+                );
+                let mut grow = None;
+                if let Some(gc) = registry.cfg.disk_grow
+                    && let Some((fs, dev)) = sample_disk(&entry).await
+                {
+                    // Note the device size while the VM is still up to answer
+                    // the question. Once the offload ladder deletes that VM,
+                    // the registry row is the only thing left that knows how
+                    // big a restore has to build its replacement (see
+                    // `Store::set_disk_gb`), and a stale value corrects itself
+                    // here on the next idle-stop.
+                    registry.store.set_disk_gb(&schema, device_gb(dev));
+                    if let GrowVerdict::Grow(target) = grow_verdict(fs, dev, gc.pct, gc.max_gb) {
+                        info!(
+                            "schema {schema}: data fs is >= {:.0}% full and spans its device — \
+                             queueing offline device grow to {target}GiB",
+                            gc.pct
+                        );
+                        grow = Some((schema.clone(), entry.sandbox_id(), target));
+                    }
                 }
+                checkpoint_and_stop(&entry, &schema).await;
+                // Dropping the last Arc here tears down the tunnel + pool. Data
+                // on the VM's /dev/vdb persists; a later connect restarts it.
+                grow
             }
-            checkpoint_and_stop(&entry, &schema).await;
-            // Dropping the last Arc here tears down the tunnel + pool. Data on
-            // the VM's /dev/vdb persists; a later connect restarts the VM.
+        }))
+        .buffer_unordered(IDLE_STOP_CONCURRENCY);
+        while let Some(queued) = stops.next().await {
+            grow.extend(queued);
         }
         // The disks just released are prime reclaim candidates — without a trim
         // each keeps its full high-water allocation on the host. Trigger a run
@@ -1905,10 +2077,10 @@ impl SchemaRegistry {
             tiers.join(", "),
             match max_holdoff {
                 Some(d) => format!(
-                    "after {d:?} held off by queued clients it trickles one no-boot job at a \
-                     time anyway"
+                    "after {d:?} held off by queued clients or a reclaim pass it trickles one \
+                     no-boot job at a time anyway"
                 ),
-                None => "it yields to queued clients indefinitely \
+                None => "it yields to queued clients and reclaim passes indefinitely \
                          (PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS=0)"
                     .to_string(),
             }
@@ -1974,9 +2146,10 @@ impl SchemaRegistry {
                 if jobs.len() >= workers {
                     continue;
                 }
-                // How long this dispatch has been owed, when it is the
-                // starvation escape hatch rather than a normal quiet-host one.
-                let mut forced: Option<Duration> = None;
+                // How long this dispatch has been owed and what was holding
+                // it, when it is the starvation escape hatch rather than a
+                // normal quiet-host one.
+                let mut forced: Option<(Duration, Backpressure)> = None;
                 match registry.dispatch_backpressure() {
                     None => {
                         held_since = None;
@@ -1985,7 +2158,7 @@ impl SchemaRegistry {
                     Some(bp) => {
                         let held = held_since.get_or_insert_with(Instant::now).elapsed();
                         if forced_dispatch(bp, held, jobs.is_empty(), max_holdoff) {
-                            forced = Some(held);
+                            forced = Some((held, bp));
                         } else {
                             // Log the first deferral of each busy stretch only: this
                             // loop runs 86 400 times a day and a busy host would
@@ -2029,10 +2202,11 @@ impl SchemaRegistry {
                     // long is invisible otherwise (the holdoff itself only
                     // logs at debug), and this is the log that explains why
                     // housekeeping is running during peak traffic.
-                    Some(held) => info!(
-                        "offload dispatch: {} {schema} single-file — held off {held:?} by \
-                         queued client bring-ups (PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS)",
-                        kind.as_str()
+                    Some((held, bp)) => info!(
+                        "offload dispatch: {} {schema} single-file — held off {held:?} \
+                         because {} (PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS)",
+                        kind.as_str(),
+                        bp.reason()
                     ),
                     None => info!(
                         "offload dispatch: {} {schema} ({}/{workers} in flight)",
@@ -2062,9 +2236,9 @@ impl SchemaRegistry {
     /// pressure-pass claims are excluded at pick time via `is_archiving`.
     ///
     /// The distinction between the variants is what the starvation escape
-    /// hatch keys on: politeness may be overridden after a long enough
-    /// holdoff, a conflict over the same disks never may. See
-    /// [`Backpressure`].
+    /// hatch keys on: a deferral that only costs someone else time may be
+    /// overridden after a long enough holdoff, one that would duplicate work
+    /// already claimed never may. See [`Backpressure`].
     fn dispatch_backpressure(&self) -> Option<Backpressure> {
         if crate::vm::bringups_waiting() > 0 {
             return Some(Backpressure::ClientsQueued);
@@ -4657,8 +4831,18 @@ async fn checkpoint_and_stop(entry: &SchemaEntry, schema: &str) {
             "pre-stop CHECKPOINT for schema {schema} timed out after {PRE_STOP_CHECKPOINT_TIMEOUT:?}"
         ),
     }
-    if let Err(e) = entry.sandbox.stop().await {
-        warn!("failed to stop VM for schema {schema}: {e:#}");
+    // Bounded: an unbounded stop against a wedged daemon parks the caller
+    // forever, and both callers are background passes that must keep moving
+    // (see [`IDLE_STOP_TIMEOUT`]). A stop that times out is not lost work —
+    // the VM stays running, its warm entry is already gone, and the untracked
+    // reaper picks it up on its next pass.
+    match tokio::time::timeout(IDLE_STOP_TIMEOUT, entry.sandbox.stop()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("failed to stop VM for schema {schema}: {e:#}"),
+        Err(_) => warn!(
+            "stopping VM for schema {schema} timed out after {IDLE_STOP_TIMEOUT:?}; \
+             leaving it to the untracked reaper"
+        ),
     }
 }
 
@@ -4955,9 +5139,23 @@ enum Backpressure {
     /// dispatch one no-boot job at a time anyway rather than let the backlog
     /// (and the disk) grow until the host happens to go quiet.
     ClientsQueued,
-    /// A reclaim pass holds the boot gate and is fsck'ing/shrinking the very
-    /// disks an offload would read. A genuine conflict over the same files,
-    /// not politeness — never overridden.
+    /// A reclaim pass is fsck'ing/shrinking disks an offload would read.
+    ///
+    /// Deferring on it is a *progress* choice, not a safety one: the actual
+    /// exclusion is per disk, taken by the job itself
+    /// (`reclaim::try_disk_permit`, which never preempts a pass), so the worst
+    /// a dispatch during a pass can do is find the one disk it wanted busy and
+    /// skip that schema. What deferring buys is that the pass keeps its
+    /// progress instead of the two of them trading disks — worth having while
+    /// there is any other time to run, which is why this defers by default.
+    ///
+    /// It is overridable for the same reason [`Self::ClientsQueued`] is, and
+    /// it matters more: a pass runs up to `RECLAIM_TIMEOUT` (30 minutes) and
+    /// is re-triggered 30s after every idle reap, so on a churning host
+    /// "later" was very nearly never — the pacer would stand down host-wide
+    /// for most of the day while the disk it was supposed to be freeing
+    /// climbed toward the pressure mark. Forced dispatches here are no-boot
+    /// kinds only, single file, exactly as for queued clients.
     ReclaimPass,
     /// A manual or disk-pressure sweep is already draining through the same
     /// picker. Overriding it would only double-dispatch against the claims it
@@ -4983,18 +5181,29 @@ impl Backpressure {
 /// `bp` says the host is busy? `held` is how long the current unbroken stretch
 /// of backpressure has run and `idle` whether the pacer has nothing in flight.
 ///
-/// Three conditions, each load-bearing: only the client gate is politeness
-/// (the others are conflicts over the same disks), only a pacer with nothing
-/// in flight may force one (so the override can never stack), and only past
-/// the operator's holdoff — `None` keeps the historical behavior of yielding
-/// to clients forever.
+/// Three conditions, each load-bearing: the backpressure must be one of the
+/// negotiable kinds (see [`Backpressure`] — `Sweeping` never is, because
+/// overriding it would only double-dispatch against claims the sweep already
+/// holds), only a pacer with nothing in flight may force one (so the override
+/// can never stack), and only past the operator's holdoff — `None` keeps the
+/// historical behavior of yielding forever.
+///
+/// Both negotiable kinds are counted by the same `held` clock on purpose. They
+/// alternate on a busy host — clients queue, a reap fires a reclaim pass,
+/// clients queue again — and a clock that reset on every changeover would
+/// never reach the holdoff at all, which is exactly how the pacer could go
+/// hours without dispatching while neither condition alone looked pathological.
 fn forced_dispatch(
     bp: Backpressure,
     held: Duration,
     idle: bool,
     max_holdoff: Option<Duration>,
 ) -> bool {
-    bp == Backpressure::ClientsQueued && idle && max_holdoff.is_some_and(|limit| held >= limit)
+    matches!(
+        bp,
+        Backpressure::ClientsQueued | Backpressure::ReclaimPass
+    ) && idle
+        && max_holdoff.is_some_and(|limit| held >= limit)
 }
 
 fn dispatch_allowance(in_flight: usize, workers: usize, load: Option<f64>, load_max: f64) -> bool {
@@ -5478,6 +5687,43 @@ mod archive_tests {
         assert!(b.holding("a").is_none());
     }
 
+    /// The two-speed reaper's whole policy: price the warm hold off what the
+    /// bring-up actually cost. The failure it exists for is a fleet of VMs
+    /// that are cheap to restart sitting warm for the timeout a *create*
+    /// deserves, holding RAM and disks the reclaim and offload ladders cannot
+    /// touch until the VM is stopped.
+    #[test]
+    fn idle_budget_prices_the_warm_hold_off_the_measured_bringup() {
+        let normal = Duration::from_secs(900);
+        let fast = Some(Duration::from_secs(60));
+        let threshold = Duration::from_secs(5);
+        let budget = |took: u64| idle_budget(Duration::from_secs(took), normal, fast, threshold);
+
+        // A restart of a VM still on disk: ~200ms, so a 900s hold buys the
+        // next client 200ms. Short budget.
+        assert_eq!(
+            idle_budget(Duration::from_millis(200), normal, fast, threshold),
+            Duration::from_secs(60)
+        );
+        // The boundary is inclusive — a bring-up exactly at the threshold is
+        // still a cheap one.
+        assert_eq!(budget(5), Duration::from_secs(60));
+        // A create, a spare claim that had to initdb, an S3 thaw: expensive,
+        // so the full hold is worth paying for.
+        assert_eq!(budget(6), normal);
+        assert_eq!(budget(40), normal);
+
+        // The load backstop, which is why this is measured rather than keyed
+        // on "was the VM already on disk". A saturated heyvmd turns a 200ms
+        // restart into seconds; those VMs fall back to the long hold on their
+        // own, so the reaper stops adding stop/start work to a daemon that is
+        // already behind.
+        assert_eq!(budget(30), normal);
+
+        // Disabled: one timeout for everything, whatever the bring-up cost.
+        assert_eq!(idle_budget(Duration::from_millis(200), normal, None, threshold), normal);
+    }
+
     #[test]
     fn jittered_timeout_is_stable_bounded_and_spread() {
         let base = Duration::from_secs(1000);
@@ -5561,7 +5807,7 @@ mod archive_tests {
     /// for a whole tick, then drains the whole backlog in one burst against a
     /// disk already near the pressure line.
     #[test]
-    fn forced_dispatch_overrides_only_client_politeness() {
+    fn forced_dispatch_overrides_deferrals_but_never_a_running_sweep() {
         let limit = Some(Duration::from_secs(300));
         let (under, over) = (Duration::from_secs(299), Duration::from_secs(300));
 
@@ -5572,15 +5818,25 @@ mod archive_tests {
         // ...and never stacked: a forced job runs strictly single-file.
         assert!(!forced_dispatch(Backpressure::ClientsQueued, over, false, limit));
 
-        // A reclaim pass or a sweep is a conflict over the same disks, not
-        // politeness — no holdoff, however long, may override those.
+        // A reclaim pass is the same shape of deferral, and the one that
+        // starves the pacer hardest: a pass runs up to half an hour and is
+        // re-triggered after every idle reap. The job's own per-disk permit
+        // (`reclaim::try_disk_permit`) is what keeps the two off the same
+        // disk, so the pacer no longer has to stand down host-wide for it.
         let forever = Duration::from_secs(86_400);
-        assert!(!forced_dispatch(Backpressure::ReclaimPass, forever, true, limit));
+        assert!(forced_dispatch(Backpressure::ReclaimPass, over, true, limit));
+        assert!(!forced_dispatch(Backpressure::ReclaimPass, under, true, limit));
+        assert!(!forced_dispatch(Backpressure::ReclaimPass, over, false, limit));
+
+        // A running sweep is different in kind: it drains through this very
+        // picker and already holds per-schema claims, so forcing past it would
+        // only double-dispatch. No holdoff, however long, overrides it.
         assert!(!forced_dispatch(Backpressure::Sweeping, forever, true, limit));
 
         // Disabled (PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS=0) keeps the strict
-        // yield-to-every-client behavior.
+        // yield-to-everything behavior.
         assert!(!forced_dispatch(Backpressure::ClientsQueued, forever, true, None));
+        assert!(!forced_dispatch(Backpressure::ReclaimPass, forever, true, None));
     }
 
     /// Kind ⇒ boot is exact: only the dump-based kinds take the bring-up gate,
