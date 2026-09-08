@@ -371,11 +371,25 @@ impl Authenticator {
         // Providers are alternatives: a gate listing both admits a person with a
         // Google session *or* a program with a token, and neither has to know
         // the other exists.
+        // `admits` is skipped in front of app-lb's own admin API, for the same
+        // reason it is skipped on a scoped public path there: the caller is not
+        // acting on the deployment that fronts the API, and the API behind it
+        // scope-checks every request against the deployment actually being
+        // addressed. See `Authenticator::fronts_admin_api`.
+        //
+        // Both places need it. A path listed in `public_paths` takes the scoped
+        // branch; everything else takes this one — so fixing only the first
+        // leaves a namespace token able to reach `/metrics` and not
+        // `/deployments`, which is a distinction nobody asked for.
+        //
+        // Admitting here is not authorizing: no tier is checked at this gate at
+        // all, and the admin listener refuses an `admin: none` token on every
+        // route it guards.
         if gate.accepts_app_token()
             && let Some(presented) = &req.bearer
             && let Some(tokens) = &self.tokens
             && let Some(token) = tokens.verify(presented, now_secs())
-            && token.admits(deployment_id, deployment_namespace)
+            && (req.fronts_admin_api || token.admits(deployment_id, deployment_namespace))
         {
             // No `Identity`: a token is not a person, and forwarding
             // `x-auth-request-email` for one would put a name upstream that
@@ -2665,6 +2679,50 @@ mod tests {
             };
             assert_eq!(r.status, 403);
             assert!(r.body.contains("'view'"), "{}", r.body);
+        }
+
+        /// The same relaxation on the *ordinary* gate path, which is the one a
+        /// request takes when the route is not in `public_paths` at all. Both
+        /// branches need it: fixing only the scoped one leaves a namespace
+        /// token able to reach a listed path and not an unlisted one, which is
+        /// a distinction nobody asked for and nobody could predict.
+        #[tokio::test]
+        async fn the_ordinary_gate_path_skips_admits_in_front_of_the_admin_api_too() {
+            let (a, tokens) = with_tokens();
+            // No public_paths at all — the shape after `/deployments` is removed
+            // from the list, which is what a hardened admin gate looks like.
+            let g: AuthGate = serde_json::from_str(r#"{"provider":"app-token"}"#).unwrap();
+
+            // Exactly the token that failed: namespaced, admin tier, `*`.
+            // `*` inside a wall means every deployment *there*, so it does not
+            // help across one.
+            let t = tokens
+                .mint(
+                    NewToken {
+                        name: "sam".into(),
+                        admin: AdminScope::Admin,
+                        namespace: Some("samcurrie".into()),
+                        deployments: vec!["*".into()],
+                        expires_in_secs: None,
+                    },
+                    now_secs(),
+                )
+                .unwrap()
+                .1;
+
+            let mut ordinary = bearer("/deployments", &t);
+            ordinary.fronts_admin_api = false;
+            assert!(
+                matches!(a.decide(&g, "app-lb-admin", "default", &ordinary).await, Decision::Answered(_)),
+                "in front of an application the namespace wall is the gate's to enforce",
+            );
+
+            let mut fronting = bearer("/deployments", &t);
+            fronting.fronts_admin_api = true;
+            assert!(
+                matches!(a.decide(&g, "app-lb-admin", "default", &fronting).await, Decision::Allow(_)),
+                "in front of the admin API it is the API's to enforce, per request",
+            );
         }
 
         /// A token admitted at a scoped path forwards no identity, exactly as

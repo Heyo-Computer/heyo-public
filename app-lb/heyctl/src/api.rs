@@ -776,10 +776,27 @@ impl Client {
             .transport
             .send(Request::new(Method::Get, path.to_string()))
             .await?;
+        // `error` alone is often the useless half. app-lb's gate answers
+        // `{"error":"authentication required","scope":"admin","detail":"…"}`,
+        // where `detail` is the sentence that says what would actually work —
+        // dropping it turns a diagnosis back into "authentication required".
         let detail = serde_json::from_str::<serde_json::Value>(&r.body)
             .ok()
-            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
-            .filter(|d| !d.is_empty());
+            .and_then(|v| {
+                let field = |k: &str| {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .map(str::to_owned)
+                };
+                match (field("error"), field("detail")) {
+                    (Some(e), Some(d)) => Some(format!("{e} — {d}")),
+                    (Some(e), None) => Some(e),
+                    (None, Some(d)) => Some(d),
+                    (None, None) => None,
+                }
+            });
         Ok((r.status, detail))
     }
 
