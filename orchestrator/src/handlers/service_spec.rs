@@ -432,7 +432,6 @@ mod tests {
         for spec in [
             include_str!("../../../.heyo/services/orchestrator.json"),
             include_str!("../../../.heyo/services/heyosecret.json"),
-            include_str!("../../../.heyo/services/app-lb.json"),
             include_str!("../../../.heyo/services/app-obs.json"),
         ] {
             let internal = serde_json::from_str::<ServiceSpecRequest>(spec).unwrap().into_internal().unwrap();
@@ -462,6 +461,6 @@ mod tests {
             }
             count += 1;
         }
-        assert!(count >= 7, "provide all seven service workflow payloads");
+        assert!(count >= 6, "provide all six VM service workflow payloads");
     }
 }

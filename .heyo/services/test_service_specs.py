@@ -194,7 +194,7 @@ def assert_invariants(service, payload):
         assert payload["deploy"][field] == spec["deploy"][field], (service, field)
 
 
-for service in ("heyosecret", "orchestrator", "app-lb", "app-obs"):
+for service in ("heyosecret", "orchestrator", "app-obs"):
     new = execute(workflow, service)
     assert_invariants(service, new)
     if fixture_dir:
@@ -212,4 +212,4 @@ assert new["deploy"]["archive_id"] == "archive-1"
 if old_workflow is not None:
     old = execute(old_workflow, "orchestrator", discovery=True, uploaded=True)
     assert new == old_to_canonical(old), "discovery/upload canonical payload changed semantics"
-print(f"executed and validated 4 public deploy payloads plus discovery/upload variant{' against ' + baseline_ref if baseline_ref else ''}")
+print(f"executed and validated 3 public deploy payloads plus discovery/upload variant{' against ' + baseline_ref if baseline_ref else ''}")

@@ -176,9 +176,10 @@ Config via env (all optional):
 | `PG_VM_POOL_DAEMON_URL` | `http://127.0.0.1:34099` | base URL of the heyvmd daemon every VM operation addresses. Read once at first use. Set it when the daemon listens on a non-default port; the cold-start load harness (`src/loadtest.rs`) also uses it to aim the pooler at an in-process daemon stub |
 | `PG_VM_POOL_SIZE_CLASS` | `micro` | VM resource tier for every schema's VM: `micro` (0.25 CPU, 512MB), `mini` (0.5 CPU, 1GB), `small` (1 CPU, 2GB), `medium` (2 CPU, 4GB), `large` (4 CPU, 8GB) |
 | `PG_VM_POOL_USER` / `PG_VM_POOL_PASSWORD` | `postgres` / unset | probe+bootstrap credentials, and (if set) the required client password |
-| `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables. Applies to VMs that were *expensive* to bring up — see `PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS` for the rest. The effective timeout is jittered ±15% per schema and at most 24 VMs stop per reaper pass (oldest-idle first), 8 at a time — so a cohort of VMs that went idle together drains as a slope, not a cliff, instead of mass-stopping into a reclaim pass + synchronized cold-start storm. A pass that hits the cap with victims left re-arms in 10s rather than waiting out the tick, so the cap smooths the drain without capping its rate |
+| `PG_VM_POOL_IDLE_TIMEOUT_SECS` | `900` | stop a VM after this long with no connections; `0` disables. Applies to VMs that were *expensive* to bring up — see `PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS` for the rest. The effective timeout is jittered ±15% per schema, and how many VMs may actually stop per pass (oldest-idle first, 8 at a time) is bounded by `PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS`, so a cohort that went idle together drains as a ramp rather than mass-stopping into a reclaim pass + synchronized cold-start storm — see "Draining as a ramp" |
 | `PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS` | `60` | the *short* idle timeout, applied to a VM the pooler measured as cheap to bring back (see below); `0` disables the two-speed reaper. Clamped to `PG_VM_POOL_IDLE_TIMEOUT_SECS` — it can only pull a stop earlier, never push it out — see "Two-speed idle reaping" |
 | `PG_VM_POOL_FAST_BRINGUP_SECS` | `5` | how fast a bring-up must have been for its VM to be reaped on the short timeout. Measured per entry, not assumed from whether the VM already existed, so a loaded host where restarts have gone slow falls back to the long timeout on its own |
+| `PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS` | `600` | the shortest time in which the reaper may stop the **whole** live fleet. Bounds the rate of change so a synchronized expiry ramps down instead of falling off a cliff; `0` disables the limit. Applies to the untracked reaper too — see "Draining as a ramp" |
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
 | `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
@@ -287,10 +288,64 @@ The reaper is paced off the shortest budget in play, stops up to 8 VMs
 concurrently (a stop is almost all waiting — a guest `df`, a `CHECKPOINT`, the
 daemon's stop — so serially a full pass cost the sum of every victim's worst
 case and ran longer than the tick that scheduled it), and bounds each stop at
-30s so one wedged VM cannot park the pass. A pass that hits its 24-VM cap with
-victims still queued re-arms in 10s instead of waiting a full tick: the cap is
-there to turn a mass expiry into a slope, not to put a ceiling of 24 stops per
-tick on how fast the fleet can drain.
+30s so one wedged VM cannot park the pass. How many it may stop per pass is
+governed by `PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS` — see "Draining as a ramp".
+
+### Draining as a ramp (`PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS`)
+
+Idle reaping is **deadline-driven**, and real workloads arrive in bursts — so
+they go idle in bursts, and every VM in the burst comes due within seconds of
+the others. The per-schema jitter spreads a cohort's deadlines by only ±15%,
+which on a 60s budget is a window of about eighteen seconds. What the reaper
+does with that backlog is what decides whether the fleet ramps down or falls
+off a cliff.
+
+A flat per-pass cap does not decide it. Any cohort larger than the cap keeps
+the reaper saturated at cap-per-tick regardless of how the deadlines spread —
+so widening the jitter cannot fix a mass expiry, and only bounding the *rate*
+can. Concretely, simulating a 600-VM cohort going idle together:
+
+| drain policy | time to drain | peak | median |
+|---|---|---|---|
+| flat cap, run flat out | 384 s | 120/min | 120/min |
+| flat cap, one pass per tick | 504 s | 96/min | 72/min |
+| **rate-limited (this)** | 774 s | 60/min | 45/min |
+
+The rate limit is `live_schemas × tick / window` VMs per pass: at most one
+window's worth of the fleet per window, i.e. a straight line of known gradient
+however synchronized the expiry. It is sized off the **live-tier schema count**
+rather than the warm or running count on purpose — stopping a VM does not
+change its tier, so the divisor holds still for the length of a drain and the
+slope stays constant. Sizing it off the running count instead makes the
+allowance shrink as the drain proceeds, decaying into a long tail: the last VMs
+of a 600-VM cohort would wait half an hour past a 60s budget.
+
+Two clamps bound it. A floor (4/pass) keeps a small fleet from smoothing
+something that was never going to be a swing; a ceiling (24/pass, 8 stopped
+concurrently) is the daemon's protection and binds on a fleet big enough to ask
+for more, which simply means the drain takes longer than the window:
+
+| live schemas | rate | whole fleet drains in |
+|---|---|---|
+| 50 | 16/min | 3.1 min |
+| 300 | 32/min | 9.4 min |
+| 600 | 60/min | 10.0 min |
+| 2000 | 96/min (capped) | 20.8 min |
+| 5000 | 96/min (capped) | 52.1 min |
+
+The same limit governs the **untracked reaper**, which needs it more sharply:
+after a pooler restart the warm map starts empty, so every running VM is
+untracked by definition and its population is the entire fleet at once.
+Uncapped, that made every deploy stop the whole fleet about two passes (~2.5
+min) later.
+
+**The trade is explicit.** In a large synchronized expiry a VM stops well after
+its own idle budget — bounded by the window, and bought in exchange for a fleet
+that does not swing. The monitoring page's **"past idle budget"** tile is how
+you watch it: some backlog during a drain is the ramp working, but a number
+that never returns to zero means VMs are going idle faster than the window lets
+the reaper stop them, and the window (or the 24/pass ceiling) is too slow for
+the workload.
 
 ### Offload pacer
 

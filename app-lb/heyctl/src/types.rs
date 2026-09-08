@@ -475,6 +475,19 @@ impl UpdateSpec {
     }
 }
 
+/// One entry in [`AuthGate::public_paths`]: a path prefix, and what app-lb
+/// requires on it in place of the sign-in gate.
+///
+/// No `#[serde(default)]`: app-lb always sends both fields, and a row with an
+/// empty `path` would silently match every request when rendered.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicPath {
+    pub path: String,
+    /// `public` | `none` | `view` | `admin`. Only `public` admits a request
+    /// that presents no credential at all.
+    pub scope: String,
+}
+
 /// An optional sign-in gate in front of a deployment.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
@@ -490,7 +503,18 @@ pub struct AuthGate {
     pub client_secret: Option<SecretRef>,
     pub allowed_domains: Vec<String>,
     pub allowed_emails: Vec<String>,
-    pub public_paths: Vec<String>,
+    /// Path prefixes the *sign-in* gate does not sit in front of, and what
+    /// app-lb requires in its place.
+    ///
+    /// Read as objects rather than strings since scopes were added. app-lb
+    /// always serializes the object form, so a bare string only ever appears in
+    /// a spec somebody wrote by hand — where it means `scope: "admin"`, the
+    /// fail-closed default.
+    pub public_paths: Vec<PublicPath>,
+    /// When set, signing in at this gate mints an app-token with this scope,
+    /// which app-lb presents upstream for the life of the session. Absent on
+    /// every gate that does not — which is most of them.
+    pub session_scope: Option<String>,
     pub base_path: String,
     pub session_ttl_secs: u64,
     pub cookie_name: String,

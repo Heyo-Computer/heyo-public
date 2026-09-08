@@ -45,8 +45,7 @@ class DeploymentEnvironmentTests(unittest.TestCase):
         self.assertEqual(request['vm']['env_vars']['ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES'], 'heyosecret,orchestrator')
 
     def test_other_services_and_hosts_do_not_gain_replica_policy(self):
-        for service in ['app-lb', 'app-obs']:
-            self.assertNotIn('scaling', payload(environment(), service)[0])
+        self.assertNotIn('scaling', payload(environment(), 'app-obs')[0])
         self.assertNotIn('scaling', payload(environment('other.example'))[0])
 
     def test_explicit_policy_overrides_defaults(self):

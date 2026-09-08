@@ -761,11 +761,43 @@ impl Client {
     /// Every other method turns a non-2xx into an [`Error`], which is right for
     /// a request you meant and wrong for a question you are asking.
     pub async fn probe(&self, path: &str) -> Result<u16> {
-        Ok(self
+        Ok(self.probe_detail(path).await?.0)
+    }
+
+    /// The status *and* whatever the server said about it.
+    ///
+    /// A refusal from app-lb names the actual reason — which token, which
+    /// scope, which deployment it does not admit — and a caller that keeps only
+    /// the status has to guess at all of it. `login` guessed wrong twice: a
+    /// namespace-confined token was reported as an unrecognised one, and the
+    /// operator went looking at the token instead of the gate.
+    pub async fn probe_detail(&self, path: &str) -> Result<(u16, Option<String>)> {
+        let r = self
             .transport
             .send(Request::new(Method::Get, path.to_string()))
-            .await?
-            .status)
+            .await?;
+        // `error` alone is often the useless half. app-lb's gate answers
+        // `{"error":"authentication required","scope":"admin","detail":"…"}`,
+        // where `detail` is the sentence that says what would actually work —
+        // dropping it turns a diagnosis back into "authentication required".
+        let detail = serde_json::from_str::<serde_json::Value>(&r.body)
+            .ok()
+            .and_then(|v| {
+                let field = |k: &str| {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .map(str::to_owned)
+                };
+                match (field("error"), field("detail")) {
+                    (Some(e), Some(d)) => Some(format!("{e} — {d}")),
+                    (Some(e), None) => Some(e),
+                    (None, Some(d)) => Some(d),
+                    (None, None) => None,
+                }
+            });
+        Ok((r.status, detail))
     }
 
     /// The base URL, when this client was built from one.

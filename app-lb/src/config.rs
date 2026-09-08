@@ -1999,10 +1999,44 @@ pub struct AuthGate {
     /// Individual addresses allowed regardless of domain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_emails: Vec<String>,
-    /// Path prefixes served without the gate: health endpoints, webhook
-    /// receivers, anything with its own authentication.
+    /// Path prefixes the *sign-in* gate does not sit in front of.
+    ///
+    /// This list was never "paths with no authorization" — it is "paths an API
+    /// client reaches without being sent to Google", which is a different
+    /// thing and was too easily read as the first. Each entry now carries the
+    /// scope app-lb requires in the gate's place, and an entry written as a
+    /// bare string means [`PathScope::Admin`]: the fail-closed reading, because
+    /// the alternative default is the one that leaked.
+    ///
+    /// A path whose *upstream* does its own authorization — an artifact store
+    /// checking its API key, a secret service checking a bearer — says so with
+    /// `{"path": "/blobs/", "scope": "public"}`. That is the only spelling that
+    /// means "no credential at all", and it has to be written out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub public_paths: Vec<String>,
+    pub public_paths: Vec<PublicPath>,
+    /// Mint an app-token when somebody signs in here, and present it upstream
+    /// for the life of their session.
+    ///
+    /// This exists because a sign-in gate and the thing behind it are two
+    /// different checks. A browser that has signed in with Google holds a
+    /// session cookie, which the *upstream* has no way to verify — so a
+    /// deployment fronting an API that authenticates for itself (app-lb's own
+    /// admin listener, most of all) had no way to accept a signed-in person
+    /// except by turning its own authentication off. That is how a dashboard
+    /// ends up served by an unauthenticated CRUD API.
+    ///
+    /// With this set, the gate mints a real app-token at the callback, scoped
+    /// as named here and expiring with the session, and the proxy presents it
+    /// as `Authorization: Bearer` on every request that session admits. The
+    /// upstream then authenticates the person the same way it authenticates any
+    /// other client, and scope-checks them the same way too.
+    ///
+    /// **Absent means no token is minted**, which is the right default for
+    /// every gate in front of an ordinary application: signing in to a web app
+    /// should not hand the browser a credential for app-lb's admin API. Set it
+    /// only on a deployment whose upstream you mean to authorize this way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_scope: Option<crate::tokens::AdminScope>,
     /// Where app-lb's own endpoints live under this deployment's hostname:
     /// `<base_path>/callback`, `/login` and `/logout`. The callback is the URL
     /// that must be registered with the provider.
@@ -2571,8 +2605,25 @@ impl AuthGate {
     }
 
     /// Whether `path` is served without the gate.
+    /// What `path` requires in the gate's place, or `None` when the gate
+    /// applies normally.
+    ///
+    /// Longest prefix wins, so a narrow entry can tighten a broad one:
+    /// `/api/` at `view` beside `/api/admin/` at `admin` means what it reads
+    /// like. Without that rule the answer would depend on list order, which is
+    /// not somewhere a security decision should live.
+    pub fn public_scope(&self, path: &str) -> Option<PathScope> {
+        self.public_paths
+            .iter()
+            .filter(|p| path.starts_with(p.path.as_str()))
+            .max_by_key(|p| p.path.len())
+            .map(|p| p.scope)
+    }
+
+    /// Whether the sign-in gate is bypassed on `path`, whatever is required
+    /// instead. Kept for the places that only care about the redirect.
     pub fn is_public(&self, path: &str) -> bool {
-        self.public_paths.iter().any(|p| path.starts_with(p.as_str()))
+        self.public_scope(path).is_some()
     }
 
     /// Whether this identity may enter.
@@ -2792,8 +2843,8 @@ impl AuthGate {
             return Err(SpecError::BadAuthBasePath(self.base_path.clone()));
         }
         for p in &self.public_paths {
-            if !p.starts_with('/') {
-                return Err(SpecError::BadPublicPath(p.clone()));
+            if !p.path.starts_with('/') {
+                return Err(SpecError::BadPublicPath(p.path.clone()));
             }
         }
         if self.session_ttl_secs == 0 {
@@ -2962,6 +3013,106 @@ fn default_namespace() -> String {
 
 fn is_default_namespace(ns: &String) -> bool {
     ns == DEFAULT_NAMESPACE
+}
+
+/// What app-lb requires on a path the sign-in gate does not cover.
+///
+/// The three lower tiers mirror [`crate::tokens::AdminScope`] exactly, because
+/// they are the same scopes an app-token carries; `Public` is the extra one,
+/// and it is the only value that admits a request presenting nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PathScope {
+    /// No credential at all. For a path whose upstream authorizes it, or one
+    /// that genuinely has nothing to protect — a health endpoint.
+    Public,
+    /// Any credential the gate would admit, with no admin tier required. What
+    /// an app-token minted with `admin: none` carries, which is the shape an
+    /// application is handed to get past its own deployment's gate.
+    None,
+    /// `view`-tier: metrics and the dashboard's data.
+    View,
+    /// Everything. The default when a scope is not written down, because a
+    /// forgotten field must not be the one that opens a route.
+    #[default]
+    Admin,
+}
+
+impl PathScope {
+    /// The app-token tier this demands, or `None` when no credential is needed.
+    pub fn required(self) -> Option<crate::tokens::AdminScope> {
+        match self {
+            Self::Public => None,
+            Self::None => Some(crate::tokens::AdminScope::None),
+            Self::View => Some(crate::tokens::AdminScope::View),
+            Self::Admin => Some(crate::tokens::AdminScope::Admin),
+        }
+    }
+}
+
+/// One entry in [`AuthGate::public_paths`]: a path prefix and what it requires.
+///
+/// Deserializes from either spelling, and a bare string is the reason this type
+/// exists rather than a plain tuple:
+///
+/// ```json
+/// "public_paths": [
+///   {"path": "/healthz", "scope": "public"},
+///   {"path": "/api/", "scope": "view"},
+///   "/deployments"
+/// ]
+/// ```
+///
+/// That last one requires `admin`. Every spec written before scopes existed is
+/// a list of bare strings, so this is a deliberate behaviour change on upgrade:
+/// paths that were open become closed, loudly, instead of staying open quietly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublicPath {
+    pub path: String,
+    pub scope: PathScope,
+}
+
+impl From<&str> for PublicPath {
+    /// The bare-string spelling, with the same default the wire form uses —
+    /// so a spec built in code and one parsed from JSON cannot disagree about
+    /// what an unqualified path means.
+    fn from(path: &str) -> Self {
+        Self { path: path.to_string(), scope: PathScope::default() }
+    }
+}
+
+impl From<String> for PublicPath {
+    fn from(path: String) -> Self {
+        Self { path, scope: PathScope::default() }
+    }
+}
+
+impl PublicPath {
+    /// A path with nothing in front of it and nothing required.
+    pub fn public(path: impl Into<String>) -> Self {
+        Self { path: path.into(), scope: PathScope::Public }
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicPath {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Bare(String),
+            Full {
+                path: String,
+                #[serde(default)]
+                scope: PathScope,
+            },
+        }
+        Ok(match Wire::deserialize(d)? {
+            // The default lives here as well as in `PathScope`, because an
+            // absent field and an absent object must land in the same place.
+            Wire::Bare(path) => Self { path, scope: PathScope::default() },
+            Wire::Full { path, scope } => Self { path, scope },
+        })
+    }
 }
 
 /// A namespace name a spec or a token may carry: the same alphabet as a
@@ -5406,6 +5557,7 @@ mod tests {
 
     fn auth_gate() -> AuthGate {
         AuthGate {
+            session_scope: None,
             provider: Default::default(),
             client_id: Some("cid.apps.googleusercontent.com".into()),
             client_secret: Some(crate::secrets::SecretRef {

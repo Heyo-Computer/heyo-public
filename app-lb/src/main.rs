@@ -593,10 +593,14 @@ fn main() {
             }
             let Some(gate) = &spec.auth else { continue };
             let health = spec.health.path.as_deref();
+            // Only the entries that still admit an unauthenticated request. A
+            // scoped entry is no longer a bypass — app-lb checks the scope
+            // itself — so listing one here would cry wolf about the very fix.
             let exposed: Vec<&str> = gate
                 .public_paths
                 .iter()
-                .map(String::as_str)
+                .filter(|p| p.scope == crate::config::PathScope::Public)
+                .map(|p| p.path.as_str())
                 .filter(|p| *p != "/healthz" && Some(*p) != health)
                 .collect();
             if !exposed.is_empty() {
@@ -639,12 +643,13 @@ fn main() {
             .unwrap_or_else(|| Arc::from(obs::LB_DEPLOYMENT)),
     );
 
-    let auth = Arc::new(Authenticator::new(
+    let auth = Arc::new(Authenticator::with_admin_addr(
         Authenticator::load_key(&auth_key_path)
             .unwrap_or_else(|e| panic!("cannot read or create {}: {e}", auth_key_path.display())),
         secrets.clone(),
         Some(tokens.clone()),
         siem.as_ref().map(|s| s.sink.clone()),
+        Some(cfg.admin_addr.clone()),
     ));
 
     let daemon_api_key = ["APP_LB_DAEMON_API_KEY", "HEYO_API_KEY"]

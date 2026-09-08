@@ -79,6 +79,17 @@ pub enum AdminScope {
 }
 
 impl AdminScope {
+    /// The wire spelling, matching the `serde` representation. Used where a
+    /// scope has to appear in an error a person reads, which must not drift
+    /// from the value they would type into a spec.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::View => "view",
+            Self::Admin => "admin",
+        }
+    }
+
     /// Whether this scope satisfies a route needing `want`.
     pub fn satisfies(self, want: AdminScope) -> bool {
         match want {

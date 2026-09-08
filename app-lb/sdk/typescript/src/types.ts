@@ -250,6 +250,16 @@ export interface UpdateSpec {
  * alternatives, so any one of them admits a request. A gate written before
  * app-tokens existed omits it entirely and means `"google"`.
  */
+/** One entry in {@link AuthGate.public_paths}. */
+export interface PublicPath {
+  path: string;
+  /**
+   * `public` | `none` | `view` | `admin`. The lower three mirror an app-token's
+   * `admin` scope; `public` is the only one that needs no credential.
+   */
+  scope: "public" | "none" | "view" | "admin";
+}
+
 export interface AuthGate {
   provider?: AuthProvider | AuthProvider[];
   /** Required for `google`, meaningless without it. */
@@ -257,7 +267,19 @@ export interface AuthGate {
   client_secret?: SecretRef;
   allowed_domains?: string[];
   allowed_emails?: string[];
-  public_paths?: string[];
+  /**
+   * Path prefixes the *sign-in* gate does not sit in front of, and what app-lb
+   * requires instead. `public` is the only scope that admits a request
+   * presenting no credential; a bare string written by hand means `admin`.
+   */
+  public_paths?: PublicPath[];
+  /**
+   * When set, signing in at this gate mints an app-token with this scope and
+   * app-lb presents it upstream for the life of the session — so an upstream
+   * that authenticates for itself can accept a signed-in person without its
+   * own authentication being turned off. Absent means no token is minted.
+   */
+  session_scope?: "none" | "view" | "admin";
   base_path?: string;
   session_ttl_secs?: number;
   cookie_name?: string;
