@@ -7,7 +7,6 @@ on:
       - 'heyosecret/**'
       - 'orchestrator/**'
       - 'heyosecret-client/**'
-      - 'app-lb/**'
       - 'app-obs/**'
       - '.heyo/workflows/deploy-heyo-services.yml'
       - '.heyo/deployment-environments.json'
@@ -21,7 +20,6 @@ on:
           - all
           - heyosecret
           - orchestrator
-          - app-lb
           - app-obs
       forceStaleDeploy:
         description: "Allow deploying a commit that is no longer current on main"
@@ -64,8 +62,6 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - target: app-lb
-            paths: app-lb
           - target: app-obs
             paths: app-obs
           - target: heyosecret
@@ -109,9 +105,13 @@ jobs:
           selected=0
           requested="${REQUESTED_HEYO_SERVICE:-}"
           target="${TARGET_HEYO_SERVICE:?}"
+          case "$target" in
+            heyosecret|orchestrator|app-obs) ;;
+            *) echo "Unsupported public VM service: $target" >&2; exit 1 ;;
+          esac
           case "$requested" in
             ""|all) ;;
-            heyosecret|orchestrator|app-lb|app-obs) ;;
+            heyosecret|orchestrator|app-obs) ;;
             *) echo "Unsupported requested public service: $requested" >&2; exit 1 ;;
           esac
           if [ "${BOOTSTRAP_DISCOVERY_ROUTING:-false}" = true ] && [ "$requested" != orchestrator ]; then
@@ -121,14 +121,13 @@ jobs:
           if [ -n "$requested" ]; then
             if [ "$requested" = all ] || [ "$requested" = "$target" ]; then selected=1; fi
           else
-            if [ -n "${CI_CHANGED_PATHS:-}" ]; then
+            if [ "${CI_CHANGED_PATHS+x}" = x ]; then
               changed_paths="$CI_CHANGED_PATHS"
             else
               changed_paths="$({ git diff --name-only "${CI_BEFORE:-${CI_AFTER:-HEAD}^}" "${CI_AFTER:-HEAD}" 2>/dev/null || git diff --name-only HEAD^ HEAD 2>/dev/null || true; git diff --name-only HEAD -- 2>/dev/null || true; } | sort -u)"
             fi
-            if [ -n "${CI_REPO_URL:-}" ] && [ -z "$(printf %s "$changed_paths" | tr -d '[:space:]')" ]; then
-              selected=1
-            elif printf '%s\n' "$changed_paths" | grep -Eq "^(${TARGET_HEYO_SERVICE_PATHS})/|^\.heyo/workflows/deploy-heyo-services\.yml$|^\.heyo/deployment-environments\.json$"; then
+            # Shared workflow/config changes are not a request to replace every service.
+            if printf '%s\n' "$changed_paths" | grep -Eq "^(${TARGET_HEYO_SERVICE_PATHS})/"; then
               selected=1
             fi
           fi
@@ -169,11 +168,9 @@ jobs:
           required = {
               "heyosecret": ["heyosecret/database-url", "heyosecret/master-key"],
               "orchestrator": ["orchestrator/database-url", "orchestrator/jwt-secret", "orchestrator/internal-api-key", "cloud/internal-api-key"],
-              "app-lb": ["app-lb/admin-password", "cloud/internal-api-key", "orchestrator/internal-api-key"],
               "app-obs": ["app-lb/admin-password", "app-obs/api-token"],
           }[target]
           generated = {
-              "app-lb/admin-password": "Generated app-lb dashboard password",
               "app-obs/api-token": "Generated app-obs API token",
           }
           host = os.environ.get("HEYO_PUBLIC_HOST", "").strip()
@@ -254,15 +251,6 @@ jobs:
         if: ${{ env.SERVICE_SELECTED == '1' }}
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install app-lb build dependencies
-        if: ${{ env.SERVICE_SELECTED == '1' && matrix.target == 'app-lb' }}
-        run: |
-          set -eu
-          if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get -o DPkg::Lock::Timeout=600 update
-            sudo apt-get -o DPkg::Lock::Timeout=600 install -y cmake libssl-dev pkg-config
-          fi
-
       - name: Test or check selected service
         run: |
           set -eu
@@ -271,7 +259,6 @@ jobs:
           case "$TARGET_HEYO_SERVICE" in
             heyosecret) cargo test --locked --manifest-path heyosecret/Cargo.toml ;;
             orchestrator) cargo check --locked --manifest-path orchestrator/Cargo.toml --bin orchestrator ;;
-            app-lb) cargo test --locked --manifest-path app-lb/Cargo.toml -p app-lb ;;
             app-obs) cargo test --locked --manifest-path app-obs/Cargo.toml ;;
           esac
 
@@ -317,69 +304,6 @@ jobs:
           touch "$HEYO_SERVICE_LOG" 2>/dev/null || true
           exec >>"$HEYO_SERVICE_LOG" 2>&1
           exec ./orchestrator
-          EOF
-              ;;
-            app-lb)
-              cat > "$package/bootstrap-state.json" <<'EOF'
-          [
-            {
-              "id": "heyosecret",
-              "routes": [{"path_prefix": "/heyosecret", "strip_prefix": true}],
-              "upstreams": [],
-              "discovery": {"service_id": "heyosecret"},
-              "health": {"path": "/health", "timeout_secs": 2}
-            },
-            {
-              "id": "orchestrator",
-              "routes": [{"path_prefix": "/orchestrator", "strip_prefix": true}],
-              "upstreams": [],
-              "discovery": {"service_id": "orchestrator"},
-              "health": {"path": "/health", "timeout_secs": 2}
-            },
-            {
-              "id": "app-obs",
-              "routes": [{"path_prefix": "/app-obs", "strip_prefix": true}],
-              "upstreams": [],
-              "discovery": {"service_id": "app-obs"},
-              "health": {"path": "/healthz", "timeout_secs": 2}
-            },
-            {
-              "id": "app-lb-admin",
-              "routes": [{"path_prefix": "/"}],
-              "upstreams": ["127.0.0.1:9090"],
-              "health": {"path": "/healthz", "timeout_secs": 2}
-            }
-          ]
-          EOF
-              cat > "$package/start.sh" <<'EOF'
-          #!/usr/bin/env sh
-          set -eu
-          : "${APP_LB_STATE_PATH:=/workspace/state/app-lb-state.json}"
-          : "${APP_LB_SECRETS_PATH:=/workspace/state/app-lb-secrets.json}"
-          : "${APP_LB_TOKENS_PATH:=/workspace/state/app-lb-tokens.json}"
-          : "${APP_LB_GUARD_PATH:=/workspace/state/app-lb-guard.json}"
-          : "${APP_LB_AUTH_KEY:=/workspace/state/app-lb-auth-key}"
-          : "${APP_LB_ACME_DIR:=/workspace/state/acme}"
-          : "${APP_LB_BUILD_DIR:=/workspace/state/builds}"
-          : "${APP_LB_MOUNTS_DIR:=/workspace/state/mounts}"
-          : "${APP_LB_WORKSPACES_DIR:=/workspace/state/workspaces}"
-          export APP_LB_STATE_PATH APP_LB_SECRETS_PATH APP_LB_TOKENS_PATH APP_LB_GUARD_PATH
-          export APP_LB_AUTH_KEY APP_LB_ACME_DIR APP_LB_BUILD_DIR APP_LB_MOUNTS_DIR APP_LB_WORKSPACES_DIR
-          if [ -z "${APP_LB_DAEMON_URL:-}" ]; then
-            host_gateway="$(ip -4 route show default | awk 'NR == 1 { print $3 }')"
-            if [ -z "$host_gateway" ]; then
-              echo "cannot determine the host gateway for APP_LB_DAEMON_URL" >&2
-              exit 1
-            fi
-            APP_LB_DAEMON_URL="http://${host_gateway}:3000"
-            export APP_LB_DAEMON_URL
-          fi
-          mkdir -p "$(dirname "$APP_LB_STATE_PATH")" "$APP_LB_ACME_DIR" "$APP_LB_BUILD_DIR" "$APP_LB_MOUNTS_DIR" "$APP_LB_WORKSPACES_DIR"
-          state_dir="${APP_LB_STATE_PATH%.*}.d"
-          if [ ! -e "$APP_LB_STATE_PATH" ] && [ ! -d "$state_dir" ]; then
-            cp /workspace/bootstrap-state.json "$APP_LB_STATE_PATH"
-          fi
-          exec ./app-lb
           EOF
               ;;
             app-obs) cat > "$package/start.sh" <<'EOF'
@@ -494,11 +418,8 @@ jobs:
           deployment_id=f"svc-{service}-{uuid.uuid4().hex[:12]}"
           # Keep this free of single quotes while heyvm embeds env-bearing commands in a single-quoted sh -c wrapper.
           start_command="i=0; until mountpoint -q /workspace && [ -x /workspace/start.sh ]; do sudo -n modprobe 9p 2>/dev/null || true; sudo -n modprobe 9pnet 2>/dev/null || true; sudo -n modprobe 9pnet_virtio 2>/dev/null || true; sudo -n mount -a 2>/dev/null || true; i=$((i + 1)); if [ \"$i\" -ge 300 ]; then echo \"workspace mount did not become ready within 300 seconds\" >&2; exit 1; fi; sleep 1; done; cd /workspace; exec ./start.sh"
-          priority={"heyosecret":10010,"orchestrator":10010,"app-lb":10010,"app-obs":10010}[service]
-          if service == "app-lb":
-              route={"host":f"app-lb.{public_host}","pathPrefix":"/metrics","entryPoints":["websecure"],"stripPrefix":False,"passHostHeader":True,"priority":priority}
-          else:
-              route={"host":public_host,"pathPrefix":f"/{service}","entryPoints":["websecure"],"stripPrefix":True,"passHostHeader":False,"priority":priority}
+          priority={"heyosecret":10010,"orchestrator":10010,"app-obs":10010}[service]
+          route={"host":public_host,"pathPrefix":f"/{service}","entryPoints":["websecure"],"stripPrefix":True,"passHostHeader":False,"priority":priority}
           if os.environ.get("HEYO_TRAEFIK_CERT_RESOLVER"): route["certResolver"]=os.environ["HEYO_TRAEFIK_CERT_RESOLVER"]
           payload={"serviceId":service,"deploymentId":deployment_id,"userId":os.environ.get("HEYO_SERVICE_USER_ID","heyo-system"),"accountId":os.environ.get("HEYO_SERVICE_ACCOUNT_ID","heyo-system"),"name":f"heyo-{service}","archiveName":archive_name,"region":os.environ.get("HEYO_SERVICE_REGION") or "EU","driver":os.environ.get("HEYO_SERVICE_DRIVER") or "libvirt","image":os.environ.get("HEYO_SERVICE_IMAGE") or "ubuntu:24.04","ports":[8080],"workingDirectory":"/","startCommand":start_command,"sizeClass":os.environ.get("HEYO_SERVICE_SIZE_CLASS","small"),"ttlSeconds":0,"healthPath":"/health","healthTimeoutSeconds":900,"drainSeconds":30,"retirePrevious":True,"retirePreviousAsync":True,"deletePrevious":True,"metadata":{"gitSha":git_sha,"gitRef":os.environ.get("GITHUB_REF", ""),"repositoryUrl":repo,"workflow":"Deploy Heyo public services"},"revisionGuard":{"repositoryUrl":repo,"ref":required("CI_REF"),"expectedSha":required("CI_AFTER"),"force":os.environ.get("FORCE_STALE_SERVICE_DEPLOY","").lower() in {"1","true"}},"env":{},"envRefs":[],"route":route}
           discovery_routed={item.strip() for item in os.environ.get("ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES","").split(",") if item.strip()}
@@ -519,8 +440,6 @@ jobs:
           bootstrap_discovery=os.environ.get("BOOTSTRAP_DISCOVERY_ROUTING","").lower() in {"1","true","yes"}
           if bootstrap_discovery and service != "orchestrator":
               raise SystemExit("bootstrapDiscoveryRouting requires service=orchestrator")
-          if service == "app-lb" and service in discovery_routed:
-              raise SystemExit("app-lb cannot use its own discovery membership for traffic management")
           if service in discovery_routed and not bootstrap_discovery:
               if placement_pool:
                   payload["placementPool"]=placement_pool
@@ -552,10 +471,6 @@ jobs:
               for name in ["ORCHESTRATOR_BACKEND_API_URL", "ORCHESTRATOR_TARGET_OS", "ORCHESTRATOR_TARGET_SUPPORTED_DRIVERS", "ORCHESTRATOR_TARGET_ARCHIVE_SUPPORTED_DRIVERS", "ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES"]:
                   if os.environ.get(name): payload["env"][name]=os.environ[name]
               payload["envRefs"]=[envref("DATABASE_URL","orchestrator/database-url"),envref("ORCHESTRATOR_DATABASE_URL","orchestrator/database-url"),envref("JWT_SECRET","orchestrator/jwt-secret"),envref("ORCHESTRATOR_JWT_SECRET","orchestrator/jwt-secret"),envref("ORCHESTRATOR_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("HEYOSECRET_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("ORCHESTRATOR_HEYOSECRET_INTERNAL_API_KEY","orchestrator/internal-api-key"),envref("CLOUD_INTERNAL_API_KEY","cloud/internal-api-key")]
-          elif service=="app-lb":
-              payload["healthPath"]="/healthz"
-              payload["env"]={"APP_LB_PROXY_ADDR":"0.0.0.0:8080","APP_LB_ADMIN_ADDR":"127.0.0.1:9090","APP_LB_STATE_PATH":"/workspace/state/app-lb-state.json","APP_LB_NAME":"stage-app-lb","APP_LB_DASHBOARD_USER":"admin","APP_LB_ADMIN_AUTH":"true","APP_LB_DISCOVERY_URL":f"https://{public_host}/orchestrator"}
-              payload["envRefs"]=[envref("APP_LB_DASHBOARD_PASSWORD","app-lb/admin-password"),envref("APP_LB_DAEMON_API_KEY","cloud/internal-api-key"),envref("APP_LB_DISCOVERY_TOKEN","orchestrator/internal-api-key")]
           elif service=="app-obs":
               payload["healthPath"]="/healthz"
               payload["env"]={"APP_OBS_DATA_DIR":"/workspace/data","APP_OBS_INGEST_ADDR":"127.0.0.1:9500","APP_OBS_SYSLOG_ADDR":"127.0.0.1:9514","APP_OBS_API_ADDR":"0.0.0.0:8080","APP_LB_URL":f"https://app-lb.{public_host}","APP_LB_USER":"admin","APP_OBS_SOURCE":"stage-edge"}
@@ -573,8 +488,6 @@ jobs:
               checks=[(f"https://{public_host}/heyosecret/health",lambda b:json.loads(b).get("status")=="ok")]
           elif service=="orchestrator":
               checks=[(f"https://{public_host}/orchestrator/health",lambda b:json.loads(b).get("deploymentGitSha")==git_sha)]
-          elif service=="app-lb":
-              checks=[(f"https://app-lb.{public_host}/metrics",lambda b:b=="authentication required\n",401)]
           else:
               checks=[(f"https://{public_host}/app-obs/healthz",lambda b:b.strip()=="ok",200)]
           if service in {"heyosecret","orchestrator"}:

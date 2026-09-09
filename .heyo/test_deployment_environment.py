@@ -45,8 +45,7 @@ class DeploymentEnvironmentTests(unittest.TestCase):
         self.assertEqual(request['env']['ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES'], 'heyosecret,orchestrator')
 
     def test_other_services_and_hosts_do_not_gain_replica_policy(self):
-        for service in ['app-lb', 'app-obs']:
-            self.assertNotIn('desiredReplicas', payload(environment(), service)[0])
+        self.assertNotIn('desiredReplicas', payload(environment(), 'app-obs')[0])
         self.assertNotIn('desiredReplicas', payload(environment('other.example'))[0])
 
     def test_explicit_policy_overrides_defaults(self):
