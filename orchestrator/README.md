@@ -187,10 +187,12 @@ regional allocation policy. The same discovery-service list is passed into the
 replacement Orchestrator, so the upgrade does not silently disable discovery.
 Other hosts receive no staging defaults. No server IDs are selected by this file.
 
-The receiver-only deployment failed before cutover. Use the host-app-lb boundary
-correction in PR #55 while the old receiver still serves; it selects only
-Orchestrator and preserves the flat request. Shared workflow edits no longer
-select every service. Resolve the host discovery endpoint dependency before rollout.
+The PR #55 receiver deployment failed before cutover: the installed CICD runner
+overwrote `GITHUB_ENV` defaults with empty job environment values. Load the
+host-keyed defaults inside the deployment Python process, before constructing
+the request, so recovery does not require a CICD upgrade first. This README change
+selects only Orchestrator; the recovery workflow still uses the flat request.
+Shared workflow edits alone select no services, and app-lb remains host-managed.
 Run `python3 .heyo/test_deployment_environment.py` for offline regression checks.
 
 Both public and private service-deployment workflows must move with this interface.

@@ -1,33 +1,27 @@
 """Offline regression checks for the actual workflow's deployment inputs."""
 import os
 from pathlib import Path
-import tempfile
 import textwrap
 import unittest
 from unittest.mock import patch
 
 
 WORKFLOW = Path('.heyo/workflows/deploy-heyo-services.yml').read_text()
-LOAD = textwrap.dedent(WORKFLOW.split('      - name: Load deployment environment defaults\n', 1)[1]
-                       .split("          python3 - <<'PY'\n", 1)[1].split('\n          PY', 1)[0])
-DEPLOY = textwrap.dedent('          discovery_routed=' + WORKFLOW.split('          discovery_routed=', 1)[1]
-                         .split('          archive_path=', 1)[0])
+DEPLOY = textwrap.dedent(WORKFLOW.split('      - name: Deploy selected service through Heyo orchestrator\n', 1)[1]
+                         .split("          python3 - <<'PY'\n", 1)[1].split('          archive_path=', 1)[0])
 
 
 def environment(host='stage.heyo.computer', **overrides):
-    env = {'HEYO_PUBLIC_HOST': host, **overrides}
-    with tempfile.NamedTemporaryFile() as output:
-        with patch.dict(os.environ, {**env, 'GITHUB_ENV': output.name}, clear=True):
-            exec(LOAD, {})
-        env.update(dict(line.split('=', 1) for line in Path(output.name).read_text().splitlines()))
-    return env
+    return {'HEYO_PUBLIC_HOST': host, 'ORCHESTRATOR_INTERNAL_API_KEY': 'test-key',
+            'CI_REPO_URL': 'https://example.test/repo', 'CI_REF': 'refs/heads/main',
+            'CI_AFTER': 'test-revision', **overrides}
 
 
 def payload(env, service='orchestrator'):
-    scope = dict(service=service, payload={'env': {}, 'envRefs': []}, route={'stripPrefix': True},
-                 public_host=env['HEYO_PUBLIC_HOST'], key='test-key', git_sha='test-revision',
-                 envref=lambda name, path: f'{name}=heyosecret://{path}@active', os=os)
-    with patch.dict(os.environ, env, clear=True):
+    scope = {}
+    # Start with the empty job settings from the failed run, without a GITHUB_ENV handoff.
+    with patch.dict(os.environ, {**env, 'TARGET_HEYO_SERVICE': service}, clear=True), \
+         patch('subprocess.check_output', return_value='test-revision\n'):
         exec(DEPLOY, scope)
     return scope['payload'], scope['route']
 
