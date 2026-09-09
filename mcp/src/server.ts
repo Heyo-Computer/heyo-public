@@ -20,6 +20,7 @@ import { diagnosticTools, type Tool } from "./tools/diagnose.js";
 import { actionTools } from "./tools/actions.js";
 import { sandboxTools } from "./tools/sandbox.js";
 import { feedTools } from "./tools/feed.js";
+import { artifactTools } from "./tools/artifacts.js";
 
 /**
  * The tools this configuration can actually serve.
@@ -53,6 +54,7 @@ export function buildTools(config: Config): Tool[] {
     ...(config.cloud?.auth ? sandboxTools(clients) : []),
     ...feedTools(clients),
     ...actionTools(clients),
+    ...artifactTools(clients),
   ];
 }
 
