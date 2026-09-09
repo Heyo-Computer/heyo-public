@@ -73,7 +73,7 @@ class Result:
         self.stdout = stdout
 
 
-def execute(source, service, *, discovery=False, uploaded=False):
+def execute(source, service, *, discovery=False, uploaded=False, staging=False):
     captured = []
     real_open = builtins.open
 
@@ -115,6 +115,10 @@ def execute(source, service, *, discovery=False, uploaded=False):
         "HEYO_TRAEFIK_CERT_RESOLVER": "test-resolver",
         "ORCHESTRATOR_BACKEND_API_URL": "https://backend.example.test",
     }
+    if staging:
+        env.update({"HEYO_PUBLIC_HOST": "stage.heyo.computer",
+                    "ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES": "",
+                    "HEYO_SERVICE_REPLICAS": ""})
     if discovery:
         env.update({
             "ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES": service,
@@ -209,7 +213,21 @@ assert new["scaling"] == {"min_replicas": 2, "max_replicas": 2}
 assert new["deploy"]["replica_regions"] == ["EU", "US"]
 assert new["deploy"]["placement_pool"] == "pool-a"
 assert new["deploy"]["archive_id"] == "archive-1"
+if fixture_dir:
+    (Path(fixture_dir) / "orchestrator-discovery.json").write_text(json.dumps(new) + "\n")
 if old_workflow is not None:
     old = execute(old_workflow, "orchestrator", discovery=True, uploaded=True)
     assert new == old_to_canonical(old), "discovery/upload canonical payload changed semantics"
-print(f"executed and validated 3 public deploy payloads plus discovery/upload variant{' against ' + baseline_ref if baseline_ref else ''}")
+
+# Reproduce the failed run's raw staging settings through the actual POST call.
+new = execute(workflow, "orchestrator", staging=True)
+assert set(new) == {"id", "user_id", "account_id", "vm", "routes", "health", "scaling", "deploy"}
+assert new["scaling"] == {"min_replicas": 1, "max_replicas": 1}
+assert new["routes"][0]["strip_prefix"] is False
+assert new["vm"]["driver"] == "libvirt"
+assert new["deploy"]["retire_previous_async"] is True
+if fixture_dir:
+    (Path(fixture_dir) / "orchestrator-staging.json").write_text(json.dumps(new) + "\n")
+if old_workflow is not None:
+    assert new == old_to_canonical(execute(old_workflow, "orchestrator", staging=True))
+print(f"executed and validated 3 public deploy payloads plus discovery/upload and staging variants{' against ' + baseline_ref if baseline_ref else ''}")

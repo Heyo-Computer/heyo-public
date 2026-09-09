@@ -411,7 +411,8 @@ jobs:
           deployment_id=f"svc-{service}-{uuid.uuid4().hex[:12]}"
           priority={"heyosecret":10010,"orchestrator":10010,"app-obs":10010}[service]
           route={"host":public_host,"path_prefix":f"/{service}","strip_prefix":True}
-          payload=json.load(open(f".heyo/services/{service}.json",encoding="utf-8"))
+          with open(f".heyo/services/{service}.json",encoding="utf-8") as source:
+              payload=json.load(source)
           payload["user_id"]=os.environ.get("HEYO_SERVICE_USER_ID","heyo-system"); payload["account_id"]=os.environ.get("HEYO_SERVICE_ACCOUNT_ID","heyo-system")
           payload["vm"]["driver"]=os.environ.get("HEYO_SERVICE_DRIVER") or payload["vm"]["driver"]
           payload["vm"]["image"]=os.environ.get("HEYO_SERVICE_IMAGE") or payload["vm"]["image"]

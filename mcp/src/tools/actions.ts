@@ -197,7 +197,60 @@ export function actionTools(clients: Clients): Tool[] {
         ),
     },
 
-    // ---- ci ------------------------------------------------------------
+    // ---- ci reads --------------------------------------------------------
+    {
+      name: "ci_run_status",
+      description:
+        "Whether a ci run has finished and whether it worked, with every job and step. THE " +
+        "call to make after submitting a build — without it, a run in progress and a run " +
+        "that died look identical, and silence reads as failure when it usually means " +
+        "'still going'.\n\n" +
+        "Read `run.finished` rather than interpreting `run.status`: 'queued' and 'running' " +
+        "are both not-yet, and a status this client has never heard of is deliberately not " +
+        "finished. A run that is not finished is not a failed run, however long it has been " +
+        "— builds here routinely take tens of minutes.\n\n" +
+        "Each job carries `queue_wait_secs`, which separates the two diagnoses a stuck run " +
+        "has: a large and growing wait means nothing ever claimed the job (check " +
+        "diagnose_ci_job for a queue with no consumer), while a job that started and is " +
+        "still running is simply slow.\n\n" +
+        "Works against ci's public hostname: this route is in public_paths and takes the " +
+        "repository submit token, so CI_TOKEN should be the value `git submit` uses " +
+        "(`git config ci.token`). A token for a different repository answers 404, not 401.",
+      schema: { run_id: z.string() },
+      handler: async (a) => json(await clients.ci({ path: `/api/runs/${enc(String(a.run_id))}` })),
+    },
+    {
+      name: "ci_run_logs",
+      description:
+        "What a run printed, per job and step. The follow-up to ci_run_status when a run " +
+        "failed and the question is why.\n\n" +
+        "Returns the TAIL of each step's log — a failure is at the end — capped, with " +
+        "`truncated` saying whether anything was cut. `failed_only` narrows to the steps that " +
+        "did not succeed, and `job` to one job by its key.\n\n" +
+        "The two steps at negative indices are the executor's own and are where a job that " +
+        "failed before its first declared step explains itself: 'VM console' (-2) and " +
+        "'checkout' (-1). A run whose logs have been swept returns its rows with `log` null " +
+        "and the byte counts intact, which is not the same as a run that printed nothing.",
+      schema: {
+        run_id: z.string(),
+        job: z.string().optional().describe("one job by key; default every job"),
+        tail: z.number().optional().describe("bytes per step from the end; default 16384"),
+        failed_only: z.boolean().optional().describe("only steps that did not succeed"),
+      },
+      handler: async (a) =>
+        json(
+          await clients.ci({
+            path: `/api/runs/${enc(String(a.run_id))}/logs`,
+            query: {
+              job: a.job as string | undefined,
+              tail: a.tail as number | undefined,
+              failed_only: a.failed_only === undefined ? undefined : String(a.failed_only),
+            },
+          }),
+        ),
+    },
+
+    // ---- ci mutations ----------------------------------------------------
     {
       name: "ci_cancel_run",
       description:

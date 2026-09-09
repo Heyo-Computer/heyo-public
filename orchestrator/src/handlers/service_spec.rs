@@ -441,12 +441,14 @@ mod tests {
         }
     }
 
-    /// Integration with the offline workflow harness in both repositories.
+    /// Integration with public workflow requests; also validate any supplied private callers.
     #[test]
     fn accepts_generated_workflow_payloads_when_supplied() {
         let Some(dir) = std::env::var_os("SERVICE_SPEC_FIXTURE_DIR") else { return };
-        let mut count = 0;
-        for entry in std::fs::read_dir(dir).unwrap() {
+        for name in ["orchestrator", "heyosecret", "app-obs", "orchestrator-discovery", "orchestrator-staging"] {
+            assert!(std::path::Path::new(&dir).join(format!("{name}.json")).is_file(), "missing workflow fixture {name}");
+        }
+        for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_none_or(|extension| extension != "json") { continue; }
             let text = std::fs::read_to_string(&path).unwrap();
@@ -459,8 +461,12 @@ mod tests {
             if request.service_id == "cicd" {
                 assert_eq!(request.mounts.len(), 1);
             }
-            count += 1;
+            if path.file_stem().unwrap() == "orchestrator-staging" {
+                assert_eq!(request.desired_replicas, Some(1));
+                assert!(!request.route.as_ref().unwrap().strip_prefix);
+                assert_eq!(request.driver, "libvirt");
+                assert!(request.retire_previous_async);
+            }
         }
-        assert!(count >= 6, "provide all six VM service workflow payloads");
     }
 }
