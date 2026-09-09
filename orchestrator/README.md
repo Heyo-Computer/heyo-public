@@ -56,13 +56,13 @@ Service rollouts keep the previous healthy deployment active while the candidate
 The public VM workflow deploys only Orchestrator, HeyoSecret and app-obs.
 app-lb runs on the host and is not a VM deployment target, including for
 `service=all`. app-obs still connects to the existing app-lb admin endpoint.
-Automatic selection requires a change under the service's source paths;
+Automatic selection requires a change under the service's source paths or its
+`.heyo/services/<service>.json` declaration;
 shared workflow/environment edits and empty change lists select no services.
 Use an explicit service dispatch when only shared deployment settings change.
 
-For the pending JSON receiver upgrade, this README change selects Orchestrator
-alone. Keep the flat deployment request in this workflow until the running
-receiver upgrades; then submit the separate JSON caller changes. Before any
+The receiver-only prerequisite uses the flat request and selects Orchestrator
+alone. This JSON caller workflow must wait until that receiver upgrades. Before any
 receiver rollout, ensure host app-lb discovery does not depend on the retiring
 Orchestrator VM's port. Verify discovery through a stable endpoint and preserve
 the existing host proxy; do not recreate app-lb to upgrade the receiver.
@@ -152,10 +152,10 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 
 ### Service deployment files
 
-This receiver introduces the JSON contract below. The subsequent caller migration
-adds `.heyo/services` files and a workflow that loads a file, fills in the build
-artifact, target host/region and revision, then submits it. This receiver-only
-change deliberately leaves the deployment workflow unchanged for self-upgrade.
+Service configuration lives in [`.heyo/services`](../.heyo/services). The workflow
+loads a file, fills in the build artifact, target host/region and revision, then
+submits it. Install the receiver-only upgrade before activating this workflow;
+see the breaking-change rollout below.
 Application environment variables remain application settings; there is no change
 to Orchestrator's own process-config loader.
 
@@ -196,8 +196,11 @@ Other hosts receive no staging defaults. No server IDs are selected by this file
 The PR #55 receiver deployment failed before cutover: the installed CICD runner
 overwrote `GITHUB_ENV` defaults with empty job environment values. Load the
 host-keyed defaults inside the deployment Python process, before constructing
-the request, so recovery does not require a CICD upgrade first. This README change
-selects only Orchestrator; the recovery workflow still uses the flat request.
+the request, so recovery does not require a CICD upgrade first. The new-format
+Orchestrator is now serving staging. The PR #58 deployment was rejected with HTTP
+422 because the workflow still sent the flat `serviceId` request. Public callers
+now load `.heyo/services/{service}.json` and send `id`, `vm`, `routes`, `health`,
+`scaling`, and `deploy`; no old-format fallback is supported.
 Shared workflow edits alone select no services, and app-lb remains host-managed.
 Run `python3 .heyo/test_deployment_environment.py` for offline regression checks.
 
@@ -222,5 +225,8 @@ still serves; do not advance the callers. After cutover, use the new callers.
 No deployment or infrastructure change is performed by preparing these PRs.
 
 Receiver validation: `cargo test --locked --manifest-path orchestrator/Cargo.toml`.
-The caller migration supplies offline workflow tests and synthetic payloads for
-the optional `SERVICE_SPEC_FIXTURE_DIR` Rust contract test.
+Offline validation: `python3 .heyo/services/test_service_specs.py` executes the
+workflow with mocked network/build calls. `SERVICE_SPEC_BASELINE_REF` optionally
+compares against an old-workflow Git revision. `SERVICE_SPEC_FIXTURE_DIR` exports
+synthetic payloads; use the same directory for the private caller tests and the
+Rust contract test to validate all six VM service requests.

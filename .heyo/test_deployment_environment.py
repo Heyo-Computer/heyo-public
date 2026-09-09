@@ -31,26 +31,26 @@ class DeploymentEnvironmentTests(unittest.TestCase):
         env = environment(ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES='', HEYO_SERVICE_REPLICAS='')
         for service in ['orchestrator', 'heyosecret']:
             request, route = payload(env, service)
-            self.assertEqual(request['desiredReplicas'], 1)
-            self.assertNotIn('placementPool', request)
-            self.assertNotIn('replicaRegions', request)
-            self.assertFalse(route['stripPrefix'])
+            self.assertEqual(request['scaling'], {'min_replicas': 1, 'max_replicas': 1})
+            self.assertNotIn('placement_pool', request['deploy'])
+            self.assertNotIn('replica_regions', request['deploy'])
+            self.assertFalse(route['strip_prefix'])
         request, _ = payload(env)
-        self.assertEqual(request['env']['ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES'], 'heyosecret,orchestrator')
+        self.assertEqual(request['vm']['env_vars']['ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES'], 'heyosecret,orchestrator')
 
     def test_other_services_and_hosts_do_not_gain_replica_policy(self):
-        self.assertNotIn('desiredReplicas', payload(environment(), 'app-obs')[0])
-        self.assertNotIn('desiredReplicas', payload(environment('other.example'))[0])
+        self.assertNotIn('scaling', payload(environment(), 'app-obs')[0])
+        self.assertNotIn('scaling', payload(environment('other.example'))[0])
 
     def test_explicit_policy_overrides_defaults(self):
         env = environment(ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES='orchestrator',
                           HEYO_SERVICE_REPLICAS='orchestrator=2',
                           HEYO_SERVICE_REPLICA_REGIONS='US,EU', HEYO_SERVICE_PLACEMENT_POOL='custom')
         request, _ = payload(env)
-        self.assertEqual(request['desiredReplicas'], 2)
-        self.assertEqual(request['replicaRegions'], ['US', 'EU'])
-        self.assertEqual(request['placementPool'], 'custom')
-        self.assertEqual(request['env']['ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES'], 'orchestrator')
+        self.assertEqual(request['scaling'], {'min_replicas': 2, 'max_replicas': 2})
+        self.assertEqual(request['deploy']['replica_regions'], ['US', 'EU'])
+        self.assertEqual(request['deploy']['placement_pool'], 'custom')
+        self.assertEqual(request['vm']['env_vars']['ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES'], 'orchestrator')
 
     def test_mismatched_region_count_still_fails(self):
         with self.assertRaises(SystemExit):

@@ -1,0 +1,49 @@
+{
+    "id": "app-obs",
+    "user_id": "heyo-system",
+    "account_id": "heyo-system",
+    "vm": {
+        "driver": "libvirt",
+        "image": "ubuntu:24.04",
+        "port": 8080,
+        "start_command": "i=0; until mountpoint -q /workspace && [ -x /workspace/start.sh ]; do sudo -n modprobe 9p 2>/dev/null || true; sudo -n modprobe 9pnet 2>/dev/null || true; sudo -n modprobe 9pnet_virtio 2>/dev/null || true; sudo -n mount -a 2>/dev/null || true; i=$((i + 1)); if [ \"$i\" -ge 300 ]; then echo \"workspace mount did not become ready within 300 seconds\" >&2; exit 1; fi; sleep 1; done; cd /workspace; exec ./start.sh",
+        "working_directory": "/",
+        "size_class": "small",
+        "ttl_seconds": 0,
+        "env_vars": {
+            "APP_OBS_DATA_DIR": "/workspace/data",
+            "APP_OBS_INGEST_ADDR": "127.0.0.1:9500",
+            "APP_OBS_SYSLOG_ADDR": "127.0.0.1:9514",
+            "APP_OBS_API_ADDR": "0.0.0.0:8080",
+            "APP_LB_USER": "admin",
+            "APP_OBS_SOURCE": "stage-edge"
+        },
+        "env_from": [
+            {
+                "secret": "app-lb",
+                "key": "admin-password",
+                "as": "APP_LB_PASSWORD"
+            },
+            {
+                "secret": "app-obs",
+                "key": "api-token",
+                "as": "APP_OBS_API_TOKEN"
+            }
+        ]
+    },
+    "routes": [],
+    "health": {
+        "path": "/healthz",
+        "timeout_secs": 5
+    },
+    "deploy": {
+        "name": "heyo-app-obs",
+        "async": true,
+        "region": "EU",
+        "health_timeout_seconds": 900,
+        "drain_seconds": 30,
+        "retire_previous": true,
+        "retire_previous_async": true,
+        "delete_previous": true
+    }
+}
