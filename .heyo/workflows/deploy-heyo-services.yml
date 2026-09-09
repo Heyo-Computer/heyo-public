@@ -141,23 +141,6 @@ jobs:
             printf 'USE_VALIDATED_SERVICE_ARTIFACTS=1\n' >> "$GITHUB_ENV"
           fi
 
-      - name: Load deployment environment defaults
-        run: |
-          set -eu
-          python3 - <<'PY'
-          import json, os
-          with open('.heyo/deployment-environments.json', encoding='utf-8') as source:
-              environments = json.load(source)
-          defaults = environments.get(os.environ.get('HEYO_PUBLIC_HOST', '').strip(), {})
-          # Explicit dispatch/CI values override the checked-in environment defaults.
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
-              for name, value in defaults.items():
-                  if not isinstance(value, str) or '\n' in value or '\r' in value:
-                      raise SystemExit(f'Invalid deployment environment value for {name}')
-                  if not os.environ.get(name, '').strip():
-                      output.write(f'{name}={value}\n')
-          PY
-
       - name: Ensure deployment secret references
         run: |
           set -eu
@@ -354,6 +337,16 @@ jobs:
           fi
           python3 - <<'PY'
           import base64, json, os, subprocess, sys, time, urllib.error, urllib.request, uuid
+
+          # Load in this process: older CICD runners overwrite GITHUB_ENV with job env.
+          with open('.heyo/deployment-environments.json', encoding='utf-8') as source:
+              environments = json.load(source)
+          defaults = environments.get(os.environ.get('HEYO_PUBLIC_HOST', '').strip(), {})
+          for name, value in defaults.items():
+              if not isinstance(value, str) or '\n' in value or '\r' in value:
+                  raise SystemExit(f'Invalid deployment environment value for {name}')
+              if not os.environ.get(name, '').strip():
+                  os.environ[name] = value
 
           def required(name):
               value = os.environ.get(name, "").strip()
