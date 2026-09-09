@@ -203,13 +203,17 @@ impl Authenticator {
     /// asked about* — and asking the coarse one first can only ever refuse
     /// callers the fine one would have admitted.
     ///
-    /// Best-effort, and matched as a string: an alias (`localhost` against
-    /// `127.0.0.1`) reads as a different address and falls back to the strict
-    /// check, which refuses rather than admits. Wrong in the safe direction.
+    /// Compared as *addresses*, not as strings. A byte comparison was the first
+    /// version and it was wrong on the first fleet that ran it: app-lb bound
+    /// `0.0.0.0:9090` while the deployment fronting it named `127.0.0.1:9090` —
+    /// the same listener, spelled the way each side naturally spells it. The
+    /// mismatch is invisible (everything routes, the dashboard works) and
+    /// surfaces only as a namespace-scoped token refused at the gate for no
+    /// discoverable reason.
     pub fn fronts_admin_api(&self, spec: &crate::config::DeploymentSpec) -> bool {
         self.admin_addr
             .as_deref()
-            .is_some_and(|addr| spec.upstreams.iter().any(|u| u == addr))
+            .is_some_and(|addr| spec.upstreams.iter().any(|u| same_listener(addr, u)))
     }
 
     /// Queue one refused sign-in for analysis.
@@ -460,6 +464,92 @@ impl Authenticator {
         match self.session(gate, deployment_id, req) {
             Some(identity) => Decision::Allow(Box::new(Some(identity))),
             None => {
+                // A token this store *recognises* that did not admit this deployment is
+                // a different answer from no credential at all, and until this branch
+                // the gate gave both the same one: a 401 naming a browser sign-in URL.
+                // To a program that reads as "your connection is broken" — so the
+                // holder of a perfectly valid token goes looking at transport,
+                // credentials and DNS, none of which is the problem. The scoped-public
+                // path has explained this since it was written (`scoped_public`); every
+                // other path did not, which is an inconsistency nobody could have
+                // guessed at from the outside.
+                //
+                // Discloses nothing: it is the caller's own token, and they reached
+                // this deployment by naming it.
+                //
+                // Placed *after* the session check rather than beside the
+                // admitting branch above, so this can only ever change a
+                // refusal and never create one. A browser holding a valid
+                // session that also happens to send an `Authorization` header
+                // is let in exactly as before; only a caller with no other way
+                // through reaches this, and for them the alternative was the
+                // sign-in redirect that started the confusion.
+                if gate.accepts_app_token()
+                    && let Some(presented) = &req.bearer
+                    && let Some(tokens) = &self.tokens
+                    && let Some(token) = tokens.verify(presented, now_secs())
+                {
+                    // The admitting branch above returns on exactly one condition, so
+                    // reaching here with a verified token means precisely that it does
+                    // not admit this deployment. Never the tier: this gate does not
+                    // check one, and saying "insufficient tier" here would send someone
+                    // to mint a wider token that would be refused identically.
+                    debug_assert!(
+                        !req.fronts_admin_api,
+                        "in front of the admin API `admits` is skipped, so a verified token \
+                         cannot reach this branch",
+                    );
+                    tracing::info!(
+                        deployment = %deployment_id,
+                        namespace = %deployment_namespace,
+                        token = %token.id,
+                        path = %req.path,
+                        "refused a recognised token that does not admit this deployment",
+                    );
+                    // Built with `serde_json` rather than `format!`, unlike the older
+                    // bodies in this file: this one interpolates a deployment id, a
+                    // namespace and a token name, none of which this module controls.
+                    // Hand-escaping three caller-influenced strings into JSON is a bug
+                    // waiting for the first id with a quote in it.
+                    let scope = match &token.namespace {
+                        Some(ns) => format!("confined to namespace \"{ns}\""),
+                        None => "not confined to a namespace".to_string(),
+                    };
+                    let body = serde_json::json!({
+                        "error": "insufficient_scope",
+                        "detail": format!(
+                            "this token is {scope} and its deployment scope does not cover \
+                             \"{deployment_id}\" in namespace \"{deployment_namespace}\". This gate \
+                             checks reach, never the admin tier, so a wider tier will not change \
+                             this answer — the token needs this deployment, or its namespace, in \
+                             scope."
+                        ),
+                        "deployment": deployment_id,
+                        "namespace": deployment_namespace,
+                        // Enough of the presenting token to explain *this* refusal, and
+                        // deliberately not its full `deployments` list. The caller
+                        // already holds the token, so nothing here is new to them — but
+                        // this body is reachable at every gated hostname on the public
+                        // internet, and a stolen token that answers "and here is
+                        // everything else I open" at the first door is worse than one
+                        // whose reach has to be probed. `GET /whoami` on the admin API
+                        // gives the whole scope; that listener is loopback by default,
+                        // which is the surface that difference is about.
+                        "token_id": token.id,
+                        "token_admin_scope": token.admin.as_str(),
+                        "token_namespace": token.namespace,
+                    });
+                    return Decision::Answered(Response::json(
+                        403,
+                        serde_json::to_string(&body).unwrap_or_else(|_| {
+                            // Unreachable — every value above is a string, a list of
+                            // strings or null — but a gate must refuse rather than
+                            // panic on the request path.
+                            r#"{"error":"insufficient_scope"}"#.to_string()
+                        }) + "\n",
+                    ));
+                }
+
                 let return_to = match req.query {
                     Some(q) if !q.is_empty() => format!("{}?{}", req.path, q),
                     _ => req.path.to_string(),
@@ -688,7 +778,17 @@ impl Authenticator {
             let mut detail: Vec<&str> = Vec::new();
             if gate.accepts_app_token() {
                 accepts.push("\"app-token\"");
-                detail.push("an app-token as `Authorization: Bearer applb_…` or `?app_token=`");
+                // The header, and only the header. `?app_token=` was advertised
+                // here for a long time and has never worked at this gate: the
+                // credential is read from `Authorization` alone
+                // (`proxy::request_info`), and the query form exists on exactly
+                // one route in the whole system — the admin API's WebSocket
+                // shell, because a browser's `WebSocket` constructor cannot set
+                // headers. Advertising it here sent programmatic callers to
+                // generalise a form that is refused everywhere they would try
+                // it, and a 401 that names a mechanism the path rejects is
+                // worse than one that names nothing.
+                detail.push("an app-token as `Authorization: Bearer applb_…`");
             }
             if gate.accepts_jwt() {
                 accepts.push("\"jwt\"");
@@ -1365,6 +1465,53 @@ fn validate_claims(claims: &IdClaims, client_id: &str) -> Result<Identity, Strin
 }
 
 // -- small helpers ---------------------------------------------------------
+
+/// Whether two `host:port` strings name the same local listener.
+///
+/// The port must match exactly; the host is compared by what it *means*:
+///
+/// * a wildcard bind (`0.0.0.0`, `::`, `*`, or an empty host) answers on every
+///   local address, so any host on that port reaches it;
+/// * otherwise the two must be the same address — textually, as parsed IPs, or
+///   as two spellings of loopback.
+///
+/// No DNS. This runs on the request path, and a name lookup there would trade a
+/// comparison for a network round trip; a hostname that needs one falls through
+/// to `false`, which refuses rather than admits.
+fn same_listener(admin: &str, upstream: &str) -> bool {
+    fn split(s: &str) -> Option<(String, String)> {
+        let (host, port) = s.trim().rsplit_once(':')?;
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        Some((host.to_ascii_lowercase(), port.trim().to_string()))
+    }
+    let (Some((ah, ap)), Some((uh, up))) = (split(admin), split(upstream)) else {
+        return false;
+    };
+    if ap != up {
+        return false;
+    }
+    // A wildcard bind is reachable at every local address on that port, so the
+    // upstream's choice of spelling cannot make it a different listener. Nor can
+    // anything else be listening there: binding 0.0.0.0:P and 127.0.0.1:P at
+    // once is what the OS refuses.
+    if matches!(ah.as_str(), "0.0.0.0" | "::" | "*" | "") {
+        return true;
+    }
+    if ah == uh {
+        return true;
+    }
+    let loopback = |h: &str| {
+        h == "localhost"
+            || h.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+    };
+    if loopback(&ah) && loopback(&uh) {
+        return true;
+    }
+    match (ah.parse::<std::net::IpAddr>(), uh.parse::<std::net::IpAddr>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let pkey = openssl::pkey::PKey::hmac(key).expect("hmac key");
@@ -2046,6 +2193,38 @@ mod tests {
             assert!(r.location.is_none(), "there is no flow to redirect to");
         }
 
+        /// A 401 must not name a mechanism the path will refuse.
+        ///
+        /// `?app_token=` was advertised here for a long time and has never been
+        /// read at this gate — `proxy::request_info` takes the bearer from the
+        /// `Authorization` header alone. The cost of the wrong sentence is not
+        /// abstract: a client generalised it to another host, spent a
+        /// permission grant proving it did not work, and reported the wrong
+        /// cause. The query form exists on exactly one route in the system
+        /// (the admin API's WebSocket shell, which cannot set headers), and
+        /// this is not that route.
+        #[tokio::test]
+        async fn an_app_token_gate_advertises_only_the_header_it_reads() {
+            let a = with_secret();
+            let g: AuthGate =
+                serde_json::from_str(r#"{"provider":"app-token"}"#).unwrap();
+
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &req("/", vec![])).await
+            else {
+                panic!("an unauthenticated request must not be let through");
+            };
+            assert_eq!(r.status, 401);
+            let body: serde_json::Value =
+                serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{}: {e}", r.body));
+            assert_eq!(body["accepts"], serde_json::json!(["app-token"]));
+            let detail = body["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("Authorization: Bearer applb_"), "{body}");
+            assert!(
+                !detail.contains("app_token="),
+                "the gate advertised a query parameter it does not read: {body}",
+            );
+        }
+
         /// A gate taking both machine credentials names both.
         #[tokio::test]
         async fn a_gate_taking_both_machine_credentials_says_so() {
@@ -2207,13 +2386,28 @@ mod tests {
             let g = token_gate(r#""app-token""#);
             let secret = mint(&t, &["other"]);
 
-            // Refused as if no credential were presented — the deployment it *is*
-            // scoped to is none of this deployment's business.
+            // A 403 that says why, not a 401 that implies the credential was
+            // never understood. This used to answer 401 "as if no credential
+            // were presented", and that reads to a program as a broken
+            // connection: the holder of a valid token goes and checks
+            // transport, DNS and the token itself, none of which is wrong.
+            // What is disclosed is the caller's own token and a deployment they
+            // named, so the discretion bought nothing.
             let Decision::Answered(r) = a.decide(&g, "web", "default", &bearing("/private", &secret)).await
             else {
                 panic!("expected a refusal");
             };
-            assert_eq!(r.status, 401);
+            assert_eq!(r.status, 403);
+            let body: serde_json::Value =
+                serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{}: {e}", r.body));
+            assert_eq!(body["error"], "insufficient_scope");
+            assert_eq!(body["deployment"], "web");
+            assert_eq!(body["namespace"], "default");
+            // The other deployment this token *is* scoped to stays that
+            // token's business: this body is reachable from every gated
+            // hostname on the internet.
+            assert!(body.get("token_deployments").is_none(), "{body}");
+            assert!(!r.body.contains("other"), "{}", r.body);
         }
 
         #[tokio::test]
@@ -2245,7 +2439,42 @@ mod tests {
             else {
                 panic!("expected a refusal outside the namespace");
             };
-            assert_eq!(r.status, 401);
+            assert_eq!(r.status, 403);
+            let body: serde_json::Value =
+                serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{}: {e}", r.body));
+            // The wall that actually refused this, named — a namespace token
+            // refused outside its namespace looked identical to a bad password
+            // before, which is a long way from the fix (mint in the right
+            // namespace, or widen the token).
+            assert_eq!(body["token_namespace"], "team-a");
+            assert_eq!(body["namespace"], "default");
+            assert!(
+                body["detail"].as_str().is_some_and(|d| d.contains("namespace")),
+                "{body}"
+            );
+        }
+
+        /// The new explanation must only ever change a *refusal*, never create
+        /// one. A gate taking both providers, a session that is valid, and a
+        /// bearer scoped somewhere else: the session wins, exactly as before.
+        #[tokio::test]
+        async fn a_valid_session_still_wins_over_a_bearer_scoped_elsewhere() {
+            let (a, t) = with_tokens();
+            let g = token_gate(r#"["google","app-token"]"#);
+            let elsewhere = mint(&t, &["other"]);
+            let who = super::identity("someone@example.com", Some("example.com"));
+            let cookie = super::session_cookie(&a, &g, &who, now_secs() + 3600);
+
+            let req = RequestInfo {
+                bearer: Some(elsewhere.clone()),
+                cookies: vec![cookie],
+                ..req("/private", vec![])
+            };
+            let Decision::Allow(identity) = a.decide(&g, "web", "default", &req).await else {
+                panic!("a valid session must still admit, bearer or no bearer");
+            };
+            let identity = identity.expect("a session carries an identity");
+            assert_eq!(identity.email, "someone@example.com");
         }
 
         #[tokio::test]
@@ -2611,7 +2840,38 @@ mod tests {
             assert_eq!(r.status, 401, "unrecognised is a 401");
         }
 
-        /// In front of app-lb's own admin API the gate checks the tier and
+        /// The comparison that decides whether a deployment fronts the admin API.
+    /// A byte-for-byte version of this shipped and was wrong in production:
+    /// `0.0.0.0:9090` and `127.0.0.1:9090` are the same listener.
+    #[test]
+    fn the_admin_listener_is_matched_by_address_not_by_spelling() {
+        // The case that broke: a wildcard bind, an upstream naming loopback.
+        assert!(same_listener("0.0.0.0:9090", "127.0.0.1:9090"));
+        assert!(same_listener("0.0.0.0:9090", "localhost:9090"));
+        assert!(same_listener("[::]:9090", "127.0.0.1:9090"));
+        // Two spellings of loopback.
+        assert!(same_listener("127.0.0.1:9090", "localhost:9090"));
+        assert!(same_listener("localhost:9090", "127.0.0.1:9090"));
+        assert!(same_listener("[::1]:9090", "127.0.0.1:9090"));
+        // Identical, and equivalent IPv6 spellings.
+        assert!(same_listener("127.0.0.1:9090", "127.0.0.1:9090"));
+        assert!(same_listener("[0:0:0:0:0:0:0:1]:9090", "[::1]:9090"));
+
+        // The port is never negotiable — a different port is a different
+        // process, whatever the host says.
+        assert!(!same_listener("0.0.0.0:9090", "127.0.0.1:9091"));
+        assert!(!same_listener("127.0.0.1:9090", "127.0.0.1:8080"));
+        // A specific non-loopback bind is not every address.
+        assert!(!same_listener("10.0.0.5:9090", "127.0.0.1:9090"));
+        assert!(!same_listener("10.0.0.5:9090", "10.0.0.6:9090"));
+        // A name needing DNS is refused rather than resolved on the hot path.
+        assert!(!same_listener("127.0.0.1:9090", "some-host:9090"));
+        // Malformed input refuses.
+        assert!(!same_listener("9090", "127.0.0.1:9090"));
+        assert!(!same_listener("", ""));
+    }
+
+    /// In front of app-lb's own admin API the gate checks the tier and
         /// nothing else, because the API behind it scope-checks better than the
         /// gate can. Without this a namespace-confined token could not reach
         /// the admin API at all through its hostname — it admits no deployment

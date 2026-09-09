@@ -51,6 +51,23 @@ export interface RequestOptions {
   path: string;
   query?: Record<string, string | number | undefined>;
   body?: unknown;
+  /**
+   * Sent verbatim instead of `body`, for an API that takes bytes rather than
+   * JSON. The artifact store's `PUT /blobs/{digest}` is the case: the body is
+   * the blob, and JSON-encoding it would both corrupt it and change its digest
+   * — which is its name.
+   */
+  rawBody?: Uint8Array | string;
+  /** Content type for `rawBody`. Ignored when `body` is used, which is JSON. */
+  contentType?: string;
+  /**
+   * Return the response body as text rather than parsing it.
+   *
+   * For the endpoints whose success answer is not JSON and must not be guessed
+   * at — `PUT /manifests` answers JSON, but `GET /manifests/{ref}` answers the
+   * manifest document and `GET /tags/{name}` answers a bare digest.
+   */
+  expectText?: boolean;
 }
 
 function withQuery(path: string, query?: RequestOptions["query"]): string {
@@ -72,7 +89,14 @@ export async function request(
   const path = withQuery(opts.path, opts.query);
   const headers: Record<string, string> = { accept: "application/json" };
   if (cfg.auth) headers.authorization = cfg.auth;
+  // Before the per-request ones, so a service that carries a second credential
+  // cannot have it silently dropped, and after `authorization`, which is the
+  // one header a service config never puts here. See `ServiceConfig.headers`.
+  Object.assign(headers, cfg.headers ?? {});
   if (opts.body !== undefined) headers["content-type"] = "application/json";
+  if (opts.rawBody !== undefined) {
+    headers["content-type"] = opts.contentType ?? "application/octet-stream";
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -81,7 +105,12 @@ export async function request(
     res = await fetch(`${cfg.baseUrl}${path}`, {
       method: opts.method ?? "GET",
       headers,
-      body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+      body:
+        opts.rawBody !== undefined
+          ? opts.rawBody
+          : opts.body === undefined
+            ? undefined
+            : JSON.stringify(opts.body),
       signal: controller.signal,
     });
   } catch (e) {
@@ -111,6 +140,7 @@ export async function request(
     throw new ServiceError(service, res.status, path, text, hint);
   }
   if (!text.trim()) return null;
+  if (opts.expectText) return text;
   try {
     return JSON.parse(text);
   } catch {

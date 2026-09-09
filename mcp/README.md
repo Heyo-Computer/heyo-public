@@ -3,7 +3,8 @@
 An MCP server over heyo: **heyo cloud** for sandboxes — boot a microVM, run a
 command in it, get files in and out — and the three services that answer
 operational questions about a fleet, [app-lb](../app-lb) (deployments and VM
-pools), [app-obs](../app-obs) (logs and metrics) and [ci](../ci) (builds).
+pools), [app-obs](../app-obs) (logs and metrics), [ci](../ci) (builds) and the
+[artifact store](../artifacts) (the bytes a deployment runs from).
 
 The sandbox half is the API an agent runs work on. The operational half exists
 because its questions span three services: "why is nothing running" is app-lb's
@@ -41,8 +42,11 @@ ci, or a cloud that is not the public one.
 | `APPLB_BASIC` | `user:pass`, or a complete `Basic …` header |
 | `APP_OBS_URL` | app-obs base URL |
 | `APP_OBS_API_TOKEN` | bearer for its query routes (`/healthz` stays open) |
-| `CI_URL` | ci's **own** listener — see above |
-| `CI_TOKEN` | bearer, if ci is reached somewhere that wants one |
+| `CI_URL` | ci's **own** listener for the pages — see below; the read API works either way |
+| `CI_TOKEN` | a repository submit token (`git config ci.token`) — what `ci_run_status` and `ci_run_logs` present |
+| `ART_URL` | artifact store base URL |
+| `ART_API_KEY` | the store's own key, sent as `x-api-key` |
+| `ART_GATE_TOKEN` | app-token for the gate in front of the store; defaults to `APPLB_TOKEN` |
 | `HEYO_MCP_TIMEOUT_MS` | per-request bound, default 30000 |
 
 Each service is independent: configure one and its tools work while the others
@@ -53,32 +57,105 @@ surfaces there rather than inside some later call.
 A `Basic` value is passed through byte for byte, because app-lb compares it that
 way — a re-encoded-but-equivalent header is rejected.
 
-## ci needs a direct URL, and no token changes that
+## Publishing a build
 
-`ci` deployed behind an app-lb `AuthGate` **admits browsers and nothing else.**
-The gate splits on `Accept: text/html`, and ci's `public_paths` are only:
+`art_publish` is the tool for "update deployment X with this build". It is the
+step `applb_start_update` cannot do: app-lb rolls a deployment onto bytes that
+must already be in the store, so without this the workflow dead-ends halfway.
 
-```json
-["/healthz", "/api/submit", "/api/stream/", "/__ui/"]
+A publish is **three** requests and the order and the digests matter:
+
+```
+PUT /blobs/{sha256}     the bytes, at their own hash
+PUT /manifests          {schema:1, kind:"generic", entries:[{name,digest,size}]}
+                        → answers {digest} — the MANIFEST's digest
+PUT /tags/{tag}         that manifest digest, as text/plain
 ```
 
-Every page worth reading — runs, jobs, `/networks`, `/runners`, `/vms`,
-`/repos` — is outside that list, so a machine client is refused whatever
-credential it presents. This is deliberate in ci: minting a submit token is
-minting the right to run code on a runner, so those routes are for browsers with
-an admin role.
+**A tag names a manifest, never a blob.** The store does not check this: it
+writes whatever digest it is handed, so tagging a blob digest succeeds and then
+resolves for no reader — a tag that looks right in a listing and works for
+nobody. That is why publishing is one composite tool rather than three
+primitives with a warning: a composite that always uses the manifest digest
+cannot make the mistake. The primitives are still there (`art_request`) for
+everything else.
 
-So `CI_URL` wants **ci's own listener**, not its public hostname — from the host
-it runs on, or through an SSH tunnel:
+Then `applb_start_update` to roll the deployment, and `applb_deployment_jobs` to
+watch it.
+
+### Two credentials, one request
+
+The store is the only service here with **two authenticators stacked in front of
+it**, and until both were used it could not be written to from outside the
+network at all:
+
+| Layer | Credential | Header |
+|---|---|---|
+| app-lb's gate | app-token with `admin` scope over the `artifacts` deployment | `Authorization: Bearer applb_…` |
+| the store itself | `ART_API_KEY` | `x-api-key` |
+
+Both are ordinarily presented as `Authorization`, which is why this reads as
+unsatisfiable: whichever one you send, the other layer refuses it. The way
+through is that the store also accepts `x-api-key`, so one request passes both
+doors. ci never hits this because ci runs inside the network, where there is no
+gate.
+
+Reached on its own listener there is no gate, and `ART_API_KEY` alone is enough.
+
+## ci: the pages need a direct URL, the read API does not
+
+`ci` deployed behind an app-lb `AuthGate` **admits browsers and almost nothing
+else.** The gate splits on `Accept: text/html`, and ci's `public_paths` are only:
+
+```json
+["/healthz", "/api/submit", "/api/runs/", "/api/stream/", "/__ui/"]
+```
+
+The pages — runs, jobs, `/networks`, `/runners`, `/vms`, `/repos` — are outside
+that list, so a machine client is refused there whatever credential it presents.
+This is deliberate in ci: minting a submit token is minting the right to run code
+on a runner, so those routes are for browsers with an admin role.
+
+So `CI_URL` wants **ci's own listener** for `diagnose_ci_job` and the rest — from
+the host it runs on, or through an SSH tunnel:
 
 ```bash
 ssh -N -L 8081:127.0.0.1:8081 us2.heyo.work   # then CI_URL=http://127.0.0.1:8081
 ```
 
-Pointed at the gated host, ci tools fail with that explanation rather than a
-bare 401, because a token hunt is the wrong response to it.
+`/api/runs/` is the exception, and it is the one that matters most often.
+`ci_run_status` and `ci_run_logs` are machine routes with their own credential —
+a repository submit token in `CI_TOKEN`, the same value `git submit` uses — so
+they work against the public hostname too. Without them a client that submitted a
+build was blind to its outcome, and silence reads as failure: a run that is
+merely slow is indistinguishable from one that died. Read `run.finished`, not the
+status string; builds here routinely take tens of minutes.
+
+Pointed at the gated host, the page-backed tools fail with that explanation
+rather than a bare 401, because a token hunt is the wrong response to it.
 
 app-lb and app-obs are ordinary bearer APIs and need no such arrangement.
+
+## Which credential am I?
+
+`heyo_whoami` answers it: admin scope, namespace, deployment scope, expiry.
+
+Run it first on any 401 or 403 from an `applb_*` tool. Scope problems and
+authentication problems look identical from outside — a token minted without
+admin scope, or scoped to the wrong namespace, produces a refusal that reads as
+a broken connection — and this is what tells them apart. It used to take a
+second, wider credential on another machine to answer, because listing tokens is
+itself an `admin` route.
+
+Two scopes decide everything, and they are checked in **different places**:
+
+- the **admin tier** (`none` / `view` / `admin`) is what app-lb's admin API
+  requires;
+- the **deployment scope** is what a deployment's own gate requires — that gate
+  checks reach and never the tier.
+
+So a token can pass a gate and be refused by the admin API, and the reverse.
+Read both fields.
 
 ## Sandboxes
 
@@ -350,11 +427,14 @@ unauthenticated hole into a process that can delete a deployment.
 | Tool | Answers |
 |---|---|
 | `heyo_status` | which services are reachable, and what each says about itself |
+| `heyo_whoami` | what this credential is: admin scope, namespace, deployment scope, expiry |
 | `fleet_overview` | every deployment, host CPU/memory, app-lb topology, ingest counters |
 | `diagnose_deployment` | one deployment: record, jobs, series, recent errors |
 | `deployment_logs` | log lines with app-obs's filters and paging |
 | `diagnose_empty_pool` | why a pool is empty or will not fill |
-| `diagnose_ci_job` | why a ci job is not running |
+| `diagnose_ci_job` | why a ci job is not running (needs ci's own listener) |
+| `ci_run_status` | has this run finished, and did it work — every job and step |
+| `ci_run_logs` | what a failed run printed, tailed per step |
 
 **Sandboxes** — heyo cloud:
 
@@ -385,6 +465,15 @@ ahead of everything, and the tool says "feed reset" and returns the lot rather
 than reporting nothing new for ever. Nothing publishes unless a deployment's
 spec opts in with `feed.announce` or `feed.issues`.
 
+**The artifact store** — where a deployment's bytes come from:
+
+| Tool | Does |
+|---|---|
+| `art_publish` | the whole three-request publish, with the tag pointing at the manifest |
+| `art_list_tags` / `art_get_tag` | what exists, and what one tag resolves to |
+| `art_get_manifest` | a manifest's kind and entries — where a tag-on-a-blob fails visibly |
+| `art_list_blobs` / `art_usage` | what is stored, and how much room is left |
+
 **Actions** — app-lb reads and lifecycle, ci run control, and `*_request` raw
 tools covering everything without a dedicated tool.
 
@@ -399,8 +488,8 @@ approval prompt.
 
 `sandbox_kill` is named the same way, for the same reason.
 
-The raw `heyo_request` / `applb_request` / `obs_request` / `ci_request` tools
-reach the rest of each API, including destructive methods. Prefer a named tool when one exists —
+The raw `heyo_request` / `applb_request` / `obs_request` / `ci_request` /
+`art_request` tools reach the rest of each API, including destructive methods. Prefer a named tool when one exists —
 the raw one's intent cannot be read without reading its arguments.
 
 `applb_purge_orphan_disks` deserves particular care: *orphaned* is app-lb's
@@ -414,4 +503,6 @@ exactly like one belonging to nothing.
 beside a pool that will not fill is a signal, not the absence of one — read the
 file with `applb_exec`.
 
-**Anything ci knows, when ci is behind its gate.** See above.
+**ci's pages, when ci is behind its gate.** Runs, jobs, runners, vms and repos
+need ci's own listener. `ci_run_status` and `ci_run_logs` are the exception and
+work either way — see above.

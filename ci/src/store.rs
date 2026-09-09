@@ -98,6 +98,24 @@ impl RunStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Success | Self::Failure | Self::Cancelled)
     }
+
+    /// The inverse of [`Self::as_str`], for the columns that store a status as
+    /// text.
+    ///
+    /// `None` for anything this build does not know, and every caller must
+    /// treat that as "not finished" rather than defaulting it to a variant. A
+    /// row written by a newer binary is the case that matters: guessing
+    /// `Success` there would report somebody's failed deploy as green.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "queued" => Self::Queued,
+            "running" => Self::Running,
+            "success" => Self::Success,
+            "failure" => Self::Failure,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +147,21 @@ impl JobStatus {
             self,
             Self::Success | Self::Failure | Self::Skipped | Self::Cancelled
         )
+    }
+
+    /// The inverse of [`Self::as_str`]. `None` for an unrecognised status, for
+    /// the reason [`RunStatus::parse`] gives.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "pending" => Self::Pending,
+            "queued" => Self::Queued,
+            "running" => Self::Running,
+            "success" => Self::Success,
+            "failure" => Self::Failure,
+            "skipped" => Self::Skipped,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
     }
 
     /// What `needs.<job>.result` reports. A skipped dependency is not a failure

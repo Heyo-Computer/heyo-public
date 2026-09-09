@@ -15,6 +15,8 @@ export interface Clients {
   applb: Requester;
   obs: Requester;
   ci: Requester;
+  /** The artifact store — the bytes a `site` or `vm` deployment runs from. */
+  art: Requester;
   /**
    * The managed namespace app-lb calls are confined to, discovering it if that
    * has not happened yet. Tools that must *name* the namespace rather than just
@@ -38,6 +40,7 @@ export function makeClients(config: Config): Clients {
     applb: bind("app-lb", applb, "APPLB_URL or APPLB_TOKEN", config),
     obs: bind("app-obs", config.obs, "APP_OBS_URL", config),
     ci: bind("ci", config.ci, "CI_URL", config),
+    art: bind("artifacts", config.art, "ART_URL (plus ART_API_KEY)", config),
     applbNamespace: async () =>
       typeof applb === "function" ? (await applb()).namespace : applb?.namespace,
   };

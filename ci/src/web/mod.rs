@@ -10,14 +10,16 @@
 //! and a page's own `EventSource` all get `401 {"error":"authentication
 //! required"}`. Machine routes therefore live under `/api` and are listed in the
 //! deployment's `public_paths`, each carrying its own credential — the submit
-//! endpoint a repository token or an HMAC, the log stream a short-TTL
-//! run-scoped token minted by the page that opens it.
+//! endpoint a repository token or an HMAC, the read API in [`api`] the same
+//! repository token scoped to the run it is asking about, the log stream a
+//! short-TTL run-scoped token minted by the page that opens it.
 //!
 //! The repository-management routes are the mirror image: they are *not* in
 //! `public_paths`, precisely because minting a submit token is minting the right
 //! to run code on a runner. They are for browsers, they run behind the gate, and
 //! they check an admin role on top of it.
 
+pub mod api;
 pub mod identity;
 pub mod pages;
 pub mod stream;
@@ -124,6 +126,11 @@ pub fn router(
             "/api/submit",
             post(submit).layer(DefaultBodyLimit::max(submit_limit)),
         )
+        // The read half of the machine API: run status and logs, on the same
+        // repository token a submit uses. In `public_paths` beside the two
+        // above, for the reason this module's header gives — a machine route
+        // behind the gate answers 401 whatever it carries. See [`api`].
+        .merge(api::router())
         .with_state(state)
 }
 

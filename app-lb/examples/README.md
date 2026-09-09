@@ -137,7 +137,7 @@ This is the interesting shape for a gate. `art serve` puts two surfaces on port
 
 | Paths | Who calls it | How it authenticates today |
 | --- | --- | --- |
-| `/blobs/…`, `/manifests…`, `/tags…`, `/usage` | CI, the `art` client | `ART_API_KEY`, in a header no browser sends |
+| `/blobs/…`, `/manifests…`, `/tags…`, `/usage` | CI, the `art` client | `ART_API_KEY`, in a header no browser sends — plus an `admin` app-token at the gate, as this spec now stands; see the notes |
 | `/`, `/dashboard/…`, `/login`, `/logout` | people | `ART_ADMIN_PASSWORD` + a login form |
 | `/healthz` | probes | nothing, by design |
 
@@ -159,12 +159,40 @@ heyctl build artifacts --wait      # optional: build the image from the repo
   not listed — including `/` — is gated, which is what puts the dashboard behind
   Google while leaving the API reachable.
 
-- **The gate does not protect the API.** Everything in `public_paths` is exactly
-  as exposed as it was before, guarded only by `ART_API_KEY`. If that is not
-  acceptable, the gate is the wrong tool for those paths — there is no way for a
-  headless client to sign in with Google. Worth being explicit about, because
-  "the store is behind Google sign-in" would be a fair reading of this spec and a
-  wrong one.
+- **Every entry now spells its `scope`, and that changed what this spec means.**
+  When this example was written a `public_paths` entry was a bare string and
+  meant *no credential at all* — "the gate does not protect the API; those paths
+  are guarded only by `ART_API_KEY`", which is what the paragraph here used to
+  say. Scopes arrived afterwards, and a bare string now defaults to `admin`. So
+  this spec quietly became **two** credentials for the machine API: an app-token
+  with `admin` scope over `artifacts` at the gate, *plus* `ART_API_KEY` at the
+  store. That is a defensible posture, but it was never a decision anyone made
+  here, and it is the reason pushing a build from outside the network reads as
+  impossible — both layers are ordinarily addressed through `Authorization`, so
+  whichever credential you send, the other refuses it.
+
+  Two things follow, and they are worth separating:
+
+  - **It is satisfiable.** The store accepts `x-api-key` as well as a bearer, so
+    one request can carry `Authorization: Bearer applb_…` for the gate and
+    `x-api-key` for the store. That is exactly what `mcp`'s `art_publish` does;
+    see [`mcp/README.md`](../../mcp/README.md#two-credentials-one-request). ci
+    never meets the problem because ci runs inside the network, with no gate in
+    front of it.
+  - **Decide which posture you want, rather than inheriting one.** Left at
+    `admin` the gate is a real second layer over the machine API. Set to
+    `public` these paths go back to the original intent — open at the gate,
+    guarded by `ART_API_KEY` alone — and a headless client needs one credential
+    again. Both are reasonable; the default is not a choice.
+
+  `/healthz` is the one entry that is not a judgement call, and it is now
+  `public` explicitly: a readiness probe carries no credentials, so a health
+  endpoint requiring `admin` answers 401 to every prober. `/__ui/` joins it —
+  the sign-in page has to be able to fetch its own stylesheet.
+
+- **A headless client cannot sign in with Google.** Whatever scope the paths
+  carry, that stays true: an app-token or nothing. "The store is behind Google
+  sign-in" would be a fair reading of this spec and a wrong one.
 
 - **The dashboard now asks twice.** artifacts refuses to serve its dashboard at
   all unless `ART_ADMIN_PASSWORD` is set, and then presents its own login form —

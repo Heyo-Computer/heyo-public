@@ -505,9 +505,20 @@ fn narrows_itself(matched: &str) -> bool {
     // `/namespaces` narrows through `may_view`, exactly as `/metrics` does — it
     // is the deployment directory regrouped, so refusing a scoped token here
     // while handing it the directory would be a wall with a door beside it.
+    // `/whoami` is the extreme case of narrowing: it answers only about the
+    // credential presented, so there is nothing there for a scoped token to
+    // reach past. Refusing it as "fleet-wide" would deny a caller the one fact
+    // it already holds, which is how a token's own scope became undiscoverable
+    // without a *second*, wider credential to list tokens with.
     matches!(
         matched,
-        "/" | "/metrics" | "/dashboard" | "/security" | "/siem" | "/ingress" | "/namespaces"
+        "/" | "/metrics"
+            | "/dashboard"
+            | "/security"
+            | "/siem"
+            | "/ingress"
+            | "/namespaces"
+            | "/whoami"
     )
 }
 
@@ -881,6 +892,22 @@ async fn require_view_auth(State(state): State<AdminState>, req: Request, next: 
 
 async fn require_crud_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
     authorize(state, req, next, crate::tokens::AdminScope::Admin).await
+}
+
+/// The lowest bar there is: a credential this server recognises, and no tier.
+///
+/// Only `/whoami` uses it, and the tier is `None` rather than `View` on
+/// purpose. A token minted with `admin: none` — the shape an application is
+/// handed to get past its own deployment's gate — is precisely the one whose
+/// holder cannot work out why the admin API refuses them, so it is the one that
+/// most needs to be able to ask. Requiring `view` here would leave exactly that
+/// caller unable to discover the thing that would explain their 403s.
+async fn require_any_credential(
+    State(state): State<AdminState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    authorize(state, req, next, crate::tokens::AdminScope::None).await
 }
 
 #[derive(Serialize)]
@@ -4457,9 +4484,21 @@ fn router(state: AdminState) -> Router {
         require_view_auth,
     ));
 
+    // Self-introspection, on its own layer because it is the only route with no
+    // tier requirement at all. It is never folded into `view`: `gate_view` off
+    // would then make it answer `Ungated` to callers who did present a token,
+    // which is the one answer it must never give wrongly.
+    let whoami = Router::new()
+        .route("/whoami", get(whoami))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_any_credential,
+        ));
+
     Router::new()
         .route("/healthz", get(healthz))
         .merge(view)
+        .merge(whoami)
         .merge(crud)
         .merge(open)
         .with_state(state)
@@ -4504,6 +4543,124 @@ impl BackgroundService for AdminApi {
             tracing::error!(error = %e, "admin API stopped");
         }
     }
+}
+
+// -- self-introspection ------------------------------------------------------
+
+/// `GET /whoami` — what this credential is, and what it may do.
+///
+/// ## Why this route exists
+///
+/// A token's scope was, until this route, only readable through `GET /tokens`,
+/// which needs `admin`. That is a circular dependency dressed as a permission
+/// check: the caller who most needs to know their scope is the one whose scope
+/// is too small to look it up, so the only way to answer "why am I getting a
+/// 401" was to go and find a *second*, wider credential on another machine. A
+/// client could not discover its own reach, and every scope problem therefore
+/// presented as an authentication problem — which sends people to rotate a
+/// token that was never the issue.
+///
+/// ## Why it discloses nothing
+///
+/// Every field describes the credential the caller already holds. There is no
+/// registry read, no other token, and no fleet inventory here — `deployments`
+/// is the token's own scope list as it was minted, not a list of things that
+/// exist. Answering "you are `admin` over `["marketing"]`" tells the holder of
+/// that token exactly what it could work out by trying two requests, minus the
+/// afternoon.
+///
+/// The secret is never echoed, for the reason [`MintedToken`] gives: only its
+/// hash is kept, and a route that could read one back would undo that.
+async fn whoami(caller: Option<axum::Extension<Caller>>) -> impl IntoResponse {
+    let now = now_secs();
+    // The layer always inserts one; `None` would mean the route was reached
+    // without the middleware, which is a wiring bug rather than a caller error.
+    let Some(axum::Extension(caller)) = caller else {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no caller on this request; /whoami was reached without its auth layer",
+        )
+        .into_response();
+    };
+
+    let mut body = serde_json::json!({
+        // What kind of credential answered, spelled the way the rest of the API
+        // spells them, so "app-token" here and `applb_…` in a header are
+        // recognisably the same thing.
+        "caller": match &caller {
+            Caller::Ungated => "ungated",
+            Caller::Operator => "operator",
+            Caller::Token(_) => "app-token",
+            Caller::Federated(_) => "federated",
+        },
+        // The two questions a refused request actually raises, answered
+        // directly rather than left to be derived from the tier.
+        "may": {
+            "read_view_routes": caller.satisfies(crate::tokens::AdminScope::View),
+            "use_admin_routes": caller.satisfies(crate::tokens::AdminScope::Admin),
+        },
+        // Whether this credential is confined to a namespace, which is the
+        // other half of why a request gets refused and the half that does not
+        // show up in the tier at all.
+        "fleet": caller.covers_fleet(),
+        "confined": caller.confined(),
+    });
+
+    match &caller {
+        Caller::Ungated => {
+            body["admin_scope"] = "unchecked".into();
+            body["detail"] = "this listener has no credential configured, so every request                               is admitted and no scope is checked. APP_LB_ADMIN_PASSWORD is                               what turns the gate on."
+                .into();
+        }
+        Caller::Operator => {
+            body["admin_scope"] = "admin".into();
+            body["detail"] = "the configured Basic credential, which is unscoped by                               definition — it is what mints tokens, so it outranks every                               token it could produce."
+                .into();
+        }
+        Caller::Token(t) => {
+            body["admin_scope"] = t.admin.as_str().into();
+            body["token"] = serde_json::json!({ "id": t.id, "name": t.name });
+            body["namespace"] = t.namespace.clone().into();
+            // Verbatim, including `["*"]` and the empty list, because both are
+            // meaningful and neither means what it looks like: `*` is every
+            // deployment, and empty on a *namespace* token is everything in
+            // that namespace rather than nothing.
+            body["deployments"] = t.deployments.clone().into();
+            body["expires_at"] = t.expires_at.into();
+            body["expires_in_secs"] = t.expires_at.map(|e| e.saturating_sub(now)).into();
+        }
+        Caller::Federated(g) => {
+            // A grant has a tier per namespace rather than one tier, so the
+            // strongest is reported alongside the map instead of instead of it.
+            body["admin_scope"] = if caller.satisfies(crate::tokens::AdminScope::Admin) {
+                crate::tokens::AdminScope::Admin.as_str()
+            } else if caller.satisfies(crate::tokens::AdminScope::View) {
+                crate::tokens::AdminScope::View.as_str()
+            } else {
+                crate::tokens::AdminScope::None.as_str()
+            }
+            .into();
+            body["subject"] = serde_json::json!({
+                "user_id": g.subject.user_id,
+                "email": g.subject.email,
+                "account_id": g.subject.account_id,
+            });
+            body["namespaces"] = serde_json::json!(
+                g.namespaces
+                    .iter()
+                    .map(|(ns, scope)| (ns.clone(), scope.as_str()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            );
+        }
+    }
+
+    // Named here rather than left to the caller to know: the gate in front of a
+    // deployment and this API check *different* things, and a caller who has
+    // only ever seen one of them will attribute a refusal to the wrong one.
+    body["note"] = "A deployment's own gate checks whether this credential admits that                     deployment; it does not check the admin tier. This API checks the                     tier as well. A token can therefore pass a gate and still be refused                     here, and vice versa."
+        .into();
+
+    Json(body).into_response()
 }
 
 // -- app-tokens --------------------------------------------------------------
@@ -5561,6 +5718,75 @@ mod tests {
                 AdminScope::Admin,
                 NOW,
             )
+        }
+
+        /// The circularity `/whoami` exists to break: the credential that most
+        /// needs to know its own scope is the one whose scope is too small to
+        /// look it up.
+        #[test]
+        fn a_token_with_no_admin_scope_can_still_ask_what_it_is() {
+            let t = store();
+            let hdr = format!("Bearer {}", mint(&t, AdminScope::None, &["marketing"]));
+
+            // The route it needs, at the tier its layer asks for.
+            assert!(matches!(
+                on(Some(&basic()), &t, Some(&hdr), "/whoami", "/whoami", AdminScope::None),
+                Verdict::Allow(_)
+            ));
+
+            // And every other way of asking stays shut, which is the whole
+            // reason the scope was undiscoverable: listing tokens is `admin`,
+            // and the dashboard's data is `view`.
+            assert!(matches!(
+                on(Some(&basic()), &t, Some(&hdr), "/tokens", "/tokens", AdminScope::Admin),
+                Verdict::Forbidden(_)
+            ));
+            assert!(matches!(
+                on(Some(&basic()), &t, Some(&hdr), "/metrics", "/metrics", AdminScope::View),
+                Verdict::Forbidden(_)
+            ));
+        }
+
+        /// A deployment-scoped token is not "fleet-wide" on this route: there is
+        /// nothing on it to reach past, because the answer is only ever about
+        /// the caller. Without `narrows_itself` the fleet-route rule would
+        /// refuse exactly the callers the route is for.
+        #[test]
+        fn a_scoped_token_is_not_refused_at_whoami_as_a_fleet_route() {
+            let t = store();
+            let scoped = format!("Bearer {}", mint(&t, AdminScope::Admin, &["marketing"]));
+            let confined = format!("Bearer {}", mint_in_namespace(&t, AdminScope::None, "team-a"));
+
+            for hdr in [&scoped, &confined] {
+                assert!(
+                    matches!(
+                        on(Some(&basic()), &t, Some(hdr), "/whoami", "/whoami", AdminScope::None),
+                        Verdict::Allow(_)
+                    ),
+                    "a confined caller must be able to ask about itself",
+                );
+            }
+
+            // The contrast: a genuinely fleet-wide route still refuses both.
+            assert!(matches!(
+                on(Some(&basic()), &t, Some(&scoped), "/jobs", "/jobs", AdminScope::Admin),
+                Verdict::Forbidden(_)
+            ));
+        }
+
+        /// No credential is still no credential. `/whoami` lowers the tier, not
+        /// the requirement — an anonymous caller has no "self" to report.
+        #[test]
+        fn whoami_still_needs_a_credential() {
+            let t = store();
+            assert!(matches!(
+                on(Some(&basic()), &t, None, "/whoami", "/whoami", AdminScope::None),
+                Verdict::Unauthorized
+            ));
+            assert!(matches!(
+                on(Some(&basic()), &t, Some("Bearer applb_nope_nope"), "/whoami", "/whoami", AdminScope::None),
+                Verdict::Unauthorized
+            ));
         }
 
         #[test]
