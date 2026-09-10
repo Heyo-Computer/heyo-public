@@ -476,7 +476,7 @@ let depsById = {};   // id -> latest deployment view, for form prefills
 const DEP_PAGE = 50;
 let depOffset = 0;   // first deployment on the current page
 let depPrefix = "";  // id-prefix filter, sent to the server, not applied here
-let depNamespace = ""; // namespace filter, likewise server-side; "" is all of them
+let depNamespace = new URLSearchParams(location.search).get("namespace") || "";
 let knownNamespaces = []; // last seen from GET /namespaces, for the mint form
 
 const $ = (id) => document.getElementById(id);
@@ -770,9 +770,9 @@ function renderDeploymentPager(matched) {
   matched = matched ?? 0;
   $("deps-count").textContent = matched ? `(${matched})` : "";
 
-  // A fleet that fits on one page and isn't being filtered gets no controls at
-  // all, so a handful of services looks the way it always did.
-  const needed = matched > DEP_PAGE || depOffset > 0 || depPrefix !== "";
+  // Workspace navigation is needed even when its apps fit on one page.
+  const needed = matched > DEP_PAGE || depOffset > 0 || depPrefix !== "" ||
+    depNamespace !== "" || knownNamespaces.length > 1;
   $("dep-controls").classList.toggle("on", needed);
   if (!needed) return;
 
@@ -2335,6 +2335,10 @@ function renderNamespaces(list) {
 
 $("ns-filter").addEventListener("change", (e) => {
   depNamespace = e.target.value;
+  const url = new URL(location.href);
+  if (depNamespace) url.searchParams.set("namespace", depNamespace);
+  else url.searchParams.delete("namespace");
+  history.replaceState(null, "", url);
   // Back to the first page: the offset described a different result set, and
   // keeping it lands on an empty page of a namespace that has fewer rows.
   depOffset = 0;

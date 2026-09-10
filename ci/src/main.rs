@@ -185,6 +185,7 @@ async fn main() {
         bus.jobs_stream(),
         bus.events_stream()
     );
+    bus.clone().spawn_outbox_publisher(store.clone());
 
     let artifacts = match artifacts::sink_for(&config) {
         Ok(s) => Arc::from(s),

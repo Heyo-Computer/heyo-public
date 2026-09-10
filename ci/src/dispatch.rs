@@ -716,9 +716,6 @@ impl Dispatcher {
                     self.store
                         .set_job_status(&job.id, JobStatus::Skipped, None)
                         .await?;
-                    self.bus
-                        .publish_event(run_id, &plan.key, &serde_json::json!({"status": "skipped"}))
-                        .await;
                     continue;
                 }
                 Err(e) => {
@@ -1100,16 +1097,6 @@ impl Dispatcher {
             tracing::info!(job = %msg.job_key, "no longer runnable; dropping delivery");
             return Ok(JobStatus::Success);
         }
-        self.bus
-            .publish_event(
-                &msg.run_id,
-                &plan.key,
-                &serde_json::json!({
-                    "status": "running", "runner": runner,
-                    "phase": "acquiring a VM", "attempt": attempt
-                }),
-            )
-            .await;
         tracing::info!(job = %plan.key, runner = %runner, attempt, "acquiring a VM");
 
         let workspace = self.workspace(&msg.run_id);
@@ -1173,17 +1160,6 @@ impl Dispatcher {
             self.release_vm(&plan, &vm, false).await;
             return Ok(JobStatus::Success);
         }
-        self.bus
-            .publish_event(
-                &msg.run_id,
-                &plan.key,
-                &serde_json::json!({
-                    "status": "running", "runner": runner,
-                    "sandbox": vm.id(), "reusedVm": reused, "attempt": attempt,
-                    "sizeClass": plan.vm.size_class.map(|s| s.as_str())
-                }),
-            )
-            .await;
         tracing::info!(
             job = %plan.key, runner = %runner, vm = vm.id(), reused,
             "running"
@@ -1230,13 +1206,6 @@ impl Dispatcher {
         self.store
             .set_job_status(&msg.job_id, status, error.as_deref())
             .await?;
-        self.bus
-            .publish_event(
-                &msg.run_id,
-                &plan.key,
-                &serde_json::json!({"status": status.as_str(), "error": error}),
-            )
-            .await;
         Ok(status)
     }
 
@@ -2592,7 +2561,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 let transfer = started.elapsed();
 
                 self.store
-                    .record_artifact(&msg.run_id, &msg.job_id, &name, &stored)
+                    .record_artifact(&msg.run_id, &msg.job_id, sid, &name, &stored)
                     .await?;
                 // The link is the point of `public: true`, so it goes in the
                 // log where a person reading the run will find it. A sink
@@ -2880,14 +2849,6 @@ async fn process_delivery(
                     delay.as_secs()
                 );
                 let _ = dispatcher.store.note_job_error(&job.job_id, &detail).await;
-                dispatcher
-                    .bus
-                    .publish_event(
-                        &job.run_id,
-                        &job.job_key,
-                        &serde_json::json!({"status": "running", "error": detail}),
-                    )
-                    .await;
                 let _ = msg
                     .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
                     .await;

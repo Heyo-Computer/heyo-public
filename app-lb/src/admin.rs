@@ -2031,8 +2031,11 @@ async fn namespaces(
     State(state): State<AdminState>,
     caller: Option<axum::Extension<Caller>>,
 ) -> impl IntoResponse {
-    let caller = caller.as_ref().map(|c| &c.0);
+    Json(visible_namespaces(&state, caller.as_ref().map(|c| &c.0)))
+}
 
+/// Shared by the API and workspace picker; neither may disclose extra rooms.
+fn visible_namespaces(state: &AdminState, caller: Option<&Caller>) -> Vec<NamespaceEntry> {
     // BTreeMap so the order is the namespace order and not the registry's.
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for d in state.registry.deployments().values() {
@@ -2060,8 +2063,7 @@ async fn namespaces(
         }
     }
 
-    Json(
-        counts
+    counts
             .into_iter()
             .map(|(namespace, deployments)| {
                 let declared = state.namespaces.get(&namespace);
@@ -2073,8 +2075,7 @@ async fn namespaces(
                     namespace,
                 }
             })
-            .collect::<Vec<_>>(),
-    )
+            .collect()
 }
 
 /// `POST /namespaces` — declare one.
@@ -2345,6 +2346,7 @@ async fn purge_orphan_disks(State(state): State<AdminState>) -> Response {
 /// hostnames genuinely offers three places to go, and this page exists to be
 /// clicked.
 struct DirectoryEntry {
+    namespace: String,
     url: String,
     deployment: String,
     kind: &'static str,
@@ -2389,6 +2391,7 @@ impl EntryState {
 fn directory_entries(
     state: &AdminState,
     scope: Option<&[String]>,
+    namespace: Option<&str>,
 ) -> (Vec<DirectoryEntry>, Vec<String>) {
     let deployments = state.registry.deployments();
     let mut entries = Vec::new();
@@ -2399,6 +2402,10 @@ fn directory_entries(
         if let Some(ids) = scope
             && !ids.iter().any(|id| id.as_str() == d.spec.id.as_str())
         {
+            continue;
+        }
+
+        if namespace.is_some_and(|ns| ns != d.spec.namespace) {
             continue;
         }
 
@@ -2461,6 +2468,7 @@ fn directory_entries(
         let gated = d.spec.auth.is_some();
         for url in urls {
             entries.push(DirectoryEntry {
+                namespace: d.spec.namespace.clone(),
                 url,
                 deployment: d.spec.id.clone(),
                 kind,
@@ -2534,10 +2542,12 @@ fn render_directory_cards(entries: &[DirectoryEntry], unlinkable: &[String]) -> 
                      <span class=\"tag {kind}\">{kind}</span>\
                    </div>\
                    <div class=\"url\">{url}</div>\
+                   <div class=\"workspace-name\">{namespace}</div>\
                    <div class=\"meta\"><span class=\"dot {dot}\"></span>{detail}</div>\
                  </a>",
                 url = html_escape(&e.url),
                 id = html_escape(&e.deployment),
+                namespace = html_escape(&e.namespace),
                 kind = e.kind,
                 dot = e.state.dot(),
                 detail = html_escape(&e.detail),
@@ -2582,7 +2592,49 @@ fn directory_lede(entries: &[DirectoryEntry]) -> String {
     s
 }
 
-/// `GET /` — a directory of everything this app-lb routes.
+#[derive(Default, Deserialize)]
+struct DirectoryQuery {
+    namespace: Option<String>,
+}
+
+/// A query narrows existing grants; it never grants access to another workspace.
+/// Unknown and inaccessible names deliberately have the same answer.
+fn selected_workspace<'a>(
+    visible: &'a [NamespaceEntry],
+    requested: Option<&str>,
+) -> Result<Option<&'a str>, ()> {
+    match requested {
+        Some("") => Ok(None),
+        Some(name) => visible.iter().find(|n| n.namespace == name)
+            .map(|n| Some(n.namespace.as_str())).ok_or(()),
+        None if visible.len() == 1 => Ok(Some(&visible[0].namespace)),
+        None => Ok(None),
+    }
+}
+
+fn render_workspace_picker(visible: &[NamespaceEntry], selected: Option<&str>) -> String {
+    let mut options = format!(
+        "<option value=\"\"{}>All accessible workspaces</option>",
+        if selected.is_none() { " selected" } else { "" },
+    );
+    for ns in visible {
+        options.push_str(&format!(
+            "<option value=\"{name}\"{selected}>{name} ({count})</option>",
+            name = html_escape(&ns.namespace),
+            selected = if selected == Some(ns.namespace.as_str()) { " selected" } else { "" },
+            count = ns.deployments,
+        ));
+    }
+    format!(
+        "<form class=\"workspace-picker\" method=\"get\" action=\"/\">\
+           <label for=\"workspace\">Workspace</label>\
+           <select id=\"workspace\" name=\"namespace\">{options}</select>\
+           <button type=\"submit\">Open</button>\
+         </form>"
+    )
+}
+
+/// `GET /` — workspace apps, with platform controls separate from app logic.
 ///
 /// Server-rendered, unlike `/dashboard`: it is a landing page that should be
 /// complete in its first response, work without JavaScript, and not hold a
@@ -2590,15 +2642,29 @@ fn directory_lede(entries: &[DirectoryEntry]) -> String {
 /// underlying registry changes; the app name is substituted once at startup.
 async fn directory(
     State(state): State<AdminState>,
+    Query(query): Query<DirectoryQuery>,
     headers: axum::http::HeaderMap,
     caller: Option<axum::Extension<Caller>>,
-) -> impl IntoResponse {
-    let scope = visible_ids(&state, caller.as_ref().map(|c| &c.0));
-    let (entries, unlinkable) = directory_entries(&state, scope.as_deref());
+) -> Response {
+    let caller = caller.as_ref().map(|c| &c.0);
+    let workspaces = visible_namespaces(&state, caller);
+    let Ok(selected) = selected_workspace(&workspaces, query.namespace.as_deref()) else {
+        return err(StatusCode::NOT_FOUND, "workspace not found").into_response();
+    };
+    let scope = visible_ids(&state, caller);
+    let (entries, unlinkable) = directory_entries(&state, scope.as_deref(), selected);
+    let platform_url = match selected {
+        Some(ns) => format!("/dashboard?{}", form_urlencoded::Serializer::new(String::new())
+            .append_pair("namespace", ns).finish()),
+        None => "/dashboard".into(),
+    };
     let html = render_page(&state, &state.directory_html, &headers)
+        .replace("{{WORKSPACE_PICKER}}", &render_workspace_picker(&workspaces, selected))
+        .replace("{{WORKSPACE_TITLE}}", &html_escape(selected.unwrap_or("All accessible workspaces")))
+        .replace("{{PLATFORM_URL}}", &html_escape(&platform_url))
         .replace("{{LEDE}}", &html_escape(&directory_lede(&entries)))
         .replace("{{CARDS}}", &render_directory_cards(&entries, &unlinkable));
-    Html(html)
+    Html(html).into_response()
 }
 
 async fn dashboard(
@@ -5030,8 +5096,37 @@ mod tests {
     mod directory {
         use super::*;
 
+        fn workspace(name: &str) -> NamespaceEntry {
+            NamespaceEntry {
+                namespace: name.into(), deployments: 0, declared: true,
+                description: None, created_at: None,
+            }
+        }
+
+        #[test]
+        fn workspace_selection_never_widens_an_unknown_or_inaccessible_name() {
+            let visible = vec![workspace("team-a"), workspace("team-b")];
+            assert_eq!(selected_workspace(&visible, Some("team-b")), Ok(Some("team-b")));
+            assert_eq!(selected_workspace(&visible, Some("team-private")), Err(()));
+            assert_eq!(selected_workspace(&visible, Some("missing")), Err(()));
+            assert_eq!(selected_workspace(&visible, None), Ok(None));
+            assert_eq!(selected_workspace(&visible[..1], None), Ok(Some("team-a")));
+            assert_eq!(selected_workspace(&visible[..1], Some("")), Ok(None));
+            assert_eq!(selected_workspace(&[], None), Ok(None));
+        }
+
+        #[test]
+        fn workspace_picker_keeps_empty_workspaces_and_escapes_names() {
+            let html = render_workspace_picker(&[workspace("team-empty"), workspace("\"><script>")], Some("team-empty"));
+            assert!(html.contains("value=\"team-empty\" selected>team-empty (0)"));
+            assert!(!html.contains("<script>"));
+            assert!(html.contains("&lt;script&gt;"));
+            assert!(html.contains("method=\"get\""), "workspace switching works without JavaScript");
+        }
+
         fn entry(id: &str, url: &str, state: EntryState) -> DirectoryEntry {
             DirectoryEntry {
+                namespace: "team-a".into(),
                 url: url.into(),
                 deployment: id.into(),
                 kind: "vm",
@@ -5172,6 +5267,9 @@ mod tests {
                 .replace("{{APP_NAME}}", "app-lb")
                 .replace("{{HTML_ATTRS}}", r#"data-theme="dark""#)
                 .replace("{{WHO}}", "")
+                .replace("{{WORKSPACE_PICKER}}", &render_workspace_picker(&[], None))
+                .replace("{{WORKSPACE_TITLE}}", "All accessible workspaces")
+                .replace("{{PLATFORM_URL}}", "/dashboard")
                 .replace("{{LEDE}}", &directory_lede(&[]))
                 .replace("{{CARDS}}", &render_directory_cards(&[], &[]));
             assert!(!rendered.contains("{{"), "an unfilled placeholder would ship to a browser");
@@ -5198,6 +5296,9 @@ mod tests {
                     .replace("{{APP_NAME}}", "app-lb")
                     .replace("{{HTML_ATTRS}}", r#"data-theme="light""#)
                     .replace("{{WHO}}", "ops@example.com")
+                    .replace("{{WORKSPACE_PICKER}}", &render_workspace_picker(&[], None))
+                    .replace("{{WORKSPACE_TITLE}}", "All accessible workspaces")
+                    .replace("{{PLATFORM_URL}}", "/dashboard")
                     .replace("{{LEDE}}", "")
                     .replace("{{CARDS}}", "");
                 assert!(!rendered.contains("{{"), "{name} left a placeholder unfilled");

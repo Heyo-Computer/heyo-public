@@ -496,7 +496,134 @@ pub struct Store {
     statement_timeout: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct OutboxEvent {
+    pub id: uuid::Uuid,
+    pub subject: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunEvent {
+    pub id: uuid::Uuid,
+    pub revision: i64,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub job_id: Option<String>,
+    pub job_key: Option<String>,
+    pub step_id: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub transitioned_at: DateTime<Utc>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub attempts: i32,
+    pub last_error: Option<String>,
+}
+
 impl Store {
+    async fn add_event(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        run_id: &str,
+        job_id: Option<&str>,
+        job_key: Option<&str>,
+        step_id: Option<&str>,
+        kind: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<uuid::Uuid, StoreError> {
+        let id = uuid::Uuid::new_v4();
+        let subject = format!("{run_id}.{}", job_key.unwrap_or("run"));
+        let row = sqlx::query(
+            "INSERT INTO ci_event_outbox
+               (id, run_id, repo_id, subject, event_type, job_id, job_key, step_id, status, error, payload)
+             SELECT $1,$2,r.repo_id,$3,$4,$5,$6,$7,$8,$9,'{}'::jsonb FROM ci_run r WHERE r.id=$2
+             RETURNING revision, transitioned_at, repo_id,
+                       (SELECT sha FROM ci_run WHERE id=$2) AS sha,
+                       (SELECT git_ref FROM ci_run WHERE id=$2) AS git_ref"
+        ).bind(id).bind(run_id).bind(&subject).bind(kind).bind(job_id).bind(job_key)
+          .bind(step_id).bind(status).bind(error).fetch_one(&mut **tx).await.map_err(StoreError::sql)?;
+        let revision: i64 = row.get("revision");
+        let transitioned_at: DateTime<Utc> = row.get("transitioned_at");
+        let repo_id: Option<String> = row.get("repo_id");
+        let sha: String = row.get("sha");
+        let git_ref: String = row.get("git_ref");
+        let payload = serde_json::json!({
+            "version": 1,
+            "id": id,
+            "revision": revision,
+            "type": kind,
+            "run_id": run_id,
+            "repo_id": repo_id,
+            "sha": sha,
+            "git_ref": git_ref,
+            "job_id": job_id,
+            "job_key": job_key,
+            "step_id": step_id,
+            // Kept at the top level for existing dashboard consumers.
+            "status": status,
+            "error": error,
+            "transitioned_at": transitioned_at.to_rfc3339(),
+        });
+        sqlx::query("UPDATE ci_event_outbox SET payload=$2 WHERE id=$1")
+            .bind(id).bind(payload)
+            .execute(&mut **tx).await.map_err(StoreError::sql)?;
+        Ok(id)
+    }
+
+    async fn add_step_event(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        step_id: &str,
+        job_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let row = sqlx::query("SELECT run_id, job_key FROM ci_job WHERE id=$1")
+            .bind(job_id).fetch_one(&mut **tx).await.map_err(StoreError::sql)?;
+        let run: String = row.get("run_id");
+        let key: String = row.get("job_key");
+        Self::add_event(tx, &run, Some(job_id), Some(&key), Some(step_id), "ci.step.status.v1", status, error).await.map(|_| ())
+    }
+
+    pub async fn next_outbox_event(&self) -> Result<Option<OutboxEvent>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, subject, payload FROM ci_event_outbox
+              WHERE published_at IS NULL ORDER BY revision LIMIT 1",
+        ).fetch_optional(&self.pool).await.map_err(StoreError::sql)?;
+        Ok(row.map(|r| OutboxEvent {
+            id: r.get("id"), subject: r.get("subject"), payload: r.get("payload"),
+        }))
+    }
+
+    pub async fn mark_outbox_published(&self, id: uuid::Uuid) -> Result<(), StoreError> {
+        sqlx::query("UPDATE ci_event_outbox SET published_at=now(), attempts=attempts+1, last_error=NULL WHERE id=$1")
+            .bind(id).execute(&self.pool).await.map_err(StoreError::sql)?;
+        Ok(())
+    }
+
+    pub async fn mark_outbox_failed(&self, id: uuid::Uuid, error: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE ci_event_outbox SET attempts=attempts+1, last_error=$2 WHERE id=$1 AND published_at IS NULL")
+            .bind(id).bind(error).execute(&self.pool).await.map_err(StoreError::sql)?;
+        Ok(())
+    }
+
+    /// A bounded page in newest-first order. `before` is an exclusive revision
+    /// cursor, stable even when multiple transitions share a timestamp.
+    pub async fn run_events(&self, run_id: &str, before: Option<i64>, limit: i64) -> Result<Vec<RunEvent>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, revision, event_type, payload, job_id, job_key, step_id, status, error,
+                    transitioned_at, published_at, attempts, last_error
+               FROM ci_event_outbox WHERE run_id=$1 AND ($2::bigint IS NULL OR revision < $2)
+              ORDER BY revision DESC LIMIT $3"
+        ).bind(run_id).bind(before).bind(limit).fetch_all(&self.pool).await.map_err(StoreError::sql)?;
+        Ok(rows.into_iter().map(|r| RunEvent {
+            id: r.get("id"), revision: r.get("revision"), event_type: r.get("event_type"),
+            payload: r.get("payload"),
+            job_id: r.get("job_id"), job_key: r.get("job_key"), step_id: r.get("step_id"),
+            status: r.get("status"), error: r.get("error"), transitioned_at: r.get("transitioned_at"),
+            published_at: r.get("published_at"), attempts: r.get("attempts"), last_error: r.get("last_error"),
+        }).collect())
+    }
     pub async fn connect(
         database_url: &str,
         log_dir: PathBuf,
@@ -777,6 +904,7 @@ impl Store {
         .map_err(StoreError::sql)?;
 
         for job in &plan.jobs {
+            let id = job_id(run_id, &job.key);
             let matrix = serde_json::to_value(&job.matrix).unwrap_or(serde_json::json!({}));
             let plan_json = serde_json::to_value(job).unwrap_or(serde_json::json!({}));
             sqlx::query(
@@ -784,7 +912,7 @@ impl Store {
                                      fingerprint, status, matrix, plan)
                  VALUES ($1,$2,$3,$4,$5,$6,NULL,'pending',$7,$8)",
             )
-            .bind(job_id(run_id, &job.key))
+            .bind(&id)
             .bind(run_id)
             .bind(&job.key)
             .bind(&job.base_id)
@@ -795,7 +923,10 @@ impl Store {
             .execute(&mut *tx)
             .await
             .map_err(StoreError::sql)?;
+            Self::add_event(&mut tx, run_id, Some(&id), Some(&job.key), None, "ci.job.status.v1", "pending", None).await?;
         }
+
+        Self::add_event(&mut tx, run_id, None, None, None, "ci.run.status.v1", "queued", None).await?;
 
         tx.commit().await.map_err(StoreError::sql)?;
         Ok(())
@@ -866,7 +997,8 @@ impl Store {
         // The timestamps are set by the same statement that sets the status, so
         // a run can never be `running` with no `started_at` for a reader to trip
         // over.
-        sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let result = sqlx::query(
             "UPDATE ci_run
                 SET status = $2,
                     error = COALESCE($3, error),
@@ -879,9 +1011,13 @@ impl Store {
         .bind(run_id)
         .bind(status.as_str())
         .bind(error)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
+        if result.rows_affected() > 0 {
+            Self::add_event(&mut tx, run_id, None, None, None, "ci.run.status.v1", status.as_str(), error).await?;
+        }
+        tx.commit().await.map_err(StoreError::sql)?;
         Ok(())
     }
 
@@ -931,6 +1067,7 @@ impl Store {
     /// notices at its next step boundary. So this one statement covers work in
     /// all three states without needing to reach any of them.
     pub async fn cancel_run(&self, run_id: &str) -> Result<Option<u64>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
         let run = sqlx::query(
             "UPDATE ci_run
                 SET status='cancelled', finished_at=now(),
@@ -938,10 +1075,11 @@ impl Store {
               WHERE id = $1 AND status NOT IN ('success','failure','cancelled')",
         )
         .bind(run_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
         if run.rows_affected() == 0 {
+            tx.rollback().await.map_err(StoreError::sql)?;
             return Ok(None);
         }
 
@@ -950,13 +1088,20 @@ impl Store {
                 SET status='cancelled', finished_at=now(),
                     error=COALESCE(error, 'cancelled')
               WHERE run_id = $1
-                AND status NOT IN ('success','failure','skipped','cancelled')",
+                AND status NOT IN ('success','failure','skipped','cancelled')
+              RETURNING id, job_key",
         )
         .bind(run_id)
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
-        Ok(Some(jobs.rows_affected()))
+        Self::add_event(&mut tx, run_id, None, None, None, "ci.run.status.v1", "cancelled", Some("cancelled")).await?;
+        for row in &jobs {
+            let id: String = row.get("id"); let key: String = row.get("job_key");
+            Self::add_event(&mut tx, run_id, Some(&id), Some(&key), None, "ci.job.status.v1", "cancelled", Some("cancelled")).await?;
+        }
+        tx.commit().await.map_err(StoreError::sql)?;
+        Ok(Some(jobs.len() as u64))
     }
 
     /// Jobs that have sat on a queue longer than a runner was ever going to
@@ -1047,20 +1192,27 @@ impl Store {
         runner_hd_id: &str,
         attempt: i32,
     ) -> Result<bool, StoreError> {
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query(
             "UPDATE ci_job
                 SET status = 'running', runner_hd_id = $2, attempt = $3,
                     started_at = COALESCE(started_at, now())
               WHERE id = $1
-                AND status NOT IN ('success','failure','skipped','cancelled')",
+                AND status NOT IN ('success','failure','skipped','cancelled')
+              RETURNING run_id, job_key",
         )
         .bind(job_id)
         .bind(runner_hd_id)
         .bind(attempt)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
-        Ok(result.rows_affected() > 0)
+        if let Some(row) = row {
+            let run: String = row.get("run_id"); let key: String = row.get("job_key");
+            Self::add_event(&mut tx, &run, Some(job_id), Some(&key), None, "ci.job.status.v1", "running", None).await?;
+            tx.commit().await.map_err(StoreError::sql)?;
+            Ok(true)
+        } else { tx.commit().await.map_err(StoreError::sql)?; Ok(false) }
     }
 
     /// Record why an attempt failed, without deciding the job's fate.
@@ -1076,15 +1228,23 @@ impl Store {
     /// Guarded on non-terminal so a late-arriving attempt cannot scribble over
     /// the outcome of one that finished.
     pub async fn note_job_error(&self, job_id: &str, error: &str) -> Result<(), StoreError> {
-        sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query(
             "UPDATE ci_job SET error = $2
-              WHERE id = $1 AND status NOT IN ('success','failure','skipped','cancelled')",
+              WHERE id = $1 AND status NOT IN ('success','failure','skipped','cancelled')
+              RETURNING run_id, job_key, status",
         )
         .bind(job_id)
         .bind(error)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
+        if let Some(row) = row {
+            Self::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(job_id),
+                Some(&row.get::<String,_>("job_key")), None, "ci.job.status.v1",
+                &row.get::<String,_>("status"), Some(error)).await?;
+        }
+        tx.commit().await.map_err(StoreError::sql)?;
         Ok(())
     }
 
@@ -1127,15 +1287,19 @@ impl Store {
     /// `Nats-Msg-Id` dedup is the belt; this is the braces, and it also keeps
     /// the row's status honest.
     pub async fn queue_job(&self, job_id: &str) -> Result<bool, StoreError> {
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query(
             "UPDATE ci_job SET status = 'queued', queued_at = now()
-                  WHERE id = $1 AND status = 'pending'",
+                  WHERE id = $1 AND status = 'pending' RETURNING run_id, job_key",
         )
         .bind(job_id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
-        Ok(result.rows_affected() > 0)
+        if let Some(row) = row {
+            Self::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(job_id), Some(&row.get::<String,_>("job_key")), None, "ci.job.status.v1", "queued", None).await?;
+            tx.commit().await.map_err(StoreError::sql)?; Ok(true)
+        } else { tx.commit().await.map_err(StoreError::sql)?; Ok(false) }
     }
 
     /// Put a job back on the runway after its message failed to publish.
@@ -1147,15 +1311,19 @@ impl Store {
     ///
     /// Guarded on `queued` so it can never take a job that has since started.
     pub async fn unqueue_job(&self, job_id: &str) -> Result<bool, StoreError> {
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query(
             "UPDATE ci_job SET status='pending', queued_at=NULL
-              WHERE id = $1 AND status = 'queued'",
+              WHERE id = $1 AND status = 'queued' RETURNING run_id, job_key",
         )
         .bind(job_id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
-        Ok(result.rows_affected() > 0)
+        if let Some(row) = row {
+            Self::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(job_id), Some(&row.get::<String,_>("job_key")), None, "ci.job.status.v1", "pending", Some("queue publication failed; retrying")).await?;
+            tx.commit().await.map_err(StoreError::sql)?; Ok(true)
+        } else { tx.commit().await.map_err(StoreError::sql)?; Ok(false) }
     }
 
     /// Give a job of a re-run the result its counterpart earned in the run
@@ -1167,20 +1335,24 @@ impl Store {
     /// whether it did, so a key the new plan no longer has is a count of zero
     /// rather than an error.
     pub async fn carry_over_job(&self, job_id: &str, from: &JobRow) -> Result<bool, StoreError> {
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query(
             "UPDATE ci_job
                 SET status = $2, outputs = $3, carried_from = $4,
                     started_at = now(), finished_at = now()
-              WHERE id = $1 AND status = 'pending'",
+              WHERE id = $1 AND status = 'pending' RETURNING run_id, job_key",
         )
         .bind(job_id)
         .bind(&from.status)
         .bind(&from.outputs)
         .bind(&from.run_id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
-        Ok(result.rows_affected() > 0)
+        if let Some(row) = row {
+            Self::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(job_id), Some(&row.get::<String,_>("job_key")), None, "ci.job.status.v1", &from.status, None).await?;
+            tx.commit().await.map_err(StoreError::sql)?; Ok(true)
+        } else { tx.commit().await.map_err(StoreError::sql)?; Ok(false) }
     }
 
     /// Active runs that still have a job waiting to be scheduled.
@@ -1209,20 +1381,26 @@ impl Store {
         status: JobStatus,
         error: Option<&str>,
     ) -> Result<(), StoreError> {
-        sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query(
             "UPDATE ci_job
                 SET status = $2,
                     error = COALESCE($3, error),
                     finished_at = CASE WHEN $2 IN ('success','failure','skipped','cancelled')
                                        THEN now() ELSE finished_at END
-              WHERE id = $1",
+              WHERE id = $1 RETURNING run_id, job_key",
         )
         .bind(job_id)
         .bind(status.as_str())
         .bind(error)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
+        if let Some(row) = row {
+            let run: String = row.get("run_id"); let key: String = row.get("job_key");
+            Self::add_event(&mut tx, &run, Some(job_id), Some(&key), None, "ci.job.status.v1", status.as_str(), error).await?;
+        }
+        tx.commit().await.map_err(StoreError::sql)?;
         Ok(())
     }
 
@@ -1280,7 +1458,8 @@ impl Store {
         name: &str,
         uses: Option<&str>,
     ) -> Result<(), StoreError> {
-        sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let inserted = sqlx::query(
             "INSERT INTO ci_step (id, job_id, idx, name, uses, status)
              VALUES ($1,$2,$3,$4,$5,'pending')
              ON CONFLICT (job_id, idx) DO NOTHING",
@@ -1290,23 +1469,32 @@ impl Store {
         .bind(idx)
         .bind(name)
         .bind(uses)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
+        if inserted.rows_affected() > 0 {
+            let row = sqlx::query("SELECT run_id, job_key FROM ci_job WHERE id=$1").bind(job_id).fetch_one(&mut *tx).await.map_err(StoreError::sql)?;
+            let run: String = row.get("run_id"); let key: String = row.get("job_key");
+            Self::add_event(&mut tx, &run, Some(job_id), Some(&key), Some(step_id), "ci.step.status.v1", "pending", None).await?;
+        }
+        tx.commit().await.map_err(StoreError::sql)?;
         Ok(())
     }
 
     pub async fn start_step(&self, step_id: &str, operation_id: &str) -> Result<(), StoreError> {
-        sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query(
             "UPDATE ci_step
                 SET status='running', operation_id=$2, started_at=COALESCE(started_at, now())
-              WHERE id = $1",
+              WHERE id = $1 RETURNING job_id",
         )
         .bind(step_id)
         .bind(operation_id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
+        if let Some(row) = row { self.add_step_event(&mut tx, step_id, &row.get::<String,_>("job_id"), "running", None).await?; }
+        tx.commit().await.map_err(StoreError::sql)?;
         Ok(())
     }
 
@@ -1317,18 +1505,21 @@ impl Store {
         exit_code: Option<i32>,
         error: Option<&str>,
     ) -> Result<(), StoreError> {
-        sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query(
             "UPDATE ci_step
                 SET status=$2, exit_code=$3, error=$4, finished_at=now()
-              WHERE id = $1",
+              WHERE id = $1 RETURNING job_id",
         )
         .bind(step_id)
         .bind(status.as_str())
         .bind(exit_code)
         .bind(error)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
+        if let Some(row) = row { self.add_step_event(&mut tx, step_id, &row.get::<String,_>("job_id"), status.as_str(), error).await?; }
+        tx.commit().await.map_err(StoreError::sql)?;
         Ok(())
     }
 
@@ -1405,14 +1596,25 @@ impl Store {
         &self,
         run_id: &str,
         job_id: &str,
+        step_id: &str,
         name: &str,
         stored: &crate::artifacts::StoredArtifact,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO ci_artifact (id, run_id, job_id, name, sink, digest, size_bytes, uri, public_url)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        // Resolve all scope from a real step/job relationship, not independent
+        // foreign keys that could associate another repository's artifact.
+        let key: String = sqlx::query_scalar(
+            "SELECT j.job_key FROM ci_job j JOIN ci_step s ON s.job_id=j.id
+             WHERE j.id=$1 AND j.run_id=$2 AND s.id=$3",
+        ).bind(job_id).bind(run_id).bind(step_id)
+            .fetch_one(&mut *tx).await.map_err(StoreError::sql)?;
+        let artifact_id = crate::vm::new_id();
+        let inserted = sqlx::query(
+            "INSERT INTO ci_artifact (id, run_id, job_id, name, sink, digest, size_bytes, uri, public_url, step_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+             ON CONFLICT (step_id) DO NOTHING",
         )
-        .bind(crate::vm::new_id())
+        .bind(&artifact_id)
         .bind(run_id)
         .bind(job_id)
         .bind(name)
@@ -1421,10 +1623,37 @@ impl Store {
         .bind(stored.size_bytes as i64)
         .bind(&stored.uri)
         .bind(&stored.public_url)
-        .execute(&self.pool)
+        .bind(step_id)
+        .execute(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
-        Ok(())
+        if inserted.rows_affected() == 0 {
+            // An uncertain DB acknowledgement may retry the upload. Accept
+            // the same publication, never silently replace its recorded bytes.
+            let same: bool = sqlx::query_scalar(
+                "SELECT name=$2 AND sink=$3 AND digest IS NOT DISTINCT FROM $4
+                        AND size_bytes=$5 AND uri=$6 AND public_url IS NOT DISTINCT FROM $7
+                   FROM ci_artifact WHERE step_id=$1",
+            ).bind(step_id).bind(name).bind(stored.sink).bind(&stored.digest)
+                .bind(stored.size_bytes as i64).bind(&stored.uri).bind(&stored.public_url)
+                .fetch_one(&mut *tx).await.map_err(StoreError::sql)?;
+            if !same {
+                return Err(StoreError::Sql(format!("artifact publication changed for step {step_id}")));
+            }
+        } else {
+            let event_id = Self::add_event(
+                &mut tx, run_id, Some(job_id), Some(&key), Some(step_id),
+                "ci.artifact.published.v1", "published", None,
+            ).await?;
+            let artifact = serde_json::json!({
+                "id": artifact_id, "name": name, "sink": stored.sink,
+                "digest": stored.digest, "size_bytes": stored.size_bytes,
+                "uri": stored.uri, "public_url": stored.public_url,
+            });
+            sqlx::query("UPDATE ci_event_outbox SET payload=payload || jsonb_build_object('artifact', $2::jsonb) WHERE id=$1")
+                .bind(event_id).bind(artifact).execute(&mut *tx).await.map_err(StoreError::sql)?;
+        }
+        tx.commit().await.map_err(StoreError::sql)
     }
 
     pub async fn artifacts_of(&self, run_id: &str) -> Result<Vec<ArtifactRow>, StoreError> {
@@ -1988,6 +2217,131 @@ mod tests {
             .expect("connects");
         store.migrate().await.expect("migrations apply");
         store
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Postgres"]
+    async fn outbox_insert_rolls_back_with_its_state_transaction() {
+        let store = test_store().await;
+        let run_id = crate::vm::new_id();
+        store.create_run(&run_id, &RunRequest::default(), &test_plan()).await.unwrap();
+        let before = store.run_events(&run_id, None, 100).await.unwrap().len();
+        // Force only this run's event insert to fail, through the production
+        // status API. An update accidentally outside its transaction would
+        // leave the run running even though publication cannot be recorded.
+        let constraint = format!("reject_outbox_{run_id}");
+        sqlx::query(&format!(
+            "ALTER TABLE ci_event_outbox ADD CONSTRAINT \"{constraint}\" CHECK (run_id <> '{run_id}' OR status <> 'running')"
+        )).execute(&store.pool).await.unwrap();
+        let result = store.set_run_status(&run_id, RunStatus::Running, None).await;
+        sqlx::query(&format!("ALTER TABLE ci_event_outbox DROP CONSTRAINT \"{constraint}\""))
+            .execute(&store.pool).await.unwrap();
+        assert!(result.is_err(), "outbox failure must reject the transition");
+        assert_eq!(store.run_events(&run_id, None, 100).await.unwrap().len(), before);
+        assert_eq!(store.get_run(&run_id).await.unwrap().unwrap().status, "queued", "the actual transition rolls back too");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Postgres"]
+    async fn retry_and_restart_keep_event_identity() {
+        let store = test_store().await;
+        let run_id = crate::vm::new_id();
+        let request = RunRequest {
+            sha: "aabbcc00112233445566778899aabbcc00112233".into(),
+            git_ref: "refs/heads/release".into(),
+            ..RunRequest::default()
+        };
+        store.create_run(&run_id, &request, &test_plan()).await.unwrap();
+        let row = sqlx::query("SELECT id, subject, payload FROM ci_event_outbox WHERE run_id=$1 ORDER BY revision DESC LIMIT 1")
+            .bind(&run_id)
+            .fetch_one(&store.pool).await.unwrap();
+        let first = OutboxEvent { id: row.get("id"), subject: row.get("subject"), payload: row.get("payload") };
+        assert_eq!(first.payload["sha"], request.sha);
+        assert_eq!(first.payload["git_ref"], request.git_ref);
+        let page = store.run_events(&run_id, None, 2).await.unwrap();
+        assert_eq!(page.len(), 2);
+        let older = store.run_events(&run_id, Some(page[1].revision), 2).await.unwrap();
+        assert!(!older.is_empty());
+        assert!(older.iter().all(|e| e.revision < page[1].revision));
+        assert!(store.run_events("not-this-run", None, 2).await.unwrap().is_empty());
+        store.mark_outbox_failed(first.id, "nats unavailable").await.unwrap();
+        // Drop the original pool and reconnect: this exercises durable state,
+        // not merely another handle to the same Store.
+        let url = std::env::var("CI_TEST_DATABASE_URL").unwrap();
+        drop(store);
+        let restarted = Store::connect(&url, std::env::temp_dir().join(crate::vm::new_id()), Duration::from_secs(30)).await.unwrap();
+        let row = sqlx::query("SELECT id, subject, payload FROM ci_event_outbox WHERE id=$1 AND published_at IS NULL")
+            .bind(first.id).fetch_one(&restarted.pool).await.unwrap();
+        let again = OutboxEvent { id: row.get("id"), subject: row.get("subject"), payload: row.get("payload") };
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.payload, first.payload);
+        restarted.mark_outbox_published(again.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Postgres"]
+    async fn artifact_publication_is_atomic_scoped_and_retry_safe() {
+        let store = test_store().await;
+        let run = crate::vm::new_id();
+        let request = RunRequest {
+            sha: "11223344556677889900aabbccddeeff00112233".into(),
+            git_ref: "refs/heads/release".into(),
+            ..RunRequest::default()
+        };
+        store.create_run(&run, &request, &test_plan()).await.unwrap();
+        let job = store.jobs_of(&run).await.unwrap().remove(0);
+        let sid = step_id(&job.id, 0);
+        store.create_step(&sid, &job.id, 0, "Upload", Some("ci/upload-artifact")).await.unwrap();
+        let artifact = crate::artifacts::StoredArtifact {
+            sink: "artifacts", digest: Some("ab".repeat(32)), size_bytes: 37,
+            uri: "ci-release-test".into(), public_url: None,
+        };
+        // Fail the real outbox write, not a simulated transaction. Neither
+        // the artifact nor its event can become visible alone.
+        let constraint = format!("reject_artifact_{run}");
+        sqlx::query(&format!(
+            "ALTER TABLE ci_event_outbox ADD CONSTRAINT \"{constraint}\" CHECK (run_id <> '{run}' OR event_type <> 'ci.artifact.published.v1')"
+        )).execute(&store.pool).await.unwrap();
+        let failed = store.record_artifact(&run, &job.id, &sid, "binary", &artifact).await;
+        sqlx::query(&format!("ALTER TABLE ci_event_outbox DROP CONSTRAINT \"{constraint}\""))
+            .execute(&store.pool).await.unwrap();
+        assert!(failed.is_err());
+        assert!(store.artifacts_of(&run).await.unwrap().is_empty());
+
+        let (a, b) = tokio::join!(
+            store.record_artifact(&run, &job.id, &sid, "binary", &artifact),
+            store.record_artifact(&run, &job.id, &sid, "binary", &artifact),
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(store.artifacts_of(&run).await.unwrap().len(), 1);
+        let events = store.run_events(&run, None, 100).await.unwrap();
+        let publications: Vec<_> = events.iter().filter(|e| e.event_type == "ci.artifact.published.v1").collect();
+        assert_eq!(publications.len(), 1);
+        let event = publications[0];
+        assert_eq!(event.payload["sha"], request.sha);
+        assert_eq!(event.payload["git_ref"], request.git_ref);
+        assert_eq!(event.payload["step_id"], sid);
+        assert_eq!(event.payload["artifact"]["digest"], "ab".repeat(32));
+        assert_eq!(event.payload["artifact"]["size_bytes"], 37);
+        assert_eq!(event.payload["artifact"]["uri"], "ci-release-test");
+        assert!(event.published_at.is_none(), "recorded without any NATS connection");
+        let artifact_id: String = sqlx::query_scalar("SELECT id FROM ci_artifact WHERE step_id=$1")
+            .bind(&sid).fetch_one(&store.pool).await.unwrap();
+        assert_eq!(event.payload["artifact"]["id"], artifact_id);
+
+        let changed = crate::artifacts::StoredArtifact { digest: Some("cd".repeat(32)), ..artifact.clone() };
+        assert!(store.record_artifact(&run, &job.id, &sid, "binary", &changed).await.is_err());
+        let other = crate::vm::new_id();
+        store.create_run(&other, &RunRequest::default(), &test_plan()).await.unwrap();
+        assert!(store.record_artifact(&other, &job.id, &sid, "binary", &artifact).await.is_err());
+        assert!(store.artifacts_of(&other).await.unwrap().is_empty());
+        assert_eq!(store.artifacts_of(&run).await.unwrap()[0].digest, artifact.digest);
+        let replay = store.run_events(&run, None, 100).await.unwrap();
+        let replay: Vec<_> = replay.iter().filter(|e| e.event_type == "ci.artifact.published.v1").collect();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].id, event.id);
+        assert_eq!(replay[0].payload, event.payload);
     }
 
     fn test_plan() -> Plan {
@@ -2825,7 +3179,13 @@ jobs:
         );
 
         // And cancelling twice reports that there was nothing left to stop.
+        let before: i64 = sqlx::query("SELECT count(*) n FROM ci_event_outbox WHERE run_id=$1")
+            .bind(&run_id).fetch_one(&store.pool).await.unwrap().get("n");
         assert_eq!(store.cancel_run(&run_id).await.unwrap(), None);
+        assert!(!store.claim_job(&running, "hd-2", 3).await.unwrap());
+        let after: i64 = sqlx::query("SELECT count(*) n FROM ci_event_outbox WHERE run_id=$1")
+            .bind(&run_id).fetch_one(&store.pool).await.unwrap().get("n");
+        assert_eq!(after, before, "terminal cancel and claim no-ops emit no false transition");
     }
 
     // ---- log retention ---------------------------------------------------

@@ -14,7 +14,7 @@
 //! app; anything a second app would want belongs in the shared file.
 
 use crate::runners::{Pool, Runner, RunnerSet, RunnerStatus, TunnelFailure};
-use crate::store::{ArtifactRow, JobRow, Repo, RepoToken, Run, StepRow};
+use crate::store::{ArtifactRow, JobRow, Repo, RepoToken, Run, RunEvent, StepRow};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -78,6 +78,10 @@ pre.log:empty::after { content: "(no output)"; color: var(--text-muted); }
 .repo .head form { margin-left: auto; }
 /* Side-by-side buttons under a run's heading: cancel, run again, re-run failed. */
 .actions { display: flex; gap: var(--gap-2); flex-wrap: wrap; align-items: center; }
+.timeline { border-left: 1px solid var(--border-color); margin-left: var(--gap-2); }
+.timeline .event { padding: var(--gap-2) var(--gap-3); position: relative; }
+.timeline .event::before { content: ""; position: absolute; left: -4px; top: 15px; width: 7px; height: 7px; border-radius: 50%; background: var(--border-accent); }
+.timeline .event-error { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--danger); margin-top: var(--gap-1); }
 
 /* A freshly minted token, shown exactly once. Dashed and in the warning colour
    because that is the point: this is the only time anyone will see it, and the
@@ -1419,6 +1423,7 @@ pub fn runs_page(
 // ---- run detail ---------------------------------------------------------
 
 /// `GET /runs/{id}` — one run's jobs, in dependency order, plus its artifacts.
+#[cfg(test)]
 pub fn run_page(
     chrome: &Chrome,
     run: &Run,
@@ -1426,6 +1431,19 @@ pub fn run_page(
     jobs: &[JobRow],
     artifacts: &[ArtifactRow],
     vm_logs: &[(String, Option<String>)],
+    retention_days: Option<u64>,
+) -> Markup {
+    run_page_with_events(chrome, run, reruns, jobs, artifacts, vm_logs, &[], retention_days)
+}
+
+pub fn run_page_with_events(
+    chrome: &Chrome,
+    run: &Run,
+    reruns: &[Run],
+    jobs: &[JobRow],
+    artifacts: &[ArtifactRow],
+    vm_logs: &[(String, Option<String>)],
+    events: &[RunEvent],
     retention_days: Option<u64>,
 ) -> Markup {
     let body = html! {
@@ -1539,6 +1557,38 @@ pub fn run_page(
             }
         }
 
+        section id="events" {
+            h2 { "Event timeline" }
+            p .sub { "Up to 100 durable state events per page. NATS delivery does not determine execution status." }
+            @if events.is_empty() {
+                p .empty { "No events have been recorded for this run." }
+            } @else {
+                div .timeline {
+                    @for event in events.iter().take(100).rev() {
+                        div .event {
+                            div {
+                                time .mono { (event.transitioned_at.format("%Y-%m-%d %H:%M:%S%.3f UTC")) }
+                                " · " strong { (event_entity(event)) } " " (pill(&event.status))
+                                " · " span .meta {
+                                    @if event.published_at.is_some() { "NATS published" } @else { "NATS pending" }
+                                }
+                            }
+                            @if let Some(error) = &event.error { div .event-error { (error) } }
+                            @if event.published_at.is_none() {
+                                @if let Some(error) = &event.last_error { div .meta .event-error { "Publication: " (error) } }
+                            }
+                        }
+                    }
+                }
+            }
+            div .actions {
+                a href=(format!("/runs/{}#events", run.id)) { "Latest events" }
+                @if events.len() > 100 {
+                    a href=(format!("/runs/{}?before={}#events", run.id, events[99].revision)) { "Older events →" }
+                }
+            }
+        }
+
         // The VM's own console, captured when each job released its machine.
         // On the run page rather than only the job page because "the VM never
         // came up" is a property of the run somebody is looking at, and it is
@@ -1606,6 +1656,17 @@ pub fn run_page(
         }
     };
     layout(chrome, "runs", body)
+}
+
+fn event_entity(event: &RunEvent) -> String {
+    if event.event_type == "ci.artifact.published.v1" {
+        if let Some(name) = event.payload["artifact"]["name"].as_str() {
+            return format!("artifact {name}");
+        }
+    }
+    if let Some(step) = &event.step_id { format!("step {step}") }
+    else if let Some(job) = event.job_key.as_deref().or(event.job_id.as_deref()) { format!("job {job}") }
+    else { "run".to_string() }
 }
 
 /// `needs:` comes out of the stored plan rather than a column, because it is a
@@ -2291,6 +2352,45 @@ mod page_tests {
         r.repo_name = None;
         let html = runs_page(&chrome(), &[r], &[registered_repo()], None).into_string();
         assert!(!html.contains("/?repo="), "nothing to filter by");
+    }
+
+    #[test]
+    fn the_event_timeline_escapes_errors_and_shows_publication_state() {
+        let mut events = vec![RunEvent {
+            id: uuid::Uuid::new_v4(), revision: 42, event_type: "ci.job.status.v1".into(),
+            payload: serde_json::json!({}),
+            job_id: Some("run.build".into()), job_key: Some("build".into()), step_id: None,
+            status: "failure".into(), error: Some("bad <script>alert('x')</script>\nsecond line".into()),
+            transitioned_at: Utc::now(), published_at: None, attempts: 2,
+            last_error: Some("NATS unavailable <retry>".into()),
+        }];
+        events.push(RunEvent {
+            revision: 41, status: "running".into(), error: None,
+            published_at: Some(Utc::now()), last_error: None,
+            ..events[0].clone()
+        });
+        events.push(RunEvent {
+            revision: 40, event_type: "ci.artifact.published.v1".into(), status: "published".into(),
+            payload: serde_json::json!({ "artifact": { "name": "binary <release>.tar.gz" } }),
+            step_id: Some("run.build.0".into()), error: None,
+            published_at: Some(Utc::now()), last_error: None,
+            ..events[0].clone()
+        });
+        let html = run_page_with_events(&chrome(), &run("failure"), &[], &[job("build", "failure")], &[], &[], &events, Some(2)).into_string();
+        assert!(html.contains("Event timeline") && html.contains("NATS pending"));
+        assert!(html.contains("NATS published"));
+        assert!(html.contains("artifact binary &lt;release&gt;.tar.gz"));
+        assert!(!html.contains("Older events →"));
+        assert!(html.contains("&lt;script&gt;") && !html.contains("<script>alert"));
+        assert!(html.contains("NATS unavailable &lt;retry&gt;"));
+        if let Ok(path) = std::env::var("CI_TIMELINE_HTML") { std::fs::write(path, &html).unwrap(); }
+
+        let history: Vec<_> = (1..=101).rev().map(|revision| RunEvent {
+            revision, ..events[0].clone()
+        }).collect();
+        let paged = run_page_with_events(&chrome(), &run("failure"), &[], &[], &[], &[], &history, Some(2)).into_string();
+        assert_eq!(paged.matches("class=\"event\"").count(), 100);
+        assert!(paged.contains("?before=2#events"), "cursor excludes the oldest event actually shown");
     }
 
     #[test]

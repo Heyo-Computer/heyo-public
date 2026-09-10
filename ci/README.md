@@ -1067,6 +1067,58 @@ Postgres for runs, jobs, steps, artifacts and the pool; **step logs go to disk**
 with the path and byte count on the row. A build log is megabytes, and putting it
 in a column means every listing query drags all of it across the wire.
 
+### Durable execution events
+
+Postgres is authoritative for run, job, and step state. Each authoritative
+status mutation writes a `ci_event_outbox` row in the **same transaction**. A
+single background publisher reads those rows, publishes to
+`<CI_NATS_PREFIX>.evt.<run_id>.<job_key|run>`, waits for JetStream's PubAck, and
+only then marks the row published. NATS outages therefore delay notifications;
+they do not roll back execution state or cause work to execute again. Job
+subjects and their work-queue retention are unchanged.
+
+The JSON envelope is version 1 and contains `version`, stable UUID `id`, history
+cursor `revision`, repository scope (`repo_id`), exact Git `sha` and `git_ref`, `transitioned_at`, `type`
+(`ci.run.status.v1`, `ci.job.status.v1`, `ci.step.status.v1`, or `ci.artifact.published.v1`), `run_id`, and
+nullable `job_id`, `job_key`, and `step_id`. `status` and `error` remain top-level
+for existing dashboard consumers. The same UUID is sent as `Nats-Msg-Id` on
+every retry. A crash after PubAck and before the database update can redeliver
+the same event after JetStream's duplicate window, so consumers must deduplicate
+by `id` and tolerate at-least-once delivery. Events are retained by JetStream
+for 24 hours; the outbox currently has no automatic archival/pruning policy.
+The authenticated `GET /api/runs/{run_id}/events?limit=50&before=<revision>` API
+uses the same repository bearer token or path-HMAC semantics as other run reads,
+returns 404 across repository boundaries, and caps pages at 100 events. The run
+page shows 100 transitions at a time with older/latest navigation and whether
+each is pending or published to NATS. Revisions order history, not concurrent
+transaction commits or NATS delivery. Consumers must re-read authoritative
+state rather than assuming receipt order determines the latest state.
+
+`ci.artifact.published.v1` records a successful sink upload and its artifact row
+in the same transaction as the event. Its `artifact` object contains `id`,
+`name`, `sink`, `digest`, `size_bytes`, `uri`, and nullable `public_url`. The
+upload step ID is the idempotency key: concurrent retries produce one row and
+one event; a retry with different recorded metadata fails instead of replacing
+the publication. History reads return the complete NATS envelope with additional
+`publication` delivery metadata, so reconciliation does not lose commit or
+artifact identity. Existing artifacts are retained without synthetic events.
+
+A publication is **not a release or deploy approval**. Uploads can precede a
+later test failure or cancellation. CD must independently check exact-revision
+validation, merge/release admission, and required artifacts. Use the digest to
+identify immutable content, not a mutable tag in `uri`; disk artifacts have no
+digest and are not a cross-host deployment handoff. A sink write and Postgres
+cannot share a transaction: a crash between them can leave an unrecorded blob;
+an upload retry reconciles through the sink before recording publication.
+
+This is CI execution history, not deployment authorization. Consolidation still
+requires an exact-revision validation/merge gate, version-bump and release
+operations, an admitted release-artifact handoff, and durable deployment operations
+with reconciliation of uncertain remote outcomes. Native Intel Mac and Windows
+execution must preserve workflow semantics and atomically fence leases/results
+before the private runners can be retired. Neither a Linux cross-build nor an
+event saying tests passed substitutes for those requirements.
+
 **A run's page also carries each job's VM log** — the machine's own console as
 its daemon saw it, read from `GET /sandboxes/{id}/logs` and captured *before* the
 VM is released, because a job with `reuse: false` destroys it on the next line.

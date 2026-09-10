@@ -67,10 +67,10 @@ pub fn router(
     let submit_limit = config.max_source_bytes.saturating_mul(4) / 3 + (1 << 20);
 
     let state = AppState {
-        config,
+        config: config.clone(),
         runners,
-        store,
-        dispatcher,
+        store: store.clone(),
+        dispatcher: dispatcher.clone(),
     };
 
     Router::new()
@@ -416,9 +416,15 @@ async fn runs_page(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct RunPageQuery {
+    before: Option<i64>,
+}
+
 async fn run_page(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
+    Query(query): Query<RunPageQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let who = who_of(&headers);
@@ -439,13 +445,18 @@ async fn run_page(
             }
 
             let reruns = state.store.reruns_of(&run_id).await.unwrap_or_default();
-            pages::run_page(
+            let events = match state.store.run_events(&run_id, query.before, 101).await {
+                Ok(events) => events,
+                Err(e) => return page_error(&state, &headers, who.as_ref(), &format!("could not load execution history: {e}")),
+            };
+            pages::run_page_with_events(
                 &chrome(&state, &headers, who.as_ref()),
                 &run,
                 &reruns,
                 &jobs,
                 &artifacts,
                 &vm_logs,
+                &events,
                 state.config.log_retention.map(|d| d.as_secs() / 86_400),
             )
             .into_response()
