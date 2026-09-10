@@ -106,7 +106,7 @@ function publishTool(clients: Clients): Tool {
     name: "art_publish",
     description:
       "Publish a bundle to the artifact store and point a tag at it. THE TOOL TO USE for " +
-      "'update deployment X with this build' — it is the step applb_start_update cannot do, " +
+      "'update deployment X with this build' — it is the step applb_pull cannot do, " +
       "because app-lb rolls a deployment onto bytes that must already be in the store.\n\n" +
       "Does the whole three-request sequence in the right order: PUT the blob at its sha256, " +
       "PUT a manifest naming it, then point the tag at THE MANIFEST'S digest. That last part " +
@@ -118,10 +118,17 @@ function publishTool(clients: Clients): Tool {
       "filesystem is somewhere else; costs ~4 tokens per 3 bytes, so it is for bundles, not " +
       "rootfs images).\n\n" +
       "Idempotent: the store is content-addressed, so re-publishing identical bytes writes " +
-      "nothing new and just moves the tag. Follow with applb_start_update to roll the " +
-      "deployment onto it.",
+      "nothing new and just moves the tag. Follow with applb_pull to roll the deployment " +
+      "onto it — NOT applb_host_update, which runs a static deployment's own commands on the " +
+      "app-lb host and refuses a managed one outright.",
     schema: {
-      tag: z.string().describe("the tag to point at this build, e.g. 'marketing-site'"),
+      // The message moved here from the handler when schemas began to be
+      // parsed: validation now runs first, so a check whose wording was worth
+      // having has to live where the rejection happens.
+      tag: z
+        .string({ required_error: "`tag` is required — a publish nothing names is unreachable." })
+        .min(1, "`tag` is required — a publish nothing names is unreachable.")
+        .describe("the tag to point at this build, e.g. 'marketing-site'"),
       path: z.string().optional().describe("file on THIS server's filesystem"),
       content_base64: z.string().optional().describe("the bundle's bytes, base64"),
       name: z
@@ -196,7 +203,15 @@ function publishTool(clients: Clients): Tool {
         blob: { digest, size: entry.size, name: entry.name },
         manifest: { digest: manifestDigest, kind: manifest.kind },
         tag_points_at: manifestDigest,
-        next: "applb_start_update rolls a deployment onto this; applb_deployment_jobs polls it.",
+        // Named a tool that refuses the main case until 2026-09-10: `applb_pull`
+        // is what rolls a `vm` deployment onto bytes from a store, and the tool
+        // this used to name (then `applb_start_update`) applies to static and
+        // site deployments only. A composite exists to make a sequence hard to
+        // get wrong, so handing back the wrong next step was the worst
+        // available bug.
+        next:
+          "applb_pull rolls a vm or site deployment onto this (applb_host_update instead for " +
+          "a static `upstreams` deployment); poll the job it returns with applb_job.",
       });
     },
   };
@@ -264,7 +279,15 @@ export function artifactTools(clients: Clients): Tool[] {
         "wrong order or tag a blob digest, both of which the store accepts and no reader can " +
         "resolve.",
       schema: {
-        method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
+        // Upper-cased before the enum sees it, as in `actions.ts`: a lowercase
+        // `get` reached fetch and worked before arguments were parsed, and no
+        // HTTP server cares about the difference.
+        method: z
+          .preprocess(
+            (v) => (typeof v === "string" ? v.toUpperCase() : v),
+            z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+          )
+          .default("GET"),
         path: z.string().describe("path beginning with '/'"),
         query: z.record(z.string()).optional(),
         body: z.unknown().optional().describe("JSON body"),
@@ -273,7 +296,7 @@ export function artifactTools(clients: Clients): Tool[] {
       handler: async (a) =>
         json(
           await clients.art({
-            method: (a.method as string) ?? "GET",
+            method: a.method as string,
             path: String(a.path),
             query: a.query as Record<string, string> | undefined,
             body: a.body,

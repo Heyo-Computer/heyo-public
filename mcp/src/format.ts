@@ -33,10 +33,26 @@ export function report(headline: string, sections: Section[]): string {
   return parts.join("\n").trimEnd();
 }
 
-/** Fold a settled read into a section, so the failure survives as text. */
+/**
+ * Fold a settled read into a section, so the failure survives as text.
+ *
+ * `errorTitle` exists because a heading may assert an *outcome*, and an
+ * outcome-asserting heading is a claim that has to be withdrawn when the probe
+ * it describes fails. `heyo_status` printed "reachable, and the key is good"
+ * directly above the 401 disproving it — in the tool advertised as where to
+ * start when something is wrong.
+ *
+ * A heading that only names what was probed ("app-lb /metrics") stays true
+ * either way and passes no third argument. The parameter is optional so the
+ * neutral majority is unchanged, and typed so the next assertive heading has an
+ * obvious place to put its retraction.
+ */
 export function section(
   title: string,
   r: { ok: true; value: unknown } | { ok: false; error: string },
+  errorTitle?: string,
 ): Section {
-  return r.ok ? { title, body: r.value } : { title, body: null, error: r.error };
+  return r.ok
+    ? { title, body: r.value }
+    : { title: errorTitle ?? title, body: null, error: r.error };
 }

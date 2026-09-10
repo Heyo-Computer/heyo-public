@@ -65,7 +65,7 @@ const ID_LEN: usize = 12;
 const SECRET_BYTES: usize = 32;
 
 /// What a token may do on the admin API.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AdminScope {
     /// No admin API access. Still usable against a deployment's data-plane gate,

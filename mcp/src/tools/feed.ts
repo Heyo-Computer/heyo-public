@@ -30,6 +30,7 @@
  */
 
 import { z } from "zod";
+import { num } from "./schema.js";
 import type { Clients } from "../clients/index.js";
 import { json, report } from "../format.js";
 import type { Tool } from "./diagnose.js";
@@ -111,8 +112,8 @@ export function feedTools(clients: Clients): Tool[] {
         "for ever.\n\n" + MANAGED_DOOR_NOTE,
       schema: {
         namespace: z.string().optional().describe("defaults to the configured namespace"),
-        since_id: z.number().optional().describe("the previous call's latest_id"),
-        limit: z.number().optional().describe("most recent N after filtering"),
+        since_id: num().optional().describe("the previous call's latest_id"),
+        limit: num().optional().describe("most recent N after filtering"),
         kind: z
           .enum(["deployed", "updated", "removed", "issue"])
           .optional()

@@ -10,7 +10,7 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-import { loadConfig, configured } from "./config.js";
+import { loadConfig, configured, faultBanner } from "./config.js";
 import { buildTools, createServer } from "./server.js";
 import { serveHttp } from "./serve-http.js";
 
@@ -28,4 +28,9 @@ if (Number.isFinite(port) && port > 0) {
   console.error(
     `heyo-mcp ready — ${tools.length} tools; configured: ${configured(config).join(", ") || "nothing"}`,
   );
+  // After the ready line so it is the last thing on the screen, and never
+  // fatal: an instance whose cloud key is wrong still serves every app-lb, ci
+  // and artifact tool, and refusing to start would take those away too.
+  const faults = faultBanner(config);
+  if (faults) console.error(`\n${faults}`);
 }

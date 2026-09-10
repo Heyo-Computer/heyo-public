@@ -40,7 +40,7 @@ fn b64() -> base64::engine::general_purpose::GeneralPurpose {
 /// "token"}` can be read, edited, backed up and diffed without ever carrying the
 /// credential, and the indirection is what lets the token be rotated in one
 /// place for every deployment that builds from that repo.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SecretRef {
     /// The secret's id.
     pub secret: String,

@@ -208,7 +208,7 @@ test("the feed cursor is the caller's, and one from before a restart reads as a 
 test("a fleet-operations instance lists no sandbox tools at all", () => {
   // Behind an app-token gate there is no cloud credential and no way to acquire
   // one, so the sandbox tools are not missing — they are not part of this
-  // deployment. Listing them would advertise sixteen operations whose only
+  // deployment. Listing them would advertise a set of operations whose only
   // possible outcome is an auth error.
   const withCloud = buildTools(
     loadConfig({ APPLB_URL: "http://127.0.0.1:8080", HEYO_API_KEY: "heyo_api_x" }),

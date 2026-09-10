@@ -12,7 +12,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 import type { Config } from "./config.js";
-import { configured, withForwardedAuth } from "./config.js";
+import { configured, credentialFaults, faultBanner, withForwardedAuth } from "./config.js";
 import { buildTools, createServer } from "./server.js";
 import { identityFrom, identityRequired, Unauthenticated } from "./identity.js";
 
@@ -33,7 +33,14 @@ export async function serveHttp(config: Config, port: number, host: string): Pro
     // Open, and answered without touching a client. app-lb polls this to decide
     // whether a backend is in rotation, so it must not queue behind anything.
     if (url.pathname === "/healthz") {
-      json(res, 200, { ok: true, tools: tools.length, configured: configured(config) });
+      json(res, 200, {
+        ok: true,
+        tools: tools.length,
+        configured: configured(config),
+        // Named here too: an operator watching a health endpoint should not
+        // have to read process logs to learn that a credential cannot work.
+        faults: credentialFaults(config).map((f) => f.summary),
+      });
       return;
     }
 
@@ -87,4 +94,6 @@ export async function serveHttp(config: Config, port: number, host: string): Pro
       `upstreams: ${configured(config).join(", ") || "nothing"}; ` +
       `identity ${identityRequired() ? "required" : "NOT REQUIRED (testing)"}`,
   );
+  const faults = faultBanner(config);
+  if (faults) console.error(`\n${faults}`);
 }

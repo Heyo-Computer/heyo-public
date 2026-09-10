@@ -4692,7 +4692,7 @@ fn file_older_than(path: &std::path::Path, age: Duration) -> bool {
 }
 
 /// One GiB, for device-size math.
-const GIB: u64 = 1024 * 1024 * 1024;
+pub(crate) const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Per-schema failure memory for offloads, so the archive/freeze/pressure
 /// sweeps stop re-trying the same sick schemas every pass. Each failed
@@ -4799,7 +4799,7 @@ fn device_gb(device_bytes: u64) -> u32 {
 /// What should happen to a VM's data device, given how full its guest
 /// filesystem is. See [`grow_verdict`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GrowVerdict {
+pub(crate) enum GrowVerdict {
     /// Below the trigger, or the filesystem has room left inside its device.
     NotNeeded,
     /// Grow the device to this many GiB.
@@ -4832,7 +4832,12 @@ enum GrowVerdict {
 /// stopping anyway (cheap, fires at `DiskGrowConfig::pct`), and the urgent
 /// path stops a live one to do it (expensive, fires at
 /// `DiskGrowConfig::urgent_pct`).
-fn grow_verdict(fs: (u64, u64, u64), device_bytes: u64, pct: f64, max_gb: u64) -> GrowVerdict {
+pub(crate) fn grow_verdict(
+    fs: (u64, u64, u64),
+    device_bytes: u64,
+    pct: f64,
+    max_gb: u64,
+) -> GrowVerdict {
     let (total, used, avail) = fs;
     let Some(used_pct) = used_pct(used, avail) else {
         return GrowVerdict::NotNeeded;
