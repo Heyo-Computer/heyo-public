@@ -2348,9 +2348,23 @@ pub(crate) async fn probe_pg(pool: &Pool) -> PgProbe {
 /// reply (io error, refused, EOF): nothing is listening.
 fn classify_pg_error(e: &tokio_postgres::Error) -> PgProbe {
     if e.code().is_some() {
-        PgProbe::Responding(e.to_string())
+        PgProbe::Responding(pg_error_text(e))
     } else {
-        PgProbe::Unreachable(e.to_string())
+        PgProbe::Unreachable(pg_error_text(e))
+    }
+}
+
+/// `tokio_postgres::Error` displays only its kind, so a server refusing the
+/// connection — the very case the readiness waits exist for — prints as a
+/// bare "db error", its SQLSTATE and reason behind `source()`. Spell them out:
+/// the readiness logs are the only place a boot's refusal ever surfaces.
+fn pg_error_text(e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        return format!("{} {}: {}", db.severity(), db.code().code(), db.message());
+    }
+    match std::error::Error::source(e) {
+        Some(cause) => format!("{e}: {cause}"),
+        None => e.to_string(),
     }
 }
 
@@ -2957,8 +2971,9 @@ async fn wait_pg_ready(pool: &Pool, timeout: Duration, name: &str) -> Result<()>
         let last_err = match pool.get().await {
             Ok(client) => match client.simple_query("SELECT 1").await {
                 Ok(_) => return Ok(()),
-                Err(e) => e.to_string(),
+                Err(e) => pg_error_text(&e),
             },
+            Err(deadpool_postgres::PoolError::Backend(e)) => pg_error_text(&e),
             Err(e) => e.to_string(),
         };
         if Instant::now() >= deadline {
@@ -2981,6 +2996,26 @@ mod tests {
 
     fn pool_at(port: u16) -> Pool {
         build_pool("127.0.0.1", port, "postgres", "postgres", None).unwrap()
+    }
+
+    /// The cause has to survive into the text: the error's own Display is just
+    /// its kind, which is how readiness logs used to say only "db error".
+    #[tokio::test]
+    async fn pg_error_text_carries_the_cause() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = tokio_postgres::connect(
+            &format!("host=127.0.0.1 port={port} user=postgres connect_timeout=2"),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .err()
+        .expect("nothing listens on a just-released port");
+        let text = pg_error_text(&err);
+        assert!(text.starts_with(&err.to_string()), "{text}");
+        assert!(text.len() > err.to_string().len(), "cause dropped: {text}");
     }
 
     /// Exhaust the gate, confirm nothing is left, and confirm dropped permits

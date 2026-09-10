@@ -36,7 +36,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, DiskGrowConfig};
+use crate::registry::{GIB, GrowVerdict, grow_verdict};
 use crate::s3::S3Config;
 
 /// How long to wait after a stop for the Firecracker process to release the
@@ -70,6 +71,11 @@ const PRESIGN_TTL: Duration = Duration::from_secs(3600);
 /// ext4 superblock magic: 0xEF53 little-endian at byte offset 1080
 /// (superblock at 1024 + s_magic at 56).
 const EXT4_MAGIC_OFFSET: u64 = 1080;
+
+/// Used% at or above which a restored image gets a bigger device when disk
+/// growth isn't configured (`PG_VM_POOL_DISK_GROW_PCT` unset). Matches the
+/// trigger the supervisor config ships with.
+const RESTORE_GROW_PCT: f64 = 85.0;
 const EXT4_MAGIC: [u8; 2] = [0x53, 0xEF];
 
 /// Duplicated from `vm::MIN_ARCHIVE_BYTES` (private there): the smallest
@@ -832,6 +838,7 @@ async fn adopt_zst_image(
             out.status.code()
         );
     }
+    ensure_restore_headroom(cfg, schema, raw).await?;
 
     // The readopt maneuver: a booted, ready VM — a warm spare whenever the
     // pool has one — stopped, its empty disk overwritten in place with the
@@ -881,6 +888,108 @@ async fn adopt_zst_image(
         return Err(e);
     }
     Ok((sandbox, provenance))
+}
+
+/// Give a restored image room to boot. A VM that wedged on a full disk and was
+/// then imaged as-is can't come back on a device of the same size: Postgres
+/// has to write before it accepts a single connection (crash recovery, its
+/// relcache init file), so every restore hits the same wall — and the grow
+/// paths can't rescue it, since they sample usage through Postgres.
+///
+/// When the image's filesystem is at the grow trigger and fills its device,
+/// extend the image file (sparse, so nothing is allocated) to the size the
+/// idle-stop grow would pick. `swap_and_boot` copies it over the VM's disk at
+/// that length, and the guest's grow watcher resizes the filesystem into it at
+/// boot, ahead of Postgres. The growth config supplies the trigger and cap when
+/// set; a full image is unbootable either way, so this grows it even with
+/// growth off.
+async fn ensure_restore_headroom(cfg: &Config, schema: &str, raw: &Path) -> Result<()> {
+    let usage = match run(Command::new("dumpe2fs").arg(raw), FSCK_TIMEOUT).await {
+        Ok(out) if out.status.success() => dumpe2fs_usage(&String::from_utf8_lossy(&out.stdout)),
+        _ => None,
+    };
+    let Some(usage) = usage else {
+        warn!(
+            "schema {schema}: could not read the restored image's usage with dumpe2fs; \
+             restoring it at its archived size"
+        );
+        return Ok(());
+    };
+    let device_bytes = tokio::fs::metadata(raw)
+        .await
+        .with_context(|| format!("statting {}", raw.display()))?
+        .len();
+    let (total_blocks, free_blocks, _) = usage;
+    let used_pct = 100.0 * (1.0 - free_blocks as f64 / total_blocks.max(1) as f64);
+    match restore_grow_verdict(usage, device_bytes, cfg.disk_grow) {
+        GrowVerdict::NotNeeded => Ok(()),
+        GrowVerdict::AtCap { current_gb } => {
+            warn!(
+                "schema {schema}: restored image is {used_pct:.0}% full and its {current_gb}GiB \
+                 device is already at the growth cap — Postgres may not start on it \
+                 (raise PG_VM_POOL_DISK_MAX_GB)"
+            );
+            Ok(())
+        }
+        GrowVerdict::Grow(target_gb) => {
+            info!(
+                "schema {schema}: restored image is {used_pct:.0}% full on a {}GiB device — \
+                 extending the device to {target_gb}GiB so Postgres has room to start",
+                device_bytes.div_ceil(GIB)
+            );
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(raw)
+                .await
+                .with_context(|| format!("opening {} to extend it", raw.display()))?
+                .set_len(target_gb * GIB)
+                .await
+                .with_context(|| format!("extending {} to {target_gb}GiB", raw.display()))
+        }
+    }
+}
+
+/// [`grow_verdict`] for a restored image's `(total blocks, free blocks, block
+/// size)` on a `device_bytes` device, under the configured growth trigger and
+/// cap — or [`RESTORE_GROW_PCT`] and the daemon's ceiling when growth is off.
+fn restore_grow_verdict(
+    usage: (u64, u64, u64),
+    device_bytes: u64,
+    grow: Option<DiskGrowConfig>,
+) -> GrowVerdict {
+    let (total_blocks, free_blocks, block_size) = usage;
+    let (pct, max_gb) = match grow {
+        Some(g) => (g.pct, g.max_gb),
+        None => (RESTORE_GROW_PCT, u64::from(crate::vm::DAEMON_MAX_DISK_GB)),
+    };
+    let total = total_blocks * block_size;
+    let avail = free_blocks.min(total_blocks) * block_size;
+    grow_verdict((total, total - avail, avail), device_bytes, pct, max_gb)
+}
+
+/// `(total blocks, free blocks, block size)` from `dumpe2fs` output. Free space
+/// is summed over the group descriptors rather than read off the superblock:
+/// ext4 writes the superblock's free count back lazily (reliably only at a
+/// clean unmount), so an image taken after an unclean stop can carry a stale
+/// one, while the descriptors are journaled with every allocation.
+fn dumpe2fs_usage(out: &str) -> Option<(u64, u64, u64)> {
+    let (mut total, mut block_size, mut free, mut groups) = (None, None, 0u64, 0u32);
+    for line in out.lines() {
+        if let Some(v) = line.strip_prefix("Block count:") {
+            total = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("Block size:") {
+            block_size = v.trim().parse().ok();
+        } else if let Some((n, _)) = line.trim_start().split_once(" free blocks, ")
+            && let Ok(n) = n.parse::<u64>()
+        {
+            free += n;
+            groups += 1;
+        }
+    }
+    if groups == 0 {
+        return None;
+    }
+    Some((total?, free, block_size?))
 }
 
 async fn swap_and_boot(
@@ -1266,6 +1375,62 @@ async fn run_ok(cmd: &mut Command, what: &str, timeout: Duration) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Trimmed `dumpe2fs` of a full 2GiB data disk. The superblock's
+    /// "Free blocks" is stale (an unclean stop never wrote it back); the group
+    /// descriptors hold the real count.
+    const DUMPE2FS_FULL: &str = "\
+Filesystem volume name:   <none>
+Block count:              524288
+Reserved block count:     0
+Free blocks:              401233
+Block size:               4096
+
+Group 0: (Blocks 0-32767) csum 0x1a2b [ITABLE_ZEROED]
+  Primary superblock at 0, Group descriptors at 1-1
+  12 free blocks, 0 free inodes, 2 directories
+  Free blocks: 32756-32767
+  Free inodes:
+Group 1: (Blocks 32768-65535) csum 0x3c4d [INODE_UNINIT, ITABLE_ZEROED]
+  Backup superblock at 32768, Group descriptors at 32769-32769
+  0 free blocks, 8192 free inodes, 0 directories, 8192 unused inodes
+  Free blocks:
+  Free inodes: 8193-16384
+";
+
+    #[test]
+    fn dumpe2fs_usage_sums_group_descriptors_not_the_superblock() {
+        assert_eq!(dumpe2fs_usage(DUMPE2FS_FULL), Some((524_288, 12, 4096)));
+        assert_eq!(dumpe2fs_usage("Block count: 10\nBlock size: 4096\n"), None);
+    }
+
+    #[test]
+    fn restore_grows_a_full_image_even_with_growth_off() {
+        let full = dumpe2fs_usage(DUMPE2FS_FULL).unwrap();
+        assert_eq!(
+            restore_grow_verdict(full, 2 * GIB, None),
+            GrowVerdict::Grow(4)
+        );
+        // Half full: room to boot, restored as archived.
+        assert_eq!(
+            restore_grow_verdict((524_288, 262_144, 4096), 2 * GIB, None),
+            GrowVerdict::NotNeeded
+        );
+        // A thin fs below its device is the guest watcher's to grow.
+        assert_eq!(
+            restore_grow_verdict((262_144, 0, 4096), 4 * GIB, None),
+            GrowVerdict::NotNeeded
+        );
+        let capped = DiskGrowConfig {
+            pct: 85.0,
+            urgent_pct: None,
+            max_gb: 2,
+        };
+        assert_eq!(
+            restore_grow_verdict(full, 2 * GIB, Some(capped)),
+            GrowVerdict::AtCap { current_gb: 2 }
+        );
+    }
     use std::sync::{Arc, Mutex};
 
     #[test]
