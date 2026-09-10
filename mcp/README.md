@@ -495,71 +495,145 @@ to infer from sixty tool names.
 
 ## Tools
 
-**Diagnostics** — cross-service, shaped like the question:
+<!-- BEGIN GENERATED CATALOGUE -->
 
-| Tool | Answers |
-|---|---|
-| `heyo_status` | which services are reachable, and what each says about itself |
-| `heyo_whoami` | what this credential is: admin scope, namespace, deployment scope, expiry |
-| `fleet_overview` | every deployment, host CPU/memory, app-lb topology, ingest counters |
-| `diagnose_deployment` | one deployment: record, jobs, series, recent errors |
-| `deployment_logs` | log lines with app-obs's filters and paging |
-| `diagnose_empty_pool` | why a pool is empty or will not fill |
-| `diagnose_ci_job` | why a ci job is not running (needs ci's own listener) |
-| `ci_run_status` | has this run finished, and did it work — every job and step |
-| `ci_run_logs` | what a failed run printed, tailed per step |
+### Diagnostics
 
-**Sandboxes** — heyo cloud:
+Cross-service, shaped like the question rather than the endpoint.
 
-| Tool | Does |
-|---|---|
-| `sandbox_create` | boot one and wait for it; `archive_id` seeds `/workspace` |
-| `sandbox_list` / `sandbox_info` | find one again; poll readiness |
-| `sandbox_exec` | run a command, buffered, with its exit code |
-| `sandbox_read_file` / `sandbox_write_file` | small files inline; the write refuses what 413 would |
-| `sandbox_upload_url` / `sandbox_finalize_upload` / `sandbox_attach_archive` | the route past the 1 MB body |
-| `sandbox_set_ttl` | keep a sandbox alive across a conversation |
-| `sandbox_stop` / `sandbox_start` / `sandbox_restart` | park and resume; the disk survives all three |
-| `sandbox_kill` | DESTRUCTIVE — the VM and its disk |
-| `heyo_capacity` | your daemons and your running sandboxes, before booting more |
+| Tool | | Does |
+| --- | --- | --- |
+| `heyo_status` | read-only | Which of heyo cloud, app-lb, app-obs, ci and the artifact store this server can reach, and what each says about itself. |
+| `heyo_whoami` | read-only | What this server's credential is and what it may do: admin scope, namespace, deployment scope and expiry. |
+| `fleet_overview` | read-only | The whole managed fleet in one call: app-obs's per-deployment rows with host CPU and memory, app-lb's current topology with health and drain state, and app-obs's ingest counters. |
+| `diagnose_deployment` | read-only | Everything about one deployment at once: app-lb's record and its VM pool, app-obs's bucketed series, and the most recent error-level logs. |
+| `deployment_logs` | read-only | Log lines for one deployment, newest first, with the filters app-obs supports: time window or explicit from/to, level, backend, a substring query, and a cursor for paging. |
+| `diagnose_empty_pool` | read-only | Why a deployment's VM pool is empty or will not fill. |
+| `diagnose_ci_job` | read-only | Why a ci job is not running. |
 
-**The event feed** — app-lb's per-namespace RSS, as data:
+### Deploying
 
-| Tool | Answers |
-|---|---|
-| `applb_feeds` | which namespaces have events |
-| `applb_feed` | deployment lifecycle and issues, newest first, since a cursor |
+`applb_deploy` is the entry point and does the whole sequence; the rest are the primitives underneath it. Which job tool applies depends on the backend, and picking wrong is refused rather than ignored — `applb_build` for a Dockerfile, `applb_pull` for bytes from a store, `applb_host_update` for a static deployment's own commands.
 
-The feed is **polled, never pushed**, and no subscription state exists anywhere:
-app-lb tracks no per-reader watermark, so `applb_feed` takes `since_id` and
-returns `latest_id` for the caller to keep. The ring is in memory, so an app-lb
-restart empties it and ids begin again — a cursor from before that reads as
-ahead of everything, and the tool says "feed reset" and returns the lot rather
-than reporting nothing new for ever. Nothing publishes unless a deployment's
-spec opts in with `feed.announce` or `feed.issues`.
+| Tool | | Does |
+| --- | --- | --- |
+| `applb_deploy` |  | **THE tool for 'deploy this'.** Takes a full spec and does the whole sequence: checks the rules a schema cannot express, registers or edits as appropriate, starts the job that matches the backend, waits for it, and reports what TLS will do. |
+| `applb_spec_schema` | read-only | The deployment spec in full: every field of a named block with its complete documentation, plus the cross-field rules that apply to it. |
+| `applb_create_deployment` |  | Register a deployment from a full spec, REPLACING any deployment with the same id and recycling its VM pool. |
+| `applb_update_deployment` |  | Edit an existing deployment in place, replacing its whole spec. |
+| `applb_delete_deployment` | **destructive** | Deregisters a deployment from app-lb and tears down its backends. |
+| `applb_scale` |  | Change a deployment's scaling parameters. |
+| `applb_build` |  | Build a managed (`vm`) deployment's image from its `build` block and roll the pool onto it. |
+| `applb_pull` |  | Materialize a `vm` or `site` deployment's bytes from an artifact store and roll it onto them. |
+| `applb_pull_mounts` |  | Re-unpack the guest mounts a `vm` deployment declares, from their artifact stores. |
+| `applb_host_update` |  | Run a STATIC (`upstreams`) or `site` deployment's own `update.commands` on the app-lb host, then re-probe its upstreams. |
+| `applb_job` | read-only | One job by its id — what applb_build, applb_pull, applb_pull_mounts and applb_host_update each return. |
+| `applb_deployment_jobs` | read-only | Recent build/pull/update jobs for a deployment, with their outcomes. |
 
-**The artifact store** — where a deployment's bytes come from:
+### Fleet and pools
 
-| Tool | Does |
-|---|---|
-| `art_publish` | the whole three-request publish, with the tag pointing at the manifest |
-| `art_list_tags` / `art_get_tag` | what exists, and what one tag resolves to |
-| `art_get_manifest` | a manifest's kind and entries — where a tag-on-a-blob fails visibly |
-| `art_list_blobs` / `art_usage` | what is stored, and how much room is left |
+Reads over app-lb's topology, plus the operations that move VMs and disks.
 
-**Actions** — app-lb reads and lifecycle, ci run control, and `*_request` raw
-tools covering everything without a dedicated tool.
+| Tool | | Does |
+| --- | --- | --- |
+| `applb_list_deployments` | read-only | Every deployment app-lb manages, with its backends and current state. |
+| `applb_get_deployment` | read-only | One deployment in full: its spec, desired and ready replica counts, and every VM with its health. |
+| `applb_metrics` | read-only | app-lb's live metrics: per-deployment pool counters, request stats, and create/boot outcomes. |
+| `applb_disks` | read-only | Disk inventory and usage. |
+| `applb_certs` | read-only | TLS certificates app-lb holds, with their hostname, issuer and expiry. |
+| `applb_drain_upstream` | **destructive** | Take one upstream of a STATIC (`upstreams`) deployment out of rotation. |
+| `applb_uncordon_upstream` |  | Put a drained upstream back into rotation. |
+| `applb_evict_vm` | **destructive** | Removes one VM from a deployment's pool and destroys it. |
+| `applb_purge_disk` | **destructive** | Permanently deletes one disk and everything on it. |
+| `applb_purge_orphan_disks` | **destructive** | Deletes every disk app-lb considers orphaned, in one call. |
+| `applb_sweep_disks` | **destructive** | Runs the disk expiry sweep now instead of waiting for the next tick, deleting every disk past its TTL. |
+| `applb_exec` | **destructive** | Runs a command inside a deployment's guest and returns its output. |
+
+### The event feed
+
+app-lb's per-namespace RSS, as data.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `applb_feeds` | read-only | Which namespaces have deployment events, and how many. |
+| `applb_feed` | read-only | Deployment events for one namespace, newest first: deployed, updated, removed, and operational issues. |
+
+### Sandboxes
+
+heyo cloud. Listed only when a usable cloud API key is configured.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `sandbox_create` |  | Boot a sandbox (a microVM) and return it once it is running. |
+| `sandbox_list` |  | Every sandbox this key can see, with status, image, uptime and bound URLs. |
+| `sandbox_info` |  | One sandbox by id: status, region, size, TTL and bound URLs. |
+| `sandbox_exec` |  | Run a command in the sandbox with `sh -c` and return stdout, stderr and exit_code. |
+| `sandbox_read_file` |  | Read a file from the sandbox. |
+| `sandbox_write_file` |  | Write a file into the sandbox. |
+| `sandbox_upload_url` |  | Reserve an archive and return a presigned URL to PUT its bytes to. |
+| `sandbox_finalize_upload` |  | Close out an upload started by sandbox_upload_url: the archive is only usable once finalized. |
+| `sandbox_attach_archive` |  | Mount a finalized archive onto a sandbox that is already running, replacing what is at `sandbox_path`. |
+| `sandbox_set_ttl` |  | Reset how long the sandbox may run unattended, from now. |
+| `sandbox_stop` |  | Stop the sandbox without destroying it. |
+| `sandbox_start` |  | Start a stopped sandbox again, with its disk as it was left. |
+| `sandbox_restart` |  | Reboot the sandbox. |
+| `sandbox_kill` | **destructive** | Permanently deletes the sandbox and its disk. |
+| `heyo_capacity` | read-only | What can be told about capacity *before* booting something. |
+
+### The artifact store
+
+Where a deployment's bytes come from.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `art_publish` |  | Publish a bundle to the artifact store and point a tag at it. |
+| `art_list_tags` | read-only | Every tag in the store and the digest it points at. |
+| `art_get_tag` | read-only | What one tag points at. |
+| `art_get_manifest` | read-only | One manifest by digest or by tag: its kind, its entries and their digests and sizes. |
+| `art_list_blobs` | read-only | Every blob with its size, its label and the tags pointing at it. |
+| `art_usage` | read-only | The store's disk usage. |
+
+### ci
+
+Build status and VM pool control.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `ci_run_status` | read-only | Whether a ci run has finished and whether it worked, with every job and step. |
+| `ci_run_logs` | read-only | What a run printed, per job and step. |
+| `ci_cancel_run` | **destructive** | Cancels a ci run and every unfinished job in it. |
+| `ci_destroy_vm` | **destructive** | Destroys one pooled ci VM. |
+| `ci_cleanup_failed_vms` | **destructive** | Destroys every idle ci VM whose last run failed. |
+
+### Raw escape hatches
+
+Everything without a dedicated tool. Prefer a named tool when one exists — a raw call's intent cannot be read without reading its arguments.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `heyo_request` |  | Raw HTTP against heyo cloud, for endpoints without a dedicated tool above. |
+| `applb_request` |  | Raw HTTP against app-lb, for endpoints without a dedicated tool above. |
+| `obs_request` |  | Raw HTTP against app-obs, for endpoints without a dedicated tool above. |
+| `ci_request` |  | Raw HTTP against ci, for endpoints without a dedicated tool above. |
+| `art_request` |  | Raw HTTP against the artifact store, for endpoints without a dedicated tool above. |
+
+_64 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
+
+<!-- END GENERATED CATALOGUE -->
 
 ### Destructive tools are named, not hidden
 
-`applb_delete_deployment`, `applb_evict_vm`, `applb_purge_disk`,
-`applb_purge_orphan_disks`, `applb_exec`, `ci_cancel_run`, `ci_destroy_vm` and
-`ci_cleanup_failed_vms` each have their own tool and a description that opens
-with `DESTRUCTIVE`. Folding them into a generic request tool would hide a
-`DELETE` inside a parameter, where it is invisible in a transcript and in an
-approval prompt.
+Each has its own tool and a description that opens with `DESTRUCTIVE` — marked
+in the tables above, so the set is generated rather than listed here. It used to
+be listed here, and named eight when there were eleven.
 
-`sandbox_kill` is named the same way, for the same reason.
+Folding them into a generic request tool would hide a `DELETE` inside a
+parameter, where it is invisible in a transcript and in an approval prompt. The
+same reasoning names `sandbox_kill` rather than leaving it to `heyo_request`.
+
+The prose is the part that matters: the SDK is explicit that clients should
+never make tool-use decisions from annotations, so the sentence the model reads
+carries the warning and `destructiveHint` is derived from it.
 
 The raw `heyo_request` / `applb_request` / `obs_request` / `ci_request` /
 `art_request` tools reach the rest of each API, including destructive methods. Prefer a named tool when one exists —
