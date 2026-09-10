@@ -60,8 +60,8 @@ way — a re-encoded-but-equivalent header is rejected.
 ## Publishing a build
 
 `art_publish` is the tool for "update deployment X with this build". It is the
-step `applb_start_update` cannot do: app-lb rolls a deployment onto bytes that
-must already be in the store, so without this the workflow dead-ends halfway.
+step `applb_pull` cannot do: app-lb rolls a deployment onto bytes that must
+already be in the store, so without this the workflow dead-ends halfway.
 
 A publish is **three** requests and the order and the digests matter:
 
@@ -80,8 +80,16 @@ primitives with a warning: a composite that always uses the manifest digest
 cannot make the mistake. The primitives are still there (`art_request`) for
 everything else.
 
-Then `applb_start_update` to roll the deployment, and `applb_deployment_jobs` to
-watch it.
+Then `applb_pull` to roll the deployment onto it, and `applb_job` to watch the
+job it returns.
+
+**Not `applb_host_update`.** That runs a *static* deployment's own
+`update.commands` on the app-lb host and refuses a managed (`vm`) deployment
+outright — app-lb's `HostUpdate` job applies to `upstreams` and `site` backends
+only. Until 2026-09-10 both this page and `art_publish`'s own result named it as
+the next step, which was wrong for the main case; `applb_pull` is what rolls a
+managed deployment onto new bytes, and `applb_build` is what rebuilds an image
+from a Dockerfile.
 
 ### Two credentials, one request
 
@@ -241,8 +249,10 @@ SDK's `Namespaces.create`, and deployments registered through this door land
 in it whether or not the spec says so.
 
 What the door exposes: `applb_list_deployments`, `applb_get_deployment`,
-`applb_create_deployment`, `applb_scale`, `applb_start_build`,
-`applb_start_update`, `applb_deployment_jobs`, `applb_delete_deployment`,
+`applb_deploy`, `applb_create_deployment`, `applb_update_deployment`,
+`applb_scale`, `applb_build`, `applb_pull`, `applb_pull_mounts`,
+`applb_host_update`, `applb_job`, `applb_deployment_jobs`,
+`applb_delete_deployment`, `applb_spec_schema`,
 `applb_evict_vm`, `applb_exec` and `applb_metrics`. The fleet-wide operator
 tools — `applb_disks`, `applb_certs`, `applb_purge_disk`,
 `applb_purge_orphan_disks`, `applb_sweep_disks` — answer `404 route not exposed
@@ -419,6 +429,69 @@ daemon, anything holding a static bearer) therefore wants either
 
 Pick deliberately. Turning the check off *without* a gate in front leaves an
 unauthenticated hole into a process that can delete a deployment.
+
+## Deploying: one tool, and reference material behind it
+
+`applb_deploy` is the entry point. It carries the deployment spec's schema —
+generated from app-lb's own Rust types, not transcribed — checks the cross-field
+rules a schema cannot express, registers *or* edits as appropriate, starts the
+job that matches the backend, and reports what TLS will do.
+
+Three of those steps exist because each was easy to get wrong by hand:
+
+- **Register or edit.** `POST /deployments` replaces a deployment and recycles
+  its VM pool; `PUT` preserves the pool whenever the `vm` block is unchanged.
+  Only the first was exposed, so every scaling or route edit cost a full roll.
+- **Which job.** app-lb's job kinds each apply to a subset of backends. `build`
+  is for a `vm` with a Dockerfile, `pull` rolls a `vm` or `site` onto bytes from
+  a store, and `host_update` runs a *static* deployment's own commands on the
+  app-lb host and refuses a managed one. Picking wrong is refused, not ignored.
+- **TLS.** An exact `host` route is issued automatically within seconds. A
+  `host_suffix` route never gets its own certificate and needs a fleet wildcard;
+  one no wildcard covers is served a fallback that will not validate.
+
+The primitives are still there — `applb_create_deployment`,
+`applb_update_deployment`, `applb_build`, `applb_pull`, `applb_pull_mounts`,
+`applb_host_update`, `applb_job` — for when you want exactly one request.
+
+### What a host's approval dialog sees
+
+Every tool carries MCP annotations, derived rather than declared: `destructiveHint`
+comes from the `DESTRUCTIVE.` sentence at the front of a description, so the two
+cannot drift apart. The prose is what the model reads — the SDK is explicit that
+clients should never make tool use decisions from annotations — and the
+annotation is what an approval UI reads.
+
+Only what the MCP defaults do not already say is emitted, which matters for
+correctness and not just size: `destructiveHint` defaults to **true**, so a tool
+that is neither read-only nor destructive has to say `destructiveHint: false` out
+loud or a host is told it destroys things.
+
+`readOnlyHint` is the one hint that cannot be derived, and the one where being
+wrong is a safety problem — a host may auto-approve what it believes is a read.
+The list of read-only tools is checked by running each of them against a stubbed
+transport and failing if any issues anything but a `GET`.
+
+### Resources and prompts
+
+The server serves reference material as MCP **resources**, which are pulled when
+wanted rather than pushed on every connect:
+
+| URI | What |
+|---|---|
+| `heyo://applb/deployment-spec` | the full generated schema, plus every cross-field rule |
+| `heyo://applb/deploy-guide` | the sequence end to end |
+| `heyo://applb/tls` | why an exact host gets HTTPS and a suffix does not |
+| `heyo://applb/examples/{name}` | each of app-lb's shipped example specs, with its notes |
+
+That split is what makes it honest for the advertised schema to summarise the
+auth gate and the mount blocks: `applb_spec_schema` and these resources have
+them in full, one call away, costing nothing until asked for.
+
+There is one **prompt**, `deploy_a_service(kind, id, host?)`, which returns the
+ordered plan for that backend kind. A host that surfaces prompts as slash
+commands turns "how do I deploy" into a visible affordance rather than something
+to infer from sixty tool names.
 
 ## Tools
 

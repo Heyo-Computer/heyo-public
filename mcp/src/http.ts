@@ -16,7 +16,7 @@
  */
 
 import type { Config, ServiceConfig } from "./config.js";
-import { CI_GATE_HINT, CLOUD_CAPACITY_HINT } from "./config.js";
+import { CI_GATE_HINT, CLOUD_CAPACITY_HINT, CLOUD_KEY_HINT, isApplbToken } from "./config.js";
 
 export class ServiceError extends Error {
   constructor(
@@ -68,6 +68,16 @@ export interface RequestOptions {
    * manifest document and `GET /tags/{name}` answers a bare digest.
    */
   expectText?: boolean;
+  /**
+   * A sentence attached to any error from this call, on top of whatever the
+   * status alone implies.
+   *
+   * For a call the *user* did not make. Namespace discovery is the case: it
+   * runs inside the first app-lb tool of the process, against cloud, on a path
+   * nobody asked for, so its failures need to say what they were for before
+   * they say what went wrong.
+   */
+  hint?: string;
 }
 
 function withQuery(path: string, query?: RequestOptions["query"]): string {
@@ -131,12 +141,23 @@ export async function request(
     // more often than it is a bad token, and a 503 from cloud is region
     // capacity rather than a fault. Attaching the sentence here means every
     // call site carries it, including the ones that only pass a body through.
-    const hint =
+    const status =
       service === "ci" && res.status === 401
         ? CI_GATE_HINT
         : service === "heyo cloud" && res.status === 503
           ? CLOUD_CAPACITY_HINT
-          : undefined;
+          : // A cloud 401 or 403 with an app-lb token is not a bad password, it
+            // is the wrong *kind* of credential, and the difference decides
+            // whether retrying is pointless. Checked here rather than only at
+            // config load because a hosted instance holds no key of its own and
+            // takes the caller's — see `withForwardedAuth`, which can install
+            // this credential long after `credentialFaults` has run.
+            (res.status === 401 || res.status === 403) &&
+              service === "heyo cloud" &&
+              isApplbToken(cfg.auth ?? "")
+            ? CLOUD_KEY_HINT
+            : undefined;
+    const hint = [opts.hint, status].filter(Boolean).join("\n\n") || undefined;
     throw new ServiceError(service, res.status, path, text, hint);
   }
   if (!text.trim()) return null;

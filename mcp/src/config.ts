@@ -237,7 +237,7 @@ export function artService(
  * caller might present — a `heyo_api_*` cloud key, or a JWT from some other
  * issuer. See {@link withForwardedAuth}.
  */
-const APPLB_TOKEN_PREFIX = "applb_";
+export const APPLB_TOKEN_PREFIX = "applb_";
 
 /**
  * The bearer's value, without the scheme, or undefined if it isn't a bearer.
@@ -250,13 +250,23 @@ const APPLB_TOKEN_PREFIX = "applb_";
  * to prevent. So the detector errs wide and the strict parser downstream
  * decides.
  */
-function bearerToken(header: string): string | undefined {
+export function bearerToken(header: string): string | undefined {
   const match = /^Bearer[ \t]+(\S.*)$/i.exec(header.trim());
   return match?.[1]?.trim();
 }
 
-/** Whether the caller presented a token app-lb minted. */
-function isApplbToken(header: string): boolean {
+/**
+ * Whether a bearer header carries a token app-lb minted.
+ *
+ * Exported because the same test answers two different questions. For a header
+ * a *caller* sent, it decides whose credential speaks at app-lb — see
+ * {@link withForwardedAuth}. For a credential this process was *configured*
+ * with, it decides whether that credential can work at all: cloud has never
+ * heard of an `applb_…` token, so one in `HEYO_API_KEY` can only ever 401.
+ * Takes a full header rather than a bare token so both callers pass what they
+ * already hold.
+ */
+export function isApplbToken(header: string): boolean {
   return bearerToken(header)?.startsWith(APPLB_TOKEN_PREFIX) ?? false;
 }
 
@@ -309,7 +319,7 @@ function isApplbToken(header: string): boolean {
  * So a configured `HEYO_API_KEY` is kept (every caller admitted by an app-token
  * gate shares that one cloud account), and where there is no key the caller's
  * app-lb token is *not* substituted for one — cloud stays unconfigured, and
- * `buildTools` lists no sandbox tools rather than sixteen that always fail.
+ * `buildTools` lists no sandbox tools rather than a set that always fails.
  *
  * Only that prefix is excluded. A `heyo_api_*` key is exactly what cloud wants
  * and is still forwarded, which is what makes managed mode multi-tenant; a JWT
@@ -393,7 +403,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 /** Which services are usable, for the startup banner and for `heyo_status`. */
 export function configured(config: Config): string[] {
   const on: string[] = [];
-  if (config.cloud?.auth) on.push(`heyo cloud (${config.cloud.baseUrl})`);
+  if (config.cloud?.auth) {
+    // Named the way the artifact branch below names its two doors, and for the
+    // same reason: "cloud is configured" is not the useful fact when the key it
+    // is configured with is one cloud will refuse.
+    on.push(
+      cloudUsable(config)
+        ? `heyo cloud (${config.cloud.baseUrl})`
+        : `heyo cloud (${config.cloud.baseUrl}) — NO usable key: HEYO_API_KEY holds an applb_… token`,
+    );
+  }
   if (config.applb) {
     on.push(
       config.applb.namespace
@@ -418,6 +437,139 @@ export function configured(config: Config): string[] {
     on.push(`artifacts (${parts.join(", ")})`);
   }
   return on;
+}
+
+/**
+ * A credential that is present, well-formed, and cannot possibly work.
+ *
+ * The gap this closes: {@link configured} answers "is there a credential", and
+ * every consumer treated that as "is there a *usable* credential". They are not
+ * the same question, and the difference is a whole class of failure that this
+ * server can detect at load and instead lets the user discover one 401 at a
+ * time — the same class the artifact branch of `configured` already calls out
+ * ("the failure arrives at publish time rather than at startup").
+ *
+ * `summary` is one line for a banner. `detail` explains the fix in
+ * {@link NotConfigured}'s register: name the variable, then name the
+ * configuration that works. Neither ever contains the token.
+ */
+export interface CredentialFault {
+  readonly service: "heyo cloud" | "app-lb";
+  readonly summary: string;
+  readonly detail: string;
+}
+
+/**
+ * Whether cloud has a credential it could actually authenticate with.
+ *
+ * The predicate `makeClients` and `buildTools` must agree on, which is why it
+ * is a function rather than a test written twice. Disagreement is worse than
+ * either answer: list the sandbox tools on a config that cannot reach cloud and
+ * every one of them answers `NotConfigured`; withhold them from a config that
+ * can and the caller is told a capability does not exist.
+ */
+export function cloudUsable(config: Config): boolean {
+  return Boolean(config.cloud?.auth && !isApplbToken(config.cloud.auth));
+}
+
+/** How much of a token may be shown: enough to recognise, not enough to use. */
+function redact(header?: string): string {
+  const token = header ? bearerToken(header) : undefined;
+  return token ? `${token.slice(0, APPLB_TOKEN_PREFIX.length + 4)}…` : "(none)";
+}
+
+/**
+ * Credentials that are configured and cannot work, with the fix for each.
+ *
+ * Both faults are the same mistake seen from two sides: an `applb_…` token
+ * where a `heyo_api_*` key is required. It is an easy mistake to make, because
+ * an app-lb token is a real credential that a customer is legitimately given —
+ * it is simply not a *cloud* credential, and cloud is what both of these
+ * variables reach. {@link withForwardedAuth} already treats this as settled for
+ * a token a caller *sends*; this applies the same law to the token this process
+ * was *configured* with, which is the direction nothing checked.
+ *
+ * Loud, never fatal. A fleet-operations instance with a bad `HEYO_API_KEY` and
+ * a good `APPLB_TOKEN` is still a useful server, and refusing to start would
+ * take away the tools that do work.
+ */
+export function credentialFaults(config: Config): CredentialFault[] {
+  const faults: CredentialFault[] = [];
+
+  if (config.cloud?.auth && isApplbToken(config.cloud.auth)) {
+    faults.push({
+      service: "heyo cloud",
+      summary: `HEYO_API_KEY holds an app-lb token (${redact(config.cloud.auth)}), which cloud cannot accept`,
+      detail:
+        "HEYO_API_KEY is a heyo cloud API key and must start with `heyo_api_`. It holds a " +
+        "token app-lb minted for itself instead. Cloud has never heard of app-lb's tokens, so " +
+        "every sandbox call — and every managed-namespace lookup — can only answer 401.\n\n" +
+        "An `applb_…` token is a real credential; it just belongs somewhere else. Put it in " +
+        "APPLB_TOKEN and set APPLB_URL to app-lb's own admin listener, then leave HEYO_API_KEY " +
+        "unset: the app-lb tools work, and the sandbox tools are correctly not listed rather " +
+        "than listed and failing. Over HTTP, send it as the request's own `Authorization` " +
+        "header and this process needs no credential at all.",
+    });
+  }
+
+  const cloudBase = config.cloud?.baseUrl ?? CLOUD_BASE_URL;
+  const applb = config.applb;
+  if (applb?.auth && isApplbToken(applb.auth) && applb.baseUrl.startsWith(cloudBase)) {
+    faults.push({
+      service: "app-lb",
+      summary: `app-lb is reached through cloud's managed door with an app-lb token (${redact(applb.auth)}), which that door cannot resolve`,
+      detail:
+        `app-lb is configured at ${applb.baseUrl}, which is heyo cloud's managed door, but its ` +
+        "credential is a token app-lb minted. That door forwards a `heyo_api_*` key for cloud " +
+        "to resolve into a namespace grant; it cannot resolve an app-token, so namespace " +
+        "discovery answers 401 before any deployment call is even attempted.\n\n" +
+        // Where the credential came from, when it was not named directly. With
+        // no APPLB_TOKEN the managed door borrows cloud's key, so the variable
+        // the user actually set is HEYO_API_KEY and saying only "set
+        // APPLB_TOKEN" would leave them fixing half of it.
+        (applb.auth === config.cloud?.auth
+          ? "This credential is not APPLB_TOKEN — none is set, so the managed door borrowed " +
+            "HEYO_API_KEY, which through that door is meant to be the same kind of key. " +
+            "Fixing HEYO_API_KEY therefore fixes both halves at once.\n\n"
+          : "") +
+        "Set APPLB_URL to app-lb's own admin listener and keep this token in APPLB_TOKEN — " +
+        "reached directly, app-lb scope-checks it itself. Or supply a `heyo_api_*` key and " +
+        "reach app-lb through the managed door as before.",
+    });
+  }
+
+  return faults;
+}
+
+/**
+ * What a 401 from cloud means when the key is an app-lb token.
+ *
+ * The third hint, and the one that catches what config-load cannot: a hosted
+ * instance carries no credential of its own, so the offending key can arrive on
+ * the request itself via {@link withForwardedAuth} and never pass through
+ * {@link credentialFaults} at all. Stated here so every cloud call site carries
+ * it, exactly as the two hints below are.
+ */
+export const CLOUD_KEY_HINT =
+  "The key used for this call is an app-lb token (`applb_…`), and heyo cloud has never " +
+  "heard of app-lb's tokens — this 401 is the credential being the wrong kind, not the " +
+  "wrong value, and no retry will change it. Cloud wants a `heyo_api_*` key. An " +
+  "`applb_…` token reaches app-lb directly: set APPLB_URL to app-lb's own admin listener " +
+  "with APPLB_TOKEN, or send it as the request's own Authorization header. Run " +
+  "`heyo_status` to see every credential this server holds and what each one can reach.";
+
+/**
+ * The fault report both entrypoints print at boot, or "" when there is none.
+ *
+ * Shared so the two transports cannot diverge on what counts as worth saying.
+ * stderr in both cases: on stdio, stdout is the protocol channel.
+ */
+export function faultBanner(config: Config): string {
+  const faults = credentialFaults(config);
+  if (faults.length === 0) return "";
+  return faults
+    .map((f) => `heyo-mcp: CREDENTIAL FAULT — ${f.summary}.\n${f.detail}`)
+    .join("\n\n");
 }
 
 export const CI_GATE_HINT =

@@ -14,13 +14,18 @@
  */
 
 import { z } from "zod";
+import { bool, num , DESTRUCTIVE_PREFIX } from "./schema.js";
 import type { Clients } from "../clients/index.js";
-import { json } from "../format.js";
+import { json, report, type Section } from "../format.js";
+import { ServiceError } from "../http.js";
 import type { Tool } from "./diagnose.js";
+import { cloudUsable, type Config } from "../config.js";
+import { DEPLOYMENT_SPEC_FULL, DEPLOYMENT_SPEC_SCHEMA } from "../applb/spec.schema.js";
+import { checkSpec, rulesFor, suffixRoutesWithoutCerts } from "../applb/rules.js";
 
-const DESTRUCTIVE = "DESTRUCTIVE. ";
+const DESTRUCTIVE = DESTRUCTIVE_PREFIX;
 
-export function actionTools(clients: Clients): Tool[] {
+export function actionTools(clients: Clients, config: Config): Tool[] {
   const enc = encodeURIComponent;
 
   return [
@@ -57,7 +62,19 @@ export function actionTools(clients: Clients): Tool[] {
     },
     {
       name: "applb_certs",
-      description: "TLS certificates app-lb holds, with their expiry.",
+      description:
+        "TLS certificates app-lb holds, with their hostname, issuer and expiry.\n\n" +
+        "Read-only, and there is no endpoint that requests a certificate — so this answers " +
+        "'did it arrive' and never 'please issue one'. For an exact `host` route it should: " +
+        "registering nudges ACME, issuance is HTTP-01, and certificates are chosen " +
+        "per-handshake from SNI, so one issued seconds ago serves without a restart.\n\n" +
+        "The trap: **a `host_suffix` route never gets its own certificate.** It names a " +
+        "subtree, and a subtree is covered by a fleet wildcard issued over DNS-01. A suffix " +
+        "no wildcard covers is warned about once and then served a fallback certificate that " +
+        "will not validate — which from outside is indistinguishable from TLS being broken, " +
+        "and is not something this list will show you as an error.\n\n" +
+        "Requires port 80 to reach app-lb's plaintext listener. Failures back off to a 6h " +
+        "cap, so a fixed cause is not retried quickly. See the heyo://applb/tls resource.",
       schema: {},
       handler: async () => json(await clients.applb({ path: "/certs" })),
     },
@@ -66,23 +83,331 @@ export function actionTools(clients: Clients): Tool[] {
     {
       name: "applb_create_deployment",
       description:
-        "Register a deployment from a full spec (`id`, `routes`, and one of `vm`, `upstreams` " +
-        "or `site`; optional `scaling`, `health`, `build`). Through the managed service the " +
-        "namespace is the configured one and need not be given. A POST whose `id` already " +
-        "exists REPLACES that deployment and recycles its VM pool — use applb_get_deployment " +
-        "first if unsure, and applb_scale for a scaling-only change.",
-      schema: { spec: z.record(z.unknown()).describe("the deployment spec app-lb expects") },
+        "Register a deployment from a full spec, REPLACING any deployment with the same id " +
+        "and recycling its VM pool. **Prefer applb_deploy**, which carries the spec's schema, " +
+        "checks the cross-field rules before app-lb has to, chooses between registering and " +
+        "editing, and starts the right job afterwards. This is the primitive underneath it, " +
+        "for when you want exactly a POST and nothing else.\n\n" +
+        "Through the managed service the namespace is the configured one and need not be " +
+        "given. A POST whose `id` already exists REPLACES that deployment and recycles its " +
+        "VM pool — use applb_get_deployment first if unsure, and applb_scale for a " +
+        "scaling-only change.\n\n" +
+        "What the schema cannot state, because it is a relationship between fields rather " +
+        "than a field: exactly one of `vm`, `upstreams` or `site`; `build` and `artifact` " +
+        "are mutually exclusive; `vm.workspace` forces max_replicas 1, warm_pool 0 and the " +
+        "firecracker driver. **applb_spec_schema returns every such rule**, plus the full " +
+        "detail of any block this tool summarises. TLS for an exact `host` route is " +
+        "automatic and needs no second call; a `host_suffix` route never gets its own " +
+        "certificate.",
+      // Deliberately permissive, and deliberately *not* a transcription of the
+      // schema above. app-lb accepts unknown fields — `DeploymentSpec` has no
+      // `deny_unknown_fields`, and heyctl edits specs as untyped JSON so a field
+      // it has never heard of survives the trip. A client that validated
+      // strictly here would reject specs the server would happily take, which is
+      // a worse failure than an under-described one.
+      schema: { spec: z.record(z.unknown()).describe("the deployment spec; see inputSchema") },
       handler: async (a) =>
         json(await clients.applb({ method: "POST", path: "/deployments", body: a.spec })),
+    },
+    {
+      name: "applb_spec_schema",
+      description:
+        "The deployment spec in full: every field of a named block with its complete " +
+        "documentation, plus the cross-field rules that apply to it. Read this when " +
+        "applb_create_deployment's schema summarises a block you need to write — `auth`, " +
+        "`jwt`, `mounts`, `workspace` — or when a spec was refused and the reason names a " +
+        "rule rather than a field.\n\n" +
+        "Generated from app-lb's own types, so it cannot disagree with what the server " +
+        "accepts. With no `block`, returns the list of blocks and every rule.",
+      schema: {
+        block: z
+          .string()
+          .optional()
+          .describe(
+            'a block name such as "VmSpec", "AuthGate", "JwtSpec", "MountSpec", ' +
+              '"ScalingPolicy" or "BuildSpec"; omit for the index and all rules',
+          ),
+      },
+      handler: async (a) => {
+        const defs = (DEPLOYMENT_SPEC_FULL.$defs ?? {}) as Record<string, unknown>;
+        const block = typeof a.block === "string" ? a.block.trim() : "";
+        if (!block) {
+          return json({
+            blocks: Object.keys(defs).sort(),
+            top_level: DEPLOYMENT_SPEC_FULL.properties,
+            required: DEPLOYMENT_SPEC_FULL.required,
+            rules: rulesFor().map((r) => r.rule),
+          });
+        }
+        // Case-insensitively, because a caller reading `vm.workspace` in a spec
+        // is more likely to ask for "workspace" than for "WorkspaceSpec".
+        const key =
+          Object.keys(defs).find((k) => k.toLowerCase() === block.toLowerCase()) ??
+          Object.keys(defs).find((k) => k.toLowerCase().startsWith(block.toLowerCase()));
+        if (!key) {
+          return json({
+            error: `no block named ${block}`,
+            blocks: Object.keys(defs).sort(),
+          });
+        }
+        return json({ block: key, schema: defs[key], rules: rulesFor(key).map((r) => r.rule) });
+      },
+    },
+    {
+      name: "applb_deploy",
+      description:
+        "**THE tool for 'deploy this'.** Takes a full spec and does the whole sequence: " +
+        "checks the rules a schema cannot express, registers or edits as appropriate, starts " +
+        "the job that matches the backend, waits for it, and reports what TLS will do.\n\n" +
+        "The `spec` parameter carries app-lb's own generated schema — every field, type and " +
+        "default — so a spec can be written from this tool alone. applb_spec_schema returns " +
+        "any block in full, plus the rules that constrain it.\n\n" +
+        "Three things it gets right that are easy to get wrong by hand. It uses PUT for an " +
+        "existing deployment, which **preserves the VM pool** when the `vm` block is " +
+        "unchanged, where a plain register recycles it. It picks the job by backend — " +
+        "`build` for a Dockerfile, `pull` for bytes from a store, `host_update` for a static " +
+        "deployment's own commands — where choosing wrong is refused rather than ignored. " +
+        "And it tells you when a `host_suffix` route will not get its own certificate.\n\n" +
+        "`wait_seconds` bounds the poll only; the job continues regardless and applb_job " +
+        "reports it.",
+      // The one tool carrying the spec schema. A second copy would be ~12 KB on
+      // every connect for every client, so the primitives point here instead.
+      inputSchema: {
+        type: "object",
+        properties: {
+          spec: DEPLOYMENT_SPEC_SCHEMA,
+          wait_seconds: {
+            type: "number",
+            description: "how long to poll the job before returning; default 120, 0 to skip",
+          },
+        },
+        required: ["spec"],
+      },
+      schema: {
+        spec: z.record(z.unknown()).describe("the deployment spec; see inputSchema"),
+        wait_seconds: num().optional().describe("poll the job for this long; default 120"),
+      },
+      handler: async (a) => {
+        const spec = a.spec as Record<string, unknown>;
+        const id = String(spec?.id ?? "");
+        const sections: Section[] = [];
+
+        // Locally first. app-lb would refuse these too, but its answer is a
+        // SpecError in a 400 body after a round trip; naming the rule in the
+        // caller's own vocabulary before spending that is the point of a
+        // composite.
+        const problems = checkSpec(spec);
+        if (problems.length > 0) {
+          return report(`${id || "spec"}: not sent — ${problems.length} rule(s) broken`, [
+            { title: "Rules this spec breaks", body: problems },
+            {
+              title: "Next",
+              body: "Fix these and call again. applb_spec_schema returns the full schema for " +
+                "any block, with the rules that apply to it.",
+            },
+          ]);
+        }
+        if (!id) return "The spec has no `id`, so there is nothing to register.";
+
+        // Exists or not decides POST vs PUT, and that decides whether the pool
+        // survives. A 404 here is the normal create path, not an error.
+        let exists = false;
+        let previousVm: unknown;
+        try {
+          const current = (await clients.applb({ path: `/deployments/${enc(id)}` })) as {
+            spec?: { vm?: unknown };
+            vm?: unknown;
+          };
+          exists = true;
+          previousVm = current?.spec?.vm ?? current?.vm;
+        } catch (e) {
+          if (!(e instanceof ServiceError && e.status === 404)) throw e;
+        }
+
+        const registered = await clients.applb({
+          method: exists ? "PUT" : "POST",
+          path: exists ? `/deployments/${enc(id)}` : "/deployments",
+          body: spec,
+        });
+        const vmChanged =
+          exists && JSON.stringify(previousVm ?? null) !== JSON.stringify(spec.vm ?? null);
+        sections.push({
+          title: exists ? "Edited (PUT)" : "Registered (POST)",
+          body: exists
+            ? {
+                pool: vmChanged
+                  ? "REBUILDING — the `vm` template changed, so the running VMs are replaced"
+                  : "preserved — the `vm` template is unchanged, so running VMs are untouched",
+                deployment: registered,
+              }
+            : registered,
+        });
+
+        // The job that matches the backend. Picking by what the spec contains
+        // is what makes the wrong choice unrepresentable.
+        const backend = spec.vm ? "vm" : spec.site ? "site" : "upstreams";
+        const job =
+          spec.build && backend === "vm"
+            ? { path: "build", tool: "applb_build" }
+            : spec.artifact && (backend === "vm" || backend === "site")
+              ? { path: "pull", tool: "applb_pull" }
+              : spec.update && (backend === "upstreams" || backend === "site")
+                ? { path: "update", tool: "applb_host_update" }
+                : undefined;
+
+        let jobId: string | undefined;
+        if (job) {
+          const started = (await clients.applb({
+            method: "POST",
+            path: `/deployments/${enc(id)}/${job.path}`,
+            ...(job.path === "update" ? {} : { body: {} }),
+          })) as { id?: unknown };
+          jobId = typeof started?.id === "string" ? started.id : undefined;
+          sections.push({ title: `Started ${job.tool}`, body: started });
+        } else {
+          sections.push({
+            title: "No job started",
+            body:
+              `A ${backend} deployment with no ` +
+              (backend === "upstreams" ? "`update`" : "`build` or `artifact`") +
+              " block has nothing to roll onto; app-lb serves it as registered.",
+          });
+        }
+
+        const wait = a.wait_seconds === undefined ? 120 : Number(a.wait_seconds);
+        if (jobId && wait > 0) {
+          const deadline = Date.now() + wait * 1000;
+          let last: Record<string, unknown> | undefined;
+          while (Date.now() < deadline) {
+            last = (await clients.applb({ path: `/jobs/${enc(jobId)}` })) as Record<string, unknown>;
+            const status = String(last?.status ?? "");
+            if (status && !["queued", "running", "pending"].includes(status)) break;
+            await new Promise((r) => setTimeout(r, 3000));
+          }
+          sections.push({ title: `Job ${jobId}`, body: last ?? "no status read" });
+        }
+
+        // TLS, which nothing else on the surface would have told them.
+        const suffixes = suffixRoutesWithoutCerts(spec);
+        if (suffixes.length > 0) {
+          sections.push({
+            title: "TLS warning",
+            body:
+              `These are host_suffix routes and NEVER get their own certificate: ` +
+              `${suffixes.join(", ")}. A subtree's certificate is a fleet wildcard; one no ` +
+              `wildcard covers is served a fallback that will not validate. Exact host ` +
+              `routes are issued automatically within seconds. See heyo://applb/tls.`,
+          });
+        }
+
+        sections.push({
+          title: "Next",
+          body: [
+            jobId ? `applb_job ${jobId} — the job continues whether or not this waited` : null,
+            "applb_metrics — whether replicas became healthy",
+            "applb_certs — whether app-lb holds a certificate for each exact host",
+            "deployment_logs — what the application itself said",
+          ].filter(Boolean),
+        });
+
+        return report(`${id}: ${exists ? "edited" : "registered"}`, sections);
+      },
+    },
+    {
+      name: "applb_drain_upstream",
+      description:
+        DESTRUCTIVE +
+        "Take one upstream of a STATIC (`upstreams`) deployment out of rotation. In-flight " +
+        "requests finish; no new ones are routed to it.\n\n" +
+        "For taking a backend out to work on it without editing the spec — an edit would have " +
+        "to be undone, and forgetting to undo it is how an upstream stays missing. " +
+        "applb_uncordon_upstream puts it back. The upstream is named exactly as it appears in " +
+        "the spec, `host:port`.",
+      schema: {
+        id: z.string(),
+        upstream: z.string().describe("`host:port`, exactly as the spec spells it"),
+      },
+      handler: async (a) =>
+        json(
+          await clients.applb({
+            method: "PUT",
+            path: `/deployments/${enc(String(a.id))}/upstreams/${enc(String(a.upstream))}/drain`,
+          }),
+        ),
+    },
+    {
+      name: "applb_uncordon_upstream",
+      description:
+        "Put a drained upstream back into rotation. The inverse of applb_drain_upstream; it " +
+        "starts taking traffic again once it passes its health check.",
+      schema: {
+        id: z.string(),
+        upstream: z.string().describe("`host:port`, exactly as the spec spells it"),
+      },
+      handler: async (a) =>
+        json(
+          await clients.applb({
+            method: "DELETE",
+            path: `/deployments/${enc(String(a.id))}/upstreams/${enc(String(a.upstream))}/drain`,
+          }),
+        ),
+    },
+    {
+      name: "applb_update_deployment",
+      description:
+        "Edit an existing deployment in place, replacing its whole spec.\n\n" +
+        "**The distinction that matters: this PRESERVES the VM pool when the `vm` block is " +
+        "unchanged.** A scaling, route, health or auth edit never disturbs running VMs; only " +
+        "a change to `vm` reboots them, because the existing machines were built from the old " +
+        "template. applb_create_deployment re-registers and recycles the pool regardless, so " +
+        "for an edit this is the tool and that one is not.\n\n" +
+        "The whole spec is replaced, not merged — read applb_get_deployment first and send it " +
+        "back changed. The path id wins, so the body cannot retarget another deployment. The " +
+        "spec's schema is on applb_create_deployment; applb_spec_schema has it in full.",
+      schema: {
+        id: z.string(),
+        spec: z
+          .record(z.unknown())
+          .describe(
+            "the complete replacement spec — see applb_create_deployment's schema, or " +
+              "applb_spec_schema for any block in full",
+          ),
+      },
+      handler: async (a) =>
+        json(
+          await clients.applb({
+            method: "PUT",
+            path: `/deployments/${enc(String(a.id))}`,
+            body: a.spec,
+          }),
+        ),
     },
     {
       name: "applb_scale",
       description:
         "Change a deployment's scaling parameters. Takes effect on the next reconcile; " +
-        "scaling to zero lets the pool drain, which is not instant.",
+        "scaling to zero lets the pool drain, which is not instant.\n\n" +
+        "A PARTIAL policy: only the fields you send are changed and the rest are kept, so " +
+        "`{min_replicas: 2}` does not reset the timeouts it does not mention. Never touches " +
+        "the VM template, so the pool is always preserved — which is why this is the tool for " +
+        "a scaling-only change rather than applb_update_deployment.",
+      // The generated `ScalingPolicy`, straight from app-lb's own type. Every
+      // field defaults there, so it has no `required` and is already the right
+      // shape for a patch body.
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          scaling: {
+            ...(DEPLOYMENT_SPEC_SCHEMA.$defs as Record<string, object>).ScalingPolicy,
+            description: "the fields to change; anything omitted is left as it is",
+          },
+        },
+        required: ["id", "scaling"],
+      },
       schema: {
         id: z.string(),
-        scaling: z.record(z.unknown()).describe("the PATCH body app-lb expects"),
+        scaling: z.record(z.unknown()).describe("the fields to change; see inputSchema"),
       },
       handler: async (a) =>
         json(
@@ -94,32 +419,118 @@ export function actionTools(clients: Clients): Tool[] {
         ),
     },
     {
-      name: "applb_start_build",
-      description: "Start a build for a deployment. Returns a job; poll applb_deployment_jobs.",
-      schema: { id: z.string(), body: z.record(z.unknown()).optional() },
+      name: "applb_build",
+      description:
+        "Build a managed (`vm`) deployment's image from its `build` block and roll the pool " +
+        "onto it. Returns a job immediately; poll applb_job with the id it returns.\n\n" +
+        "The recipe is the deployment's own `build` block — a git checkout or a Dockerfile " +
+        "manifest in a store — not this call. `ref` overrides the version for THIS build only " +
+        "and does not become the deployment's default, which is what a hotfix build looks " +
+        "like. It is checked against whichever source the spec names, so a git ref given to a " +
+        "store-backed deployment is refused here rather than minutes into a build.\n\n" +
+        "For a deployment whose image comes from an artifact store rather than a Dockerfile, " +
+        "the tool is applb_pull. For a static or site deployment, applb_host_update.",
+      schema: {
+        id: z.string(),
+        git_ref: z
+          .string()
+          .optional()
+          .describe("branch, commit, tag or digest to build instead of the spec's; one-off"),
+      },
       handler: async (a) =>
         json(
           await clients.applb({
             method: "POST",
             path: `/deployments/${enc(String(a.id))}/build`,
-            body: a.body ?? {},
+            body: a.git_ref === undefined ? {} : { ref: a.git_ref },
           }),
         ),
     },
     {
-      name: "applb_start_update",
+      name: "applb_pull",
       description:
-        "Start an update for a deployment — this rolls its VMs. Not destructive of data, but " +
-        "it does replace running machines.",
-      schema: { id: z.string(), body: z.record(z.unknown()).optional() },
+        "Materialize a `vm` or `site` deployment's bytes from an artifact store and roll it " +
+        "onto them. Returns a job; poll applb_job.\n\n" +
+        "**This is what rolls a managed deployment onto a new image**, and the usual next " +
+        "step after art_publish. It reads the deployment's `artifact` block; `ref` overrides " +
+        "the reference for this pull only and does not become the default, so " +
+        "`{ref: \"<digest>\"}` is what a rollback to known bytes looks like.\n\n" +
+        "`force` re-fetches something already on disk. Rarely wanted — the filename IS the " +
+        "digest, so the file being there is proof the bytes are right — and it exists for a " +
+        "file damaged after it was written.\n\n" +
+        "Does not apply to a static (`upstreams`) deployment, which has no image; that is " +
+        "applb_host_update. A deployment whose image comes from a Dockerfile wants applb_build.",
+      schema: {
+        id: z.string(),
+        artifact_ref: z
+          .string()
+          .optional()
+          .describe("tag or digest to pull instead of the spec's; one-off, not stored"),
+        force: bool().optional().describe("re-fetch even when the image is already on disk"),
+      },
+      handler: async (a) =>
+        json(
+          await clients.applb({
+            method: "POST",
+            path: `/deployments/${enc(String(a.id))}/pull`,
+            body: {
+              ...(a.artifact_ref === undefined ? {} : { ref: a.artifact_ref }),
+              ...(a.force === undefined ? {} : { force: a.force }),
+            },
+          }),
+        ),
+    },
+    {
+      name: "applb_pull_mounts",
+      description:
+        "Re-unpack the guest mounts a `vm` deployment declares, from their artifact stores. " +
+        "Returns a job; poll applb_job, whose `mounts` array reports each tree separately.\n\n" +
+        "Registration already starts this automatically, so this is for re-fetching after a " +
+        "mount's tag moved. `force` re-fetches trees already on this host, which is rarely " +
+        "wanted for the same reason a pull's `force` is.",
+      schema: {
+        id: z.string(),
+        force: bool().optional().describe("re-fetch trees already present on the host"),
+      },
+      handler: async (a) =>
+        json(
+          await clients.applb({
+            method: "POST",
+            path: `/deployments/${enc(String(a.id))}/mounts/pull`,
+            body: a.force === undefined ? {} : { force: a.force },
+          }),
+        ),
+    },
+    {
+      name: "applb_host_update",
+      description:
+        "Run a STATIC (`upstreams`) or `site` deployment's own `update.commands` on the app-lb " +
+        "host, then re-probe its upstreams. Returns a job; poll applb_job.\n\n" +
+        "**It does not roll VMs, and a managed (`vm`) deployment is refused.** The commands run " +
+        "on this host in `update.working_dir` — `git pull && cargo build && systemctl restart` " +
+        "is the shape — so what moves is the code answering on upstreams that do not change. " +
+        "A deployment with no `update` block has nothing to run and is refused too.\n\n" +
+        "For a managed deployment the tool you want is applb_pull (new bytes from a store) or " +
+        "applb_build (a new image from a Dockerfile). This tool was previously named " +
+        "applb_start_update and described as rolling VMs, which it has never done.",
+      schema: { id: z.string() },
       handler: async (a) =>
         json(
           await clients.applb({
             method: "POST",
             path: `/deployments/${enc(String(a.id))}/update`,
-            body: a.body ?? {},
           }),
         ),
+    },
+    {
+      name: "applb_job",
+      description:
+        "One job by its id — what applb_build, applb_pull, applb_pull_mounts and " +
+        "applb_host_update each return. THE call to make after starting any of them: they " +
+        "answer as soon as the work is scheduled, not when it is done.\n\n" +
+        "For every job on one deployment rather than one job by id, use applb_deployment_jobs.",
+      schema: { job_id: z.string() },
+      handler: async (a) => json(await clients.applb({ path: `/jobs/${enc(String(a.job_id))}` })),
     },
     {
       name: "applb_deployment_jobs",
@@ -174,7 +585,13 @@ export function actionTools(clients: Clients): Tool[] {
     },
     {
       name: "applb_sweep_disks",
-      description: "Reclaims space by sweeping disks app-lb considers reclaimable.",
+      description:
+        DESTRUCTIVE +
+        "Runs the disk expiry sweep now instead of waiting for the next tick, deleting every " +
+        "disk past its TTL. Its two siblings — applb_purge_disk and applb_purge_orphan_disks " +
+        "— were marked destructive and this was not, although it deletes gigabytes by the " +
+        "same mechanism and with no undo. Holds are respected: a claimed or retained disk is " +
+        "skipped and counted.",
       schema: {},
       handler: async () => json(await clients.applb({ method: "POST", path: "/disks/sweep" })),
     },
@@ -186,13 +603,43 @@ export function actionTools(clients: Clients): Tool[] {
         "execution on a production VM — the same power as a shell. Useful for reading a guest " +
         "file nothing exports, notably /var/log/heyvm-start.log when a start_command fails and " +
         "app-obs has nothing.",
-      schema: { id: z.string(), body: z.record(z.unknown()).describe("app-lb's exec body") },
+      // Flattened out of a `body` blob, which mattered more here than anywhere
+      // else on this server: this is arbitrary code execution on a production
+      // VM, and while the command lived inside an untyped object it was
+      // invisible in the schema, in the transcript, and in whatever approval
+      // prompt a host renders from the schema — which showed a parameter named
+      // `body` of type `object`. What is about to be run should be readable
+      // before it is approved. The shape also now matches sandbox_exec.
+      schema: {
+        id: z.string(),
+        command: z.string().describe("run through `sh -c` in the guest"),
+        cwd: z.string().optional(),
+        env: z.record(z.string()).optional(),
+        timeout_secs: num().optional(),
+        wake: bool()
+          .optional()
+          .describe(
+            "boot or resume a VM if none is running; default true. false asks for a 409 " +
+              "instead of waiting",
+          ),
+        sandbox_id: z
+          .string()
+          .optional()
+          .describe("run in THIS VM of the pool rather than whichever is offered"),
+      },
       handler: async (a) =>
         json(
           await clients.applb({
             method: "POST",
             path: `/deployments/${enc(String(a.id))}/exec`,
-            body: a.body,
+            body: {
+              command: a.command,
+              ...(a.cwd === undefined ? {} : { cwd: a.cwd }),
+              ...(a.env === undefined ? {} : { env: a.env }),
+              ...(a.timeout_secs === undefined ? {} : { timeout_secs: a.timeout_secs }),
+              ...(a.wake === undefined ? {} : { wake: a.wake }),
+              ...(a.sandbox_id === undefined ? {} : { sandbox_id: a.sandbox_id }),
+            },
           }),
         ),
     },
@@ -234,8 +681,8 @@ export function actionTools(clients: Clients): Tool[] {
       schema: {
         run_id: z.string(),
         job: z.string().optional().describe("one job by key; default every job"),
-        tail: z.number().optional().describe("bytes per step from the end; default 16384"),
-        failed_only: z.boolean().optional().describe("only steps that did not succeed"),
+        tail: num().optional().describe("bytes per step from the end; default 16384"),
+        failed_only: bool().optional().describe("only steps that did not succeed"),
       },
       handler: async (a) =>
         json(
@@ -279,7 +726,14 @@ export function actionTools(clients: Clients): Tool[] {
     // ---- raw, for everything not named above ---------------------------
     ...(
       [
-        { key: "cloud", tool: "heyo_request", label: "heyo cloud" },
+        // Gated with the sandbox tools it shares a credential with. It was
+        // listed unconditionally while targeting cloud, so on a
+        // fleet-operations instance it advertised a door that could only ever
+        // answer `NotConfigured` — the same thing `buildTools` withholds the
+        // sandbox tools to avoid.
+        ...(cloudUsable(config)
+          ? ([{ key: "cloud", tool: "heyo_request", label: "heyo cloud" }] as const)
+          : []),
         { key: "applb", tool: "applb_request", label: "app-lb" },
         { key: "obs", tool: "obs_request", label: "app-obs" },
         { key: "ci", tool: "ci_request", label: "ci" },
@@ -291,7 +745,17 @@ export function actionTools(clients: Clients): Tool[] {
         "surface, including methods that destroy things — prefer a named tool when one " +
         "exists, because this one's intent is invisible until the arguments are read.",
       schema: {
-        method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
+        // Upper-cased before the enum sees it. Until arguments were parsed a
+        // lowercase `get` reached `fetch` and worked, so validating the enum
+        // alone would start refusing calls that have always been fine — for a
+        // difference no HTTP server cares about. `preprocess` rather than
+        // `.transform`, which runs *after* the check it would need to help.
+        method: z
+          .preprocess(
+            (v) => (typeof v === "string" ? v.toUpperCase() : v),
+            z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+          )
+          .default("GET"),
         path: z.string().describe("path beginning with '/'"),
         query: z.record(z.string()).optional(),
         body: z.unknown().optional(),
@@ -299,7 +763,7 @@ export function actionTools(clients: Clients): Tool[] {
       handler: async (a: Record<string, unknown>) =>
         json(
           await clients[key]({
-            method: (a.method as string) ?? "GET",
+            method: a.method as string,
             path: String(a.path),
             query: a.query as Record<string, string> | undefined,
             body: a.body,

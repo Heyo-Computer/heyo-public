@@ -9,15 +9,34 @@
  */
 
 import { z } from "zod";
+import { num } from "./schema.js";
 import type { Clients } from "../clients/index.js";
 import { settle } from "../clients/index.js";
-import { report, section, json } from "../format.js";
-import { configured, type Config } from "../config.js";
+import { report, section, json, type Section } from "../format.js";
+import { configured, credentialFaults, type Config } from "../config.js";
 
 export interface Tool {
   name: string;
   description: string;
   schema: z.ZodRawShape;
+  /**
+   * A pre-built JSON Schema to advertise instead of converting `schema`.
+   *
+   * For an input whose real shape is defined somewhere other than here. The
+   * deployment spec is the case: it is app-lb's, it is generated from app-lb's
+   * own types, and every attempt to restate it in a client's own vocabulary has
+   * drifted — the TypeScript SDK still lists a driver the server rejects and
+   * omits a field it accepts. Handing the generated schema through untouched is
+   * the only version of this that cannot go stale.
+   *
+   * `schema` is still required and still what validates: it stays deliberately
+   * permissive for such an input, because app-lb accepts unknown fields and a
+   * client that refused them would reject specs the server would take. So the
+   * two describe the same input at different resolutions — this one teaches,
+   * `schema` admits — and they must agree on the top-level keys, which
+   * `listing.test.ts` checks.
+   */
+  inputSchema?: Record<string, unknown>;
   handler: (args: Record<string, unknown>) => Promise<string>;
 }
 
@@ -46,12 +65,33 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
           // thing that actually fails. `/usage` goes through both doors.
           art: clients.art({ path: "/usage" }),
         });
+        // Above every probe, because a credential that cannot work explains
+        // all of them at once. Without it the reader has to infer one cause
+        // from five separate 401s, which is the inference that sent a customer
+        // into our source.
+        const faults = credentialFaults(config).map(
+          (f): Section => ({
+            title: `${f.service} — CREDENTIAL FAULT`,
+            body: null,
+            error: `${f.summary}.\n\n${f.detail}`,
+          }),
+        );
         return report(`Configured: ${configured(config).join(", ") || "nothing"}`, [
-          section("heyo cloud /me/daemons — reachable, and the key is good", r.cloud),
+          ...faults,
+          section(
+            "heyo cloud /me/daemons — reachable, and the key is good",
+            r.cloud,
+            "heyo cloud /me/daemons — FAILED. This is where a bad HEYO_API_KEY shows up.",
+          ),
           section("app-lb /metrics", r.applb),
           section("app-obs /healthz", r.obs),
           section("ci /healthz", r.ci),
-          section("artifacts /usage — passes the gate AND the store's own key", r.art),
+          section(
+            "artifacts /usage — passes the gate AND the store's own key",
+            r.art,
+            "artifacts /usage — FAILED at the gate or at the store's own key; " +
+              "the Configured line above says which credential is missing.",
+          ),
         ]);
       },
     },
@@ -161,7 +201,7 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         level: z.string().optional().describe("e.g. 'error', 'warn'"),
         backend: z.string().optional().describe("restrict to one backend/sandbox"),
         q: z.string().optional().describe("substring match on the message"),
-        limit: z.number().optional().describe("default 100"),
+        limit: num().optional().describe("default 100"),
         before: z.string().optional().describe("cursor from a previous page"),
       },
       handler: async (args) => {

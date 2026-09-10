@@ -320,7 +320,7 @@ impl LbConfig {
 /// A rule matches when *every* populated field matches. An empty rule matches
 /// nothing (rejected at registration) rather than everything, so a typo can't
 /// silently swallow all traffic.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct RouteRule {
     /// Exact hostname match, case-insensitive, port stripped. For HTTP/2 this
     /// is matched against `:authority`, which carries no `Host` header.
@@ -448,7 +448,7 @@ fn default_boot_timeout_secs() -> u64 {
 /// suspend rather than parking a gigabyte per idle replica. A `Retain`
 /// deployment with no data disk therefore saves boot time and nothing else.
 /// Persistent state has to live under `/workspace`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum IdleAction {
     /// Kill it: the sandbox, its data disk and its rootfs all go. The default,
@@ -472,7 +472,7 @@ pub enum IdleAction {
 /// one still *deserializes* and is then refused by
 /// [`DeploymentSpec::validate`] with an explanation. Dropping the variants
 /// would turn a good error message into an opaque serde failure.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Driver {
     #[default]
@@ -582,10 +582,15 @@ impl Default for LxcConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ScalingPolicy {
+    /// Replicas kept running even with no traffic. Defaults to 0, which lets
+    /// the pool scale to zero and makes the next request pay a cold start.
     #[serde(default)]
     pub min_replicas: u32,
+    /// Ceiling on replicas the autoscaler may run. Defaults to 5. Must be 1
+    /// when [`VmSpec::workspace`] is set — a single-writer workspace cannot
+    /// have two replicas capturing divergent copies of it.
     #[serde(default = "default_max_replicas")]
     pub max_replicas: u32,
     /// Idle-but-ready spares kept above what current load requires.
@@ -594,6 +599,9 @@ pub struct ScalingPolicy {
     /// In-flight requests per VM the autoscaler aims for.
     #[serde(default = "default_target_concurrency")]
     pub target_concurrency: u32,
+    /// Idle seconds before a pool with `min_replicas: 0` and no warm pool is
+    /// torn down entirely. Defaults to 300; `0` means the pool tears down on
+    /// the first idle tick.
     #[serde(default = "default_scale_to_zero_after_secs")]
     pub scale_to_zero_after_secs: u64,
     /// How long a request will wait for a VM to boot before giving up with 503.
@@ -654,7 +662,7 @@ fn default_health_timeout_secs() -> u64 {
 ///
 /// This exists because the SDK's readiness signal is not trustworthy on its own
 /// (see `vm::wait_until_running`), so we always probe the guest ourselves.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HealthCheck {
     /// `None` means a bare TCP connect is enough.
     #[serde(default = "default_health_path")]
@@ -662,6 +670,8 @@ pub struct HealthCheck {
     /// Health port, if the guest serves health somewhere other than `port`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// How long a single probe may take before it counts as a failure.
+    /// Defaults to 2.
     #[serde(default = "default_health_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -676,6 +686,25 @@ impl Default for HealthCheck {
     }
 }
 
+/// `heyo_sdk::SandboxSize`, mirrored for schema generation only.
+///
+/// The real type is in another crate and cannot carry a derive from this one.
+/// A mirror is the drift risk this whole generator exists to remove, so it is
+/// kept to the one thing that cannot be avoided — six unit variants — and the
+/// crate that owns them is named here so a version bump has somewhere to look.
+/// Nothing deserializes through it; it exists to be pointed at by `schemars(with)`.
+#[derive(schemars::JsonSchema)]
+#[schemars(rename = "SandboxSize", rename_all = "lowercase")]
+#[allow(dead_code)]
+enum SandboxSizeSchema {
+    Micro,
+    Mini,
+    Small,
+    Medium,
+    Large,
+    Xlarge,
+}
+
 /// The VM template. Mirrors `SandboxCreateOptions`, minus the fields the LB owns
 /// (`name` is generated per-replica; `wait_for_ready` is always zero because the
 /// autoscaler polls readiness itself rather than blocking its reconcile loop).
@@ -687,7 +716,7 @@ impl Default for HealthCheck {
 /// `PartialEq` is load-bearing: an in-place edit keeps the running pool only
 /// when the VM *template* is unchanged, so the update path compares old and new
 /// `VmSpec`s to decide whether the VMs must be rebuilt.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct VmSpec {
     /// `firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system
     /// container from an OCI image). `libvirt` and `firecracker_containerd`
@@ -698,18 +727,52 @@ pub struct VmSpec {
     pub image: Option<String>,
     /// The guest port traffic is proxied to.
     pub port: u16,
+    /// Shell command that starts the workload, run once per replica after boot.
+    ///
+    /// It must *return*: the daemon runs it and waits, so a command that blocks
+    /// in the foreground is a VM that never finishes booting. Daemonize
+    /// explicitly — every example here spells it
+    /// `setsid nohup <program> </dev/null >/var/log/<name>.log 2>&1 &`. Its
+    /// output goes to `/var/log/heyvm-start.log` *inside the guest*, so it lives
+    /// and dies with the boot; read it with `applb_exec`, not app-obs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_command: Option<String>,
+    /// CPU and memory, as one of the daemon's named classes.
+    ///
+    /// The only resource knob the SDK has — vcpu and memory cannot be set
+    /// directly — and the daemon resolves it host-side. Unset takes the
+    /// daemon's default. On `lxc` the host mapping runs micro (1 CPU, 512 MiB)
+    /// through xlarge (8 CPU, 16 GiB), and unset there means `small`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<SandboxSizeSchema>")]
     pub size_class: Option<SandboxSize>,
+    /// Size of the replica's persistent data disk, mounted at `/workspace`.
+    ///
+    /// Separate from the rootfs, which is fixed when the image is built and
+    /// cannot be grown afterwards — so this is not the knob for "the image ran
+    /// out of space". The disk belongs to one sandbox: a rollout, a restart or
+    /// any `vm` edit boots a replica with a fresh one, and only
+    /// [`WorkspaceSpec`] carries contents across.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_size_gb: Option<u32>,
+    /// Directory `start_command` runs in. Defaults to the guest's own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    /// Plain environment variables for every replica.
+    ///
+    /// Stored in the spec as written, so they are readable from
+    /// `GET /deployments` and from the state file on disk. Anything secret
+    /// belongs in [`env_from`](Self::env_from), which resolves from the secret
+    /// store at create time and keeps the value out of both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_vars: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_hooks: Option<Vec<String>>,
+    /// Guest ports to open *in addition to* [`port`](Self::port), which is
+    /// added automatically.
+    ///
+    /// For a service reached on more than the one port the proxy forwards to —
+    /// a broker with a client port beside its monitoring port, say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_ports: Vec<u16>,
     /// Directories handed to every replica, unpacked from tarballs in an
@@ -774,7 +837,7 @@ fn default_vm_ttl_secs() -> u64 {
 /// actually fetches (`POST /sandbox-deploy` with `s3_archive_key`). app-lb
 /// refuses a spec that reaches it with the id alone rather than guessing at
 /// a key — a wrong guess would boot a replica with someone else's files.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct WorkspaceArchive {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_id: Option<String>,
@@ -876,7 +939,7 @@ const RESERVED_MOUNT_PATHS: [&str; 6] = ["/proc", "/sys", "/dev", "/boot", "/run
 ///
 /// One is started automatically when a deployment with mounts is registered or
 /// edited, so the usual path is: `POST /deployments` → a pull job → a pool.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MountSpec {
     /// Where the tree appears inside the guest: an absolute path, created if it
     /// does not exist.
@@ -1049,7 +1112,7 @@ pub const DEFAULT_WORKSPACE_PATH: &str = "/workspace";
 /// workload that runs as root reads and writes them regardless; one that
 /// checks ownership (git's `safe.directory`, Postgres's data-directory check)
 /// needs to be told. Modes, symlinks and timestamps survive.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct WorkspaceSpec {
     /// Where the workspace appears inside the guest. Defaults to
     /// [`DEFAULT_WORKSPACE_PATH`], which is also the only path heyvmd sizes from
@@ -1326,7 +1389,7 @@ pub fn is_sha256_hex(s: &str) -> bool {
 /// an ext4 rootfs on this host, built from a Dockerfile the daemon never sees, and
 /// `heyvm mvm build` exposes neither `--build-arg` nor a push target for the
 /// local-only path.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct BuildSpec {
     /// Git remote: `https://…`, `ssh://…`, `git@host:path`, or a local path.
     /// Mutually exclusive with `store`; exactly one must be set.
@@ -1571,7 +1634,7 @@ fn is_supported_store(store: &str) -> bool {
 /// base images in, `art put dist.tgz --tag <name>` puts a site bundle in,
 /// `heyctl artifact push` puts a locally-built rootfs in, and any of them is
 /// pullable here.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ArtifactSpec {
     /// The store to pull from, in one of two forms:
     ///
@@ -1819,7 +1882,7 @@ fn is_safe_relative_path(p: &str) -> bool {
 /// addresses; what moved is the code answering on them. That is why the job
 /// re-probes those addresses afterwards: "the commands exited 0" is not the same
 /// claim as "the service is serving".
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct UpdateSpec {
     /// Absolute path on the app-lb host. Must exist when the job runs — app-lb
     /// never creates it, because a typo that silently created an empty directory
@@ -1901,7 +1964,7 @@ impl UpdateSpec {
 }
 
 /// One secret value, exported to the update commands as an environment variable.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SecretEnv {
     pub secret: String,
     #[serde(default = "default_env_secret_key")]
@@ -1971,7 +2034,7 @@ impl SecretEnv {
 /// The client *secret* is a [`SecretRef`], not a value, for the same reason a
 /// build's git token is: the admin API echoes specs back and the state file
 /// holds them in the clear.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AuthGate {
     /// Which credentials get past the gate. A bare string for one
     /// (`"provider": "google"`) or a list for several
@@ -2157,7 +2220,7 @@ pub const MAX_JWT_LEEWAY_SECS: u64 = 300;
 /// itself: it is still in the `Authorization` header the request arrived with,
 /// signed, and the app already trusts the issuer or it would not be behind this
 /// gate. Copying claims into headers would only give it a second, weaker copy.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct JwtSpec {
     /// The HMAC shared secret, as a reference into the secret store. For the
     /// `HS*` algorithms, and the shape the Heyo auth API uses (`JWT_SECRET`).
@@ -2457,7 +2520,7 @@ fn is_valid_cookie_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthProvider {
     /// Google sign-in: an OAuth redirect, a session cookie, an allow-list of
@@ -2533,6 +2596,26 @@ impl<'de> Deserialize<'de> for Providers {
             OneOrMany::One(p) => Self(vec![p]),
             OneOrMany::Many(v) => Self(v),
         })
+    }
+}
+
+/// Hand-written for the same reason `Serialize` above is: the wire form is a
+/// union this type's fields do not describe. A derive would emit the schema of
+/// a one-field tuple struct, which is a shape no spec has ever contained.
+impl schemars::JsonSchema for Providers {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Providers".into()
+    }
+
+    fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let one = g.subschema_for::<AuthProvider>().to_value();
+        schemars::Schema::try_from(serde_json::json!({
+            "description": "One provider, or several. A single provider is written as a bare \
+                            string so a gate authored before app-tokens existed round-trips \
+                            unchanged.",
+            "anyOf": [one, { "type": "array", "items": one }],
+        }))
+        .expect("a hand-written schema is an object")
     }
 }
 
@@ -2875,8 +2958,10 @@ impl AuthGate {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct DeploymentSpec {
+    /// Unique name for this deployment, and its handle in every other call.
+    /// Registering an id that already exists REPLACES that deployment.
     pub id: String,
     /// The namespace this deployment belongs to. Namespaces segregate use: a
     /// token minted for a namespace reaches only the deployments in it, and the
@@ -2896,14 +2981,24 @@ pub struct DeploymentSpec {
     pub account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+    /// Which requests reach this deployment, most specific rule winning.
+    ///
+    /// May be empty only for a `vm` deployment, which is then reachable by exec
+    /// and shell but takes no HTTP traffic. A static deployment and a site are
+    /// reachable only through the proxy, so both need at least one.
     pub routes: Vec<RouteRule>,
     /// The VM template for a *managed* deployment: app-lb boots and autoscales a
     /// pool of microVMs. Mutually exclusive with `upstreams`; exactly one of the
     /// two must be set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<VmSpec>,
+    /// How many replicas run and when. Every field defaults, so the whole block
+    /// may be omitted; it applies to a `vm` deployment (a static deployment's
+    /// upstreams and a site's files are not app-lb's to scale).
     #[serde(default)]
     pub scaling: ScalingPolicy,
+    /// How app-lb decides a replica is ready to take traffic. Defaults to an
+    /// HTTP GET of `/` on the deployment's own port.
     #[serde(default)]
     pub health: HealthCheck,
     /// A *static* (proxy_pass) deployment: forward matched requests to a fixed
@@ -2980,7 +3075,7 @@ pub struct DeploymentSpec {
 ///
 /// Not part of [`VmSpec`], so toggling it edits nothing about the VMs and
 /// never recycles the pool.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct IngressSpec {
     /// Ask the Heyo cloud for a URL, and keep the pool bound behind it.
     #[serde(default)]
@@ -2998,7 +3093,7 @@ impl IngressSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct DiscoverySpec {
     pub service_id: String,
 }
@@ -3020,7 +3115,7 @@ fn is_default_namespace(ns: &String) -> bool {
 /// The three lower tiers mirror [`crate::tokens::AdminScope`] exactly, because
 /// they are the same scopes an app-token carries; `Public` is the extra one,
 /// and it is the only value that admits a request presenting nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum PathScope {
     /// No credential at all. For a path whose upstream authorizes it, or one
@@ -3115,6 +3210,34 @@ impl<'de> Deserialize<'de> for PublicPath {
     }
 }
 
+/// Hand-written: the wire form is `string | {path, scope}`, and the bare
+/// spelling is the *closed* one. Worth stating in the schema itself, because a
+/// reader who assumes a bare path is public has it exactly backwards.
+impl schemars::JsonSchema for PublicPath {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PublicPath".into()
+    }
+
+    fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let scope = g.subschema_for::<PathScope>().to_value();
+        schemars::Schema::try_from(serde_json::json!({
+            "description": "A path exempted from the gate, as either a bare string or an \
+                            object. A BARE STRING MEANS scope \"admin\" — the most closed \
+                            scope, not the most open one — so an entry written as a plain \
+                            path is reachable only by an admin credential.",
+            "anyOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" }, "scope": scope },
+                    "required": ["path"],
+                },
+            ],
+        }))
+        .expect("a hand-written schema is an object")
+    }
+}
+
 /// A namespace name a spec or a token may carry: the same alphabet as a
 /// deployment id, so it can appear in a URL path and a filename unescaped.
 ///
@@ -3140,7 +3263,7 @@ pub fn is_valid_namespace(ns: &str) -> bool {
 /// a default did. The three switches are independent — a deployment can
 /// announce itself without reporting issues, report issues without announcing,
 /// or neither and only `expose` the feed for the rest of its namespace.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FeedSpec {
     /// Publish this deployment's lifecycle — registered, updated, removed — to
     /// the namespace feed.
@@ -3198,7 +3321,7 @@ pub enum Backend {
 ///
 /// Deliberately not configurable: rewrites, redirects, per-location blocks. A
 /// site that needs those wants a real server behind a `proxy_pass` deployment.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SiteSpec {
     /// Absolute path to the directory to serve. Nothing outside it is ever
     /// served, symlinks included — see `site::resolve`.
@@ -3601,7 +3724,7 @@ impl std::fmt::Display for SpecError {
             Self::EmptyRoute => {
                 write!(
                     f,
-                    "a route must set at least one of `host` or `path_prefix`"
+                    "a route must set at least one of `host`, `host_suffix` or `path_prefix`"
                 )
             }
             Self::StripPrefixWithoutPath => write!(
@@ -7317,6 +7440,262 @@ mod tests {
             // force rather than what somebody happened to type.
             assert_eq!(with["jwt"]["email_claim"], "email");
             assert!(with["jwt"].get("require").is_none(), "an empty require is not written");
+        }
+    }
+
+    /// The generated JSON Schema for `DeploymentSpec`, as a checked-in file.
+    ///
+    /// Written from the types themselves rather than transcribed, because
+    /// transcription is what went wrong every previous time: the TypeScript SDK
+    /// omits `ingress` and still lists `libvirt` as a driver, and `heyctl`'s
+    /// mirror lost five fields without a test failing. A generated artifact
+    /// cannot drift from its source — it can only be *stale*, which is a diff,
+    /// which is a failing test.
+    ///
+    /// Regenerate with `UPDATE_GOLDEN=1 cargo test --bins schema_golden`, and
+    /// read the diff: a changed schema is a changed API, and something
+    /// downstream is now describing a shape that no longer exists.
+    mod schema_golden {
+        use super::*;
+        use std::path::PathBuf;
+
+        fn schema_path() -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("schema").join("deployment-spec.json")
+        }
+
+        #[test]
+        fn the_checked_in_schema_matches_the_types() {
+            let schema = schemars::schema_for!(DeploymentSpec);
+            let rendered = format!(
+                "{}\n",
+                serde_json::to_string_pretty(&schema).expect("a schema serializes")
+            );
+            let path = schema_path();
+
+            if std::env::var("UPDATE_GOLDEN").is_ok() {
+                std::fs::create_dir_all(path.parent().expect("schema/ has a parent"))
+                    .expect("create schema dir");
+                std::fs::write(&path, &rendered).expect("write schema");
+                return;
+            }
+
+            let current = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{}: {e}\nrun `UPDATE_GOLDEN=1 cargo test --bins schema_golden`",
+                    path.display()
+                )
+            });
+            // Deliberately not `assert_eq!`: these are 70 KB documents, and
+            // printing both of them buries the one line that matters under a
+            // screenful nobody reads. Name what moved instead, and leave the
+            // diff to git — which is where the reviewer is going to read it.
+            if current != rendered {
+                let (old, new) = (parse_defs(&current), parse_defs(&rendered));
+                let added: Vec<_> = new.iter().filter(|k| !old.contains(*k)).collect();
+                let removed: Vec<_> = old.iter().filter(|k| !new.contains(*k)).collect();
+                panic!(
+                    "the checked-in schema is stale — every client that reads it is now \
+                     describing the wrong shape.\n\
+                     types added: {added:?}\n\
+                     types removed: {removed:?}\n\
+                     (an empty pair here means a field or a doc comment moved, not a type)\n\
+                     Regenerate with `UPDATE_GOLDEN=1 cargo test --bins schema_golden` \
+                     and read the diff.",
+                );
+            }
+        }
+
+        #[test]
+        fn the_schema_is_no_stricter_than_the_server() {
+            // `DeploymentSpec` carries no `deny_unknown_fields`, and heyctl
+            // deliberately edits specs as untyped JSON so a field it has never
+            // heard of survives the trip. A schema that forbade unknown keys
+            // would make every future field an error in clients that are
+            // merely out of date — turning drift from "under-documented" into
+            // "valid spec rejected", which is the worse failure by far.
+            let schema = serde_json::to_value(schemars::schema_for!(DeploymentSpec))
+                .expect("a schema serializes");
+            let mut closed = Vec::new();
+            find_closed(&schema, String::from("#"), &mut closed);
+            assert!(closed.is_empty(), "these object schemas forbid unknown keys: {closed:?}");
+        }
+
+        /// The names of the types a rendered schema defines, for a failure
+        /// message that says what changed rather than printing both documents.
+        fn parse_defs(text: &str) -> Vec<String> {
+            serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .and_then(|v| v.get("$defs").and_then(|d| d.as_object()).cloned())
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+
+        /// Every string a unit enum accepts, however schemars chose to render it.
+        ///
+        /// A variant carrying a doc comment becomes its own `oneOf` branch with
+        /// a `const`; variants without one are grouped into a single `enum`
+        /// array. A type with some of each — `Driver` — contains both spellings
+        /// at once, so a test that assumes either alone is wrong half the time.
+        fn enum_values(v: &serde_json::Value) -> Vec<String> {
+            let mut out = Vec::new();
+            if let Some(one_of) = v.get("oneOf").and_then(|o| o.as_array()) {
+                for branch in one_of {
+                    out.extend(enum_values(branch));
+                }
+            }
+            if let Some(c) = v.get("const").and_then(|c| c.as_str()) {
+                out.push(c.to_string());
+            }
+            if let Some(values) = v.get("enum").and_then(|e| e.as_array()) {
+                out.extend(values.iter().filter_map(|x| x.as_str().map(String::from)));
+            }
+            out
+        }
+
+        fn find_closed(v: &serde_json::Value, at: String, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    if map.get("additionalProperties") == Some(&serde_json::Value::Bool(false)) {
+                        out.push(at.clone());
+                    }
+                    for (k, child) in map {
+                        find_closed(child, format!("{at}/{k}"), out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, child) in items.iter().enumerate() {
+                        find_closed(child, format!("{at}/{i}"), out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        #[test]
+        fn the_awkward_shapes_survived_generation() {
+            // The three the derive could not have got right on its own, and the
+            // ones a hand-written mirror has always got wrong. If any of these
+            // stops holding, the manual impls above have gone stale.
+            let schema = serde_json::to_value(schemars::schema_for!(DeploymentSpec))
+                .expect("a schema serializes");
+            let defs = schema.get("$defs").expect("nested types are defined");
+
+            // A union, not a struct with one field.
+            assert!(
+                defs["Providers"].get("anyOf").is_some(),
+                "auth.provider lost its one-or-many form",
+            );
+            // A union whose bare form is the *closed* one.
+            assert!(defs["PublicPath"].get("anyOf").is_some(), "public_paths lost its bare form");
+            assert!(
+                defs["PublicPath"]["description"].as_str().is_some_and(|d| d.contains("admin")),
+                "public_paths no longer warns that a bare string means admin",
+            );
+            // Mirrored from another crate, so worth asserting it is still there
+            // and still six.
+            let sizes = enum_values(&defs["SandboxSize"]);
+            assert_eq!(sizes.len(), 6, "the size classes moved: {sizes:?}");
+            // `libvirt` and `firecracker_containerd` deserialize and are then
+            // refused, so the schema lists them — it describes what parses. The
+            // caveat has to travel with them, and it does, because the doc
+            // comments say so and doc comments are what a generated schema is
+            // made of. That is the whole argument for generating this file.
+            let drivers = enum_values(&defs["Driver"]);
+            for expected in ["firecracker", "kvm", "lxc", "libvirt"] {
+                assert!(drivers.contains(&expected.to_string()), "driver lost {expected}: {drivers:?}");
+            }
+            let caveat = defs["VmSpec"]["properties"]["driver"]["description"]
+                .as_str()
+                .expect("the driver field is documented");
+            assert!(
+                caveat.contains("libvirt") && caveat.contains("rejected"),
+                "the driver field no longer warns that two of its values are refused: {caveat}",
+            );
+        }
+    }
+
+    /// The specs in `examples/`, held to the same standard as a real request.
+    ///
+    /// They ship as ready-to-POST documents and were parsed by nothing: not one
+    /// line in this crate ever read them, so an example could name a field that
+    /// no longer exists, or describe a deployment the server would refuse, and
+    /// stay that way indefinitely. They are also the closest thing this
+    /// repository has to a specification by demonstration — the clients that
+    /// mirror `DeploymentSpec` read them, and so does anyone learning the shape
+    /// — which makes "does it still parse" a contract rather than housekeeping.
+    mod examples {
+        use super::*;
+        use std::path::{Path, PathBuf};
+
+        /// Every `*.json` under `examples/`, including the one in a subdirectory.
+        fn example_files() -> Vec<PathBuf> {
+            fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+                let entries = std::fs::read_dir(dir)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else if path.extension().is_some_and(|e| e == "json") {
+                        out.push(path);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples"), &mut out);
+            out.sort();
+            out
+        }
+
+        #[test]
+        fn every_example_parses_and_validates() {
+            let files = example_files();
+            assert!(!files.is_empty(), "no examples found — did the directory move?");
+
+            for path in files {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                let mut spec: DeploymentSpec = serde_json::from_str(&text).unwrap_or_else(|e| {
+                    panic!("{} is not a DeploymentSpec: {e}", path.display())
+                });
+                // Through the same front door a POST takes: `normalize` runs
+                // first on every entry path, so validating without it would
+                // hold the examples to a stricter standard than real requests.
+                spec.normalize();
+                if let Err(e) = spec.validate() {
+                    panic!("{} would be refused by the server: {e}", path.display());
+                }
+            }
+        }
+
+        #[test]
+        fn an_example_does_not_quietly_lose_fields() {
+            // Round-tripping catches the other half: a key the server no longer
+            // deserializes parses fine and vanishes. `skip_serializing_if` is on
+            // nearly every field, so this compares only what was actually
+            // written — an example that omits a field stays legal, one that
+            // names a field into the void does not.
+            for path in example_files() {
+                let text = std::fs::read_to_string(&path).expect("read example");
+                let raw: serde_json::Value = serde_json::from_str(&text).expect("example is JSON");
+                let spec: DeploymentSpec = serde_json::from_str(&text).expect("example is a spec");
+                let round: serde_json::Value =
+                    serde_json::to_value(&spec).expect("a spec serializes");
+
+                let (raw_obj, round_obj) = (
+                    raw.as_object().expect("an example is an object"),
+                    round.as_object().expect("a spec serializes to an object"),
+                );
+                for key in raw_obj.keys() {
+                    assert!(
+                        round_obj.contains_key(key),
+                        "{}: `{key}` was accepted and then dropped — the field is gone from \
+                         DeploymentSpec and this example is describing something that no \
+                         longer exists",
+                        path.display(),
+                    );
+                }
+            }
         }
     }
 }
