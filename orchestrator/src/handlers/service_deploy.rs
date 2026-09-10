@@ -12,7 +12,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use heyosecret_client::{HeyoSecretClient, HeyoSecretClientOptions};
-use sea_orm::{ConnectionTrait, DbBackend, Statement, Value as SeaValue};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, Statement, TransactionTrait, Value as SeaValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -476,10 +476,16 @@ async fn deploy_service_inner(
     validate_service_deployment_request(&state, &request)
         .await
         .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    let service_id = sanitize_service_id(&request.service_id)?;
+    // Keep retirement and deployment mutually exclusive across Orchestrator instances.
+    // This transaction only owns the advisory lock; rollout progress remains durable
+    // through the ordinary connections even if this process exits.
+    let _guard = try_service_lifecycle_lock(db::get_db()?, &service_id)
+        .await?
+        .with_context(|| format!("service {service_id} has a deployment or retirement in progress"))?;
     if request.desired_replicas.is_none() {
         return deploy_service_candidate(state, request, None).await;
     }
-    let service_id = sanitize_service_id(&request.service_id)?;
     let rollout_id = request
         .deployment_id
         .clone()
@@ -2389,8 +2395,38 @@ pub async fn run_retirement_reconciler(state: AppState) {
     }
 }
 
+async fn try_service_lifecycle_lock(
+    db: &DatabaseConnection,
+    service_id: &str,
+) -> Result<Option<DatabaseTransaction>> {
+    let transaction = db.begin().await?;
+    let row = transaction.query_one(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_try_advisory_xact_lock(hashtextextended('service-lifecycle:' || $1, 0)) AS acquired",
+        [service_id.into()],
+    )).await?.context("service lifecycle lock returned no result")?;
+    if !row.try_get::<bool>("", "acquired")? {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+    Ok(Some(transaction))
+}
+
 async fn reconcile_pending_service_retirements(state: &AppState) -> Result<()> {
-    for retirement in list_pending_service_retirements().await? {
+    let db = db::get_db()?;
+    for retirement in list_pending_service_retirements(db).await? {
+        let Some(guard) = try_service_lifecycle_lock(db, &retirement.service_id).await? else {
+            continue;
+        };
+        // The initial scan is only a hint. A rollout or another reconciler may have
+        // changed eligibility since then. Recheck while holding the lifecycle lock
+        // and retain that lock until the external stop/delete has finished.
+        if !list_pending_service_retirements(&guard).await?.iter().any(|current| {
+            current.deployment_id == retirement.deployment_id
+                && current.previous_deployment_id == retirement.previous_deployment_id
+        }) {
+            continue;
+        }
         let retired = if retirement.delete_previous {
             // A previous instance can stop itself before it records the stop.
             // Retrying delete is the durable operation: Cloud treats an absent
@@ -2426,8 +2462,7 @@ async fn reconcile_pending_service_retirements(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-async fn list_pending_service_retirements() -> Result<Vec<PendingServiceRetirement>> {
-    let db = db::get_db()?;
+async fn list_pending_service_retirements(db: &impl ConnectionTrait) -> Result<Vec<PendingServiceRetirement>> {
     let rows = db
         .query_all(Statement::from_string(
             DbBackend::Postgres,
@@ -2475,8 +2510,9 @@ async fn list_pending_service_retirements() -> Result<Vec<PendingServiceRetireme
                 AND NOT EXISTS (
                     SELECT 1
                     FROM service_rollouts rollout
-                    WHERE rollout.rollout_id = intent.deployment_id
-                        AND rollout.status <> 'passed'
+                    WHERE rollout.service_id = intent.service_id
+                        AND (rollout.rollout_id <> intent.deployment_id
+                            OR rollout.status <> 'passed')
                 )
                 AND NOT EXISTS (
                     SELECT 1
@@ -2491,6 +2527,8 @@ async fn list_pending_service_retirements() -> Result<Vec<PendingServiceRetireme
                         AND completed.metadata->'response'->>'previousDeploymentId'
                             = intent.previous_deployment_id
                         AND (
+                            completed.phase = 'previous-retire-cancelled'
+                            OR
                             (
                                 intent.delete_previous
                                 AND completed.phase = 'previous-deleted'
@@ -4355,12 +4393,16 @@ mod tests {
         target_regions_covered, target_regions_ready, validate_revision_ref,
         validate_revision_repository_url, validate_revision_sha, validate_service_traffic_mode,
         verify_applied_placement, SecretVersionSelector, ServiceDeployRequest, ServiceRouteRequest,
+        list_pending_service_retirements, try_service_lifecycle_lock,
     };
     use crate::cloud_client::CreateDeploymentResponse;
     use crate::handlers::service_discovery::{
         ServiceDiscoveryEndpoint, ServiceDiscoverySnapshot,
     };
+    use anyhow::Result;
     use chrono::Utc;
+    use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+    use uuid::Uuid;
 
     fn discovery_snapshot() -> ServiceDiscoverySnapshot {
         ServiceDiscoverySnapshot {
@@ -4682,5 +4724,104 @@ mod tests {
         assert!(parse_ls_remote_revision(output, "refs/heads/release").is_err());
         let ambiguous = [output.as_slice(), output.as_slice()].concat();
         assert!(parse_ls_remote_revision(&ambiguous, "refs/heads/main").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ORCHESTRATOR_TEST_DATABASE_URL (disposable PostgreSQL)"]
+    async fn retirement_reactivation_and_supersession_postgres() -> Result<()> {
+        let db = sea_orm::Database::connect(std::env::var("ORCHESTRATOR_TEST_DATABASE_URL")?).await?;
+        let tx = db.begin().await?;
+        let schema = format!("retirement_test_{}", Uuid::new_v4().simple());
+        tx.execute_unprepared(&format!("CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema};")).await?;
+        for migration in [
+            include_str!("../../migrations/028_add_service_deployment_state.sql"),
+            include_str!("../../migrations/030_add_service_deployment_runs.sql"),
+            include_str!("../../migrations/031_add_service_discovery.sql"),
+            include_str!("../../migrations/032_add_service_rollout_state.sql"),
+            include_str!("../../migrations/034_cancel_reactivated_service_retirements.sql"),
+            // Startup applies migrations repeatedly; cancellation must be idempotent.
+            include_str!("../../migrations/034_cancel_reactivated_service_retirements.sql"),
+        ] {
+            tx.execute_unprepared(migration).await?;
+        }
+        tx.execute_unprepared("INSERT INTO service_deployment_states(service_id,active_deployment_id) VALUES ('orchestrator','replacement');
+            INSERT INTO service_deployment_runs(deployment_id,service_id,status,phase) VALUES ('sept4','orchestrator','passed','completed'), ('today','orchestrator','running','rollout-drain');
+            INSERT INTO service_deployment_events(deployment_id,service_id,phase,status,message,metadata,created_at) VALUES
+            ('sept4','orchestrator','previous-retire-wait','running','drain','{\"response\":{\"previousDeploymentId\":\"old\",\"deletePrevious\":true,\"drainSeconds\":30}}',NOW()-INTERVAL '5 days'),
+            ('sept4','orchestrator','completed','passed','done','{}',NOW()-INTERVAL '5 days');").await?;
+        let eligible = list_pending_service_retirements(&tx).await?;
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].deployment_id, "sept4");
+        assert_eq!(eligible[0].previous_deployment_id, "old");
+
+        // The incident's direct recovery SQL: restoring old must permanently
+        // revoke sept4's authority, not merely hide it while old is active.
+        tx.execute_unprepared("UPDATE service_deployment_states SET active_deployment_id='old' WHERE service_id='orchestrator';").await?;
+        assert!(list_pending_service_retirements(&tx).await?.is_empty());
+        tx.execute_unprepared("UPDATE service_deployment_states SET active_deployment_id='replacement' WHERE service_id='orchestrator';").await?;
+        assert!(list_pending_service_retirements(&tx).await?.is_empty());
+        let row = tx.query_one(Statement::from_string(DbBackend::Postgres,
+            "SELECT COUNT(*) AS count FROM service_deployment_events WHERE phase='previous-retire-cancelled'".to_string())).await?.unwrap();
+        assert_eq!(row.try_get::<i64>("", "count")?, 1);
+
+        // Upgrade after a recovery performed by the old binary: backfill must
+        // cancel the existing active target, not only future state transitions.
+        tx.execute_unprepared("ALTER TABLE service_deployment_states DISABLE TRIGGER cancel_reactivated_service_retirements;
+            UPDATE service_deployment_states SET active_deployment_id='old';
+            DELETE FROM service_deployment_events WHERE phase='previous-retire-cancelled';").await?;
+        for _ in 0..2 {
+            tx.execute_unprepared(include_str!("../../migrations/034_cancel_reactivated_service_retirements.sql")).await?;
+        }
+        tx.execute_unprepared("UPDATE service_deployment_states SET active_deployment_id='replacement';").await?;
+        assert!(list_pending_service_retirements(&tx).await?.is_empty());
+        let row = tx.query_one(Statement::from_string(DbBackend::Postgres,
+            "SELECT COUNT(*) AS count FROM service_deployment_events WHERE phase='previous-retire-cancelled'".to_string())).await?.unwrap();
+        assert_eq!(row.try_get::<i64>("", "count")?, 1);
+
+        // Simulate an uncancelled legacy intent predating the migration. The
+        // service's newer rollout blocks it even after its lease expires.
+        tx.execute_unprepared("DELETE FROM service_deployment_events WHERE phase='previous-retire-cancelled';
+            INSERT INTO service_rollouts(service_id,rollout_id,desired_replicas,status,stage,lease_expires_at) VALUES ('orchestrator','today',1,'running','rollout-drain',NOW()-INTERVAL '1 hour');").await?;
+        assert!(list_pending_service_retirements(&tx).await?.is_empty());
+        tx.execute_unprepared("UPDATE service_rollouts SET status='passed';").await?;
+        assert!(list_pending_service_retirements(&tx).await?.is_empty());
+
+        // Only today's own completed rollout and expired drain can retire old.
+        tx.execute_unprepared("INSERT INTO service_deployment_events(deployment_id,service_id,phase,status,message,metadata,created_at) VALUES
+            ('today','orchestrator','previous-retire-wait','running','drain','{\"response\":{\"previousDeploymentId\":\"old\",\"deletePrevious\":false,\"drainSeconds\":30}}',NOW());").await?;
+        assert!(list_pending_service_retirements(&tx).await?.is_empty());
+        tx.execute_unprepared("INSERT INTO service_deployment_events(deployment_id,service_id,phase,status,message) VALUES ('today','orchestrator','completed','passed','done');").await?;
+        assert!(list_pending_service_retirements(&tx).await?.is_empty());
+        tx.execute_unprepared("UPDATE service_deployment_events SET created_at=NOW()-INTERVAL '31 seconds' WHERE deployment_id='today' AND phase='previous-retire-wait';").await?;
+        let eligible = list_pending_service_retirements(&tx).await?;
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].deployment_id, "today");
+        assert!(!eligible[0].delete_previous);
+        tx.execute_unprepared("UPDATE service_rollouts SET status='running';").await?;
+        assert!(list_pending_service_retirements(&tx).await?.is_empty());
+        tx.execute_unprepared("UPDATE service_rollouts SET status='passed';
+            INSERT INTO service_deployment_events(deployment_id,service_id,phase,status,message,metadata) VALUES ('today','orchestrator','previous-retained','passed','done','{\"response\":{\"previousDeploymentId\":\"old\"}}');").await?;
+        assert!(list_pending_service_retirements(&tx).await?.is_empty());
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ORCHESTRATOR_TEST_DATABASE_URL (disposable PostgreSQL)"]
+    async fn retirement_lifecycle_lock_postgres() -> Result<()> {
+        let url = std::env::var("ORCHESTRATOR_TEST_DATABASE_URL")?;
+        let first = sea_orm::Database::connect(url.clone()).await?;
+        let second = sea_orm::Database::connect(url).await?;
+        let service = format!("lock-test-{}", Uuid::new_v4());
+        let deployment = try_service_lifecycle_lock(&first, &service).await?.unwrap();
+        assert!(try_service_lifecycle_lock(&second, &service).await?.is_none());
+        let unrelated = try_service_lifecycle_lock(&second, &format!("{service}-other")).await?.unwrap();
+        unrelated.rollback().await?;
+        deployment.rollback().await?;
+        let retirement = try_service_lifecycle_lock(&second, &service).await?.unwrap();
+        assert!(try_service_lifecycle_lock(&first, &service).await?.is_none());
+        retirement.rollback().await?;
+        assert!(try_service_lifecycle_lock(&first, &service).await?.is_some());
+        Ok(())
     }
 }

@@ -57,6 +57,12 @@ class ServiceSelectionTests(unittest.TestCase):
             self.assertEqual(self.selected(paths), set())
         self.assertEqual(self.selected(shared + '\norchestrator/README.md'), {'orchestrator'})
 
+    def test_json_changes_select_only_their_owner(self):
+        for target in TARGETS:
+            self.assertEqual(self.selected(f'.heyo/services/{target}.json'), {target})
+        self.assertEqual(self.selected('.heyo/services/app-lb.json'), set())
+        self.assertEqual(self.selected('.heyo/services/orchestrator.json.bak'), set())
+
     def test_explicit_dispatch_overrides_paths(self):
         self.assertEqual(self.selected('heyosecret/src/main.rs', REQUESTED_HEYO_SERVICE='orchestrator'),
                          {'orchestrator'})

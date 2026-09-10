@@ -56,13 +56,13 @@ Service rollouts keep the previous healthy deployment active while the candidate
 The public VM workflow deploys only Orchestrator, HeyoSecret and app-obs.
 app-lb runs on the host and is not a VM deployment target, including for
 `service=all`. app-obs still connects to the existing app-lb admin endpoint.
-Automatic selection requires a change under the service's source paths;
+Automatic selection requires a change under the service's source paths or its
+`.heyo/services/<service>.json` declaration;
 shared workflow/environment edits and empty change lists select no services.
 Use an explicit service dispatch when only shared deployment settings change.
 
-For the pending JSON receiver upgrade, this README change selects Orchestrator
-alone. Keep the flat deployment request in this workflow until the running
-receiver upgrades; then submit the separate JSON caller changes. Before any
+The receiver-only prerequisite uses the flat request and selects Orchestrator
+alone. This JSON caller workflow must wait until that receiver upgrades. Before any
 receiver rollout, ensure host app-lb discovery does not depend on the retiring
 Orchestrator VM's port. Verify discovery through a stable endpoint and preserve
 the existing host proxy; do not recreate app-lb to upgrade the receiver.
@@ -100,6 +100,12 @@ Fill in at least:
 Set `ORCHESTRATOR_PROXY_BASE_DOMAINS` to a comma-separated list of wildcard proxy base domains when backend deployment URLs must be probed through `ORCHESTRATOR_BACKEND_API_URL` instead of public DNS.
 
 Rolling replicas are an explicit discovery-routed traffic mode. Configure `ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES` with a comma-separated allowlist. A replicated request must include the service's stable `route`; Orchestrator verifies that route through the active app-lb backend, rewrites ingress to that backend, and only then drains a previous replica. Asynchronous retirement persists drain intent but does not stop an old replica until the parent rollout has recorded success, so Orchestrator can safely roll itself. `replicaRegions` may assign each desired replica to a region and must contain exactly `desiredReplicas` entries. `placementPool` selects a Cloud-managed host pool without naming physical servers; Cloud additionally scopes that pool to its own configured environment. app-lb itself must never be in the discovery-routing allowlist.
+
+Retirement authority cannot carry across a newer replica rollout. Cleanup requires the owning rollout to remain current and successful, as well as an expired drain and a non-active target. An unfinished rollout remains protected even after its lease expires; lease expiry permits a new rollout claim, not deletion of the old instance. Deployment and retirement hold the same PostgreSQL per-service advisory lock, and retirement rechecks eligibility under that lock before making a Cloud stop/delete call. Different services can progress independently; concurrent operations on the same service must retry after the current operation finishes.
+
+Migration `034` records `previous-retire-cancelled` events when an active deployment changes back to a target of earlier retirement work. This is atomic with the state update, including direct recovery SQL, and does not rewrite historical rollout results. Moving away from that deployment later cannot revive the cancelled retirement. Obsolete cleanup is deliberately left ineligible rather than guessing whether its target is safe to delete; the current rollout must own any fresh retirement. Direct database recovery still requires quiescing deployment/cleanup first: a trigger cannot recall a Cloud deletion already in flight. Older Orchestrator binaries do not participate in the new lock/cancellation protocol, so mixed-version operation is not a substitute for that recovery precaution.
+
+PostgreSQL regression tests use an isolated, rolled-back schema and two independent connection pools: `ORCHESTRATOR_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:54329/postgres cargo test --locked --manifest-path orchestrator/Cargo.toml retirement_ -- --include-ignored`. Point this only at a disposable local database. The tests cover reactivation, superseded legacy cleanup, unfinished/expired leases, completed rollout and drain gating, and same-service exclusion in both directions.
 
 The public-service workflow accepts `HEYO_SERVICE_REPLICA_REGIONS` as a comma-separated list such as `EU,US`, which sets both `replicaRegions` and `desiredReplicas` for every allowlisted service. `HEYO_SERVICE_PLACEMENT_POOL` is optional; use `platform` after the intended shared hosts have registered in that pool. Manual dispatches may provide `discoveryRoutedServices`, `replicaRegions`, `placementPool`, and `serviceDriver` without changing the CICD service environment; omitted inputs retain the configured environment values and existing single-region behavior. `HEYO_SERVICE_REPLICAS` remains available as either one count or a per-service map such as `heyosecret=2,orchestrator=2`; when both settings are present, their counts must agree. The existing host app-lb must already contain the discovery-backed route definitions; this workflow does not install or replace it.
 
@@ -146,10 +152,10 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 
 ### Service deployment files
 
-This receiver introduces the JSON contract below. The subsequent caller migration
-adds `.heyo/services` files and a workflow that loads a file, fills in the build
-artifact, target host/region and revision, then submits it. This receiver-only
-change deliberately leaves the deployment workflow unchanged for self-upgrade.
+Service configuration lives in [`.heyo/services`](../.heyo/services). The workflow
+loads a file, fills in the build artifact, target host/region and revision, then
+submits it. Install the receiver-only upgrade before activating this workflow;
+see the breaking-change rollout below.
 Application environment variables remain application settings; there is no change
 to Orchestrator's own process-config loader.
 
@@ -190,8 +196,11 @@ Other hosts receive no staging defaults. No server IDs are selected by this file
 The PR #55 receiver deployment failed before cutover: the installed CICD runner
 overwrote `GITHUB_ENV` defaults with empty job environment values. Load the
 host-keyed defaults inside the deployment Python process, before constructing
-the request, so recovery does not require a CICD upgrade first. This README change
-selects only Orchestrator; the recovery workflow still uses the flat request.
+the request, so recovery does not require a CICD upgrade first. The new-format
+Orchestrator is now serving staging. The PR #58 deployment was rejected with HTTP
+422 because the workflow still sent the flat `serviceId` request. Public callers
+now load `.heyo/services/{service}.json` and send `id`, `vm`, `routes`, `health`,
+`scaling`, and `deploy`; no old-format fallback is supported.
 Shared workflow edits alone select no services, and app-lb remains host-managed.
 Run `python3 .heyo/test_deployment_environment.py` for offline regression checks.
 
@@ -216,5 +225,8 @@ still serves; do not advance the callers. After cutover, use the new callers.
 No deployment or infrastructure change is performed by preparing these PRs.
 
 Receiver validation: `cargo test --locked --manifest-path orchestrator/Cargo.toml`.
-The caller migration supplies offline workflow tests and synthetic payloads for
-the optional `SERVICE_SPEC_FIXTURE_DIR` Rust contract test.
+Offline validation: `python3 .heyo/services/test_service_specs.py` executes the
+workflow with mocked network/build calls. `SERVICE_SPEC_BASELINE_REF` optionally
+compares against an old-workflow Git revision. `SERVICE_SPEC_FIXTURE_DIR` exports
+synthetic payloads; use the same directory for the private caller tests and the
+Rust contract test to validate all six VM service requests.

@@ -427,12 +427,28 @@ mod tests {
         assert!(serde_json::from_value::<ServiceSpecRequest>(value).unwrap().into_internal().is_err());
     }
 
-    /// Integration with the offline workflow harness in both repositories.
+    #[test]
+    fn accepts_authored_public_service_files() {
+        for spec in [
+            include_str!("../../../.heyo/services/orchestrator.json"),
+            include_str!("../../../.heyo/services/heyosecret.json"),
+            include_str!("../../../.heyo/services/app-obs.json"),
+        ] {
+            let internal = serde_json::from_str::<ServiceSpecRequest>(spec).unwrap().into_internal().unwrap();
+            assert_eq!(internal.health_probe_timeout_seconds, 5);
+            assert_eq!(internal.ports, [8080]);
+            assert_eq!(internal.ttl_seconds, Some(0));
+        }
+    }
+
+    /// Integration with public workflow requests; also validate any supplied private callers.
     #[test]
     fn accepts_generated_workflow_payloads_when_supplied() {
         let Some(dir) = std::env::var_os("SERVICE_SPEC_FIXTURE_DIR") else { return };
-        let mut count = 0;
-        for entry in std::fs::read_dir(dir).unwrap() {
+        for name in ["orchestrator", "heyosecret", "app-obs", "orchestrator-discovery", "orchestrator-staging"] {
+            assert!(std::path::Path::new(&dir).join(format!("{name}.json")).is_file(), "missing workflow fixture {name}");
+        }
+        for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_none_or(|extension| extension != "json") { continue; }
             let text = std::fs::read_to_string(&path).unwrap();
@@ -445,8 +461,12 @@ mod tests {
             if request.service_id == "cicd" {
                 assert_eq!(request.mounts.len(), 1);
             }
-            count += 1;
+            if path.file_stem().unwrap() == "orchestrator-staging" {
+                assert_eq!(request.desired_replicas, Some(1));
+                assert!(!request.route.as_ref().unwrap().strip_prefix);
+                assert_eq!(request.driver, "libvirt");
+                assert!(request.retire_previous_async);
+            }
         }
-        assert!(count >= 7, "provide all seven service workflow payloads");
     }
 }
