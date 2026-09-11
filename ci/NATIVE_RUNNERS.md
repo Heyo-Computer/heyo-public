@@ -51,6 +51,31 @@ private `CICD_RUNNER_TOKEN` and the public CI submission token. Allow
 itself. The checked-in us2 route example includes that exception but changing
 the file does not change an installed route.
 
+For an artifact-backed single-VM trial, `deploy/trial-service.json` is an
+Orchestrator service template. Replace its owner/account, Linux runtime image,
+network and admin-email placeholders. Package the Linux x86_64 `ci` and
+`nats-server` binaries with `deploy/trial-start.sh` as `start.sh` and
+`deploy/trial-nats.conf` as `nats.conf` at the archive root. Upload that archive
+through Orchestrator's service archive API and attach its ID and exact source
+revision to the deployment request. A local artifact build does not merge the
+branch or submit CI; bypassing the normal CICD deployment path requires approval.
+
+This template uses a dedicated Postgres database and the five
+`ci-us3-trial/*` HeyoSecret references named in `env_from`. NATS runs only on
+the VM's loopback interface; its monitoring port is not exposed. If either
+process exits, the startup wrapper terminates the other and exits nonzero.
+The template creates no public route: configure an authenticated app-lb route
+only after checking that the VM port has no public bypass. A staging JWT gate
+can forward the existing Auth identity; it does not provide browser sign-in or
+SSO. Google/browser login is a separate gate configuration, not a second Auth
+service inside the CI VM.
+
+This is not an HA or automatic-upgrade deployment. NATS state, source trees,
+logs and disk artifacts live in that VM's `/workspace/ci-state`; Postgres alone
+does not preserve those files. The template deliberately retains previous VMs.
+Preserve/export their state before replacement or retirement, and do not treat
+this service VM as an ephemeral CI job cleanup target.
+
 `native-smoke.yml` is an opt-in test workflow outside the active workflow
 directory. Register it for the trial repository, or copy it into that
 repository's `.ci/workflows/`. It tests native commands, conditions, outputs,
