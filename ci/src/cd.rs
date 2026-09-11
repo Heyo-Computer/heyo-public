@@ -50,8 +50,21 @@ pub async fn deploy(
     if token.trim().is_empty() { return Err("ci/deploy-service needs an orchestrator credential from secrets".into()); }
     let endpoint = endpoint(base)?;
     let run = store.get_run(&msg.run_id).await.map_err(|e| e.to_string())?.ok_or("run not found")?;
+    let release = crate::release::get(store, &msg.run_id).await?;
+    let release_workflow = store.jobs_of(&msg.run_id).await.map_err(|e| e.to_string())?.iter()
+        .any(|job| job.plan["steps"].as_array().is_some_and(|steps| steps.iter().any(|s| s["uses"] == "ci/merge-release")));
+    let (sha, git_ref) = if release_workflow || release.is_some() {
+        let release = release.as_ref().filter(|r| r.status == "published")
+            .ok_or("deployment requires a confirmed published release")?;
+        let archive = spec["deploy"]["archive_id"].as_str().unwrap_or("");
+        let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_service_archive WHERE run_id=$1 AND archive_id=$2 AND sha=$3 AND orchestrator_url=$4)")
+            .bind(&msg.run_id).bind(archive).bind(&release.prepared.release_sha).bind(base.trim_end_matches('/'))
+            .fetch_one(store.pool()).await.map_err(|e| e.to_string())?;
+        if !matches { return Err("deployment archive was not published from this run's release checkout to this orchestrator".into()); }
+        (&release.prepared.release_sha, &release.prepared.git_ref)
+    } else { (&run.sha, &run.git_ref) };
     let id = format!("ci-{}", hex::encode(Sha256::digest(step.as_bytes())));
-    let (service, request) = prepare(spec, &id, &run.repo_url, &run.git_ref, &run.sha)?;
+    let (service, request) = prepare(spec, &id, &run.repo_url, git_ref, sha)?;
     let request_hash = hex::encode(Sha256::digest(format!("{endpoint}\n{request}")));
     let http = reqwest::Client::builder().timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string())?;
@@ -72,7 +85,7 @@ pub async fn deploy(
         let current = store.service_deployments_of(&msg.run_id).await.map_err(|e| e.to_string())?
             .into_iter().find(|d| d.id == id).ok_or("deployment record disappeared")?;
         match current.status.as_str() {
-            "passed" => return Ok(format!("[ci] service {service} deployed at {} (operation {id})\n", run.sha)),
+            "passed" => return Ok(format!("[ci] service {service} deployed at {sha} (operation {id})\n")),
             "failed" => return Err(current.error.or(current.message).unwrap_or_else(|| format!("deployment {id} failed"))),
             _ => {}
         }
@@ -233,6 +246,27 @@ mod tests {
             std::env::temp_dir().join(crate::vm::new_id()), Duration::from_secs(30)).await.unwrap();
         deploy(&restarted, &msg, &waiting_sid, spec, &base, "test-secret", Duration::from_secs(10), &masker).await.unwrap();
         assert_eq!(remote.lock().unwrap().posts, posts, "reconnecting must reconcile the existing deployment, not POST again");
+
+        let release_sha = "b".repeat(40);
+        let prepared = json!({"source_sha":"a".repeat(40),"release_sha":release_sha,
+            "git_ref":"refs/heads/main","versions":{"package.json":"1.2.3"}});
+        sqlx::query("INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status) VALUES($1,'test',$2,$2,'refs/heads/main','{}',$3,$4,'published')")
+            .bind(&run).bind("a".repeat(40)).bind(&release_sha).bind(prepared)
+            .execute(restarted.pool()).await.unwrap();
+        let release_sid = crate::store::step_id(&msg.job_id, 3);
+        restarted.create_step(&release_sid, &msg.job_id, 3, "Release deploy", Some("ci/deploy-service")).await.unwrap();
+        let release_spec = json!({"id":"api","deploy":{"archive_id":"release-archive"}});
+        sqlx::query("INSERT INTO ci_service_archive(step_id,run_id,job_id,archive_id,sha,orchestrator_url) VALUES($1,$2,$3,'release-archive',$4,$5)")
+            .bind(&release_sid).bind(&run).bind(&msg.job_id).bind("a".repeat(40)).bind(&base)
+            .execute(restarted.pool()).await.unwrap();
+        assert!(deploy(&restarted, &msg, &release_sid, release_spec.clone(), &base, "test-secret", Duration::from_secs(10), &masker)
+            .await.unwrap_err().contains("release checkout"));
+        assert_eq!(remote.lock().unwrap().posts, posts, "pre-bump archive must never deploy");
+        sqlx::query("UPDATE ci_service_archive SET sha=$2 WHERE step_id=$1").bind(&release_sid).bind(&release_sha)
+            .execute(restarted.pool()).await.unwrap();
+        deploy(&restarted, &msg, &release_sid, release_spec, &base, "test-secret", Duration::from_secs(10), &masker).await.unwrap();
+        assert_eq!(remote.lock().unwrap().request.as_ref().unwrap()["deploy"]["revision_guard"]["expected_sha"], release_sha);
+        assert_eq!(restarted.service_deployments_of(&run).await.unwrap().iter().find(|d| d.step_id == release_sid).unwrap().sha, release_sha);
         server.abort();
     }
 }

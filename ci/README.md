@@ -1067,6 +1067,51 @@ Postgres for runs, jobs, steps, artifacts and the pool; **step logs go to disk**
 with the path and byte count on the row. A build log is megabytes, and putting it
 in a column means every listing query drags all of it across the wire.
 
+### Validation, merge, version bump, build and deployment
+
+The opt-in [release workflow example](release-example.yml) connects these stages
+using built-in actions. It is outside `.ci/workflows/` and does not enable live
+publication automatically. Use only trusted registered workflows with explicitly
+granted HeyoSecret credentials; branch protections and repository permissions
+still apply. No action creates a GitHub release or tag.
+
+- `ci/merge-release` requires successful, fresh validation jobs in `needs`,
+  including every matrix cell and every declared validation step. Skipped,
+  carried-over or error-tolerant validations cannot authorize publication.
+  `with.manifests` is a JSON array of `package.json`/`Cargo.toml` paths;
+  `with.token` is the Git HTTPS credential. The submitted `before` commit must
+  be an ancestor of the submitted source, and the remote ref must still equal
+  that base. Publication fast-forwards that ref to the source plus a deterministic
+  version commit, never merges unvalidated concurrent trunk changes. Resubmit and
+  revalidate if trunk moved. Submit a Git bundle, not `--archive`.
+- Changed components receive a major bump for breaking changes, minor for
+  conventional `feat` commits, otherwise patch. Unchanged components are omitted.
+  Explicit package versions and adjacent Cargo/npm lockfiles are supported;
+  inherited Cargo workspace versions are rejected. Empty changes produce no
+  extra version commit. Outputs are `sha`, `ref`, and JSON-string `versions`.
+- CI persists the candidate before pushing. A lost acknowledgement can retry
+  only that same candidate, never generate another version bump. The run page's
+  **Release** section and authenticated `/api/runs/{run_id}/release` distinguish
+  prepared, uncertain, and confirmed publication and show both source/release SHAs.
+- `ci/checkout-release` clears the job checkout and extracts the confirmed
+  release tree before building. It deliberately has no `.git` directory; use
+  its `sha` output for build stamps. Build jobs must run this explicitly, then
+  build/package from those files. Original `ci.sha` remains the validated source.
+- `ci/publish-service-archive` uploads an already-built tarball (`with.path`,
+  relative to the job working directory) using Orchestrator presign, upload,
+  and finalize APIs. It also requires `url`, `token`, `user-id`, and `name`.
+  It records the finalized archive's release SHA and returns `archive-id` and
+  `sha`. The job must have completed `ci/checkout-release`. This is distinct
+  from the generic artifact sink; a deployment cannot substitute its tag/URL.
+- In release workflows, `ci/deploy-service` accepts only an archive recorded
+  for this run's confirmed release and the same Orchestrator. The revision guard
+  and deployment UI use the release SHA, not the pre-bump source SHA.
+
+Archive APIs lack idempotency keys: a retry can leave an extra uploaded archive,
+but failed/uncertain finalization never authorizes a deployment. Publication,
+release and deployment state write NATS outbox events transactionally. These
+actions do not change app-lb, namespaces, existing VM pages, or Retail.
+
 ### Service deployments
 
 `ci/deploy-service` runs an asynchronous service rollout through Orchestrator's
@@ -1104,7 +1149,8 @@ tag/digest; automatic transfer between the two stores is not implemented here.
 Use the repository-owned service spec for real startup, health, route, and
 secret-reference settings. The action overwrites `deploy.deployment_id`, `async`,
 and `revision_guard` with its stable step identity and the CI run's repository,
-branch ref and full SHA; `force` is always false. The remote branch must still
+branch ref and full SHA (the confirmed release SHA for release workflows);
+`force` is always false. The remote branch must still
 point at that revision when Orchestrator checks it. Workflow dependencies and
 secret permissions remain the admission boundary; the action does not merge a
 branch or create a release.
@@ -1133,7 +1179,8 @@ subjects and their work-queue retention are unchanged.
 
 The JSON envelope is version 1 and contains `version`, stable UUID `id`, history
 cursor `revision`, repository scope (`repo_id`), exact Git `sha` and `git_ref`, `transitioned_at`, `type`
-(`ci.run.status.v1`, `ci.job.status.v1`, `ci.step.status.v1`, `ci.artifact.published.v1`, or `ci.deployment.status.v1`), `run_id`, and
+(`ci.run.status.v1`, `ci.job.status.v1`, `ci.step.status.v1`, `ci.artifact.published.v1`,
+`ci.release.status.v1`, `ci.service_archive.published.v1`, or `ci.deployment.status.v1`), `run_id`, and
 nullable `job_id`, `job_key`, and `step_id`. `status` and `error` remain top-level
 for existing dashboard consumers. The same UUID is sent as `Nats-Msg-Id` on
 every retry. A crash after PubAck and before the database update can redeliver
@@ -1164,10 +1211,10 @@ digest and are not a cross-host deployment handoff. A sink write and Postgres
 cannot share a transaction: a crash between them can leave an unrecorded blob;
 an upload retry reconciles through the sink before recording publication.
 
-This is CI execution history, not deployment authorization. Consolidation still
-requires an exact-revision validation/merge gate, version-bump and release
-operations, an admitted release-artifact handoff, and durable deployment operations
-with reconciliation of uncertain remote outcomes. Native Intel Mac and Windows
+This is CI execution history, not deployment authorization. The release actions
+above separately gate publication and the release-artifact handoff. Automatic
+reconciliation of uncertain deployments after finished runs remains outstanding.
+Native Intel Mac and Windows
 execution must preserve workflow semantics and atomically fence leases/results
 before the private runners can be retired. Neither a Linux cross-build nor an
 event saying tests passed substitutes for those requirements.
@@ -1227,7 +1274,7 @@ Not built yet:
 
 - **The S3 artifact sink.** Declared and selectable; fails loudly naming the
   alternatives rather than reporting an artifact stored that is not there.
-- **Composite `uses:` actions.** `ci/upload-artifact` and `ci/deploy-service` are built in. Fetching
+- **Composite `uses:` actions.** Artifact, release and deployment actions above are built in. Fetching
   an `action.yml` from a repository is a different feature with a different trust
   model.
 - **Triggers other than `submit`.** `on: [schedule]` parses and is reported as

@@ -1954,6 +1954,11 @@ impl Dispatcher {
         vm: &Vm,
     ) -> Result<(), DispatchError> {
         let sid = format!("{}.checkout", msg.job_id);
+        // A redelivery starts from the submitted source again. Do not retain
+        // release provenance from a previous VM or attempt.
+        sqlx::query("UPDATE ci_job SET release_sha=NULL WHERE id=$1")
+            .bind(&msg.job_id).execute(self.store.pool()).await
+            .map_err(|e| DispatchError::Checkout(e.to_string()))?;
         self.store
             .create_step(&sid, &msg.job_id, -1, "Checkout", None)
             .await?;
@@ -2193,7 +2198,12 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     .run_action(msg, plan, vm, action, step, &ctx, &sid, &log_path, &masker)
                     .await
                 {
-                    Ok(note) => {
+                    Ok((note, outputs)) => {
+                        if let Some(id) = &step.id {
+                            step_outputs.insert(id.clone(), serde_json::json!({
+                                "outputs": outputs, "outcome": "success"
+                            }));
+                        }
                         self.store
                             .append_log(&sid, &log_path, &masker.mask(&note))
                             .await?;
@@ -2367,10 +2377,74 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
         sid: &str,
         log_path: &std::path::Path,
         masker: &crate::secrets::Masker,
-    ) -> Result<String, DispatchError> {
+    ) -> Result<(String, Value), DispatchError> {
         let with = |k: &str| step.with.get(k).map(|v| ctx.substitute(v));
+        let required = |key: &str| with(key).filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
         match action {
+            "ci/merge-release" => {
+                let manifests: Vec<String> = serde_json::from_str(&required("manifests")?)
+                    .map_err(|_| DispatchError::StepFailed("with.manifests must be a JSON array of manifest paths".into()))?;
+                let source = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
+                let release = crate::release::merge(&self.store, msg, plan, &source.root,
+                    &manifests, &required("token")?).await.map_err(DispatchError::StepFailed)?;
+                Ok((format!("[ci] merged and published release {} on {}\nVersions: {}\n",
+                    release.release_sha, release.git_ref, release.versions), serde_json::json!({
+                        "sha": release.release_sha, "ref": release.git_ref, "versions": release.versions.to_string()
+                    })))
+            }
+            "ci/checkout-release" => {
+                let release = crate::release::get(&self.store, &msg.run_id).await
+                    .map_err(DispatchError::StepFailed)?.filter(|r| r.status == "published")
+                    .ok_or_else(|| DispatchError::StepFailed("release checkout requires a confirmed published release".into()))?;
+                let source = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
+                let bytes = crate::release_git::archive(&source.root, &release.prepared.release_sha)
+                    .await.map_err(DispatchError::StepFailed)?;
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                let remote = format!("{}/.ci-release.tar.gz", workdir.trim_end_matches('/'));
+                vm.upload_bytes(sid, &remote, &bytes).await?;
+                let command = format!("set -e; find {wd} -mindepth 1 -maxdepth 1 ! -name .ci-release.tar.gz -exec rm -rf {{}} +; tar -xzf {src} -C {wd}; rm -f {src}",
+                    wd = shell_quote(workdir), src = shell_quote(&remote));
+                let out = vm.exec(&format!("{sid}.release"), &command, &HashMap::new(), step_timeout(step, plan)).await?;
+                if !out.succeeded() { return Err(DispatchError::StepFailed("release checkout failed".into())); }
+                sqlx::query("UPDATE ci_job SET release_sha=$2 WHERE id=$1")
+                    .bind(&msg.job_id).bind(&release.prepared.release_sha).execute(self.store.pool()).await
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                Ok((format!("[ci] clean checkout of release {}\n", release.prepared.release_sha),
+                    serde_json::json!({"sha": release.prepared.release_sha})))
+            }
+            "ci/publish-service-archive" => {
+                let sha: Option<String> = sqlx::query_scalar("SELECT release_sha FROM ci_job WHERE id=$1")
+                    .bind(&msg.job_id).fetch_one(self.store.pool()).await
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                let sha = sha.ok_or_else(|| DispatchError::StepFailed("service archive must be built after ci/checkout-release in this job".into()))?;
+                let base = required("url")?;
+                let path = required("path")?;
+                let name = required("name")?;
+                let user = required("user-id")?;
+                let token = required("token")?;
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                if std::path::Path::new(&path).is_absolute() || std::path::Path::new(&path).components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+                    return Err(DispatchError::StepFailed("archive path must be relative to the job working directory".into()));
+                }
+                let bytes = vm.download_file(&format!("{sid}.archive"), &format!("{workdir}/{path}"), step_timeout(step, plan)).await?;
+                let archive = crate::service_archive::publish(&base, &token, &user, sid, &name, bytes)
+                    .await.map_err(DispatchError::StepFailed)?;
+                let mut tx = self.store.pool().begin().await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                sqlx::query("INSERT INTO ci_service_archive(step_id,run_id,job_id,archive_id,sha,orchestrator_url) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(step_id) DO UPDATE SET archive_id=excluded.archive_id,sha=excluded.sha,orchestrator_url=excluded.orchestrator_url")
+                    .bind(sid).bind(&msg.run_id).bind(&msg.job_id).bind(&archive).bind(&sha).bind(base.trim_end_matches('/'))
+                    .execute(&mut *tx).await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                let event = Store::add_event(&mut tx, &msg.run_id, Some(&msg.job_id), Some(&msg.job_key), Some(sid),
+                    "ci.service_archive.published.v1", "published", None).await?;
+                sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2 WHERE id=$1")
+                    .bind(event).bind(serde_json::json!({"archive_id":archive,"release_sha":sha}))
+                    .execute(&mut *tx).await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                tx.commit().await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                Ok((format!("[ci] finalized service archive {archive} for release {sha}\n"),
+                    serde_json::json!({"archive-id":archive,"sha":sha})))
+            }
             "ci/deploy-service" => {
                 let required = |key: &str| with(key).filter(|v| !v.trim().is_empty())
                     .ok_or_else(|| DispatchError::StepFailed(format!("ci/deploy-service requires with.{key}")));
@@ -2378,7 +2452,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     .map_err(|_| DispatchError::StepFailed("ci/deploy-service with.spec must be JSON".into()))?;
                 crate::cd::deploy(&self.store, msg, sid, spec, &required("url")?,
                     &required("token")?, step_timeout(step, plan), masker)
-                    .await.map_err(DispatchError::StepFailed)
+                    .await.map(|note| (note, serde_json::json!({}))).map_err(DispatchError::StepFailed)
             }
             "ci/upload-artifact" => {
                 let name = with("name").ok_or_else(|| {
@@ -2591,15 +2665,15 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     ),
                     (None, false) => String::new(),
                 };
-                Ok(format!(
+                Ok((format!(
                     "[ci] stored artifact {name:?} ({} bytes) in the {} sink as {} — \
                      {how} in {transfer:.0?}{public}\n",
                     stored.size_bytes, stored.sink, stored.uri
-                ))
+                ), serde_json::json!({})))
             }
             other => Err(DispatchError::Artifact(format!(
                 "`uses: {other}` is not a built-in action. Available: \
-                 ci/upload-artifact, ci/deploy-service. Composite actions from a repository are not \
+                 ci/upload-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service. Composite actions from a repository are not \
                  supported."
             ))),
         }

@@ -85,6 +85,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/runs/{run_id}/logs", get(run_logs))
         .route("/api/runs/{run_id}/events", get(run_events))
         .route("/api/runs/{run_id}/deployments", get(run_deployments))
+        .route("/api/runs/{run_id}/release", get(run_release))
 }
 
 const DEFAULT_EVENT_LIMIT: i64 = 50;
@@ -197,6 +198,35 @@ fn deployment_json(deployment: &ServiceDeploymentRow) -> serde_json::Value {
         "created_at": deployment.created_at.to_rfc3339(),
         "updated_at": deployment.updated_at.to_rfc3339(),
     })
+}
+
+async fn run_release(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let path = format!("/api/runs/{run_id}/release");
+    let reader = match authenticate(&state, &headers, &path).await {
+        Ok(reader) => reader,
+        Err(response) => return response,
+    };
+    if let Err(response) = readable_run(&state, &reader, &run_id).await {
+        return response;
+    }
+    match crate::release::get(&state.store, &run_id).await {
+        Ok(release) => axum::Json(serde_json::json!({
+            "run_id": run_id,
+            "release": release,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!("could not load release for run {run_id}: {e}");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not load run release",
+            )
+        }
+    }
 }
 
 // -- authentication ----------------------------------------------------------

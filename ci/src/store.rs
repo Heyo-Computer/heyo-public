@@ -538,7 +538,7 @@ pub struct RunEvent {
 }
 
 impl Store {
-    async fn add_event(
+    pub(crate) async fn add_event(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         run_id: &str,
         job_id: Option<&str>,
@@ -708,8 +708,9 @@ impl Store {
         let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
         let inserted = sqlx::query(
             "INSERT INTO ci_service_deployment (id, step_id, run_id, job_id, service_id, request_hash, status, sha, git_ref)
-             SELECT $1,s.id,r.id,j.id,$3,$4,'submitting',r.sha,r.git_ref
+             SELECT $1,s.id,r.id,j.id,$3,$4,'submitting',COALESCE(rel.candidate_sha,r.sha),COALESCE(rel.git_ref,r.git_ref)
              FROM ci_step s JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=j.run_id
+             LEFT JOIN ci_release rel ON rel.run_id=r.id AND rel.status='published'
              WHERE s.id=$2 AND j.status='running' AND r.status <> 'cancelled'
              ON CONFLICT (step_id) DO NOTHING RETURNING run_id, job_id"
         ).bind(id).bind(step).bind(service).bind(request_hash)
@@ -758,6 +759,7 @@ impl Store {
             "ci.deployment.status.v1", &row.get::<String,_>("status"), row.get::<Option<String>,_>("error").as_deref()).await?;
         let detail = serde_json::json!({
             "deployment_id": id, "service_id": row.get::<String,_>("service_id"),
+            "deployment_sha": row.get::<String,_>("sha"),
             "phase": row.get::<Option<String>,_>("phase"), "message": row.get::<Option<String>,_>("message"),
         });
         sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2::jsonb WHERE id=$1")

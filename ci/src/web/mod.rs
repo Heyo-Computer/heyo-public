@@ -439,6 +439,17 @@ async fn run_page(
             }
 
             let reruns = state.store.reruns_of(&run_id).await.unwrap_or_default();
+            let release = match crate::release::get(&state.store, &run_id).await {
+                Ok(release) => release,
+                Err(e) => {
+                    return page_error(
+                        &state,
+                        &headers,
+                        who.as_ref(),
+                        &format!("could not load release: {e}"),
+                    );
+                }
+            };
             let deployments = match state.store.service_deployments_of(&run_id).await {
                 Ok(deployments) => deployments,
                 Err(e) => {
@@ -457,6 +468,7 @@ async fn run_page(
                 &jobs,
                 &artifacts,
                 &vm_logs,
+                release.as_ref(),
                 &deployments,
                 state.config.log_retention.map(|d| d.as_secs() / 86_400),
             )

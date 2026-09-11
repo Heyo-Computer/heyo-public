@@ -1,0 +1,53 @@
+# Opt-in example, NOT an automatically enabled repository workflow.
+# Supply a build image with Rust, Git, tar and the service's native dependencies.
+# Register the workflow and its environment-scoped HeyoSecret credentials first.
+name: service-release
+on: [submit]
+jobs:
+  validate:
+    vm: { driver: firecracker }
+    steps:
+      - run: cargo test --locked --manifest-path ci/Cargo.toml -- --test-threads=1
+  release:
+    needs: [validate]
+    vm: { driver: firecracker }
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - id: release
+        uses: ci/merge-release
+        with:
+          manifests: '["ci/Cargo.toml"]'
+          token: ${{ secrets.GIT_AUTH_TOKEN }}
+  build:
+    needs: [release]
+    vm: { driver: firecracker }
+    outputs:
+      archive_id: ${{ steps.archive.outputs.archive-id }}
+    steps:
+      - uses: ci/checkout-release
+      - run: cargo build --locked --release --manifest-path ci/Cargo.toml
+      # Include runtime files/configuration required by your own service spec.
+      - run: tar -czf service.tar.gz -C ci/target/release ci
+      - id: archive
+        uses: ci/publish-service-archive
+        with:
+          path: service.tar.gz
+          name: ci-service
+          url: ${{ vars.ORCHESTRATOR_URL }}
+          user-id: ${{ vars.SERVICE_OWNER }}
+          token: ${{ secrets.ORCHESTRATOR_TOKEN }}
+  deploy:
+    needs: [build]
+    vm: { driver: firecracker }
+    steps:
+      - uses: ci/deploy-service
+        timeout-minutes: 15
+        with:
+          url: ${{ vars.ORCHESTRATOR_URL }}
+          token: ${{ secrets.ORCHESTRATOR_TOKEN }}
+          # Adapt startup, health, route and secret refs to the service.
+          spec: >-
+            {"id":"example-ci","user_id":"${{ vars.SERVICE_OWNER }}",
+             "vm":{"driver":"firecracker","image":"ubuntu","port":8080},
+             "deploy":{"archive_id":"${{ needs.build.outputs.archive_id }}"}}

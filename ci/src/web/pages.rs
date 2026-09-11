@@ -13,6 +13,7 @@
 //! debugging. What is left in `STYLE` below is only what is peculiar to this
 //! app; anything a second app would want belongs in the shared file.
 
+use crate::release::ReleaseRow;
 use crate::runners::{Pool, Runner, RunnerSet, RunnerStatus, TunnelFailure};
 use crate::store::{ArtifactRow, JobRow, Repo, RepoToken, Run, ServiceDeploymentRow, StepRow};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
@@ -109,6 +110,9 @@ form.row input[type=text], form.row select { min-width: 16rem; }
 .deployment-table { table-layout: fixed; width: 100%; }
 .deployment-table td { overflow-wrap: anywhere; }
 .deployment-table code { white-space: normal; }
+.release-table { table-layout: fixed; width: 100%; }
+.release-table th { width: 110px; }
+.release-table td, .release-table code { overflow-wrap: anywhere; white-space: normal; }
 @media (max-width: 900px) {
   .deployment-table, .deployment-table tbody { display: block; }
   .deployment-table thead { display: none; }
@@ -1448,6 +1452,7 @@ pub fn run_page(
         jobs,
         artifacts,
         vm_logs,
+        None,
         &[],
         retention_days,
     )
@@ -1460,6 +1465,7 @@ pub fn run_page_with_deployments(
     jobs: &[JobRow],
     artifacts: &[ArtifactRow],
     vm_logs: &[(String, Option<String>)],
+    release: Option<&ReleaseRow>,
     deployments: &[ServiceDeploymentRow],
     retention_days: Option<u64>,
 ) -> Markup {
@@ -1570,6 +1576,39 @@ pub fn run_page_with_deployments(
                     @if let Some(err) = &j.error {
                         div .banner { strong { (j.display) ": " } (err) }
                     }
+                }
+            }
+        }
+
+        @if let Some(release) = release {
+            section {
+                h2 { "Release" }
+                p {
+                    (pill(&release.status))
+                    @if release.status == "unknown" {
+                        " Publication outcome is unknown; this does not mean the release was published."
+                    }
+                }
+                div .scroll {
+                    table .release-table {
+                        tbody {
+                            tr { th { "Source SHA" } td { code .mono { (release.prepared.source_sha) } } }
+                            tr { th { "Release SHA" } td { code .mono { (release.prepared.release_sha) } } }
+                            tr { th { "Branch" } td { code .mono { (release.prepared.git_ref) } } }
+                            tr { th { "Versions" } td {
+                                @if let Some(versions) = release.prepared.versions.as_object() {
+                                    @for (name, version) in versions {
+                                        div { code .mono { (name) } ": " code .mono {
+                                            (version.as_str().map(str::to_owned).unwrap_or_else(|| version.to_string()))
+                                        } }
+                                    }
+                                }
+                            } }
+                        }
+                    }
+                }
+                @if let Some(error) = &release.error {
+                    div .banner { (error) }
                 }
             }
         }
@@ -2407,6 +2446,7 @@ mod page_tests {
             &[job("deploy", "failure")],
             &[],
             &[],
+            None,
             &deployments,
             Some(2),
         )
@@ -2435,6 +2475,53 @@ mod page_tests {
         assert!(!html.contains("Retry deployment") && !html.contains("Cancel deployment"));
         if let Ok(path) = std::env::var("CI_DEPLOYMENTS_HTML") {
             std::fs::write(path, &html).unwrap();
+        }
+    }
+
+    #[test]
+    fn release_and_deployments_render_truthful_escaped_exportable_html() {
+        let release = ReleaseRow {
+            prepared: crate::release_git::PreparedRelease {
+                source_sha: "1111111111111111111111111111111111111111".into(),
+                release_sha: "2222222222222222222222222222222222222222".into(),
+                git_ref: "refs/heads/release/public".into(),
+                versions: serde_json::json!({"ci": "1.2.3", "web": "4.5.6"}),
+            },
+            status: "unknown".into(),
+            error: Some("push outcome <unknown> & must be checked".into()),
+        };
+        let html = run_page_with_deployments(
+            &chrome(),
+            &run("failure"),
+            &[],
+            &[job("release", "failure"), job("deploy", "skipped")],
+            &[],
+            &[],
+            Some(&release),
+            &[],
+            Some(2),
+        )
+        .into_string();
+
+        assert!(html.contains("1111111111111111111111111111111111111111"));
+        assert!(html.contains("2222222222222222222222222222222222222222"));
+        assert!(html.contains("ci</code>: <code class=\"mono\">1.2.3"));
+        assert!(html.contains("outcome &lt;unknown&gt; &amp; must be checked"));
+        assert!(!html.contains("outcome <unknown>"));
+        assert!(html.contains("does not mean the release was published"));
+        assert!(html.find("Release").unwrap() < html.find("Deployments").unwrap());
+        if let Ok(path) = std::env::var("CI_RELEASE_HTML") {
+            std::fs::write(format!("{path}.unknown.html"), &html).unwrap();
+            let mut published = release.clone();
+            published.status = "published".into();
+            published.error = None;
+            let mut deployment = deployments_fixture("passed", "public-ci");
+            deployment.sha = published.prepared.release_sha.clone();
+            deployment.git_ref = published.prepared.git_ref.clone();
+            let published_html = run_page_with_deployments(&chrome(), &run("success"), &[],
+                &[job("validate", "success"), job("release", "success"), job("build", "success"), job("deploy", "success")],
+                &[], &[], Some(&published), &[deployment], Some(2)).into_string();
+            std::fs::write(path, published_html).unwrap();
         }
     }
 
