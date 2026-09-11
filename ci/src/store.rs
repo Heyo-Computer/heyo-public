@@ -504,6 +504,23 @@ pub struct OutboxEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct ServiceDeploymentRow {
+    pub id: String,
+    pub step_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub service_id: String,
+    pub status: String,
+    pub phase: Option<String>,
+    pub message: Option<String>,
+    pub error: Option<String>,
+    pub sha: String,
+    pub git_ref: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunEvent {
     pub id: uuid::Uuid,
     pub revision: i64,
@@ -682,6 +699,81 @@ impl Store {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Returns true only to the transaction that owns the single POST attempt.
+    pub async fn begin_service_deployment(
+        &self, id: &str, step: &str, service: &str, request_hash: &str,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let inserted = sqlx::query(
+            "INSERT INTO ci_service_deployment (id, step_id, run_id, job_id, service_id, request_hash, status, sha, git_ref)
+             SELECT $1,s.id,r.id,j.id,$3,$4,'submitting',r.sha,r.git_ref
+             FROM ci_step s JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=j.run_id
+             WHERE s.id=$2 AND j.status='running' AND r.status <> 'cancelled'
+             ON CONFLICT (step_id) DO NOTHING RETURNING run_id, job_id"
+        ).bind(id).bind(step).bind(service).bind(request_hash)
+            .fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+        if inserted.is_some() {
+            Self::add_service_deployment_event(&mut tx, id).await?;
+            tx.commit().await.map_err(StoreError::sql)?;
+            Ok(true)
+        } else {
+            let matches: Option<bool> = sqlx::query_scalar(
+                "SELECT id=$2 AND service_id=$3 AND request_hash=$4 FROM ci_service_deployment WHERE step_id=$1"
+            ).bind(step).bind(id).bind(service).bind(request_hash)
+                .fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+            if matches != Some(true) {
+                return Err(StoreError::Sql("deployment request changed, or job is no longer running".into()));
+            }
+            tx.commit().await.map_err(StoreError::sql)?;
+            Ok(false)
+        }
+    }
+
+    pub async fn update_service_deployment(
+        &self, id: &str, status: &str, phase: Option<&str>, message: Option<&str>, error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query(
+            "UPDATE ci_service_deployment SET status=$2,phase=$3,message=$4,error=$5,updated_at=now()
+             WHERE id=$1 AND status NOT IN ('passed','failed')
+               AND (status,phase,message,error) IS DISTINCT FROM ($2,$3,$4,$5)
+             RETURNING run_id,job_id,step_id"
+        ).bind(id).bind(status).bind(phase).bind(message).bind(error)
+            .fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+        if row.is_some() {
+            Self::add_service_deployment_event(&mut tx, id).await?;
+        }
+        tx.commit().await.map_err(StoreError::sql)
+    }
+
+    async fn add_service_deployment_event(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, id: &str,
+    ) -> Result<(), StoreError> {
+        let row = sqlx::query("SELECT d.*,j.job_key FROM ci_service_deployment d JOIN ci_job j ON j.id=d.job_id WHERE d.id=$1")
+            .bind(id).fetch_one(&mut **tx).await.map_err(StoreError::sql)?;
+        let event = Self::add_event(tx, &row.get::<String,_>("run_id"), Some(&row.get::<String,_>("job_id")),
+            Some(&row.get::<String,_>("job_key")), Some(&row.get::<String,_>("step_id")),
+            "ci.deployment.status.v1", &row.get::<String,_>("status"), row.get::<Option<String>,_>("error").as_deref()).await?;
+        let detail = serde_json::json!({
+            "deployment_id": id, "service_id": row.get::<String,_>("service_id"),
+            "phase": row.get::<Option<String>,_>("phase"), "message": row.get::<Option<String>,_>("message"),
+        });
+        sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2::jsonb WHERE id=$1")
+            .bind(event).bind(detail).execute(&mut **tx).await.map_err(StoreError::sql)?;
+        Ok(())
+    }
+
+    pub async fn service_deployments_of(&self, run: &str) -> Result<Vec<ServiceDeploymentRow>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM ci_service_deployment WHERE run_id=$1 ORDER BY created_at,id")
+            .bind(run).fetch_all(&self.pool).await.map_err(StoreError::sql)?;
+        Ok(rows.iter().map(|r| ServiceDeploymentRow {
+            id: r.get("id"), step_id: r.get("step_id"), run_id: r.get("run_id"), job_id: r.get("job_id"),
+            service_id: r.get("service_id"), status: r.get("status"), phase: r.get("phase"),
+            message: r.get("message"), error: r.get("error"), sha: r.get("sha"), git_ref: r.get("git_ref"),
+            created_at: r.get("created_at"), updated_at: r.get("updated_at"),
+        }).collect())
     }
 
     /// Apply the migrations compiled into this binary, in filename order.

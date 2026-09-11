@@ -13,6 +13,7 @@
 
 mod artifacts;
 mod bus;
+mod cd;
 // The platform UI kit — tokens, the theme cookie and forwarded identity —
 // shared with app-lb, app-obs, heyosecret and artifacts. Included by path
 // rather than depended on as a crate: those five apps sit on three different

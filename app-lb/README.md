@@ -1662,21 +1662,9 @@ registered with the cloud (`heyvmd`) for the binds to reach it.
 ## Directory
 
 `http://<admin-addr>/` (default `http://127.0.0.1:9090/`) is a landing page: one
-card per routable URL, linking to the app deployment that serves it. The
-workspace picker uses the same namespace grants as `GET /namespaces`.
-`/?namespace=team-a` shows only that workspace's accessible apps; an unknown or
-inaccessible workspace returns the same 404. Empty workspaces remain selectable.
-A caller with exactly one visible workspace lands in it automatically.
-
-A workspace is an app-lb **namespace**, not a VM's filesystem workspace. CI/CD,
-orchestrator, and other services are apps deployed into it. app-lb owns the VM
-platform and access boundary, not those apps' business logic. The **VMs & platform**
-link preserves the workspace selection in `/dashboard?namespace=team-a`; API
-authorization still applies independently of this display filter.
-
-Retail remains the signup/account surface. These control-panel additions do not
-remove its existing CI/CD or sandbox screens; removal requires feature parity
-and explicit approval after verification.
+card per routable URL, linking to the deployment that serves it. It is the
+answer to "what is running on this box, and where do I click", which the
+dashboard answers only incidentally.
 
 ```
 edge-1                                      Dashboard  Metrics  Theme

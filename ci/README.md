@@ -1067,6 +1067,60 @@ Postgres for runs, jobs, steps, artifacts and the pool; **step logs go to disk**
 with the path and byte count on the row. A build log is megabytes, and putting it
 in a column means every listing query drags all of it across the wire.
 
+### Service deployments
+
+`ci/deploy-service` runs an asynchronous service rollout through Orchestrator's
+existing `POST /orchestration/services/deployments` API. It does not create VMs,
+implement routing, or change app-lb's namespace model. The existing CI run page
+has a **Deployments** section with service, operation ID, exact revision, phase,
+status, errors, and the last observation time. Refresh the page for new status.
+`GET /api/runs/{run_id}/deployments` uses the same repository-scoped authentication
+as other run reads.
+
+The action takes `with.url` (Orchestrator base URL), `with.token` (resolved from
+the workflow's HeyoSecret-backed secrets), and `with.spec` (a JSON string in the
+existing snake_case service format). HTTPS is required except on loopback;
+redirects are not followed. No installation-wide credential is automatically
+granted to a workflow. Orchestrator currently requires an **internal API key**,
+so enable this only for trusted service-deployment workflows; this is not yet a
+tenant-scoped customer deployment credential.
+
+```yaml
+# Steps within a trusted deployment job, after its build/validation dependencies.
+- uses: ci/deploy-service
+  timeout-minutes: 15
+  with:
+    url: ${{ vars.ORCHESTRATOR_URL }}
+    token: ${{ secrets.ORCHESTRATOR_TOKEN }}
+    spec: >-
+      {"id":"example-api","user_id":"service-owner",
+       "vm":{"driver":"firecracker","image":"ubuntu","port":8080},
+       "deploy":{"archive_id":"${{ needs.build.outputs.archive_id }}"}}
+```
+
+`deploy.archive_id` must identify a finalized **Orchestrator service archive**,
+uploaded through its existing archive APIs. It is not a `ci/upload-artifact`
+tag/digest; automatic transfer between the two stores is not implemented here.
+Use the repository-owned service spec for real startup, health, route, and
+secret-reference settings. The action overwrites `deploy.deployment_id`, `async`,
+and `revision_guard` with its stable step identity and the CI run's repository,
+branch ref and full SHA; `force` is always false. The remote branch must still
+point at that revision when Orchestrator checks it. Workflow dependencies and
+secret permissions remain the admission boundary; the action does not merge a
+branch or create a release.
+
+Before POST, CI commits an operation ledger row and NATS outbox event together.
+Orchestrator does not deduplicate POSTs, so repeated execution of the **same
+step** only polls that operation ID. A changed request for that step is rejected.
+Lost responses, 404s, and status lookup failures never cause a second POST.
+Only an identity-matched terminal Orchestrator status marks a rollout passed or
+failed. Cancellation/timeout stops CI waiting, not the remote rollout; the UI
+keeps its last known status and warns that it may continue. Re-running a run
+with unresolved deployment records is refused. Automatic reconciliation after
+a finished/cancelled run, and an operator reconciliation UI, remain follow-up
+work; queue replay of an unfinished action resumes GET polling with resolved
+workflow credentials. Do not erase unknown operation records to retry them.
+
 ### Durable execution events
 
 Postgres is authoritative for run, job, and step state. Each authoritative
@@ -1079,7 +1133,7 @@ subjects and their work-queue retention are unchanged.
 
 The JSON envelope is version 1 and contains `version`, stable UUID `id`, history
 cursor `revision`, repository scope (`repo_id`), exact Git `sha` and `git_ref`, `transitioned_at`, `type`
-(`ci.run.status.v1`, `ci.job.status.v1`, `ci.step.status.v1`, or `ci.artifact.published.v1`), `run_id`, and
+(`ci.run.status.v1`, `ci.job.status.v1`, `ci.step.status.v1`, `ci.artifact.published.v1`, or `ci.deployment.status.v1`), `run_id`, and
 nullable `job_id`, `job_key`, and `step_id`. `status` and `error` remain top-level
 for existing dashboard consumers. The same UUID is sent as `Nats-Msg-Id` on
 every retry. A crash after PubAck and before the database update can redeliver
@@ -1088,9 +1142,8 @@ by `id` and tolerate at-least-once delivery. Events are retained by JetStream
 for 24 hours; the outbox currently has no automatic archival/pruning policy.
 The authenticated `GET /api/runs/{run_id}/events?limit=50&before=<revision>` API
 uses the same repository bearer token or path-HMAC semantics as other run reads,
-returns 404 across repository boundaries, and caps pages at 100 events. The run
-page shows 100 transitions at a time with older/latest navigation and whether
-each is pending or published to NATS. Revisions order history, not concurrent
+returns 404 across repository boundaries, and caps pages at 100 events.
+Revisions order history, not concurrent
 transaction commits or NATS delivery. Consumers must re-read authoritative
 state rather than assuming receipt order determines the latest state.
 
@@ -1174,7 +1227,7 @@ Not built yet:
 
 - **The S3 artifact sink.** Declared and selectable; fails loudly naming the
   alternatives rather than reporting an artifact stored that is not there.
-- **Composite `uses:` actions.** Only `ci/upload-artifact` is built in. Fetching
+- **Composite `uses:` actions.** `ci/upload-artifact` and `ci/deploy-service` are built in. Fetching
   an `action.yml` from a repository is a different feature with a different trust
   model.
 - **Triggers other than `submit`.** `on: [schedule]` parses and is reported as

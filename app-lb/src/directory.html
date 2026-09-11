@@ -56,7 +56,6 @@
   .wrap { max-width: 1100px; margin: 0 auto; }
 
   header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
-  header.topbar { height: auto; min-height: 52px; padding-top: 12px; padding-bottom: 12px; }
   h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
   .lede { color: var(--text-2); margin: 0 0 28px; }
   .links { margin-left: auto; display: flex; gap: 14px; align-items: baseline; }
@@ -110,20 +109,6 @@
     border: 1px dashed var(--grid); border-radius: 0;
     padding: 28px; text-align: center; color: var(--text-2);
   }
-  .workspace-picker { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 28px 0; }
-  .workspace-picker label, .workspace-name { color: var(--text-2); font-size: 12px; }
-  .workspace-picker select { min-width: 220px; max-width: 100%; }
-  .workspace-picker select, .workspace-picker button {
-    font: inherit; color: var(--text); background: var(--surface);
-    border: 1px solid var(--border); padding: 8px 12px;
-  }
-  .workspace-picker button { cursor: pointer; }
-  .workspace-picker button:hover { border-color: var(--accent); }
-  .workspace-name { margin-bottom: 10px; }
-  .workspace-heading { margin-bottom: 8px; overflow-wrap: anywhere; }
-  .section-heading { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin: 28px 0 14px; }
-  .section-heading h2 { font-size: 16px; margin: 0; }
-  .section-heading a { margin-left: auto; }
   .note { margin-top: 26px; color: var(--muted); font-size: 12.5px; }
   code {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
@@ -141,8 +126,8 @@
 <header class="topbar">
     <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
     <nav class="topbar-nav">
-      <a href="/" aria-current="page">Apps</a>
-      <a href="{{PLATFORM_URL}}">VMs &amp; platform</a>
+      <a href="/" aria-current="page">Directory</a>
+      <a href="/dashboard">Dashboard</a>
       <a href="/siem">Security</a>
       <a href="/storage">Disks</a>
       <a href="/metrics">Metrics</a>
@@ -152,13 +137,6 @@
       <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
     </div>
   </header>
-  {{WORKSPACE_PICKER}}
-  <h1 class="workspace-heading">{{WORKSPACE_TITLE}}</h1>
-  <p class="lede">Open an app in your workspace. VM resources and access are managed by the platform.</p>
-  <div class="section-heading">
-    <h2>Apps</h2>
-    <a href="{{PLATFORM_URL}}">Manage VMs &amp; platform →</a>
-  </div>
   <p class="lede">{{LEDE}}</p>
   {{CARDS}}
 </div>

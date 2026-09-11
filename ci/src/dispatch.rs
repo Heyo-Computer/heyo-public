@@ -560,6 +560,12 @@ impl Dispatcher {
                 run.status
             )));
         }
+        if self.store.service_deployments_of(run_id).await?.iter()
+            .any(|d| !matches!(d.status.as_str(), "passed" | "failed")) {
+            return Err(DispatchError::Workflow(
+                "a service rollout is still running or has an unknown submission outcome; reconcile it before creating another run".into()
+            ));
+        }
 
         // The registration the original ran under, when it had one — it is
         // what decides the workflow glob, the network and the secrets prefix,
@@ -2184,7 +2190,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     .log_path(&msg.run_id, &plan.key, idx as i32, &sid);
                 self.store.start_step(&sid, &sid).await?;
                 match self
-                    .run_action(msg, plan, vm, action, step, &ctx, &sid, &log_path)
+                    .run_action(msg, plan, vm, action, step, &ctx, &sid, &log_path, &masker)
                     .await
                 {
                     Ok(note) => {
@@ -2345,7 +2351,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
 
     /// Run a built-in `uses:` action.
     ///
-    /// Only the artifact actions exist. Composite actions — fetching an
+    /// Artifact publication and service deployment. Composite actions — fetching an
     /// `action.yml` from a repository and running its steps — are a different
     /// feature with a different trust model, and pretending to support them by
     /// silently doing nothing would be worse than saying so.
@@ -2360,10 +2366,20 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
         ctx: &Context,
         sid: &str,
         log_path: &std::path::Path,
+        masker: &crate::secrets::Masker,
     ) -> Result<String, DispatchError> {
         let with = |k: &str| step.with.get(k).map(|v| ctx.substitute(v));
 
         match action {
+            "ci/deploy-service" => {
+                let required = |key: &str| with(key).filter(|v| !v.trim().is_empty())
+                    .ok_or_else(|| DispatchError::StepFailed(format!("ci/deploy-service requires with.{key}")));
+                let spec: Value = serde_json::from_str(&required("spec")?)
+                    .map_err(|_| DispatchError::StepFailed("ci/deploy-service with.spec must be JSON".into()))?;
+                crate::cd::deploy(&self.store, msg, sid, spec, &required("url")?,
+                    &required("token")?, step_timeout(step, plan), masker)
+                    .await.map_err(DispatchError::StepFailed)
+            }
             "ci/upload-artifact" => {
                 let name = with("name").ok_or_else(|| {
                     DispatchError::Artifact("ci/upload-artifact needs `with.name`".into())
@@ -2583,7 +2599,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
             }
             other => Err(DispatchError::Artifact(format!(
                 "`uses: {other}` is not a built-in action. Available: \
-                 ci/upload-artifact. Composite actions from a repository are not \
+                 ci/upload-artifact, ci/deploy-service. Composite actions from a repository are not \
                  supported."
             ))),
         }

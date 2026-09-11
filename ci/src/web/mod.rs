@@ -416,15 +416,9 @@ async fn runs_page(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct RunPageQuery {
-    before: Option<i64>,
-}
-
 async fn run_page(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
-    Query(query): Query<RunPageQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let who = who_of(&headers);
@@ -445,18 +439,25 @@ async fn run_page(
             }
 
             let reruns = state.store.reruns_of(&run_id).await.unwrap_or_default();
-            let events = match state.store.run_events(&run_id, query.before, 101).await {
-                Ok(events) => events,
-                Err(e) => return page_error(&state, &headers, who.as_ref(), &format!("could not load execution history: {e}")),
+            let deployments = match state.store.service_deployments_of(&run_id).await {
+                Ok(deployments) => deployments,
+                Err(e) => {
+                    return page_error(
+                        &state,
+                        &headers,
+                        who.as_ref(),
+                        &format!("could not load deployments: {e}"),
+                    );
+                }
             };
-            pages::run_page_with_events(
+            pages::run_page_with_deployments(
                 &chrome(&state, &headers, who.as_ref()),
                 &run,
                 &reruns,
                 &jobs,
                 &artifacts,
                 &vm_logs,
-                &events,
+                &deployments,
                 state.config.log_retention.map(|d| d.as_secs() / 86_400),
             )
             .into_response()
