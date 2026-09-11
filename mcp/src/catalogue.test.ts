@@ -12,39 +12,72 @@
  * answers `tools/list` — and this test fails when the checked-in README is
  * behind it. Adding a tool without running `npm run catalogue` is a failing
  * test rather than a stale document.
+ *
+ * ## Why these tests skip in the image build
+ *
+ * `deploy/image/Dockerfile` copies `src/` and the package manifests into the
+ * builder and nothing else, so neither the README nor `scripts/` exists there.
+ * That is the right place for this check to be absent: it asserts that a
+ * document agrees with the code, and a stale README should fail CI, not stop a
+ * production image from building.
+ *
+ * The generator is therefore imported lazily. A static import of a file the
+ * build context does not contain fails the whole module at load time, before any
+ * `skip` can run — which is what failed `heyctl build heyo-mcp` on 2026-09-11,
+ * reported as one failing test in place of these three.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-
-// @ts-expect-error - a plain .mjs build script, deliberately not compiled
-import { BEGIN, END, catalogueBlock, spliceCatalogue } from "../scripts/gen-catalogue.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { loadConfig } from "./config.js";
 import { buildTools, toolListing } from "./server.js";
 import { DESTRUCTIVE_PREFIX } from "./tools/schema.js";
 
 // dist/ at runtime, so the package root is one level up.
-const readmePath = join(dirname(fileURLToPath(import.meta.url)), "..", "README.md");
+const pkgRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const readmePath = join(pkgRoot, "README.md");
+const generatorPath = join(pkgRoot, "scripts", "gen-catalogue.mjs");
+
+const skip =
+  existsSync(readmePath) && existsSync(generatorPath)
+    ? false
+    : "README.md or scripts/ is not in this build context — the image build copies src/ only";
+
+/** The generator's exports, loaded only when it is actually there. */
+const generator = () =>
+  import(pathToFileURL(generatorPath).href) as Promise<{
+    BEGIN: string;
+    END: string;
+    catalogueBlock: () => string;
+    spliceCatalogue: (readme: string, block: string) => string;
+  }>;
+
 const readme = () => readFileSync(readmePath, "utf8");
 
-test("the checked-in catalogue matches the server's own listing", () => {
+/** The generated block, markers included, as it stands in the README. */
+async function block(): Promise<string> {
+  const { BEGIN, END } = await generator();
+  const text = readme();
+  return text.slice(text.indexOf(BEGIN), text.indexOf(END));
+}
+
+test("the checked-in catalogue matches the server's own listing", { skip }, async () => {
+  const { catalogueBlock, spliceCatalogue } = await generator();
   const current = readme();
-  const regenerated = spliceCatalogue(current, catalogueBlock() as string);
   assert.equal(
     current,
-    regenerated,
+    spliceCatalogue(current, catalogueBlock()),
     "README.md's tool catalogue is stale — run `npm run build && npm run catalogue` " +
       "and commit the result.",
   );
 });
 
-test("every tool appears in the catalogue exactly once", () => {
-  const text = readme();
-  const block = text.slice(text.indexOf(BEGIN as string), text.indexOf(END as string));
+test("every tool appears in the catalogue exactly once", { skip }, async () => {
+  const text = await block();
   const tools = buildTools(
     loadConfig({
       HEYO_API_KEY: "heyo_api_x",
@@ -54,32 +87,26 @@ test("every tool appears in the catalogue exactly once", () => {
       ART_URL: "http://a",
     }),
   );
-
   for (const t of tools) {
-    const rows = block.split("\n").filter((l) => l.startsWith(`| \`${t.name}\` |`));
+    const rows = text.split("\n").filter((l) => l.startsWith(`| \`${t.name}\` |`));
     assert.equal(rows.length, 1, `${t.name} appears ${rows.length} times in the catalogue`);
   }
 });
 
-test("the catalogue marks exactly the tools that call themselves destructive", () => {
+test("the catalogue marks exactly the tools that call themselves destructive", { skip }, async () => {
   // The contradiction that used to exist: prose in one place, a different set in
   // another, and nothing comparing them. Here they are compared.
-  const text = readme();
-  const block = text.slice(text.indexOf(BEGIN as string), text.indexOf(END as string));
   const marked = new Set(
-    block
+    (await block())
       .split("\n")
       .filter((l) => l.includes("**destructive**"))
       .map((l) => /^\| `([^`]+)`/.exec(l)?.[1])
       .filter((n): n is string => !!n),
   );
-
-  const listed = toolListing(
-    buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_TOKEN: "heyo_api_lb" })),
-  );
   const destructive = new Set(
-    listed.filter((t) => t.description.startsWith(DESTRUCTIVE_PREFIX)).map((t) => t.name),
+    toolListing(buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_TOKEN: "heyo_api_lb" })))
+      .filter((t) => t.description.startsWith(DESTRUCTIVE_PREFIX))
+      .map((t) => t.name),
   );
-
   assert.deepEqual([...marked].sort(), [...destructive].sort());
 });

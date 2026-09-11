@@ -81,6 +81,16 @@ export interface Config {
   readonly ci?: ServiceConfig;
   readonly art?: ServiceConfig;
   readonly timeoutMs: number;
+  /**
+   * Whether this process serves over HTTP rather than stdio.
+   *
+   * It changes what one tool may do. Over stdio the caller *is* the machine this
+   * runs on, so `art_publish` reading a local `path` reads the caller's own file.
+   * Over HTTP the caller is somewhere else, and the same read would be a remote
+   * request for this server's disk — the more so behind a gate whose `/mcp` path
+   * is public. Survives `withForwardedAuth`, which spreads the config it is given.
+   */
+  readonly http?: boolean;
 }
 
 function trimUrl(raw: string): string {
@@ -393,6 +403,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     obs: service(env.APP_OBS_URL, env.APP_OBS_API_TOKEN),
     ci: service(env.CI_URL, env.CI_TOKEN),
     art: artService(env.ART_URL, env.ART_API_KEY, env.ART_GATE_TOKEN, env.APPLB_TOKEN),
+    // The same test `index.ts` uses to decide which transport to start.
+    http: Number(env.HEYO_MCP_HTTP_PORT ?? "") > 0,
     // Generous, but bounded. Every call here is a diagnostic or a sandbox
     // operation, and a hung one is worse than a failed one: it stalls the
     // conversation with no output at all.

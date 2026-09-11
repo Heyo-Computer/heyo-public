@@ -267,6 +267,17 @@ therefore their own namespaces. A configured token otherwise wins over a
 caller's header — an instance deployed to act as itself must not be talked into
 acting as someone else.
 
+**Behind an app-token gate, the instance's own MCP path has to be public.** A
+gate checks a token against the deployment *it* belongs to before anything
+behind it runs, and a hosted instance usually lives in `default` — so a token
+confined to any other namespace is refused at the door with a 403, however well
+it is scoped for everything else. Give the path
+`{"path": "/mcp", "scope": "public"}` and set `HEYO_MCP_REQUIRE_IDENTITY=0`.
+That is safe only because the instance holds no credential: an anonymous
+request reaches a server with nothing to act with, and every call it makes
+carries the caller's own token to be judged where it lands. Over HTTP,
+`art_publish` takes `content_base64` only. `deploy/vm.md` has the reasoning.
+
 **One credential overrides that, and must: a token app-lb minted itself.** A
 caller presenting `Authorization: Bearer applb_…` reaches app-lb with *that*
 token, whether or not this process has one of its own. An app-token carries a

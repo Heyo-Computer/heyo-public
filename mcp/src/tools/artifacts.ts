@@ -33,6 +33,7 @@
 
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import type { Config } from "../config.js";
 
 import { z } from "zod";
 import type { Clients } from "../clients/index.js";
@@ -56,9 +57,19 @@ const SCHEMA_VERSION = 1;
  * tokens, which the description says out loud rather than letting somebody
  * discover it with a 200 MB rootfs.
  */
-async function bytesOf(args: Record<string, unknown>): Promise<Uint8Array> {
+async function bytesOf(args: Record<string, unknown>, http = false): Promise<Uint8Array> {
   const path = typeof args.path === "string" ? args.path.trim() : "";
   const b64 = typeof args.content_base64 === "string" ? args.content_base64.trim() : "";
+  // Before anything else, and before any read. The schema already omits `path`
+  // over HTTP, so a validated call never gets here with one; this is for any
+  // caller that reaches the handler another way. Over HTTP the path names this
+  // server's disk on behalf of someone who is not on it.
+  if (path && http) {
+    throw new Error(
+      "`path` is not accepted over HTTP: it would name a file on this server's disk, " +
+        "not yours. Send the bytes as `content_base64`.",
+    );
+  }
   if (path && b64) {
     throw new Error("give either `path` or `content_base64`, not both.");
   }
@@ -88,7 +99,11 @@ async function bytesOf(args: Record<string, unknown>): Promise<Uint8Array> {
     }
     return new Uint8Array(bytes);
   }
-  throw new Error("no bytes: give `path` (stdio) or `content_base64` (HTTP).");
+  throw new Error(
+    http
+      ? "no bytes: give `content_base64` — over HTTP it is the only way bytes reach this server."
+      : "no bytes: give `path` (stdio) or `content_base64` (HTTP).",
+  );
 }
 
 function sha256(bytes: Uint8Array): string {
@@ -101,7 +116,7 @@ interface ManifestEntry {
   size: number;
 }
 
-function publishTool(clients: Clients): Tool {
+function publishTool(clients: Clients, http: boolean): Tool {
   return {
     name: "art_publish",
     description:
@@ -113,10 +128,14 @@ function publishTool(clients: Clients): Tool {
       "is the one that goes wrong by hand — a tag must name a manifest, the store does not " +
       "check it, and a tag pointing at a blob digest is accepted and then resolves for " +
       "nobody.\n\n" +
-      "Give the bytes as `path` (a file on this server — right for stdio, where the host " +
-      "launched this process) or `content_base64` (right for HTTP, where the caller's " +
-      "filesystem is somewhere else; costs ~4 tokens per 3 bytes, so it is for bundles, not " +
-      "rootfs images).\n\n" +
+      (http
+        ? "Give the bytes as `content_base64`, which costs ~4 tokens per 3 bytes — for " +
+          "bundles, not rootfs images. This server is reached over HTTP, so a file path " +
+          "would name its disk rather than yours, and `path` is not accepted here.\n\n"
+        : "Give the bytes as `path` (a file on this server — right for stdio, where the host " +
+          "launched this process) or `content_base64` (right for HTTP, where the caller's " +
+          "filesystem is somewhere else; costs ~4 tokens per 3 bytes, so it is for bundles, not " +
+          "rootfs images).\n\n") +
       "Idempotent: the store is content-addressed, so re-publishing identical bytes writes " +
       "nothing new and just moves the tag. Follow with applb_pull to roll the deployment " +
       "onto it — NOT applb_host_update, which runs a static deployment's own commands on the " +
@@ -129,7 +148,11 @@ function publishTool(clients: Clients): Tool {
         .string({ required_error: "`tag` is required — a publish nothing names is unreachable." })
         .min(1, "`tag` is required — a publish nothing names is unreachable.")
         .describe("the tag to point at this build, e.g. 'marketing-site'"),
-      path: z.string().optional().describe("file on THIS server's filesystem"),
+      // Absent over HTTP rather than present-and-refused: advertising a parameter
+      // that can only fail is the shape this server is organised against.
+      ...(http
+        ? {}
+        : { path: z.string().optional().describe("file on THIS server's filesystem") }),
       content_base64: z.string().optional().describe("the bundle's bytes, base64"),
       name: z
         .string()
@@ -148,7 +171,7 @@ function publishTool(clients: Clients): Tool {
       const tag = String(a.tag ?? "").trim();
       if (!tag) throw new Error("`tag` is required — a publish nothing names is unreachable.");
 
-      const bytes = await bytesOf(a);
+      const bytes = await bytesOf(a, http);
       const digest = sha256(bytes);
       const entry: ManifestEntry = {
         name: (a.name as string | undefined)?.trim() || tag,
@@ -217,11 +240,11 @@ function publishTool(clients: Clients): Tool {
   };
 }
 
-export function artifactTools(clients: Clients): Tool[] {
+export function artifactTools(clients: Clients, config: Config): Tool[] {
   const enc = encodeURIComponent;
 
   return [
-    publishTool(clients),
+    publishTool(clients, Boolean(config.http)),
 
     {
       name: "art_list_tags",

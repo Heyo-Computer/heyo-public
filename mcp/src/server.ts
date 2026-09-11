@@ -62,7 +62,7 @@ export function buildTools(config: Config): Tool[] {
     ...(cloudUsable(config) ? sandboxTools(clients) : []),
     ...feedTools(clients),
     ...actionTools(clients, config),
-    ...artifactTools(clients),
+    ...artifactTools(clients, config),
   ].map(validated);
 }
 

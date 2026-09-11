@@ -168,6 +168,9 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         "`build` for a Dockerfile, `pull` for bytes from a store, `host_update` for a static " +
         "deployment's own commands — where choosing wrong is refused rather than ignored. " +
         "And it tells you when a `host_suffix` route will not get its own certificate.\n\n" +
+        "If your token is confined to a namespace, set `namespace` in the spec to it: " +
+        "registering does not fill it in, and the default is `default`, which such a token " +
+        "cannot reach.\n\n" +
         "`wait_seconds` bounds the poll only; the job continues regardless and applb_job " +
         "reports it.",
       // The one tool carrying the spec schema. A second copy would be ~12 KB on

@@ -132,6 +132,14 @@ export const SPEC_RULES: readonly SpecRule[] = [
       "certificate; it needs a wildcard configured on the fleet, and a suffix no wildcard " +
       "covers is served a fallback certificate that will not validate.",
   },
+  {
+    blocks: ["*"],
+    rule:
+      "A token confined to a namespace must set `namespace` to that namespace. " +
+      "Registering does not fill it in, and a spec without one means `default` — which " +
+      "such a token cannot reach, so it is refused with the same 403 as any request " +
+      "outside the token's scope.",
+  },
 ];
 
 /** The rules touching a named block, plus the whole-spec ones. */
