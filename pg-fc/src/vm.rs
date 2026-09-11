@@ -19,7 +19,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::registry::SchemaEntry;
+use crate::registry::{GIB, GrowVerdict, SchemaEntry};
 use crate::s3::S3Config;
 
 const VM_PG_PORT: u16 = 5432;
@@ -268,6 +268,12 @@ const READY_NOTFOUND_GRACE: Duration = Duration::from_secs(45);
 /// and no data to lose: one that hasn't booted in this long is a sick build to
 /// throw away and retry, not something to keep a replenish pass parked on.
 pub(crate) const SPARE_READY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long a power-cycle waits for Firecracker to let go of a just-stopped
+/// VM's data disk before checking whether it needs to grow. The daemon acks
+/// the stop before the process exits; past this the restart goes ahead on the
+/// disk as it is.
+const POWER_CYCLE_DISK_SETTLE: Duration = Duration::from_secs(10);
 
 /// Exclusive use of the process-wide VM state for the caller's whole test.
 ///
@@ -2228,6 +2234,14 @@ async fn power_cycle(
             .stop()
             .await
             .with_context(|| format!("stopping {name} for power-cycle"))?;
+        // A postmaster that died of a full disk dies again on a fresh boot
+        // into it. The daemon acks the stop before Firecracker lets go of the
+        // disk, hence the settle.
+        if let Err(e) =
+            grow_stopped_disk(cfg, name, sandbox.sandbox_id(), POWER_CYCLE_DISK_SETTLE).await
+        {
+            warn!("{name}: {e:#}; restarting it on the disk it has");
+        }
         sandbox
             .start()
             .await
@@ -2701,6 +2715,72 @@ pub(crate) async fn pg_listening(sandbox: &Sandbox) -> Result<Option<bool>> {
     Ok(Some(connected))
 }
 
+/// Grow a stopped VM's data device before booting it, when its filesystem is
+/// at the grow trigger and fills the device.
+///
+/// A VM whose Postgres died of `No space left on device` never gets warm
+/// again — crash recovery has to write before the server accepts a
+/// connection — so neither grow path that samples through Postgres ever sees
+/// it, and every bring-up boots it back into the same full disk (pg-0rtk7Stq
+/// retried all day on a 2GiB disk 94% full). So read it offline, the way a
+/// restored image is: dumpe2fs on the disk file, judged by
+/// [`crate::imgarchive::offline_grow_verdict`].
+///
+/// Does nothing without a run dir or disk file, or while anything holds the
+/// disk open: a running VM's filesystem is the guest's to report, and there
+/// is no resizing under it. `settle` is how long to wait for a just-stopped
+/// VM's Firecracker to let go. The caller holds the boot permit — the
+/// daemon's resize fscks the file, which must not interleave with a reclaim
+/// pass. The registry banks the new size from its first sample of the booted
+/// VM, as it does for every warm schema.
+async fn grow_stopped_disk(cfg: &Config, name: &str, id: &str, settle: Duration) -> Result<()> {
+    let Some(run_dir) = cfg.run_dir.as_ref() else {
+        return Ok(());
+    };
+    let disk = run_dir.join(id).join("data.ext4");
+    let Ok(md) = tokio::fs::metadata(&disk).await else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + settle;
+    while crate::imgarchive::disk_held_open(&disk).await {
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    let Some(usage) = crate::imgarchive::offline_fs_usage(&disk).await else {
+        return Ok(());
+    };
+    let (total_blocks, free_blocks, _) = usage;
+    let used_pct = 100.0 * (1.0 - free_blocks as f64 / total_blocks.max(1) as f64);
+    let size_gb = md.len().div_ceil(GIB);
+    match crate::imgarchive::offline_grow_verdict(usage, md.len(), cfg.disk_grow) {
+        GrowVerdict::NotNeeded => Ok(()),
+        GrowVerdict::AtCap { current_gb } => {
+            warn!(
+                "{name}: stopped data disk is {used_pct:.0}% full and its {current_gb}GiB device \
+                 is already at the growth cap — Postgres may not start on it (raise \
+                 PG_VM_POOL_DISK_MAX_GB)"
+            );
+            Ok(())
+        }
+        GrowVerdict::Grow(target) => {
+            info!(
+                "{name}: stopped data disk is {used_pct:.0}% full on a {size_gb}GiB device — \
+                 growing it to {target}GiB before booting {id}, so Postgres has room to start"
+            );
+            resize_disk(id, target).await.with_context(|| {
+                format!("growing {name}'s data device to {target}GiB before boot")
+            })?;
+            crate::events::journal_info(
+                "disk-grow",
+                format!("{name}: device grown to {target}GiB before boot ({id})"),
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Connect to an existing sandbox by id and force it to a running, ready state.
 /// `Ok(None)` means it no longer exists (deleted out-of-band → caller creates).
 ///
@@ -2730,6 +2810,12 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
     // no cycle to deadlock on.
     let started = {
         let _permit = crate::reclaim::boot_permit(id).await;
+        // Under the permit, before the slot: the check reads the disk offline
+        // and a grow resizes it, neither of which is boot traffic. A failed
+        // grow still boots, on the disk it had.
+        if let Err(e) = grow_stopped_disk(cfg, name, id, Duration::ZERO).await {
+            warn!("{name}: {e:#}; booting it on the disk it has");
+        }
         let _slot = bringup_slot(name).await;
         sb.start().await
     };

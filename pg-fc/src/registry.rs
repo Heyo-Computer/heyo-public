@@ -328,11 +328,34 @@ const IDLE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// The same bound for the untracked reaper's stops, which always had one.
 const UNTRACKED_STOP_TIMEOUT: Duration = IDLE_STOP_TIMEOUT;
 
-/// How often the urgent device-grow watcher samples the warm set. It exists
-/// to beat a filling disk, not to catch it the instant it crosses — a minute
-/// of ENOSPC is survivable, a guest query per warm VM every few seconds is
-/// not. See [`SchemaRegistry::spawn_disk_grower`].
+/// How often the urgent device-grow watcher samples a warm schema that is not
+/// filling. A guest query per warm VM every few seconds is not survivable, so
+/// the bulk of the warm set is looked at once a minute. See
+/// [`SchemaRegistry::spawn_disk_grower`].
 const URGENT_GROW_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the urgent grower re-samples a schema that is filling, sits near
+/// the threshold, or has been sampled only once — and so how often its loop
+/// ticks. A minute is too slow for a bulk load: at 15–30 MB/s the last 5% of a
+/// 2GiB device goes in seconds, and a migration's copy ran straight past the
+/// urgent threshold into `No space left on device` between two samples. Only
+/// the schemas that earn it pay for this cadence.
+const URGENT_GROW_FAST_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Fill rate, between two samples, that puts a schema on the fast cadence.
+/// Well above what WAL churn and ordinary writes produce; a bulk load clears
+/// it by an order of magnitude.
+const URGENT_GROW_FILLING_BYTES_PER_SEC: f64 = 1024.0 * 1024.0;
+
+/// A schema within this many points of the urgent threshold is sampled on the
+/// fast cadence whatever its measured rate: one burst between two slow
+/// samples would otherwise carry it over.
+const URGENT_GROW_WATCH_MARGIN_PCT: f64 = 15.0;
+
+/// Added to the projection horizon for the stop itself: once a grow is
+/// decided, the guest keeps writing through the checkpoint and the daemon's
+/// stop.
+const URGENT_GROW_STOP_MARGIN: Duration = Duration::from_secs(10);
 
 /// Cap on devices the urgent grower resizes in one pass. Each one drops a
 /// schema's live sessions, so a pass that finds many trickles instead of
@@ -543,6 +566,11 @@ pub struct SchemaRegistry {
     // doubles as the rate limiter for the "at the cap, cannot help" complaint,
     // which would otherwise repeat every pass forever.
     grow_backoff: OffloadBackoff,
+    // The urgent grower's last disk sample per warm schema: what turns two
+    // samples into a fill rate and decides how soon to look again. Pruned to
+    // the warm set every pass; a grow forgets the schema, whose next bring-up
+    // starts a fresh baseline on the resized device.
+    urgent_samples: StdMutex<HashMap<String, GrowSample>>,
     /// Per-schema bring-up circuit breaker — see [`BringupBreaker`].
     bringup_breaker: BringupBreaker,
     // Single-flights the dashboard's purge action.
@@ -606,6 +634,7 @@ impl SchemaRegistry {
             dumps,
             offload_backoff: OffloadBackoff::new(),
             grow_backoff: OffloadBackoff::new(),
+            urgent_samples: StdMutex::new(HashMap::new()),
             bringup_breaker: BringupBreaker::default(),
             purging: AtomicBool::new(false),
             dedicated,
@@ -2537,15 +2566,21 @@ impl SchemaRegistry {
         };
         info!(
             "urgent device growth: a warm VM whose data fs is >= {urgent:.0}% full and spans \
-             its device is stopped, resized (doubling, cap {}GiB) and left for the next \
-             connect to boot — checked every {:?}, at most {} per pass",
-            gc.max_gb, URGENT_GROW_CHECK_INTERVAL, URGENT_GROW_MAX_PER_PASS
+             its device, or is filling fast enough to get there before its next check, is \
+             stopped, resized (doubling, cap {}GiB) and left for the next connect to boot — \
+             checked every {:?}, or every {:?} while filling or within {:.0} points of the \
+             threshold; at most {} per pass",
+            gc.max_gb,
+            URGENT_GROW_CHECK_INTERVAL,
+            URGENT_GROW_FAST_INTERVAL,
+            URGENT_GROW_WATCH_MARGIN_PCT,
+            URGENT_GROW_MAX_PER_PASS
         );
         let registry = self.clone();
         tokio::spawn(supervise(
             "disk-grow",
-            URGENT_GROW_CHECK_INTERVAL,
-            URGENT_GROW_CHECK_INTERVAL,
+            URGENT_GROW_FAST_INTERVAL,
+            URGENT_GROW_FAST_INTERVAL,
             move || {
                 let registry = registry.clone();
                 async move { registry.urgent_grow_pass().await }
@@ -2569,12 +2604,24 @@ impl SchemaRegistry {
         // then released: the sampling below talks to guests, which must never
         // happen with the map lock held.
         let now = Instant::now();
-        let candidates: Vec<(String, Arc<SchemaEntry>)> = {
+        let warm: Vec<(String, Arc<SchemaEntry>)> = {
             let map = self.entries.lock().await;
             map.iter()
                 .filter_map(|(schema, cell)| cell.get().map(|e| (schema.clone(), e.clone())))
                 .filter(|(schema, _)| !self.is_archiving(schema))
                 .filter(|(schema, _)| self.grow_backoff.active(schema, now).is_none())
+                .collect()
+        };
+        // Forget schemas that left the warm set, and sample only the ones due
+        // this tick: new, filling or nearly-full schemas on the fast cadence,
+        // everything else once a minute.
+        let candidates: Vec<(String, Arc<SchemaEntry>)> = {
+            let mut memory = self.urgent_samples.lock().unwrap();
+            let names: HashSet<&str> = warm.iter().map(|(schema, _)| schema.as_str()).collect();
+            memory.retain(|schema, _| names.contains(schema.as_str()));
+            warm.iter()
+                .filter(|(schema, _)| urgent_sample_due(memory.get(schema), now))
+                .cloned()
                 .collect()
         };
         if candidates.is_empty() {
@@ -2584,24 +2631,32 @@ impl SchemaRegistry {
         // Sample concurrently. Each read goes over its own schema's
         // housekeeping pool, so schemas never contend with each other, and a
         // wedged VM costs one bounded `STATS_TIMEOUT` instead of stalling
-        // every schema queued behind it.
-        let samples: Vec<(String, Option<DiskSample>)> =
+        // every schema queued behind it. Each reading keeps its own
+        // timestamp: a fill rate is only as good as the gap it divides by.
+        let samples: Vec<(String, Option<DiskSample>, Instant)> =
             futures::stream::iter(candidates.into_iter().map(|(schema, entry)| async move {
-                (schema, sample_disk(&entry).await)
+                let sample = sample_disk(&entry).await;
+                (schema, sample, Instant::now())
             }))
             .buffer_unordered(URGENT_GROW_SAMPLE_CONCURRENCY)
             .collect()
             .await;
 
         let mut grown = 0usize;
-        for (schema, sample) in samples {
+        for (schema, sample, at) in samples {
             let Some((fs, dev)) = sample else { continue };
             // The sample already answers the question `disk_gb` exists to
             // answer, so bank it here too rather than only at idle-stop: a
             // warm schema offloaded before it ever idles would otherwise be
             // restored into a stale — or entirely unknown — device size.
             self.store.set_disk_gb(&schema, device_gb(dev));
-            match grow_verdict(fs, dev, urgent, gc.max_gb) {
+            let reading = {
+                let mut memory = self.urgent_samples.lock().unwrap();
+                let reading = next_grow_sample(memory.get(&schema), fs, at, urgent);
+                memory.insert(schema.clone(), reading);
+                reading
+            };
+            match urgent_verdict(fs, dev, &reading, urgent, gc.max_gb) {
                 GrowVerdict::NotNeeded => {}
                 GrowVerdict::AtCap { current_gb } => {
                     // Growth is the only lever this pooler has and it is
@@ -2634,10 +2689,24 @@ impl SchemaRegistry {
                     if grown >= URGENT_GROW_MAX_PER_PASS {
                         continue;
                     }
+                    // Say so when it is the projection that crossed, not the
+                    // reading: the stop is about to drop live sessions on a
+                    // filesystem that still has room — just not for long.
+                    if grow_verdict(fs, dev, urgent, gc.max_gb) == GrowVerdict::NotNeeded {
+                        info!(
+                            "schema {schema}: data fs is {:.0}% full and filling at {}/s — \
+                             projected past {urgent:.0}% before its next check; growing it now",
+                            used_pct(fs.1, fs.2).unwrap_or(0.0),
+                            crate::orphans::human_iec(reading.rate.unwrap_or(0.0).max(0.0) as u64),
+                        );
+                    }
                     match self.grow_device_now(&schema, target).await {
                         Ok(true) => {
                             grown += 1;
                             self.grow_backoff.clear(&schema);
+                            // A new device: the next bring-up starts a fresh
+                            // baseline rather than dividing across the resize.
+                            self.urgent_samples.lock().unwrap().remove(&schema);
                         }
                         // Lost a race to an offload, or the schema went cold
                         // under us. Neither is this schema's fault, so it
@@ -2670,9 +2739,9 @@ impl SchemaRegistry {
     /// Unlike every other exclusive operation in this file, this one does
     /// **not** refuse when the entry has live sessions. A schema that never
     /// goes idle is exactly the one this path exists for, and by the time it
-    /// qualifies its database cannot write another byte — those sessions are
-    /// already failing. Breaking them costs a reconnect; leaving them costs
-    /// the database.
+    /// qualifies its database is out of room or seconds from it — those
+    /// sessions are failing, or about to. Breaking them costs a reconnect;
+    /// leaving them costs the database.
     ///
     /// The VM is deliberately left stopped rather than restarted here. The
     /// clients are reconnecting anyway, and `checkout`'s cold path already
@@ -2721,10 +2790,10 @@ impl SchemaRegistry {
         let id = entry.sandbox_id();
         let sessions = entry.active_count();
         warn!(
-            "schema {schema}: data filesystem is full and spans its device — growing it to \
-             {target}GiB now rather than waiting for an idle stop a schema under load never \
-             reaches. Stopping VM {id} and dropping {sessions} live session(s); the next \
-             connect boots it with room"
+            "schema {schema}: data filesystem is full, or about to be, and spans its device — \
+             growing it to {target}GiB now rather than waiting for an idle stop a schema under \
+             load never reaches. Stopping VM {id} and dropping {sessions} live session(s); the \
+             next connect boots it with room"
         );
 
         checkpoint_and_stop(&entry, schema).await;
@@ -4855,6 +4924,104 @@ pub(crate) fn grow_verdict(
     GrowVerdict::Grow((current_gb * 2).min(max_gb))
 }
 
+/// The urgent grower's memory of one warm schema's last disk sample: enough
+/// to turn two samples into a fill rate and to decide how soon to look again.
+#[derive(Debug, Clone, Copy)]
+struct GrowSample {
+    /// Guest data filesystem bytes in use (df semantics), and when read.
+    used: u64,
+    at: Instant,
+    /// Bytes per second since the previous sample; `None` until there are two.
+    rate: Option<f64>,
+    /// On the fast cadence: filling, near the threshold, or not yet rated.
+    hot: bool,
+}
+
+impl GrowSample {
+    /// How long until this schema is due another sample.
+    fn every(&self) -> Duration {
+        if self.hot {
+            URGENT_GROW_FAST_INTERVAL
+        } else {
+            URGENT_GROW_CHECK_INTERVAL
+        }
+    }
+}
+
+/// Whether the urgent grower samples a schema this tick. Half a tick of
+/// slack, so a schema read late in one pass is not pushed a whole tick past
+/// its cadence by the next.
+fn urgent_sample_due(last: Option<&GrowSample>, now: Instant) -> bool {
+    last.is_none_or(|s| {
+        now.saturating_duration_since(s.at) + URGENT_GROW_FAST_INTERVAL / 2 >= s.every()
+    })
+}
+
+/// Fold a fresh `(total, used, avail)` reading taken `at` into a schema's
+/// sample memory: the fill rate since `prev`, and whether the schema belongs
+/// on the fast cadence.
+fn next_grow_sample(
+    prev: Option<&GrowSample>,
+    fs: (u64, u64, u64),
+    at: Instant,
+    urgent_pct: f64,
+) -> GrowSample {
+    let (_, used, avail) = fs;
+    let rate = prev.and_then(|p| {
+        let secs = at.saturating_duration_since(p.at).as_secs_f64();
+        (secs > 0.0).then(|| (used as f64 - p.used as f64) / secs)
+    });
+    let filling = rate.is_some_and(|r| r >= URGENT_GROW_FILLING_BYTES_PER_SEC);
+    let near =
+        used_pct(used, avail).is_some_and(|pct| pct >= urgent_pct - URGENT_GROW_WATCH_MARGIN_PCT);
+    GrowSample {
+        used,
+        at,
+        rate,
+        hot: rate.is_none() || filling || near,
+    }
+}
+
+/// `fs` with `rate` bytes/s of growth over `horizon` moved from avail to used:
+/// the filesystem as the next check would find it. A flat, shrinking or
+/// unknown rate projects nothing, and growth stops at full.
+fn project_fs(fs: (u64, u64, u64), rate: Option<f64>, horizon: Duration) -> (u64, u64, u64) {
+    let (total, used, avail) = fs;
+    let Some(rate) = rate.filter(|r| *r > 0.0) else {
+        return fs;
+    };
+    let more = ((rate * horizon.as_secs_f64()) as u64).min(avail);
+    (total, used + more, avail - more)
+}
+
+/// The urgent grower's verdict for one reading: [`grow_verdict`] on the
+/// filesystem as it is, or — for a schema filling fast enough to cross the
+/// threshold before it is next sampled and stopped — as it will be by then.
+/// A projected crossing on a device already at the cap stays `NotNeeded`: the
+/// at-cap complaint is for a disk that is actually full.
+fn urgent_verdict(
+    fs: (u64, u64, u64),
+    device_bytes: u64,
+    sample: &GrowSample,
+    urgent_pct: f64,
+    max_gb: u64,
+) -> GrowVerdict {
+    let current = grow_verdict(fs, device_bytes, urgent_pct, max_gb);
+    if current != GrowVerdict::NotNeeded {
+        return current;
+    }
+    let horizon = sample.every() + URGENT_GROW_STOP_MARGIN;
+    match grow_verdict(
+        project_fs(fs, sample.rate, horizon),
+        device_bytes,
+        urgent_pct,
+        max_gb,
+    ) {
+        GrowVerdict::AtCap { .. } => GrowVerdict::NotNeeded,
+        verdict => verdict,
+    }
+}
+
 /// Permanently delete sandbox `id` (kill = sandbox + disk; the SDK treats an
 /// already-gone sandbox as success).
 /// Which VM a manual image archive should target. `recorded` is the registry
@@ -6562,6 +6729,134 @@ mod tests {
         let full = (gib(8), gib(8) * 96 / 100, gib(8) * 4 / 100);
         assert_eq!(grow_verdict(full, gib(8), 85.0, 100), GrowVerdict::Grow(16));
         assert_eq!(grow_verdict(full, gib(8), 95.0, 100), GrowVerdict::Grow(16));
+    }
+
+    /// A bulk load is caught before its disk is full: two samples make a fill
+    /// rate, the rate projects what the next check would find, and the grow
+    /// fires while there is still room to stop cleanly.
+    #[test]
+    fn a_filling_disk_grows_before_it_reaches_the_threshold() {
+        let mib = |n: u64| n * 1024 * 1024;
+        let dev = 2 * GIB;
+        let fs_at = |used: u64| (dev, used, dev - used);
+        let t0 = Instant::now();
+
+        // First reading, 40% used: no rate yet, so it is looked at again soon.
+        let used0 = dev * 40 / 100;
+        let first = next_grow_sample(None, fs_at(used0), t0, 95.0);
+        assert_eq!(first.rate, None);
+        assert!(first.hot);
+        assert_eq!(
+            urgent_verdict(fs_at(used0), dev, &first, 95.0, 100),
+            GrowVerdict::NotNeeded
+        );
+
+        // 300MiB later, ten seconds on: 30MiB/s. The next check plus the stop
+        // (20s) would land near 84% — not yet.
+        let t1 = t0 + Duration::from_secs(10);
+        let used1 = used0 + mib(300);
+        let second = next_grow_sample(Some(&first), fs_at(used1), t1, 95.0);
+        assert!((second.rate.unwrap() - mib(30) as f64).abs() < 1.0);
+        assert!(second.hot);
+        assert_eq!(
+            urgent_verdict(fs_at(used1), dev, &second, 95.0, 100),
+            GrowVerdict::NotNeeded
+        );
+
+        // Another 300MiB: 69% used, which alone is nowhere near 95% — but by
+        // the next check it would be past it. Grow now, with ~600MiB to spare.
+        let t2 = t1 + Duration::from_secs(10);
+        let used2 = used1 + mib(300);
+        let third = next_grow_sample(Some(&second), fs_at(used2), t2, 95.0);
+        assert_eq!(
+            grow_verdict(fs_at(used2), dev, 95.0, 100),
+            GrowVerdict::NotNeeded
+        );
+        assert_eq!(
+            urgent_verdict(fs_at(used2), dev, &third, 95.0, 100),
+            GrowVerdict::Grow(4)
+        );
+    }
+
+    /// The fast cadence is for schemas that earn it. Everything else keeps
+    /// the one guest query a minute the warm set can afford.
+    #[test]
+    fn only_filling_or_nearly_full_schemas_get_the_fast_cadence() {
+        let mib = |n: u64| n * 1024 * 1024;
+        let dev = 8 * GIB;
+        let fs_at = |used: u64| (dev, used, dev - used);
+        let t0 = Instant::now();
+
+        // Never sampled: due now. Sampled once: due again on the fast cadence.
+        assert!(urgent_sample_due(None, t0));
+        let first = next_grow_sample(None, fs_at(2 * GIB), t0, 95.0);
+        assert!(urgent_sample_due(
+            Some(&first),
+            t0 + URGENT_GROW_FAST_INTERVAL
+        ));
+
+        // Quiet (1MiB in 10s) at 25%: back to once a minute.
+        let t1 = t0 + Duration::from_secs(10);
+        let quiet = next_grow_sample(Some(&first), fs_at(2 * GIB + mib(1)), t1, 95.0);
+        assert!(!quiet.hot);
+        assert!(!urgent_sample_due(
+            Some(&quiet),
+            t1 + URGENT_GROW_FAST_INTERVAL
+        ));
+        assert!(urgent_sample_due(
+            Some(&quiet),
+            t1 + URGENT_GROW_CHECK_INTERVAL
+        ));
+
+        // Filling at 2MiB/s: fast.
+        let t2 = t1 + Duration::from_secs(10);
+        let filling = next_grow_sample(Some(&quiet), fs_at(2 * GIB + mib(21)), t2, 95.0);
+        assert!(filling.hot);
+
+        // Flat, but within the watch margin of the threshold (82% vs 80%): fast.
+        let flat_near = GrowSample {
+            used: dev * 82 / 100,
+            at: t1,
+            rate: Some(0.0),
+            hot: false,
+        };
+        let near = next_grow_sample(Some(&flat_near), fs_at(dev * 82 / 100), t2, 95.0);
+        assert_eq!(near.rate, Some(0.0));
+        assert!(near.hot);
+
+        // Shrinking and far from the wall: not filling.
+        let shrinking = next_grow_sample(Some(&quiet), fs_at(GIB), t2, 95.0);
+        assert!(!shrinking.hot);
+    }
+
+    #[test]
+    fn projection_never_invents_growth_or_a_cap_complaint() {
+        let fs = (2 * GIB, GIB, GIB);
+        let horizon = Duration::from_secs(20);
+        // No rate, flat, or shrinking: the reading as it is.
+        assert_eq!(project_fs(fs, None, horizon), fs);
+        assert_eq!(project_fs(fs, Some(0.0), horizon), fs);
+        assert_eq!(project_fs(fs, Some(-1e6), horizon), fs);
+        // Growth beyond the space left stops at full.
+        assert_eq!(project_fs(fs, Some(1e12), horizon), (2 * GIB, 2 * GIB, 0));
+
+        // Projected to cross on a device already at the cap: not a complaint
+        // yet — only a disk that is actually full gets the at-cap error.
+        let racing = GrowSample {
+            used: GIB,
+            at: Instant::now(),
+            rate: Some(1e9),
+            hot: true,
+        };
+        assert_eq!(
+            urgent_verdict(fs, 2 * GIB, &racing, 95.0, 2),
+            GrowVerdict::NotNeeded
+        );
+        let full = (2 * GIB, 2 * GIB * 96 / 100, 2 * GIB * 4 / 100);
+        assert_eq!(
+            urgent_verdict(full, 2 * GIB, &racing, 95.0, 2),
+            GrowVerdict::AtCap { current_gb: 2 }
+        );
     }
 
     #[test]
