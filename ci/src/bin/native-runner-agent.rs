@@ -393,7 +393,9 @@ fn ensure_inside(root: &Path, path: &Path) -> Result<()> {
     {
         bail!("working-directory escapes workspace")
     }
-    if path.is_absolute() && !path.starts_with(root) {
+    // Windows rooted/drive-relative paths need not satisfy is_absolute().
+    // Callers already joined the path to root, so require that prefix always.
+    if !path.starts_with(root) {
         bail!("working-directory escapes workspace")
     }
     Ok(())
@@ -415,6 +417,8 @@ mod tests {
     fn workspace_gate_rejects_escape() {
         assert!(ensure_inside(Path::new("/tmp/root"), Path::new("../bad")).is_err());
         assert!(ensure_inside(Path::new("/tmp/root"), Path::new("/etc")).is_err());
+        assert!(ensure_inside(Path::new("C:/work/job"), Path::new("C:outside")).is_err());
+        assert!(ensure_inside(Path::new("/tmp/root"), Path::new("/tmp/root/src")).is_ok());
     }
 
     fn step(run:&str)->Step{Step{name:None,id:None,condition:None,uses:None,with:BTreeMap::new(),run:Some(run.into()),shell:None,working_directory:None,env:BTreeMap::new(),timeout_minutes:None,continue_on_error:false}}
