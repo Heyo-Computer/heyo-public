@@ -2561,8 +2561,8 @@ fn spare_can_serve(disk_gb: u32, default_gb: u32) -> bool {
 pub(crate) const DAEMON_MAX_DISK_GB: u32 = 250;
 
 /// Grow a sandbox's persistent data device to `target_gb` through the
-/// daemon's offline workspace resize (`POST /deployed-sandboxes/{id}/resize`
-/// with `disk_size_gb`; heyvmd's workspace-resize feature, grow-only).
+/// daemon's offline workspace resize (`POST /sandboxes/{id}/resize` with
+/// `disk_size_gb`; heyvmd's workspace-resize feature, grow-only).
 ///
 /// The daemon takes the sandbox's lifecycle lock, stops it, grows the image
 /// and its ext4 in place, cold-boots once to verify the new capacity from
@@ -2572,8 +2572,11 @@ pub(crate) const DAEMON_MAX_DISK_GB: u32 = 250;
 /// reflects that.
 ///
 /// Raw HTTP rather than the SDK: the published heyo-sdk (0.1.5) predates
-/// `Sandbox::resize_disk`. Swap to the SDK call once 0.1.6 ships — the wire
-/// format here is byte-identical to it.
+/// `Sandbox::resize_disk`. Before swapping to the SDK call once it ships, check
+/// the route it targets: the SDK's size-class `resize` posts to
+/// `/deployed-sandboxes/{id}/resize`, which the local daemon doesn't serve at
+/// all — a disk grow sent there is an empty-bodied 404, and every growth
+/// attempt fails.
 pub(crate) async fn resize_disk(sandbox_id: &str, target_gb: u64) -> Result<()> {
     resize_disk_at(daemon_base_url(), sandbox_id, target_gb).await
 }
@@ -2585,7 +2588,7 @@ async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Res
         (1..=u64::from(DAEMON_MAX_DISK_GB)).contains(&target_gb),
         "disk_size_gb must be within 1–{DAEMON_MAX_DISK_GB} GiB (daemon limit)"
     );
-    let url = format!("{base_url}/deployed-sandboxes/{sandbox_id}/resize");
+    let url = format!("{base_url}/sandboxes/{sandbox_id}/resize");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()
@@ -2601,8 +2604,8 @@ async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Res
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         bail!(
-            "daemon workspace resize returned {status}: {} (a 404/405 means the \
-             deployed heyvmd predates the workspace-resize feature)",
+            "daemon workspace resize returned {status}: {} (a 404 with an empty \
+             body means the deployed heyvmd has no workspace-resize route)",
             body.trim()
         );
     }
@@ -3737,7 +3740,7 @@ mod tests {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
         let log = seen.clone();
         let app = axum::Router::new().route(
-            "/deployed-sandboxes/{id}/resize",
+            "/sandboxes/{id}/resize",
             axum::routing::post(move |AxPath(id): AxPath<String>, req_body: String| {
                 log.lock().unwrap().push((id, req_body));
                 async move { (status, body) }
