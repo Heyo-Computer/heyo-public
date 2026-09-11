@@ -1,6 +1,8 @@
 # Opt-in example, NOT an automatically enabled repository workflow.
 # Supply a build image with Rust, Git, tar and the service's native dependencies.
 # Register the workflow and its environment-scoped HeyoSecret credentials first.
+# Releases always fast-forward the repository's validated default branch; the
+# submitted feature branch remains the immutable source identity for the run.
 name: service-release
 on: [submit]
 jobs:

@@ -1079,9 +1079,14 @@ still apply. No action creates a GitHub release or tag.
   including every matrix cell and every declared validation step. Skipped,
   carried-over or error-tolerant validations cannot authorize publication.
   `with.manifests` is a JSON array of `package.json`/`Cargo.toml` paths;
-  `with.token` is the Git HTTPS credential. The submitted `before` commit must
-  be an ancestor of the submitted source, and the remote ref must still equal
-  that base. Publication fast-forwards that ref to the source plus a deterministic
+  `with.token` is the Git HTTPS credential. The public submit client separately
+  captures `repository.defaultBranch` and `repository.releaseBaseSha` from
+  `origin/HEAD` and its remote-tracking tip. Fetch trunk before submission. That
+  base must be an ancestor of the submitted source, and target trunk must still
+  equal that base at publication. The submitted feature branch is not advanced.
+  Ordinary `before` change detection is unchanged; missing release metadata
+  prevents release publication but does not prevent ordinary builds.
+  Publication fast-forwards target trunk to the source plus a deterministic
   version commit, never merges unvalidated concurrent trunk changes. Resubmit and
   revalidate if trunk moved. Submit a Git bundle, not `--archive`.
 - Changed components receive a major bump for breaking changes, minor for
@@ -1214,10 +1219,11 @@ an upload retry reconciles through the sink before recording publication.
 This is CI execution history, not deployment authorization. The release actions
 above separately gate publication and the release-artifact handoff. Automatic
 reconciliation of uncertain deployments after finished runs remains outstanding.
-Native Intel Mac and Windows
-execution must preserve workflow semantics and atomically fence leases/results
-before the private runners can be retired. Neither a Linux cross-build nor an
-event saying tests passed substitutes for those requirements.
+Native Intel Mac and Windows execution is available through the separate
+[native runner protocol](NATIVE_RUNNERS.md), with durable leases and fenced
+results/artifacts. Real-host testing remains a cutover prerequisite; local
+executor tests do not establish Windows or Intel Mac installation readiness.
+Neither a Linux cross-build nor an event saying tests passed substitutes for it.
 
 **A run's page also carries each job's VM log** — the machine's own console as
 its daemon saw it, read from `GET /sandboxes/{id}/logs` and captured *before* the

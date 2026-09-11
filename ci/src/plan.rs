@@ -43,6 +43,10 @@ pub struct JobPlan {
     /// What to show a human: `build (x86_64)`.
     pub display: String,
     pub target: Target,
+    /// Empty for the existing heyvm path; otherwise all labels required from a
+    /// native runner.
+    #[serde(default)]
+    pub native_labels: Vec<String>,
     pub fallback: Fallback,
     pub vm: VmSpec,
     /// Base ids this job waits for.
@@ -114,6 +118,7 @@ impl Plan {
                     target: job
                         .target()
                         .map_err(|e| PlanError::Workflow(e.to_string()))?,
+                    native_labels: job.runs_on.clone(),
                     fallback: job.fallback,
                     vm: job.vm.clone(),
                     needs: job.needs.clone(),
@@ -165,6 +170,7 @@ fn substitute_matrix(job: &mut JobPlan) {
     if let Some(image) = &job.vm.image {
         job.vm.image = Some(ctx.substitute(image));
     }
+    job.native_labels = job.native_labels.iter().map(|v| ctx.substitute(v)).collect();
     job.env = job
         .env
         .iter()

@@ -94,6 +94,7 @@ futures = "0.3"
 # the readable way to write one without hand-rolling a `Stream` impl.
 async-stream = "0.3"
 async-trait = "0.1"
+anyhow = "1"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

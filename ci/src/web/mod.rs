@@ -31,6 +31,7 @@ use crate::runners::Runners;
 use crate::store::{Repo, Store};
 use crate::trigger;
 use axum::Form;
+use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -122,6 +123,12 @@ pub fn router(
         // `Accept: text/event-stream` and app-lb's gate admits only
         // `text/html`. It carries its own run-scoped token instead.
         .route("/api/stream/{run_id}/{job_key}", get(log_stream))
+        .route("/api/native/register", post(native_register))
+        .route("/api/native/poll", post(native_poll))
+        .route("/api/native/heartbeat", post(native_heartbeat))
+        .route("/api/native/complete", post(native_complete))
+        .route("/api/native/jobs/{lease}/source", get(native_source))
+        .route("/api/native/jobs/{lease}/artifacts/{index}", post(native_artifact).layer(DefaultBodyLimit::max(512 * 1024 * 1024)))
         .route(
             "/api/submit",
             post(submit).layer(DefaultBodyLimit::max(submit_limit)),
@@ -133,6 +140,20 @@ pub fn router(
         .merge(api::router())
         .with_state(state)
 }
+
+fn native_auth(state: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {
+    use subtle::ConstantTimeEq;
+    let Some(expected)=state.config.native_runner_secret.as_deref() else { return Err(error(StatusCode::SERVICE_UNAVAILABLE,"native runners are not configured")); };
+    let Some(got)=bearer(headers) else { return Err(error(StatusCode::UNAUTHORIZED,"native runner bearer required")); };
+    if expected.as_bytes().ct_eq(got.as_bytes()).into() { Ok(()) } else { Err(error(StatusCode::UNAUTHORIZED,"invalid native runner bearer")) }
+}
+async fn native_register(State(s):State<AppState>,h:HeaderMap,Json(r):Json<crate::native::Registration>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::register(&s.store,r).await {Ok(())=>Json(serde_json::json!({"ok":true})).into_response(),Err(e)=>error(StatusCode::BAD_REQUEST,&e)} }
+async fn native_poll(State(s):State<AppState>,h:HeaderMap,Json(p):Json<crate::native::Poll>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};if let Ok(runs)=crate::native::pending_advancements(&s.store).await{for run in runs{if s.dispatcher.advance_run(&run).await.is_ok(){let _=crate::native::advancement_done(&s.store,&run).await;}}} match crate::native::poll(&s.store,p,&s.config.public_url,&s.dispatcher.secrets).await {Ok(job)=>Json(serde_json::json!({"job":job})).into_response(),Err(e)=>error(StatusCode::CONFLICT,&e)} }
+async fn native_heartbeat(State(s):State<AppState>,h:HeaderMap,Json(u):Json<crate::native::LeaseUpdate>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::heartbeat(&s.store,&u).await {Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)} }
+async fn native_complete(State(s):State<AppState>,h:HeaderMap,Json(c):Json<crate::native::Completion>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::complete(&s.store,&s.dispatcher.secrets,c).await {Ok(Some(run))=>{match s.dispatcher.advance_run(&run).await{Ok(_)=>{let _=crate::native::advancement_done(&s.store,&run).await;},Err(e)=>tracing::error!("native completion scheduling failed: {e}")} StatusCode::NO_CONTENT.into_response()},Ok(None)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::CONFLICT,&e)} }
+async fn native_source(State(s):State<AppState>,h:HeaderMap,Path(lease):Path<uuid::Uuid>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; let run=match crate::native::source_run(&s.store,lease).await {Ok(Some(r))=>r,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e)}; let root=s.dispatcher.workspace(&run); match tokio::task::spawn_blocking(move||{let mut gz=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default()); {let mut tar=tar::Builder::new(&mut gz); tar.append_dir_all(".",root)?; tar.finish()?;} gz.finish()}).await {Ok(Ok(bytes))=>([(axum::http::header::CONTENT_TYPE,"application/gzip")],bytes).into_response(),_=>error(StatusCode::INTERNAL_SERVER_ERROR,"could not archive submitted source")} }
+#[derive(serde::Deserialize)] struct NativeArtifactQuery{name:String,#[serde(default)]description:Option<String>,#[serde(default)]public:bool}
+async fn native_artifact(State(s):State<AppState>,h:HeaderMap,Path((lease,index)):Path<(uuid::Uuid,usize)>,Query(q):Query<NativeArtifactQuery>,body:Bytes)->impl IntoResponse{if let Err(e)=native_auth(&s,&h){return e};if q.name.trim().is_empty()||q.name.contains('/')||q.name.contains('\\')||q.name==".."{return error(StatusCode::BAD_REQUEST,"invalid artifact name")};let (run,_job,key,workflow)=match crate::native::artifact_context(&s.store,lease,index).await{Ok(Some(v))=>v,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::BAD_REQUEST,&e)};let r=crate::artifacts::ArtifactRef{run_id:run,job_key:key,workflow_id:workflow,name:q.name.clone(),description:q.description,public:q.public};let stored=match s.dispatcher.artifacts.put(&r,body.to_vec()).await{Ok(v)=>v,Err(e)=>return error(StatusCode::BAD_GATEWAY,&e.to_string())};match crate::native::record_artifact(&s.store,lease,index,&q.name,&stored).await{Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced during upload"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)}}
 
 /// How a submit proved it may start a build.
 enum Credential {

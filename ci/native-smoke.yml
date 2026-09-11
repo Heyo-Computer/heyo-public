@@ -1,0 +1,28 @@
+# Opt-in us3 trial workflow. No merge, version bump or deployment.
+name: native-smoke
+on: [submit]
+jobs:
+  mac-intel:
+    runs-on: [namespace-profile-mac-build, macos, macos-intel, x86_64-apple-darwin]
+    steps:
+      - run: rustc --version
+      - id: check
+        run: echo 'verified=yes' >> "$GITHUB_OUTPUT"
+      - if: ${{ steps.check.outputs.verified == 'yes' }}
+        run: uname -sm > native-host.txt
+      - uses: ci/upload-artifact
+        with:
+          name: mac-intel-host
+          path: native-host.txt
+  windows:
+    runs-on: [blacksmith-2vcpu-windows-2025, windows, windows-x64, x86_64-pc-windows-msvc]
+    steps:
+      - run: rustc --version
+      - id: check
+        run: "'verified=yes' >> $env:GITHUB_OUTPUT"
+      - if: ${{ steps.check.outputs.verified == 'yes' }}
+        run: "[System.Runtime.InteropServices.RuntimeInformation]::OSDescription | Out-File native-host.txt"
+      - uses: ci/upload-artifact
+        with:
+          name: windows-host
+          path: native-host.txt

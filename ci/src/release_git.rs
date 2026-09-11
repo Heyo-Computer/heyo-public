@@ -798,6 +798,15 @@ mod tests {
                 &format!("{base}:refs/heads/main"),
             ],
         );
+        run(&repo, &["branch", "feature", &head]);
+        run(
+            &repo,
+            &[
+                "push",
+                bare.to_str().unwrap(),
+                &format!("{head}:refs/heads/feature"),
+            ],
+        );
         publish(&repo, bare.to_str().unwrap(), "unused", &base, &first)
             .await
             .unwrap();
@@ -809,6 +818,16 @@ mod tests {
             .split_whitespace()
             .next(),
             Some(first.release_sha.as_str())
+        );
+        assert_eq!(
+            run(
+                &repo,
+                &["ls-remote", bare.to_str().unwrap(), "refs/heads/feature"]
+            )
+            .split_whitespace()
+            .next(),
+            Some(head.as_str()),
+            "publishing the release must not move the submitted feature branch"
         );
         // Published retry is idempotent and cannot double-bump.
         publish(&repo, bare.to_str().unwrap(), "unused", &base, &first)

@@ -222,6 +222,8 @@ pub struct Run {
     pub git_ref: String,
     pub sha: String,
     pub before_sha: String,
+    pub default_branch: Option<String>,
+    pub release_base_sha: Option<String>,
     /// What this run's commit changed, as the submit worked it out. Read by the
     /// scheduler for the `ci` expression scope, so a job's `if:` can gate on a
     /// subtree of a monorepo.
@@ -253,6 +255,8 @@ impl Run {
             git_ref: r.get("git_ref"),
             sha: r.get("sha"),
             before_sha: r.get("before_sha"),
+            default_branch: r.try_get("default_branch").ok().flatten(),
+            release_base_sha: r.try_get("release_base_sha").ok().flatten(),
             // A row whose JSON does not deserialize falls back to "no answer",
             // which builds everything. The alternative — failing the query —
             // would take the dashboard down over a column nothing renders.
@@ -477,6 +481,8 @@ pub struct RunRequest {
     pub git_ref: String,
     pub sha: String,
     pub before_sha: String,
+    pub default_branch: Option<String>,
+    pub release_base_sha: Option<String>,
     /// What the submit changed, relative to `before_sha`. Defaults to "no
     /// answer", which is what a caller that cannot work it out should leave it
     /// as — that reads as "build everything" downstream.
@@ -967,8 +973,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO ci_run (id, workflow_id, workflow_path, workflow_name, repo_url,
                                  git_ref, sha, before_sha, actor_subject, actor_email,
-                                 source, status, repo_id, changes, rerun_of)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12,$13,$14)",
+                                 source, status, repo_id, changes, rerun_of, default_branch, release_base_sha)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12,$13,$14,$15,$16)",
         )
         .bind(run_id)
         .bind(&req.workflow_id)
@@ -993,6 +999,8 @@ impl Store {
             serde_json::to_value(crate::paths::Changes::default()).unwrap_or_default()
         }))
         .bind(&req.rerun_of)
+        .bind(&req.default_branch)
+        .bind(&req.release_base_sha)
         .execute(&mut *tx)
         .await
         .map_err(StoreError::sql)?;

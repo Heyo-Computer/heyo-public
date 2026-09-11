@@ -2283,6 +2283,8 @@ mod page_tests {
             git_ref: "refs/heads/main".into(),
             sha: "9183de223817abcdef".into(),
             before_sha: "0000de223817abcdef".into(),
+            default_branch: Some("main".into()),
+            release_base_sha: None,
             changes: crate::paths::Changes::known(vec!["src/main.rs".into()]),
             actor_email: Some("sam@sarocu.com".into()),
             status: status.into(),

@@ -26,6 +26,7 @@ mod expr;
 mod heyo_ui;
 mod image;
 mod nats_auth;
+mod native;
 mod objects;
 mod paths;
 mod plan;

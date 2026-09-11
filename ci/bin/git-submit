@@ -157,7 +157,13 @@ branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 repo_url="$(git config --get remote.origin.url || echo "")"
 repo_name="$(basename "$(git rev-parse --show-toplevel)")"
 default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
-before="$(git rev-parse --verify "${rev}^" 2>/dev/null || echo "")"
+# Keep ordinary CI change detection independent of the release target. Missing
+# target metadata disables release publication, not ordinary build submission.
+before="$(git rev-parse --verify "${rev}^" 2>/dev/null || true)"
+release_base=""
+if [ -n "$default_branch" ]; then
+  release_base="$(git rev-parse --verify "refs/remotes/origin/$default_branch^{commit}" 2>/dev/null || true)"
+fi
 pusher_name="$(git config --get user.name || echo "")"
 pusher_email="$(git config --get user.email || echo "")"
 
@@ -250,6 +256,7 @@ if [ "$dry_run" -eq 1 ]; then
   printf '  repository %s (%s)\n' "$repo_name" "${repo_url:-no remote}"
   printf '  ref        refs/heads/%s\n' "$branch"
   printf '  commit     %s\n' "$sha"
+  printf '  release    %s at %s\n' "${default_branch:-unavailable}" "${release_base:-unavailable}"
   printf '  source     %s, %s bytes%s\n' "$format" "$size" \
     "$([ "$dirty" -eq 1 ] && echo ' (including uncommitted changes)')"
   printf '  credential %s\n' "$([ -n "$token" ] && echo 'repository token (ci.token)' || echo 'shared secret (ci.secret)')"
@@ -283,12 +290,12 @@ base64 < "$payload_file" | tr -d '\n' > "$content"
 if command -v jq >/dev/null 2>&1; then
   jq -n \
     --arg id "$repo_name" --arg name "$repo_name" --arg url "$repo_url" \
-    --arg db "$default_branch" --arg ref "refs/heads/$branch" \
+    --arg db "$default_branch" --arg rb "$release_base" --arg ref "refs/heads/$branch" \
     --arg before "$before" --arg after "$sha" \
     --arg pn "$pusher_name" --arg pe "$pusher_email" \
     --arg wf "$workflow" --arg fmt "$format" --rawfile content "$content" \
     --arg only "$(printf '%s\n' ${only[@]+"${only[@]}"})" \
-    '{repository:{id:$id,name:$name,url:$url,defaultBranch:(if $db=="" then null else $db end)},
+    '{repository:{id:$id,name:$name,url:$url,defaultBranch:(if $db=="" then null else $db end),releaseBaseSha:(if $rb=="" then null else $rb end)},
       ref:$ref, before:$before, after:$after, dryRun:false,
       pusher:{name:$pn,email:$pe},
       workflowId:(if $wf=="" then null else $wf end),
@@ -301,9 +308,10 @@ else
   # variable, for the reason above.
   esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
   {
-    printf '{"repository":{"id":"%s","name":"%s","url":"%s","defaultBranch":%s},' \
+    printf '{"repository":{"id":"%s","name":"%s","url":"%s","defaultBranch":%s,"releaseBaseSha":%s},' \
       "$(esc "$repo_name")" "$(esc "$repo_name")" "$(esc "$repo_url")" \
-      "$([ -n "$default_branch" ] && printf '"%s"' "$(esc "$default_branch")" || printf 'null')"
+      "$([ -n "$default_branch" ] && printf '"%s"' "$(esc "$default_branch")" || printf 'null')" \
+      "$([ -n "$release_base" ] && printf '"%s"' "$release_base" || printf 'null')"
     printf '"ref":"refs/heads/%s","before":"%s","after":"%s","dryRun":false,' \
       "$(esc "$branch")" "$before" "$sha"
     printf '"pusher":{"name":"%s","email":"%s"},' "$(esc "$pusher_name")" "$(esc "$pusher_email")"

@@ -128,23 +128,31 @@ pub async fn merge(
     let mut policy = manifests.to_vec();
     policy.sort();
     policy.dedup();
+    let default_branch = run
+        .default_branch
+        .as_deref()
+        .ok_or("release requires a validated repository default branch")?;
+    let release_base = run.release_base_sha.as_deref()
+        .ok_or("release requires the submitted target-trunk base; update the public git-submit client")?;
+    let target_ref = format!("refs/heads/{default_branch}");
     let request_hash = hex::encode(Sha256::digest(
         serde_json::to_vec(&json!({
-            "version": 1, "repo": run.repo_url, "base": run.before_sha,
-            "source": run.sha, "ref": run.git_ref, "manifests": policy,
+            "version": 1, "repo": run.repo_url, "base": release_base,
+            "source": run.sha, "source_ref": run.git_ref,
+            "target_ref": target_ref, "manifests": policy,
         }))
         .map_err(|e| e.to_string())?,
     ));
     let prepared =
-        release_git::prepare(source, &run.before_sha, &run.sha, &run.git_ref, &policy).await?;
+        release_git::prepare(source, release_base, &run.sha, &target_ref, &policy).await?;
     let prepared_json = serde_json::to_value(&prepared).map_err(|e| e.to_string())?;
 
     let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
     sqlx::query(
         "INSERT INTO ci_release (run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'prepared') ON CONFLICT (run_id) DO NOTHING")
-        .bind(&msg.run_id).bind(&request_hash).bind(&run.sha).bind(&run.before_sha)
-        .bind(&run.git_ref).bind(&prepared.versions).bind(&prepared.release_sha).bind(&prepared_json)
+        .bind(&msg.run_id).bind(&request_hash).bind(&run.sha).bind(release_base)
+        .bind(&target_ref).bind(&prepared.versions).bind(&prepared.release_sha).bind(&prepared_json)
         .execute(&mut *tx).await.map_err(|e| e.to_string())?;
     let owned = sqlx::query(
         "SELECT request_hash,prepared,status FROM ci_release WHERE run_id=$1 FOR UPDATE",
@@ -190,7 +198,7 @@ pub async fn merge(
         return Err("cancelled job cannot publish a release".into());
     }
     if let Err(_publish_error) =
-        release_git::publish(source, &run.repo_url, token, &run.before_sha, &saved).await
+        release_git::publish(source, &run.repo_url, token, release_base, &saved).await
     {
         let generic = "release publication outcome is unknown; retry the persisted candidate";
         let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
@@ -419,6 +427,8 @@ mod tests {
                         git_ref: "refs/heads/main".into(),
                         sha: head.into(),
                         before_sha: base.into(),
+                        default_branch: Some("main".into()),
+                        release_base_sha: Some(base.into()),
                         ..Default::default()
                     },
                     plan,

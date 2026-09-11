@@ -318,6 +318,9 @@ pub struct Config {
     /// repository, cannot say which repository is submitting, and a leaked copy
     /// is a leak of the whole system.
     pub require_repo_token: bool,
+    /// Dedicated bearer for native runner machine routes. Never inferred from
+    /// app-lb forwarded identity or the submit credential.
+    pub native_runner_secret: Option<String>,
     /// Glob for workflow files inside a submitted tree.
     ///
     /// A workflow object will override this per repository; until then it is the
@@ -630,6 +633,7 @@ impl Config {
             app_lb_token: opt("CI_APP_LB_TOKEN"),
             webhook_secret,
             require_repo_token: flag("CI_REQUIRE_REPO_TOKEN", false)?,
+            native_runner_secret: opt("CI_NATIVE_RUNNER_SECRET"),
             default_workflow_path: opt("CI_WORKFLOW_PATH")
                 .unwrap_or_else(|| ".ci/workflows/*.yml".to_string()),
             max_source_bytes: bytes("CI_MAX_SOURCE_BYTES", 64 * 1024 * 1024)?,

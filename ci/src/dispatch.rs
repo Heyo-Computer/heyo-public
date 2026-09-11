@@ -429,6 +429,8 @@ impl Dispatcher {
                             git_ref: req.r#ref.clone(),
                             sha: req.after.clone(),
                             before_sha: req.before.clone(),
+                            default_branch: req.repository.default_branch.clone(),
+                            release_base_sha: req.repository.release_base_sha.clone(),
                             // A workflow forced by `--only` gets *unknown*
                             // changes, not the real diff. The real diff is what
                             // just declined it at the workflow gate, and the
@@ -605,7 +607,8 @@ impl Dispatcher {
                     .or_else(|| run.repo_name.clone())
                     .unwrap_or_default(),
                 url: run.repo_url.clone(),
-                default_branch: None,
+                default_branch: run.default_branch.clone(),
+                release_base_sha: run.release_base_sha.clone(),
             },
             r#ref: run.git_ref.clone(),
             before: run.before_sha.clone(),
@@ -737,6 +740,13 @@ impl Dispatcher {
                 }
             }
 
+            if !plan.native_labels.is_empty() {
+                crate::native::enqueue(&self.store, &job.id, run_id, &plan.native_labels)
+                    .await.map_err(DispatchError::Native)?;
+                tracing::info!(run=run_id, job=%plan.key, labels=?plan.native_labels, "queued for native runner");
+                continue;
+            }
+
             let route = match self.route_for(&plan).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -807,7 +817,7 @@ impl Dispatcher {
     /// A run this process cannot read at all yields an empty scope rather than
     /// an error: `ci.sha` resolving to null is a condition an author can see is
     /// wrong, whereas failing the job says nothing about what to fix.
-    fn ci_scope(run: Option<&crate::store::Run>) -> Value {
+    pub(crate) fn ci_scope(run: Option<&crate::store::Run>) -> Value {
         let Some(run) = run else {
             return Value::Object(Default::default());
         };
@@ -875,6 +885,12 @@ impl Dispatcher {
     ) -> Result<(), DispatchError> {
         let pool = self.runners.snapshot();
         for job in &mut plan.jobs {
+            if !job.native_labels.is_empty() {
+                if self.config.native_runner_secret.is_none() {
+                    return Err(DispatchError::Native("configure native runners before submitting runs-on jobs".into()));
+                }
+                continue;
+            }
             // `uses: default` names no network on purpose — it is wherever this
             // orchestrator's host happens to be — so the repository's assignment
             // must not be written over it.
@@ -3927,6 +3943,7 @@ fn or_none(items: &[String]) -> String {
 
 #[derive(Debug)]
 pub enum DispatchError {
+    Native(String),
     Store(crate::store::StoreError),
     Pool(crate::pool::PoolError),
     Bus(crate::bus::BusError),
@@ -4112,6 +4129,7 @@ fn checkout_error(e: VmError) -> DispatchError {
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Native(e) => write!(f, "native runner: {e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Pool(e) => write!(f, "{e}"),
             Self::Bus(e) => write!(f, "{e}"),
