@@ -904,11 +904,7 @@ async fn adopt_zst_image(
 /// set; a full image is unbootable either way, so this grows it even with
 /// growth off.
 async fn ensure_restore_headroom(cfg: &Config, schema: &str, raw: &Path) -> Result<()> {
-    let usage = match run(Command::new("dumpe2fs").arg(raw), FSCK_TIMEOUT).await {
-        Ok(out) if out.status.success() => dumpe2fs_usage(&String::from_utf8_lossy(&out.stdout)),
-        _ => None,
-    };
-    let Some(usage) = usage else {
+    let Some(usage) = offline_fs_usage(raw).await else {
         warn!(
             "schema {schema}: could not read the restored image's usage with dumpe2fs; \
              restoring it at its archived size"
@@ -921,7 +917,7 @@ async fn ensure_restore_headroom(cfg: &Config, schema: &str, raw: &Path) -> Resu
         .len();
     let (total_blocks, free_blocks, _) = usage;
     let used_pct = 100.0 * (1.0 - free_blocks as f64 / total_blocks.max(1) as f64);
-    match restore_grow_verdict(usage, device_bytes, cfg.disk_grow) {
+    match offline_grow_verdict(usage, device_bytes, cfg.disk_grow) {
         GrowVerdict::NotNeeded => Ok(()),
         GrowVerdict::AtCap { current_gb } => {
             warn!(
@@ -949,10 +945,12 @@ async fn ensure_restore_headroom(cfg: &Config, schema: &str, raw: &Path) -> Resu
     }
 }
 
-/// [`grow_verdict`] for a restored image's `(total blocks, free blocks, block
-/// size)` on a `device_bytes` device, under the configured growth trigger and
-/// cap — or [`RESTORE_GROW_PCT`] and the daemon's ceiling when growth is off.
-fn restore_grow_verdict(
+/// [`grow_verdict`] for a disk read offline — a restored image, or a stopped
+/// VM's data disk about to boot (see `vm::grow_stopped_disk`) — from its
+/// `(total blocks, free blocks, block size)` on a `device_bytes` device, under
+/// the configured growth trigger and cap, or [`RESTORE_GROW_PCT`] and the
+/// daemon's ceiling when growth is off: a full disk is unbootable either way.
+pub(crate) fn offline_grow_verdict(
     usage: (u64, u64, u64),
     device_bytes: u64,
     grow: Option<DiskGrowConfig>,
@@ -990,6 +988,29 @@ fn dumpe2fs_usage(out: &str) -> Option<(u64, u64, u64)> {
         return None;
     }
     Some((total?, free, block_size?))
+}
+
+/// [`dumpe2fs_usage`] of the ext4 filesystem in `disk`, read offline. `None`
+/// when dumpe2fs fails or its output carries no group descriptors.
+pub(crate) async fn offline_fs_usage(disk: &Path) -> Option<(u64, u64, u64)> {
+    match run(Command::new("dumpe2fs").arg(disk), FSCK_TIMEOUT).await {
+        Ok(out) if out.status.success() => dumpe2fs_usage(&String::from_utf8_lossy(&out.stdout)),
+        _ => None,
+    }
+}
+
+/// Whether anything on the host holds `disk` open right now — the same
+/// (device, inode) fd scan [`wait_disk_released`] polls. A scan that can see
+/// nothing reads as "not held".
+pub(crate) async fn disk_held_open(disk: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = tokio::fs::metadata(disk).await else {
+        return false;
+    };
+    let target = (md.dev(), md.ino());
+    tokio::task::spawn_blocking(move || crate::orphans::open_inodes().contains(&target))
+        .await
+        .unwrap_or(false)
 }
 
 async fn swap_and_boot(
@@ -1408,17 +1429,17 @@ Group 1: (Blocks 32768-65535) csum 0x3c4d [INODE_UNINIT, ITABLE_ZEROED]
     fn restore_grows_a_full_image_even_with_growth_off() {
         let full = dumpe2fs_usage(DUMPE2FS_FULL).unwrap();
         assert_eq!(
-            restore_grow_verdict(full, 2 * GIB, None),
+            offline_grow_verdict(full, 2 * GIB, None),
             GrowVerdict::Grow(4)
         );
         // Half full: room to boot, restored as archived.
         assert_eq!(
-            restore_grow_verdict((524_288, 262_144, 4096), 2 * GIB, None),
+            offline_grow_verdict((524_288, 262_144, 4096), 2 * GIB, None),
             GrowVerdict::NotNeeded
         );
         // A thin fs below its device is the guest watcher's to grow.
         assert_eq!(
-            restore_grow_verdict((262_144, 0, 4096), 4 * GIB, None),
+            offline_grow_verdict((262_144, 0, 4096), 4 * GIB, None),
             GrowVerdict::NotNeeded
         );
         let capped = DiskGrowConfig {
@@ -1427,7 +1448,37 @@ Group 1: (Blocks 32768-65535) csum 0x3c4d [INODE_UNINIT, ITABLE_ZEROED]
             max_gb: 2,
         };
         assert_eq!(
-            restore_grow_verdict(full, 2 * GIB, Some(capped)),
+            offline_grow_verdict(full, 2 * GIB, Some(capped)),
+            GrowVerdict::AtCap { current_gb: 2 }
+        );
+    }
+
+    /// pg-0rtk7Stq: its Postgres died of ENOSPC and its stopped 2GiB disk sat
+    /// 94% full, so every bring-up booted it straight back into the wall. The
+    /// boot-time check reads the disk offline and grows it first; a disk with
+    /// room boots as it is.
+    #[test]
+    fn a_nearly_full_stopped_disk_is_grown_before_it_boots() {
+        let grow = DiskGrowConfig {
+            pct: 85.0,
+            urgent_pct: Some(95.0),
+            max_gb: 25,
+        };
+        // 524288 4KiB blocks, 30419 free: the disk as it was found.
+        let stuck = (524_288, 30_419, 4096);
+        assert_eq!(
+            offline_grow_verdict(stuck, 2 * GIB, Some(grow)),
+            GrowVerdict::Grow(4)
+        );
+        // 60% used: room to recover.
+        assert_eq!(
+            offline_grow_verdict((524_288, 209_715, 4096), 2 * GIB, Some(grow)),
+            GrowVerdict::NotNeeded
+        );
+        // At the configured cap there is nothing to do but say so.
+        let capped = DiskGrowConfig { max_gb: 2, ..grow };
+        assert_eq!(
+            offline_grow_verdict(stuck, 2 * GIB, Some(capped)),
             GrowVerdict::AtCap { current_gb: 2 }
         );
     }
