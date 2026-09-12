@@ -26,7 +26,7 @@ WORKDIR /app/heyosecret
 COPY ui /app/ui
 COPY heyosecret/Cargo.toml heyosecret/Cargo.lock* ./
 COPY heyosecret/src ./src
-RUN cargo build --release --locked || cargo build --release
+RUN cargo test --locked && cargo build --release --locked
 
 # --- runtime rootfs ---
 FROM ubuntu:24.04
@@ -37,17 +37,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# SSH access for `heyvm exec` / `heyvm sh`. Pre-generate host keys at build time
-# so sshd doesn't block on entropy at boot. Ubuntu 24.04 may ship password auth
-# disabled, and Firecracker has no cloud-init to fix it — enable it explicitly.
+# SSH accepts installed public keys only. The serial command protocol does not
+# require SSH passwords. Generate host keys without waiting at guest boot.
 RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d \
-    && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config \
-    && echo "PermitEmptyPasswords yes" >> /etc/ssh/sshd_config \
-    && echo "PasswordAuthentication yes" > /etc/ssh/sshd_config.d/50-heyo.conf \
-    && chmod 644 /etc/ssh/sshd_config.d/50-heyo.conf \
+    && printf 'PermitRootLogin prohibit-password\nPermitEmptyPasswords no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' > /etc/ssh/sshd_config.d/00-heyo.conf \
     && passwd -d root \
-    && useradd -m -s /bin/bash heyo \
-    && echo 'heyo:heyo' | chpasswd \
     && ssh-keygen -A
 
 COPY --from=builder /app/heyosecret/target/release/heyosecret /usr/local/bin/heyosecret

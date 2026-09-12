@@ -230,3 +230,30 @@ workflow with mocked network/build calls. `SERVICE_SPEC_BASELINE_REF` optionally
 compares against an old-workflow Git revision. `SERVICE_SPEC_FIXTURE_DIR` exports
 synthetic payloads; use the same directory for the private caller tests and the
 Rust contract test to validate all six VM service requests.
+
+### us3 app-lb deployment
+
+`app-lb.us3.json` is an inert bootstrap spec: no public routes, zero replicas,
+and a commit placeholder. `Dockerfile.firecracker` builds and tests the locked
+Rust source from the public repository root. It includes migrations and a serial
+guest init; app-lb launches the daemon with resolved `env_from` secrets.
+
+Before registering it, replace the build ref with the verified public commit,
+provision a region-isolated database, and deliver its URL and existing JWT/internal
+keys through app-lb secrets backed by HeyoSecret. Do not reuse `orchestrator_db`
+for us3: it holds eu1 service state and retirement history even though its Postgres
+host is in us3. Startup runs migrations and immediately processes pending events,
+expired step leases, and eligible previous-deployment stop/delete intents.
+
+Build through `POST /deployments/orchestrator-us3/build` on the existing us3
+app-lb, inspect the returned job, then set one minimum replica. Attach the existing
+Heyo JWT gate and `orchestrator.us3.heyo.work` route only after readiness. Machine
+API paths must retain Orchestrator's own bearer authentication. This adds an app;
+it does not replace app-lb or change retail/login.
+
+A healthy `/health` does not prove CD works. Configure and verify regional
+`CLOUD_INTERNAL_URL`, `ORCHESTRATOR_BACKEND_API_URL`, proxy domains, and optional
+`ORCHESTRATOR_NATS_URL`/`ORCHESTRATOR_NATS_ENABLED` before accepting deployment
+jobs. Cloud must accept the configured internal key and allocate the us3 backend.
+Keep staging/eu1 dependencies explicit until those services are regionalized;
+do not call a health-only installation an independent region.
