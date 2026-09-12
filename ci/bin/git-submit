@@ -37,7 +37,7 @@
 #   CI_WEBHOOK_SECRET / git config ci.secret     the shared HMAC secret
 set -euo pipefail
 
-GIT_SUBMIT_VERSION="0.5.0"
+GIT_SUBMIT_VERSION="0.6.0"
 
 # `git-submit` invoked as `git submit`, `git-ci` invoked as `git ci`. Only used
 # in messages, but a script that tells you to run a command that does not exist
@@ -122,12 +122,33 @@ git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
 
 # --- configuration ----------------------------------------------------------
 
-endpoint="${CI_ENDPOINT:-$(git config --get ci.endpoint || true)}"
+# cicd.endpoint/CICD_ENDPOINT were used by the original private client. Accept
+# them so an existing `git submit` installation can move to this public client,
+# but never guess when old and new settings point at different services.
+normalize_endpoint() {
+  local value="${1%/}"
+  case "$value" in
+    */api/submit) printf '%s\n' "$value" ;;
+    */git/push) printf '%s/api/submit\n' "${value%/git/push}" ;;
+    *) printf '%s/api/submit\n' "$value" ;;
+  esac
+}
+
+ci_config_endpoint="$(git config --get ci.endpoint || true)"
+cicd_config_endpoint="$(git config --get cicd.endpoint || true)"
+canonical_endpoint="${CI_ENDPOINT:-$ci_config_endpoint}"
+legacy_endpoint="${CICD_ENDPOINT:-$cicd_config_endpoint}"
+endpoint="${canonical_endpoint:-$legacy_endpoint}"
 [ -n "$endpoint" ] || die "no endpoint. Set CI_ENDPOINT or run:
     git config ci.endpoint https://ci.example.com"
-base="${endpoint%/}"
-base="${base%/api/submit}"
-submit_url="$base/api/submit"
+submit_url="$(normalize_endpoint "$endpoint")"
+
+if [ -n "$canonical_endpoint" ] && [ -n "$legacy_endpoint" ] \
+    && [ "$(normalize_endpoint "$canonical_endpoint")" != "$(normalize_endpoint "$legacy_endpoint")" ]; then
+  die "conflicting endpoint settings. ci.endpoint/CI_ENDPOINT and legacy cicd.endpoint/CICD_ENDPOINT must resolve to the same public submission API"
+fi
+
+base="${submit_url%/api/submit}"
 
 token="${CI_TOKEN:-$(git config --get ci.token || true)}"
 secret="${CI_WEBHOOK_SECRET:-$(git config --get ci.secret || true)}"
