@@ -983,6 +983,34 @@ Pulls share the job machinery with builds: `202` with a record, polled from
 the `artifact` reference asked for, the `digest` it resolved to, and the `bytes`
 transferred.
 
+CI callers can opt into a durable, idempotent pull by supplying `operation_id`
+and an explicit pinned SHA-256 manifest digest (tags are rejected in this mode):
+
+```sh
+curl -XPOST localhost:9090/deployments/web/pull -H 'content-type: application/json' -d '{"operation_id":"ci-run-42-web","ref":"1b9b737b73e26aa4c55d7b609351fa51f0e21b0b6afbaa9ef9f4561dd18337d7"}'
+```
+
+The identity is `(namespace, deployment, operation_id)`. Repeating identical
+intent returns the same `202` job record, including after app-lb restarts;
+changing the digest, `force`, or deployment template for that identity returns
+`409` without starting work. Correlated records add `target_namespace`,
+`intent_fingerprint`, `config_fingerprint`, `source_spec_fingerprint`,
+`readiness_verified`, and `reconciliation_required`. `succeeded` requires the
+desired replica count to be healthy in the exact replacement pool created by
+this operation. The source spec is checked under the deployment mutation lock
+before replacement; a concurrent edit is not overwritten. Non-VM and
+zero-desired-replica targets are rejected before pulling. If app-lb
+restarts during a correlated operation, it marks the durable job `failed` with
+`reconciliation_required: true`; it never repeats a possibly destructive
+rollout automatically.
+
+Records are synced to `jobs/` beneath the configured per-deployment state
+directory (for example `app-lb-state.d/jobs/`). Correlation records are not
+evicted by the ordinary in-memory history limits. An unreadable ledger disables
+new correlated pulls until repaired and app-lb restarted; it is never treated
+as an empty ledger. Status persistence failures require reconciliation, not a
+successful CI result. Legacy pulls retain their existing behavior.
+
 **Two transports, chosen by how `store` is spelled.** They are not fallbacks for
 each other — they are different situations:
 

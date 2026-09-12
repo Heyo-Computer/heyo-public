@@ -57,7 +57,8 @@ use crate::deployment::{Deployment, now_secs};
 use crate::health;
 use crate::registry::Registry;
 use crate::secrets::SecretStore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -92,7 +93,7 @@ const VERIFY_SETTLE: Duration = Duration::from_secs(2);
 /// Gap between verification probes.
 const VERIFY_INTERVAL: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum JobKind {
     /// Build a guest image from git + a Dockerfile (managed deployments).
@@ -144,7 +145,7 @@ impl JobKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     Running,
@@ -156,7 +157,7 @@ pub enum JobStatus {
 ///
 /// The kind-specific fields are omitted rather than nulled, so a `host-update`
 /// record doesn't carry six empty image fields.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JobRecord {
     pub id: String,
     pub deployment: String,
@@ -164,6 +165,26 @@ pub struct JobRecord {
     pub status: JobStatus,
     pub started_at: u64,
     pub finished_at: Option<u64>,
+    /// Caller correlation for durable, idempotent pulls. Absent for legacy jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_namespace: Option<String>,
+    /// SHA-256 of the immutable requested artifact and deployment template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_fingerprint: Option<String>,
+    /// Template fingerprint captured before any artifact or VM effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_fingerprint: Option<String>,
+    /// Exact source spec, including the image, checked under the mutation lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_spec_fingerprint: Option<String>,
+    /// True only after a healthy replacement from this rollout is observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_verified: Option<bool>,
+    /// A restart found this operation in flight and cannot prove its outcome.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reconciliation_required: bool,
 
     // -- image-build ------------------------------------------------------
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,7 +203,7 @@ pub struct JobRecord {
     pub image: Option<String>,
     /// Whether `vm.image` was updated and the pool told to roll. Set by both
     /// image sources — it describes the roll-out, not how the image was made.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rolled_out: bool,
 
     // -- artifact-pull ----------------------------------------------------
@@ -202,7 +223,7 @@ pub struct JobRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
     /// Whether the fetch was skipped because the content was already present.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reused: bool,
     /// The directory a site's bundle was unpacked into. Only a site pull sets
     /// it — for a managed deployment the pull's destination is `image`.
@@ -218,7 +239,7 @@ pub struct JobRecord {
     /// deployment's mounts in one job, and the single `digest`/`store` fields
     /// above cannot describe eight of them — so this is the record, and those
     /// stay empty on a mount pull.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountOutcome>,
 
     // -- host-update ------------------------------------------------------
@@ -246,7 +267,7 @@ pub struct JobRecord {
 /// several mounts on one deployment, "3 GB transferred" answers nothing, and
 /// which of them moved is the entire question when a pull takes longer than
 /// expected.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MountOutcome {
     /// The guest path, which is the mount's identity within the deployment.
     pub path: String,
@@ -271,11 +292,11 @@ pub struct MountOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unpacked: Option<u64>,
     /// Whether the tree was already on this host and nothing was fetched.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reused: bool,
     /// Whether this mount's digest changed — the reason, or not, that the pool
     /// was recycled.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub changed: bool,
 }
 
@@ -288,6 +309,13 @@ impl JobRecord {
             status: JobStatus::Running,
             started_at: now_secs(),
             finished_at: None,
+            operation_id: None,
+            target_namespace: None,
+            intent_fingerprint: None,
+            config_fingerprint: None,
+            source_spec_fingerprint: None,
+            readiness_verified: None,
+            reconciliation_required: false,
             repo: None,
             git_ref: None,
             commit: None,
@@ -340,6 +368,8 @@ pub enum StartError {
     },
     AlreadyRunning(String),
     BadRef(String),
+    ConflictingOperation(String),
+    Persistence(String),
 }
 
 impl std::fmt::Display for StartError {
@@ -431,6 +461,8 @@ impl std::fmt::Display for StartError {
                 "a job for deployment {id:?} is already running; wait for it to finish"
             ),
             Self::BadRef(r) => write!(f, "{r}"),
+            Self::ConflictingOperation(id) => write!(f, "operation_id {id:?} was already used with different artifact or deployment configuration"),
+            Self::Persistence(e) => write!(f, "could not durably record deployment operation: {e}"),
         }
     }
 }
@@ -438,6 +470,63 @@ impl std::fmt::Display for StartError {
 /// A digest, short enough for a one-line job outcome.
 fn short(digest: &str) -> String {
     digest.chars().take(12).collect()
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn fingerprint(value: &impl Serialize) -> String {
+    // Value's object map sorts keys, including nested HashMaps in VM templates.
+    // Hashing the struct directly makes retry identity depend on hash seed.
+    let value = serde_json::to_value(value).expect("job intent serializes");
+    let bytes = serde_json::to_vec(&value).expect("job intent serializes");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Configuration a rollout must preserve. `vm.image` is the field the rollout
+/// itself changes and `artifact.ref` is overridden by the pinned request.
+fn deployment_config_fingerprint(spec: &crate::config::DeploymentSpec) -> String {
+    let mut normalized = spec.clone();
+    if let Some(vm) = normalized.vm.as_mut() {
+        vm.image = None;
+    }
+    if let Some(artifact) = normalized.artifact.as_mut() {
+        artifact.artifact_ref.clear();
+    }
+    fingerprint(&normalized)
+}
+
+fn persist_job(dir: &Path, record: &JobRecord) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}.json", record.id));
+    let temporary = dir.join(format!("{}.json.tmp", record.id));
+    let bytes = serde_json::to_vec_pretty(record).map_err(|e| e.to_string())?;
+    use std::io::Write;
+    let mut file = std::fs::File::create(&temporary).map_err(|e| e.to_string())?;
+    file.write_all(&bytes).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    std::fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
+    std::fs::File::open(dir).and_then(|dir| dir.sync_all()).map_err(|e| e.to_string())
+}
+
+fn load_durable_jobs(dir: &Path) -> Result<Vec<JobRecord>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.path().extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).map_err(|e| e.to_string())?;
+        records.push(serde_json::from_slice(&bytes).map_err(|e| format!("unreadable durable job {}: {e}", entry.path().display()))?);
+    }
+    records.sort_by_key(|r: &JobRecord| r.started_at);
+    Ok(records)
 }
 
 /// What a build source produced, which is all `heyvm mvm build` needs.
@@ -500,6 +589,8 @@ pub struct Jobs {
     autoscaler: Arc<Autoscaler>,
     secrets: Arc<SecretStore>,
     history: Mutex<VecDeque<JobRecord>>,
+    durable_dir: PathBuf,
+    durable_error: Option<String>,
     /// Deployment ids with a job in flight.
     running: Mutex<HashSet<String>>,
     /// Mirrors step output into app-obs, so a transcript outlives this process's
@@ -515,6 +606,26 @@ impl Jobs {
         secrets: Arc<SecretStore>,
         obs: Option<crate::obs::LogSink>,
     ) -> Self {
+        let durable_dir = registry.state_dir().join("jobs");
+        let (mut history, mut durable_error) = match load_durable_jobs(&durable_dir) {
+            Ok(history) => (history, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        for record in &mut history {
+            if record.status == JobStatus::Running {
+                record.status = JobStatus::Failed;
+                record.finished_at = Some(now_secs());
+                record.reconciliation_required = true;
+                record.readiness_verified = Some(false);
+                record.error = Some("app-lb restarted while this rollout was running; outcome is uncertain and reconciliation is required; destructive work was not replayed".into());
+                if let Err(error) = persist_job(&durable_dir, record) {
+                    durable_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = &durable_error {
+            tracing::error!(%error, "correlated pulls disabled: durable job history needs repair");
+        }
         Self {
             puller: Puller::new(
                 cfg.art_bin.clone(),
@@ -526,7 +637,9 @@ impl Jobs {
             registry,
             autoscaler,
             secrets,
-            history: Mutex::new(VecDeque::new()),
+            history: Mutex::new(history.into()),
+            durable_dir,
+            durable_error,
             running: Mutex::new(HashSet::new()),
             obs,
         }
@@ -660,6 +773,93 @@ impl Jobs {
                 jobs.run_pull(&job_id, &deployment_id, &spec, force).await
             },
         )
+    }
+
+    /// Durable, caller-correlated pull. Unlike the legacy form this requires a
+    /// digest and does not consider installation alone a successful rollout.
+    pub fn start_correlated_pull(
+        self: &Arc<Self>,
+        deployment_id: &str,
+        operation_id: String,
+        digest: String,
+        force: bool,
+    ) -> Result<JobRecord, StartError> {
+        if let Some(error) = &self.durable_error {
+            return Err(StartError::Persistence(error.clone()));
+        }
+        if operation_id.trim().is_empty() || operation_id.len() > 200 {
+            return Err(StartError::BadRef("operation_id must be 1..=200 characters".into()));
+        }
+        if !is_sha256_digest(&digest) {
+            return Err(StartError::BadRef("correlated pulls require `ref` to be a pinned 64-character lowercase SHA-256 digest".into()));
+        }
+        let deployment = self.claimable(deployment_id, JobKind::ArtifactPull)?;
+        if deployment.spec.vm.is_none() {
+            return Err(StartError::BadRef("correlated pulls require a managed VM deployment".into()));
+        }
+        if deployment.desired_replicas() == 0 {
+            return Err(StartError::BadRef("correlated pulls require a non-zero desired replica target; app-lb will not invent scaling demand".into()));
+        }
+        let Some(mut artifact) = deployment.spec.artifact.clone() else {
+            return Err(StartError::NoSpec { id: deployment_id.into(), kind: JobKind::ArtifactPull });
+        };
+        artifact.artifact_ref = digest.clone();
+        let config_fingerprint = deployment_config_fingerprint(&deployment.spec);
+        let intent_fingerprint = fingerprint(&(digest.clone(), force, &config_fingerprint));
+
+        let mut running = self.running.lock().expect("job slot mutex poisoned");
+        let mut history = self.history.lock().expect("job history mutex poisoned");
+        if let Some(existing) = history.iter().find(|r| {
+            r.deployment == deployment_id
+                && r.target_namespace.as_deref() == Some(&deployment.spec.namespace)
+                && r.operation_id.as_deref() == Some(&operation_id)
+        }) {
+            return if existing.intent_fingerprint.as_deref() == Some(&intent_fingerprint) {
+                Ok(existing.clone())
+            } else {
+                Err(StartError::ConflictingOperation(operation_id))
+            };
+        }
+        if !running.insert(deployment_id.to_string()) {
+            return Err(StartError::AlreadyRunning(deployment_id.to_string()));
+        }
+        let mut record = JobRecord::new(new_job_id(), deployment_id.into(), JobKind::ArtifactPull);
+        record.operation_id = Some(operation_id);
+        record.target_namespace = Some(deployment.spec.namespace.clone());
+        record.intent_fingerprint = Some(intent_fingerprint);
+        record.config_fingerprint = Some(config_fingerprint.clone());
+        record.source_spec_fingerprint = Some(fingerprint(&deployment.spec));
+        record.store = Some(artifact.store.clone());
+        record.artifact_ref = Some(digest.clone());
+        history.push_back(record.clone());
+        trim_history(&mut history, deployment_id);
+        if let Err(e) = persist_job(&self.durable_dir, &record) {
+            // Rename may have succeeded before directory sync failed. Keep
+            // the identity reserved even though no worker will be started.
+            let failed = history.iter_mut().find(|r| r.id == record.id).expect("record just inserted");
+            failed.status = JobStatus::Failed;
+            failed.finished_at = Some(now_secs());
+            failed.reconciliation_required = true;
+            failed.readiness_verified = Some(false);
+            failed.error = Some(format!("submission persistence failed; no worker started: {e}"));
+            running.remove(deployment_id);
+            return Err(StartError::Persistence(e));
+        }
+        drop(history);
+        drop(running);
+
+        let jobs = self.clone();
+        let job_id = record.id.clone();
+        let deployment_id = deployment_id.to_string();
+        tokio::spawn(async move {
+            let _slot = JobSlot { jobs: jobs.clone(), deployment: deployment_id.clone() };
+            let result = jobs.run_pull(&job_id, &deployment_id, &artifact, force).await;
+            match result {
+                Ok(_) => jobs.finish(&job_id, JobStatus::Succeeded, None),
+                Err(e) => jobs.finish(&job_id, JobStatus::Failed, Some(e)),
+            }
+        });
+        Ok(record)
     }
 
     /// Materialize every guest mount a managed deployment declares, then roll the
@@ -857,7 +1057,17 @@ impl Jobs {
     fn update_record(&self, job_id: &str, f: impl FnOnce(&mut JobRecord)) {
         let mut history = self.history.lock().expect("job history mutex poisoned");
         if let Some(r) = history.iter_mut().find(|r| r.id == job_id) {
+            if r.reconciliation_required {
+                return;
+            }
             f(r);
+            if r.operation_id.is_some() && let Err(e) = persist_job(&self.durable_dir, r) {
+                tracing::error!(job = %job_id, error = %e, "failed to persist correlated job update");
+                r.status = JobStatus::Failed;
+                r.reconciliation_required = true;
+                r.readiness_verified = Some(false);
+                r.error = Some(format!("could not persist rollout status; reconciliation required: {e}"));
+            }
         }
     }
 
@@ -1184,7 +1394,7 @@ impl Jobs {
         job_id: &str,
         deployment_id: &str,
         image: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Arc<Deployment>, String> {
         let change = self.registry.change_guard().await;
         let Some(old) = self.registry.get(deployment_id) else {
             return Err(format!(
@@ -1192,6 +1402,17 @@ impl Jobs {
                  the image {image:?} was built but nothing is using it"
             ));
         };
+        {
+            let history = self.history.lock().expect("job history mutex poisoned");
+            if let Some(record) = history.iter().find(|r| r.id == job_id && r.operation_id.is_some()) {
+                if record.reconciliation_required {
+                    return Err("rollout persistence failed; no VM replacement attempted".into());
+                }
+                if record.source_spec_fingerprint.as_deref() != Some(&fingerprint(&old.spec)) {
+                    return Err("deployment changed since pull acceptance; no VM replacement attempted".into());
+                }
+            }
+        }
         let mut spec = old.spec.clone();
         let Some(vm) = spec.vm.as_mut() else {
             return Err(format!(
@@ -1202,7 +1423,8 @@ impl Jobs {
         vm.image = Some(image.to_string());
 
         let deployment = self.registry.upsert(spec);
-        if let Err(e) = self.registry.persist_one(&deployment.spec.id) {
+        let persistence_error = self.registry.persist_one(&deployment.spec.id).err();
+        if let Some(e) = &persistence_error {
             tracing::error!(error = %e, "failed to persist state after a build");
         }
         drop(change);
@@ -1216,13 +1438,28 @@ impl Jobs {
                 previous.as_deref().unwrap_or("(daemon default)")
             ));
         });
+        if let Some(error) = persistence_error {
+            let correlated = self.history.lock().expect("job history mutex poisoned")
+                .iter().any(|r| r.id == job_id && r.operation_id.is_some());
+            if correlated {
+                let error = format!("replacement started but deployment state could not be persisted; reconciliation required: {error}");
+                self.update_record(job_id, |r| {
+                    r.status = JobStatus::Failed;
+                    r.finished_at = Some(now_secs());
+                    r.reconciliation_required = true;
+                    r.readiness_verified = Some(false);
+                    r.error = Some(error.clone());
+                });
+                return Err(error);
+            }
+        }
         tracing::info!(
             deployment = %deployment_id,
             image = %image,
             previous = previous.as_deref().unwrap_or("(none)"),
             "rolled deployment onto its new image",
         );
-        Ok(())
+        Ok(deployment)
     }
 
     // -- artifact pulls ----------------------------------------------------
@@ -1275,8 +1512,53 @@ impl Jobs {
         // Unconditional, exactly as a build's is. A pull that reused an image
         // already on disk still has to roll: the running VMs hold a copy of
         // whatever rootfs they booted from, which is not necessarily this one.
-        self.roll_out(job_id, deployment_id, &pulled.image).await?;
+        let replacement = self.roll_out(job_id, deployment_id, &pulled.image).await?;
+        let correlated = self.history.lock().expect("job history mutex poisoned")
+            .iter().any(|r| r.id == job_id && r.operation_id.is_some());
+        if correlated {
+            self.verify_correlated_readiness(job_id, deployment_id, &replacement).await?;
+        }
         Ok(pulled.image)
+    }
+
+    async fn verify_correlated_readiness(
+        &self,
+        job_id: &str,
+        deployment_id: &str,
+        replacement: &Arc<Deployment>,
+    ) -> Result<(), String> {
+        let image = replacement.spec.vm.as_ref().and_then(|vm| vm.image.as_deref()).unwrap_or("");
+        let deadline = tokio::time::Instant::now() + self.cfg.timeout;
+        loop {
+            let Some(deployment) = self.registry.get(deployment_id) else {
+                return Err("deployment was removed while waiting for replacement readiness".into());
+            };
+            if !Arc::ptr_eq(&deployment, replacement) {
+                self.update_record(job_id, |r| r.readiness_verified = Some(false));
+                return Err("deployment was replaced again during rollout; readiness cannot be attributed to this operation".into());
+            }
+            if deployment.spec.vm.as_ref().and_then(|vm| vm.image.as_deref()) != Some(image) {
+                self.update_record(job_id, |r| r.readiness_verified = Some(false));
+                return Err("deployment image changed before replacement readiness was proven".into());
+            }
+            let backends = deployment.backends();
+            let desired = deployment.desired_replicas() as usize;
+            if desired > 0 && backends.len() >= desired && backends.iter().all(|b| b.is_healthy() && !b.is_draining()) {
+                self.update_record(job_id, |r| {
+                    r.readiness_verified = Some(true);
+                    r.push_log(format!("{} replacement replica(s) healthy on requested image {image}", backends.len()));
+                });
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.update_record(job_id, |r| r.readiness_verified = Some(false));
+                return Err(format!("replacement on requested image {image} did not become healthy within {}s", self.cfg.timeout.as_secs()));
+            }
+            tokio::select! {
+                _ = deployment.ready_signal.notified() => {},
+                _ = tokio::time::sleep(VERIFY_INTERVAL) => {},
+            }
+        }
     }
 
     /// The site reading of a pull: a bundle unpacked into `site.root`.
@@ -1879,19 +2161,27 @@ async fn probe_peer(peer: &str, check: &crate::config::HealthCheck) -> bool {
 ///
 /// Oldest-first order is preserved, so `records` still reads newest-first.
 fn trim_history(history: &mut VecDeque<JobRecord>, deployment: &str) {
-    let mut mine = history.iter().filter(|r| r.deployment == deployment).count();
+    // Correlation records are the retry ledger, not expendable log history.
+    // Keep them until an explicit operation-retention policy exists.
+    let mut mine = history.iter().filter(|r| r.deployment == deployment && r.operation_id.is_none()).count();
     if mine > HISTORY_PER_DEPLOYMENT {
         history.retain(|r| {
-            if r.deployment != deployment || mine <= HISTORY_PER_DEPLOYMENT {
+            if r.operation_id.is_some() || r.deployment != deployment || mine <= HISTORY_PER_DEPLOYMENT {
                 return true;
             }
             mine -= 1;
             false
         });
     }
-    while history.len() > HISTORY_LIMIT {
-        history.pop_front();
-    }
+    let mut excess = history.iter().filter(|r| r.operation_id.is_none()).count().saturating_sub(HISTORY_LIMIT);
+    history.retain(|r| {
+        if r.operation_id.is_none() && excess > 0 {
+            excess -= 1;
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// Whether a site's root still holds something worth serving.
@@ -2190,6 +2480,15 @@ mod retention {
 mod tests {
     use super::*;
 
+    fn deployment_spec() -> crate::config::DeploymentSpec {
+        serde_json::from_value(serde_json::json!({
+            "id": "web", "namespace": "ci", "routes": [],
+            "vm": {"driver": "firecracker", "image": "old", "port": 8080},
+            "scaling": {"min_replicas": 1, "max_replicas": 1},
+            "artifact": {"store": "/artifacts", "ref": "old-tag"}
+        })).unwrap()
+    }
+
     fn build_spec() -> BuildSpec {
         BuildSpec {
             repo: Some("https://example.com/acme/web.git".into()),
@@ -2208,6 +2507,182 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn jobs_at(dir: &Path) -> Arc<Jobs> {
+        let registry = Arc::new(Registry::new(dir.join("state.json")));
+        let secrets = Arc::new(SecretStore::new(dir.join("secrets.json"), None));
+        let mounts = crate::mounts::MountStore::new(dir.join("mounts"), 0);
+        let vms = crate::vm::VmManager::new(Some("http://127.0.0.1:1".into()), None, mounts.clone()).unwrap();
+        let workspaces = Arc::new(crate::workspace::Workspaces::new(
+            crate::workspace::WorkspaceConfig {
+                root: dir.join("workspaces"), tar_bin: "tar".into(), aws_bin: "aws".into(),
+                art_bin: "art".into(), s3_endpoint: None, home: None, timeout: Duration::from_secs(1),
+            }, vms.clone(), registry.clone(), secrets.clone(),
+        ));
+        let autoscaler = Arc::new(Autoscaler::new(
+            registry.clone(),
+            crate::runtime::Runtime::new(vms, crate::config::LxcConfig { enabled: false, ..Default::default() }),
+            Arc::new(crate::metrics::Metrics::new()), Arc::new(crate::feed::Feed::new()),
+            workspaces, secrets.clone(),
+        ));
+        Arc::new(Jobs::new(JobConfig {
+            work_dir: dir.join("work"), heyvm_bin: "heyvm".into(), art_bin: "art".into(),
+            images_dir: dir.join("images"), git_bin: "git".into(), mounts, shell: "sh".into(),
+            timeout: Duration::ZERO, home: None,
+        }, registry, autoscaler, secrets, None))
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_full_healthy_pool_and_exact_generation() {
+        let dir = scratch("pool-readiness");
+        let jobs = jobs_at(&dir);
+        let mut spec = deployment_spec();
+        spec.scaling.min_replicas = 2;
+        spec.scaling.max_replicas = 2;
+        let replacement = jobs.registry.upsert(spec.clone());
+        let first = Arc::new(crate::deployment::VmBackend::for_upstream("10.0.0.1:8080".into()));
+        let second = Arc::new(crate::deployment::VmBackend::for_upstream("10.0.0.2:8080".into()));
+        replacement.set_backends(vec![first.clone()]);
+        assert!(jobs.verify_correlated_readiness("job", "web", &replacement).await.is_err());
+        replacement.set_backends(vec![first.clone(), second.clone()]);
+        second.set_healthy(false);
+        assert!(jobs.verify_correlated_readiness("job", "web", &replacement).await.is_err());
+        second.set_healthy(true);
+        second.set_draining(true);
+        assert!(jobs.verify_correlated_readiness("job", "web", &replacement).await.is_err());
+        second.set_draining(false);
+        assert!(jobs.verify_correlated_readiness("job", "web", &replacement).await.is_ok());
+        let later = jobs.registry.upsert(spec);
+        later.set_backends(vec![first, second]);
+        let error = jobs.verify_correlated_readiness("job", "web", &replacement).await.unwrap_err();
+        assert!(error.contains("replaced again"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_pull_cannot_overwrite_concurrent_image_change() {
+        let dir = scratch("stale-pull");
+        let jobs = jobs_at(&dir);
+        let mut spec = deployment_spec();
+        jobs.registry.upsert(spec.clone());
+        let mut record = JobRecord::new("job".into(), "web".into(), JobKind::ArtifactPull);
+        record.operation_id = Some("run".into());
+        record.source_spec_fingerprint = Some(fingerprint(&spec));
+        jobs.history.lock().unwrap().push_back(record);
+        spec.vm.as_mut().unwrap().image = Some("concurrent-image".into());
+        let concurrent = jobs.registry.upsert(spec);
+        assert!(jobs.roll_out("job", "web", "stale-image").await.err().unwrap().contains("changed since"));
+        assert!(Arc::ptr_eq(&jobs.registry.get("web").unwrap(), &concurrent));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_status_persistence_cannot_later_report_success() {
+        let dir = scratch("status-persistence");
+        let jobs = jobs_at(&dir);
+        let mut record = JobRecord::new("job".into(), "web".into(), JobKind::ArtifactPull);
+        record.operation_id = Some("run".into());
+        jobs.history.lock().unwrap().push_back(record);
+        std::fs::create_dir_all(jobs.durable_dir.parent().unwrap()).unwrap();
+        std::fs::write(&jobs.durable_dir, "not a directory").unwrap();
+        jobs.update_record("job", |r| r.readiness_verified = Some(true));
+        std::fs::remove_file(&jobs.durable_dir).unwrap();
+        jobs.finish("job", JobStatus::Succeeded, None);
+        let record = jobs.records(None).remove(0);
+        assert_eq!(record.status, JobStatus::Failed);
+        assert_eq!(record.readiness_verified, Some(false));
+        assert!(record.reconciliation_required);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fingerprints_ignore_map_insertion_order() {
+        use std::collections::HashMap;
+        let first: HashMap<_, _> = [("z", "last"), ("a", "first")].into_iter().collect();
+        let second: HashMap<_, _> = [("a", "first"), ("z", "last")].into_iter().collect();
+        assert_eq!(fingerprint(&first), fingerprint(&second));
+        assert_eq!(fingerprint(&first), fingerprint(&serde_json::json!({"a":"first", "z":"last"})));
+    }
+
+    #[test]
+    fn correlation_identity_survives_both_history_limits() {
+        let mut history = VecDeque::new();
+        let mut durable = JobRecord::new("durable".into(), "web".into(), JobKind::ArtifactPull);
+        durable.operation_id = Some("run-1".into());
+        history.push_back(durable);
+        for i in 0..HISTORY_PER_DEPLOYMENT + 10 {
+            history.push_back(JobRecord::new(format!("web-{i}"), "web".into(), JobKind::ArtifactPull));
+            trim_history(&mut history, "web");
+        }
+        for i in 0..HISTORY_LIMIT + 10 {
+            let id = format!("other-{i}");
+            history.push_back(JobRecord::new(id.clone(), id.clone(), JobKind::ArtifactPull));
+            trim_history(&mut history, &id);
+        }
+        assert_eq!(history.front().unwrap().id, "durable");
+        assert_eq!(history.len(), HISTORY_LIMIT + 1);
+    }
+
+    #[test]
+    fn correlated_job_is_persisted_before_execution_and_loadable() {
+        let dir = scratch("durable-submission");
+        let mut record = JobRecord::new("job-durable".into(), "web".into(), JobKind::ArtifactPull);
+        record.operation_id = Some("ci-run-42".into());
+        record.target_namespace = Some("ci".into());
+        persist_job(&dir, &record).unwrap();
+        let loaded = load_durable_jobs(&dir).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].status, JobStatus::Running);
+        assert_eq!(loaded[0].operation_id.as_deref(), Some("ci-run-42"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn intent_distinguishes_artifact_and_template_but_not_rollout_image_swap() {
+        let mut spec = deployment_spec();
+        let authorized = deployment_config_fingerprint(&spec);
+        spec.vm.as_mut().unwrap().image = Some("new-digest-image".into());
+        assert_eq!(deployment_config_fingerprint(&spec), authorized);
+        spec.vm.as_mut().unwrap().port = 9090;
+        assert_ne!(deployment_config_fingerprint(&spec), authorized);
+        assert_ne!(fingerprint(&("a", false, &authorized)), fingerprint(&("b", false, &authorized)));
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_running_identity_without_replaying_it() {
+        let dir = scratch("interrupted");
+        let spec = deployment_spec();
+        let digest = "a".repeat(64);
+        let mut record = JobRecord::new("job-interrupted".into(), "web".into(), JobKind::ArtifactPull);
+        record.operation_id = Some("ci-run-43".into());
+        record.target_namespace = Some(spec.namespace.clone());
+        record.intent_fingerprint = Some(fingerprint(&(digest.clone(), false, deployment_config_fingerprint(&spec))));
+        persist_job(&dir.join("state.d/jobs"), &record).unwrap();
+        let jobs = jobs_at(&dir);
+        jobs.registry.upsert(spec);
+        let replay = jobs.start_correlated_pull("web", "ci-run-43".into(), digest, false).unwrap();
+        assert_eq!(replay.id, "job-interrupted");
+        assert_eq!(replay.status, JobStatus::Failed);
+        assert!(replay.reconciliation_required);
+        assert!(jobs.running.lock().unwrap().is_empty());
+        assert!(matches!(jobs.start_correlated_pull("web", "ci-run-43".into(), "b".repeat(64), false), Err(StartError::ConflictingOperation(_))));
+        let again = load_durable_jobs(&jobs.durable_dir).unwrap();
+        assert_eq!(again[0].status, JobStatus::Failed);
+        assert!(again[0].reconciliation_required);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn corrupt_ledger_blocks_new_correlated_work() {
+        let dir = scratch("corrupt-ledger");
+        std::fs::create_dir_all(dir.join("state.d/jobs")).unwrap();
+        std::fs::write(dir.join("state.d/jobs/job.json"), "broken").unwrap();
+        let jobs = jobs_at(&dir);
+        jobs.registry.upsert(deployment_spec());
+        assert!(matches!(jobs.start_correlated_pull("web", "run".into(), "a".repeat(64), false), Err(StartError::Persistence(_))));
+        assert!(jobs.running.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn touch(path: &Path) {
