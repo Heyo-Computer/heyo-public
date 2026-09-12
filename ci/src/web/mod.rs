@@ -46,6 +46,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+const RUN_EVENT_PAGE_SIZE: i64 = 50;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -440,9 +442,11 @@ async fn runs_page(
 async fn run_page(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let who = who_of(&headers);
+    let event_before = q.get("events_before").and_then(|value| value.parse::<i64>().ok());
     match state.store.get_run(&run_id).await {
         Ok(Some(run)) => {
             let jobs = state.store.jobs_of(&run_id).await.unwrap_or_default();
@@ -482,6 +486,25 @@ async fn run_page(
                     );
                 }
             };
+            let mut events = match state
+                .store
+                .run_events(&run_id, event_before, RUN_EVENT_PAGE_SIZE + 1)
+                .await
+            {
+                Ok(events) => events,
+                Err(e) => {
+                    return page_error(
+                        &state,
+                        &headers,
+                        who.as_ref(),
+                        &format!("could not load event timeline: {e}"),
+                    );
+                }
+            };
+            let events_have_more = events.len() as i64 > RUN_EVENT_PAGE_SIZE;
+            if events_have_more {
+                events.pop();
+            }
             pages::run_page_with_deployments(
                 &chrome(&state, &headers, who.as_ref()),
                 &run,
@@ -491,6 +514,9 @@ async fn run_page(
                 &vm_logs,
                 release.as_ref(),
                 &deployments,
+                &events,
+                event_before,
+                events_have_more,
                 state.config.log_retention.map(|d| d.as_secs() / 86_400),
             )
             .into_response()

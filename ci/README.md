@@ -1195,6 +1195,10 @@ for 24 hours; the outbox currently has no automatic archival/pruning policy.
 The authenticated `GET /api/runs/{run_id}/events?limit=50&before=<revision>` API
 uses the same repository bearer token or path-HMAC semantics as other run reads,
 returns 404 across repository boundaries, and caps pages at 100 events.
+The authenticated browser run page also renders an **Event timeline** beside
+Release and Deployments, with 50 records per page, older/newest navigation,
+transition errors, and NATS publication attempts/errors. It reads the same
+durable records; publication status is not approval to release or deploy.
 Revisions order history, not concurrent
 transaction commits or NATS delivery. Consumers must re-read authoritative
 state rather than assuming receipt order determines the latest state.

@@ -356,6 +356,7 @@ fn jwt_spec() -> DeploymentSpec {
             name_claim: "name".into(),
             leeway_secs: Some(30),
             cookie: Some("heyo_access_token".into()),
+            login_endpoint: None,
         }),
     });
     s

@@ -2296,6 +2296,12 @@ pub struct JwtSpec {
     /// when both are present: a request that says what it is presenting means it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
+    /// Optional Heyo Auth `/api/auth/login` endpoint for browser email/password
+    /// sign-in. The returned access token must pass this JWT policy before a
+    /// host-only HttpOnly cookie is set. Requires `cookie`; never stores refresh
+    /// tokens or passwords. Existing bearer-only gates remain unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_endpoint: Option<String>,
 }
 
 fn default_subject_claim() -> String {
@@ -2460,6 +2466,20 @@ impl JwtSpec {
             && !is_valid_cookie_name(cookie)
         {
             return Err(SpecError::BadCookieName(cookie.clone()));
+        }
+        if let Some(endpoint) = &self.login_endpoint {
+            let valid = reqwest::Url::parse(endpoint).is_ok_and(|url| {
+                (url.scheme() == "https"
+                    || (url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))))
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            });
+            if !valid || self.cookie.is_none() {
+                return Err(SpecError::BadJwtLoginEndpoint);
+            }
         }
         Ok(())
     }
@@ -3518,6 +3538,7 @@ pub enum SpecError {
     },
     BadJwtIssuer(String),
     BadJwtAudience(String),
+    BadJwtLoginEndpoint,
     EmptyJwtClaimName,
     JwtLeewayTooLarge {
         secs: u64,
@@ -3936,6 +3957,7 @@ impl std::fmt::Display for SpecError {
                 "auth.jwt.audience {a:?} must be the exact `aud` the tokens carry, with no \
                  surrounding whitespace"
             ),
+            Self::BadJwtLoginEndpoint => write!(f, "auth.jwt.login_endpoint requires a cookie and an HTTPS URL without credentials, query or fragment (HTTP loopback is allowed)"),
             Self::EmptyJwtClaimName => write!(
                 f,
                 "auth.jwt names an empty claim; subject_claim, email_claim, name_claim and \
@@ -7134,6 +7156,21 @@ mod tests {
                 "audience": "heyo-app",
                 "subject_claim": "userId",
             })
+        }
+
+        #[test]
+        fn browser_login_requires_cookie_and_safe_issuer_transport() {
+            for endpoint in ["http://issuer.example/login", "https://user:pass@issuer.example/login", "https://issuer.example/login#fragment", "https://issuer.example/login?token=x", "file:///login"] {
+                let mut block = heyo_block();
+                block["cookie"] = serde_json::json!("heyo_login");
+                block["login_endpoint"] = serde_json::json!(endpoint);
+                assert!(matches!(with_jwt(r#""jwt""#, block).validate(), Err(SpecError::BadJwtLoginEndpoint)), "{endpoint}");
+            }
+            let mut block = heyo_block();
+            block["login_endpoint"] = serde_json::json!("https://stage.heyo.computer/api/auth/login");
+            assert!(matches!(with_jwt(r#""jwt""#, block.clone()).validate(), Err(SpecError::BadJwtLoginEndpoint)));
+            block["cookie"] = serde_json::json!("heyo_login");
+            with_jwt(r#""jwt""#, block).validate().unwrap();
         }
 
         /// The shape a Heyo auth API gate is actually written in.

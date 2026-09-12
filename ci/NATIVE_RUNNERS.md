@@ -66,9 +66,12 @@ the VM's loopback interface; its monitoring port is not exposed. If either
 process exits, the startup wrapper terminates the other and exits nonzero.
 The template creates no public route: configure an authenticated app-lb route
 only after checking that the VM port has no public bypass. A staging JWT gate
-can forward the existing Auth identity; it does not provide browser sign-in or
-SSO. Google/browser login is a separate gate configuration, not a second Auth
-service inside the CI VM.
+can forward the existing Auth identity. For browser email/password sign-in,
+configure its `jwt.cookie` and `jwt.login_endpoint` (the existing staging
+`/api/auth/login` endpoint) using an app-lb binary that supports those fields.
+The gate verifies the returned token before setting the cookie. This is not
+cross-domain SSO or a second Auth service inside the CI VM; Google sign-in
+remains a separate gate configuration.
 
 This is not an HA or automatic-upgrade deployment. NATS state, source trees,
 logs and disk artifacts live in that VM's `/workspace/ci-state`; Postgres alone

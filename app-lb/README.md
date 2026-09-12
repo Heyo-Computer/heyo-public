@@ -2326,6 +2326,32 @@ name a cookie to read the token from:
 The `Authorization` header still wins when both are present — a request that sets
 it is stating what it presents.
 
+**Browser sign-in with existing Heyo Auth.** Add `login_endpoint` to the JWT
+block to show an email/password form to unauthenticated browser navigations:
+
+```jsonc
+"jwt": {
+  "secret": {"secret": "heyo-auth", "key": "jwt_secret"},
+  "algorithms": ["HS256"],
+  "issuer": "auth-service",
+  "audience": "heyo-app",
+  "subject_claim": "userId",
+  "cookie": "heyo_access_token",
+  "login_endpoint": "https://stage.heyo.computer/api/auth/login"
+}
+```
+
+The gate posts credentials to that fixed endpoint and verifies the returned
+JWT against the same issuer, audience, signature and `require` policy before
+setting a host-only Secure/HttpOnly cookie. The form requires HTTPS, same-origin
+POST and signed, short-lived login state. Passwords and refresh tokens are not
+persisted; endpoint redirects are refused. Logout clears the access cookie.
+Machine clients still receive 401 and continue using their existing credentials.
+An Auth service requiring CAPTCHA or another interactive challenge cannot use
+this password form; those requirements are not bypassed. This is not Google SSO
+or cross-domain session sharing. Existing bearer-only gates are unchanged unless
+this field is configured. Deploy the updated app-lb binary before configuring it.
+
 **Mixing providers** works as it does everywhere else. `["google", "jwt"]` is the
 common shape for a product UI: a person opens it in a browser and signs in with
 Google; the UI's own API calls carry the token the auth service gave it. Both are
