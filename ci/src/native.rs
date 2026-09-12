@@ -374,6 +374,32 @@ mod tests {
         assert!(plan.jobs.iter().any(|j|j.native_labels.contains(&"windows-x64".into())));
     }
 
+    #[test]
+    fn system_workflow_gates_release_on_real_builds_and_defaults_to_no_publication() {
+        let workflow=crate::workflow::Workflow::parse("system.yml",include_str!("../system.yml")).unwrap();
+        let plan=crate::plan::Plan::build(&workflow).unwrap();
+        assert_eq!(plan.jobs.len(),6);
+        let job=|key:&str| plan.jobs.iter().find(|j|j.key==key).unwrap();
+        let release=job("release");
+        assert_eq!(release.needs,vec!["linux","mac-intel","windows"]);
+        for key in &release.needs {
+            let validation=job(key);
+            assert!(validation.condition.is_none());
+            assert!(!validation.continue_on_error);
+            assert!(validation.steps.iter().all(|s|!s.continue_on_error));
+            assert!(validation.steps.iter().any(|s|s.run.as_deref().is_some_and(|r|r.contains("cargo test --locked"))));
+            assert!(validation.steps.iter().any(|s|s.run.as_deref().is_some_and(|r|r.contains("cargo build --locked --release"))));
+        }
+        assert!(job("mac-intel").native_labels.contains(&"macos-intel".into()));
+        assert!(job("windows").native_labels.contains(&"windows-x64".into()));
+        let ctx=crate::expr::Context::new();
+        assert!(!ctx.eval_condition(release.condition.as_deref().unwrap()).unwrap());
+        assert!(!ctx.eval_condition(job("deploy").condition.as_deref().unwrap()).unwrap());
+        assert_eq!(job("release-archive").needs,vec!["release"]);
+        assert_eq!(job("release-archive").steps[0].uses.as_deref(),Some("ci/checkout-release"));
+        assert_eq!(job("deploy").needs,vec!["release-archive"]);
+    }
+
     #[tokio::test]
     #[ignore = "needs CI_TEST_DATABASE_URL; disposable PostgreSQL only"]
     async fn native_leases_fence_concurrency_expiry_cancellation_and_completion_rollback() {

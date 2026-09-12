@@ -825,6 +825,7 @@ impl Dispatcher {
         serde_json::json!({
             "sha": run.sha,
             "before": run.before_sha,
+            "release_base_sha": run.release_base_sha,
             "ref": run.git_ref,
             "branch": run.git_ref.strip_prefix("refs/heads/").unwrap_or(&run.git_ref),
             "repository": run.repo_url,

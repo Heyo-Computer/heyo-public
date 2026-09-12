@@ -43,6 +43,29 @@ ci --check-workflows .ci/workflows/*.yml
 
 This is a static check, not evidence that build commands or deployments work.
 
+### Building and releasing the public CI system
+
+Register `ci/system.yml` as the repository workflow to build the Linux CI service
+and test/build the native agent on real Intel Mac and Windows hosts. It uses the
+repository's assigned Linux network, not the existing us2 host pin. All three
+builds upload artifacts and are required by the single release job.
+
+Release and deployment default to disabled. `RELEASE_ENABLED=true` permits the
+gated merge/version/tag action with `GIT_AUTH_TOKEN`; `DEPLOY_ENABLED=true` also
+permits Orchestrator deployment. These are separate publication permissions, not
+runner setup options. The release checks the exact captured `ci.release_base_sha`
+to source diff and refuses changes outside `ci/` and `.ci/image/ci/`: CI tests
+cannot authorize merging unrelated application changes.
+
+The release archive is rebuilt from the confirmed bumped tree and contains the
+CI executable, `start.sh`, and `REVISION`. Configure `ORCHESTRATOR_URL`,
+`SERVICE_OWNER`, a complete `SERVICE_SPEC`, and `ORCHESTRATOR_TOKEN` through the
+workflow's HeyoSecret scope. The workflow inserts only the finalized archive ID
+into that spec. The target must supply external Postgres/NATS and durable CI
+workspace/log/artifact storage. This archive does **not** replace the stateful
+us3 CI/NATS bundle without a state-preserving migration; do not point it at that
+service and assume its local NATS or files will transfer automatically.
+
 ## Submitting a build
 
 ```bash

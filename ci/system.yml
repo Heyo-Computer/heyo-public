@@ -1,0 +1,152 @@
+# Registered CI-system pipeline: Linux service and real native runner builds.
+# Register this path on the target CI installation; no us2 host pin is inherited.
+name: CI system
+on: [submit]
+jobs:
+  linux:
+    vm: &linux
+      driver: firecracker
+      build:
+        dockerfile: .ci/image/ci/Dockerfile
+        context: .ci/image/ci
+        size_mb: 6144
+      size_class: large
+      disk_size_gb: 40
+      ttl_seconds: 14400
+      cache_key_files: [ci/Cargo.lock, ci/Cargo.toml, rust-toolchain.toml]
+    timeout-minutes: 120
+    steps:
+      - name: Require attached build disk
+        run: test "$(stat -c %d /var/cache/ci)" != "$(stat -c %d /)"
+      - name: Test CI and build service
+        working-directory: /workspace/ci
+        run: |
+          set -eu
+          cargo test --locked -- --test-threads=1
+          cargo build --locked --release --bins
+      - name: Test submission client
+        run: python3 ci/test-git-submit.py
+      - name: Package validated binaries
+        run: |
+          set -eu
+          mkdir -p dist
+          cp "$CARGO_TARGET_DIR/release/ci" dist/ci
+          cp "$CARGO_TARGET_DIR/release/native-runner-agent" dist/native-runner-agent
+          printf '%s\n' '${{ ci.sha }}' > dist/REVISION
+          (cd dist && sha256sum ci native-runner-agent > SHA256SUMS)
+      - uses: ci/upload-artifact
+        with: { name: ci-linux, path: dist }
+
+  mac-intel:
+    runs-on: [namespace-profile-mac-build, macos, macos-intel, x86_64-apple-darwin]
+    timeout-minutes: 120
+    steps:
+      - name: Test native agent
+        working-directory: ci
+        run: cargo test --locked --bin native-runner-agent
+      - name: Build native agent
+        working-directory: ci
+        run: cargo build --locked --release --bin native-runner-agent
+      - uses: ci/upload-artifact
+        with: { name: native-agent-mac-intel, path: ci/target/release/native-runner-agent }
+
+  windows:
+    runs-on: [blacksmith-2vcpu-windows-2025, windows, windows-x64, x86_64-pc-windows-msvc]
+    timeout-minutes: 120
+    steps:
+      - name: Test native agent
+        working-directory: ci
+        run: cargo test --locked --bin native-runner-agent
+      - name: Build native agent
+        working-directory: ci
+        run: cargo build --locked --release --bin native-runner-agent
+      - uses: ci/upload-artifact
+        with: { name: native-agent-windows, path: ci/target/release/native-runner-agent.exe }
+
+  release:
+    needs: [linux, mac-intel, windows]
+    if: ${{ vars.RELEASE_ENABLED == 'true' }}
+    vm: *linux
+    steps:
+      - name: Refuse changes outside the validated CI component
+        env:
+          RELEASE_BASE: ${{ ci.release_base_sha }}
+          SOURCE_SHA: ${{ ci.sha }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import os, subprocess
+          base, head = os.environ['RELEASE_BASE'], os.environ['SOURCE_SHA']
+          if not base or not head:
+              raise SystemExit('release requires captured base and source SHA')
+          paths = subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', '-z', base, head]).decode().split('\0')
+          outside = [p for p in paths if p and not p.startswith(('ci/', '.ci/image/ci/'))]
+          if outside:
+              raise SystemExit('CI-only release cannot authorize other components: ' + ', '.join(outside))
+          PY
+      - uses: ci/merge-release
+        with:
+          manifests: '["ci/Cargo.toml"]'
+          tags: '{"ci/Cargo.toml":"ci-v"}'
+          token: ${{ secrets.GIT_AUTH_TOKEN }}
+
+  release-archive:
+    needs: [release]
+    vm: *linux
+    timeout-minutes: 120
+    outputs:
+      archive_id: ${{ steps.archive.outputs.archive-id }}
+    steps:
+      - id: checkout
+        uses: ci/checkout-release
+      - name: Build release service
+        working-directory: /workspace/ci
+        run: cargo build --locked --release --bin ci
+      - name: Package release service
+        run: |
+          set -eu
+          mkdir -p dist
+          cp "$CARGO_TARGET_DIR/release/ci" dist/ci
+          printf '%s\n' '#!/bin/sh' 'set -eu' 'exec ./ci' > dist/start.sh
+          chmod 755 dist/start.sh
+          printf '%s\n' '${{ steps.checkout.outputs.sha }}' > dist/REVISION
+          tar -C dist -czf ci-service.tar.gz .
+      - id: archive
+        uses: ci/publish-service-archive
+        with:
+          path: ci-service.tar.gz
+          name: ci-service
+          url: ${{ vars.ORCHESTRATOR_URL }}
+          user-id: ${{ vars.SERVICE_OWNER }}
+          token: ${{ secrets.ORCHESTRATOR_TOKEN }}
+
+  deploy:
+    needs: [release-archive]
+    if: ${{ vars.RELEASE_ENABLED == 'true' && vars.DEPLOY_ENABLED == 'true' }}
+    vm: *linux
+    steps:
+      - id: spec
+        name: Attach confirmed archive to configured service
+        env:
+          SERVICE_SPEC: ${{ vars.SERVICE_SPEC }}
+          ARCHIVE_ID: ${{ needs.release-archive.outputs.archive_id }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os
+          spec = json.loads(os.environ['SERVICE_SPEC'])
+          if not isinstance(spec.get('deploy'), dict):
+              raise SystemExit('SERVICE_SPEC requires a deploy object')
+          archive = os.environ['ARCHIVE_ID'].strip()
+          if not archive:
+              raise SystemExit('confirmed service archive is missing')
+          spec['deploy']['archive_id'] = archive
+          with open(os.environ['CI_OUTPUT'], 'a') as output:
+              output.write('json=' + json.dumps(spec, separators=(',', ':')) + '\n')
+          PY
+      - uses: ci/deploy-service
+        timeout-minutes: 20
+        with:
+          url: ${{ vars.ORCHESTRATOR_URL }}
+          token: ${{ secrets.ORCHESTRATOR_TOKEN }}
+          spec: ${{ steps.spec.outputs.json }}
