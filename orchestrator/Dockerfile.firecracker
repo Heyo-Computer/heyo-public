@@ -6,8 +6,7 @@
 # heyvm discards OCI metadata and boots /init.sh directly. x86_64 only.
 
 FROM rust:1-bookworm AS builder
-ARG TARGETARCH
-RUN test "$TARGETARCH" = "amd64"
+RUN test "$(dpkg --print-architecture)" = "amd64"
 WORKDIR /app
 COPY heyosecret-client/ heyosecret-client/
 COPY orchestrator/ orchestrator/
