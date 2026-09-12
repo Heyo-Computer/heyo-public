@@ -1702,6 +1702,7 @@ mod tests {
             redirect_url: None,
             forward_identity: true,
             jwt: None,
+            provider_ref: None,
         }
     }
 
