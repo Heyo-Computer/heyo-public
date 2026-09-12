@@ -255,5 +255,15 @@ A healthy `/health` does not prove CD works. Configure and verify regional
 `CLOUD_INTERNAL_URL`, `ORCHESTRATOR_BACKEND_API_URL`, proxy domains, and optional
 `ORCHESTRATOR_NATS_URL`/`ORCHESTRATOR_NATS_ENABLED` before accepting deployment
 jobs. Cloud must accept the configured internal key and allocate the us3 backend.
+The current Orchestrator also reads Cloud's `deployed_sandboxes` table directly:
+regional Cloud must use this region's database and populate its deployment state.
+Pointing an isolated Orchestrator at staging Cloud does not satisfy that contract.
 Keep staging/eu1 dependencies explicit until those services are regionalized;
 do not call a health-only installation an independent region.
+
+The app-lb host needs Docker for image builds. If Postgres is protected by the
+existing per-VM allowlist, grant each candidate's exact IP and tap interface
+access to port 6432 before expecting database readiness. Retain existing rules;
+do not open the database publicly. A replacement VM needs its own grant, so this
+bootstrap setup is not unattended rollout readiness. Keep a candidate's boot
+deadline long enough to establish that access, then restore the normal deadline.
