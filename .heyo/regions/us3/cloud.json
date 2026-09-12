@@ -1,0 +1,40 @@
+{
+  "id": "cloud-us3",
+  "routes": [],
+  "vm": {
+    "driver": "firecracker",
+    "image": "REPLACE_WITH_VERIFIED_RUNTIME_IMAGE",
+    "port": 8080,
+    "size_class": "small",
+    "ttl_seconds": 0,
+    "working_directory": "/",
+    "start_command": "REPLACE_WITH_START_CLOUD_SH_LAUNCHER",
+    "env_vars": {
+      "CLOUD_SERVER_PORT": "8080",
+      "CLOUD_ENVIRONMENT": "us3",
+      "CLOUD_HOSTNAME": "cloud.us3.heyo.work",
+      "CLOUD_BASE_HOSTNAME": "us3.heyo.work",
+      "CLOUD_PUBLIC_BASE_URL": "https://cloud.us3.heyo.work",
+      "CLOUD_ORCHESTRATOR_INTERNAL_URL": "https://orchestrator.us3.heyo.work",
+      "CLOUD_HEYOSECRET_URL": "https://heyosecret.us3.heyo.work",
+      "HEYO_AUTH_SERVER_URL": "https://stage.heyo.computer",
+      "CLOUD_STORAGE_DRIVER": "s3",
+      "CLOUD_NATS_ENABLED": "false",
+      "CLOUD_MVM_CTRL_BACKEND_SCHEME": "http"
+    },
+    "env_from": [
+      {"secret": "orchestrator-us3", "key": "database-url", "as": "DATABASE_URL"},
+      {"secret": "orchestrator-us3", "key": "jwt-secret", "as": "JWT_SECRET"},
+      {"secret": "orchestrator-us3", "key": "internal-api-key", "as": "CLOUD_INTERNAL_API_KEY"},
+      {"secret": "heyosecret-us3", "key": "internal-api-key", "as": "HEYOSECRET_INTERNAL_API_KEY"},
+      {"secret": "cloud-us3", "key": "s3-bucket", "as": "CLOUD_S3_BUCKET"},
+      {"secret": "cloud-us3", "key": "s3-region", "as": "CLOUD_S3_REGION"},
+      {"secret": "cloud-us3", "key": "s3-access-key-id", "as": "CLOUD_S3_ACCESS_KEY_ID"},
+      {"secret": "cloud-us3", "key": "s3-secret-access-key", "as": "CLOUD_S3_SECRET_ACCESS_KEY"},
+      {"secret": "cloud-us3", "key": "source-archive-url", "as": "CLOUD_SOURCE_ARCHIVE_URL"},
+      {"secret": "cloud-us3", "key": "source-archive-sha256", "as": "CLOUD_SOURCE_ARCHIVE_SHA256"}
+    ]
+  },
+  "health": {"path": "/health", "timeout_secs": 5},
+  "scaling": {"min_replicas": 0, "max_replicas": 1, "warm_pool": 0, "boot_timeout_secs": 600}
+}
