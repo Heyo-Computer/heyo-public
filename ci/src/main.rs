@@ -55,6 +55,30 @@ use vm::Vms;
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        if args[0] != "--check-workflows" || args.len() < 2 {
+            eprintln!("usage: ci [--check-workflows FILE ...]");
+            std::process::exit(2);
+        }
+        let mut failed = false;
+        for path in &args[1..] {
+            let result = std::fs::read_to_string(path)
+                .map_err(|e| format!("{path}: {e}"))
+                .and_then(|yaml| workflow::Workflow::parse(path, &yaml).map_err(|e| e.to_string()))
+                .and_then(|workflow| plan::Plan::build(&workflow).map_err(|e| e.to_string()));
+            match result {
+                Ok(plan) => println!("{path}: valid plan ({} jobs)", plan.jobs.len()),
+                Err(error) => {
+                    eprintln!("{path}: {error}");
+                    failed = true;
+                }
+            }
+        }
+        // Offline: no configuration, database, broker or runner connections.
+        std::process::exit(if failed { 1 } else { 0 });
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

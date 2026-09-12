@@ -37,6 +37,7 @@ use crate::vm::{ExecOutput, SizeCheck, Vm, VmError, Vms, sandbox_name};
 use crate::workflow::{Fallback, Step};
 use async_nats::jetstream::AckKind;
 use serde_json::Value;
+use sqlx::Row;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -2402,12 +2403,16 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
             "ci/merge-release" => {
                 let manifests: Vec<String> = serde_json::from_str(&required("manifests")?)
                     .map_err(|_| DispatchError::StepFailed("with.manifests must be a JSON array of manifest paths".into()))?;
+                let tags = with("tags").map(|raw| serde_json::from_str(&raw)
+                    .map_err(|_| DispatchError::StepFailed("with.tags must be a JSON object mapping manifest paths to tag prefixes".into())))
+                    .transpose()?.unwrap_or_default();
                 let source = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
                 let release = crate::release::merge(&self.store, msg, plan, &source.root,
-                    &manifests, &required("token")?).await.map_err(DispatchError::StepFailed)?;
+                    &manifests, &tags, &required("token")?).await.map_err(DispatchError::StepFailed)?;
                 Ok((format!("[ci] merged and published release {} on {}\nVersions: {}\n",
                     release.release_sha, release.git_ref, release.versions), serde_json::json!({
-                        "sha": release.release_sha, "ref": release.git_ref, "versions": release.versions.to_string()
+                        "sha": release.release_sha, "ref": release.git_ref, "versions": release.versions.to_string(),
+                        "tags": release.tags
                     })))
             }
             "ci/checkout-release" => {
@@ -2687,9 +2692,45 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     stored.size_bytes, stored.sink, stored.uri
                 ), serde_json::json!({})))
             }
+            "ci/download-artifact" => {
+                let name = required("name")?;
+                let path = required("path")?;
+                let producer = with("job").filter(|v| !v.trim().is_empty());
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                let remote = artifact_download_path(workdir, &path)?;
+                // Scope at the query boundary: workflow input can name an
+                // artifact and (only for duplicate names) its producer, never
+                // a run, URI, path in the sink, or remote URL.
+                let rows = sqlx::query(
+                    "SELECT a.run_id,a.name,a.sink,a.digest,a.size_bytes,a.uri,a.public_url,
+                            j.job_key,j.status,j.finished_at IS NOT NULL AS finished
+                       FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id
+                      WHERE a.run_id=$1 AND a.name=$2 ORDER BY a.created_at",
+                ).bind(&msg.run_id).bind(&name).fetch_all(self.store.pool()).await
+                    .map_err(|e| DispatchError::Artifact(format!("looking up artifact {name:?}: {e}")))?;
+                let candidates = rows.iter().map(|r| Ok(DownloadCandidate {
+                    run_id: r.get("run_id"), name: r.get("name"), job_key: r.get("job_key"),
+                    status: r.get("status"), finished: r.get("finished"),
+                    stored: crate::artifacts::StoredArtifact {
+                        sink: match r.get::<String,_>("sink").as_str() {
+                            "disk" => "disk", "s3" => "s3", "artifacts" => "artifacts",
+                            other => return Err(DispatchError::Artifact(format!("artifact {name:?} has unknown recorded sink {other:?}"))),
+                        },
+                        digest: r.get("digest"), size_bytes: r.get::<i64,_>("size_bytes").try_into()
+                            .map_err(|_| DispatchError::Artifact(format!("artifact {name:?} has invalid recorded size")))?,
+                        uri: r.get("uri"), public_url: r.get("public_url"),
+                    },
+                })).collect::<Result<Vec<_>, DispatchError>>()?;
+                let selected = select_download(&msg.run_id, &name, producer.as_deref(), &candidates)?;
+                let bytes = self.artifacts.get(&selected.stored).await
+                    .map_err(|e| DispatchError::Artifact(format!("downloading artifact {name:?}: {e}")))?;
+                vm.upload_bytes(sid, &remote, &bytes).await?;
+                Ok((format!("[ci] downloaded artifact {name:?} from job {:?} to {path:?} ({} bytes)\n",
+                    selected.job_key, bytes.len()), serde_json::json!({})))
+            }
             other => Err(DispatchError::Artifact(format!(
                 "`uses: {other}` is not a built-in action. Available: \
-                 ci/upload-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service. Composite actions from a repository are not \
+                 ci/upload-artifact, ci/download-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service. Composite actions from a repository are not \
                  supported."
             ))),
         }
@@ -2718,6 +2759,45 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
         env.insert("CI_JOB_KEY".to_string(), plan.key.clone());
         env
     }
+}
+
+#[derive(Debug, Clone)]
+struct DownloadCandidate {
+    run_id: String,
+    name: String,
+    job_key: String,
+    status: String,
+    finished: bool,
+    stored: crate::artifacts::StoredArtifact,
+}
+
+fn select_download<'a>(run_id: &str, name: &str, producer: Option<&str>, candidates: &'a [DownloadCandidate])
+    -> Result<&'a DownloadCandidate, DispatchError>
+{
+    let matching = candidates.iter().filter(|a| a.run_id == run_id && a.name == name &&
+        producer.is_none_or(|job| a.job_key == job)).collect::<Vec<_>>();
+    match matching.as_slice() {
+        [] => Err(DispatchError::Artifact(format!("no artifact named {name:?}{} exists in the current run",
+            producer.map(|j| format!(" from job {j:?}")).unwrap_or_default()))),
+        [one] if one.status != "success" || !one.finished => Err(DispatchError::Artifact(format!(
+            "artifact {name:?} was produced by job {:?}, which is not completed successfully (status {:?})",
+            one.job_key, one.status))),
+        [one] => Ok(one),
+        many => Err(DispatchError::Artifact(format!("artifact {name:?} is ambiguous: {} producers match; set with.job", many.len()))),
+    }
+}
+
+fn artifact_download_path(workdir: &str, path: &str) -> Result<String, DispatchError> {
+    let relative = std::path::Path::new(path);
+    if path.trim().is_empty() || path.ends_with('/') || relative.file_name().is_none()
+        || relative.is_absolute() || !relative.components().all(|c|
+            matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+    {
+        return Err(DispatchError::Artifact(
+            "ci/download-artifact with.path must name a file relative to the job working directory".into(),
+        ));
+    }
+    Ok(std::path::Path::new(workdir).join(relative).to_string_lossy().into_owned())
 }
 
 /// Give a second run of the same submission its own workspace.
@@ -4390,6 +4470,39 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             exit_code: exit,
+        }
+    }
+
+    fn download_candidate(run: &str, job: &str) -> DownloadCandidate {
+        DownloadCandidate {
+            run_id: run.into(), name: "bundle".into(), job_key: job.into(),
+            status: "success".into(), finished: true,
+            stored: crate::artifacts::StoredArtifact {
+                sink: "disk", digest: None, size_bytes: 1, uri: "/recorded".into(), public_url: None,
+            },
+        }
+    }
+
+    #[test]
+    fn artifact_download_selection_is_same_run_unique_and_explicit() {
+        let wrong = vec![download_candidate("other-run", "build")];
+        assert!(select_download("this-run", "bundle", None, &wrong).unwrap_err().to_string().contains("current run"));
+        assert!(select_download("this-run", "missing", None, &[]).unwrap_err().to_string().contains("no artifact"));
+
+        let two = vec![download_candidate("this-run", "mac"), download_candidate("this-run", "windows")];
+        assert!(select_download("this-run", "bundle", None, &two).unwrap_err().to_string().contains("ambiguous"));
+        assert_eq!(select_download("this-run", "bundle", Some("windows"), &two).unwrap().job_key, "windows");
+    }
+
+    #[test]
+    fn artifact_download_requires_a_finished_successful_producer_and_safe_path() {
+        let mut failed = download_candidate("run", "build");
+        failed.status = "failure".into();
+        assert!(select_download("run", "bundle", None, &[failed]).unwrap_err().to_string().contains("not completed successfully"));
+        assert_eq!(artifact_download_path("/workspace", "dist/native.tar.gz").unwrap(), "/workspace/dist/native.tar.gz");
+        assert_eq!(artifact_download_path("/workspace/", ".cache/native.tar.gz").unwrap(), "/workspace/.cache/native.tar.gz");
+        for path in ["../secret", "dist/../../secret", "/etc/passwd", ".", "", "dist/"] {
+            assert!(artifact_download_path("/workspace", path).is_err(), "{path:?}");
         }
     }
 

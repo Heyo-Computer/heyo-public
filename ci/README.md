@@ -30,9 +30,18 @@ CI_DATABASE_URL=postgres://…/ci CI_WEBHOOK_SECRET=$(openssl rand -hex 32) \
 cargo run
 ```
 
-Configuration is environment-only; there are no CLI arguments. **A
+Service configuration is environment-only. **A
 misconfiguration is a startup exit, not a degraded service** — every error names
 the variable to fix. See `deploy/supervisor/ci.conf` for the full set.
+
+Validate workflow parsing and matrix/dependency planning without starting the
+service or connecting to Postgres, NATS, or runners:
+
+```bash
+ci --check-workflows .ci/workflows/*.yml
+```
+
+This is a static check, not evidence that build commands or deployments work.
 
 ## Submitting a build
 
@@ -1073,7 +1082,8 @@ The opt-in [release workflow example](release-example.yml) connects these stages
 using built-in actions. It is outside `.ci/workflows/` and does not enable live
 publication automatically. Use only trusted registered workflows with explicitly
 granted HeyoSecret credentials; branch protections and repository permissions
-still apply. No action creates a GitHub release or tag.
+still apply. No action creates a GitHub release. Component tags require an
+explicit `with.tags` policy.
 
 - `ci/merge-release` requires successful, fresh validation jobs in `needs`,
   including every matrix cell and every declared validation step. Skipped,
@@ -1094,6 +1104,12 @@ still apply. No action creates a GitHub release or tag.
   Explicit package versions and adjacent Cargo/npm lockfiles are supported;
   inherited Cargo workspace versions are rejected. Empty changes produce no
   extra version commit. Outputs are `sha`, `ref`, and JSON-string `versions`.
+- Optional `with.tags` maps declared manifests to tag prefixes, for example
+  `'{"ci/Cargo.toml":"ci-v"}'`. Only changed manifests produce tags. CI pushes
+  lightweight component tags and the version commit atomically, with exact-ref
+  leases. Conflicting tags or moved trunk refuse publication; retries reconcile
+  the same candidate and never overwrite a tag at a different commit. Existing
+  workflows without this field remain tagless.
 - CI persists the candidate before pushing. A lost acknowledgement can retry
   only that same candidate, never generate another version bump. The run page's
   **Release** section and authenticated `/api/runs/{run_id}/release` distinguish
@@ -1102,6 +1118,8 @@ still apply. No action creates a GitHub release or tag.
   release tree before building. It deliberately has no `.git` directory; use
   its `sha` output for build stamps. Build jobs must run this explicitly, then
   build/package from those files. Original `ci.sha` remains the validated source.
+  Native Intel Mac and Windows jobs support the same action through a
+  lease-fenced download of that exact release tree.
 - `ci/publish-service-archive` uploads an already-built tarball (`with.path`,
   relative to the job working directory) using Orchestrator presign, upload,
   and finalize APIs. It also requires `url`, `token`, `user-id`, and `name`.
@@ -1215,10 +1233,20 @@ artifact identity. Existing artifacts are retained without synthetic events.
 A publication is **not a release or deploy approval**. Uploads can precede a
 later test failure or cancellation. CD must independently check exact-revision
 validation, merge/release admission, and required artifacts. Use the digest to
-identify immutable content, not a mutable tag in `uri`; disk artifacts have no
-digest and are not a cross-host deployment handoff. A sink write and Postgres
+identify immutable content, not a mutable tag in `uri`. New disk uploads also
+record SHA256; legacy disk records may omit it. Disk storage is still local to
+the CI service, not a shared deployment store. A sink write and Postgres
 cannot share a transaction: a crash between them can leave an unrecorded blob;
 an upload retry reconciles through the sink before recording publication.
+
+Linux jobs can use `ci/download-artifact` with `name` and a relative file `path`
+to download an earlier successful job's stored archive in the same run. Declare
+the producer in `needs`; set `with.job` to its expanded job key if multiple
+producers used the same artifact name. Missing, ambiguous, unfinished, or failed
+producers are refused. Downloads verify size and SHA256 when recorded, preserve
+the uploaded tar.gz bytes, and do not unpack them. Disk and `artifacts` stores
+support downloads; the S3 sink remains unimplemented. Downloading an artifact
+does not make it an approved release or service archive.
 
 This is CI execution history, not deployment authorization. The release actions
 above separately gate publication and the release-artifact handoff. Automatic

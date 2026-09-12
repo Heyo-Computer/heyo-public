@@ -302,6 +302,13 @@ async fn execute(h: &reqwest::Client, c: &Config, j: &Lease, mut lost:tokio::syn
             reports.push(StepResult{index:i,status:status.into(),exit_code:None,log:String::new(),error,outputs:serde_json::json!({})});
             if status=="failure"&&!s.continue_on_error{blocking_failed=true} continue
         }
+        if s.uses.as_deref()==Some("ci/checkout-release") {
+            let result=checkout_release(h,c,j,i,&root).await;
+            let (status,error,outputs)=match result{Ok(sha)=>("success",None,serde_json::json!({"sha":sha})),Err(e)=>("failure",Some(format!("{e:#}")),serde_json::json!({}))};
+            reports.push(StepResult{index:i,status:status.into(),exit_code:None,log:String::new(),error,outputs:outputs.clone()});
+            if let Some(id)=&s.id {step_scope.insert(id.clone(),serde_json::json!({"outcome":status,"conclusion":status,"outputs":outputs}));}
+            if status=="failure"&&!s.continue_on_error{blocking_failed=true} continue
+        }
         if let Some(u) = &s.uses {
             reports.push(StepResult{index:i,status:"failure".into(),exit_code:None,log:String::new(),error:Some(format!("native builtin `{u}` is unsupported; release builtins must run in a Linux job")),outputs:serde_json::json!({})});
             blocking_failed=true;
@@ -372,6 +379,31 @@ fn failure_reports(j:&Lease,error:&str)->Vec<StepResult>{j.plan.steps.iter().enu
 fn mask(text:&str,values:&[String])->String{values.iter().filter(|v|v.len()>=4).fold(text.to_string(),|s,v|s.replace(v,"***"))}
 async fn parse_outputs(path:&Path)->Result<Value>{let bytes=match tokio::fs::read(path).await{Ok(v)=>v,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(serde_json::json!({})),Err(e)=>return Err(e.into())};let text=if bytes.starts_with(&[0xff,0xfe]){if bytes.len()%2!=0{bail!("invalid UTF-16 output")};String::from_utf16(&bytes[2..].chunks_exact(2).map(|b|u16::from_le_bytes([b[0],b[1]])).collect::<Vec<_>>())?}else{String::from_utf8(bytes)?};let mut m=serde_json::Map::new();for line in text.trim_start_matches('\u{feff}').lines(){let (k,v)=line.split_once('=').context("invalid output; expected name=value")?;if k.is_empty()||k.contains(|c:char|!c.is_ascii_alphanumeric()&&c!='_'&&c!='-'){bail!("invalid output name")};m.insert(k.into(),Value::String(v.into()));}Ok(Value::Object(m))}
 async fn extract_source(bytes:Vec<u8>,root:PathBuf)->Result<()>{tokio::task::spawn_blocking(move||->Result<()>{let gz=flate2::read::GzDecoder::new(bytes.as_slice());let mut ar=tar::Archive::new(gz);for entry in ar.entries()?{let mut e=entry?;let p=e.path()?.into_owned();if p.is_absolute()||p.components().any(|c|matches!(c,std::path::Component::ParentDir)){bail!("source archive path escapes workspace")};let kind=e.header().entry_type();if kind.is_symlink()||kind.is_hard_link(){bail!("source archive links are forbidden")};e.unpack_in(&root)?;}Ok(())}).await??;Ok(())}
+async fn checkout_release(h:&reqwest::Client,c:&Config,j:&Lease,index:usize,root:&Path)->Result<String>{
+    let url=format!("{}/api/native/jobs/{}/release-source/{index}",c.endpoint,j.lease_token);
+    let parsed=reqwest::Url::parse(&url)?;let endpoint=reqwest::Url::parse(&c.endpoint)?;
+    if parsed.origin()!=endpoint.origin()||!parsed.path().starts_with("/api/native/jobs/"){bail!("release source URL is outside the configured CI origin/path")}
+    let response=h.get(parsed).bearer_auth(&c.token).send().await?;
+    if response.status().is_redirection(){bail!("release source redirects are forbidden")}
+    let response=response.error_for_status()?;
+    let sha=response.headers().get("x-heyo-release-sha").context("release source omitted sha")?.to_str()?.to_string();
+    if sha.len()!=40||!sha.bytes().all(|b|b.is_ascii_hexdigit()){bail!("release source returned invalid sha")}
+    let bytes=response.bytes().await?.to_vec();
+    replace_checkout(bytes,c,root).await?;
+    Ok(sha)
+}
+async fn replace_checkout(bytes:Vec<u8>,c:&Config,root:&Path)->Result<()>{
+    let workdir=tokio::fs::canonicalize(&c.workdir).await?;let current=tokio::fs::canonicalize(root).await?;
+    if !current.starts_with(&workdir)||current==workdir{bail!("job checkout is outside native workdir")}
+    let parent=current.parent().context("job checkout has no parent")?;
+    let staging=parent.join(format!(".release-{}",Uuid::new_v4()));let backup=parent.join(format!(".previous-{}",Uuid::new_v4()));
+    tokio::fs::create_dir(&staging).await?;
+    if let Err(e)=extract_source(bytes,staging.clone()).await{let _=tokio::fs::remove_dir_all(&staging).await;return Err(e)}
+    tokio::fs::rename(&current,&backup).await?;
+    if let Err(e)=tokio::fs::rename(&staging,&current).await{let _=tokio::fs::rename(&backup,&current).await;return Err(e.into())}
+    tokio::fs::remove_dir_all(backup).await?;
+    Ok(())
+}
 async fn upload_artifact(h:&reqwest::Client,c:&Config,j:&Lease,index:usize,s:&Step,root:&Path,ctx:&expr::Context)->Result<()>{
     let name=ctx.substitute(s.with.get("name").context("upload-artifact requires with.name")?);
     if name.is_empty()||name.contains('/')||name.contains('\\')||name==".."{bail!("invalid artifact name")}
@@ -446,5 +478,26 @@ mod tests {
         let (endpoint,server)=source_server().await;let dir=tempfile::tempdir().unwrap();let job=lease(&endpoint,vec![step("sleep 30")],Duration::from_millis(50));
         let error=execute(&reqwest::Client::new(),&config(&endpoint,dir.path()),&job,tokio::sync::watch::channel(false).1).await.unwrap_err();server.abort();assert!(error.to_string().contains("timed out"));
         assert_eq!(failure_reports(&job,&error.to_string())[0].status,"failure");
+    }
+
+    fn archive_file(name:&str,contents:&[u8])->Vec<u8>{let mut gz=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());{let mut tar=tar::Builder::new(&mut gz);let mut header=tar::Header::new_gnu();header.set_size(contents.len() as u64);header.set_mode(0o644);header.set_cksum();tar.append_data(&mut header,name,contents).unwrap();tar.finish().unwrap();}gz.finish().unwrap()}
+
+    #[tokio::test]
+    async fn release_checkout_reports_server_sha_and_replaces_submitted_bytes(){
+        let bytes=archive_file("version.txt",b"bumped");let sha="0123456789abcdef0123456789abcdef01234567";
+        let app=axum::Router::new().route("/api/native/jobs/{lease}/release-source/{index}",axum::routing::get(move||{let bytes=bytes.clone();async move{([(axum::http::HeaderName::from_static("x-heyo-release-sha"),sha)],bytes)}}));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+        let dir=tempfile::tempdir().unwrap();let root=dir.path().join("job");tokio::fs::create_dir(&root).await.unwrap();tokio::fs::write(root.join("version.txt"),b"submitted").await.unwrap();
+        let endpoint=format!("http://{addr}");let job=lease(&endpoint,vec![],Duration::from_secs(1));
+        assert_eq!(checkout_release(&reqwest::Client::new(),&config(&endpoint,dir.path()),&job,0,&root).await.unwrap(),sha);
+        assert_eq!(tokio::fs::read(root.join("version.txt")).await.unwrap(),b"bumped");server.abort();
+    }
+
+    #[tokio::test]
+    async fn unsafe_release_archive_is_rejected_without_destroying_checkout(){
+        let mut gz=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());{let mut tar=tar::Builder::new(&mut gz);let mut header=tar::Header::new_gnu();header.set_entry_type(tar::EntryType::Symlink);header.set_size(0);header.set_mode(0o777);header.set_link_name("outside").unwrap();header.set_cksum();tar.append_data(&mut header,"link",std::io::empty()).unwrap();tar.finish().unwrap();}let bytes=gz.finish().unwrap();
+        let dir=tempfile::tempdir().unwrap();let root=dir.path().join("job");tokio::fs::create_dir(&root).await.unwrap();tokio::fs::write(root.join("keep"),b"safe").await.unwrap();
+        assert!(replace_checkout(bytes,&config("http://localhost",dir.path()),&root).await.is_err());
+        assert_eq!(tokio::fs::read(root.join("keep")).await.unwrap(),b"safe");
     }
 }

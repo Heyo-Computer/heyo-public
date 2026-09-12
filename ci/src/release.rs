@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -73,6 +74,7 @@ pub async fn merge(
     plan: &JobPlan,
     source: &Path,
     manifests: &[String],
+    tags: &BTreeMap<String, String>,
     token: &str,
 ) -> Result<PreparedRelease, String> {
     if token.is_empty() {
@@ -135,16 +137,20 @@ pub async fn merge(
     let release_base = run.release_base_sha.as_deref()
         .ok_or("release requires the submitted target-trunk base; update the public git-submit client")?;
     let target_ref = format!("refs/heads/{default_branch}");
+    let mut identity = json!({
+        "version": 1, "repo": run.repo_url, "base": release_base,
+        "source": run.sha, "source_ref": run.git_ref,
+        "target_ref": target_ref, "manifests": policy,
+    });
+    // Preserve identities for pre-tag workflows and persisted retries.
+    if !tags.is_empty() {
+        identity["tags"] = serde_json::to_value(tags).map_err(|e| e.to_string())?;
+    }
     let request_hash = hex::encode(Sha256::digest(
-        serde_json::to_vec(&json!({
-            "version": 1, "repo": run.repo_url, "base": release_base,
-            "source": run.sha, "source_ref": run.git_ref,
-            "target_ref": target_ref, "manifests": policy,
-        }))
-        .map_err(|e| e.to_string())?,
+        serde_json::to_vec(&identity).map_err(|e| e.to_string())?,
     ));
     let prepared =
-        release_git::prepare(source, release_base, &run.sha, &target_ref, &policy).await?;
+        release_git::prepare(source, release_base, &run.sha, &target_ref, &policy, tags).await?;
     let prepared_json = serde_json::to_value(&prepared).map_err(|e| e.to_string())?;
 
     let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
@@ -184,7 +190,7 @@ pub async fn merge(
     .map_err(|e| e.to_string())?;
     sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2 WHERE id=$1")
         .bind(event)
-        .bind(json!({"release_sha": saved.release_sha, "versions": saved.versions}))
+        .bind(json!({"release_sha": saved.release_sha, "versions": saved.versions, "tags": saved.tags}))
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -219,7 +225,7 @@ pub async fn merge(
             .map_err(|e| e.to_string())?;
             sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2 WHERE id=$1")
                 .bind(event)
-                .bind(json!({"release_sha": saved.release_sha, "versions": saved.versions}))
+                .bind(json!({"release_sha": saved.release_sha, "versions": saved.versions, "tags": saved.tags}))
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -244,7 +250,7 @@ pub async fn merge(
     .map_err(|e| e.to_string())?;
     sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2 WHERE id=$1")
         .bind(event)
-        .bind(json!({"release_sha": saved.release_sha, "versions": saved.versions}))
+        .bind(json!({"release_sha": saved.release_sha, "versions": saved.versions, "tags": saved.tags}))
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -496,6 +502,7 @@ mod tests {
                 release_plan,
                 &source,
                 &["package.json".into()],
+                &BTreeMap::new(),
                 "test"
             )
             .await
@@ -518,6 +525,7 @@ mod tests {
             release_plan,
             &source,
             &["package.json".into()],
+            &BTreeMap::new(),
             "test",
         )
         .await
@@ -536,6 +544,7 @@ mod tests {
                 release_plan,
                 &source,
                 &["package.json".into()],
+                &BTreeMap::new(),
                 "test"
             )
             .await
@@ -552,6 +561,7 @@ mod tests {
                 release_plan,
                 &source,
                 &["package.json".into()],
+                &BTreeMap::new(),
                 "test"
             )
             .await

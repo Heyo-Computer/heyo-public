@@ -2621,6 +2621,7 @@ mod page_tests {
                 release_sha: "2222222222222222222222222222222222222222".into(),
                 git_ref: "refs/heads/release/public".into(),
                 versions: serde_json::json!({"ci": "1.2.3", "web": "4.5.6"}),
+                tags: vec![],
             },
             status: "unknown".into(),
             error: Some("push outcome <unknown> & must be checked".into()),

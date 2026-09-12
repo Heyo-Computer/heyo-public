@@ -29,9 +29,13 @@ is durable and retried by later runner polls.
 
 Shell steps, general conditions, environment and output handoff, working
 directories, timeouts, process-tree termination, logs, exit status,
-`continue-on-error`, live cancellation, and `ci/upload-artifact` are supported.
-Other repository actions and CI builtins fail loudly: put those in a dependent
-Linux job. The server derives the final status from exact per-step evidence and
+`continue-on-error`, live cancellation, `ci/upload-artifact`, and an explicitly
+declared `ci/checkout-release` are supported. Release checkout downloads the
+exact persisted, published release archive from the CI origin using the active
+lease; it never clones a ref or receives repository credentials. The server
+accepts its SHA output and binds the job's release SHA only when it matches that
+confirmed release. Other repository actions and CI builtins fail loudly: put
+those in a dependent Linux job. The server derives the final status from exact per-step evidence and
 resolves and masks secrets again before writing logs; agent masking is only
 defense in depth. If cancellation races an upload, sink bytes may be orphaned,
 but the fenced artifact row and event are refused and never attached to the run.
@@ -90,5 +94,5 @@ declaring the us3 trial ready.
 Current limitations: logs arrive with the completion report, not as a live
 stream; output files support `name=value` lines (UTF-8 or PowerShell UTF-16),
 not multiline delimiters. Source archives containing links are rejected.
-Windows shells are PowerShell/pwsh; Bash is the macOS default. Release builtins
-run in a dependent Linux job. Native runner registry UI is not included yet.
+Windows shells are PowerShell/pwsh; Bash is the macOS default. Release merge and
+publication still run in a dependent Linux job. Native runner registry UI is not included yet.

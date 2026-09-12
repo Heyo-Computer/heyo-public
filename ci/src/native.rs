@@ -213,6 +213,30 @@ pub async fn source_run(store: &Store, token: Uuid) -> Result<Option<String>, St
     sqlx::query_scalar("SELECT n.run_id FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id WHERE n.lease_token=$1 AND n.state='leased' AND n.lease_expires_at>now() AND j.status='running' AND r.status NOT IN ('success','failure','cancelled')") .bind(token).fetch_optional(store.pool()).await.map_err(|e|e.to_string())
 }
 
+/// Resolve the immutable, published release source for one explicitly planned
+/// checkout step. The lease predicate deliberately matches every other native
+/// side effect so a stale token cannot fetch release bytes.
+pub async fn release_source_context(
+    store: &Store,
+    token: Uuid,
+    index: usize,
+) -> Result<Option<(String, String)>, String> {
+    let row = sqlx::query("SELECT n.run_id,j.plan,rel.status,rel.prepared FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id LEFT JOIN ci_release rel ON rel.run_id=n.run_id WHERE n.lease_token=$1 AND n.state='leased' AND n.lease_expires_at>now() AND j.status='running' AND r.status NOT IN ('success','failure','cancelled')")
+        .bind(token).fetch_optional(store.pool()).await.map_err(|e|e.to_string())?;
+    let Some(row) = row else { return Ok(None) };
+    let plan: JobPlan = serde_json::from_value(row.get("plan")).map_err(|e|e.to_string())?;
+    if plan.steps.get(index).and_then(|s|s.uses.as_deref()) != Some("ci/checkout-release") {
+        return Err("release source is not the leased step".into());
+    }
+    if row.get::<Option<String>,_>("status").as_deref() != Some("published") {
+        return Err("release checkout requires a confirmed published release".into());
+    }
+    let prepared: crate::release_git::PreparedRelease = serde_json::from_value(
+        row.get::<Option<serde_json::Value>,_>("prepared").ok_or("published release has no prepared source")?
+    ).map_err(|e|e.to_string())?;
+    Ok(Some((row.get("run_id"), prepared.release_sha)))
+}
+
 pub async fn artifact_context(store:&Store,token:Uuid,index:usize)->Result<Option<(String,String,String,String)>,String>{
     let row=sqlx::query("SELECT n.run_id,n.job_id,j.job_key,j.plan,r.workflow_id FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id WHERE n.lease_token=$1 AND n.state='leased' AND n.lease_expires_at>now() AND j.status='running' AND r.status NOT IN ('success','failure','cancelled')")
         .bind(token).fetch_optional(store.pool()).await.map_err(|e|e.to_string())?;
@@ -267,6 +291,7 @@ pub async fn complete(store: &Store, secrets:&crate::secrets::Secrets, c: Comple
     let plan:JobPlan=serde_json::from_value(row.get("plan")).map_err(|e|e.to_string())?;
     if c.steps.len()!=plan.steps.len() || c.steps.iter().enumerate().any(|(i,s)|s.index!=i || !matches!(s.status.as_str(),"success"|"failure"|"skipped")) { return Err("completion must contain exactly one valid result for every planned step in index order".into()); }
     let mut blocking_failure=false;
+    let mut confirmed_release_sha: Option<String> = None;
     let mut step_scope=serde_json::Map::new();
     for (s,planned) in c.steps.iter().zip(&plan.steps) {
         if s.status=="success" && s.exit_code.is_some_and(|x|x!=0) { return Err(format!("step {} claims success with non-zero exit",s.index)); }
@@ -274,6 +299,15 @@ pub async fn complete(store: &Store, secrets:&crate::secrets::Secrets, c: Comple
             let published:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_artifact WHERE step_id=$1 AND job_id=$2)")
                 .bind(crate::store::step_id(&job_id,s.index)).bind(&job_id).fetch_one(&mut *tx).await.map_err(|e|e.to_string())?;
             if !published { return Err("native artifact step has no recorded publication".into()); }
+        }
+        if s.status=="success" && planned.uses.as_deref()==Some("ci/checkout-release") {
+            let supplied=s.outputs.get("sha").and_then(|v|v.as_str()).ok_or("release checkout success requires sha output")?;
+            let release=crate::release::get(store,&run_id).await?
+                .filter(|r|r.status=="published")
+                .ok_or("release checkout requires a confirmed published release")?;
+            if supplied != release.prepared.release_sha { return Err("release checkout sha does not match the confirmed release".into()); }
+            if confirmed_release_sha.as_deref().is_some_and(|sha|sha!=supplied) { return Err("release checkout steps disagree on sha".into()); }
+            confirmed_release_sha=Some(supplied.into());
         }
         if s.status=="failure" && !planned.continue_on_error { blocking_failure=true; }
         if let Some(id)=&planned.id { step_scope.insert(id.clone(),serde_json::json!({"outcome":s.status,"conclusion":s.status,"outputs":s.outputs})); }
@@ -296,7 +330,7 @@ pub async fn complete(store: &Store, secrets:&crate::secrets::Secrets, c: Comple
         Store::add_event(&mut tx,&run_id,Some(&job_id),Some(&job_key),Some(&sid),"ci.step.status.v1",&s.status,step_error.as_deref()).await.map_err(|e|e.to_string())?;
     }
     let completion_error=c.error.as_deref().map(|e|masker.mask(e));
-    sqlx::query("UPDATE ci_job SET status=$2,outputs=$3,error=$4,finished_at=now() WHERE id=$1 AND status='running'").bind(&job_id).bind(final_status).bind(outputs).bind(completion_error.as_deref()).execute(&mut *tx).await.map_err(|e|e.to_string())?;
+    sqlx::query("UPDATE ci_job SET status=$2,outputs=$3,error=$4,release_sha=COALESCE($5,release_sha),finished_at=now() WHERE id=$1 AND status='running'").bind(&job_id).bind(final_status).bind(outputs).bind(completion_error.as_deref()).bind(confirmed_release_sha).execute(&mut *tx).await.map_err(|e|e.to_string())?;
     Store::add_event(&mut tx,&run_id,Some(&job_id),Some(&job_key),None,"ci.job.status.v1",final_status,completion_error.as_deref()).await.map_err(|e|e.to_string())?;
     if blocking_failure && plan.fail_fast && !plan.continue_on_error && !plan.matrix.is_empty() {
         let peers = sqlx::query("UPDATE ci_job SET status='cancelled',error='matrix fail-fast',finished_at=now() WHERE run_id=$1 AND base_id=$2 AND id<>$3 AND status IN ('pending','queued','running') RETURNING id,job_key")
@@ -363,8 +397,10 @@ mod tests {
         let (a,b) = (a.unwrap(),b.unwrap());
         assert_ne!(a.is_some(),b.is_some(),"one runner cannot acquire concurrent leases beyond capacity");
         let first = a.or(b).unwrap();
+        assert!(release_source_context(&store,first.lease_token,0).await.is_err(),"wrong action must be refused");
         sqlx::query("UPDATE ci_native_job SET lease_expires_at=now()-interval '1 second' WHERE job_id=$1")
             .bind(&job.id).execute(store.pool()).await.unwrap();
+        assert!(release_source_context(&store,first.lease_token,0).await.unwrap().is_none(),"expired lease must be fenced");
         let second = poll(&store,request(),"http://localhost",&secrets).await.unwrap().unwrap();
         assert_ne!(first.lease_token,second.lease_token);
         assert!(!heartbeat(&store,&LeaseUpdate{runner_id:runner.clone(),lease_token:first.lease_token}).await.unwrap());
@@ -387,11 +423,32 @@ mod tests {
         let cancelled_run=crate::vm::new_id();
         store.create_run(&cancelled_run,&crate::store::RunRequest::default(),&plan).await.unwrap();
         let cancelled=store.jobs_of(&cancelled_run).await.unwrap().remove(0);
-        enqueue(&store,&cancelled.id,&cancelled_run,&[label]).await.unwrap();
+        enqueue(&store,&cancelled.id,&cancelled_run,&[label.clone()]).await.unwrap();
         let lease=poll(&store,request(),"http://localhost",&secrets).await.unwrap().unwrap();
         store.set_job_status(&cancelled.id,crate::store::JobStatus::Cancelled,None).await.unwrap();
         assert!(!heartbeat(&store,&LeaseUpdate{runner_id:runner.clone(),lease_token:lease.lease_token}).await.unwrap());
         assert!(complete(&store,&secrets,report(lease.lease_token,"success","success",0)).await.unwrap().is_none());
         assert_eq!(store.get_job(&cancelled.id).await.unwrap().unwrap().status,"cancelled");
+        // Cancellation fences the worker immediately; capacity remains reserved
+        // until that worker's lease expires. Advance that deadline for this test.
+        sqlx::query("UPDATE ci_native_job SET lease_expires_at=now()-interval '1 second' WHERE job_id=$1")
+            .bind(&cancelled.id).execute(store.pool()).await.unwrap();
+
+        let release_workflow=crate::workflow::Workflow::parse("native-release.yml",&format!("jobs:\n  native:\n    runs-on: [{label}]\n    steps:\n      - id: checkout\n        uses: ci/checkout-release\n")).unwrap();
+        let release_plan=crate::plan::Plan::build(&release_workflow).unwrap();let release_run=crate::vm::new_id();
+        store.create_run(&release_run,&crate::store::RunRequest::default(),&release_plan).await.unwrap();let release_job=store.jobs_of(&release_run).await.unwrap().remove(0);
+        enqueue(&store,&release_job.id,&release_run,&[label]).await.unwrap();let release_lease=poll(&store,request(),"http://localhost",&secrets).await.unwrap().unwrap();
+        assert!(release_source_context(&store,Uuid::new_v4(),0).await.unwrap().is_none(),"foreign lease must be fenced");
+        assert!(release_source_context(&store,release_lease.lease_token,1).await.is_err(),"wrong step index must be refused");
+        assert!(release_source_context(&store,release_lease.lease_token,0).await.is_err(),"unpublished release must be refused");
+        let sha="0123456789abcdef0123456789abcdef01234567";let source_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let prepared=crate::release_git::PreparedRelease{source_sha:source_sha.into(),release_sha:sha.into(),git_ref:"refs/heads/main".into(),versions:serde_json::json!({}),tags:vec![]};
+        sqlx::query("INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status) VALUES($1,'request',$2,$2,'refs/heads/main','{}',$2,$3,'published')").bind(&release_run).bind(sha).bind(serde_json::to_value(&prepared).unwrap()).execute(store.pool()).await.unwrap();
+        assert_eq!(release_source_context(&store,release_lease.lease_token,0).await.unwrap(),Some((release_run.clone(),sha.into())));
+        let completion=|reported_sha: &str| Completion{runner_id:runner.clone(),lease_token:release_lease.lease_token,status:"success".into(),error:None,outputs:serde_json::json!({}),steps:vec![StepResult{index:0,status:"success".into(),exit_code:None,log:String::new(),error:None,outputs:serde_json::json!({"sha":reported_sha})}]};
+        assert!(complete(&store,&secrets,completion(source_sha)).await.unwrap_err().contains("does not match"));
+        assert!(sqlx::query_scalar::<_,Option<String>>("SELECT release_sha FROM ci_job WHERE id=$1").bind(&release_job.id).fetch_one(store.pool()).await.unwrap().is_none());
+        assert_eq!(complete(&store,&secrets,completion(sha)).await.unwrap(),Some(release_run));
+        assert_eq!(sqlx::query_scalar::<_,Option<String>>("SELECT release_sha FROM ci_job WHERE id=$1").bind(&release_job.id).fetch_one(store.pool()).await.unwrap().as_deref(),Some(sha));
     }
 }

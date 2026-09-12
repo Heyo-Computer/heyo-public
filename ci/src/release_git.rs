@@ -5,6 +5,7 @@
 
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use tempfile::TempDir;
@@ -27,6 +28,9 @@ pub struct PreparedRelease {
     pub release_sha: String,
     pub git_ref: String,
     pub versions: Value,
+    /// Full lightweight tag refs to publish at `release_sha`.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 pub async fn prepare(
@@ -35,10 +39,17 @@ pub async fn prepare(
     head: &str,
     git_ref: &str,
     manifests: &[String],
+    tag_policy: &BTreeMap<String, String>,
 ) -> Result<PreparedRelease, String> {
     validate_sha(base)?;
     validate_sha(head)?;
     validate_ref(git_ref)?;
+    let manifest_set: HashSet<&str> = manifests.iter().map(String::as_str).collect();
+    for path in tag_policy.keys() {
+        if !manifest_set.contains(path.as_str()) {
+            return Err(format!("tag manifest is not declared in with.manifests: {path}"));
+        }
+    }
     let actual_head = git(
         source,
         &[],
@@ -156,6 +167,19 @@ pub async fn prepare(
     if versions.is_empty() {
         return Ok(empty(head, git_ref));
     }
+    let mut tags = Vec::new();
+    let mut unique = HashSet::new();
+    for (path, prefix) in tag_policy {
+        let Some(version) = versions.get(path).and_then(Value::as_str) else {
+            continue;
+        };
+        let tag = format!("refs/tags/{prefix}{version}");
+        validate_tag_ref(&tag)?;
+        if !unique.insert(tag.clone()) {
+            return Err(format!("release tag collision: {tag}"));
+        }
+        tags.push(tag);
+    }
     let tree = git(source, &env, &["write-tree"], None).await?;
     let source_date = git(source, &[], &["show", "-s", "--format=%aI", head], None).await?;
     let message = format!("chore(release): bump packages\n\nHeyo-Release-Source: {head}\n");
@@ -179,6 +203,7 @@ pub async fn prepare(
         release_sha: release_sha.trim().into(),
         git_ref: git_ref.into(),
         versions: Value::Object(versions),
+        tags,
     })
 }
 
@@ -193,6 +218,12 @@ pub async fn publish(
     validate_sha(&prepared.source_sha)?;
     validate_sha(&prepared.release_sha)?;
     validate_ref(&prepared.git_ref)?;
+    for tag in &prepared.tags {
+        validate_tag_ref(tag)?;
+    }
+    if prepared.tags.iter().collect::<HashSet<_>>().len() != prepared.tags.len() {
+        return Err("release contains duplicate tags".into());
+    }
     validate_repository(repository)?;
     if repository.starts_with("https://")
         && repository[8..]
@@ -261,37 +292,54 @@ pub async fn publish(
             );
         }
     }
+    let mut requested_refs = vec![prepared.git_ref.as_str()];
+    requested_refs.extend(prepared.tags.iter().map(String::as_str));
+    let mut ls_args = vec!["ls-remote", "--refs", repository];
+    ls_args.extend(requested_refs.iter().copied());
     let remote = git(
         source,
         &env,
-        &["ls-remote", "--refs", repository, &prepared.git_ref],
+        &ls_args,
         None,
     )
     .await
     .map_err(|e| redact_git_error(e, token))?;
-    let remote_sha = remote
-        .split_whitespace()
-        .next()
-        .ok_or("remote release ref does not exist")?;
-    if remote_sha == prepared.release_sha {
-        return Ok(());
-    }
-    if remote_sha != base {
+    let refs = parse_remote_refs(&remote);
+    let remote_sha = refs.get(&prepared.git_ref).ok_or("remote release ref does not exist")?;
+    if *remote_sha != base && *remote_sha != prepared.release_sha {
         return Err("remote release ref moved from the validated base".into());
     }
-    let lease = format!("--force-with-lease={}:{}", prepared.git_ref, base);
-    let spec = format!("{}:{}", prepared.release_sha, prepared.git_ref);
+    for tag in &prepared.tags {
+        if refs.get(tag).is_some_and(|sha| *sha != prepared.release_sha) {
+            return Err(format!("release tag already exists at another commit: {tag}"));
+        }
+    }
+    if *remote_sha == prepared.release_sha
+        && prepared.tags.iter().all(|tag| refs.get(tag) == Some(&prepared.release_sha))
+    {
+        return Ok(());
+    }
+    let mut push_args = vec!["push".to_string(), "--no-verify".into(), "--porcelain".into(), "--atomic".into()];
+    push_args.push(format!("--force-with-lease={}:{}", prepared.git_ref, remote_sha));
+    for tag in &prepared.tags {
+        if !refs.contains_key(tag) {
+            push_args.push(format!("--force-with-lease={tag}:"));
+        }
+    }
+    push_args.push(repository.into());
+    if *remote_sha != prepared.release_sha {
+        push_args.push(format!("{}:{}", prepared.release_sha, prepared.git_ref));
+    }
+    for tag in &prepared.tags {
+        if !refs.contains_key(tag) {
+            push_args.push(format!("{}:{tag}", prepared.release_sha));
+        }
+    }
+    let push_refs: Vec<&str> = push_args.iter().map(String::as_str).collect();
     if git(
         source,
         &env,
-        &[
-            "push",
-            "--no-verify",
-            "--porcelain",
-            &lease,
-            repository,
-            &spec,
-        ],
+        &push_refs,
         None,
     )
     .await
@@ -304,12 +352,15 @@ pub async fn publish(
     let after = git(
         source,
         &env,
-        &["ls-remote", "--refs", repository, &prepared.git_ref],
+        &ls_args,
         None,
     )
     .await
     .map_err(|e| redact_git_error(e, token))?;
-    if after.split_whitespace().next() == Some(prepared.release_sha.as_str()) {
+    let after = parse_remote_refs(&after);
+    if after.get(&prepared.git_ref) == Some(&prepared.release_sha)
+        && prepared.tags.iter().all(|tag| after.get(tag) == Some(&prepared.release_sha))
+    {
         Ok(())
     } else {
         Err("exact-base release push failed and the remote does not contain the candidate".into())
@@ -322,6 +373,7 @@ fn empty(head: &str, git_ref: &str) -> PreparedRelease {
         release_sha: head.into(),
         git_ref: git_ref.into(),
         versions: json!({}),
+        tags: vec![],
     }
 }
 
@@ -597,6 +649,25 @@ fn validate_ref(s: &str) -> Result<(), String> {
     }
 }
 
+fn validate_tag_ref(s: &str) -> Result<(), String> {
+    let name = s.strip_prefix("refs/tags/").ok_or("release tag must be a full refs/tags/... ref")?;
+    if name.is_empty() || name.ends_with(['.', '/']) || name.contains("..") || name.contains("@{")
+        || name.split('/').any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+        || name.bytes().any(|b| b <= b' ' || matches!(b, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\'))
+    {
+        Err("release tag is not a valid Git ref".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_remote_refs(output: &str) -> HashMap<String, String> {
+    output.lines().filter_map(|line| {
+        let (sha, name) = line.split_once('\t')?;
+        Some((name.to_string(), sha.to_string()))
+    }).collect()
+}
+
 fn validate_repository(repository: &str) -> Result<(), String> {
     #[cfg(test)]
     if Path::new(repository).is_absolute() {
@@ -760,22 +831,31 @@ mod tests {
         )
         .unwrap();
         fs::write(repo.join("app/package-lock.json"), "{\"name\":\"app\",\"version\":\"1.2.3\",\"lockfileVersion\":3,\"packages\":{\"\":{\"name\":\"app\",\"version\":\"1.2.3\"}}}\n").unwrap();
+        fs::create_dir(repo.join("worker")).unwrap();
+        fs::write(repo.join("worker/Cargo.toml"), "[package]\nname = \"worker\"\nversion = \"4.5.6\"\n").unwrap();
         fs::write(repo.join("README"), "unchanged\n").unwrap();
         let base = commit(&repo, "initial");
         fs::write(repo.join("app/code.js"), "feature\n").unwrap();
+        fs::write(repo.join("worker/code.rs"), "feature\n").unwrap();
         let head = commit(&repo, "feat(app): useful");
-        let manifests = vec!["app/package.json".to_string()];
-        let first = prepare(&repo, &base, &head, "refs/heads/main", &manifests)
+        let manifests = vec!["app/package.json".to_string(), "worker/Cargo.toml".to_string()];
+        let tags = BTreeMap::from([
+            ("app/package.json".into(), "app-v".into()),
+            ("worker/Cargo.toml".into(), "worker-v".into()),
+        ]);
+        let first = prepare(&repo, &base, &head, "refs/heads/main", &manifests, &tags)
             .await
             .unwrap();
-        let second = prepare(&repo, &base, &head, "refs/heads/main", &manifests)
+        let second = prepare(&repo, &base, &head, "refs/heads/main", &manifests, &tags)
             .await
             .unwrap();
         assert_eq!(first, second, "release object must be deterministic");
         assert_eq!(first.versions["app/package.json"], "1.3.0");
+        assert_eq!(first.versions["worker/Cargo.toml"], "4.6.0");
+        assert_eq!(first.tags, ["refs/tags/app-v1.3.0", "refs/tags/worker-v4.6.0"]);
         assert_eq!(
             run(&repo, &["diff", "--name-only", &head, &first.release_sha]),
-            "app/package-lock.json\napp/package.json"
+            "app/package-lock.json\napp/package.json\nworker/Cargo.toml"
         );
         assert_eq!(
             run(&repo, &["show", "-s", "--format=%P", &first.release_sha]),
@@ -829,10 +909,23 @@ mod tests {
             Some(head.as_str()),
             "publishing the release must not move the submitted feature branch"
         );
+        for tag in &first.tags {
+            assert_eq!(run(&repo, &["--git-dir", bare.to_str().unwrap(), "rev-parse", tag]), first.release_sha);
+        }
         // Published retry is idempotent and cannot double-bump.
         publish(&repo, bare.to_str().unwrap(), "unused", &base, &first)
             .await
             .unwrap();
+        // Reconcile the exact persisted candidate rather than treating branch-only
+        // publication as success or preparing another version bump.
+        run(&repo, &["push", bare.to_str().unwrap(), &format!(":{}", first.tags[0])]);
+        publish(&repo, bare.to_str().unwrap(), "unused", &base, &first)
+            .await
+            .unwrap();
+        assert_eq!(
+            run(&repo, &["--git-dir", bare.to_str().unwrap(), "rev-parse", &first.tags[0]]),
+            first.release_sha
+        );
 
         run(
             &repo,
@@ -857,12 +950,35 @@ mod tests {
                 &base,
                 &head,
                 "refs/heads/main",
-                &["../package.json".into()]
+                &["../package.json".into()],
+                &BTreeMap::new()
             )
             .await
             .unwrap_err()
             .contains("unsafe")
         );
+    }
+
+    #[tokio::test]
+    async fn tag_collision_prevents_atomic_branch_movement() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("work");
+        fs::create_dir(&repo).unwrap();
+        run(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("package.json"), r#"{"name":"app","version":"1.0.0"}"#).unwrap();
+        let base = commit(&repo, "initial");
+        fs::write(repo.join("code"), "new").unwrap();
+        let head = commit(&repo, "fix: change");
+        let prepared = prepare(
+            &repo, &base, &head, "refs/heads/main", &["package.json".into()],
+            &BTreeMap::from([("package.json".into(), "app-v".into())]),
+        ).await.unwrap();
+        let bare = temp.path().join("remote.git");
+        run(temp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+        run(&repo, &["push", bare.to_str().unwrap(), &format!("{base}:refs/heads/main")]);
+        run(&repo, &["push", bare.to_str().unwrap(), &format!("{head}:{}", prepared.tags[0])]);
+        assert!(publish(&repo, bare.to_str().unwrap(), "unused", &base, &prepared).await.unwrap_err().contains("already exists"));
+        assert_eq!(run(&repo, &["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"]), base);
     }
 
     #[tokio::test]
@@ -875,7 +991,7 @@ mod tests {
         let base = commit(&repo, "initial");
         fs::write(repo.join("README"), "head\n").unwrap();
         let head = commit(&repo, "fix: docs");
-        let prepared = prepare(&repo, &base, &head, "refs/heads/main", &[])
+        let prepared = prepare(&repo, &base, &head, "refs/heads/main", &[], &BTreeMap::new())
             .await
             .unwrap();
         assert_eq!(prepared.release_sha, head);

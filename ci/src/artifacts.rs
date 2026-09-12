@@ -74,7 +74,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredArtifact {
     pub sink: &'static str,
-    /// sha256, for the content-addressed sink; `None` for disk and S3.
+    /// SHA256 for disk and content-addressed uploads. Older disk records may
+    /// omit it; downloads of those records can only verify their size.
     pub digest: Option<String>,
     pub size_bytes: u64,
     /// How to get it back — a path, an `s3://` URL, or a tag.
@@ -126,6 +127,10 @@ pub struct GuestPush {
 pub trait ArtifactSink: Send + Sync {
     /// Store `bytes` the orchestrator has in hand.
     async fn put(&self, r: &ArtifactRef, bytes: Vec<u8>) -> Result<StoredArtifact, ArtifactError>;
+
+    /// Read bytes named by a database record through this configured sink.
+    /// Implementations must not treat `uri` as a caller-provided URL/path.
+    async fn get(&self, stored: &StoredArtifact) -> Result<Vec<u8>, ArtifactError>;
 
     /// How a guest can push a blob into this sink directly, if it can at all.
     /// `None` — the default — means the orchestrator reads the bytes out of the
@@ -201,16 +206,34 @@ impl ArtifactSink for DiskSink {
                 .map_err(|e| ArtifactError::Io(format!("{}: {e}", parent.display())))?;
         }
         let size = bytes.len() as u64;
+        let digest = hex::encode(Sha256::digest(&bytes));
         tokio::fs::write(&path, bytes)
             .await
             .map_err(|e| ArtifactError::Io(format!("{}: {e}", path.display())))?;
         Ok(StoredArtifact {
             sink: "disk",
-            digest: None,
+            digest: Some(digest),
             size_bytes: size,
             uri: path.to_string_lossy().into_owned(),
             public_url: None,
         })
+    }
+
+    async fn get(&self, stored: &StoredArtifact) -> Result<Vec<u8>, ArtifactError> {
+        if stored.sink != self.kind() {
+            return Err(ArtifactError::InvalidRecord(format!("artifact was recorded for the {} sink, not disk", stored.sink)));
+        }
+        let root = tokio::fs::canonicalize(&self.root).await
+            .map_err(|e| ArtifactError::Io(format!("resolving artifact directory: {e}")))?;
+        let path = tokio::fs::canonicalize(&stored.uri).await
+            .map_err(|e| ArtifactError::Io(format!("resolving recorded artifact: {e}")))?;
+        if !path.starts_with(&root) {
+            return Err(ArtifactError::InvalidRecord("disk artifact path is outside the configured artifact directory".into()));
+        }
+        let bytes = tokio::fs::read(&path).await
+            .map_err(|e| ArtifactError::Io(format!("reading {}: {e}", path.display())))?;
+        validate(stored, &bytes)?;
+        Ok(bytes)
     }
 }
 
@@ -240,6 +263,11 @@ impl ArtifactSink for S3Sink {
                 self.key_for(r)
             ),
         })
+    }
+
+
+    async fn get(&self, stored: &StoredArtifact) -> Result<Vec<u8>, ArtifactError> {
+        Err(ArtifactError::NotImplemented { sink: "s3", detail: format!("would download {}", stored.uri) })
     }
 }
 
@@ -306,6 +334,23 @@ impl ArtifactSink for ArtifactsSink {
         }
 
         self.finish(r, digest, size).await
+    }
+
+    async fn get(&self, stored: &StoredArtifact) -> Result<Vec<u8>, ArtifactError> {
+        if stored.sink != self.kind() {
+            return Err(ArtifactError::InvalidRecord(format!("artifact was recorded for the {} sink, not artifacts", stored.sink)));
+        }
+        let digest = stored.digest.as_deref().ok_or_else(||
+            ArtifactError::InvalidRecord("artifacts-store record has no digest".into()))?;
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ArtifactError::InvalidRecord("artifacts-store record has an invalid digest".into()));
+        }
+        let response = self.auth(self.http.get(format!("{}/blobs/{digest}", self.config.url)))
+            .send().await.map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        let bytes = check(response, "downloading a blob").await?.bytes().await
+            .map_err(|e| ArtifactError::Transport(e.to_string()))?.to_vec();
+        validate(stored, &bytes)?;
+        Ok(bytes)
     }
 
     fn guest_push(&self) -> Option<GuestPush> {
@@ -587,6 +632,8 @@ pub enum ArtifactError {
     Misconfigured(String),
     Io(String),
     Transport(String),
+    InvalidRecord(String),
+    Corrupt(String),
     Store {
         what: String,
         status: u16,
@@ -610,6 +657,8 @@ impl fmt::Display for ArtifactError {
             Self::Misconfigured(e) => write!(f, "the artifact sink is misconfigured: {e}"),
             Self::Io(e) => write!(f, "writing an artifact: {e}"),
             Self::Transport(e) => write!(f, "could not reach the artifact store: {e}"),
+            Self::InvalidRecord(e) => write!(f, "invalid recorded artifact: {e}"),
+            Self::Corrupt(e) => write!(f, "downloaded artifact failed validation: {e}"),
             Self::Store {
                 what,
                 status,
@@ -646,6 +695,19 @@ impl fmt::Display for ArtifactError {
             ),
         }
     }
+}
+
+fn validate(stored: &StoredArtifact, bytes: &[u8]) -> Result<(), ArtifactError> {
+    if bytes.len() as u64 != stored.size_bytes {
+        return Err(ArtifactError::Corrupt(format!("expected {} bytes, received {}", stored.size_bytes, bytes.len())));
+    }
+    if let Some(expected) = &stored.digest {
+        let actual = hex::encode(Sha256::digest(bytes));
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(ArtifactError::Corrupt(format!("sha256 mismatch: expected {expected}, received {actual}")));
+        }
+    }
+    Ok(())
 }
 
 impl std::error::Error for ArtifactError {}
@@ -748,6 +810,41 @@ mod tests {
         assert_eq!(std::fs::read(&stored.uri).unwrap(), b"payload");
         assert!(stored.uri.contains("build-x86_64"), "{}", stored.uri);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn disk_download_roundtrips_and_rejects_changed_bytes() {
+        let root = std::env::temp_dir().join(format!("ci-art-{}", crate::vm::new_id()));
+        let sink = DiskSink { root: root.clone() };
+        let stored = sink.put(&aref(), b"payload".to_vec()).await.unwrap();
+        assert_eq!(sink.get(&stored).await.unwrap(), b"payload");
+        // Equal length distinguishes digest checking from a size-only check.
+        tokio::fs::write(&stored.uri, b"changed").await.unwrap();
+        assert!(matches!(sink.get(&stored).await.unwrap_err(), ArtifactError::Corrupt(_)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn artifacts_download_uses_configured_store_auth_and_checks_digest() {
+        use axum::{Router, body::Bytes, extract::{Path as AxumPath, State}, http::{HeaderMap, StatusCode}, response::IntoResponse, routing::get};
+        #[derive(Clone)]
+        struct StateData { bytes: Bytes }
+        let bytes = Bytes::from_static(b"native-output");
+        let app = Router::new().route("/blobs/{digest}", get(
+            |State(st): State<StateData>, AxumPath(_): AxumPath<String>, headers: HeaderMap| async move {
+                if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer scoped-token") {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                st.bytes.into_response()
+            })).with_state(StateData { bytes: bytes.clone() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let sink = ArtifactsSink::new(ArtifactsConfig { url: format!("http://{addr}"), token: Some("scoped-token".into()), guest_url: None });
+        let stored = StoredArtifact { sink: "artifacts", digest: Some(hex::encode(Sha256::digest(&bytes))), size_bytes: bytes.len() as u64, uri: "ignored-recorded-tag".into(), public_url: None };
+        assert_eq!(sink.get(&stored).await.unwrap(), bytes);
+        let corrupt = StoredArtifact { digest: Some("0".repeat(64)), ..stored };
+        assert!(matches!(sink.get(&corrupt).await.unwrap_err(), ArtifactError::Corrupt(_)));
     }
 
     /// An artifact name arrives from a workflow file; one `..` would write
