@@ -324,7 +324,9 @@ if [ "$dry_run" -eq 1 ]; then
     git bundle list-heads "$bundle" | sed 's/^/    /'
   fi
   printf '  files:\n'
-  git ls-tree -r --name-only "$send_sha" | head -20 | sed 's/^/    /'
+  # Consume the whole tree so pipefail does not turn head's SIGPIPE into a
+  # failed dry-run for repositories whose listing exceeds the pipe buffer.
+  git ls-tree -r --name-only "$send_sha" | sed -n '1,20{s/^/    /;p;}'
   exit 0
 fi
 

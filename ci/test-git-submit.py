@@ -133,10 +133,18 @@ class GitSubmitTest(unittest.TestCase):
         self.assertEqual(SubmitHandler.requests, [])
 
     def test_dry_run_never_posts_or_discloses_credentials(self):
+        # Exceed a pipe buffer: a `head -20` consumer makes git ls-tree die
+        # with SIGPIPE under pipefail, although small repositories pass.
+        for i in range(1500):
+            (self.repo / (f"entry-{i:04d}-" + "x" * 100)).write_text("data\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "large tree")
         result = self.run_client("--dry-run", env={"CI_ENDPOINT": self.base + "/git/push",
                                                     "CI_TOKEN": TOKEN})
         self.assertIn(self.base + "/api/submit", result.stdout)
         self.assertEqual(SubmitHandler.requests, [])
+        files = result.stdout.split("  files:\n", 1)[1].splitlines()
+        self.assertEqual(len(files), 20)
 
     def test_pr_selector_submits_remote_pr_head_without_checkout_or_remote_write(self):
         head_before = self.git("rev-parse", "HEAD").stdout.strip()
