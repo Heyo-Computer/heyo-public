@@ -135,19 +135,7 @@ async fn main() -> Result<()> {
     )
     .await?;
     loop {
-        let r = match http
-            .post(format!("{}/api/native/poll", c.endpoint))
-            .bearer_auth(&c.token)
-            .json(&Poll {
-                runner_id: &c.id,
-                protocol_version: VERSION,
-            })
-            .send()
-            .await { Ok(r)=>r, Err(e)=>{eprintln!("poll failed: {e}");tokio::time::sleep(Duration::from_secs(5)).await;continue} };
-        if !r.status().is_success() {
-            bail!("poll: {} {}", r.status(), r.text().await?)
-        }
-        let Some(job) = r.json::<PollResponse>().await?.job else {
+        let Some(job) = poll(&http, &c).await? else {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         };
@@ -245,6 +233,31 @@ fn config() -> Result<Config> {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("heyo-native")),
     })
+}
+async fn poll(http: &reqwest::Client, c: &Config) -> Result<Option<Lease>> {
+    loop {
+        let r = match http
+            .post(format!("{}/api/native/poll", c.endpoint))
+            .bearer_auth(&c.token)
+            .json(&Poll { runner_id: &c.id, protocol_version: VERSION })
+            .send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("poll failed: {e}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+        if r.status().is_server_error() || r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            eprintln!("poll temporarily unavailable ({}); retrying in 5s", r.status());
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        if !r.status().is_success() {
+            bail!("poll: {} {}", r.status(), r.text().await?)
+        }
+        return Ok(r.json::<PollResponse>().await?.job);
+    }
 }
 async fn post<T: Serialize>(h: &reqwest::Client, c: &Config, path: &str, value: &T) -> Result<()> {
     let mut last=String::new();
@@ -465,6 +478,35 @@ mod tests {
     }
     fn lease(endpoint:&str,steps:Vec<Step>,timeout:Duration)->Lease{Lease{job_id:"job".into(),run_id:Uuid::new_v4().to_string(),lease_token:Uuid::new_v4(),plan:Plan{key:"job".into(),env:BTreeMap::new(),steps,timeout},source_url:format!("{endpoint}/api/native/jobs/test/source"),context:serde_json::json!({}),mask_values:vec![]}}
     fn config(endpoint:&str,dir:&Path)->Config{Config{endpoint:endpoint.into(),token:"test".into(),id:"runner".into(),name:"runner".into(),labels:vec![],platform:if cfg!(windows){"windows"}else{"macos"}.into(),workdir:dir.into()}}
+
+    #[tokio::test]
+    async fn polling_survives_transient_server_errors_but_refuses_bad_credentials() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        for statuses in [vec![500,503,429,200], vec![401], vec![403]] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let responses = statuses.clone();
+            let app = axum::Router::new().route("/api/native/poll", axum::routing::post(move || {
+                let index = seen.fetch_add(1, Ordering::SeqCst);
+                let status = responses[index.min(responses.len()-1)];
+                async move { (axum::http::StatusCode::from_u16(status).unwrap(), axum::Json(serde_json::json!({"job":null}))) }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let dir = tempfile::tempdir().unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(20),
+                poll(&reqwest::Client::new(), &config(&endpoint, dir.path()))).await;
+            server.abort();
+            let result = result.expect("poll did not recover or reject within its expected retry window");
+            if statuses.len() > 1 {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(result.err().expect("credential errors must be terminal").to_string().contains(&statuses[0].to_string()));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), statuses.len());
+        }
+    }
 
     #[tokio::test]
     async fn executor_reports_failure_skips_condition_and_hands_off_outputs(){
