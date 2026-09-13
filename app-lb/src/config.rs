@@ -2362,6 +2362,7 @@ impl JwtSpec {
             name_claim: DEFAULT_NAME_CLAIM.to_string(),
             leeway_secs: None,
             cookie: None,
+            login_endpoint: None,
         }
     }
 
