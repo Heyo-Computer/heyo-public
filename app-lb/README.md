@@ -419,6 +419,16 @@ or health edit never disturbs live VMs; only a change to the `vm` block reboots
 them, because the existing VMs were built from the old template. (This is unlike
 `POST /deployments`, which always replaces and tears the pool down.)
 
+Set `maintenance: true` in that complete spec to return **503** on the
+deployment's public routes before authentication or backend selection. This
+preserves the VM pool and keeps the separate admin API, including exec,
+available. Set it back to `false` to reopen traffic. This fences new requests;
+it does not cancel in-flight requests or pause application background workers.
+Use an app-lb binary that supports this field before relying on the fence.
+Ready managed backends marked unhealthy after a connection failure are
+re-probed by the autoscaler and rejoin routing only after health succeeds;
+stopped VMs are not woken by that recovery check.
+
 `PATCH /deployments/:id/scaling` is a **partial** update of just the scaling
 policy: fields you omit keep their current values, so `{"min_replicas": 2}`
 raises the floor without resetting `target_concurrency` or the timeouts. It

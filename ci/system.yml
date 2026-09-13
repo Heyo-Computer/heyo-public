@@ -28,14 +28,17 @@ jobs:
         run: cargo build --locked --release --bins
       - name: Test submission client
         run: python3 ci/test-git-submit.py
+      - name: Test artifact boot guards
+        run: python3 ci/deploy/test_start_artifact.py
       - name: Package validated binaries
         run: |
           set -eu
           mkdir -p dist
           cp "$CARGO_TARGET_DIR/release/ci" dist/ci
           cp "$CARGO_TARGET_DIR/release/native-runner-agent" dist/native-runner-agent
+          cp ci/deploy/start-artifact.sh dist/start-artifact.sh
           printf '%s\n' '${{ ci.sha }}' > dist/REVISION
-          (cd dist && sha256sum ci native-runner-agent > SHA256SUMS)
+          (cd dist && sha256sum ci native-runner-agent start-artifact.sh > SHA256SUMS)
       - uses: ci/upload-artifact
         with: { name: ci-linux, path: dist }
 

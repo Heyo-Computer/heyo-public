@@ -90,6 +90,7 @@ fn vm_spec() -> DeploymentSpec {
                 strip_prefix: false,
             },
         ],
+        maintenance: false,
         vm: Some(crate::config::VmSpec {
             env_from: vec![],
             workspace_archive: None,
@@ -236,6 +237,7 @@ fn site_spec() -> DeploymentSpec {
         }],
         vm: None,
         scaling: crate::config::ScalingPolicy::default(),
+        maintenance: false,
         health: crate::config::HealthCheck::default(),
         upstreams: vec![],
         discovery: None,
@@ -291,6 +293,7 @@ fn static_spec() -> DeploymentSpec {
         }],
         vm: None,
         scaling: crate::config::ScalingPolicy::default(),
+        maintenance: false,
         health: crate::config::HealthCheck::default(),
         upstreams: vec!["10.0.0.4:8080".into(), "10.0.0.5:8080".into()],
         discovery: Some(crate::config::DiscoverySpec {

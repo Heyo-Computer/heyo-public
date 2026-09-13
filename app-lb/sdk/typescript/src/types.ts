@@ -370,6 +370,8 @@ export interface DeploymentSpec {
   account_id?: string;
   user_id?: string;
   routes: RouteRule[];
+  /** Return HTTP 503 for routed proxy traffic while admin management remains available. */
+  maintenance?: boolean;
   vm?: VmSpec;
   scaling?: ScalingPolicy;
   health?: HealthCheck;

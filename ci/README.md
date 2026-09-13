@@ -52,6 +52,24 @@ builds upload artifacts and are required by the single release job.
 Linux tests and release compilation have separate steps with explicit 60-minute
 limits: the two-hour job limit does not override the default 30-minute step limit.
 
+The `ci-linux` artifact also supports branch deployment without a merge or rebuild.
+On an existing CI/NATS runtime image, pin that successful run's artifact digest
+as a read-only app-lb mount at `/opt/ci-release`, with `strip_components: 1`.
+`deploy/start-artifact.sh` verifies `CI_EXPECTED_SHA` and `SHA256SUMS`, installs
+the CI binary into the runtime, and starts its existing supervisor on every boot.
+It requires a separately mounted persistent state directory with a
+`.managed-state` marker containing `ci-state-v1`; it refuses an empty or rootfs
+fallback rather than silently losing CI history. Arguments are the release,
+runtime, and state directories. This boot wrapper is included in new artifacts.
+
+For an existing rootfs-only installation, fence public traffic with app-lb's
+503 maintenance mode, drain jobs, stop CI/NATS, and verify a private state export
+before changing its VM template. Seed the managed workspace from that export.
+Adding `vm.workspace` alone does not migrate rootfs data. Validate artifact mounts,
+workspace capture/restore, and replacement ordering on the installed backend
+before using this migration for live CI. Branch promotion authorizes deployment
+of the tested artifact, not GitHub merge/tag writes.
+
 Release and deployment default to disabled. `RELEASE_ENABLED=true` permits the
 gated merge/version/tag action with `GIT_AUTH_TOKEN`; `DEPLOY_ENABLED=true` also
 permits Orchestrator deployment. These are separate publication permissions, not

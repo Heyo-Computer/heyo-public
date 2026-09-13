@@ -65,6 +65,17 @@ const RECONCILE_CONCURRENCY: usize = 32;
 /// operation rather than on the loop that reaches it.
 const CREATE_CONCURRENCY: usize = 8;
 
+/// Holds every create slot while an admin replacement fences and swaps a
+/// workspace deployment. This makes the persisted workspace fence cover even
+/// a create that had already selected the old seed.
+pub(crate) struct WorkspaceReplacementGuard<'a> {
+    _creates: tokio::sync::SemaphorePermit<'a>,
+}
+
+impl WorkspaceReplacementGuard<'_> {
+    pub(crate) fn finish(self) {}
+}
+
 /// How many lines of the guest's own output to attach to a boot timeout.
 ///
 /// The tail, because a boot that fails says so at the end: the last thing a
@@ -154,6 +165,34 @@ impl Autoscaler {
     /// The workspace store, for the admin API's status view.
     pub fn workspaces(&self) -> &Arc<Workspaces> {
         &self.workspaces
+    }
+
+    /// Fence a workspace rollout before its replacement becomes live.
+    /// Acquiring all slots first waits out creates already using the old seed;
+    /// the durable fence then prevents both the old and new objects creating.
+    pub(crate) async fn fence_workspace_replacement<'a>(
+        &'a self,
+        d: &Arc<Deployment>,
+    ) -> Result<Option<WorkspaceReplacementGuard<'a>>, String> {
+        if !Self::has_workspace(d) {
+            return Ok(None);
+        }
+        let creates = self
+            .creates
+            .acquire_many(CREATE_CONCURRENCY as u32)
+            .await
+            .expect("autoscaler create semaphore is never closed");
+        let expected_captures = d.backends().len()
+            + d.pending()
+                .iter()
+                .filter(|p| p.origin != BootOrigin::Created)
+                .count()
+            + d.state().suspended.len();
+        self.workspaces
+            .begin_replacement(&d.spec.id, expected_captures)?;
+        Ok(Some(WorkspaceReplacementGuard {
+            _creates: creates,
+        }))
     }
 
     /// Whether a deployment's VMs carry a workspace that must be captured
@@ -485,6 +524,39 @@ impl Autoscaler {
             .await;
     }
 
+    /// Re-admit Ready managed backends after a transient service failure.
+    ///
+    /// Connect failures mark a backend unhealthy in the proxy. Unlike static
+    /// upstreams, these backends used to remain excluded forever. Probe only
+    /// already-running VMs that are still in the Ready pool; this never starts
+    /// or resumes a sandbox, and health is restored only after a successful
+    /// probe. Calls are sequential within a deployment and deployments are
+    /// already bounded by `RECONCILE_CONCURRENCY`.
+    async fn reprobe_unhealthy_managed(
+        &self,
+        d: &Arc<Deployment>,
+        fleet: &HashMap<String, SandboxInfo>,
+    ) {
+        for backend in d.backends().iter().filter(|b| !b.is_healthy()) {
+            let Some(info) = fleet.get(&backend.sandbox_id) else {
+                continue;
+            };
+            let Ok(addr) = vm::routable_addr(info, d.spec.vm_spec().port) else {
+                continue;
+            };
+            if health::probe(addr, &d.spec.health).await {
+                backend.set_healthy(true);
+                d.ready_signal.notify_waiters();
+                tracing::info!(
+                    deployment = %d.spec.id,
+                    sandbox = %backend.sandbox_id,
+                    %addr,
+                    "managed backend recovered",
+                );
+            }
+        }
+    }
+
     // (`at_rest` is a free function below — it needs no autoscaler state, and
     // being pure is what makes the fast path testable without a daemon.)
 
@@ -551,6 +623,7 @@ impl Autoscaler {
 
         // `prune` already ran in `reconcile`, which needed a current backend
         // list to decide this deployment had work at all.
+        self.reprobe_unhealthy_managed(d, fleet).await;
         self.promote_pending(d, fleet).await;
 
         let desired = d.desired_replicas();
@@ -1073,6 +1146,10 @@ impl Autoscaler {
 
     async fn scale_up(&self, d: &Arc<Deployment>, count: usize) {
         tracing::info!(deployment = %d.spec.id, count, "scaling up");
+        // Keep the slot until the resulting pending pool has been published,
+        // not just until the daemon answered. A replacement draining these
+        // slots must see every VM it needs to retire before exposing a new pool.
+        let _permit = self.creates.acquire().await;
         let mut pending = (*d.pending()).clone();
         let mut created = Vec::new();
 
@@ -1087,10 +1164,6 @@ impl Autoscaler {
                 );
                 break;
             }
-            // Held across the create or resume. Reconciles run concurrently, so
-            // without this a fleet-wide scale-up event would ask the daemon to
-            // start `RECONCILE_CONCURRENCY` hypervisors at once.
-            let _permit = self.creates.acquire().await;
 
             // A workspace deployment boots from its last capture, so while a
             // capture or restore is in flight there is nothing correct to boot
@@ -2040,7 +2113,7 @@ fn at_rest(
     owned_running: &HashMap<&str, usize>,
 ) -> bool {
     let backends = d.backends();
-    if !d.pending().is_empty() || backends.iter().any(|b| b.is_draining()) {
+    if !d.pending().is_empty() || backends.iter().any(|b| b.is_draining() || !b.is_healthy()) {
         return false;
     }
     if backends.len() != d.desired_replicas() as usize {
@@ -2161,6 +2234,7 @@ mod tests {
                 ttl_seconds: 3600,
             }),
             scaling: ScalingPolicy::default(),
+            maintenance: false,
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
@@ -2189,6 +2263,7 @@ mod tests {
             }],
             vm: None,
             scaling: ScalingPolicy::default(),
+            maintenance: false,
             health: HealthCheck::default(),
             upstreams: vec!["127.0.0.1:9".into()],
             discovery: None,
@@ -3019,5 +3094,50 @@ mod tests {
         // daemon (the test VmManager points at a dead port); it just drops them.
         a.teardown(&d).await;
         assert!(d.backends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unhealthy_ready_managed_backend_recovers_only_after_health_succeeds() {
+        use heyo_sdk::SandboxStatus;
+        use std::sync::atomic::AtomicBool;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let healthy = Arc::new(AtomicBool::new(false));
+        let serving = healthy.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let ok = serving.load(Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut request = [0; 256];
+                    let _ = stream.read(&mut request).await;
+                    let status = if ok { "200 OK" } else { "503 Service Unavailable" };
+                    let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let mut deployment_spec = spec();
+        deployment_spec.health.port = Some(addr.port());
+        let (a, reg) = autoscaler_against("http://127.0.0.1:1", deployment_spec);
+        let d = reg.get("demo").unwrap();
+        let backend = Arc::new(VmBackend::new("sb-1".into(), addr));
+        backend.set_healthy(false);
+        d.set_backends(vec![backend.clone()]);
+        let fleet = HashMap::from([(
+            "sb-1".into(),
+            info(SandboxStatus::Running, Some("127.0.0.1")),
+        )]);
+
+        a.reprobe_unhealthy_managed(&d, &fleet).await;
+        assert!(!backend.is_healthy(), "a 503 must remain unroutable");
+
+        healthy.store(true, Ordering::Relaxed);
+        a.reprobe_unhealthy_managed(&d, &fleet).await;
+        assert!(backend.is_healthy(), "a successful re-probe restores routing");
+        assert_eq!(d.backends()[0].sandbox_id, "sb-1", "recovery does not replace the VM");
     }
 }

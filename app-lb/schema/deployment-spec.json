@@ -88,6 +88,10 @@
         }
       ]
     },
+    "maintenance": {
+      "description": "Temporarily fence this deployment's public data plane. Routed requests\nreceive HTTP 503 before auth or backend selection, while deployment\nmanagement and VM exec remain available on the separate admin listener.\nPersisted as part of the deployment spec and safe to toggle with PUT.",
+      "type": "boolean"
+    },
     "namespace": {
       "description": "The namespace this deployment belongs to. Namespaces segregate use: a\ntoken minted for a namespace reaches only the deployments in it, and the\nevent feed is kept per namespace. Absent means `\"default\"`, so a fleet\nthat never says the word keeps behaving as one namespace.",
       "type": "string"

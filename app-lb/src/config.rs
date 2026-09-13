@@ -3114,6 +3114,12 @@ pub struct DeploymentSpec {
     /// and shell but takes no HTTP traffic. A static deployment and a site are
     /// reachable only through the proxy, so both need at least one.
     pub routes: Vec<RouteRule>,
+    /// Temporarily fence this deployment's public data plane. Routed requests
+    /// receive HTTP 503 before auth or backend selection, while deployment
+    /// management and VM exec remain available on the separate admin listener.
+    /// Persisted as part of the deployment spec and safe to toggle with PUT.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maintenance: bool,
     /// The VM template for a *managed* deployment: app-lb boots and autoscales a
     /// pool of microVMs. Mutually exclusive with `upstreams`; exactly one of the
     /// two must be set.
@@ -5256,6 +5262,7 @@ mod tests {
                 ttl_seconds: 3600,
             }),
             scaling: ScalingPolicy::default(),
+            maintenance: false,
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
@@ -5311,6 +5318,7 @@ mod tests {
             }],
             vm: None,
             scaling: ScalingPolicy::default(),
+            maintenance: false,
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             discovery: None,

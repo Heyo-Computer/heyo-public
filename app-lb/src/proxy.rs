@@ -317,6 +317,13 @@ async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<
         .await
 }
 
+fn maintenance_response(deployment: &Deployment) -> Option<(u16, &'static str)> {
+    deployment
+        .spec
+        .maintenance
+        .then_some((503, "deployment is under maintenance\n"))
+}
+
 /// The newest events an exposed or admin-served feed returns. Half the ring:
 /// a reader wants "recent", and the full ring is the debugging view.
 pub const FEED_PAGE: usize = 100;
@@ -638,6 +645,17 @@ impl ProxyHttp for LbProxy {
             write_plain(session, 404, "no deployment matches this request\n").await?;
             return Ok(true); // response already written; stop proxying
         };
+
+        // Maintenance is a deployment data-plane fence, not an admin outage.
+        // Keep the route present and answer 503 so retrying clients wait while
+        // operators continue to use the separate admin listener (including
+        // exec). Do this before auth and backend selection: maintenance must
+        // neither turn into a terminal 401/403 nor wake a scaled-to-zero VM.
+        if let Some((status, message)) = maintenance_response(&deployment) {
+            ctx.deployment = Some(deployment);
+            write_plain(session, status, message).await?;
+            return Ok(true);
+        }
 
         ctx.route_prefix = matched_strip_prefix(&deployment, host.as_deref(), &path);
 
@@ -1278,6 +1296,7 @@ mod tests {
                 ttl_seconds: 3600,
             }),
             scaling,
+            maintenance: false,
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
@@ -1309,6 +1328,19 @@ mod tests {
         // decrement a slot it no longer owns.
         ctx.release();
         assert_eq!(b.in_flight(), 0);
+    }
+
+    #[test]
+    fn maintenance_fence_is_retryable_and_does_not_remove_the_deployment() {
+        let d = deployment(ScalingPolicy::default());
+        assert_eq!(maintenance_response(&d), None);
+        let mut spec = d.spec.clone();
+        spec.maintenance = true;
+        let fenced = Deployment::new(spec);
+        assert_eq!(
+            maintenance_response(&fenced),
+            Some((503, "deployment is under maintenance\n")),
+        );
     }
 
     #[tokio::test]
