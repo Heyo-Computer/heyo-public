@@ -53,7 +53,7 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::Deserialize;
 
 use crate::store::{JobRow, JobStatus, Repo, Run, RunStatus, ServiceDeploymentRow, StepRow};
@@ -82,10 +82,45 @@ const VM_LOG_STEP_IDX: i32 = -2;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/runs/{run_id}", get(run_status))
+        .route("/api/runs/{run_id}/rerun-failed", post(rerun_failed))
         .route("/api/runs/{run_id}/logs", get(run_logs))
         .route("/api/runs/{run_id}/events", get(run_events))
         .route("/api/runs/{run_id}/deployments", get(run_deployments))
         .route("/api/runs/{run_id}/release", get(run_release))
+}
+
+/// A submit credential can retry its own repository without a browser session.
+/// Require a bearer: read-path HMAC signatures must never authorize a write.
+async fn rerun_failed(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if bearer(&headers).is_none() {
+        return error(StatusCode::UNAUTHORIZED, "a repository submit bearer token is required");
+    }
+    let reader = match authenticate(&state, &headers, "").await {
+        Ok(reader) => reader,
+        Err(response) => return response,
+    };
+    if let Err(response) = readable_run(&state, &reader, &run_id).await {
+        return response;
+    }
+    // Reuse the existing rerun path: original source, successful-job carryover,
+    // repository policy and unresolved-deployment checks all remain in force.
+    match state.dispatcher.rerun(&run_id, true, None).await {
+        Ok(submitted) => (StatusCode::ACCEPTED, axum::Json(serde_json::json!({
+            "runs": submitted.run_ids,
+            "url": format!("{}/", state.config.public_url),
+            "warnings": submitted.warnings,
+        }))).into_response(),
+        Err(crate::dispatch::DispatchError::Workflow(message)) =>
+            error(StatusCode::CONFLICT, &message),
+        Err(e) => {
+            tracing::error!(run = %run_id, "could not rerun failed jobs: {e}");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "could not rerun failed jobs")
+        }
+    }
 }
 
 const DEFAULT_EVENT_LIMIT: i64 = 50;
@@ -388,9 +423,17 @@ async fn run_status(
         job_views.push(job_json(job, &steps));
     }
     let artifacts = state.store.artifacts_of(&run_id).await.unwrap_or_default();
+    let reruns = match state.store.reruns_of(&run_id).await {
+        Ok(reruns) => reruns,
+        Err(e) => {
+            tracing::error!("could not load reruns for {run_id}: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "could not load reruns");
+        }
+    };
 
     axum::Json(serde_json::json!({
         "run": run_json(&state, &run),
+        "reruns": reruns.iter().map(|run| run_json(&state, run)).collect::<Vec<_>>(),
         "jobs": job_views,
         "artifacts": artifacts
             .iter()

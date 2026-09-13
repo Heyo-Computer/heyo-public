@@ -647,6 +647,16 @@ Both are the dashboard's manual trigger, and both are the answer to "the build
 timed out on a cold cache": the re-run claims the same warm VM, and with it the
 cache disk the first attempt spent its budget filling.
 
+Machine callers can use `POST /api/runs/{id}/rerun-failed` with the same
+`Authorization: Bearer <repository token>` used by `git submit`. No browser
+login is required. The token must belong to the run's repository and remain
+enabled and unrevoked. Read-path HMAC signatures cannot authorize this write.
+The response is `202` with `runs`, `url`, and `warnings`, as for submission.
+An active run or unresolved service deployment returns `409`; rerunning does
+not bypass repository policy or release/deployment gates. If a request loses
+its response, check `reruns` in `GET /api/runs/{id}` before posting again:
+every accepted request creates a new run, not an idempotent reset.
+
 **A re-run is a new run**, with `rerun_of` pointing at the one it re-plays and
 the original's page listing what re-played it — never a reset of the old run.
 Run and job ids name their logs and derive the step operation ids the daemon

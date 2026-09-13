@@ -1679,6 +1679,106 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_NATS_URL"]
+    async fn machine_rerun_is_repo_scoped_and_carries_successes() {
+        use base64::Engine;
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CI_WORKSPACE_DIR", root.path());
+            std::env::set_var("CI_NATIVE_RUNNER_SECRET", "test-native-secret");
+        }
+        let app = test_router().await;
+        let store = Store::connect(&std::env::var("CI_TEST_DATABASE_URL").unwrap(),
+            root.path().join("logs"), std::time::Duration::from_secs(30)).await.unwrap();
+        let url = format!("https://example.com/{}.git", crate::vm::new_id());
+        let repo = store.register_repo(&url, "retry", Some("ci/test.yml"), None, None).await.unwrap();
+        let other = store.register_repo(&format!("{url}-other"), "other", None, None, None).await.unwrap();
+        let (token_row, token) = store.create_repo_token(&repo.id, "test", None).await.unwrap();
+        let (_, wrong_token) = store.create_repo_token(&other.id, "test", None).await.unwrap();
+
+        let workflow = b"name: retry\non: [submit]\njobs:\n  passed:\n    runs-on: [macos-intel]\n    steps: [{run: 'echo passed'}]\n  failed:\n    runs-on: [windows-x64]\n    steps: [{run: 'echo retry'}]\n";
+        let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut archive = tar::Builder::new(gzip);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(workflow.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, "ci/test.yml", &workflow[..]).unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let payload = serde_json::json!({
+            "repository": {"url": url}, "ref": "refs/heads/test", "after": "a".repeat(40),
+            "source": {"format": "tar.gz", "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes)}
+        });
+        let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/submit")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::from(payload.to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{}", String::from_utf8_lossy(&body));
+        let submitted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run = submitted["runs"][0].as_str().unwrap();
+        let path = format!("/api/runs/{run}/rerun-failed");
+        async fn post(app: Router, path: &str, token: Option<&str>) -> axum::response::Response {
+            let mut req = Request::builder().method("POST").uri(path);
+            if let Some(token) = token { req = req.header("Authorization", format!("Bearer {token}")); }
+            app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+        }
+        // Auth refusals must precede the dispatcher, including when the run exists.
+        for (credential, expected) in [(None, StatusCode::UNAUTHORIZED),
+            (Some("invalid"), StatusCode::UNAUTHORIZED), (Some(wrong_token.as_str()), StatusCode::NOT_FOUND)] {
+            assert_eq!(post(app.clone(), &path, credential).await.status(), expected);
+        }
+        assert_eq!(post(app.clone(), &path, Some(&token)).await.status(), StatusCode::CONFLICT,
+            "an active run must not be duplicated");
+        use hmac::Mac;
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"0123456789abcdef").unwrap();
+        mac.update(path.as_bytes());
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let response = app.clone().oneshot(Request::builder().method("POST").uri(&path)
+            .header(trigger::SIGNATURE_HEADER, signature).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "read signatures must not grant write access");
+        assert!(store.reruns_of(run).await.unwrap().is_empty());
+        store.set_job_status(&crate::store::job_id(run, "passed"), crate::store::JobStatus::Success, None).await.unwrap();
+        store.set_job_status(&crate::store::job_id(run, "failed"), crate::store::JobStatus::Failure, Some("offline")).await.unwrap();
+        store.set_run_status(run, crate::store::RunStatus::Failure, None).await.unwrap();
+        let response = post(app.clone(), &path, Some(&token)).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{}", String::from_utf8_lossy(&body));
+        let retried: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let next = retried["runs"][0].as_str().unwrap();
+        assert_ne!(next, run);
+        let new_run = store.get_run(next).await.unwrap().unwrap();
+        assert_eq!(new_run.rerun_of.as_deref(), Some(run));
+        assert_eq!(new_run.sha, "a".repeat(40));
+        let response = app.clone().oneshot(Request::builder().uri(format!("/api/runs/{run}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let original: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(original["reruns"].as_array().unwrap().len(), 1);
+        assert_eq!(original["reruns"][0]["id"], next, "a lost POST response can be reconciled by reading the parent");
+        let jobs = store.jobs_of(next).await.unwrap();
+        let passed = jobs.iter().find(|job| job.job_key == "passed").unwrap();
+        assert_eq!(passed.status, "success");
+        assert!(passed.carried_from.is_some());
+        assert_eq!(jobs.iter().find(|job| job.job_key == "failed").unwrap().status, "queued");
+        store.set_repo_enabled(&repo.id, false).await.unwrap();
+        assert_eq!(post(app.clone(), &path, Some(&token)).await.status(), StatusCode::UNAUTHORIZED);
+        store.set_repo_enabled(&repo.id, true).await.unwrap();
+        store.revoke_repo_token(&token_row.id).await.unwrap();
+        assert_eq!(post(app, &path, Some(&token)).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(store.reruns_of(run).await.unwrap().len(), 1);
+        store.delete_repo(&repo.id).await.unwrap();
+        store.delete_repo(&other.id).await.unwrap();
+        unsafe {
+            std::env::remove_var("CI_WORKSPACE_DIR");
+            std::env::remove_var("CI_NATIVE_RUNNER_SECRET");
+        }
+    }
+
     /// The networks page must render before the first refresh lands, because
     /// that is exactly when someone is looking at it — a cold start with a
     /// cloud that has not answered yet.
