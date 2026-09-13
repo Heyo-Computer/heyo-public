@@ -12,11 +12,12 @@
 //! that took nineteen minutes and published normally was reported to a user as
 //! a failure, because nothing here could say otherwise.
 //!
-//! So these two routes exist to answer exactly two questions, and are shaped
+//! So these routes exist to answer the CI-owned questions, and are shaped
 //! around them rather than around the tables:
 //!
 //! - `GET /api/runs/{run_id}` — is it finished, and did it work?
 //! - `GET /api/runs/{run_id}/logs` — it did not work; what was printed?
+//! - `GET /api/runs/{run_id}/deployments` — what happened to service deploys?
 //!
 //! ## The credential
 //!
@@ -52,10 +53,10 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::Deserialize;
 
-use crate::store::{JobRow, JobStatus, Repo, Run, RunStatus, StepRow};
+use crate::store::{JobRow, JobStatus, Repo, Run, RunStatus, ServiceDeploymentRow, StepRow};
 use crate::trigger;
 
 use super::AppState;
@@ -81,7 +82,186 @@ const VM_LOG_STEP_IDX: i32 = -2;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/runs/{run_id}", get(run_status))
+        .route("/api/runs/{run_id}/rerun-failed", post(rerun_failed))
         .route("/api/runs/{run_id}/logs", get(run_logs))
+        .route("/api/runs/{run_id}/events", get(run_events))
+        .route("/api/runs/{run_id}/deployments", get(run_deployments))
+        .route("/api/runs/{run_id}/release", get(run_release))
+}
+
+/// A submit credential can retry its own repository without a browser session.
+/// Require a bearer: read-path HMAC signatures must never authorize a write.
+async fn rerun_failed(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if bearer(&headers).is_none() {
+        return error(StatusCode::UNAUTHORIZED, "a repository submit bearer token is required");
+    }
+    let reader = match authenticate(&state, &headers, "").await {
+        Ok(reader) => reader,
+        Err(response) => return response,
+    };
+    if let Err(response) = readable_run(&state, &reader, &run_id).await {
+        return response;
+    }
+    // Reuse the existing rerun path: original source, successful-job carryover,
+    // repository policy and unresolved-deployment checks all remain in force.
+    match state.dispatcher.rerun(&run_id, true, None).await {
+        Ok(submitted) => (StatusCode::ACCEPTED, axum::Json(serde_json::json!({
+            "runs": submitted.run_ids,
+            "url": format!("{}/", state.config.public_url),
+            "warnings": submitted.warnings,
+        }))).into_response(),
+        Err(crate::dispatch::DispatchError::Workflow(message)) =>
+            error(StatusCode::CONFLICT, &message),
+        Err(e) => {
+            tracing::error!(run = %run_id, "could not rerun failed jobs: {e}");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "could not rerun failed jobs")
+        }
+    }
+}
+
+const DEFAULT_EVENT_LIMIT: i64 = 50;
+const MAX_EVENT_LIMIT: i64 = 100;
+
+#[derive(Debug, Deserialize)]
+struct EventQuery {
+    before: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn run_events(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Query(q): Query<EventQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let path = format!("/api/runs/{run_id}/events");
+    let reader = match authenticate(&state, &headers, &path).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if let Err(r) = readable_run(&state, &reader, &run_id).await {
+        return r;
+    }
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_EVENT_LIMIT)
+        .clamp(1, MAX_EVENT_LIMIT);
+    match state.store.run_events(&run_id, q.before, limit + 1).await {
+        Ok(mut events) => {
+            let has_more = events.len() as i64 > limit;
+            if has_more {
+                events.pop();
+            }
+            let next_before = has_more
+                .then(|| events.last().map(|e| e.revision))
+                .flatten();
+            axum::Json(serde_json::json!({
+                "events": events.iter().map(event_json).collect::<Vec<_>>(),
+                "next_before": next_before,
+                "limit": limit
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("could not load events for run {run_id}: {e}");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not load run events",
+            )
+        }
+    }
+}
+
+fn event_json(event: &crate::store::RunEvent) -> serde_json::Value {
+    // Replay must return the same envelope as NATS, including repository,
+    // commit and artifact identity, rather than a lossy display projection.
+    let mut payload = event.payload.clone();
+    payload["publication"] = serde_json::json!({
+        "state": if event.published_at.is_some() { "published" } else { "pending" },
+        "published_at": event.published_at.map(|t| t.to_rfc3339()), "attempts": event.attempts,
+        "last_error": event.last_error
+    });
+    payload
+}
+
+async fn run_deployments(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let path = format!("/api/runs/{run_id}/deployments");
+    let reader = match authenticate(&state, &headers, &path).await {
+        Ok(reader) => reader,
+        Err(response) => return response,
+    };
+    if let Err(response) = readable_run(&state, &reader, &run_id).await {
+        return response;
+    }
+    match state.store.service_deployments_of(&run_id).await {
+        Ok(deployments) => axum::Json(serde_json::json!({
+            "run_id": run_id,
+            "deployments": deployments.iter().map(deployment_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!("could not load deployments for run {run_id}: {e}");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not load run deployments",
+            )
+        }
+    }
+}
+
+fn deployment_json(deployment: &ServiceDeploymentRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": deployment.id,
+        "step_id": deployment.step_id,
+        "run_id": deployment.run_id,
+        "job_id": deployment.job_id,
+        "service_id": deployment.service_id,
+        "status": deployment.status,
+        "phase": deployment.phase,
+        "message": deployment.message,
+        "error": deployment.error,
+        "sha": deployment.sha,
+        "git_ref": deployment.git_ref,
+        "created_at": deployment.created_at.to_rfc3339(),
+        "updated_at": deployment.updated_at.to_rfc3339(),
+    })
+}
+
+async fn run_release(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let path = format!("/api/runs/{run_id}/release");
+    let reader = match authenticate(&state, &headers, &path).await {
+        Ok(reader) => reader,
+        Err(response) => return response,
+    };
+    if let Err(response) = readable_run(&state, &reader, &run_id).await {
+        return response;
+    }
+    match crate::release::get(&state.store, &run_id).await {
+        Ok(release) => axum::Json(serde_json::json!({
+            "run_id": run_id,
+            "release": release,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!("could not load release for run {run_id}: {e}");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not load run release",
+            )
+        }
+    }
 }
 
 // -- authentication ----------------------------------------------------------
@@ -243,9 +423,17 @@ async fn run_status(
         job_views.push(job_json(job, &steps));
     }
     let artifacts = state.store.artifacts_of(&run_id).await.unwrap_or_default();
+    let reruns = match state.store.reruns_of(&run_id).await {
+        Ok(reruns) => reruns,
+        Err(e) => {
+            tracing::error!("could not load reruns for {run_id}: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "could not load reruns");
+        }
+    };
 
     axum::Json(serde_json::json!({
         "run": run_json(&state, &run),
+        "reruns": reruns.iter().map(|run| run_json(&state, run)).collect::<Vec<_>>(),
         "jobs": job_views,
         "artifacts": artifacts
             .iter()
@@ -469,6 +657,71 @@ fn error(status: StatusCode, message: &str) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_api_projects_identity_revision_and_truthful_state() {
+        let now = chrono::Utc::now();
+        let deployment = ServiceDeploymentRow {
+            id: "operation-1".into(),
+            step_id: "run.deploy.0".into(),
+            run_id: "run".into(),
+            job_id: "run.deploy".into(),
+            service_id: "api".into(),
+            status: "submission_unknown".into(),
+            phase: Some("submitting".into()),
+            message: Some("the response was lost; do not resubmit".into()),
+            error: None,
+            sha: "0123456789abcdef".into(),
+            git_ref: "refs/heads/release".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        let json = deployment_json(&deployment);
+        assert_eq!(json["id"], "operation-1");
+        assert_eq!(json["service_id"], "api");
+        assert_eq!(json["status"], "submission_unknown");
+        assert_eq!(json["phase"], "submitting");
+        assert_eq!(json["sha"], "0123456789abcdef");
+        assert_eq!(json["git_ref"], "refs/heads/release");
+        assert_eq!(json["message"], "the response was lost; do not resubmit");
+        assert!(json["created_at"].as_str().is_some() && json["updated_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn history_preserves_the_bus_envelope_and_adds_publication_state() {
+        let envelope = serde_json::json!({
+            "version": 1, "type": "ci.artifact.published.v1", "repo_id": "repo-a",
+            "run_id": "run-a", "sha": "112233", "git_ref": "refs/heads/release",
+            "artifact": { "digest": "ab".repeat(32), "size_bytes": 37 }
+        });
+        let mut event = crate::store::RunEvent {
+            id: uuid::Uuid::new_v4(),
+            revision: 42,
+            event_type: "ci.artifact.published.v1".into(),
+            payload: envelope.clone(),
+            job_id: Some("run-a.build".into()),
+            job_key: Some("build".into()),
+            step_id: Some("run-a.build.0".into()),
+            status: "published".into(),
+            error: None,
+            transitioned_at: chrono::Utc::now(),
+            published_at: None,
+            attempts: 2,
+            last_error: Some("NATS unavailable".into()),
+        };
+        let mut json = event_json(&event);
+        assert_eq!(json["publication"]["state"], "pending");
+        assert_eq!(json["publication"]["attempts"], 2);
+        json.as_object_mut().unwrap().remove("publication");
+        assert_eq!(json, envelope);
+        event.published_at = Some(chrono::Utc::now());
+        event.last_error = None;
+        assert_eq!(event_json(&event)["publication"]["state"], "published");
+        assert_eq!(
+            event.payload, envelope,
+            "rendering must not mutate the saved fact"
+        );
+    }
 
     #[test]
     fn a_short_log_is_returned_whole_and_not_marked_truncated() {

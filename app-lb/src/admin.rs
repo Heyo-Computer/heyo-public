@@ -4486,6 +4486,9 @@ struct PullRequest {
     /// without making that digest the deployment's default.
     #[serde(default, rename = "ref")]
     artifact_ref: Option<String>,
+    /// Enables durable idempotency and replacement-readiness verification.
+    #[serde(default)]
+    operation_id: Option<String>,
     /// Re-fetch even when the image is already on disk. Rarely wanted — the
     /// filename is the digest, so the image being there is proof the bytes are
     /// right — and it exists for the case where the file was damaged after it
@@ -4501,8 +4504,11 @@ fn job_start_error(e: StartError) -> Response {
         e @ StartError::NoDeployment(_) => {
             err(StatusCode::NOT_FOUND, e.to_string()).into_response()
         }
-        e @ StartError::AlreadyRunning(_) => {
+        e @ (StartError::AlreadyRunning(_) | StartError::ConflictingOperation(_)) => {
             err(StatusCode::CONFLICT, e.to_string()).into_response()
+        }
+        e @ StartError::Persistence(_) => {
+            err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
         }
         e => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
@@ -4549,7 +4555,14 @@ async fn start_pull(
     body: Option<Json<PullRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    match state.jobs.start_pull(&id, req.artifact_ref, req.force) {
+    let result = match req.operation_id {
+        Some(operation_id) => match req.artifact_ref {
+            Some(digest) => state.jobs.start_correlated_pull(&id, operation_id, digest, req.force),
+            None => Err(StartError::BadRef("operation_id requires an explicit pinned `ref` digest".into())),
+        },
+        None => state.jobs.start_pull(&id, req.artifact_ref, req.force),
+    };
+    match result {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "artifact pull started");
             (StatusCode::ACCEPTED, Json(record)).into_response()

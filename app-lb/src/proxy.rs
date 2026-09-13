@@ -350,6 +350,8 @@ async fn write_gate_response(session: &mut Session, r: crate::auth::Response) ->
     // a spent authorization code, and a stored 403 would outlive the allow-list
     // change that fixes it.
     header.insert_header(http::header::CACHE_CONTROL, "no-store")?;
+    header.insert_header("X-Frame-Options", "DENY")?;
+    header.insert_header("Referrer-Policy", "same-origin")?;
     for cookie in &r.cookies {
         // Appended, not inserted: a callback sets the session cookie *and*
         // clears the flow cookie, and one `Set-Cookie` cannot carry both.
@@ -679,14 +681,45 @@ impl ProxyHttp for LbProxy {
             };
 
             let secure = is_secure_request(session);
+            // Consume credentials only on the gate-owned login endpoint, never
+            // on an application request. Bound the body before buffering it.
+            let login_post = path == gate.login_path()
+                && session.req_header().method == http::Method::POST
+                && gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some());
+            let mut login_body = Vec::new();
+            if login_post {
+                while let Some(chunk) = session.read_request_body().await? {
+                    if login_body.len() + chunk.len() > 8192 {
+                        write_plain(session, 413, "sign-in request is too large\n").await?;
+                        ctx.deployment = Some(deployment);
+                        return Ok(true);
+                    }
+                    login_body.extend_from_slice(&chunk);
+                }
+            }
+            // Origin checks and logout redirects need the browser's authority,
+            // including a non-default port; routing intentionally strips it.
+            let auth_host = if gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some()) {
+                session.req_header().uri.authority().map(|a| a.as_str())
+                    .or_else(|| session.req_header().headers.get(http::header::HOST).and_then(|v| v.to_str().ok()))
+                    .unwrap_or(host)
+            } else {
+                host
+            };
             let info = request_info(
                 session,
-                host,
+                auth_host,
                 &path,
                 secure,
                 self.auth.fronts_admin_api(&deployment.spec),
             );
-            match self.auth.decide(&gate, &deployment.spec.id, &deployment.spec.namespace, &info).await {
+            let decision = if login_post {
+                let request_origin = session.req_header().headers.get("origin").and_then(|v| v.to_str().ok());
+                Decision::Answered(self.auth.heyo_login_submit(&gate, &deployment.spec.id, &info, request_origin, &login_body).await)
+            } else {
+                self.auth.decide(&gate, &deployment.spec.id, &deployment.spec.namespace, &info).await
+            };
+            match decision {
                 Decision::Allow(identity) => ctx.identity = *identity,
                 Decision::Answered(response) => {
                     write_gate_response(session, response).await?;

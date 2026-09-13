@@ -143,6 +143,11 @@ pub struct Secrets {
 }
 
 impl Secrets {
+    #[cfg(test)]
+    pub fn unconfigured() -> Self {
+        Self { http: reqwest::Client::new(), base_url: None, token: None }
+    }
+
     pub fn new(config: &Config) -> Self {
         Self {
             http: reqwest::Client::builder()

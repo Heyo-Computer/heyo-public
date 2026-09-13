@@ -43,6 +43,14 @@ impl Context {
         Self::default()
     }
 
+    pub fn into_value(self) -> Value {
+        Value::Object(self.root.into_iter().collect())
+    }
+
+    pub fn from_value(value: Value) -> Self {
+        Self { root: value.as_object().cloned().unwrap_or_default().into_iter().collect() }
+    }
+
     /// Install a whole scope, e.g. `set("matrix", json!({"target": "x86_64"}))`.
     pub fn set(&mut self, scope: &str, value: Value) -> &mut Self {
         self.root.insert(scope.to_string(), value);

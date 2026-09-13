@@ -36,7 +36,8 @@ use crate::store::{JobStatus, RunStatus, StepStatus, Store, step_id};
 use crate::vm::{ExecOutput, SizeCheck, Vm, VmError, Vms, sandbox_name};
 use crate::workflow::{Fallback, Step};
 use async_nats::jetstream::AckKind;
-use serde_json::Value;
+use serde_json::{Value, json};
+use sqlx::Row;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -429,6 +430,8 @@ impl Dispatcher {
                             git_ref: req.r#ref.clone(),
                             sha: req.after.clone(),
                             before_sha: req.before.clone(),
+                            default_branch: req.repository.default_branch.clone(),
+                            release_base_sha: req.repository.release_base_sha.clone(),
                             // A workflow forced by `--only` gets *unknown*
                             // changes, not the real diff. The real diff is what
                             // just declined it at the workflow gate, and the
@@ -560,6 +563,20 @@ impl Dispatcher {
                 run.status
             )));
         }
+        // A failed job can make the run's rollup fail while siblings still run.
+        // Retrying that rollup must not duplicate the siblings' work.
+        if self.store.jobs_of(run_id).await?.iter()
+            .any(|job| !matches!(job.status.as_str(), "success" | "failure" | "skipped" | "cancelled")) {
+            return Err(DispatchError::Workflow(
+                "jobs in this run are still active; wait for them to finish before re-running it".into()
+            ));
+        }
+        if self.store.service_deployments_of(run_id).await?.iter()
+            .any(|d| !matches!(d.status.as_str(), "passed" | "failed")) {
+            return Err(DispatchError::Workflow(
+                "a service rollout is still running or has an unknown submission outcome; reconcile it before creating another run".into()
+            ));
+        }
 
         // The registration the original ran under, when it had one — it is
         // what decides the workflow glob, the network and the secrets prefix,
@@ -599,7 +616,8 @@ impl Dispatcher {
                     .or_else(|| run.repo_name.clone())
                     .unwrap_or_default(),
                 url: run.repo_url.clone(),
-                default_branch: None,
+                default_branch: run.default_branch.clone(),
+                release_base_sha: run.release_base_sha.clone(),
             },
             r#ref: run.git_ref.clone(),
             before: run.before_sha.clone(),
@@ -716,9 +734,6 @@ impl Dispatcher {
                     self.store
                         .set_job_status(&job.id, JobStatus::Skipped, None)
                         .await?;
-                    self.bus
-                        .publish_event(run_id, &plan.key, &serde_json::json!({"status": "skipped"}))
-                        .await;
                     continue;
                 }
                 Err(e) => {
@@ -732,6 +747,13 @@ impl Dispatcher {
                         .await?;
                     continue;
                 }
+            }
+
+            if !plan.native_labels.is_empty() {
+                crate::native::enqueue(&self.store, &job.id, run_id, &plan.native_labels)
+                    .await.map_err(DispatchError::Native)?;
+                tracing::info!(run=run_id, job=%plan.key, labels=?plan.native_labels, "queued for native runner");
+                continue;
             }
 
             let route = match self.route_for(&plan).await {
@@ -804,13 +826,14 @@ impl Dispatcher {
     /// A run this process cannot read at all yields an empty scope rather than
     /// an error: `ci.sha` resolving to null is a condition an author can see is
     /// wrong, whereas failing the job says nothing about what to fix.
-    fn ci_scope(run: Option<&crate::store::Run>) -> Value {
+    pub(crate) fn ci_scope(run: Option<&crate::store::Run>) -> Value {
         let Some(run) = run else {
             return Value::Object(Default::default());
         };
         serde_json::json!({
             "sha": run.sha,
             "before": run.before_sha,
+            "release_base_sha": run.release_base_sha,
             "ref": run.git_ref,
             "branch": run.git_ref.strip_prefix("refs/heads/").unwrap_or(&run.git_ref),
             "repository": run.repo_url,
@@ -872,6 +895,12 @@ impl Dispatcher {
     ) -> Result<(), DispatchError> {
         let pool = self.runners.snapshot();
         for job in &mut plan.jobs {
+            if !job.native_labels.is_empty() {
+                if self.config.native_runner_secret.is_none() {
+                    return Err(DispatchError::Native("configure native runners before submitting runs-on jobs".into()));
+                }
+                continue;
+            }
             // `uses: default` names no network on purpose — it is wherever this
             // orchestrator's host happens to be — so the repository's assignment
             // must not be written over it.
@@ -1100,16 +1129,6 @@ impl Dispatcher {
             tracing::info!(job = %msg.job_key, "no longer runnable; dropping delivery");
             return Ok(JobStatus::Success);
         }
-        self.bus
-            .publish_event(
-                &msg.run_id,
-                &plan.key,
-                &serde_json::json!({
-                    "status": "running", "runner": runner,
-                    "phase": "acquiring a VM", "attempt": attempt
-                }),
-            )
-            .await;
         tracing::info!(job = %plan.key, runner = %runner, attempt, "acquiring a VM");
 
         let workspace = self.workspace(&msg.run_id);
@@ -1173,17 +1192,6 @@ impl Dispatcher {
             self.release_vm(&plan, &vm, false).await;
             return Ok(JobStatus::Success);
         }
-        self.bus
-            .publish_event(
-                &msg.run_id,
-                &plan.key,
-                &serde_json::json!({
-                    "status": "running", "runner": runner,
-                    "sandbox": vm.id(), "reusedVm": reused, "attempt": attempt,
-                    "sizeClass": plan.vm.size_class.map(|s| s.as_str())
-                }),
-            )
-            .await;
         tracing::info!(
             job = %plan.key, runner = %runner, vm = vm.id(), reused,
             "running"
@@ -1230,13 +1238,6 @@ impl Dispatcher {
         self.store
             .set_job_status(&msg.job_id, status, error.as_deref())
             .await?;
-        self.bus
-            .publish_event(
-                &msg.run_id,
-                &plan.key,
-                &serde_json::json!({"status": status.as_str(), "error": error}),
-            )
-            .await;
         Ok(status)
     }
 
@@ -1979,6 +1980,11 @@ impl Dispatcher {
         vm: &Vm,
     ) -> Result<(), DispatchError> {
         let sid = format!("{}.checkout", msg.job_id);
+        // A redelivery starts from the submitted source again. Do not retain
+        // release provenance from a previous VM or attempt.
+        sqlx::query("UPDATE ci_job SET release_sha=NULL WHERE id=$1")
+            .bind(&msg.job_id).execute(self.store.pool()).await
+            .map_err(|e| DispatchError::Checkout(e.to_string()))?;
         self.store
             .create_step(&sid, &msg.job_id, -1, "Checkout", None)
             .await?;
@@ -2215,10 +2221,15 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     .log_path(&msg.run_id, &plan.key, idx as i32, &sid);
                 self.store.start_step(&sid, &sid).await?;
                 match self
-                    .run_action(msg, plan, vm, action, step, &ctx, &sid, &log_path)
+                    .run_action(msg, plan, vm, action, step, &ctx, &sid, &log_path, &masker)
                     .await
                 {
-                    Ok(note) => {
+                    Ok((note, outputs)) => {
+                        if let Some(id) = &step.id {
+                            step_outputs.insert(id.clone(), serde_json::json!({
+                                "outputs": outputs, "outcome": "success"
+                            }));
+                        }
                         self.store
                             .append_log(&sid, &log_path, &masker.mask(&note))
                             .await?;
@@ -2376,7 +2387,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
 
     /// Run a built-in `uses:` action.
     ///
-    /// Only the artifact actions exist. Composite actions — fetching an
+    /// Artifact publication and service deployment. Composite actions — fetching an
     /// `action.yml` from a repository and running its steps — are a different
     /// feature with a different trust model, and pretending to support them by
     /// silently doing nothing would be worse than saying so.
@@ -2391,10 +2402,132 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
         ctx: &Context,
         sid: &str,
         log_path: &std::path::Path,
-    ) -> Result<String, DispatchError> {
+        masker: &crate::secrets::Masker,
+    ) -> Result<(String, Value), DispatchError> {
         let with = |k: &str| step.with.get(k).map(|v| ctx.substitute(v));
+        let required = |key: &str| with(key).filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
         match action {
+            "ci/merge-release" => {
+                let manifests: Vec<String> = serde_json::from_str(&required("manifests")?)
+                    .map_err(|_| DispatchError::StepFailed("with.manifests must be a JSON array of manifest paths".into()))?;
+                let tags = with("tags").map(|raw| serde_json::from_str(&raw)
+                    .map_err(|_| DispatchError::StepFailed("with.tags must be a JSON object mapping manifest paths to tag prefixes".into())))
+                    .transpose()?.unwrap_or_default();
+                let source = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
+                let release = crate::release::merge(&self.store, msg, plan, &source.root,
+                    &manifests, &tags, &required("token")?).await.map_err(DispatchError::StepFailed)?;
+                Ok((format!("[ci] merged and published release {} on {}\nVersions: {}\n",
+                    release.release_sha, release.git_ref, release.versions), serde_json::json!({
+                        "sha": release.release_sha, "ref": release.git_ref, "versions": release.versions.to_string(),
+                        "tags": release.tags
+                    })))
+            }
+            "ci/checkout-release" => {
+                let release = crate::release::get(&self.store, &msg.run_id).await
+                    .map_err(DispatchError::StepFailed)?.filter(|r| r.status == "published")
+                    .ok_or_else(|| DispatchError::StepFailed("release checkout requires a confirmed published release".into()))?;
+                let source = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
+                let bytes = crate::release_git::archive(&source.root, &release.prepared.release_sha)
+                    .await.map_err(DispatchError::StepFailed)?;
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                let remote = format!("{}/.ci-release.tar.gz", workdir.trim_end_matches('/'));
+                vm.upload_bytes(sid, &remote, &bytes).await?;
+                let command = format!("set -e; find {wd} -mindepth 1 -maxdepth 1 ! -name .ci-release.tar.gz -exec rm -rf {{}} +; tar -xzf {src} -C {wd}; rm -f {src}",
+                    wd = shell_quote(workdir), src = shell_quote(&remote));
+                let out = vm.exec(&format!("{sid}.release"), &command, &HashMap::new(), step_timeout(step, plan)).await?;
+                if !out.succeeded() { return Err(DispatchError::StepFailed("release checkout failed".into())); }
+                sqlx::query("UPDATE ci_job SET release_sha=$2 WHERE id=$1")
+                    .bind(&msg.job_id).bind(&release.prepared.release_sha).execute(self.store.pool()).await
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                Ok((format!("[ci] clean checkout of release {}\n", release.prepared.release_sha),
+                    serde_json::json!({"sha": release.prepared.release_sha})))
+            }
+            "ci/publish-service-archive" => {
+                let sha: Option<String> = sqlx::query_scalar("SELECT release_sha FROM ci_job WHERE id=$1")
+                    .bind(&msg.job_id).fetch_one(self.store.pool()).await
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                let sha = sha.ok_or_else(|| DispatchError::StepFailed("service archive must be built after ci/checkout-release in this job".into()))?;
+                let base = required("url")?;
+                let path = required("path")?;
+                let name = required("name")?;
+                let user = required("user-id")?;
+                let token = required("token")?;
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                if std::path::Path::new(&path).is_absolute() || std::path::Path::new(&path).components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+                    return Err(DispatchError::StepFailed("archive path must be relative to the job working directory".into()));
+                }
+                let bytes = vm.download_file(&format!("{sid}.archive"), &format!("{workdir}/{path}"), step_timeout(step, plan)).await?;
+                let archive = crate::service_archive::publish(&base, &token, &user, sid, &name, bytes)
+                    .await.map_err(DispatchError::StepFailed)?;
+                let mut tx = self.store.pool().begin().await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                sqlx::query("INSERT INTO ci_service_archive(step_id,run_id,job_id,archive_id,sha,orchestrator_url) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(step_id) DO UPDATE SET archive_id=excluded.archive_id,sha=excluded.sha,orchestrator_url=excluded.orchestrator_url")
+                    .bind(sid).bind(&msg.run_id).bind(&msg.job_id).bind(&archive).bind(&sha).bind(base.trim_end_matches('/'))
+                    .execute(&mut *tx).await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                let event = Store::add_event(&mut tx, &msg.run_id, Some(&msg.job_id), Some(&msg.job_key), Some(sid),
+                    "ci.service_archive.published.v1", "published", None).await?;
+                sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2 WHERE id=$1")
+                    .bind(event).bind(serde_json::json!({"archive_id":archive,"release_sha":sha}))
+                    .execute(&mut *tx).await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                tx.commit().await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                Ok((format!("[ci] finalized service archive {archive} for release {sha}\n"),
+                    serde_json::json!({"archive-id":archive,"sha":sha})))
+            }
+            "ci/deploy-service" => {
+                let required = |key: &str| with(key).filter(|v| !v.trim().is_empty())
+                    .ok_or_else(|| DispatchError::StepFailed(format!("ci/deploy-service requires with.{key}")));
+                let spec: Value = serde_json::from_str(&required("spec")?)
+                    .map_err(|_| DispatchError::StepFailed("ci/deploy-service with.spec must be JSON".into()))?;
+                crate::cd::deploy(&self.store, msg, sid, spec, &required("url")?,
+                    &required("token")?, step_timeout(step, plan), masker)
+                    .await.map(|note| (note, serde_json::json!({}))).map_err(DispatchError::StepFailed)
+            }
+            "ci/publish-rootfs" => {
+                let path = required("path")?;
+                let image = required("image")?;
+                if std::path::Path::new(&path).is_absolute() || std::path::Path::new(&path).components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+                    return Err(DispatchError::Artifact("rootfs path must be relative to the job working directory".into()));
+                }
+                // Establish release provenance before handing a store credential
+                // to the guest or causing any externally visible upload.
+                let sha = crate::cd::publication_source_sha(&self.store, msg).await.map_err(DispatchError::StepFailed)?;
+                let push = self.artifacts.guest_push().ok_or_else(|| DispatchError::Artifact(
+                    "ci/publish-rootfs requires the artifacts HTTP sink; disk and S3 are not rootfs registries".into()))?;
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                let file = format!("{}/{path}", workdir.trim_end_matches('/'));
+                let budget = step_timeout(step, plan);
+                let mut env = HashMap::new();
+                env.insert("CI_ARTIFACT_URL".to_string(), push.url);
+                if let Some(token) = &push.token { env.insert("CI_ARTIFACT_TOKEN".to_string(), token.clone()); }
+                let out = vm.exec(&format!("{sid}.rootfs"), &guest_push_command(&file, push.token.is_some(), budget), &env, budget).await?;
+                let (blob, size) = parse_guest_push(&out).map_err(DispatchError::Artifact)?;
+                let published = self.artifacts.publish_pushed_rootfs(&blob, size, &image).await
+                    .map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                let size: i64 = published.size_bytes.try_into().map_err(|_| DispatchError::Artifact("rootfs is too large to record".into()))?;
+                let mut tx = self.store.pool().begin().await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                sqlx::query("INSERT INTO ci_app_lb_artifact(step_id,run_id,job_id,sha,store_url,manifest_digest,blob_digest,size_bytes) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(step_id) DO UPDATE SET sha=excluded.sha,store_url=excluded.store_url,manifest_digest=excluded.manifest_digest,blob_digest=excluded.blob_digest,size_bytes=excluded.size_bytes")
+                    .bind(sid).bind(&msg.run_id).bind(&msg.job_id).bind(&sha).bind(&published.store_url)
+                    .bind(&published.manifest_digest).bind(&published.blob_digest).bind(size)
+                    .execute(&mut *tx).await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                let event = Store::add_event(&mut tx, &msg.run_id, Some(&msg.job_id), Some(&msg.job_key), Some(sid),
+                    "ci.rootfs.published.v1", "published", None).await?;
+                sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2 WHERE id=$1").bind(event).bind(json!({
+                    "sha":sha,"store_url":published.store_url,"manifest_digest":published.manifest_digest,
+                    "blob_digest":published.blob_digest,"size_bytes":published.size_bytes
+                })).execute(&mut *tx).await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                tx.commit().await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                Ok((format!("[ci] published rootfs manifest {} ({} bytes) for {sha}\n", published.manifest_digest, published.size_bytes),
+                    json!({"manifest":published.manifest_digest,"blob":published.blob_digest,"size":published.size_bytes,"store":published.store_url,"sha":sha})))
+            }
+            "ci/deploy-app-lb" => {
+                crate::cd::deploy_app_lb(&self.store, msg, sid, &required("url")?, &required("token")?,
+                    &required("deployment")?, &required("namespace")?, &required("manifest")?, &required("store")?,
+                    step_timeout(step, plan), masker).await
+                    .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
+            }
             "ci/upload-artifact" => {
                 let name = with("name").ok_or_else(|| {
                     DispatchError::Artifact("ci/upload-artifact needs `with.name`".into())
@@ -2592,7 +2725,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 let transfer = started.elapsed();
 
                 self.store
-                    .record_artifact(&msg.run_id, &msg.job_id, &name, &stored)
+                    .record_artifact(&msg.run_id, &msg.job_id, sid, &name, &stored)
                     .await?;
                 // The link is the point of `public: true`, so it goes in the
                 // log where a person reading the run will find it. A sink
@@ -2606,15 +2739,51 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     ),
                     (None, false) => String::new(),
                 };
-                Ok(format!(
+                Ok((format!(
                     "[ci] stored artifact {name:?} ({} bytes) in the {} sink as {} — \
                      {how} in {transfer:.0?}{public}\n",
                     stored.size_bytes, stored.sink, stored.uri
-                ))
+                ), serde_json::json!({})))
+            }
+            "ci/download-artifact" => {
+                let name = required("name")?;
+                let path = required("path")?;
+                let producer = with("job").filter(|v| !v.trim().is_empty());
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                let remote = artifact_download_path(workdir, &path)?;
+                // Scope at the query boundary: workflow input can name an
+                // artifact and (only for duplicate names) its producer, never
+                // a run, URI, path in the sink, or remote URL.
+                let rows = sqlx::query(
+                    "SELECT a.run_id,a.name,a.sink,a.digest,a.size_bytes,a.uri,a.public_url,
+                            j.job_key,j.status,j.finished_at IS NOT NULL AS finished
+                       FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id
+                      WHERE a.run_id=$1 AND a.name=$2 ORDER BY a.created_at",
+                ).bind(&msg.run_id).bind(&name).fetch_all(self.store.pool()).await
+                    .map_err(|e| DispatchError::Artifact(format!("looking up artifact {name:?}: {e}")))?;
+                let candidates = rows.iter().map(|r| Ok(DownloadCandidate {
+                    run_id: r.get("run_id"), name: r.get("name"), job_key: r.get("job_key"),
+                    status: r.get("status"), finished: r.get("finished"),
+                    stored: crate::artifacts::StoredArtifact {
+                        sink: match r.get::<String,_>("sink").as_str() {
+                            "disk" => "disk", "s3" => "s3", "artifacts" => "artifacts",
+                            other => return Err(DispatchError::Artifact(format!("artifact {name:?} has unknown recorded sink {other:?}"))),
+                        },
+                        digest: r.get("digest"), size_bytes: r.get::<i64,_>("size_bytes").try_into()
+                            .map_err(|_| DispatchError::Artifact(format!("artifact {name:?} has invalid recorded size")))?,
+                        uri: r.get("uri"), public_url: r.get("public_url"),
+                    },
+                })).collect::<Result<Vec<_>, DispatchError>>()?;
+                let selected = select_download(&msg.run_id, &name, producer.as_deref(), &candidates)?;
+                let bytes = self.artifacts.get(&selected.stored).await
+                    .map_err(|e| DispatchError::Artifact(format!("downloading artifact {name:?}: {e}")))?;
+                vm.upload_bytes(sid, &remote, &bytes).await?;
+                Ok((format!("[ci] downloaded artifact {name:?} from job {:?} to {path:?} ({} bytes)\n",
+                    selected.job_key, bytes.len()), serde_json::json!({})))
             }
             other => Err(DispatchError::Artifact(format!(
                 "`uses: {other}` is not a built-in action. Available: \
-                 ci/upload-artifact. Composite actions from a repository are not \
+                 ci/upload-artifact, ci/download-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service, ci/publish-rootfs, ci/deploy-app-lb. Composite actions from a repository are not \
                  supported."
             ))),
         }
@@ -2643,6 +2812,45 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
         env.insert("CI_JOB_KEY".to_string(), plan.key.clone());
         env
     }
+}
+
+#[derive(Debug, Clone)]
+struct DownloadCandidate {
+    run_id: String,
+    name: String,
+    job_key: String,
+    status: String,
+    finished: bool,
+    stored: crate::artifacts::StoredArtifact,
+}
+
+fn select_download<'a>(run_id: &str, name: &str, producer: Option<&str>, candidates: &'a [DownloadCandidate])
+    -> Result<&'a DownloadCandidate, DispatchError>
+{
+    let matching = candidates.iter().filter(|a| a.run_id == run_id && a.name == name &&
+        producer.is_none_or(|job| a.job_key == job)).collect::<Vec<_>>();
+    match matching.as_slice() {
+        [] => Err(DispatchError::Artifact(format!("no artifact named {name:?}{} exists in the current run",
+            producer.map(|j| format!(" from job {j:?}")).unwrap_or_default()))),
+        [one] if one.status != "success" || !one.finished => Err(DispatchError::Artifact(format!(
+            "artifact {name:?} was produced by job {:?}, which is not completed successfully (status {:?})",
+            one.job_key, one.status))),
+        [one] => Ok(one),
+        many => Err(DispatchError::Artifact(format!("artifact {name:?} is ambiguous: {} producers match; set with.job", many.len()))),
+    }
+}
+
+fn artifact_download_path(workdir: &str, path: &str) -> Result<String, DispatchError> {
+    let relative = std::path::Path::new(path);
+    if path.trim().is_empty() || path.ends_with('/') || relative.file_name().is_none()
+        || relative.is_absolute() || !relative.components().all(|c|
+            matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+    {
+        return Err(DispatchError::Artifact(
+            "ci/download-artifact with.path must name a file relative to the job working directory".into(),
+        ));
+    }
+    Ok(std::path::Path::new(workdir).join(relative).to_string_lossy().into_owned())
 }
 
 /// Give a second run of the same submission its own workspace.
@@ -2880,14 +3088,6 @@ async fn process_delivery(
                     delay.as_secs()
                 );
                 let _ = dispatcher.store.note_job_error(&job.job_id, &detail).await;
-                dispatcher
-                    .bus
-                    .publish_event(
-                        &job.run_id,
-                        &job.job_key,
-                        &serde_json::json!({"status": "running", "error": detail}),
-                    )
-                    .await;
                 let _ = msg
                     .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
                     .await;
@@ -3876,6 +4076,7 @@ fn or_none(items: &[String]) -> String {
 
 #[derive(Debug)]
 pub enum DispatchError {
+    Native(String),
     Store(crate::store::StoreError),
     Pool(crate::pool::PoolError),
     Bus(crate::bus::BusError),
@@ -4061,6 +4262,7 @@ fn checkout_error(e: VmError) -> DispatchError {
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Native(e) => write!(f, "native runner: {e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Pool(e) => write!(f, "{e}"),
             Self::Bus(e) => write!(f, "{e}"),
@@ -4321,6 +4523,39 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             exit_code: exit,
+        }
+    }
+
+    fn download_candidate(run: &str, job: &str) -> DownloadCandidate {
+        DownloadCandidate {
+            run_id: run.into(), name: "bundle".into(), job_key: job.into(),
+            status: "success".into(), finished: true,
+            stored: crate::artifacts::StoredArtifact {
+                sink: "disk", digest: None, size_bytes: 1, uri: "/recorded".into(), public_url: None,
+            },
+        }
+    }
+
+    #[test]
+    fn artifact_download_selection_is_same_run_unique_and_explicit() {
+        let wrong = vec![download_candidate("other-run", "build")];
+        assert!(select_download("this-run", "bundle", None, &wrong).unwrap_err().to_string().contains("current run"));
+        assert!(select_download("this-run", "missing", None, &[]).unwrap_err().to_string().contains("no artifact"));
+
+        let two = vec![download_candidate("this-run", "mac"), download_candidate("this-run", "windows")];
+        assert!(select_download("this-run", "bundle", None, &two).unwrap_err().to_string().contains("ambiguous"));
+        assert_eq!(select_download("this-run", "bundle", Some("windows"), &two).unwrap().job_key, "windows");
+    }
+
+    #[test]
+    fn artifact_download_requires_a_finished_successful_producer_and_safe_path() {
+        let mut failed = download_candidate("run", "build");
+        failed.status = "failure".into();
+        assert!(select_download("run", "bundle", None, &[failed]).unwrap_err().to_string().contains("not completed successfully"));
+        assert_eq!(artifact_download_path("/workspace", "dist/native.tar.gz").unwrap(), "/workspace/dist/native.tar.gz");
+        assert_eq!(artifact_download_path("/workspace/", ".cache/native.tar.gz").unwrap(), "/workspace/.cache/native.tar.gz");
+        for path in ["../secret", "dist/../../secret", "/etc/passwd", ".", "", "dist/"] {
+            assert!(artifact_download_path("/workspace", path).is_err(), "{path:?}");
         }
     }
 

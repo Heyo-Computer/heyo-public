@@ -48,6 +48,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod heyo_login;
+
 /// Where the browser is sent to sign in.
 const GOOGLE_AUTHORIZE: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 /// Where app-lb exchanges the code for tokens, server to server.
@@ -769,6 +771,9 @@ impl Authenticator {
         req: &RequestInfo<'_>,
         return_to: &str,
     ) -> Response {
+        if req.wants_html && gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some()) {
+            return self.heyo_login_page(gate, deployment_id, req, return_to);
+        }
         // A token-only gate has no sign-in flow to start: there is no provider to
         // redirect to and no cookie to set. Say what would actually work rather
         // than sending a browser into an OAuth round trip that ends in a blank
@@ -1130,13 +1135,20 @@ impl Authenticator {
         // Only app-lb's own cookie is cleared: signing the user out of Google
         // itself is not app-lb's to do, and doing it would sign them out of
         // every other tab they have open.
-        Response::redirect(
+        let mut response = Response::redirect(
             format!("{}{}", origin(req), gate.login_path()),
             vec![
                 clear_cookie(&gate.cookie_name, req.secure, gate.cookie_domain_for(req.host).as_deref()),
                 clear_cookie(FLOW_COOKIE, req.secure, None),
             ],
-        )
+        );
+        if let Some(policy) = gate.jwt_policy()
+            && policy.login_endpoint.is_some()
+            && let Some(cookie) = policy.cookie.as_deref()
+        {
+            response.cookies.push(clear_cookie(cookie, req.secure, None));
+        }
+        response
     }
 
     /// The identity in the request's session cookie, if it has a valid one.
@@ -1950,6 +1962,94 @@ mod tests {
         use serde_json::json;
 
         const SECRET: &str = "a-shared-secret-of-some-length";
+
+        #[tokio::test]
+        async fn browser_login_uses_issuer_then_checks_policy_and_sets_host_cookie() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/login", listener.local_addr().unwrap());
+            let token = heyo_token(json!({}));
+            let router = axum::Router::new().route("/login", axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let token = token.clone();
+                    async move {
+                        assert_eq!(body, json!({"email":"someone@example.com","password":"p&ss word"}));
+                        axum::Json(json!({"success":true,"data":{"tokens":{"accessToken":token,"expiresIn":3600}}}))
+                    }
+                },
+            ));
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let a = with_secret();
+            let mut g = jwt_gate(r#""jwt""#, &format!(r#", "cookie":"heyo_login", "login_endpoint":"{endpoint}""#));
+            let page = a.start(&g, "web", &req("/runs/abc", vec![]), "/runs/abc?before=17");
+            assert_eq!(page.status, 200);
+            assert!(page.body.contains("autocomplete=\"current-password\""));
+            assert!(page.cookies[0].contains("Secure") && page.cookies[0].contains("HttpOnly"));
+            if let Ok(path) = std::env::var("HEYO_LOGIN_HTML") { std::fs::write(path, &page.body).unwrap(); }
+            let raw = cookie_values(&page.cookies, FLOW_COOKIE).remove(0);
+            let flow = Flow::decode(&a.verify(&raw).unwrap()).unwrap();
+            let body = form_urlencoded::Serializer::new(String::new())
+                .append_pair("state", &flow.nonce).append_pair("email", "someone@example.com")
+                .append_pair("password", "p&ss word").finish();
+            let request = req("/__applb/auth/login", page.cookies);
+            let r = a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com:443"), body.as_bytes()).await;
+            assert_eq!(r.status, 302);
+            assert_eq!(r.location.as_deref(), Some("/runs/abc?before=17"));
+            assert!(r.cookies[0].starts_with("heyo_login="));
+            assert!(r.cookies[0].contains("Secure") && r.cookies[0].contains("HttpOnly"));
+            assert!(!r.cookies[0].contains("Domain="));
+            assert!(matches!(a.decide(&g, "web", "default", &req("/runs/abc", r.cookies)).await, Decision::Allow(identity) if identity.is_some()));
+            g.jwt.as_mut().unwrap().require.insert("email".into(), json!("other@example.com"));
+            let denied = a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), body.as_bytes()).await;
+            assert_eq!(denied.status, 403);
+            assert!(denied.cookies.is_empty());
+            let logout = a.logout(&g, &request);
+            assert!(logout.cookies.iter().any(|c| c.starts_with("heyo_login=") && c.contains("Max-Age=0")));
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn browser_login_rejects_cross_site_expired_and_wrong_deployment_flows() {
+            let a = with_secret();
+            let g = jwt_gate(r#""jwt""#, r#", "cookie":"heyo_login", "login_endpoint":"http://127.0.0.1:9/login""#);
+            let mut request = req("/__applb/auth/login", vec![]);
+            for origin in [None, Some("https://evil.example.com"), Some("https://app.example.com:444"), Some("http://app.example.com")] {
+                assert_eq!(a.heyo_login_submit(&g, "web", &request, origin, b"state=a").await.status, 403);
+            }
+            for (deployment, exp, nonce) in [("other", now_secs()+60, "a"), ("web", now_secs(), "a"), ("web", now_secs()+60, "wrong")] {
+                let flow = Flow { deployment:deployment.into(), exp, nonce:nonce.into(), verifier:String::new(), return_to:"/".into() };
+                request.cookies = vec![format!("{FLOW_COOKIE}={}", a.sign(&flow.encode()))];
+                assert_eq!(a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), b"state=a&email=a&password=b").await.status, 403);
+            }
+            request.secure = false;
+            assert_eq!(a.start(&g, "web", &request, "/").status, 403);
+            request.secure = true;
+            request.wants_html = false;
+            assert_eq!(a.start(&g, "web", &request, "/").status, 401);
+            assert_eq!(a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), &vec![b'x';8193]).await.status, 413);
+        }
+
+        #[tokio::test]
+        async fn browser_login_does_not_forward_passwords_through_redirects() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/login", listener.local_addr().unwrap());
+            let captured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = captured.clone();
+            let router = axum::Router::new()
+                .route("/login", axum::routing::post(|| async { axum::response::Redirect::temporary("/capture") }))
+                .route("/capture", axum::routing::post(move || {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async { "unexpected credential forwarding" }
+                }));
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let a = with_secret();
+            let g = jwt_gate(r#""jwt""#, &format!(r#", "cookie":"heyo_login", "login_endpoint":"{endpoint}""#));
+            let flow = Flow { deployment:"web".into(), exp:now_secs()+60, nonce:"a".into(), verifier:String::new(), return_to:"/".into() };
+            let request = req("/__applb/auth/login", vec![format!("{FLOW_COOKIE}={}", a.sign(&flow.encode()))]);
+            let response = a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), b"state=a&email=a%40example.com&password=b").await;
+            assert_eq!(response.status, 502);
+            assert!(!captured.load(std::sync::atomic::Ordering::SeqCst));
+            server.abort();
+        }
 
         /// An authenticator whose secret store holds the issuer's signing key,
         /// as a real deployment's would.

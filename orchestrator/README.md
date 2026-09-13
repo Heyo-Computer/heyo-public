@@ -49,7 +49,7 @@ The services are independent processes but can share one PostgreSQL database. Ea
 - **Orchestrator** never talks to the backend hypervisor directly during a request — it persists the desired state, then a reconciler loop drives `mvm-ctrl` to converge. When deploying a Heyo-managed *service* whose manifest references secrets (`envRefs`), it calls **HeyoSecret** to materialize them just-in-time using the `heyosecret-client` crate.
 - **HeyoSecret** is a small KV with versioning, audit history, and AES-GCM encryption at rest. Only the orchestrator (and other internal services) holds the `HEYOSECRET_INTERNAL_API_KEY`; tenant code never sees it.
 
-Service rollouts keep the previous healthy deployment active while the candidate converges. The controller retries Cloud state and health reads with capped backoff under one deployment deadline, requires candidate and app-lb route health to remain successful for 10 seconds, and uses the candidate's public endpoint for stable route cutover even when an internal endpoint answers health first. Only persisted terminal state or the deadline is failure; deployment events are diagnostics, not a liveness signal.
+Service rollouts keep the previous healthy deployment active while the candidate converges. The controller retries Cloud state and health reads with capped backoff under one deployment deadline and requires candidate and app-lb route health to remain successful for 10 seconds. It prefers the candidate's internal endpoint for readiness and upstream routing: the public sandbox URL can require end-user authentication and return 401 for an otherwise healthy service. Legacy `url` and public endpoints remain fallbacks when no internal endpoint is supplied. Only persisted terminal state or the deadline is failure; deployment events are diagnostics, not a liveness signal.
 
 ## Public service deployment boundary
 
@@ -230,3 +230,40 @@ workflow with mocked network/build calls. `SERVICE_SPEC_BASELINE_REF` optionally
 compares against an old-workflow Git revision. `SERVICE_SPEC_FIXTURE_DIR` exports
 synthetic payloads; use the same directory for the private caller tests and the
 Rust contract test to validate all six VM service requests.
+
+### us3 app-lb deployment
+
+`app-lb.us3.json` is an inert bootstrap spec: no public routes, zero replicas,
+and a commit placeholder. `Dockerfile.firecracker` builds and tests the locked
+Rust source from the public repository root. It includes migrations and a serial
+guest init; app-lb launches the daemon with resolved `env_from` secrets.
+
+Before registering it, replace the build ref with the verified public commit,
+provision a region-isolated database, and deliver its URL and existing JWT/internal
+keys through app-lb secrets backed by HeyoSecret. Do not reuse `orchestrator_db`
+for us3: it holds eu1 service state and retirement history even though its Postgres
+host is in us3. Startup runs migrations and immediately processes pending events,
+expired step leases, and eligible previous-deployment stop/delete intents.
+
+Build through `POST /deployments/orchestrator-us3/build` on the existing us3
+app-lb, inspect the returned job, then set one minimum replica. Attach the existing
+Heyo JWT gate and `orchestrator.us3.heyo.work` route only after readiness. Machine
+API paths must retain Orchestrator's own bearer authentication. This adds an app;
+it does not replace app-lb or change retail/login.
+
+A healthy `/health` does not prove CD works. Configure and verify regional
+`CLOUD_INTERNAL_URL`, `ORCHESTRATOR_BACKEND_API_URL`, proxy domains, and optional
+`ORCHESTRATOR_NATS_URL`/`ORCHESTRATOR_NATS_ENABLED` before accepting deployment
+jobs. Cloud must accept the configured internal key and allocate the us3 backend.
+The current Orchestrator also reads Cloud's `deployed_sandboxes` table directly:
+regional Cloud must use this region's database and populate its deployment state.
+Pointing an isolated Orchestrator at staging Cloud does not satisfy that contract.
+Keep staging/eu1 dependencies explicit until those services are regionalized;
+do not call a health-only installation an independent region.
+
+The app-lb host needs Docker for image builds. If Postgres is protected by the
+existing per-VM allowlist, grant each candidate's exact IP and tap interface
+access to port 6432 before expecting database readiness. Retain existing rules;
+do not open the database publicly. A replacement VM needs its own grant, so this
+bootstrap setup is not unattended rollout readiness. Keep a candidate's boot
+deadline long enough to establish that access, then restore the normal deadline.

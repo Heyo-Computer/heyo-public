@@ -30,9 +30,45 @@ CI_DATABASE_URL=postgres://…/ci CI_WEBHOOK_SECRET=$(openssl rand -hex 32) \
 cargo run
 ```
 
-Configuration is environment-only; there are no CLI arguments. **A
+Service configuration is environment-only. **A
 misconfiguration is a startup exit, not a degraded service** — every error names
 the variable to fix. See `deploy/supervisor/ci.conf` for the full set.
+
+Validate workflow parsing and matrix/dependency planning without starting the
+service or connecting to Postgres, NATS, or runners:
+
+```bash
+ci --check-workflows .ci/workflows/*.yml
+```
+
+This is a static check, not evidence that build commands or deployments work.
+
+### Building and releasing the public CI system
+
+Register `ci/system.yml` as the repository workflow to build the Linux CI service
+and test/build the native agent on real Intel Mac and Windows hosts. It uses the
+repository's assigned Linux network, not the existing us2 host pin. All three
+builds upload artifacts and are required by the single release job.
+Linux tests and release compilation have separate steps with explicit 60-minute
+limits: the two-hour job limit does not override the default 30-minute step limit.
+
+Release and deployment default to disabled. `RELEASE_ENABLED=true` permits the
+gated merge/version/tag action with `GIT_AUTH_TOKEN`; `DEPLOY_ENABLED=true` also
+permits Orchestrator deployment. These are separate publication permissions, not
+runner setup options. The release checks the exact captured `ci.release_base_sha`
+to source diff and refuses changes outside `ci/` and `.ci/image/ci/`: CI tests
+cannot authorize merging unrelated application changes.
+
+The release archive is rebuilt from the confirmed bumped tree and contains the
+CI executable, `start.sh`, and `REVISION`. Configure `ORCHESTRATOR_URL`,
+`SERVICE_OWNER`, a complete `SERVICE_SPEC`, and `ORCHESTRATOR_TOKEN` through the
+workflow's HeyoSecret scope. The workflow inserts only the finalized archive ID
+into that spec. The target must supply external Postgres/NATS and durable CI
+workspace/log/artifact storage. This archive does **not** replace the stateful
+CI/NATS bundle by itself: it contains no broker. For the new us3 installation,
+`ci/Dockerfile.firecracker` packages CI and NATS together and
+`.heyo/regions/us3/ci.json` defines the app-lb deployment. Existing us3 CI test
+data is disposable; no migration of that test data is required.
 
 ## Submitting a build
 
@@ -45,10 +81,18 @@ git config ci.token    cis_019fca648a6e-00000002.…
 
 git submit --dry-run    # show what would be sent
 git submit              # submit HEAD
+git submit pr59         # fetch and submit the exact head commit of GitHub PR #59
 git submit --dirty      # include uncommitted tracked changes
 git submit --archive    # send a tree-only tarball instead of a bundle
 git submit --only apps  # run one workflow file, skip the rest
 ```
+
+The positional `pr<number>` selector fetches `refs/pull/<number>/head` from
+`origin` into a short-lived private local ref and submits that exact commit via
+the same bundle/archive path as `--ref`. It does not check out the PR or change
+the current branch, index, or worktree, and it performs no GitHub write. A PR
+selector cannot be combined with `--ref` or `--dirty`; malformed selectors and
+PR refs that the remote cannot provide are rejected before submission.
 
 `--only <workflow>` starts runs for just the workflow files it names and leaves
 every other one alone. A selector is the file's path
@@ -605,6 +649,16 @@ Both are the dashboard's manual trigger, and both are the answer to "the build
 timed out on a cold cache": the re-run claims the same warm VM, and with it the
 cache disk the first attempt spent its budget filling.
 
+Machine callers can use `POST /api/runs/{id}/rerun-failed` with the same
+`Authorization: Bearer <repository token>` used by `git submit`. No browser
+login is required. The token must belong to the run's repository and remain
+enabled and unrevoked. Read-path HMAC signatures cannot authorize this write.
+The response is `202` with `runs`, `url`, and `warnings`, as for submission.
+An active run or unresolved service deployment returns `409`; rerunning does
+not bypass repository policy or release/deployment gates. If a request loses
+its response, check `reruns` in `GET /api/runs/{id}` before posting again:
+every accepted request creates a new run, not an idempotent reset.
+
 **A re-run is a new run**, with `rerun_of` pointing at the one it re-plays and
 the original's page listing what re-played it — never a reset of the old run.
 Run and job ids name their logs and derive the step operation ids the daemon
@@ -784,6 +838,13 @@ authority: it returns `backend_server_id`, a different field fed by the
 `BACKEND_SERVER_ID` environment variable, and trusting it pins jobs to an id the
 cloud may have no live registration for — a queue with no consumer beside a
 daemon that is perfectly healthy. `CI_DEFAULT_NODE` overrides everything.
+
+For a fixed host, `CI_LOCAL_RUNNER` can name the daemon's direct base URL instead
+of using Cloud discovery. `CI_LOCAL_RUNNER_TOKEN` supplies that daemon's bearer
+credential when required; leaving it unset preserves unauthenticated local
+development. Keep the credential in HeyoSecret-backed deployment configuration,
+and use HTTPS or a trusted private host-to-VM network for this connection.
+This mode does not register or move the host between Cloud installations.
 
 `CI_VM_LEASE_SECS` (default 180) is the window between an instance dying and its
 VMs becoming reclaimable; renewal runs at a third of it.
@@ -1067,6 +1128,204 @@ Postgres for runs, jobs, steps, artifacts and the pool; **step logs go to disk**
 with the path and byte count on the row. A build log is megabytes, and putting it
 in a column means every listing query drags all of it across the wire.
 
+### Validation, merge, version bump, build and deployment
+
+The opt-in [release workflow example](release-example.yml) connects these stages
+using built-in actions. It is outside `.ci/workflows/` and does not enable live
+publication automatically. Use only trusted registered workflows with explicitly
+granted HeyoSecret credentials; branch protections and repository permissions
+still apply. No action creates a GitHub release. Component tags require an
+explicit `with.tags` policy.
+
+- `ci/merge-release` requires successful, fresh validation jobs in `needs`,
+  including every matrix cell and every declared validation step. Skipped,
+  carried-over or error-tolerant validations cannot authorize publication.
+  `with.manifests` is a JSON array of `package.json`/`Cargo.toml` paths;
+  `with.token` is the Git HTTPS credential. The public submit client separately
+  captures `repository.defaultBranch` and `repository.releaseBaseSha` from
+  `origin/HEAD` and its remote-tracking tip. Fetch trunk before submission. That
+  base must be an ancestor of the submitted source, and target trunk must still
+  equal that base at publication. The submitted feature branch is not advanced.
+  Ordinary `before` change detection is unchanged; missing release metadata
+  prevents release publication but does not prevent ordinary builds.
+  Publication fast-forwards target trunk to the source plus a deterministic
+  version commit, never merges unvalidated concurrent trunk changes. Resubmit and
+  revalidate if trunk moved. Submit a Git bundle, not `--archive`.
+- Changed components receive a major bump for breaking changes, minor for
+  conventional `feat` commits, otherwise patch. Unchanged components are omitted.
+  Explicit package versions and adjacent Cargo/npm lockfiles are supported;
+  inherited Cargo workspace versions are rejected. Empty changes produce no
+  extra version commit. Outputs are `sha`, `ref`, and JSON-string `versions`.
+- Optional `with.tags` maps declared manifests to tag prefixes, for example
+  `'{"ci/Cargo.toml":"ci-v"}'`. Only changed manifests produce tags. CI pushes
+  lightweight component tags and the version commit atomically, with exact-ref
+  leases. Conflicting tags or moved trunk refuse publication; retries reconcile
+  the same candidate and never overwrite a tag at a different commit. Existing
+  workflows without this field remain tagless.
+- CI persists the candidate before pushing. A lost acknowledgement can retry
+  only that same candidate, never generate another version bump. The run page's
+  **Release** section and authenticated `/api/runs/{run_id}/release` distinguish
+  prepared, uncertain, and confirmed publication and show both source/release SHAs.
+- `ci/checkout-release` clears the job checkout and extracts the confirmed
+  release tree before building. It deliberately has no `.git` directory; use
+  its `sha` output for build stamps. Build jobs must run this explicitly, then
+  build/package from those files. Original `ci.sha` remains the validated source.
+  Native Intel Mac and Windows jobs support the same action through a
+  lease-fenced download of that exact release tree.
+- `ci/publish-service-archive` uploads an already-built tarball (`with.path`,
+  relative to the job working directory) using Orchestrator presign, upload,
+  and finalize APIs. It also requires `url`, `token`, `user-id`, and `name`.
+  It records the finalized archive's release SHA and returns `archive-id` and
+  `sha`. The job must have completed `ci/checkout-release`. This is distinct
+  from the generic artifact sink; a deployment cannot substitute its tag/URL.
+- In release workflows, `ci/deploy-service` accepts only an archive recorded
+  for this run's confirmed release and the same Orchestrator. The revision guard
+  and deployment UI use the release SHA, not the pre-bump source SHA.
+
+Archive APIs lack idempotency keys: a retry can leave an extra uploaded archive,
+but failed/uncertain finalization never authorizes a deployment. Publication,
+release and deployment state write NATS outbox events transactionally. These
+actions do not change app-lb, namespaces, existing VM pages, or Retail.
+
+### Service deployments
+
+For an existing app-lb VM deployment, use `ci/publish-rootfs` followed by
+`ci/deploy-app-lb`. Publication takes `path` (a relative raw ext4 file) and
+`image` (its image name), and requires the HTTP artifacts sink. Its outputs are
+`manifest`, `blob`, `size`, `store`, and `sha`. Release workflows must publish
+from a job that ran `ci/checkout-release` at the confirmed release commit.
+
+`ci/deploy-app-lb` takes `url`, `token`, `deployment`, `namespace`, `manifest`,
+and `store`. It accepts only a manifest recorded by a successful publication
+step in this run; a cross-job producer must also have succeeded. The target
+must already exist with the matching namespace and artifact store. app-lb must
+support durable correlated pulls (`operation_id`); older servers are rejected.
+CI waits for app-lb to verify the exact replacement's health, and records the
+operation in the same Deployments UI and NATS outbox as service deployments.
+Cancellation or uncertain transport stops waiting, not the remote rollout;
+resuming the same step reconciles its operation instead of creating another.
+These actions do not register services, merge branches, or publish tags.
+
+`ci/deploy-service` runs an asynchronous service rollout through Orchestrator's
+existing `POST /orchestration/services/deployments` API. It does not create VMs,
+implement routing, or change app-lb's namespace model. The existing CI run page
+has a **Deployments** section with service, operation ID, exact revision, phase,
+status, errors, and the last observation time. Refresh the page for new status.
+`GET /api/runs/{run_id}/deployments` uses the same repository-scoped authentication
+as other run reads.
+
+The action takes `with.url` (Orchestrator base URL), `with.token` (resolved from
+the workflow's HeyoSecret-backed secrets), and `with.spec` (a JSON string in the
+existing snake_case service format). HTTPS is required except on loopback;
+redirects are not followed. No installation-wide credential is automatically
+granted to a workflow. Orchestrator currently requires an **internal API key**,
+so enable this only for trusted service-deployment workflows; this is not yet a
+tenant-scoped customer deployment credential.
+
+```yaml
+# Steps within a trusted deployment job, after its build/validation dependencies.
+- uses: ci/deploy-service
+  timeout-minutes: 15
+  with:
+    url: ${{ vars.ORCHESTRATOR_URL }}
+    token: ${{ secrets.ORCHESTRATOR_TOKEN }}
+    spec: >-
+      {"id":"example-api","user_id":"service-owner",
+       "vm":{"driver":"firecracker","image":"ubuntu","port":8080},
+       "deploy":{"archive_id":"${{ needs.build.outputs.archive_id }}"}}
+```
+
+`deploy.archive_id` must identify a finalized **Orchestrator service archive**,
+uploaded through its existing archive APIs. It is not a `ci/upload-artifact`
+tag/digest; automatic transfer between the two stores is not implemented here.
+Use the repository-owned service spec for real startup, health, route, and
+secret-reference settings. The action overwrites `deploy.deployment_id`, `async`,
+and `revision_guard` with its stable step identity and the CI run's repository,
+branch ref and full SHA (the confirmed release SHA for release workflows);
+`force` is always false. The remote branch must still
+point at that revision when Orchestrator checks it. Workflow dependencies and
+secret permissions remain the admission boundary; the action does not merge a
+branch or create a release.
+
+Before POST, CI commits an operation ledger row and NATS outbox event together.
+Orchestrator does not deduplicate POSTs, so repeated execution of the **same
+step** only polls that operation ID. A changed request for that step is rejected.
+Lost responses, 404s, and status lookup failures never cause a second POST.
+Only an identity-matched terminal Orchestrator status marks a rollout passed or
+failed. Cancellation/timeout stops CI waiting, not the remote rollout; the UI
+keeps its last known status and warns that it may continue. Re-running a run
+with unresolved deployment records is refused. Automatic reconciliation after
+a finished/cancelled run, and an operator reconciliation UI, remain follow-up
+work; queue replay of an unfinished action resumes GET polling with resolved
+workflow credentials. Do not erase unknown operation records to retry them.
+
+### Durable execution events
+
+Postgres is authoritative for run, job, and step state. Each authoritative
+status mutation writes a `ci_event_outbox` row in the **same transaction**. A
+single background publisher reads those rows, publishes to
+`<CI_NATS_PREFIX>.evt.<run_id>.<job_key|run>`, waits for JetStream's PubAck, and
+only then marks the row published. NATS outages therefore delay notifications;
+they do not roll back execution state or cause work to execute again. Job
+subjects and their work-queue retention are unchanged.
+
+The JSON envelope is version 1 and contains `version`, stable UUID `id`, history
+cursor `revision`, repository scope (`repo_id`), exact Git `sha` and `git_ref`, `transitioned_at`, `type`
+(`ci.run.status.v1`, `ci.job.status.v1`, `ci.step.status.v1`, `ci.artifact.published.v1`,
+`ci.release.status.v1`, `ci.service_archive.published.v1`, or `ci.deployment.status.v1`), `run_id`, and
+nullable `job_id`, `job_key`, and `step_id`. `status` and `error` remain top-level
+for existing dashboard consumers. The same UUID is sent as `Nats-Msg-Id` on
+every retry. A crash after PubAck and before the database update can redeliver
+the same event after JetStream's duplicate window, so consumers must deduplicate
+by `id` and tolerate at-least-once delivery. Events are retained by JetStream
+for 24 hours; the outbox currently has no automatic archival/pruning policy.
+The authenticated `GET /api/runs/{run_id}/events?limit=50&before=<revision>` API
+uses the same repository bearer token or path-HMAC semantics as other run reads,
+returns 404 across repository boundaries, and caps pages at 100 events.
+The authenticated browser run page also renders an **Event timeline** beside
+Release and Deployments, with 50 records per page, older/newest navigation,
+transition errors, and NATS publication attempts/errors. It reads the same
+durable records; publication status is not approval to release or deploy.
+Revisions order history, not concurrent
+transaction commits or NATS delivery. Consumers must re-read authoritative
+state rather than assuming receipt order determines the latest state.
+
+`ci.artifact.published.v1` records a successful sink upload and its artifact row
+in the same transaction as the event. Its `artifact` object contains `id`,
+`name`, `sink`, `digest`, `size_bytes`, `uri`, and nullable `public_url`. The
+upload step ID is the idempotency key: concurrent retries produce one row and
+one event; a retry with different recorded metadata fails instead of replacing
+the publication. History reads return the complete NATS envelope with additional
+`publication` delivery metadata, so reconciliation does not lose commit or
+artifact identity. Existing artifacts are retained without synthetic events.
+
+A publication is **not a release or deploy approval**. Uploads can precede a
+later test failure or cancellation. CD must independently check exact-revision
+validation, merge/release admission, and required artifacts. Use the digest to
+identify immutable content, not a mutable tag in `uri`. New disk uploads also
+record SHA256; legacy disk records may omit it. Disk storage is still local to
+the CI service, not a shared deployment store. A sink write and Postgres
+cannot share a transaction: a crash between them can leave an unrecorded blob;
+an upload retry reconciles through the sink before recording publication.
+
+Linux jobs can use `ci/download-artifact` with `name` and a relative file `path`
+to download an earlier successful job's stored archive in the same run. Declare
+the producer in `needs`; set `with.job` to its expanded job key if multiple
+producers used the same artifact name. Missing, ambiguous, unfinished, or failed
+producers are refused. Downloads verify size and SHA256 when recorded, preserve
+the uploaded tar.gz bytes, and do not unpack them. Disk and `artifacts` stores
+support downloads; the S3 sink remains unimplemented. Downloading an artifact
+does not make it an approved release or service archive.
+
+This is CI execution history, not deployment authorization. The release actions
+above separately gate publication and the release-artifact handoff. Automatic
+reconciliation of uncertain deployments after finished runs remains outstanding.
+Native Intel Mac and Windows execution is available through the separate
+[native runner protocol](NATIVE_RUNNERS.md), with durable leases and fenced
+results/artifacts. Real-host testing remains a cutover prerequisite; local
+executor tests do not establish Windows or Intel Mac installation readiness.
+Neither a Linux cross-build nor an event saying tests passed substitutes for it.
+
 **A run's page also carries each job's VM log** — the machine's own console as
 its daemon saw it, read from `GET /sandboxes/{id}/logs` and captured *before* the
 VM is released, because a job with `reuse: false` destroys it on the next line.
@@ -1122,7 +1381,7 @@ Not built yet:
 
 - **The S3 artifact sink.** Declared and selectable; fails loudly naming the
   alternatives rather than reporting an artifact stored that is not there.
-- **Composite `uses:` actions.** Only `ci/upload-artifact` is built in. Fetching
+- **Composite `uses:` actions.** Artifact, release and deployment actions above are built in. Fetching
   an `action.yml` from a repository is a different feature with a different trust
   model.
 - **Triggers other than `submit`.** `on: [schedule]` parses and is reported as

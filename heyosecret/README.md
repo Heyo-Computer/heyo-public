@@ -116,6 +116,24 @@ Dashboard (session cookie): `GET /`, `POST /dashboard/login`,
 `POST /dashboard/logout`, `GET /dashboard/api/session`, and
 `/dashboard/api/secret*` mirrors of the machine operations.
 
+## us3 app-lb deployment
+
+`app-lb.us3.json` registers an inert managed app with zero replicas and no routes.
+Replace its build ref with a verified public commit and supply the existing
+`heyosecret/database-url`, `heyosecret/master-key`, and
+`heyosecret/internal-api-key` through the app-lb `heyosecret-us3` delivery secret.
+Preserve the existing us3-hosted database and encryption key; do not initialize
+an empty replacement store or rotate keys as part of deployment.
+
+Use app-lb's build endpoint, inspect its job, then scale to one replica and check
+health. Before publishing `heyosecret.us3.heyo.work`, attach the existing Heyo JWT
+gate, restricted to the authorized operator. The template's dashboard gate trusts
+that upstream protection; never expose its dashboard without it. Exempt only
+`/health` and `/v1/` from the upstream browser gate: the machine API independently
+requires the existing internal bearer key. Verify anonymous dashboard rejection,
+anonymous machine API rejection, and an authenticated secret read (without
+printing its value). No additional Google login or admin password is needed.
+
 ## Tests
 
 ```sh

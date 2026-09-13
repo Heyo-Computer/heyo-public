@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
         build-essential \
         git \
+        python3 \
         pkg-config \
         libssl-dev \
     && rm -rf /var/lib/apt/lists/*

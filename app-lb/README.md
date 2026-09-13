@@ -983,6 +983,34 @@ Pulls share the job machinery with builds: `202` with a record, polled from
 the `artifact` reference asked for, the `digest` it resolved to, and the `bytes`
 transferred.
 
+CI callers can opt into a durable, idempotent pull by supplying `operation_id`
+and an explicit pinned SHA-256 manifest digest (tags are rejected in this mode):
+
+```sh
+curl -XPOST localhost:9090/deployments/web/pull -H 'content-type: application/json' -d '{"operation_id":"ci-run-42-web","ref":"1b9b737b73e26aa4c55d7b609351fa51f0e21b0b6afbaa9ef9f4561dd18337d7"}'
+```
+
+The identity is `(namespace, deployment, operation_id)`. Repeating identical
+intent returns the same `202` job record, including after app-lb restarts;
+changing the digest, `force`, or deployment template for that identity returns
+`409` without starting work. Correlated records add `target_namespace`,
+`intent_fingerprint`, `config_fingerprint`, `source_spec_fingerprint`,
+`readiness_verified`, and `reconciliation_required`. `succeeded` requires the
+desired replica count to be healthy in the exact replacement pool created by
+this operation. The source spec is checked under the deployment mutation lock
+before replacement; a concurrent edit is not overwritten. Non-VM and
+zero-desired-replica targets are rejected before pulling. If app-lb
+restarts during a correlated operation, it marks the durable job `failed` with
+`reconciliation_required: true`; it never repeats a possibly destructive
+rollout automatically.
+
+Records are synced to `jobs/` beneath the configured per-deployment state
+directory (for example `app-lb-state.d/jobs/`). Correlation records are not
+evicted by the ordinary in-memory history limits. An unreadable ledger disables
+new correlated pulls until repaired and app-lb restarted; it is never treated
+as an empty ledger. Status persistence failures require reconciliation, not a
+successful CI result. Legacy pulls retain their existing behavior.
+
 **Two transports, chosen by how `store` is spelled.** They are not fallbacks for
 each other — they are different situations:
 
@@ -2325,6 +2353,32 @@ name a cookie to read the token from:
 
 The `Authorization` header still wins when both are present — a request that sets
 it is stating what it presents.
+
+**Browser sign-in with existing Heyo Auth.** Add `login_endpoint` to the JWT
+block to show an email/password form to unauthenticated browser navigations:
+
+```jsonc
+"jwt": {
+  "secret": {"secret": "heyo-auth", "key": "jwt_secret"},
+  "algorithms": ["HS256"],
+  "issuer": "auth-service",
+  "audience": "heyo-app",
+  "subject_claim": "userId",
+  "cookie": "heyo_access_token",
+  "login_endpoint": "https://stage.heyo.computer/api/auth/login"
+}
+```
+
+The gate posts credentials to that fixed endpoint and verifies the returned
+JWT against the same issuer, audience, signature and `require` policy before
+setting a host-only Secure/HttpOnly cookie. The form requires HTTPS, same-origin
+POST and signed, short-lived login state. Passwords and refresh tokens are not
+persisted; endpoint redirects are refused. Logout clears the access cookie.
+Machine clients still receive 401 and continue using their existing credentials.
+An Auth service requiring CAPTCHA or another interactive challenge cannot use
+this password form; those requirements are not bypassed. This is not Google SSO
+or cross-domain session sharing. Existing bearer-only gates are unchanged unless
+this field is configured. Deploy the updated app-lb binary before configuring it.
 
 **Mixing providers** works as it does everywhere else. `["google", "jwt"]` is the
 common shape for a product UI: a person opens it in a browser and signs in with

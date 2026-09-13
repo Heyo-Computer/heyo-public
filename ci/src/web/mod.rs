@@ -31,6 +31,7 @@ use crate::runners::Runners;
 use crate::store::{Repo, Store};
 use crate::trigger;
 use axum::Form;
+use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -44,6 +45,8 @@ use pages::{RepoFlash, RepoView};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+const RUN_EVENT_PAGE_SIZE: i64 = 50;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -67,10 +70,10 @@ pub fn router(
     let submit_limit = config.max_source_bytes.saturating_mul(4) / 3 + (1 << 20);
 
     let state = AppState {
-        config,
+        config: config.clone(),
         runners,
-        store,
-        dispatcher,
+        store: store.clone(),
+        dispatcher: dispatcher.clone(),
     };
 
     Router::new()
@@ -122,6 +125,13 @@ pub fn router(
         // `Accept: text/event-stream` and app-lb's gate admits only
         // `text/html`. It carries its own run-scoped token instead.
         .route("/api/stream/{run_id}/{job_key}", get(log_stream))
+        .route("/api/native/register", post(native_register))
+        .route("/api/native/poll", post(native_poll))
+        .route("/api/native/heartbeat", post(native_heartbeat))
+        .route("/api/native/complete", post(native_complete))
+        .route("/api/native/jobs/{lease}/source", get(native_source))
+        .route("/api/native/jobs/{lease}/release-source/{index}", get(native_release_source))
+        .route("/api/native/jobs/{lease}/artifacts/{index}", post(native_artifact).layer(DefaultBodyLimit::max(512 * 1024 * 1024)))
         .route(
             "/api/submit",
             post(submit).layer(DefaultBodyLimit::max(submit_limit)),
@@ -133,6 +143,21 @@ pub fn router(
         .merge(api::router())
         .with_state(state)
 }
+
+fn native_auth(state: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {
+    use subtle::ConstantTimeEq;
+    let Some(expected)=state.config.native_runner_secret.as_deref() else { return Err(error(StatusCode::SERVICE_UNAVAILABLE,"native runners are not configured")); };
+    let Some(got)=bearer(headers) else { return Err(error(StatusCode::UNAUTHORIZED,"native runner bearer required")); };
+    if expected.as_bytes().ct_eq(got.as_bytes()).into() { Ok(()) } else { Err(error(StatusCode::UNAUTHORIZED,"invalid native runner bearer")) }
+}
+async fn native_register(State(s):State<AppState>,h:HeaderMap,Json(r):Json<crate::native::Registration>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::register(&s.store,r).await {Ok(())=>Json(serde_json::json!({"ok":true})).into_response(),Err(e)=>error(StatusCode::BAD_REQUEST,&e)} }
+async fn native_poll(State(s):State<AppState>,h:HeaderMap,Json(p):Json<crate::native::Poll>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};if let Ok(runs)=crate::native::pending_advancements(&s.store).await{for run in runs{if s.dispatcher.advance_run(&run).await.is_ok(){let _=crate::native::advancement_done(&s.store,&run).await;}}} match crate::native::poll(&s.store,p,&s.config.public_url,&s.dispatcher.secrets).await {Ok(job)=>Json(serde_json::json!({"job":job})).into_response(),Err(e)=>error(StatusCode::CONFLICT,&e)} }
+async fn native_heartbeat(State(s):State<AppState>,h:HeaderMap,Json(u):Json<crate::native::LeaseUpdate>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::heartbeat(&s.store,&u).await {Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)} }
+async fn native_complete(State(s):State<AppState>,h:HeaderMap,Json(c):Json<crate::native::Completion>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::complete(&s.store,&s.dispatcher.secrets,c).await {Ok(Some(run))=>{match s.dispatcher.advance_run(&run).await{Ok(_)=>{let _=crate::native::advancement_done(&s.store,&run).await;},Err(e)=>tracing::error!("native completion scheduling failed: {e}")} StatusCode::NO_CONTENT.into_response()},Ok(None)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::CONFLICT,&e)} }
+async fn native_source(State(s):State<AppState>,h:HeaderMap,Path(lease):Path<uuid::Uuid>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; let run=match crate::native::source_run(&s.store,lease).await {Ok(Some(r))=>r,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e)}; let root=s.dispatcher.workspace(&run); match tokio::task::spawn_blocking(move||{let mut gz=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default()); {let mut tar=tar::Builder::new(&mut gz); tar.append_dir_all(".",root)?; tar.finish()?;} gz.finish()}).await {Ok(Ok(bytes))=>([(axum::http::header::CONTENT_TYPE,"application/gzip")],bytes).into_response(),_=>error(StatusCode::INTERNAL_SERVER_ERROR,"could not archive submitted source")} }
+async fn native_release_source(State(s):State<AppState>,h:HeaderMap,Path((lease,index)):Path<(uuid::Uuid,usize)>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let (run,sha)=match crate::native::release_source_context(&s.store,lease,index).await{Ok(Some(v))=>v,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::BAD_REQUEST,&e)};let root=s.dispatcher.workspace(&run);match crate::release_git::archive(&root,&sha).await{Ok(bytes)=>([(axum::http::header::CONTENT_TYPE,"application/gzip"),(axum::http::HeaderName::from_static("x-heyo-release-sha"),sha.as_str())],bytes).into_response(),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)}}
+#[derive(serde::Deserialize)] struct NativeArtifactQuery{name:String,#[serde(default)]description:Option<String>,#[serde(default)]public:bool}
+async fn native_artifact(State(s):State<AppState>,h:HeaderMap,Path((lease,index)):Path<(uuid::Uuid,usize)>,Query(q):Query<NativeArtifactQuery>,body:Bytes)->impl IntoResponse{if let Err(e)=native_auth(&s,&h){return e};if q.name.trim().is_empty()||q.name.contains('/')||q.name.contains('\\')||q.name==".."{return error(StatusCode::BAD_REQUEST,"invalid artifact name")};let (run,_job,key,workflow)=match crate::native::artifact_context(&s.store,lease,index).await{Ok(Some(v))=>v,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::BAD_REQUEST,&e)};let r=crate::artifacts::ArtifactRef{run_id:run,job_key:key,workflow_id:workflow,name:q.name.clone(),description:q.description,public:q.public};let stored=match s.dispatcher.artifacts.put(&r,body.to_vec()).await{Ok(v)=>v,Err(e)=>return error(StatusCode::BAD_GATEWAY,&e.to_string())};match crate::native::record_artifact(&s.store,lease,index,&q.name,&stored).await{Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced during upload"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)}}
 
 /// How a submit proved it may start a build.
 enum Credential {
@@ -419,9 +444,11 @@ async fn runs_page(
 async fn run_page(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let who = who_of(&headers);
+    let event_before = q.get("events_before").and_then(|value| value.parse::<i64>().ok());
     match state.store.get_run(&run_id).await {
         Ok(Some(run)) => {
             let jobs = state.store.jobs_of(&run_id).await.unwrap_or_default();
@@ -439,13 +466,59 @@ async fn run_page(
             }
 
             let reruns = state.store.reruns_of(&run_id).await.unwrap_or_default();
-            pages::run_page(
+            let release = match crate::release::get(&state.store, &run_id).await {
+                Ok(release) => release,
+                Err(e) => {
+                    return page_error(
+                        &state,
+                        &headers,
+                        who.as_ref(),
+                        &format!("could not load release: {e}"),
+                    );
+                }
+            };
+            let deployments = match state.store.service_deployments_of(&run_id).await {
+                Ok(deployments) => deployments,
+                Err(e) => {
+                    return page_error(
+                        &state,
+                        &headers,
+                        who.as_ref(),
+                        &format!("could not load deployments: {e}"),
+                    );
+                }
+            };
+            let mut events = match state
+                .store
+                .run_events(&run_id, event_before, RUN_EVENT_PAGE_SIZE + 1)
+                .await
+            {
+                Ok(events) => events,
+                Err(e) => {
+                    return page_error(
+                        &state,
+                        &headers,
+                        who.as_ref(),
+                        &format!("could not load event timeline: {e}"),
+                    );
+                }
+            };
+            let events_have_more = events.len() as i64 > RUN_EVENT_PAGE_SIZE;
+            if events_have_more {
+                events.pop();
+            }
+            pages::run_page_with_deployments(
                 &chrome(&state, &headers, who.as_ref()),
                 &run,
                 &reruns,
                 &jobs,
                 &artifacts,
                 &vm_logs,
+                release.as_ref(),
+                &deployments,
+                &events,
+                event_before,
+                events_have_more,
                 state.config.log_retention.map(|d| d.as_secs() / 86_400),
             )
             .into_response()
@@ -1604,6 +1677,109 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_NATS_URL"]
+    async fn machine_rerun_is_repo_scoped_and_carries_successes() {
+        use base64::Engine;
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CI_WORKSPACE_DIR", root.path());
+            std::env::set_var("CI_NATIVE_RUNNER_SECRET", "test-native-secret");
+        }
+        let app = test_router().await;
+        let store = Store::connect(&std::env::var("CI_TEST_DATABASE_URL").unwrap(),
+            root.path().join("logs"), std::time::Duration::from_secs(30)).await.unwrap();
+        let url = format!("https://example.com/{}.git", crate::vm::new_id());
+        let repo = store.register_repo(&url, "retry", Some("ci/test.yml"), None, None).await.unwrap();
+        let other = store.register_repo(&format!("{url}-other"), "other", None, None, None).await.unwrap();
+        let (token_row, token) = store.create_repo_token(&repo.id, "test", None).await.unwrap();
+        let (_, wrong_token) = store.create_repo_token(&other.id, "test", None).await.unwrap();
+
+        let workflow = b"name: retry\non: [submit]\njobs:\n  passed:\n    runs-on: [macos-intel]\n    steps: [{run: 'echo passed'}]\n  failed:\n    runs-on: [windows-x64]\n    steps: [{run: 'echo retry'}]\n";
+        let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut archive = tar::Builder::new(gzip);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(workflow.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, "ci/test.yml", &workflow[..]).unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let payload = serde_json::json!({
+            "repository": {"url": url}, "ref": "refs/heads/test", "after": "a".repeat(40),
+            "source": {"format": "tar.gz", "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes)}
+        });
+        let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/submit")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::from(payload.to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{}", String::from_utf8_lossy(&body));
+        let submitted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run = submitted["runs"][0].as_str().unwrap();
+        let path = format!("/api/runs/{run}/rerun-failed");
+        async fn post(app: Router, path: &str, token: Option<&str>) -> axum::response::Response {
+            let mut req = Request::builder().method("POST").uri(path);
+            if let Some(token) = token { req = req.header("Authorization", format!("Bearer {token}")); }
+            app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+        }
+        // Auth refusals must precede the dispatcher, including when the run exists.
+        for (credential, expected) in [(None, StatusCode::UNAUTHORIZED),
+            (Some("invalid"), StatusCode::UNAUTHORIZED), (Some(wrong_token.as_str()), StatusCode::NOT_FOUND)] {
+            assert_eq!(post(app.clone(), &path, credential).await.status(), expected);
+        }
+        assert_eq!(post(app.clone(), &path, Some(&token)).await.status(), StatusCode::CONFLICT,
+            "an active run must not be duplicated");
+        use hmac::Mac;
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"0123456789abcdef").unwrap();
+        mac.update(path.as_bytes());
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let response = app.clone().oneshot(Request::builder().method("POST").uri(&path)
+            .header(trigger::SIGNATURE_HEADER, signature).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "read signatures must not grant write access");
+        assert!(store.reruns_of(run).await.unwrap().is_empty());
+        store.set_job_status(&crate::store::job_id(run, "failed"), crate::store::JobStatus::Failure, Some("offline")).await.unwrap();
+        store.set_run_status(run, crate::store::RunStatus::Failure, None).await.unwrap();
+        assert_eq!(post(app.clone(), &path, Some(&token)).await.status(), StatusCode::CONFLICT,
+            "a failed rollup with an active sibling must not be retried");
+        assert!(store.reruns_of(run).await.unwrap().is_empty());
+        store.set_job_status(&crate::store::job_id(run, "passed"), crate::store::JobStatus::Success, None).await.unwrap();
+        let response = post(app.clone(), &path, Some(&token)).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{}", String::from_utf8_lossy(&body));
+        let retried: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let next = retried["runs"][0].as_str().unwrap();
+        assert_ne!(next, run);
+        let new_run = store.get_run(next).await.unwrap().unwrap();
+        assert_eq!(new_run.rerun_of.as_deref(), Some(run));
+        assert_eq!(new_run.sha, "a".repeat(40));
+        let response = app.clone().oneshot(Request::builder().uri(format!("/api/runs/{run}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let original: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(original["reruns"].as_array().unwrap().len(), 1);
+        assert_eq!(original["reruns"][0]["id"], next, "a lost POST response can be reconciled by reading the parent");
+        let jobs = store.jobs_of(next).await.unwrap();
+        let passed = jobs.iter().find(|job| job.job_key == "passed").unwrap();
+        assert_eq!(passed.status, "success");
+        assert!(passed.carried_from.is_some());
+        assert_eq!(jobs.iter().find(|job| job.job_key == "failed").unwrap().status, "queued");
+        store.set_repo_enabled(&repo.id, false).await.unwrap();
+        assert_eq!(post(app.clone(), &path, Some(&token)).await.status(), StatusCode::UNAUTHORIZED);
+        store.set_repo_enabled(&repo.id, true).await.unwrap();
+        store.revoke_repo_token(&token_row.id).await.unwrap();
+        assert_eq!(post(app, &path, Some(&token)).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(store.reruns_of(run).await.unwrap().len(), 1);
+        store.delete_repo(&repo.id).await.unwrap();
+        store.delete_repo(&other.id).await.unwrap();
+        unsafe {
+            std::env::remove_var("CI_WORKSPACE_DIR");
+            std::env::remove_var("CI_NATIVE_RUNNER_SECRET");
+        }
     }
 
     /// The networks page must render before the first refresh lands, because

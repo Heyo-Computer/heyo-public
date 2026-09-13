@@ -1,0 +1,41 @@
+# Firecracker microVM rootfs for the Heyo orchestrator.
+# Build from the public repository root:
+#   heyvm mvm build --local-only -f orchestrator/Dockerfile.firecracker -c . -n orchestrator --size-mb 768
+# app-lb needs `dockerfile: "orchestrator/Dockerfile.firecracker"` and
+# `context: "."` because orchestrator depends on sibling heyosecret-client.
+# heyvm discards OCI metadata and boots /init.sh directly. x86_64 only.
+
+FROM rust:1-bookworm AS builder
+RUN test "$(dpkg --print-architecture)" = "amd64"
+WORKDIR /app
+COPY heyosecret-client/ heyosecret-client/
+COPY orchestrator/ orchestrator/
+COPY .heyo/services/ .heyo/services/
+RUN cargo test --locked --manifest-path orchestrator/Cargo.toml \
+    && cargo build --locked --release --manifest-path orchestrator/Cargo.toml
+
+# Ubuntu 24.04's glibc is newer than bookworm's, so the runtime provides every
+# glibc symbol that the builder can require.
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server \
+    iproute2 \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d \
+    && printf 'PermitRootLogin prohibit-password\nPermitEmptyPasswords no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' > /etc/ssh/sshd_config.d/00-heyo.conf \
+    && passwd -d root \
+    && ssh-keygen -A
+
+COPY --from=builder /app/orchestrator/target/release/orchestrator /usr/local/bin/orchestrator
+# Startup loads migrations from disk; the builder's CARGO_MANIFEST_DIR is not
+# present at runtime. Set ORCHESTRATOR_MIGRATIONS_DIR to this fixed path.
+COPY orchestrator/migrations /opt/orchestrator/migrations
+COPY orchestrator/init.sh /init.sh
+RUN chmod +x /init.sh /usr/local/bin/orchestrator \
+    && test -x /usr/local/bin/orchestrator \
+    && test -f /opt/orchestrator/migrations/034_cancel_reactivated_service_retirements.sql
+
+EXPOSE 22 4446
+CMD ["/init.sh"]

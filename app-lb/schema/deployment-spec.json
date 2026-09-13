@@ -607,6 +607,13 @@
           "format": "uint64",
           "minimum": 0
         },
+        "login_endpoint": {
+          "description": "Optional Heyo Auth `/api/auth/login` endpoint for browser email/password\nsign-in. The returned access token must pass this JWT policy before a\nhost-only HttpOnly cookie is set. Requires `cookie`; never stores refresh\ntokens or passwords. Existing bearer-only gates remain unchanged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "name_claim": {
           "description": "Which claim holds the display name. Absent from most tokens, and absent\nhere means the header is simply not sent.",
           "type": "string",

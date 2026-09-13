@@ -28,6 +28,7 @@
     "public_paths": [
       { "path": "/healthz", "scope": "public" },
       { "path": "/api/submit", "scope": "public" },
+      { "path": "/api/native/", "scope": "public" },
       { "path": "/api/stream/", "scope": "public" },
       { "path": "/api/runs/", "scope": "public" },
       { "path": "/__ui/", "scope": "public" }

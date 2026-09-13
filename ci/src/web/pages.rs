@@ -13,8 +13,9 @@
 //! debugging. What is left in `STYLE` below is only what is peculiar to this
 //! app; anything a second app would want belongs in the shared file.
 
+use crate::release::ReleaseRow;
 use crate::runners::{Pool, Runner, RunnerSet, RunnerStatus, TunnelFailure};
-use crate::store::{ArtifactRow, JobRow, Repo, RepoToken, Run, StepRow};
+use crate::store::{ArtifactRow, JobRow, Repo, RepoToken, Run, RunEvent, ServiceDeploymentRow, StepRow};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -39,10 +40,10 @@ h1.page { font-size: 15px; margin: 0 0 var(--gap-1); }
    heyvm's runner states, so they are mapped here rather than renamed at 40 call
    sites — and a status this list forgets still renders as a neutral pill rather
    than as nothing. */
-.pill.online, .pill.success, .pill.ready { border-color: var(--success); color: var(--success); }
-.pill.stale, .pill.warn { border-color: var(--warning); color: var(--warning); }
-.pill.failure, .pill.orphaned, .pill.error { border-color: var(--danger); color: var(--danger); }
-.pill.running, .pill.building { border-color: var(--accent); color: var(--accent); }
+.pill.online, .pill.success, .pill.ready, .pill.passed { border-color: var(--success); color: var(--success); }
+.pill.stale, .pill.warn, .pill.submission_unknown { border-color: var(--warning); color: var(--warning); }
+.pill.failure, .pill.orphaned, .pill.error, .pill.failed { border-color: var(--danger); color: var(--danger); }
+.pill.running, .pill.building, .pill.submitting { border-color: var(--accent); color: var(--accent); }
 .pill.offline, .pill.queued, .pill.pending, .pill.skipped, .pill.cancelled, .pill.draining {
   border-color: var(--border-color); color: var(--text-muted);
 }
@@ -105,6 +106,21 @@ button.quiet:hover { color: var(--danger); border-color: var(--border-color); ba
 form.row { display: flex; gap: var(--gap-2); flex-wrap: wrap; align-items: flex-end; }
 form.row label { display: flex; flex-direction: column; gap: 2px; }
 form.row input[type=text], form.row select { min-width: 16rem; }
+
+.deployment-table { table-layout: fixed; width: 100%; }
+.deployment-table td { overflow-wrap: anywhere; }
+.deployment-table code { white-space: normal; }
+.release-table { table-layout: fixed; width: 100%; }
+.release-table th { width: 110px; }
+.release-table td, .release-table code { overflow-wrap: anywhere; white-space: normal; }
+@media (max-width: 900px) {
+  .deployment-table, .deployment-table tbody { display: block; }
+  .deployment-table thead { display: none; }
+  .deployment-table tr { display: block; margin-bottom: var(--gap-3); border: 1px solid var(--border-color); }
+  .deployment-table td { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: var(--gap-2); }
+  .deployment-table td::before { content: attr(data-label); color: var(--text-muted); font-size: 11px; }
+  .deployment-table td > div { min-width: 0; }
+}
 "#;
 
 /// Everything the shell needs that is not the page itself.
@@ -1419,6 +1435,7 @@ pub fn runs_page(
 // ---- run detail ---------------------------------------------------------
 
 /// `GET /runs/{id}` — one run's jobs, in dependency order, plus its artifacts.
+#[cfg(test)]
 pub fn run_page(
     chrome: &Chrome,
     run: &Run,
@@ -1426,6 +1443,36 @@ pub fn run_page(
     jobs: &[JobRow],
     artifacts: &[ArtifactRow],
     vm_logs: &[(String, Option<String>)],
+    retention_days: Option<u64>,
+) -> Markup {
+    run_page_with_deployments(
+        chrome,
+        run,
+        reruns,
+        jobs,
+        artifacts,
+        vm_logs,
+        None,
+        &[],
+        &[],
+        None,
+        false,
+        retention_days,
+    )
+}
+
+pub fn run_page_with_deployments(
+    chrome: &Chrome,
+    run: &Run,
+    reruns: &[Run],
+    jobs: &[JobRow],
+    artifacts: &[ArtifactRow],
+    vm_logs: &[(String, Option<String>)],
+    release: Option<&ReleaseRow>,
+    deployments: &[ServiceDeploymentRow],
+    events: &[RunEvent],
+    event_before: Option<i64>,
+    events_have_more: bool,
     retention_days: Option<u64>,
 ) -> Markup {
     let body = html! {
@@ -1534,6 +1581,141 @@ pub fn run_page(
                 @for j in jobs {
                     @if let Some(err) = &j.error {
                         div .banner { strong { (j.display) ": " } (err) }
+                    }
+                }
+            }
+        }
+
+        @if let Some(release) = release {
+            section {
+                h2 { "Release" }
+                p {
+                    (pill(&release.status))
+                    @if release.status == "unknown" {
+                        " Publication outcome is unknown; this does not mean the release was published."
+                    }
+                }
+                div .scroll {
+                    table .release-table {
+                        tbody {
+                            tr { th { "Source SHA" } td { code .mono { (release.prepared.source_sha) } } }
+                            tr { th { "Release SHA" } td { code .mono { (release.prepared.release_sha) } } }
+                            tr { th { "Branch" } td { code .mono { (release.prepared.git_ref) } } }
+                            tr { th { "Versions" } td {
+                                @if let Some(versions) = release.prepared.versions.as_object() {
+                                    @for (name, version) in versions {
+                                        div { code .mono { (name) } ": " code .mono {
+                                            (version.as_str().map(str::to_owned).unwrap_or_else(|| version.to_string()))
+                                        } }
+                                    }
+                                }
+                            } }
+                        }
+                    }
+                }
+                @if let Some(error) = &release.error {
+                    div .banner { (error) }
+                }
+            }
+        }
+
+        section id="deployments" {
+            h2 { "Deployments" }
+            p .sub { "Service deployments requested by this CI run. Unknown submissions are not automatically resubmitted." }
+            @if deployments.is_empty() {
+                p .empty { "This run requested no service deployments." }
+            } @else {
+                div .scroll {
+                    table .deployment-table {
+                        thead { tr {
+                            th { "Service" } th { "Operation ID" } th { "Revision" }
+                            th { "Status" } th { "Phase" } th { "Message / error" }
+                            th { "Updated" }
+                        } }
+                        tbody {
+                            @for deployment in deployments {
+                                tr {
+                                    td data-label="Service" { div { (deployment.service_id) } }
+                                    td .mono data-label="Operation ID" { div { (deployment.id) } }
+                                    td data-label="Revision" { div {
+                                        code .mono { (deployment.sha) }
+                                        br;
+                                        code .mono { (deployment.git_ref) }
+                                    } }
+                                    td data-label="Status" { div { (pill(&deployment.status)) } }
+                                    td data-label="Phase" { div { (deployment.phase.as_deref().unwrap_or("—")) } }
+                                    td data-label="Message / error" { div {
+                                        @if let Some(message) = &deployment.message {
+                                            div { (message) }
+                                        }
+                                        @if let Some(error) = &deployment.error {
+                                            div .error { (error) }
+                                        }
+                                        @if deployment.message.is_none() && deployment.error.is_none() {
+                                            "—"
+                                        }
+                                    } }
+                                    td .mono data-label="Updated" { div { (deployment.updated_at.format("%Y-%m-%d %H:%M:%S UTC")) } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        section id="events" {
+            h2 { "Event timeline" }
+            p .sub { "Durable run transitions and their publication state. This history is informational and separate from release and deployment actions." }
+            @if events.is_empty() {
+                p .empty { "No events on this page." }
+            } @else {
+                div .scroll {
+                    table {
+                        thead { tr {
+                            th { "Revision / time" } th { "Event" } th { "Target" }
+                            th { "Status" } th { "Transition error" } th { "Publication" }
+                        } }
+                        tbody {
+                            @for event in events {
+                                tr {
+                                    td { code .mono { "#" (event.revision) } br; (event.transitioned_at.format("%Y-%m-%d %H:%M:%S UTC")) }
+                                    td {
+                                        code .mono { (event.event_type) }
+                                        details { summary { "Payload" } pre { (serde_json::to_string_pretty(&event.payload).unwrap_or_else(|_| event.payload.to_string())) } }
+                                    }
+                                    td {
+                                        @if let Some(job) = &event.job_key { div { "Job: " code .mono { (job) } } }
+                                        @if let Some(step) = &event.step_id { div { "Step: " code .mono { (step) } } }
+                                        @if event.job_key.is_none() && event.step_id.is_none() { "Run" }
+                                    }
+                                    td { (pill(&event.status)) }
+                                    td { (event.error.as_deref().unwrap_or("—")) }
+                                    td {
+                                        @if let Some(published_at) = event.published_at {
+                                            span .pill.success { "published" }
+                                            div .meta { (published_at.format("%Y-%m-%d %H:%M:%S UTC")) }
+                                        } @else if event.last_error.is_some() {
+                                            span .pill.failure { "publication failed" }
+                                        } @else {
+                                            span .pill.pending { "unpublished" }
+                                        }
+                                        div .meta { (event.attempts) " attempt" @if event.attempts != 1 { "s" } }
+                                        @if let Some(error) = &event.last_error { div .error { (error) } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div .actions {
+                @if event_before.is_some() {
+                    a href={ "/runs/" (run.id) "#events" } { "Newest events" }
+                }
+                @if events_have_more {
+                    @if let Some(last) = events.last() {
+                        a href={ "/runs/" (run.id) "?events_before=" (last.revision) "#events" } { "Older events" }
                     }
                 }
             }
@@ -2164,6 +2346,8 @@ mod page_tests {
             git_ref: "refs/heads/main".into(),
             sha: "9183de223817abcdef".into(),
             before_sha: "0000de223817abcdef".into(),
+            default_branch: Some("main".into()),
+            release_base_sha: None,
             changes: crate::paths::Changes::known(vec!["src/main.rs".into()]),
             actor_email: Some("sam@sarocu.com".into()),
             status: status.into(),
@@ -2291,6 +2475,193 @@ mod page_tests {
         r.repo_name = None;
         let html = runs_page(&chrome(), &[r], &[registered_repo()], None).into_string();
         assert!(!html.contains("/?repo="), "nothing to filter by");
+    }
+
+    fn deployments_fixture(status: &str, service: &str) -> ServiceDeploymentRow {
+        ServiceDeploymentRow {
+            id: format!("operation-{status}"),
+            step_id: "run.deploy.0".into(),
+            run_id: "019fca648a6e-00000000".into(),
+            job_id: "019fca648a6e-00000000.deploy".into(),
+            service_id: service.into(),
+            status: status.into(),
+            phase: Some(format!("phase-{status}")),
+            message: Some(format!("message-{status}")),
+            error: (status == "failed").then(|| "bad <script>alert('x')</script>".into()),
+            sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            git_ref: "refs/heads/release/exact".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn event_fixture(revision: i64) -> RunEvent {
+        RunEvent {
+            id: uuid::Uuid::new_v4(),
+            revision,
+            event_type: "ci.job.status.<event>.v1".into(),
+            payload: serde_json::json!({"detail": "payload <unsafe> & exact"}),
+            job_id: Some("run.job".into()),
+            job_key: Some("build <web>".into()),
+            step_id: Some("run.job.step".into()),
+            status: "failure".into(),
+            error: Some("transition <failed> & stopped".into()),
+            transitioned_at: Utc::now(),
+            published_at: None,
+            attempts: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn event_timeline_escapes_records_and_reports_publication_failures() {
+        let mut failed = event_fixture(42);
+        failed.attempts = 3;
+        failed.last_error = Some("NATS <offline> & unavailable".into());
+        let pending = event_fixture(41);
+        let html = run_page_with_deployments(
+            &chrome(), &run("failure"), &[], &[], &[], &[], None, &[],
+            &[failed, pending], None, false, Some(2),
+        ).into_string();
+
+        assert!(html.contains("Event timeline"));
+        assert!(html.contains("publication failed") && html.contains("unpublished"));
+        assert!(html.contains("3 attempts"));
+        for escaped in [
+            "ci.job.status.&lt;event&gt;.v1",
+            "build &lt;web&gt;",
+            "transition &lt;failed&gt; &amp; stopped",
+            "NATS &lt;offline&gt; &amp; unavailable",
+            "payload &lt;unsafe&gt; &amp; exact",
+        ] {
+            assert!(html.contains(escaped), "missing escaped value {escaped}: {html}");
+        }
+        assert!(!html.contains("<unsafe>") && !html.contains("NATS <offline>"));
+        assert!(html.find("Deployments").unwrap() < html.find("Event timeline").unwrap());
+        assert!(!html.contains("Retry event") && !html.contains("Cancel event"));
+        if let Ok(path) = std::env::var("CI_EVENTS_HTML") {
+            std::fs::write(path, html).unwrap();
+        }
+    }
+
+    #[test]
+    fn event_timeline_pagination_uses_exclusive_oldest_revision_boundaries() {
+        let events = [event_fixture(100), event_fixture(99)];
+        let first = run_page_with_deployments(
+            &chrome(), &run("success"), &[], &[], &[], &[], None, &[],
+            &events, None, true, None,
+        ).into_string();
+        assert!(first.contains("?events_before=99#events"), "{first}");
+        assert!(!first.contains("Newest events"));
+
+        let last = run_page_with_deployments(
+            &chrome(), &run("success"), &[], &[], &[], &[], None, &[],
+            &[event_fixture(98)], Some(99), false, None,
+        ).into_string();
+        assert!(last.contains("Newest events"));
+        assert!(!last.contains("Older events"));
+    }
+
+    #[test]
+    fn deployments_are_escaped_and_report_unknown_pending_and_success_truthfully() {
+        let deployments = [
+            deployments_fixture("submission_unknown", "unknown <service>"),
+            deployments_fixture("submitting", "submitting-service"),
+            deployments_fixture("running", "running-service"),
+            deployments_fixture("passed", "passed-service"),
+            deployments_fixture("failed", "failed-service"),
+        ];
+        let html = run_page_with_deployments(
+            &chrome(),
+            &run("failure"),
+            &[],
+            &[job("deploy", "failure")],
+            &[],
+            &[],
+            None,
+            &deployments,
+            &[],
+            None,
+            false,
+            Some(2),
+        )
+        .into_string();
+        for status in [
+            "submission_unknown",
+            "submitting",
+            "running",
+            "passed",
+            "failed",
+        ] {
+            assert!(
+                html.contains(&format!("pill {status}")),
+                "missing truthful state {status}"
+            );
+        }
+        assert!(html.contains("Unknown submissions are not automatically resubmitted"));
+        assert!(html.contains("unknown &lt;service&gt;") && !html.contains("unknown <service>"));
+        assert!(html.contains("bad &lt;script&gt;") && !html.contains("<script>alert"));
+        assert!(
+            html.contains("0123456789abcdef0123456789abcdef01234567"),
+            "revision is not shortened"
+        );
+        assert!(html.contains("refs/heads/release/exact"), "ref is exact");
+        assert!(html.contains("Event timeline"));
+        assert!(!html.contains("Retry deployment") && !html.contains("Cancel deployment"));
+        if let Ok(path) = std::env::var("CI_DEPLOYMENTS_HTML") {
+            std::fs::write(path, &html).unwrap();
+        }
+    }
+
+    #[test]
+    fn release_and_deployments_render_truthful_escaped_exportable_html() {
+        let release = ReleaseRow {
+            prepared: crate::release_git::PreparedRelease {
+                source_sha: "1111111111111111111111111111111111111111".into(),
+                release_sha: "2222222222222222222222222222222222222222".into(),
+                git_ref: "refs/heads/release/public".into(),
+                versions: serde_json::json!({"ci": "1.2.3", "web": "4.5.6"}),
+                tags: vec![],
+            },
+            status: "unknown".into(),
+            error: Some("push outcome <unknown> & must be checked".into()),
+        };
+        let html = run_page_with_deployments(
+            &chrome(),
+            &run("failure"),
+            &[],
+            &[job("release", "failure"), job("deploy", "skipped")],
+            &[],
+            &[],
+            Some(&release),
+            &[],
+            &[],
+            None,
+            false,
+            Some(2),
+        )
+        .into_string();
+
+        assert!(html.contains("1111111111111111111111111111111111111111"));
+        assert!(html.contains("2222222222222222222222222222222222222222"));
+        assert!(html.contains("ci</code>: <code class=\"mono\">1.2.3"));
+        assert!(html.contains("outcome &lt;unknown&gt; &amp; must be checked"));
+        assert!(!html.contains("outcome <unknown>"));
+        assert!(html.contains("does not mean the release was published"));
+        assert!(html.find("Release").unwrap() < html.find("Deployments").unwrap());
+        if let Ok(path) = std::env::var("CI_RELEASE_HTML") {
+            std::fs::write(format!("{path}.unknown.html"), &html).unwrap();
+            let mut published = release.clone();
+            published.status = "published".into();
+            published.error = None;
+            let mut deployment = deployments_fixture("passed", "public-ci");
+            deployment.sha = published.prepared.release_sha.clone();
+            deployment.git_ref = published.prepared.git_ref.clone();
+            let published_html = run_page_with_deployments(&chrome(), &run("success"), &[],
+                &[job("validate", "success"), job("release", "success"), job("build", "success"), job("deploy", "success")],
+                &[], &[], Some(&published), &[deployment], &[], None, false, Some(2)).into_string();
+            std::fs::write(path, published_html).unwrap();
+        }
     }
 
     #[test]

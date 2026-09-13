@@ -39,16 +39,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # SSH access for `heyvm exec` / `heyvm sh`. Pre-generate host keys at build time
-# so sshd doesn't block on entropy at boot. Ubuntu 24.04 may ship password auth
-# disabled, and Firecracker has no cloud-init to fix it — enable it explicitly.
+# so sshd doesn't block on entropy at boot. The daemon supplies authorized keys.
 RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d \
-    && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config \
-    && echo "PermitEmptyPasswords yes" >> /etc/ssh/sshd_config \
-    && echo "PasswordAuthentication yes" > /etc/ssh/sshd_config.d/50-heyo.conf \
-    && chmod 644 /etc/ssh/sshd_config.d/50-heyo.conf \
+    && printf 'PermitRootLogin prohibit-password\nPermitEmptyPasswords no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' > /etc/ssh/sshd_config.d/00-heyo.conf \
     && passwd -d root \
-    && useradd -m -s /bin/bash heyo \
-    && echo 'heyo:heyo' | chpasswd \
     && ssh-keygen -A
 
 COPY --from=builder /app/artifacts/target/release/art /usr/local/bin/art
