@@ -618,6 +618,20 @@
             "null"
           ]
         },
+        "login_redirect_param": {
+          "description": "The query parameter the hosted sign-in reads the return URL from. Only\nmeaningful with `login_url`; unset means `redirect_uri`. Set it to whatever\nthe issuer expects — `return_to`, `next`, `rd`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "login_url": {
+          "description": "Where to send a browser that reaches a gated path holding no valid token.\n\nThe `jwt` provider is otherwise stateless: it verifies a token that is\nalready being carried and, finding none, answers `401`. That is right for\na program, and a dead end for a person — a browser cannot set an\n`Authorization` header on a navigation, so it has no way to *acquire* one.\n\nSet this to the issuer's hosted sign-in page and a token-less **browser**\n(a request whose `Accept` includes HTML) is redirected there instead, with\nthe URL it was trying to reach passed in `login_redirect_param`. The issuer\nsigns the user in, sets the JWT in the `cookie` named above, and redirects\nback; the gate then reads the cookie and admits the request. app-lb mints\nno session and keeps no flow state — the cookie the issuer set *is* the\nsession. A program (no HTML in `Accept`) still gets the `401`, which it can\nact on and would only fail to parse as a sign-in page.\n\nRequires `cookie`: the return trip is a navigation, and a navigation can\ncarry a credential only in a cookie ([`SpecError::LoginUrlWithoutCookie`]).\nMust be `https://` (or a loopback `http://` for an issuer on this host),\nfor the same reason `jwks_url` must.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "name_claim": {
           "description": "Which claim holds the display name. Absent from most tokens, and absent\nhere means the header is simply not sent.",
           "type": "string",

@@ -365,6 +365,10 @@ fn jwt_spec() -> DeploymentSpec {
             leeway_secs: Some(30),
             cookie: Some("heyo_access_token".into()),
             login_endpoint: None,
+            // A token-less browser at this gate is bounced here to sign in and
+            // redirected back; the cookie above carries the token on the return.
+            login_url: Some("https://auth.example.com/login".into()),
+            login_redirect_param: None,
         }),
         provider_ref: None,
     });

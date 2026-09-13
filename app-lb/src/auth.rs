@@ -779,6 +779,33 @@ impl Authenticator {
         // than sending a browser into an OAuth round trip that ends in a blank
         // `client_id`.
         let Some((client_id, _)) = gate.google_credentials() else {
+            // Unless the JWT provider names a hosted sign-in page: then a
+            // *browser* holding no token is redirected there with the URL it
+            // wanted, the issuer signs the person in and sets the JWT cookie,
+            // and the return navigation is admitted by the cookie the gate
+            // already knows to read. app-lb holds no flow state here — the
+            // issuer's cookie is the whole session. See `JwtSpec::login_url`.
+            //
+            // A program (no HTML in `Accept`) falls through to the 401 below:
+            // it can act on that, and cannot follow a redirect into an HTML
+            // sign-in page anyway.
+            if req.wants_html
+                && let Some(policy) = gate.jwt_policy()
+                && let Some(login_url) = policy.login_url.as_deref()
+            {
+                // The return URL is this deployment's own origin plus the safe
+                // local path — never a caller-supplied absolute URL, so this
+                // cannot be turned into an open redirect through the issuer.
+                let return_uri = format!("{}{}", origin(req), safe_return_path(return_to));
+                let sep = if login_url.contains('?') { '&' } else { '?' };
+                let url = format!(
+                    "{login_url}{sep}{}",
+                    form_urlencoded::Serializer::new(String::new())
+                        .append_pair(policy.login_redirect_param(), &return_uri)
+                        .finish()
+                );
+                return Response::redirect(url, vec![]);
+            }
             let mut accepts: Vec<&str> = Vec::new();
             let mut detail: Vec<&str> = Vec::new();
             if gate.accepts_app_token() {
@@ -2292,6 +2319,69 @@ mod tests {
             assert_eq!(body["error"], "authentication required");
             assert!(body["detail"].as_str().is_some_and(|d| d.contains("Bearer")), "{body}");
             assert!(r.location.is_none(), "there is no flow to redirect to");
+        }
+
+        /// With a hosted sign-in configured, a token-less *browser* is redirected
+        /// to it carrying where it was going, while a program still gets the 401
+        /// it can act on.
+        #[tokio::test]
+        async fn a_hosted_login_redirects_a_browser_and_still_401s_a_program() {
+            let a = with_secret();
+            let g: AuthGate = serde_json::from_str(
+                r#"{"provider":"jwt","jwt":{"secret":{"secret":"heyo-auth","key":"jwt_secret"},
+                    "algorithms":["HS256"],"issuer":"auth-service",
+                    "cookie":"heyo_access_token",
+                    "login_url":"https://auth.example.com/login"}}"#,
+            )
+            .unwrap();
+
+            // A browser with no token is bounced to the hosted sign-in, with the
+            // URL it wanted so the issuer can send it back.
+            let mut browser = req("/dashboard", vec![]);
+            browser.query = Some("tab=usage");
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &browser).await else {
+                panic!("a token-less browser must be answered, not let through");
+            };
+            assert_eq!(r.status, 302);
+            let loc = r.location.expect("a redirect carries a Location");
+            assert!(loc.starts_with("https://auth.example.com/login?"), "{loc}");
+            assert!(
+                loc.contains("redirect_uri=https%3A%2F%2Fapp.example.com%2Fdashboard%3Ftab%3Dusage"),
+                "the return URL is this deployment's own path, encoded: {loc}",
+            );
+
+            // A program (no HTML in Accept) still gets the actionable 401: it
+            // cannot follow a redirect into an HTML sign-in page.
+            let mut program = req("/dashboard", vec![]);
+            program.wants_html = false;
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &program).await else {
+                panic!("must not let a token-less program through");
+            };
+            assert_eq!(r.status, 401);
+            assert!(r.location.is_none(), "a program is not redirected");
+        }
+
+        /// The return parameter's name is configurable, for issuers that do not
+        /// call it `redirect_uri`.
+        #[tokio::test]
+        async fn the_return_parameter_name_is_configurable() {
+            let a = with_secret();
+            let g: AuthGate = serde_json::from_str(
+                r#"{"provider":"jwt","jwt":{"secret":{"secret":"heyo-auth","key":"jwt_secret"},
+                    "algorithms":["HS256"],"issuer":"auth-service",
+                    "cookie":"heyo_access_token",
+                    "login_url":"https://auth.example.com/login",
+                    "login_redirect_param":"next"}}"#,
+            )
+            .unwrap();
+            let Decision::Answered(r) =
+                a.decide(&g, "web", "default", &req("/", vec![])).await
+            else {
+                panic!("a token-less browser must be answered");
+            };
+            let loc = r.location.expect("a redirect carries a Location");
+            assert!(loc.contains("next=https%3A%2F%2Fapp.example.com%2F"), "{loc}");
+            assert!(!loc.contains("redirect_uri="), "the default name must not leak in: {loc}");
         }
 
         /// A 401 must not name a mechanism the path will refuse.

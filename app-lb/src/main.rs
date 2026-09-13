@@ -244,6 +244,9 @@ fn config_from_env() -> LbConfig {
     if let Ok(v) = std::env::var("APP_LB_ROUTE53_ZONE_ID") {
         cfg.route53_zone_id = Some(v.trim().to_string()).filter(|z| !z.is_empty());
     }
+    if let Ok(v) = std::env::var("APP_LB_DEPLOY_BASE_DOMAIN") {
+        cfg.deploy_base_domain = Some(v.trim().to_string()).filter(|d| !d.is_empty());
+    }
     if let Ok(v) = std::env::var("APP_LB_UPDATE_SHELL") {
         cfg.update_shell = v;
     }
@@ -896,6 +899,18 @@ fn main() {
     });
     let acme_signal = acme_svc.as_ref().map(|svc| svc.task().signal());
 
+    match cfg.deploy_host_base() {
+        Some(base) => tracing::info!(
+            base = %base,
+            explicit = cfg.deploy_base_domain.is_some(),
+            "a deployment that names no host will be routed at <id>.{base}"
+        ),
+        None => tracing::info!(
+            "no deploy base domain (APP_LB_DEPLOY_BASE_DOMAIN or a wildcard); a hostless \
+             deployment is handled as before"
+        ),
+    }
+
     let admin_svc = background_service(
         "admin",
         AdminApi::new(
@@ -935,6 +950,7 @@ fn main() {
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
             event_feed.clone(),
             &cfg.public_ips,
+            cfg.deploy_host_base().map(str::to_string),
         ),
     );
 

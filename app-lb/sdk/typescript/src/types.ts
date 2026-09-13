@@ -351,6 +351,21 @@ export interface JwtSpec {
    * both are present.
    */
   cookie?: string;
+  /**
+   * Heyo Auth `/api/auth/login` endpoint for browser email/password sign-in.
+   * Requires `cookie`; app-lb stores neither passwords nor refresh tokens.
+   */
+  login_endpoint?: string;
+  /**
+   * Hosted sign-in: where to redirect a token-less *browser* (a request that
+   * accepts HTML). The issuer signs the person in, sets the JWT in `cookie`, and
+   * redirects back to the URL passed in `login_redirect_param`; app-lb keeps no
+   * session of its own. A program still gets a 401. Requires `cookie`, and must
+   * be `https://` (loopback `http://` aside).
+   */
+  login_url?: string;
+  /** The query parameter the hosted sign-in reads the return URL from. Only with `login_url`; defaults to `redirect_uri`. */
+  login_redirect_param?: string;
 }
 
 export interface DeploymentSpec {

@@ -232,6 +232,10 @@ struct AdminState {
     /// The per-namespace event feed, read by `GET /feeds/:namespace` and
     /// written by the deployment lifecycle handlers.
     feed: Arc<crate::feed::Feed>,
+    /// Base domain a hostless deployment's `<id>.<base>` route is built under,
+    /// already resolved from config (explicit, else the first wildcard). `None`
+    /// disables host synthesis. See [`assume_host`].
+    deploy_base_domain: Option<Arc<str>>,
 }
 
 impl AdminState {
@@ -277,6 +281,7 @@ impl AdminApi {
         public_url: PublicUrl,
         feed: Arc<crate::feed::Feed>,
         public_ips: &[std::net::IpAddr],
+        deploy_base_domain: Option<String>,
     ) -> Self {
         let ingress = Arc::new(Ingress::from_ips(public_ips));
         // Render the display name into the page once; the placeholder appears in
@@ -342,6 +347,10 @@ impl AdminApi {
                 disks_html,
                 public_url,
                 feed,
+                deploy_base_domain: deploy_base_domain
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(Arc::from),
             },
         }
     }
@@ -471,6 +480,23 @@ impl Caller {
             Self::Token(t) => Some(&t.deployments),
             // A grant names namespaces, never ids; `visible_ids` resolves it
             // against the registry the way a namespace token is resolved.
+            Self::Federated(_) => None,
+        }
+    }
+
+    /// The single namespace this caller is confined to, when it reaches exactly
+    /// one — the namespace a deployment spec may omit and have filled in. A
+    /// namespace token always has exactly one; a federated grant may name
+    /// several, so it qualifies only when it names one. An unconfined or
+    /// fleet caller has no single namespace to assume, so it gets `None` and the
+    /// spec keeps whatever it said (`default` when it said nothing).
+    fn sole_namespace(&self) -> Option<&str> {
+        match self {
+            Self::Ungated | Self::Operator => None,
+            Self::Token(t) => t.namespace.as_deref(),
+            Self::Federated(g) if !g.fleet && g.namespaces.len() == 1 => {
+                g.namespaces.keys().next().map(String::as_str)
+            }
             Self::Federated(_) => None,
         }
     }
@@ -2964,6 +2990,69 @@ fn warn_about(spec: &DeploymentSpec) {
 /// An operator, a local token or an ungated caller keeps what the body said:
 /// on a self-hosted app-lb there is no meter, and on the managed one those are
 /// the platform's own hands.
+/// Fill in the namespace a confined caller could have named but didn't.
+///
+/// A credential that reaches exactly one namespace should not have to repeat it
+/// in every spec: an unnamed spec (which serde parses as the `default`
+/// namespace) is taken to mean "my namespace". This never widens what a token
+/// can reach — it writes only the one namespace the caller could already have
+/// named — and it deliberately leaves an *explicit* namespace alone, so a token
+/// confined to `team-a` that writes `team-b` is still refused by the scope check
+/// downstream rather than silently rewritten. The one case it cannot serve is a
+/// confined token that genuinely wants the literal `default` namespace, which is
+/// only reachable by a token actually confined to `default` (a no-op here) —
+/// every other confined token is walled out of `default` regardless.
+///
+/// Runs before `normalize`, so secret refs bind to the assumed namespace, and
+/// before `stamp_owner`, so a federated grant meters to the right account.
+fn assume_namespace(spec: &mut DeploymentSpec, caller: Option<&Caller>) {
+    if spec.namespace == crate::config::DEFAULT_NAMESPACE
+        && let Some(sole) = caller.and_then(Caller::sole_namespace)
+    {
+        spec.namespace = sole.to_string();
+    }
+}
+
+/// Give a deployment that names no host one of its own: `<id>.<base>`.
+///
+/// So a deployment need not restate the fleet's domain to be reachable: with a
+/// base domain configured (an explicit one, else the wildcard zone that already
+/// has a certificate and DNS pointing here — see
+/// [`LbConfig::deploy_host_base`]), a spec that pins no hostname gets a route to
+/// `<id>.<base>`. Ids are globally unique, so the name is too.
+///
+/// Two shapes are left exactly as written:
+/// - one that already pins a `host` or `host_suffix` — there is nothing to
+///   assume; and
+/// - a *routeless VM*, the intentional headless-sandbox shape reached only
+///   through `exec`/`shell`. A VM earns a host only once it exposes a port with
+///   a route (even a path-only one); every other backend is unreachable without
+///   a route, so a routeless site or static deployment does get one rather than
+///   being dead weight.
+///
+/// Runs before `validate`, so the generated route is checked like any other and
+/// an auth callback resolves against it. Off entirely when no base is
+/// configured, leaving a hostless deployment to be handled exactly as before.
+///
+/// [`LbConfig::deploy_host_base`]: crate::config::LbConfig::deploy_host_base
+fn assume_host(spec: &mut DeploymentSpec, base: Option<&str>) {
+    let Some(base) = base else { return };
+    // A pinned hostname is respected; an empty id is left for `validate` to
+    // reject rather than baked into a nonsense `.base` name.
+    if spec.has_host_route() || spec.id.trim().is_empty() {
+        return;
+    }
+    // A routeless VM is private on purpose. Any other backend, or a VM that has
+    // exposed a port with a route, is reached through the proxy and gets a name.
+    if spec.routes.is_empty() && spec.vm.is_some() {
+        return;
+    }
+    spec.routes.push(crate::config::RouteRule {
+        host: Some(format!("{}.{}", spec.id.trim(), base)),
+        ..Default::default()
+    });
+}
+
 pub(crate) fn stamp_owner(spec: &mut DeploymentSpec, caller: Option<&Caller>) {
     if let Some(Caller::Federated(g)) = caller {
         spec.account_id = g.account_for(&spec.namespace).map(str::to_string);
@@ -2976,6 +3065,12 @@ async fn register(
     caller: Option<axum::Extension<Caller>>,
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
+    // A namespace token may omit the namespace and have its own filled in.
+    // Runs first, so the assumed namespace is what secret refs bind to.
+    assume_namespace(&mut spec, caller.as_ref().map(|c| &c.0));
+    // A spec that pins no hostname gets `<id>.<base>`, so a route is checked
+    // and an auth callback resolves against it below.
+    assume_host(&mut spec, state.deploy_base_domain.as_deref());
     // Bind secret references to the spec's namespace before anything reads
     // them; see `DeploymentSpec::normalize`.
     spec.normalize();
@@ -3091,6 +3186,11 @@ async fn update(
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
     spec.id = id.clone();
+    // A namespace token may omit the namespace and have its own filled in,
+    // rather than trip the cross-namespace refusal below with an unnamed spec.
+    assume_namespace(&mut spec, caller.as_ref().map(|c| &c.0));
+    // A spec that pins no hostname gets `<id>.<base>`, as at registration.
+    assume_host(&mut spec, state.deploy_base_domain.as_deref());
     spec.normalize();
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -6249,6 +6349,119 @@ mod tests {
                 stamp_owner(&mut spec, caller.as_ref());
                 assert_eq!(spec.account_id, None);
             }
+        }
+
+        /// A confined credential reaching exactly one namespace has an unnamed
+        /// spec (the `default` namespace) filled in with its own; an explicit,
+        /// different namespace is left for the scope check to refuse; and a
+        /// caller with no single namespace rewrites nothing.
+        #[test]
+        fn a_confined_caller_has_its_lone_namespace_assumed() {
+            let t = store();
+            let raw = mint_in_namespace(&t, AdminScope::Admin, "team-a");
+            let token = Caller::Token(t.verify(&raw, NOW).unwrap());
+
+            // Unnamed spec (default) → the token's own namespace.
+            let mut spec = spec_in("default", None);
+            assume_namespace(&mut spec, Some(&token));
+            assert_eq!(spec.namespace, "team-a");
+
+            // An explicit, different namespace is untouched — the downstream
+            // scope check refuses it rather than have it silently rewritten.
+            let mut spec = spec_in("team-b", None);
+            assume_namespace(&mut spec, Some(&token));
+            assert_eq!(spec.namespace, "team-b");
+
+            // A federated grant naming exactly one namespace is assumed too...
+            let one = Caller::Federated(grant(&[("team-a", AdminScope::Admin)], false));
+            let mut spec = spec_in("default", None);
+            assume_namespace(&mut spec, Some(&one));
+            assert_eq!(spec.namespace, "team-a");
+
+            // ...but one naming several has no lone namespace to assume, and a
+            // fleet, operator, ungated or absent caller never assumes at all.
+            let many = Caller::Federated(grant(
+                &[("team-a", AdminScope::Admin), ("team-b", AdminScope::Admin)],
+                false,
+            ));
+            for caller in [
+                Some(many),
+                Some(Caller::Federated(grant(&[], true))),
+                Some(Caller::Operator),
+                Some(Caller::Ungated),
+                None,
+            ] {
+                let mut spec = spec_in("default", None);
+                assume_namespace(&mut spec, caller.as_ref());
+                assert_eq!(spec.namespace, "default");
+            }
+        }
+
+        fn spec_json(v: serde_json::Value) -> DeploymentSpec {
+            serde_json::from_value(v).unwrap()
+        }
+
+        fn only_host(spec: &DeploymentSpec) -> Option<&str> {
+            match spec.routes.as_slice() {
+                [one] => one.host.as_deref(),
+                _ => None,
+            }
+        }
+
+        /// A backend that cannot be reached without a route — a site or a static
+        /// upstream list — gets `<id>.<base>` when it names no host, and a VM
+        /// gets one only once it has exposed a port with a route. A routeless VM
+        /// stays private, and a pinned host or an absent base is left alone.
+        #[test]
+        fn a_hostless_deployment_is_routed_under_the_base_domain() {
+            let base = Some("us2.heyo.work");
+
+            // A routeless site is dead weight without a host — it gets one.
+            let mut site = spec_json(serde_json::json!({
+                "id": "docs", "routes": [], "site": { "root": "/srv/docs" },
+            }));
+            assume_host(&mut site, base);
+            assert_eq!(only_host(&site), Some("docs.us2.heyo.work"));
+
+            // So does a routeless static upstream list.
+            let mut api = spec_json(serde_json::json!({
+                "id": "api", "routes": [], "upstreams": ["127.0.0.1:9000"],
+            }));
+            assume_host(&mut api, base);
+            assert_eq!(only_host(&api), Some("api.us2.heyo.work"));
+
+            // A routeless VM is a headless sandbox on purpose — no host.
+            let mut headless = spec_json(serde_json::json!({
+                "id": "agent", "routes": [], "vm": { "driver": "firecracker", "port": 8080 },
+            }));
+            assume_host(&mut headless, base);
+            assert!(headless.routes.is_empty());
+
+            // A VM that has exposed a port with a (host-less) route gets a host
+            // route added beside it, leaving the original route untouched.
+            let mut web = spec_json(serde_json::json!({
+                "id": "web", "routes": [{ "path_prefix": "/" }],
+                "vm": { "driver": "firecracker", "port": 8080 },
+            }));
+            assume_host(&mut web, base);
+            assert!(web.has_host_route());
+            assert!(web.routes.iter().any(|r| r.host.as_deref() == Some("web.us2.heyo.work")));
+            assert!(web.routes.iter().any(|r| r.path_prefix.as_deref() == Some("/")));
+
+            // A pinned host is respected; nothing is added.
+            let mut pinned = spec_json(serde_json::json!({
+                "id": "x", "routes": [{ "host": "chosen.example.com" }],
+                "site": { "root": "/srv/x" },
+            }));
+            assume_host(&mut pinned, base);
+            assert_eq!(only_host(&pinned), Some("chosen.example.com"));
+
+            // No base configured ⇒ host synthesis is off entirely.
+            let mut no_base = spec_json(serde_json::json!({
+                "id": "docs", "routes": [], "site": { "root": "/srv/docs" },
+            }));
+            assume_host(&mut no_base, None);
+            assert!(no_base.routes.is_empty());
         }
 
         fn host_sandbox(id: &str, account: Option<&str>) -> HostSandboxView {

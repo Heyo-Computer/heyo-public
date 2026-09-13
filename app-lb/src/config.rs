@@ -202,6 +202,20 @@ pub struct LbConfig {
     /// challenge records are written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route53_zone_id: Option<String>,
+    /// Base domain under which a deployment that names no host of its own is
+    /// given one: `<id>.<base>`. Set with `APP_LB_DEPLOY_BASE_DOMAIN`.
+    ///
+    /// Left unset it falls back to the first `acme_wildcards` entry (see
+    /// [`deploy_host_base`]), which is the domain that already has a wildcard
+    /// certificate and DNS pointing at this LB — so a synthesized host gets TLS
+    /// and resolves with no further setup. Point it elsewhere only if a
+    /// different base should carry the generated names, and then make sure that
+    /// domain is covered by a certificate and resolves here, since app-lb writes
+    /// neither DNS nor a per-host cert for a name outside its wildcards.
+    ///
+    /// [`deploy_host_base`]: LbConfig::deploy_host_base
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_base_domain: Option<String>,
     /// Shell that a static deployment's `update.commands` run through. They are
     /// written as shell lines (`git pull && cargo build --release`), so there is
     /// one; pointing this at `bash` buys bashisms.
@@ -295,6 +309,7 @@ impl Default for LbConfig {
             acme_wildcards: Vec::new(),
             public_ips: Vec::new(),
             route53_zone_id: None,
+            deploy_base_domain: None,
             update_shell: default_update_shell(),
             build_timeout_secs: default_build_timeout_secs(),
             heyvm_home: None,
@@ -303,6 +318,19 @@ impl Default for LbConfig {
 }
 
 impl LbConfig {
+    /// The base domain a hostless deployment's name is built under, or `None`
+    /// when there is nowhere sensible to put one. An explicit
+    /// `deploy_base_domain` wins; otherwise the first wildcard is used, because
+    /// a name under it already has a certificate and DNS. With neither, host
+    /// synthesis is simply off and a hostless deployment is handled as before.
+    pub fn deploy_host_base(&self) -> Option<&str> {
+        self.deploy_base_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.acme_wildcards.iter().map(|w| w.trim()).find(|w| !w.is_empty()))
+    }
+
     /// ACME is on iff a contact address was configured.
     pub fn acme_enabled(&self) -> bool {
         self.acme_email.is_some()
@@ -2323,6 +2351,33 @@ pub struct JwtSpec {
     /// tokens or passwords. Existing bearer-only gates remain unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_endpoint: Option<String>,
+    /// Where to send a browser that reaches a gated path holding no valid token.
+    ///
+    /// The `jwt` provider is otherwise stateless: it verifies a token that is
+    /// already being carried and, finding none, answers `401`. That is right for
+    /// a program, and a dead end for a person — a browser cannot set an
+    /// `Authorization` header on a navigation, so it has no way to *acquire* one.
+    ///
+    /// Set this to the issuer's hosted sign-in page and a token-less **browser**
+    /// (a request whose `Accept` includes HTML) is redirected there instead, with
+    /// the URL it was trying to reach passed in `login_redirect_param`. The issuer
+    /// signs the user in, sets the JWT in the `cookie` named above, and redirects
+    /// back; the gate then reads the cookie and admits the request. app-lb mints
+    /// no session and keeps no flow state — the cookie the issuer set *is* the
+    /// session. A program (no HTML in `Accept`) still gets the `401`, which it can
+    /// act on and would only fail to parse as a sign-in page.
+    ///
+    /// Requires `cookie`: the return trip is a navigation, and a navigation can
+    /// carry a credential only in a cookie ([`SpecError::LoginUrlWithoutCookie`]).
+    /// Must be `https://` (or a loopback `http://` for an issuer on this host),
+    /// for the same reason `jwks_url` must.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_url: Option<String>,
+    /// The query parameter the hosted sign-in reads the return URL from. Only
+    /// meaningful with `login_url`; unset means `redirect_uri`. Set it to whatever
+    /// the issuer expects — `return_to`, `next`, `rd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_redirect_param: Option<String>,
 }
 
 fn default_subject_claim() -> String {
@@ -2363,7 +2418,15 @@ impl JwtSpec {
             leeway_secs: None,
             cookie: None,
             login_endpoint: None,
+            login_url: None,
+            login_redirect_param: None,
         }
+    }
+
+    /// The query parameter the hosted sign-in reads the return URL from. See
+    /// [`login_url`](Self::login_url); `redirect_uri` unless overridden.
+    pub fn login_redirect_param(&self) -> &str {
+        self.login_redirect_param.as_deref().unwrap_or("redirect_uri")
     }
 
     /// Whether this gate accepts a token signed with `alg`.
@@ -2530,6 +2593,22 @@ impl JwtSpec {
             });
             if !valid || self.cookie.is_none() {
                 return Err(SpecError::BadJwtLoginEndpoint);
+            }
+        }
+        if let Some(url) = &self.login_url {
+            // The same transport rule as jwks_url: a browser redirected to
+            // plaintext http on another host is a downgrade an attacker on the
+            // path can exploit, and loopback is the only http exception.
+            match jwks_url_problem(url.trim()) {
+                None => {}
+                Some(_) => return Err(SpecError::BadLoginUrl(url.trim().to_string())),
+            }
+            // Without a cookie the return navigation has nowhere to carry the
+            // token, so the browser would be redirected to sign in, come back
+            // with no header the gate can read, and be redirected again — a loop
+            // that is impossible to diagnose from the outside.
+            if self.cookie.is_none() {
+                return Err(SpecError::LoginUrlWithoutCookie);
             }
         }
         Ok(())
@@ -3652,6 +3731,11 @@ pub enum SpecError {
     BadJwtIssuer(String),
     BadJwtAudience(String),
     BadJwtLoginEndpoint,
+    /// A `jwt.login_url` that is not an `https://` URL (or a loopback `http://`).
+    BadLoginUrl(String),
+    /// `jwt.login_url` set with no `jwt.cookie` to carry the token back on the
+    /// return navigation — the redirect would loop forever.
+    LoginUrlWithoutCookie,
     EmptyJwtClaimName,
     JwtLeewayTooLarge {
         secs: u64,
@@ -4086,6 +4170,20 @@ impl std::fmt::Display for SpecError {
                  surrounding whitespace"
             ),
             Self::BadJwtLoginEndpoint => write!(f, "auth.jwt.login_endpoint requires a cookie and an HTTPS URL without credentials, query or fragment (HTTP loopback is allowed)"),
+            Self::BadLoginUrl(u) => write!(
+                f,
+                "auth.jwt.login_url {u:?} must be an https:// URL — the hosted sign-in page a \
+                 token-less browser is redirected to. http:// is allowed only to a loopback \
+                 address, for an issuer running on this host: a browser redirected to \
+                 plaintext elsewhere can have the sign-in intercepted"
+            ),
+            Self::LoginUrlWithoutCookie => write!(
+                f,
+                "auth.jwt.login_url is set but auth.jwt.cookie is not. The browser is redirected \
+                 to sign in and comes back on a navigation, which can carry the token only in a \
+                 cookie — with none named, the gate cannot read it and redirects again, forever. \
+                 Set auth.jwt.cookie to the cookie the issuer writes the token into"
+            ),
             Self::EmptyJwtClaimName => write!(
                 f,
                 "auth.jwt names an empty claim; subject_claim, email_claim, name_claim and \
@@ -4584,6 +4682,15 @@ impl DeploymentSpec {
         Ok(())
     }
 
+    /// Whether any route pins a hostname — an exact `host` or a `host_suffix`.
+    /// A deployment with none either is reached without one (a path-only route,
+    /// or a headless routeless VM) or is a candidate for a synthesized host.
+    pub fn has_host_route(&self) -> bool {
+        self.routes
+            .iter()
+            .any(|r| r.host.is_some() || r.host_suffix.is_some())
+    }
+
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
@@ -5032,6 +5139,25 @@ impl WorkflowSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The base domain a hostless deployment is routed under: an explicit
+    /// setting wins, else the first wildcard (which already has a cert and DNS),
+    /// else nothing — and blank strings count as nothing on either side.
+    #[test]
+    fn deploy_host_base_prefers_explicit_then_the_first_wildcard() {
+        let mut cfg = LbConfig::default();
+        assert_eq!(cfg.deploy_host_base(), None);
+
+        cfg.acme_wildcards = vec!["sb.example.com".into(), "other.example.com".into()];
+        assert_eq!(cfg.deploy_host_base(), Some("sb.example.com"));
+
+        cfg.deploy_base_domain = Some("apps.example.com".into());
+        assert_eq!(cfg.deploy_host_base(), Some("apps.example.com"));
+
+        // A blank explicit value falls back rather than producing ".<id>".
+        cfg.deploy_base_domain = Some("  ".into());
+        assert_eq!(cfg.deploy_host_base(), Some("sb.example.com"));
+    }
 
     /// A declared namespace is an object with a name and very little else, so
     /// validation is where all of its rules live.
@@ -7656,6 +7782,34 @@ mod tests {
                 with_jwt(r#""google""#, heyo_block()).validate().unwrap_err(),
                 SpecError::JwtPolicyWithoutProvider,
             );
+        }
+
+        /// Hosted sign-in: a `login_url` needs a cookie to carry the token back,
+        /// must be https (loopback http aside), and is otherwise accepted.
+        #[test]
+        fn a_hosted_login_url_needs_a_cookie_and_https() {
+            // login_url without a cookie loops forever, so it is refused.
+            let mut no_cookie = heyo_block();
+            no_cookie["login_url"] = serde_json::json!("https://auth.example.com/login");
+            assert_eq!(
+                with_jwt(r#""jwt""#, no_cookie).validate().unwrap_err(),
+                SpecError::LoginUrlWithoutCookie,
+            );
+
+            // Plaintext to another host is a redirect an attacker can intercept.
+            let mut plaintext = heyo_block();
+            plaintext["cookie"] = serde_json::json!("heyo_access_token");
+            plaintext["login_url"] = serde_json::json!("http://auth.example.com/login");
+            assert!(matches!(
+                with_jwt(r#""jwt""#, plaintext).validate().unwrap_err(),
+                SpecError::BadLoginUrl(_),
+            ));
+
+            // https with a cookie is the shape that works.
+            let mut ok = heyo_block();
+            ok["cookie"] = serde_json::json!("heyo_access_token");
+            ok["login_url"] = serde_json::json!("https://auth.example.com/login");
+            assert_eq!(with_jwt(r#""jwt""#, ok).validate(), Ok(()));
         }
 
         /// `algorithms` has no default, because the only available default would
