@@ -395,6 +395,14 @@ mod tests {
         let ctx=crate::expr::Context::new();
         assert!(!ctx.eval_condition(release.condition.as_deref().unwrap()).unwrap());
         assert!(!ctx.eval_condition(job("deploy").condition.as_deref().unwrap()).unwrap());
+        let archive_condition=job("release-archive").condition.as_deref();
+        assert!(archive_condition.is_some(),"release archives must be gated, not just depend on a possibly skipped release");
+        assert!(!ctx.eval_condition(archive_condition.unwrap()).unwrap());
+        for (enabled,expected) in [("false",false),("true",true)] {
+            let mut ctx=crate::expr::Context::new();
+            ctx.set("vars",serde_json::json!({"RELEASE_ENABLED":enabled}));
+            assert_eq!(ctx.eval_condition(archive_condition.unwrap()).unwrap(),expected);
+        }
         assert_eq!(job("release-archive").needs,vec!["release"]);
         assert_eq!(job("release-archive").steps[0].uses.as_deref(),Some("ci/checkout-release"));
         assert_eq!(job("deploy").needs,vec!["release-archive"]);

@@ -92,6 +92,7 @@ jobs:
 
   release-archive:
     needs: [release]
+    if: ${{ vars.RELEASE_ENABLED == 'true' }}
     vm: *linux
     timeout-minutes: 120
     outputs:
