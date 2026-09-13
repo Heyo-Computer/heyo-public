@@ -4,6 +4,26 @@ These resources add a new installation. Do not deregister a staging backend,
 replace staging services, move staging runners, or copy staging deployment history.
 The existing Auth service and S3 object store can be shared without moving them.
 
+## CI
+
+`ci.json` builds `ci/Dockerfile.firecracker` through app-lb from a pinned public
+commit. It starts inert, with no route and zero replicas. CI and NATS run in
+the image; Postgres stays external. Existing us3 CI test files are disposable.
+
+Populate app-lb's `ci-us3` delivery secret from HeyoSecret: the existing
+`ci-us3-trial/{database-url,cloud-api-key,webhook-secret,native-runner-secret,nats-token}`
+values plus `cloud/internal-api-key` as `daemon-api-key`. The latter authenticates
+the direct us3 host daemon connection through the VM's private default gateway;
+it does not move the host's staging registration. No credential is rotated.
+
+Copy the existing CI app-lb authentication policy and configured admin emails
+before assigning a public route. Build the pinned revision, start a replica,
+grant that VM's IP/tap pair access to regional Postgres through the existing
+host firewall policy, then verify CI health and runner connectivity before
+moving `ci.us3.heyo.work` to it. Keep release/tag publication disabled during
+installation. The public client accepts `git submit pr59`; register the public
+repository with `ci/system.yml` as its workflow path.
+
 ## Cloud
 
 `cloud.json` is an inert app-lb template, with no routes and zero replicas.

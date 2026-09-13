@@ -63,8 +63,10 @@ CI executable, `start.sh`, and `REVISION`. Configure `ORCHESTRATOR_URL`,
 workflow's HeyoSecret scope. The workflow inserts only the finalized archive ID
 into that spec. The target must supply external Postgres/NATS and durable CI
 workspace/log/artifact storage. This archive does **not** replace the stateful
-us3 CI/NATS bundle without a state-preserving migration; do not point it at that
-service and assume its local NATS or files will transfer automatically.
+CI/NATS bundle by itself: it contains no broker. For the new us3 installation,
+`ci/Dockerfile.firecracker` packages CI and NATS together and
+`.heyo/regions/us3/ci.json` defines the app-lb deployment. Existing us3 CI test
+data is disposable; no migration of that test data is required.
 
 ## Submitting a build
 
@@ -77,10 +79,18 @@ git config ci.token    cis_019fca648a6e-00000002.…
 
 git submit --dry-run    # show what would be sent
 git submit              # submit HEAD
+git submit pr59         # fetch and submit the exact head commit of GitHub PR #59
 git submit --dirty      # include uncommitted tracked changes
 git submit --archive    # send a tree-only tarball instead of a bundle
 git submit --only apps  # run one workflow file, skip the rest
 ```
+
+The positional `pr<number>` selector fetches `refs/pull/<number>/head` from
+`origin` into a short-lived private local ref and submits that exact commit via
+the same bundle/archive path as `--ref`. It does not check out the PR or change
+the current branch, index, or worktree, and it performs no GitHub write. A PR
+selector cannot be combined with `--ref` or `--dirty`; malformed selectors and
+PR refs that the remote cannot provide are rejected before submission.
 
 `--only <workflow>` starts runs for just the workflow files it names and leaves
 every other one alone. A selector is the file's path
@@ -816,6 +826,13 @@ authority: it returns `backend_server_id`, a different field fed by the
 `BACKEND_SERVER_ID` environment variable, and trusting it pins jobs to an id the
 cloud may have no live registration for — a queue with no consumer beside a
 daemon that is perfectly healthy. `CI_DEFAULT_NODE` overrides everything.
+
+For a fixed host, `CI_LOCAL_RUNNER` can name the daemon's direct base URL instead
+of using Cloud discovery. `CI_LOCAL_RUNNER_TOKEN` supplies that daemon's bearer
+credential when required; leaving it unset preserves unauthenticated local
+development. Keep the credential in HeyoSecret-backed deployment configuration,
+and use HTTPS or a trusted private host-to-VM network for this connection.
+This mode does not register or move the host between Cloud installations.
 
 `CI_VM_LEASE_SECS` (default 180) is the window between an instance dying and its
 VMs becoming reclaimable; renewal runs at a third of it.

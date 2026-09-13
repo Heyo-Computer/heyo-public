@@ -228,6 +228,9 @@ pub struct HeyvmConfig {
     /// because it is the only configuration a test can assert against without a
     /// second machine. queue-fn is local-daemon-only for the same reason.
     pub local_runner: Option<String>,
+    /// Optional bearer for a protected direct daemon. Separate from the Cloud
+    /// credential: the host may trust a different internal API key.
+    pub local_runner_token: Option<String>,
 }
 
 /// Default for `CI_ALLOW_UNAUTHENTICATED_RUNNERS`.
@@ -456,6 +459,7 @@ impl Config {
                 "1" | "true" | "yes" | "on" => heyo_sdk::DEFAULT_LOCAL_BASE_URL.to_string(),
                 other => other.trim_end_matches('/').to_string(),
             }),
+            local_runner_token: opt("CI_LOCAL_RUNNER_TOKEN"),
         };
 
         let nats_url = opt("CI_NATS_URL").unwrap_or_else(|| "nats://127.0.0.1:4222".to_string());
@@ -914,8 +918,8 @@ mod tests {
 
     /// A `CI_NETWORK` of only separators names nothing, and an instance serving
     /// nothing would accept submits it can never run.
-    #[test]
-    fn a_network_list_that_names_nothing_is_refused_at_startup() {
+    #[tokio::test]
+    async fn a_network_list_that_names_nothing_is_refused_at_startup() {
         unsafe {
             std::env::set_var("CI_HEYO_API_KEY", "k");
             std::env::set_var("CI_DATABASE_URL", "postgres://localhost/ci");
@@ -926,6 +930,23 @@ mod tests {
         assert!(err.to_string().contains("CI_NETWORK"), "{err}");
         assert!(err.to_string().contains("names no network"), "{err}");
         unsafe { std::env::set_var("CI_NETWORK", "test-net") };
+        unsafe {
+            std::env::set_var("CI_LOCAL_RUNNER", "https://runner.example.test");
+            std::env::remove_var("CI_LOCAL_RUNNER_TOKEN");
+        }
+        let config = Config::from_env().unwrap();
+        let runners = crate::runners::Runners::new(std::sync::Arc::new(config));
+        assert!(runners.options_for("hd-local").await.unwrap().api_key.is_none());
+        unsafe { std::env::set_var("CI_LOCAL_RUNNER_TOKEN", "distinct-daemon-key") };
+        let config = Config::from_env().unwrap();
+        let runners = crate::runners::Runners::new(std::sync::Arc::new(config));
+        let options = runners.options_for("hd-local").await.unwrap();
+        assert_eq!(options.api_key.as_deref(), Some("distinct-daemon-key"));
+        assert_eq!(options.base_url.as_deref(), Some("https://runner.example.test"));
+        unsafe {
+            std::env::remove_var("CI_LOCAL_RUNNER");
+            std::env::remove_var("CI_LOCAL_RUNNER_TOKEN");
+        }
     }
 
     /// Retention is the one duration where zero is meaningful — it is how an

@@ -49,12 +49,14 @@ die() { printf '%s: %s\n' "$cmd" "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-Usage: $cmd [--dirty] [--ref <rev>] [--only <workflow>] [--workflow <id>] [--dry-run] [--submit-empty]
+Usage: $cmd [pr<number>] [--dirty] [--ref <rev>] [--only <workflow>] [--workflow <id>] [--dry-run] [--submit-empty]
 
 Submits a tarball of the tree to the CI orchestrator and prints the runs it
 started.
 
 Options:
+  pr<number>        fetch and submit that GitHub pull request's exact head
+                   commit (for example, pr59), without checking it out
   --dirty          include uncommitted tracked changes
   --submit-empty   submit even when the tree is identical to the default
                    branch — a run that rebuilds what main already is
@@ -86,6 +88,8 @@ EOF
 # --- argument parsing -------------------------------------------------------
 
 rev="HEAD"
+ref_selected=0
+pr_number=""
 dirty=0
 dry_run=0
 archive=0
@@ -98,7 +102,7 @@ while [ $# -gt 0 ]; do
     --submit-empty) submit_empty=1; shift ;;
     --archive)  archive=1; shift ;;
     --dry-run)  dry_run=1; shift ;;
-    --ref)      rev="${2:?--ref needs a revision}"; shift 2 ;;
+    --ref)      rev="${2:?--ref needs a revision}"; ref_selected=1; shift 2 ;;
     --workflow) workflow="${2:?--workflow needs an id}"; shift 2 ;;
     --only)     only+=("${2:?--only needs a workflow name}"); shift 2 ;;
     --upgrade)
@@ -110,9 +114,25 @@ while [ $# -gt 0 ]; do
       ;;
     --version)  printf '%s %s\n' "$me" "$GIT_SUBMIT_VERSION"; exit 0 ;;
     -h|--help)  usage; exit 0 ;;
+    pr*)
+      pr_candidate="${1#pr}"
+      case "$pr_candidate" in
+        ""|0|0*|*[!0-9]*)
+          die "malformed pull request selector $1 (expected pr<number>, for example pr59)"
+          ;;
+      esac
+      [ -z "$pr_number" ] || die "only one pull request selector may be used"
+      pr_number="$pr_candidate"
+      shift
+      ;;
     *)          die "unknown argument $1 (try --help)" ;;
   esac
 done
+
+if [ -n "$pr_number" ]; then
+  [ "$ref_selected" -eq 0 ] || die "pr$pr_number cannot be combined with --ref"
+  [ "$dirty" -eq 0 ] || die "pr$pr_number cannot be combined with --dirty"
+fi
 
 for tool in git curl base64; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is required but not on PATH"
@@ -171,10 +191,28 @@ fi
 
 # --- what to submit ---------------------------------------------------------
 
+work=""
+pr_ref=""
+cleanup() {
+  [ -z "$pr_ref" ] || git update-ref -d "$pr_ref" >/dev/null 2>&1 || true
+  [ -z "$work" ] || rm -rf "$work"
+}
+trap cleanup EXIT
+
+if [ -n "$pr_number" ]; then
+  pr_ref="refs/git-submit/pull-$pr_number-$$"
+  git fetch --quiet --no-tags origin "+refs/pull/$pr_number/head:$pr_ref" \
+    || die "cannot fetch GitHub pull request #$pr_number from origin"
+  rev="$pr_ref"
+fi
+
 sha="$(git rev-parse --verify "$rev^{commit}" 2>/dev/null)" \
   || die "cannot resolve $rev to a commit"
 branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 [ "$branch" = "HEAD" ] && branch="detached"
+if [ -n "$pr_number" ]; then
+  branch="pull/$pr_number"
+fi
 repo_url="$(git config --get remote.origin.url || echo "")"
 repo_name="$(basename "$(git rev-parse --show-toplevel)")"
 default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
@@ -189,8 +227,6 @@ pusher_name="$(git config --get user.name || echo "")"
 pusher_email="$(git config --get user.email || echo "")"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/git-submit.XXXXXX")"
-cleanup() { rm -rf "$work"; }
-trap cleanup EXIT
 
 tarball="$work/source.tar.gz"
 bundle="$work/source.bundle"

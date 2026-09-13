@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Executed regression tests for the public git-submit shell client."""
 
+import base64
 import hashlib
 import hmac
 import http.server
@@ -57,6 +58,12 @@ class GitSubmitTest(unittest.TestCase):
         (self.repo / "file.txt").write_text("feature\n")
         self.git("commit", "-qam", "feature")
         self.feature_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("switch", "-qc", "pr-source", "main")
+        (self.repo / "file.txt").write_text("pull request\n")
+        self.git("commit", "-qam", "pull request")
+        self.pr_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("push", "-q", "origin", "HEAD:refs/pull/59/head")
+        self.git("switch", "-q", "feature")
         SubmitHandler.requests = []
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SubmitHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -129,6 +136,37 @@ class GitSubmitTest(unittest.TestCase):
         result = self.run_client("--dry-run", env={"CI_ENDPOINT": self.base + "/git/push",
                                                     "CI_TOKEN": TOKEN})
         self.assertIn(self.base + "/api/submit", result.stdout)
+        self.assertEqual(SubmitHandler.requests, [])
+
+    def test_pr_selector_submits_remote_pr_head_without_checkout_or_remote_write(self):
+        head_before = self.git("rev-parse", "HEAD").stdout.strip()
+        status_before = self.git("status", "--porcelain=v1").stdout
+        remote_before = self.git("ls-remote", "origin").stdout
+        self.run_client("pr59", "--submit-empty",
+                        env={"CI_ENDPOINT": self.base, "CI_TOKEN": TOKEN})
+        _path, _headers, raw = SubmitHandler.requests.pop()
+        payload = json.loads(raw)
+        self.assertEqual(payload["after"], self.pr_sha)
+        self.assertEqual(payload["before"], self.main_sha)
+        self.assertEqual(payload["ref"], "refs/heads/pull/59")
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), head_before)
+        self.assertEqual(self.git("status", "--porcelain=v1").stdout, status_before)
+        self.assertEqual(self.git("ls-remote", "origin").stdout, remote_before)
+        self.assertEqual(self.git("for-each-ref", "refs/git-submit").stdout, "")
+
+        bundle = pathlib.Path(self.temp.name) / "submitted.bundle"
+        bundle.write_bytes(base64.b64decode(payload["source"]["contentBase64"]))
+        heads = subprocess.run(["git", "bundle", "list-heads", bundle], check=True,
+                               text=True, capture_output=True).stdout
+        self.assertIn(f"{self.pr_sha} refs/heads/pull/59", heads)
+
+    def test_pr_selector_rejects_malformed_and_conflicting_selectors(self):
+        for args in (("pr0",), ("prx",), ("pr59x",), ("pr59", "--ref", "HEAD"),
+                     ("pr59", "--dirty"), ("pr59", "pr60")):
+            with self.subTest(args=args):
+                result = self.run_client(*args, env={"CI_ENDPOINT": self.base,
+                                                     "CI_TOKEN": TOKEN}, check=False)
+                self.assertNotEqual(result.returncode, 0)
         self.assertEqual(SubmitHandler.requests, [])
 
 

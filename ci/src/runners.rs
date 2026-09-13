@@ -864,10 +864,10 @@ impl Runners {
     /// these options rides the same link rather than opening another.
     pub async fn options_for(&self, runner_id: &str) -> Result<HeyoClientOptions, RunnerError> {
         if let Some(url) = &self.config.heyvm.local_runner {
-            // A same-machine daemon runs without JWT_SECRET and ignores a
-            // bearer, so none is sent — matching `HeyoClient::local`.
+            // Development daemons may need no bearer; regional hosts can
+            // require their own internal key rather than the Cloud token.
             return Ok(HeyoClientOptions {
-                api_key: None,
+                api_key: self.config.heyvm.local_runner_token.clone(),
                 base_url: Some(url.clone()),
                 timeout: None,
             });

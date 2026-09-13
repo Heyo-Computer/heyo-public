@@ -1,0 +1,45 @@
+{
+  "id": "ci-us3",
+  "routes": [],
+  "vm": {
+    "driver": "firecracker",
+    "image": "REPLACE_WITH_VERIFIED_RUNTIME_IMAGE",
+    "port": 9500,
+    "size_class": "medium",
+    "ttl_seconds": 0,
+    "working_directory": "/opt/ci",
+    "start_command": "export CI_LOCAL_RUNNER=http://$(ip route show default | awk '{print $3}' | head -1):34099; setsid nohup bash /opt/ci/start.sh </dev/null >/workspace/ci-state.log 2>&1 &",
+    "env_vars": {
+      "CI_NAME": "ci-us3",
+      "CI_LISTEN_ADDR": "0.0.0.0:9500",
+      "CI_PUBLIC_URL": "https://ci.us3.heyo.work",
+      "CI_HEYO_BASE_URL": "https://cloud.us3.heyo.work",
+      "CI_NETWORK": "local",
+      "CI_NATS_URL": "nats://127.0.0.1:4222",
+      "CI_NATS_SUBJECT_PREFIX": "ci_us3",
+      "CI_LOG_DIR": "/workspace/ci-state/logs",
+      "CI_WORKSPACE_DIR": "/workspace/ci-state/workspaces",
+      "CI_ARTIFACT_SINK": "disk",
+      "CI_ARTIFACT_DIR": "/workspace/ci-state/artifacts",
+      "CI_REQUIRE_REPO_TOKEN": "true",
+      "CI_WORKFLOW_PATH": "ci/system.yml"
+    },
+    "env_from": [
+      {"secret": "ci-us3", "key": "database-url", "as": "CI_DATABASE_URL"},
+      {"secret": "ci-us3", "key": "cloud-api-key", "as": "CI_HEYO_API_KEY"},
+      {"secret": "ci-us3", "key": "daemon-api-key", "as": "CI_LOCAL_RUNNER_TOKEN"},
+      {"secret": "ci-us3", "key": "webhook-secret", "as": "CI_WEBHOOK_SECRET"},
+      {"secret": "ci-us3", "key": "native-runner-secret", "as": "CI_NATIVE_RUNNER_SECRET"},
+      {"secret": "ci-us3", "key": "nats-token", "as": "CI_NATS_TOKEN"}
+    ]
+  },
+  "build": {
+    "repo": "https://github.com/Heyo-Computer/heyo-public.git",
+    "ref": "REPLACE_WITH_COMMIT",
+    "dockerfile": "ci/Dockerfile.firecracker",
+    "context": ".",
+    "image_size_mb": 2048
+  },
+  "health": {"path": "/healthz", "timeout_secs": 5},
+  "scaling": {"min_replicas": 0, "max_replicas": 1, "warm_pool": 0, "boot_timeout_secs": 600}
+}
