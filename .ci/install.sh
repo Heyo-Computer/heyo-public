@@ -273,6 +273,7 @@ app_coords() {
     codegraph) echo "codegraph release codegraph" ;;
     art)       echo "art release art" ;;
     queue)     echo "queue release queue" ;;
+    pg-fc)     echo "pg-fc release pg-fc" ;;
     *) return 1 ;;
   esac
 }
@@ -288,6 +289,7 @@ app_bins() {
     codegraph) echo "codegraph" ;;
     art)       echo "art" ;;
     queue)     echo "queue" ;;
+    pg-fc)     echo "pg-vm-pool" ;;
   esac
 }
 
@@ -389,7 +391,7 @@ installed=""
 skipped_confs=""
 
 for app in $APPS; do
-  coords="$(app_coords "$app")" || die "unknown app '$app' (known: app-lb app-obs ci codegraph art queue)"
+  coords="$(app_coords "$app")" || die "unknown app '$app' (known: app-lb app-obs ci codegraph art queue pg-fc)"
   # shellcheck disable=SC2086
   set -- $coords
   wf="$1"; job="$2"; name="$3"
