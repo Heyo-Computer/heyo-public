@@ -288,6 +288,15 @@ export interface AuthGate {
   forward_identity?: boolean;
   /** How to verify a JWT, when `jwt` is among the providers. */
   jwt?: JwtSpec;
+  /**
+   * Inherit the identity half of this gate — `provider`, the OAuth credentials
+   * and allow-lists, `jwt`, `cookie_domain` — from a named provider declared on
+   * the deployment's namespace, resolved live on every request. When set, this
+   * gate carries only the route-scoped fields (`public_paths`, `session_scope`,
+   * `base_path`, `cookie_name`, `redirect_url`, `forward_identity`,
+   * `session_ttl_secs`); setting an identity field alongside it is refused.
+   */
+  provider_ref?: string;
 }
 
 export type AuthProvider = "google" | "app-token" | "jwt";

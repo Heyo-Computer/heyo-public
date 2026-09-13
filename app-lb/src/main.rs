@@ -16,6 +16,7 @@ mod acme;
 mod admin;
 mod artifact;
 mod auth;
+mod auth_providers;
 mod autoscale;
 mod config;
 mod deployment;
@@ -487,6 +488,20 @@ fn main() {
             "restored declared namespaces; some objects were unreadable and were left on disk"
         ),
     }
+    let auth_providers = Arc::new(crate::auth_providers::AuthProviderStore::new(
+        crate::auth_providers::auth_provider_dir(&cfg.state_path),
+    ));
+    match auth_providers.load() {
+        (0, 0) => tracing::debug!(dir = %auth_providers.dir().display(), "no declared auth providers"),
+        (n, 0) => tracing::info!(count = n, "restored declared auth providers"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %auth_providers.dir().display(),
+            "restored declared auth providers; some objects were unreadable and were left on disk"
+        ),
+    }
+
     // A deregistration whose file removal failed would otherwise resurrect the
     // deployment on this start. Declines to run if the load above skipped
     // anything, so it can never delete a spec it merely failed to understand.
@@ -910,6 +925,7 @@ fn main() {
             secrets,
             workflows,
             namespaces,
+            auth_providers.clone(),
             tokens,
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),
@@ -933,6 +949,7 @@ fn main() {
             siem.as_ref().map(|s| s.sink.clone()),
             guard.clone(),
             event_feed,
+            auth_providers.clone(),
         ),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);

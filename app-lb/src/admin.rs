@@ -192,6 +192,10 @@ struct AdminState {
     /// mention are not in here — `GET /namespaces` reports the union, and
     /// `declared` on each row is what tells them apart.
     namespaces: Arc<crate::namespaces::NamespaceStore>,
+    /// Reusable, namespace-scoped auth providers. A deployment inherits one with
+    /// `auth.provider_ref`; the proxy resolves it live. Managed through this API,
+    /// walled by namespace exactly as `secrets` is.
+    auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
     /// App-tokens. Verified on every gated request, so reads are lock-free.
     tokens: Arc<crate::tokens::TokenStore>,
     /// Resolves bearers the Heyo auth service issued. `None` when
@@ -263,6 +267,7 @@ impl AdminApi {
         secrets: Arc<SecretStore>,
         workflows: Arc<crate::workflows::WorkflowStore>,
         namespaces: Arc<crate::namespaces::NamespaceStore>,
+        auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
         tokens: Arc<crate::tokens::TokenStore>,
         jobs: Arc<Jobs>,
         obs: Option<Arc<crate::obs::Stats>>,
@@ -323,6 +328,7 @@ impl AdminApi {
                 ingress,
                 workflows,
                 namespaces,
+                auth_providers,
                 tokens,
                 jobs,
                 obs,
@@ -518,6 +524,7 @@ fn narrows_itself(matched: &str) -> bool {
             | "/siem"
             | "/ingress"
             | "/namespaces"
+            | "/auth-providers"
             | "/whoami"
     )
 }
@@ -525,6 +532,15 @@ fn narrows_itself(matched: &str) -> bool {
 /// The secret store's routes, which are walled by namespace in their handlers.
 fn is_secret_route(matched: &str) -> bool {
     matches!(matched, "/secrets" | "/secrets/:id")
+}
+
+/// The auth-provider routes, walled by namespace in their handlers for the same
+/// reason the secret ones are: for `POST /auth-providers` the namespace is in
+/// the body, and for the item routes it is a path parameter the gate does not
+/// read, so the handler checks reach rather than the gate. `GET /auth-providers`
+/// is handled by `narrows_itself` instead, like `/secrets` on `GET`.
+fn is_auth_provider_route(matched: &str) -> bool {
+    matches!(matched, "/auth-providers" | "/auth-providers/:namespace/:name")
 }
 
 /// The deployment a matched route acts on, if it acts on one.
@@ -721,6 +737,10 @@ fn decide_access(
             // reach — the gate cannot, because for `/secrets` the namespace is
             // in the body or the query, not the path.
             None if is_secret_route(matched) && caller.confined() => {}
+            // Auth providers, walled the same way: the `:namespace` is a path
+            // parameter the gate does not read (and the body names it on
+            // `POST`), so the handler measures the caller's reach against it.
+            None if is_auth_provider_route(matched) && caller.confined() => {}
             None if !narrows_itself(matched) && !caller.covers_fleet() => {
                 return Verdict::Forbidden(
                     "this token is scoped to specific deployments, so it cannot use a \
@@ -2171,6 +2191,270 @@ async fn delete_namespace(
     }
 }
 
+// ---- auth providers -----------------------------------------------------
+
+/// Whether `caller` may read (`admin == false`) or change (`admin == true`) the
+/// auth providers of `ns`. Walled exactly as secrets are: an ungated or operator
+/// caller may do anything; a confined credential is measured against its reach.
+fn may_use_auth_providers(caller: Option<&Caller>, ns: &str, admin: bool) -> Result<(), Response> {
+    let Some(caller) = caller else {
+        return Ok(());
+    };
+    if !caller.reaches_namespace(ns) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!("this credential cannot reach the \"{ns}\" namespace's auth providers"),
+        )
+        .into_response());
+    }
+    if admin && !caller.satisfies_in(crate::tokens::AdminScope::Admin, Some(ns)) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!(
+                "this credential may only view the \"{ns}\" namespace, not change its auth providers"
+            ),
+        )
+        .into_response());
+    }
+    Ok(())
+}
+
+/// Deployments in `ns` whose sign-in gate inherits the provider `name`. Used to
+/// keep a delete from pulling a provider out from under a live gate — which,
+/// because resolution fails closed, would take those deployments offline.
+fn auth_provider_users(state: &AdminState, ns: &str, name: &str) -> Vec<String> {
+    let mut users: Vec<String> = state
+        .registry
+        .deployments()
+        .values()
+        .filter(|d| {
+            d.spec.namespace == ns
+                && d.spec.auth.as_ref().and_then(|g| g.provider_ref.as_deref()) == Some(name)
+        })
+        .map(|d| d.spec.id.clone())
+        .collect();
+    users.sort();
+    users
+}
+
+/// The body of `POST /auth-providers`: an [`AuthProviderSpec`] plus two
+/// request-only conveniences that never reach the store.
+///
+/// `preset` expands a known template — currently only `"heyo"`, which builds the
+/// JWT policy for the Heyo auth API from `secret` alone — so "the Heyo app works
+/// out of the box once the secret is provided" is one POST rather than a dozen
+/// fields nobody should have to know.
+#[derive(Deserialize)]
+struct CreateProviderBody {
+    #[serde(flatten)]
+    spec: crate::config::AuthProviderSpec,
+    /// Expand a provider template before validation. Request-only.
+    #[serde(default)]
+    preset: Option<String>,
+    /// The signing secret a preset needs. Request-only.
+    #[serde(default)]
+    secret: Option<crate::secrets::SecretRef>,
+}
+
+/// `GET /auth-providers[?namespace=]` — the providers this caller may see.
+///
+/// View tier, and it narrows itself: with a namespace it answers only that one
+/// (refusing a caller that cannot reach it), and without, only the namespaces
+/// the caller reaches — the same shape as `list_secrets`.
+async fn list_auth_providers(
+    State(state): State<AdminState>,
+    Query(q): Query<SecretQuery>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let caller = caller.as_deref();
+    if let Some(ns) = q.namespace.as_deref().map(str::trim).filter(|ns| !ns.is_empty()) {
+        if let Err(refused) = may_use_auth_providers(caller, ns, false) {
+            return refused;
+        }
+        return Json(state.auth_providers.list(ns)).into_response();
+    }
+    let visible: Vec<_> = state
+        .auth_providers
+        .list_all()
+        .into_iter()
+        .filter(|p| caller.is_none_or(|c| c.reaches_namespace(&p.namespace)))
+        .collect();
+    Json(visible).into_response()
+}
+
+/// `POST /auth-providers` — declare or replace one in the namespace the body
+/// names (`default` when it names none). A confined caller must reach that
+/// namespace as an admin, exactly as it must to write a secret there.
+async fn create_auth_provider(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+    Json(body): Json<CreateProviderBody>,
+) -> Response {
+    let mut spec = body.spec;
+
+    // Apply the preset before validation, so what is stored and what is checked
+    // are the fully materialised provider — no preset expansion lives on the hot
+    // path or in the state file.
+    if let Some(preset) = body.preset.as_deref() {
+        match preset {
+            "heyo" => {
+                let Some(secret) = body.secret else {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "the \"heyo\" preset needs a `secret` reference to the JWT signing key, \
+                         e.g. {\"secret\": \"heyo-auth\", \"key\": \"jwt_secret\"}",
+                    )
+                    .into_response();
+                };
+                spec.provider = crate::config::Providers::one(crate::config::AuthProvider::Jwt);
+                spec.jwt = Some(crate::config::JwtSpec::heyo(secret));
+            }
+            other => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    crate::config::SpecError::UnknownAuthPreset(other.to_string()).to_string(),
+                )
+                .into_response();
+            }
+        }
+    }
+
+    let ns = spec.namespace.clone();
+    if let Err(refused) = may_use_auth_providers(caller.as_deref(), &ns, true) {
+        return refused;
+    }
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    // Stamped here, never from the body; re-declaring keeps the original clock so
+    // `apply` is idempotent.
+    let existing = state.auth_providers.get(&ns, &spec.name);
+    spec.created_at = match &existing {
+        Some(p) => p.created_at,
+        None => now_secs(),
+    };
+    let existed = existing.is_some();
+    match state.auth_providers.upsert(spec) {
+        Ok(p) => (
+            if existed { StatusCode::OK } else { StatusCode::CREATED },
+            Json(p),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "auth provider write failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not persist the auth provider",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `GET /auth-providers/:namespace/:name`. The client secret is a reference,
+/// never a value, so the object is safe to echo — the same reason a deployment
+/// spec is.
+async fn get_auth_provider(
+    State(state): State<AdminState>,
+    Path((namespace, name)): Path<(String, String)>,
+    caller: Option<axum::Extension<Caller>>,
+) -> Response {
+    if let Err(refused) = may_use_auth_providers(caller.as_deref(), &namespace, false) {
+        return refused;
+    }
+    match state.auth_providers.get(&namespace, &name) {
+        Some(p) => Json(p).into_response(),
+        None => err(
+            StatusCode::NOT_FOUND,
+            format!("no auth provider {name:?} in namespace {namespace:?}"),
+        )
+        .into_response(),
+    }
+}
+
+/// `DELETE /auth-providers/:namespace/:name`.
+///
+/// Refused while a deployment's gate still inherits it: resolution fails closed,
+/// so removing a referenced provider would take those deployments offline. The
+/// message names them, exactly as deleting a still-referenced secret does.
+async fn delete_auth_provider(
+    State(state): State<AdminState>,
+    Path((namespace, name)): Path<(String, String)>,
+    caller: Option<axum::Extension<Caller>>,
+) -> Response {
+    if let Err(refused) = may_use_auth_providers(caller.as_deref(), &namespace, true) {
+        return refused;
+    }
+    if state.auth_providers.get(&namespace, &name).is_none() {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no auth provider {name:?} in namespace {namespace:?}"),
+        )
+        .into_response();
+    }
+    let users = auth_provider_users(&state, &namespace, &name);
+    if !users.is_empty() {
+        return err(
+            StatusCode::CONFLICT,
+            format!(
+                "auth provider {name:?} is inherited by deployment(s) {}; their sign-in gates \
+                 would fail closed. Repoint or remove them first",
+                users.join(", ")
+            ),
+        )
+        .into_response();
+    }
+    match state.auth_providers.remove(&namespace, &name) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(
+            StatusCode::NOT_FOUND,
+            format!("no auth provider {name:?} in namespace {namespace:?}"),
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "auth provider delete failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not remove the auth provider",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// If `spec`'s gate inherits an auth provider, resolve it against the store now
+/// and validate the merged deployment — so a reference to a missing or
+/// incompatible provider is refused at registration (400) with the provider
+/// named, rather than surfacing as a 500 on the first gated request.
+fn check_provider_ref(state: &AdminState, spec: &DeploymentSpec) -> Result<(), Response> {
+    let Some(name) = spec.auth.as_ref().and_then(|g| g.provider_ref.as_deref()) else {
+        return Ok(());
+    };
+    let Some(provider) = state.auth_providers.get(&spec.namespace, name) else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            crate::config::SpecError::UnknownAuthProvider {
+                namespace: spec.namespace.clone(),
+                name: name.to_string(),
+            }
+            .to_string(),
+        )
+        .into_response());
+    };
+    // Validate the deployment as though the inherited identity had been written
+    // inline: the resolved gate goes through the same `DeploymentSpec::validate`,
+    // so an incompatible provider is caught here with the gate error named.
+    let mut resolved = spec.clone();
+    resolved.auth = Some(provider.resolve(spec.auth.as_ref().expect("gate present")));
+    resolved.validate().map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("auth.provider_ref {name:?} resolves to a provider this deployment cannot use: {e}"),
+        )
+        .into_response()
+    })
+}
+
 #[derive(Deserialize)]
 struct FeedQuery {
     /// `json` returns the events as structured data instead of RSS — what
@@ -2700,6 +2984,9 @@ async fn register(
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    if let Err(refused) = check_provider_ref(&state, &spec) {
+        return refused;
+    }
     warn_about(&spec);
 
     let id = spec.id.clone();
@@ -2799,6 +3086,9 @@ async fn update(
     spec.normalize();
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(refused) = check_provider_ref(&state, &spec) {
+        return refused;
     }
     warn_about(&spec);
 
@@ -4388,6 +4678,10 @@ fn router(state: AdminState) -> Router {
         // it names only namespaces whose deployments the caller can already
         // list, so it is the directory's own information regrouped.
         .route("/namespaces", get(namespaces))
+        // View tier, and it narrows itself to the caller's namespaces exactly as
+        // `/namespaces` does — a scoped token gets its own providers rather than
+        // a 403. The item reads and every write are on the CRUD side below.
+        .route("/auth-providers", get(list_auth_providers))
         .route("/feeds", get(feeds_index))
         .route("/feeds/:namespace", get(feed_rss))
         // Where DNS should point. View tier: it is the answer to "what do I
@@ -4468,6 +4762,15 @@ fn router(state: AdminState) -> Router {
         // matches on path, not method.
         .route("/namespaces", post(create_namespace))
         .route("/namespaces/:name", delete(delete_namespace))
+        // Auth providers. `POST` shares its path with the view-tier list above,
+        // exactly as `/namespaces` does; the item read sits here beside its
+        // delete so one path lives on one tier. The item GET is CRUD-tier out of
+        // the same caution that keeps a deployment spec there.
+        .route("/auth-providers", post(create_auth_provider))
+        .route(
+            "/auth-providers/:namespace/:name",
+            get(get_auth_provider).delete(delete_auth_provider),
+        )
         .route("/tokens", post(mint_token).get(list_tokens))
         .route(
             "/tokens/:id",

@@ -90,9 +90,14 @@ pub struct LbProxy {
     /// The per-namespace event feed, for the deployments that `expose` it on
     /// their own routes, and for the cold-start-timeout issue hook.
     feed: Arc<crate::feed::Feed>,
+    /// The declared auth providers, resolved live for a gate that inherits one
+    /// with `auth.provider_ref`. Read only on the gated path; a deployment
+    /// without a reference never touches it.
+    auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
 }
 
 impl LbProxy {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Arc<Registry>,
         metrics: Arc<Metrics>,
@@ -102,6 +107,7 @@ impl LbProxy {
         security: Option<SecuritySink>,
         guard: Arc<Guard>,
         feed: Arc<crate::feed::Feed>,
+        auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
     ) -> Self {
         Self {
             registry,
@@ -112,6 +118,39 @@ impl LbProxy {
             security,
             guard,
             feed,
+            auth_providers,
+        }
+    }
+
+    /// Resolve a gate that may inherit its identity from a namespace provider.
+    ///
+    /// A gate with no `provider_ref` is returned untouched. One with a reference
+    /// is merged with the named provider in `namespace` — identity from the
+    /// provider, the route-scoped fields from the gate — into a plain,
+    /// self-contained [`AuthGate`] the rest of the pipeline treats exactly like
+    /// an inline one, including [`policy_fingerprint`], so an edit to the
+    /// provider re-signs the sessions issued under the old policy.
+    ///
+    /// A reference that names no provider in the namespace is an `Err`, and the
+    /// caller refuses the request: a gate that cannot be built must fail closed,
+    /// never fall open to serving the deployment with no gate at all.
+    ///
+    /// [`AuthGate`]: crate::config::AuthGate
+    /// [`policy_fingerprint`]: crate::config::AuthGate::policy_fingerprint
+    fn resolve_gate(
+        &self,
+        gate: crate::config::AuthGate,
+        namespace: &str,
+    ) -> std::result::Result<crate::config::AuthGate, String> {
+        let Some(name) = gate.provider_ref.as_deref() else {
+            return Ok(gate);
+        };
+        match self.auth_providers.get(namespace, name) {
+            Some(provider) => Ok(provider.resolve(&gate)),
+            None => Err(format!(
+                "this deployment's sign-in gate inherits the auth provider {name:?}, \
+                 which is not declared in its namespace\n"
+            )),
         }
     }
 
@@ -607,6 +646,25 @@ impl ProxyHttp for LbProxy {
         // anything touches a backend — including the cold-start wait, so an
         // unauthenticated request never boots a VM.
         if let Some(gate) = deployment.spec.auth.clone() {
+            // Inherit the identity half from a namespace provider if this gate
+            // names one. Resolution is live — read on every request, so an edit
+            // to the provider reaches here at once — and fails *closed*: a gate
+            // whose provider no longer resolves refuses the request rather than
+            // serving the deployment ungated.
+            let gate = match self.resolve_gate(gate, &deployment.spec.namespace) {
+                Ok(g) => g,
+                Err(msg) => {
+                    tracing::warn!(
+                        deployment = %deployment.spec.id,
+                        namespace = %deployment.spec.namespace,
+                        "auth gate references an unresolvable provider; refusing the request",
+                    );
+                    write_plain(session, 500, &msg).await?;
+                    ctx.deployment = Some(deployment);
+                    return Ok(true);
+                }
+            };
+
             // A gate needs a hostname to build its callback URL against; a
             // request routed purely by path prefix with no Host header cannot
             // complete a sign-in, and saying so beats redirecting to a URL the

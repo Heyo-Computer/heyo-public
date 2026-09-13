@@ -199,6 +199,11 @@ fn vm_spec() -> DeploymentSpec {
             redirect_url: Some("https://sandbox.example.com/__applb/auth/callback".into()),
             forward_identity: true,
             jwt: None,
+            // This gate spells its identity out inline; the inherited shape is a
+            // separate golden (`auth_provider` / `inherited_gate`). Unset here,
+            // and `skip_serializing_if` keeps it out of the wire entirely, so
+            // this fixture is byte-for-byte what it was before the field existed.
+            provider_ref: None,
         }),
     }
 }
@@ -358,6 +363,7 @@ fn jwt_spec() -> DeploymentSpec {
             cookie: Some("heyo_access_token".into()),
             login_endpoint: None,
         }),
+        provider_ref: None,
     });
     s
 }
@@ -491,6 +497,88 @@ fn deployment_status_is_stable() {
             },
         );
     }
+}
+
+/// The auth-provider objects and the shape of a gate that inherits one, so a
+/// client author learns both the reusable identity object and how a deployment
+/// references it. The generated deployment-spec schema carries the `provider_ref`
+/// field; this carries the *object* and a worked inherited gate.
+#[test]
+fn auth_provider_objects_are_stable() {
+    // A Google provider: the identity half of a gate, named and namespaced.
+    let google = crate::config::AuthProviderSpec {
+        name: "corp-google".into(),
+        namespace: "team-a".into(),
+        description: Some("Workspace sign-in for team-a's apps".into()),
+        created_at: 1_722_400_000,
+        provider: crate::config::Providers::default(),
+        client_id: Some("1234.apps.googleusercontent.com".into()),
+        client_secret: Some(crate::secrets::SecretRef {
+            namespace: None,
+            secret: "google-oauth".into(),
+            key: "client_secret".into(),
+            username: None,
+        }),
+        allowed_domains: vec!["example.com".into()],
+        allowed_emails: vec![],
+        jwt: None,
+        cookie_domain: Some(".example.com".into()),
+    };
+    google.validate().expect("the google provider fixture must be valid");
+    golden("auth-provider-google", &google);
+
+    // The Heyo auth API as a provider — what the `heyo` preset materialises from
+    // a secret alone. Built through the same constructor the handler uses, so the
+    // golden and the preset cannot drift.
+    let heyo = crate::config::AuthProviderSpec {
+        name: "heyo".into(),
+        namespace: "team-a".into(),
+        description: None,
+        created_at: 1_722_400_000,
+        provider: crate::config::Providers::one(crate::config::AuthProvider::Jwt),
+        client_id: None,
+        client_secret: None,
+        allowed_domains: vec![],
+        allowed_emails: vec![],
+        jwt: Some(crate::config::JwtSpec::heyo(crate::secrets::SecretRef {
+            namespace: None,
+            secret: "heyo-auth".into(),
+            key: "jwt_secret".into(),
+            username: None,
+        })),
+        cookie_domain: None,
+    };
+    heyo.validate().expect("the heyo provider fixture must be valid");
+    golden("auth-provider-heyo", &heyo);
+
+    // A deployment whose gate inherits a provider: only the route-scoped fields
+    // are its own, and `provider_ref` names the object above.
+    let mut inheriting = vm_spec();
+    inheriting.id = "team-a-app".into();
+    inheriting.namespace = "team-a".into();
+    inheriting.auth = Some(crate::config::AuthGate {
+        provider_ref: Some("corp-google".into()),
+        // Everything identity-related is unset: the provider supplies it.
+        provider: crate::config::Providers::default(),
+        client_id: None,
+        client_secret: None,
+        allowed_domains: vec![],
+        allowed_emails: vec![],
+        jwt: None,
+        cookie_domain: None,
+        // Route-scoped, this deployment's own.
+        session_scope: None,
+        public_paths: vec![crate::config::PublicPath::public("/healthz")],
+        base_path: "/__applb/auth".into(),
+        session_ttl_secs: 43200,
+        cookie_name: "applb_session".into(),
+        redirect_url: None,
+        forward_identity: true,
+    });
+    inheriting
+        .validate()
+        .expect("the inheriting deployment fixture must be valid on its own");
+    golden("deployment-inherited-gate", &inheriting);
 }
 
 #[test]
