@@ -493,6 +493,11 @@ run on different runners concurrently instead of queueing behind whichever one
 is mid-build. The run page shows the two clocks separately, as **Queued** (time
 on the queue) and **Duration** (time since pickup).
 
+Consumers reserve a worker slot before requesting one message in a finite,
+blocking JetStream batch. They do not prefetch jobs into a local buffer: that
+would start AckWait before a job has a worker to send progress acknowledgements,
+allowing queued work to be redelivered and executed twice.
+
 **Cancelling frees the queue immediately.** A cancelled job used to hold its
 queue slot until the running step's own end — the daemon cannot abort an exec,
 and the dispatcher waited for it — so a cancelled two-hour build read as

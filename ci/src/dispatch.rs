@@ -2908,14 +2908,15 @@ where
 /// `num_pending` is only a useful backlog number if each consumer serves one
 /// host.
 async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
-    use futures::StreamExt;
-
     let label = format!("{route:?}");
     /// How many unpinned jobs one network queue may be running at once — the
     /// fan-out bound for `Route::Network` below. Small: each slot can be a VM
     /// create somewhere in the fleet.
     const NETWORK_CONCURRENCY: usize = 4;
-    let network_slots = Arc::new(tokio::sync::Semaphore::new(NETWORK_CONCURRENCY));
+    let slots = Arc::new(tokio::sync::Semaphore::new(match &route {
+        Route::Runner(_) => 1,
+        Route::Network(_) => NETWORK_CONCURRENCY,
+    }));
     loop {
         let consumer = match dispatcher.bus.consumer_for(&route).await {
             Ok(c) => c,
@@ -2926,20 +2927,13 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
             }
         };
 
-        let mut messages = match consumer.messages().await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("{label}: could not stream messages, retrying: {e}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-
-        while let Some(next) = messages.next().await {
-            let msg = match next {
-                Ok(m) => m,
+        loop {
+            let (msg, permit) = match pull_with_capacity(&consumer, Arc::clone(&slots)).await {
+                Ok(Some(delivery)) => delivery,
+                Ok(None) => continue,
                 Err(e) => {
                     tracing::warn!("{label}: message error, rebinding: {e}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                     break;
                 }
             };
@@ -2956,6 +2950,7 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 // A runner's own queue is strictly serial: one job on that
                 // host at a time, each getting its full budget from pickup.
                 Route::Runner(_) => {
+                    let _permit = permit;
                     process_delivery(Arc::clone(&dispatcher), msg, job, attempt).await;
                 }
                 // The network's shared queue is where "any host" jobs wait, and
@@ -2968,11 +2963,6 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 // keeps a burst from starting more VM creates than a host
                 // fleet wants concurrently.
                 Route::Network(_) => {
-                    let permit = network_slots
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .expect("the semaphore is never closed");
                     let dispatcher = Arc::clone(&dispatcher);
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -2981,6 +2971,24 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 }
             }
         }
+    }
+}
+
+/// Reserve capacity before JetStream delivers anything. The continuous stream
+/// prefetches 200 messages, starting AckWait while buffered jobs have no worker
+/// or progress heartbeat. A finite blocking batch avoids both that redelivery
+/// race and an idle polling loop.
+async fn pull_with_capacity(
+    consumer: &async_nats::jetstream::consumer::PullConsumer,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<Option<(async_nats::jetstream::Message, tokio::sync::OwnedSemaphorePermit)>, async_nats::Error> {
+    use futures::StreamExt;
+    let permit = slots.acquire_owned().await?;
+    let mut batch = consumer.batch().max_messages(1)
+        .expires(Duration::from_secs(30)).messages().await?;
+    match batch.next().await {
+        Some(message) => Ok(Some((message?, permit))),
+        None => Ok(None),
     }
 }
 
@@ -4801,6 +4809,49 @@ mod tests {
             ..job
         };
         assert_eq!(never_queued.queue_wait(), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_NATS_URL; disposable JetStream"]
+    async fn queued_jobs_are_not_delivered_before_capacity_or_prefetched() {
+        let client = async_nats::connect(std::env::var("CI_TEST_NATS_URL").unwrap()).await.unwrap();
+        let js = async_nats::jetstream::new(client);
+        let name = format!("capacity_{}", uuid::Uuid::new_v4().simple());
+        let stream = js.create_stream(async_nats::jetstream::stream::Config {
+            name: name.clone(), subjects: vec![name.clone()], ..Default::default()
+        }).await.unwrap();
+        let mut consumer = stream.create_consumer(async_nats::jetstream::consumer::pull::Config {
+            ack_wait: Duration::from_millis(100), ..Default::default()
+        }).await.unwrap();
+        for body in ["first", "second", "third"] {
+            js.publish(name.clone(), body.into()).await.unwrap().await.unwrap();
+        }
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (first, permit) = pull_with_capacity(&consumer, Arc::clone(&slots)).await.unwrap().unwrap();
+        assert_eq!(first.payload.as_ref(), b"first");
+        first.double_ack().await.unwrap();
+        let waiting = {
+            let consumer = consumer.clone();
+            let slots = Arc::clone(&slots);
+            tokio::spawn(async move { pull_with_capacity(&consumer, slots).await })
+        };
+        // Longer than AckWait: neither waiting job may have entered delivery.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(!waiting.is_finished());
+        let info = consumer.info().await.unwrap();
+        assert_eq!(info.delivered.consumer_sequence, 1);
+        assert_eq!(info.num_pending, 2);
+        assert_eq!(info.num_ack_pending, 0);
+        drop(permit);
+        let (second, permit) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await.unwrap().unwrap().unwrap().unwrap();
+        assert_eq!(second.payload.as_ref(), b"second");
+        assert_eq!(second.info().unwrap().delivered, 1);
+        second.double_ack().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(consumer.info().await.unwrap().num_pending, 1, "no background refill may take the third job");
+        drop(permit);
+        js.delete_stream(name).await.unwrap();
     }
 
     /// Three jobs on one route with capacity one. Each takes 90% of the

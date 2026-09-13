@@ -54,13 +54,11 @@ jobs:
       - name: Require attached build disk
         run: test "$(stat -c %d /var/cache/ci)" != "$(stat -c %d /)"
       - name: Test component and workspace members
-        working-directory: /workspace/${{ matrix.component }}
         timeout-minutes: 90
-        run: cargo test --locked --workspace
+        run: cd '/workspace/${{ matrix.component }}' && cargo test --locked --workspace
       - name: Build component binaries
-        working-directory: /workspace/${{ matrix.component }}
         timeout-minutes: 90
-        run: cargo build --locked --release --workspace --bins
+        run: cd '/workspace/${{ matrix.component }}' && cargo build --locked --release --workspace --bins
       - name: Package validated component
         run: |
           set -eu
