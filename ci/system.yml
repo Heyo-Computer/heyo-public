@@ -18,12 +18,14 @@ jobs:
     steps:
       - name: Require attached build disk
         run: test "$(stat -c %d /var/cache/ci)" != "$(stat -c %d /)"
-      - name: Test CI and build service
+      - name: Test CI
         working-directory: /workspace/ci
-        run: |
-          set -eu
-          cargo test --locked -- --test-threads=1
-          cargo build --locked --release --bins
+        timeout-minutes: 60
+        run: cargo test --locked -- --test-threads=1
+      - name: Build CI service
+        working-directory: /workspace/ci
+        timeout-minutes: 60
+        run: cargo build --locked --release --bins
       - name: Test submission client
         run: python3 ci/test-git-submit.py
       - name: Package validated binaries

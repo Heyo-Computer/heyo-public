@@ -49,6 +49,8 @@ Register `ci/system.yml` as the repository workflow to build the Linux CI servic
 and test/build the native agent on real Intel Mac and Windows hosts. It uses the
 repository's assigned Linux network, not the existing us2 host pin. All three
 builds upload artifacts and are required by the single release job.
+Linux tests and release compilation have separate steps with explicit 60-minute
+limits: the two-hour job limit does not override the default 30-minute step limit.
 
 Release and deployment default to disabled. `RELEASE_ENABLED=true` permits the
 gated merge/version/tag action with `GIT_AUTH_TOKEN`; `DEPLOY_ENABLED=true` also

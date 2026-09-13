@@ -390,6 +390,9 @@ mod tests {
             assert!(validation.steps.iter().any(|s|s.run.as_deref().is_some_and(|r|r.contains("cargo test --locked"))));
             assert!(validation.steps.iter().any(|s|s.run.as_deref().is_some_and(|r|r.contains("cargo build --locked --release"))));
         }
+        let compile_steps:Vec<_>=job("linux").steps.iter().filter(|s|s.run.as_deref().is_some_and(|r|r.contains("cargo test")||r.contains("cargo build"))).collect();
+        assert_eq!(compile_steps.len(),2,"tests and release compilation need separate progress and timeout budgets");
+        assert!(compile_steps.iter().all(|s|s.timeout_minutes==Some(60)),"job timeout alone does not override the default 30-minute step timeout");
         assert!(job("mac-intel").native_labels.contains(&"macos-intel".into()));
         assert!(job("windows").native_labels.contains(&"windows-x64".into()));
         let ctx=crate::expr::Context::new();
