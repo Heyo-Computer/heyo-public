@@ -16,6 +16,12 @@ values plus `cloud/internal-api-key` as `daemon-api-key`. The latter authenticat
 the direct us3 host daemon connection through the VM's private default gateway;
 it does not move the host's staging registration. No credential is rotated.
 
+Deliver `ci-us3/heyosecret-token` as `heyosecret-token` for server-side workflow
+secret resolution. CI uses the regional artifact store's separate `api-key`.
+Repository registration selects the workflow file; this does not require giving
+the CI process fleet-admin access to app-lb's workflow-object API. Deployment
+actions receive their own target-scoped app-lb credential through workflow secrets.
+
 Copy the existing CI app-lb authentication policy and configured admin emails
 before assigning a public route. Build the pinned revision, start a replica,
 grant that VM's IP/tap pair access to regional Postgres through the existing

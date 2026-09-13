@@ -352,6 +352,130 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL; uses a local fake app-lb"]
+    async fn app_lb_deploy_requires_provenance_and_exact_durable_result() {
+        use axum::{Json, Router, extract::{Path, State}, routing::{get, post}};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Copy)]
+        enum Reply { Success, WrongDigest, WrongNamespace, MaskedFailure }
+        struct Remote { posts: usize, reply: Reply, operation: String, artifact: String }
+        let remote = Arc::new(Mutex::new(Remote {
+            posts: 0, reply: Reply::Success, operation: String::new(), artifact: String::new(),
+        }));
+        let spec = json!({
+            "id":"api", "namespace":"team", "routes":[],
+            "vm":{"image":"old-image","port":8080},
+            "artifact":{"store":"https://artifacts.test/","ref":"old-ref"}
+        });
+        let normalized = json!({"id":"api","namespace":"team","routes":[],
+            "vm":{"port":8080},"artifact":{"store":"https://artifacts.test/","ref":""}});
+        let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&normalized).unwrap()));
+        let response_fingerprint = fingerprint.clone();
+        let job_response = move |remote: &Remote| {
+            let (status, namespace, artifact, error) = match remote.reply {
+                Reply::Success => ("succeeded", "team", remote.artifact.clone(), Value::Null),
+                Reply::WrongDigest => ("succeeded", "team", "f".repeat(64), Value::Null),
+                Reply::WrongNamespace => ("succeeded", "other", remote.artifact.clone(), Value::Null),
+                Reply::MaskedFailure => ("failed", "team", remote.artifact.clone(), json!("test-secret remote-secret failed")),
+            };
+            json!({"id":"job_1", "deployment":"api", "operation_id":remote.operation,
+                "target_namespace":namespace, "artifact":artifact, "config_fingerprint":response_fingerprint,
+                "status":status, "readiness_verified":true, "rolled_out":true, "error":error})
+        };
+        let app = Router::new()
+            .route("/deployments/{deployment}", get({
+                let spec = spec.clone();
+                move |Path(deployment): Path<String>| { let spec = spec.clone(); async move {
+                    assert_eq!(deployment, "api"); Json(json!({"spec":spec}))
+                }}
+            }))
+            .route("/deployments/{deployment}/pull", post(
+                |State(remote): State<Arc<Mutex<Remote>>>, Path(deployment): Path<String>,
+                 headers: axum::http::HeaderMap, Json(request): Json<Value>| async move {
+                    assert_eq!(deployment, "api");
+                    assert_eq!(headers["authorization"], "Bearer test-secret");
+                    assert_eq!(request["force"], false);
+                    let mut remote = remote.lock().unwrap();
+                    remote.posts += 1;
+                    remote.operation = request["operation_id"].as_str().unwrap().into();
+                    remote.artifact = request["ref"].as_str().unwrap().into();
+                    Json(json!({"id":"job_1", "deployment":"api", "operation_id":remote.operation.clone(),
+                        "target_namespace":"team", "artifact":remote.artifact.clone(),
+                        "config_fingerprint":fingerprint, "status":"running"}))
+                }
+            ))
+            .route("/jobs/{id}", get(move |State(remote): State<Arc<Mutex<Remote>>>, Path(id): Path<String>| async move {
+                assert_eq!(id, "job_1");
+                Json(job_response(&remote.lock().unwrap()))
+            }))
+            .with_state(remote.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+        let store = Store::connect(&std::env::var("CI_TEST_DATABASE_URL").unwrap(),
+            std::env::temp_dir().join(crate::vm::new_id()), Duration::from_secs(30)).await.unwrap();
+        store.migrate().await.unwrap();
+        let workflow = crate::workflow::Workflow::parse("deploy.yml", "jobs:\n  deploy:\n    vm: { driver: firecracker }\n    steps: [{ uses: ci/publish-rootfs }, { uses: ci/deploy-app-lb }]\n  producer:\n    vm: { driver: firecracker }\n    steps: [{ uses: ci/publish-rootfs }]\n").unwrap();
+        let plan = crate::plan::Plan::build(&workflow).unwrap();
+        let run = crate::vm::new_id();
+        let sha = "a".repeat(40);
+        store.create_run(&run, &crate::store::RunRequest {
+            repo_url: "https://example.test/repo.git".into(), git_ref: "refs/heads/main".into(), sha: sha.clone(),
+            ..Default::default()
+        }, &plan).await.unwrap();
+        let jobs = store.jobs_of(&run).await.unwrap();
+        let deploy_job = jobs.iter().find(|j| j.job_key == "deploy").unwrap();
+        let producer_job = jobs.iter().find(|j| j.job_key == "producer").unwrap();
+        store.set_job_status(&deploy_job.id, crate::store::JobStatus::Running, None).await.unwrap();
+        let published = crate::store::step_id(&deploy_job.id, 0);
+        store.create_step(&published, &deploy_job.id, 0, "Publish", Some("ci/publish-rootfs")).await.unwrap();
+        store.finish_step(&published, crate::store::StepStatus::Success, Some(0), None).await.unwrap();
+        let digest = "b".repeat(64);
+        sqlx::query("INSERT INTO ci_app_lb_artifact(step_id,run_id,job_id,sha,store_url,manifest_digest,blob_digest,size_bytes) VALUES($1,$2,$3,$4,$5,$6,$7,1)")
+            .bind(&published).bind(&run).bind(&deploy_job.id).bind(&sha).bind("https://artifacts.test").bind(&digest).bind("c".repeat(64))
+            .execute(store.pool()).await.unwrap();
+        let cross_step = crate::store::step_id(&producer_job.id, 0);
+        store.create_step(&cross_step, &producer_job.id, 0, "Publish from unfinished job", Some("ci/publish-rootfs")).await.unwrap();
+        store.finish_step(&cross_step, crate::store::StepStatus::Success, Some(0), None).await.unwrap();
+        let cross_digest = "d".repeat(64);
+        sqlx::query("INSERT INTO ci_app_lb_artifact(step_id,run_id,job_id,sha,store_url,manifest_digest,blob_digest,size_bytes) VALUES($1,$2,$3,$4,$5,$6,$7,1)")
+            .bind(&cross_step).bind(&run).bind(&producer_job.id).bind(&sha).bind("https://artifacts.test").bind(&cross_digest).bind("e".repeat(64))
+            .execute(store.pool()).await.unwrap();
+        let msg = JobMessage { run_id: run.clone(), job_id: deploy_job.id.clone(), job_key: deploy_job.job_key.clone() };
+        let masker = Masker::new(["test-secret", "remote-secret"].into_iter());
+
+        let rejected_step = crate::store::step_id(&deploy_job.id, 1);
+        store.create_step(&rejected_step, &deploy_job.id, 1, "Reject", Some("ci/deploy-app-lb")).await.unwrap();
+        assert!(deploy_app_lb(&store, &msg, &rejected_step, &base, "test-secret", "api", "team", &cross_digest,
+            "https://artifacts.test", Duration::from_secs(5), &masker).await.unwrap_err().contains("not published successfully"));
+        assert_eq!(remote.lock().unwrap().posts, 0);
+
+        let success_step = crate::store::step_id(&deploy_job.id, 2);
+        store.create_step(&success_step, &deploy_job.id, 2, "Deploy", Some("ci/deploy-app-lb")).await.unwrap();
+        deploy_app_lb(&store, &msg, &success_step, &base, "test-secret", "api", "team", &digest,
+            "https://artifacts.test/", Duration::from_secs(5), &masker).await.unwrap();
+        deploy_app_lb(&store, &msg, &success_step, &base, "test-secret", "api", "team", &digest,
+            "https://artifacts.test/", Duration::from_secs(5), &masker).await.unwrap();
+        assert_eq!(remote.lock().unwrap().posts, 1, "a verified operation must not POST twice");
+
+        for (idx, reply) in [(3, Reply::WrongDigest), (4, Reply::WrongNamespace), (5, Reply::MaskedFailure)] {
+            remote.lock().unwrap().reply = reply;
+            let sid = crate::store::step_id(&deploy_job.id, idx);
+            store.create_step(&sid, &deploy_job.id, idx as i32, "Bad deploy", Some("ci/deploy-app-lb")).await.unwrap();
+            let error = deploy_app_lb(&store, &msg, &sid, &base, "test-secret", "api", "team", &digest,
+                "https://artifacts.test", Duration::from_secs(5), &masker).await.unwrap_err();
+            assert!(!error.contains("test-secret") && !error.contains("remote-secret"));
+            let row = store.service_deployments_of(&run).await.unwrap().into_iter().find(|d| d.step_id == sid).unwrap();
+            assert_eq!(row.status, "failed");
+            assert_eq!(row.error.as_deref(), Some(error.as_str()));
+        }
+        assert!(remote.lock().unwrap().posts >= 4);
+        server.abort();
+    }
+
+    #[tokio::test]
     #[ignore = "needs CI_TEST_DATABASE_URL; uses a local fake orchestrator"]
     async fn uncertain_acceptance_and_concurrent_replay_never_post_twice() {
         use axum::{Router, Json, extract::State, http::StatusCode, response::IntoResponse, routing::post};

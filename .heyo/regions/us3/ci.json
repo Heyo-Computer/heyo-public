@@ -19,7 +19,9 @@
       "CI_NATS_SUBJECT_PREFIX": "ci_us3",
       "CI_LOG_DIR": "/workspace/ci-state/logs",
       "CI_WORKSPACE_DIR": "/workspace/ci-state/workspaces",
-      "CI_ARTIFACT_SINK": "disk",
+      "CI_ARTIFACT_SINK": "artifacts",
+      "CI_ARTIFACT_URL": "https://artifacts.us3.heyo.work",
+      "CI_HEYOSECRET_URL": "https://heyosecret.us3.heyo.work",
       "CI_ARTIFACT_DIR": "/workspace/ci-state/artifacts",
       "CI_REQUIRE_REPO_TOKEN": "true",
       "CI_WORKFLOW_PATH": "ci/system.yml"
@@ -30,7 +32,9 @@
       {"secret": "ci-us3", "key": "daemon-api-key", "as": "CI_LOCAL_RUNNER_TOKEN"},
       {"secret": "ci-us3", "key": "webhook-secret", "as": "CI_WEBHOOK_SECRET"},
       {"secret": "ci-us3", "key": "native-runner-secret", "as": "CI_NATIVE_RUNNER_SECRET"},
-      {"secret": "ci-us3", "key": "nats-token", "as": "CI_NATS_TOKEN"}
+      {"secret": "ci-us3", "key": "nats-token", "as": "CI_NATS_TOKEN"},
+      {"secret": "artifacts-us3", "key": "api-key", "as": "CI_ARTIFACT_TOKEN"},
+      {"secret": "ci-us3", "key": "heyosecret-token", "as": "CI_HEYOSECRET_TOKEN"}
     ]
   },
   "build": {
