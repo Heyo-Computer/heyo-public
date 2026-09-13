@@ -168,6 +168,26 @@ class GitSubmitTest(unittest.TestCase):
                                text=True, capture_output=True).stdout
         self.assertIn(f"{self.pr_sha} refs/heads/pull/59", heads)
 
+    def test_linked_worktree_bundles_use_the_shared_object_store(self):
+        linked = pathlib.Path(self.temp.name) / "linked worktree"
+        self.git("worktree", "add", "-q", "-b", "linked", str(linked), "feature")
+        self.repo = linked
+        for selector, sha, contents in [((), self.feature_sha, "feature\n"),
+                                         (("pr59",), self.pr_sha, "pull request\n")]:
+            with self.subTest(selector=selector):
+                self.run_client(*selector, env={"CI_ENDPOINT": self.base, "CI_TOKEN": TOKEN})
+                payload = json.loads(SubmitHandler.requests.pop()[2])
+                bundle = pathlib.Path(self.temp.name) / "linked.bundle"
+                bundle.write_bytes(base64.b64decode(payload["source"]["contentBase64"]))
+                with tempfile.TemporaryDirectory() as clone:
+                    subprocess.run(["git", "clone", "-q", str(bundle), clone], check=True)
+                    actual = subprocess.check_output(["git", "-C", clone, "rev-parse", "HEAD"], text=True).strip()
+                    self.assertEqual(actual, sha)
+                    self.assertEqual((pathlib.Path(clone) / "file.txt").read_text(), contents)
+                self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.feature_sha)
+                self.assertEqual(self.git("status", "--porcelain").stdout, "")
+                self.assertEqual(self.git("for-each-ref", "refs/git-submit").stdout, "")
+
     def test_pr_selector_rejects_malformed_and_conflicting_selectors(self):
         for args in (("pr0",), ("prx",), ("pr59x",), ("pr59", "--ref", "HEAD"),
                      ("pr59", "--dirty"), ("pr59", "pr60")):

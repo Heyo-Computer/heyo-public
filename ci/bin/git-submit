@@ -294,7 +294,9 @@ else
   # repository is touched, including on a failed submit.
   pack="$work/pack.git"
   git init -q --bare "$pack"
-  printf '%s/objects\n' "$(git rev-parse --absolute-git-dir)" \
+  # Linked worktrees keep objects in the common Git directory, not their
+  # per-worktree administrative directory. Ask Git for the actual object path.
+  printf '%s\n' "$(git rev-parse --path-format=absolute --git-path objects)" \
     > "$pack/objects/info/alternates"
   ref="refs/heads/$branch"
   [ "$branch" = "detached" ] && ref="refs/heads/ci-submit"
