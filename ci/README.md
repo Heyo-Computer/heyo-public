@@ -50,6 +50,8 @@ and test/build the native agent on real Intel Mac and Windows hosts. Its platfor
 matrix also tests and builds app-lb (including heyctl), artifacts, HeyoSecret, and
 Orchestrator. It uses the repository's assigned Linux network, not an us2 host
 pin. Every validation job and matrix cell must pass before the release job.
+The platform matrix starts after Linux CI validation, so a broken CI build stops
+the pipeline before allocating the other platform build VMs.
 Each Linux component uploads its own binary artifact with `REVISION` and checksums.
 Linux tests and release compilation have separate steps with explicit 60-minute
 limits: the two-hour job limit does not override the default 30-minute step limit.

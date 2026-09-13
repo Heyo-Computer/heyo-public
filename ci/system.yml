@@ -43,11 +43,11 @@ jobs:
         with: { name: ci-linux, path: dist }
 
   platform:
+    needs: [linux]
     vm: *linux
     strategy:
       matrix:
         component: [app-lb, artifacts, heyosecret, orchestrator]
-      max-parallel: 2
       fail-fast: false
     timeout-minutes: 180
     steps:
