@@ -30,6 +30,11 @@ is durable and retried by later runner polls.
 Idle polling retries network failures, HTTP 5xx, and HTTP 429 after five seconds,
 so a CI restart does not terminate the runner. Other HTTP errors, including
 401 and 403, remain terminal and require correcting the credential or request.
+Artifact uploads use a five-minute request timeout and up to three attempts for
+timeouts, connection errors, HTTP 429, and HTTP 5xx, resending identical bytes.
+If CI rejects a completion because its lease expired or was fenced, the agent
+reports that rejection and resumes polling; it does not claim the job succeeded.
+Other completion errors remain terminal.
 
 Shell steps, general conditions, environment and output handoff, working
 directories, timeouts, process-tree termination, logs, exit status,

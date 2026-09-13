@@ -17,6 +17,8 @@ mod expr;
 mod paths;
 
 const VERSION: u32 = 1;
+const ARTIFACT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const ARTIFACT_UPLOAD_ATTEMPTS: usize = 3;
 #[derive(Clone)]
 struct Config {
     endpoint: String,
@@ -264,7 +266,17 @@ async fn post<T: Serialize>(h: &reqwest::Client, c: &Config, path: &str, value: 
     for attempt in 0..3 {
         match h.post(format!("{}/api/native/{path}", c.endpoint)).bearer_auth(&c.token).json(value).send().await {
             Ok(r) if r.status().is_success()=>return Ok(()),
-            Ok(r)=>{last=format!("{} {}",r.status(),r.text().await.unwrap_or_default());if !last.starts_with('5'){break}},
+            Ok(r)=>{
+                let status=r.status();
+                let body=r.text().await.unwrap_or_default();
+                if path=="complete" && status==reqwest::StatusCode::CONFLICT
+                    && serde_json::from_str::<Value>(&body).ok().is_some_and(|v|v["error"]=="lease expired or fenced") {
+                    eprintln!("completion rejected: lease expired or fenced; returning to polling");
+                    return Ok(());
+                }
+                last=format!("{status} {body}");
+                if !status.is_server_error(){break}
+            },
             Err(e)=>last=e.to_string(),
         }
         tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
@@ -423,9 +435,32 @@ async fn upload_artifact(h:&reqwest::Client,c:&Config,j:&Lease,index:usize,s:&St
     let rel=ctx.substitute(s.with.get("path").context("upload-artifact requires with.path")?);
     let path=root.join(&rel);ensure_inside(root,&path)?;let canonical=tokio::fs::canonicalize(&path).await?;let canonical_root=tokio::fs::canonicalize(root).await?;if !canonical.starts_with(&canonical_root){bail!("artifact path escapes workspace")}
     let bytes=tokio::task::spawn_blocking(move||->Result<Vec<u8>>{let mut gz=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());{let mut tar=tar::Builder::new(&mut gz);if canonical.is_dir(){tar.append_dir_all(".",&canonical)?}else{tar.append_path_with_name(&canonical,canonical.file_name().context("artifact file has no name")?)?};tar.finish()?;}Ok(gz.finish()?)}).await??;
-    let mut request=h.post(format!("{}/api/native/jobs/{}/artifacts/{index}",c.endpoint,j.lease_token)).bearer_auth(&c.token).query(&[("name",name.as_str())]);
-    if let Some(v)=s.with.get("description"){request=request.query(&[("description",ctx.substitute(v))])} if s.with.get("public").is_some_and(|v|ctx.substitute(v).eq_ignore_ascii_case("true")){request=request.query(&[("public","true")])}
-    let response=request.body(bytes).send().await?;if !response.status().is_success(){bail!("artifact upload: {} {}",response.status(),response.text().await?)} Ok(())
+    let description=s.with.get("description").map(|v|ctx.substitute(v));
+    let public=s.with.get("public").is_some_and(|v|ctx.substitute(v).eq_ignore_ascii_case("true"));
+    send_artifact(h,&format!("{}/api/native/jobs/{}/artifacts/{index}",c.endpoint,j.lease_token),&c.token,&name,description.as_deref(),public,bytes,ARTIFACT_UPLOAD_TIMEOUT).await
+}
+async fn send_artifact(h:&reqwest::Client,url:&str,token:&str,name:&str,description:Option<&str>,public:bool,bytes:Vec<u8>,timeout:Duration)->Result<()>{
+    let mut last=String::new();
+    for attempt in 0..ARTIFACT_UPLOAD_ATTEMPTS {
+        let mut request=h.post(url).bearer_auth(token).query(&[("name",name)]).timeout(timeout);
+        if let Some(v)=description{request=request.query(&[("description",v)])}
+        if public{request=request.query(&[("public","true")])}
+        match request.body(bytes.clone()).send().await {
+            Ok(response) if response.status().is_success()=>return Ok(()),
+            Ok(response)=>{
+                let retry=response.status().is_server_error()||response.status()==reqwest::StatusCode::TOO_MANY_REQUESTS;
+                last=format!("{} {}",response.status(),response.text().await.unwrap_or_default());
+                if !retry{break}
+            }
+            Err(e)=>{
+                let retry=e.is_timeout()||e.is_connect();
+                last=e.to_string();
+                if !retry{break}
+            }
+        }
+        if attempt+1<ARTIFACT_UPLOAD_ATTEMPTS {tokio::time::sleep(Duration::from_secs(1 << attempt)).await;}
+    }
+    bail!("artifact upload: {last}")
 }
 #[cfg(unix)] fn configure_process_tree(cmd:&mut Command){use std::os::unix::process::CommandExt;cmd.as_std_mut().process_group(0);}
 #[cfg(windows)] fn configure_process_tree(cmd:&mut Command){use std::os::windows::process::CommandExt;cmd.as_std_mut().creation_flags(0x00000200);}
@@ -506,6 +541,48 @@ mod tests {
             }
             assert_eq!(calls.load(Ordering::SeqCst), statuses.len());
         }
+    }
+
+    #[tokio::test]
+    async fn fenced_completion_allows_polling_but_other_errors_remain_terminal() {
+        for (path,status,message,accepted) in [
+            ("complete",409,"lease expired or fenced",true),
+            ("heartbeat",409,"lease expired or fenced",false),
+            ("complete",409,"invalid completion",false),
+            ("complete",401,"lease expired or fenced",false),
+        ] {
+            let app=axum::Router::new().route(&format!("/api/native/{path}"),axum::routing::post(move||async move{
+                (axum::http::StatusCode::from_u16(status).unwrap(),axum::Json(serde_json::json!({"error":message})))
+            }));
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint=format!("http://{}",listener.local_addr().unwrap());
+            let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+            let dir=tempfile::tempdir().unwrap();
+            let result=post(&reqwest::Client::new(),&config(&endpoint,dir.path()),path,&serde_json::json!({})).await;
+            server.abort();
+            assert_eq!(result.is_ok(),accepted,"{path} {status} {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_retries_transient_response_and_overrides_client_timeout() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls=Arc::new(AtomicUsize::new(0));let seen=calls.clone();
+        let app=axum::Router::new().route("/upload",axum::routing::post(move||{let call=seen.fetch_add(1,Ordering::SeqCst);async move{if call==0{axum::http::StatusCode::SERVICE_UNAVAILABLE}else{tokio::time::sleep(Duration::from_millis(50)).await;axum::http::StatusCode::NO_CONTENT}}}));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let url=format!("http://{}/upload",listener.local_addr().unwrap());let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+        let client=reqwest::Client::builder().timeout(Duration::from_millis(10)).build().unwrap();
+        send_artifact(&client,&url,"token","artifact",None,false,b"identical".to_vec(),Duration::from_secs(1)).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst),2);server.abort();
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_does_not_retry_auth_failure() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls=Arc::new(AtomicUsize::new(0));let seen=calls.clone();
+        let app=axum::Router::new().route("/upload",axum::routing::post(move||{seen.fetch_add(1,Ordering::SeqCst);async{axum::http::StatusCode::UNAUTHORIZED}}));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let url=format!("http://{}/upload",listener.local_addr().unwrap());let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+        let error=send_artifact(&reqwest::Client::new(),&url,"bad","artifact",None,false,vec![],Duration::from_secs(1)).await.unwrap_err();
+        assert!(error.to_string().contains("401"));assert_eq!(calls.load(Ordering::SeqCst),1);server.abort();
     }
 
     #[tokio::test]
