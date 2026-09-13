@@ -1739,9 +1739,12 @@ mod tests {
             .header(trigger::SIGNATURE_HEADER, signature).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "read signatures must not grant write access");
         assert!(store.reruns_of(run).await.unwrap().is_empty());
-        store.set_job_status(&crate::store::job_id(run, "passed"), crate::store::JobStatus::Success, None).await.unwrap();
         store.set_job_status(&crate::store::job_id(run, "failed"), crate::store::JobStatus::Failure, Some("offline")).await.unwrap();
         store.set_run_status(run, crate::store::RunStatus::Failure, None).await.unwrap();
+        assert_eq!(post(app.clone(), &path, Some(&token)).await.status(), StatusCode::CONFLICT,
+            "a failed rollup with an active sibling must not be retried");
+        assert!(store.reruns_of(run).await.unwrap().is_empty());
+        store.set_job_status(&crate::store::job_id(run, "passed"), crate::store::JobStatus::Success, None).await.unwrap();
         let response = post(app.clone(), &path, Some(&token)).await;
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();

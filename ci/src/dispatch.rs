@@ -563,6 +563,14 @@ impl Dispatcher {
                 run.status
             )));
         }
+        // A failed job can make the run's rollup fail while siblings still run.
+        // Retrying that rollup must not duplicate the siblings' work.
+        if self.store.jobs_of(run_id).await?.iter()
+            .any(|job| !matches!(job.status.as_str(), "success" | "failure" | "skipped" | "cancelled")) {
+            return Err(DispatchError::Workflow(
+                "jobs in this run are still active; wait for them to finish before re-running it".into()
+            ));
+        }
         if self.store.service_deployments_of(run_id).await?.iter()
             .any(|d| !matches!(d.status.as_str(), "passed" | "failed")) {
             return Err(DispatchError::Workflow(
