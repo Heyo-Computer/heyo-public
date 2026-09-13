@@ -1177,6 +1177,23 @@ actions do not change app-lb, namespaces, existing VM pages, or Retail.
 
 ### Service deployments
 
+For an existing app-lb VM deployment, use `ci/publish-rootfs` followed by
+`ci/deploy-app-lb`. Publication takes `path` (a relative raw ext4 file) and
+`image` (its image name), and requires the HTTP artifacts sink. Its outputs are
+`manifest`, `blob`, `size`, `store`, and `sha`. Release workflows must publish
+from a job that ran `ci/checkout-release` at the confirmed release commit.
+
+`ci/deploy-app-lb` takes `url`, `token`, `deployment`, `namespace`, `manifest`,
+and `store`. It accepts only a manifest recorded by a successful publication
+step in this run; a cross-job producer must also have succeeded. The target
+must already exist with the matching namespace and artifact store. app-lb must
+support durable correlated pulls (`operation_id`); older servers are rejected.
+CI waits for app-lb to verify the exact replacement's health, and records the
+operation in the same Deployments UI and NATS outbox as service deployments.
+Cancellation or uncertain transport stops waiting, not the remote rollout;
+resuming the same step reconciles its operation instead of creating another.
+These actions do not register services, merge branches, or publish tags.
+
 `ci/deploy-service` runs an asynchronous service rollout through Orchestrator's
 existing `POST /orchestration/services/deployments` API. It does not create VMs,
 implement routing, or change app-lb's namespace model. The existing CI run page

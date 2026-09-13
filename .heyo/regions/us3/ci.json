@@ -8,7 +8,7 @@
     "size_class": "medium",
     "ttl_seconds": 0,
     "working_directory": "/opt/ci",
-    "start_command": "export CI_LOCAL_RUNNER=http://$(ip route show default | awk '{print $3}' | head -1):34099; setsid nohup bash /opt/ci/start.sh </dev/null >/workspace/ci-state.log 2>&1 &",
+    "start_command": "set -- $(ip route show default); export CI_LOCAL_RUNNER=http://$3:34099; setsid nohup bash /opt/ci/start.sh </dev/null >/workspace/ci-state.log 2>&1 &",
     "env_vars": {
       "CI_NAME": "ci-us3",
       "CI_LISTEN_ADDR": "0.0.0.0:9500",

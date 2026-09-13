@@ -7,6 +7,175 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
+pub(crate) async fn source_sha(store: &Store, msg: &JobMessage) -> Result<String, String> {
+    let run = store.get_run(&msg.run_id).await.map_err(|e| e.to_string())?.ok_or("run not found")?;
+    let release_workflow = store.jobs_of(&msg.run_id).await.map_err(|e| e.to_string())?.iter()
+        .any(|job| job.plan["steps"].as_array().is_some_and(|steps| steps.iter().any(|s| s["uses"] == "ci/merge-release")));
+    if release_workflow {
+        let release = crate::release::get(store, &msg.run_id).await?
+            .filter(|r| r.status == "published").ok_or("rootfs publication/deployment requires a confirmed published release")?;
+        Ok(release.prepared.release_sha)
+    } else {
+        Ok(run.sha)
+    }
+}
+
+pub(crate) async fn publication_source_sha(store: &Store, msg: &JobMessage) -> Result<String, String> {
+    let sha = source_sha(store, msg).await?;
+    if crate::release::get(store, &msg.run_id).await?.is_some() {
+        let checked_out: Option<String> = sqlx::query_scalar("SELECT release_sha FROM ci_job WHERE id=$1")
+            .bind(&msg.job_id).fetch_one(store.pool()).await.map_err(|e| e.to_string())?;
+        if checked_out.as_deref() != Some(&sha) {
+            return Err("rootfs must be built after ci/checkout-release at the exact release commit".into());
+        }
+    }
+    Ok(sha)
+}
+
+fn app_lb_endpoint(base: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(base).map_err(|_| "invalid app-lb URL")?;
+    let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    if (url.scheme() != "https" && !(url.scheme() == "http" && loopback)) || !url.username().is_empty()
+        || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+        return Err("app-lb URL must use HTTPS (HTTP allowed on loopback), without credentials, query or fragment".into());
+    }
+    Ok(base.trim_end_matches('/').into())
+}
+
+fn valid_digest(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn clean_remote_error(masker: &Masker, token: &str, error: &str) -> String {
+    masker.mask(error).replace(token, "***")
+}
+
+fn app_lb_config_fingerprint(mut spec: Value) -> String {
+    if let Some(vm) = spec["vm"].as_object_mut() { vm.remove("image"); }
+    spec["artifact"]["ref"] = json!("");
+    hex::encode(Sha256::digest(serde_json::to_vec(&spec).expect("JSON value serializes")))
+}
+
+fn validate_app_lb_job(body: &Value, expected_job: Option<&str>, operation: &str, deployment: &str,
+    namespace: &str, digest: &str, config_fingerprint: &str) -> Result<&'static str, String> {
+    let id = body["id"].as_str().filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+        .ok_or("app-lb response omitted a valid job id")?;
+    if expected_job.is_some_and(|expected| expected != id) {
+        return Err("app-lb returned a different job than the correlated pull".into());
+    }
+    if body["operation_id"] != operation || body["deployment"] != deployment
+        || body["target_namespace"] != namespace || body["artifact"] != digest
+        || body["config_fingerprint"] != config_fingerprint {
+        return Err("app-lb returned a job with the wrong operation, deployment, namespace, artifact digest, or target spec".into());
+    }
+    match body["status"].as_str() {
+        Some("running") => Ok("running"),
+        Some("failed") => Err(body["error"].as_str().unwrap_or("app-lb deployment failed").into()),
+        Some("succeeded") if body["readiness_verified"] == true && matches!(body.get("reconciliation_required"), None | Some(Value::Bool(false)))
+            && body["rolled_out"] == true => Ok("passed"),
+        Some("succeeded") => Err("app-lb completed without an exact healthy replacement, or requires reconciliation".into()),
+        _ => Err("app-lb returned an invalid deployment status".into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn deploy_app_lb(store: &Store, msg: &JobMessage, step: &str, base: &str, token: &str,
+    deployment: &str, namespace: &str, digest: &str, store_url: &str, timeout: Duration,
+    masker: &Masker) -> Result<String, String> {
+    if token.trim().is_empty() { return Err("ci/deploy-app-lb needs an app-lb credential from secrets".into()); }
+    if !valid_digest(digest) { return Err("manifest must be a 64-character lowercase SHA256 digest".into()); }
+    if deployment.is_empty() || namespace.is_empty() || !deployment.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("deployment and namespace are required, and deployment must be a safe identifier".into());
+    }
+    let base = app_lb_endpoint(base)?;
+    let sha = source_sha(store, msg).await?;
+    let authorized: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_app_lb_artifact a JOIN ci_step s ON s.id=a.step_id JOIN ci_job j ON j.id=a.job_id WHERE a.run_id=$1 AND a.sha=$2 AND a.store_url=$3 AND a.manifest_digest=$4 AND s.status='success' AND (a.job_id=$5 OR j.status='success'))")
+        .bind(&msg.run_id).bind(&sha).bind(store_url.trim_end_matches('/')).bind(digest)
+        .bind(&msg.job_id)
+        .fetch_one(store.pool()).await.map_err(|e| e.to_string())?;
+    if !authorized { return Err("deployment manifest was not published successfully by this run at the expected source SHA and artifact store".into()); }
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|e| e.to_string())?;
+    let spec: Value = http.get(format!("{base}/deployments/{deployment}")).bearer_auth(token).send().await
+        .map_err(|_| "could not read the registered app-lb deployment")?.error_for_status()
+        .map_err(|e| format!("could not read registered app-lb deployment: {e}"))?.json().await.map_err(|_| "invalid app-lb deployment response")?;
+    if spec["spec"]["namespace"].as_str().unwrap_or("default") != namespace
+        || spec["spec"]["artifact"]["store"].as_str().map(|s| s.trim_end_matches('/')) != Some(store_url.trim_end_matches('/')) {
+        return Err("registered app-lb deployment namespace or artifact.store does not match the authorized target/store".into());
+    }
+    let source_spec_fingerprint = app_lb_config_fingerprint(spec["spec"].clone());
+    let operation = format!("ci-app-lb-{}", hex::encode(Sha256::digest(step.as_bytes())));
+    let request = json!({"operation_id":operation,"ref":digest,"force":false});
+    let request_hash = hex::encode(Sha256::digest(format!("{base}\n{namespace}\n{}\n{deployment}\n{source_spec_fingerprint}\n{request}", store_url.trim_end_matches('/'))));
+    let first = store.begin_service_deployment(&operation, step, deployment, &request_hash).await.map_err(|e| e.to_string())?;
+    if let Some(current) = store.service_deployments_of(&msg.run_id).await.map_err(|e| e.to_string())?
+        .into_iter().find(|d| d.id == operation) {
+        if current.status == "passed" {
+            return Ok(format!("[ci] app-lb deployment {deployment} already verified (operation {operation})\n"));
+        }
+        if current.status == "failed" {
+            return Err(current.error.or(current.message).unwrap_or_else(|| "app-lb deployment previously failed".into()));
+        }
+    }
+    let started = Instant::now();
+    if store.is_job_cancelled(&msg.job_id).await.map_err(|e| e.to_string())? || started.elapsed() >= timeout {
+        return Err(format!("CI stopped before submitting app-lb operation {operation}"));
+    }
+    let response = if first {
+        Some(http.post(format!("{base}/deployments/{deployment}/pull")).bearer_auth(token).json(&request).send().await)
+    } else { None };
+    let job_id = match response {
+        Some(Ok(r)) if r.status().is_success() => {
+            let body: Value = r.json().await.map_err(|_| "invalid app-lb pull response")?;
+            if let Err(e) = validate_app_lb_job(&body, None, &operation, deployment, namespace, digest, &source_spec_fingerprint) {
+                let clean = clean_remote_error(masker, token, &e);
+                store.update_service_deployment(&operation, "failed", Some("app-lb-pull"), None, Some(&clean)).await.map_err(|x| x.to_string())?;
+                return Err(clean);
+            }
+            body["id"].as_str().ok_or("app-lb pull response omitted job id")?.to_string()
+        }
+        _ => {
+            let jobs: Vec<Value> = http.get(format!("{base}/deployments/{deployment}/jobs")).bearer_auth(token).send().await
+                .map_err(|_| "app-lb submission outcome is uncertain and reconciliation failed")?.json().await
+                .map_err(|_| "invalid app-lb reconciliation response")?;
+            let found = jobs.into_iter().find(|j| j["operation_id"] == operation)
+                .ok_or("app-lb submission outcome is uncertain; operation was not found")?
+                ;
+            if let Err(e) = validate_app_lb_job(&found, None, &operation, deployment, namespace, digest, &source_spec_fingerprint) {
+                let clean = clean_remote_error(masker, token, &e);
+                store.update_service_deployment(&operation, "failed", Some("app-lb-pull"), None, Some(&clean)).await.map_err(|x| x.to_string())?;
+                return Err(clean);
+            }
+            found["id"].as_str().unwrap().to_owned()
+        }
+    };
+    store.update_service_deployment(&operation, "running", Some("app-lb-pull"), Some("Waiting for exact healthy replacement."), None).await.map_err(|e| e.to_string())?;
+    loop {
+        if store.is_job_cancelled(&msg.job_id).await.map_err(|e| e.to_string())? || started.elapsed() >= timeout {
+            return Err(format!("CI stopped waiting; reconcile app-lb operation {operation} before retrying"));
+        }
+        let body: Value = http.get(format!("{base}/jobs/{job_id}")).bearer_auth(token).send().await
+            .map_err(|_| "could not reconcile app-lb job")?.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(|_| "invalid app-lb job response")?;
+        match validate_app_lb_job(&body, Some(&job_id), &operation, deployment, namespace, digest, &source_spec_fingerprint) {
+            Ok("running") => {}
+            Ok("passed") => {
+                if store.is_job_cancelled(&msg.job_id).await.map_err(|e| e.to_string())? || started.elapsed() >= timeout {
+                    return Err(format!("CI stopped waiting; reconcile app-lb operation {operation} before retrying"));
+                }
+                store.update_service_deployment(&operation, "passed", Some("ready"), Some("Exact healthy replacement verified."), None).await.map_err(|e| e.to_string())?;
+                return Ok(format!("[ci] app-lb deployment {deployment} installed manifest {digest} and verified readiness (operation {operation})\n"));
+            }
+            Ok(_) => unreachable!(),
+            Err(e) => {
+                let clean = clean_remote_error(masker, token, &e);
+                store.update_service_deployment(&operation, "failed", Some("app-lb-pull"), None, Some(&clean)).await.map_err(|x| x.to_string())?;
+                return Err(clean);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 fn prepare(mut spec: Value, operation: &str, repo: &str, git_ref: &str, sha: &str) -> Result<(String, Value), String> {
     if repo.is_empty() || !git_ref.starts_with("refs/heads/") ||
         !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
@@ -127,6 +296,36 @@ pub async fn deploy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_lb_requires_exact_identity_and_complete_readiness() {
+        let digest = "a".repeat(64);
+        let base = json!({"id":"job","deployment":"api","operation_id":"ci-app-lb-1",
+            "target_namespace":"team","artifact":digest,"status":"succeeded",
+            "config_fingerprint":"spec","readiness_verified":true,"rolled_out":true});
+        assert_eq!(validate_app_lb_job(&base, None, "ci-app-lb-1", "api", "team", &digest, "spec").unwrap(), "passed");
+        for (key, value) in [("target_namespace", json!("other")), ("artifact", json!("b".repeat(64))), ("id", json!("../other"))] {
+            let mut bad = base.clone(); bad[key] = value;
+            assert!(validate_app_lb_job(&bad, None, "ci-app-lb-1", "api", "team", &digest, "spec").is_err());
+        }
+        for (key, value) in [("readiness_verified", json!(false)), ("reconciliation_required", json!(true)), ("reconciliation_required", json!("false")), ("rolled_out", json!(false))] {
+            let mut incomplete = base.clone(); incomplete[key] = value;
+            assert!(validate_app_lb_job(&incomplete, None, "ci-app-lb-1", "api", "team", &digest, "spec").is_err());
+        }
+        assert!(validate_app_lb_job(&base, Some("different-job"), "ci-app-lb-1", "api", "team", &digest, "spec").is_err());
+        let mut wrong_spec = base.clone(); wrong_spec["config_fingerprint"] = json!("changed");
+        assert!(validate_app_lb_job(&wrong_spec, Some("job"), "ci-app-lb-1", "api", "team", &digest, "spec").is_err());
+        let mut spec = json!({"vm":{"image":"old","port":8080},"artifact":{"store":"https://art.test","ref":"old"}});
+        let before = app_lb_config_fingerprint(spec.clone());
+        spec["vm"]["image"] = json!("new"); spec["artifact"]["ref"] = json!("new");
+        assert_eq!(app_lb_config_fingerprint(spec.clone()), before);
+        spec["vm"]["port"] = json!(9090);
+        assert_ne!(app_lb_config_fingerprint(spec), before);
+        let masker = Masker::new(["remote-secret"].into_iter());
+        assert_eq!(clean_remote_error(&masker, "bearer-secret", "remote-secret bearer-secret failed"), "*** *** failed");
+        assert!(!valid_digest(&"A".repeat(64)));
+        assert!(!valid_digest("abc"));
+    }
 
     #[test]
     fn revision_and_operation_identity_cannot_be_overridden() {

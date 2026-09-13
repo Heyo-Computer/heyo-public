@@ -24,6 +24,20 @@ moving `ci.us3.heyo.work` to it. Keep release/tag publication disabled during
 installation. The public client accepts `git submit pr59`; register the public
 repository with `ci/system.yml` as its workflow path.
 
+## Artifact store
+
+`artifacts.json` builds the public `artifacts/Dockerfile`. Provision
+`artifacts-us3/api-key` in HeyoSecret and deliver it through app-lb's
+`artifacts-us3` secret. Build at zero replicas, then start one and verify
+`/healthz` and authenticated blob/manifest access before assigning
+`artifacts.us3.heyo.work`. Anonymous API calls must be rejected. The store's
+data disk is service state; never recycle it as CI job scratch space.
+
+Configure CI's HTTP artifacts sink with that URL and credential. app-lb pulls
+the same immutable manifests using an artifact credential reference. The CI
+actions `ci/publish-rootfs` and `ci/deploy-app-lb` join publication to app-lb's
+existing VM deployment; they do not introduce another scheduler or namespace.
+
 ## Cloud
 
 `cloud.json` is an inert app-lb template, with no routes and zero replicas.

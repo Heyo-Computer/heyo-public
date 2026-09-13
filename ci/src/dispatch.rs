@@ -36,7 +36,7 @@ use crate::store::{JobStatus, RunStatus, StepStatus, Store, step_id};
 use crate::vm::{ExecOutput, SizeCheck, Vm, VmError, Vms, sandbox_name};
 use crate::workflow::{Fallback, Step};
 use async_nats::jetstream::AckKind;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::Row;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -2476,6 +2476,50 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     &required("token")?, step_timeout(step, plan), masker)
                     .await.map(|note| (note, serde_json::json!({}))).map_err(DispatchError::StepFailed)
             }
+            "ci/publish-rootfs" => {
+                let path = required("path")?;
+                let image = required("image")?;
+                if std::path::Path::new(&path).is_absolute() || std::path::Path::new(&path).components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+                    return Err(DispatchError::Artifact("rootfs path must be relative to the job working directory".into()));
+                }
+                // Establish release provenance before handing a store credential
+                // to the guest or causing any externally visible upload.
+                let sha = crate::cd::publication_source_sha(&self.store, msg).await.map_err(DispatchError::StepFailed)?;
+                let push = self.artifacts.guest_push().ok_or_else(|| DispatchError::Artifact(
+                    "ci/publish-rootfs requires the artifacts HTTP sink; disk and S3 are not rootfs registries".into()))?;
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                let file = format!("{}/{path}", workdir.trim_end_matches('/'));
+                let budget = step_timeout(step, plan);
+                let mut env = HashMap::new();
+                env.insert("CI_ARTIFACT_URL".to_string(), push.url);
+                if let Some(token) = &push.token { env.insert("CI_ARTIFACT_TOKEN".to_string(), token.clone()); }
+                let out = vm.exec(&format!("{sid}.rootfs"), &guest_push_command(&file, push.token.is_some(), budget), &env, budget).await?;
+                let (blob, size) = parse_guest_push(&out).map_err(DispatchError::Artifact)?;
+                let published = self.artifacts.publish_pushed_rootfs(&blob, size, &image).await
+                    .map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                let size: i64 = published.size_bytes.try_into().map_err(|_| DispatchError::Artifact("rootfs is too large to record".into()))?;
+                let mut tx = self.store.pool().begin().await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                sqlx::query("INSERT INTO ci_app_lb_artifact(step_id,run_id,job_id,sha,store_url,manifest_digest,blob_digest,size_bytes) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(step_id) DO UPDATE SET sha=excluded.sha,store_url=excluded.store_url,manifest_digest=excluded.manifest_digest,blob_digest=excluded.blob_digest,size_bytes=excluded.size_bytes")
+                    .bind(sid).bind(&msg.run_id).bind(&msg.job_id).bind(&sha).bind(&published.store_url)
+                    .bind(&published.manifest_digest).bind(&published.blob_digest).bind(size)
+                    .execute(&mut *tx).await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                let event = Store::add_event(&mut tx, &msg.run_id, Some(&msg.job_id), Some(&msg.job_key), Some(sid),
+                    "ci.rootfs.published.v1", "published", None).await?;
+                sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2 WHERE id=$1").bind(event).bind(json!({
+                    "sha":sha,"store_url":published.store_url,"manifest_digest":published.manifest_digest,
+                    "blob_digest":published.blob_digest,"size_bytes":published.size_bytes
+                })).execute(&mut *tx).await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                tx.commit().await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                Ok((format!("[ci] published rootfs manifest {} ({} bytes) for {sha}\n", published.manifest_digest, published.size_bytes),
+                    json!({"manifest":published.manifest_digest,"blob":published.blob_digest,"size":published.size_bytes,"store":published.store_url,"sha":sha})))
+            }
+            "ci/deploy-app-lb" => {
+                crate::cd::deploy_app_lb(&self.store, msg, sid, &required("url")?, &required("token")?,
+                    &required("deployment")?, &required("namespace")?, &required("manifest")?, &required("store")?,
+                    step_timeout(step, plan), masker).await
+                    .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
+            }
             "ci/upload-artifact" => {
                 let name = with("name").ok_or_else(|| {
                     DispatchError::Artifact("ci/upload-artifact needs `with.name`".into())
@@ -2731,7 +2775,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
             }
             other => Err(DispatchError::Artifact(format!(
                 "`uses: {other}` is not a built-in action. Available: \
-                 ci/upload-artifact, ci/download-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service. Composite actions from a repository are not \
+                 ci/upload-artifact, ci/download-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service, ci/publish-rootfs, ci/deploy-app-lb. Composite actions from a repository are not \
                  supported."
             ))),
         }

@@ -66,6 +66,7 @@
 
 use crate::config::{ArtifactSinkKind, ArtifactsConfig, Config, S3Config};
 use async_trait::async_trait;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::PathBuf;
@@ -123,6 +124,17 @@ pub struct GuestPush {
     pub token: Option<String>,
 }
 
+/// Identity of a raw ext4 publication. Unlike [`StoredArtifact`], the digest
+/// here names the rootfs manifest (the reference app-lb consumes), while
+/// `blob_digest` names the bytes pushed by the guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedRootfs {
+    pub store_url: String,
+    pub manifest_digest: String,
+    pub blob_digest: String,
+    pub size_bytes: u64,
+}
+
 #[async_trait]
 pub trait ArtifactSink: Send + Sync {
     /// Store `bytes` the orchestrator has in hand.
@@ -153,6 +165,17 @@ pub trait ArtifactSink: Send + Sync {
         Err(ArtifactError::Misconfigured(format!(
             "the {} sink cannot accept a blob pushed from a guest (digest {digest})",
             self.kind()
+        )))
+    }
+
+    /// Finish an already-pushed raw ext4 image as a bootable rootfs manifest.
+    /// This is opt-in so disk/S3 can never masquerade as a rootfs registry.
+    async fn publish_pushed_rootfs(
+        &self, digest: &str, size: u64, image: &str,
+    ) -> Result<PublishedRootfs, ArtifactError> {
+        let _ = (size, image);
+        Err(ArtifactError::Misconfigured(format!(
+            "the {} sink is not a rootfs registry (blob {digest})", self.kind()
         )))
     }
 
@@ -383,6 +406,35 @@ impl ArtifactSink for ArtifactsSink {
             Some(_) => self.finish(r, digest.to_string(), size).await,
         }
     }
+
+    async fn publish_pushed_rootfs(
+        &self, digest: &str, size: u64, image: &str,
+    ) -> Result<PublishedRootfs, ArtifactError> {
+        validate_digest(digest)?;
+        if image.trim().is_empty() {
+            return Err(ArtifactError::InvalidRecord("rootfs image name is empty".into()));
+        }
+        match self.stat_blob(digest).await? {
+            None => return Err(ArtifactError::NotPushed { digest: digest.into(), detail: "the store does not have it".into() }),
+            Some(Some(stored)) if stored != size => return Err(ArtifactError::NotPushed {
+                digest: digest.into(), detail: format!("the guest measured {size} bytes, the store holds {stored}"),
+            }),
+            // A rootfs publication requires a verified HEAD size, rather than
+            // accepting an old store that omitted Content-Length.
+            Some(None) => return Err(ArtifactError::NotPushed { digest: digest.into(), detail: "HEAD did not report a Content-Length".into() }),
+            Some(Some(_)) => {}
+        }
+        let manifest = rootfs_manifest(digest, size, image);
+        let response = self.auth(self.http.put(format!("{}/manifests", self.config.url)))
+            .json(&manifest).send().await.map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        let body: serde_json::Value = check(response, "storing a rootfs manifest").await?
+            .json().await.map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        let manifest_digest = body.get("digest").and_then(Value::as_str)
+            .ok_or_else(|| ArtifactError::InvalidRecord("store omitted the rootfs manifest digest".into()))?;
+        validate_digest(manifest_digest)?;
+        Ok(PublishedRootfs { store_url: self.config.url.trim_end_matches('/').into(),
+            manifest_digest: manifest_digest.into(), blob_digest: digest.into(), size_bytes: size })
+    }
 }
 
 impl ArtifactsSink {
@@ -585,6 +637,21 @@ fn manifest_for(r: &ArtifactRef, digest: &str, size: u64) -> serde_json::Value {
     })
 }
 
+fn rootfs_manifest(digest: &str, size: u64, image: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1, "kind": "heyvm.rootfs.v1",
+        "entries": [{"name":"rootfs.ext4", "digest":digest, "size":size}],
+        "annotations": {"heyvm.image":image, "heyvm.nominal_size":size.to_string(), "heyvm.primitive":"ext4_raw"}
+    })
+}
+
+fn validate_digest(digest: &str) -> Result<(), ArtifactError> {
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return Err(ArtifactError::InvalidRecord("digest must be 64 lowercase hexadecimal characters".into()));
+    }
+    Ok(())
+}
+
 /// A tag the store will accept: `[A-Za-z0-9_.-]`, at most 64 characters, no
 /// leading `-` or `.`.
 ///
@@ -727,6 +794,19 @@ mod tests {
             description: None,
             public: false,
         }
+    }
+
+    #[test]
+    fn rootfs_publication_schema_matches_app_lb() {
+        let digest = "a".repeat(64);
+        let m = rootfs_manifest(&digest, 4096, "app-image");
+        assert_eq!(m["kind"], "heyvm.rootfs.v1");
+        assert_eq!(m["entries"][0], serde_json::json!({"name":"rootfs.ext4","digest":digest,"size":4096}));
+        assert_eq!(m["annotations"]["heyvm.primitive"], "ext4_raw");
+        assert_eq!(m["annotations"]["heyvm.nominal_size"], "4096");
+        assert_eq!(m["annotations"]["heyvm.image"], "app-image");
+        assert!(validate_digest(&"A".repeat(64)).is_err());
+        assert!(validate_digest("abc").is_err());
     }
 
     /// The store's tag charset excludes `/`, which every natural artifact
