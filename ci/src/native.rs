@@ -378,12 +378,17 @@ mod tests {
     fn system_workflow_gates_release_on_real_builds_and_defaults_to_no_publication() {
         let workflow=crate::workflow::Workflow::parse("system.yml",include_str!("../system.yml")).unwrap();
         let plan=crate::plan::Plan::build(&workflow).unwrap();
-        assert_eq!(plan.jobs.len(),6);
+        assert_eq!(plan.jobs.len(),10);
         let job=|key:&str| plan.jobs.iter().find(|j|j.key==key).unwrap();
         let release=job("release");
-        assert_eq!(release.needs,vec!["linux","mac-intel","windows"]);
-        for key in &release.needs {
-            let validation=job(key);
+        assert_eq!(release.needs,vec!["linux","platform","mac-intel","windows"]);
+        let components:std::collections::BTreeSet<_>=plan.jobs.iter()
+            .filter(|j|j.base_id=="platform")
+            .map(|j|j.matrix["component"].as_str().unwrap()).collect();
+        assert_eq!(components,std::collections::BTreeSet::from(["app-lb","artifacts","heyosecret","orchestrator"]));
+        let merge=release.steps.iter().find(|s|s.uses.as_deref()==Some("ci/merge-release")).unwrap();
+        assert!(!merge.with.contains_key("tags"),"merging must not implicitly publish tags");
+        for validation in plan.jobs.iter().filter(|j|release.needs.contains(&j.base_id)) {
             assert!(validation.condition.is_none());
             assert!(!validation.continue_on_error);
             assert!(validation.steps.iter().all(|s|!s.continue_on_error));
@@ -401,13 +406,18 @@ mod tests {
         let archive_condition=job("release-archive").condition.as_deref();
         assert!(archive_condition.is_some(),"release archives must be gated, not just depend on a possibly skipped release");
         assert!(!ctx.eval_condition(archive_condition.unwrap()).unwrap());
-        for (enabled,expected) in [("false",false),("true",true)] {
+        for (enabled,source,expected) in [("false","validated-source",false),("true","validated-source",true),("true","another-source",false),("true","",false)] {
             let mut ctx=crate::expr::Context::new();
-            ctx.set("vars",serde_json::json!({"RELEASE_ENABLED":enabled}));
+            ctx.set("ci",serde_json::json!({"sha":"validated-source"}));
+            ctx.set("vars",serde_json::json!({"RELEASE_ENABLED":enabled,"RELEASE_SOURCE_SHA":source}));
+            assert_eq!(ctx.eval_condition(release.condition.as_deref().unwrap()).unwrap(),expected);
             assert_eq!(ctx.eval_condition(archive_condition.unwrap()).unwrap(),expected);
         }
         assert_eq!(job("release-archive").needs,vec!["release"]);
         assert_eq!(job("release-archive").steps[0].uses.as_deref(),Some("ci/checkout-release"));
+        assert!(job("release-archive").steps.iter().any(|s|s.uses.as_deref()==Some("ci/upload-artifact") && s.with.get("name").map(String::as_str)==Some("ci-linux-release")));
+        let publish=job("release-archive").steps.iter().find(|s|s.uses.as_deref()==Some("ci/publish-service-archive")).unwrap();
+        assert!(publish.condition.as_deref().unwrap().contains("DEPLOY_ENABLED"));
         assert_eq!(job("deploy").needs,vec!["release-archive"]);
     }
 

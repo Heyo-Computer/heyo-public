@@ -46,9 +46,11 @@ This is a static check, not evidence that build commands or deployments work.
 ### Building and releasing the public CI system
 
 Register `ci/system.yml` as the repository workflow to build the Linux CI service
-and test/build the native agent on real Intel Mac and Windows hosts. It uses the
-repository's assigned Linux network, not the existing us2 host pin. All three
-builds upload artifacts and are required by the single release job.
+and test/build the native agent on real Intel Mac and Windows hosts. Its platform
+matrix also tests and builds app-lb (including heyctl), artifacts, HeyoSecret, and
+Orchestrator. It uses the repository's assigned Linux network, not an us2 host
+pin. Every validation job and matrix cell must pass before the release job.
+Each Linux component uploads its own binary artifact with `REVISION` and checksums.
 Linux tests and release compilation have separate steps with explicit 60-minute
 limits: the two-hour job limit does not override the default 30-minute step limit.
 
@@ -62,31 +64,38 @@ It requires a separately mounted persistent state directory with a
 fallback rather than silently losing CI history. Arguments are the release,
 runtime, and state directories. This boot wrapper is included in new artifacts.
 
-For an existing rootfs-only installation, fence public traffic with app-lb's
-503 maintenance mode, drain jobs, stop CI/NATS, and verify a private state export
-before changing its VM template. Seed the managed workspace from that export.
+For an existing rootfs-only installation, wait for jobs to finish, fence public
+traffic with app-lb's 503 maintenance mode, and confirm no work remains before
+stopping CI/NATS. Verify a private state export before changing the VM template.
+Seed the managed workspace from that export.
 Adding `vm.workspace` alone does not migrate rootfs data. Validate artifact mounts,
 workspace capture/restore, and replacement ordering on the installed backend
-before using this migration for live CI. Branch promotion authorizes deployment
-of the tested artifact, not GitHub merge/tag writes.
+before using this migration for live CI. Database access must survive a change of
+VM address/interface; a firewall allowance tied to the retired VM is insufficient.
+Branch promotion authorizes deployment of the tested artifact, not GitHub merge/tag writes.
 
-Release and deployment default to disabled. `RELEASE_ENABLED=true` permits the
-gated merge/version/tag action with `GIT_AUTH_TOKEN`; `DEPLOY_ENABLED=true` also
-permits Orchestrator deployment. These are separate publication permissions, not
-runner setup options. The release checks the exact captured `ci.release_base_sha`
-to source diff and refuses changes outside `ci/` and `.ci/image/ci/`: CI tests
-cannot authorize merging unrelated application changes.
+Release and deployment default to disabled. A merge requires both
+`RELEASE_ENABLED=true` and `RELEASE_SOURCE_SHA` equal to the exact submitted commit,
+plus the HeyoSecret-backed `GIT_AUTH_TOKEN`. CI checks the captured base, requires
+fresh successful validation, fast-forwards GitHub's default branch, and bumps
+`ci/Cargo.toml`. This workflow publishes no Git tags or GitHub releases.
+The source-diff guard permits only the five validated component directories and
+their `.ci/`/`.heyo/` configuration; unrelated application changes remain rejected.
 
-The release archive is rebuilt from the confirmed bumped tree and contains the
-CI executable, `start.sh`, and `REVISION`. Configure `ORCHESTRATOR_URL`,
+After the merge, `ci-linux-release` is rebuilt from the confirmed bumped tree and
+contains CI, the Linux native agent, the artifact boot wrapper, `start.sh`,
+`REVISION`, and checksums. It can be promoted through app-lb after the run finishes,
+without making an installation depend on Orchestrator archive publication.
+`DEPLOY_ENABLED=true` additionally enables the Orchestrator archive/deploy steps.
+Configure `ORCHESTRATOR_URL`,
 `SERVICE_OWNER`, a complete `SERVICE_SPEC`, and `ORCHESTRATOR_TOKEN` through the
 workflow's HeyoSecret scope. The workflow inserts only the finalized archive ID
 into that spec. The target must supply external Postgres/NATS and durable CI
 workspace/log/artifact storage. This archive does **not** replace the stateful
 CI/NATS bundle by itself: it contains no broker. For the new us3 installation,
 `ci/Dockerfile.firecracker` packages CI and NATS together and
-`.heyo/regions/us3/ci.json` defines the app-lb deployment. Existing us3 CI test
-data is disposable; no migration of that test data is required.
+`.heyo/regions/us3/ci.json` defines the app-lb deployment. Subsequent artifact
+promotions retain the managed CI workspace and external database.
 
 ## Submitting a build
 

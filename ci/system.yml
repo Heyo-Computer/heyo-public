@@ -1,4 +1,4 @@
-# Registered CI-system pipeline: Linux service and real native runner builds.
+# Registered platform pipeline: CI, control-plane services, and native runners.
 # Register this path on the target CI installation; no us2 host pin is inherited.
 name: CI system
 on: [submit]
@@ -9,11 +9,11 @@ jobs:
       build:
         dockerfile: .ci/image/ci/Dockerfile
         context: .ci/image/ci
-        size_mb: 6144
+        size_mb: 10240
       size_class: large
       disk_size_gb: 40
       ttl_seconds: 14400
-      cache_key_files: [ci/Cargo.lock, ci/Cargo.toml, rust-toolchain.toml]
+      cache_key_files: [rust-toolchain.toml, ci/rust-toolchain.toml]
     timeout-minutes: 120
     steps:
       - name: Require attached build disk
@@ -42,6 +42,44 @@ jobs:
       - uses: ci/upload-artifact
         with: { name: ci-linux, path: dist }
 
+  platform:
+    vm: *linux
+    strategy:
+      matrix:
+        component: [app-lb, artifacts, heyosecret, orchestrator]
+      max-parallel: 2
+      fail-fast: false
+    timeout-minutes: 180
+    steps:
+      - name: Require attached build disk
+        run: test "$(stat -c %d /var/cache/ci)" != "$(stat -c %d /)"
+      - name: Test component and workspace members
+        working-directory: /workspace/${{ matrix.component }}
+        timeout-minutes: 90
+        run: cargo test --locked --workspace
+      - name: Build component binaries
+        working-directory: /workspace/${{ matrix.component }}
+        timeout-minutes: 90
+        run: cargo build --locked --release --workspace --bins
+      - name: Package validated component
+        run: |
+          set -eu
+          component='${{ matrix.component }}'
+          case "$component" in
+            app-lb) binaries='app-lb heyctl' ;;
+            artifacts) binaries=art ;;
+            heyosecret|orchestrator) binaries="$component" ;;
+            *) exit 1 ;;
+          esac
+          mkdir -p dist
+          for binary in $binaries; do
+            cp "$CARGO_TARGET_DIR/release/$binary" "dist/$binary"
+          done
+          printf '%s\n' '${{ ci.sha }}' > dist/REVISION
+          (cd dist && sha256sum $binaries > SHA256SUMS)
+      - uses: ci/upload-artifact
+        with: { name: '${{ matrix.component }}-linux', path: dist }
+
   mac-intel:
     runs-on: [namespace-profile-mac-build, macos, macos-intel, x86_64-apple-darwin]
     timeout-minutes: 120
@@ -69,11 +107,11 @@ jobs:
         with: { name: native-agent-windows, path: ci/target/release/native-runner-agent.exe }
 
   release:
-    needs: [linux, mac-intel, windows]
-    if: ${{ vars.RELEASE_ENABLED == 'true' }}
+    needs: [linux, platform, mac-intel, windows]
+    if: ${{ vars.RELEASE_ENABLED == 'true' && vars.RELEASE_SOURCE_SHA == ci.sha }}
     vm: *linux
     steps:
-      - name: Refuse changes outside the validated CI component
+      - name: Refuse changes outside the validated platform components
         env:
           RELEASE_BASE: ${{ ci.release_base_sha }}
           SOURCE_SHA: ${{ ci.sha }}
@@ -85,19 +123,19 @@ jobs:
           if not base or not head:
               raise SystemExit('release requires captured base and source SHA')
           paths = subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', '-z', base, head]).decode().split('\0')
-          outside = [p for p in paths if p and not p.startswith(('ci/', '.ci/image/ci/'))]
+          prefixes = ('ci/', 'app-lb/', 'artifacts/', 'heyosecret/', 'orchestrator/', '.ci/', '.heyo/')
+          outside = [p for p in paths if p and not p.startswith(prefixes)]
           if outside:
-              raise SystemExit('CI-only release cannot authorize other components: ' + ', '.join(outside))
+              raise SystemExit('platform release cannot authorize unvalidated components: ' + ', '.join(outside))
           PY
       - uses: ci/merge-release
         with:
           manifests: '["ci/Cargo.toml"]'
-          tags: '{"ci/Cargo.toml":"ci-v"}'
           token: ${{ secrets.GIT_AUTH_TOKEN }}
 
   release-archive:
     needs: [release]
-    if: ${{ vars.RELEASE_ENABLED == 'true' }}
+    if: ${{ vars.RELEASE_ENABLED == 'true' && vars.RELEASE_SOURCE_SHA == ci.sha }}
     vm: *linux
     timeout-minutes: 120
     outputs:
@@ -107,17 +145,24 @@ jobs:
         uses: ci/checkout-release
       - name: Build release service
         working-directory: /workspace/ci
-        run: cargo build --locked --release --bin ci
+        timeout-minutes: 90
+        run: cargo build --locked --release --bins
       - name: Package release service
         run: |
           set -eu
           mkdir -p dist
           cp "$CARGO_TARGET_DIR/release/ci" dist/ci
+          cp "$CARGO_TARGET_DIR/release/native-runner-agent" dist/native-runner-agent
+          cp ci/deploy/start-artifact.sh dist/start-artifact.sh
           printf '%s\n' '#!/bin/sh' 'set -eu' 'exec ./ci' > dist/start.sh
           chmod 755 dist/start.sh
           printf '%s\n' '${{ steps.checkout.outputs.sha }}' > dist/REVISION
+          (cd dist && sha256sum ci native-runner-agent start-artifact.sh start.sh > SHA256SUMS)
           tar -C dist -czf ci-service.tar.gz .
+      - uses: ci/upload-artifact
+        with: { name: ci-linux-release, path: dist }
       - id: archive
+        if: ${{ vars.DEPLOY_ENABLED == 'true' }}
         uses: ci/publish-service-archive
         with:
           path: ci-service.tar.gz
@@ -128,7 +173,7 @@ jobs:
 
   deploy:
     needs: [release-archive]
-    if: ${{ vars.RELEASE_ENABLED == 'true' && vars.DEPLOY_ENABLED == 'true' }}
+    if: ${{ vars.RELEASE_ENABLED == 'true' && vars.RELEASE_SOURCE_SHA == ci.sha && vars.DEPLOY_ENABLED == 'true' }}
     vm: *linux
     steps:
       - id: spec
