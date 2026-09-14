@@ -855,7 +855,7 @@ impl SchemaRegistry {
     /// the pressure pass and the dashboard's buttons from picking this schema
     /// out from under a half-finished restart.
     pub async fn apply_replication_mode(self: &Arc<Self>, schema: &str) -> Result<()> {
-        let _claim = ArchivingGuard::claim(&self.archiving, schema)
+        let claim = ArchivingGuard::claim(&self.archiving, schema)
             .with_context(|| format!("schema {schema} is busy with another offload or restart"))?;
         // Drop the warm entry so the next checkout re-runs the full bring-up
         // (which reattaches to the same VM by id — nothing is stopped here).
@@ -864,7 +864,7 @@ impl SchemaRegistry {
             self.evict(schema, &cell).await;
         }
         let _guard = self
-            .checkout(schema)
+            .checkout_inner(schema, Some(&claim))
             .await
             .with_context(|| format!("bringing schema {schema} up in its new replication mode"))?;
         Ok(())
@@ -1350,6 +1350,17 @@ impl SchemaRegistry {
     /// The returned guard keeps the VM off the reaper's radar until dropped.
     /// Concurrent callers for the same schema share one bring-up.
     pub async fn checkout(&self, schema: &str) -> Result<ConnGuard> {
+        self.checkout_inner(schema, None).await
+    }
+
+    /// Check out while this caller owns this schema's maintenance claim. The
+    /// borrowed claim is both the authority to pass the archiving wait and the
+    /// lifetime proof that exclusion remains held through the checkout.
+    async fn checkout_inner(
+        &self,
+        schema: &str,
+        claim: Option<&ArchivingGuard<'_>>,
+    ) -> Result<ConnGuard> {
         // Refresh durable activity up front so the S3 eviction sweep sees this
         // schema as recently used even long after its VM leaves the warm map
         // (the in-memory `SchemaEntry::last_active` doesn't survive that).
@@ -1362,7 +1373,9 @@ impl SchemaRegistry {
             // completely silent — a client parked here for a whole offload
             // read as unexplained connect latency — so name it, once, and
             // account for it when it ends.
-            if self.is_archiving(schema) {
+            if self.is_archiving(schema)
+                && !claim.is_some_and(|c| c.owns(&self.archiving, schema))
+            {
                 if offload_waited.is_none() {
                     offload_waited = Some(Instant::now());
                     info!(
@@ -5357,6 +5370,13 @@ impl<'a> ArchivingGuard<'a> {
             None
         }
     }
+
+    /// Whether this is the still-live claim for exactly `schema` in `set`.
+    /// Checking both identities prevents a claim for another registry or
+    /// schema from becoming a general maintenance bypass.
+    fn owns(&self, set: &StdMutex<HashSet<String>>, schema: &str) -> bool {
+        std::ptr::eq(self.set, set) && self.schema == schema
+    }
 }
 
 impl Drop for ArchivingGuard<'_> {
@@ -6554,6 +6574,52 @@ fn used_pct(used: u64, avail: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owned_claim_checkout_progresses_while_ordinary_checkout_waits() {
+        let dir = std::env::temp_dir().join(format!("pgfc-claimed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::from_env().unwrap();
+        cfg.state_file = dir.join("registry.tsv");
+        cfg.dedicated_file = dir.join("dedicated.tsv");
+        cfg.peers_file = dir.join("peers.tsv");
+        cfg.replication_file = dir.join("replication.tsv");
+        cfg.reclaim = None;
+        cfg.run_dir = None;
+        cfg.warm_spares = 0;
+        cfg.freeze = None;
+        cfg.archive = None;
+        let registry = Arc::new(SchemaRegistry::new(cfg));
+        // Fail immediately after passing the maintenance gate, without any
+        // daemon or database connection. The original apply path instead
+        // waited forever on its own claim and never reached this breaker.
+        registry.bringup_breaker.record_failure("tenant");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.apply_replication_mode("tenant"),
+        )
+        .await
+        .expect("replication mode checkout must not wait on its own claim");
+        assert!(format!("{:#}", result.unwrap_err()).contains("holding off new attempts"));
+        assert!(!registry.is_archiving("tenant"), "failed operation must release its claim");
+
+        let claim = ArchivingGuard::claim(&registry.archiving, "tenant").unwrap();
+        let ordinary = registry.checkout("tenant");
+        tokio::pin!(ordinary);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut ordinary)
+                .await
+                .is_err(),
+            "public checkout must remain blocked while maintenance owns the schema"
+        );
+
+        drop(claim);
+        let result = tokio::time::timeout(Duration::from_secs(1), ordinary)
+            .await
+            .expect("ordinary checkout must resume after the claim is released");
+        assert!(result.err().unwrap().to_string().contains("holding off new attempts"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// The orphan sweep's abort breaker must count *consecutive* daemon
     /// errors. It once cleared its run only on `Gone`, which made it count

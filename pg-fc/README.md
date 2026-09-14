@@ -53,6 +53,22 @@ Linux only — Firecracker needs KVM, so there's no macOS host support.
 | `heyvm` / `heyvmd` (from the sibling `heyo` project) | the VM control plane: `heyvmd` (or `heyvm --api --port 34099`) serves the local sandbox HTTP API pg-vm-pool drives, and the `heyvm` CLI builds the `pg` image (`heyvm mvm build`) |
 | `heyo-sdk` crate, `>= 0.1.5` | Rust client for that API; pulled automatically by `cargo build` from crates.io, already pinned in `Cargo.toml` — no separate install needed |
 
+### Host service on systemd
+
+`deploy/pg-fc@.service` runs `/usr/local/bin/pg-vm-pool` using
+`/etc/pg-fc/<node>.env`, `/etc/pg-fc/<node>.secrets.env`, and working directory
+`/var/lib/pg-fc-<node>`. Create these paths before enabling the instance. Set
+`PG_VM_POOL_STATE_FILE` explicitly inside that state directory; the working
+directory alone does not override the default registry path. Keep the secrets
+file mode `0600`, populated from your secret manager, including `HEYO_API_KEY`
+when the host-local heyvm API requires authentication.
+
+Install the unit under `/etc/systemd/system/` and validate it with
+`systemd-analyze verify` before reloading systemd and enabling the instance.
+It does not install heyvm, provision an image, expose ports, or establish
+replication. Leave automatic eviction, orphan sweeping, and disk reclamation
+disabled on a shared host until resource ownership is configured.
+
 ## Postgres VM
 
 A Firecracker rootfs that boots straight into Postgres, with the data directory
@@ -77,6 +93,12 @@ The OS rootfs stays disposable; **all database state lives on `/workspace`**,
 which is a second Firecracker drive (`/dev/vdb` by default). On first boot the
 volume is formatted ext4 and the cluster is `initdb`'d into
 `/workspace/pgdata`; subsequent boots just mount and start.
+
+Both image recipes include `en_US.UTF-8`, so existing clusters initialized
+with that locale remain readable after a cold boot. Running `localedef` only
+inside a guest is not a durable repair: Firecracker recreates its disposable
+rootfs from the catalog image when it boots again. Preserve the PostgreSQL
+major version and the separate data disk when updating a database's rootfs.
 
 ### Build
 
@@ -1052,6 +1074,12 @@ second pg-fc host. The flow is: provision the database on node A as usual, add
 node B as a **peer**, then start replication from node A's `/replication` page.
 Node B builds a VM for the same database, seeds it, and follows.
 
+Upgrade the guest image as well as the host binary. The image must contain
+the current `init.sh` support for `/workspace/heyvm-replication`; older images
+can keep `wal_level=minimal` after pg-fc requests replication. Verify the
+marker and locale survive a cold boot on a disposable data disk before
+changing a service database.
+
 ```
 node A (primary)                              node B (replica)
   pg-acme VM, wal_level=logical                 pg-acme VM
@@ -1267,7 +1295,25 @@ the host-local tap.
 
 The cert files are **hot-reloaded**: the pooler stats them before each
 handshake and rebuilds its acceptor when they change, so an external renewer
-can rotate certs with no pooler restart. With Let's Encrypt/certbot:
+can rotate certs with no pooler restart.
+
+When host-local Traefik owns the certificate, `deploy/sync-traefik-cert.py`
+exports the exact hostname's certificate and key from its ACME JSON store.
+It validates expiry, hostname, and matching public keys with OpenSSL before
+atomically switching a `current` symlink to a protected certificate generation:
+
+```sh
+python3 deploy/sync-traefik-cert.py /path/acme.json pg.example.com /etc/pg-fc/tls
+```
+
+Point `PG_VM_POOL_TLS_CERT` at `/etc/pg-fc/tls/current/cert.pem` and
+`PG_VM_POOL_TLS_KEY` at `/etc/pg-fc/tls/current/key.pem`. Run the exporter
+periodically or after certificate renewal. Unchanged material is a no-op;
+invalid material leaves the existing certificate in place. The pooler
+hot-reloads the exported files without a restart.
+The exporter does not modify Traefik's ACME store or request certificates.
+
+With Let's Encrypt/certbot:
 
 ```sh
 # one-time issuance (needs public DNS -> this host, port 80 free for the challenge)
