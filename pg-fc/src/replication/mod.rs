@@ -59,8 +59,11 @@
 pub mod names;
 pub mod orchestrate;
 pub mod peer;
+pub mod physical;
+pub mod physical_store;
 pub mod sql;
 pub mod store;
 pub mod wire;
 
 pub use store::{ReplRecord, ReplStore, Role, SequenceSnapshot, State};
+pub use physical_store::{PhysicalPhase, PhysicalRecord, PhysicalSourceRecord, PhysicalSourceStore, PhysicalStore};

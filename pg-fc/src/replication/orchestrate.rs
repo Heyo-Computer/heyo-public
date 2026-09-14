@@ -46,7 +46,7 @@ fn cfg(reg: &Arc<SchemaRegistry>) -> Result<&ReplicationConfig> {
 /// The guest microVMs ship with an empty `/etc/resolv.conf`, so a hostname
 /// handed to one simply never resolves — the same constraint that makes the S3
 /// path pin IPs with `curl --resolve`. IPv4 only, because the guest tap/NAT is.
-async fn resolve_v4(host: &str, port: u16) -> Result<Ipv4Addr> {
+pub(crate) async fn resolve_v4(host: &str, port: u16) -> Result<Ipv4Addr> {
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return Ok(ip);
     }
@@ -793,6 +793,9 @@ pub async fn unfence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
 /// sequences logical replication never carried.
 pub async fn promote(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::PromoteResponse> {
     let _operation = reg.replication_operation(database).await;
+    if reg.physical().reserves_database(database) || reg.physical_sources().get(database).is_some() {
+        bail!("physical migration owns this database; logical promotion is disabled");
+    }
     let rcfg = cfg(reg)?;
     let rec = reg
         .replication()
@@ -851,6 +854,9 @@ pub async fn promote(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::
 /// as a promote minus the sequence re-seed.
 pub async fn detach(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::DetachResponse> {
     let _operation = reg.replication_operation(database).await;
+    if reg.physical().reserves_database(database) || reg.physical_sources().get(database).is_some() {
+        bail!("physical migration owns this database; logical detach is disabled");
+    }
     let rcfg = cfg(reg)?;
     let rec = reg
         .replication()

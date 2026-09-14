@@ -43,6 +43,8 @@ RUN apt-get update \
         mount \
         locales \
         gosu \
+        jq \
+        python3-minimal \
     && localedef -i en_US -f UTF-8 en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -58,7 +60,8 @@ RUN mkdir -p /workspace \
 # so the script must live at the rootfs *root* (not /sbin). A mismatch panics
 # the kernel with "Requested init /init.sh failed (error -2)" (ENOENT).
 COPY init.sh /init.sh
-RUN chmod +x /init.sh
+COPY physical.sh /usr/local/bin/pg-fc-physical
+RUN chmod +x /init.sh /usr/local/bin/pg-fc-physical
 
 # ENTRYPOINT is ignored on the Firecracker boot path (the kernel `init=` arg
 # wins), but keep it so the image is still runnable as a normal container.

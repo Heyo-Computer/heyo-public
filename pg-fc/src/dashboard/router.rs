@@ -43,6 +43,9 @@ pub fn build(state: DashState) -> Router {
             "/api/replication/peer/replicas",
             post(replication::api_accept_replica),
         )
+        .route("/api/replication/peer/physical-replicas", post(replication::api_accept_physical_replica))
+        .route("/api/replication/{database}/physical-prepare", post(replication::api_physical_prepare))
+        .route("/api/replication/{database}/physical", get(replication::api_physical_get))
         .route(
             "/api/replication/{database}",
             get(replication::api_get).delete(replication::api_forget),

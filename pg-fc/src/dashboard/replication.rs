@@ -395,7 +395,27 @@ pub async fn api_node_info(State(st): State<DashState>) -> Json<wire::NodeInfo> 
         server_version_num: None,
         tls: st.registry.tls_enabled(),
         pg_listen_port: Some(st.registry.listen_port()),
+        physical_prepare: true,
     })
+}
+
+pub async fn api_physical_prepare(State(st): State<DashState>, Path(db): Path<String>, Json(req): Json<wire::PhysicalPrepareRequest>) -> Response {
+    match crate::replication::physical::prepare_source(&st.registry, &db, &req.generation).await {
+        Ok(record) => (StatusCode::ACCEPTED, Json(record)).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_accept_physical_replica(State(st): State<DashState>, Json(req): Json<wire::PhysicalReplicaRequest>) -> Response {
+    match crate::replication::physical::accept_candidate(&st.registry, req) {
+        Ok(record) => (StatusCode::ACCEPTED, Json(wire::PhysicalRecordJson::from(&record))).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_physical_get(State(st): State<DashState>, Path(db): Path<String>) -> Response {
+    match st.registry.physical().get(&db) {
+        Some(record) => Json(wire::PhysicalRecordJson::from(&record)).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(ApiError { error: format!("no physical preparation for {db}") })).into_response(),
+    }
 }
 
 /// A primary asking this node to build the replica. Validates synchronously

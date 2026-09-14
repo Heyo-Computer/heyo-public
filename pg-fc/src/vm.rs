@@ -2019,6 +2019,32 @@ async fn exec_guest_env(
         .with_context(|| format!("{what}: guest exec failed"))
 }
 
+pub(crate) async fn physical_exec(
+    cfg: &Config, sandbox: &Sandbox, command: &str, env: HashMap<String, String>, what: &str,
+) -> Result<CommandResult> {
+    let command = format!("for pgbin in /usr/lib/postgresql/*/bin; do [ ! -d \"$pgbin\" ] || export PATH=\"$pgbin:$PATH\"; done\n{command}");
+    exec_guest_env(cfg, sandbox, &command, Some(env), what).await
+}
+
+/// Resolve by the operation's unique durable name before creating.  This is
+/// the lost-create-response recovery path; physical candidates deliberately
+/// bypass normal schema checkout and are never entered in the serving store.
+pub(crate) async fn physical_candidate(cfg: &Config, name: &str, allow_create: bool, own: &(dyn Fn(&str) -> Result<()> + Send + Sync)) -> Result<Sandbox> {
+    if !name.starts_with("repl-seed-") { bail!("invalid physical candidate name"); }
+    if let Some(info) = find_by_name_with_retry(name).await.context("finding physical candidate")? {
+        own(&info.id).context("durably adopting named physical candidate")?;
+        return bring_up_existing(cfg, name, &info.id).await?.context("physical candidate disappeared while resuming");
+    }
+    if !allow_create {
+        bail!("physical create outcome is unknown and named candidate is not visible; refusing a second create");
+    }
+    create_vm_within(cfg, name, true, cfg.ready_timeout, cfg.data_disk_gb, Some(own)).await
+}
+
+pub(crate) async fn connect_physical_candidate(cfg: &Config, name: &str, id: &str) -> Result<Sandbox> {
+    bring_up_existing(cfg, name, id).await?.context("recorded physical candidate no longer exists")
+}
+
 /// Best-effort human-readable detail from a failed guest command: the combined
 /// output if the backend populated it, else stderr.
 fn exec_detail(res: &CommandResult) -> &str {
@@ -2708,6 +2734,7 @@ pub(crate) async fn create_spare(cfg: &Config, name: &str) -> Result<Sandbox> {
         false,
         cfg.ready_timeout.min(SPARE_READY_TIMEOUT),
         cfg.data_disk_gb,
+        None,
     )
     .await
 }
@@ -2856,7 +2883,7 @@ pub(crate) async fn create_vm(
     keepalive: bool,
     disk_gb: u32,
 ) -> Result<Sandbox> {
-    create_vm_within(cfg, name, keepalive, cfg.ready_timeout, disk_gb).await
+    create_vm_within(cfg, name, keepalive, cfg.ready_timeout, disk_gb, None).await
 }
 
 /// [`create_vm`] with an explicit readiness budget — warm spares get a shorter
@@ -2867,6 +2894,7 @@ async fn create_vm_within(
     keepalive: bool,
     ready_timeout: Duration,
     disk_gb: u32,
+    own: Option<&(dyn Fn(&str) -> Result<()> + Send + Sync)>,
 ) -> Result<Sandbox> {
     info!(
         "creating VM {name}{}{}",
@@ -2918,6 +2946,7 @@ async fn create_vm_within(
         .with_context(|| format!("creating VM {name}"))?;
         (sandbox, started)
     };
+    if let Some(own) = own { own(sandbox.sandbox_id()).context("durably owning physical candidate VM")?; }
     // The daemon 202-accepts deploys, so this id exists (with a daemon-side
     // record behind it) long before the VM is usable — and until the registry
     // binds schema→id on full bring-up success, this variable is the only
@@ -2930,6 +2959,7 @@ async fn create_vm_within(
     }
     crate::inventory::insert(name, sandbox.sandbox_id());
     if let Err(e) = wait_ready(&sandbox, ready_timeout, name).await {
+        if own.is_some() { return Err(e).with_context(|| format!("waiting for owned physical candidate {name}")); }
         // Kill the half-built VM now, by the id in hand — no listing, which is
         // exactly what's unreachable when bring-ups fail en masse. It never
         // served a client, so its disk holds nothing worth keeping. Best

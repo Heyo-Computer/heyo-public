@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("pending-bringups.tsv"),
     );
-    let registry = Arc::new(SchemaRegistry::new(cfg));
+    let registry = Arc::new(SchemaRegistry::new(cfg)?);
     registry.spawn_reaper();
     // Stops running VMs nothing tracks (left over from a pooler restart, a
     // failed idle-stop, or a daemon-side boot) so the ladder can reclaim them.

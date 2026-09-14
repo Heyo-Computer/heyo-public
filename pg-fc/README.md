@@ -1107,9 +1107,41 @@ shared credentials cannot request this mode. The bound VM's hard fence denies
 it; a selective fence allows the replication login to reconnect. Upstream
 PostgreSQL must also allow physical replication in `pg_hba.conf` (a `host all`
 rule does not cover it). The original startup packet is forwarded unchanged.
-This protocol support does **not** change the provisioning API above into a
-physical standby API: base-backup seeding, standby boot, and coordinated
-promotion/rejoin are not implemented yet. Existing pairings remain logical.
+Existing pairings remain logical until explicitly migrated. Physical candidate
+preparation is a separate, authenticated operation; it does not promote or
+replace a serving database.
+
+#### Preparing a physical replacement
+
+Upgrade the host binary on both peers and build the new guest image with the
+**same PostgreSQL major as the source**. `physical.sh` must be installed as
+`/usr/local/bin/pg-fc-physical`. Guest boot now refuses to initialize a database
+when its persistent volume is missing, keeping only the management console up.
+The release artifact includes checksummed guest build inputs alongside the
+host binary.
+
+On the existing logical primary, POST `/api/replication/<database>/physical-prepare`
+with `{"generation":"<unique-lowercase-operation-id>"}`. Repeating that request
+resumes the same operation. The source durably owns a separate physical slot
+before creating it; the existing logical slot and serving databases remain
+untouched. Both peers must advertise physical preparation support.
+
+The peer creates a distinct `repl-seed-<generation>` VM, records its ownership,
+and runs `pg_basebackup` under an exclusive guest lock. A durable plan inhibits
+ordinary initialization until backup validation and activation succeed. Verify
+progress with GET `/api/replication/<database>/physical` on the replica. The
+`verified` phase requires the expected system identifier, recovery/read-only
+mode, source sender and slot, database/role, and replay position. It does not
+change the serving VM binding. Existing eu1 logical or libvirt databases are
+not seed targets.
+
+Errors retain ownership and lifecycle protection. If creation was attempted
+but the daemon has no visible record yet, retries refuse a second create.
+While candidates exist, destructive cleanup is conservatively blocked,
+including pending-creation and orphan-disk cleanup. Logical promote/detach
+cannot remove credentials or slots owned by an ongoing physical migration.
+Coordinated physical switchover, serving-binding activation, and rejoin are
+not provided by this preparation endpoint.
 
 #### Setting it up
 

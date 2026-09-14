@@ -60,6 +60,10 @@ impl PeerClient {
         self.post("/api/replication/peer/replicas", req).await
     }
 
+    pub async fn provision_physical_replica(&self, req: &wire::PhysicalReplicaRequest) -> Result<wire::PhysicalRecordJson> {
+        self.post("/api/replication/peer/physical-replicas", req).await
+    }
+
     pub async fn status(&self, database: &str) -> Result<wire::StatusJson> {
         self.get(&format!("/api/replication/{}", enc(database)))
             .await

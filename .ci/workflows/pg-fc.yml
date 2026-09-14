@@ -40,13 +40,18 @@ jobs:
         run: |
           set -eu
           python3 -m unittest discover -s deploy -p 'test_sync_traefik_cert.py' -v
+          sh -n init.sh
+          sh -n physical.sh
+          python3 -m py_compile deploy/test_physical_seed.py
           cargo test --locked
           cargo build --release --locked --bin pg-vm-pool
           mkdir -p /workspace/dist
+          mkdir -p /workspace/dist/guest
+          cp Dockerfile init.sh physical.sh /workspace/dist/guest/
           cp "$CARGO_TARGET_DIR/release/pg-vm-pool" /workspace/dist/pg-vm-pool
           strip /workspace/dist/pg-vm-pool
           printf 'commit %s\nbranch %s\nrun %s\n' '${{ ci.sha }}' '${{ ci.branch }}' '${{ ci.run_id }}' > /workspace/dist/BUILD-INFO
-          (cd /workspace/dist && sha256sum pg-vm-pool BUILD-INFO > SHA256SUMS)
+          (cd /workspace/dist && sha256sum pg-vm-pool BUILD-INFO guest/Dockerfile guest/init.sh guest/physical.sh > SHA256SUMS)
 
       - uses: ci/upload-artifact
         with:

@@ -38,6 +38,47 @@ pub struct NodeInfo {
     /// they typed against what the peer actually believes.
     #[serde(default)]
     pub pg_listen_port: Option<u16>,
+    /// Explicit opt-in: old peers deserialize without this and are refused by
+    /// physical preparation before either side creates a slot or VM.
+    #[serde(default)]
+    pub physical_prepare: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PhysicalPrepareRequest { pub generation: String }
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PhysicalReplicaRequest {
+    pub database: String,
+    pub generation: String,
+    pub source_node: String,
+    pub source_vm_id: String,
+    pub system_identifier: String,
+    pub pg_major: u32,
+    pub source_lsn: String,
+    pub settings: std::collections::BTreeMap<String, i32>,
+    pub tenant: Login,
+    pub repl: Login,
+    pub primary: PrimaryEndpoint,
+    pub slot: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct PhysicalRecordJson {
+    pub database: String,
+    pub generation: String,
+    pub phase: String,
+    pub candidate_id: Option<String>,
+    pub previous_vm_id: Option<String>,
+    pub source_vm_id: String,
+    pub last_error: Option<String>,
+}
+
+impl From<&crate::replication::PhysicalRecord> for PhysicalRecordJson {
+    fn from(r: &crate::replication::PhysicalRecord) -> Self { Self {
+        database: r.database.clone(), generation: r.generation.clone(), phase: format!("{:?}", r.phase).to_lowercase(),
+        candidate_id: r.candidate_id.clone(), previous_vm_id: r.previous_vm_id.clone(), source_vm_id: r.source_vm_id.clone(), last_error: r.last_error.clone(),
+    }}
 }
 
 /// One end of the replication link, as the *other* node must dial it.

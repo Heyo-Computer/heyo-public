@@ -599,11 +599,13 @@ pub struct SchemaRegistry {
     // replicating VM off the idle reaper and the offload ladder — see
     // [`Self::pinned`].
     replication: Arc<crate::replication::ReplStore>,
+    physical: Arc<crate::replication::PhysicalStore>,
+    physical_sources: Arc<crate::replication::PhysicalSourceStore>,
     replication_ops: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SchemaRegistry {
-    pub fn new(cfg: Config) -> Self {
+    pub fn new(cfg: Config) -> Result<Self> {
         // Per-disk reclaim locks live under the run dir. Publish it once here:
         // the boot path is a free function with no access to the config.
         crate::reclaim::set_run_dir(cfg.run_dir.clone());
@@ -623,7 +625,9 @@ impl SchemaRegistry {
         let replication = Arc::new(crate::replication::ReplStore::load(
             cfg.replication_file.clone(),
         ));
-        Self {
+        let physical = Arc::new(crate::replication::PhysicalStore::load(cfg.replication_file.with_extension("physical.json"))?);
+        let physical_sources = Arc::new(crate::replication::PhysicalSourceStore::load(cfg.replication_file.with_extension("physical-sources.json"))?);
+        Ok(Self {
             cfg,
             entries: Mutex::new(HashMap::new()),
             store,
@@ -641,10 +645,12 @@ impl SchemaRegistry {
             dedicated,
             peers,
             replication,
+            physical,
+            physical_sources,
             replication_ops: StdMutex::new(HashMap::new()),
             repl_status: StdMutex::new(HashMap::new()),
             repl_inactive: StdMutex::new(HashMap::new()),
-        }
+        })
     }
 
     /// The trusted peer nodes — what the replication API and dashboard mutate.
@@ -655,6 +661,18 @@ impl SchemaRegistry {
     /// The replication pairings this node is part of.
     pub fn replication(&self) -> &Arc<crate::replication::ReplStore> {
         &self.replication
+    }
+
+    pub fn physical(&self) -> &Arc<crate::replication::PhysicalStore> { &self.physical }
+    pub fn physical_sources(&self) -> &Arc<crate::replication::PhysicalSourceStore> { &self.physical_sources }
+    pub fn bound_vm_id(&self, database: &str) -> Option<String> { self.store.record(database).map(|r| r.sandbox_id) }
+
+    pub async fn exec_bound(&self, database: &str, expected_id: &str, command: &str, env: HashMap<String, String>) -> Result<()> {
+        let guard = self.checkout(database).await?;
+        if guard.entry().sandbox_id() != expected_id { bail!("database binding changed during physical preparation"); }
+        let result = vm::physical_exec(&self.cfg, &guard.entry().sandbox, command, env, "physical source setup").await?;
+        if result.exit_code != 0 { bail!("physical source guest setup failed (exit {})", result.exit_code); }
+        Ok(())
     }
 
     pub async fn replication_operation(&self, database: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -683,6 +701,7 @@ impl SchemaRegistry {
     /// including emergency disk-pressure eviction.
     pub fn pinned(&self, schema: &str) -> bool {
         self.cfg.is_keepalive(schema) || self.replication.is_pinned(schema)
+            || self.physical.reserves_database(schema) || self.physical_sources.get(schema).is_some()
     }
 
     /// [`Self::pin_reason`] for whichever schema currently binds VM `id`, so a
@@ -690,6 +709,12 @@ impl SchemaRegistry {
     /// having to resolve the schema itself. `None` when the VM backs nothing
     /// pinned.
     pub fn pin_reason_for_vm(&self, id: &str) -> Option<String> {
+        if self.physical.owns_vm(id) || self.physical_sources.owns_vm(id)
+            || !self.physical.list().is_empty() {
+            // Also covers a create accepted by the daemon before its ID can be
+            // durably recorded. No manual unbound-VM cleanup during preparation.
+            return Some(format!("VM cleanup is reserved by physical replica preparation ({id})"));
+        }
         self.store_records()
             .into_iter()
             .find(|(_, r)| r.sandbox_id == id && r.tier == Tier::Live)
@@ -699,6 +724,9 @@ impl SchemaRegistry {
     /// Why `schema` is pinned, for a dashboard refusal that tells the operator
     /// what to do about it. `None` when it isn't.
     pub fn pin_reason(&self, schema: &str) -> Option<String> {
+        if self.physical.reserves_database(schema) || self.physical_sources.get(schema).is_some() {
+            return Some(format!("{schema} is reserved by physical replication; ordinary lifecycle changes are disabled"));
+        }
         if self.replication.is_fenced(schema) {
             return Some(format!("{schema} is fenced for a planned switchover; explicitly unfence it first"));
         }
@@ -3974,6 +4002,10 @@ impl SchemaRegistry {
     }
 
     async fn purge_pass(&self) {
+        if !self.physical.list().is_empty() {
+            crate::events::journal_error("purge", "physical replica preparation is pending; refusing all purge cleanup");
+            return;
+        }
         let infos = match heyo_sdk::Sandbox::list(vm::local_opts()).await {
             Ok(l) => l,
             Err(e) => {
@@ -4447,6 +4479,10 @@ impl SchemaRegistry {
     /// and deletion needs the daemon to positively confirm the record — the
     /// same ambiguity-never-deletes rule as the orphan-disk sweep.
     async fn pending_pass(&self) -> usize {
+        if !self.physical.list().is_empty() {
+            warn!("pending-bringup janitor: physical preparation pending; refusing cleanup");
+            return 0;
+        }
         // Twice the ready budget plus slack: a slow-but-alive bring-up (ready
         // wait + restore) must never race its own janitor.
         let min_age = self.cfg.ready_timeout * 2 + Duration::from_secs(300);
@@ -4541,6 +4577,10 @@ impl SchemaRegistry {
     /// same in-use and age guards as a directory, plus the daemon reporting the
     /// VM not running; the cost of being wrong is one extra image clone.
     async fn sweep_orphans(&self) -> (usize, usize) {
+        if !self.physical.list().is_empty() {
+            warn!("orphan-disk sweep: physical preparation pending; refusing cleanup");
+            return (0, 0);
+        }
         let Some(run_dir) = self.cfg.run_dir.clone() else {
             return (0, 0);
         };
@@ -6668,7 +6708,7 @@ mod tests {
         cfg.warm_spares = 0;
         cfg.freeze = None;
         cfg.archive = None;
-        let registry = Arc::new(SchemaRegistry::new(cfg));
+        let registry = Arc::new(SchemaRegistry::new(cfg).unwrap());
         // Fail immediately after passing the maintenance gate, without any
         // daemon or database connection. The original apply path instead
         // waited forever on its own claim and never reached this breaker.

@@ -929,7 +929,7 @@ async fn postgres_fence_controller_restart_recovers_without_tenant_bringup() {
         id: vm_id.into(), name: format!("pg-{database}"), running: true,
     });
     crate::store::Store::load(cfg.state_file.clone()).put(&database, vm_id);
-    let registry = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()));
+    let registry = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap());
     registry.replication().create(ReplRecord::new(&database, Role::Primary, "test-peer", "test-password"), &|_| false).unwrap();
     registry.replication().set_state(&database, ReplState::Active, "test").unwrap();
     registry.replication().set_fence(&database, "intent", "simulate controller crash after admission close", vm_id, "").unwrap();
@@ -939,7 +939,7 @@ async fn postgres_fence_controller_restart_recovers_without_tenant_bringup() {
     // Fresh registry, no warm entries. Normal tenant bring-up would attempt
     // per-database grants and fail because that database refuses connections.
     daemon().metrics.reset();
-    let registry = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()));
+    let registry = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap());
     let result = orchestrate::fence(&registry, &database).await.unwrap();
     assert_eq!(result.vm_id, vm_id);
     let again = orchestrate::fence(&registry, &database).await.unwrap();
@@ -1001,7 +1001,7 @@ async fn physical_replication_startup_uses_authenticated_vm_and_its_fence() {
     // Seed synchronously: Store::put persists on a detached task, which can
     // race the independent Store loaded by SchemaRegistry::new below.
     std::fs::write(&cfg.state_file, format!("{database}\t{vm_id}\t0\tlive\n")).unwrap();
-    let registry = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()));
+    let registry = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap());
     registry.replication().create(rec.clone(), &|_| false).unwrap();
     registry.replication().set_state(&database, ReplState::Active, "test").unwrap();
     // Use the bound-VM maintenance path, without database provisioning/DDL.
@@ -1041,4 +1041,27 @@ async fn physical_replication_startup_uses_authenticated_vm_and_its_fence() {
     maintenance.batch_execute(&format!("DROP ROLE {}", rec.repl_role)).await.unwrap();
     std::fs::remove_file(cfg.state_file).unwrap();
     std::fs::remove_file(cfg.replication_file).unwrap();
+}
+
+#[tokio::test]
+async fn physical_candidate_unknown_create_never_duplicates() {
+    let _exclusive = exclusive().await;
+    let cfg = config_for(0, 0);
+    daemon().seed(0);
+    daemon().metrics.reset();
+    let owned = StdMutex::new(None);
+    let own = |id: &str| { *owned.lock().unwrap() = Some(id.to_string()); Ok(()) };
+    let name = "repl-seed-resume-test";
+    let result = crate::vm::physical_candidate(&cfg, name, false, &own).await;
+    assert!(result.err().unwrap().to_string().contains("refusing a second create"));
+    assert!(owned.lock().unwrap().is_none());
+
+    // The delayed daemon record becomes visible: resume that exact candidate.
+    daemon().vms.lock().unwrap().insert("sb-candidate".into(), Vm {
+        id: "sb-candidate".into(), name: name.into(), running: true,
+    });
+    let sb = crate::vm::physical_candidate(&cfg, name, false, &own).await.unwrap();
+    assert_eq!(sb.sandbox_id(), "sb-candidate");
+    assert_eq!(owned.lock().unwrap().as_deref(), Some("sb-candidate"));
+    assert_eq!(daemon().metrics.calls.lock().unwrap().get("POST /sandbox-deploy").copied().unwrap_or(0), 0);
 }
