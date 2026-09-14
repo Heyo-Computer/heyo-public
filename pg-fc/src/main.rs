@@ -223,14 +223,14 @@ async fn handle_conn(
     // credential may open only its own database (so it can never provision a
     // second VM), a shared-password client may not open a dedicated one, and a
     // replication login may open only the database it replicates.
-    if let Err(reason) = registry.authorize_route(&info.user, &info.database) {
-        // Tell the client why rather than dropping the socket: "cannot open any
-        // other database" is exactly the feedback that stops someone retrying a
-        // typo'd database name forever.
-        auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
-        anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
-    }
-    if let Some(fence) = registry.replication().get(&info.database).and_then(|r| r.fence)
+    let schema = match registry.authorize_route(&info.user, &info.database, info.physical_replication) {
+        Ok(schema) => schema,
+        Err(reason) => {
+            auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
+            anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
+        }
+    };
+    if let Some(fence) = registry.replication().get(&schema).and_then(|r| r.fence)
         && (fence.mode != "selective"
             || registry.replication().by_repl_role(&info.user).is_none())
     {
@@ -240,9 +240,8 @@ async fn handle_conn(
             "database is fenced for a planned switchover; operator unfence is required",
         )
         .await?;
-        anyhow::bail!("refused connection to fenced database {}", info.database);
+        anyhow::bail!("refused connection to fenced database {schema}");
     }
-    let schema = info.database.clone();
     if !is_valid_schema(&schema) {
         anyhow::bail!("rejecting invalid schema name {schema:?}");
     }

@@ -2,8 +2,9 @@
 //!
 //! We only read enough of the v3 protocol to (a) answer the SSL/GSS preamble —
 //! upgrading to TLS when the pooler has a cert, declining otherwise — and
-//! (b) pull the `database` parameter out of the `StartupMessage`; that name is
-//! our schema/VM routing key. The raw startup bytes are kept so the proxy can
+//! (b) read the database and replication mode from the `StartupMessage`.
+//! Physical replication ignores the database and routes by authenticated role.
+//! The raw startup bytes are kept so the proxy can
 //! replay them verbatim to the VM (always plaintext upstream — TLS terminates
 //! here), leaving the rest of the session a pure byte splice.
 
@@ -34,6 +35,9 @@ pub struct StartupInfo {
     /// a dedicated database — the key the pooler resolves the client's
     /// credential from (see [`crate::dedicated`]).
     pub user: String,
+    /// Physical replication has no PostgreSQL database context. Its VM must
+    /// be selected from the authenticated replication login, not `database`.
+    pub physical_replication: bool,
     /// The full StartupMessage bytes (length prefix included) to replay upstream.
     pub raw: Vec<u8>,
 }
@@ -124,11 +128,19 @@ fn parse_startup_message(len_buf: &[u8; 4], body: &[u8]) -> Result<StartupInfo> 
     if database.is_empty() {
         bail!("startup packet had neither database nor user");
     }
+    let physical_replication = match params.get("replication").map(String::as_str) {
+        None | Some("database") => false,
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "t" | "tr" | "tru" | "true" | "y" | "ye" | "yes" | "on" => true,
+            "0" | "f" | "fa" | "fal" | "fals" | "false" | "n" | "no" | "of" | "off" => false,
+            _ => bail!("invalid replication startup parameter"),
+        },
+    };
 
     let mut raw = Vec::with_capacity(4 + body.len());
     raw.extend_from_slice(len_buf);
     raw.extend_from_slice(body);
-    Ok(StartupInfo { database, user, raw })
+    Ok(StartupInfo { database, user, physical_replication, raw })
 }
 
 /// Parameters are a flat `key\0value\0...\0` list terminated by an extra `\0`.
@@ -147,4 +159,30 @@ fn parse_params(bytes: &[u8]) -> HashMap<String, String> {
         );
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_mode_matches_postgres_without_rewriting_startup() {
+        for (value, physical) in [("true", true), ("T", true), ("ye", true), ("ON", true),
+            ("1", true), ("database", false), ("false", false), ("of", false), ("0", false)] {
+            let mut body = PROTOCOL_V3.to_be_bytes().to_vec();
+            body.extend_from_slice(format!("user\0acme_pgfcrepl\0database\0replication\0replication\0{value}\0\0").as_bytes());
+            let len = ((body.len() + 4) as i32).to_be_bytes();
+            let info = parse_startup_message(&len, &body).unwrap();
+            assert_eq!(info.physical_replication, physical, "{value}");
+            assert_eq!(info.database, "replication");
+            assert_eq!(info.user, "acme_pgfcrepl");
+            assert_eq!(info.raw, [len.as_slice(), body.as_slice()].concat());
+        }
+        for value in ["", "o", "Database", "truth"] {
+            let mut body = PROTOCOL_V3.to_be_bytes().to_vec();
+            body.extend_from_slice(format!("user\0acme\0replication\0{value}\0\0").as_bytes());
+            let len = ((body.len() + 4) as i32).to_be_bytes();
+            assert!(parse_startup_message(&len, &body).is_err(), "{value}");
+        }
+    }
 }

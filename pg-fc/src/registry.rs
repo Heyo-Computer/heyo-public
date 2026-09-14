@@ -1154,15 +1154,15 @@ impl SchemaRegistry {
         )
     }
 
-    /// Whether an *authenticated* client may route to `database`.
+    /// Resolve an *authenticated* client's VM, rejecting unauthorized routes.
     ///
     /// A replication login is pinned to its own database exactly as a
     /// dedicated one is — and it has to be resolved **first**, because
     /// `Credentials::authorize` would otherwise reject it under the "this
     /// database is dedicated, only its own role may open it" rule, which is
     /// precisely the database it is trying to reach.
-    pub fn authorize_route(&self, role: &str, database: &str) -> Result<(), String> {
-        authorize_route_in(&self.replication, &self.dedicated, role, database)
+    pub fn authorize_route(&self, role: &str, database: &str, physical: bool) -> Result<String, String> {
+        authorize_route_in(&self.replication, &self.dedicated, role, database, physical)
     }
 
     /// The configured idle-reaping timeout (`None` when reaping is disabled), so
@@ -5562,10 +5562,21 @@ fn authorize_route_in(
     ded: &Credentials,
     role: &str,
     database: &str,
-) -> Result<(), String> {
+    physical: bool,
+) -> Result<String, String> {
     if let Some(rec) = repl.by_repl_role(role) {
+        if physical {
+            // PostgreSQL discards the database parameter for a physical
+            // walsender. pg_basebackup/walreceiver normally send "replication".
+            // Only the already-authenticated replication identity selects a VM.
+            return if rec.role == crate::replication::Role::Primary && rec.state.pins() {
+                Ok(rec.database)
+            } else {
+                Err("physical replication requires a live primary pairing".into())
+            };
+        }
         return if rec.database == database {
-            Ok(())
+            Ok(database.into())
         } else {
             Err(format!(
                 "role \"{role}\" is a replication login for database \"{}\" only \
@@ -5574,7 +5585,10 @@ fn authorize_route_in(
             ))
         };
     }
-    ded.authorize(role, database)
+    if physical {
+        return Err("physical replication requires a registered replication login".into());
+    }
+    ded.authorize(role, database).map(|()| database.into())
 }
 
 #[cfg(test)]
@@ -5630,14 +5644,31 @@ mod auth_composition_tests {
         // The regression this ordering exists to prevent: `acme` IS a
         // dedicated database, so delegating to `Credentials::authorize` first
         // would reject the very login that has to reach it.
-        assert!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", "acme").is_ok());
-        let err = authorize_route_in(&repl, &ded, "acme_pgfcrepl", "other").unwrap_err();
+        assert!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", "acme", false).is_ok());
+        let err = authorize_route_in(&repl, &ded, "acme_pgfcrepl", "other", false).unwrap_err();
         assert!(err.contains("replication login"), "{err}");
         // Everything the dedicated rules already guaranteed still holds.
-        assert!(authorize_route_in(&repl, &ded, "acme", "acme").is_ok());
-        assert!(authorize_route_in(&repl, &ded, "acme", "other").is_err());
-        assert!(authorize_route_in(&repl, &ded, "postgres", "acme").is_err());
-        assert!(authorize_route_in(&repl, &ded, "postgres", "tenant1").is_ok());
+        assert!(authorize_route_in(&repl, &ded, "acme", "acme", false).is_ok());
+        assert!(authorize_route_in(&repl, &ded, "acme", "other", false).is_err());
+        assert!(authorize_route_in(&repl, &ded, "postgres", "acme", false).is_err());
+        assert!(authorize_route_in(&repl, &ded, "postgres", "tenant1", false).is_ok());
+    }
+
+    #[test]
+    fn physical_replication_routes_by_identity_not_claimed_database() {
+        let (repl, ded) = stores("physical");
+        for claimed in ["replication", "other_tenant", "postgres", "acme"] {
+            assert_eq!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", claimed, true).unwrap(), "acme");
+        }
+        for user in ["acme", "postgres", "unknown"] {
+            assert!(authorize_route_in(&repl, &ded, user, "acme", true).is_err());
+        }
+        let mut replica = ReplRecord::new("standby", Role::Replica, "node_a", "replpassword34");
+        replica.state = State::Active;
+        repl.create(replica, &|r| ded.by_role(r).is_some()).unwrap();
+        assert!(authorize_route_in(&repl, &ded, "standby_pgfcrepl", "replication", true).is_err());
+        repl.set_state("acme", State::Detached, "test detached pairing").unwrap();
+        assert!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", "replication", true).is_err());
     }
 }
 

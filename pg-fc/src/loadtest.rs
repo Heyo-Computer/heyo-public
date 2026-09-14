@@ -968,3 +968,77 @@ async fn postgres_fence_controller_restart_recovers_without_tenant_bringup() {
     std::fs::remove_file(cfg.state_file).unwrap();
     std::fs::remove_file(cfg.replication_file).unwrap();
 }
+
+/// Real libpq physical startup through the production password/route/splice
+/// path. PostgreSQL ignores the claimed database, and so must this route.
+/// The disposable server must allow physical replication from the test host
+/// in pg_hba.conf, e.g. `host replication all all scram-sha-256`.
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL18 on 127.0.0.1:5432 and psql on PATH"]
+async fn physical_replication_startup_uses_authenticated_vm_and_its_fence() {
+    use crate::replication::{ReplRecord, Role, State as ReplState};
+    let _exclusive = exclusive().await;
+    let url = std::env::var("PG_FC_FENCE_TEST_URL").expect("disposable PostgreSQL URL required");
+    let pg: tokio_postgres::Config = url.parse().unwrap();
+    assert_eq!(pg.get_ports(), &[5432]);
+    assert_eq!(pg.get_dbname(), Some("postgres"));
+    let (maintenance, connection) = pg.connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move { let _ = connection.await; });
+    let database = format!("physical_route_{}", std::process::id());
+    let rec = ReplRecord::new(&database, Role::Primary, "test-peer", "physical-test-password");
+    maintenance.batch_execute(&format!("CREATE DATABASE {database}")).await.unwrap();
+    maintenance.batch_execute(&format!("CREATE ROLE {} LOGIN REPLICATION PASSWORD 'physical-test-password'", rec.repl_role)).await.unwrap();
+    let system: String = maintenance.query_one("SELECT system_identifier::text FROM pg_control_system()", &[]).await.unwrap().get(0);
+    let mut cfg = config_for(0, 0);
+    cfg.pg_user = pg.get_user().unwrap().to_string();
+    cfg.pg_password = pg.get_password().map(|p| String::from_utf8(p.to_vec()).unwrap());
+    cfg.direct_connect = true;
+    let vm_id = "sb-physical-route";
+    daemon().seed(0);
+    daemon().vms.lock().unwrap().insert(vm_id.into(), Vm {
+        id: vm_id.into(), name: format!("pg-{database}"), running: true,
+    });
+    // Seed synchronously: Store::put persists on a detached task, which can
+    // race the independent Store loaded by SchemaRegistry::new below.
+    std::fs::write(&cfg.state_file, format!("{database}\t{vm_id}\t0\tlive\n")).unwrap();
+    let registry = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()));
+    registry.replication().create(rec.clone(), &|_| false).unwrap();
+    registry.replication().set_state(&database, ReplState::Active, "test").unwrap();
+    // Use the bound-VM maintenance path, without database provisioning/DDL.
+    registry.replication().set_fence_payload(&database, "selective", "ready", "test admission", vm_id, "0/1", vec![]).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let serving = registry.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let registry = serving.clone();
+            tokio::spawn(async move {
+                if let Err(error) = crate::handle_conn(socket, registry, None).await {
+                    eprintln!("physical protocol test connection: {error:#}");
+                }
+            });
+        }
+    });
+    let conninfo = format!("host=127.0.0.1 port={port} user={} dbname=unrelated_claim replication=true sslmode=disable connect_timeout=10", rec.repl_role);
+    for (password, succeeds) in [("wrong-password", false), ("physical-test-password", true)] {
+        let out = tokio::process::Command::new("psql").args(["-X", "-w", "-At", "-d", &conninfo, "-c", "IDENTIFY_SYSTEM"])
+            .env("PGPASSWORD", password).output().await.unwrap();
+        assert_eq!(out.status.success(), succeeds, "{}", String::from_utf8_lossy(&out.stderr));
+        if succeeds {
+            assert_eq!(String::from_utf8_lossy(&out.stdout).split('|').next(), Some(system.as_str()));
+        } else {
+            assert!(String::from_utf8_lossy(&out.stderr).contains("password authentication failed"));
+        }
+    }
+    registry.replication().set_fence_payload(&database, "hard", "ready", "test closed", vm_id, "0/1", vec![]).unwrap();
+    let out = tokio::process::Command::new("psql").args(["-X", "-w", "-At", "-d", &conninfo, "-c", "IDENTIFY_SYSTEM"])
+        .env("PGPASSWORD", "physical-test-password").output().await.unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("database is fenced"), "fence lookup used claimed database instead of authenticated VM");
+    server.abort();
+    drop(registry);
+    maintenance.batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)")).await.unwrap();
+    maintenance.batch_execute(&format!("DROP ROLE {}", rec.repl_role)).await.unwrap();
+    std::fs::remove_file(cfg.state_file).unwrap();
+    std::fs::remove_file(cfg.replication_file).unwrap();
+}

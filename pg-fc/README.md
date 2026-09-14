@@ -1093,12 +1093,23 @@ It is **logical** replication, not a physical standby, and that choice has
 consequences worth reading before you rely on it — see "What it does not
 carry" below.
 
-Nothing in the proxy path needed changing to carry the stream. The replica's
-walreceiver connects to node A's ordinary pooler listener like any other
+The logical replica's walreceiver connects to node A's ordinary pooler listener like any other
 client: the pooler challenges it for the replication login's password, the
 `dbname` routes it to the right VM, and the raw StartupMessage (including
 `replication=database`) is replayed upstream verbatim. So the only network
 requirement is that node A's `PG_VM_POOL_LISTEN` is reachable from node B.
+
+The listener also accepts **physical replication protocol** connections from
+a registered replication login on an active or syncing primary pairing. In
+this mode PostgreSQL ignores `dbname`, so the authenticated login selects its
+bound database VM, regardless of the client's database parameter. Tenant and
+shared credentials cannot request this mode. The bound VM's hard fence denies
+it; a selective fence allows the replication login to reconnect. Upstream
+PostgreSQL must also allow physical replication in `pg_hba.conf` (a `host all`
+rule does not cover it). The original startup packet is forwarded unchanged.
+This protocol support does **not** change the provisioning API above into a
+physical standby API: base-backup seeding, standby boot, and coordinated
+promotion/rejoin are not implemented yet. Existing pairings remain logical.
 
 #### Setting it up
 
