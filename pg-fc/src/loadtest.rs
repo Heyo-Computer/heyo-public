@@ -1035,11 +1035,30 @@ async fn physical_replication_startup_uses_authenticated_vm_and_its_fence() {
         .env("PGPASSWORD", "physical-test-password").output().await.unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("database is fenced"), "fence lookup used claimed database instead of authenticated VM");
+    // A later physical writer must authenticate and stream without the old
+    // logical pairing, including while its own source fence closes tenants.
+    registry.physical_sources().create(crate::replication::PhysicalSourceRecord {
+        database: database.clone(), generation: "physical-auth-g1".into(), predecessor: None,
+        source_vm_id: vm_id.into(), repl: Some(crate::replication::wire::Login { role: rec.repl_role.clone(), password: rec.repl_password.clone() }),
+        fence: None, system_identifier: system.clone(), pg_major: 18, slot: "physical_auth_slot".into(),
+        source_lsn: "0/1".into(), peer: "test-peer".into(), handoff: None, last_error: None,
+    }).unwrap();
+    registry.physical_sources().set_fence(&database, "physical-auth-g1", "ready", Some("0/1")).unwrap();
+    registry.replication().clear_fence(&database).unwrap();
+    registry.replication().remove(&database).unwrap();
+    for (password, succeeds) in [("wrong-password", false), ("physical-test-password", true)] {
+        let out = tokio::process::Command::new("psql").args(["-X", "-w", "-At", "-d", &conninfo, "-c", "IDENTIFY_SYSTEM"])
+            .env("PGPASSWORD", password).output().await.unwrap();
+        assert_eq!(out.status.success(), succeeds, "{}", String::from_utf8_lossy(&out.stderr));
+        if succeeds { assert_eq!(String::from_utf8_lossy(&out.stdout).split('|').next(), Some(system.as_str())); }
+        else { assert!(String::from_utf8_lossy(&out.stderr).contains("password authentication failed")); }
+    }
     server.abort();
     drop(registry);
     maintenance.batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)")).await.unwrap();
     maintenance.batch_execute(&format!("DROP ROLE {}", rec.repl_role)).await.unwrap();
     std::fs::remove_file(cfg.state_file).unwrap();
+    std::fs::remove_file(cfg.replication_file.with_extension("physical-sources.json")).unwrap();
     std::fs::remove_file(cfg.replication_file).unwrap();
 }
 
@@ -1054,8 +1073,8 @@ async fn physical_handoff_restart_admission_and_source_grant_are_fail_closed() {
     cfg.replication_file = dir.join("replication.tsv");
     std::fs::write(&cfg.state_file, "acme\tsb-old\t0\tlive\nsource\tsb-source\t0\tlive\n").unwrap();
     let mut reg = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap());
-    reg.physical().create(PhysicalRecord { database: "acme".into(), generation: "g1".into(),
-        candidate_name: PhysicalRecord::candidate_name("g1"), candidate_id: None,
+    reg.physical().create(PhysicalRecord { database: "acme".into(), generation: "g1".into(), predecessor: None,
+        candidate_name: PhysicalRecord::candidate_name("g1"), repl: None, candidate_id: None,
         previous_vm_id: Some("sb-old".into()), source_node: "us3".into(), source_vm_id: "sb-source".into(),
         system_identifier: "123456".into(), pg_major: 18, slot: "physical_acme".into(),
         phase: P::Intent, handoff_barrier: None, last_error: None }).unwrap();
@@ -1083,7 +1102,8 @@ async fn physical_handoff_restart_admission_and_source_grant_are_fail_closed() {
 
     let logical = ReplRecord::new("source", Role::Primary, "eu1", "test-password");
     reg.replication().create(logical.clone(), &|_| false).unwrap();
-    reg.physical_sources().create(PhysicalSourceRecord { database: "source".into(), generation: "g2".into(),
+    reg.physical_sources().create(PhysicalSourceRecord { database: "source".into(), generation: "g2".into(), predecessor: None,
+        repl: None, fence: None,
         source_vm_id: "sb-source".into(), system_identifier: "123456".into(), pg_major: 18,
         slot: "physical_source".into(), source_lsn: "0/1".into(), peer: "eu1".into(), handoff: None, last_error: None }).unwrap();
     assert!(!reg.physical_reconnect_allowed("source", &logical.repl_role));
@@ -1097,6 +1117,72 @@ async fn physical_handoff_restart_admission_and_source_grant_are_fail_closed() {
     assert!(crate::replication::orchestrate::unfence(&reg, "source").await.unwrap_err().to_string().contains("irrevocably"));
     assert!(reg.checkout("source").await.err().unwrap().to_string().contains("lost its fence"));
     drop(reg);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn physical_three_transfers_preserve_revocation_and_replication_credentials() {
+    use crate::replication::{PhysicalRecord, PhysicalPhase as P, PhysicalSourceRecord, PhysicalHandoffGrant, wire::Login};
+    let _exclusive = exclusive().await;
+    let base = config_for(0, 0);
+    let dir = base.state_file.parent().unwrap().join("physical-three-transfers");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut configs = Vec::new();
+    for (region, vm) in [("us3", "u0"), ("eu1", "e0")] {
+        let mut cfg = base.clone();
+        cfg.state_file = dir.join(format!("{region}.tsv"));
+        cfg.replication_file = dir.join(format!("{region}-replication.tsv"));
+        std::fs::write(&cfg.state_file, format!("acme\t{vm}\t0\tlive\n")).unwrap();
+        configs.push(cfg);
+    }
+    let mut regions: Vec<_> = configs.iter().map(|cfg| Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap())).collect();
+    let login = Login { role: "repl_acme".into(), password: "persisted-repl-password".into() };
+    for (round, (source_idx, target_idx, candidate, barrier)) in [(0, 1, "e1", "0/101"), (1, 0, "u1", "0/202"), (0, 1, "e2", "0/303")].into_iter().enumerate() {
+        let generation = format!("g{}", round + 1);
+        let source_reg = &regions[source_idx];
+        let target_reg = &regions[target_idx];
+        let source_vm = source_reg.bound_vm_id("acme").unwrap();
+        let previous_vm = target_reg.bound_vm_id("acme").unwrap();
+        let active = source_reg.physical().get("acme");
+        let predecessor = active.as_ref().map(|r| r.generation.clone());
+        let source = PhysicalSourceRecord { database: "acme".into(), generation: generation.clone(), predecessor: predecessor.clone(),
+            source_vm_id: source_vm.clone(), repl: Some(login.clone()), fence: None, system_identifier: "123456".into(), pg_major: 18,
+            slot: format!("slot_{generation}"), source_lsn: "0/1".into(), peer: ["us3", "eu1"][target_idx].into(), handoff: None, last_error: None };
+        if let Some(active) = active { source_reg.physical_sources().create_successor(source.clone(), &active, &source_vm).unwrap(); }
+        else { source_reg.physical_sources().create(source.clone()).unwrap(); }
+        assert!(source_reg.physical_admission_ready("acme"));
+        let intent = PhysicalRecord { database: "acme".into(), generation: generation.clone(), predecessor,
+            candidate_name: PhysicalRecord::candidate_name(&generation), repl: Some(login.clone()), candidate_id: None,
+            previous_vm_id: Some(previous_vm.clone()), source_node: ["us3", "eu1"][source_idx].into(), source_vm_id: source_vm.clone(),
+            system_identifier: "123456".into(), pg_major: 18, slot: source.slot.clone(), phase: P::Intent, handoff_barrier: None, last_error: None };
+        if round == 0 { target_reg.physical().create(intent).unwrap(); }
+        else { target_reg.physical().create_successor(intent, &target_reg.physical_sources().get("acme").unwrap(), &previous_vm).unwrap(); }
+        for (from, to, id) in [(P::Intent, P::Creating, None), (P::Creating, P::Candidate, Some(candidate.into())), (P::Candidate, P::Seeding, None), (P::Seeding, P::Verified, None)] {
+            target_reg.physical().advance("acme", &generation, from, to, id).unwrap();
+        }
+        source_reg.physical_sources().set_fence("acme", &generation, "ready", Some(barrier)).unwrap();
+        assert!(!source_reg.physical_admission_ready("acme"), "a new fence must override an old activation");
+        assert!(source_reg.physical_reconnect_allowed("acme", &login.role));
+        assert!(!source_reg.physical_reconnect_allowed("acme", "tenant"));
+        source_reg.physical_sources().grant_handoff("acme", &generation, PhysicalHandoffGrant { candidate_id: candidate.into(), peer: source.peer, barrier_lsn: barrier.into() }).unwrap();
+        target_reg.physical().begin_handoff("acme", &generation, barrier).unwrap();
+        for (from, to) in [(P::Prepared, P::Promoting), (P::Promoting, P::Promoted), (P::Promoted, P::Binding)] {
+            target_reg.physical().advance("acme", &generation, from, to, None).unwrap();
+        }
+        target_reg.commit_physical_binding("acme", &previous_vm, candidate).await.unwrap();
+        assert!(!target_reg.physical_admission_ready("acme"));
+        target_reg.physical().advance("acme", &generation, P::Binding, P::Activated, None).unwrap();
+        regions = configs.iter().map(|cfg| Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap())).collect();
+        assert!(!regions[source_idx].physical_admission_ready("acme"));
+        assert!(regions[target_idx].physical_admission_ready("acme"));
+        assert_eq!(regions[source_idx].physical_sources().by_repl_role(&login.role).unwrap().repl, Some(login.clone()));
+        assert!(crate::replication::orchestrate::unfence(&regions[source_idx], "acme").await.is_err());
+    }
+    assert!(regions[0].physical_sources().has_grant_for_source_vm("acme", "u0"));
+    assert!(regions[0].physical_sources().has_grant_for_source_vm("acme", "u1"));
+    assert!(regions[1].physical_sources().has_grant_for_source_vm("acme", "e1"));
+    assert!(!regions[1].physical_sources().has_grant_for_source_vm("acme", "e2"));
+    drop(regions);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

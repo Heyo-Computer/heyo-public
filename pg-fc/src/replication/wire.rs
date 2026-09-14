@@ -42,6 +42,10 @@ pub struct NodeInfo {
     /// physical preparation before either side creates a slot or VM.
     #[serde(default)]
     pub physical_prepare: bool,
+    #[serde(default)]
+    pub physical_handoff: bool,
+    #[serde(default)]
+    pub physical_successor: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -75,6 +79,8 @@ pub struct PhysicalHandoffGrantJson {
 pub struct PhysicalReplicaRequest {
     pub database: String,
     pub generation: String,
+    #[serde(default)]
+    pub predecessor: Option<String>,
     pub source_node: String,
     pub source_vm_id: String,
     pub system_identifier: String,

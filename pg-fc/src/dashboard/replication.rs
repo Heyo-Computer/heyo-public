@@ -396,6 +396,8 @@ pub async fn api_node_info(State(st): State<DashState>) -> Json<wire::NodeInfo> 
         tls: st.registry.tls_enabled(),
         pg_listen_port: Some(st.registry.listen_port()),
         physical_prepare: true,
+        physical_handoff: true,
+        physical_successor: true,
     })
 }
 
@@ -426,7 +428,7 @@ pub async fn api_physical_grant(State(st): State<DashState>, Path(db): Path<Stri
 }
 
 pub async fn api_accept_physical_replica(State(st): State<DashState>, Json(req): Json<wire::PhysicalReplicaRequest>) -> Response {
-    match crate::replication::physical::accept_candidate(&st.registry, req) {
+    match crate::replication::physical::accept_candidate(&st.registry, req).await {
         Ok(record) => (StatusCode::ACCEPTED, Json(wire::PhysicalRecordJson::from(&record))).into_response(), Err(e) => api_err(&e).into_response(),
     }
 }

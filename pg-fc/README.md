@@ -1173,9 +1173,23 @@ no-DDL fenced attach path; a mismatched registry binding is refused. The old
 logical VM remains owned and is not stopped, overwritten, or deleted.
 
 This protocol is operator-driven planned handoff, not automatic failover.
-Cleanup and constructing/rejoining a successor physical generation (including
-switch-back preparation) remain separate work. External secret DSNs and
-regional/application routing are also outside the controller operation.
+For switch-back, call `physical-prepare` on the activated writer with a new
+generation. Both peers must advertise `physical_successor`. The request links
+the new operation to the preceding activation and source grant, retains the
+replication credential, and seeds a fresh VM in the other region. It never
+reuses or rewinds a former writer. Repeat `physical-handoff` after verification.
+Current operations and immutable history are persisted together; an old VM's
+grant permanently revokes that VM even after later switches. Stale requests
+and queued seed workers cannot mutate a newer generation.
+
+Physical sources own their durable fences independently of logical replication
+metadata. Before a grant, `unfence` invalidates the saved barrier before reopening
+admission. After a grant it is permanently refused for that source VM. An
+ambiguous journal directory-sync failure stops the controller so restart reloads
+disk state instead of continuing with stale in-memory authorization.
+
+Cleanup, external secret DSNs, and regional/application routing remain outside
+the controller operation.
 
 #### Guest promoted-but-fenced transition
 

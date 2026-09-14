@@ -668,16 +668,27 @@ impl SchemaRegistry {
     pub fn bound_vm_id(&self, database: &str) -> Option<String> { self.store.record(database).map(|r| r.sandbox_id) }
 
     pub fn physical_admission_ready(&self, database: &str) -> bool {
-        !self.physical_sources.get(database).is_some_and(|r| r.handoff.is_some())
-            && self.physical.get(database).is_none_or(|r| !r.handoff_started()
-                || r.phase == crate::replication::PhysicalPhase::Activated
-                    && r.candidate_id.as_deref() == self.bound_vm_id(database).as_deref())
+        let bound = self.bound_vm_id(database);
+        if bound.is_none() && (self.physical.get(database).is_some() || self.physical_sources.get(database).is_some()) { return false; }
+        !bound.as_deref().is_some_and(|id| self.physical_sources.has_grant_for_source_vm(database, id))
+            && !self.physical_source_fenced(database)
+            && self.physical.get(database).is_none_or(|r| {
+                if r.handoff_started() {
+                    r.phase == crate::replication::PhysicalPhase::Activated && r.candidate_id == bound
+                } else { r.previous_vm_id == bound }
+            })
+    }
+
+    pub fn physical_source_fenced(&self, database: &str) -> bool {
+        self.physical_sources.get(database).is_some_and(|r| r.fence.is_some()
+            && self.bound_vm_id(database).as_deref() == Some(r.source_vm_id.as_str()))
     }
 
     pub fn physical_reconnect_allowed(&self, database: &str, role: &str) -> bool {
         let Some(source) = self.physical_sources.get(database) else { return false };
-        source.handoff.is_some()
-            && self.replication.by_repl_role(role).is_some_and(|r| r.database == database && r.repl_role == role)
+        (source.handoff.is_some() || source.fence.is_some())
+            && (source.repl.as_ref().is_some_and(|login| login.role == role)
+                || self.replication.by_repl_role(role).is_some_and(|r| r.database == database && r.repl_role == role))
             && self.bound_vm_id(database).as_deref() == Some(source.source_vm_id.as_str())
     }
 
@@ -905,12 +916,14 @@ impl SchemaRegistry {
         &self,
         schema: &str,
     ) -> Result<(ConnGuard, deadpool_postgres::Object)> {
-        let fence = self.replication.get(schema).and_then(|r| r.fence)
+        let expected_vm = self.physical_sources.get(schema).filter(|r| r.fence.is_some()
+            && self.bound_vm_id(schema).as_deref() == Some(r.source_vm_id.as_str())).map(|r| r.source_vm_id)
+            .or_else(|| self.replication.get(schema).and_then(|r| r.fence).map(|f| f.vm_id))
             .with_context(|| format!("refusing maintenance bypass for unfenced database {schema}"))?;
         let record = self.store.record(schema)
             .with_context(|| format!("fenced database {schema} has no durable VM binding"))?;
         if record.tier != Tier::Live { bail!("fenced database {schema} is not on a live VM"); }
-        if !fence.vm_id.is_empty() && fence.vm_id != record.sandbox_id {
+        if !expected_vm.is_empty() && expected_vm != record.sandbox_id {
             bail!("fenced database {schema} VM identity changed");
         }
         let cell = self.entries.lock().await.entry(schema.to_string())
@@ -1196,6 +1209,9 @@ impl SchemaRegistry {
     /// whatever was asked for, so a prober cannot enumerate provisioned names
     /// by watching which connections get challenged.
     pub fn challenge_password_for(&self, role: &str) -> Option<String> {
+        if let Some(source) = self.physical_sources.by_repl_role(role) {
+            return source.repl.map(|login| login.password);
+        }
         challenge_password_in(
             &self.replication,
             &self.dedicated,
@@ -1212,6 +1228,12 @@ impl SchemaRegistry {
     /// database is dedicated, only its own role may open it" rule, which is
     /// precisely the database it is trying to reach.
     pub fn authorize_route(&self, role: &str, database: &str, physical: bool) -> Result<String, String> {
+        if physical && let Some(source) = self.physical_sources.by_repl_role(role) {
+            if self.bound_vm_id(&source.database).as_deref() != Some(source.source_vm_id.as_str()) {
+                return Err("physical source no longer owns the serving binding".into());
+            }
+            return Ok(source.database);
+        }
         authorize_route_in(&self.replication, &self.dedicated, role, database, physical)
     }
 
@@ -1443,6 +1465,17 @@ impl SchemaRegistry {
     /// The returned guard keeps the VM off the reaper's radar until dropped.
     /// Concurrent callers for the same schema share one bring-up.
     pub async fn checkout(&self, schema: &str) -> Result<ConnGuard> {
+        // An outgoing grant/fence takes precedence over the older activation
+        // that originally made this same VM a writer.
+        if self.physical_source_fenced(schema) {
+            return self.maintenance_client(schema).await.map(|(guard, _)| guard);
+        }
+        if self.bound_vm_id(schema).as_deref().is_some_and(|id| self.physical_sources.has_grant_for_source_vm(schema, id)) {
+            if self.replication.is_fenced(schema) {
+                return self.maintenance_client(schema).await.map(|(guard, _)| guard);
+            }
+            bail!("physical source grant lost its fence; refusing ordinary checkout");
+        }
         if let Some(rec) = self.physical.get(schema).filter(|r| r.handoff_started()) {
             if rec.phase != crate::replication::PhysicalPhase::Activated {
                 bail!("physical handoff for {schema} is incomplete; admission remains closed");
@@ -1457,15 +1490,12 @@ impl SchemaRegistry {
             return ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await
                 .context("physical handoff connection slots exhausted");
         }
-        if self.physical_sources.get(schema).is_some_and(|r| r.handoff.is_some())
-            && !self.replication.is_fenced(schema) {
-            bail!("physical source grant lost its fence; refusing ordinary checkout");
-        }
         if self.replication.is_fenced(schema) {
             // Status polling and startup warming must not take the normal
             // restore/grant path for a fenced database either.
             return self.maintenance_client(schema).await.map(|(guard, _)| guard);
         }
+        if !self.physical_admission_ready(schema) { bail!("physical preparation binding mismatch; refusing ordinary checkout"); }
         self.checkout_inner(schema, None).await
     }
 

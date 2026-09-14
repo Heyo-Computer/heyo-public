@@ -704,7 +704,7 @@ async fn fence_postgres_selective<M: tokio_postgres::GenericClient + Sync>(
 
 /// PostgreSQL's admission/drain/barrier protocol, separate from VM resolution
 /// so the production protocol can be exercised against a disposable server.
-async fn fence_postgres(
+pub(super) async fn fence_postgres(
     maintenance: &mut tokio_postgres::Client,
     database: &str,
     slot: &str,
@@ -774,8 +774,21 @@ async fn fence_postgres(
 
 pub async fn unfence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
     let _operation = reg.replication_operation(database).await;
-    if reg.physical_sources().get(database).is_some_and(|r| r.handoff.is_some()) {
+    if reg.bound_vm_id(database).as_deref().is_some_and(|id| reg.physical_sources().has_grant_for_source_vm(database, id)) {
         bail!("physical handoff was irrevocably authorized; source admission can never be reopened");
+    }
+    if let Some(source) = reg.physical_sources().get(database).filter(|r| r.fence.is_some()) {
+        if reg.bound_vm_id(database).as_deref() != Some(&source.source_vm_id) {
+            bail!("physical fence does not describe the bound source");
+        }
+        let (_guard, maintenance) = reg.maintenance_client(database).await?;
+        reg.physical_sources().set_fence(database, &source.generation, "unfencing", None)?;
+        maintenance.batch_execute("SET synchronous_commit = on").await?;
+        maintenance.batch_execute(&sql::set_allow_connections(database, true)).await
+            .context("durably restoring physical source admission")?;
+        if reg.replication().is_fenced(database) { reg.replication().clear_fence(database)?; }
+        reg.physical_sources().clear_fence(database, &source.generation)?;
+        return Ok(());
     }
     let rec = reg.replication().get(database).with_context(|| format!("{database} is not replicating"))?;
     if rec.fence.is_none() { bail!("{database} is not fenced"); }
