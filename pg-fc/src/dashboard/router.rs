@@ -49,6 +49,7 @@ pub fn build(state: DashState) -> Router {
         )
         .route("/api/replication/{database}/promote", post(replication::api_promote))
         .route("/api/replication/{database}/fence", post(replication::api_fence))
+        .route("/api/replication/{database}/fence-selective", post(replication::api_fence_selective))
         .route("/api/replication/{database}/unfence", post(replication::api_unfence))
         .route("/api/replication/{database}/refresh", post(replication::api_refresh))
         .route("/api/replication/{database}/detach", post(replication::api_detach))

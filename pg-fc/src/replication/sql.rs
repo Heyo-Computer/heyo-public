@@ -119,6 +119,54 @@ pub fn set_allow_connections(database: &str, allow: bool) -> String {
 
 pub const PREPARED_XACTS_SQL: &str = "SELECT count(*)::int8 FROM pg_prepared_xacts WHERE database = $1";
 
+pub const TENANT_ROLE_ESCAPE_SQL: &str = "\
+WITH RECURSIVE can_become_owner(roleid) AS (
+  SELECT oid FROM pg_roles WHERE rolname = $1
+  UNION
+  SELECT m.member FROM pg_auth_members m JOIN can_become_owner c ON c.roleid = m.roleid
+  WHERE m.set_option OR m.inherit_option
+)
+SELECT r.rolname FROM can_become_owner c JOIN pg_roles r ON r.oid = c.roleid
+WHERE r.rolcanlogin AND r.rolname <> $1
+ORDER BY 1";
+
+// A dedicated cluster may admit only its controller, owner and replication
+// login. Other logins can hold independent table grants without inheriting the
+// owner, so checking owner membership alone does not establish a write fence.
+pub const UNSUPPORTED_FENCE_ROLES_SQL: &str = "\
+SELECT rolname FROM pg_roles
+WHERE (rolcanlogin AND rolname NOT IN (current_user, $1, $2))
+   OR (rolname IN ($1, $2) AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolbypassrls))
+ORDER BY 1";
+
+pub const SEQUENCES_SQL: &str = "\
+SELECT n.nspname, c.relname, format_type(s.seqtypid, NULL), s.seqstart, s.seqmin,
+       s.seqmax, s.seqincrement, s.seqcycle, s.seqcache
+FROM pg_sequence s JOIN pg_class c ON c.oid=s.seqrelid
+JOIN pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') ORDER BY 1,2";
+
+pub fn selective_admission(database: &str, owner: &str, repl_role: &str) -> String {
+    format!(
+        "ALTER DATABASE {} ALLOW_CONNECTIONS true; ALTER ROLE {} NOLOGIN; \
+         REVOKE CONNECT ON DATABASE {} FROM PUBLIC; REVOKE CONNECT ON DATABASE {} FROM {}; \
+         GRANT CONNECT ON DATABASE {} TO {}",
+        quote_ident(database), quote_ident(owner), quote_ident(database), quote_ident(database),
+        quote_ident(owner), quote_ident(database), quote_ident(repl_role)
+    )
+}
+
+pub fn restore_selective_admission(database: &str, owner: &str) -> String {
+    format!(
+        "ALTER ROLE {} LOGIN; GRANT CONNECT ON DATABASE {} TO {}",
+        quote_ident(owner), quote_ident(database), quote_ident(owner)
+    )
+}
+
+pub fn sequence_value(schema: &str, name: &str) -> String {
+    format!("SELECT last_value::int8, is_called FROM {}.{}", quote_ident(schema), quote_ident(name))
+}
+
 pub const DATABASE_OBJECT_LOCKS_SQL: &str = "\
 SELECT l.pid FROM pg_locks l
 WHERE l.locktype = 'object' AND l.classid = 'pg_database'::regclass

@@ -230,7 +230,10 @@ async fn handle_conn(
         auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
         anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
     }
-    if registry.replication().is_fenced(&info.database) {
+    if let Some(fence) = registry.replication().get(&info.database).and_then(|r| r.fence)
+        && (fence.mode != "selective"
+            || registry.replication().by_repl_role(&info.user).is_none())
+    {
         auth::send_fatal(
             &mut client,
             auth::SQLSTATE_INSUFFICIENT_PRIVILEGE,

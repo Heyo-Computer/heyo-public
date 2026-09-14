@@ -137,3 +137,120 @@ async fn postgres_fence_rejects_prepared_transactions_without_discarding_them() 
     drop(app);
     maintenance.batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)")).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires PG_FC_FENCE_TEST_URL pointing to disposable PostgreSQL 18"]
+async fn postgres_selective_fence_drains_tenant_and_captures_real_sequences() {
+    let (mut config, maintenance, database) = database().await;
+    let owner = format!("{database}_owner");
+    let repl = format!("{database}_repl");
+    maintenance.batch_execute(&format!(
+        "CREATE ROLE {owner} LOGIN PASSWORD 'disposable-fence-test'; CREATE ROLE {repl} LOGIN REPLICATION PASSWORD 'disposable-fence-test'; ALTER DATABASE {database} OWNER TO {owner}"
+    )).await.unwrap();
+    config.dbname(&database).user(&owner).options("-c synchronous_commit=off");
+    let tenant = connect(&config).await;
+    let mut other_config = config.clone();
+    other_config.dbname("postgres");
+    let other_database_session = connect(&other_config).await;
+    tenant.batch_execute("CREATE SEQUENCE public.cached CACHE 20; CREATE SEQUENCE public.uncalled; SELECT setval('public.uncalled', 73, false)").await.unwrap();
+    tenant.batch_execute("BEGIN; SELECT nextval('public.cached'); ROLLBACK").await.unwrap();
+    let mut controller_config = maintenance_config();
+    controller_config.dbname(&database);
+    let mut controller = connect(&controller_config).await;
+    let controller_pid: i32 = controller.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+
+    let (barrier, snapshots) = fence_postgres_selective(
+        &maintenance, &mut controller, &database, &owner, &repl, "unused_test_slot",
+        controller_pid, |_, _| Ok(())
+    ).await.unwrap();
+    assert!(tenant.query_one("SELECT 1", &[]).await.is_err(), "pre-existing tenant survived");
+    assert!(other_database_session.query_one("SELECT 1", &[]).await.is_err(), "tenant session in another database survived");
+    assert!(config.connect(NoTls).await.is_err(), "NOLOGIN owner reconnected");
+    let mut repl_config = maintenance_config();
+    repl_config.dbname(&database).user(&repl);
+    let repl_client = connect(&repl_config).await;
+    assert_eq!(repl_client.query_one("SELECT 1", &[]).await.unwrap().get::<_, i32>(0), 1);
+    let cached = snapshots.iter().find(|s| s.name == "cached").unwrap();
+    assert_eq!(cached.last_value, 20, "rolled-back/cached allocation must not be derived from table MAX");
+    assert!(cached.is_called);
+    let uncalled = snapshots.iter().find(|s| s.name == "uncalled").unwrap();
+    assert_eq!((uncalled.last_value, uncalled.is_called), (73, false));
+    let flushed: bool = maintenance.query_one("SELECT pg_current_wal_flush_lsn() >= $1::text::pg_lsn", &[&barrier]).await.unwrap().get(0);
+    assert!(flushed);
+
+    drop(repl_client);
+    drop(controller);
+    maintenance.batch_execute(&sql::restore_selective_admission(&database, &owner)).await.unwrap();
+    maintenance.batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)")).await.unwrap();
+    maintenance.batch_execute(&format!("DROP ROLE {owner}; DROP ROLE {repl}")).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PG_FC_FENCE_TEST_URL pointing to disposable PostgreSQL 18"]
+async fn postgres_selective_fence_detects_set_role_escape() {
+    let (_config, maintenance, database) = database().await;
+    let owner = format!("{database}_owner");
+    let escape = format!("{database}_escape");
+    maintenance.batch_execute(&format!("CREATE ROLE {owner} LOGIN; CREATE ROLE {escape} LOGIN; GRANT {owner} TO {escape} WITH SET TRUE")).await.unwrap();
+    let found: Vec<String> = maintenance.query(sql::TENANT_ROLE_ESCAPE_SQL, &[&owner]).await.unwrap().iter().map(|r| r.get(0)).collect();
+    assert_eq!(found, vec![escape.clone()]);
+    maintenance.batch_execute(&format!("GRANT {owner} TO {escape} WITH SET FALSE, INHERIT TRUE")).await.unwrap();
+    let found: Vec<String> = maintenance.query(sql::TENANT_ROLE_ESCAPE_SQL, &[&owner]).await.unwrap().iter().map(|r| r.get(0)).collect();
+    assert_eq!(found, vec![escape.clone()], "inherited ownership bypasses a SET-only check");
+    maintenance.batch_execute(&format!("REVOKE {owner} FROM {escape}")).await.unwrap();
+    let unsupported = validate_selective_roles(&maintenance, &owner, "absent_repl").await.unwrap_err();
+    assert!(unsupported.to_string().contains(&escape), "an independent login with table grants must also prevent fencing");
+    maintenance.batch_execute(&format!("DROP DATABASE {database}")).await.unwrap();
+    maintenance.batch_execute(&format!("DROP OWNED BY {escape}; DROP ROLE {escape}; DROP ROLE {owner}")).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "restarts disposable container named by PG_FC_FENCE_RESTART_CONTAINER; run serially"]
+async fn postgres_selective_fence_survives_postgres_restart() {
+    let container = std::env::var("PG_FC_FENCE_RESTART_CONTAINER").expect("explicit disposable container required");
+    assert!(container.starts_with("heyo-pg-fence-"), "refusing to restart a non-test container");
+    let (mut config, maintenance, database) = database().await;
+    let owner = format!("{database}_owner");
+    let repl = format!("{database}_repl");
+    maintenance.batch_execute(&format!(
+        "CREATE ROLE {owner} LOGIN PASSWORD 'disposable-fence-test'; CREATE ROLE {repl} LOGIN REPLICATION PASSWORD 'disposable-fence-test'; ALTER DATABASE {database} OWNER TO {owner}"
+    )).await.unwrap();
+    config.dbname(&database);
+    let mut controller = connect(&config).await;
+    controller.batch_execute("CREATE SEQUENCE durable CACHE 20; SELECT nextval('durable')").await.unwrap();
+    let pid: i32 = controller.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+    let (_, sequences) = fence_postgres_selective(&maintenance, &mut controller, &database, &owner, &repl, "unused", pid, |_, _| Ok(())).await.unwrap();
+    assert_eq!(sequences[0].last_value, 20);
+    drop(controller);
+    drop(maintenance);
+    let status = tokio::process::Command::new("docker").args(["restart", &container]).status().await.unwrap();
+    assert!(status.success());
+    let config_maintenance = maintenance_config();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let maintenance = loop {
+        match config_maintenance.connect(NoTls).await {
+            Ok((client, connection)) => {
+                tokio::spawn(async move { let _ = connection.await; });
+                break client;
+            }
+            Err(_) => {
+                assert!(tokio::time::Instant::now() < deadline, "disposable PostgreSQL did not restart");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    validate_selective_roles(&maintenance, &owner, &repl).await.unwrap();
+    config.user(&owner);
+    assert!(config.connect(NoTls).await.is_err(), "restart restored owner LOGIN");
+    config.user(&repl);
+    let replication_client = connect(&config).await;
+    assert_eq!(replication_client.query_one("SELECT 1", &[]).await.unwrap().get::<_, i32>(0), 1);
+    drop(replication_client);
+    config.user("postgres");
+    let controller = connect(&config).await;
+    let value: i64 = controller.query_one("SELECT last_value FROM durable", &[]).await.unwrap().get(0);
+    assert_eq!(value, 20, "checkpoint did not persist the captured allocation");
+    drop(controller);
+    maintenance.batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)")).await.unwrap();
+    maintenance.batch_execute(&format!("DROP ROLE {owner}; DROP ROLE {repl}")).await.unwrap();
+}

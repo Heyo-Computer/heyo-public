@@ -123,13 +123,19 @@ pub struct RecordJson {
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct FenceJson {
+    #[serde(default = "hard_fence_mode")]
+    pub mode: String,
     pub phase: String,
     pub message: String,
     pub vm_id: String,
     pub barrier_lsn: String,
     pub requested_at: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub sequences: Vec<crate::replication::SequenceSnapshot>,
 }
+
+fn hard_fence_mode() -> String { "hard".into() }
 
 impl From<&crate::replication::ReplRecord> for RecordJson {
     fn from(r: &crate::replication::ReplRecord) -> Self {
@@ -146,9 +152,9 @@ impl From<&crate::replication::ReplRecord> for RecordJson {
             created_at: r.created_at,
             updated_at: r.updated_at,
             fence: r.fence.as_ref().map(|f| FenceJson {
-                phase: f.phase.clone(), message: f.message.clone(), vm_id: f.vm_id.clone(),
+                mode: f.mode.clone(), phase: f.phase.clone(), message: f.message.clone(), vm_id: f.vm_id.clone(),
                 barrier_lsn: f.barrier_lsn.clone(), requested_at: f.requested_at,
-                updated_at: f.updated_at,
+                updated_at: f.updated_at, sequences: f.sequences.clone(),
             }),
         }
     }

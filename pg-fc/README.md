@@ -1163,6 +1163,7 @@ authentication):
 
 ```sh
 curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication/acme/fence
+curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication/acme/fence-selective
 curl -u admin:secret http://127.0.0.1:34199/api/replication/acme
 curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication/acme/unfence
 ```
@@ -1192,6 +1193,33 @@ Neither endpoint promotes a replica, drops replication objects, or authorizes
 target writes. The barrier is local source durability evidence only; a later
 coordinator must prove the replica applied that exact LSN before handoff.
 
+`fence-selective` is the explicit reversible-handoff variant for dedicated,
+unprivileged tenants. The ordinary `fence` remains the hard default, and a hard
+fence must be explicitly unfenced before selective mode can be requested.
+Selective mode durably records its mode and bound VM, sets the database owner
+`NOLOGIN`, revokes database `CONNECT` from both `PUBLIC` and the owner, and
+grants it only to the pairing's exact replication role. The frontend continues
+to authenticate that role with its replication password and bind it to this
+database; all tenant routes are rejected. Before changing admission, pg-fc
+rejects alternative LOGIN roles, including inherited/`SET ROLE` ownership,
+and privileged tenant roles. Only the controller, tenant owner, and exact
+replication login may be login roles in this dedicated cluster. Existing tenant
+sessions in other databases are terminated too. Sessions/startups are drained with the same worker,
+prepared-transaction, fixed-barrier, checkpoint, and flush checks as the hard
+fence while one private controller connection remains attached.
+
+After drain, the controller reads every schema-qualified sequence's actual
+`last_value` and `is_called`, plus type/start/min/max/increment/cycle/cache
+definition, directly from the sequence and catalogs. It persists that snapshot
+with the fixed barrier and VM identity in `record.fence.sequences`; values are
+never inferred from table maxima. A ready retry returns the same durable
+snapshot/barrier. Controller/Postgres restart recovery reattaches only the
+bound VM through the maintenance path and does not run ordinary role DDL, so it
+cannot restore tenant `LOGIN`. `unfence` restores owner `LOGIN` and owner
+`CONNECT` before clearing durable intent. It does not regrant `PUBLIC` access.
+This endpoint deliberately stops at the callable source boundary: it does not
+prove target replay, apply sequences, promote, or establish reverse pairing.
+
 Run the PostgreSQL protocol regressions against a disposable PostgreSQL 18
 server with `wal_level=logical`, `max_prepared_transactions > 0`, and
 `synchronous_commit=off`. Install `pg_recvlogical` for the sender test. The
@@ -1200,6 +1228,14 @@ disposable server on `127.0.0.1:5432` to include it:
 
 ```sh
 PG_FC_FENCE_TEST_URL=postgres://postgres:password@127.0.0.1:5432/postgres cargo test --locked --manifest-path pg-fc/Cargo.toml postgres_fence -- --ignored --nocapture
+```
+
+Selective-fence regressions require an otherwise isolated cluster and run
+serially. The restart test requires a disposable Docker container whose name
+starts with `heyo-pg-fence-`, using disk-backed PostgreSQL storage, not tmpfs:
+
+```sh
+PG_FC_FENCE_TEST_URL=postgres://postgres:password@127.0.0.1:55440/postgres PG_FC_FENCE_RESTART_CONTAINER=heyo-pg-fence-durable-restart cargo test --locked --manifest-path pg-fc/Cargo.toml postgres_selective -- --ignored --test-threads=1
 ```
 
 What that does, in order — each step durable before the thing it describes

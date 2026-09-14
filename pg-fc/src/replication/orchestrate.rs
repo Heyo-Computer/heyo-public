@@ -545,6 +545,158 @@ pub async fn fence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::Fe
     }
 }
 
+/// Fence tenant writes while retaining the exact database-bound replication
+/// login. Unlike [`fence`], this is an explicit coordinated-handoff boundary:
+/// it never converts or silently reopens a pre-existing hard fence.
+pub async fn fence_selective(
+    reg: &Arc<SchemaRegistry>,
+    database: &str,
+) -> Result<wire::FenceResponse> {
+    let _operation = reg.replication_operation(database).await;
+    let rec = reg.replication().get(database).with_context(|| format!("{database} is not replicating"))?;
+    if rec.role != Role::Primary { bail!("{database} is not a replication primary"); }
+    let tenant = reg.dedicated().by_database(database)
+        .context("selective fencing requires a dedicated tenant credential")?;
+    if let Some(f) = &rec.fence {
+        if f.mode != "selective" { bail!("{database} already has a hard fence; explicitly unfence before requesting selective admission"); }
+        if f.phase == "ready" {
+            let bound = reg.schema_record(database).context("ready fence lost its VM binding")?;
+            if bound.sandbox_id != f.vm_id || f.barrier_lsn.is_empty() { bail!("ready selective fence identity/barrier mismatch"); }
+            let (_guard, maintenance) = reg.maintenance_client(database).await?;
+            validate_selective_roles(&**maintenance, &tenant.role, &rec.repl_role).await?;
+            let state = maintenance.query_one(
+                "SELECT d.datallowconn, NOT o.rolcanlogin, has_database_privilege(r.oid, d.oid, 'CONNECT') \
+                 FROM pg_database d JOIN pg_roles o ON o.rolname=$2 JOIN pg_roles r ON r.rolname=$3 \
+                 WHERE d.datname=$1", &[&database, &tenant.role, &rec.repl_role]
+            ).await.context("verifying durable selective admission")?;
+            if !state.get::<_, bool>(0) || !state.get::<_, bool>(1) || !state.get::<_, bool>(2) {
+                bail!("ready selective fence no longer matches PostgreSQL admission state");
+            }
+            return Ok(wire::FenceResponse { record: (&rec).into(), database: database.into(), vm_id: f.vm_id.clone(), barrier_lsn: f.barrier_lsn.clone() });
+        }
+    }
+    let (guard, maintenance) = if rec.fence.is_some() {
+        reg.maintenance_client(database).await?
+    } else {
+        let guard = reg.checkout(database).await?;
+        let client = guard.entry().pool.get().await?;
+        (guard, client)
+    };
+    let vm_id = guard.entry().sandbox_id();
+    if let Some(f) = &rec.fence && !f.vm_id.is_empty() && f.vm_id != vm_id {
+        bail!("selective fence retry reached a different VM; refusing moving barrier");
+    }
+    let mut database_client = crate::vm::db_client(reg.cfg(), &guard.entry().target, database).await?;
+    let controller_pid: i32 = database_client.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+
+    validate_selective_roles(&**maintenance, &tenant.role, &rec.repl_role).await?;
+    reg.replication().set_fence_payload(database, "selective", "intent",
+        "selective fence requested; tenant admission not yet closed", &vm_id, "", vec![])?;
+    let result = fence_postgres_selective(
+        &**maintenance, &mut database_client, database, &tenant.role, &rec.repl_role,
+        &rec.slot, controller_pid,
+        |phase, message| reg.replication().set_fence(database, phase, message, &vm_id, ""),
+    ).await;
+    match result {
+        Ok((barrier, sequences)) => {
+            reg.replication().set_fence_payload(database, "selective", "ready",
+                "tenant drained; source sequences and fixed WAL barrier captured", &vm_id,
+                &barrier, sequences)?;
+            let rec = reg.replication().get(database).unwrap_or(rec);
+            Ok(wire::FenceResponse { record: (&rec).into(), database: database.into(), vm_id, barrier_lsn: barrier })
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let _ = reg.replication().set_fence(database, "error", &msg, &vm_id, "");
+            Err(e)
+        }
+    }
+}
+
+async fn validate_selective_roles<M: tokio_postgres::GenericClient + Sync>(
+    maintenance: &M,
+    owner: &str,
+    repl_role: &str,
+) -> Result<()> {
+    let escapes: Vec<String> = maintenance.query(sql::TENANT_ROLE_ESCAPE_SQL, &[&owner]).await?
+        .iter().map(|r| r.get(0)).collect();
+    if !escapes.is_empty() {
+        bail!("tenant owner {owner} has alternative LOGIN roles with inherited/SET ROLE access: {}; selective fencing is unsupported", escapes.join(", "));
+    }
+    let unsupported: Vec<String> = maintenance.query(sql::UNSUPPORTED_FENCE_ROLES_SQL, &[&owner, &repl_role]).await?
+        .iter().map(|r| r.get(0)).collect();
+    if !unsupported.is_empty() {
+        bail!("selective fencing requires an isolated unprivileged tenant; unsupported roles: {}", unsupported.join(", "));
+    }
+    Ok(())
+}
+
+async fn fence_postgres_selective<M: tokio_postgres::GenericClient + Sync>(
+    maintenance: &M,
+    database_client: &mut tokio_postgres::Client,
+    database: &str,
+    owner: &str,
+    repl_role: &str,
+    slot: &str,
+    controller_pid: i32,
+    progress: impl Fn(&str, &str) -> Result<()>,
+) -> Result<(String, Vec<super::SequenceSnapshot>)> {
+    validate_selective_roles(maintenance, owner, repl_role).await?;
+    progress("closing_admission", "disabling tenant owner and CONNECT inheritance")?;
+    maintenance.batch_execute("SET synchronous_commit = on").await?;
+    maintenance.batch_execute(&sql::selective_admission(database, owner, repl_role)).await?;
+    progress("draining_startups", "waiting for pre-existing startup locks")?;
+    let deadline = tokio::time::Instant::now() + FENCE_DRAIN_TIMEOUT;
+    loop {
+        let holders = maintenance.query(sql::DATABASE_OBJECT_LOCKS_SQL, &[&database]).await?;
+        if holders.iter().all(|r| r.get::<_, i32>(0) == controller_pid) { break; }
+        if tokio::time::Instant::now() >= deadline { bail!("startup lock holders did not drain; selective fence retained"); }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let prepared: i64 = maintenance.query_one(sql::PREPARED_XACTS_SQL, &[&database]).await?.get(0);
+    if prepared != 0 { bail!("database has {prepared} prepared transaction(s); selective fence retained"); }
+    let rows = maintenance.query(sql::FENCE_ACTIVITY_SQL, &[&database, &slot]).await?;
+    for row in &rows {
+        let pid: i32 = row.get("pid");
+        let backend: &str = row.get("backend_type");
+        let expected: bool = row.get("is_expected_sender");
+        if pid != controller_pid && backend != "client backend" && !expected {
+            bail!("unexpected database worker pid {pid} ({backend}); selective fence retained");
+        }
+    }
+    maintenance.query("SELECT pg_terminate_backend(a.pid) FROM pg_stat_activity a LEFT JOIN pg_replication_slots s ON s.slot_name=$2 WHERE (a.datname=$1 OR a.usename=$4) AND a.pid <> $3 AND a.backend_type='client backend' AND a.pid <> COALESCE(s.active_pid,-1)", &[&database, &slot, &controller_pid, &owner]).await?;
+    let deadline = tokio::time::Instant::now() + FENCE_DRAIN_TIMEOUT;
+    loop {
+        let rows = maintenance.query(sql::FENCE_ACTIVITY_SQL, &[&database, &slot]).await?;
+        let remaining = rows.iter().filter(|r| r.get::<_, i32>("pid") != controller_pid && !r.get::<_, bool>("is_expected_sender")).count();
+        let owner_sessions: i64 = maintenance.query_one("SELECT count(*) FROM pg_stat_activity WHERE usename=$1", &[&owner]).await?.get(0);
+        if remaining == 0 && owner_sessions == 0 { break; }
+        if tokio::time::Instant::now() >= deadline { bail!("{remaining} tenant session(s) did not exit; selective fence retained"); }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let prepared: i64 = maintenance.query_one(sql::PREPARED_XACTS_SQL, &[&database]).await?.get(0);
+    if prepared != 0 { bail!("database has {prepared} prepared transaction(s) after drain; selective fence retained"); }
+
+    let mut sequences = Vec::new();
+    for row in database_client.query(sql::SEQUENCES_SQL, &[]).await? {
+        let schema: String = row.get(0);
+        let name: String = row.get(1);
+        let value = database_client.query_one(&sql::sequence_value(&schema, &name), &[]).await?;
+        sequences.push(super::SequenceSnapshot {
+            schema, name, data_type: row.get(2), start_value: row.get(3), min_value: row.get(4),
+            max_value: row.get(5), increment_by: row.get(6), cycle: row.get(7), cache_size: row.get(8),
+            last_value: value.get(0), is_called: value.get(1),
+        });
+    }
+    progress("barrier", "tenant drained; authoritative sequences captured")?;
+    database_client.batch_execute("SET synchronous_commit = on").await?;
+    let barrier: String = database_client.query_one("SELECT pg_current_wal_insert_lsn()::text", &[]).await?.get(0);
+    maintenance.batch_execute("CHECKPOINT").await?;
+    let flushed: bool = maintenance.query_one("SELECT pg_current_wal_flush_lsn() >= $1::text::pg_lsn", &[&barrier]).await?.get(0);
+    if !flushed { bail!("WAL flush did not reach fixed barrier {barrier}; selective fence retained"); }
+    Ok((barrier, sequences))
+}
+
 /// PostgreSQL's admission/drain/barrier protocol, separate from VM resolution
 /// so the production protocol can be exercised against a disposable server.
 async fn fence_postgres(
@@ -625,8 +777,14 @@ pub async fn unfence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
     // or failed clear must never leave an open database marked ready-fenced.
     reg.replication().set_fence(database, "unfencing", "operator requested admission reopen; prior barrier invalid", &f.vm_id, "")?;
     maintenance.batch_execute("SET synchronous_commit = on").await?;
-    maintenance.batch_execute(&sql::set_allow_connections(database, true)).await
-        .context("durably restoring database admission")?;
+    if f.mode == "selective" {
+        let tenant = reg.dedicated().by_database(database).context("selective fence lost tenant credential")?;
+        maintenance.batch_execute(&sql::restore_selective_admission(database, &tenant.role)).await
+            .context("restoring selective tenant admission")?;
+    } else {
+        maintenance.batch_execute(&sql::set_allow_connections(database, true)).await
+            .context("durably restoring database admission")?;
+    }
     reg.replication().clear_fence(database)?;
     Ok(())
 }

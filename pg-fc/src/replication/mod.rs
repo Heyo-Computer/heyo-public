@@ -63,4 +63,4 @@ pub mod sql;
 pub mod store;
 pub mod wire;
 
-pub use store::{ReplRecord, ReplStore, Role, State};
+pub use store::{ReplRecord, ReplStore, Role, SequenceSnapshot, State};

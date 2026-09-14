@@ -156,12 +156,32 @@ pub struct ReplRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fence {
+    /// `hard` closes the whole database; `selective` leaves only the private
+    /// controller and this pairing's authenticated replication login usable.
+    pub mode: String,
     pub phase: String,
     pub message: String,
     pub vm_id: String,
     pub barrier_lsn: String,
     pub requested_at: u64,
     pub updated_at: u64,
+    /// Authoritative source values captured after the selective drain.
+    pub sequences: Vec<SequenceSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SequenceSnapshot {
+    pub schema: String,
+    pub name: String,
+    pub data_type: String,
+    pub start_value: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub increment_by: i64,
+    pub cycle: bool,
+    pub cache_size: i64,
+    pub last_value: i64,
+    pub is_called: bool,
 }
 
 impl ReplRecord {
@@ -370,16 +390,45 @@ impl ReplStore {
             };
             let now = now_unix();
             let requested_at = rec.fence.as_ref().map(|f| f.requested_at).unwrap_or(now);
+            let mode = rec.fence.as_ref().map(|f| f.mode.clone()).unwrap_or_else(|| "hard".into());
+            let sequences = rec.fence.as_ref().map(|f| f.sequences.clone()).unwrap_or_default();
             rec.fence = Some(Fence {
+                mode,
                 phase: one_line(phase),
                 message: one_line(message),
                 vm_id: one_line(vm_id),
                 barrier_lsn: one_line(barrier_lsn),
                 requested_at,
                 updated_at: now,
+                sequences,
             });
             rec.updated_at = now;
         }
+        if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
+        Ok(())
+    }
+
+    pub fn set_fence_payload(
+        &self,
+        database: &str,
+        mode: &str,
+        phase: &str,
+        message: &str,
+        vm_id: &str,
+        barrier_lsn: &str,
+        sequences: Vec<SequenceSnapshot>,
+    ) -> Result<()> {
+        let mut map = self.by_database.lock().unwrap();
+        let old = map.get(database).cloned().context("replication record disappeared")?;
+        let rec = map.get_mut(database).context("replication record disappeared")?;
+        let now = now_unix();
+        let requested_at = rec.fence.as_ref().map(|f| f.requested_at).unwrap_or(now);
+        rec.fence = Some(Fence {
+            mode: one_line(mode), phase: one_line(phase), message: one_line(message),
+            vm_id: one_line(vm_id), barrier_lsn: one_line(barrier_lsn), requested_at,
+            updated_at: now, sequences,
+        });
+        rec.updated_at = now;
         if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
         Ok(())
     }
@@ -494,13 +543,20 @@ fn parse(s: &str) -> HashMap<String, ReplRecord> {
                 message: f[9].to_string(),
                 created_at: f.get(10).and_then(|v| v.parse().ok()).unwrap_or(0),
                 updated_at: f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0),
-                fence: f.get(12).filter(|v| !v.is_empty()).map(|phase| Fence {
-                    phase: (*phase).to_string(),
-                    message: f.get(13).unwrap_or(&"").to_string(),
+                fence: f.get(12).filter(|v| !v.is_empty()).map(|phase| {
+                    let mode = f.get(18).filter(|v| !v.is_empty()).unwrap_or(&"hard").to_string();
+                    let sequences = f.get(19).and_then(|v| serde_json::from_str(v).ok());
+                    let invalid = mode == "selective" && sequences.is_none();
+                    Fence {
+                    mode,
+                    phase: if invalid { "error".into() } else { (*phase).to_string() },
+                    message: if invalid { "invalid sequence snapshot; source fence retained".into() } else { f.get(13).unwrap_or(&"").to_string() },
                     vm_id: f.get(14).unwrap_or(&"").to_string(),
-                    barrier_lsn: f.get(15).unwrap_or(&"").to_string(),
+                    barrier_lsn: if invalid { String::new() } else { f.get(15).unwrap_or(&"").to_string() },
                     requested_at: f.get(16).and_then(|v| v.parse().ok()).unwrap_or(0),
                     updated_at: f.get(17).and_then(|v| v.parse().ok()).unwrap_or(0),
+                    sequences: sequences.unwrap_or_default(),
+                    }
                 }),
             },
         );
@@ -554,6 +610,10 @@ fn serialize(map: &HashMap<String, ReplRecord>) -> String {
             out.push_str(&f.requested_at.to_string());
             out.push('\t');
             out.push_str(&f.updated_at.to_string());
+            out.push('\t');
+            out.push_str(&f.mode);
+            out.push('\t');
+            out.push_str(&serde_json::to_string(&f.sequences).expect("sequence snapshots serialize"));
         }
         out.push('\n');
     }
@@ -646,6 +706,33 @@ mod tests {
         assert_eq!(reloaded.get("acme").unwrap().fence.unwrap().barrier_lsn, "0/CAFE");
         reloaded.clear_fence("acme").unwrap();
         assert!(!reloaded.is_fenced("acme"));
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn selective_fence_payload_round_trips_without_moving_identity() {
+        let s = store();
+        s.create(rec("acme", Role::Primary), &free).unwrap();
+        let sequence = SequenceSnapshot {
+            schema: "odd schema".into(), name: "orders_seq".into(), data_type: "bigint".into(),
+            start_value: 1, min_value: 1, max_value: i64::MAX, increment_by: 1,
+            cycle: false, cache_size: 32, last_value: 96, is_called: true,
+        };
+        s.set_fence_payload("acme", "selective", "ready", "captured", "vm-7", "0/BEEF", vec![sequence.clone()]).unwrap();
+        let fence = ReplStore::load(s.path.clone()).get("acme").unwrap().fence.unwrap();
+        assert_eq!(fence.mode, "selective");
+        assert_eq!(fence.vm_id, "vm-7");
+        assert_eq!(fence.barrier_lsn, "0/BEEF");
+        assert_eq!(fence.sequences, vec![sequence]);
+        let content = std::fs::read_to_string(&s.path).unwrap();
+        let malformed = content.replace("\"last_value\":96", "\"last_value\":null");
+        assert_ne!(content, malformed);
+        std::fs::write(&s.path, malformed).unwrap();
+        let recovered = ReplStore::load(s.path.clone());
+        let fence = recovered.get("acme").unwrap().fence.unwrap();
+        assert!(recovered.is_fenced("acme"));
+        assert_eq!(fence.phase, "error");
+        assert!(fence.barrier_lsn.is_empty(), "corrupt sequence evidence must invalidate readiness");
         let _ = std::fs::remove_file(&s.path);
     }
 

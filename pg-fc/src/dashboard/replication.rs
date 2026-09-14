@@ -338,6 +338,13 @@ pub async fn api_fence(State(st): State<DashState>, Path(db): Path<String>) -> R
     }
 }
 
+pub async fn api_fence_selective(State(st): State<DashState>, Path(db): Path<String>) -> Response {
+    match orchestrate::fence_selective(&st.registry, &db).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => api_err(&e).into_response(),
+    }
+}
+
 pub async fn api_unfence(State(st): State<DashState>, Path(db): Path<String>) -> Response {
     match orchestrate::unfence(&st.registry, &db).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
