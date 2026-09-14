@@ -1133,8 +1133,9 @@ boot marker and apply the WAL, sender, and slot settings on an in-guest
 Postgres restart; restart failures are reported rather than hidden.
 
 Initial schema copy preserves table ownership and privileges. The tenant login
-is mirrored before copying; additional roles referenced by the source schema
-must already exist on the replica or the transactional schema copy fails.
+is mirrored before copying, and the publisher's replication role is created as
+a non-login ACL grantee. Additional roles referenced by the source schema must
+already exist on the replica or the transactional schema copy fails.
 
 Then, on node A's dashboard: add node B under **peers** (its dashboard URL and
 Basic credentials, plus the host and port a guest on node A would dial to reach

@@ -189,6 +189,12 @@ ORDER BY 1";
 
 // --- replica side -----------------------------------------------------------
 
+/// Schema dumps include the publisher's grants to its replication role. The
+/// subscriber needs the grantee name, but not a login or replication privilege.
+pub fn create_replica_acl_role(role: &str) -> String {
+    format!("CREATE ROLE {} NOLOGIN NOREPLICATION", quote_ident(role))
+}
+
 /// `create_slot = true` means the *subscriber* creates the slot on the
 /// primary. That ordering is deliberate and load-bearing: until this runs, the
 /// primary owns nothing that pins WAL, so a setup that dies after the
@@ -371,6 +377,14 @@ mod tests {
         assert!(
             s.contains("user='acme_pgfcrepl'") && s.contains("sslmode='require'"),
             "{s}"
+        );
+    }
+
+    #[test]
+    fn replica_acl_role_is_quoted_and_cannot_log_in_or_replicate() {
+        assert_eq!(
+            create_replica_acl_role("a\"b"),
+            "CREATE ROLE \"a\"\"b\" NOLOGIN NOREPLICATION"
         );
     }
 

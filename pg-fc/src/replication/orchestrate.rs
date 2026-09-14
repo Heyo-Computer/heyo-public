@@ -422,6 +422,18 @@ async fn build_replica(reg: &Arc<SchemaRegistry>, req: &wire::ProvisionReplica) 
 
     // Logical replication carries no DDL, so the tables have to exist before
     // the subscription's initial copy can land anything.
+    // pg-fc grants this role schema USAGE on the publisher. Preserve that ACL
+    // during schema copy without creating a second replication login here.
+    let role_exists = db
+        .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&req.repl.role])
+        .await
+        .context("checking the schema-copy ACL role")?
+        .is_some();
+    if !role_exists {
+        db.batch_execute(&sql::create_replica_acl_role(&req.repl.role))
+            .await
+            .context("creating the schema-copy ACL role")?;
+    }
     crate::vm::copy_schema_from_primary(
         reg.cfg(),
         &entry.sandbox,
