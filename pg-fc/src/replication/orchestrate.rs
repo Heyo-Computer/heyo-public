@@ -27,6 +27,10 @@ use super::{ReplRecord, Role, State, peer::PeerClient, sql, wire};
 
 const FENCE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[cfg(test)]
+#[path = "fence_tests.rs"]
+mod fence_tests;
+
 /// Length of a generated replication password. Same 144 bits of entropy as a
 /// dedicated database's, and generated the same way.
 const PASSWORD_LEN: usize = 24;
@@ -90,6 +94,7 @@ pub async fn enable_primary(
     database: &str,
     peer_name: &str,
 ) -> Result<ReplRecord> {
+    let _operation = reg.replication_operation(database).await;
     let rcfg = cfg(reg)?;
 
     // The tenant credential has to be mirrored onto the replica so the same
@@ -353,6 +358,7 @@ pub fn accept_replica(
 /// write is a no-op when it matches, the schema copy runs in one transaction
 /// against an empty database, and the subscription is skipped when it exists.
 async fn build_replica(reg: &Arc<SchemaRegistry>, req: &wire::ProvisionReplica) -> Result<()> {
+    let _operation = reg.replication_operation(&req.database).await;
     let rcfg = cfg(reg)?;
     let database = &req.database;
 
@@ -489,68 +495,41 @@ async fn build_replica(reg: &Arc<SchemaRegistry>, req: &wire::ProvisionReplica) 
 /// flushed WAL barrier. This does not alter the subscription or either
 /// replication role and therefore is not promotion/failover.
 pub async fn fence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::FenceResponse> {
+    let _operation = reg.replication_operation(database).await;
     let rec = reg.replication().get(database)
         .with_context(|| format!("{database} is not replicating"))?;
     if rec.role != Role::Primary {
         bail!("{database} is a replication replica on this node; only the source may be fenced");
     }
-    reg.replication().set_fence(database, "intent", "fence requested; database state not yet verified", "", "")?;
-
-    let result: Result<(String, String)> = async {
-        let (guard, mut maintenance) = reg.maintenance_client(database).await?;
-        let vm_id = guard.entry().sandbox.sandbox_id().to_string();
-        reg.replication().set_fence(database, "closing_admission", "waiting for database object-lock holders, then committing ALLOW_CONNECTIONS false", &vm_id, "")?;
-
-        // synchronous_commit=on overrides the guest's source tuning. ALTER
-        // DATABASE obtains the object lock which serializes with in-flight
-        // startup admission; commit precedes the fresh activity sweep.
-        let tx = maintenance.transaction().await.context("starting durable fence transaction")?;
-        tx.batch_execute("SET LOCAL synchronous_commit = on").await?;
-        tx.batch_execute(&sql::set_allow_connections(database, false)).await?;
-        tx.commit().await.context("durably committing ALLOW_CONNECTIONS false")?;
-        reg.replication().set_fence(database, "draining", "admission closed; draining sessions", &vm_id, "")?;
-
-        let prepared: i64 = maintenance.query_one(sql::PREPARED_XACTS_SQL, &[&database]).await?.get(0);
-        if prepared != 0 {
-            bail!("database has {prepared} prepared transaction(s); fence retained; resolve them explicitly before retrying");
-        }
-
-        // Reject background workers rather than killing something whose write
-        // semantics are unknown. Client backends are application sessions and
-        // are terminated; the exact slot's active logical walsender survives.
-        let rows = maintenance.query(sql::FENCE_ACTIVITY_SQL, &[&database, &rec.slot]).await?;
-        for row in &rows {
-            let backend: &str = row.get("backend_type");
-            let expected: bool = row.get("is_expected_sender");
-            if backend != "client backend" && !expected {
-                bail!("unexpected database worker pid {} ({backend}); fence retained", row.get::<_, i32>("pid"));
-            }
-        }
-        maintenance.query(sql::TERMINATE_APP_SESSIONS_SQL, &[&database, &rec.slot]).await?;
-        let deadline = tokio::time::Instant::now() + FENCE_DRAIN_TIMEOUT;
-        loop {
-            let rows = maintenance.query(sql::FENCE_ACTIVITY_SQL, &[&database, &rec.slot]).await?;
-            let remaining = rows.iter().filter(|r| !r.get::<_, bool>("is_expected_sender")).count();
-            if remaining == 0 { break; }
-            if tokio::time::Instant::now() >= deadline {
-                bail!("{remaining} application session(s) did not exit within 30s; fence retained");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        reg.replication().set_fence(database, "barrier", "sessions drained; capturing fixed WAL insert barrier", &vm_id, "")?;
-        maintenance.batch_execute("SET synchronous_commit = on").await?;
-        let barrier: String = maintenance.query_one("SELECT pg_current_wal_insert_lsn()::text", &[]).await?.get(0);
-        maintenance.batch_execute("CHECKPOINT").await.context("checkpointing fixed WAL barrier")?;
-        let flushed: bool = maintenance.query_one(
-            "SELECT pg_current_wal_flush_lsn() >= $1::pg_lsn", &[&barrier]
+    if let Some(f) = &rec.fence && f.phase == "ready" {
+        let bound = reg.schema_record(database).context("ready fence lost its VM binding")?;
+        if bound.sandbox_id != f.vm_id || f.barrier_lsn.is_empty() { bail!("ready fence identity/barrier mismatch"); }
+        let (_guard, maintenance) = reg.maintenance_client(database).await?;
+        let closed: bool = maintenance.query_one(
+            "SELECT NOT datallowconn FROM pg_database WHERE datname = $1", &[&database]
         ).await?.get(0);
-        if !flushed { bail!("WAL flush did not reach fixed barrier {barrier}; fence retained"); }
-        Ok((vm_id, barrier))
-    }.await;
+        if !closed { bail!("ready fence database admission is open; barrier is not valid"); }
+        return Ok(wire::FenceResponse { record: (&rec).into(), database: database.into(), vm_id: f.vm_id.clone(), barrier_lsn: f.barrier_lsn.clone() });
+    }
+    let (guard, mut maintenance) = if rec.fence.is_some() {
+        reg.maintenance_client(database).await?
+    } else {
+        let guard = reg.checkout(database).await?;
+        let client = guard.entry().pool.get().await?;
+        (guard, client)
+    };
+    let vm_id = guard.entry().sandbox.sandbox_id().to_string();
+    if let Some(f) = &rec.fence && !f.vm_id.is_empty() && f.vm_id != vm_id {
+        bail!("fence retry reached a different VM; refusing moving barrier");
+    }
+    reg.replication().set_fence(database, "intent", "fence requested; database state not yet verified", &vm_id, "")?;
+
+    let result = fence_postgres(&mut maintenance, database, &rec.slot, |phase, message| {
+        reg.replication().set_fence(database, phase, message, &vm_id, "")
+    }).await;
 
     match result {
-        Ok((vm_id, barrier)) => {
+        Ok(barrier) => {
             reg.replication().set_fence(database, "ready", "source fenced and fixed WAL barrier flushed", &vm_id, &barrier)?;
             let rec = reg.replication().get(database).unwrap_or(rec);
             Ok(wire::FenceResponse { record: (&rec).into(), database: database.into(), vm_id, barrier_lsn: barrier })
@@ -566,10 +545,85 @@ pub async fn fence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::Fe
     }
 }
 
+/// PostgreSQL's admission/drain/barrier protocol, separate from VM resolution
+/// so the production protocol can be exercised against a disposable server.
+async fn fence_postgres(
+    maintenance: &mut tokio_postgres::Client,
+    database: &str,
+    slot: &str,
+    progress: impl Fn(&str, &str) -> Result<()>,
+) -> Result<String> {
+        progress("closing_admission", "durably closing admission")?;
+
+        // synchronous_commit=on overrides the guest's source tuning. ALTER
+        // DATABASE takes no target database-object lock; the explicit holder
+        // wait below supplies the startup admission barrier.
+        let tx = maintenance.transaction().await.context("starting durable fence transaction")?;
+        tx.batch_execute("SET LOCAL synchronous_commit = on").await?;
+        tx.batch_execute(&sql::set_allow_connections(database, false)).await?;
+        tx.commit().await.context("durably committing ALLOW_CONNECTIONS false")?;
+        progress("draining_startups", "waiting for pre-existing startup locks")?;
+        let deadline = tokio::time::Instant::now() + FENCE_DRAIN_TIMEOUT;
+        loop {
+            let holders = maintenance.query(sql::DATABASE_OBJECT_LOCKS_SQL, &[&database]).await?;
+            if holders.is_empty() { break; }
+            if tokio::time::Instant::now() >= deadline { bail!("{} startup lock holder(s) did not finish within 30s; fence retained", holders.len()); }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        progress("draining", "startup admission quiesced; draining fresh activity snapshot")?;
+
+        let prepared: i64 = maintenance.query_one(sql::PREPARED_XACTS_SQL, &[&database]).await?.get(0);
+        if prepared != 0 {
+            bail!("database has {prepared} prepared transaction(s); fence retained; resolve them explicitly before retrying");
+        }
+
+        // Reject background workers rather than killing something whose write
+        // semantics are unknown. Client backends are application sessions and
+        // are terminated; the exact slot's active logical walsender survives.
+        let rows = maintenance.query(sql::FENCE_ACTIVITY_SQL, &[&database, &slot]).await?;
+        for row in &rows {
+            let backend: &str = row.get("backend_type");
+            let expected: bool = row.get("is_expected_sender");
+            if backend != "client backend" && !expected {
+                bail!("unexpected database worker pid {} ({backend}); fence retained", row.get::<_, i32>("pid"));
+            }
+        }
+        maintenance.query(sql::TERMINATE_APP_SESSIONS_SQL, &[&database, &slot]).await?;
+        let deadline = tokio::time::Instant::now() + FENCE_DRAIN_TIMEOUT;
+        loop {
+            let rows = maintenance.query(sql::FENCE_ACTIVITY_SQL, &[&database, &slot]).await?;
+            let remaining = rows.iter().filter(|r| !r.get::<_, bool>("is_expected_sender")).count();
+            if remaining == 0 { break; }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("{remaining} application session(s) did not exit within 30s; fence retained");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // A transaction may have prepared after the first check but before
+        // termination. Prepared transactions survive the originating backend.
+        let prepared: i64 = maintenance.query_one(sql::PREPARED_XACTS_SQL, &[&database]).await?.get(0);
+        if prepared != 0 { bail!("database has {prepared} prepared transaction(s) after drain; fence retained"); }
+        progress("barrier", "sessions drained; capturing fixed WAL insert barrier")?;
+        maintenance.batch_execute("SET synchronous_commit = on").await?;
+        let barrier: String = maintenance.query_one("SELECT pg_current_wal_insert_lsn()::text", &[]).await?.get(0);
+        maintenance.batch_execute("CHECKPOINT").await.context("checkpointing fixed WAL barrier")?;
+        let flushed: bool = maintenance.query_one(
+            "SELECT pg_current_wal_flush_lsn() >= $1::text::pg_lsn", &[&barrier]
+        ).await?.get(0);
+        if !flushed { bail!("WAL flush did not reach fixed barrier {barrier}; fence retained"); }
+        Ok(barrier)
+}
+
 pub async fn unfence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
+    let _operation = reg.replication_operation(database).await;
     let rec = reg.replication().get(database).with_context(|| format!("{database} is not replicating"))?;
     if rec.fence.is_none() { bail!("{database} is not fenced"); }
     let (_guard, maintenance) = reg.maintenance_client(database).await?;
+    let f = rec.fence.as_ref().unwrap();
+    // Invalidate a ready barrier durably before reopening admission. A crash
+    // or failed clear must never leave an open database marked ready-fenced.
+    reg.replication().set_fence(database, "unfencing", "operator requested admission reopen; prior barrier invalid", &f.vm_id, "")?;
     maintenance.batch_execute("SET synchronous_commit = on").await?;
     maintenance.batch_execute(&sql::set_allow_connections(database, true)).await
         .context("durably restoring database admission")?;
@@ -580,6 +634,7 @@ pub async fn unfence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
 /// Cut a replica loose: stop applying, drop the subscription, and re-seed the
 /// sequences logical replication never carried.
 pub async fn promote(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::PromoteResponse> {
+    let _operation = reg.replication_operation(database).await;
     let rcfg = cfg(reg)?;
     let rec = reg
         .replication()
@@ -637,6 +692,7 @@ pub async fn promote(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::
 /// `max_slot_wal_keep_size` invalidates it. On a replica it is the same work
 /// as a promote minus the sequence re-seed.
 pub async fn detach(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::DetachResponse> {
+    let _operation = reg.replication_operation(database).await;
     let rcfg = cfg(reg)?;
     let rec = reg
         .replication()
@@ -715,6 +771,7 @@ pub async fn detach(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::D
 /// Logical replication publishes new tables automatically but the subscriber
 /// only notices on a refresh — and the table still has to exist here.
 pub async fn refresh(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
+    let _operation = reg.replication_operation(database).await;
     let rec = reg
         .replication()
         .get(database)
@@ -733,7 +790,12 @@ pub async fn local_status(
     reg: &Arc<SchemaRegistry>,
     rec: &ReplRecord,
 ) -> Result<(Option<wire::PrimaryStatus>, Option<wire::ReplicaStatus>)> {
-    let (_guard, db) = reg.db_client(&rec.database).await?;
+    let (_guard, db) = if rec.fence.is_some() && rec.role == Role::Primary {
+        // Slot feedback is cluster-wide; tenant admission is deliberately shut.
+        reg.maintenance_client(&rec.database).await?
+    } else {
+        reg.db_client(&rec.database).await?
+    };
     match rec.role {
         Role::Primary => {
             let row = db

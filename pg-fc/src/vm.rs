@@ -716,6 +716,22 @@ pub async fn ensure_vm(
     result
 }
 
+/// Reattach only to an already-bound fenced VM. Never creates/restores a
+/// sandbox or database and never opens the tenant database for grants.
+pub async fn ensure_fenced_vm(cfg: &Config, schema: &str, sandbox_id: &str) -> Result<Arc<SchemaEntry>> {
+    let sandbox = Sandbox::connect(sandbox_id.to_string(), local_opts())?;
+    sandbox.set_ttl(0).await.context("pinning fenced VM")?;
+    let name = format!("pg-{schema}");
+    let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
+    let client = pool.get().await.context("connecting to fenced VM maintenance database")?;
+    if client.query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&schema]).await?.is_none() {
+        bail!("fenced database {schema} is missing from VM {sandbox_id}");
+    }
+    drop(client);
+    let slots = client_slot_budget(&pool, &name).await;
+    Ok(Arc::new(SchemaEntry::new(sandbox, target, tunnel, pool, true, slots, Duration::ZERO)))
+}
+
 /// Validity window for a presigned S3 URL handed to the guest. Generous enough
 /// to cover a slow upload/download of a large dump, short enough that a URL that
 /// leaks (e.g. into a guest shell-history) expires quickly.

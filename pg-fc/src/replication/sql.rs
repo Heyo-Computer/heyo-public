@@ -117,11 +117,13 @@ pub fn set_allow_connections(database: &str, allow: bool) -> String {
     )
 }
 
-/// Run from `postgres`. The ALTER's database-object lock is the admission
-/// barrier: it waits behind startup processes already holding the object lock;
-/// only after its durable commit may the caller perform a fresh activity
-/// sweep. That closes the startup-vs-pg_stat_activity race without sleeping.
 pub const PREPARED_XACTS_SQL: &str = "SELECT count(*)::int8 FROM pg_prepared_xacts WHERE database = $1";
+
+pub const DATABASE_OBJECT_LOCKS_SQL: &str = "\
+SELECT l.pid FROM pg_locks l
+WHERE l.locktype = 'object' AND l.classid = 'pg_database'::regclass
+  AND l.objid = (SELECT oid FROM pg_database WHERE datname = $1)
+  AND l.granted AND l.pid IS NOT NULL";
 
 /// Preserve only our positively identified logical sender (the active pid of
 /// this pairing's exact slot). Everything else is classified by the caller.
@@ -137,6 +139,7 @@ SELECT pg_terminate_backend(a.pid)
 FROM pg_stat_activity a
 LEFT JOIN pg_replication_slots s ON s.slot_name = $2
 WHERE a.datname = $1 AND a.pid <> pg_backend_pid()
+  AND a.backend_type = 'client backend'
   AND NOT (a.backend_type = 'walsender' AND a.pid = s.active_pid)";
 
 // --- primary side -----------------------------------------------------------
@@ -441,6 +444,14 @@ mod tests {
         let s = drop_slot_if_inactive("pgfc_acme_node_b");
         assert!(s.contains("NOT s.active"), "{s}");
         assert!(s.contains("'pgfc_acme_node_b'"), "{s}");
+    }
+
+    #[test]
+    fn fence_uses_the_startup_object_lock_and_only_terminates_clients() {
+        assert!(DATABASE_OBJECT_LOCKS_SQL.contains("'pg_database'::regclass"));
+        assert!(DATABASE_OBJECT_LOCKS_SQL.contains("l.granted"));
+        assert!(TERMINATE_APP_SESSIONS_SQL.contains("backend_type = 'client backend'"));
+        assert!(FENCE_ACTIVITY_SQL.contains("s.active_pid"));
     }
 
     #[test]

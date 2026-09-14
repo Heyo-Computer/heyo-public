@@ -289,12 +289,12 @@ impl ReplStore {
                 rec.repl_role
             );
         }
-        let snapshot = {
+        {
             let mut map = self.by_database.lock().unwrap();
             // A finished or failed pairing may be replaced; a live one may not
             // — re-pairing a streaming database would silently orphan its slot.
             if let Some(old) = map.get(&rec.database)
-                && !old.state.is_terminal()
+                && (!old.state.is_terminal() || old.fence.is_some())
             {
                 bail!(
                     "database {:?} is already replicating ({} with peer {:?}); \
@@ -317,14 +317,11 @@ impl ReplStore {
                     other.database
                 );
             }
-            map.insert(rec.database.clone(), rec.clone());
-            serialize(&map)
-        };
-        if let Err(e) = write_atomic(&self.path, &snapshot) {
-            self.by_database.lock().unwrap().remove(&rec.database);
-            return Err(e).with_context(|| {
-                format!("persisting replication records to {}", self.path.display())
-            });
+            let old = map.insert(rec.database.clone(), rec.clone());
+            if let Err(e) = write_atomic(&self.path, &serialize(&map)) {
+                if let Some(old) = old { map.insert(rec.database.clone(), old); } else { map.remove(&rec.database); }
+                return Err(e).with_context(|| format!("persisting replication records to {}", self.path.display()));
+            }
         }
         info!(
             "replication: recorded {} as {} with peer {}",
@@ -338,8 +335,9 @@ impl ReplStore {
     /// Advance a record's state and persist. `message` is sanitized to one
     /// printable line.
     pub fn set_state(&self, database: &str, state: State, message: &str) -> Result<()> {
-        let snapshot = {
-            let mut map = self.by_database.lock().unwrap();
+        let mut map = self.by_database.lock().unwrap();
+        let old = map.get(database).cloned().with_context(|| format!("no replication record for database {database:?}"))?;
+        {
             let Some(rec) = map.get_mut(database) else {
                 bail!("no replication record for database {database:?}");
             };
@@ -349,10 +347,9 @@ impl ReplStore {
             rec.state = state;
             rec.message = one_line(message);
             rec.updated_at = now_unix();
-            serialize(&map)
-        };
-        write_atomic(&self.path, &snapshot)
-            .with_context(|| format!("persisting replication records to {}", self.path.display()))
+        }
+        if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
+        Ok(())
     }
 
     /// Persist fence intent/progress before the corresponding database side
@@ -365,8 +362,9 @@ impl ReplStore {
         vm_id: &str,
         barrier_lsn: &str,
     ) -> Result<()> {
-        let snapshot = {
-            let mut map = self.by_database.lock().unwrap();
+        let mut map = self.by_database.lock().unwrap();
+        let old = map.get(database).cloned().with_context(|| format!("no replication record for database {database:?}"))?;
+        {
             let Some(rec) = map.get_mut(database) else {
                 bail!("no replication record for database {database:?}");
             };
@@ -381,24 +379,23 @@ impl ReplStore {
                 updated_at: now,
             });
             rec.updated_at = now;
-            serialize(&map)
-        };
-        write_atomic(&self.path, &snapshot)
-            .with_context(|| format!("persisting replication records to {}", self.path.display()))
+        }
+        if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
+        Ok(())
     }
 
     pub fn clear_fence(&self, database: &str) -> Result<()> {
-        let snapshot = {
-            let mut map = self.by_database.lock().unwrap();
+        let mut map = self.by_database.lock().unwrap();
+        let old = map.get(database).cloned().with_context(|| format!("no replication record for database {database:?}"))?;
+        {
             let Some(rec) = map.get_mut(database) else {
                 bail!("no replication record for database {database:?}");
             };
             rec.fence = None;
             rec.updated_at = now_unix();
-            serialize(&map)
-        };
-        write_atomic(&self.path, &snapshot)
-            .with_context(|| format!("persisting replication records to {}", self.path.display()))
+        }
+        if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
+        Ok(())
     }
 
     pub fn is_fenced(&self, database: &str) -> bool {
@@ -408,16 +405,10 @@ impl ReplStore {
     /// Forget a pairing entirely. The Postgres objects are the caller's
     /// problem — this only drops the bookkeeping.
     pub fn remove(&self, database: &str) -> Result<bool> {
-        let snapshot = {
-            let mut map = self.by_database.lock().unwrap();
-            if map.remove(database).is_none() {
-                return Ok(false);
-            }
-            serialize(&map)
-        };
-        write_atomic(&self.path, &snapshot).with_context(|| {
-            format!("persisting replication records to {}", self.path.display())
-        })?;
+        let mut map = self.by_database.lock().unwrap();
+        if map.get(database).is_some_and(|r| r.fence.is_some()) { bail!("{database} is fenced; explicitly unfence before removal"); }
+        let Some(old) = map.remove(database) else { return Ok(false); };
+        if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
         info!("replication: removed the record for {database}");
         Ok(true)
     }
@@ -590,6 +581,9 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))
         .with_context(|| format!("tightening permissions on {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::File::open(parent)?.sync_all()
+        .with_context(|| format!("syncing replication record directory {}", parent.display()))?;
     Ok(())
 }
 
@@ -652,6 +646,35 @@ mod tests {
         assert_eq!(reloaded.get("acme").unwrap().fence.unwrap().barrier_lsn, "0/CAFE");
         reloaded.clear_fence("acme").unwrap();
         assert!(!reloaded.is_fenced("acme"));
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn failed_fence_clear_keeps_memory_and_disk_fenced() {
+        let s = store();
+        s.create(rec("acme", Role::Primary), &free).unwrap();
+        s.set_fence("acme", "ready", "flushed", "vm-7", "0/CAFE").unwrap();
+        let expected = s.get("acme").unwrap().fence;
+        // Force the atomic replacement's temporary-file open to fail without
+        // relying on permissions (which root test runners can bypass).
+        let temporary = s.path.with_extension("tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        assert!(s.clear_fence("acme").is_err());
+        assert_eq!(s.get("acme").unwrap().fence, expected);
+        assert_eq!(ReplStore::load(s.path.clone()).get("acme").unwrap().fence, expected);
+        std::fs::remove_dir(temporary).unwrap();
+        std::fs::remove_file(&s.path).unwrap();
+    }
+
+    #[test]
+    fn a_fenced_terminal_record_cannot_be_recreated_or_removed() {
+        let s = store();
+        s.create(rec("acme", Role::Primary), &free).unwrap();
+        s.set_state("acme", State::Detached, "done").unwrap();
+        s.set_fence("acme", "error", "operator action required", "vm-7", "").unwrap();
+        assert!(s.create(rec("acme", Role::Replica), &free).is_err());
+        assert!(s.remove("acme").is_err());
+        assert_eq!(s.get("acme").unwrap().role, Role::Primary);
         let _ = std::fs::remove_file(&s.path);
     }
 

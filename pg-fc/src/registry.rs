@@ -599,6 +599,7 @@ pub struct SchemaRegistry {
     // replicating VM off the idle reaper and the offload ladder — see
     // [`Self::pinned`].
     replication: Arc<crate::replication::ReplStore>,
+    replication_ops: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SchemaRegistry {
@@ -640,6 +641,7 @@ impl SchemaRegistry {
             dedicated,
             peers,
             replication,
+            replication_ops: StdMutex::new(HashMap::new()),
             repl_status: StdMutex::new(HashMap::new()),
             repl_inactive: StdMutex::new(HashMap::new()),
         }
@@ -653,6 +655,12 @@ impl SchemaRegistry {
     /// The replication pairings this node is part of.
     pub fn replication(&self) -> &Arc<crate::replication::ReplStore> {
         &self.replication
+    }
+
+    pub async fn replication_operation(&self, database: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self.replication_ops.lock().unwrap().entry(database.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
+        lock.lock_owned().await
     }
 
     /// Whether replication is enabled on this node (`PG_VM_POOL_REPLICATION`).
@@ -691,6 +699,9 @@ impl SchemaRegistry {
     /// Why `schema` is pinned, for a dashboard refusal that tells the operator
     /// what to do about it. `None` when it isn't.
     pub fn pin_reason(&self, schema: &str) -> Option<String> {
+        if self.replication.is_fenced(schema) {
+            return Some(format!("{schema} is fenced for a planned switchover; explicitly unfence it first"));
+        }
         if let Some(rec) = self.replication.get(schema).filter(|r| r.state.pins()) {
             return Some(format!(
                 "{schema} is replicating ({} with peer {}); detach or promote it first",
@@ -841,10 +852,25 @@ impl SchemaRegistry {
     /// publicly routable by database name and remains usable while the tenant
     /// database has `ALLOW_CONNECTIONS false`.
     pub async fn maintenance_client(
-        self: &Arc<Self>,
+        &self,
         schema: &str,
     ) -> Result<(ConnGuard, deadpool_postgres::Object)> {
-        let guard = self.checkout(schema).await?;
+        let fence = self.replication.get(schema).and_then(|r| r.fence)
+            .with_context(|| format!("refusing maintenance bypass for unfenced database {schema}"))?;
+        let record = self.store.record(schema)
+            .with_context(|| format!("fenced database {schema} has no durable VM binding"))?;
+        if record.tier != Tier::Live { bail!("fenced database {schema} is not on a live VM"); }
+        if !fence.vm_id.is_empty() && fence.vm_id != record.sandbox_id {
+            bail!("fenced database {schema} VM identity changed");
+        }
+        let cell = self.entries.lock().await.entry(schema.to_string())
+            .or_insert_with(|| Arc::new(OnceCell::new())).clone();
+        if let Some(entry) = cell.get() && entry.sandbox_id() != record.sandbox_id {
+            bail!("warm VM identity differs from the durable fenced VM binding");
+        }
+        let entry = cell.get_or_try_init(|| vm::ensure_fenced_vm(&self.cfg, schema, &record.sandbox_id)).await?;
+        let guard = ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await
+            .with_context(|| format!("maintenance connection slots exhausted for {schema}"))?;
         let client = guard
             .entry()
             .pool
@@ -1367,6 +1393,11 @@ impl SchemaRegistry {
     /// The returned guard keeps the VM off the reaper's radar until dropped.
     /// Concurrent callers for the same schema share one bring-up.
     pub async fn checkout(&self, schema: &str) -> Result<ConnGuard> {
+        if self.replication.is_fenced(schema) {
+            // Status polling and startup warming must not take the normal
+            // restore/grant path for a fenced database either.
+            return self.maintenance_client(schema).await.map(|(guard, _)| guard);
+        }
         self.checkout_inner(schema, None).await
     }
 

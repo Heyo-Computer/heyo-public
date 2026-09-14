@@ -902,3 +902,69 @@ async fn listing_cost_tracks_fleet_size() {
         "listing 1000 VMs ({large}B) must cost far more than listing 10 ({small}B)"
     );
 }
+
+/// Real PostgreSQL plus the existing daemon stand-in: exercises controller
+/// recovery without giving the test permission to recreate a database VM.
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 18 on 127.0.0.1:5432 via PG_FC_FENCE_TEST_URL"]
+async fn postgres_fence_controller_restart_recovers_without_tenant_bringup() {
+    use crate::replication::{ReplRecord, Role, State as ReplState, orchestrate};
+    let _exclusive = exclusive().await;
+    let url = std::env::var("PG_FC_FENCE_TEST_URL").expect("disposable PostgreSQL URL required");
+    let pg: tokio_postgres::Config = url.parse().unwrap();
+    assert_eq!(pg.get_ports(), &[5432], "the daemon stand-in exposes guest PostgreSQL on port 5432");
+    assert_eq!(pg.get_dbname(), Some("postgres"));
+    let (maintenance, connection) = pg.connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move { let _ = connection.await; });
+    let database = format!("fence_recovery_{}", std::process::id());
+    maintenance.batch_execute(&format!("CREATE DATABASE {database}")).await.unwrap();
+
+    let mut cfg = config_for(0, 0);
+    cfg.pg_user = pg.get_user().unwrap().to_string();
+    cfg.pg_password = pg.get_password().map(|p| String::from_utf8(p.to_vec()).unwrap());
+    cfg.direct_connect = true;
+    let vm_id = "sb-fenced-recovery";
+    daemon().seed(0);
+    daemon().vms.lock().unwrap().insert(vm_id.into(), Vm {
+        id: vm_id.into(), name: format!("pg-{database}"), running: true,
+    });
+    crate::store::Store::load(cfg.state_file.clone()).put(&database, vm_id);
+    let registry = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()));
+    registry.replication().create(ReplRecord::new(&database, Role::Primary, "test-peer", "test-password"), &|_| false).unwrap();
+    registry.replication().set_state(&database, ReplState::Active, "test").unwrap();
+    registry.replication().set_fence(&database, "intent", "simulate controller crash after admission close", vm_id, "").unwrap();
+    maintenance.batch_execute(&crate::replication::sql::set_allow_connections(&database, false)).await.unwrap();
+    drop(registry);
+
+    // Fresh registry, no warm entries. Normal tenant bring-up would attempt
+    // per-database grants and fail because that database refuses connections.
+    daemon().metrics.reset();
+    let registry = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()));
+    let result = orchestrate::fence(&registry, &database).await.unwrap();
+    assert_eq!(result.vm_id, vm_id);
+    let again = orchestrate::fence(&registry, &database).await.unwrap();
+    assert_eq!(again.barrier_lsn, result.barrier_lsn, "retry moved the ready barrier");
+    let _warm = registry.checkout(&database).await.unwrap();
+    let rec = registry.replication().get(&database).unwrap();
+    orchestrate::local_status(&registry, &rec).await.unwrap();
+    assert!(registry.pin_reason(&database).unwrap().contains("fenced"));
+
+    let operation = registry.replication_operation(&database).await;
+    let other = registry.clone();
+    let name = database.clone();
+    let mut unfence = tokio::spawn(async move { orchestrate::unfence(&other, &name).await });
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut unfence).await.is_err(), "unfence bypassed the operation lock");
+    let closed: bool = maintenance.query_one("SELECT NOT datallowconn FROM pg_database WHERE datname=$1", &[&database]).await.unwrap().get(0);
+    assert!(closed);
+    drop(operation);
+    unfence.await.unwrap().unwrap();
+    assert!(!registry.replication().is_fenced(&database));
+    let reopened: bool = maintenance.query_one("SELECT datallowconn FROM pg_database WHERE datname=$1", &[&database]).await.unwrap().get(0);
+    assert!(reopened);
+    assert_eq!(daemon().metrics.calls.lock().unwrap().get("POST /sandbox-deploy").copied().unwrap_or(0), 0, "recovery recreated its source VM");
+    drop(_warm);
+    drop(registry);
+    maintenance.batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)")).await.unwrap();
+    std::fs::remove_file(cfg.state_file).unwrap();
+    std::fs::remove_file(cfg.replication_file).unwrap();
+}

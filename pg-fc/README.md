@@ -1170,9 +1170,10 @@ curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication/acme/unfence
 `fence` is valid only on a replication primary. It durably records intent,
 then uses that VM's private `postgres` maintenance connection to commit
 `ALTER DATABASE acme ALLOW_CONNECTIONS false` with `synchronous_commit=on`.
-The database-object lock serializes with already-admitted startup processes;
-after it commits, pg-fc freshly classifies and terminates application sessions
-and waits for their actual exit. It rejects prepared transactions and unknown
+ALTER does not lock out already-admitted startup processes. After its commit,
+pg-fc explicitly waits for target database-object lock holders to finish startup,
+then freshly classifies and terminates application sessions and waits for their
+actual exit. It rejects prepared transactions before and after drain and unknown
 database workers, preserving only the walsender positively identified by this
 pairing's slot. It then captures one fixed `pg_current_wal_insert_lsn()`, runs
 `CHECKPOINT`, and verifies `pg_current_wal_flush_lsn()` reached that barrier.
@@ -1184,11 +1185,22 @@ Any failure leaves the durable fence in phase `error`; it never auto-unfences.
 Because PostgreSQL's database fence is intentionally nonselective, logical
 replication may disconnect and cannot reconnect while fenced. That is an
 abort/unfence/retry condition, not permission to reopen the source for
-catch-up. `unfence` explicitly restores `ALLOW_CONNECTIONS true` through the
-maintenance database with synchronous commit, then clears the durable intent.
+catch-up. `unfence` durably invalidates any ready barrier, explicitly restores
+`ALLOW_CONNECTIONS true` through the maintenance database with synchronous
+commit, then clears the durable intent.
 Neither endpoint promotes a replica, drops replication objects, or authorizes
 target writes. The barrier is local source durability evidence only; a later
 coordinator must prove the replica applied that exact LSN before handoff.
+
+Run the PostgreSQL protocol regressions against a disposable PostgreSQL 18
+server with `wal_level=logical`, `max_prepared_transactions > 0`, and
+`synchronous_commit=off`. Install `pg_recvlogical` for the sender test. The
+controller-recovery test uses the mock daemon's fixed guest port, so run the
+disposable server on `127.0.0.1:5432` to include it:
+
+```sh
+PG_FC_FENCE_TEST_URL=postgres://postgres:password@127.0.0.1:5432/postgres cargo test --locked --manifest-path pg-fc/Cargo.toml postgres_fence -- --ignored --nocapture
+```
 
 What that does, in order — each step durable before the thing it describes
 exists, so a crash leaves a retryable row rather than an object nothing names:
