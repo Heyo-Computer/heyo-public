@@ -101,6 +101,12 @@ pub struct PhysicalRecordJson {
     pub candidate_id: Option<String>,
     pub previous_vm_id: Option<String>,
     pub source_vm_id: String,
+    #[serde(default)]
+    pub source_node: String,
+    #[serde(default)]
+    pub system_identifier: String,
+    #[serde(default)]
+    pub pg_major: u32,
     pub last_error: Option<String>,
 }
 
@@ -108,6 +114,7 @@ impl From<&crate::replication::PhysicalRecord> for PhysicalRecordJson {
     fn from(r: &crate::replication::PhysicalRecord) -> Self { Self {
         database: r.database.clone(), generation: r.generation.clone(), phase: format!("{:?}", r.phase).to_lowercase(),
         candidate_id: r.candidate_id.clone(), previous_vm_id: r.previous_vm_id.clone(), source_vm_id: r.source_vm_id.clone(), last_error: r.last_error.clone(),
+        source_node: r.source_node.clone(), system_identifier: r.system_identifier.clone(), pg_major: r.pg_major,
     }}
 }
 
@@ -364,6 +371,28 @@ mod tests {
             serde_json::from_str(r#"{"node":"b","replication_enabled":true}"#).unwrap();
         assert!(!n.tls, "unknown means do not assume TLS");
         assert_eq!(n.server_version_num, None);
+    }
+
+    #[test]
+    fn physical_status_supplies_handoff_identity_without_credentials() {
+        let record = crate::replication::PhysicalRecord {
+            database: "acme".into(), generation: "g1".into(), predecessor: None,
+            candidate_name: "repl-seed-g1".into(), candidate_id: Some("candidate-e1".into()),
+            previous_vm_id: Some("old-e0".into()), source_node: "us3".into(), source_vm_id: "source-u0".into(),
+            system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(),
+            phase: crate::replication::PhysicalPhase::Verified, handoff_barrier: None, last_error: None,
+            repl: Some(Login { role: "repl_acme".into(), password: "not-for-status".into() }),
+        };
+        let mut value = serde_json::to_value(PhysicalRecordJson::from(&record)).unwrap();
+        assert!(!value.to_string().contains("not-for-status"));
+        assert!(!value.to_string().contains("repl_acme"));
+        value["barrier_lsn"] = "0/0".into();
+        let request: PhysicalHandoffRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(request.source_node, "us3");
+        assert_eq!(request.source_vm_id, "source-u0");
+        assert_eq!(request.candidate_id, "candidate-e1");
+        assert_eq!(request.system_identifier, "7431234567890123456");
+        assert_eq!(request.pg_major, 18);
     }
 
     /// Both passwords cross the wire in this one struct; neither may reach a

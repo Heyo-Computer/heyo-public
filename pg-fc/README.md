@@ -1153,7 +1153,9 @@ separate controller operation described below.
 
 POST `/api/replication/<database>/physical-handoff` on the source with the
 exact generation, candidate ID, source node/VM, system identifier, PostgreSQL
-major, and an initially informational `barrier_lsn`. The controller re-reads
+major, and an initially informational `barrier_lsn` (use `0/0`). Obtain the
+identity fields from GET `/api/replication/<database>/physical` on the candidate
+region; the response includes no replication credentials. The controller re-reads
 the candidate from the trusted peer, fences and drains the exact source VM,
 captures the authoritative flushed WAL barrier, then durably and irrevocably
 authorizes only that peer/candidate/generation/barrier. Ordinary unfence is
