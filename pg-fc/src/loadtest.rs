@@ -1044,6 +1044,63 @@ async fn physical_replication_startup_uses_authenticated_vm_and_its_fence() {
 }
 
 #[tokio::test]
+async fn physical_handoff_restart_admission_and_source_grant_are_fail_closed() {
+    use crate::replication::{PhysicalRecord, PhysicalPhase as P, PhysicalSourceRecord, PhysicalHandoffGrant, ReplRecord, Role};
+    let _exclusive = exclusive().await;
+    let mut cfg = config_for(0, 0);
+    let dir = cfg.state_file.parent().unwrap().join("handoff-admission");
+    std::fs::create_dir_all(&dir).unwrap();
+    cfg.state_file = dir.join("registry.tsv");
+    cfg.replication_file = dir.join("replication.tsv");
+    std::fs::write(&cfg.state_file, "acme\tsb-old\t0\tlive\nsource\tsb-source\t0\tlive\n").unwrap();
+    let mut reg = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap());
+    reg.physical().create(PhysicalRecord { database: "acme".into(), generation: "g1".into(),
+        candidate_name: PhysicalRecord::candidate_name("g1"), candidate_id: None,
+        previous_vm_id: Some("sb-old".into()), source_node: "us3".into(), source_vm_id: "sb-source".into(),
+        system_identifier: "123456".into(), pg_major: 18, slot: "physical_acme".into(),
+        phase: P::Intent, handoff_barrier: None, last_error: None }).unwrap();
+    for (from, to, id) in [(P::Intent, P::Creating, None), (P::Creating, P::Candidate, Some("sb-candidate".into())),
+        (P::Candidate, P::Seeding, None), (P::Seeding, P::Verified, None)] {
+        assert!(reg.physical_admission_ready("acme"), "preparation must preserve the old serving database");
+        reg.physical().advance("acme", "g1", from, to, id).unwrap();
+    }
+    reg.physical().begin_handoff("acme", "g1", "0/ABC").unwrap();
+    for (from, to) in [(P::Prepared, P::Promoting), (P::Promoting, P::Promoted), (P::Promoted, P::Binding)] {
+        reg = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap());
+        assert!(!reg.physical_admission_ready("acme"));
+        assert!(reg.checkout("acme").await.err().unwrap().to_string().contains("incomplete"));
+        reg.physical().advance("acme", "g1", from, to, None).unwrap();
+    }
+    reg.commit_physical_binding("acme", "sb-old", "sb-candidate").await.unwrap();
+    reg = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap());
+    assert!(!reg.physical_admission_ready("acme"), "a persisted binding alone must not open admission");
+    reg.physical().advance("acme", "g1", P::Binding, P::Activated, None).unwrap();
+    reg = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap());
+    assert!(reg.physical_admission_ready("acme"));
+    reg.commit_physical_binding("acme", "sb-candidate", "sb-wrong").await.unwrap();
+    assert!(!reg.physical_admission_ready("acme"));
+    assert!(reg.checkout("acme").await.err().unwrap().to_string().contains("mismatch"));
+
+    let logical = ReplRecord::new("source", Role::Primary, "eu1", "test-password");
+    reg.replication().create(logical.clone(), &|_| false).unwrap();
+    reg.physical_sources().create(PhysicalSourceRecord { database: "source".into(), generation: "g2".into(),
+        source_vm_id: "sb-source".into(), system_identifier: "123456".into(), pg_major: 18,
+        slot: "physical_source".into(), source_lsn: "0/1".into(), peer: "eu1".into(), handoff: None, last_error: None }).unwrap();
+    assert!(!reg.physical_reconnect_allowed("source", &logical.repl_role));
+    reg.physical_sources().grant_handoff("source", "g2", PhysicalHandoffGrant {
+        candidate_id: "sb-destination".into(), peer: "eu1".into(), barrier_lsn: "0/ABC".into() }).unwrap();
+    reg = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap());
+    assert!(!reg.physical_admission_ready("source"));
+    assert!(reg.physical_reconnect_allowed("source", &logical.repl_role));
+    assert!(!reg.physical_reconnect_allowed("source", "tenant"));
+    assert!(!reg.physical_reconnect_allowed("acme", &logical.repl_role));
+    assert!(crate::replication::orchestrate::unfence(&reg, "source").await.unwrap_err().to_string().contains("irrevocably"));
+    assert!(reg.checkout("source").await.err().unwrap().to_string().contains("lost its fence"));
+    drop(reg);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn physical_candidate_unknown_create_never_duplicates() {
     let _exclusive = exclusive().await;
     let cfg = config_for(0, 0);

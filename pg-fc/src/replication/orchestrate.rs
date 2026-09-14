@@ -496,6 +496,11 @@ async fn build_replica(reg: &Arc<SchemaRegistry>, req: &wire::ProvisionReplica) 
 /// replication role and therefore is not promotion/failover.
 pub async fn fence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::FenceResponse> {
     let _operation = reg.replication_operation(database).await;
+    fence_locked(reg, database).await
+}
+
+/// Caller holds the database operation lock through any subsequent grant.
+pub(super) async fn fence_locked(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::FenceResponse> {
     let rec = reg.replication().get(database)
         .with_context(|| format!("{database} is not replicating"))?;
     if rec.role != Role::Primary {
@@ -769,6 +774,9 @@ async fn fence_postgres(
 
 pub async fn unfence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
     let _operation = reg.replication_operation(database).await;
+    if reg.physical_sources().get(database).is_some_and(|r| r.handoff.is_some()) {
+        bail!("physical handoff was irrevocably authorized; source admission can never be reopened");
+    }
     let rec = reg.replication().get(database).with_context(|| format!("{database} is not replicating"))?;
     if rec.fence.is_none() { bail!("{database} is not fenced"); }
     let (_guard, maintenance) = reg.maintenance_client(database).await?;

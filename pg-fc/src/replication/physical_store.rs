@@ -21,7 +21,19 @@ pub enum PhysicalPhase {
     Candidate,
     Seeding,
     Verified,
+    Prepared,
+    Promoting,
+    Promoted,
+    Binding,
     Activated,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalHandoffGrant {
+    pub candidate_id: String,
+    pub peer: String,
+    pub barrier_lsn: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -38,12 +50,18 @@ pub struct PhysicalRecord {
     pub pg_major: u32,
     pub slot: String,
     pub phase: PhysicalPhase,
+    #[serde(default)]
+    pub handoff_barrier: Option<String>,
     pub last_error: Option<String>,
 }
 
 impl PhysicalRecord {
     pub fn candidate_name(generation: &str) -> String {
         format!("repl-seed-{generation}")
+    }
+
+    pub fn handoff_started(&self) -> bool {
+        phase_number(self.phase) >= phase_number(PhysicalPhase::Prepared)
     }
 }
 
@@ -66,6 +84,8 @@ pub struct PhysicalSourceRecord {
     pub slot: String,
     pub source_lsn: String,
     pub peer: String,
+    #[serde(default)]
+    pub handoff: Option<PhysicalHandoffGrant>,
     pub last_error: Option<String>,
 }
 
@@ -115,6 +135,26 @@ impl PhysicalSourceStore {
         persist_values(&self.path, next.values())?;
         *records = next;
         Ok(record)
+    }
+
+    /// Irrevocably authorize one identity-bound promotion. Once persisted this
+    /// record is never cleared; a retry must present the identical grant.
+    pub fn grant_handoff(&self, database: &str, generation: &str, grant: PhysicalHandoffGrant) -> Result<PhysicalSourceRecord> {
+        validate_token("candidate VM ID", &grant.candidate_id, 128)?;
+        validate_token("peer", &grant.peer, 128)?;
+        validate_lsn(&grant.barrier_lsn)?;
+        let mut records = self.by_database.lock().unwrap();
+        let current = records.get(database).context("no physical source operation")?;
+        if current.generation != generation || current.peer != grant.peer { bail!("stale or mismatched physical handoff grant"); }
+        if let Some(existing) = &current.handoff {
+            if existing == &grant { return Ok(current.clone()); }
+            bail!("a different physical handoff is already irrevocably authorized");
+        }
+        let mut updated = current.clone(); updated.handoff = Some(grant);
+        let mut next = records.clone(); next.insert(database.into(), updated.clone());
+        persist_values(&self.path, next.values())?;
+        *records = next;
+        Ok(updated)
     }
 }
 
@@ -209,6 +249,28 @@ impl PhysicalStore {
         Ok(updated)
     }
 
+    /// Persist the peer-verified source grant before any guest promotion effect.
+    pub fn begin_handoff(&self, database: &str, generation: &str, barrier: &str) -> Result<PhysicalRecord> {
+        validate_lsn(barrier)?;
+        let mut records = self.by_database.lock().unwrap();
+        let current = records.get(database).context("no physical candidate")?;
+        if current.generation != generation { bail!("stale physical handoff generation"); }
+        if current.handoff_started() {
+            if current.handoff_barrier.as_deref() == Some(barrier) { return Ok(current.clone()); }
+            bail!("physical handoff barrier changed");
+        }
+        if current.phase != PhysicalPhase::Verified { bail!("physical candidate is not verified"); }
+        let mut updated = current.clone();
+        updated.handoff_barrier = Some(barrier.to_owned());
+        updated.phase = PhysicalPhase::Prepared;
+        validate_record(&updated)?;
+        let mut next = records.clone();
+        next.insert(database.to_owned(), updated.clone());
+        persist(&self.path, &next)?;
+        *records = next;
+        Ok(updated)
+    }
+
     pub fn set_error(&self, database: &str, generation: &str, error: Option<String>) -> Result<PhysicalRecord> {
         let mut records = self.by_database.lock().unwrap();
         let current = records.get(database).with_context(|| format!("no physical replication operation for database {database:?}"))?;
@@ -241,13 +303,22 @@ fn phase_number(phase: PhysicalPhase) -> u8 {
         PhysicalPhase::Candidate => 2,
         PhysicalPhase::Seeding => 3,
         PhysicalPhase::Verified => 4,
-        PhysicalPhase::Activated => 5,
+        PhysicalPhase::Prepared => 5,
+        PhysicalPhase::Promoting => 6,
+        PhysicalPhase::Promoted => 7,
+        PhysicalPhase::Binding => 8,
+        PhysicalPhase::Activated => 9,
     }
 }
 
 fn validate_record(record: &PhysicalRecord) -> Result<()> {
     validate_pg_identifier("database", &record.database)?;
     validate_generation(&record.generation)?;
+    if record.handoff_started() {
+        validate_lsn(record.handoff_barrier.as_deref().context("handoff phase requires durable source barrier")?)?;
+    } else if record.handoff_barrier.is_some() {
+        bail!("preparation cannot contain a handoff barrier");
+    }
     let derived = PhysicalRecord::candidate_name(&record.generation);
     if record.candidate_name != derived { bail!("candidate name must be derived from the generation"); }
     validate_token("source node", &record.source_node, 128)?;
@@ -280,7 +351,22 @@ fn validate_source(record: &PhysicalSourceRecord) -> Result<()> {
     validate_pg_identifier("replication slot", &record.slot)?;
     if record.system_identifier.is_empty() || record.system_identifier.len() > 20 || !record.system_identifier.bytes().all(|b| b.is_ascii_digit()) { bail!("PostgreSQL system identifier must be a numeric string"); }
     if record.pg_major == 0 || record.source_lsn.is_empty() || record.source_lsn.len() > 32 { bail!("invalid physical source identity"); }
+    if let Some(grant) = &record.handoff {
+        validate_token("candidate VM ID", &grant.candidate_id, 128)?;
+        validate_token("peer", &grant.peer, 128)?;
+        validate_lsn(&grant.barrier_lsn)?;
+        if grant.peer != record.peer { bail!("handoff peer differs from source owner"); }
+    }
     if let Some(error) = &record.last_error { validate_error(error)?; }
+    Ok(())
+}
+
+fn validate_lsn(value: &str) -> Result<()> {
+    let parts: Vec<_> = value.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|part| part.is_empty() || part.len() > 8
+        || !part.bytes().all(|b| b.is_ascii_hexdigit())) {
+        bail!("invalid WAL barrier LSN");
+    }
     Ok(())
 }
 
@@ -346,7 +432,12 @@ mod tests {
         std::env::temp_dir().join(format!("pgfc-physical-{label}-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
     }
     fn record(database: &str, generation: &str) -> PhysicalRecord {
-        PhysicalRecord { database: database.into(), generation: generation.into(), candidate_name: PhysicalRecord::candidate_name(generation), candidate_id: None, previous_vm_id: Some("logical-vm-1".into()), source_node: "eu2".into(), source_vm_id: "source-vm-1".into(), system_identifier: "7431234567890123456".into(), pg_major: 17, slot: "physical_acme".into(), phase: PhysicalPhase::Intent, last_error: None }
+        PhysicalRecord { database: database.into(), generation: generation.into(), candidate_name: PhysicalRecord::candidate_name(generation), candidate_id: None, previous_vm_id: Some("logical-vm-1".into()), source_node: "eu2".into(), source_vm_id: "source-vm-1".into(), system_identifier: "7431234567890123456".into(), pg_major: 17, slot: "physical_acme".into(), phase: PhysicalPhase::Intent, handoff_barrier: None, last_error: None }
+    }
+    fn source(database: &str, generation: &str) -> PhysicalSourceRecord {
+        PhysicalSourceRecord { database: database.into(), generation: generation.into(), source_vm_id: "source-vm-1".into(),
+            system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(),
+            source_lsn: "0/16B6C50".into(), peer: "eu1".into(), handoff: None, last_error: None }
     }
     #[test]
     fn roundtrip_is_private() {
@@ -406,5 +497,59 @@ mod tests {
         let p = path("concurrent"); let store = Arc::new(PhysicalStore::load(p.clone()).unwrap());
         std::thread::scope(|scope| { for generation in ["g1", "g2"] { let store = Arc::clone(&store); scope.spawn(move || { let _ = store.create(record("acme", generation)); }); } });
         assert_eq!(store.list().len(), 1); let _ = std::fs::remove_file(p);
+    }
+    #[test]
+    fn handoff_grant_is_irrevocable_idempotent_and_restart_safe() {
+        let p = path("grant"); let store = PhysicalSourceStore::load(p.clone()).unwrap();
+        store.create(source("acme", "g1")).unwrap();
+        let grant = PhysicalHandoffGrant { candidate_id: "candidate-1".into(), peer: "eu1".into(), barrier_lsn: "0/16B6C50".into() };
+        store.grant_handoff("acme", "g1", grant.clone()).unwrap();
+        store.grant_handoff("acme", "g1", grant.clone()).unwrap();
+        assert!(store.grant_handoff("acme", "g1", PhysicalHandoffGrant { candidate_id: "candidate-2".into(), ..grant.clone() }).is_err());
+        assert_eq!(PhysicalSourceStore::load(p.clone()).unwrap().get("acme").unwrap().handoff, Some(grant));
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn candidate_handoff_requires_a_durable_fixed_barrier_at_every_phase() {
+        let p = path("candidate-handoff");
+        let store = PhysicalStore::load(p.clone()).unwrap();
+        store.create(record("acme", "g1")).unwrap();
+        assert!(store.begin_handoff("acme", "g1", "0/ABC").is_err());
+        store.advance("acme", "g1", PhysicalPhase::Intent, PhysicalPhase::Creating, None).unwrap();
+        store.advance("acme", "g1", PhysicalPhase::Creating, PhysicalPhase::Candidate, Some("candidate-1".into())).unwrap();
+        store.advance("acme", "g1", PhysicalPhase::Candidate, PhysicalPhase::Seeding, None).unwrap();
+        store.advance("acme", "g1", PhysicalPhase::Seeding, PhysicalPhase::Verified, None).unwrap();
+        assert!(!store.get("acme").unwrap().handoff_started());
+        assert!(store.advance("acme", "g1", PhysicalPhase::Verified, PhysicalPhase::Prepared, None).is_err());
+        for bad in ["/", "1/", "/A", "1/100000000", "G/1"] {
+            assert!(store.begin_handoff("acme", "g1", bad).is_err());
+        }
+        assert!(store.begin_handoff("acme", "stale", "0/ABC").is_err());
+        store.begin_handoff("acme", "g1", "0/ABC").unwrap();
+        for (from, to) in [(PhysicalPhase::Prepared, PhysicalPhase::Promoting),
+            (PhysicalPhase::Promoting, PhysicalPhase::Promoted), (PhysicalPhase::Promoted, PhysicalPhase::Binding),
+            (PhysicalPhase::Binding, PhysicalPhase::Activated)] {
+            let restarted = PhysicalStore::load(p.clone()).unwrap();
+            assert_eq!(restarted.begin_handoff("acme", "g1", "0/ABC").unwrap().phase, from);
+            assert!(restarted.begin_handoff("acme", "g1", "0/ABD").is_err());
+            restarted.advance("acme", "g1", from, to, None).unwrap();
+        }
+        let mut corrupt = PhysicalStore::load(p.clone()).unwrap().get("acme").unwrap();
+        corrupt.handoff_barrier = None;
+        std::fs::write(&p, serde_json::to_vec(&vec![corrupt]).unwrap()).unwrap();
+        assert!(PhysicalStore::load(p.clone()).is_err());
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn failed_grant_persistence_keeps_journal_open() {
+        let dir = path("grant-fail"); std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("source.json"); let store = PhysicalSourceStore::load(p.clone()).unwrap();
+        store.create(source("acme", "g1")).unwrap();
+        std::fs::remove_file(&p).unwrap(); std::fs::remove_dir(&dir).unwrap();
+        let grant = PhysicalHandoffGrant { candidate_id: "candidate-1".into(), peer: "eu1".into(), barrier_lsn: "0/16B6C50".into() };
+        assert!(store.grant_handoff("acme", "g1", grant).is_err());
+        assert!(store.get("acme").unwrap().handoff.is_none());
     }
 }

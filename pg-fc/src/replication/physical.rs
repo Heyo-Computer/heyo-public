@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use tracing::warn;
 
 use crate::registry::SchemaRegistry;
-use super::{PhysicalPhase, PhysicalRecord, PhysicalSourceRecord, Role, State, peer::PeerClient, wire};
+use super::{PhysicalHandoffGrant, PhysicalPhase, PhysicalRecord, PhysicalSourceRecord, Role, State, peer::PeerClient, wire};
 
 const SETTINGS: [&str; 5] = ["max_connections", "max_prepared_transactions", "max_locks_per_transaction", "max_wal_senders", "max_worker_processes"];
 
@@ -48,7 +48,7 @@ pub async fn prepare_source(reg: &Arc<SchemaRegistry>, database: &str, generatio
     let mut settings = BTreeMap::new();
     for key in SETTINGS { let value: i32 = db.query_one("SELECT current_setting($1)::int", &[&key]).await?.get(0); settings.insert(key.into(), value); }
     let slot = format!("pgfc_phys_{}", generation.replace('-', "_"));
-    let source = reg.physical_sources().create(PhysicalSourceRecord { database: database.into(), generation: generation.into(), source_vm_id: source_vm_id.clone(), system_identifier: system_identifier.clone(), pg_major: pg_major as u32, slot: slot.clone(), source_lsn: source_lsn.clone(), peer: logical.peer.clone(), last_error: None })?;
+    let source = reg.physical_sources().create(PhysicalSourceRecord { database: database.into(), generation: generation.into(), source_vm_id: source_vm_id.clone(), system_identifier: system_identifier.clone(), pg_major: pg_major as u32, slot: slot.clone(), source_lsn: source_lsn.clone(), peer: logical.peer.clone(), handoff: None, last_error: None })?;
     if source.source_vm_id != source_vm_id || source.system_identifier != system_identifier || source.pg_major != pg_major as u32 || source.slot != slot || source.peer != logical.peer {
         bail!("durable physical source identity no longer matches the bound logical primary");
     }
@@ -81,11 +81,140 @@ pub fn accept_candidate(reg: &Arc<SchemaRegistry>, req: wire::PhysicalReplicaReq
     if tenant.role != req.tenant.role || tenant.password != req.tenant.password { bail!("physical tenant credential does not match the logical replica"); }
     if SETTINGS.iter().any(|key| !req.settings.contains_key(*key)) || req.settings.len() != SETTINGS.len() { bail!("physical source settings are incomplete"); }
     let previous = reg.bound_vm_id(&req.database).context("logical replica has no durable serving VM")?;
-    let rec = reg.physical().create(PhysicalRecord { database: req.database.clone(), generation: req.generation.clone(), candidate_name: PhysicalRecord::candidate_name(&req.generation), candidate_id: None, previous_vm_id: Some(previous), source_node: req.source_node.clone(), source_vm_id: req.source_vm_id.clone(), system_identifier: req.system_identifier.clone(), pg_major: req.pg_major, slot: req.slot.clone(), phase: PhysicalPhase::Intent, last_error: None })?;
+    let rec = reg.physical().create(PhysicalRecord { database: req.database.clone(), generation: req.generation.clone(), candidate_name: PhysicalRecord::candidate_name(&req.generation), candidate_id: None, previous_vm_id: Some(previous), source_node: req.source_node.clone(), source_vm_id: req.source_vm_id.clone(), system_identifier: req.system_identifier.clone(), pg_major: req.pg_major, slot: req.slot.clone(), phase: PhysicalPhase::Intent, handoff_barrier: None, last_error: None })?;
     let background = rec.clone();
     let reg2 = reg.clone(); tokio::spawn(async move { if let Err(e) = seed(reg2.clone(), req).await { let _ = reg2.physical().set_error(&background.database, &background.generation, Some(format!("{e:#}").chars().take(500).collect())); warn!("physical candidate prepare failed: {e:#}"); } });
     Ok(rec)
 }
+
+pub async fn source_grant(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::PhysicalHandoffGrantJson> {
+    let _operation = reg.replication_operation(database).await;
+    let source = reg.physical_sources().get(database).context("no physical source operation")?;
+    let grant = source.handoff.context("physical handoff has not been authorized")?;
+    let fence = reg.replication().get(database).and_then(|r| r.fence).context("physical grant lost source fence")?;
+    if fence.phase != "ready" || fence.mode == "selective" || fence.vm_id != source.source_vm_id
+        || fence.barrier_lsn != grant.barrier_lsn { bail!("physical grant source fence no longer matches"); }
+    let (_guard, maintenance) = reg.maintenance_client(database).await?;
+    let closed: bool = maintenance.query_one("SELECT NOT datallowconn FROM pg_database WHERE datname=$1", &[&database]).await?.get(0);
+    if !closed { bail!("physical grant source admission is open"); }
+    Ok(wire::PhysicalHandoffGrantJson { database: source.database, generation: source.generation,
+        candidate_id: grant.candidate_id, source_vm_id: source.source_vm_id,
+        system_identifier: source.system_identifier, pg_major: source.pg_major,
+        barrier_lsn: grant.barrier_lsn, peer: grant.peer })
+}
+
+pub async fn handoff_source(reg: &Arc<SchemaRegistry>, req: wire::PhysicalHandoffRequest) -> Result<wire::PhysicalRecordJson> {
+    let operation = reg.replication_operation(&req.database).await;
+    let source = reg.physical_sources().get(&req.database).context("no physical source preparation")?;
+    if source.generation != req.generation || source.source_vm_id != req.source_vm_id
+        || source.system_identifier != req.system_identifier || source.pg_major != req.pg_major
+        || reg.replication_cfg().context("replication disabled")?.node_name != req.source_node { bail!("handoff request does not match durable source ownership"); }
+    let peer = reg.peers().get(&source.peer).context("physical source peer is missing")?;
+    let client = PeerClient::new(peer, reg.replication_cfg().context("replication disabled")?.peer_timeout)?;
+    let target = client.physical_status(&req.database).await?;
+    let already_granted = source.handoff.as_ref().is_some_and(|g| g.candidate_id == req.candidate_id && g.peer == source.peer);
+    if target.generation != req.generation || target.candidate_id.as_deref() != Some(&req.candidate_id)
+        || target.source_vm_id != req.source_vm_id || (!already_granted && target.phase != "verified") {
+        bail!("peer candidate is not the exact verified physical preparation");
+    }
+    let fence = super::orchestrate::fence_locked(reg, &req.database).await?;
+    if fence.vm_id != source.source_vm_id { bail!("fenced source VM differs from physical source ownership"); }
+    let mut authorized = req.clone(); authorized.barrier_lsn = fence.barrier_lsn.clone();
+    reg.physical_sources().grant_handoff(&req.database, &req.generation, PhysicalHandoffGrant {
+        candidate_id: req.candidate_id.clone(), peer: source.peer.clone(), barrier_lsn: fence.barrier_lsn,
+    })?;
+    drop(operation);
+    // A lost response is intentionally not grounds to reopen the source. The
+    // identical request resumes from the destination's durable phase.
+    client.physical_handoff(&authorized).await
+}
+
+pub async fn accept_handoff(reg: &Arc<SchemaRegistry>, req: wire::PhysicalHandoffRequest) -> Result<wire::PhysicalRecordJson> {
+    let _operation = reg.replication_operation(&req.database).await;
+    let mut rec = reg.physical().get(&req.database).context("no physical candidate preparation")?;
+    let candidate = rec.candidate_id.clone().context("physical candidate has no durable VM identity")?;
+    let previous = rec.previous_vm_id.clone().context("physical candidate lost previous VM ownership")?;
+    if rec.generation != req.generation || candidate != req.candidate_id || rec.source_node != req.source_node
+        || rec.source_vm_id != req.source_vm_id || rec.system_identifier != req.system_identifier || rec.pg_major != req.pg_major {
+        bail!("stale or identity-mismatched physical handoff request");
+    }
+    if rec.phase == PhysicalPhase::Verified {
+        let peer = reg.peers().get(&rec.source_node).context("physical source peer is missing")?;
+        let client = PeerClient::new(peer, reg.replication_cfg().context("replication disabled")?.peer_timeout)?;
+        let grant = client.physical_grant(&req.database).await?;
+        if grant.database != req.database || grant.generation != req.generation || grant.candidate_id != candidate
+            || grant.source_vm_id != req.source_vm_id || grant.system_identifier != req.system_identifier
+            || grant.pg_major != req.pg_major || grant.barrier_lsn != req.barrier_lsn || grant.peer != reg.replication_cfg().unwrap().node_name {
+            bail!("source authorization does not exactly match this candidate and barrier");
+        }
+        rec = reg.physical().begin_handoff(&req.database, &req.generation, &req.barrier_lsn)?;
+    } else if !rec.handoff_started() || rec.handoff_barrier.as_deref() != Some(&req.barrier_lsn) {
+        bail!("physical candidate is not ready or its durable barrier differs");
+    }
+    if rec.phase == PhysicalPhase::Activated {
+        if reg.bound_vm_id(&req.database).as_deref() != Some(&candidate) { bail!("activated handoff binding changed"); }
+        return Ok((&rec).into());
+    }
+    let mut env = promotion_env(&rec, &req.barrier_lsn);
+    if rec.phase == PhysicalPhase::Prepared {
+        run_guest(reg, &rec.candidate_name, &candidate, "prepare-promotion", env.clone()).await?;
+        rec = reg.physical().advance(&req.database, &req.generation, PhysicalPhase::Prepared, PhysicalPhase::Promoting, None)?;
+    }
+    if rec.phase == PhysicalPhase::Promoting {
+        env.insert("PG_FC_ADMIN_ROLE".into(), reg.cfg().pg_user.clone());
+        env.insert("PG_FC_ADMIN_PASSWORD".into(), reg.cfg().pg_password.clone().context("physical promotion requires configured admin password")?);
+        run_guest(reg, &rec.candidate_name, &candidate, "promote", env).await?;
+        rec = reg.physical().advance(&req.database, &req.generation, PhysicalPhase::Promoting, PhysicalPhase::Promoted, None)?;
+    }
+    if rec.phase == PhysicalPhase::Promoted { rec = reg.physical().advance(&req.database, &req.generation, PhysicalPhase::Promoted, PhysicalPhase::Binding, None)?; }
+    if rec.phase == PhysicalPhase::Binding {
+        reg.commit_physical_binding(&req.database, &previous, &candidate).await?;
+        // The old logical VM remains owned by PhysicalRecord; only stale local
+        // logical routing metadata is retired.
+        reg.replication().remove(&req.database)?;
+        let mut open_env = promotion_env(&rec, &req.barrier_lsn);
+        open_env.insert("PG_FC_ADMIN_ROLE".into(), reg.cfg().pg_user.clone());
+        open_env.insert("PG_FC_ADMIN_PASSWORD".into(), reg.cfg().pg_password.clone().context("physical admission requires configured admin password")?);
+        run_guest(reg, &rec.candidate_name, &candidate, "open-admission", open_env).await?;
+        rec = reg.physical().advance(&req.database, &req.generation, PhysicalPhase::Binding, PhysicalPhase::Activated, None)?;
+    }
+    Ok((&rec).into())
+}
+
+fn promotion_env(rec: &PhysicalRecord, barrier: &str) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    env.insert("PG_FC_GENERATION".into(), rec.generation.clone()); env.insert("PG_FC_SYSTEM_IDENTIFIER".into(), rec.system_identifier.clone());
+    env.insert("PG_FC_PG_MAJOR".into(), rec.pg_major.to_string()); env.insert("PG_FC_TENANT_DATABASE".into(), rec.database.clone());
+    env.insert("PG_FC_BARRIER_LSN".into(), barrier.into());
+    env
+}
+
+async fn run_guest(reg: &SchemaRegistry, name: &str, id: &str, action: &str, env: HashMap<String, String>) -> Result<()> {
+    let sandbox = crate::vm::connect_physical_candidate(reg.cfg(), name, id).await?;
+    let command = if action == "open-admission" {
+        OPEN_ADMISSION
+    } else { if action == "promote" { "/usr/local/bin/pg-fc-physical promote" } else { "/usr/local/bin/pg-fc-physical prepare-promotion" } };
+    let out = crate::vm::physical_exec(reg.cfg(), &sandbox, command, env, "physical handoff guest transition").await?;
+    if out.exit_code != 0 { bail!("guest physical handoff {action} failed (exit {})", out.exit_code); }
+    Ok(())
+}
+
+const OPEN_ADMISSION: &str = r#"set -eu
+/usr/local/bin/pg-fc-physical prepare-promotion
+test "$(/usr/local/bin/pg-fc-physical status | jq -r .phase)" = promoted-but-fenced
+export PGPASSWORD="$PG_FC_ADMIN_PASSWORD"
+psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -U "$PG_FC_ADMIN_ROLE" -d template1 <<'SQL'
+\getenv database PG_FC_TENANT_DATABASE
+\getenv identity PG_FC_SYSTEM_IDENTIFIER
+SELECT NOT pg_is_in_recovery() AND (pg_control_system()).system_identifier::text = :'identity' AS valid \gset
+\if :valid
+SET synchronous_commit = on;
+SELECT format('ALTER DATABASE %I ALLOW_CONNECTIONS true', :'database') \gexec
+\else
+\quit 1
+\endif
+SQL
+"#;
 
 async fn seed(reg: Arc<SchemaRegistry>, req: wire::PhysicalReplicaRequest) -> Result<()> {
     let _guard = reg.replication_operation(&req.database).await;

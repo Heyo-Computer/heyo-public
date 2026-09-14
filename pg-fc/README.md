@@ -1146,8 +1146,81 @@ but the daemon has no visible record yet, retries refuse a second create.
 While candidates exist, destructive cleanup is conservatively blocked,
 including pending-creation and orphan-disk cleanup. Logical promote/detach
 cannot remove credentials or slots owned by an ongoing physical migration.
-Coordinated physical switchover, serving-binding activation, and rejoin are
-not provided by this preparation endpoint.
+Preparation itself does not activate the candidate. A planned handoff is a
+separate controller operation described below.
+
+#### Planned physical handoff
+
+POST `/api/replication/<database>/physical-handoff` on the source with the
+exact generation, candidate ID, source node/VM, system identifier, PostgreSQL
+major, and an initially informational `barrier_lsn`. The controller re-reads
+the candidate from the trusted peer, fences and drains the exact source VM,
+captures the authoritative flushed WAL barrier, then durably and irrevocably
+authorizes only that peer/candidate/generation/barrier. Ordinary unfence is
+permanently refused after this grant. A lost peer response therefore leaves
+the source closed and an identical request safely resumes; it never guesses
+that promotion failed.
+
+The destination independently reads that grant through the authenticated peer
+API and persists its barrier before any guest transition. Subsequent retries
+use that durable authorization even if the source is offline, and reject a
+different barrier. It journals `prepared`, `promoting`, `promoted`, `binding`, and
+`activated` around guest preparation/promotion, the fsynced expected-old to
+candidate registry CAS, stale warm-entry removal, logical metadata retirement,
+and explicit admission open. Until `activated`, ordinary client admission is
+fail-closed. After activation, checkout attaches the exact candidate ID via the
+no-DDL fenced attach path; a mismatched registry binding is refused. The old
+logical VM remains owned and is not stopped, overwritten, or deleted.
+
+This protocol is operator-driven planned handoff, not automatic failover.
+Cleanup and constructing/rejoining a successor physical generation (including
+switch-back preparation) remain separate work. External secret DSNs and
+regional/application routing are also outside the controller operation.
+
+#### Guest promoted-but-fenced transition
+
+`pg-fc-physical` provides a deliberately narrower primitive for an authenticated
+controller that has already fenced the source. It is **not standalone failover**:
+the helper does not authorize or fence a source, change a serving binding,
+admit tenants, route traffic, or rejoin the old primary. The controller supplies
+the final source WAL barrier and must not commit serving ownership until the
+guest reports `promoted-but-fenced`.
+
+The controller invokes two durable boundaries, with the same environment on
+every retry:
+
+```sh
+PG_FC_GENERATION=generation-1 PG_FC_SYSTEM_IDENTIFIER=... PG_FC_PG_MAJOR=18 PG_FC_TENANT_DATABASE=tenant_db PG_FC_BARRIER_LSN=0/ABC PG_FC_ADMIN_ROLE=postgres PG_FC_ADMIN_PASSWORD=... /usr/local/bin/pg-fc-physical prepare-promotion
+PG_FC_GENERATION=generation-1 PG_FC_SYSTEM_IDENTIFIER=... PG_FC_PG_MAJOR=18 PG_FC_TENANT_DATABASE=tenant_db PG_FC_BARRIER_LSN=0/ABC PG_FC_ADMIN_ROLE=postgres PG_FC_ADMIN_PASSWORD=... /usr/local/bin/pg-fc-physical promote
+```
+
+`prepare-promotion` validates the values against the durable seed plan and
+cluster, requires the exact database to exist with `ALLOW_CONNECTIONS false`,
+and requires a recovering standby whose replay LSN is at or beyond the barrier.
+It then atomically writes mode-0600
+`/workspace/pg-fc-physical/promotion.json` with the generation, system ID,
+PostgreSQL major, database, barrier and phase `prepared`. The password is read
+only from the environment and is never included in the operation record,
+status, command output, or retained error log.
+
+`promote` changes the record to `promoting` before calling `pg_promote`. It then
+verifies recovery ended, identity is unchanged, and tenant admission is still
+closed; finally it changes only `PG_FC_ADMIN_ROLE`'s password (the role must
+already be a superuser) and records `promoted-but-fenced`. PostgreSQL identifier
+and password quoting are performed by PostgreSQL rather than shell SQL
+interpolation. Tenant and replication roles are not modified. There is no
+guest command to reopen admission.
+
+Both commands and `seed` serialize on `seed.lock`. Once any promotion record
+exists, seeding refuses permanently. A retry at `prepared` repeats preflight; a
+retry at `promoting` distinguishes recovery from an already-promoted primary,
+then resumes credential reconciliation and acknowledgment. A restart with a
+valid promotion record remains in physical boot mode: `prepared` still requires
+`standby.signal`, while `promoting` and `promoted-but-fenced` accept the same
+identity after promotion removed it. Missing, corrupt, extra-field, or
+plan-mismatched metadata inhibits PostgreSQL boot and cannot fall through to
+ordinary initialization. The durable seed plan and persistent root marker are
+retained throughout.
 
 #### Setting it up
 

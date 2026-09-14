@@ -47,6 +47,30 @@ pub struct NodeInfo {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct PhysicalPrepareRequest { pub generation: String }
 
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct PhysicalHandoffRequest {
+    pub database: String,
+    pub generation: String,
+    pub candidate_id: String,
+    pub source_vm_id: String,
+    pub system_identifier: String,
+    pub pg_major: u32,
+    pub barrier_lsn: String,
+    pub source_node: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct PhysicalHandoffGrantJson {
+    pub database: String,
+    pub generation: String,
+    pub candidate_id: String,
+    pub source_vm_id: String,
+    pub system_identifier: String,
+    pub pg_major: u32,
+    pub barrier_lsn: String,
+    pub peer: String,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct PhysicalReplicaRequest {
     pub database: String,

@@ -405,6 +405,26 @@ pub async fn api_physical_prepare(State(st): State<DashState>, Path(db): Path<St
     }
 }
 
+pub async fn api_physical_handoff(State(st): State<DashState>, Path(db): Path<String>, Json(mut req): Json<wire::PhysicalHandoffRequest>) -> Response {
+    if req.database != db { return api_err(&anyhow::anyhow!("path database does not match handoff request")).into_response(); }
+    req.database = db;
+    match crate::replication::physical::handoff_source(&st.registry, req).await {
+        Ok(record) => Json(record).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_accept_physical_handoff(State(st): State<DashState>, Json(req): Json<wire::PhysicalHandoffRequest>) -> Response {
+    match crate::replication::physical::accept_handoff(&st.registry, req).await {
+        Ok(record) => Json(record).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_physical_grant(State(st): State<DashState>, Path(db): Path<String>) -> Response {
+    match crate::replication::physical::source_grant(&st.registry, &db).await {
+        Ok(grant) => Json(grant).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
 pub async fn api_accept_physical_replica(State(st): State<DashState>, Json(req): Json<wire::PhysicalReplicaRequest>) -> Response {
     match crate::replication::physical::accept_candidate(&st.registry, req) {
         Ok(record) => (StatusCode::ACCEPTED, Json(wire::PhysicalRecordJson::from(&record))).into_response(), Err(e) => api_err(&e).into_response(),

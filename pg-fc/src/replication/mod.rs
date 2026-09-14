@@ -66,4 +66,4 @@ pub mod store;
 pub mod wire;
 
 pub use store::{ReplRecord, ReplStore, Role, SequenceSnapshot, State};
-pub use physical_store::{PhysicalPhase, PhysicalRecord, PhysicalSourceRecord, PhysicalSourceStore, PhysicalStore};
+pub use physical_store::{PhysicalHandoffGrant, PhysicalPhase, PhysicalRecord, PhysicalSourceRecord, PhysicalSourceStore, PhysicalStore};

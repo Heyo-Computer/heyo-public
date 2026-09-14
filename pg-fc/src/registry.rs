@@ -667,6 +667,28 @@ impl SchemaRegistry {
     pub fn physical_sources(&self) -> &Arc<crate::replication::PhysicalSourceStore> { &self.physical_sources }
     pub fn bound_vm_id(&self, database: &str) -> Option<String> { self.store.record(database).map(|r| r.sandbox_id) }
 
+    pub fn physical_admission_ready(&self, database: &str) -> bool {
+        !self.physical_sources.get(database).is_some_and(|r| r.handoff.is_some())
+            && self.physical.get(database).is_none_or(|r| !r.handoff_started()
+                || r.phase == crate::replication::PhysicalPhase::Activated
+                    && r.candidate_id.as_deref() == self.bound_vm_id(database).as_deref())
+    }
+
+    pub fn physical_reconnect_allowed(&self, database: &str, role: &str) -> bool {
+        let Some(source) = self.physical_sources.get(database) else { return false };
+        source.handoff.is_some()
+            && self.replication.by_repl_role(role).is_some_and(|r| r.database == database && r.repl_role == role)
+            && self.bound_vm_id(database).as_deref() == Some(source.source_vm_id.as_str())
+    }
+
+    pub async fn commit_physical_binding(self: &Arc<Self>, database: &str, expected: &str, candidate: &str) -> Result<()> {
+        let reg = self.clone();
+        let (db, old, new) = (database.to_owned(), expected.to_owned(), candidate.to_owned());
+        tokio::task::spawn_blocking(move || reg.store.commit_handoff_binding(&db, &old, &new)).await??;
+        self.entries.lock().await.remove(database);
+        Ok(())
+    }
+
     pub async fn exec_bound(&self, database: &str, expected_id: &str, command: &str, env: HashMap<String, String>) -> Result<()> {
         let guard = self.checkout(database).await?;
         if guard.entry().sandbox_id() != expected_id { bail!("database binding changed during physical preparation"); }
@@ -1421,6 +1443,24 @@ impl SchemaRegistry {
     /// The returned guard keeps the VM off the reaper's radar until dropped.
     /// Concurrent callers for the same schema share one bring-up.
     pub async fn checkout(&self, schema: &str) -> Result<ConnGuard> {
+        if let Some(rec) = self.physical.get(schema).filter(|r| r.handoff_started()) {
+            if rec.phase != crate::replication::PhysicalPhase::Activated {
+                bail!("physical handoff for {schema} is incomplete; admission remains closed");
+            }
+            let candidate = rec.candidate_id.context("activated handoff lost candidate identity")?;
+            if self.bound_vm_id(schema).as_deref() != Some(candidate.as_str()) {
+                bail!("activated physical handoff binding mismatch");
+            }
+            let cell = self.entries.lock().await.entry(schema.to_string()).or_insert_with(|| Arc::new(OnceCell::new())).clone();
+            let entry = cell.get_or_try_init(|| vm::ensure_fenced_vm(&self.cfg, schema, &candidate)).await?;
+            if entry.sandbox_id() != candidate { bail!("warm physical handoff binding mismatch"); }
+            return ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await
+                .context("physical handoff connection slots exhausted");
+        }
+        if self.physical_sources.get(schema).is_some_and(|r| r.handoff.is_some())
+            && !self.replication.is_fenced(schema) {
+            bail!("physical source grant lost its fence; refusing ordinary checkout");
+        }
         if self.replication.is_fenced(schema) {
             // Status polling and startup warming must not take the normal
             // restore/grant path for a fenced database either.

@@ -53,8 +53,10 @@ class PhysicalSeedTest(unittest.TestCase):
         self.wait_ready(self.source)
         self.sql("CREATE TABLE seed_test(id bigserial PRIMARY KEY, v text); "
                  "INSERT INTO seed_test(v) VALUES ('before'); CREATE SEQUENCE extra_seq START 41; "
+                 "CREATE ROLE tenant_role LOGIN PASSWORD 'tenantsecret'; "
                  "CREATE ROLE repl WITH LOGIN REPLICATION PASSWORD 'replsecret'; "
                  "SELECT pg_create_physical_replication_slot('standby_slot');")
+        self.sql("CREATE DATABASE tenant_db OWNER tenant_role;")
         run("docker", "exec", self.source, "sh", "-c",
             "echo 'host replication repl 0.0.0.0/0 scram-sha-256' >> \"$PGDATA/pg_hba.conf\"")
         self.sql("SELECT pg_reload_conf()")
@@ -126,6 +128,13 @@ class PhysicalSeedTest(unittest.TestCase):
         # docker exec cannot add mounts, so copy this exact checkout's script.
         run("docker", "cp", str(SCRIPT), f"{self.candidate}:/mounted-physical.sh")
         self.cexec("mkdir -p /mounted && mv /mounted-physical.sh /mounted/physical.sh && chmod +x /mounted/physical.sh")
+
+    def promotion_env(self, barrier, password="target admin ' password"):
+        return ("PG_FC_TEST_ALLOW_NONMOUNT=1", "PG_FC_TEST_ALLOW_PLAN_OWNER=1",
+                "PG_FC_GENERATION=generation-1", f"PG_FC_SYSTEM_IDENTIFIER={self.system_id}",
+                "PG_FC_PG_MAJOR=18", "PG_FC_TENANT_DATABASE=tenant_db",
+                f"PG_FC_BARRIER_LSN={barrier}", "PG_FC_ADMIN_ROLE=postgres",
+                f"PG_FC_ADMIN_PASSWORD={password}")
 
     def test_seed_replication_recovery_and_boot_guards(self):
         self.mount_script()
@@ -207,6 +216,119 @@ class PhysicalSeedTest(unittest.TestCase):
         self.cexec(self.seed_cmd)
         self.wait_ready(self.candidate)
         self.assertEqual(self.cexec("psql -U postgres -Atqc 'select pg_is_in_recovery()'", env=("PGHOST=/var/run/postgresql",)).stdout.strip(), "t")
+
+    def test_promoted_but_fenced_lifecycle(self):
+        self.mount_script()
+        self.cexec(self.seed_cmd)
+        self.wait_ready(self.candidate)
+        before_hashes = self.cexec(
+            "psql -U postgres -d template1 -Atqc \"SELECT rolname||'='||rolpassword FROM pg_authid WHERE rolname IN ('postgres','tenant_role','repl') ORDER BY 1\"",
+            env=("PGHOST=/var/run/postgresql",)).stdout.splitlines()
+        barrier = self.sql("SELECT pg_current_wal_flush_lsn();").strip()
+        # A barrier alone is not authorization: the database fence must itself
+        # have arrived through WAL before durable intent can be recorded.
+        r = self.cexec("/mounted/physical.sh prepare-promotion", env=self.promotion_env(barrier), check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse((self.root / "workspace/pg-fc-physical/promotion.json").exists())
+        self.sql("ALTER DATABASE tenant_db ALLOW_CONNECTIONS false; INSERT INTO seed_test(v) VALUES ('fenced'); SELECT nextval('extra_seq');")
+        barrier = self.sql("SELECT pg_current_wal_flush_lsn();").strip()
+        r = self.cexec("/mounted/physical.sh prepare-promotion",
+                       env=self.promotion_env("FFFFFFFF/FFFFFFFF"), check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse((self.root / "workspace/pg-fc-physical/promotion.json").exists())
+        for _ in range(80):
+            r = self.cexec("/mounted/physical.sh prepare-promotion", env=self.promotion_env(barrier), check=False)
+            if r.returncode == 0:
+                break
+            time.sleep(.25)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        operation = json.loads((self.root / "workspace/pg-fc-physical/promotion.json").read_text())
+        self.assertEqual(operation["phase"], "prepared")
+        self.assertNotIn("password", json.dumps(operation).lower())
+        self.assertEqual(self.cexec("PG_FC_TEST_ALLOW_NONMOUNT=1 PG_FC_TEST_ALLOW_PLAN_OWNER=1 PG_FC_ROOT_MARKER=/tmp/physical-required /mounted/physical.sh boot-check", check=False).returncode, 10)
+        # Prepared is a durable boundary and must make all subsequent seed
+        # attempts refuse the cluster, including after PostgreSQL restart.
+        self.assertNotEqual(self.cexec(self.seed_cmd, check=False).returncode, 0)
+        self.cexec("gosu postgres pg_ctl -D /workspace/pgdata -m fast -w restart")
+        # Model a controller/guest crash after persisting intent but before
+        # pg_promote: retry must recheck the fenced standby and finish it.
+        operation["phase"] = "promoting"
+        operation_path = self.root / "workspace/pg-fc-physical/promotion.json"
+        operation_path.write_text(json.dumps(operation))
+        self.cexec("sync")
+        self.cexec("/mounted/physical.sh promote", env=self.promotion_env(barrier))
+        self.assertEqual(self.cexec("psql -U postgres -d template1 -Atqc 'SELECT pg_is_in_recovery()'",
+                                    env=("PGHOST=/var/run/postgresql",)).stdout.strip(), "f")
+        self.assertEqual(self.cexec("psql -U postgres -d template1 -Atqc \"SELECT datallowconn FROM pg_database WHERE datname='tenant_db'\"",
+                                    env=("PGHOST=/var/run/postgresql",)).stdout.strip(), "f")
+        state = self.cexec("psql -U postgres -d postgres -Atqc \"SELECT string_agg(v,',' ORDER BY id),(SELECT last_value FROM extra_seq) FROM seed_test\"",
+                           env=("PGHOST=/var/run/postgresql",)).stdout.strip()
+        values, sequence = state.split("|")
+        self.assertEqual(values, "before,fenced")
+        # PostgreSQL WAL-logs sequence cache reservations, so a physical
+        # standby may show a value ahead of the source's last returned value;
+        # it must never regress or lose the sequence.
+        self.assertGreaterEqual(int(sequence), 42)
+        after_hashes = self.cexec(
+            "psql -U postgres -d template1 -Atqc \"SELECT rolname||'='||rolpassword FROM pg_authid WHERE rolname IN ('postgres','tenant_role','repl') ORDER BY 1\"",
+            env=("PGHOST=/var/run/postgresql",)).stdout.splitlines()
+        self.assertNotEqual([x for x in before_hashes if x.startswith("postgres=")],
+                            [x for x in after_hashes if x.startswith("postgres=")])
+        self.assertEqual([x for x in before_hashes if not x.startswith("postgres=")],
+                         [x for x in after_hashes if not x.startswith("postgres=")])
+        # Use the container network, not loopback (the source's loopback HBA
+        # entries use trust), to test actual SCRAM authentication.
+        self.assertEqual(self.cexec("psql -X -w -U postgres -d template1 -Atqc 'SELECT 1'",
+                         env=("PGHOST=" + self.candidate, "PGPASSWORD=target admin ' password")).stdout.strip(), "1")
+        self.assertNotEqual(self.cexec("psql -X -w -U postgres -d template1 -Atqc 'SELECT 1'",
+                            env=("PGHOST=" + self.candidate, "PGPASSWORD=secret"), check=False).returncode, 0)
+        self.assertEqual(self.cexec("psql -X -w -U tenant_role -d template1 -Atqc 'SELECT 1'",
+                         env=("PGHOST=" + self.candidate, "PGPASSWORD=tenantsecret")).stdout.strip(), "1")
+        self.assertNotEqual(self.cexec("psql -X -w -U tenant_role -d tenant_db -Atqc 'SELECT 1'",
+                            env=("PGHOST=" + self.candidate, "PGPASSWORD=tenantsecret"), check=False).returncode, 0)
+        # Model lost acknowledgment after promotion/credential reconciliation
+        # but before the final record persisted. The already-promoted branch
+        # must finish safely after a PostgreSQL restart.
+        operation_path.write_text(json.dumps(operation))
+        self.cexec("sync")
+        self.assertEqual(self.cexec("PG_FC_TEST_ALLOW_NONMOUNT=1 PG_FC_TEST_ALLOW_PLAN_OWNER=1 PG_FC_ROOT_MARKER=/tmp/physical-required /mounted/physical.sh boot-check", check=False).returncode, 10)
+        self.cexec("gosu postgres pg_ctl -D /workspace/pgdata -m fast -w restart")
+        self.cexec("/mounted/physical.sh promote", env=self.promotion_env(barrier))
+        self.assertEqual(json.loads((self.root / "workspace/pg-fc-physical/promotion.json").read_text())["phase"],
+                         "promoted-but-fenced")
+        self.assertEqual(self.cexec("PG_FC_TEST_ALLOW_NONMOUNT=1 PG_FC_TEST_ALLOW_PLAN_OWNER=1 PG_FC_ROOT_MARKER=/tmp/physical-required /mounted/physical.sh boot-check", check=False).returncode, 10)
+        self.assertNotEqual(self.cexec(self.seed_cmd, check=False).returncode, 0)
+        # Execute the controller's actual admission command, including SQL
+        # quoting and retry after admission succeeded but acknowledgment was lost.
+        controller = (SCRIPT.parent / "src/replication/physical.rs").read_text()
+        admission = controller.split('const OPEN_ADMISSION: &str = r#"', 1)[1].split('"#;', 1)[0]
+        self.cexec("ln -sf /mounted/physical.sh /usr/local/bin/pg-fc-physical")
+        bad_env = tuple(v if not v.startswith("PG_FC_SYSTEM_IDENTIFIER=") else "PG_FC_SYSTEM_IDENTIFIER=123"
+                        for v in self.promotion_env(barrier))
+        self.assertNotEqual(self.cexec(admission, env=bad_env, check=False).returncode, 0)
+        self.cexec(admission, env=self.promotion_env(barrier))
+        self.cexec(admission, env=self.promotion_env(barrier))
+        self.assertEqual(self.cexec("psql -X -w -U tenant_role -d tenant_db -Atqc 'SELECT 1'",
+                         env=("PGHOST=" + self.candidate, "PGPASSWORD=tenantsecret")).stdout.strip(), "1")
+        self.assertEqual(self.cexec("psql -X -w -U tenant_role -d tenant_db -Atqc \"CREATE TABLE after_promotion(v integer); INSERT INTO after_promotion VALUES (73); SELECT v FROM after_promotion\"",
+                         env=("PGHOST=" + self.candidate, "PGPASSWORD=tenantsecret")).stdout.strip(), "73")
+        self.assertEqual(self.sql("SELECT datallowconn FROM pg_database WHERE datname='tenant_db'").strip(), "f")
+        self.cexec("touch /workspace/pgdata/standby.signal")
+        self.assertEqual(self.cexec("PG_FC_TEST_ALLOW_NONMOUNT=1 PG_FC_TEST_ALLOW_PLAN_OWNER=1 PG_FC_ROOT_MARKER=/tmp/physical-required /mounted/physical.sh boot-check", check=False).returncode, 20)
+
+    def test_corrupt_promotion_metadata_fails_closed(self):
+        self.mount_script()
+        self.cexec(self.seed_cmd)
+        path = self.root / "workspace/pg-fc-physical/promotion.json"
+        path.write_text(json.dumps({"generation": "other", "system_identifier": self.system_id,
+                                    "pg_major": 18, "tenant_database": "tenant_db",
+                                    "barrier_lsn": "0/1", "phase": "prepared"}))
+        os.chmod(path, 0o600)
+        self.assertEqual(self.cexec("PG_FC_TEST_ALLOW_NONMOUNT=1 PG_FC_TEST_ALLOW_PLAN_OWNER=1 PG_FC_ROOT_MARKER=/tmp/physical-required /mounted/physical.sh boot-check", check=False).returncode, 20)
+        path.write_text('{"phase":"promoted-but-fenced"}')
+        os.chmod(path, 0o600)
+        self.assertEqual(self.cexec("PG_FC_TEST_ALLOW_NONMOUNT=1 PG_FC_TEST_ALLOW_PLAN_OWNER=1 PG_FC_ROOT_MARKER=/tmp/physical-required /mounted/physical.sh boot-check", check=False).returncode, 20)
+        self.assertNotEqual(self.cexec(self.seed_cmd, check=False).returncode, 0)
 
 
 if __name__ == "__main__":

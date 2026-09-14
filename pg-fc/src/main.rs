@@ -230,9 +230,14 @@ async fn handle_conn(
             anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
         }
     };
+    if !info.physical_replication && !registry.physical_admission_ready(&schema) {
+        auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, "physical handoff is incomplete; admission remains closed").await?;
+        anyhow::bail!("refused connection during incomplete physical handoff for {schema}");
+    }
     if let Some(fence) = registry.replication().get(&schema).and_then(|r| r.fence)
         && (fence.mode != "selective"
             || registry.replication().by_repl_role(&info.user).is_none())
+        && !(info.physical_replication && registry.physical_reconnect_allowed(&schema, &info.user))
     {
         auth::send_fatal(
             &mut client,

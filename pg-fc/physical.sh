@@ -15,6 +15,7 @@ PLAN="$STATE_DIR/plan.json"
 ACTIVE="$STATE_DIR/activated.json"
 STATUS="$STATE_DIR/status.json"
 LOCK="$STATE_DIR/seed.lock"
+PROMOTION="$STATE_DIR/promotion.json"
 COMMAND=${1:-}
 
 say_status() {
@@ -76,6 +77,82 @@ verify_cluster() {
     grep -Eq "^[[:space:]]*primary_conninfo[[:space:]]*=" "$dir/postgresql.auto.conf" || return 1
 }
 
+verify_identity() {
+    dir=$1
+    [ "$(cat "$dir/PG_VERSION" 2>/dev/null)" = "$pg_major" ] || return 1
+    [ "$(installed_major)" = "$pg_major" ] || return 1
+    [ "$(cluster_system_id "$dir")" = "$system_identifier" ] || return 1
+}
+
+load_promotion() {
+    [ -f "$PROMOTION" ] || return 1
+    jq -e '. as $p | ($p|type=="object") and
+      (($p|keys|sort)==["barrier_lsn","generation","pg_major","phase","system_identifier","tenant_database"]) and
+      ($p.generation|type=="string") and ($p.system_identifier|type=="string") and
+      ($p.pg_major|type=="number" and floor==.) and
+      ($p.tenant_database|type=="string" and length>0 and length<=63 and (test("[[:cntrl:]]")|not)) and
+      ($p.barrier_lsn|type=="string" and test("^[0-9A-F]+/[0-9A-F]+$")) and
+      (["prepared","promoting","promoted-but-fenced"]|index($p.phase)!=null)' "$PROMOTION" >/dev/null || fail "invalid promotion record"
+    promotion_generation=$(jq -r .generation "$PROMOTION")
+    promotion_system_identifier=$(jq -r .system_identifier "$PROMOTION")
+    promotion_pg_major=$(jq -r .pg_major "$PROMOTION")
+    promotion_database=$(jq -r .tenant_database "$PROMOTION")
+    promotion_barrier=$(jq -r .barrier_lsn "$PROMOTION")
+    promotion_phase=$(jq -r .phase "$PROMOTION")
+    [ "$promotion_generation" = "$generation" ] &&
+      [ "$promotion_system_identifier" = "$system_identifier" ] &&
+      [ "$promotion_pg_major" = "$pg_major" ] || fail "promotion record identity does not match seed plan"
+}
+
+write_promotion() {
+    phase=$1 database=$2 barrier=$3
+    tmp="$STATE_DIR/.promotion.$$"
+    jq -nc --arg generation "$generation" --arg system_identifier "$system_identifier" \
+      --argjson pg_major "$pg_major" --arg tenant_database "$database" --arg barrier_lsn "$barrier" --arg phase "$phase" \
+      '{generation:$generation,system_identifier:$system_identifier,pg_major:$pg_major,tenant_database:$tenant_database,barrier_lsn:$barrier_lsn,phase:$phase}' >"$tmp"
+    chmod 600 "$tmp"; chown postgres:postgres "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$PROMOTION"; sync
+}
+
+psql_local() {
+    gosu postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d template1 "$@"
+}
+
+verify_fence() {
+    database=$1
+    result=$(psql_local -Atq -v database="$database" <<'SQL'
+SELECT count(*) = 1 AND bool_and(NOT datallowconn)
+FROM pg_database WHERE datname = :'database';
+SQL
+    ) || return 1
+    [ "$result" = t ]
+}
+
+verify_replay_barrier() {
+    barrier=$1
+    result=$(psql_local -Atq -v barrier="$barrier" <<'SQL'
+SELECT pg_is_in_recovery()
+   AND pg_last_wal_replay_lsn() IS NOT NULL
+   AND pg_wal_lsn_diff(pg_last_wal_replay_lsn(), :'barrier'::pg_lsn) >= 0;
+SQL
+    ) || return 1
+    [ "$result" = t ]
+}
+
+validate_promotion_env() {
+    : "${PG_FC_GENERATION:?PG_FC_GENERATION is required}"
+    : "${PG_FC_SYSTEM_IDENTIFIER:?PG_FC_SYSTEM_IDENTIFIER is required}"
+    : "${PG_FC_PG_MAJOR:?PG_FC_PG_MAJOR is required}"
+    : "${PG_FC_TENANT_DATABASE:?PG_FC_TENANT_DATABASE is required}"
+    : "${PG_FC_BARRIER_LSN:?PG_FC_BARRIER_LSN is required}"
+    [ "$PG_FC_GENERATION" = "$generation" ] || fail "expected generation does not match seed plan"
+    [ "$PG_FC_SYSTEM_IDENTIFIER" = "$system_identifier" ] || fail "expected system identifier does not match seed plan"
+    [ "$PG_FC_PG_MAJOR" = "$pg_major" ] || fail "expected PostgreSQL major does not match seed plan"
+    printf '%s' "$PG_FC_TENANT_DATABASE" | grep -Eq '^[^[:cntrl:]]{1,63}$' || fail "invalid tenant database"
+    printf '%s' "$PG_FC_BARRIER_LSN" | grep -Eq '^[0-9A-F]+/[0-9A-F]+$' || fail "invalid WAL barrier"
+    verify_identity "$PGDATA" || fail "cluster identity does not match seed plan"
+}
+
 write_physical_conf() {
     dir=$1
     conf="$dir/pg-fc-physical.conf"
@@ -121,6 +198,18 @@ boot_check() {
     fi
     persistent_workspace || fail "physical plan requires persistent workspace" 20
     load_plan
+    if [ -e "$PROMOTION" ]; then
+        load_promotion
+        verify_identity "$PGDATA" || fail "promoting cluster identity changed" 20
+        case "$promotion_phase" in
+            prepared) verify_cluster "$PGDATA" || fail "prepared standby recovery configuration changed" 20 ;;
+            promoting)
+                [ ! -e "$PGDATA/standby.signal" ] || verify_cluster "$PGDATA" || fail "promoting standby recovery configuration changed" 20
+                ;;
+            promoted-but-fenced) [ ! -e "$PGDATA/standby.signal" ] || fail "promoted cluster has a standby signal" 20 ;;
+        esac
+        say_status "$promotion_phase"; echo "$promotion_phase"; exit 10
+    fi
     if is_active; then say_status active; echo active; exit 10; fi
     say_status inhibited "physical activation is not verified"
     echo inhibited; exit 20
@@ -133,13 +222,14 @@ seed() {
     chmod 600 "$ROOT_MARKER" 2>/dev/null || true
     exec 9>"$LOCK"
     if ! flock -n 9; then echo "seed already running" >&2; exit 75; fi
+    [ ! -e "$PROMOTION" ] || fail "promotion has started; refusing to reseed"
     # Unexpected helper failures must not leave a dead worker reporting
     # "copying" forever. Do not overwrite a more specific fail() message.
     trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$(jq -r .phase "$STATUS" 2>/dev/null)" != failed ]; then say_status failed "seed exited unexpectedly (exit $rc); see controller.log"; fi' 0
     sync
     if is_active; then
         if ! gosu postgres pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
-            gosu postgres pg_ctl -D "$PGDATA" -w start >"$WORKSPACE/pg-startup.log" 2>&1 || fail "activated standby failed to restart"
+            gosu postgres pg_ctl -D "$PGDATA" -w start 9>&- >"$WORKSPACE/pg-startup.log" 2>&1 || fail "activated standby failed to restart"
         fi
         say_status active; exit 0
     fi
@@ -225,8 +315,76 @@ PY
     fi
     say_status starting
     mkdir -p /var/run/postgresql; chown postgres:postgres /var/run/postgresql
-    gosu postgres pg_ctl -D "$PGDATA" -w start >"$WORKSPACE/pg-startup.log" 2>&1 || fail "activated standby failed to start"
+    # postmaster inherits otherwise-open descriptors. Do not let it retain the
+    # operation lock for the lifetime of the guest. The parent keeps the lock
+    # until startup and its status update finish.
+    gosu postgres pg_ctl -D "$PGDATA" -w start 9>&- >"$WORKSPACE/pg-startup.log" 2>&1 || fail "activated standby failed to start"
     say_status active
+}
+
+prepare_promotion() {
+    persistent_workspace || fail "physical promotion requires persistent workspace"
+    load_plan
+    exec 9>"$LOCK"; flock -n 9 || { echo "physical operation already running" >&2; exit 75; }
+    validate_promotion_env
+    if [ -e "$PROMOTION" ]; then
+        load_promotion
+        [ "$promotion_database" = "$PG_FC_TENANT_DATABASE" ] && [ "$promotion_barrier" = "$PG_FC_BARRIER_LSN" ] || fail "promotion request does not match durable intent"
+        if [ "$promotion_phase" = prepared ]; then
+            verify_fence "$promotion_database" || fail "tenant database does not exist or still allows connections"
+            verify_replay_barrier "$promotion_barrier" || fail "standby has not replayed the required WAL barrier"
+        fi
+        say_status "$promotion_phase"; exit 0
+    fi
+    is_active || fail "cluster is not an activated physical standby"
+    verify_fence "$PG_FC_TENANT_DATABASE" || fail "tenant database does not exist or still allows connections"
+    verify_replay_barrier "$PG_FC_BARRIER_LSN" || fail "standby has not replayed the required WAL barrier"
+    write_promotion prepared "$PG_FC_TENANT_DATABASE" "$PG_FC_BARRIER_LSN"
+    say_status prepared
+}
+
+promote() {
+    persistent_workspace || fail "physical promotion requires persistent workspace"
+    load_plan
+    exec 9>"$LOCK"; flock -n 9 || { echo "physical operation already running" >&2; exit 75; }
+    validate_promotion_env
+    load_promotion || fail "promotion has not been prepared"
+    [ "$promotion_database" = "$PG_FC_TENANT_DATABASE" ] && [ "$promotion_barrier" = "$PG_FC_BARRIER_LSN" ] || fail "promotion request does not match durable intent"
+    if [ "$promotion_phase" = prepared ]; then
+        verify_fence "$promotion_database" || fail "tenant database does not exist or still allows connections"
+        verify_replay_barrier "$promotion_barrier" || fail "standby has not replayed the required WAL barrier"
+        write_promotion promoting "$promotion_database" "$promotion_barrier"
+        promotion_phase=promoting
+    fi
+    recovering=$(psql_local -Atqc 'SELECT pg_is_in_recovery()') || fail "cannot inspect promotion state"
+    if [ "$recovering" = t ]; then
+        [ "$promotion_phase" != promoted-but-fenced ] || fail "promoted cluster unexpectedly returned to recovery"
+        verify_fence "$promotion_database" || fail "tenant database does not exist or still allows connections"
+        verify_replay_barrier "$promotion_barrier" || fail "standby has not replayed the required WAL barrier"
+        psql_local -Atqc 'SELECT pg_promote(true, 60)' >/dev/null || fail "PostgreSQL promotion failed"
+    elif [ "$recovering" != f ]; then
+        fail "invalid PostgreSQL recovery state"
+    fi
+    [ "$(psql_local -Atqc 'SELECT pg_is_in_recovery()')" = f ] || fail "PostgreSQL is still in recovery"
+    verify_identity "$PGDATA" || fail "cluster identity changed during promotion"
+    verify_fence "$promotion_database" || fail "tenant admission opened during promotion"
+    : "${PG_FC_ADMIN_ROLE:?PG_FC_ADMIN_ROLE is required}"
+    : "${PG_FC_ADMIN_PASSWORD:?PG_FC_ADMIN_PASSWORD is required}"
+    printf '%s' "$PG_FC_ADMIN_ROLE" | grep -Eq '^[^[:cntrl:]]{1,63}$' || fail "invalid administrative role"
+    if ! psql_local -q >/dev/null 2>/dev/null <<'SQL'
+\getenv role PG_FC_ADMIN_ROLE
+\getenv password PG_FC_ADMIN_PASSWORD
+SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role' AND rolsuper)
+       THEN format('ALTER ROLE %I PASSWORD %L', :'role', :'password')
+       ELSE 'DO $$ BEGIN RAISE EXCEPTION ''administrative role missing or is not superuser''; END $$'
+       END
+\gexec
+SQL
+    then
+        fail "administrative credential reconciliation failed"
+    fi
+    write_promotion promoted-but-fenced "$promotion_database" "$promotion_barrier"
+    say_status promoted-but-fenced
 }
 
 status_cmd() {
@@ -235,7 +393,9 @@ status_cmd() {
 
 case "${1:-}" in
     seed) seed ;;
+    prepare-promotion) prepare_promotion ;;
+    promote) promote ;;
     boot-check) boot_check ;;
     status) status_cmd ;;
-    *) echo "usage: pg-fc-physical {seed|boot-check|status}" >&2; exit 64 ;;
+    *) echo "usage: pg-fc-physical {seed|prepare-promotion|promote|boot-check|status}" >&2; exit 64 ;;
 esac

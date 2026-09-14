@@ -64,6 +64,18 @@ impl PeerClient {
         self.post("/api/replication/peer/physical-replicas", req).await
     }
 
+    pub async fn physical_handoff(&self, req: &wire::PhysicalHandoffRequest) -> Result<wire::PhysicalRecordJson> {
+        self.post("/api/replication/peer/physical-handoff", req).await
+    }
+
+    pub async fn physical_grant(&self, database: &str) -> Result<wire::PhysicalHandoffGrantJson> {
+        self.get(&format!("/api/replication/peer/physical-grants/{}", enc(database))).await
+    }
+
+    pub async fn physical_status(&self, database: &str) -> Result<wire::PhysicalRecordJson> {
+        self.get(&format!("/api/replication/{}/physical", enc(database))).await
+    }
+
     pub async fn status(&self, database: &str) -> Result<wire::StatusJson> {
         self.get(&format!("/api/replication/{}", enc(database)))
             .await
