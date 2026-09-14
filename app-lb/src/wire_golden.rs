@@ -90,6 +90,7 @@ fn vm_spec() -> DeploymentSpec {
                 strip_prefix: false,
             },
         ],
+        maintenance: false,
         vm: Some(crate::config::VmSpec {
             env_from: vec![],
             workspace_archive: None,
@@ -236,6 +237,7 @@ fn site_spec() -> DeploymentSpec {
         }],
         vm: None,
         scaling: crate::config::ScalingPolicy::default(),
+        maintenance: false,
         health: crate::config::HealthCheck::default(),
         upstreams: vec![],
         discovery: None,
@@ -291,6 +293,7 @@ fn static_spec() -> DeploymentSpec {
         }],
         vm: None,
         scaling: crate::config::ScalingPolicy::default(),
+        maintenance: false,
         health: crate::config::HealthCheck::default(),
         upstreams: vec!["10.0.0.4:8080".into(), "10.0.0.5:8080".into()],
         discovery: Some(crate::config::DiscoverySpec {
@@ -361,6 +364,7 @@ fn jwt_spec() -> DeploymentSpec {
             name_claim: "name".into(),
             leeway_secs: Some(30),
             cookie: Some("heyo_access_token".into()),
+            login_endpoint: None,
             // A token-less browser at this gate is bounced here to sign in and
             // redirected back; the cookie above carries the token on the return.
             login_url: Some("https://auth.example.com/login".into()),
@@ -750,6 +754,13 @@ fn job_records_are_stable() {
         status: JobStatus::Succeeded,
         started_at: 1_722_400_000,
         finished_at: Some(1_722_400_123),
+        operation_id: None,
+        target_namespace: None,
+        intent_fingerprint: None,
+        config_fingerprint: None,
+        source_spec_fingerprint: None,
+        readiness_verified: None,
+        reconciliation_required: false,
         repo: None,
         git_ref: None,
         commit: None,

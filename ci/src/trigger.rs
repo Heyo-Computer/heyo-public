@@ -41,6 +41,8 @@ pub struct RepositoryRef {
     pub url: String,
     #[serde(default)]
     pub default_branch: Option<String>,
+    #[serde(default)]
+    pub release_base_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -439,8 +441,12 @@ fn validate_descriptor(source: &GitPatchSource) -> Result<(), TriggerError> {
 }
 
 pub fn read_descriptor(workspace: &Workspace) -> Result<GitPatchSource, TriggerError> {
-    let bytes = std::fs::read(&workspace.descriptor).map_err(|e| TriggerError::Io {
-        path: workspace.descriptor.clone(), reason: e.to_string(),
+    read_descriptor_path(&workspace.descriptor)
+}
+
+pub fn read_descriptor_path(path: &Path) -> Result<GitPatchSource, TriggerError> {
+    let bytes = std::fs::read(path).map_err(|e| TriggerError::Io {
+        path: path.to_path_buf(), reason: e.to_string(),
     })?;
     let source = serde_json::from_slice(&bytes)
         .map_err(|e| TriggerError::BadArchive(format!("stored git-patch descriptor is invalid: {e}")))?;

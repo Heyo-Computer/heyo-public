@@ -339,6 +339,7 @@ mod tests {
                 ttl_seconds: 3600,
             }),
             scaling: Default::default(),
+            maintenance: false,
             health: Default::default(),
             upstreams: vec![],
             discovery: None,

@@ -9,13 +9,14 @@ die() { printf '%s: %s\n' "$cmd" "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-Usage: $cmd [--dirty] [--ref <rev>] [--only <workflow>] [--workflow <id>] [--dry-run] [--submit-empty]
+Usage: $cmd [pr<number>] [--dirty] [--ref <rev>] [--only <workflow>] [--workflow <id>] [--dry-run] [--submit-empty]
 
 Submits an exact Git revision and patch to the CI orchestrator. The runner
 checks out the fetchable base revision from repository.url, then applies the
 patch and verifies the resulting tree.
 
 Options:
+  pr<number>        fetch and submit that GitHub pull request's exact head
   --dirty          include uncommitted tracked changes
   --submit-empty   submit even when the target tree equals the default branch
   --archive        removed: full-repository archive uploads are not supported
@@ -36,14 +37,14 @@ Configuration (environment wins over git config):
 EOF
 }
 
-rev=HEAD; dirty=0; dry_run=0; submit_empty=0; workflow=""; only=()
+rev=HEAD; ref_selected=0; pr_number=""; dirty=0; dry_run=0; submit_empty=0; workflow=""; only=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --dirty) dirty=1; shift ;;
     --submit-empty) submit_empty=1; shift ;;
     --archive) die "--archive was removed: CI no longer accepts full-repository bundles or archives. Publish a base commit, then use $cmd (or $cmd --dirty)." ;;
     --dry-run) dry_run=1; shift ;;
-    --ref) [ $# -ge 2 ] || die "--ref needs a revision"; rev="$2"; shift 2 ;;
+    --ref) [ $# -ge 2 ] || die "--ref needs a revision"; rev="$2"; ref_selected=1; shift 2 ;;
     --workflow) [ $# -ge 2 ] || die "--workflow needs an id"; workflow="$2"; shift 2 ;;
     --only) [ $# -ge 2 ] || die "--only needs a workflow name"; only+=("$2"); shift 2 ;;
     --upgrade)
@@ -54,33 +55,57 @@ while [ $# -gt 0 ]; do
       ;;
     --version) printf '%s %s\n' "$me" "$GIT_SUBMIT_VERSION"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
+    pr*) pr_candidate="${1#pr}"; case "$pr_candidate" in ""|0|0*|*[!0-9]*) die "malformed pull request selector $1 (expected pr<number>, for example pr59)";; esac; [ -z "$pr_number" ] || die "only one pull request selector may be used"; pr_number="$pr_candidate"; shift ;;
     *) die "unknown argument $1 (try --help)" ;;
   esac
 done
 
+if [ -n "$pr_number" ]; then
+  [ "$ref_selected" -eq 0 ] || die "pr$pr_number cannot be combined with --ref"
+  [ "$dirty" -eq 0 ] || die "pr$pr_number cannot be combined with --dirty"
+fi
+
 for tool in git curl base64 python3; do command -v "$tool" >/dev/null 2>&1 || die "$tool is required but not on PATH"; done
 git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
 
-endpoint="${CI_ENDPOINT:-$(git config --get ci.endpoint || true)}"
+normalize_endpoint() { local value="${1%/}"; case "$value" in */api/submit) printf '%s\n' "$value";; */git/push) printf '%s/api/submit\n' "${value%/git/push}";; *) printf '%s/api/submit\n' "$value";; esac; }
+ci_config_endpoint="$(git config --get ci.endpoint || true)"
+cicd_config_endpoint="$(git config --get cicd.endpoint || true)"
+canonical_endpoint="${CI_ENDPOINT:-$ci_config_endpoint}"
+legacy_endpoint="${CICD_ENDPOINT:-$cicd_config_endpoint}"
+endpoint="${canonical_endpoint:-$legacy_endpoint}"
 [ -n "$endpoint" ] || die "no endpoint. Set CI_ENDPOINT or git config ci.endpoint https://ci.example.com"
-base="${endpoint%/}"; base="${base%/api/submit}"; submit_url="$base/api/submit"
+submit_url="$(normalize_endpoint "$endpoint")"
+if [ -n "$canonical_endpoint" ] && [ -n "$legacy_endpoint" ] && [ "$(normalize_endpoint "$canonical_endpoint")" != "$(normalize_endpoint "$legacy_endpoint")" ]; then die "conflicting endpoint settings. ci.endpoint/CI_ENDPOINT and legacy cicd.endpoint/CICD_ENDPOINT must resolve to the same public submission API"; fi
+base="${submit_url%/api/submit}"
 token="${CI_TOKEN:-$(git config --get ci.token || true)}"
 secret="${CI_WEBHOOK_SECRET:-$(git config --get ci.secret || true)}"
 [ -n "$token" ] || [ -n "$secret" ] || die "no credential. Register at $base/repos and set git config ci.token <token>"
 if [ -z "$token" ]; then command -v openssl >/dev/null 2>&1 || die "openssl is required when using ci.secret"; fi
 
-target_commit="$(git rev-parse --verify "$rev^{commit}" 2>/dev/null)" || die "cannot resolve $rev to a commit"
-original_commit="$target_commit"
-branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || printf detached)"
-repo_url="$(git config --get remote.origin.url || true)"
-[ -n "$repo_url" ] || die "repository has no remote.origin.url; publish a base commit to an origin the runner can fetch"
-repo_name="$(basename "$(git rev-parse --show-toplevel)")"
-default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
-before="$(git rev-parse --verify "${rev}^" 2>/dev/null || true)"
-pusher_name="$(git config --get user.name || true)"; pusher_email="$(git config --get user.email || true)"
-
 work="$(mktemp -d "${TMPDIR:-/tmp}/git-submit.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
+repo_url="$(git config --get remote.origin.url || true)"
+[ -n "$repo_url" ] || die "repository has no remote.origin.url; publish a base commit to an origin the runner can fetch"
+if [ -n "$pr_number" ]; then
+  pr_repo="$work/pr.git"; git init -q --bare "$pr_repo"
+  git --git-dir="$pr_repo" fetch --quiet --no-tags "$repo_url" "+refs/pull/$pr_number/head:refs/heads/pr" || die "cannot fetch GitHub pull request #$pr_number from origin"
+  target_commit="$(git --git-dir="$pr_repo" rev-parse refs/heads/pr)"
+  git_objects="$(git rev-parse --path-format=absolute --git-path objects)"
+  printf '%s\n' "$pr_repo/objects" > "$work/pr-alternate"
+  export GIT_ALTERNATE_OBJECT_DIRECTORIES="$pr_repo/objects${GIT_ALTERNATE_OBJECT_DIRECTORIES:+:$GIT_ALTERNATE_OBJECT_DIRECTORIES}"
+  rev="$target_commit"
+else
+  target_commit="$(git rev-parse --verify "$rev^{commit}" 2>/dev/null)" || die "cannot resolve $rev to a commit"
+fi
+original_commit="$target_commit"
+branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || printf detached)"
+[ -z "$pr_number" ] || branch="pull/$pr_number"
+repo_name="$(basename "$(git rev-parse --show-toplevel)")"
+default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
+release_base=""; [ -z "$default_branch" ] || release_base="$(git ls-remote "$repo_url" "refs/heads/$default_branch" | awk 'NR==1{print $1}')"
+before="$(git rev-parse --verify "${rev}^" 2>/dev/null || true)"
+pusher_name="$(git config --get user.name || true)"; pusher_email="$(git config --get user.email || true)"
 
 # A private index makes --dirty include tracked worktree changes without
 # modifying HEAD, the user's index, or any refs.
@@ -198,12 +223,12 @@ PY
 
 payload="$work/payload.json"
 REPO_NAME="$repo_name" REPO_URL="$repo_url" DEFAULT_BRANCH="$default_branch" BRANCH="$branch" BEFORE="$before" AFTER="$after" \
-PUSHER_NAME="$pusher_name" PUSHER_EMAIL="$pusher_email" WORKFLOW="$workflow" ONLY_FILE="$work/only" DESCRIPTOR="$descriptor" PAYLOAD="$payload" python3 - <<'PY'
+PUSHER_NAME="$pusher_name" PUSHER_EMAIL="$pusher_email" RELEASE_BASE="$release_base" WORKFLOW="$workflow" ONLY_FILE="$work/only" DESCRIPTOR="$descriptor" PAYLOAD="$payload" python3 - <<'PY'
 import base64,json,os
 open(os.environ['ONLY_FILE'],'w').write('')
 only=json.loads(os.environ.get('ONLY_JSON','[]')) if os.environ.get('ONLY_JSON') else []
 d=json.load(open(os.environ['DESCRIPTOR']))
-p={'repository':{'id':os.environ['REPO_NAME'],'name':os.environ['REPO_NAME'],'url':os.environ['REPO_URL'],'defaultBranch':os.environ['DEFAULT_BRANCH'] or None},
+p={'repository':{'id':os.environ['REPO_NAME'],'name':os.environ['REPO_NAME'],'url':os.environ['REPO_URL'],'defaultBranch':os.environ['DEFAULT_BRANCH'] or None,'releaseBaseSha':os.environ['RELEASE_BASE'] or None},
    'ref':'refs/heads/'+os.environ['BRANCH'],'before':os.environ['BEFORE'],'after':os.environ['AFTER'],'dryRun':False,
    'pusher':{'name':os.environ['PUSHER_NAME'],'email':os.environ['PUSHER_EMAIL']},'workflowId':os.environ['WORKFLOW'] or None,
    'only':only,'source':{'format':'git-patch','contentBase64':base64.b64encode(json.dumps(d,separators=(',',':')).encode()).decode()}}
