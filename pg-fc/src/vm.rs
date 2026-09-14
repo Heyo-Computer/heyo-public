@@ -2022,8 +2022,17 @@ async fn exec_guest_env(
 pub(crate) async fn physical_exec(
     cfg: &Config, sandbox: &Sandbox, command: &str, env: HashMap<String, String>, what: &str,
 ) -> Result<CommandResult> {
-    let command = format!("for pgbin in /usr/lib/postgresql/*/bin; do [ ! -d \"$pgbin\" ] || export PATH=\"$pgbin:$PATH\"; done\n{command}");
+    let command = physical_exec_command(command);
     exec_guest_env(cfg, sandbox, &command, Some(env), what).await
+}
+
+fn physical_exec_command(command: &str) -> String {
+    use base64::Engine;
+    // No literal newlines may reach the serial shell, even inside quotes:
+    // console framing can finish capture before multiline bodies print.
+    let body = format!("for pgbin in /usr/lib/postgresql/*/bin; do [ ! -d \"$pgbin\" ] || export PATH=\"$pgbin:$PATH\"; done\n{command}");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(body);
+    format!("printf '%s' '{encoded}' | base64 -d | sh")
 }
 
 /// Resolve by the operation's unique durable name before creating.  This is
@@ -3128,6 +3137,16 @@ async fn wait_pg_ready(pool: &Pool, timeout: Duration, name: &str) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_exec_preserves_one_shell_body_and_exit_status() {
+        let command = physical_exec_command("cat <<'SQL'\nSELECT :'db', '$literal';\nSQL\nprintf '%s\\n' \"$PGFC_VALUE\"\nexit 17");
+        assert!(!command.contains('\n'), "serial capture needs one physical line");
+        let output = std::process::Command::new("sh").args(["-c", &command])
+            .env("PGFC_VALUE", "a'b $unchanged").output().unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "SELECT :'db', '$literal';\na'b $unchanged\n");
+    }
 
     fn pool_at(port: u16) -> Pool {
         build_pool("127.0.0.1", port, "postgres", "postgres", None).unwrap()

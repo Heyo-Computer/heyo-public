@@ -44,7 +44,7 @@ RUN apt-get update \
         locales \
         gosu \
         jq \
-        python3-minimal \
+        python3 \
     && localedef -i en_US -f UTF-8 en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 

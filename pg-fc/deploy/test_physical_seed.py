@@ -26,8 +26,9 @@ class PhysicalSeedTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tag = "pgfc-physical-test-" + uuid.uuid4().hex[:10]
-        dockerfile = "FROM postgres:18-bookworm\nRUN apt-get update && apt-get install -y jq util-linux python3-minimal && rm -rf /var/lib/apt/lists/*\n"
-        run("docker", "build", "-t", cls.tag, "-", input=dockerfile)
+        # Exercise the production guest's package set, not the richer official
+        # postgres image (which masked missing ctypes in python3-minimal).
+        run("docker", "build", "--build-arg", "PG_MAJOR=18", "-t", cls.tag, str(HERE))
 
     @classmethod
     def tearDownClass(cls):
@@ -46,7 +47,7 @@ class PhysicalSeedTest(unittest.TestCase):
         type(self).containers = [self.source, self.candidate]
         run("docker", "network", "create", self.network)
         run("docker", "run", "-d", "--name", self.source, "--network", self.network,
-            "-e", "POSTGRES_PASSWORD=secret", self.tag,
+            "-e", "POSTGRES_PASSWORD=secret", IMAGE,
             "-c", "wal_level=replica", "-c", "max_wal_senders=10",
             "-c", "max_replication_slots=10")
         self.wait_ready(self.source)
@@ -64,7 +65,8 @@ class PhysicalSeedTest(unittest.TestCase):
         run("docker", "run", "-d", "--name", self.candidate, "--network", self.network,
             "-e", "POSTGRES_PASSWORD=scratch", "-e", "PGDATA=/workspace/pgdata",
             "-v", f"{workspace}:/workspace", "--entrypoint", "sh", self.tag, "-c",
-            "docker-entrypoint.sh postgres & exec sleep infinity")
+            "set -e; gosu postgres initdb -D /workspace/pgdata --auth=trust; "
+            "gosu postgres pg_ctl -D /workspace/pgdata -w start; exec sleep infinity")
         self.wait_ready(self.candidate)
         state = workspace / "pg-fc-physical"
         state.mkdir(); os.chmod(state, 0o777)
@@ -130,6 +132,14 @@ class PhysicalSeedTest(unittest.TestCase):
         # Plan presence inhibits an incomplete seed.
         r = self.cexec("PG_FC_TEST_ALLOW_NONMOUNT=1 PG_FC_TEST_ALLOW_PLAN_OWNER=1 PG_FC_ROOT_MARKER=/tmp/m /mounted/physical.sh boot-check", check=False)
         self.assertEqual(r.returncode, 20)
+        # An unexpected tool exit (such as a missing Python module) must not
+        # leave a stopped worker advertising that its copy is still running.
+        self.cexec("mkdir -p /tmp/failed-tools; printf '#!/bin/sh\\nexit 31\\n' > /tmp/failed-tools/python3; chmod +x /tmp/failed-tools/python3")
+        r = self.cexec("PATH=/tmp/failed-tools:$PATH " + self.seed_cmd, check=False)
+        self.assertEqual(r.returncode, 31)
+        status = json.loads(self.cexec("/mounted/physical.sh status").stdout)
+        self.assertEqual(status["phase"], "failed")
+        self.assertIn("exit 31", status["error"])
         # Copy failure is durable and retryable without touching scratch.
         r = self.cexec("PG_FC_TEST_ALLOW_NONMOUNT=1 PG_FC_TEST_ALLOW_PLAN_OWNER=1 PG_FC_ROOT_MARKER=/tmp/m PG_FC_TEST_FAIL_AT=after-copy /mounted/physical.sh seed", check=False)
         self.assertNotEqual(r.returncode, 0)
@@ -156,6 +166,14 @@ class PhysicalSeedTest(unittest.TestCase):
         # Execute the exact controller verification script. In particular,
         # psql -c does not expand the variables used for identity checks.
         source = (HERE / "src/replication/physical.rs").read_text()
+        read_status = re.search(r'const READ_STATUS: &str = r#"(.*?)"#;', source, re.S).group(1)
+        read_status = read_status.replace("/usr/local/bin/pg-fc-physical", "/mounted/physical.sh")
+        # Firecracker commands run on a TTY: jq otherwise emits ANSI colors,
+        # which a pipe-only container exec test cannot detect.
+        tty_status = run("docker", "exec", "-t", self.candidate, "sh", "-c", read_status).stdout
+        self.assertEqual(json.loads(tty_status), {"phase": "active", "error": None})
+        failed_probe = read_status.replace("/mounted/physical.sh status", "sh -c 'exit 23'")
+        self.assertEqual(self.cexec(failed_probe, check=False).returncode, 23)
         verify = re.search(r'const VERIFY_RUNTIME: &str = r#"(.*?)"#;', source, re.S).group(1)
         variables = ("PGFC_DB=postgres", "PGFC_ROLE=postgres", f"PGFC_SYSTEM_ID={self.system_id}",
                      "PGFC_SLOT=standby_slot", "PGFC_LSN=0/1", f"PGFC_HOST={self.source}", "PGFC_PORT=5432")

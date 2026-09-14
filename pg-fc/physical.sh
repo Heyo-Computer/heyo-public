@@ -133,6 +133,9 @@ seed() {
     chmod 600 "$ROOT_MARKER" 2>/dev/null || true
     exec 9>"$LOCK"
     if ! flock -n 9; then echo "seed already running" >&2; exit 75; fi
+    # Unexpected helper failures must not leave a dead worker reporting
+    # "copying" forever. Do not overwrite a more specific fail() message.
+    trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$(jq -r .phase "$STATUS" 2>/dev/null)" != failed ]; then say_status failed "seed exited unexpectedly (exit $rc); see controller.log"; fi' 0
     sync
     if is_active; then
         if ! gosu postgres pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then

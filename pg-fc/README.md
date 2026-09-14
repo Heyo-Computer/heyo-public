@@ -1118,7 +1118,11 @@ Upgrade the host binary on both peers and build the new guest image with the
 `/usr/local/bin/pg-fc-physical`. Guest boot now refuses to initialize a database
 when its persistent volume is missing, keeping only the management console up.
 The release artifact includes checksummed guest build inputs alongside the
-host binary.
+host binary. The guest requires the full `python3` package: `python3-minimal`
+does not provide `ctypes`, used to parse credentials with libpq. Run
+`python3 pg-fc/deploy/test_physical_seed.py` from the repository root to test
+the production guest Dockerfile with PostgreSQL 18, including TTY status output
+and retry after a helper exits unexpectedly.
 
 On the existing logical primary, POST `/api/replication/<database>/physical-prepare`
 with `{"generation":"<unique-lowercase-operation-id>"}`. Repeating that request

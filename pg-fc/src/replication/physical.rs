@@ -112,7 +112,7 @@ async fn seed(reg: Arc<SchemaRegistry>, req: wire::PhysicalReplicaRequest) -> Re
     let deadline = tokio::time::Instant::now() + reg.replication_cfg().context("replication disabled")?.setup_deadline;
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let status = crate::vm::physical_exec(reg.cfg(), &sandbox, "/usr/local/bin/pg-fc-physical status", HashMap::new(), "probing physical seed").await?;
+        let status = crate::vm::physical_exec(reg.cfg(), &sandbox, READ_STATUS, HashMap::new(), "probing physical seed").await?;
         if status.exit_code != 0 { bail!("physical seed status probe failed"); }
         let value: serde_json::Value = serde_json::from_str(if status.stdout.is_empty() { status.output.trim() } else { status.stdout.trim() })?;
         match value["phase"].as_str() { Some("active") => break, Some("failed") => bail!("guest seed failed: {}", value["error"].as_str().unwrap_or("unknown error")), _ if tokio::time::Instant::now() >= deadline => bail!("physical seed still running after setup deadline; retry will resume under guest lock"), _ => {} }
@@ -128,6 +128,13 @@ async fn seed(reg: Arc<SchemaRegistry>, req: wire::PhysicalReplicaRequest) -> Re
     reg.physical().advance(&req.database, &req.generation, PhysicalPhase::Seeding, PhysicalPhase::Verified, None)?;
     Ok(())
 }
+
+// Command substitution gives jq a pipe instead of the serial TTY, disabling
+// ANSI colors even in already-created guests. Preserve a failed probe's exit.
+const READ_STATUS: &str = r#"set -e
+status=$(/usr/local/bin/pg-fc-physical status)
+printf '%s\n' "$status"
+"#;
 
 const INSTALL_SEED_PLAN: &str = r#"set -eu
 umask 077
