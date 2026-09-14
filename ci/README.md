@@ -46,7 +46,6 @@ git config ci.token    cis_019fca648a6e-00000002.…
 git submit --dry-run    # show what would be sent
 git submit              # submit HEAD
 git submit --dirty      # include uncommitted tracked changes
-git submit --archive    # send a tree-only tarball instead of a bundle
 git submit --only apps  # run one workflow file, skip the rest
 ```
 
@@ -71,33 +70,43 @@ The field rides the payload as `only`; a server older than this build ignores
 unknown fields and would run everything, so upgrade the server before leaning
 on it.
 
-`git submit` sends a **`git bundle`**, which clones in the guest into a real
-repository — so `git describe`, `git log` and `git rev-parse` work in a step. Two
-consequences of the submitter packing it rather than the server fetching it, and
-both are the point:
+`git submit` does **not** upload a repository, bundle, or source archive. It
+inspects the actual `origin`, chooses a full commit SHA the runner can fetch,
+and sends only a binary full-index Git patch from that revision to the requested
+target tree. A published commit is its own pinned base and has an empty patch.
+Moving a branch after submission cannot change the checkout.
 
-- **No repository credential exists anywhere in this system.** Not on the
-  orchestrator, not in a guest. The submitter already had read access — they ran
-  `git bundle` — so nothing else needs its own. A CI system that clones for you
-  is a CI system holding a key to every repository it builds.
-- **The tree is exactly what the submitter meant.** No re-resolving a ref that
-  may have moved, no guessing whether dirty work was included.
+The runner owns checkout: it authenticates to `repository.url`, fetches the
+exact `baseRevision`, applies the patch, and refuses the build unless the
+resulting Git tree is exactly `targetTree`. Private repositories therefore need
+checkout credentials configured for the CI runner/service (normally through
+HeyoSecret). The submit token authenticates submission but is not repository
+read access, and no checkout credential is embedded in the patch.
 
-The cost is history. A bundle that clones on its own **must reach a root
-commit**: `git bundle create --depth` does not exist, and a `--max-count` slice
-is refused at clone time with *"Repository lacks these prerequisite commits"*. So
-the payload scales with history rather than with one tree, and `--archive` sends
-the old tree-only tarball for the repository where that is the wrong trade.
+Local commits and `--dirty` work when an ancestor is currently published at
+`origin`. The client checks advertised remote heads rather than trusting stale
+`origin/*` refs, uses a private index for dirty tracked files, and never pushes
+or changes HEAD/the user's index. If no published ancestor exists (including an
+unpublished root-only repository), publish a base branch first. There is no
+full-repository fallback; `--archive` exits with migration guidance.
 
-Two practical requirements: a bundle needs `git` on the orchestrator **and** in
-the guest image; a tarball needs neither. Each absence is reported by name.
+The `git-patch` source descriptor carries the pinned base, expected tree,
+binary patch, workflow YAML metadata, and known/unknown changed paths. A patched
+checkout may have a synthetic commit SHA, so submitted `after` and checkout
+commit identity can differ; **tree identity is the invariant**. For a published
+submission, the original SHA is the base and the patch is empty.
 
-Three shapes of `git bundle` do not work, and the client is built around them:
-it refuses a bare sha (*"Refusing to create empty bundle"*), so `--ref <sha>` and
-`--dirty` pack through a throwaway bare repo that borrows your object store via
-`alternates` rather than writing refs into it; and a bundle carrying **zero
-refs** passes `git bundle verify` as "complete" and clones into an empty
-repository, so the server counts refs itself rather than trusting the verify.
+Workflow metadata comes from the target Git tree (or private dirty target), not
+arbitrary worktree files. Defaults are `.ci/workflows/*.yml` and
+`.ci/workflows/*.yaml`. A repository using a registered custom workflow glob
+must configure the corresponding client glob:
+
+```bash
+git config --add ci.workflowPath 'ci/workflows/*.yaml'
+```
+
+Only safe relative YAML paths are eligible. Each file is limited to 256 KiB and
+the metadata total to 1 MiB. Python 3, Git, curl, and base64 are required.
 
 ## Registered repositories, and the token that submits
 
@@ -266,23 +275,17 @@ and a workflow filter cannot disagree about what a pattern covers. It is not
 `contains(ci.changed_files, …)`, which on an array is an equality test and would
 need the exact path of every file somebody might touch.
 
-**The diff comes from the submitted bundle's own history**, not from a fetch:
-`git diff --name-only --no-renames <before> HEAD` in the unpacked clone, where
-`before` is what the client sent (`git rev-parse HEAD^`). Rename detection is
-off deliberately — a file moved between two packages must rebuild both, and with
-it git reports only the destination.
-
-The **`after` side is the clone's `HEAD`, not the payload's `after`**, because
-`git submit --dirty` reports `<sha>-dirty`: a label for a person, not a
-resolvable object. The bundle's `HEAD` is the only thing that points at the tree
-that actually travelled.
+**The diff comes from the submitter's verified Git tree** and is recorded in the
+durable source descriptor. Rename detection is off deliberately — a file moved
+between two packages must rebuild both, not only the destination. The runner
+reconstructs the exact base revision plus patch and verifies the target tree;
+the CI service never expands a repository archive.
 
 #### When the diff cannot be read
 
-`--archive` sends a tarball with no history. A root commit has no parent. A
-`before` from a history the bundle is not part of resolves to nothing. In all of
-these there is no answer, and **no answer matches every filter** — the workflow
-builds.
+A root commit has no parent, and a base unavailable to the submitter cannot be
+diffed. In these cases there is no answer, and **no answer matches every
+filter** — the workflow builds.
 
 The other direction is the failure worth designing against: unknown meaning
 "nothing changed" is a CI system that quietly stops building and reports a green
@@ -309,7 +312,7 @@ ci.workflow
 Read from the run row rather than frozen onto each job's plan, unlike the network
 assignment beside it. The two are not the same kind of fact: a repository can be
 reassigned to another network mid-build, so the plan freezes that; the commit a
-run is for is fixed when the bundle is unpacked and cannot move under a
+run is for is fixed by the durable descriptor and cannot move under a
 redelivery. Freezing it anyway would copy a monorepo-sized path list onto every
 job row.
 
@@ -347,7 +350,8 @@ the `building` row above, looked exactly like a run nothing had picked up.
 
 Because the build *is* `docker build`, docker's semantics apply in full —
 multi-stage, `COPY --from=`, `ADD`, `ARG`, `.dockerignore`. `ci` does not parse
-the Dockerfile; it hashes the bytes and ships them. What does not survive is
+the Dockerfile; the runner daemon hashes and stages its verified local inputs.
+What does not survive is
 what `docker export` has never carried: **OCI metadata**. `ENV`, `CMD` and
 `ENTRYPOINT` build fine and then vanish from the rootfs — an environment
 variable steps need must be written to `/etc/profile.d` by a `RUN` (steps run
@@ -611,12 +615,12 @@ Run and job ids name their logs and derive the step operation ids the daemon
 reattaches to, and the failed attempt is what somebody will want to read beside
 the one that passed.
 
-**What it runs is the source the submit sent.** This service never clones — it
-holds no credential to — so there is no "run this workflow on that branch" form:
-the only source it can run is one a `git submit` already delivered, and every
-submit keeps its bundle or tarball beside the workspace under `CI_WORKSPACE_DIR`
-for exactly this. A run whose stored source is gone says so and asks for a new
-submit. The re-run goes through the same path as a submit, with the run's own
+**What it runs is the source the submit described.** The CI service never clones
+or stores a repository credential. It durably keeps the immutable revisions and
+patch descriptor under `CI_WORKSPACE_DIR`; the selected runner reconstructs and
+verifies that tree using a freshly resolved job-scoped HeyoSecret. A run whose
+descriptor is gone says so and asks for a new submit. The re-run goes through
+the same path as a submit, with the run's own
 workflow file as its `--only` selector, so it is planned, routed and given
 secrets exactly as the original was. As with `--only`, the `on.submit` branch
 and path filters do not apply — and the run inherits the original's recorded
