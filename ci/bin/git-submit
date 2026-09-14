@@ -150,13 +150,15 @@ if git --git-dir="$pack" for-each-ref --contains "$original_commit" --format='%(
   base_revision="$original_commit"
 else
   best_count=""
+  # Minimal Linux guests may not provide /dev/fd for process substitution.
+  git --git-dir="$pack" for-each-ref --format='%(objectname)' refs/remotes/submit | sort -u > "$work/remote-tips"
   while read -r remote_tip; do
     candidate="$(git --git-dir="$pack" merge-base "$remote_tip" "$target_commit" 2>/dev/null || true)"
     if [ -n "$candidate" ] && git --git-dir="$pack" merge-base --is-ancestor "$candidate" "$target_commit" 2>/dev/null; then
       count="$(git --git-dir="$pack" rev-list --count "$candidate..$target_commit")"
       if [ -z "$best_count" ] || [ "$count" -lt "$best_count" ]; then base_revision="$candidate"; best_count="$count"; fi
     fi
-  done < <(git --git-dir="$pack" for-each-ref --format='%(objectname)' refs/remotes/submit | sort -u)
+  done < "$work/remote-tips"
 fi
 [ -n "$base_revision" ] || die "no fetchable published commit is an ancestor of $rev. Push a base commit/branch to origin first; full-repository upload fallback is disabled"
 git --git-dir="$pack" cat-file -e "$base_revision^{commit}" 2>/dev/null || die "selected base $base_revision could not be verified after fetching origin"
