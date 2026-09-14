@@ -103,7 +103,11 @@ def _validate(cert, key, hostname):
         os.chmod(cert_path, 0o600)
         os.chmod(key_path, 0o600)
         _openssl(["x509", "-in", str(cert_path), "-noout", "-checkend", "0"])
-        _openssl(["x509", "-in", str(cert_path), "-noout", "-checkhost", hostname])
+        # OpenSSL 3.0 can exit zero even when -checkhost reports a mismatch.
+        # Require its positive verdict, not merely successful command execution.
+        verdict = _openssl(["x509", "-in", str(cert_path), "-noout", "-checkhost", hostname])
+        if verdict.strip() != f"Hostname {hostname} does match certificate".encode():
+            raise SyncError("certificate hostname does not match")
         cert_public = _openssl(["x509", "-in", str(cert_path), "-pubkey", "-noout"])
         key_public = _openssl(["pkey", "-in", str(key_path), "-pubout"])
         if cert_public != key_public:
