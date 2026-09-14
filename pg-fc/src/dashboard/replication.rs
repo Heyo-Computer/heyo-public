@@ -384,6 +384,10 @@ pub async fn api_forget(State(st): State<DashState>, Path(db): Path<String>) -> 
 // Node-to-node
 // ---------------------------------------------------------------------------
 
+pub async fn api_writer_tunnel(State(st): State<DashState>, mut request: axum::extract::Request) -> Response {
+    crate::writer_routing::accept(&st.registry, st.cfg.basic_auth.is_some(), &mut request).await
+}
+
 /// The handshake a peer performs before creating anything. Deliberately says
 /// nothing about which databases exist here — a peer is trusted to drive this
 /// node, but the handshake itself is the least it needs.

@@ -1156,12 +1156,16 @@ exact generation, candidate ID, source node/VM, system identifier, PostgreSQL
 major, and an initially informational `barrier_lsn` (use `0/0`). Obtain the
 identity fields from GET `/api/replication/<database>/physical` on the candidate
 region; the response includes no replication credentials. The controller re-reads
-the candidate from the trusted peer, fences and drains the exact source VM,
+the candidate from the trusted peer and durably authorizes that exact candidate
+before fencing. It then fences and drains the exact source VM,
 captures the authoritative flushed WAL barrier, then durably and irrevocably
-authorizes only that peer/candidate/generation/barrier. Ordinary unfence is
-permanently refused after this grant. A lost peer response therefore leaves
-the source closed and an identical request safely resumes; it never guesses
-that promotion failed.
+grants only that peer/candidate/generation/barrier. Ordinary unfence is refused
+once candidate authorization is saved, even before the grant. Request failure
+or disconnection does not cancel an accepted handoff. A controller worker scans
+every five seconds, including after restart, and retries authorized source
+operations and destination `prepared` through `binding` operations. A merely
+`verified` standby never promotes automatically. Completed source requests are
+acknowledged durably and removed from the retry set, not from ownership history.
 
 The destination independently reads that grant through the authenticated peer
 API and persists its barrier before any guest transition. Subsequent retries
@@ -1185,13 +1189,34 @@ grant permanently revokes that VM even after later switches. Stale requests
 and queued seed workers cannot mutate a newer generation.
 
 Physical sources own their durable fences independently of logical replication
-metadata. Before a grant, `unfence` invalidates the saved barrier before reopening
-admission. After a grant it is permanently refused for that source VM. An
+metadata. Before handoff authorization, `unfence` invalidates the saved barrier
+before reopening admission. After authorization the operation must finish; after
+a grant reopening that source VM is permanently forbidden. An
 ambiguous journal directory-sync failure stops the controller so restart reloads
 disk state instead of continuing with stale in-memory authorization.
 
 Cleanup, external secret DSNs, and regional/application routing remain outside
 the controller operation.
+
+#### Stable region-local SQL endpoints
+
+For dedicated tenants participating in physical handoff, the regional pooler
+routes new ordinary SQL connections to the authorized writer. A verified initial
+physical preparation routes to its source; an irrevocable source grant routes
+to its exact activated destination. The old guest remains revoked even though
+its region's frontend can forward to the new writer. Incomplete handoffs, stale
+bindings, mismatched identities, and unavailable peers fail closed.
+
+Forwarding uses a one-hop HTTP/1.1 upgrade on the peer dashboard API with
+certificate-verified HTTPS, no redirects, and the existing full-trust dashboard
+Basic credentials. These credentials are full administrative access, not an
+isolated SQL permission. The receiving endpoint validates tenant and ownership
+and can only attach a local writer; it never forwards again. Replication and
+maintenance connections are excluded. Sessions remain pinned to one backend;
+disconnects never cause SQL or transactions to be replayed. Applications must
+reconnect after a handoff, but can retain their region-local connection URL.
+This does not move applications, elect a writer during a partition, or implement
+regional maintenance orchestration. Prepare both peers before adopting these URLs.
 
 #### Guest promoted-but-fenced transition
 

@@ -4,9 +4,10 @@
 //! ownership and asks the existing logical peer to seed a distinct candidate.
 //! `POST /api/replication/peer/physical-replicas` durably records that
 //! candidate before VM creation. Both endpoints are generation-idempotent and
-//! return a sanitized [`wire::PhysicalRecordJson`]. The background worker may
+//! return a sanitized [`wire::PhysicalRecordJson`]. The preparation worker may
 //! advance only through `verified`: it never changes the ordinary database
 //! binding, promotes either VM, or tears down logical replication.
+//! A separate recovery worker resumes only explicitly authorized handoffs.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -44,7 +45,7 @@ pub async fn prepare_source(reg: &Arc<SchemaRegistry>, database: &str, generatio
     }
     if let Some(existing) = reg.physical_sources().get(database) {
         if existing.generation == generation {
-            if existing.source_vm_id != source_vm_id || existing.handoff.is_some() || existing.fence.is_some() {
+            if existing.source_vm_id != source_vm_id || existing.handoff_candidate.is_some() || existing.handoff.is_some() || existing.fence.is_some() {
                 bail!("source preparation is stale or already fenced");
             }
             reg.physical_sources().set_repl(database, generation, repl.clone())?;
@@ -62,7 +63,7 @@ pub async fn prepare_source(reg: &Arc<SchemaRegistry>, database: &str, generatio
     let mut settings = BTreeMap::new();
     for key in SETTINGS { let value: i32 = db.query_one("SELECT current_setting($1)::int", &[&key]).await?.get(0); settings.insert(key.into(), value); }
     let slot = format!("pgfc_phys_{}", generation.replace('-', "_"));
-    let intent = PhysicalSourceRecord { database: database.into(), generation: generation.into(), predecessor: predecessor.clone(), source_vm_id: source_vm_id.clone(), repl: Some(repl.clone()), fence: None, system_identifier: system_identifier.clone(), pg_major: pg_major as u32, slot: slot.clone(), source_lsn: source_lsn.clone(), peer: peer_name.clone(), handoff: None, last_error: None };
+    let intent = PhysicalSourceRecord { database: database.into(), generation: generation.into(), predecessor: predecessor.clone(), source_vm_id: source_vm_id.clone(), repl: Some(repl.clone()), fence: None, system_identifier: system_identifier.clone(), pg_major: pg_major as u32, slot: slot.clone(), source_lsn: source_lsn.clone(), peer: peer_name.clone(), handoff_candidate: None, handoff_complete: false, handoff: None, last_error: None };
     let source = if let Some(active) = &incoming {
         reg.physical_sources().create_successor(intent, active, &source_vm_id)?
     } else { reg.physical_sources().create(intent)? };
@@ -148,22 +149,83 @@ pub async fn handoff_source(reg: &Arc<SchemaRegistry>, req: wire::PhysicalHandof
     let target = client.physical_status(&req.database).await?;
     let already_granted = source.handoff.as_ref().is_some_and(|g| g.candidate_id == req.candidate_id && g.peer == source.peer);
     if target.generation != req.generation || target.candidate_id.as_deref() != Some(&req.candidate_id)
-        || target.source_vm_id != req.source_vm_id || (!already_granted && target.phase != "verified") {
+        || target.source_vm_id != req.source_vm_id || target.source_node != req.source_node
+        || target.system_identifier != req.system_identifier || target.pg_major != req.pg_major
+        || (!already_granted && target.phase != "verified") {
         bail!("peer candidate is not the exact verified physical preparation");
+    }
+    if reg.replication().get(&req.database).and_then(|r| r.fence).is_some_and(|f| f.mode == "selective") {
+        bail!("clear the selective fence before authorizing a physical handoff");
     }
     if source.repl.is_none() {
         let logical = reg.replication().get(&req.database).context("physical source lost replication credential")?;
         reg.physical_sources().set_repl(&req.database, &req.generation, wire::Login { role: logical.repl_role, password: logical.repl_password })?;
     }
+    // From this fsynced authorization onward, request loss or controller restart
+    // must resume this exact candidate. Merely preparing a standby never arms it.
+    reg.physical_sources().authorize_handoff(&req.database, &req.generation, &req.candidate_id)?;
     let barrier = fence_source(reg, &source).await?;
     let mut authorized = req.clone(); authorized.barrier_lsn = barrier.clone();
     reg.physical_sources().grant_handoff(&req.database, &req.generation, PhysicalHandoffGrant {
         candidate_id: req.candidate_id.clone(), peer: source.peer.clone(), barrier_lsn: barrier,
     })?;
     drop(operation);
-    // A lost response is intentionally not grounds to reopen the source. The
-    // identical request resumes from the destination's durable phase.
-    client.physical_handoff(&authorized).await
+    let answer = client.physical_handoff(&authorized).await?;
+    if answer.database != req.database || answer.generation != req.generation
+        || answer.candidate_id.as_deref() != Some(&req.candidate_id)
+        || answer.source_vm_id != req.source_vm_id || answer.system_identifier != req.system_identifier
+        || answer.pg_major != req.pg_major || answer.phase != "activated" {
+        bail!("peer did not confirm the exact activated handoff");
+    }
+    reg.physical_sources().complete_handoff(&req.database, &req.generation, &req.candidate_id)?;
+    Ok(answer)
+}
+
+/// Resume only explicit source authorization or destination Prepared-and-later
+/// phases. No orchestrator database or request connection is needed. Each DB has
+/// its own task so an unavailable peer/guest cannot block another handoff.
+pub fn spawn_handoff_recovery(reg: Arc<SchemaRegistry>) {
+    if reg.replication_cfg().is_none() { return; }
+    tokio::spawn(async move {
+        let mut workers = HashMap::<String, tokio::task::JoinHandle<()>>::new();
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            let finished: Vec<_> = workers.iter().filter(|(_, task)| task.is_finished()).map(|(db, _)| db.clone()).collect();
+            for database in finished {
+                if let Err(error) = workers.remove(&database).unwrap().await {
+                    warn!(%database, %error, "physical handoff recovery task failed");
+                }
+            }
+            let mut requests = Vec::new();
+            for rec in reg.physical().list().into_iter().filter(|r| r.handoff_started() && r.phase != PhysicalPhase::Activated) {
+                requests.push((false, wire::PhysicalHandoffRequest {
+                    database: rec.database, generation: rec.generation, candidate_id: rec.candidate_id.unwrap(),
+                    source_vm_id: rec.source_vm_id, system_identifier: rec.system_identifier, pg_major: rec.pg_major,
+                    barrier_lsn: rec.handoff_barrier.unwrap(), source_node: rec.source_node,
+                }));
+            }
+            for rec in reg.physical_sources().pending_handoffs() {
+                // An old source can remain current in its source journal after
+                // a fresh incoming activation. It no longer has work to drive.
+                if reg.bound_vm_id(&rec.database).as_deref() != Some(&rec.source_vm_id) { continue; }
+                requests.push((true, wire::PhysicalHandoffRequest {
+                    database: rec.database, generation: rec.generation, candidate_id: rec.handoff_candidate.unwrap(),
+                    source_vm_id: rec.source_vm_id, system_identifier: rec.system_identifier, pg_major: rec.pg_major,
+                    barrier_lsn: String::new(), source_node: reg.replication_cfg().unwrap().node_name.clone(),
+                }));
+            }
+            for (source, req) in requests {
+                if workers.contains_key(&req.database) { continue; }
+                let database = req.database.clone();
+                let registry = reg.clone();
+                workers.insert(database.clone(), tokio::spawn(async move {
+                    let result = if source { handoff_source(&registry, req).await } else { accept_handoff(&registry, req).await };
+                    if let Err(error) = result { warn!(%database, %error, "physical handoff recovery will retry"); }
+                }));
+            }
+        }
+    });
 }
 
 /// The operation lock is held throughout source fencing and grant creation.

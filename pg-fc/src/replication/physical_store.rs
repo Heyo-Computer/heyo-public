@@ -127,6 +127,11 @@ pub struct PhysicalSourceRecord {
     pub slot: String,
     pub source_lsn: String,
     pub peer: String,
+    /// Explicit operator authorization, persisted before any fencing effect.
+    #[serde(default)]
+    pub handoff_candidate: Option<String>,
+    #[serde(default)]
+    pub handoff_complete: bool,
     #[serde(default)]
     pub handoff: Option<PhysicalHandoffGrant>,
     pub last_error: Option<String>,
@@ -150,6 +155,48 @@ impl PhysicalSourceStore {
 
     pub fn get(&self, database: &str) -> Option<PhysicalSourceRecord> {
         self.journal.lock().unwrap().current.get(database).cloned()
+    }
+
+    pub fn pending_handoffs(&self) -> Vec<PhysicalSourceRecord> {
+        self.journal.lock().unwrap().current.values()
+            .filter(|r| r.handoff_candidate.is_some() && !r.handoff_complete).cloned().collect()
+    }
+
+    pub fn authorize_handoff(&self, database: &str, generation: &str, candidate: &str) -> Result<()> {
+        validate_token("candidate VM ID", candidate, 128)?;
+        let mut journal = self.journal.lock().unwrap();
+        let current = journal.current.get(database).context("no physical source operation")?;
+        if current.generation != generation { bail!("stale physical handoff authorization"); }
+        if current.fence.as_ref().is_some_and(|f| f.phase == "unfencing") {
+            bail!("finish the in-progress unfence before authorizing handoff");
+        }
+        if current.handoff.as_ref().is_some_and(|g| g.candidate_id != candidate) {
+            bail!("handoff authorization conflicts with irrevocable grant");
+        }
+        if let Some(existing) = &current.handoff_candidate {
+            if existing == candidate { return Ok(()); }
+            bail!("another candidate already owns this handoff authorization");
+        }
+        let mut next = journal.clone();
+        next.current.get_mut(database).unwrap().handoff_candidate = Some(candidate.into());
+        persist_journal(&self.path, &next)?;
+        *journal = next;
+        Ok(())
+    }
+
+    pub fn complete_handoff(&self, database: &str, generation: &str, candidate: &str) -> Result<()> {
+        let mut journal = self.journal.lock().unwrap();
+        let current = journal.current.get(database).context("no physical source operation")?;
+        if current.generation != generation || current.handoff_candidate.as_deref() != Some(candidate)
+            || !current.handoff.as_ref().is_some_and(|g| g.candidate_id == candidate) {
+            bail!("handoff completion does not match authorized grant");
+        }
+        if current.handoff_complete { return Ok(()); }
+        let mut next = journal.clone();
+        next.current.get_mut(database).unwrap().handoff_complete = true;
+        persist_journal(&self.path, &next)?;
+        *journal = next;
+        Ok(())
     }
 
     pub fn by_repl_role(&self, role: &str) -> Option<PhysicalSourceRecord> {
@@ -178,6 +225,9 @@ impl PhysicalSourceStore {
         let mut journal = self.journal.lock().unwrap();
         let current = journal.current.get(database).context("no physical source")?;
         if current.generation != generation { bail!("stale physical source fence update"); }
+        if phase == "unfencing" && current.handoff_candidate.is_some() {
+            bail!("authorized physical handoff must finish; source cannot be unfenced");
+        }
         if let Some(grant) = &current.handoff {
             if phase != "ready" || barrier != Some(&grant.barrier_lsn) { bail!("irrevocable source barrier cannot change"); }
         }
@@ -192,7 +242,7 @@ impl PhysicalSourceStore {
         let mut journal = self.journal.lock().unwrap();
         let current = journal.current.get(database).context("no physical source")?;
         if current.generation != generation { bail!("stale physical source fence clear"); }
-        if current.handoff.is_some() { bail!("irrevocable source fence cannot be cleared"); }
+        if current.handoff.is_some() || current.handoff_candidate.is_some() { bail!("authorized source fence cannot be cleared"); }
         if current.fence.as_ref().is_some_and(|f| f.phase != "unfencing") {
             bail!("invalidate the physical barrier before clearing its fence");
         }
@@ -251,12 +301,13 @@ impl PhysicalSourceStore {
             || record.predecessor.as_deref() != Some(incoming.generation.as_str()) {
             bail!("successor source is not linked to the activated current binding");
         }
-        if record.handoff.is_some() { bail!("new successor source cannot already contain a grant"); }
+        if record.handoff.is_some() || record.handoff_candidate.is_some() { bail!("new successor source cannot already contain handoff authorization"); }
         let mut journal = self.journal.lock().unwrap();
         if let Some(existing) = journal.current.get(&record.database) {
             if existing.generation == record.generation {
                 let mut intent = existing.clone();
                 intent.source_lsn = record.source_lsn.clone(); intent.handoff = None; intent.last_error = None;
+                intent.handoff_candidate = None; intent.handoff_complete = false;
                 if intent == record { return Ok(existing.clone()); }
                 bail!("conflicting retry of successor source intent");
             }
@@ -283,6 +334,9 @@ impl PhysicalSourceStore {
         let mut journal = self.journal.lock().unwrap();
         let current = journal.current.get(database).context("no physical source operation")?;
         if current.generation != generation || current.peer != grant.peer { bail!("stale or mismatched physical handoff grant"); }
+        if current.handoff_candidate.as_ref().is_some_and(|id| id != &grant.candidate_id) {
+            bail!("grant differs from authorized candidate");
+        }
         if let Some(existing) = &current.handoff {
             if existing == &grant { return Ok(current.clone()); }
             bail!("a different physical handoff is already irrevocably authorized");
@@ -543,6 +597,16 @@ fn validate_source(record: &PhysicalSourceRecord) -> Result<()> {
     validate_pg_identifier("replication slot", &record.slot)?;
     if record.system_identifier.is_empty() || record.system_identifier.len() > 20 || !record.system_identifier.bytes().all(|b| b.is_ascii_digit()) { bail!("PostgreSQL system identifier must be a numeric string"); }
     if record.pg_major == 0 || record.source_lsn.is_empty() || record.source_lsn.len() > 32 { bail!("invalid physical source identity"); }
+    if let Some(candidate) = &record.handoff_candidate {
+        validate_token("authorized candidate VM ID", candidate, 128)?;
+        if record.handoff.as_ref().is_some_and(|g| &g.candidate_id != candidate)
+            || record.fence.as_ref().is_some_and(|f| f.phase == "unfencing") {
+            bail!("physical handoff authorization conflicts with source state");
+        }
+    }
+    if record.handoff_complete && (record.handoff_candidate.is_none() || record.handoff.is_none()) {
+        bail!("physical handoff completion lacks authorization or grant");
+    }
     if let Some(grant) = &record.handoff {
         validate_token("candidate VM ID", &grant.candidate_id, 128)?;
         validate_token("peer", &grant.peer, 128)?;
@@ -720,7 +784,53 @@ mod tests {
         PhysicalSourceRecord { database: database.into(), generation: generation.into(), predecessor: None, source_vm_id: "source-vm-1".into(),
             repl: None, fence: None,
             system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(),
-            source_lsn: "0/16B6C50".into(), peer: "eu1".into(), handoff: None, last_error: None }
+            source_lsn: "0/16B6C50".into(), peer: "eu1".into(), handoff_candidate: None, handoff_complete: false, handoff: None, last_error: None }
+    }
+
+    #[test]
+    fn handoff_authorization_survives_restart_before_fencing_and_finishes_once() {
+        let p = path("authorization");
+        let store = PhysicalSourceStore::load(p.clone()).unwrap();
+        store.create(source("acme", "g1")).unwrap();
+        assert!(store.pending_handoffs().is_empty());
+        assert!(store.authorize_handoff("acme", "stale", "candidate-1").is_err());
+        store.authorize_handoff("acme", "g1", "candidate-1").unwrap();
+        drop(store);
+        let store = PhysicalSourceStore::load(p.clone()).unwrap();
+        let pending = store.pending_handoffs();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].handoff_candidate.as_deref(), Some("candidate-1"));
+        assert!(pending[0].fence.is_none());
+        assert!(pending[0].handoff.is_none());
+        assert!(store.authorize_handoff("acme", "g1", "candidate-2").is_err());
+        assert!(store.complete_handoff("acme", "g1", "candidate-1").is_err());
+        assert!(store.set_fence("acme", "g1", "unfencing", None).is_err());
+        assert!(store.clear_fence("acme", "g1").is_err());
+        let grant = PhysicalHandoffGrant { candidate_id: "candidate-1".into(), peer: "eu1".into(), barrier_lsn: "0/109".into() };
+        assert!(store.grant_handoff("acme", "g1", PhysicalHandoffGrant { candidate_id: "candidate-2".into(), ..grant.clone() }).is_err());
+        store.set_fence("acme", "g1", "ready", Some("0/109")).unwrap();
+        store.grant_handoff("acme", "g1", grant).unwrap();
+        assert!(store.complete_handoff("acme", "stale", "candidate-1").is_err());
+        assert!(store.complete_handoff("acme", "g1", "candidate-2").is_err());
+        store.complete_handoff("acme", "g1", "candidate-1").unwrap();
+        drop(store);
+        let store = PhysicalSourceStore::load(p.clone()).unwrap();
+        store.authorize_handoff("acme", "g1", "candidate-1").unwrap();
+        store.complete_handoff("acme", "g1", "candidate-1").unwrap();
+        assert!(store.pending_handoffs().is_empty());
+        assert!(store.has_grant_for_source_vm("acme", "source-vm-1"));
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn failed_authorization_persistence_does_not_arm_recovery() {
+        let dir = path("authorization-failure"); std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("source.json"); let store = PhysicalSourceStore::load(p.clone()).unwrap();
+        store.create(source("acme", "g1")).unwrap();
+        std::fs::remove_file(p).unwrap(); std::fs::remove_dir(dir).unwrap();
+        assert!(store.authorize_handoff("acme", "g1", "candidate-1").is_err());
+        assert!(store.pending_handoffs().is_empty());
+        assert!(store.get("acme").unwrap().handoff_candidate.is_none());
     }
 
     #[test]

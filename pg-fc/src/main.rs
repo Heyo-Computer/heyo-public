@@ -31,6 +31,7 @@ mod startup;
 mod store;
 mod tls;
 mod vm;
+mod writer_routing;
 
 use std::sync::Arc;
 
@@ -142,6 +143,9 @@ async fn main() -> Result<()> {
     // when an inactive slot starts pinning WAL. No-op when nothing is
     // replicating.
     registry.spawn_replication_monitor();
+    // Continue explicitly authorized physical handoffs after request loss or
+    // process restart, including when orchestrator's own database is moving.
+    replication::physical::spawn_handoff_recovery(registry.clone());
     // Delete VMs whose bring-up handed out an id but never reached a registry
     // binding — the "stuck in provisioning, bound to nothing" leak no other
     // sweep covers. Always on; idle when the pending ledger is empty.
@@ -230,6 +234,18 @@ async fn handle_conn(
             anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
         }
     };
+    if writer_routing::is_routable_tenant(&registry, &info, &schema) {
+        match writer_routing::route(&registry, &schema)? {
+            writer_routing::Route::Local => {}
+            writer_routing::Route::Peer { peer, claim } => {
+                return writer_routing::forward(client, &info.raw, peer, claim).await;
+            }
+            writer_routing::Route::Unavailable(reason) => {
+                auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, reason).await?;
+                anyhow::bail!("writer unavailable for {schema}: {reason}");
+            }
+        }
+    }
     if !info.physical_replication && !registry.physical_admission_ready(&schema) {
         auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, "physical handoff is incomplete; admission remains closed").await?;
         anyhow::bail!("refused connection during incomplete physical handoff for {schema}");

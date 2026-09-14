@@ -774,6 +774,10 @@ pub(super) async fn fence_postgres(
 
 pub async fn unfence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
     let _operation = reg.replication_operation(database).await;
+    if reg.physical_sources().get(database).is_some_and(|r| r.handoff_candidate.is_some()
+        && reg.bound_vm_id(database).as_deref() == Some(&r.source_vm_id)) {
+        bail!("physical handoff is authorized and will resume; source cannot be unfenced");
+    }
     if reg.bound_vm_id(database).as_deref().is_some_and(|id| reg.physical_sources().has_grant_for_source_vm(database, id)) {
         bail!("physical handoff was irrevocably authorized; source admission can never be reopened");
     }

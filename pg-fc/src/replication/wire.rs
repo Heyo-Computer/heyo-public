@@ -15,6 +15,31 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WriterClaimKind { Activation, InitialSource }
+
+/// Exact, single-hop ownership assertion carried by the SQL upgrade request.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WriterClaim {
+    pub kind: WriterClaimKind,
+    pub database: String,
+    pub generation: String,
+    pub candidate_id: String,
+    pub source_vm_id: String,
+    pub system_identifier: String,
+    pub pg_major: u32,
+    pub sender_node: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterTunnelRequest {
+    pub claim: WriterClaim,
+    pub startup: Vec<u8>,
+}
+
 /// `GET /api/replication/peer/node` — the handshake before anything is
 /// created, so a mismatch is a clean refusal rather than half a pairing.
 #[derive(Clone, Serialize, Deserialize, Debug)]

@@ -1041,7 +1041,7 @@ async fn physical_replication_startup_uses_authenticated_vm_and_its_fence() {
         database: database.clone(), generation: "physical-auth-g1".into(), predecessor: None,
         source_vm_id: vm_id.into(), repl: Some(crate::replication::wire::Login { role: rec.repl_role.clone(), password: rec.repl_password.clone() }),
         fence: None, system_identifier: system.clone(), pg_major: 18, slot: "physical_auth_slot".into(),
-        source_lsn: "0/1".into(), peer: "test-peer".into(), handoff: None, last_error: None,
+        source_lsn: "0/1".into(), peer: "test-peer".into(), handoff_candidate: None, handoff_complete: false, handoff: None, last_error: None,
     }).unwrap();
     registry.physical_sources().set_fence(&database, "physical-auth-g1", "ready", Some("0/1")).unwrap();
     registry.replication().clear_fence(&database).unwrap();
@@ -1105,7 +1105,7 @@ async fn physical_handoff_restart_admission_and_source_grant_are_fail_closed() {
     reg.physical_sources().create(PhysicalSourceRecord { database: "source".into(), generation: "g2".into(), predecessor: None,
         repl: None, fence: None,
         source_vm_id: "sb-source".into(), system_identifier: "123456".into(), pg_major: 18,
-        slot: "physical_source".into(), source_lsn: "0/1".into(), peer: "eu1".into(), handoff: None, last_error: None }).unwrap();
+        slot: "physical_source".into(), source_lsn: "0/1".into(), peer: "eu1".into(), handoff_candidate: None, handoff_complete: false, handoff: None, last_error: None }).unwrap();
     assert!(!reg.physical_reconnect_allowed("source", &logical.repl_role));
     reg.physical_sources().grant_handoff("source", "g2", PhysicalHandoffGrant {
         candidate_id: "sb-destination".into(), peer: "eu1".into(), barrier_lsn: "0/ABC".into() }).unwrap();
@@ -1120,9 +1120,98 @@ async fn physical_handoff_restart_admission_and_source_grant_are_fail_closed() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Exercise the production upgrade receiver and raw PG splice with libpq and
+/// a disposable server. This isolates protocol framing from public TLS routing.
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL18 on 127.0.0.1:5432 and psql on PATH"]
+async fn writer_tunnel_preserves_postgres_auth_and_session() {
+    use crate::replication::{PhysicalRecord, PhysicalPhase as P, wire};
+    use tokio::io::copy_bidirectional;
+    let _exclusive = exclusive().await;
+    let pg: tokio_postgres::Config = std::env::var("PG_FC_FENCE_TEST_URL").unwrap().parse().unwrap();
+    assert_eq!(pg.get_ports(), &[5432]);
+    assert_eq!(pg.get_dbname(), Some("postgres"));
+    let (admin, connection) = pg.connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move { connection.await.unwrap(); });
+    let database = format!("writer_tunnel_{}", std::process::id());
+    admin.batch_execute(&format!("CREATE ROLE {database} LOGIN PASSWORD 'writer-test-password';")).await.unwrap();
+    admin.batch_execute(&format!("CREATE DATABASE {database} OWNER {database}")).await.unwrap();
+    let system: String = admin.query_one("SELECT system_identifier::text FROM pg_control_system()", &[]).await.unwrap().get(0);
+    let mut cfg = config_for(0, 0);
+    let dir = cfg.state_file.parent().unwrap().join("writer-tunnel");
+    std::fs::create_dir_all(&dir).unwrap();
+    cfg.state_file = dir.join("registry.tsv"); cfg.replication_file = dir.join("replication.tsv");
+    cfg.peers_file = dir.join("peers.tsv"); cfg.dedicated_file = dir.join("dedicated.tsv");
+    cfg.pg_user = pg.get_user().unwrap().into();
+    cfg.pg_password = pg.get_password().map(|p| String::from_utf8(p.to_vec()).unwrap());
+    cfg.direct_connect = true;
+    std::fs::write(&cfg.state_file, format!("{database}\tsb-previous\t0\tlive\n")).unwrap();
+    let reg = Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap());
+    reg.dedicated().create(&database, &database, "writer-test-password").unwrap();
+    reg.peers().create("source", "https://source.invalid", "admin", "test-password", "127.0.0.1", 6432).unwrap();
+    let vm = "sb-writer-tunnel";
+    daemon().seed(0);
+    daemon().vms.lock().unwrap().insert(vm.into(), Vm { id: vm.into(), name: "repl-seed-writer-test".into(), running: true });
+    reg.physical().create(PhysicalRecord {
+        database: database.clone(), generation: "writer-test".into(), predecessor: None,
+        candidate_name: "repl-seed-writer-test".into(), repl: None, candidate_id: None,
+        previous_vm_id: Some("sb-previous".into()), source_node: "source".into(), source_vm_id: "sb-source".into(),
+        system_identifier: system.clone(), pg_major: 18, slot: "writer_slot".into(), phase: P::Intent,
+        handoff_barrier: None, last_error: None,
+    }).unwrap();
+    for (from, to, id) in [(P::Intent, P::Creating, None), (P::Creating, P::Candidate, Some(vm.into())), (P::Candidate, P::Seeding, None), (P::Seeding, P::Verified, None)] {
+        reg.physical().advance(&database, "writer-test", from, to, id).unwrap();
+    }
+    reg.physical().begin_handoff(&database, "writer-test", "0/105").unwrap();
+    for (from, to) in [(P::Prepared, P::Promoting), (P::Promoting, P::Promoted), (P::Promoted, P::Binding)] {
+        reg.physical().advance(&database, "writer-test", from, to, None).unwrap();
+    }
+    reg.commit_physical_binding(&database, "sb-previous", vm).await.unwrap();
+    reg.physical().advance(&database, "writer-test", P::Binding, P::Activated, None).unwrap();
+    let receiver = axum::Router::new().route("/tunnel", post(|State(reg): State<Arc<crate::registry::SchemaRegistry>>, mut req: axum::extract::Request| async move {
+        crate::writer_routing::accept(&reg, true, &mut req).await
+    })).with_state(reg.clone());
+    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/tunnel", http.local_addr().unwrap());
+    let receiver_task = tokio::spawn(async move { axum::serve(http, receiver).await.unwrap(); });
+    let frontend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = frontend.local_addr().unwrap().port();
+    let claim = wire::WriterClaim { kind: wire::WriterClaimKind::Activation, database: database.clone(),
+        generation: "writer-test".into(), candidate_id: vm.into(), source_vm_id: "sb-source".into(),
+        system_identifier: system, pg_major: 18, sender_node: "source".into() };
+    let frontend_task = tokio::spawn(async move {
+        while let Ok((socket, _)) = frontend.accept().await {
+            let endpoint = endpoint.clone(); let claim = claim.clone();
+            tokio::spawn(async move {
+                let (mut socket, info) = crate::startup::read_startup(socket, None).await.unwrap();
+                if crate::auth::require_password(&mut socket, "writer-test-password").await.is_err() { return; }
+                let response = reqwest::Client::new().post(endpoint).header("Connection", "upgrade")
+                    .header("Upgrade", "pg-fc-sql/1").json(&wire::WriterTunnelRequest { claim, startup: info.raw }).send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+                let mut upgraded = response.upgrade().await.unwrap();
+                copy_bidirectional(&mut socket, &mut upgraded).await.unwrap();
+            });
+        }
+    });
+    for (password, succeeds) in [("wrong-password", false), ("writer-test-password", true)] {
+        let out = tokio::process::Command::new("psql").args(["-X", "-w", "-At", "-v", "ON_ERROR_STOP=1", "-d",
+            &format!("host=127.0.0.1 port={port} user={database} dbname={database} sslmode=disable connect_timeout=20"),
+            "-c", "CREATE TABLE proof (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, value text); INSERT INTO proof(value) VALUES ('one-hop'); SELECT pg_sleep(11); SELECT id, value FROM proof;"])
+            .env("PGPASSWORD", password).output().await.unwrap();
+        assert_eq!(out.status.success(), succeeds, "{}", String::from_utf8_lossy(&out.stderr));
+        if succeeds { assert!(String::from_utf8_lossy(&out.stdout).contains("1|one-hop"), "{}", String::from_utf8_lossy(&out.stdout)); }
+    }
+    frontend_task.abort(); receiver_task.abort();
+    drop(reg);
+    admin.batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)")).await.unwrap();
+    admin.batch_execute(&format!("DROP ROLE {database}")).await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn physical_three_transfers_preserve_revocation_and_replication_credentials() {
     use crate::replication::{PhysicalRecord, PhysicalPhase as P, PhysicalSourceRecord, PhysicalHandoffGrant, wire::Login};
+    use crate::writer_routing::{route, Route, validate_destination};
     let _exclusive = exclusive().await;
     let base = config_for(0, 0);
     let dir = base.state_file.parent().unwrap().join("physical-three-transfers");
@@ -1132,6 +1221,16 @@ async fn physical_three_transfers_preserve_revocation_and_replication_credential
         let mut cfg = base.clone();
         cfg.state_file = dir.join(format!("{region}.tsv"));
         cfg.replication_file = dir.join(format!("{region}-replication.tsv"));
+        cfg.peers_file = dir.join(format!("{region}-peers.tsv"));
+        cfg.replication = Some(crate::config::ReplicationConfig {
+            node_name: region.into(), advertise_host: None, advertise_port: 6432,
+            sslmode: "require".into(), allow_insecure: false, peer_timeout: Duration::from_secs(1),
+            setup_deadline: Duration::from_secs(1), monitor_interval: None,
+            slot_stale: Duration::from_secs(60), lag_warn_bytes: 1024, fix_sequences: true,
+        });
+        let peer = if region == "us3" { "eu1" } else { "us3" };
+        crate::peers::PeerStore::load(cfg.peers_file.clone()).create(peer,
+            &format!("https://{peer}.invalid"), "admin", "test-password", "127.0.0.1", 6432).unwrap();
         std::fs::write(&cfg.state_file, format!("acme\t{vm}\t0\tlive\n")).unwrap();
         configs.push(cfg);
     }
@@ -1147,7 +1246,7 @@ async fn physical_three_transfers_preserve_revocation_and_replication_credential
         let predecessor = active.as_ref().map(|r| r.generation.clone());
         let source = PhysicalSourceRecord { database: "acme".into(), generation: generation.clone(), predecessor: predecessor.clone(),
             source_vm_id: source_vm.clone(), repl: Some(login.clone()), fence: None, system_identifier: "123456".into(), pg_major: 18,
-            slot: format!("slot_{generation}"), source_lsn: "0/1".into(), peer: ["us3", "eu1"][target_idx].into(), handoff: None, last_error: None };
+            slot: format!("slot_{generation}"), source_lsn: "0/1".into(), peer: ["us3", "eu1"][target_idx].into(), handoff_candidate: None, handoff_complete: false, handoff: None, last_error: None };
         if let Some(active) = active { source_reg.physical_sources().create_successor(source.clone(), &active, &source_vm).unwrap(); }
         else { source_reg.physical_sources().create(source.clone()).unwrap(); }
         assert!(source_reg.physical_admission_ready("acme"));
@@ -1160,21 +1259,48 @@ async fn physical_three_transfers_preserve_revocation_and_replication_credential
         for (from, to, id) in [(P::Intent, P::Creating, None), (P::Creating, P::Candidate, Some(candidate.into())), (P::Candidate, P::Seeding, None), (P::Seeding, P::Verified, None)] {
             target_reg.physical().advance("acme", &generation, from, to, id).unwrap();
         }
+        if round == 0 {
+            let Route::Peer { claim, .. } = route(target_reg, "acme").unwrap() else { panic!("verified initial replica must route to source") };
+            assert_eq!(claim.kind, crate::replication::wire::WriterClaimKind::InitialSource);
+            assert_eq!(claim.source_vm_id, "u0");
+        }
+        source_reg.physical_sources().authorize_handoff("acme", &generation, candidate).unwrap();
+        assert!(crate::replication::orchestrate::unfence(source_reg, "acme").await.is_err());
         source_reg.physical_sources().set_fence("acme", &generation, "ready", Some(barrier)).unwrap();
         assert!(!source_reg.physical_admission_ready("acme"), "a new fence must override an old activation");
+        assert!(matches!(route(source_reg, "acme").unwrap(), Route::Unavailable(_)));
         assert!(source_reg.physical_reconnect_allowed("acme", &login.role));
         assert!(!source_reg.physical_reconnect_allowed("acme", "tenant"));
         source_reg.physical_sources().grant_handoff("acme", &generation, PhysicalHandoffGrant { candidate_id: candidate.into(), peer: source.peer, barrier_lsn: barrier.into() }).unwrap();
+        let Route::Peer { claim, .. } = route(source_reg, "acme").unwrap() else { panic!("granted source must route to candidate") };
+        assert_eq!(claim.generation, generation);
+        assert_eq!(claim.candidate_id, candidate);
+        // In the reverse-grant window both frontends can have old remote
+        // routes. Local-only tunnel validation must refuse the second hop.
+        assert!(validate_destination(target_reg, &claim, &previous_vm).is_err());
         target_reg.physical().begin_handoff("acme", &generation, barrier).unwrap();
         for (from, to) in [(P::Prepared, P::Promoting), (P::Promoting, P::Promoted), (P::Promoted, P::Binding)] {
+            assert!(validate_destination(target_reg, &claim, &previous_vm).is_err());
             target_reg.physical().advance("acme", &generation, from, to, None).unwrap();
         }
         target_reg.commit_physical_binding("acme", &previous_vm, candidate).await.unwrap();
         assert!(!target_reg.physical_admission_ready("acme"));
+        assert!(validate_destination(target_reg, &claim, candidate).is_err());
         target_reg.physical().advance("acme", &generation, P::Binding, P::Activated, None).unwrap();
+        source_reg.physical_sources().complete_handoff("acme", &generation, candidate).unwrap();
         regions = configs.iter().map(|cfg| Arc::new(crate::registry::SchemaRegistry::new(cfg.clone()).unwrap())).collect();
         assert!(!regions[source_idx].physical_admission_ready("acme"));
         assert!(regions[target_idx].physical_admission_ready("acme"));
+        assert!(matches!(route(&regions[target_idx], "acme").unwrap(), Route::Local));
+        assert!(matches!(route(&regions[source_idx], "acme").unwrap(), Route::Peer { .. }));
+        assert!(regions[source_idx].physical_sources().pending_handoffs().is_empty());
+        validate_destination(&regions[target_idx], &claim, candidate).unwrap();
+        for field in ["generation", "candidate_id", "source_vm_id", "system_identifier", "sender_node", "database", "pg_major"] {
+            let mut value = serde_json::to_value(&claim).unwrap();
+            value[field] = if field == "pg_major" { json!(17) } else { json!("wrong") };
+            let wrong = serde_json::from_value(value).unwrap();
+            assert!(validate_destination(&regions[target_idx], &wrong, candidate).is_err(), "accepted wrong {field}");
+        }
         assert_eq!(regions[source_idx].physical_sources().by_repl_role(&login.role).unwrap().repl, Some(login.clone()));
         assert!(crate::replication::orchestrate::unfence(&regions[source_idx], "acme").await.is_err());
     }

@@ -45,6 +45,7 @@ pub fn build(state: DashState) -> Router {
         )
         .route("/api/replication/peer/physical-replicas", post(replication::api_accept_physical_replica))
         .route("/api/replication/peer/physical-handoff", post(replication::api_accept_physical_handoff))
+        .route("/api/replication/peer/writer-tunnel", post(replication::api_writer_tunnel))
         .route("/api/replication/peer/physical-grants/{database}", get(replication::api_physical_grant))
         .route("/api/replication/{database}/physical-prepare", post(replication::api_physical_prepare))
         .route("/api/replication/{database}/physical-handoff", post(replication::api_physical_handoff))

@@ -31,6 +31,7 @@ impl PeerClient {
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building the peer HTTP client")?;
         let auth = format!(
@@ -48,6 +49,44 @@ impl PeerClient {
     /// The handshake, before anything is created anywhere.
     pub async fn node_info(&self) -> Result<wire::NodeInfo> {
         self.get("/api/replication/peer/node").await
+    }
+
+    pub async fn writer_tunnel(&self, req: &wire::WriterTunnelRequest) -> Result<reqwest::Upgraded> {
+        let url = self.https_url("/api/replication/peer/writer-tunnel")?;
+        // A request timeout must not become a lifetime limit on the upgraded
+        // SQL session. Bound connect/send/upgrade explicitly instead.
+        let tunnel_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .http1_only()
+            .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
+            .build().context("building peer SQL tunnel client")?;
+        let send = tunnel_http.post(&url)
+            .header(reqwest::header::AUTHORIZATION, &self.auth)
+            .header(reqwest::header::CONNECTION, "upgrade")
+            .header(reqwest::header::UPGRADE, "pg-fc-sql/1")
+            .json(req).send();
+        let res = tokio::time::timeout(Duration::from_secs(10), send).await
+            .context("peer SQL tunnel request timed out")??;
+        if res.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS
+            || res.headers().get(reqwest::header::UPGRADE).and_then(|v| v.to_str().ok()) != Some("pg-fc-sql/1") {
+            // Do not wait without a deadline for an error body's completion.
+            bail!("peer refused SQL tunnel upgrade ({})", res.status());
+        }
+        tokio::time::timeout(Duration::from_secs(10), res.upgrade()).await
+            .context("peer SQL tunnel upgrade timed out")?
+            .context("upgrading peer SQL tunnel")
+    }
+
+    /// Identity checks for SQL transport are HTTPS-only even when an operator
+    /// has elected to permit insecure replication control calls.
+    pub async fn verified_node_info(&self) -> Result<wire::NodeInfo> {
+        let path = "/api/replication/peer/node";
+        let url = self.https_url(path)?;
+        let res = self.http.get(&url).header(reqwest::header::AUTHORIZATION, &self.auth).send().await?;
+        let body = self.check(res, &url).await?;
+        serde_json::from_str(&body).context("parsing peer identity handshake")
     }
 
     /// Ask the peer to build the replica. Takes its own, longer timeout: the
@@ -174,6 +213,12 @@ impl PeerClient {
         }
         Ok(self.peer.url(path))
     }
+
+    fn https_url(&self, path: &str) -> Result<String> {
+        let url = self.url(path)?;
+        if !url.starts_with("https://") { bail!("SQL forwarding requires an HTTPS peer dashboard URL"); }
+        Ok(url)
+    }
 }
 
 /// Percent-encode a path segment. Names are already validated, so this only
@@ -255,5 +300,12 @@ mod tests {
             .decode(encoded)
             .unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), "admin:secret");
+    }
+
+    #[test]
+    fn sql_transport_refuses_plain_http() {
+        let mut c = client();
+        c.peer.base_url = "http://b.example:34199".into();
+        assert!(c.https_url("/api/replication/peer/writer-tunnel").is_err());
     }
 }
