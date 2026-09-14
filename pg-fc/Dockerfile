@@ -37,6 +37,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         postgresql-${PG_MAJOR} \
         postgresql-client-${PG_MAJOR} \
+        postgresql-${PG_MAJOR}-hypopg \
         e2fsprogs \
         util-linux \
         mount \

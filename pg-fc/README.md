@@ -1136,6 +1136,9 @@ Initial schema copy preserves table ownership and privileges. The tenant login
 is mirrored before copying, and the publisher's replication role is created as
 a non-login ACL grantee. Additional roles referenced by the source schema must
 already exist on the replica or the transactional schema copy fails.
+Both guest image recipes include HypoPG so schemas using that extension can be
+restored. Other extensions must be installed in the replica image before copying;
+schema copy does not silently omit an unavailable extension.
 
 Then, on node A's dashboard: add node B under **peers** (its dashboard URL and
 Basic credentials, plus the host and port a guest on node A would dial to reach
