@@ -116,8 +116,8 @@ git submit --only apps  # run one workflow file, skip the rest
 ```
 
 The positional `pr<number>` selector fetches `refs/pull/<number>/head` from
-`origin` into a short-lived private local ref and submits that exact commit via
-the same bundle/archive path as `--ref`. It does not check out the PR or change
+`origin` into a temporary object store and submits that exact commit via
+the same Git-patch descriptor path as `--ref`. It does not check out the PR or change
 the current branch, index, or worktree, and it performs no GitHub write. A PR
 selector cannot be combined with `--ref` or `--dirty`; malformed selectors and
 PR refs that the remote cannot provide are rejected before submission.
@@ -1188,7 +1188,8 @@ explicit `with.tags` policy.
   prevents release publication but does not prevent ordinary builds.
   Publication fast-forwards target trunk to the source plus a deterministic
   version commit, never merges unvalidated concurrent trunk changes. Resubmit and
-  revalidate if trunk moved. Submit a Git bundle, not `--archive`.
+  revalidate if trunk moved. Use the Git-patch submission format; legacy bundles
+  and `--archive` are rejected.
 - Changed components receive a major bump for breaking changes, minor for
   conventional `feat` commits, otherwise patch. Unchanged components are omitted.
   Explicit package versions and adjacent Cargo/npm lockfiles are supported;
@@ -1204,12 +1205,12 @@ explicit `with.tags` policy.
   only that same candidate, never generate another version bump. The run page's
   **Release** section and authenticated `/api/runs/{run_id}/release` distinguish
   prepared, uncertain, and confirmed publication and show both source/release SHAs.
-- `ci/checkout-release` clears the job checkout and extracts the confirmed
-  release tree before building. It deliberately has no `.git` directory; use
-  its `sha` output for build stamps. Build jobs must run this explicitly, then
+- `ci/checkout-release` makes the runner fetch and check out the confirmed
+  release commit directly from Git. Use its `sha` output for build stamps.
+  Build jobs must run this explicitly, then
   build/package from those files. Original `ci.sha` remains the validated source.
   Native Intel Mac and Windows jobs support the same action through a
-  lease-fenced download of that exact release tree.
+  lease-fenced command to fetch that exact release commit themselves.
 - `ci/publish-service-archive` uploads an already-built tarball (`with.path`,
   relative to the job working directory) using Orchestrator presign, upload,
   and finalize APIs. It also requires `url`, `token`, `user-id`, and `name`.

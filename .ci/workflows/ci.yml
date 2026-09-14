@@ -13,14 +13,14 @@
 # this cannot catch is a `ci` binary too broken to dispatch anything, which is
 # the bootstrap every CI system has and not one a workflow file can solve.
 #
-# Submitted from the repository root, with an ordinary bundle:
+# Submitted from the repository root, with a pinned Git-patch descriptor:
 #
 #     git submit
 #
-# **No `--archive`**, as everywhere else here. This repository's whole history
-# bundles to a few MB against a 64 MB `CI_MAX_SOURCE_BYTES`, so `.git` exists in
-# the guest — the version stamp below is a real `git describe` — and the change
-# set is real, so the `paths:` filter actually filters.
+# The runner fetches the pinned base from GitHub and applies any submitted
+# patch, then verifies the resulting tree. No repository or history is uploaded
+# through CI. The guest has `.git`; a patched local submission may have a
+# synthetic HEAD. Changed-path metadata drives the `paths:` filter.
 #
 # ## One job, and no checks yet
 #
