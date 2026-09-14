@@ -3187,6 +3187,9 @@ mod tests {
         // replica try to publish or subscribe on its own behalf.
         assert!(body.contains("--no-publications") && body.contains("--no-subscriptions"), "{body}");
         assert!(body.contains("ON_ERROR_STOP=1") && body.contains(" -1 "), "{body}");
+        // The mirrored tenant must retain table ownership and grants after
+        // promotion; restoring everything as postgres would break app writes.
+        assert!(!body.contains("--no-owner") && !body.contains("--no-privileges"), "{body}");
     }
 
     #[test]
@@ -3944,6 +3947,69 @@ mod tests {
     }
 
     #[test]
+    fn replication_marker_round_trips_through_the_boot_shell_reader() {
+        let dir = std::env::temp_dir().join(format!("pgfc-repl-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("marker");
+        for role in ["primary", "replica"] {
+            let command = replication_marker_command(Some(role))
+                .replace(REPL_MARKER, marker.to_str().unwrap());
+            let out = std::process::Command::new("sh").args(["-c", &command]).output().unwrap();
+            assert!(out.status.success(), "{:?}", out);
+            assert_eq!(std::fs::read(&marker).unwrap(), format!("{role}\n").as_bytes());
+            let out = std::process::Command::new("sh")
+                .args(["-c", "read -r role < \"$1\" && printf %s \"$role\"", "sh"])
+                .arg(&marker).output().unwrap();
+            assert!(out.status.success());
+            assert_eq!(out.stdout, role.as_bytes());
+        }
+        let command = replication_marker_command(None).replace(REPL_MARKER, marker.to_str().unwrap());
+        assert!(std::process::Command::new("sh").args(["-c", &command]).status().unwrap().success());
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replication_restart_supplies_role_settings_and_preserves_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::replication::Role;
+        let dir = std::env::temp_dir().join(format!("pgfc-repl-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, body) in [
+            ("gosu", "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PGDATA/args\"\nexit \"$TEST_RC\"\n"),
+            ("nproc", "#!/bin/sh\necho 3\n"),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join("replication-restart.log"), "restart failure detail\n").unwrap();
+        for (role, code, expected) in [
+            (Some(Role::Primary), 0, "wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10"),
+            (Some(Role::Replica), 0, "wal_level=minimal -c max_wal_senders=0 -c max_replication_slots=8"),
+            (None, 0, "wal_level=minimal -c max_wal_senders=0 -c max_replication_slots=10"),
+            (Some(Role::Primary), 7, "wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10"),
+        ] {
+            let out = std::process::Command::new("sh")
+                .args(["-c", &replication_restart_command(role)])
+                .env("PATH", format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()))
+                .env("PGDATA", &dir).env("TEST_RC", code.to_string())
+                .output().unwrap();
+            assert_eq!(out.status.code(), Some(code), "{:?}", out);
+            let args = std::fs::read_to_string(dir.join("args")).unwrap();
+            assert!(args.contains(&format!("-o\n-c {expected}")), "{args}");
+            if role == Some(Role::Replica) {
+                assert!(args.contains("max_worker_processes=15"), "{args}");
+            }
+            if code != 0 {
+                assert!(String::from_utf8_lossy(&out.stderr).contains("restart failure detail"));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn quote_ident_escapes_embedded_quotes() {
         assert_eq!(quote_ident("acme"), "\"acme\"");
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
@@ -3990,7 +4056,7 @@ fn schema_copy_job_body(user: &str, db: &str, conninfo: &str) -> String {
         "ec=0\n\
          rm -f {SCHEMA_COPY_FAIL_MARK}\n\
          {{ pg_dump --schema-only --no-publications --no-subscriptions \
-         --no-security-labels --no-owner --no-privileges -d {conninfo} \
+         --no-security-labels -d {conninfo} \
          || echo 1 > {SCHEMA_COPY_FAIL_MARK}; }} \
          | psql -h 127.0.0.1 -U {user} -d {db} -v ON_ERROR_STOP=1 -1 -q || ec=$?\n\
          if [ -f {SCHEMA_COPY_FAIL_MARK} ]; then\n\
@@ -4112,37 +4178,36 @@ async fn ensure_replication_mode(
     // What the running cluster is actually at, which is the only thing worth
     // reconciling against — the marker says what the NEXT start will do.
     let client = pool.get().await.context("checkout for wal_level check")?;
-    let have: String = client
-        .query_one("SELECT current_setting('wal_level')", &[])
+    let settings = client
+        .query_one(
+            "SELECT current_setting('wal_level'), current_setting('max_wal_senders')::int4, \
+             current_setting('max_replication_slots')::int4",
+            &[],
+        )
         .await
-        .context("reading wal_level")?
-        .get(0);
+        .context("reading replication settings")?;
+    let have: String = settings.get(0);
+    let senders: i32 = settings.get(1);
+    let slots: i32 = settings.get(2);
     drop(client);
-    let want_level = match want {
-        // A publisher needs `logical`. A subscriber only applies changes, so
-        // it keeps the cheap `minimal` profile — what it needs from init.sh is
-        // slots and apply workers, which are not visible here.
-        Some(crate::replication::Role::Primary) => "logical",
-        Some(crate::replication::Role::Replica) | None => "minimal",
-    };
+    let (want_level, want_senders, want_slots) = replication_settings(want);
 
     write_replication_marker(cfg, sandbox, schema, want.map(|r| r.as_str())).await?;
 
-    // A replica's WAL level is unchanged, so only the marker mattered — but it
-    // still has to be planted before the next boot picks up its worker budget.
-    if have == want_level {
+    // A subscriber can already be at minimal WAL while lacking the slots
+    // needed for replication origins. Compare the complete role settings.
+    if have == want_level && senders == want_senders && slots == want_slots {
         return Ok(());
     }
     info!(
         "schema {schema}: wal_level is {have}, replication needs {want_level} — \
          restarting Postgres in-guest"
     );
-    // `$PGDATA` is the guest's own environment (init.sh exports it), so let
-    // the guest shell expand it and fall back to the image's default rather
-    // than baking a path the image could change.
-    let restart = "gosu postgres pg_ctl -D \"${PGDATA:-/workspace/pgdata}\" \
-                   -m fast -w -t 60 restart >/dev/null 2>&1"
-        .to_string();
+    // init.sh consumes the marker only on a VM boot. A postmaster-only
+    // restart must supply the same settings explicitly; otherwise it reloads
+    // the old tuning file. Command-line settings also override stale manual
+    // ALTER SYSTEM values without rewriting unrelated operator configuration.
+    let restart = replication_restart_command(want);
     let res = exec_guest(cfg, sandbox, &restart, false, "restarting Postgres").await?;
     if res.exit_code != 0 {
         bail!(
@@ -4168,19 +4233,62 @@ async fn ensure_replication_mode(
         ),
     }
     let client = pool.get().await.context("checkout after restart")?;
-    let now: String = client
-        .query_one("SELECT current_setting('wal_level')", &[])
+    let settings = client
+        .query_one(
+            "SELECT current_setting('wal_level'), current_setting('max_wal_senders')::int4, \
+             current_setting('max_replication_slots')::int4",
+            &[],
+        )
         .await
-        .context("re-reading wal_level")?
-        .get(0);
-    if now != want_level {
+        .context("re-reading replication settings")?;
+    let now: String = settings.get(0);
+    if now != want_level || settings.get::<_, i32>(1) != want_senders
+        || settings.get::<_, i32>(2) != want_slots
+    {
         bail!(
-            "schema {schema}: Postgres restarted but wal_level is {now}, not {want_level} — \
-             the guest image predates replication support (rebuild it from init.sh)"
+            "schema {schema}: Postgres restarted but replication settings do not match \
+             the requested role (wal_level={now}, expected {want_level})"
         );
     }
     info!("schema {schema}: wal_level is now {now}");
     Ok(())
+}
+
+fn replication_settings(role: Option<crate::replication::Role>) -> (&'static str, i32, i32) {
+    match role {
+        Some(crate::replication::Role::Primary) => ("logical", 10, 10),
+        Some(crate::replication::Role::Replica) => ("minimal", 0, 8),
+        None => ("minimal", 0, 10),
+    }
+}
+
+fn replication_restart_command(role: Option<crate::replication::Role>) -> String {
+    let (level, senders, slots) = replication_settings(role);
+    let workers = if role == Some(crate::replication::Role::Replica) {
+        " -c max_logical_replication_workers=4 -c max_sync_workers_per_subscription=2 \
+         -c max_worker_processes=$(( $(nproc) + 12 ))"
+    } else {
+        ""
+    };
+    format!(
+        "for pgbin in /usr/lib/postgresql/*/bin; do \
+           [ ! -d \"$pgbin\" ] || export PATH=\"$pgbin:$PATH\"; done; \
+         PGDATA=\"${{PGDATA:-/workspace/pgdata}}\"; \
+         if gosu postgres pg_ctl -D \"$PGDATA\" -m fast -w -t 60 \
+           -l \"$PGDATA/replication-restart.log\" \
+           -o \"-c wal_level={level} -c max_wal_senders={senders} -c max_replication_slots={slots}{workers}\" restart; \
+         then :; else rc=$?; tail -c 2000 \"$PGDATA/replication-restart.log\" >&2; exit \"$rc\"; fi"
+    )
+}
+
+fn replication_marker_command(role: Option<&str>) -> String {
+    match role {
+        Some(r) => format!(
+            "printf '%s\\n' {} > {REPL_MARKER}.tmp && mv {REPL_MARKER}.tmp {REPL_MARKER} && sync && echo ok",
+            shell_squote(r)
+        ),
+        None => format!("rm -f {REPL_MARKER} {REPL_MARKER}.tmp && sync && echo ok"),
+    }
 }
 
 /// Plant or remove [`REPL_MARKER`] on the data disk.
@@ -4200,13 +4308,7 @@ async fn write_replication_marker(
     schema: &str,
     role: Option<&str>,
 ) -> Result<()> {
-    let cmd = match role {
-        Some(r) => format!(
-            "printf %s\\n {} > {REPL_MARKER}.tmp && mv {REPL_MARKER}.tmp {REPL_MARKER} && sync && echo ok",
-            shell_squote(r)
-        ),
-        None => format!("rm -f {REPL_MARKER} {REPL_MARKER}.tmp && sync && echo ok"),
-    };
+    let cmd = replication_marker_command(role);
     let res = exec_guest(cfg, sandbox, &cmd, false, "writing the replication marker").await?;
     if res.exit_code != 0 {
         bail!(

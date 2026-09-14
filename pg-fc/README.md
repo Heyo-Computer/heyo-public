@@ -1127,6 +1127,15 @@ another host. It is resolved to an IPv4 address **on the host** before it ever
 reaches a guest, because the microVMs ship with an empty `/etc/resolv.conf` —
 the same reason the S3 path pins IPs with `curl --resolve`.
 
+The resolved address is set as both libpq `host` and `hostaddr`, so an inherited
+guest `PGHOST` cannot override the TLS server name. Role changes persist a
+boot marker and apply the WAL, sender, and slot settings on an in-guest
+Postgres restart; restart failures are reported rather than hidden.
+
+Initial schema copy preserves table ownership and privileges. The tenant login
+is mirrored before copying; additional roles referenced by the source schema
+must already exist on the replica or the transactional schema copy fails.
+
 Then, on node A's dashboard: add node B under **peers** (its dashboard URL and
 Basic credentials, plus the host and port a guest on node A would dial to reach
 node B's pooler), pick the database and the peer, and press **start

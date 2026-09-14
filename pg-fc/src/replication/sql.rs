@@ -18,7 +18,8 @@ use super::names;
 /// statement of a real constraint: the guest microVMs ship with an empty
 /// `/etc/resolv.conf`, so a hostname handed to a guest simply never resolves.
 /// The pooler resolves peer hostnames on the *host* side, exactly as the S3
-/// path pins IPs with `curl --resolve`.
+/// path pins IPs with `curl --resolve`. Rendering also sets `host` to this
+/// address so an inherited `PGHOST` cannot become libpq's TLS server name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conninfo {
     pub hostaddr: Ipv4Addr,
@@ -63,7 +64,8 @@ impl Conninfo {
 
     fn render(&self, password: &str) -> String {
         format!(
-            "hostaddr={} port={} dbname={} user={} password={} sslmode={} application_name={}",
+            "host={} hostaddr={} port={} dbname={} user={} password={} sslmode={} application_name={}",
+            quote_conn(&self.hostaddr.to_string()),
             quote_conn(&self.hostaddr.to_string()),
             quote_conn(&self.port.to_string()),
             quote_conn(&self.dbname),
@@ -336,6 +338,17 @@ mod tests {
         // `x\y` would be parsed as a further keyword.
         assert!(s.contains(r"password='p w\'x\\y'"), "{s}");
         assert!(s.ends_with("application_name='pgfc_node_b'"), "{s}");
+    }
+
+    #[test]
+    fn conninfo_renderings_pin_host_and_hostaddr_to_the_resolved_ip() {
+        let c = conn();
+        for s in [c.to_libpq(), c.without_password(), c.redacted()] {
+            assert!(
+                s.starts_with("host='203.0.113.10' hostaddr='203.0.113.10'"),
+                "{s}"
+            );
+        }
     }
 
     #[test]
