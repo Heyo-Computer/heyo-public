@@ -230,6 +230,15 @@ async fn handle_conn(
         auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
         anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
     }
+    if registry.replication().is_fenced(&info.database) {
+        auth::send_fatal(
+            &mut client,
+            auth::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            "database is fenced for a planned switchover; operator unfence is required",
+        )
+        .await?;
+        anyhow::bail!("refused connection to fenced database {}", info.database);
+    }
     let schema = info.database.clone();
     if !is_valid_schema(&schema) {
         anyhow::bail!("rejecting invalid schema name {schema:?}");

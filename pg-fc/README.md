@@ -1157,6 +1157,39 @@ curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication \
 curl -u admin:secret http://127.0.0.1:34199/api/replication/acme   # state + lag
 ```
 
+For an operator-coordinated planned switchover, node A also exposes a bounded
+source-admission fence (all routes are protected by the same dashboard Basic
+authentication):
+
+```sh
+curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication/acme/fence
+curl -u admin:secret http://127.0.0.1:34199/api/replication/acme
+curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication/acme/unfence
+```
+
+`fence` is valid only on a replication primary. It durably records intent,
+then uses that VM's private `postgres` maintenance connection to commit
+`ALTER DATABASE acme ALLOW_CONNECTIONS false` with `synchronous_commit=on`.
+The database-object lock serializes with already-admitted startup processes;
+after it commits, pg-fc freshly classifies and terminates application sessions
+and waits for their actual exit. It rejects prepared transactions and unknown
+database workers, preserving only the walsender positively identified by this
+pairing's slot. It then captures one fixed `pg_current_wal_insert_lsn()`, runs
+`CHECKPOINT`, and verifies `pg_current_wal_flush_lsn()` reached that barrier.
+The successful JSON response contains `database`, `vm_id`, `barrier_lsn`, and
+the full replication `record`; GET exposes durable fence phase/error/barrier
+under `record.fence` after a restart as well.
+
+Any failure leaves the durable fence in phase `error`; it never auto-unfences.
+Because PostgreSQL's database fence is intentionally nonselective, logical
+replication may disconnect and cannot reconnect while fenced. That is an
+abort/unfence/retry condition, not permission to reopen the source for
+catch-up. `unfence` explicitly restores `ALLOW_CONNECTIONS true` through the
+maintenance database with synchronous commit, then clears the durable intent.
+Neither endpoint promotes a replica, drops replication objects, or authorizes
+target writes. The barrier is local source durability evidence only; a later
+coordinator must prove the replica applied that exact LSN before handoff.
+
 What that does, in order — each step durable before the thing it describes
 exists, so a crash leaves a retryable row rather than an object nothing names:
 

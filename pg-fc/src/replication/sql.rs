@@ -109,6 +109,36 @@ fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+pub fn set_allow_connections(database: &str, allow: bool) -> String {
+    format!(
+        "ALTER DATABASE {} ALLOW_CONNECTIONS {}",
+        quote_ident(database),
+        if allow { "true" } else { "false" }
+    )
+}
+
+/// Run from `postgres`. The ALTER's database-object lock is the admission
+/// barrier: it waits behind startup processes already holding the object lock;
+/// only after its durable commit may the caller perform a fresh activity
+/// sweep. That closes the startup-vs-pg_stat_activity race without sleeping.
+pub const PREPARED_XACTS_SQL: &str = "SELECT count(*)::int8 FROM pg_prepared_xacts WHERE database = $1";
+
+/// Preserve only our positively identified logical sender (the active pid of
+/// this pairing's exact slot). Everything else is classified by the caller.
+pub const FENCE_ACTIVITY_SQL: &str = "\
+SELECT a.pid, a.backend_type, a.usename, a.application_name,
+       a.pid = COALESCE(s.active_pid, -1) AS is_expected_sender
+FROM pg_stat_activity a
+LEFT JOIN pg_replication_slots s ON s.slot_name = $2
+WHERE a.datname = $1 AND a.pid <> pg_backend_pid()";
+
+pub const TERMINATE_APP_SESSIONS_SQL: &str = "\
+SELECT pg_terminate_backend(a.pid)
+FROM pg_stat_activity a
+LEFT JOIN pg_replication_slots s ON s.slot_name = $2
+WHERE a.datname = $1 AND a.pid <> pg_backend_pid()
+  AND NOT (a.backend_type = 'walsender' AND a.pid = s.active_pid)";
+
 // --- primary side -----------------------------------------------------------
 
 /// What the replication login needs to actually read the tables it streams.

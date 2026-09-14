@@ -25,6 +25,8 @@ use crate::registry::SchemaRegistry;
 
 use super::{ReplRecord, Role, State, peer::PeerClient, sql, wire};
 
+const FENCE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Length of a generated replication password. Same 144 bits of entropy as a
 /// dedicated database's, and generated the same way.
 const PASSWORD_LEN: usize = 24;
@@ -483,6 +485,98 @@ async fn build_replica(reg: &Arc<SchemaRegistry>, req: &wire::ProvisionReplica) 
 // Promote / detach
 // ---------------------------------------------------------------------------
 
+/// Close a primary database to new sessions and establish a fixed, locally
+/// flushed WAL barrier. This does not alter the subscription or either
+/// replication role and therefore is not promotion/failover.
+pub async fn fence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::FenceResponse> {
+    let rec = reg.replication().get(database)
+        .with_context(|| format!("{database} is not replicating"))?;
+    if rec.role != Role::Primary {
+        bail!("{database} is a replication replica on this node; only the source may be fenced");
+    }
+    reg.replication().set_fence(database, "intent", "fence requested; database state not yet verified", "", "")?;
+
+    let result: Result<(String, String)> = async {
+        let (guard, mut maintenance) = reg.maintenance_client(database).await?;
+        let vm_id = guard.entry().sandbox.sandbox_id().to_string();
+        reg.replication().set_fence(database, "closing_admission", "waiting for database object-lock holders, then committing ALLOW_CONNECTIONS false", &vm_id, "")?;
+
+        // synchronous_commit=on overrides the guest's source tuning. ALTER
+        // DATABASE obtains the object lock which serializes with in-flight
+        // startup admission; commit precedes the fresh activity sweep.
+        let tx = maintenance.transaction().await.context("starting durable fence transaction")?;
+        tx.batch_execute("SET LOCAL synchronous_commit = on").await?;
+        tx.batch_execute(&sql::set_allow_connections(database, false)).await?;
+        tx.commit().await.context("durably committing ALLOW_CONNECTIONS false")?;
+        reg.replication().set_fence(database, "draining", "admission closed; draining sessions", &vm_id, "")?;
+
+        let prepared: i64 = maintenance.query_one(sql::PREPARED_XACTS_SQL, &[&database]).await?.get(0);
+        if prepared != 0 {
+            bail!("database has {prepared} prepared transaction(s); fence retained; resolve them explicitly before retrying");
+        }
+
+        // Reject background workers rather than killing something whose write
+        // semantics are unknown. Client backends are application sessions and
+        // are terminated; the exact slot's active logical walsender survives.
+        let rows = maintenance.query(sql::FENCE_ACTIVITY_SQL, &[&database, &rec.slot]).await?;
+        for row in &rows {
+            let backend: &str = row.get("backend_type");
+            let expected: bool = row.get("is_expected_sender");
+            if backend != "client backend" && !expected {
+                bail!("unexpected database worker pid {} ({backend}); fence retained", row.get::<_, i32>("pid"));
+            }
+        }
+        maintenance.query(sql::TERMINATE_APP_SESSIONS_SQL, &[&database, &rec.slot]).await?;
+        let deadline = tokio::time::Instant::now() + FENCE_DRAIN_TIMEOUT;
+        loop {
+            let rows = maintenance.query(sql::FENCE_ACTIVITY_SQL, &[&database, &rec.slot]).await?;
+            let remaining = rows.iter().filter(|r| !r.get::<_, bool>("is_expected_sender")).count();
+            if remaining == 0 { break; }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("{remaining} application session(s) did not exit within 30s; fence retained");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        reg.replication().set_fence(database, "barrier", "sessions drained; capturing fixed WAL insert barrier", &vm_id, "")?;
+        maintenance.batch_execute("SET synchronous_commit = on").await?;
+        let barrier: String = maintenance.query_one("SELECT pg_current_wal_insert_lsn()::text", &[]).await?.get(0);
+        maintenance.batch_execute("CHECKPOINT").await.context("checkpointing fixed WAL barrier")?;
+        let flushed: bool = maintenance.query_one(
+            "SELECT pg_current_wal_flush_lsn() >= $1::pg_lsn", &[&barrier]
+        ).await?.get(0);
+        if !flushed { bail!("WAL flush did not reach fixed barrier {barrier}; fence retained"); }
+        Ok((vm_id, barrier))
+    }.await;
+
+    match result {
+        Ok((vm_id, barrier)) => {
+            reg.replication().set_fence(database, "ready", "source fenced and fixed WAL barrier flushed", &vm_id, &barrier)?;
+            let rec = reg.replication().get(database).unwrap_or(rec);
+            Ok(wire::FenceResponse { record: (&rec).into(), database: database.into(), vm_id, barrier_lsn: barrier })
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let current = reg.replication().get(database).and_then(|r| r.fence);
+            let vm = current.as_ref().map(|f| f.vm_id.as_str()).unwrap_or("");
+            let barrier = current.as_ref().map(|f| f.barrier_lsn.as_str()).unwrap_or("");
+            let _ = reg.replication().set_fence(database, "error", &msg, vm, barrier);
+            Err(e)
+        }
+    }
+}
+
+pub async fn unfence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
+    let rec = reg.replication().get(database).with_context(|| format!("{database} is not replicating"))?;
+    if rec.fence.is_none() { bail!("{database} is not fenced"); }
+    let (_guard, maintenance) = reg.maintenance_client(database).await?;
+    maintenance.batch_execute("SET synchronous_commit = on").await?;
+    maintenance.batch_execute(&sql::set_allow_connections(database, true)).await
+        .context("durably restoring database admission")?;
+    reg.replication().clear_fence(database)?;
+    Ok(())
+}
+
 /// Cut a replica loose: stop applying, drop the subscription, and re-seed the
 /// sequences logical replication never carried.
 pub async fn promote(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::PromoteResponse> {
@@ -493,6 +587,9 @@ pub async fn promote(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::
         .with_context(|| format!("{database} is not replicating"))?;
     if rec.role != Role::Replica {
         bail!("{database} is a replication primary on this node, not a replica");
+    }
+    if rec.fence.is_some() {
+        bail!("{database} is fenced; explicitly unfence it before promotion");
     }
 
     let (_guard, db) = reg.db_client(database).await?;
@@ -545,6 +642,9 @@ pub async fn detach(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::D
         .replication()
         .get(database)
         .with_context(|| format!("{database} is not replicating"))?;
+    if rec.fence.is_some() {
+        bail!("{database} is fenced; explicitly unfence it before detach");
+    }
 
     // Best-effort: tell the peer first, so its subscriber lets go of the slot
     // and the drop below finds it inactive. A peer that cannot be reached is

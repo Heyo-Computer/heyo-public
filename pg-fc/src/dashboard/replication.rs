@@ -331,6 +331,20 @@ pub async fn api_promote(State(st): State<DashState>, Path(db): Path<String>) ->
     }
 }
 
+pub async fn api_fence(State(st): State<DashState>, Path(db): Path<String>) -> Response {
+    match orchestrate::fence(&st.registry, &db).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_unfence(State(st): State<DashState>, Path(db): Path<String>) -> Response {
+    match orchestrate::unfence(&st.registry, &db).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => api_err(&e).into_response(),
+    }
+}
+
 pub async fn api_refresh(State(st): State<DashState>, Path(db): Path<String>) -> Response {
     match orchestrate::refresh(&st.registry, &db).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

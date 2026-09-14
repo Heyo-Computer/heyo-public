@@ -837,6 +837,23 @@ impl SchemaRegistry {
         Ok((guard, client))
     }
 
+    /// Connect to this VM's `postgres` maintenance database. This path is not
+    /// publicly routable by database name and remains usable while the tenant
+    /// database has `ALLOW_CONNECTIONS false`.
+    pub async fn maintenance_client(
+        self: &Arc<Self>,
+        schema: &str,
+    ) -> Result<(ConnGuard, deadpool_postgres::Object)> {
+        let guard = self.checkout(schema).await?;
+        let client = guard
+            .entry()
+            .pool
+            .get()
+            .await
+            .with_context(|| format!("connecting to maintenance database for {schema}"))?;
+        Ok((guard, client))
+    }
+
     /// Make `schema`'s running VM match the replication role now recorded for
     /// it — planting the durable marker and, when the WAL level has to change,
     /// restarting Postgres inside the guest.

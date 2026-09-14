@@ -117,6 +117,18 @@ pub struct RecordJson {
     pub message: String,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub fence: Option<FenceJson>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct FenceJson {
+    pub phase: String,
+    pub message: String,
+    pub vm_id: String,
+    pub barrier_lsn: String,
+    pub requested_at: u64,
+    pub updated_at: u64,
 }
 
 impl From<&crate::replication::ReplRecord> for RecordJson {
@@ -133,8 +145,21 @@ impl From<&crate::replication::ReplRecord> for RecordJson {
             message: r.message.clone(),
             created_at: r.created_at,
             updated_at: r.updated_at,
+            fence: r.fence.as_ref().map(|f| FenceJson {
+                phase: f.phase.clone(), message: f.message.clone(), vm_id: f.vm_id.clone(),
+                barrier_lsn: f.barrier_lsn.clone(), requested_at: f.requested_at,
+                updated_at: f.updated_at,
+            }),
         }
     }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct FenceResponse {
+    pub record: RecordJson,
+    pub database: String,
+    pub vm_id: String,
+    pub barrier_lsn: String,
 }
 
 /// What a primary can see about its own side of the link.

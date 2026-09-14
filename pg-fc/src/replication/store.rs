@@ -1,6 +1,6 @@
 //! The durable record of what this node is replicating, and to or from whom.
 //!
-//! One row per database, twelve tab-separated columns, `0600`, temp-file +
+//! One row per database, eighteen tab-separated columns, `0600`, temp-file +
 //! rename — the same shape as [`crate::dedicated`] and for the same reasons.
 //! It holds a cleartext password (the replication login's) so it is no more
 //! world-readable than `dedicated.tsv` is.
@@ -149,6 +149,19 @@ pub struct ReplRecord {
     pub message: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Durable planned-switchover source fence. This is deliberately
+    /// orthogonal to replication state: fencing never promotes either side.
+    pub fence: Option<Fence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fence {
+    pub phase: String,
+    pub message: String,
+    pub vm_id: String,
+    pub barrier_lsn: String,
+    pub requested_at: u64,
+    pub updated_at: u64,
 }
 
 impl ReplRecord {
@@ -169,6 +182,7 @@ impl ReplRecord {
             message: String::new(),
             created_at: now,
             updated_at: now,
+            fence: None,
         }
     }
 }
@@ -239,7 +253,7 @@ impl ReplStore {
             .lock()
             .unwrap()
             .get(database)
-            .is_some_and(|r| r.state.pins())
+            .is_some_and(|r| r.state.pins() || r.fence.is_some())
     }
 
     /// Every pinned database, so startup can warm them before the untracked
@@ -250,7 +264,7 @@ impl ReplStore {
             .lock()
             .unwrap()
             .values()
-            .filter(|r| r.state.pins())
+            .filter(|r| r.state.pins() || r.fence.is_some())
             .map(|r| r.database.clone())
             .collect();
         out.sort();
@@ -339,6 +353,56 @@ impl ReplStore {
         };
         write_atomic(&self.path, &snapshot)
             .with_context(|| format!("persisting replication records to {}", self.path.display()))
+    }
+
+    /// Persist fence intent/progress before the corresponding database side
+    /// effect. Once present it remains until an explicit successful unfence.
+    pub fn set_fence(
+        &self,
+        database: &str,
+        phase: &str,
+        message: &str,
+        vm_id: &str,
+        barrier_lsn: &str,
+    ) -> Result<()> {
+        let snapshot = {
+            let mut map = self.by_database.lock().unwrap();
+            let Some(rec) = map.get_mut(database) else {
+                bail!("no replication record for database {database:?}");
+            };
+            let now = now_unix();
+            let requested_at = rec.fence.as_ref().map(|f| f.requested_at).unwrap_or(now);
+            rec.fence = Some(Fence {
+                phase: one_line(phase),
+                message: one_line(message),
+                vm_id: one_line(vm_id),
+                barrier_lsn: one_line(barrier_lsn),
+                requested_at,
+                updated_at: now,
+            });
+            rec.updated_at = now;
+            serialize(&map)
+        };
+        write_atomic(&self.path, &snapshot)
+            .with_context(|| format!("persisting replication records to {}", self.path.display()))
+    }
+
+    pub fn clear_fence(&self, database: &str) -> Result<()> {
+        let snapshot = {
+            let mut map = self.by_database.lock().unwrap();
+            let Some(rec) = map.get_mut(database) else {
+                bail!("no replication record for database {database:?}");
+            };
+            rec.fence = None;
+            rec.updated_at = now_unix();
+            serialize(&map)
+        };
+        write_atomic(&self.path, &snapshot)
+            .with_context(|| format!("persisting replication records to {}", self.path.display()))
+    }
+
+    pub fn is_fenced(&self, database: &str) -> bool {
+        self.get(database).is_some_and(|r| r.fence.is_some())
     }
 
     /// Forget a pairing entirely. The Postgres objects are the caller's
@@ -439,6 +503,14 @@ fn parse(s: &str) -> HashMap<String, ReplRecord> {
                 message: f[9].to_string(),
                 created_at: f.get(10).and_then(|v| v.parse().ok()).unwrap_or(0),
                 updated_at: f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0),
+                fence: f.get(12).filter(|v| !v.is_empty()).map(|phase| Fence {
+                    phase: (*phase).to_string(),
+                    message: f.get(13).unwrap_or(&"").to_string(),
+                    vm_id: f.get(14).unwrap_or(&"").to_string(),
+                    barrier_lsn: f.get(15).unwrap_or(&"").to_string(),
+                    requested_at: f.get(16).and_then(|v| v.parse().ok()).unwrap_or(0),
+                    updated_at: f.get(17).and_then(|v| v.parse().ok()).unwrap_or(0),
+                }),
             },
         );
     }
@@ -482,6 +554,16 @@ fn serialize(map: &HashMap<String, ReplRecord>) -> String {
         out.push_str(&r.created_at.to_string());
         out.push('\t');
         out.push_str(&r.updated_at.to_string());
+        out.push('\t');
+        if let Some(f) = &r.fence {
+            for field in [&f.phase, &f.message, &f.vm_id, &f.barrier_lsn] {
+                out.push_str(field);
+                out.push('\t');
+            }
+            out.push_str(&f.requested_at.to_string());
+            out.push('\t');
+            out.push_str(&f.updated_at.to_string());
+        }
         out.push('\n');
     }
     out
@@ -552,6 +634,24 @@ mod tests {
         assert!(s.remove("acme").unwrap());
         assert!(!s.remove("acme").unwrap());
         assert!(ReplStore::load(s.path.clone()).list().is_empty());
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn fence_round_trips_and_pins_until_explicit_clear() {
+        let s = store();
+        s.create(rec("acme", Role::Primary), &free).unwrap();
+        s.set_fence("acme", "intent", "requested", "vm-7", "").unwrap();
+        assert!(s.is_fenced("acme"));
+        assert!(s.is_pinned("acme"), "a pending fence survives lifecycle cleanup");
+        let reloaded = ReplStore::load(s.path.clone());
+        let f = reloaded.get("acme").unwrap().fence.unwrap();
+        assert_eq!(f.phase, "intent");
+        assert_eq!(f.vm_id, "vm-7");
+        reloaded.set_fence("acme", "ready", "flushed", "vm-7", "0/CAFE").unwrap();
+        assert_eq!(reloaded.get("acme").unwrap().fence.unwrap().barrier_lsn, "0/CAFE");
+        reloaded.clear_fence("acme").unwrap();
+        assert!(!reloaded.is_fenced("acme"));
         let _ = std::fs::remove_file(&s.path);
     }
 
