@@ -1,0 +1,59 @@
+name: pg-fc
+
+on:
+  submit:
+    paths:
+      - 'pg-fc/**'
+      - 'ui/**'
+      - '.ci/workflows/pg-fc.yml'
+      - '.ci/image/codegraph/**'
+
+jobs:
+  release:
+    vm:
+      driver: firecracker
+      build:
+        dockerfile: .ci/image/codegraph/Dockerfile
+        context: .ci/image/codegraph
+        size_mb: 6144
+      size_class: large
+      disk_size_gb: 20
+      ttl_seconds: 5400
+      cache_key_files:
+        - pg-fc/Cargo.lock
+        - pg-fc/Cargo.toml
+        - pg-fc/rust-toolchain.toml
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '4'
+    timeout-minutes: 90
+    steps:
+      - name: Check persistent build cache
+        run: |
+          set -eu
+          test "$(stat -c %d "$CARGO_TARGET_DIR")" != "$(stat -c %d /)"
+          df -P "$CARGO_TARGET_DIR" /
+
+      - name: Test and build pg-fc
+        working-directory: /workspace/pg-fc
+        timeout-minutes: 75
+        run: |
+          set -eu
+          python3 -m unittest discover -s deploy -p 'test_sync_traefik_cert.py' -v
+          cargo test --locked
+          cargo build --release --locked --bin pg-vm-pool
+
+      - name: Collect verified host binary
+        run: |
+          set -eu
+          mkdir -p dist
+          cp "$CARGO_TARGET_DIR/release/pg-vm-pool" dist/pg-vm-pool
+          strip dist/pg-vm-pool
+          printf 'commit %s\nbranch %s\nrun %s\n' '${{ ci.sha }}' '${{ ci.branch }}' '${{ ci.run_id }}' > dist/BUILD-INFO
+          (cd dist && sha256sum pg-vm-pool BUILD-INFO > SHA256SUMS)
+
+      - uses: ci/upload-artifact
+        with:
+          name: pg-fc
+          description: PostgreSQL Firecracker pooler host binary, including peer replication APIs and build provenance.
+          path: dist
