@@ -195,6 +195,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "u-siem",
+ "url",
 ]
 
 [[package]]

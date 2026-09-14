@@ -100,8 +100,8 @@ pub struct LbConfig {
     pub auth_timeout_secs: u64,
     /// HTTPS listener for the proxy data plane, bound *in addition to* the
     /// plaintext `proxy_addr`. Enabled when ACME is on or a static cert pair is
-    /// configured. Upstreams stay plaintext regardless — the guest IP is on a
-    /// host-local tap network.
+    /// configured. Managed VM upstreams stay plaintext on their host-local tap
+    /// network; static upstreams may explicitly use HTTPS.
     #[serde(default = "default_tls_addr")]
     pub tls_addr: String,
     /// Whether `tls_addr` was configured explicitly rather than defaulted.
@@ -3675,7 +3675,7 @@ pub enum SpecError {
     NoBackendKind,
     EmptyDiscoveryServiceId,
     DiscoveryWithOtherBackend,
-    /// A static upstream address is not a valid `host:port`.
+    /// A static upstream address is not a valid plaintext `host:port` or HTTPS URL.
     BadUpstream(String),
     /// A static deployment declared a `build` block; there is no image to build.
     BuildOnStaticDeployment,
@@ -4017,7 +4017,7 @@ impl std::fmt::Display for SpecError {
             ),
             Self::BadUpstream(a) => write!(
                 f,
-                "static upstream {a:?} is not a valid `host:port` address"
+                "static upstream {a:?} is not a valid `host:port` address or HTTPS URL"
             ),
             Self::BuildOnStaticDeployment => write!(
                 f,
@@ -4858,12 +4858,13 @@ impl DeploymentSpec {
             if let Some(update) = &self.update {
                 update.validate()?;
             }
-            // Static: every upstream must be a well-formed `host:port`. Actual
+            // Static: every upstream must be a well-formed plaintext `host:port`
+            // or HTTPS URL. Actual
             // name resolution happens at request time (pingora) and per tick (the
             // health re-probe), so a temporarily-unresolvable name is not a
             // registration error — only a malformed address is.
             for addr in &self.upstreams {
-                if !is_valid_host_port(addr) {
+                if StaticUpstream::parse(addr).is_none() {
                     return Err(SpecError::BadUpstream(addr.clone()));
                 }
             }
@@ -4886,6 +4887,53 @@ fn is_valid_host_port(s: &str) -> bool {
         return false;
     }
     matches!(port.parse::<u16>(), Ok(p) if p > 0)
+}
+
+/// The connection details encoded by a static upstream string. Bare addresses
+/// retain their historical plaintext meaning; an `https://` URL opts into TLS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaticUpstream {
+    pub address: String,
+    pub tls: bool,
+    pub sni: String,
+}
+
+impl StaticUpstream {
+    pub fn parse(value: &str) -> Option<Self> {
+        if !value.contains("://") {
+            return is_valid_host_port(value).then(|| Self {
+                address: value.to_string(),
+                tls: false,
+                sni: String::new(),
+            });
+        }
+
+        // URL parsing normalizes dot segments and backslashes. Refuse them
+        // before parsing rather than silently accepting a non-origin input.
+        let (_, authority) = value.split_once("://")?;
+        let authority = authority.strip_suffix('/').unwrap_or(authority);
+        if authority.contains(['/', '\\', '?', '#', '@'])
+            || value.chars().any(char::is_whitespace)
+        {
+            return None;
+        }
+        let parsed = url::Url::parse(value).ok()?;
+        if parsed.scheme() != "https"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        let port = parsed.port_or_known_default()?;
+        if port == 0 { return None; }
+        // Pingora verifies DNS names with X509_VERIFY_PARAM_add1_host, not
+        // the IP-SAN verifier. Do not promise IP-literal certificate support.
+        let url::Host::Domain(host) = parsed.host()? else { return None; };
+        Some(Self { address: format!("{host}:{port}"), tls: true, sni: host.to_string() })
+    }
 }
 
 // ---- namespace objects --------------------------------------------------
@@ -6879,6 +6927,9 @@ mod tests {
         let s = static_spec(&["10.0.0.9:8080", "backend.internal:8080", "[::1]:9000"]);
         assert!(s.is_static());
         assert_eq!(s.validate(), Ok(()));
+
+        let https = static_spec(&["https://ci.eu1.heyo.work:443"]);
+        assert_eq!(https.validate(), Ok(()));
     }
 
     #[test]
@@ -6896,7 +6947,16 @@ mod tests {
 
     #[test]
     fn rejects_malformed_upstreams() {
-        for bad in ["no-port", "host:", ":8080", "host:0", "host:notaport"] {
+        for bad in [
+            "no-port", "host:", ":8080", "host:0", "host:notaport",
+            "http://ci.example:80", "ftp://ci.example:21", "https://user@ci.example:443",
+            "https://ci.example:443/api", "https://ci.example:443/?q=1",
+            "https://ci.example:443/#fragment", "https://:443",
+            "https://ci.example:0", "https://ci.example/a/..",
+            "https://ci.example/%2e/", "https://ci.example\\",
+            " https://ci.example", "https://ci.example\n",
+            "https://127.0.0.1:443", "https://[::1]:443",
+        ] {
             let s = static_spec(&[bad]);
             assert_eq!(
                 s.validate(),

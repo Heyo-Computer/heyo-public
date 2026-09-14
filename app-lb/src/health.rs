@@ -38,6 +38,35 @@ pub async fn probe(addr: SocketAddr, check: &HealthCheck) -> bool {
     }
 }
 
+/// Probe an HTTPS static upstream by hostname, retaining normal CA/hostname
+/// verification (and therefore using `host` as TLS SNI). Unlike the plaintext
+/// probe, DNS must not be replaced with a resolved IP or certificate checking
+/// would verify the wrong identity.
+pub async fn probe_https(address: &str, host: &str, check: &HealthCheck) -> bool {
+    let port = check.port.unwrap_or_else(|| {
+        address.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(443)
+    });
+    let path = check.path.as_deref().unwrap_or("/");
+    let host = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+    let url = format!("https://{host}:{port}{path}");
+    let timeout = Duration::from_secs(check.timeout_secs.max(1));
+    let client = match reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    match client.get(url).send().await {
+        Ok(response) => response.status().as_u16() < 500,
+        Err(error) => {
+            tracing::trace!(%address, %error, "HTTPS health probe failed");
+            false
+        }
+    }
+}
+
 async fn probe_inner(target: SocketAddr, path: Option<&str>) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(target).await?;
     let Some(path) = path else {

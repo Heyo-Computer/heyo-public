@@ -262,6 +262,10 @@ async fn resolve_peer(peer: &str) -> Option<SocketAddr> {
     tokio::net::lookup_host(peer).await.ok()?.next()
 }
 
+fn http_peer(backend: &VmBackend, address: SocketAddr) -> HttpPeer {
+    HttpPeer::new(address, backend.tls, backend.sni.clone())
+}
+
 /// The key authorization to serve for `path`, if it names an outstanding
 /// HTTP-01 challenge.
 ///
@@ -914,7 +918,7 @@ impl ProxyHttp for LbProxy {
             }
             ctx.backend = Some(backend.clone());
 
-            match resolve_peer(&backend.peer).await {
+            match resolve_peer(&backend.address).await {
                 Some(addr) => break addr,
                 None => {
                     tracing::warn!(
@@ -929,9 +933,11 @@ impl ProxyHttp for LbProxy {
             }
         };
 
-        // Plaintext, in both modes: a managed VM's guest IP is on a host-local
-        // tap network, and static proxy_pass upstreams are plaintext by design.
-        Ok(Box::new(HttpPeer::new(addr, false, String::new())))
+        let backend = ctx
+            .backend
+            .as_ref()
+            .expect("selected backend remains in context");
+        Ok(Box::new(http_peer(backend, addr)))
     }
 
     async fn response_filter(
@@ -1215,6 +1221,16 @@ mod tests {
         assert!(
             resolve_peer("definitely-not-a-real-host.invalid:80").await.is_none()
         );
+    }
+
+    #[test]
+    fn https_backend_builds_a_tls_peer_with_url_hostname_as_sni() {
+        let backend = VmBackend::for_upstream("https://ci.eu1.heyo.work:443".into());
+        let peer = http_peer(&backend, "127.0.0.1:443".parse().unwrap());
+        assert!(peer.is_tls());
+        assert_eq!(peer.sni, "ci.eu1.heyo.work");
+        assert!(peer.options.verify_cert);
+        assert!(peer.options.verify_hostname);
     }
 
     #[test]

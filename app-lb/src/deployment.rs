@@ -1,6 +1,6 @@
 //! Live deployment state: the VM pool, in-flight accounting, and selection.
 
-use crate::config::DeploymentSpec;
+use crate::config::{DeploymentSpec, StaticUpstream};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -30,6 +30,11 @@ pub fn now_secs() -> u64 {
 pub struct VmBackend {
     pub sandbox_id: String,
     pub peer: String,
+    /// Resolvable connection address, separated from `peer` because an HTTPS
+    /// upstream keeps its URL as the stable identity shown to operators.
+    pub address: String,
+    pub tls: bool,
+    pub sni: String,
     /// Makes checking admission and reserving an in-flight slot atomic with an
     /// operator drain. Selection itself is intentionally lock-free and may be
     /// stale; [`try_acquire`](Self::try_acquire) is the authoritative gate.
@@ -58,20 +63,32 @@ pub struct VmBackend {
 impl VmBackend {
     /// A backend for a managed VM, addressed by its resolved guest `SocketAddr`.
     pub fn new(sandbox_id: String, addr: SocketAddr) -> Self {
-        Self::with_peer(sandbox_id, addr.to_string())
+        let address = addr.to_string();
+        Self::with_peer(sandbox_id, address.clone(), address, false, String::new())
     }
 
     /// A backend for a static proxy_pass upstream, addressed by a `host:port`
     /// string (which pingora resolves per connection). The address doubles as the
     /// backend's display id, since there is no sandbox.
     pub fn for_upstream(address: String) -> Self {
-        Self::with_peer(address.clone(), address)
+        let target = StaticUpstream::parse(&address)
+            .expect("deployment specs validate static upstreams before construction");
+        Self::with_peer(
+            address.clone(),
+            address,
+            target.address,
+            target.tls,
+            target.sni,
+        )
     }
 
-    fn with_peer(sandbox_id: String, peer: String) -> Self {
+    fn with_peer(sandbox_id: String, peer: String, address: String, tls: bool, sni: String) -> Self {
         Self {
             sandbox_id,
             peer,
+            address,
+            tls,
+            sni,
             admission: Mutex::new(()),
             in_flight: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
@@ -768,6 +785,19 @@ mod tests {
         c.set_healthy(false);
         assert!(d.select(std::slice::from_ref(&a.peer)).is_none());
         assert_eq!(d.select(&[]).unwrap().peer, a.peer);
+    }
+
+    #[test]
+    fn https_upstream_keeps_identity_and_separates_tls_connection_details() {
+        let backend = VmBackend::for_upstream("https://ci.eu1.heyo.work:443".into());
+        assert_eq!(backend.peer, "https://ci.eu1.heyo.work:443");
+        assert_eq!(backend.address, "ci.eu1.heyo.work:443");
+        assert!(backend.tls);
+        assert_eq!(backend.sni, "ci.eu1.heyo.work");
+
+        let plaintext = VmBackend::for_upstream("ci.eu1.heyo.work:443".into());
+        assert!(!plaintext.tls);
+        assert!(plaintext.sni.is_empty());
     }
 
     #[test]

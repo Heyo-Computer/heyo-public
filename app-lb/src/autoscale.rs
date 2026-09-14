@@ -733,12 +733,15 @@ impl Autoscaler {
     /// each tick, so a name that fails to resolve reads as unhealthy.
     async fn reconcile_static(&self, d: &Arc<Deployment>) {
         for b in d.backends().iter() {
-            let healthy = match tokio::net::lookup_host(&b.peer).await {
-                Ok(mut addrs) => match addrs.next() {
-                    Some(addr) => health::probe(addr, &d.spec.health).await,
-                    None => false, // resolved to nothing
-                },
-                Err(e) => {
+            let healthy = if b.tls {
+                health::probe_https(&b.address, &b.sni, &d.spec.health).await
+            } else {
+                match tokio::net::lookup_host(&b.address).await {
+                    Ok(mut addrs) => match addrs.next() {
+                        Some(addr) => health::probe(addr, &d.spec.health).await,
+                        None => false, // resolved to nothing
+                    },
+                    Err(e) => {
                     tracing::debug!(
                         deployment = %d.spec.id,
                         upstream = %b.peer,
@@ -746,6 +749,7 @@ impl Autoscaler {
                         "static upstream did not resolve; marking unhealthy",
                     );
                     false
+                    }
                 }
             };
             let was = b.is_healthy();

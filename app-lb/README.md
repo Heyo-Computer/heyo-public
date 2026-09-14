@@ -290,10 +290,14 @@ curl -XPOST localhost:9090/deployments -H 'content-type: application/json' -d '{
 }'
 ```
 
-Each upstream is a `host:port` (or `ip:port`); a hostname is re-resolved per connection. To
+Each upstream is a plaintext `host:port` (or `ip:port`), or an HTTPS origin URL such as
+`https://ci.eu1.heyo.work:443`; a hostname is re-resolved per connection. HTTPS uses the URL
+hostname for SNI and normal certificate verification while preserving the caller's original
+`Host` header. HTTPS requires a DNS hostname, not an IP literal. URLs may contain only the origin (an optional `/` is allowed), with no credentials,
+query, or fragment. To
 change the targets, `PUT` the deployment with a new `upstreams` list (the backends are rebuilt).
 Scaling (`PATCH .../scaling`) and per-VM eviction (`DELETE .../vms/...`) do not apply to a
-static deployment and are rejected. Upstreams are proxied over **plaintext HTTP**.
+static deployment and are rejected. Bare addresses remain proxied over **plaintext HTTP**.
 
 Orchestrator can own membership while app-lb continues to own the local daemon and static
 least-in-flight/failover behavior. A discovery-backed static spec may start empty:

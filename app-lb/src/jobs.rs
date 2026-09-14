@@ -1921,7 +1921,7 @@ impl Jobs {
 
             let mut unhealthy = Vec::new();
             for b in backends.iter() {
-                if !probe_peer(&b.peer, &d.spec.health).await {
+                if !probe_peer(b, &d.spec.health).await {
                     unhealthy.push(b.peer.clone());
                 }
             }
@@ -2140,8 +2140,14 @@ impl Drop for JobSlot {
 
 /// Resolve an upstream and probe it with the deployment's health check — the
 /// same two steps the autoscaler's static re-probe takes each tick.
-async fn probe_peer(peer: &str, check: &crate::config::HealthCheck) -> bool {
-    match tokio::net::lookup_host(peer).await {
+async fn probe_peer(
+    peer: &crate::deployment::VmBackend,
+    check: &crate::config::HealthCheck,
+) -> bool {
+    if peer.tls {
+        return health::probe_https(&peer.address, &peer.sni, check).await;
+    }
+    match tokio::net::lookup_host(&peer.address).await {
         Ok(mut addrs) => match addrs.next() {
             Some(addr) => health::probe(addr, check).await,
             None => false,
