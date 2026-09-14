@@ -122,11 +122,64 @@ async fn seed(reg: Arc<SchemaRegistry>, req: wire::PhysicalReplicaRequest) -> Re
     verify_env.insert("PGFC_SYSTEM_ID".into(), req.system_identifier.clone()); verify_env.insert("PGFC_SLOT".into(), req.slot.clone()); verify_env.insert("PGFC_LSN".into(), req.source_lsn.clone());
     verify_env.insert("PGFC_HOST".into(), req.primary.hostaddr.clone());
     verify_env.insert("PGFC_PORT".into(), req.primary.port.to_string());
-    let verify = crate::vm::physical_exec(reg.cfg(), &sandbox, VERIFY_RUNTIME, verify_env, "verifying physical candidate runtime").await?;
-    let result = if verify.stdout.is_empty() { verify.output.trim() } else { verify.stdout.trim() };
-    if verify.exit_code != 0 || result != "t" { bail!("physical candidate runtime identity/streaming verification failed"); }
+    // Guest activation starts Postgres; it does not wait for the WAL receiver
+    // to connect and replay the source barrier. Only a true probe verifies it.
+    wait_for_runtime(deadline, || async {
+        let verify = crate::vm::physical_exec(reg.cfg(), &sandbox, VERIFY_RUNTIME, verify_env.clone(), "verifying physical candidate runtime").await?;
+        if verify.exit_code != 0 { bail!("physical candidate runtime probe failed"); }
+        let result = if verify.stdout.is_empty() { verify.output.trim() } else { verify.stdout.trim() };
+        match result {
+            "t" => Ok(true),
+            "f" => Ok(false),
+            _ => bail!("physical candidate runtime probe returned an invalid result"),
+        }
+    }).await?;
     reg.physical().advance(&req.database, &req.generation, PhysicalPhase::Seeding, PhysicalPhase::Verified, None)?;
     Ok(())
+}
+
+async fn wait_for_runtime<F, Fut>(deadline: tokio::time::Instant, mut probe: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    loop {
+        if probe().await? { return Ok(()); }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("physical candidate runtime identity/streaming verification did not become ready before setup deadline");
+        }
+        tokio::time::sleep_until(std::cmp::min(deadline, tokio::time::Instant::now() + Duration::from_secs(5))).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_wait_requires_a_true_probe_after_startup() {
+        let mut probes = 0;
+        wait_for_runtime(tokio::time::Instant::now() + Duration::from_secs(10), || {
+            probes += 1;
+            std::future::ready(Ok(probes == 2))
+        }).await.unwrap();
+        assert_eq!(probes, 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_wait_preserves_deadline_and_probe_errors() {
+        let mut probes = 0;
+        let error = wait_for_runtime(tokio::time::Instant::now(), || {
+            probes += 1;
+            std::future::ready(Ok(false))
+        }).await.unwrap_err();
+        assert!(error.to_string().contains("setup deadline"));
+        assert_eq!(probes, 1);
+        let error = wait_for_runtime(tokio::time::Instant::now() + Duration::from_secs(10), || {
+            std::future::ready(Err(anyhow::anyhow!("capture failed")))
+        }).await.unwrap_err();
+        assert_eq!(error.to_string(), "capture failed");
+    }
 }
 
 // Command substitution gives jq a pipe instead of the serial TTY, disabling

@@ -1135,9 +1135,11 @@ and runs `pg_basebackup` under an exclusive guest lock. A durable plan inhibits
 ordinary initialization until backup validation and activation succeed. Verify
 progress with GET `/api/replication/<database>/physical` on the replica. The
 `verified` phase requires the expected system identifier, recovery/read-only
-mode, source sender and slot, database/role, and replay position. It does not
-change the serving VM binding. Existing eu1 logical or libvirt databases are
-not seed targets.
+mode, source sender and slot, database/role, and replay position. After guest
+startup, verification waits within the setup deadline for streaming and replay
+to become ready; command errors or malformed probe output still fail immediately.
+It does not change the serving VM binding. Existing eu1 logical or libvirt
+databases are not seed targets.
 
 Errors retain ownership and lifecycle protection. If creation was attempted
 but the daemon has no visible record yet, retries refuse a second create.
