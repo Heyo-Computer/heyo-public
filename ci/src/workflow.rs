@@ -299,6 +299,11 @@ pub struct Job {
     /// online host in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uses: Option<String>,
+    /// Native runner labels. Every label must be advertised by one runner.
+    /// Mutually exclusive with `uses:` and `vm:` placement.
+    #[serde(rename = "runs-on", default, skip_serializing_if = "Vec::is_empty")]
+    pub runs_on: Vec<String>,
+    #[serde(default)]
     pub vm: VmSpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needs: Vec<String>,
@@ -325,6 +330,17 @@ pub struct Job {
 
 impl Job {
     pub fn target(&self) -> Result<Target, WorkflowError> {
+        if !self.runs_on.is_empty() {
+            if self.uses.is_some() {
+                return Err(WorkflowError::NativePlacement("`runs-on` and `uses` are mutually exclusive".into()));
+            }
+            if self.vm != VmSpec::default() {
+                return Err(WorkflowError::NativePlacement("native `runs-on` jobs cannot have a `vm` block".into()));
+            }
+            if self.runs_on.iter().any(|label| label.trim().is_empty()) {
+                return Err(WorkflowError::NativePlacement("`runs-on` labels cannot be empty".into()));
+            }
+        }
         match &self.uses {
             Some(u) => Target::parse(u),
             None => Ok(Target::any()),
@@ -701,6 +717,7 @@ pub fn is_job_id(s: &str) -> bool {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WorkflowError {
+    NativePlacement(String),
     Yaml {
         path: String,
         detail: String,
@@ -765,6 +782,7 @@ pub enum WorkflowError {
 impl fmt::Display for WorkflowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NativePlacement(detail) => write!(f, "invalid native runner placement: {detail}"),
             Self::Yaml { path, detail } => write!(f, "{path} is not valid workflow YAML: {detail}"),
             Self::NoJobs(path) => write!(f, "{path} declares no jobs"),
             Self::DuplicateJob(path) => write!(f, "{path} declares the same job id twice"),

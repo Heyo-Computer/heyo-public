@@ -1,0 +1,26 @@
+{
+  "name": "heyo",
+  "namespace": "team-a",
+  "created_at": 1722400000,
+  "provider": "jwt",
+  "jwt": {
+    "secret": {
+      "secret": "heyo-auth",
+      "key": "jwt_secret"
+    },
+    "algorithms": [
+      "HS256"
+    ],
+    "issuer": "auth-service",
+    "audience": "heyo-app",
+    "require": {
+      "role": [
+        "user",
+        "admin"
+      ]
+    },
+    "subject_claim": "userId",
+    "email_claim": "email",
+    "name_claim": "name"
+  }
+}

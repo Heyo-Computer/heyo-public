@@ -1,0 +1,33 @@
+{
+  "id": "heyosecret-us3",
+  "routes": [],
+  "vm": {
+    "driver": "firecracker",
+    "image": "heyosecret-us3-pending",
+    "port": 4455,
+    "size_class": "small",
+    "ttl_seconds": 0,
+    "working_directory": "/opt/heyosecret",
+    "start_command": "nohup /usr/local/bin/heyosecret </dev/null >/tmp/heyosecret.log 2>&1 &",
+    "env_vars": {
+      "HEYOSECRET_SERVER_PORT": "4455",
+      "HEYOSECRET_MIGRATIONS_DIR": "/opt/heyosecret/migrations",
+      "HEYOSECRET_DASHBOARD_GATE": "true"
+    },
+    "env_from": [
+      {"secret": "heyosecret-us3", "key": "database-url", "as": "HEYOSECRET_DATABASE_URL"},
+      {"secret": "heyosecret-us3", "key": "master-key", "as": "HEYOSECRET_MASTER_KEY"},
+      {"secret": "heyosecret-us3", "key": "internal-api-key", "as": "HEYOSECRET_INTERNAL_API_KEY"}
+    ]
+  },
+  "health": {"path": "/health", "timeout_secs": 5},
+  "scaling": {"min_replicas": 0, "max_replicas": 1, "warm_pool": 0, "boot_timeout_secs": 300},
+  "build": {
+    "repo": "https://github.com/Heyo-Computer/heyo-public.git",
+    "ref": "REPLACE_WITH_VERIFIED_COMMIT",
+    "dockerfile": "heyosecret/Dockerfile",
+    "context": ".",
+    "image_name": "heyosecret-us3",
+    "image_size_mb": 768
+  }
+}

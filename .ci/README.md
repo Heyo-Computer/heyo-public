@@ -13,6 +13,7 @@ to "did this commit pass"; every file here holds one job. See
 | `ci.yml` | `release` | `ci` | `ci` — binary, `ci.conf`, `migrations/`, `SHA256SUMS`, `BUILD-INFO` |
 | `art.yml` | `release` | `art` | `art` — binary, `SHA256SUMS`, `BUILD-INFO` |
 | `queue.yml` | `release` | `queue` | `queue` — binary, `queue.conf`, an app-lb deployment template, `SHA256SUMS`, `BUILD-INFO` |
+| `pg-fc.yml` | `release` | `pg-vm-pool` | `pg-fc` — tested host binary, `SHA256SUMS`, `BUILD-INFO` |
 
 The other six crates here (`artifacts`, `computer`, `heyosecret`,
 `heyosecret-client`, `orchestrator`, `printer`) have no workflow yet. Adding one
@@ -98,6 +99,15 @@ private; a public blob is a download, not a listing.
 `queue` is deliberately not in that default set: it is a dashboard for a NATS
 server, so it belongs on the host running one and nowhere else. Ask for it by
 name — `sh .ci/install.sh queue` — on the box that has `nats-server` on it.
+
+`pg-fc` is also opt-in: `sh .ci/install.sh pg-fc` installs only the
+`pg-vm-pool` binary. It does not configure or restart a pooler, replace heyvm,
+create databases, or change registries, disks, networking, or TLS. Keep the
+host's service configuration and state paths when upgrading; point its service
+command at the installed binary and restart that service explicitly. For a new
+peer, follow `pg-fc/README.md`'s cross-host replication configuration and use a
+distinct state directory and the intended host-local heyvm endpoint. The pg-fc
+artifact is private by default; use authenticated artifact-store access.
 
 ```sh
 sh .ci/install.sh --list            # what the store has, and what each thing is

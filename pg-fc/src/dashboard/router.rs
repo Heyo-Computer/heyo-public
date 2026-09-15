@@ -5,7 +5,7 @@ use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::Router;
 
-use super::{archives, auth, dedicated, handlers, state::DashState};
+use super::{archives, auth, dedicated, handlers, replication, state::DashState};
 
 pub fn build(state: DashState) -> Router {
     Router::new()
@@ -20,6 +20,51 @@ pub fn build(state: DashState) -> Router {
             get(dedicated::api_list).post(dedicated::api_create),
         )
         .route("/api/databases/{database}", delete(dedicated::api_delete))
+        // Cross-host logical replication: peers, pairings, and the
+        // node-to-node endpoints a peer drives. All under the same Basic-auth
+        // layer — peering is a full trust relationship, and the credential a
+        // peer holds is the one that already runs this dashboard.
+        .route("/replication", get(replication::page))
+        .route("/replication/enable", post(replication::enable_form))
+        .route("/replication/{database}/promote", post(replication::promote_form))
+        .route("/replication/{database}/refresh", post(replication::refresh_form))
+        .route("/replication/{database}/detach", post(replication::detach_form))
+        .route("/replication/{database}/delete", post(replication::delete_form))
+        .route("/peers", post(replication::peer_create_form))
+        .route("/peers/{name}/delete", post(replication::peer_delete_form))
+        .route(
+            "/api/replication",
+            get(replication::api_list).post(replication::api_enable),
+        )
+        // Namespaced so what a PEER may drive reads off the route table in one
+        // place, and so it cannot collide with a database named "peer".
+        .route("/api/replication/peer/node", get(replication::api_node_info))
+        .route(
+            "/api/replication/peer/replicas",
+            post(replication::api_accept_replica),
+        )
+        .route("/api/replication/peer/physical-replicas", post(replication::api_accept_physical_replica))
+        .route("/api/replication/peer/physical-handoff", post(replication::api_accept_physical_handoff))
+        .route("/api/replication/peer/writer-tunnel", post(replication::api_writer_tunnel))
+        .route("/api/replication/peer/physical-grants/{database}", get(replication::api_physical_grant))
+        .route("/api/replication/{database}/physical-prepare", post(replication::api_physical_prepare))
+        .route("/api/replication/{database}/physical-handoff", post(replication::api_physical_handoff))
+        .route("/api/replication/{database}/physical", get(replication::api_physical_get))
+        .route(
+            "/api/replication/{database}",
+            get(replication::api_get).delete(replication::api_forget),
+        )
+        .route("/api/replication/{database}/promote", post(replication::api_promote))
+        .route("/api/replication/{database}/fence", post(replication::api_fence))
+        .route("/api/replication/{database}/fence-selective", post(replication::api_fence_selective))
+        .route("/api/replication/{database}/unfence", post(replication::api_unfence))
+        .route("/api/replication/{database}/refresh", post(replication::api_refresh))
+        .route("/api/replication/{database}/detach", post(replication::api_detach))
+        .route(
+            "/api/peers",
+            get(replication::api_peers_list).post(replication::api_peer_create),
+        )
+        .route("/api/peers/{name}", delete(replication::api_peer_delete))
         // Archive reconciliation: schemas whose data is in S3 but whose
         // registry tier stops the pooler from ever restoring it.
         .route("/archives", get(archives::page))

@@ -40,7 +40,8 @@ const KNOWN = {
     UpdateSpec: ["working_dir", "commands", "env", "env_from", "auth", "timeout_secs", "verify_timeout_secs"],
     SecretEnv: ["secret", "key", "as", "namespace"],
     SecretRef: ["secret", "key", "username", "namespace"],
-    AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity", "jwt"],
+    AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "session_scope", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity", "jwt"],
+    PublicPath: ["path", "scope"],
     JwtSpec: ["secret", "public_key", "jwks_url", "algorithms", "issuer", "audience", "require", "subject_claim", "email_claim", "name_claim", "leeway_secs", "cookie"],
     DeploymentView: ["id", "namespace", "account_id", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
     UpstreamTrafficStatus: ["deployment_id", "upstream", "state", "healthy", "in_flight", "reason", "started_at"],
@@ -135,6 +136,9 @@ const NESTED = {
   spec: "DeploymentSpec", vm: "VmSpec", scaling: "ScalingPolicy", health: "HealthCheck",
   discovery: "DiscoverySpec", build: "BuildSpec", artifact: "ArtifactSpec", site: "SiteSpec", update: "UpdateSpec",
   auth: "AuthGate", client_secret: "SecretRef", pool: "PoolStatus", host: "HostUsage",
+  // Each entry is a path plus the scope app-lb requires there; a client that
+  // read only the path would render an admin-only route as an open one.
+  public_paths: "PublicPath",
   // `jwt` is the gate's verification policy. Its own `secret` is a SecretRef,
   // and `require` is a free-form claim map with no declaration to check against
   // — app-lb may carry any claim name there without that being an API change.

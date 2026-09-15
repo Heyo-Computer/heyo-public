@@ -300,6 +300,15 @@ pub struct VmSpec {
     pub ttl_seconds: Option<u64>,
 }
 
+impl Default for VmSpec {
+    fn default() -> Self {
+        Self { driver: SandboxDriver::Firecracker, image: None, build: None,
+            size_class: None, disk_size_gb: None, working_directory: None,
+            env_vars: BTreeMap::new(), setup_hooks: Vec::new(), cache_key_files: Vec::new(),
+            reuse: true, ttl_seconds: None }
+    }
+}
+
 fn default_reuse() -> bool {
     true
 }

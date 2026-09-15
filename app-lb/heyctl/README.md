@@ -18,6 +18,19 @@ imperative helpers (`create`, `scale`, `set`) that write those specs for you, an
 (`get`, `describe`, `top`) that render them back. What it drives is app-lb's admin API —
 deployments, their microVM pools, and the certificates app-lb issues for their hostnames.
 
+## Install
+
+```sh
+curl -fsSL https://heyo.computer/install.sh | sh
+```
+
+That is [`install.sh`](install.sh), served from the marketing site. It puts
+`heyctl` in `~/.local/bin`; `sh -s -- --prefix /usr/local` puts it somewhere
+else, and `--list` shows what is published. Note the `-s --`: without it `sh`
+reads the script from stdin and takes the flags for its own.
+
+Or build it:
+
 ```sh
 cargo build --release -p heyctl
 install -m 0755 target/release/heyctl ~/.local/bin/
@@ -25,6 +38,78 @@ install -m 0755 target/release/heyctl ~/.local/bin/
 
 It is a separate crate from the load balancer, so installing it doesn't drag in pingora, openssl
 or the ACME stack — it shares nothing with app-lb but the wire format.
+
+### What the installer needs from a release
+
+The binaries live in the artifact store, but the store's anonymous carve-out is
+exactly one route — `GET /blobs/{digest}` for a blob marked public — so tags,
+which is how [`.ci/install.sh`](../../.ci/install.sh) finds the newest build,
+are not readable without `ART_API_KEY`. A public installer therefore cannot ask
+the store what "latest" means.
+
+It asks the site instead, through a small manifest at
+`<site>/heyctl/versions.json`. [`publish-versions.sh`](publish-versions.sh)
+writes it:
+
+```sh
+ART_API_KEY=… sh app-lb/heyctl/publish-versions.sh \
+    --from-url https://heyo.computer/heyctl/versions.json \
+    --out versions.json
+```
+
+Then upload `versions.json` to that path. That is the whole release.
+
+The division of labour is the point: `publish-versions.sh` holds the credential
+and runs once per release; `install.sh` holds nothing and runs on strangers'
+machines. Given `--from-url`, the live manifest *is* the state, so nobody has
+to keep a copy in a working tree.
+
+What it does, in order: finds the newest `ci-app-lb-<run>-release-app-lb` tag
+and resolves it to a blob digest; downloads that blob and checks it hashes to
+the digest it was fetched by; unpacks it, confirms there is a `heyctl` inside,
+and reads the version out of `BUILD-INFO` — which the workflow wrote as
+`heyctl --version`, so the manifest says what the binary says; makes sure the
+blob is marked public; and merges the entry in, keeping the versions already
+there so a pinned `--version 0.1.6` goes on working after 0.1.7 ships.
+
+```sh
+sh publish-versions.sh --dry-run                    # resolve and verify, write nothing
+sh publish-versions.sh --ref ci-app-lb-019fca… --no-latest   # backfill, or stage a build
+sh publish-versions.sh --keep 5                     # cap how far the manifest grows
+sh publish-versions.sh --platform darwin-aarch64    # once CI builds one
+```
+
+The file it writes:
+
+```json
+{
+  "latest": "0.1.7",
+  "store": "https://art.us2.heyo.work",
+  "artifacts": [
+    { "version": "0.1.7",
+      "platform": "linux-x86_64",
+      "digest": "<sha256 of the tarball>",
+      "bin": "heyctl" }
+  ]
+}
+```
+
+`artifacts` is a flat array rather than nested objects because the installer
+parses it in POSIX `sh` with no `jq`, and flat records split unambiguously.
+Adding macOS is a CI target plus one more entry — the installer already asks
+for `${OS}-${ARCH}` and reports what the manifest actually offers.
+
+Marking the blob public is normally a no-op: `.ci/workflows/app-lb.yml` uploads
+with `public: true` and prints the resulting `{store}/blobs/{digest}` link. The
+generator checks anyway and marks it if needed, because a manifest published
+over a private blob is an install that 401s for every stranger and works for
+whoever tests it with a key in their environment. By hand that step is
+`art public <digest>`.
+
+The installer verifies the download against the digest it was fetched by (a
+blob's name *is* the sha256 of its bytes) and then against the `SHA256SUMS`
+inside the tarball. That makes `versions.json` the trust root, so it has to be
+served over HTTPS from a host you control.
 
 ## As a library
 

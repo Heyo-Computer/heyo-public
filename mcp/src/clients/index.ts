@@ -6,8 +6,8 @@
  * Tools reach into what they need and pass the rest through.
  */
 
-import { bind, request, type Requester, type ServiceSource } from "../http.js";
-import type { Config, ServiceConfig } from "../config.js";
+import { bind, request, ServiceError, type Requester, type ServiceSource } from "../http.js";
+import { cloudUsable, credentialFaults, type Config, type ServiceConfig } from "../config.js";
 
 export interface Clients {
   /** heyo cloud — sandboxes, archives, daemons. */
@@ -15,6 +15,8 @@ export interface Clients {
   applb: Requester;
   obs: Requester;
   ci: Requester;
+  /** The artifact store — the bytes a `site` or `vm` deployment runs from. */
+  art: Requester;
   /**
    * The managed namespace app-lb calls are confined to, discovering it if that
    * has not happened yet. Tools that must *name* the namespace rather than just
@@ -28,16 +30,20 @@ export interface Clients {
 export const CLOUD_SERVICE = "heyo cloud";
 
 export function makeClients(config: Config): Clients {
-  // Cloud with no credential at all is not a usable service: unlike app-lb's
+  // Cloud with no *usable* credential is not a usable service: unlike app-lb's
   // self-hosted shape, there is no unauthenticated cloud to talk to. Say so as
-  // "not configured" rather than letting every call come back 401.
-  const cloud = config.cloud?.auth ? config.cloud : undefined;
+  // "not configured" rather than letting every call come back 401 — which is
+  // also why the test is `cloudUsable` and not mere presence. An `applb_…`
+  // token is present and cannot work, and letting it through here is what made
+  // one wrong variable look like a total outage.
+  const cloud = cloudUsable(config) ? config.cloud : undefined;
   const applb = applbSource(config);
   return {
     cloud: bind(CLOUD_SERVICE, cloud, "HEYO_API_KEY", config),
     applb: bind("app-lb", applb, "APPLB_URL or APPLB_TOKEN", config),
     obs: bind("app-obs", config.obs, "APP_OBS_URL", config),
     ci: bind("ci", config.ci, "CI_URL", config),
+    art: bind("artifacts", config.art, "ART_URL (plus ART_API_KEY)", config),
     applbNamespace: async () =>
       typeof applb === "function" ? (await applb()).namespace : applb?.namespace,
   };
@@ -56,8 +62,20 @@ export function makeClients(config: Config): Clients {
  *   tool at the wrong room, so it fails naming them;
  * - none means there is nothing to point at yet, and says how to make one.
  *
- * Memoized across calls but **not** across failures: a namespace created a
- * minute after the first attempt should work without a restart.
+ * Memoized across calls, and across the failures that a retry cannot change.
+ *
+ * Not memoizing *any* failure was the original rule, justified by one case: a
+ * namespace created a minute after the first attempt should work without a
+ * restart. That reasoning is sound and still applies — to a lookup that
+ * succeeded and found nothing.
+ *
+ * It does not apply to a credential cloud refuses. Nothing about the next call
+ * differs, so every tool in the process re-issued `GET /namespaces` and
+ * re-collected the same 401: one wrong environment variable turned into a
+ * network round-trip per tool call, each printing the same paragraph. So the
+ * split is by what a retry could possibly fix — a refused credential and a
+ * detected fault are held; everything else (5xx, timeouts, transport, and a key
+ * that reaches no namespace *yet*) is retried as before.
  */
 function applbSource(config: Config): ServiceSource | undefined {
   const cfg = config.applb;
@@ -67,11 +85,19 @@ function applbSource(config: Config): ServiceSource | undefined {
   let pending: Promise<ServiceConfig> | undefined;
   return () => {
     pending ??= discoverNamespace(cfg, config).catch((e) => {
-      pending = undefined;
+      if (!isPermanent(e)) pending = undefined;
       throw e;
     });
     return pending;
   };
+}
+
+/** Whether re-running namespace discovery could plausibly answer differently. */
+function isPermanent(e: unknown): boolean {
+  if (e instanceof ServiceError) return e.status === 401 || e.status === 403;
+  // The pre-flight fault: the configuration is wrong, and it cannot become
+  // right while this process runs.
+  return e instanceof Error && e.name === "CredentialFaultError";
 }
 
 interface NamespaceRow {
@@ -80,7 +106,30 @@ interface NamespaceRow {
 }
 
 async function discoverNamespace(cfg: ServiceConfig, config: Config): Promise<ServiceConfig> {
-  const body = await request(CLOUD_SERVICE, cfg, config.timeoutMs, { path: "/namespaces" });
+  // Before the round-trip, not after it. This lookup is the first thing every
+  // app-lb tool does when no namespace was named, so a credential that cannot
+  // work here surfaces as ~20 tools failing against `/namespaces` — a cloud
+  // path the user never asked about, for a question they asked app-lb. Naming
+  // the real fault first is the difference between "app-lb is down" and "this
+  // token goes in a different variable".
+  const fault = credentialFaults(config).find((f) => f.service === "app-lb");
+  if (fault) {
+    const e = new Error(`${fault.summary}.\n\n${fault.detail}`);
+    e.name = "CredentialFaultError";
+    throw e;
+  }
+
+  const body = await request(CLOUD_SERVICE, cfg, config.timeoutMs, {
+    path: "/namespaces",
+    // Said out loud because the label above is `heyo cloud` and the caller
+    // asked app-lb something: this call is cloud resolving which app-lb the
+    // managed door means, and it happens because APPLB_NAMESPACE is unset.
+    hint:
+      "This was namespace discovery for the managed app-lb door, not a call you " +
+      "made: with APPLB_NAMESPACE unset, cloud is asked which namespace this key " +
+      "reaches before any app-lb path is built. Set APPLB_NAMESPACE to skip it, or " +
+      "APPLB_URL to reach a self-hosted app-lb that has no namespaces at all.",
+  });
   const rows: NamespaceRow[] = Array.isArray(body)
     ? body
     : Array.isArray((body as { namespaces?: unknown })?.namespaces)

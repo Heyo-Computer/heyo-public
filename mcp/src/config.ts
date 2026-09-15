@@ -1,10 +1,11 @@
 /**
  * Where the services are, and what proves us to them.
  *
- * There are four: **heyo cloud** (the sandbox control plane — create a VM, run
- * a command in it, read and write its files), and the three that answer
- * operational questions about a fleet — app-lb, app-obs and ci. All of them
- * speak `Authorization: Bearer`, so this is mostly uniform. Two asymmetries are
+ * There are five: **heyo cloud** (the sandbox control plane — create a VM, run
+ * a command in it, read and write its files), the three that answer operational
+ * questions about a fleet — app-lb, app-obs and ci — and the artifact store,
+ * which is where a deployment's bytes come from. All of them speak
+ * `Authorization: Bearer`, so this is mostly uniform. Three asymmetries are
  * load-bearing enough to state here rather than leave to a 401.
  *
  * **The minimal configuration is two API keys and nothing else.**
@@ -17,15 +18,25 @@
  * both — `APPLB_TOKEN` exists for the deployment that wants them separate, and
  * for a self-hosted app-lb where they are genuinely different credentials.
  *
- * **`ci` behind an app-lb gate admits browsers and nothing else.** The gate
- * splits on `Accept: text/html`, and only `/healthz`, `/api/submit`,
- * `/api/stream/` and `/__ui/` are in its `public_paths`. Every page worth
- * reading — runs, jobs, networks, runners, vms, repos — is outside that list,
- * so a token-carrying client is refused no matter which token it carries.
- * `CI_URL` therefore wants ci's own listener, not its public hostname: reach it
- * from the box it runs on, or through an SSH tunnel. Pointing it at the gated
- * host is a supported mistake — {@link CI_GATE_HINT} turns the resulting 401
- * into that sentence instead of an authentication red herring.
+ * **`ci` behind an app-lb gate admits browsers and *almost* nothing else.** The
+ * gate splits on `Accept: text/html`, and only `/healthz`, `/api/submit`,
+ * `/api/runs/`, `/api/stream/` and `/__ui/` are in its `public_paths`. The
+ * pages — runs, jobs, networks, runners, vms, repos — are outside that list, so
+ * a token-carrying client is refused there no matter which token it carries,
+ * and `CI_URL` wants ci's own listener for them: reach it from the box it runs
+ * on, or through an SSH tunnel. Pointing it at the gated host is a supported
+ * mistake — {@link CI_GATE_HINT} turns the resulting 401 into that sentence
+ * instead of an authentication red herring.
+ *
+ * `/api/runs/` is the exception and the reason `ci_run_status` works against
+ * the public hostname: it is a machine route with its own credential, so `git
+ * submit`'s repository token in `CI_TOKEN` is enough. Without it, "did my
+ * deploy work" had no answer at all for a programmatic client — a slow run and
+ * a dead one were the same silence.
+ *
+ * **The artifact store takes two credentials at once**, one per layer. That is
+ * `ART_API_KEY` plus `ART_GATE_TOKEN`, and {@link artService} explains why they
+ * cannot be the same header.
  */
 
 /** Cloud's public base. The default for both cloud and the managed app-lb. */
@@ -35,6 +46,19 @@ export interface ServiceConfig {
   readonly baseUrl: string;
   /** `Authorization` header value, already assembled, or undefined. */
   readonly auth?: string;
+  /**
+   * Headers sent with every request to this service, beside `Authorization`.
+   *
+   * One service needs this and it is the whole reason the field exists. The
+   * artifact store sits behind an app-lb gate *and* authenticates callers
+   * itself, and both layers were reached through `Authorization` — so no single
+   * request could satisfy both, and the push half of the store was unreachable
+   * from outside the network. The store also accepts `x-api-key`, which is the
+   * way out: the gate takes the `applb_…` bearer, the store takes its own key
+   * on a header the gate does not touch, and one request passes both. See
+   * {@link artService}.
+   */
+  readonly headers?: Readonly<Record<string, string>>;
   /**
    * The managed namespace this app-lb config is confined to, when it reaches
    * app-lb through heyo cloud's `/namespaces/{ns}/lb` door rather than an
@@ -55,7 +79,18 @@ export interface Config {
   readonly applb?: ServiceConfig;
   readonly obs?: ServiceConfig;
   readonly ci?: ServiceConfig;
+  readonly art?: ServiceConfig;
   readonly timeoutMs: number;
+  /**
+   * Whether this process serves over HTTP rather than stdio.
+   *
+   * It changes what one tool may do. Over stdio the caller *is* the machine this
+   * runs on, so `art_publish` reading a local `path` reads the caller's own file.
+   * Over HTTP the caller is somewhere else, and the same read would be a remote
+   * request for this server's disk — the more so behind a gate whose `/mcp` path
+   * is public. Survives `withForwardedAuth`, which spreads the config it is given.
+   */
+  readonly http?: boolean;
 }
 
 function trimUrl(raw: string): string {
@@ -148,30 +183,208 @@ export function applbService(
 }
 
 /**
+ * Where the artifact store is, and the two credentials it takes at once.
+ *
+ * **This is the one service with two authenticators stacked in front of it**,
+ * and the shape of that stack is why publishing a build was impossible from
+ * outside the network before this existed:
+ *
+ * 1. app-lb's gate. `art.us2`'s spec lists `/blobs/`, `/manifests` and `/tags`
+ *    in `public_paths`, which takes them out of the browser sign-in flow but
+ *    not out of authorization — an unqualified entry requires an app-token with
+ *    `admin` scope. That is `Authorization: Bearer applb_…`.
+ * 2. the store itself, which checks `ART_API_KEY` on every write.
+ *
+ * Both were reached through `Authorization`, so no single request satisfied
+ * both, and every attempt from outside ended in one 401 or the other. ci never
+ * noticed because ci runs inside the network, where there is no gate.
+ *
+ * The way through is that the store accepts **`x-api-key`** as well as a
+ * bearer. So the gate gets the `Authorization` header and the store gets a
+ * header the gate does not read, and one request passes both layers. That is
+ * what this function assembles, and it is the reason `ART_API_KEY` and the gate
+ * token are separate variables rather than one: they are two credentials for
+ * two different doors, and putting them in the same place is exactly the
+ * mistake that made this look structural.
+ *
+ * `ART_GATE_TOKEN` is optional and falls back to `APPLB_TOKEN`, because in
+ * practice they are the same app-token — one minted with `admin` scope covering
+ * the `artifacts` deployment. Naming it separately is for the fleet where they
+ * are not.
+ *
+ * A store reached on its own listener — inside the network, or over a tunnel —
+ * has no gate in front of it and needs only `ART_API_KEY`. That works here with
+ * no extra configuration: with no gate token the `Authorization` header is
+ * simply absent, and the store never wanted one.
+ */
+export function artService(
+  url?: string,
+  apiKey?: string,
+  gateToken?: string,
+  applbToken?: string,
+): ServiceConfig | undefined {
+  if (!url || !url.trim()) return undefined;
+  // The gate's credential, not the store's. Only an app-token means anything
+  // to an app-lb gate, so an `APPLB_BASIC` or a cloud key is deliberately not
+  // borrowed here — it would be sent, refused, and read as "the store is down".
+  const gate = gateToken?.trim() || (applbToken?.trim() ?? "");
+  const key = apiKey?.trim();
+  return {
+    baseUrl: trimUrl(url),
+    auth: gate ? authHeader(gate) : undefined,
+    // Only when there is one: an empty `x-api-key` is a header the store will
+    // compare against its configured value and refuse, which is a worse failure
+    // than sending nothing at all on a store that has no key configured.
+    headers: key ? { "x-api-key": key } : undefined,
+  };
+}
+
+/**
+ * Prefix on a token app-lb minted for itself (`applb_<id>_<secret>`).
+ *
+ * The prefix is load-bearing, not cosmetic: it is what distinguishes a
+ * credential **app-lb issued and will scope-check** from every other bearer a
+ * caller might present — a `heyo_api_*` cloud key, or a JWT from some other
+ * issuer. See {@link withForwardedAuth}.
+ */
+export const APPLB_TOKEN_PREFIX = "applb_";
+
+/**
+ * The bearer's value, without the scheme, or undefined if it isn't a bearer.
+ *
+ * Looser than app-lb's own `strip_prefix("Bearer ")` — case-insensitive, any
+ * run of spaces — on purpose. The two ways of being wrong here are not
+ * symmetric: a header this accepts that app-lb will not parse ends in a 401,
+ * while one app-lb would accept and this missed falls back to the configured
+ * credential, which is exactly the escalation {@link withForwardedAuth} exists
+ * to prevent. So the detector errs wide and the strict parser downstream
+ * decides.
+ */
+export function bearerToken(header: string): string | undefined {
+  const match = /^Bearer[ \t]+(\S.*)$/i.exec(header.trim());
+  return match?.[1]?.trim();
+}
+
+/**
+ * Whether a bearer header carries a token app-lb minted.
+ *
+ * Exported because the same test answers two different questions. For a header
+ * a *caller* sent, it decides whose credential speaks at app-lb — see
+ * {@link withForwardedAuth}. For a credential this process was *configured*
+ * with, it decides whether that credential can work at all: cloud has never
+ * heard of an `applb_…` token, so one in `HEYO_API_KEY` can only ever 401.
+ * Takes a full header rather than a bare token so both callers pass what they
+ * already hold.
+ */
+export function isApplbToken(header: string): boolean {
+  return bearerToken(header)?.startsWith(APPLB_TOKEN_PREFIX) ?? false;
+}
+
+/**
  * The config to serve one HTTP request with.
  *
- * When cloud or app-lb is configured without a credential of its own, the
- * caller's `Authorization` header is forwarded instead — so one hosted instance
- * serves every tenant, each under their own key and therefore their own
- * sandboxes and namespace grant. A configured key always wins: that instance
- * was deployed to act as itself, and a caller's header must not be able to
- * change who it acts as. Returns the same object when nothing applies, so the
- * per-process tool set can be reused.
+ * Three rules. Each exists because the one before it is not sufficient.
+ *
+ * **A service with no credential of its own borrows the caller's.** That is
+ * what lets one hosted instance serve every tenant, each under their own key
+ * and therefore their own sandboxes and namespace grant.
+ *
+ * **An app-lb-minted token always speaks for itself at app-lb, configured
+ * credential or not.** A token carries a scope — an `admin` level and a
+ * `deployments` list — and app-lb enforces it on every route. Falling back to
+ * this process's own `APPLB_TOKEN` for a caller who presented one would hand a
+ * token scoped to a single deployment the reach of whatever fleet-wide
+ * credential the operator configured. That is a confused deputy: the gate in
+ * front authenticated a narrow principal and the process would then act for it
+ * with broad authority. The caller's token is therefore preferred over the
+ * configured one whenever it is app-lb's own kind, so a scope is never widened
+ * by passing through here. Unconditional for app-lb because app-lb is always
+ * the authenticator for app-lb: its admin listener verifies an `applb_…` bearer
+ * against the same store the gate does, whatever else is configured — including
+ * `APPLB_BASIC`, which is unscoped and is exactly what must not be borrowed.
+ *
+ * **app-obs and ci follow the same rule, but only when app-lb is what stands in
+ * front of them.** Reached directly on loopback they authenticate themselves,
+ * with their own service tokens, and an `applb_…` bearer means nothing to them
+ * — forwarding one there would turn every working deployment's obs and ci tools
+ * into 401s. Reached through an app-lb gate the credential *is* an app-lb
+ * token, and then the caller's must win for the same reason it does at app-lb:
+ * a caller whose token does not admit `app-obs` must not read app-obs on this
+ * process's ticket. What separates the two shapes is the shape of what is
+ * configured — an `applb_…` value means the gate is the authenticator — so no
+ * new switch is needed to tell them apart, and an instance that configures
+ * nothing for them acts purely as the caller.
+ *
+ * The prefix test is what keeps all of this from breaking the other gate
+ * shapes. A `heyo_api_*` key or a JWT is not an app-lb token — it means nothing
+ * to app-lb's admin API — so those still fall to the configured credential and
+ * a JWT-gated deployment behaves exactly as before. And preferring a caller's
+ * `applb_…` is never an escalation in the other direction either: it is a
+ * credential they already hold, and app-lb re-checks its scope regardless of
+ * who relayed it.
+ *
+ * Cloud is left out of the second rule and, for an app-lb token, out of the
+ * first one too. An `applb_…` token is not a cloud credential: cloud has never
+ * heard of it, so forwarding one could only produce a 401 on every sandbox call.
+ * So a configured `HEYO_API_KEY` is kept (every caller admitted by an app-token
+ * gate shares that one cloud account), and where there is no key the caller's
+ * app-lb token is *not* substituted for one — cloud stays unconfigured, and
+ * `buildTools` lists no sandbox tools rather than a set that always fails.
+ *
+ * Only that prefix is excluded. A `heyo_api_*` key is exactly what cloud wants
+ * and is still forwarded, which is what makes managed mode multi-tenant; a JWT
+ * is left alone as before.
+ *
+ * Returns the same object when nothing applies, so the per-process tool set can
+ * be reused.
  */
 export function withForwardedAuth(
   config: Config,
   headers: Record<string, string | string[] | undefined>,
 ): Config {
-  const needsCloud = config.cloud && !config.cloud.auth;
-  const needsApplb = config.applb && !config.applb.auth;
-  if (!needsCloud && !needsApplb) return config;
   const raw = headers["authorization"];
   const value = Array.isArray(raw) ? raw[0] : raw;
   if (!value || !value.trim()) return config;
+
+  const fromApplb = isApplbToken(value);
+
+  /**
+   * Whether a service behind an app-lb gate should be reached as the caller.
+   *
+   * Deliberately narrower than the rule for app-lb itself: an app-lb token is
+   * the *only* credential that can mean anything to app-obs or ci other than
+   * their own, so a caller presenting anything else leaves them untouched. What
+   * is configured then decides — nothing at all, or another `applb_…`, both of
+   * which say the gate is doing the authenticating; a service's own token says
+   * it is not, and is left alone.
+   */
+  const gated = (service?: ServiceConfig): boolean =>
+    Boolean(service && fromApplb && (!service.auth || isApplbToken(service.auth)));
+
+  // An app-lb token is the one bearer that must not stand in for a cloud key:
+  // see above. Every other credential keeps the borrow-when-empty rule.
+  const needsCloud = Boolean(config.cloud && !config.cloud.auth && !fromApplb);
+  // Either app-lb has nothing of its own, or the caller presented a credential
+  // that carries its own scope and must not be traded up for this one's.
+  const needsApplb = Boolean(config.applb && (!config.applb.auth || fromApplb));
+  const needsObs = gated(config.obs);
+  const needsCi = gated(config.ci);
+  // The store follows the same rule for its *gate* credential and only that
+  // one. `x-api-key` is this process's own and is never traded for a caller's:
+  // it is not a scoped credential, there is nothing in it to widen or narrow,
+  // and a caller has no way to present one anyway. So the caller's app-token
+  // decides what the gate admits, and the store key stays put — which is the
+  // per-hop split `artService` exists to make.
+  const needsArt = gated(config.art);
+  if (!needsCloud && !needsApplb && !needsObs && !needsCi && !needsArt) return config;
+
   return {
     ...config,
     cloud: needsCloud ? { ...config.cloud!, auth: value } : config.cloud,
     applb: needsApplb ? { ...config.applb!, auth: value } : config.applb,
+    obs: needsObs ? { ...config.obs!, auth: value } : config.obs,
+    ci: needsCi ? { ...config.ci!, auth: value } : config.ci,
+    art: needsArt ? { ...config.art!, auth: value } : config.art,
   };
 }
 
@@ -189,6 +402,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ),
     obs: service(env.APP_OBS_URL, env.APP_OBS_API_TOKEN),
     ci: service(env.CI_URL, env.CI_TOKEN),
+    art: artService(env.ART_URL, env.ART_API_KEY, env.ART_GATE_TOKEN, env.APPLB_TOKEN),
+    // The same test `index.ts` uses to decide which transport to start.
+    http: Number(env.HEYO_MCP_HTTP_PORT ?? "") > 0,
     // Generous, but bounded. Every call here is a diagnostic or a sandbox
     // operation, and a hung one is worse than a failed one: it stalls the
     // conversation with no output at all.
@@ -199,7 +415,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 /** Which services are usable, for the startup banner and for `heyo_status`. */
 export function configured(config: Config): string[] {
   const on: string[] = [];
-  if (config.cloud?.auth) on.push(`heyo cloud (${config.cloud.baseUrl})`);
+  if (config.cloud?.auth) {
+    // Named the way the artifact branch below names its two doors, and for the
+    // same reason: "cloud is configured" is not the useful fact when the key it
+    // is configured with is one cloud will refuse.
+    on.push(
+      cloudUsable(config)
+        ? `heyo cloud (${config.cloud.baseUrl})`
+        : `heyo cloud (${config.cloud.baseUrl}) — NO usable key: HEYO_API_KEY holds an applb_… token`,
+    );
+  }
   if (config.applb) {
     on.push(
       config.applb.namespace
@@ -211,15 +436,164 @@ export function configured(config: Config): string[] {
   }
   if (config.obs) on.push("app-obs");
   if (config.ci) on.push("ci");
+  if (config.art) {
+    // Both halves named, because "art is configured" is not the useful fact —
+    // which of the two doors this process can open is. A store behind a gate
+    // with no gate token answers 401 on every path, and a store with no
+    // `ART_API_KEY` answers 401 on every write while reads look fine, so the
+    // failure arrives at publish time rather than at startup.
+    const parts = [
+      config.art.headers?.["x-api-key"] ? "store key" : "NO store key (ART_API_KEY)",
+      config.art.auth ? "gate token" : "no gate token",
+    ];
+    on.push(`artifacts (${parts.join(", ")})`);
+  }
   return on;
 }
 
+/**
+ * A credential that is present, well-formed, and cannot possibly work.
+ *
+ * The gap this closes: {@link configured} answers "is there a credential", and
+ * every consumer treated that as "is there a *usable* credential". They are not
+ * the same question, and the difference is a whole class of failure that this
+ * server can detect at load and instead lets the user discover one 401 at a
+ * time — the same class the artifact branch of `configured` already calls out
+ * ("the failure arrives at publish time rather than at startup").
+ *
+ * `summary` is one line for a banner. `detail` explains the fix in
+ * {@link NotConfigured}'s register: name the variable, then name the
+ * configuration that works. Neither ever contains the token.
+ */
+export interface CredentialFault {
+  readonly service: "heyo cloud" | "app-lb";
+  readonly summary: string;
+  readonly detail: string;
+}
+
+/**
+ * Whether cloud has a credential it could actually authenticate with.
+ *
+ * The predicate `makeClients` and `buildTools` must agree on, which is why it
+ * is a function rather than a test written twice. Disagreement is worse than
+ * either answer: list the sandbox tools on a config that cannot reach cloud and
+ * every one of them answers `NotConfigured`; withhold them from a config that
+ * can and the caller is told a capability does not exist.
+ */
+export function cloudUsable(config: Config): boolean {
+  return Boolean(config.cloud?.auth && !isApplbToken(config.cloud.auth));
+}
+
+/** How much of a token may be shown: enough to recognise, not enough to use. */
+function redact(header?: string): string {
+  const token = header ? bearerToken(header) : undefined;
+  return token ? `${token.slice(0, APPLB_TOKEN_PREFIX.length + 4)}…` : "(none)";
+}
+
+/**
+ * Credentials that are configured and cannot work, with the fix for each.
+ *
+ * Both faults are the same mistake seen from two sides: an `applb_…` token
+ * where a `heyo_api_*` key is required. It is an easy mistake to make, because
+ * an app-lb token is a real credential that a customer is legitimately given —
+ * it is simply not a *cloud* credential, and cloud is what both of these
+ * variables reach. {@link withForwardedAuth} already treats this as settled for
+ * a token a caller *sends*; this applies the same law to the token this process
+ * was *configured* with, which is the direction nothing checked.
+ *
+ * Loud, never fatal. A fleet-operations instance with a bad `HEYO_API_KEY` and
+ * a good `APPLB_TOKEN` is still a useful server, and refusing to start would
+ * take away the tools that do work.
+ */
+export function credentialFaults(config: Config): CredentialFault[] {
+  const faults: CredentialFault[] = [];
+
+  if (config.cloud?.auth && isApplbToken(config.cloud.auth)) {
+    faults.push({
+      service: "heyo cloud",
+      summary: `HEYO_API_KEY holds an app-lb token (${redact(config.cloud.auth)}), which cloud cannot accept`,
+      detail:
+        "HEYO_API_KEY is a heyo cloud API key and must start with `heyo_api_`. It holds a " +
+        "token app-lb minted for itself instead. Cloud has never heard of app-lb's tokens, so " +
+        "every sandbox call — and every managed-namespace lookup — can only answer 401.\n\n" +
+        "An `applb_…` token is a real credential; it just belongs somewhere else. Put it in " +
+        "APPLB_TOKEN and set APPLB_URL to app-lb's own admin listener, then leave HEYO_API_KEY " +
+        "unset: the app-lb tools work, and the sandbox tools are correctly not listed rather " +
+        "than listed and failing. Over HTTP, send it as the request's own `Authorization` " +
+        "header and this process needs no credential at all.",
+    });
+  }
+
+  const cloudBase = config.cloud?.baseUrl ?? CLOUD_BASE_URL;
+  const applb = config.applb;
+  if (applb?.auth && isApplbToken(applb.auth) && applb.baseUrl.startsWith(cloudBase)) {
+    faults.push({
+      service: "app-lb",
+      summary: `app-lb is reached through cloud's managed door with an app-lb token (${redact(applb.auth)}), which that door cannot resolve`,
+      detail:
+        `app-lb is configured at ${applb.baseUrl}, which is heyo cloud's managed door, but its ` +
+        "credential is a token app-lb minted. That door forwards a `heyo_api_*` key for cloud " +
+        "to resolve into a namespace grant; it cannot resolve an app-token, so namespace " +
+        "discovery answers 401 before any deployment call is even attempted.\n\n" +
+        // Where the credential came from, when it was not named directly. With
+        // no APPLB_TOKEN the managed door borrows cloud's key, so the variable
+        // the user actually set is HEYO_API_KEY and saying only "set
+        // APPLB_TOKEN" would leave them fixing half of it.
+        (applb.auth === config.cloud?.auth
+          ? "This credential is not APPLB_TOKEN — none is set, so the managed door borrowed " +
+            "HEYO_API_KEY, which through that door is meant to be the same kind of key. " +
+            "Fixing HEYO_API_KEY therefore fixes both halves at once.\n\n"
+          : "") +
+        "Set APPLB_URL to app-lb's own admin listener and keep this token in APPLB_TOKEN — " +
+        "reached directly, app-lb scope-checks it itself. Or supply a `heyo_api_*` key and " +
+        "reach app-lb through the managed door as before.",
+    });
+  }
+
+  return faults;
+}
+
+/**
+ * What a 401 from cloud means when the key is an app-lb token.
+ *
+ * The third hint, and the one that catches what config-load cannot: a hosted
+ * instance carries no credential of its own, so the offending key can arrive on
+ * the request itself via {@link withForwardedAuth} and never pass through
+ * {@link credentialFaults} at all. Stated here so every cloud call site carries
+ * it, exactly as the two hints below are.
+ */
+export const CLOUD_KEY_HINT =
+  "The key used for this call is an app-lb token (`applb_…`), and heyo cloud has never " +
+  "heard of app-lb's tokens — this 401 is the credential being the wrong kind, not the " +
+  "wrong value, and no retry will change it. Cloud wants a `heyo_api_*` key. An " +
+  "`applb_…` token reaches app-lb directly: set APPLB_URL to app-lb's own admin listener " +
+  "with APPLB_TOKEN, or send it as the request's own Authorization header. Run " +
+  "`heyo_status` to see every credential this server holds and what each one can reach.";
+
+/**
+ * The fault report both entrypoints print at boot, or "" when there is none.
+ *
+ * Shared so the two transports cannot diverge on what counts as worth saying.
+ * stderr in both cases: on stdio, stdout is the protocol channel.
+ */
+export function faultBanner(config: Config): string {
+  const faults = credentialFaults(config);
+  if (faults.length === 0) return "";
+  return faults
+    .map((f) => `heyo-mcp: CREDENTIAL FAULT — ${f.summary}.\n${f.detail}`)
+    .join("\n\n");
+}
+
 export const CI_GATE_HINT =
-  "ci returned 401 for a machine request. If CI_URL points at a gated host " +
-  "(ci.us2.heyo.work), that is expected and no token will fix it: app-lb's gate " +
-  "admits browsers only, and ci's public_paths list just /healthz, /api/submit, " +
-  "/api/stream/ and /__ui/. Point CI_URL at ci's own listener instead — from the " +
-  "host it runs on, or through an SSH tunnel.";
+  "ci returned 401 for a machine request. Which fix applies depends on the path:\n\n" +
+  "• /api/runs/… — these are in ci's public_paths, so the gate is not what refused " +
+  "you. They take a repository submit token, the same one `git submit` uses: set " +
+  "CI_TOKEN to it (`git config ci.token`), or sign the request path with " +
+  "CI_WEBHOOK_SECRET. A token for another repository reads as 404, not 401.\n\n" +
+  "• anything else (/runs, /jobs, /runners, /vms, /repos) — that is the gate, and no " +
+  "token will fix it: app-lb admits browsers only there, splitting on " +
+  "`Accept: text/html`. Point CI_URL at ci's own listener instead — from the host it " +
+  "runs on, or through an SSH tunnel.";
 
 /**
  * What a 503 from cloud means, said once here rather than guessed at each call

@@ -44,6 +44,7 @@ fn shell_with_head(title: &str, extra_head: Markup, body: Markup) -> Markup {
                     nav {
                         a href="/" { "Databases" }
                         a href="/dedicated" { "dedicated" }
+                        a href="/replication" { "replication" }
                         a href="/monitoring" { "monitoring" }
                         a href="/archives" { "archives" }
                         a href="/events" { "events" }
@@ -290,8 +291,10 @@ fn credential_panel(cred: &Credential, port: u16) -> Markup {
     }
 }
 
-/// Per-hour event series for the monitoring page's activity charts, each as
-/// oldest-first `(hour_start_unix, count)` buckets from `crate::events`.
+/// What the monitoring page's activity section reads from `crate::events`:
+/// per-hour counts for the charts, each as oldest-first
+/// `(hour_start_unix, count)` buckets, plus the timing distributions that go
+/// beside them.
 pub struct ActivitySeries {
     pub restores_s3: Vec<(u64, u32)>,
     pub restores_local: Vec<(u64, u32)>,
@@ -299,6 +302,10 @@ pub struct ActivitySeries {
     pub offloads_done: Vec<(u64, u32)>,
     pub vms_deleted: Vec<(u64, u32)>,
     pub spares_claimed: Vec<(u64, u32)>,
+    /// How long creating a new VM took over the same window. `None` when
+    /// nothing was created in it — which is not the same as "creates are
+    /// instant", so the page says which it is.
+    pub vm_create: Option<crate::events::TimingStats>,
 }
 
 /// The monitoring view: whole-host CPU/memory/disk saturation plus pooler-fleet
@@ -341,6 +348,19 @@ pub fn monitoring_page(
     let untracked = running
         .iter()
         .filter(|r| r.live_sessions.is_none() && !r.name.starts_with(crate::spares::SPARE_PREFIX))
+        .count();
+    // Warm VMs already past their own idle budget: the idle reaper's backlog.
+    //
+    // Smoothing the drain means a synchronized expiry is stopped over minutes
+    // rather than at once, so *some* backlog during one is normal and healthy
+    // — it is the ramp. A number that never returns to zero is the signal that
+    // matters: it means VMs are going idle faster than
+    // PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS lets the reaper stop them, and the
+    // smoothing has turned into a permanent lag. Without this tile that trade
+    // is invisible: the cliff on the chart is simply replaced by nothing.
+    let past_budget = rows
+        .iter()
+        .filter(|r| matches!((r.idle_secs, r.idle_budget_secs), (Some(i), Some(b)) if i >= b))
         .count();
     let queued_bringups = crate::vm::bringups_waiting();
     let reclaim_running = crate::reclaim::pass_running();
@@ -435,6 +455,12 @@ pub fn monitoring_page(
                 }
                 (stat("running, untracked", &untracked.to_string(),
                     if untracked > 0 { Some("no warm entry — reaper stops these in ≤2 passes") } else { None }))
+                (stat("past idle budget", &past_budget.to_string(),
+                    if past_budget == 0 {
+                        None
+                    } else {
+                        Some("draining on a ramp — persistent = drain window too slow")
+                    }))
                 (stat("bring-ups queued", &queued_bringups.to_string(),
                     if queued_bringups > 0 { Some("clients waiting for a VM") } else { None }))
                 (stat("reclaim pass", if reclaim_running { "running" } else { "idle" },
@@ -471,6 +497,7 @@ pub fn monitoring_page(
 
             h3.sub-head { "VMs created" }
             (hourly_bar_chart(&activity.vms_created, "VM"))
+            (timing_stats_block(activity.vm_create.as_ref()))
 
             h3.sub-head { "warm spares claimed" }
             (hourly_bar_chart(&activity.spares_claimed, "claim"))
@@ -1263,6 +1290,45 @@ fn meter_level(frac: f64) -> &'static str {
 }
 
 /// A compact aggregate stat card: a number, a label, and an optional caption.
+/// Create-latency percentiles beside the create-rate chart: how long a new VM
+/// actually takes to build, over the same 24h window the chart covers.
+///
+/// The sample count is shown as prominently as the percentiles, and a window
+/// with too few samples to support a p99 says so rather than printing a figure
+/// that is really just "the slowest of the four creates we saw". `None` —
+/// nothing created at all — is its own message, because a blank or zeroed
+/// latency block reads as "creates are instant", which is the opposite of what
+/// an empty window means.
+fn timing_stats_block(stats: Option<&crate::events::TimingStats>) -> Markup {
+    let Some(s) = stats else {
+        return html! {
+            p.note { "No VMs were created in the last 24h — no create latency to report." }
+        };
+    };
+    // Nearest-rank needs at least this many samples for the percentile to be
+    // distinguishable from the maximum (rank ceil(p/100 * n) < n).
+    let thin = |p: u32| (100 / (100 - p)) as usize;
+    html! {
+        div.stats {
+            (stat("create p50", &human_ms(s.p50_ms as u128), Some("median")))
+            (stat("create p95", &human_ms(s.p95_ms as u128),
+                if s.count >= thin(95) { None } else { Some("too few samples") }))
+            (stat("create p99", &human_ms(s.p99_ms as u128),
+                if s.count >= thin(99) { None } else { Some("too few samples") }))
+            (stat("slowest create", &human_ms(s.max_ms as u128), None))
+            (stat("creates measured", &s.count.to_string(), Some("last 24h")))
+        }
+        p.note {
+            "Time from the daemon accepting the deploy to the VM reporting ready — the "
+            "wait for a bring-up slot is excluded, since that measures how many creates "
+            "are already in flight rather than what this one costs. Successful creates "
+            "only: a failed one is bounded by " code { "PG_VM_POOL_READY_TIMEOUT_SECS" }
+            " and would drag every percentile toward that ceiling. Percentiles are "
+            "nearest-rank, so each figure is a create that actually happened."
+        }
+    }
+}
+
 fn stat(label: &str, value: &str, sub: Option<&str>) -> Markup {
     html! {
         div.stat {
@@ -1421,9 +1487,21 @@ pub fn vm_detail_page(
                     dt { "idle for" }
                     dd {
                         (human_secs(idle))
-                        @if let Some(t) = st.registry.idle_timeout() {
+                        // The budget is per-VM, so show THIS VM's — and the
+                        // bring-up time that chose it, which is the whole
+                        // answer to "why did that one stop after a minute".
+                        @if let Some(budget) = r.idle_budget_secs {
+                            span.dim { " (reaped after " (human_secs(budget)) ")" }
+                        } @else if let Some(t) = st.registry.idle_timeout() {
                             span.dim { " (reaped after " (human_secs(t.as_secs())) ")" }
                         }
+                    }
+                }
+                @if let Some(ms) = r.bringup_ms {
+                    dt { "bring-up took" }
+                    dd {
+                        (human_ms(ms))
+                        span.dim { " — what the idle budget above is priced off" }
                     }
                 }
                 @if let Some(s) = db {
@@ -1851,6 +1929,20 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
+/// A bring-up duration. Sub-second is the interesting case here — that is
+/// what a restart of a VM still on disk looks like, and what earns the short
+/// idle budget — so it keeps millisecond resolution below a second and hands
+/// anything longer to [`human_secs`].
+fn human_ms(ms: u128) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 10_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        human_secs((ms / 1000) as u64)
+    }
+}
+
 fn human_secs(s: u64) -> String {
     let d = s / 86_400;
     let h = (s % 86_400) / 3_600;
@@ -1867,9 +1959,291 @@ fn human_secs(s: u64) -> String {
     }
 }
 
+/// One row of the replication table: the durable record plus whatever the
+/// last status sample saw.
+pub struct ReplRow {
+    pub rec: crate::replication::ReplRecord,
+    pub primary: Option<crate::replication::wire::PrimaryStatus>,
+    pub replica: Option<crate::replication::wire::ReplicaStatus>,
+    pub error: Option<String>,
+}
+
+/// The replication page: peers, live pairings, and the form that starts one.
+///
+/// Everything here reads the monitor's cached sample rather than querying a
+/// VM, for the reason `dashboard::mod`'s header states about the browsable
+/// pages: viewing a page must never disturb the thing it is showing, and one
+/// wedged VM must not hang the render.
+pub fn replication_page(
+    st: &DashState,
+    rows: &[ReplRow],
+    peers: &[crate::peers::PeerInfo],
+    candidates: &[String],
+    b: &Banner,
+) -> Markup {
+    let enabled = st.registry.replication_cfg().is_some();
+    shell(
+        "Replication",
+        html! {
+            div.pagehead {
+                h1 { "Replication" }
+                div.pagehead-actions { a.button-link href="/replication" { "↻ refresh" } }
+            }
+            (banner(b))
+            @if !enabled {
+                div.banner.err {
+                    "replication is disabled on this node — set PG_VM_POOL_REPLICATION=1 "
+                    "(and PG_VM_POOL_ADVERTISE_PG_HOST to act as a primary) and restart. "
+                    "Existing pairings below still keep their VMs pinned."
+                }
+            }
+
+            section.controls {
+                h2 { "peers" }
+                @if peers.is_empty() {
+                    p.note { "No peers yet. A peer is another pg-fc node: its dashboard URL and "
+                             "Basic-auth credentials (how this node drives it), plus the address "
+                             "and port a guest VM on THIS host dials to reach its pooler." }
+                } @else {
+                    table.dedicated {
+                        thead { tr {
+                            th { "name" } th { "dashboard" } th { "pg endpoint" }
+                            th { "added" } th {}
+                        } }
+                        tbody {
+                            @for p in peers {
+                                tr {
+                                    td { code { (p.name) } }
+                                    td { code { (p.base_url) } }
+                                    td { code { (p.pg_host) ":" (p.pg_port) } }
+                                    td.dim { (fmt_age(p.created_at)) }
+                                    td {
+                                        form method="post" action={ "/peers/" (p.name) "/delete" } {
+                                            button.danger type="submit" { "remove" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                form.alert-add method="post" action="/peers" {
+                    label { "name" input type="text" name="name" pattern="[a-z][a-z0-9_]*"
+                            maxlength="63" placeholder="node_b" required; }
+                    label { "dashboard URL" input type="text" name="base_url"
+                            placeholder="https://b.example:34199" required; }
+                    label { "dashboard user" input type="text" name="user" required; }
+                    label { "dashboard password" input type="password" name="password" required; }
+                    label { "pg host" input type="text" name="pg_host"
+                            placeholder="10.0.0.2" required; }
+                    label { "pg port" input type="number" name="pg_port" value="6432" required; }
+                    button type="submit" { "add peer" }
+                }
+            }
+
+            section {
+                h2 { "replicated databases" }
+                @if rows.is_empty() {
+                    p.note { "Nothing is replicating from or to this node." }
+                } @else {
+                    table.dedicated {
+                        thead { tr {
+                            th { "database" } th { "role" } th { "peer" } th { "state" }
+                            th { "progress" } th { "slot" } th {}
+                        } }
+                        tbody {
+                            @for r in rows { (repl_row(r)) }
+                        }
+                    }
+                }
+            }
+
+            section.controls {
+                h2 { "replicate a database" }
+                @if candidates.is_empty() {
+                    p.note { "Every dedicated database is already paired — or none is "
+                             "provisioned yet. Replication mirrors a dedicated database's "
+                             "role and password onto the replica, so provision one on "
+                             (PreEscaped("<a href=\"/dedicated\">dedicated</a>")) " first." }
+                } @else if peers.is_empty() {
+                    p.note { "Add a peer above first." }
+                } @else {
+                    form.alert-add method="post" action="/replication/enable" {
+                        label { "database"
+                            select name="database" required {
+                                @for c in candidates { option value=(c) { (c) } }
+                            }
+                        }
+                        label { "peer"
+                            select name="peer" required {
+                                @for p in peers { option value=(p.name) { (p.name) } }
+                            }
+                        }
+                        button type="submit" { "start replicating" }
+                    }
+                    p.note {
+                        "This restarts the database's Postgres to raise its WAL level, creates a "
+                        "publication and a replication login, and asks the peer to build the "
+                        "replica. Note what logical replication does NOT carry: schema changes, "
+                        "sequence values, or large objects — and a table with no primary key "
+                        "needs a REPLICA IDENTITY before its UPDATEs and DELETEs will replicate."
+                    }
+                }
+            }
+
+            section.controls {
+                h2 { "API" }
+                pre.log {
+r#"GET    /api/replication                    list pairings
+POST   /api/replication                    {"database":"acme","peer":"node_b"}
+GET    /api/replication/{database}         record + live status (?fresh=1 to sample now)
+POST   /api/replication/{database}/promote cut a replica loose (irreversible)
+POST   /api/replication/{database}/refresh pick up newly published tables
+POST   /api/replication/{database}/detach  tear down this node's half
+DELETE /api/replication/{database}         forget the record only
+GET    /api/peers                          list peers (no passwords)
+POST   /api/peers                          {"name":...,"base_url":...,"user":...,
+                                            "password":...,"pg_host":...,"pg_port":6432}
+DELETE /api/peers/{name}                   forget a peer"#
+                }
+            }
+        },
+    )
+}
+
+fn repl_row(r: &ReplRow) -> Markup {
+    let rec = &r.rec;
+    let is_replica = rec.role == crate::replication::Role::Replica;
+    html! {
+        tr {
+            td { code { (rec.database) } }
+            td { span.pill { (rec.role.as_str()) } }
+            td { code { (rec.peer) } }
+            td {
+                span.pill.(state_class(rec.state)) { (rec.state.as_str()) }
+                @if !rec.message.is_empty() {
+                    div.note { (rec.message) }
+                }
+            }
+            td { (progress(r)) }
+            td { code.small { (rec.slot) } }
+            td {
+                @if rec.state.pins() {
+                    @if is_replica {
+                        form method="post" action={ "/replication/" (rec.database) "/promote" }
+                             onsubmit="return confirm('Promote this replica? It stops following the primary, its sequences are re-seeded, and this cannot be undone.')" {
+                            button type="submit" { "promote" }
+                        }
+                        form method="post" action={ "/replication/" (rec.database) "/refresh" } {
+                            button type="submit" { "refresh" }
+                        }
+                    }
+                    form method="post" action={ "/replication/" (rec.database) "/detach" }
+                         onsubmit="return confirm('Detach? This drops the replication slot and publication on this node.')" {
+                        button.danger type="submit" { "detach" }
+                    }
+                } @else {
+                    form method="post" action={ "/replication/" (rec.database) "/delete" } {
+                        button.danger type="submit" { "remove" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The one number an operator actually watches. On a primary that is how much
+/// WAL the slot is holding — the figure that eventually fills the data disk if
+/// the subscriber never comes back. On a replica it is initial-copy progress,
+/// then how recently anything arrived.
+fn progress(r: &ReplRow) -> Markup {
+    html! {
+        @if let Some(e) = &r.error {
+            span.warn { (e) }
+        } @else if let Some(p) = &r.primary {
+            @if !p.slot_active {
+                span.warn { "no subscriber attached" }
+                @if let Some(b) = p.behind_bytes { " — " (human_bytes(b.max(0) as u64)) " of WAL retained" }
+            } @else {
+                @if let Some(b) = p.behind_bytes { (human_bytes(b.max(0) as u64)) " behind" }
+                @if let Some(l) = p.flush_lag_s { " · " (format!("{l:.3}s flush")) }
+            }
+            @if let Some(w) = &p.wal_status {
+                @if w != "reserved" {
+                    div.warn { "wal_status=" (w)
+                        @if w == "lost" { " — the replica must be re-seeded" } }
+                }
+            }
+        } @else if let Some(s) = &r.replica {
+            @if s.tables_total > 0 && s.tables_ready < s.tables_total {
+                (s.tables_ready) " / " (s.tables_total) " tables copied"
+            } @else if !s.worker_running {
+                span.warn { "apply worker is not running" }
+            } @else if let Some(a) = s.last_msg_age_s {
+                (format!("{a:.1}s")) " since the last change"
+            } @else { "streaming" }
+            @if !s.enabled { div.warn { "subscription is disabled" } }
+        } @else {
+            span.note { "—" }
+        }
+    }
+}
+
+fn state_class(s: crate::replication::State) -> &'static str {
+    use crate::replication::State::*;
+    match s {
+        Active => "ok",
+        Syncing | Pending => "warn",
+        Failed => "err",
+        Promoted | Detached => "muted",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::TimingStats;
+
+    /// An empty window and a populated one are different statements, and the
+    /// difference has to survive into the rendered page: a blank or zeroed
+    /// latency block reads as "creates are instant", which is the opposite of
+    /// "nothing was created".
+    #[test]
+    fn create_latency_block_distinguishes_empty_from_fast() {
+        let empty = timing_stats_block(None).into_string();
+        assert!(empty.contains("No VMs were created"), "{empty}");
+        assert!(!empty.contains("p50"), "an empty window must not print percentiles");
+
+        // 4 samples: enough for a median, nowhere near enough for a p95/p99,
+        // and the tiles must say so rather than quietly printing the max three
+        // times as if it were three percentiles.
+        let thin = timing_stats_block(Some(&TimingStats {
+            count: 4,
+            p50_ms: 21_500,
+            p95_ms: 40_000,
+            p99_ms: 40_000,
+            max_ms: 40_000,
+        }))
+        .into_string();
+        // Tens of seconds render as whole seconds — the precision that matters
+        // is sub-second (a restart) versus tens of seconds (a create).
+        assert!(thin.contains("21s"), "{thin}");
+        assert_eq!(thin.matches("too few samples").count(), 2, "p95 and p99 flagged");
+
+        // 200 samples supports every percentile shown, so nothing is flagged.
+        let full = timing_stats_block(Some(&TimingStats {
+            count: 200,
+            p50_ms: 800,
+            p95_ms: 30_000,
+            p99_ms: 95_000,
+            max_ms: 120_000,
+        }))
+        .into_string();
+        assert!(!full.contains("too few samples"), "{full}");
+        assert!(full.contains("800ms"), "sub-second p50 stays in ms: {full}");
+        assert!(full.contains("1m 35s"), "p99 reads as clock time: {full}");
+        assert!(full.contains("200"), "the sample count is shown");
+    }
 
     /// A row shaped like the ones `model::build_rows` produces, with the
     /// offload tier under test. `offload: Some(_)` is the synthetic row spliced
@@ -1897,6 +2271,8 @@ mod tests {
             live_sessions: None,
             client_slots: None,
             idle_secs: None,
+            idle_budget_secs: None,
+            bringup_ms: None,
             keepalive: false,
             target: None,
             tunneled: None,

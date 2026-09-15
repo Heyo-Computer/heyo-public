@@ -7,6 +7,25 @@ use std::time::Duration;
 
 use heyo_sdk::SandboxSize;
 
+/// Default for [`Config::idle_timeout_fast`]: a VM the pooler can bring back in
+/// well under a second does not earn a multi-minute warm hold. 60s still
+/// absorbs the common "client reconnects between statements" pattern while
+/// cutting the standing warm fleet — and every VM it stops is one the reclaim
+/// and offload ladders can finally work on.
+const DEFAULT_IDLE_TIMEOUT_FAST: Duration = Duration::from_secs(60);
+
+/// Default for [`Config::idle_drain_window`]: the minimum time in which the
+/// idle reaper may stop the whole live fleet. Ten minutes is long enough that
+/// a fleet-wide expiry reads as a ramp on a chart (and on the host's disk and
+/// CPU) rather than a cliff, and short enough that a cohort's stragglers are
+/// not left running for an hour past their budget.
+const DEFAULT_IDLE_DRAIN_WINDOW: Duration = Duration::from_secs(600);
+
+/// Default for [`Config::fast_bringup`]. Deliberately far above a healthy
+/// restart (~0.2–1s) and far below a create or a thaw (tens of seconds to
+/// minutes), so it separates the two populations without needing to be tuned.
+const DEFAULT_FAST_BRINGUP: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 pub struct Config {
     /// Where the pooler listens for Postgres clients.
@@ -37,6 +56,73 @@ pub struct Config {
     /// the daemon's own TTL can't, since it's absolute from VM boot and the
     /// daemon doesn't see connections. Keep-alive schemas are exempt.
     pub idle_timeout: Option<Duration>,
+    /// The *short* inactivity timeout, applied to a VM the pooler measured as
+    /// cheap to bring back — see [`Self::fast_bringup`]. `None` disables the
+    /// two-speed reaper (every VM waits out [`Self::idle_timeout`]).
+    ///
+    /// Why two timeouts at all: [`Self::idle_timeout`] is really a bet on the
+    /// *next* bring-up. Keeping a VM warm buys the next client whatever that
+    /// bring-up would have cost, and for a schema whose VM still exists on
+    /// disk that is a daemon `start()` plus a Postgres restart — a fraction of
+    /// a second on a healthy host, against the ~40s create+`initdb` the same
+    /// number has to cover for a schema being built from scratch. One timeout
+    /// for both means the cheap case is priced like the expensive one, and the
+    /// fleet fills up with running VMs nobody is using: RAM held, and disks
+    /// the reclaim and offload ladders cannot touch (both need the VM stopped).
+    ///
+    /// Clamped to `<= idle_timeout` at parse time — a "fast" timeout longer
+    /// than the normal one would silently keep VMs up *longer* than the
+    /// operator's own setting.
+    ///
+    /// Env `PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS` (default 60); `0` disables.
+    pub idle_timeout_fast: Option<Duration>,
+    /// How fast a bring-up has to have been for its VM to be reaped on
+    /// [`Self::idle_timeout_fast`] instead of [`Self::idle_timeout`].
+    ///
+    /// Measured, not assumed — the entry records what its own bring-up
+    /// actually cost (everything after the admission queue: resolve/boot,
+    /// Postgres readiness, database setup), and the reaper compares that. A
+    /// warm restart on an idle host lands ~0.2–1s; a create, a spare claim
+    /// that still has to `initdb`, or any thaw lands far above this.
+    ///
+    /// The point of measuring rather than keying on "was this VM already on
+    /// disk" is the loaded host. When heyvmd is saturated, a restart that
+    /// normally takes 200ms takes seconds — and that is exactly when a short
+    /// timeout would be most harmful, churning stop/start work into a daemon
+    /// already behind. Pricing the timeout off the observed cost backs the
+    /// reaper off automatically, with no extra knob.
+    ///
+    /// Env `PG_VM_POOL_FAST_BRINGUP_SECS` (default 5).
+    pub fast_bringup: Duration,
+    /// The shortest time in which the idle reaper may stop the *entire* live
+    /// fleet — the knob that turns a synchronized expiry into a slope.
+    ///
+    /// Idle reaping is deadline-driven, so a workload that arrives in a burst
+    /// goes idle in a burst and every one of its VMs comes due inside the same
+    /// few seconds (the per-schema jitter is ±15%, which on a 60s budget is a
+    /// spread of only ~18s). Left to run flat out, the reaper answers that by
+    /// stopping hundreds of VMs a minute: the fleet falls off a cliff, the
+    /// disks all get trimmed at once, and the schemas all come back cold
+    /// together. That is the sawtooth.
+    ///
+    /// This bounds the *rate of change* instead. Each pass may stop at most
+    /// `live_schemas × tick / window` VMs (clamped to
+    /// [`crate::registry`]'s per-pass floor and ceiling), so however
+    /// synchronized the expiry, the fleet drains along a straight line of
+    /// known gradient. Sized off the live-tier schema count rather than the
+    /// warm count because stopping a VM does not change its tier: the divisor
+    /// holds still while a cohort drains, which is what keeps the slope
+    /// constant instead of decaying into a long tail.
+    ///
+    /// The trade is explicit: in a large synchronized expiry a VM can stop
+    /// well after its own idle budget. That lateness is bounded by this
+    /// window, and it buys a fleet that does not swing.
+    ///
+    /// `None` disables the rate limit — every pass may stop up to the flat
+    /// per-pass ceiling, which is the pre-window behavior.
+    ///
+    /// Env `PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS` (default 600); `0` disables.
+    pub idle_drain_window: Option<Duration>,
     /// How long to wait for a VM (and then Postgres) to become ready.
     pub ready_timeout: Duration,
     /// Cap on the iroh tunnel handshake (`expose_tcp` + `P2pTunnel::connect`).
@@ -83,6 +169,24 @@ pub struct Config {
     /// `PG_VM_POOL_DEDICATED_FILE`; defaults to `dedicated.tsv` next to the
     /// state file.
     pub dedicated_file: PathBuf,
+    /// Where the trusted-peer records live — another pg-fc node's dashboard
+    /// URL, its Basic-auth credentials, and the pooler address a guest on
+    /// *this* host dials to reach it. Holds another node's admin password, so
+    /// it is written `0600`. Env `PG_VM_POOL_PEERS_FILE`; defaults to
+    /// `peers.tsv` next to the state file. See [`crate::peers`].
+    pub peers_file: PathBuf,
+    /// Where replication pairings persist (`database → role + peer + state`).
+    /// Loaded regardless of whether [`Self::replication`] is enabled: this
+    /// file holds the pin that keeps a replicating VM off the idle reaper and
+    /// the offload ladder, and dropping that because a flag was turned off
+    /// would break live pairings silently. Env `PG_VM_POOL_REPLICATION_FILE`;
+    /// defaults to `replication.tsv` next to the state file. See
+    /// [`crate::replication`].
+    pub replication_file: PathBuf,
+    /// Cross-host logical replication settings. `None` (the default) hides
+    /// the dashboard routes and refuses new pairings; existing records still
+    /// load and still pin their VMs.
+    pub replication: Option<ReplicationConfig>,
     /// Where the monitoring event metrics keep their daily partition files
     /// (`events-YYYY-MM-DD.tsv`), so the restore/create charts survive
     /// restarts. Env `PG_VM_POOL_METRICS_DIR`; defaults to `metrics/` next to
@@ -174,6 +278,29 @@ pub struct Config {
     /// under disk saturation as well as CPU. Env
     /// `PG_VM_POOL_OFFLOAD_LOAD_MAX` (default 0.75).
     pub offload_load_max: f64,
+    /// How long the pacer may be held off by *client* backpressure before it
+    /// starts dispatching anyway, single-file and no-boot only. `None`
+    /// (`PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS=0`) restores the strict
+    /// yield-to-every-client behavior.
+    ///
+    /// Without this the gate is all-or-nothing: on a host whose bring-up queue
+    /// is never empty for a whole tick — the steady state once enough schemas
+    /// are offloaded, since every cold connect is then a thaw — the pacer
+    /// dispatches *nothing* for hours, the disk climbs toward the pressure
+    /// high-water mark, and the whole backlog then drains in one burst the
+    /// moment the host finally goes quiet. That sawtooth is what this bounds:
+    /// past the holdoff the pacer keeps trickling one job at a time until the
+    /// host is quiet again, so the same total work is spread across the busy
+    /// hours instead of landing against the 85% line.
+    ///
+    /// Only the client gate is overridable, and only by jobs that boot no VM
+    /// (compact / image-archive / promote): those take no bring-up slot, so
+    /// nothing a client is queued for moves behind them — they cost host disk
+    /// I/O, which the nice-19 children and the single-file cap bound. A
+    /// reclaim pass or a running sweep is a real conflict over the same disks,
+    /// never politeness, and is never overridden. Env
+    /// `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` (default 300).
+    pub offload_max_holdoff: Option<Duration>,
 }
 
 /// Settings for automatic disk-slack reclamation. Present (`Some`) only when
@@ -450,6 +577,12 @@ impl ImageArchiveConfig {
     }
 }
 
+/// Default for `PG_VM_POOL_DISK_GROW_URGENT_PCT` — see
+/// [`DiskGrowConfig::urgent_pct`]. High on purpose: this path costs live
+/// sessions, so it is a last resort ahead of `No space left on device`, not a
+/// second routine trigger.
+const DEFAULT_DISK_GROW_URGENT_PCT: f64 = 95.0;
+
 /// Settings for automatic data-device growth (see `Config::disk_grow`).
 #[derive(Clone, Copy)]
 pub struct DiskGrowConfig {
@@ -457,6 +590,28 @@ pub struct DiskGrowConfig {
     /// next idle stop. Env `PG_VM_POOL_DISK_GROW_PCT` — setting it (> 0) is
     /// the on/off switch; sensible range 50–95.
     pub pct: f64,
+    /// Guest-filesystem used% at or above which a **warm** VM's device is
+    /// grown without waiting for it to go idle — stop, resize, start, dropping
+    /// whatever sessions it had.
+    ///
+    /// Why a second, higher threshold rather than reusing [`Self::pct`]: the
+    /// idle-stop grow is free (the VM is stopping anyway), so it can afford to
+    /// fire early. This one costs every live session on the schema, so it must
+    /// fire late — only once the filesystem is genuinely at the wall.
+    ///
+    /// Without it a schema under continuous write load can never grow at all.
+    /// The guest's own watcher extends the filesystem *inside* the device and
+    /// then exits ("filesystem spans $DATA_DEV; watcher done"); past that only
+    /// a host-side device resize helps, the resize is offline-only, and the
+    /// one trigger for it was an idle stop that a busy schema never reaches.
+    /// The database wedges on `No space left on device` and stays wedged until
+    /// its traffic happens to pause for a whole idle timeout.
+    ///
+    /// Env `PG_VM_POOL_DISK_GROW_URGENT_PCT` (default 95); `0` disables the
+    /// online path, restoring idle-stop-only growth. Never below
+    /// [`Self::pct`] — a lower value would preempt the free path with the
+    /// expensive one.
+    pub urgent_pct: Option<f64>,
     /// Ceiling the device is never grown past, in GiB. Env
     /// `PG_VM_POOL_DISK_MAX_GB` (default 100; the daemon caps at 250).
     pub max_gb: u64,
@@ -484,7 +639,32 @@ impl DiskGrowConfig {
             (1..=250).contains(&max_gb),
             "PG_VM_POOL_DISK_MAX_GB ({max_gb}) must be within 1–250 (daemon limit)"
         );
-        Ok(Some(Self { pct, max_gb }))
+        let urgent_pct = match std::env::var("PG_VM_POOL_DISK_GROW_URGENT_PCT") {
+            Ok(v) => match v.trim().parse::<f64>() {
+                Ok(p) if p > 0.0 => Some(p),
+                // An explicit 0 is the documented off switch, not an error.
+                Ok(_) => None,
+                Err(_) => anyhow::bail!("invalid PG_VM_POOL_DISK_GROW_URGENT_PCT: {v:?}"),
+            },
+            Err(_) => Some(DEFAULT_DISK_GROW_URGENT_PCT),
+        };
+        if let Some(u) = urgent_pct {
+            anyhow::ensure!(
+                (1.0..=99.0).contains(&u),
+                "PG_VM_POOL_DISK_GROW_URGENT_PCT ({u}) must be within 1–99"
+            );
+            anyhow::ensure!(
+                u >= pct,
+                "PG_VM_POOL_DISK_GROW_URGENT_PCT ({u}) must be >= \
+                 PG_VM_POOL_DISK_GROW_PCT ({pct}) — the urgent path stops a live VM and \
+                 drops its sessions, so it must never fire before the free idle-stop grow"
+            );
+        }
+        Ok(Some(Self {
+            pct,
+            urgent_pct,
+            max_gb,
+        }))
     }
 }
 
@@ -553,6 +733,180 @@ impl PressureConfig {
     }
 }
 
+/// Settings for cross-host logical replication. Present (`Some`) only when
+/// `PG_VM_POOL_REPLICATION` is truthy — that env var is the on/off switch.
+///
+/// Note what this gates and what it does not. Turning it off hides the
+/// dashboard routes and refuses *new* pairings; it deliberately does **not**
+/// stop the peers and replication stores from loading, because those hold the
+/// pin that keeps an already-replicating VM off the idle reaper and the
+/// offload ladder. A feature flag that silently un-pinned live pairings would
+/// break them on the next restart with nothing in the log to say why.
+#[derive(Clone)]
+pub struct ReplicationConfig {
+    /// This node's name in a peering. Sent in the handshake so a node can
+    /// refuse to peer with itself, and used as the subscriber's
+    /// `application_name` so it is identifiable in the primary's
+    /// `pg_stat_replication`. Env `PG_VM_POOL_NODE_NAME`; defaults to the
+    /// hostname.
+    pub node_name: String,
+    /// Host or IPv4 literal that a *peer's guest VMs* dial to reach this
+    /// node's `PG_VM_POOL_LISTEN`. Required before this node can act as a
+    /// replication primary, and deliberately separate from `listen_addr`,
+    /// which is frequently `0.0.0.0` or a private address that means nothing
+    /// to another host. Env `PG_VM_POOL_ADVERTISE_PG_HOST`.
+    pub advertise_host: Option<String>,
+    /// The port that goes with it. Env `PG_VM_POOL_ADVERTISE_PG_PORT`;
+    /// defaults to `PG_VM_POOL_LISTEN`'s port.
+    pub advertise_port: u16,
+    /// libpq `sslmode` for the replication link. `require` by default:
+    /// it encrypts the one hop that leaves the host. It does not
+    /// *authenticate* the server — `verify-full` cannot work against a bare
+    /// IP, and the guests carry no pinned CA.
+    pub sslmode: String,
+    /// Permit an `sslmode` weaker than `require`, and permit acting as a
+    /// primary with no TLS configured. Lab escape hatch; off by default,
+    /// because the replication login's password crosses the network on this
+    /// link. Env `PG_VM_POOL_REPL_ALLOW_INSECURE`.
+    pub allow_insecure: bool,
+    /// Per-request bound on any call to a peer's dashboard API. Env
+    /// `PG_VM_POOL_REPL_PEER_TIMEOUT_SECS` (default 20).
+    pub peer_timeout: Duration,
+    /// Bound on the in-guest schema-copy job. This is a `pg_dump` across a WAN
+    /// link plus a `psql` replaying it, so it is sized like the archive
+    /// deadline rather than like an exec. Env `PG_VM_POOL_REPL_SETUP_SECS`
+    /// (default 3600).
+    pub setup_deadline: Duration,
+    /// How often the background sampler refreshes each pairing's lag and
+    /// health. `None` (`0`) disables it — the dashboard then shows only what
+    /// a page load fetches. Env `PG_VM_POOL_REPL_MONITOR_SECS` (default 60).
+    pub monitor_interval: Option<Duration>,
+    /// How long a replication slot may sit inactive before the monitor says
+    /// so loudly. An inactive slot pins WAL on the primary's data disk, and a
+    /// full data disk is a cluster-wide PANIC — this is the warning before
+    /// the guest's own `max_slot_wal_keep_size` invalidates the slot. Env
+    /// `PG_VM_POOL_REPL_SLOT_STALE_SECS` (default 3600).
+    pub slot_stale: Duration,
+    /// Retained-WAL figure above which a pairing is reported as lagging. Env
+    /// `PG_VM_POOL_REPL_LAG_WARN_BYTES` (default 256MiB).
+    pub lag_warn_bytes: u64,
+    /// Re-seed column-owned sequences during a promote. Logical replication
+    /// carries no sequence values, so without this the first insert after a
+    /// promote collides with a replicated row. Env
+    /// `PG_VM_POOL_REPL_FIX_SEQUENCES` (default on).
+    pub fix_sequences: bool,
+}
+
+impl ReplicationConfig {
+    fn from_env(listen_addr: SocketAddr) -> anyhow::Result<Option<Self>> {
+        let on = std::env::var("PG_VM_POOL_REPLICATION")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no"))
+            .unwrap_or(false);
+        if !on {
+            return Ok(None);
+        }
+        let node_name = std::env::var("PG_VM_POOL_NODE_NAME")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(default_node_name);
+        // The name is embedded in replication slot names, which are narrower
+        // than Postgres identifiers — refuse a bad one at startup rather than
+        // at the first pairing.
+        crate::dedicated::validate_identifier(&node_name, "node name")?;
+
+        let advertise_host = std::env::var("PG_VM_POOL_ADVERTISE_PG_HOST")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let advertise_port = match std::env::var("PG_VM_POOL_ADVERTISE_PG_PORT") {
+            Ok(v) => v
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("PG_VM_POOL_ADVERTISE_PG_PORT must be a port number"))?,
+            Err(_) => listen_addr.port(),
+        };
+        let allow_insecure = std::env::var("PG_VM_POOL_REPL_ALLOW_INSECURE")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let sslmode = std::env::var("PG_VM_POOL_REPL_SSLMODE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "require".to_string());
+        const WEAK: &[&str] = &["disable", "allow", "prefer"];
+        if WEAK.contains(&sslmode.as_str()) && !allow_insecure {
+            anyhow::bail!(
+                "PG_VM_POOL_REPL_SSLMODE={sslmode} would send the replication login's \
+                 password across the network in cleartext; use `require` (or set \
+                 PG_VM_POOL_REPL_ALLOW_INSECURE=1 if both nodes share a trusted link)"
+            );
+        }
+        const VALID: &[&str] = &[
+            "disable", "allow", "prefer", "require", "verify-ca", "verify-full",
+        ];
+        if !VALID.contains(&sslmode.as_str()) {
+            anyhow::bail!("PG_VM_POOL_REPL_SSLMODE={sslmode} is not a libpq sslmode");
+        }
+
+        let secs = |name: &str, default: u64| -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(default)
+        };
+        let monitor = secs("PG_VM_POOL_REPL_MONITOR_SECS", 60);
+        Ok(Some(Self {
+            node_name,
+            advertise_host,
+            advertise_port,
+            sslmode,
+            allow_insecure,
+            peer_timeout: Duration::from_secs(secs("PG_VM_POOL_REPL_PEER_TIMEOUT_SECS", 20).max(1)),
+            setup_deadline: Duration::from_secs(secs("PG_VM_POOL_REPL_SETUP_SECS", 3600).max(60)),
+            monitor_interval: (monitor > 0).then(|| Duration::from_secs(monitor.max(5))),
+            slot_stale: Duration::from_secs(secs("PG_VM_POOL_REPL_SLOT_STALE_SECS", 3600).max(60)),
+            lag_warn_bytes: std::env::var("PG_VM_POOL_REPL_LAG_WARN_BYTES")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(256 * 1024 * 1024),
+            fix_sequences: std::env::var("PG_VM_POOL_REPL_FIX_SEQUENCES")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
+        }))
+    }
+}
+
+/// The machine's hostname, lowercased and with anything outside the
+/// identifier charset mapped to `_`, so the default node name is usable in a
+/// replication slot without the operator having to think about it.
+fn default_node_name() -> String {
+    let raw = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_default();
+    let cleaned: String = raw
+        .trim()
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Must start with a lowercase letter to pass `validate_identifier`.
+    match cleaned.chars().next() {
+        Some(c) if c.is_ascii_lowercase() => cleaned,
+        Some(_) => format!("node_{cleaned}"),
+        None => "node".to_string(),
+    }
+}
+
 /// Settings for the optional server-side-rendered admin dashboard. Present
 /// (`Some`) only when `PG_VM_POOL_DASHBOARD_LISTEN` is set — that env var is the
 /// on/off switch.
@@ -600,6 +954,9 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_USER",
     "PG_VM_POOL_PASSWORD",
     "PG_VM_POOL_IDLE_TIMEOUT_SECS",
+    "PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS",
+    "PG_VM_POOL_FAST_BRINGUP_SECS",
+    "PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS",
     "PG_VM_POOL_READY_TIMEOUT_SECS",
     "PG_VM_POOL_CONNECT_TIMEOUT_SECS",
     "PG_VM_POOL_ADMIT_TIMEOUT_SECS",
@@ -610,6 +967,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_DEDICATED_FILE",
     "PG_VM_POOL_METRICS_DIR",
     "PG_VM_POOL_DISK_GROW_PCT",
+    "PG_VM_POOL_DISK_GROW_URGENT_PCT",
     "PG_VM_POOL_DISK_MAX_GB",
     "PG_VM_POOL_TLS_CERT",
     "PG_VM_POOL_TLS_KEY",
@@ -631,6 +989,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_ORPHAN_SWEEP_SECS",
     "PG_VM_POOL_OFFLOAD_WORKERS",
     "PG_VM_POOL_OFFLOAD_LOAD_MAX",
+    "PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS",
     "PG_VM_POOL_WARM_SPARES",
     "PG_VM_POOL_FREEZE_AFTER_SECS",
     "PG_VM_POOL_FREEZE_SWEEP_SECS",
@@ -647,6 +1006,30 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_S3_ACCESS_KEY_ID",
     "PG_VM_POOL_S3_SECRET_ACCESS_KEY",
     "PG_VM_POOL_DAEMON_URL",
+    // Read by `CompactConfig::from_env` and `vm.rs`, set by the shipped
+    // supervisor conf, but historically missing here — so a correctly
+    // configured production host logged five "ignoring unknown env var"
+    // warnings at every start.
+    "PG_VM_POOL_COMPACT_AFTER_SECS",
+    "PG_VM_POOL_COMPACT_SWEEP_SECS",
+    "PG_VM_POOL_COMPACT_DIR",
+    "PG_VM_POOL_MAX_CONCURRENT_BRINGUPS",
+    "PG_VM_POOL_ARCHIVE_VIA_GUEST",
+    // Cross-host logical replication (see `crate::replication`).
+    "PG_VM_POOL_REPLICATION",
+    "PG_VM_POOL_NODE_NAME",
+    "PG_VM_POOL_PEERS_FILE",
+    "PG_VM_POOL_REPLICATION_FILE",
+    "PG_VM_POOL_ADVERTISE_PG_HOST",
+    "PG_VM_POOL_ADVERTISE_PG_PORT",
+    "PG_VM_POOL_REPL_SSLMODE",
+    "PG_VM_POOL_REPL_ALLOW_INSECURE",
+    "PG_VM_POOL_REPL_PEER_TIMEOUT_SECS",
+    "PG_VM_POOL_REPL_SETUP_SECS",
+    "PG_VM_POOL_REPL_MONITOR_SECS",
+    "PG_VM_POOL_REPL_SLOT_STALE_SECS",
+    "PG_VM_POOL_REPL_LAG_WARN_BYTES",
+    "PG_VM_POOL_REPL_FIX_SEQUENCES",
 ];
 
 impl Config {
@@ -687,6 +1070,34 @@ impl Config {
             },
             Err(_) => Some(Duration::from_secs(900)),
         };
+        // The short timeout for cheap-to-restart VMs; `0` disables the
+        // two-speed reaper. Clamped to `idle_timeout` so it can only ever pull
+        // a stop *earlier* than the operator's own setting, never push it out.
+        let idle_timeout_fast = match std::env::var("PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS") {
+            Ok(v) => match v.parse::<u64>() {
+                Ok(0) => None,
+                Ok(secs) => Some(Duration::from_secs(secs)),
+                Err(_) => Some(DEFAULT_IDLE_TIMEOUT_FAST),
+            },
+            Err(_) => Some(DEFAULT_IDLE_TIMEOUT_FAST),
+        }
+        .map(|fast| match idle_timeout {
+            Some(normal) => fast.min(normal),
+            None => fast,
+        });
+        let idle_drain_window = match std::env::var("PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS") {
+            Ok(v) => match v.parse::<u64>() {
+                Ok(0) => None,
+                Ok(secs) => Some(Duration::from_secs(secs)),
+                Err(_) => Some(DEFAULT_IDLE_DRAIN_WINDOW),
+            },
+            Err(_) => Some(DEFAULT_IDLE_DRAIN_WINDOW),
+        };
+        let fast_bringup = std::env::var("PG_VM_POOL_FAST_BRINGUP_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_FAST_BRINGUP);
         let ready_secs = std::env::var("PG_VM_POOL_READY_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -728,6 +1139,22 @@ impl Config {
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .join("dedicated.tsv")
             });
+        // Peer and replication records live beside the state file too — same
+        // directory, same lifecycle as the registry they key into.
+        let sibling = |var: &str, name: &str| -> PathBuf {
+            std::env::var(var)
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    state_file
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join(name)
+                })
+        };
+        let peers_file = sibling("PG_VM_POOL_PEERS_FILE", "peers.tsv");
+        let replication_file = sibling("PG_VM_POOL_REPLICATION_FILE", "replication.tsv");
         // Daily-partitioned event metrics live beside the state file unless
         // pointed elsewhere.
         let metrics_dir = std::env::var("PG_VM_POOL_METRICS_DIR")
@@ -766,6 +1193,38 @@ impl Config {
             .collect();
 
         let dashboard = DashboardConfig::from_env()?;
+        let replication = ReplicationConfig::from_env(listen_addr)?;
+        // Acting as a primary means a peer's guests dial this listener, so it
+        // has to be reachable and it has to be encrypted — the replication
+        // login's password crosses that hop. Both are warnings rather than
+        // errors: a node can legitimately run as replica-only, where neither
+        // applies, and that is not knowable until a pairing is attempted.
+        if let Some(r) = replication.as_ref() {
+            if r.advertise_host.is_none() {
+                tracing::info!(
+                    "replication enabled without PG_VM_POOL_ADVERTISE_PG_HOST — this node \
+                     can host replicas but cannot be a primary (a peer's guests would have \
+                     no address to dial)"
+                );
+            }
+            if tls_cert.is_none() && !r.allow_insecure {
+                tracing::warn!(
+                    "replication is enabled but TLS is not (PG_VM_POOL_TLS_CERT/KEY) — a \
+                     replica's connection carries its password in cleartext, so acting as a \
+                     primary will be refused; set the cert pair or \
+                     PG_VM_POOL_REPL_ALLOW_INSECURE=1"
+                );
+            }
+            if listen_addr.ip().is_loopback() && r.advertise_host.is_some() {
+                tracing::warn!(
+                    "replication advertises {}:{} but PG_VM_POOL_LISTEN is loopback ({}) — \
+                     a peer's guests cannot reach it; bind 0.0.0.0",
+                    r.advertise_host.as_deref().unwrap_or(""),
+                    r.advertise_port,
+                    listen_addr
+                );
+            }
+        }
         let archive = ArchiveConfig::from_env()?;
         // Pressure eviction archives to S3, so it's meaningless without the
         // tier — a set path with the tier off is a config mistake, fail fast.
@@ -798,6 +1257,20 @@ impl Config {
                 _ => anyhow::bail!("invalid PG_VM_POOL_OFFLOAD_LOAD_MAX {v:?}: expected > 0"),
             },
             Err(_) => 0.75,
+        };
+        // `0` is the explicit "never override the client gate" opt-out, not a
+        // zero-second holdoff — a holdoff of 0 would dispatch through every
+        // waiting client, which is the one thing the gate exists to prevent.
+        let offload_max_holdoff = match std::env::var("PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS") {
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(n) => Some(Duration::from_secs(n)),
+                Err(_) => anyhow::bail!(
+                    "invalid PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS {v:?}: expected whole seconds \
+                     (0 disables)"
+                ),
+            },
+            Err(_) => Some(Duration::from_secs(300)),
         };
         let freeze = FreezeConfig::from_env()?;
         // Explicit run dir, else reuse the pressure path (same directory: the
@@ -886,6 +1359,9 @@ impl Config {
             pg_user,
             pg_password,
             idle_timeout,
+            idle_timeout_fast,
+            fast_bringup,
+            idle_drain_window,
             ready_timeout: Duration::from_secs(ready_secs),
             connect_timeout: Duration::from_secs(connect_secs),
             admit_timeout: Duration::from_secs(admit_secs),
@@ -894,6 +1370,9 @@ impl Config {
             direct_connect,
             state_file,
             dedicated_file,
+            peers_file,
+            replication_file,
+            replication,
             metrics_dir,
             disk_grow: DiskGrowConfig::from_env()?,
             tls_cert,
@@ -910,6 +1389,7 @@ impl Config {
             orphan_sweep,
             offload_workers,
             offload_load_max,
+            offload_max_holdoff,
         })
     }
 }

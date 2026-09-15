@@ -31,6 +31,8 @@ rustls-pki-types = "1"
 # the HTTP Basic auth header. The hyper/http/tower stack axum 0.8 pulls is
 # already resolved in Cargo.lock via heyo-sdk's reqwest, so no version conflict.
 axum = "0.8"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 maud = { version = "0.27", features = ["axum"] }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
@@ -44,7 +46,9 @@ hex = "0.4"
 # before the source VM's disk is reclaimed. Same version/features heyo-sdk
 # already resolves (rustls + ring + webpki roots), so this adds no new
 # compilation — it just makes the existing dependency direct.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-
-[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Node-to-node replication calls speak JSON over the peer's admin API, and the
+# dashboard's own API already returns it through axum. Promoted from a
+# dev-dependency; already resolved in Cargo.lock via the axum stack, so this
+# adds no new compilation.
 serde_json = "1"

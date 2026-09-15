@@ -36,7 +36,7 @@ use crate::vm::VmSpec;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::fmt;
-use std::path::Path;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Who is holding a VM, and how long the claim is good for without a renewal.
@@ -67,7 +67,27 @@ const FINGERPRINT_LEN: usize = 12;
 /// `workspace` is the materialized checkout; `cache_key_files` are resolved
 /// relative to it. They are validated as relative, `..`-free paths when the
 /// workflow is parsed, and re-checked here because this function reads files.
-pub fn fingerprint(spec: &VmSpec, workspace: &Path) -> Result<String, PoolError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedContent {
+    Sha256([u8; 32]),
+    Absent,
+}
+
+/// Inputs proved by the runner after it reconstructed and verified the exact
+/// submitted tree. Production deliberately has no filesystem implementation.
+pub trait FingerprintInputs {
+    fn verified(&self, path: &str) -> Result<VerifiedContent, PoolError>;
+}
+
+impl FingerprintInputs for BTreeMap<String, VerifiedContent> {
+    fn verified(&self, path: &str) -> Result<VerifiedContent, PoolError> {
+        self.get(path)
+            .cloned()
+            .ok_or_else(|| PoolError::MissingVerifiedDigest(path.to_string()))
+    }
+}
+
+pub fn fingerprint<I: FingerprintInputs + ?Sized>(spec: &VmSpec, inputs: &I) -> Result<String, PoolError> {
     let mut hashable = spec.clone();
     // Removed before serializing — see the module doc.
     hashable.cache_key_files = Vec::new();
@@ -87,23 +107,24 @@ pub fn fingerprint(spec: &VmSpec, workspace: &Path) -> Result<String, PoolError>
         }
         h.update(rel.as_bytes());
         h.update([0u8]);
-        match std::fs::read(workspace.join(rel)) {
-            Ok(bytes) => {
-                let mut fh = Sha256::new();
-                fh.update(&bytes);
-                h.update(fh.finalize());
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => h.update(ABSENT.as_bytes()),
-            Err(e) => {
-                return Err(PoolError::UnreadableFile {
-                    path: rel.clone(),
-                    reason: e.to_string(),
-                });
-            }
+        match inputs.verified(rel)? {
+            VerifiedContent::Sha256(digest) => h.update(digest),
+            VerifiedContent::Absent => h.update(ABSENT.as_bytes()),
         }
     }
 
     Ok(hex::encode(h.finalize())[..FINGERPRINT_LEN].to_string())
+}
+
+#[cfg(test)]
+impl FingerprintInputs for std::path::PathBuf {
+    fn verified(&self, path: &str) -> Result<VerifiedContent, PoolError> {
+        match std::fs::read(self.join(path)) {
+            Ok(bytes) => Ok(VerifiedContent::Sha256(Sha256::digest(bytes).into())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(VerifiedContent::Absent),
+            Err(e) => Err(PoolError::UnreadableFile { path: path.to_string(), reason: e.to_string() }),
+        }
+    }
 }
 
 /// A VM this orchestrator owns.
@@ -761,6 +782,7 @@ pub enum PoolError {
     Encode(String),
     EscapingPath(String),
     UnreadableFile { path: String, reason: String },
+    MissingVerifiedDigest(String),
     Sql(String),
 }
 
@@ -784,6 +806,10 @@ impl fmt::Display for PoolError {
                 "could not read cache_key_files entry {path:?}: {reason}. A missing \
                  file is fine and busts the pool when it appears; this one exists \
                  but could not be read."
+            ),
+            Self::MissingVerifiedDigest(path) => write!(
+                f,
+                "runner source preparation omitted requested cache key {path:?}; upgrade the runner backend"
             ),
             Self::Sql(e) => write!(f, "database error: {e}"),
         }

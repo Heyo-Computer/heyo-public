@@ -18,10 +18,18 @@
 //!     local dump file), or `archived` (data only in S3). Both offloaded tiers
 //!     mean the next checkout must restore before serving.
 //!
-//! Format: one `schema\tsandbox_id\tlast_active_unix\tstate` line per entry.
-//! Older 2-column files (`schema\tsandbox_id`) still parse: the missing
+//! A fifth field, `disk_gb`, is what makes a dump-tier restore survivable for a
+//! schema whose data device had grown: the VM that held it is deleted at
+//! offload time, so without a durable note of how big that device was, the
+//! restore builds the default-size one and `pg_restore` fills it (see
+//! [`Store::set_disk_gb`]).
+//!
+//! Format: one `schema\tsandbox_id\tlast_active_unix\tstate\tdisk_gb` line per
+//! entry. Older 2-column files (`schema\tsandbox_id`) still parse: the missing
 //! `last_active` defaults to *load time* (so an upgrade doesn't make every
-//! pre-existing schema instantly eligible for eviction) and state to `live`.
+//! pre-existing schema instantly eligible for eviction), state to `live`, and
+//! `disk_gb` to `0` ("unknown — use the configured default"). Trailing fields
+//! are ignored positionally, so an older binary reads a 5-column file fine.
 //! Schema names are validated upstream to contain no control chars (so never a
 //! tab or newline), so this needs no escaping.
 
@@ -98,6 +106,12 @@ pub struct StoreRecord {
     pub last_active: u64,
     /// Storage tier: whether a VM disk, a local dump, or S3 holds the data.
     pub tier: Tier,
+    /// Size in GiB of the data device this schema last had, or `0` when it was
+    /// never observed. Read when a restore has to *build* the VM: the data
+    /// fitted in a device this big before it was offloaded, and the default
+    /// (`PG_VM_POOL_DATA_DISK_GB`) is a starting size, not a promise that the
+    /// schema still fits in one.
+    pub disk_gb: u32,
 }
 
 impl StoreRecord {
@@ -108,10 +122,12 @@ impl StoreRecord {
 }
 
 /// Internal map value backing a [`StoreRecord`].
+#[derive(Clone)]
 struct Rec {
     sandbox_id: String,
     last_active: u64,
     tier: Tier,
+    disk_gb: u32,
 }
 
 impl Rec {
@@ -120,6 +136,7 @@ impl Rec {
             sandbox_id: self.sandbox_id.clone(),
             last_active: self.last_active,
             tier: self.tier,
+            disk_gb: self.disk_gb,
         }
     }
 }
@@ -185,6 +202,25 @@ impl Store {
         self.map.lock().unwrap().get(schema).map(Rec::view)
     }
 
+    /// How many schemas are on the live tier — data on a VM disk rather than
+    /// offloaded to a dump, a compacted image or S3.
+    ///
+    /// Counted under the lock without cloning, because the idle reaper reads
+    /// it every pass to size its drain rate ([`crate::registry`]'s
+    /// `drain_allowance`) and [`Self::records`] would clone the whole map for
+    /// a number. Deliberately *not* "how many VMs are running": stopping a VM
+    /// does not change its tier, so this stays constant while a cohort drains
+    /// — which is exactly what makes the drain a constant slope instead of a
+    /// decaying one.
+    pub fn live_count(&self) -> usize {
+        self.map
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.tier == Tier::Live)
+            .count()
+    }
+
     /// Every `(schema, record)` known to the store — the durable list of schemas
     /// the pooler has backed, including those whose VM is stopped or archived.
     pub fn records(&self) -> Vec<(String, StoreRecord)> {
@@ -216,12 +252,19 @@ impl Store {
                 _ => {
                     // A new or changed binding flushes immediately: this is
                     // what makes a served schema findable after a crash.
+                    // `disk_gb` is carried across the rebinding — a restore
+                    // that just built a right-sized VM would otherwise forget
+                    // the size on the very write that records it. A stale
+                    // value only ever over-provisions the next restore, and
+                    // the next idle-stop sample corrects it.
+                    let disk_gb = map.get(schema).map(|r| r.disk_gb).unwrap_or(0);
                     map.insert(
                         schema.to_string(),
                         Rec {
                             sandbox_id: id.to_string(),
                             last_active: now,
                             tier: Tier::Live,
+                            disk_gb,
                         },
                     );
                     *self.bound_cache.lock().unwrap() = None;
@@ -230,6 +273,37 @@ impl Store {
             }
         };
         self.write_detached(snapshot);
+    }
+
+    /// Commit a handoff binding, or fail without publishing it in memory.
+    /// The caller must hold its database operation lock and keep admission
+    /// closed until its handoff journal acknowledges this commit. Retrying an
+    /// already-committed candidate is allowed; an unrelated binding is not.
+    ///
+    /// Unlike ordinary activity writes, this rare operation holds the map
+    /// across fsync to prevent another snapshot from racing the binding. Run
+    /// it on a blocking thread. Errors after rename have an unknown durable
+    /// outcome, so they must retain the handoff fence and be retried.
+    pub fn commit_handoff_binding(&self, schema: &str, expected: &str, candidate: &str) -> Result<()> {
+        let mut map = self.map.lock().unwrap();
+        let current = map.get(schema).context("handoff database has no serving binding")?;
+        anyhow::ensure!(current.tier == Tier::Live, "handoff binding is not live");
+        anyhow::ensure!(current.sandbox_id == expected || current.sandbox_id == candidate,
+            "handoff serving binding changed");
+        let mut next = map.clone();
+        next.get_mut(schema).unwrap().sandbox_id = candidate.to_string();
+        let (seq, contents) = self.stamp(serialize(&next));
+        let mut newest = self.written.lock().unwrap();
+        write_atomic(&self.path, &contents)?;
+        let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)?.sync_all().context("fsync handoff binding directory")?;
+        *newest = seq;
+        *map = next;
+        drop(newest);
+        drop(map);
+        *self.bound_cache.lock().unwrap() = None;
+        Ok(())
     }
 
     /// Bind `schema` to the archived tier so the next checkout restores it from
@@ -268,12 +342,14 @@ impl Store {
                 .map(|r| r.sandbox_id.clone())
                 .unwrap_or_else(|| format!("{ADOPTED_ID_PREFIX}{schema}"));
             let last_active = prev.as_ref().map(|r| r.last_active).unwrap_or_else(now_unix);
+            let disk_gb = prev.as_ref().map(|r| r.disk_gb).unwrap_or(0);
             map.insert(
                 schema.to_string(),
                 Rec {
                     sandbox_id,
                     last_active,
                     tier: Tier::Archived,
+                    disk_gb,
                 },
             );
             *self.bound_cache.lock().unwrap() = None;
@@ -339,6 +415,34 @@ impl Store {
             return;
         };
         r.last_active = now;
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Record the size (GiB) of `schema`'s data device. No-op when the schema
+    /// isn't known or the value is unchanged.
+    ///
+    /// This is the one fact about an offloaded schema that cannot be
+    /// recovered after the fact: the dump tiers delete the VM, and a dump
+    /// carries no record of the device it came off. Restoring one into a
+    /// freshly created VM — which is sized `PG_VM_POOL_DATA_DISK_GB`, the
+    /// *starting* size for a brand-new schema — is how a schema that had grown
+    /// its device comes back into a device too small to hold it, fills it
+    /// mid-`pg_restore`, and leaves a half-loaded cluster behind.
+    ///
+    /// Deliberately debounced (like [`Self::touch`]) rather than fsync'd: the
+    /// offload paths call this immediately before [`Self::set_tier`], whose
+    /// durable write serializes the same map — so the value that matters is on
+    /// disk before the VM it describes is killed, without a second fsync on
+    /// the idle-stop path that also records it.
+    pub fn set_disk_gb(&self, schema: &str, disk_gb: u32) {
+        let mut map = self.map.lock().unwrap();
+        let Some(r) = map.get_mut(schema) else {
+            return;
+        };
+        if r.disk_gb == disk_gb {
+            return;
+        }
+        r.disk_gb = disk_gb;
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -442,12 +546,16 @@ fn parse(s: &str, now: u64) -> HashMap<String, Rec> {
             }
             let last_active = f.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(now);
             let tier = Tier::parse(f.next().unwrap_or("live"));
+            // Absent (pre-upgrade row) or unparseable ⇒ 0 ⇒ "unknown", which
+            // every consumer reads as "use the configured default size".
+            let disk_gb = f.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
             Some((
                 schema.to_string(),
                 Rec {
                     sandbox_id: id.to_string(),
                     last_active,
                     tier,
+                    disk_gb,
                 },
             ))
         })
@@ -465,6 +573,8 @@ fn serialize(map: &HashMap<String, Rec>) -> String {
         out.push_str(&v.last_active.to_string());
         out.push('\t');
         out.push_str(state);
+        out.push('\t');
+        out.push_str(&v.disk_gb.to_string());
         out.push('\n');
     }
     out
@@ -505,18 +615,24 @@ mod tests {
                 sandbox_id: format!("{ADOPTED_ID_PREFIX}wb1"),
                 last_active: 1_700_000_000,
                 tier: Tier::Archived,
+                disk_gb: 8,
             },
         );
         let back = parse(&serialize(&map), 0);
         let r = back.get("wb1").expect("an adopted row must survive a round-trip");
         assert_eq!(r.tier, Tier::Archived, "the tier is the whole point of the row");
         assert_eq!(r.last_active, 1_700_000_000);
+        assert_eq!(
+            r.disk_gb, 8,
+            "the device size must survive too — it is the only surviving record of how big a \
+             restore's VM has to be"
+        );
 
         // The failure this guards against, stated directly.
         let mut blank = HashMap::new();
         blank.insert(
             "wb2".to_string(),
-            Rec { sandbox_id: String::new(), last_active: 0, tier: Tier::Archived },
+            Rec { sandbox_id: String::new(), last_active: 0, tier: Tier::Archived, disk_gb: 0 },
         );
         assert!(
             parse(&serialize(&blank), 0).is_empty(),
@@ -535,6 +651,43 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pg-fc-store-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Store::load(dir.join("registry.tsv"))
+    }
+
+    #[test]
+    fn handoff_binding_is_durable_idempotent_and_rejects_stale_writes() {
+        let store = tmp_store("handoff");
+        store.put("a", "sb-old");
+        store.put("other", "sb-unrelated");
+        store.set_disk_gb("a", 13);
+        let stale = store.stamp(serialize(&store.map.lock().unwrap()));
+        assert!(store.bound_ids().contains("sb-old"));
+        store.commit_handoff_binding("a", "sb-old", "sb-candidate").unwrap();
+        write_latest(&store.path, &store.written, stale.0, &stale.1);
+        store.commit_handoff_binding("a", "sb-old", "sb-candidate").unwrap();
+        assert!(store.commit_handoff_binding("a", "sb-old", "sb-wrong").is_err());
+        assert!(store.commit_handoff_binding("missing", "sb-old", "sb-candidate").is_err());
+        let loaded = Store::load(store.path.clone());
+        let record = loaded.record("a").unwrap();
+        assert_eq!(record.sandbox_id, "sb-candidate");
+        assert_eq!(record.disk_gb, 13);
+        assert_eq!(loaded.record("other").unwrap().sandbox_id, "sb-unrelated");
+        assert!(store.bound_ids().contains("sb-candidate"));
+        assert!(!store.bound_ids().contains("sb-old"));
+    }
+
+    #[test]
+    fn handoff_persistence_failure_does_not_publish_the_candidate() {
+        let store = tmp_store("handoff-failure");
+        store.put("a", "sb-old");
+        let backup = store.path.with_extension("backup");
+        std::fs::rename(&store.path, &backup).unwrap();
+        std::fs::create_dir(&store.path).unwrap();
+        assert!(store.commit_handoff_binding("a", "sb-old", "sb-candidate").is_err());
+        assert_eq!(store.record("a").unwrap().sandbox_id, "sb-old");
+        assert_eq!(Store::load(backup).record("a").unwrap().sandbox_id, "sb-old");
+        std::fs::remove_dir(&store.path).unwrap();
+        store.commit_handoff_binding("a", "sb-old", "sb-candidate").unwrap();
+        assert_eq!(Store::load(store.path.clone()).record("a").unwrap().sandbox_id, "sb-candidate");
     }
 
     #[test]
@@ -572,6 +725,41 @@ mod tests {
         std::fs::remove_file(&store.path).unwrap();
         store.flush_dirty(); // not dirty anymore: stays clean
         assert!(!store.path.exists(), "flush_dirty wrote while clean");
+    }
+
+    /// The device size is the one fact about an offloaded schema that cannot
+    /// be recovered later — the VM that had it is deleted — so every path that
+    /// rewrites a row has to carry it, and a pre-upgrade file has to read as
+    /// "unknown" rather than as "zero GiB".
+    #[test]
+    fn the_recorded_device_size_survives_rebinding_and_upgrades() {
+        let store = tmp_store("diskgb");
+        store.put("wb", "sb-1");
+        assert_eq!(store.record("wb").unwrap().disk_gb, 0, "unknown until observed");
+
+        store.set_disk_gb("wb", 16);
+        assert_eq!(store.record("wb").unwrap().disk_gb, 16);
+
+        // A restore rebinds the schema to the VM it just built. That write
+        // must not drop the size the same restore was sized from.
+        store.put("wb", "sb-2");
+        assert_eq!(
+            store.record("wb").unwrap().disk_gb,
+            16,
+            "rebinding dropped the device size — the next restore would build the default"
+        );
+
+        // Unknown schemas are a no-op, not a panic or an invented row.
+        store.set_disk_gb("never-seen", 8);
+        assert!(store.record("never-seen").is_none());
+
+        // A registry written by an older pooler carries no fifth column.
+        let legacy = parse("wb1\tsb-1\t1700000000\tarchived\n", 999);
+        assert_eq!(
+            legacy.get("wb1").unwrap().disk_gb,
+            0,
+            "a pre-upgrade row must read as unknown, which every consumer floors at the default"
+        );
     }
 
     #[test]

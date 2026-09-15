@@ -36,7 +36,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, DiskGrowConfig};
+use crate::registry::{GIB, GrowVerdict, grow_verdict};
 use crate::s3::S3Config;
 
 /// How long to wait after a stop for the Firecracker process to release the
@@ -70,6 +71,11 @@ const PRESIGN_TTL: Duration = Duration::from_secs(3600);
 /// ext4 superblock magic: 0xEF53 little-endian at byte offset 1080
 /// (superblock at 1024 + s_magic at 56).
 const EXT4_MAGIC_OFFSET: u64 = 1080;
+
+/// Used% at or above which a restored image gets a bigger device when disk
+/// growth isn't configured (`PG_VM_POOL_DISK_GROW_PCT` unset). Matches the
+/// trigger the supervisor config ships with.
+const RESTORE_GROW_PCT: f64 = 85.0;
 const EXT4_MAGIC: [u8; 2] = [0x53, 0xEF];
 
 /// Duplicated from `vm::MIN_ARCHIVE_BYTES` (private there): the smallest
@@ -220,6 +226,12 @@ pub async fn archive_disk(
         .await
         .with_context(|| format!("schema {schema}: no data disk at {}", disk.display()))?;
 
+    // Exclusive with the reclaim script for as long as this reads the disk —
+    // both sides `e2fsck -E discard` it, and two of those on one filesystem is
+    // corruption. Non-preempting: a pass already on this disk keeps it, and
+    // the schema comes back around on the next scan.
+    let disk_lock = reclaim_lock(schema, sandbox_id, "archive")?;
+
     wait_disk_released(&disk).await?;
 
     let pg_version = pg_version_of(&disk).await;
@@ -256,7 +268,7 @@ pub async fn archive_disk(
     }
 
     let spool = img_cfg.spool_dir.join(format!("{schema}.img.zst"));
-    let res = archive_via_spool(s3, schema, &disk, &spool).await;
+    let res = archive_via_spool(s3, schema, &disk, &spool, Some(disk_lock)).await;
     // The spool file is scratch either way; a failed upload's remnant would
     // only mislead the next attempt's free-space math.
     let _ = tokio::fs::remove_file(&spool).await;
@@ -283,6 +295,9 @@ pub async fn compact_disk(
     let md = tokio::fs::metadata(&disk)
         .await
         .with_context(|| format!("schema {schema}: no data disk at {}", disk.display()))?;
+
+    // See `archive_disk`: same disk, same `e2fsck -E discard`, same exclusion.
+    let disk_lock = reclaim_lock(schema, sandbox_id, "compact")?;
 
     wait_disk_released(&disk).await?;
 
@@ -313,23 +328,55 @@ pub async fn compact_disk(
 
     let dest = compact.compact_path(schema);
     let tmp = compact.compact_dir.join(format!("{schema}.img.zst.tmp"));
-    let res = compact_via_tmp(schema, &disk, &tmp, &dest).await;
+    let res = compact_via_tmp(schema, &disk, &tmp, &dest, Some(disk_lock)).await;
     if res.is_err() {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     res
 }
 
+/// Take the reclaim exclusion for a stopped VM's disk, or fail this offload
+/// with a message that says why. `what` names the caller for the error.
+///
+/// An `Err` here is not a defect — it is the reclaim script holding the disk
+/// this second. It surfaces as a normal offload failure, which puts the schema
+/// into the per-schema backoff and picks it up again later, by which time the
+/// pass has moved on. That is the whole point of settling the collision per
+/// disk instead of standing the pacer down host-wide while any pass runs.
+fn reclaim_lock(
+    schema: &str,
+    sandbox_id: &str,
+    what: &str,
+) -> Result<crate::reclaim::BootPermit> {
+    crate::reclaim::try_disk_permit(sandbox_id).with_context(|| {
+        format!(
+            "schema {schema}: a disk-reclaim pass holds {sandbox_id}'s disk — \
+             not {what}ing it now; the next scan retries"
+        )
+    })
+}
+
 /// compress → verify → rename. Split out so `compact_disk` can clean the tmp
 /// file on every failure path; the rename is what makes a compact file at its
 /// final path always a verified-complete image.
-async fn compact_via_tmp(schema: &str, disk: &Path, tmp: &Path, dest: &Path) -> Result<u64> {
-    run_ok(
+async fn compact_via_tmp(
+    schema: &str,
+    disk: &Path,
+    tmp: &Path,
+    dest: &Path,
+    // As `archive_via_spool`: held until the compression has read `disk`.
+    disk_lock: Option<crate::reclaim::BootPermit>,
+) -> Result<u64> {
+    let compressed = run_ok(
         deprioritize(Command::new("zstd").args(["-q", "-f", "-3", zstd_threads(), "-o"]).arg(tmp).arg(disk)),
         "compressing the disk image (is zstd installed?)",
         ZSTD_TIMEOUT,
     )
-    .await?;
+    .await;
+    // Last read of the disk — see `archive_via_spool`. Verification and the
+    // rename below touch only the tmp file.
+    drop(disk_lock);
+    compressed?;
     let len = tokio::fs::metadata(tmp)
         .await
         .with_context(|| format!("statting compact tmp {}", tmp.display()))?
@@ -416,15 +463,26 @@ async fn archive_via_spool(
     schema: &str,
     disk: &Path,
     spool: &Path,
+    // Exclusion on `disk`, held until the compression below has read it.
+    // `None` only in tests, which have no reclaim script to exclude.
+    disk_lock: Option<crate::reclaim::BootPermit>,
 ) -> Result<u64> {
     // -3 is zstd's default level: the bulk of these images is zeros and
     // page-structured data where higher levels buy little for a lot of CPU.
-    run_ok(
+    let compressed = run_ok(
         deprioritize(Command::new("zstd").args(["-q", "-f", "-3", zstd_threads(), "-o"]).arg(spool).arg(disk)),
         "compressing the disk image (is zstd installed?)",
         ZSTD_TIMEOUT,
     )
-    .await?;
+    .await;
+    // Last read of the disk: everything below works on the spool file. Release
+    // the reclaim exclusion here rather than at the end of the function — the
+    // upload is minutes of network, and holding a disk (or, in the gate
+    // fallback, every disk) across it is what would turn this exclusion into
+    // the stall it exists to avoid. Dropped before the `?` so a failed
+    // compression releases it too.
+    drop(disk_lock);
+    compressed?;
     let len = tokio::fs::metadata(spool)
         .await
         .with_context(|| format!("statting spool file {}", spool.display()))?
@@ -591,6 +649,11 @@ pub(crate) async fn materialize_from_image(
     schema: &str,
     s3: &S3Config,
     spares: crate::vm::Spares<'_>,
+    // Whether this schema's VM must never be idle-stopped (a keepalive schema,
+    // or a live replication pairing). Carried down to `create_vm` so a restored
+    // VM is created pinned rather than acquiring the pin only on its next
+    // bring-up.
+    pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     let run_dir = cfg
         .run_dir
@@ -644,7 +707,10 @@ pub(crate) async fn materialize_from_image(
         );
     }
 
-    let res = materialize_inner(cfg, schema, s3, &key, &http, expect_len, &zst, &raw, spares).await;
+    let res = materialize_inner(
+        cfg, schema, s3, &key, &http, expect_len, &zst, &raw, spares, pinned,
+    )
+    .await;
     let _ = tokio::fs::remove_file(&zst).await;
     let _ = tokio::fs::remove_file(&raw).await;
     res
@@ -661,6 +727,11 @@ pub(crate) async fn materialize_from_local_image(
     schema: &str,
     src: &Path,
     spares: crate::vm::Spares<'_>,
+    // Whether this schema's VM must never be idle-stopped (a keepalive schema,
+    // or a live replication pairing). Carried down to `create_vm` so a restored
+    // VM is created pinned rather than acquiring the pin only on its next
+    // bring-up.
+    pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     let run_dir = cfg
         .run_dir
@@ -700,7 +771,7 @@ pub(crate) async fn materialize_from_local_image(
             crate::orphans::human_iec(len),
         );
     }
-    let res = adopt_zst_image(cfg, schema, src, &raw, spares).await;
+    let res = adopt_zst_image(cfg, schema, src, &raw, spares, pinned).await;
     let _ = tokio::fs::remove_file(&raw).await;
     res
 }
@@ -716,9 +787,14 @@ async fn materialize_inner(
     zst: &Path,
     raw: &Path,
     spares: crate::vm::Spares<'_>,
+    // Whether this schema's VM must never be idle-stopped (a keepalive schema,
+    // or a live replication pairing). Carried down to `create_vm` so a restored
+    // VM is created pinned rather than acquiring the pin only on its next
+    // bring-up.
+    pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     download(s3, http, key, expect_len, zst).await?;
-    adopt_zst_image(cfg, schema, zst, raw, spares).await
+    adopt_zst_image(cfg, schema, zst, raw, spares, pinned).await
 }
 
 /// The shared tail of every image restore: decompress `zst` into `raw`,
@@ -735,6 +811,8 @@ async fn adopt_zst_image(
     zst: &Path,
     raw: &Path,
     spares: crate::vm::Spares<'_>,
+    // Whether this schema's VM must never be idle-stopped — see the callers.
+    pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     run_ok(
         Command::new("zstd").args(["-q", "-d", "-f", "--sparse", "-o"]).arg(raw).arg(zst),
@@ -760,11 +838,13 @@ async fn adopt_zst_image(
             out.status.code()
         );
     }
+    ensure_restore_headroom(cfg, schema, raw).await?;
 
     // The readopt maneuver: a booted, ready VM — a warm spare whenever the
     // pool has one — stopped, its empty disk overwritten in place with the
     // image, then booted on the real data.
-    let (sandbox, provenance) = crate::vm::claim_restore_vehicle(cfg, schema, spares).await?;
+    let (sandbox, provenance) =
+        crate::vm::claim_restore_vehicle(cfg, schema, spares, pinned).await?;
     if let Err(e) = swap_and_boot(cfg, &sandbox, schema, raw).await {
         // The half-adopted VM must not survive at all: merely *stopping* it
         // leaves a sandbox holding an empty-or-torn database that a later
@@ -808,6 +888,129 @@ async fn adopt_zst_image(
         return Err(e);
     }
     Ok((sandbox, provenance))
+}
+
+/// Give a restored image room to boot. A VM that wedged on a full disk and was
+/// then imaged as-is can't come back on a device of the same size: Postgres
+/// has to write before it accepts a single connection (crash recovery, its
+/// relcache init file), so every restore hits the same wall — and the grow
+/// paths can't rescue it, since they sample usage through Postgres.
+///
+/// When the image's filesystem is at the grow trigger and fills its device,
+/// extend the image file (sparse, so nothing is allocated) to the size the
+/// idle-stop grow would pick. `swap_and_boot` copies it over the VM's disk at
+/// that length, and the guest's grow watcher resizes the filesystem into it at
+/// boot, ahead of Postgres. The growth config supplies the trigger and cap when
+/// set; a full image is unbootable either way, so this grows it even with
+/// growth off.
+async fn ensure_restore_headroom(cfg: &Config, schema: &str, raw: &Path) -> Result<()> {
+    let Some(usage) = offline_fs_usage(raw).await else {
+        warn!(
+            "schema {schema}: could not read the restored image's usage with dumpe2fs; \
+             restoring it at its archived size"
+        );
+        return Ok(());
+    };
+    let device_bytes = tokio::fs::metadata(raw)
+        .await
+        .with_context(|| format!("statting {}", raw.display()))?
+        .len();
+    let (total_blocks, free_blocks, _) = usage;
+    let used_pct = 100.0 * (1.0 - free_blocks as f64 / total_blocks.max(1) as f64);
+    match offline_grow_verdict(usage, device_bytes, cfg.disk_grow) {
+        GrowVerdict::NotNeeded => Ok(()),
+        GrowVerdict::AtCap { current_gb } => {
+            warn!(
+                "schema {schema}: restored image is {used_pct:.0}% full and its {current_gb}GiB \
+                 device is already at the growth cap — Postgres may not start on it \
+                 (raise PG_VM_POOL_DISK_MAX_GB)"
+            );
+            Ok(())
+        }
+        GrowVerdict::Grow(target_gb) => {
+            info!(
+                "schema {schema}: restored image is {used_pct:.0}% full on a {}GiB device — \
+                 extending the device to {target_gb}GiB so Postgres has room to start",
+                device_bytes.div_ceil(GIB)
+            );
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(raw)
+                .await
+                .with_context(|| format!("opening {} to extend it", raw.display()))?
+                .set_len(target_gb * GIB)
+                .await
+                .with_context(|| format!("extending {} to {target_gb}GiB", raw.display()))
+        }
+    }
+}
+
+/// [`grow_verdict`] for a disk read offline — a restored image, or a stopped
+/// VM's data disk about to boot (see `vm::grow_stopped_disk`) — from its
+/// `(total blocks, free blocks, block size)` on a `device_bytes` device, under
+/// the configured growth trigger and cap, or [`RESTORE_GROW_PCT`] and the
+/// daemon's ceiling when growth is off: a full disk is unbootable either way.
+pub(crate) fn offline_grow_verdict(
+    usage: (u64, u64, u64),
+    device_bytes: u64,
+    grow: Option<DiskGrowConfig>,
+) -> GrowVerdict {
+    let (total_blocks, free_blocks, block_size) = usage;
+    let (pct, max_gb) = match grow {
+        Some(g) => (g.pct, g.max_gb),
+        None => (RESTORE_GROW_PCT, u64::from(crate::vm::DAEMON_MAX_DISK_GB)),
+    };
+    let total = total_blocks * block_size;
+    let avail = free_blocks.min(total_blocks) * block_size;
+    grow_verdict((total, total - avail, avail), device_bytes, pct, max_gb)
+}
+
+/// `(total blocks, free blocks, block size)` from `dumpe2fs` output. Free space
+/// is summed over the group descriptors rather than read off the superblock:
+/// ext4 writes the superblock's free count back lazily (reliably only at a
+/// clean unmount), so an image taken after an unclean stop can carry a stale
+/// one, while the descriptors are journaled with every allocation.
+fn dumpe2fs_usage(out: &str) -> Option<(u64, u64, u64)> {
+    let (mut total, mut block_size, mut free, mut groups) = (None, None, 0u64, 0u32);
+    for line in out.lines() {
+        if let Some(v) = line.strip_prefix("Block count:") {
+            total = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("Block size:") {
+            block_size = v.trim().parse().ok();
+        } else if let Some((n, _)) = line.trim_start().split_once(" free blocks, ")
+            && let Ok(n) = n.parse::<u64>()
+        {
+            free += n;
+            groups += 1;
+        }
+    }
+    if groups == 0 {
+        return None;
+    }
+    Some((total?, free, block_size?))
+}
+
+/// [`dumpe2fs_usage`] of the ext4 filesystem in `disk`, read offline. `None`
+/// when dumpe2fs fails or its output carries no group descriptors.
+pub(crate) async fn offline_fs_usage(disk: &Path) -> Option<(u64, u64, u64)> {
+    match run(Command::new("dumpe2fs").arg(disk), FSCK_TIMEOUT).await {
+        Ok(out) if out.status.success() => dumpe2fs_usage(&String::from_utf8_lossy(&out.stdout)),
+        _ => None,
+    }
+}
+
+/// Whether anything on the host holds `disk` open right now — the same
+/// (device, inode) fd scan [`wait_disk_released`] polls. A scan that can see
+/// nothing reads as "not held".
+pub(crate) async fn disk_held_open(disk: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = tokio::fs::metadata(disk).await else {
+        return false;
+    };
+    let target = (md.dev(), md.ino());
+    tokio::task::spawn_blocking(move || crate::orphans::open_inodes().contains(&target))
+        .await
+        .unwrap_or(false)
 }
 
 async fn swap_and_boot(
@@ -1193,6 +1396,92 @@ async fn run_ok(cmd: &mut Command, what: &str, timeout: Duration) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Trimmed `dumpe2fs` of a full 2GiB data disk. The superblock's
+    /// "Free blocks" is stale (an unclean stop never wrote it back); the group
+    /// descriptors hold the real count.
+    const DUMPE2FS_FULL: &str = "\
+Filesystem volume name:   <none>
+Block count:              524288
+Reserved block count:     0
+Free blocks:              401233
+Block size:               4096
+
+Group 0: (Blocks 0-32767) csum 0x1a2b [ITABLE_ZEROED]
+  Primary superblock at 0, Group descriptors at 1-1
+  12 free blocks, 0 free inodes, 2 directories
+  Free blocks: 32756-32767
+  Free inodes:
+Group 1: (Blocks 32768-65535) csum 0x3c4d [INODE_UNINIT, ITABLE_ZEROED]
+  Backup superblock at 32768, Group descriptors at 32769-32769
+  0 free blocks, 8192 free inodes, 0 directories, 8192 unused inodes
+  Free blocks:
+  Free inodes: 8193-16384
+";
+
+    #[test]
+    fn dumpe2fs_usage_sums_group_descriptors_not_the_superblock() {
+        assert_eq!(dumpe2fs_usage(DUMPE2FS_FULL), Some((524_288, 12, 4096)));
+        assert_eq!(dumpe2fs_usage("Block count: 10\nBlock size: 4096\n"), None);
+    }
+
+    #[test]
+    fn restore_grows_a_full_image_even_with_growth_off() {
+        let full = dumpe2fs_usage(DUMPE2FS_FULL).unwrap();
+        assert_eq!(
+            offline_grow_verdict(full, 2 * GIB, None),
+            GrowVerdict::Grow(4)
+        );
+        // Half full: room to boot, restored as archived.
+        assert_eq!(
+            offline_grow_verdict((524_288, 262_144, 4096), 2 * GIB, None),
+            GrowVerdict::NotNeeded
+        );
+        // A thin fs below its device is the guest watcher's to grow.
+        assert_eq!(
+            offline_grow_verdict((262_144, 0, 4096), 4 * GIB, None),
+            GrowVerdict::NotNeeded
+        );
+        let capped = DiskGrowConfig {
+            pct: 85.0,
+            urgent_pct: None,
+            max_gb: 2,
+        };
+        assert_eq!(
+            offline_grow_verdict(full, 2 * GIB, Some(capped)),
+            GrowVerdict::AtCap { current_gb: 2 }
+        );
+    }
+
+    /// pg-0rtk7Stq: its Postgres died of ENOSPC and its stopped 2GiB disk sat
+    /// 94% full, so every bring-up booted it straight back into the wall. The
+    /// boot-time check reads the disk offline and grows it first; a disk with
+    /// room boots as it is.
+    #[test]
+    fn a_nearly_full_stopped_disk_is_grown_before_it_boots() {
+        let grow = DiskGrowConfig {
+            pct: 85.0,
+            urgent_pct: Some(95.0),
+            max_gb: 25,
+        };
+        // 524288 4KiB blocks, 30419 free: the disk as it was found.
+        let stuck = (524_288, 30_419, 4096);
+        assert_eq!(
+            offline_grow_verdict(stuck, 2 * GIB, Some(grow)),
+            GrowVerdict::Grow(4)
+        );
+        // 60% used: room to recover.
+        assert_eq!(
+            offline_grow_verdict((524_288, 209_715, 4096), 2 * GIB, Some(grow)),
+            GrowVerdict::NotNeeded
+        );
+        // At the configured cap there is nothing to do but say so.
+        let capped = DiskGrowConfig { max_gb: 2, ..grow };
+        assert_eq!(
+            offline_grow_verdict(stuck, 2 * GIB, Some(capped)),
+            GrowVerdict::AtCap { current_gb: 2 }
+        );
+    }
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1291,7 +1580,7 @@ mod tests {
 
         let tmp = dir.join("s.img.zst.tmp");
         let dest = dir.join("s.img.zst");
-        let len = compact_via_tmp("s", &disk, &tmp, &dest).await.unwrap();
+        let len = compact_via_tmp("s", &disk, &tmp, &dest, None).await.unwrap();
         assert!(dest.exists(), "verified image landed at its final path");
         assert!(!tmp.exists(), "tmp renamed away");
         assert_eq!(std::fs::metadata(&dest).unwrap().len(), len);
@@ -1301,7 +1590,7 @@ mod tests {
         std::fs::write(&bogus, vec![1u8; 64 * 1024]).unwrap();
         let tmp2 = dir.join("b.img.zst.tmp");
         let dest2 = dir.join("b.img.zst");
-        assert!(compact_via_tmp("b", &bogus, &tmp2, &dest2).await.is_err());
+        assert!(compact_via_tmp("b", &bogus, &tmp2, &dest2, None).await.is_err());
         assert!(!dest2.exists(), "unverified image must not land");
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -66,6 +66,73 @@ test("the caller's bearer is forwarded only to a service with no credential of i
   assert.equal(withForwardedAuth(loadConfig({}), { authorization: "Bearer x" }).applb, undefined);
 });
 
+test("an app-lb-minted token is never traded up for this process's own", () => {
+  // The escalation this closes: a token scoped to one deployment, admitted by
+  // an app-token gate, reaching app-lb as whatever fleet-wide credential the
+  // operator configured. The caller's own token wins, so app-lb scope-checks
+  // the principal that was actually authenticated.
+  const own = loadConfig({ APPLB_URL: "http://127.0.0.1:8080", APPLB_TOKEN: "applb_fleet_wide" });
+  const scoped = withForwardedAuth(own, { authorization: "Bearer applb_abc123_secret" });
+  assert.equal(scoped.applb?.auth, "Bearer applb_abc123_secret");
+  assert.equal(scoped.applb?.baseUrl, own.applb?.baseUrl);
+
+  // Basic-gated dashboards are configured the same way and get the same rule.
+  const basic = loadConfig({ APPLB_URL: "http://127.0.0.1:8080", APPLB_BASIC: "admin:hunter2" });
+  assert.equal(
+    withForwardedAuth(basic, { authorization: "Bearer applb_abc123_secret" }).applb?.auth,
+    "Bearer applb_abc123_secret",
+  );
+
+  // Only app-lb's own kind of token. A JWT from the heyo auth API means nothing
+  // to app-lb's admin API, so a jwt-gated deployment keeps acting as itself
+  // rather than forwarding a credential app-lb cannot read.
+  const jwtCaller = withForwardedAuth(own, { authorization: "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x" });
+  assert.equal(jwtCaller.applb?.auth, "Bearer applb_fleet_wide");
+
+  // Nor is a cloud key one, even though managed mode reaches app-lb with it:
+  // there the process has no credential of its own and the first rule already
+  // forwards it.
+  assert.equal(
+    withForwardedAuth(own, { authorization: "Bearer heyo_api_caller" }).applb?.auth,
+    "Bearer applb_fleet_wide",
+  );
+
+  // The prefix is tested on the token, not the raw header, so neither the
+  // scheme's spelling nor a bearer that merely mentions the prefix decides it.
+  // Detection is deliberately looser than app-lb's own `strip_prefix("Bearer ")`,
+  // because the two failure directions are not symmetric: a form detected here
+  // that app-lb will not parse is a 401, while one app-lb accepts and this
+  // missed would fall back to the configured token — the escalation. The header
+  // itself is still forwarded byte for byte, as the Basic case requires.
+  assert.equal(
+    withForwardedAuth(own, { authorization: "bearer   applb_abc123_secret" }).applb?.auth,
+    "bearer   applb_abc123_secret",
+  );
+  assert.equal(
+    withForwardedAuth(own, { authorization: "Basic applb_not_a_bearer" }).applb?.auth,
+    "Bearer applb_fleet_wide",
+  );
+  assert.equal(
+    withForwardedAuth(own, { authorization: "Bearer x_applb_suffix" }).applb?.auth,
+    "Bearer applb_fleet_wide",
+  );
+
+  // Cloud stays on its own key: an applb_ token is not a cloud credential, and
+  // swapping it in would break every sandbox tool rather than narrow anything.
+  const both = loadConfig({
+    APPLB_URL: "http://127.0.0.1:8080",
+    APPLB_TOKEN: "applb_fleet_wide",
+    HEYO_API_KEY: "heyo_api_server",
+  });
+  const mixed = withForwardedAuth(both, { authorization: "Bearer applb_abc123_secret" });
+  assert.equal(mixed.applb?.auth, "Bearer applb_abc123_secret");
+  assert.equal(mixed.cloud?.auth, "Bearer heyo_api_server");
+
+  // And the reuse path survives: fully configured, with a caller whose bearer
+  // is nobody's business here, the same object comes back.
+  assert.equal(withForwardedAuth(both, { authorization: "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x" }), both);
+});
+
 test("two API keys are the whole configuration", () => {
   // The claim the README makes, asserted: no URL, no namespace, no anything
   // else, and both cloud and the managed app-lb come up.
@@ -114,4 +181,117 @@ test("no credential at all configures nothing", () => {
   const config = loadConfig({});
   assert.equal(config.applb, undefined);
   assert.deepEqual(configured(config), []);
+});
+
+test("an app-lb token is never substituted for a cloud key", () => {
+  // The fleet-operations shape: an app-token gate in front, no HEYO_API_KEY, and
+  // callers who by definition present `applb_…`. Cloud has never heard of that
+  // credential, so borrowing it under the "no credential of its own" rule would
+  // turn every sandbox tool into a guaranteed 401 — capability advertised and
+  // unreachable. Cloud stays unconfigured instead, and `buildTools` lists none.
+  const fleetOps = loadConfig({ APPLB_URL: "http://127.0.0.1:8080" });
+  assert.equal(fleetOps.cloud?.auth, undefined);
+
+  const asCaller = withForwardedAuth(fleetOps, { authorization: "Bearer applb_abc123_secret" });
+  assert.equal(asCaller.applb?.auth, "Bearer applb_abc123_secret");
+  assert.equal(asCaller.cloud?.auth, undefined);
+
+  // Only that prefix. A cloud key is exactly what cloud wants and is still
+  // borrowed — this is the rule that makes managed mode multi-tenant, and
+  // narrowing it would have cost every hosted instance its sandboxes.
+  assert.equal(
+    withForwardedAuth(fleetOps, { authorization: "Bearer heyo_api_caller" }).cloud?.auth,
+    "Bearer heyo_api_caller",
+  );
+  // A JWT likewise: some other gate issued it, and this is not the place to
+  // decide cloud will refuse it.
+  assert.equal(
+    withForwardedAuth(fleetOps, { authorization: "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x" }).cloud?.auth,
+    "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x",
+  );
+
+  // And with nothing to give either service, the same object comes back rather
+  // than a copy that changed nothing.
+  assert.equal(
+    withForwardedAuth(
+      loadConfig({ APPLB_URL: "http://127.0.0.1:8080", APPLB_TOKEN: "applb_fleet_wide" }),
+      { authorization: "Bearer heyo_api_caller" },
+    ).cloud?.auth,
+    "Bearer heyo_api_caller",
+  );
+});
+
+test("app-obs and ci act as the caller when app-lb is what gates them", () => {
+  // The VM shape: obs and ci are reached at their public hostnames, behind
+  // app-lb gates, so the credential is an app-lb token and nothing is
+  // configured here. Each caller's own token clears each gate, which is what
+  // makes a caller whose scope omits app-obs unable to read app-obs.
+  const gated = loadConfig({
+    APPLB_URL: "https://admin.us2.heyo.work",
+    APP_OBS_URL: "https://obs.us2.heyo.work",
+    CI_URL: "https://ci.us2.heyo.work",
+  });
+  assert.equal(gated.obs?.auth, undefined);
+  const asCaller = withForwardedAuth(gated, { authorization: "Bearer applb_abc123_secret" });
+  assert.equal(asCaller.applb?.auth, "Bearer applb_abc123_secret");
+  assert.equal(asCaller.obs?.auth, "Bearer applb_abc123_secret");
+  assert.equal(asCaller.ci?.auth, "Bearer applb_abc123_secret");
+  assert.equal(asCaller.obs?.baseUrl, gated.obs?.baseUrl);
+
+  // A configured fallback that is itself an app-lb token is still only a
+  // fallback: it says "the gate authenticates here", not "act as me".
+  const withFallback = loadConfig({
+    APP_OBS_URL: "https://obs.us2.heyo.work",
+    APP_OBS_API_TOKEN: "applb_svc_fallback",
+    CI_URL: "https://ci.us2.heyo.work",
+    CI_TOKEN: "applb_svc_fallback",
+  });
+  const overridden = withForwardedAuth(withFallback, {
+    authorization: "Bearer applb_abc123_secret",
+  });
+  assert.equal(overridden.obs?.auth, "Bearer applb_abc123_secret");
+  assert.equal(overridden.ci?.auth, "Bearer applb_abc123_secret");
+});
+
+test("app-obs and ci reached directly keep their own service tokens", () => {
+  // The regression this guards: the loopback deployment, where APP_OBS_API_TOKEN
+  // is app-obs's *own* token and app-obs compares it to what it was configured
+  // with. An app-lb token means nothing there, so forwarding one would 401 every
+  // obs and ci tool on a deployment that was working. The shape of what is
+  // configured is what tells the two apart — no `applb_` prefix, no gate.
+  const loopback = loadConfig({
+    APPLB_URL: "http://127.0.0.1:8080",
+    APP_OBS_URL: "http://127.0.0.1:9600",
+    APP_OBS_API_TOKEN: "obs_service_secret",
+    CI_URL: "http://127.0.0.1:9555",
+    CI_TOKEN: "ci_service_secret",
+  });
+  const called = withForwardedAuth(loopback, { authorization: "Bearer applb_abc123_secret" });
+  assert.equal(called.obs?.auth, "Bearer obs_service_secret");
+  assert.equal(called.ci?.auth, "Bearer ci_service_secret");
+  // app-lb itself still yields, because app-lb is always its own authenticator.
+  assert.equal(called.applb?.auth, "Bearer applb_abc123_secret");
+
+  // And only an app-lb token reaches obs and ci at all. A cloud key or a JWT is
+  // not a credential either of them has any use for, gated or not.
+  const gated = loadConfig({
+    APP_OBS_URL: "https://obs.us2.heyo.work",
+    CI_URL: "https://ci.us2.heyo.work",
+  });
+  for (const bearer of ["Bearer heyo_api_caller", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x"]) {
+    const out = withForwardedAuth(gated, { authorization: bearer });
+    assert.equal(out.obs?.auth, undefined, bearer);
+    assert.equal(out.ci?.auth, undefined, bearer);
+  }
+
+  // Nothing to change on any of the four: the same object comes back and the
+  // per-process tool set is reused.
+  const settled = loadConfig({
+    APPLB_URL: "http://127.0.0.1:8080",
+    APPLB_TOKEN: "applb_fleet_wide",
+    HEYO_API_KEY: "heyo_api_server",
+    APP_OBS_URL: "http://127.0.0.1:9600",
+    APP_OBS_API_TOKEN: "obs_service_secret",
+  });
+  assert.equal(withForwardedAuth(settled, { authorization: "Bearer heyo_api_caller" }), settled);
 });

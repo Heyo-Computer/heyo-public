@@ -13,6 +13,7 @@
 
 mod artifacts;
 mod bus;
+mod cd;
 // The platform UI kit — tokens, the theme cookie and forwarded identity —
 // shared with app-lb, app-obs, heyosecret and artifacts. Included by path
 // rather than depended on as a crate: those five apps sit on three different
@@ -25,13 +26,17 @@ mod expr;
 mod heyo_ui;
 mod image;
 mod nats_auth;
+mod native;
 mod objects;
 mod paths;
 mod plan;
 mod pool;
+mod release;
+mod release_git;
 mod repos;
 mod runners;
 mod secrets;
+mod service_archive;
 mod store;
 mod trigger;
 mod vm;
@@ -50,6 +55,30 @@ use vm::Vms;
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        if args[0] != "--check-workflows" || args.len() < 2 {
+            eprintln!("usage: ci [--check-workflows FILE ...]");
+            std::process::exit(2);
+        }
+        let mut failed = false;
+        for path in &args[1..] {
+            let result = std::fs::read_to_string(path)
+                .map_err(|e| format!("{path}: {e}"))
+                .and_then(|yaml| workflow::Workflow::parse(path, &yaml).map_err(|e| e.to_string()))
+                .and_then(|workflow| plan::Plan::build(&workflow).map_err(|e| e.to_string()));
+            match result {
+                Ok(plan) => println!("{path}: valid plan ({} jobs)", plan.jobs.len()),
+                Err(error) => {
+                    eprintln!("{path}: {error}");
+                    failed = true;
+                }
+            }
+        }
+        // Offline: no configuration, database, broker or runner connections.
+        std::process::exit(if failed { 1 } else { 0 });
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -185,6 +214,7 @@ async fn main() {
         bus.jobs_stream(),
         bus.events_stream()
     );
+    bus.clone().spawn_outbox_publisher(store.clone());
 
     let artifacts = match artifacts::sink_for(&config) {
         Ok(s) => Arc::from(s),

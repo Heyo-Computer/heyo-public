@@ -129,6 +129,7 @@ pub struct DeploymentSpec {
     pub account_id: Option<String>,
     pub user_id: Option<String>,
     pub routes: Vec<RouteRule>,
+    pub maintenance: bool,
     pub vm: Option<VmSpec>,
     pub scaling: ScalingPolicy,
     pub health: HealthCheck,
@@ -475,6 +476,19 @@ impl UpdateSpec {
     }
 }
 
+/// One entry in [`AuthGate::public_paths`]: a path prefix, and what app-lb
+/// requires on it in place of the sign-in gate.
+///
+/// No `#[serde(default)]`: app-lb always sends both fields, and a row with an
+/// empty `path` would silently match every request when rendered.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicPath {
+    pub path: String,
+    /// `public` | `none` | `view` | `admin`. Only `public` admits a request
+    /// that presents no credential at all.
+    pub scope: String,
+}
+
 /// An optional sign-in gate in front of a deployment.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
@@ -490,7 +504,18 @@ pub struct AuthGate {
     pub client_secret: Option<SecretRef>,
     pub allowed_domains: Vec<String>,
     pub allowed_emails: Vec<String>,
-    pub public_paths: Vec<String>,
+    /// Path prefixes the *sign-in* gate does not sit in front of, and what
+    /// app-lb requires in its place.
+    ///
+    /// Read as objects rather than strings since scopes were added. app-lb
+    /// always serializes the object form, so a bare string only ever appears in
+    /// a spec somebody wrote by hand — where it means `scope: "admin"`, the
+    /// fail-closed default.
+    pub public_paths: Vec<PublicPath>,
+    /// When set, signing in at this gate mints an app-token with this scope,
+    /// which app-lb presents upstream for the life of the session. Absent on
+    /// every gate that does not — which is most of them.
+    pub session_scope: Option<String>,
     pub base_path: String,
     pub session_ttl_secs: u64,
     pub cookie_name: String,
@@ -1733,6 +1758,33 @@ impl TokenSummary {
     pub fn allows(&self, deployment: &str) -> bool {
         self.deployments.iter().any(|d| d == "*" || d == deployment)
     }
+}
+
+// -- namespaces -------------------------------------------------------------
+
+/// One namespace, from `GET /namespaces`.
+///
+/// Distinct from [`FeedIndexEntry`], which answers a narrower question: that one
+/// lists namespaces with *feed events*, this one lists namespaces with
+/// deployments the caller can see. A namespace appears here the moment
+/// something is registered in it and disappears when the last thing leaves —
+/// there is no namespace object to create or delete.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct NamespaceEntry {
+    pub namespace: String,
+    /// Deployments in it that *this credential* may see. Narrowed server-side,
+    /// so a scoped token sees its own arithmetic rather than the fleet's.
+    pub deployments: u64,
+    /// Whether a namespace *object* exists, as opposed to the name being one a
+    /// deployment happens to mention. Both scope identically; the difference is
+    /// whether there is anything to delete or describe.
+    pub declared: bool,
+    pub description: Option<String>,
+    /// Present only when `declared`.
+    pub created_at: Option<u64>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 // -- the event feed ---------------------------------------------------------

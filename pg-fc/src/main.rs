@@ -19,16 +19,19 @@ mod inventory;
 #[cfg(test)]
 mod loadtest;
 mod orphans;
+mod peers;
 mod pending;
 mod proxy;
 mod reclaim;
 mod registry;
+mod replication;
 mod s3;
 mod spares;
 mod startup;
 mod store;
 mod tls;
 mod vm;
+mod writer_routing;
 
 use std::sync::Arc;
 
@@ -94,7 +97,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("pending-bringups.tsv"),
     );
-    let registry = Arc::new(SchemaRegistry::new(cfg));
+    let registry = Arc::new(SchemaRegistry::new(cfg)?);
     registry.spawn_reaper();
     // Stops running VMs nothing tracks (left over from a pooler restart, a
     // failed idle-stop, or a daemon-side boot) so the ladder can reclaim them.
@@ -108,6 +111,12 @@ async fn main() -> Result<()> {
     // high-water mark, archive oldest-idle schemas (TTL overridden) until it
     // recovers. No-op unless PG_VM_POOL_PRESSURE_PATH is configured.
     registry.spawn_pressure_reaper();
+    // Urgent device growth: the only path that grows a *warm* VM's data
+    // device. The idle-stop grow can't help a schema whose write load never
+    // pauses, and once the guest's filesystem spans its device that schema
+    // wedges on ENOSPC. No-op unless PG_VM_POOL_DISK_GROW_PCT is set (and
+    // PG_VM_POOL_DISK_GROW_URGENT_PCT is not 0).
+    registry.spawn_disk_grower();
     // Warm-spare pool: pre-booted empty VMs that cold bring-ups (notably S3
     // restores) claim instead of paying create + boot + initdb. No-op unless
     // PG_VM_POOL_WARM_SPARES > 0.
@@ -126,6 +135,17 @@ async fn main() -> Result<()> {
     // kill it acked but didn't act on), reclaiming the stranded disk. No-op
     // unless PG_VM_POOL_ORPHAN_SWEEP_SECS (and PG_VM_POOL_RUN_DIR) are set.
     registry.spawn_orphan_reaper();
+    // Bring up every VM a replication pairing depends on. Must run before the
+    // untracked reaper's first pass, which classifies a running VM with no
+    // warm entry as untracked. No-op when nothing is replicating.
+    registry.spawn_replication_pinner();
+    // Samples each pairing's lag and slot health for the dashboard, and warns
+    // when an inactive slot starts pinning WAL. No-op when nothing is
+    // replicating.
+    registry.spawn_replication_monitor();
+    // Continue explicitly authorized physical handoffs after request loss or
+    // process restart, including when orchestrator's own database is moving.
+    replication::physical::spawn_handoff_recovery(registry.clone());
     // Delete VMs whose bring-up handed out an id but never reached a registry
     // binding — the "stuck in provisioning, bound to nothing" leak no other
     // sweep covers. Always on; idle when the pending ledger is empty.
@@ -195,26 +215,54 @@ async fn handle_conn(
     tls: Option<Arc<TlsReloader>>,
 ) -> Result<()> {
     let (mut client, info) = startup::read_startup(client, tls.as_deref()).await?;
-    let creds = registry.dedicated();
     // Which password this client must prove, decided from its *role* alone: a
-    // provisioned role is challenged with its own, everyone else with the
-    // shared `PG_VM_POOL_PASSWORD`. Keeping the requested database out of this
-    // step means the handshake looks the same either way, so the challenge
-    // can't be used to enumerate which database names are dedicated.
-    if let Some(password) = creds.challenge_password(&info.user, registry.client_password()) {
+    // replication or dedicated login is challenged with its own, everyone else
+    // with the shared `PG_VM_POOL_PASSWORD`. Keeping the requested database
+    // out of this step means the handshake looks the same either way, so the
+    // challenge can't be used to enumerate which database names are dedicated.
+    if let Some(password) = registry.challenge_password_for(&info.user) {
         auth::require_password(&mut client, &password).await?;
     }
     // Authenticated — now, may this client route where it asked? A dedicated
     // credential may open only its own database (so it can never provision a
-    // second VM), and a shared-password client may not open a dedicated one.
-    if let Err(reason) = creds.authorize(&info.user, &info.database) {
-        // Tell the client why rather than dropping the socket: "cannot open any
-        // other database" is exactly the feedback that stops someone retrying a
-        // typo'd database name forever.
-        auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
-        anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
+    // second VM), a shared-password client may not open a dedicated one, and a
+    // replication login may open only the database it replicates.
+    let schema = match registry.authorize_route(&info.user, &info.database, info.physical_replication) {
+        Ok(schema) => schema,
+        Err(reason) => {
+            auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
+            anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
+        }
+    };
+    if writer_routing::is_routable_tenant(&registry, &info, &schema) {
+        match writer_routing::route(&registry, &schema)? {
+            writer_routing::Route::Local => {}
+            writer_routing::Route::Peer { peer, claim } => {
+                return writer_routing::forward(client, &info.raw, peer, claim).await;
+            }
+            writer_routing::Route::Unavailable(reason) => {
+                auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, reason).await?;
+                anyhow::bail!("writer unavailable for {schema}: {reason}");
+            }
+        }
     }
-    let schema = info.database.clone();
+    if !info.physical_replication && !registry.physical_admission_ready(&schema) {
+        auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, "physical handoff is incomplete; admission remains closed").await?;
+        anyhow::bail!("refused connection during incomplete physical handoff for {schema}");
+    }
+    if let Some(fence) = registry.replication().get(&schema).and_then(|r| r.fence)
+        && (fence.mode != "selective"
+            || registry.replication().by_repl_role(&info.user).is_none())
+        && !(info.physical_replication && registry.physical_reconnect_allowed(&schema, &info.user))
+    {
+        auth::send_fatal(
+            &mut client,
+            auth::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            "database is fenced for a planned switchover; operator unfence is required",
+        )
+        .await?;
+        anyhow::bail!("refused connection to fenced database {schema}");
+    }
     if !is_valid_schema(&schema) {
         anyhow::bail!("rejecting invalid schema name {schema:?}");
     }

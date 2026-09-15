@@ -16,6 +16,7 @@ mod acme;
 mod admin;
 mod artifact;
 mod auth;
+mod auth_providers;
 mod autoscale;
 mod config;
 mod deployment;
@@ -26,13 +27,16 @@ mod federated;
 mod feed;
 mod guard;
 mod health;
+mod incus;
 mod jobs;
 mod jwt;
 mod metrics;
 mod mounts;
+mod namespaces;
 mod obs;
 mod proxy;
 mod registry;
+mod runtime;
 mod secrets;
 mod siem;
 mod site;
@@ -142,6 +146,53 @@ fn config_from_env() -> LbConfig {
     if let Ok(v) = std::env::var("APP_LB_BUILD_DIR") {
         cfg.build_dir = v;
     }
+    if let Ok(v) = std::env::var("APP_LB_LXC_ENABLED") {
+        cfg.lxc.enabled = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_SOCKET") {
+        cfg.lxc.socket = v.trim().into();
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_PROJECT") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            cfg.lxc.project = v;
+        }
+    }
+    // `name=url,name=url`. Replaces the default rather than adding to it, so a
+    // host that names its own registries is not silently still pulling from
+    // Docker Hub.
+    if let Ok(v) = std::env::var("APP_LB_LXC_REMOTES") {
+        let remotes: std::collections::BTreeMap<String, String> = v
+            .split(',')
+            .filter_map(|entry| entry.trim().split_once('='))
+            .map(|(name, url)| (name.trim().to_string(), url.trim().to_string()))
+            .filter(|(name, url)| !name.is_empty() && !url.is_empty())
+            .collect();
+        if !remotes.is_empty() {
+            cfg.lxc.remotes = remotes;
+        }
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_DEFAULT_REMOTE") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            cfg.lxc.default_remote = v;
+        }
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_PROFILES") {
+        cfg.lxc.profiles = v
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    if let Ok(v) = std::env::var("APP_LB_LXC_NETWORK_NIC") {
+        let v = v.trim().to_string();
+        cfg.lxc.network_nic = (!v.is_empty()).then_some(v);
+    }
     if let Ok(v) = std::env::var("APP_LB_HEYVM_BIN") {
         cfg.heyvm_bin = v;
     }
@@ -192,6 +243,9 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_ROUTE53_ZONE_ID") {
         cfg.route53_zone_id = Some(v.trim().to_string()).filter(|z| !z.is_empty());
+    }
+    if let Ok(v) = std::env::var("APP_LB_DEPLOY_BASE_DOMAIN") {
+        cfg.deploy_base_domain = Some(v.trim().to_string()).filter(|d| !d.is_empty());
     }
     if let Ok(v) = std::env::var("APP_LB_UPDATE_SHELL") {
         cfg.update_shell = v;
@@ -269,7 +323,14 @@ fn main() {
         tracing::debug!("rustls crypto provider was already installed");
     }
 
-    let cfg = config_from_env();
+    let mut cfg = config_from_env();
+    // Stamped on every container so two app-lb processes on one host do not
+    // adopt each other's. Defaults to the LB's own name rather than being a
+    // separate setting nobody would remember to set.
+    if cfg.lxc.instance.is_empty() {
+        cfg.lxc.instance = cfg.name.clone();
+    }
+    let cfg = cfg;
     let discovery_cfg = discovery::DiscoveryConfig::from_env()
         .unwrap_or_else(|e| panic!("invalid discovery configuration: {e}"));
 
@@ -415,6 +476,35 @@ fn main() {
             "restored CI workflows; some objects were unreadable and were left on disk"
         ),
     }
+    // Beside the others, same derivation: `app-lb-state.json` gives
+    // `app-lb-namespaces.d/`.
+    let namespaces = Arc::new(crate::namespaces::NamespaceStore::new(
+        crate::namespaces::namespace_dir(&cfg.state_path),
+    ));
+    match namespaces.load() {
+        (0, 0) => tracing::debug!(dir = %namespaces.dir().display(), "no declared namespaces"),
+        (n, 0) => tracing::info!(count = n, "restored declared namespaces"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %namespaces.dir().display(),
+            "restored declared namespaces; some objects were unreadable and were left on disk"
+        ),
+    }
+    let auth_providers = Arc::new(crate::auth_providers::AuthProviderStore::new(
+        crate::auth_providers::auth_provider_dir(&cfg.state_path),
+    ));
+    match auth_providers.load() {
+        (0, 0) => tracing::debug!(dir = %auth_providers.dir().display(), "no declared auth providers"),
+        (n, 0) => tracing::info!(count = n, "restored declared auth providers"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %auth_providers.dir().display(),
+            "restored declared auth providers; some objects were unreadable and were left on disk"
+        ),
+    }
+
     // A deregistration whose file removal failed would otherwise resurrect the
     // deployment on this start. Declines to run if the load above skipped
     // anything, so it can never delete a spec it merely failed to understand.
@@ -521,10 +611,14 @@ fn main() {
             }
             let Some(gate) = &spec.auth else { continue };
             let health = spec.health.path.as_deref();
+            // Only the entries that still admit an unauthenticated request. A
+            // scoped entry is no longer a bypass — app-lb checks the scope
+            // itself — so listing one here would cry wolf about the very fix.
             let exposed: Vec<&str> = gate
                 .public_paths
                 .iter()
-                .map(String::as_str)
+                .filter(|p| p.scope == crate::config::PathScope::Public)
+                .map(|p| p.path.as_str())
                 .filter(|p| *p != "/healthz" && Some(*p) != health)
                 .collect();
             if !exposed.is_empty() {
@@ -567,12 +661,13 @@ fn main() {
             .unwrap_or_else(|| Arc::from(obs::LB_DEPLOYMENT)),
     );
 
-    let auth = Arc::new(Authenticator::new(
+    let auth = Arc::new(Authenticator::with_admin_addr(
         Authenticator::load_key(&auth_key_path)
             .unwrap_or_else(|e| panic!("cannot read or create {}: {e}", auth_key_path.display())),
         secrets.clone(),
         Some(tokens.clone()),
         siem.as_ref().map(|s| s.sink.clone()),
+        Some(cfg.admin_addr.clone()),
     ));
 
     let daemon_api_key = ["APP_LB_DAEMON_API_KEY", "HEYO_API_KEY"]
@@ -605,6 +700,11 @@ fn main() {
     // socket client reports `http://localhost` as its base URL, and the choice
     // is made from the environment rather than from app-lb's own config.
     tracing::info!(transport = %vms.transport(), "heyvm daemon transport");
+    // Both runtimes. Building this cannot fail and does no I/O: whether Incus is
+    // actually usable is asked once from the autoscaler's background service,
+    // where there is a runtime to await on. A host with no Incus is a fact about
+    // the host, not a misconfiguration — a fleet of microVMs never notices.
+    let runtime = runtime::Runtime::new(vms.clone(), cfg.lxc.clone());
     // Kept for the sweeper, which is built after the last move of `registry`.
     let mount_registry = registry.clone();
 
@@ -695,7 +795,7 @@ fn main() {
         "autoscaler",
         Autoscaler::new(
             registry.clone(),
-            vms.clone(),
+            runtime,
             metrics.clone(),
             event_feed.clone(),
             workspaces.clone(),
@@ -799,6 +899,18 @@ fn main() {
     });
     let acme_signal = acme_svc.as_ref().map(|svc| svc.task().signal());
 
+    match cfg.deploy_host_base() {
+        Some(base) => tracing::info!(
+            base = %base,
+            explicit = cfg.deploy_base_domain.is_some(),
+            "a deployment that names no host will be routed at <id>.{base}"
+        ),
+        None => tracing::info!(
+            "no deploy base domain (APP_LB_DEPLOY_BASE_DOMAIN or a wildcard); a hostless \
+             deployment is handled as before"
+        ),
+    }
+
     let admin_svc = background_service(
         "admin",
         AdminApi::new(
@@ -827,6 +939,8 @@ fn main() {
             acme_signal,
             secrets,
             workflows,
+            namespaces,
+            auth_providers.clone(),
             tokens,
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),
@@ -836,6 +950,7 @@ fn main() {
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
             event_feed.clone(),
             &cfg.public_ips,
+            cfg.deploy_host_base().map(str::to_string),
         ),
     );
 
@@ -850,6 +965,7 @@ fn main() {
             siem.as_ref().map(|s| s.sink.clone()),
             guard.clone(),
             event_feed,
+            auth_providers.clone(),
         ),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);

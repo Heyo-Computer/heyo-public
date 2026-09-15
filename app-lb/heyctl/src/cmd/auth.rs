@@ -116,12 +116,33 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
             bail!("an empty token will not authenticate against anything");
         }
         let client = Client::connect(&server, None, None, Some(&token), insecure, timeout)?;
-        match client.status_of("/deployments")? {
+        // The server's own words first, when it gave any: app-lb names the token,
+        // the scope and the deployment it does not admit, and the guesses below
+        // are only for a server that said nothing.
+        let (status, detail) = client.status_detail_of("/deployments")?;
+        if let Some(why) = detail.filter(|_| status == 401 || status == 403) {
+            bail!("{why}");
+        }
+        match status {
             200 => {}
-            401 => bail!("the server rejected this token"),
+            // 401 and 403 are the two halves of "this did not work", and
+            // conflating them costs an afternoon: 401 means nothing verified
+            // the token, 403 means something did and said no. They have
+            // completely different fixes, so they say completely different
+            // things.
+            401 => bail!(
+                "the server did not recognise this token. Either it is not this server's \
+                 token — one minted on a different app-lb, or copied incompletely — or a \
+                 sign-in gate in front answered before app-lb saw it, which is what \
+                 happens when the gate's `provider` does not list \"app-token\""
+            ),
             403 => bail!(
-                "the server knows this token but it may not list deployments here — a \
-                 namespace-scoped key must be used against its own namespace's door"
+                "the server knows this token but will not let it list deployments. Most \
+                 often its admin scope is `none`, which is the default in the dashboard's \
+                 mint form and reaches no admin route at all — mint one with `admin` \
+                 (`heyctl token mint <NAME> --admin admin --all-deployments`). Otherwise \
+                 it is scoped to particular deployments, or it is a namespace-scoped key \
+                 that has to be used against its own namespace's door"
             ),
             404 => bail!(
                 "{server} has no /deployments — for a Heyo cloud, the server is \

@@ -73,7 +73,10 @@
         "example.com"
       ],
       "public_paths": [
-        "/healthz"
+        {
+          "path": "/healthz",
+          "scope": "admin"
+        }
       ],
       "base_path": "/__applb/auth",
       "session_ttl_secs": 43200,
@@ -100,7 +103,8 @@
         "email_claim": "email",
         "name_claim": "name",
         "leeway_secs": 30,
-        "cookie": "heyo_access_token"
+        "cookie": "heyo_access_token",
+        "login_url": "https://auth.example.com/login"
       }
     }
   },

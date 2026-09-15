@@ -12,10 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use deadpool_postgres::Pool;
 use heyo_sdk::{HeyoError, P2pTunnel, Sandbox};
+use futures::StreamExt;
 use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, DiskGrowConfig, PressureConfig};
+use crate::config::{Config, PressureConfig};
 use crate::dedicated::{Credential, Credentials};
 use crate::dumpsrv::DumpServer;
 use crate::reclaim::{POST_STOP_RECLAIM_DELAY, RECLAIM_FIRST_DELAY, Reclaimer};
@@ -165,6 +166,15 @@ pub struct SchemaEntry {
     /// `last_active` is what marks the VM idle. Refreshed at checkout so an
     /// entry handed out but not yet counted in `active` isn't reaped mid-race.
     last_active: StdMutex<Instant>,
+    /// What this entry's own bring-up cost, measured from the moment it
+    /// cleared the admission queue to the moment Postgres was serving (see
+    /// `vm::ensure_vm`). The queue wait is excluded on purpose: it is a
+    /// function of how many other clients arrived at once, not of what this
+    /// VM costs to bring back.
+    ///
+    /// This is the price of *not* keeping the VM warm, so it is what the
+    /// reaper prices the idle timeout off — see [`Self::idle_budget`].
+    bringup_took: Duration,
 }
 
 impl SchemaEntry {
@@ -175,6 +185,7 @@ impl SchemaEntry {
         pool: Pool,
         keepalive: bool,
         slots: usize,
+        bringup_took: Duration,
     ) -> Self {
         Self {
             sandbox,
@@ -186,6 +197,7 @@ impl SchemaEntry {
             slot_limit: slots,
             active: AtomicUsize::new(0),
             last_active: StdMutex::new(Instant::now()),
+            bringup_took,
         }
     }
 
@@ -232,12 +244,128 @@ impl SchemaEntry {
             && self.last_active.lock().unwrap().elapsed() >= timeout
     }
 
+    /// How long this particular VM may sit idle before the reaper stops it —
+    /// see [`idle_budget`], which this hands its measured bring-up cost to.
+    fn idle_budget(
+        &self,
+        normal: Duration,
+        fast: Option<Duration>,
+        fast_bringup: Duration,
+    ) -> Duration {
+        idle_budget(self.bringup_took, normal, fast, fast_bringup)
+    }
 }
 
-/// Cap on VMs the idle reaper stops in one pass (oldest-idle first; the rest
-/// wait a tick). See [`SchemaRegistry::reap_idle`] for why mass stops are
-/// worse than a few extra minutes of warm RAM.
+/// Which idle timeout applies to a VM whose own bring-up took `bringup_took`.
+///
+/// The warm hold exists to spare the next client the bring-up, so it is priced
+/// off what that bring-up actually cost: a VM that came back in under
+/// `fast_bringup` — the daemon `start()` of a VM still on disk — gets `fast`,
+/// and everything else (a create, a spare claim that still had to `initdb`,
+/// any thaw) keeps the full `normal` budget. `fast` of `None` disables the
+/// two-speed behavior entirely.
+///
+/// Measured rather than inferred from whether the VM already existed, because
+/// the number that matters is what the *host* can do right now. When heyvmd is
+/// saturated a restart that is normally 200ms takes seconds — and that is
+/// exactly when a short timeout does damage, feeding stop/start work to a
+/// daemon already behind. Those bring-ups fail this test on their own and fall
+/// back to `normal`, so the reaper eases off under load with no extra knob and
+/// no load signal to calibrate.
+///
+/// Free-standing so the policy can be tested without building a `SchemaEntry`
+/// (which needs a live sandbox, tunnel and pool).
+fn idle_budget(
+    bringup_took: Duration,
+    normal: Duration,
+    fast: Option<Duration>,
+    fast_bringup: Duration,
+) -> Duration {
+    match fast {
+        Some(fast) if bringup_took <= fast_bringup => fast,
+        _ => normal,
+    }
+}
+
+/// Hard ceiling on one pass's stop allowance, above whatever the drain window
+/// asks for. This is daemon protection rather than smoothing — 24 stops, 8 at
+/// a time, is about as much as one heyvmd should be asked to absorb in a tick
+/// while it is also serving bring-ups. On a fleet big enough for the window to
+/// ask for more, this binds and the fleet simply drains over longer than the
+/// window, which is the safe direction to err.
 const IDLE_MAX_STOPS_PER_PASS: usize = 24;
+
+/// How many idle-stops run concurrently within one reaper pass.
+///
+/// A stop is almost entirely waiting — a guest `df`, a CHECKPOINT, the
+/// daemon's stop call — so serializing them made a pass cost the sum of every
+/// victim's worst case (tens of seconds each) and let one slow VM push the
+/// whole fleet past its idle deadline. Bounded rather than unleashed because
+/// the far end is one heyvmd, whose sandbox manager goes lock-contended before
+/// anything else does: a mass expiry must not become a burst of stop calls
+/// against the same daemon the clients are queued on. Eight finishes a full
+/// capped pass in three rounds even if every stop hits its worst case, and
+/// stays well under what a bring-up burst already asks of the daemon.
+const IDLE_STOP_CONCURRENCY: usize = 8;
+
+/// Floor on one pass's stop allowance, whatever the drain window works out to.
+///
+/// Without it a small fleet computes a fractional allowance and the reaper
+/// would take many passes to stop a handful of VMs — smoothing something that
+/// was never going to be a swing. Four per pass clears a small backlog in
+/// seconds and is far below any rate that shows up on a chart.
+const IDLE_MIN_STOPS_PER_PASS: usize = 4;
+
+/// Bound on the daemon's stop call for one idle-stopped VM.
+///
+/// The reaper used to await `Sandbox::stop()` with no timeout at all, so a
+/// single VM whose stop never returned (a lock-contended or wedged heyvmd —
+/// the exact condition under which the pooler most needs to be shedding VMs)
+/// parked the pass, and with it every other stop, indefinitely. Matches the
+/// untracked reaper's bound, which always had one.
+const IDLE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The same bound for the untracked reaper's stops, which always had one.
+const UNTRACKED_STOP_TIMEOUT: Duration = IDLE_STOP_TIMEOUT;
+
+/// How often the urgent device-grow watcher samples a warm schema that is not
+/// filling. A guest query per warm VM every few seconds is not survivable, so
+/// the bulk of the warm set is looked at once a minute. See
+/// [`SchemaRegistry::spawn_disk_grower`].
+const URGENT_GROW_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the urgent grower re-samples a schema that is filling, sits near
+/// the threshold, or has been sampled only once — and so how often its loop
+/// ticks. A minute is too slow for a bulk load: at 15–30 MB/s the last 5% of a
+/// 2GiB device goes in seconds, and a migration's copy ran straight past the
+/// urgent threshold into `No space left on device` between two samples. Only
+/// the schemas that earn it pay for this cadence.
+const URGENT_GROW_FAST_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Fill rate, between two samples, that puts a schema on the fast cadence.
+/// Well above what WAL churn and ordinary writes produce; a bulk load clears
+/// it by an order of magnitude.
+const URGENT_GROW_FILLING_BYTES_PER_SEC: f64 = 1024.0 * 1024.0;
+
+/// A schema within this many points of the urgent threshold is sampled on the
+/// fast cadence whatever its measured rate: one burst between two slow
+/// samples would otherwise carry it over.
+const URGENT_GROW_WATCH_MARGIN_PCT: f64 = 15.0;
+
+/// Added to the projection horizon for the stop itself: once a grow is
+/// decided, the guest keeps writing through the checkpoint and the daemon's
+/// stop.
+const URGENT_GROW_STOP_MARGIN: Duration = Duration::from_secs(10);
+
+/// Cap on devices the urgent grower resizes in one pass. Each one drops a
+/// schema's live sessions, so a pass that finds many trickles instead of
+/// restarting the whole warm set at once.
+const URGENT_GROW_MAX_PER_PASS: usize = 4;
+
+/// How many warm schemas the urgent grower samples at once. Each sample uses
+/// its own schema's housekeeping pool, so this bounds pooler-side concurrency
+/// only — it never puts two queries on one VM.
+const URGENT_GROW_SAMPLE_CONCURRENCY: usize = 8;
 
 /// Per-schema idle-timeout jitter: a deterministic factor in [0.85, 1.15)
 /// derived from the schema name. Clients that arrive (and go quiet) together
@@ -251,6 +379,41 @@ fn jittered_timeout(schema: &str, timeout: Duration) -> Duration {
     schema.hash(&mut h);
     let unit = (h.finish() % 1000) as f64 / 1000.0;
     timeout.mul_f64(0.85 + 0.30 * unit)
+}
+
+/// How many VMs one reaper pass may stop, given the live-tier fleet size.
+///
+/// This is the whole answer to the sawtooth. Idle reaping is deadline-driven,
+/// so a burst workload goes idle in a burst: with a 60s budget the ±15%
+/// per-schema jitter spreads a cohort's deadlines over about eighteen seconds,
+/// and every VM in it is due at once. What the reaper does with that backlog
+/// decides whether the fleet ramps down or falls off a cliff — and a flat
+/// per-pass cap does not decide it, because a cohort larger than the cap keeps
+/// the reaper saturated at cap-per-tick regardless of how the deadlines
+/// spread. Widening the jitter cannot fix that; only bounding the rate can.
+///
+/// So the allowance is `live × tick / window`: at most one window's worth of
+/// the fleet per window, i.e. a straight line of known gradient however
+/// synchronized the expiry. `live` is the live-tier schema count rather than
+/// the warm/running count on purpose — stopping a VM does not change its tier,
+/// so the divisor holds still for the length of a drain and the slope stays
+/// constant. Sizing off the running count instead makes the allowance shrink
+/// as the drain proceeds, which decays into a long tail: the last VMs of a
+/// 600-VM cohort would wait half an hour past a 60s budget.
+///
+/// Clamped both ways. [`IDLE_MIN_STOPS_PER_PASS`] keeps a small fleet from
+/// smoothing something that was never a swing; [`IDLE_MAX_STOPS_PER_PASS`] is
+/// the daemon's protection and binds on a fleet big enough to ask for more,
+/// which just means the drain takes longer than the window.
+///
+/// `window` of `None` disables the rate limit (the flat ceiling, as before).
+fn drain_allowance(live: usize, tick: Duration, window: Option<Duration>) -> usize {
+    let Some(window) = window.filter(|w| !w.is_zero()) else {
+        return IDLE_MAX_STOPS_PER_PASS;
+    };
+    // Rounded up so the allowance is never zero while any window is set.
+    let per_pass = (live as u128 * tick.as_millis()).div_ceil(window.as_millis().max(1)) as usize;
+    per_pass.clamp(IDLE_MIN_STOPS_PER_PASS, IDLE_MAX_STOPS_PER_PASS)
 }
 
 /// RAII marker for one in-flight client connection. Bumps the entry's active
@@ -345,6 +508,14 @@ pub struct EntrySnapshot {
     pub free_slots: usize,
     pub slot_limit: usize,
     pub idle_secs: u64,
+    /// The idle timeout that actually applies to this entry, which with
+    /// two-speed reaping is per-VM rather than the one configured number —
+    /// see [`idle_budget`]. `None` when idle reaping is off.
+    pub idle_budget_secs: Option<u64>,
+    /// What this entry's own bring-up cost, the input that chose that budget.
+    /// Surfaced so "why did this VM stop after a minute" is answerable from
+    /// the dashboard instead of the log.
+    pub bringup_ms: u128,
     pub keepalive: bool,
     pub tunneled: bool,
 }
@@ -389,6 +560,17 @@ pub struct SchemaRegistry {
     // Per-schema failure memory so the sweeps skip recently-failed offloads
     // instead of burning a ready-timeout on the same sick schemas every pass.
     offload_backoff: OffloadBackoff,
+    // Per-schema failure memory for the *urgent* device-grow path, kept
+    // separate from `offload_backoff` on purpose: a schema whose grow keeps
+    // failing must not thereby become un-offloadable, and vice versa. Also
+    // doubles as the rate limiter for the "at the cap, cannot help" complaint,
+    // which would otherwise repeat every pass forever.
+    grow_backoff: OffloadBackoff,
+    // The urgent grower's last disk sample per warm schema: what turns two
+    // samples into a fill rate and decides how soon to look again. Pruned to
+    // the warm set every pass; a grow forgets the schema, whose next bring-up
+    // starts a fresh baseline on the resized device.
+    urgent_samples: StdMutex<HashMap<String, GrowSample>>,
     /// Per-schema bring-up circuit breaker — see [`BringupBreaker`].
     bringup_breaker: BringupBreaker,
     // Single-flights the dashboard's purge action.
@@ -398,10 +580,32 @@ pub struct SchemaRegistry {
     // client may route here at all) and on every bring-up (so the owning role
     // exists inside the VM). Empty unless an operator has provisioned one.
     dedicated: Arc<Credentials>,
+    // Trusted peer nodes: how to reach another pooler's admin API, and the
+    // address a guest on this host dials to reach its pooler. Empty unless an
+    // operator has recorded one.
+    peers: Arc<crate::peers::PeerStore>,
+    // When each pairing's slot was first seen with no subscriber attached, and
+    // whether that has already been reported. Edge-triggered like the
+    // dashboard's webhook alerts: an inactive slot is a standing condition, so
+    // warning every tick would bury the journal instead of informing it.
+    repl_inactive: StdMutex<HashMap<String, (Instant, bool)>>,
+    // Last replication status sample per database, refreshed by
+    // `spawn_replication_monitor`. The dashboard renders from this rather than
+    // querying a VM, so a page load never disturbs what it is showing and a
+    // wedged VM cannot hang a render.
+    repl_status: StdMutex<HashMap<String, crate::replication::wire::StatusJson>>,
+    // Replication pairings, `database → (role, peer, state)`. Loaded even when
+    // the feature is disabled, because this is what holds the pin that keeps a
+    // replicating VM off the idle reaper and the offload ladder — see
+    // [`Self::pinned`].
+    replication: Arc<crate::replication::ReplStore>,
+    physical: Arc<crate::replication::PhysicalStore>,
+    physical_sources: Arc<crate::replication::PhysicalSourceStore>,
+    replication_ops: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SchemaRegistry {
-    pub fn new(cfg: Config) -> Self {
+    pub fn new(cfg: Config) -> Result<Self> {
         // Per-disk reclaim locks live under the run dir. Publish it once here:
         // the boot path is a free function with no access to the config.
         crate::reclaim::set_run_dir(cfg.run_dir.clone());
@@ -417,7 +621,13 @@ impl SchemaRegistry {
         let dumps = (cfg.freeze.is_some() || cfg.archive.is_some())
             .then(|| Arc::new(DumpServer::new(cfg.dump_net.dump_dir.clone())));
         let dedicated = Arc::new(Credentials::load(cfg.dedicated_file.clone()));
-        Self {
+        let peers = Arc::new(crate::peers::PeerStore::load(cfg.peers_file.clone()));
+        let replication = Arc::new(crate::replication::ReplStore::load(
+            cfg.replication_file.clone(),
+        ));
+        let physical = Arc::new(crate::replication::PhysicalStore::load(cfg.replication_file.with_extension("physical.json"))?);
+        let physical_sources = Arc::new(crate::replication::PhysicalSourceStore::load(cfg.replication_file.with_extension("physical-sources.json"))?);
+        Ok(Self {
             cfg,
             entries: Mutex::new(HashMap::new()),
             store,
@@ -428,10 +638,141 @@ impl SchemaRegistry {
             spares,
             dumps,
             offload_backoff: OffloadBackoff::new(),
+            grow_backoff: OffloadBackoff::new(),
+            urgent_samples: StdMutex::new(HashMap::new()),
             bringup_breaker: BringupBreaker::default(),
             purging: AtomicBool::new(false),
             dedicated,
+            peers,
+            replication,
+            physical,
+            physical_sources,
+            replication_ops: StdMutex::new(HashMap::new()),
+            repl_status: StdMutex::new(HashMap::new()),
+            repl_inactive: StdMutex::new(HashMap::new()),
+        })
+    }
+
+    /// The trusted peer nodes — what the replication API and dashboard mutate.
+    pub fn peers(&self) -> &Arc<crate::peers::PeerStore> {
+        &self.peers
+    }
+
+    /// The replication pairings this node is part of.
+    pub fn replication(&self) -> &Arc<crate::replication::ReplStore> {
+        &self.replication
+    }
+
+    pub fn physical(&self) -> &Arc<crate::replication::PhysicalStore> { &self.physical }
+    pub fn physical_sources(&self) -> &Arc<crate::replication::PhysicalSourceStore> { &self.physical_sources }
+    pub fn bound_vm_id(&self, database: &str) -> Option<String> { self.store.record(database).map(|r| r.sandbox_id) }
+
+    pub fn physical_admission_ready(&self, database: &str) -> bool {
+        let bound = self.bound_vm_id(database);
+        if bound.is_none() && (self.physical.get(database).is_some() || self.physical_sources.get(database).is_some()) { return false; }
+        !bound.as_deref().is_some_and(|id| self.physical_sources.has_grant_for_source_vm(database, id))
+            && !self.physical_source_fenced(database)
+            && self.physical.get(database).is_none_or(|r| {
+                if r.handoff_started() {
+                    r.phase == crate::replication::PhysicalPhase::Activated && r.candidate_id == bound
+                } else { r.previous_vm_id == bound }
+            })
+    }
+
+    pub fn physical_source_fenced(&self, database: &str) -> bool {
+        self.physical_sources.get(database).is_some_and(|r| r.fence.is_some()
+            && self.bound_vm_id(database).as_deref() == Some(r.source_vm_id.as_str()))
+    }
+
+    pub fn physical_reconnect_allowed(&self, database: &str, role: &str) -> bool {
+        let Some(source) = self.physical_sources.get(database) else { return false };
+        (source.handoff.is_some() || source.fence.is_some())
+            && (source.repl.as_ref().is_some_and(|login| login.role == role)
+                || self.replication.by_repl_role(role).is_some_and(|r| r.database == database && r.repl_role == role))
+            && self.bound_vm_id(database).as_deref() == Some(source.source_vm_id.as_str())
+    }
+
+    pub async fn commit_physical_binding(self: &Arc<Self>, database: &str, expected: &str, candidate: &str) -> Result<()> {
+        let reg = self.clone();
+        let (db, old, new) = (database.to_owned(), expected.to_owned(), candidate.to_owned());
+        tokio::task::spawn_blocking(move || reg.store.commit_handoff_binding(&db, &old, &new)).await??;
+        self.entries.lock().await.remove(database);
+        Ok(())
+    }
+
+    pub async fn exec_bound(&self, database: &str, expected_id: &str, command: &str, env: HashMap<String, String>) -> Result<()> {
+        let guard = self.checkout(database).await?;
+        if guard.entry().sandbox_id() != expected_id { bail!("database binding changed during physical preparation"); }
+        let result = vm::physical_exec(&self.cfg, &guard.entry().sandbox, command, env, "physical source setup").await?;
+        if result.exit_code != 0 { bail!("physical source guest setup failed (exit {})", result.exit_code); }
+        Ok(())
+    }
+
+    pub async fn replication_operation(&self, database: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self.replication_ops.lock().unwrap().entry(database.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
+        lock.lock_owned().await
+    }
+
+    /// Whether replication is enabled on this node (`PG_VM_POOL_REPLICATION`).
+    /// Gates the routes and new pairings only — existing records still pin.
+    pub fn replication_cfg(&self) -> Option<&crate::config::ReplicationConfig> {
+        self.cfg.replication.as_ref()
+    }
+
+    /// True when nothing may stop, compact, freeze, archive or purge this
+    /// schema's VM.
+    ///
+    /// The union of the operator's static `PG_VM_POOL_KEEPALIVE_SCHEMAS` pin
+    /// and the *dynamic* replication pin, and it replaces every bare
+    /// `cfg.is_keepalive` call on a lifecycle path. Stopping a replicated VM
+    /// costs more than the usual cold start: on a primary it drops the
+    /// walsender and leaves an inactive slot pinning WAL (which, unbounded,
+    /// fills the data disk — a cluster-wide PANIC), and on a replica it stops
+    /// consuming so the primary's slot backs up instead. Both are recoverable
+    /// only by a full re-seed, which is why this outranks every storage tier
+    /// including emergency disk-pressure eviction.
+    pub fn pinned(&self, schema: &str) -> bool {
+        self.cfg.is_keepalive(schema) || self.replication.is_pinned(schema)
+            || self.physical.reserves_database(schema) || self.physical_sources.get(schema).is_some()
+    }
+
+    /// [`Self::pin_reason`] for whichever schema currently binds VM `id`, so a
+    /// dashboard action keyed on a sandbox id can refuse without the caller
+    /// having to resolve the schema itself. `None` when the VM backs nothing
+    /// pinned.
+    pub fn pin_reason_for_vm(&self, id: &str) -> Option<String> {
+        if self.physical.owns_vm(id) || self.physical_sources.owns_vm(id)
+            || !self.physical.list().is_empty() {
+            // Also covers a create accepted by the daemon before its ID can be
+            // durably recorded. No manual unbound-VM cleanup during preparation.
+            return Some(format!("VM cleanup is reserved by physical replica preparation ({id})"));
         }
+        self.store_records()
+            .into_iter()
+            .find(|(_, r)| r.sandbox_id == id && r.tier == Tier::Live)
+            .and_then(|(schema, _)| self.pin_reason(&schema))
+    }
+
+    /// Why `schema` is pinned, for a dashboard refusal that tells the operator
+    /// what to do about it. `None` when it isn't.
+    pub fn pin_reason(&self, schema: &str) -> Option<String> {
+        if self.physical.reserves_database(schema) || self.physical_sources.get(schema).is_some() {
+            return Some(format!("{schema} is reserved by physical replication; ordinary lifecycle changes are disabled"));
+        }
+        if self.replication.is_fenced(schema) {
+            return Some(format!("{schema} is fenced for a planned switchover; explicitly unfence it first"));
+        }
+        if let Some(rec) = self.replication.get(schema).filter(|r| r.state.pins()) {
+            return Some(format!(
+                "{schema} is replicating ({} with peer {}); detach or promote it first",
+                rec.role.as_str(),
+                rec.peer
+            ));
+        }
+        self.cfg
+            .is_keepalive(schema)
+            .then(|| format!("{schema} is in PG_VM_POOL_KEEPALIVE_SCHEMAS"))
     }
 
     /// The provisioned dedicated-database credentials — the auth path's lookup
@@ -457,6 +798,49 @@ impl SchemaRegistry {
     /// this does; the VM is built by the first checkout, exactly like any other
     /// schema (callers that want it warm up front can follow with
     /// [`Self::spawn_provision`]).
+    /// Assemble everything a bring-up needs to know about `schema` that
+    /// [`Config`] cannot answer: the pin, the owning role, and the schema's
+    /// replication role and login.
+    ///
+    /// One place, so a new per-schema fact never has to be threaded through
+    /// `ensure_vm`'s callers again.
+    fn bring_up_for<'a>(
+        &self,
+        schema: &str,
+        owner: Option<&'a Credential>,
+        repl_login: Option<&'a Credential>,
+    ) -> vm::BringUp<'a> {
+        vm::BringUp {
+            pinned: self.pinned(schema),
+            owner,
+            replication: self
+                .replication
+                .get(schema)
+                .filter(|r| r.state.pins())
+                .map(|r| r.role),
+            repl_login,
+        }
+    }
+
+    /// The `REPLICATION` login that must exist inside `schema`'s VM, as a
+    /// [`Credential`] so it reuses `vm::ensure_role`'s create/align path.
+    ///
+    /// Only a **primary** has one: it is the credential a replica
+    /// authenticates *with*, so on the replica's own VM there is nothing for
+    /// it to log into. Returned owned; the caller holds it for the borrow that
+    /// [`Self::bring_up_for`] takes.
+    fn repl_login_for(&self, schema: &str) -> Option<Credential> {
+        self.replication
+            .get(schema)
+            .filter(|r| r.state.pins() && r.role == crate::replication::Role::Primary)
+            .map(|r| Credential {
+                database: r.database.clone(),
+                role: r.repl_role.clone(),
+                password: r.repl_password.clone(),
+                created_at: r.created_at,
+            })
+    }
+
     pub fn create_dedicated(
         &self,
         database: &str,
@@ -493,6 +877,319 @@ impl SchemaRegistry {
         });
     }
 
+    /// The pooler's configuration, for the replication flows that have to
+    /// build guest commands and per-database connections themselves.
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// Whether this node terminates client TLS. A primary refuses to hand a
+    /// replica a credential it would then send in cleartext.
+    pub fn tls_enabled(&self) -> bool {
+        self.cfg.tls_cert.is_some()
+    }
+
+    /// A superuser connection to `schema`'s **own** database, bringing its VM
+    /// up first if it isn't warm.
+    ///
+    /// The returned [`ConnGuard`] must be held for the length of the
+    /// operation: it is what keeps the idle reaper off the VM while the
+    /// caller is talking to it. `SchemaEntry::pool` cannot be used directly
+    /// for this — it is pinned to `postgres` — and publications,
+    /// subscriptions, grants and the replication status views are all
+    /// per-database objects.
+    pub async fn db_client(
+        self: &Arc<Self>,
+        schema: &str,
+    ) -> Result<(ConnGuard, deadpool_postgres::Object)> {
+        let guard = self.checkout(schema).await?;
+        let client = vm::db_client(&self.cfg, &guard.entry().target, schema)
+            .await
+            .with_context(|| format!("connecting to database {schema}"))?;
+        Ok((guard, client))
+    }
+
+    /// Connect to this VM's `postgres` maintenance database. This path is not
+    /// publicly routable by database name and remains usable while the tenant
+    /// database has `ALLOW_CONNECTIONS false`.
+    pub async fn maintenance_client(
+        &self,
+        schema: &str,
+    ) -> Result<(ConnGuard, deadpool_postgres::Object)> {
+        let expected_vm = self.physical_sources.get(schema).filter(|r| r.fence.is_some()
+            && self.bound_vm_id(schema).as_deref() == Some(r.source_vm_id.as_str())).map(|r| r.source_vm_id)
+            .or_else(|| self.replication.get(schema).and_then(|r| r.fence).map(|f| f.vm_id))
+            .with_context(|| format!("refusing maintenance bypass for unfenced database {schema}"))?;
+        let record = self.store.record(schema)
+            .with_context(|| format!("fenced database {schema} has no durable VM binding"))?;
+        if record.tier != Tier::Live { bail!("fenced database {schema} is not on a live VM"); }
+        if !expected_vm.is_empty() && expected_vm != record.sandbox_id {
+            bail!("fenced database {schema} VM identity changed");
+        }
+        let cell = self.entries.lock().await.entry(schema.to_string())
+            .or_insert_with(|| Arc::new(OnceCell::new())).clone();
+        if let Some(entry) = cell.get() && entry.sandbox_id() != record.sandbox_id {
+            bail!("warm VM identity differs from the durable fenced VM binding");
+        }
+        let entry = cell.get_or_try_init(|| vm::ensure_fenced_vm(&self.cfg, schema, &record.sandbox_id)).await?;
+        let guard = ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await
+            .with_context(|| format!("maintenance connection slots exhausted for {schema}"))?;
+        let client = guard
+            .entry()
+            .pool
+            .get()
+            .await
+            .with_context(|| format!("connecting to maintenance database for {schema}"))?;
+        Ok((guard, client))
+    }
+
+    /// Make `schema`'s running VM match the replication role now recorded for
+    /// it — planting the durable marker and, when the WAL level has to change,
+    /// restarting Postgres inside the guest.
+    ///
+    /// The bring-up path already does this ([`vm::ensure_vm`] calls
+    /// `ensure_replication_mode`), but that only runs on a *cold* start. A
+    /// pairing is set up against a database that is normally already warm, so
+    /// without this the primary would keep serving at `wal_level = minimal`
+    /// until something happened to evict it — and `CREATE PUBLICATION` would
+    /// succeed while nothing could ever stream from it.
+    ///
+    /// Implemented as evict-then-checkout rather than a bespoke path, so the
+    /// mode is applied by exactly the same code a cold start uses. The
+    /// `archiving` claim is held throughout for the reason every other
+    /// multi-step VM operation holds it: it is what stops the offload pacer,
+    /// the pressure pass and the dashboard's buttons from picking this schema
+    /// out from under a half-finished restart.
+    pub async fn apply_replication_mode(self: &Arc<Self>, schema: &str) -> Result<()> {
+        let claim = ArchivingGuard::claim(&self.archiving, schema)
+            .with_context(|| format!("schema {schema} is busy with another offload or restart"))?;
+        // Drop the warm entry so the next checkout re-runs the full bring-up
+        // (which reattaches to the same VM by id — nothing is stopped here).
+        let cell = self.entries.lock().await.get(schema).cloned();
+        if let Some(cell) = cell {
+            self.evict(schema, &cell).await;
+        }
+        let _guard = self
+            .checkout_inner(schema, Some(&claim))
+            .await
+            .with_context(|| format!("bringing schema {schema} up in its new replication mode"))?;
+        Ok(())
+    }
+
+    /// The last status sample for `database`, or `None` if it has not been
+    /// sampled yet.
+    pub fn replication_status_cached(
+        &self,
+        database: &str,
+    ) -> Option<crate::replication::wire::StatusJson> {
+        self.repl_status.lock().unwrap().get(database).cloned()
+    }
+
+    /// Sample one pairing now: this node's own side over its VM, plus the
+    /// peer's side over its admin API.
+    ///
+    /// Neither half is allowed to fail the whole sample. A primary whose peer
+    /// is unreachable still reports its own slot — which is precisely the
+    /// situation where the slot's retained WAL is the number that matters.
+    pub async fn sample_replication(
+        self: &Arc<Self>,
+        rec: &crate::replication::ReplRecord,
+    ) -> crate::replication::wire::StatusJson {
+        let mut out = crate::replication::wire::StatusJson {
+            record: rec.into(),
+            primary: None,
+            replica: None,
+            peer_error: None,
+        };
+        match crate::replication::orchestrate::local_status(self, rec).await {
+            Ok((p, r)) => {
+                out.primary = p;
+                out.replica = r;
+            }
+            Err(e) => out.peer_error = Some(format!("local: {e:#}")),
+        }
+        // The peer's half, best-effort and timeout-bounded.
+        if let (Some(peer), Some(cfg)) = (self.peers.get(&rec.peer), self.cfg.replication.as_ref())
+            && let Ok(client) =
+                crate::replication::peer::PeerClient::new(peer, cfg.peer_timeout)
+        {
+            match client.status(&rec.database).await {
+                Ok(remote) => {
+                    // Fill in whichever side we are not.
+                    if out.primary.is_none() {
+                        out.primary = remote.primary;
+                    }
+                    if out.replica.is_none() {
+                        out.replica = remote.replica;
+                    }
+                }
+                Err(e) => out.peer_error = Some(format!("peer {}: {e:#}", rec.peer)),
+            }
+        }
+        self.repl_status
+            .lock()
+            .unwrap()
+            .insert(rec.database.clone(), out.clone());
+        out
+    }
+
+    /// Background sampler for every live pairing.
+    ///
+    /// Besides feeding the dashboard, this is the thing that shouts before a
+    /// replication slot becomes a disk-full PANIC. An inactive slot pins WAL
+    /// on the primary's data disk indefinitely; the guest's
+    /// `max_slot_wal_keep_size` is the hard backstop (it invalidates the slot
+    /// instead of filling the disk), and this is the warning that arrives
+    /// first, while the pairing is still savable.
+    ///
+    /// No-op when nothing is replicating or `PG_VM_POOL_REPL_MONITOR_SECS=0`.
+    pub fn spawn_replication_monitor(self: &Arc<Self>) {
+        let Some(interval) = self.cfg.replication.as_ref().and_then(|c| c.monitor_interval) else {
+            return;
+        };
+        let registry = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                registry.replication_pass().await;
+            }
+        });
+    }
+
+    async fn replication_pass(self: &Arc<Self>) {
+        let Some(cfg) = self.cfg.replication.as_ref() else {
+            return;
+        };
+        for rec in self.replication.list() {
+            if !rec.state.pins() {
+                continue;
+            }
+            let s = self.sample_replication(&rec).await;
+
+            // Promote Syncing -> Active once the initial copy has finished.
+            if let Some(r) = s.replica.as_ref()
+                && rec.state == crate::replication::State::Syncing
+                && r.worker_running
+                && (r.tables_total == 0 || r.tables_ready == r.tables_total)
+            {
+                let _ = self.replication.set_state(
+                    &rec.database,
+                    crate::replication::State::Active,
+                    "streaming",
+                );
+            }
+
+            let Some(p) = s.primary.as_ref() else { continue };
+            // `wal_status` leaving `reserved` means WAL the subscriber still
+            // needs is at risk; `lost` means it is already gone and the
+            // replica has to be rebuilt from scratch.
+            if let Some(w) = p.wal_status.as_deref()
+                && w != "reserved"
+            {
+                let msg = format!(
+                    "{}: replication slot {} is {w} — {}",
+                    rec.database,
+                    rec.slot,
+                    if w == "lost" {
+                        "WAL the replica needed has been removed; it must be re-seeded"
+                    } else {
+                        "the slot is retaining WAL past max_wal_size"
+                    }
+                );
+                warn!("{msg}");
+                crate::events::journal_error("replication", msg);
+                if w == "lost" {
+                    let _ = self.replication.set_state(
+                        &rec.database,
+                        crate::replication::State::Failed,
+                        "the replication slot was invalidated (wal_status=lost)",
+                    );
+                }
+            }
+            self.note_slot_activity(&rec, p, cfg);
+        }
+    }
+
+    /// Track how long a slot has had no subscriber, and say so once when that
+    /// becomes worth acting on.
+    ///
+    /// This is the warning that arrives *before* the guest's
+    /// `max_slot_wal_keep_size` fires. Two independent triggers, because they
+    /// catch different failures: a slot pinning a lot of WAL is the one about
+    /// to fill the data disk, while a slot that has simply been unattached for
+    /// a long time is a replica that has quietly gone away and will pin WAL
+    /// eventually. Edge-triggered — reported once per outage and re-armed when
+    /// a subscriber comes back — so a standing condition informs the journal
+    /// rather than burying it.
+    fn note_slot_activity(
+        &self,
+        rec: &crate::replication::ReplRecord,
+        p: &crate::replication::wire::PrimaryStatus,
+        cfg: &crate::config::ReplicationConfig,
+    ) {
+        let mut seen = self.repl_inactive.lock().unwrap();
+        if p.slot_active {
+            if seen.remove(&rec.database).is_some() {
+                info!("{}: a subscriber is attached to slot {} again", rec.database, rec.slot);
+            }
+            return;
+        }
+        let now = Instant::now();
+        let (since, warned) = seen
+            .entry(rec.database.clone())
+            .or_insert_with(|| (now, false));
+        if *warned {
+            return;
+        }
+        let idle = now.duration_since(*since);
+        let behind = p.behind_bytes.unwrap_or(0).max(0) as u64;
+        let reason = if behind >= cfg.lag_warn_bytes {
+            format!("it is pinning {} of WAL", crate::orphans::human_iec(behind))
+        } else if idle >= cfg.slot_stale {
+            format!("it has had none for {} minutes", idle.as_secs() / 60)
+        } else {
+            return;
+        };
+        *warned = true;
+        drop(seen);
+        let msg = format!(
+            "{}: no subscriber is attached to replication slot {} and {reason}. An inactive \
+             slot retains WAL on this VM's data disk indefinitely, and a full data disk is a \
+             cluster-wide PANIC — max_slot_wal_keep_size will invalidate the slot (forcing a \
+             re-seed) before that happens. Detach the pairing if the replica is gone for good.",
+            rec.database, rec.slot
+        );
+        warn!("{msg}");
+        crate::events::journal_error("replication", msg);
+    }
+
+    /// Warm every VM a replication pairing depends on, once, at startup.
+    ///
+    /// Two things need this. The obvious one: a pairing only replicates while
+    /// both VMs are up, and after a pooler restart nothing has checked them
+    /// out. The subtler one: `reap_untracked` classifies a running VM with no
+    /// warm entry as untracked and stops it, so until a pinned schema is in
+    /// the entry map it is a stop waiting to happen — the pin there is a
+    /// guard, this is what makes it unnecessary.
+    ///
+    /// Each is an ordinary background checkout through the same gates as a
+    /// client's, so this cannot storm the daemon; a failure is logged and left
+    /// for the next attempt, exactly like [`Self::spawn_provision`].
+    pub fn spawn_replication_pinner(self: &Arc<Self>) {
+        let pinned = self.replication.pinned_databases();
+        if pinned.is_empty() {
+            return;
+        }
+        info!(
+            "replication: warming {} pinned VM(s): {}",
+            pinned.len(),
+            pinned.join(", ")
+        );
+        for schema in pinned {
+            self.spawn_provision(&schema);
+        }
+    }
+
     /// Sandbox ids currently bound to a schema — the exclusion set that keeps
     /// the spare pool from handing out a VM some schema already owns (a spare
     /// keeps its `spare-pg-*` name after being claimed, so the name alone
@@ -501,10 +1198,43 @@ impl SchemaRegistry {
         self.store.bound_ids()
     }
 
-    /// Password clients must present before the pooler proxies them anywhere;
-    /// `None` if `PG_VM_POOL_PASSWORD` is unset (no client auth gate).
-    pub fn client_password(&self) -> Option<&str> {
-        self.cfg.pg_password.as_deref()
+    /// Which password this client must prove, decided from its **role**
+    /// alone — the property [`Credentials::challenge_password`] exists to
+    /// preserve, extended to cover replication logins.
+    ///
+    /// Order: a replication login is challenged with its own password, then a
+    /// dedicated one with its own, then everyone else with the shared
+    /// `PG_VM_POOL_PASSWORD` (`None` = no gate). Keeping the requested
+    /// database out of this step is what makes the handshake look identical
+    /// whatever was asked for, so a prober cannot enumerate provisioned names
+    /// by watching which connections get challenged.
+    pub fn challenge_password_for(&self, role: &str) -> Option<String> {
+        if let Some(source) = self.physical_sources.by_repl_role(role) {
+            return source.repl.map(|login| login.password);
+        }
+        challenge_password_in(
+            &self.replication,
+            &self.dedicated,
+            self.cfg.pg_password.as_deref(),
+            role,
+        )
+    }
+
+    /// Resolve an *authenticated* client's VM, rejecting unauthorized routes.
+    ///
+    /// A replication login is pinned to its own database exactly as a
+    /// dedicated one is — and it has to be resolved **first**, because
+    /// `Credentials::authorize` would otherwise reject it under the "this
+    /// database is dedicated, only its own role may open it" rule, which is
+    /// precisely the database it is trying to reach.
+    pub fn authorize_route(&self, role: &str, database: &str, physical: bool) -> Result<String, String> {
+        if physical && let Some(source) = self.physical_sources.by_repl_role(role) {
+            if self.bound_vm_id(&source.database).as_deref() != Some(source.source_vm_id.as_str()) {
+                return Err("physical source no longer owns the serving binding".into());
+            }
+            return Ok(source.database);
+        }
+        authorize_route_in(&self.replication, &self.dedicated, role, database, physical)
     }
 
     /// The configured idle-reaping timeout (`None` when reaping is disabled), so
@@ -639,6 +1369,11 @@ impl SchemaRegistry {
                     free_slots: e.free_slots(),
                     slot_limit: e.slot_limit(),
                     idle_secs: e.idle_for().as_secs(),
+                    idle_budget_secs: self.cfg.idle_timeout.map(|t| {
+                        e.idle_budget(t, self.cfg.idle_timeout_fast, self.cfg.fast_bringup)
+                            .as_secs()
+                    }),
+                    bringup_ms: e.bringup_took.as_millis(),
                     keepalive: e.keepalive,
                     tunneled: e.is_tunneled(),
                 })
@@ -730,6 +1465,48 @@ impl SchemaRegistry {
     /// The returned guard keeps the VM off the reaper's radar until dropped.
     /// Concurrent callers for the same schema share one bring-up.
     pub async fn checkout(&self, schema: &str) -> Result<ConnGuard> {
+        // An outgoing grant/fence takes precedence over the older activation
+        // that originally made this same VM a writer.
+        if self.physical_source_fenced(schema) {
+            return self.maintenance_client(schema).await.map(|(guard, _)| guard);
+        }
+        if self.bound_vm_id(schema).as_deref().is_some_and(|id| self.physical_sources.has_grant_for_source_vm(schema, id)) {
+            if self.replication.is_fenced(schema) {
+                return self.maintenance_client(schema).await.map(|(guard, _)| guard);
+            }
+            bail!("physical source grant lost its fence; refusing ordinary checkout");
+        }
+        if let Some(rec) = self.physical.get(schema).filter(|r| r.handoff_started()) {
+            if rec.phase != crate::replication::PhysicalPhase::Activated {
+                bail!("physical handoff for {schema} is incomplete; admission remains closed");
+            }
+            let candidate = rec.candidate_id.context("activated handoff lost candidate identity")?;
+            if self.bound_vm_id(schema).as_deref() != Some(candidate.as_str()) {
+                bail!("activated physical handoff binding mismatch");
+            }
+            let cell = self.entries.lock().await.entry(schema.to_string()).or_insert_with(|| Arc::new(OnceCell::new())).clone();
+            let entry = cell.get_or_try_init(|| vm::ensure_fenced_vm(&self.cfg, schema, &candidate)).await?;
+            if entry.sandbox_id() != candidate { bail!("warm physical handoff binding mismatch"); }
+            return ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await
+                .context("physical handoff connection slots exhausted");
+        }
+        if self.replication.is_fenced(schema) {
+            // Status polling and startup warming must not take the normal
+            // restore/grant path for a fenced database either.
+            return self.maintenance_client(schema).await.map(|(guard, _)| guard);
+        }
+        if !self.physical_admission_ready(schema) { bail!("physical preparation binding mismatch; refusing ordinary checkout"); }
+        self.checkout_inner(schema, None).await
+    }
+
+    /// Check out while this caller owns this schema's maintenance claim. The
+    /// borrowed claim is both the authority to pass the archiving wait and the
+    /// lifetime proof that exclusion remains held through the checkout.
+    async fn checkout_inner(
+        &self,
+        schema: &str,
+        claim: Option<&ArchivingGuard<'_>>,
+    ) -> Result<ConnGuard> {
         // Refresh durable activity up front so the S3 eviction sweep sees this
         // schema as recently used even long after its VM leaves the warm map
         // (the in-memory `SchemaEntry::last_active` doesn't survive that).
@@ -742,7 +1519,9 @@ impl SchemaRegistry {
             // completely silent — a client parked here for a whole offload
             // read as unexplained connect latency — so name it, once, and
             // account for it when it ends.
-            if self.is_archiving(schema) {
+            if self.is_archiving(schema)
+                && !claim.is_some_and(|c| c.owns(&self.archiving, schema))
+            {
                 if offload_waited.is_none() {
                     offload_waited = Some(Instant::now());
                     info!(
@@ -869,6 +1648,8 @@ impl SchemaRegistry {
             // VM serves it — including one a restore has just rebuilt from
             // scratch, which carries the data but no roles.
             let owner = self.owner_of(schema);
+            let repl_login = self.repl_login_for(schema);
+            let up = self.bring_up_for(schema, owner.as_ref(), repl_login.as_ref());
             match cell
                 .get_or_try_init(|| {
                     vm::ensure_vm(
@@ -876,8 +1657,12 @@ impl SchemaRegistry {
                         schema,
                         known_id.as_deref(),
                         restore.as_ref(),
+                        // How big this schema's data device was when it was
+                        // last seen. Only a restore that has to build the VM
+                        // reads it, and only there does it matter.
+                        record.as_ref().map(|r| r.disk_gb).filter(|gb| *gb > 0),
                         self.spares.as_deref().map(|p| (p, &*bound)),
-                        owner.as_ref(),
+                        &up,
                     )
                 })
                 .await
@@ -1025,7 +1810,12 @@ impl SchemaRegistry {
     /// lands between the listing and the map check is never stopped
     /// mid-flight. Unbound running VMs (no live registry row) are left
     /// alone: the purge owns offloaded-tier leftovers and anything else is
-    /// not the pooler's to stop. Same cadence as the idle reaper.
+    /// not the pooler's to stop. Same cadence as the idle reaper, and the same
+    /// [`drain_allowance`] rate limit — this pass needs it even more than the
+    /// idle reaper does, because after a pooler restart its population is the
+    /// *entire running fleet* at once (the warm map starts empty, so every
+    /// running VM is untracked by definition). Uncapped, that made every
+    /// deploy stop the whole fleet about two passes later.
     pub fn spawn_untracked_reaper(self: &Arc<Self>) {
         let Some(timeout) = self.cfg.idle_timeout else {
             return; // idle reaping off ⇒ the operator wants VMs left running
@@ -1038,14 +1828,14 @@ impl SchemaRegistry {
             let suspects = suspects.clone();
             async move {
                 let mut suspects = suspects.lock().await;
-                registry.reap_untracked(&mut suspects).await
+                registry.reap_untracked(&mut suspects, tick).await
             }
         }));
     }
 
     /// One reconciler pass — see [`Self::spawn_untracked_reaper`]. Returns
     /// how many VMs were stopped.
-    async fn reap_untracked(&self, suspects: &mut HashSet<String>) -> usize {
+    async fn reap_untracked(&self, suspects: &mut HashSet<String>, tick: Duration) -> usize {
         let infos = match vm::list_with_retry().await {
             Ok(l) => l,
             Err(e) => {
@@ -1068,6 +1858,12 @@ impl SchemaRegistry {
         let mut seen_now: HashSet<String> = HashSet::new();
         let mut stopped = 0usize;
         let mut superseded_seen = 0usize;
+        // `(id, schema, superseded)` for every VM confirmed untracked on two
+        // consecutive passes — collected first, then rate-limited and stopped
+        // below rather than stopped inline, which is what made this pass a
+        // fleet-wide cliff.
+        let mut confirmed: Vec<(String, String, bool)> = Vec::new();
+        let allowance = drain_allowance(self.store.live_count(), tick, self.cfg.idle_drain_window);
         for info in infos
             .iter()
             .filter(|i| i.status == heyo_sdk::SandboxStatus::Running)
@@ -1103,34 +1899,83 @@ impl SchemaRegistry {
             if self.is_archiving(schema) || crate::pending::get(schema).as_deref() == Some(&info.id) {
                 continue;
             }
+            // A pinned schema's VM must stay up even when nothing has checked
+            // it out yet. This is the exclusion that actually bites: after a
+            // pooler restart the warm-entry map is empty until the first
+            // client connects, so a replicating VM looks "untracked" and would
+            // be stopped here — breaking the pairing on every restart, with
+            // only a routine idle-stop line in the log to explain it.
+            // `spawn_replication_pinner` warms these at startup so this is a
+            // belt-and-braces guard, not the only one.
+            if !superseded && self.pinned(schema) {
+                continue;
+            }
             if superseded {
                 superseded_seen += 1;
             }
+            // Every current suspect is recorded, including any this pass will
+            // not get to: that is what keeps a deferred VM *confirmed* rather
+            // than restarting its two-pass clock every time the allowance
+            // runs out.
             seen_now.insert(info.id.clone());
             if !suspects.contains(&info.id) {
                 continue; // first sighting: confirm next pass
             }
+            confirmed.push((info.id.clone(), schema.to_string(), superseded));
+        }
+        // Rate-limited exactly like the idle reaper, for a sharper version of
+        // the same reason. This pass's whole population appears at once after a
+        // pooler restart — the warm map starts empty, so every running VM is
+        // untracked by definition — and stopping all of them was a fleet-wide
+        // cliff two passes (~2.5 min) after every deploy. Oldest-first has no
+        // meaning here, so the daemon's own listing order decides; the excess
+        // stays confirmed and goes next pass.
+        let deferred = confirmed.len().saturating_sub(allowance);
+        confirmed.truncate(allowance);
+        if deferred > 0 {
             info!(
-                "untracked-reaper: VM {} (schema {schema}{}) is running with no warm entry \
-                 and no bring-up in flight on two consecutive passes — stopping it so the \
-                 idle/offload ladder can reclaim it",
-                info.id,
-                if superseded { ", superseded duplicate" } else { "" }
+                "untracked-reaper: stopping {} untracked VM(s) this pass, deferring \
+                 {deferred} to keep the fleet ramping down instead of falling off a cliff \
+                 (PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS)",
+                confirmed.len()
             );
-            match heyo_sdk::Sandbox::connect(info.id.clone(), vm::local_opts()) {
-                Ok(sb) => match tokio::time::timeout(Duration::from_secs(30), sb.stop()).await {
-                    Ok(Ok(())) => {
-                        stopped += 1;
-                        crate::events::journal_info(
-                            "untracked",
-                            format!("schema {schema}: stopped untracked running VM {}", info.id),
-                        );
+        }
+        let mut stops = futures::stream::iter(confirmed.into_iter().map(
+            |(id, schema, superseded)| async move {
+                info!(
+                    "untracked-reaper: VM {id} (schema {schema}{}) is running with no warm \
+                     entry and no bring-up in flight on two consecutive passes — stopping it \
+                     so the idle/offload ladder can reclaim it",
+                    if superseded { ", superseded duplicate" } else { "" }
+                );
+                match heyo_sdk::Sandbox::connect(id.clone(), vm::local_opts()) {
+                    Ok(sb) => {
+                        match tokio::time::timeout(UNTRACKED_STOP_TIMEOUT, sb.stop()).await {
+                            Ok(Ok(())) => {
+                                crate::events::journal_info(
+                                    "untracked",
+                                    format!(
+                                        "schema {schema}: stopped untracked running VM {id}"
+                                    ),
+                                );
+                                return true;
+                            }
+                            Ok(Err(e)) => {
+                                warn!("untracked-reaper: stopping {id} failed: {e:#}")
+                            }
+                            Err(_) => warn!("untracked-reaper: stopping {id} timed out"),
+                        }
                     }
-                    Ok(Err(e)) => warn!("untracked-reaper: stopping {} failed: {e:#}", info.id),
-                    Err(_) => warn!("untracked-reaper: stopping {} timed out", info.id),
-                },
-                Err(e) => warn!("untracked-reaper: connecting to {} failed: {e:#}", info.id),
-            }
+                    Err(e) => warn!("untracked-reaper: connecting to {id} failed: {e:#}"),
+                }
+                false
+            },
+        ))
+        // Serially these cost up to UNTRACKED_STOP_TIMEOUT each, so a full
+        // allowance could outlast several ticks and pile passes up behind it.
+        .buffer_unordered(IDLE_STOP_CONCURRENCY);
+        while let Some(ok) = stops.next().await {
+            stopped += usize::from(ok);
         }
         if !seen_now.is_empty() && stopped == 0 {
             info!(
@@ -1154,7 +1999,19 @@ impl SchemaRegistry {
             info!("idle reaping disabled (PG_VM_POOL_IDLE_TIMEOUT_SECS=0)");
             return;
         };
-        info!("idle reaper: stopping VMs after {timeout:?} without connections");
+        match self.cfg.idle_timeout_fast {
+            Some(fast) => info!(
+                "idle reaper: stopping VMs after {timeout:?} without connections, or {fast:?} \
+                 for a VM whose own bring-up took <= {:?} (a restart of a VM still on disk — \
+                 keeping one of those warm buys the next client almost nothing)",
+                self.cfg.fast_bringup
+            ),
+            None => info!(
+                "idle reaper: stopping VMs after {timeout:?} without connections \
+                 (PG_VM_POOL_IDLE_TIMEOUT_FAST_SECS=0: no short timeout for \
+                 cheap-to-restart VMs)"
+            ),
+        }
         match self.cfg.disk_grow {
             Some(g) => info!(
                 "disk growth: at idle-stop, devices spanned by a >= {:.0}%-full data fs \
@@ -1165,49 +2022,82 @@ impl SchemaRegistry {
         }
         let registry = self.clone();
         // Check a few times per timeout window so shutdown lands close to the
-        // deadline, but not so often it busies the daemon.
-        let tick = (timeout / 4).max(Duration::from_secs(5));
+        // deadline, but not so often it busies the daemon. Paced off the
+        // SHORTEST budget in play: with a 60s fast timeout under a 900s normal
+        // one, a 225s tick would let every cheap VM overshoot its deadline by
+        // more than the deadline itself.
+        let shortest = self.cfg.idle_timeout_fast.unwrap_or(timeout).min(timeout);
+        let tick = (shortest / 4).max(Duration::from_secs(5));
+        match self.cfg.idle_drain_window {
+            Some(w) => info!(
+                "idle reaper: draining at most the whole live fleet per {w:?} \
+                 ({IDLE_MIN_STOPS_PER_PASS}–{IDLE_MAX_STOPS_PER_PASS} VMs per {tick:?} pass) — \
+                 a synchronized expiry ramps down instead of falling off a cliff \
+                 (PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS)"
+            ),
+            None => info!(
+                "idle reaper: drain rate limit disabled — up to \
+                 {IDLE_MAX_STOPS_PER_PASS} VMs stop per {tick:?} pass \
+                 (PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS=0)"
+            ),
+        }
         // Reaper `tick` is already short, so first pass and steady state match.
         tokio::spawn(supervise("idle-reaper", tick, tick, move || {
             let registry = registry.clone();
-            async move { registry.reap_idle(timeout).await }
+            async move { registry.reap_idle(timeout, tick).await }
         }));
     }
 
-    /// Evict and stop idle VMs — at most [`IDLE_MAX_STOPS_PER_PASS`] per
-    /// pass, oldest-idle first. Eviction (removing the map cell) happens
-    /// under the lock so a concurrent `checkout` either sees the entry before
-    /// eviction (and bumps `active`, sparing it) or misses it and brings up a
-    /// fresh VM. The actual stop happens after the lock is released.
+    /// Evict and stop idle VMs — at most [`drain_allowance`] of them per pass,
+    /// oldest-idle first. Eviction (removing the map cell) happens under the
+    /// lock so a concurrent `checkout` either sees the entry before eviction
+    /// (and bumps `active`, sparing it) or misses it and brings up a fresh VM.
+    /// The actual stop happens after the lock is released.
     ///
-    /// The cap plus the per-schema timeout jitter (see [`jittered_timeout`])
-    /// keep a cohort of VMs that went idle together — clients that arrived in
-    /// one burst — from all stopping in one pass: an uncapped mass stop reads
-    /// as "the fleet fell off a cliff" on the dashboard, floods the post-stop
-    /// reclaim trigger with hundreds of disks at once, and converts into a
-    /// synchronized cold-start (and spare-claim) storm when those schemas
-    /// return. The excess stays warm one more tick.
+    /// Each entry is judged against its own budget — see [`idle_budget`] — so
+    /// a VM that is cheap to restart expires on the short timeout while one
+    /// that cost a create or a thaw keeps the full warm hold.
+    ///
+    /// The per-pass allowance is what keeps a *synchronized* expiry from
+    /// becoming a cliff. Clients arrive in bursts and go idle in bursts, and
+    /// the per-schema jitter (see [`jittered_timeout`]) only spreads a
+    /// cohort's deadlines by ±15% — eighteen seconds on a 60s budget. Stopping
+    /// all of them as fast as the daemon will take them reads as "the fleet
+    /// fell off a cliff" on the dashboard, hands the post-stop reclaim trigger
+    /// hundreds of disks at once, and converts into a synchronized cold-start
+    /// (and spare-claim) storm when those schemas come back. The allowance
+    /// turns it into a ramp of known gradient; the excess waits a tick and is
+    /// picked up oldest-first, so nothing is forgotten, only paced.
     ///
     /// Returns how many VMs were stopped, for the supervisor's heartbeat.
-    async fn reap_idle(&self, timeout: Duration) -> usize {
+    async fn reap_idle(self: &Arc<Self>, timeout: Duration, tick: Duration) -> usize {
+        let fast = self.cfg.idle_timeout_fast;
+        let fast_bringup = self.cfg.fast_bringup;
+        // Sized from the durable live-tier count, not the warm map: see
+        // [`drain_allowance`] for why the divisor must not shrink mid-drain.
+        let allowance = drain_allowance(self.store.live_count(), tick, self.cfg.idle_drain_window);
         let mut victims: Vec<(String, Arc<SchemaEntry>)> = Vec::new();
         let deferred;
         {
             let mut map = self.entries.lock().await;
             // Collect every expired entry with its idle age, then take only
-            // the oldest-idle CAP of them out of the map.
+            // the oldest-idle CAP of them out of the map. Each entry is judged
+            // against its OWN budget (see `SchemaEntry::idle_budget`), so a
+            // cheap-to-restart VM expires on the short timeout while one that
+            // cost a create or a thaw keeps the full warm hold.
             let mut expired: Vec<(String, Duration)> = map
                 .iter()
                 .filter_map(|(schema, cell)| {
                     let entry = cell.get()?;
+                    let budget = entry.idle_budget(timeout, fast, fast_bringup);
                     entry
-                        .is_idle(jittered_timeout(schema, timeout))
+                        .is_idle(jittered_timeout(schema, budget))
                         .then(|| (schema.clone(), entry.idle_for()))
                 })
                 .collect();
             expired.sort_by_key(|(_, idle)| std::cmp::Reverse(*idle));
-            deferred = expired.len().saturating_sub(IDLE_MAX_STOPS_PER_PASS);
-            for (schema, _) in expired.into_iter().take(IDLE_MAX_STOPS_PER_PASS) {
+            deferred = expired.len().saturating_sub(allowance);
+            for (schema, _) in expired.into_iter().take(allowance) {
                 if let Some(entry) = map.get(&schema).and_then(|cell| cell.get()).cloned() {
                     map.remove(&schema);
                     victims.push((schema, entry));
@@ -1216,7 +2106,9 @@ impl SchemaRegistry {
         }
         if deferred > 0 {
             info!(
-                "idle reaper: stopping {} oldest-idle VM(s) this pass, deferring {deferred}                  (cap {IDLE_MAX_STOPS_PER_PASS}/pass smooths mass expiries)",
+                "idle reaper: stopping {} oldest-idle VM(s) this pass, deferring {deferred} \
+                 — draining a synchronized expiry at {allowance}/pass so the fleet ramps \
+                 down instead of falling off a cliff (PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS)",
                 victims.len()
             );
         }
@@ -1227,22 +2119,51 @@ impl SchemaRegistry {
         // the resize is cheapest exactly then (the daemon's resize is offline;
         // on an already-stopped VM it costs no client disruption at all).
         let mut grow: Vec<(String, String, u64)> = Vec::new();
-        for (schema, entry) in victims {
-            info!("idle-stopping VM for schema {schema} (no connections for >= {timeout:?})");
-            if let Some(gc) = self.cfg.disk_grow
-                && let Some((fs, dev)) = sample_disk(&entry).await
-                && let Some(target) = grow_target_gb(fs, dev, &gc)
-            {
+        // Victims stop concurrently, bounded by IDLE_STOP_CONCURRENCY. Each
+        // stop is a sequence of waits on things outside this process — a guest
+        // `df`, a CHECKPOINT on a micro VM, then the daemon's stop — so one at
+        // a time a pass costs the SUM of them, tens of seconds apiece, which
+        // on a busy host runs longer than the tick that scheduled it. No cap
+        // can fix that; the work is per-VM-independent and the only reason it
+        // was serial is that it was written as a loop.
+        let mut stops = futures::stream::iter(victims.into_iter().map(|(schema, entry)| {
+            let registry = self.clone();
+            async move {
                 info!(
-                    "schema {schema}: data fs is >= {:.0}% full and spans its device — \
-                     queueing offline device grow to {target}GiB",
-                    gc.pct
+                    "idle-stopping VM for schema {schema} (no connections for >= {:?}; \
+                     its bring-up took {:?})",
+                    entry.idle_budget(timeout, fast, fast_bringup),
+                    entry.bringup_took,
                 );
-                grow.push((schema.clone(), entry.sandbox_id(), target));
+                let mut grow = None;
+                if let Some(gc) = registry.cfg.disk_grow
+                    && let Some((fs, dev)) = sample_disk(&entry).await
+                {
+                    // Note the device size while the VM is still up to answer
+                    // the question. Once the offload ladder deletes that VM,
+                    // the registry row is the only thing left that knows how
+                    // big a restore has to build its replacement (see
+                    // `Store::set_disk_gb`), and a stale value corrects itself
+                    // here on the next idle-stop.
+                    registry.store.set_disk_gb(&schema, device_gb(dev));
+                    if let GrowVerdict::Grow(target) = grow_verdict(fs, dev, gc.pct, gc.max_gb) {
+                        info!(
+                            "schema {schema}: data fs is >= {:.0}% full and spans its device — \
+                             queueing offline device grow to {target}GiB",
+                            gc.pct
+                        );
+                        grow = Some((schema.clone(), entry.sandbox_id(), target));
+                    }
+                }
+                checkpoint_and_stop(&entry, &schema).await;
+                // Dropping the last Arc here tears down the tunnel + pool. Data
+                // on the VM's /dev/vdb persists; a later connect restarts it.
+                grow
             }
-            checkpoint_and_stop(&entry, &schema).await;
-            // Dropping the last Arc here tears down the tunnel + pool. Data on
-            // the VM's /dev/vdb persists; a later connect restarts the VM.
+        }))
+        .buffer_unordered(IDLE_STOP_CONCURRENCY);
+        while let Some(queued) = stops.next().await {
+            grow.extend(queued);
         }
         // The disks just released are prime reclaim candidates — without a trim
         // each keeps its full high-water allocation on the host. Trigger a run
@@ -1259,12 +2180,17 @@ impl SchemaRegistry {
         // which must never interleave with a reclaim pass fsck'ing the same
         // file (see reclaim::BOOT_GATE).
         if !grow.is_empty() {
+            let registry = self.clone();
             tokio::spawn(async move {
                 for (schema, id, target) in grow {
                     let _permit = crate::reclaim::boot_permit(&id).await;
                     match vm::resize_disk(&id, target).await {
                         Ok(()) => {
                             info!("schema {schema}: data device grown to {target}GiB");
+                            // The new size, recorded the moment it is real: a
+                            // schema archived before its next idle-stop would
+                            // otherwise be restored into the pre-grow device.
+                            registry.store.set_disk_gb(&schema, target as u32);
                             crate::events::journal_info(
                                 "disk-grow",
                                 format!("schema {schema}: device grown to {target}GiB ({id})"),
@@ -1353,6 +2279,18 @@ impl SchemaRegistry {
     ///   - backpressure pauses NEW dispatch only — in-flight jobs always run
     ///     to completion (they hold per-schema claims, not host-wide locks).
     ///
+    /// With one bound on the yielding, because "wait for quiet" is not the
+    /// same promise as "eventually run". A host whose bring-up queue is never
+    /// empty for a whole tick starves the pacer completely, and the work does
+    /// not go away: it piles up until the host goes quiet (or the disk-pressure
+    /// watchdog fires) and then lands as the single burst this design exists to
+    /// avoid, against a disk already near the high-water mark. So after
+    /// `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` of continuous *client*
+    /// backpressure the pacer dispatches anyway — one job at a time, no-boot
+    /// kinds only, and only that gate overridden (see [`Backpressure`]). It
+    /// keeps trickling for as long as the host stays busy, so the same total
+    /// work is spread across the busy hours instead of stacking up for them.
+    ///
     /// Each dispatch re-picks against a fresh view of the host, excluding
     /// schemas already in flight here or claimed elsewhere (dashboard buttons,
     /// the pressure pass). The total work done is the same; it is spread thin
@@ -1400,11 +2338,21 @@ impl SchemaRegistry {
         let idle_rescan = self.offload_idle_rescan();
         let workers = self.cfg.offload_workers;
         let load_max = self.cfg.offload_load_max;
+        let max_holdoff = self.cfg.offload_max_holdoff;
         info!(
             "offload pacer: {} — up to {workers} concurrent job(s), at most one that boots a VM, \
              extras only while load/core < {load_max} (tick {OFFLOAD_TICK:?}, rescan \
-             {idle_rescan:?} when there is nothing to do)",
+             {idle_rescan:?} when there is nothing to do); {}",
             tiers.join(", "),
+            match max_holdoff {
+                Some(d) => format!(
+                    "after {d:?} held off by queued clients or a reclaim pass it trickles one \
+                     no-boot job at a time anyway"
+                ),
+                None => "it yields to queued clients and reclaim passes indefinitely \
+                         (PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS=0)"
+                    .to_string(),
+            }
         );
 
         let registry = self.clone();
@@ -1413,6 +2361,11 @@ impl SchemaRegistry {
             // When the last scan found nothing, don't scan again until this.
             let mut hold_until: Option<Instant> = None;
             let mut quiet_since: Option<Instant> = None;
+            // When the current unbroken stretch of backpressure began. Cleared
+            // only when the host actually goes quiet — deliberately NOT by a
+            // forced dispatch, so a host that stays busy keeps getting one
+            // no-boot job at a time instead of one per holdoff window.
+            let mut held_since: Option<Instant> = None;
             // In-flight jobs, each in its own JoinSet task so a panic inside
             // one offload is contained — the pacer must outlive any single
             // schema. The side map keys by task id so a job's label survives
@@ -1462,23 +2415,42 @@ impl SchemaRegistry {
                 if jobs.len() >= workers {
                     continue;
                 }
-                if let Some(reason) = registry.dispatch_backpressure() {
-                    // Log the first deferral of each busy stretch only: this
-                    // loop runs 86 400 times a day and a busy host would
-                    // otherwise fill the log with it.
-                    if quiet_since.take().is_some() {
-                        debug!("offload pacer: holding off — {reason}");
+                // How long this dispatch has been owed and what was holding
+                // it, when it is the starvation escape hatch rather than a
+                // normal quiet-host one.
+                let mut forced: Option<(Duration, Backpressure)> = None;
+                match registry.dispatch_backpressure() {
+                    None => {
+                        held_since = None;
+                        quiet_since.get_or_insert_with(Instant::now);
                     }
-                    continue;
+                    Some(bp) => {
+                        let held = held_since.get_or_insert_with(Instant::now).elapsed();
+                        if forced_dispatch(bp, held, jobs.is_empty(), max_holdoff) {
+                            forced = Some((held, bp));
+                        } else {
+                            // Log the first deferral of each busy stretch only: this
+                            // loop runs 86 400 times a day and a busy host would
+                            // otherwise fill the log with it.
+                            if quiet_since.take().is_some() {
+                                debug!("offload pacer: holding off — {}", bp.reason());
+                            }
+                            continue;
+                        }
+                    }
                 }
-                quiet_since.get_or_insert_with(Instant::now);
-                if !dispatch_allowance(jobs.len(), workers, normalized_load(), load_max) {
+                if forced.is_none()
+                    && !dispatch_allowance(jobs.len(), workers, normalized_load(), load_max)
+                {
                     continue;
                 }
                 let mut policy = registry.offload_policy();
                 // At most one boot-kind job in flight: those compete with
-                // waiting clients for the FIFO bring-up gate.
-                policy.no_boot = in_flight.values().any(|(_, kind, _)| kind.boots());
+                // waiting clients for the FIFO bring-up gate — and a forced
+                // job must boot nothing at all, since the clients it is
+                // stepping in front of are queued for exactly that gate.
+                policy.no_boot =
+                    forced.is_some() || in_flight.values().any(|(_, kind, _)| kind.boots());
                 let excluded: HashSet<String> =
                     in_flight.values().map(|(schema, ..)| schema.clone()).collect();
                 let Some(job) = registry.next_offload_job(policy, &excluded).await else {
@@ -1494,11 +2466,23 @@ impl SchemaRegistry {
                 hold_until = None;
                 let r = registry.clone();
                 let (schema, kind) = (job.schema.clone(), job.kind);
-                info!(
-                    "offload dispatch: {} {schema} ({}/{workers} in flight)",
-                    kind.as_str(),
-                    jobs.len() + 1
-                );
+                match forced {
+                    // Worth a line of its own at info: a pacer starved this
+                    // long is invisible otherwise (the holdoff itself only
+                    // logs at debug), and this is the log that explains why
+                    // housekeeping is running during peak traffic.
+                    Some((held, bp)) => info!(
+                        "offload dispatch: {} {schema} single-file — held off {held:?} \
+                         because {} (PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS)",
+                        kind.as_str(),
+                        bp.reason()
+                    ),
+                    None => info!(
+                        "offload dispatch: {} {schema} ({}/{workers} in flight)",
+                        kind.as_str(),
+                        jobs.len() + 1
+                    ),
+                }
                 let task_id = jobs
                     .spawn(async move {
                         let _ = r.run_offload_job(job).await;
@@ -1519,18 +2503,23 @@ impl SchemaRegistry {
     /// between offloads themselves is the dispatcher's business (worker cap +
     /// load gate + pick-time exclusion), not this function's — dashboard and
     /// pressure-pass claims are excluded at pick time via `is_archiving`.
-    fn dispatch_backpressure(&self) -> Option<&'static str> {
+    ///
+    /// The distinction between the variants is what the starvation escape
+    /// hatch keys on: a deferral that only costs someone else time may be
+    /// overridden after a long enough holdoff, one that would duplicate work
+    /// already claimed never may. See [`Backpressure`].
+    fn dispatch_backpressure(&self) -> Option<Backpressure> {
         if crate::vm::bringups_waiting() > 0 {
-            return Some("client bring-ups are queued");
+            return Some(Backpressure::ClientsQueued);
         }
         // A pass holds the boot gate; an offload that boots a VM to dump it
         // would make it yield and lose that pass's progress.
         if crate::reclaim::pass_running() {
-            return Some("a disk-reclaim pass is running");
+            return Some(Backpressure::ReclaimPass);
         }
         // A manual batch sweep from the dashboard.
         if self.sweeping.load(Ordering::SeqCst) {
-            return Some("a manual sweep is running");
+            return Some(Backpressure::Sweeping);
         }
         None
     }
@@ -1584,7 +2573,11 @@ impl SchemaRegistry {
             &records,
             &live,
             policy,
-            &|schema| self.cfg.is_keepalive(schema),
+            // `pinned`, not `is_keepalive`: a replicated schema must never be
+            // offloaded, and this closure is what the routine pacer, the
+            // emergency pressure pass and the dashboard's TTL sweep all pick
+            // through.
+            &|schema| self.pinned(schema),
             &|schema| {
                 in_flight.contains(schema)
                     || self.is_archiving(schema)
@@ -1696,6 +2689,301 @@ impl SchemaRegistry {
     /// emergency-archive the oldest-idle schemas — TTL ignored — until it
     /// drops below the low-water mark. The backstop against the disk-full
     /// outage where VM creates, Postgres, and the dumps themselves all fail.
+    /// Spawn the urgent device-grow watcher — the only path that can grow a
+    /// **warm** VM's data device.
+    ///
+    /// Why it has to exist. Growth has two halves and neither one covers a
+    /// busy schema on its own. Inside the guest, `init.sh`'s watcher extends
+    /// the *filesystem* online as it fills, and then retires
+    /// (`filesystem spans $DATA_DEV; watcher done`) — from that moment the
+    /// *device* is the binding constraint. Growing the device is offline-only
+    /// (the daemon fscks and cold-boots the disk to do it), and its one
+    /// trigger was the idle-stop path in [`Self::reap_idle`]. A schema under
+    /// continuous write load never goes idle, so it never reaches that
+    /// trigger: it fills its device, Postgres starts failing writes with
+    /// `No space left on device`, and it stays that way until its traffic
+    /// happens to pause for a whole idle timeout. The busiest schemas were
+    /// precisely the ones that could not grow.
+    ///
+    /// So this loop trades the idle-stop path's patience for a stop it
+    /// schedules itself, and pays for that with a much higher threshold
+    /// ([`crate::config::DiskGrowConfig::urgent_pct`], default 95% vs. 85%):
+    /// the cheap path keeps handling everything that does go idle, and this
+    /// one only touches schemas that are actually at the wall.
+    pub fn spawn_disk_grower(self: &Arc<Self>) {
+        let Some(gc) = self.cfg.disk_grow else {
+            // `spawn_reaper` already logs that growth is off entirely.
+            return;
+        };
+        let Some(urgent) = gc.urgent_pct else {
+            info!(
+                "urgent device growth disabled (PG_VM_POOL_DISK_GROW_URGENT_PCT=0) — a schema \
+                 whose write load never pauses for a full idle timeout cannot grow its device \
+                 and will wedge on ENOSPC once its filesystem spans it"
+            );
+            return;
+        };
+        info!(
+            "urgent device growth: a warm VM whose data fs is >= {urgent:.0}% full and spans \
+             its device, or is filling fast enough to get there before its next check, is \
+             stopped, resized (doubling, cap {}GiB) and left for the next connect to boot — \
+             checked every {:?}, or every {:?} while filling or within {:.0} points of the \
+             threshold; at most {} per pass",
+            gc.max_gb,
+            URGENT_GROW_CHECK_INTERVAL,
+            URGENT_GROW_FAST_INTERVAL,
+            URGENT_GROW_WATCH_MARGIN_PCT,
+            URGENT_GROW_MAX_PER_PASS
+        );
+        let registry = self.clone();
+        tokio::spawn(supervise(
+            "disk-grow",
+            URGENT_GROW_FAST_INTERVAL,
+            URGENT_GROW_FAST_INTERVAL,
+            move || {
+                let registry = registry.clone();
+                async move { registry.urgent_grow_pass().await }
+            },
+        ));
+    }
+
+    /// One pass of the urgent device-grow watcher: sample every warm schema's
+    /// data filesystem and grow the devices that are at the wall. Returns how
+    /// many were grown.
+    async fn urgent_grow_pass(&self) -> usize {
+        let Some(gc) = self.cfg.disk_grow else {
+            return 0;
+        };
+        let Some(urgent) = gc.urgent_pct else {
+            return 0;
+        };
+
+        // Warm, initialized entries that no offload has claimed and that are
+        // not inside a grow-backoff window. Snapshotted under the lock and
+        // then released: the sampling below talks to guests, which must never
+        // happen with the map lock held.
+        let now = Instant::now();
+        let warm: Vec<(String, Arc<SchemaEntry>)> = {
+            let map = self.entries.lock().await;
+            map.iter()
+                .filter_map(|(schema, cell)| cell.get().map(|e| (schema.clone(), e.clone())))
+                .filter(|(schema, _)| !self.is_archiving(schema))
+                .filter(|(schema, _)| self.grow_backoff.active(schema, now).is_none())
+                .collect()
+        };
+        // Forget schemas that left the warm set, and sample only the ones due
+        // this tick: new, filling or nearly-full schemas on the fast cadence,
+        // everything else once a minute.
+        let candidates: Vec<(String, Arc<SchemaEntry>)> = {
+            let mut memory = self.urgent_samples.lock().unwrap();
+            let names: HashSet<&str> = warm.iter().map(|(schema, _)| schema.as_str()).collect();
+            memory.retain(|schema, _| names.contains(schema.as_str()));
+            warm.iter()
+                .filter(|(schema, _)| urgent_sample_due(memory.get(schema), now))
+                .cloned()
+                .collect()
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Sample concurrently. Each read goes over its own schema's
+        // housekeeping pool, so schemas never contend with each other, and a
+        // wedged VM costs one bounded `STATS_TIMEOUT` instead of stalling
+        // every schema queued behind it. Each reading keeps its own
+        // timestamp: a fill rate is only as good as the gap it divides by.
+        let samples: Vec<(String, Option<DiskSample>, Instant)> =
+            futures::stream::iter(candidates.into_iter().map(|(schema, entry)| async move {
+                let sample = sample_disk(&entry).await;
+                (schema, sample, Instant::now())
+            }))
+            .buffer_unordered(URGENT_GROW_SAMPLE_CONCURRENCY)
+            .collect()
+            .await;
+
+        let mut grown = 0usize;
+        for (schema, sample, at) in samples {
+            let Some((fs, dev)) = sample else { continue };
+            // The sample already answers the question `disk_gb` exists to
+            // answer, so bank it here too rather than only at idle-stop: a
+            // warm schema offloaded before it ever idles would otherwise be
+            // restored into a stale — or entirely unknown — device size.
+            self.store.set_disk_gb(&schema, device_gb(dev));
+            let reading = {
+                let mut memory = self.urgent_samples.lock().unwrap();
+                let reading = next_grow_sample(memory.get(&schema), fs, at, urgent);
+                memory.insert(schema.clone(), reading);
+                reading
+            };
+            match urgent_verdict(fs, dev, &reading, urgent, gc.max_gb) {
+                GrowVerdict::NotNeeded => {}
+                GrowVerdict::AtCap { current_gb } => {
+                    // Growth is the only lever this pooler has and it is
+                    // spent. Say so at error level with the fix in the
+                    // message — silence here reads as "the pooler is fine"
+                    // while the database fails every write. Recorded as a
+                    // failure purely to rate-limit the complaint.
+                    error!(
+                        "schema {schema}: data fs is >= {urgent:.0}% full and spans its \
+                         {current_gb}GiB device, which is already at PG_VM_POOL_DISK_MAX_GB \
+                         ({}GiB) — the pooler cannot grow it any further and Postgres will \
+                         fail writes with `No space left on device`. Raise \
+                         PG_VM_POOL_DISK_MAX_GB, or move this schema off the pool",
+                        gc.max_gb
+                    );
+                    crate::events::journal_error(
+                        "disk-grow",
+                        format!(
+                            "schema {schema}: device at the {}GiB cap and full — raise \
+                             PG_VM_POOL_DISK_MAX_GB",
+                            gc.max_gb
+                        ),
+                    );
+                    self.grow_backoff.record_failure(&schema, Instant::now());
+                }
+                GrowVerdict::Grow(target) => {
+                    // Bound the blast radius: each grow drops a schema's live
+                    // sessions, so a pass that found many of them trickles
+                    // rather than restarting the whole warm set at once.
+                    if grown >= URGENT_GROW_MAX_PER_PASS {
+                        continue;
+                    }
+                    // Say so when it is the projection that crossed, not the
+                    // reading: the stop is about to drop live sessions on a
+                    // filesystem that still has room — just not for long.
+                    if grow_verdict(fs, dev, urgent, gc.max_gb) == GrowVerdict::NotNeeded {
+                        info!(
+                            "schema {schema}: data fs is {:.0}% full and filling at {}/s — \
+                             projected past {urgent:.0}% before its next check; growing it now",
+                            used_pct(fs.1, fs.2).unwrap_or(0.0),
+                            crate::orphans::human_iec(reading.rate.unwrap_or(0.0).max(0.0) as u64),
+                        );
+                    }
+                    match self.grow_device_now(&schema, target).await {
+                        Ok(true) => {
+                            grown += 1;
+                            self.grow_backoff.clear(&schema);
+                            // A new device: the next bring-up starts a fresh
+                            // baseline rather than dividing across the resize.
+                            self.urgent_samples.lock().unwrap().remove(&schema);
+                        }
+                        // Lost a race to an offload, or the schema went cold
+                        // under us. Neither is this schema's fault, so it
+                        // keeps its clean backoff record.
+                        Ok(false) => {}
+                        Err(e) => {
+                            let (n, hold) =
+                                self.grow_backoff.record_failure(&schema, Instant::now());
+                            warn!(
+                                "schema {schema}: urgent device grow to {target}GiB failed \
+                                 ({n} consecutive); holding off for {hold:?}: {e:#}"
+                            );
+                            crate::events::journal_error(
+                                "disk-grow",
+                                format!(
+                                    "schema {schema}: urgent grow to {target}GiB failed: {e:#}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        grown
+    }
+
+    /// Grow one warm schema's data device now: claim it, stop it, resize, and
+    /// leave it for the next connect to boot.
+    ///
+    /// Unlike every other exclusive operation in this file, this one does
+    /// **not** refuse when the entry has live sessions. A schema that never
+    /// goes idle is exactly the one this path exists for, and by the time it
+    /// qualifies its database is out of room or seconds from it — those
+    /// sessions are failing, or about to. Breaking them costs a reconnect;
+    /// leaving them costs the database.
+    ///
+    /// The VM is deliberately left stopped rather than restarted here. The
+    /// clients are reconnecting anyway, and `checkout`'s cold path already
+    /// knows how to reattach by id and boot it — routing through that one path
+    /// keeps the bring-up gate, the pending ledger and the failure bookkeeping
+    /// in charge of the boot instead of duplicating all three here.
+    /// `Ok(true)` grew the device; `Ok(false)` means this schema was not this
+    /// pass's to touch after all (an offload claimed it, or it went cold
+    /// between the sample and here) — a race, not a failure, so the caller
+    /// must not put it in a backoff window for it. `Err` is a real failure.
+    async fn grow_device_now(&self, schema: &str, target: u64) -> Result<bool> {
+        // The same claim an offload takes. `checkout` waits on this set, so a
+        // client arriving mid-resize queues at the front door instead of
+        // racing the stop/start — and no offload can pick this schema while
+        // its VM is halfway through a resize.
+        let Some(_guard) = ArchivingGuard::claim(&self.archiving, schema) else {
+            debug!("schema {schema}: an offload claimed it first; skipping this grow");
+            return Ok(false);
+        };
+
+        // Take the entry out of the map, but only once it is actually
+        // initialized: removing a cell whose bring-up is still in flight would
+        // orphan that bring-up — it completes, hands back an entry, and
+        // nothing is left holding it.
+        let entry = {
+            let mut map = self.entries.lock().await;
+            let initialized = match map.get(schema) {
+                Some(cell) => cell.get().cloned(),
+                None => None,
+            };
+            match initialized {
+                Some(entry) => {
+                    map.remove(schema);
+                    entry
+                }
+                None => {
+                    debug!(
+                        "schema {schema} is no longer warm (gone cold, or a bring-up is in \
+                         flight); leaving its device to the next pass"
+                    );
+                    return Ok(false);
+                }
+            }
+        };
+
+        let id = entry.sandbox_id();
+        let sessions = entry.active_count();
+        warn!(
+            "schema {schema}: data filesystem is full, or about to be, and spans its device — \
+             growing it to {target}GiB now rather than waiting for an idle stop a schema under \
+             load never reaches. Stopping VM {id} and dropping {sessions} live session(s); the \
+             next connect boots it with room"
+        );
+
+        checkpoint_and_stop(&entry, schema).await;
+        // Drop the last handle before the resize: it owns the tunnel and the
+        // housekeeping pool, both now pointed at a stopped VM.
+        drop(entry);
+
+        // Same interlock as the idle-stop grow: the daemon's resize fscks and
+        // cold-boots the stopped disk, which must never interleave with a
+        // reclaim pass fsck'ing the same file (see `reclaim::BOOT_GATE`).
+        let _permit = crate::reclaim::boot_permit(&id).await;
+        vm::resize_disk(&id, target)
+            .await
+            .with_context(|| format!("growing schema {schema}'s data device to {target}GiB"))?;
+        // Recorded the moment it is real: a schema offloaded before its next
+        // idle stop would otherwise be restored into the pre-grow device.
+        self.store.set_disk_gb(schema, target as u32);
+        info!(
+            "schema {schema}: data device grown to {target}GiB; next connect boots {id} \
+             ({sessions} session(s) were dropped to do it)"
+        );
+        crate::events::journal_info(
+            "disk-grow",
+            format!(
+                "schema {schema}: urgent device grow to {target}GiB ({id}); \
+                 {sessions} session(s) dropped"
+            ),
+        );
+        Ok(true)
+    }
+
     pub fn spawn_pressure_reaper(self: &Arc<Self>) {
         let Some(pressure) = self.cfg.archive.as_ref().and_then(|a| a.pressure.clone()) else {
             info!("disk-pressure eviction disabled (PG_VM_POOL_PRESSURE_PATH unset)");
@@ -2118,7 +3406,7 @@ impl SchemaRegistry {
         let (mut refreshed, mut keepalive, mut already, mut not_idle) = (0usize, 0usize, 0usize, 0usize);
         for (schema, rec) in self.store_records() {
             total += 1;
-            let ka = self.cfg.is_keepalive(&schema);
+            let ka = self.pinned(&schema);
             if rec.tier == Tier::Frozen || rec.tier == Tier::Compacted {
                 if !ka && now.saturating_sub(rec.last_active) >= threshold_secs {
                     if rec.tier == Tier::Frozen {
@@ -2346,13 +3634,16 @@ impl SchemaRegistry {
         let known_id = self.store.record(schema).map(|r| r.sandbox_id);
         // No spare pool here: this bring-up exists to dump an *existing* VM's
         // data — a fresh spare would have nothing to dump.
+        let owner = self.owner_of(schema);
+        let repl_login = self.repl_login_for(schema);
         let entry = match vm::ensure_vm(
             &self.cfg,
             schema,
             known_id.as_deref(),
             None,
             None,
-            self.owner_of(schema).as_ref(),
+            None,
+            &self.bring_up_for(schema, owner.as_ref(), repl_login.as_ref()),
         )
         .await {
             Ok(entry) => entry,
@@ -2373,6 +3664,17 @@ impl SchemaRegistry {
                     .await;
             }
         };
+
+        // Note the data device's size while the VM that has it is still up.
+        // The dump routes delete that VM, and a dump carries no trace of the
+        // device it came off — so this row is the only thing that later stops
+        // the restore from rebuilding the schema into a default-size device
+        // and filling it mid-`pg_restore` (see `Store::set_disk_gb`). Recorded
+        // before `set_tier`, whose durable write is what carries it to disk
+        // ahead of the kill.
+        if let Some((_, dev)) = sample_disk(&entry).await {
+            self.store.set_disk_gb(schema, device_gb(dev));
+        }
 
         // On dump failure, stop the VM this attempt booted before propagating.
         // Without this every failed archive leaks a running VM — nothing else
@@ -2770,6 +4072,10 @@ impl SchemaRegistry {
     }
 
     async fn purge_pass(&self) {
+        if !self.physical.list().is_empty() {
+            crate::events::journal_error("purge", "physical replica preparation is pending; refusing all purge cleanup");
+            return;
+        }
         let infos = match heyo_sdk::Sandbox::list(vm::local_opts()).await {
             Ok(l) => l,
             Err(e) => {
@@ -2805,6 +4111,21 @@ impl SchemaRegistry {
         let mut probed = 0usize;
         for (schema, rec) in self.store_records() {
             if rec.tier == Tier::Live {
+                continue;
+            }
+            // Defensive: a pinned schema is always `Live`, so the check above
+            // already covers it — but this loop *deletes VMs*, and a record
+            // that somehow carried an offloaded tier while a pairing still
+            // depended on it would destroy the only copy of a primary.
+            if self.pinned(&schema) {
+                crate::events::journal_error(
+                    "purge",
+                    format!(
+                        "schema {schema} is tiered {} but is pinned by a replication \
+                         pairing or keepalive — refusing to delete its VM",
+                        rec.tier.as_str()
+                    ),
+                );
                 continue;
             }
             if !live_ids.contains(&rec.sandbox_id) {
@@ -2976,13 +4297,16 @@ impl SchemaRegistry {
         }
 
         let known_id = self.store.record(schema).map(|r| r.sandbox_id);
+        let owner = self.owner_of(schema);
+        let repl_login = self.repl_login_for(schema);
         let entry = match vm::ensure_vm(
             &self.cfg,
             schema,
             known_id.as_deref(),
             None,
             None,
-            self.owner_of(schema).as_ref(),
+            None,
+            &self.bring_up_for(schema, owner.as_ref(), repl_login.as_ref()),
         )
         .await {
             Ok(entry) => entry,
@@ -2993,6 +4317,17 @@ impl SchemaRegistry {
                     .with_context(|| format!("bringing up VM for schema {schema} to freeze it"));
             }
         };
+
+        // Note the data device's size while the VM that has it is still up.
+        // The dump routes delete that VM, and a dump carries no trace of the
+        // device it came off — so this row is the only thing that later stops
+        // the restore from rebuilding the schema into a default-size device
+        // and filling it mid-`pg_restore` (see `Store::set_disk_gb`). Recorded
+        // before `set_tier`, whose durable write is what carries it to disk
+        // ahead of the kill.
+        if let Some((_, dev)) = sample_disk(&entry).await {
+            self.store.set_disk_gb(schema, device_gb(dev));
+        }
 
         // Same leak guard as archive_schema_inner: a failed dump must not
         // leave the VM it booted running and unowned.
@@ -3214,6 +4549,10 @@ impl SchemaRegistry {
     /// and deletion needs the daemon to positively confirm the record — the
     /// same ambiguity-never-deletes rule as the orphan-disk sweep.
     async fn pending_pass(&self) -> usize {
+        if !self.physical.list().is_empty() {
+            warn!("pending-bringup janitor: physical preparation pending; refusing cleanup");
+            return 0;
+        }
         // Twice the ready budget plus slack: a slow-but-alive bring-up (ready
         // wait + restore) must never race its own janitor.
         let min_age = self.cfg.ready_timeout * 2 + Duration::from_secs(300);
@@ -3308,6 +4647,10 @@ impl SchemaRegistry {
     /// same in-use and age guards as a directory, plus the daemon reporting the
     /// VM not running; the cost of being wrong is one extra image clone.
     async fn sweep_orphans(&self) -> (usize, usize) {
+        if !self.physical.list().is_empty() {
+            warn!("orphan-disk sweep: physical preparation pending; refusing cleanup");
+            return (0, 0);
+        }
         let Some(run_dir) = self.cfg.run_dir.clone() else {
             return (0, 0);
         };
@@ -3589,7 +4932,7 @@ fn file_older_than(path: &std::path::Path, age: Duration) -> bool {
 }
 
 /// One GiB, for device-size math.
-const GIB: u64 = 1024 * 1024 * 1024;
+pub(crate) const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Per-schema failure memory for offloads, so the archive/freeze/pressure
 /// sweeps stop re-trying the same sick schemas every pass. Each failed
@@ -3662,7 +5005,11 @@ fn fmt_backoff(d: Duration) -> String {
 /// count × 512 via `pg_read_file` — the same source the daemon's own resize
 /// verification reads in-guest). `None` when either read fails within the
 /// stats timeout; the caller just skips growth this cycle.
-async fn sample_disk(entry: &SchemaEntry) -> Option<((u64, u64, u64), u64)> {
+/// One [`sample_disk`] reading: the guest data filesystem's
+/// `(total, used, avail)` in bytes, and the size of the device backing it.
+type DiskSample = ((u64, u64, u64), u64);
+
+async fn sample_disk(entry: &SchemaEntry) -> Option<DiskSample> {
     let query = async {
         let mut client = entry.pool.get().await.ok()?;
         // Explicit (offset, length): sysfs files stat as 0 bytes, so the
@@ -3682,9 +5029,33 @@ async fn sample_disk(entry: &SchemaEntry) -> Option<((u64, u64, u64), u64)> {
     tokio::time::timeout(STATS_TIMEOUT, query).await.ok()?
 }
 
-/// Decide whether (and to what) an idle-stopping VM's data device should
-/// grow. `fs` is the guest data filesystem's (total, used, avail) and
-/// `device_bytes` its backing device size.
+/// A data device's size in whole GiB, rounded up — the unit both the daemon's
+/// create and its resize speak, and the unit the registry records. Never 0: a
+/// device that exists is at least 1GiB to anything that has to rebuild it.
+fn device_gb(device_bytes: u64) -> u32 {
+    device_bytes.div_ceil(GIB).max(1).min(u32::MAX as u64) as u32
+}
+
+/// What should happen to a VM's data device, given how full its guest
+/// filesystem is. See [`grow_verdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrowVerdict {
+    /// Below the trigger, or the filesystem has room left inside its device.
+    NotNeeded,
+    /// Grow the device to this many GiB.
+    Grow(u64),
+    /// The filesystem is at the trigger and spans a device already at
+    /// `max_gb`. Nothing the pooler can do — growth is the only lever it has,
+    /// and it is spent. Distinguished from `NotNeeded` so the caller can say
+    /// so out loud instead of silently declining to act on a schema that is
+    /// about to fail every write.
+    AtCap { current_gb: u64 },
+}
+
+/// Decide whether (and to what) a VM's data device should grow. `fs` is the
+/// guest data filesystem's (total, used, avail), `device_bytes` its backing
+/// device size, `pct` the used% trigger to judge against, and `max_gb` the
+/// ceiling.
 ///
 /// Grows only when BOTH hold:
 /// - used% (df semantics: used / (used + avail)) is at/above the trigger, and
@@ -3694,20 +5065,132 @@ async fn sample_disk(entry: &SchemaEntry) -> Option<((u64, u64, u64), u64)> {
 ///   has nowhere left to grow inside it.
 ///
 /// The step doubles the device (whole GiB, current size rounded up), capped
-/// at `cfg.max_gb` — the same amortization policy as the guest fs watcher.
-fn grow_target_gb(fs: (u64, u64, u64), device_bytes: u64, cfg: &DiskGrowConfig) -> Option<u64> {
+/// at `max_gb` — the same amortization policy as the guest fs watcher.
+///
+/// `pct` is a parameter rather than read off the config because there are two
+/// callers with two different prices: the idle-stop path grows a VM that is
+/// stopping anyway (cheap, fires at `DiskGrowConfig::pct`), and the urgent
+/// path stops a live one to do it (expensive, fires at
+/// `DiskGrowConfig::urgent_pct`).
+pub(crate) fn grow_verdict(
+    fs: (u64, u64, u64),
+    device_bytes: u64,
+    pct: f64,
+    max_gb: u64,
+) -> GrowVerdict {
     let (total, used, avail) = fs;
-    if used_pct(used, avail)? < cfg.pct {
-        return None;
+    let Some(used_pct) = used_pct(used, avail) else {
+        return GrowVerdict::NotNeeded;
+    };
+    if used_pct < pct {
+        return GrowVerdict::NotNeeded;
     }
     if total < device_bytes.saturating_mul(9) / 10 {
-        return None;
+        return GrowVerdict::NotNeeded;
     }
     let current_gb = device_bytes.div_ceil(GIB).max(1);
-    if current_gb >= cfg.max_gb {
-        return None;
+    if current_gb >= max_gb {
+        return GrowVerdict::AtCap { current_gb };
     }
-    Some((current_gb * 2).min(cfg.max_gb))
+    GrowVerdict::Grow((current_gb * 2).min(max_gb))
+}
+
+/// The urgent grower's memory of one warm schema's last disk sample: enough
+/// to turn two samples into a fill rate and to decide how soon to look again.
+#[derive(Debug, Clone, Copy)]
+struct GrowSample {
+    /// Guest data filesystem bytes in use (df semantics), and when read.
+    used: u64,
+    at: Instant,
+    /// Bytes per second since the previous sample; `None` until there are two.
+    rate: Option<f64>,
+    /// On the fast cadence: filling, near the threshold, or not yet rated.
+    hot: bool,
+}
+
+impl GrowSample {
+    /// How long until this schema is due another sample.
+    fn every(&self) -> Duration {
+        if self.hot {
+            URGENT_GROW_FAST_INTERVAL
+        } else {
+            URGENT_GROW_CHECK_INTERVAL
+        }
+    }
+}
+
+/// Whether the urgent grower samples a schema this tick. Half a tick of
+/// slack, so a schema read late in one pass is not pushed a whole tick past
+/// its cadence by the next.
+fn urgent_sample_due(last: Option<&GrowSample>, now: Instant) -> bool {
+    last.is_none_or(|s| {
+        now.saturating_duration_since(s.at) + URGENT_GROW_FAST_INTERVAL / 2 >= s.every()
+    })
+}
+
+/// Fold a fresh `(total, used, avail)` reading taken `at` into a schema's
+/// sample memory: the fill rate since `prev`, and whether the schema belongs
+/// on the fast cadence.
+fn next_grow_sample(
+    prev: Option<&GrowSample>,
+    fs: (u64, u64, u64),
+    at: Instant,
+    urgent_pct: f64,
+) -> GrowSample {
+    let (_, used, avail) = fs;
+    let rate = prev.and_then(|p| {
+        let secs = at.saturating_duration_since(p.at).as_secs_f64();
+        (secs > 0.0).then(|| (used as f64 - p.used as f64) / secs)
+    });
+    let filling = rate.is_some_and(|r| r >= URGENT_GROW_FILLING_BYTES_PER_SEC);
+    let near =
+        used_pct(used, avail).is_some_and(|pct| pct >= urgent_pct - URGENT_GROW_WATCH_MARGIN_PCT);
+    GrowSample {
+        used,
+        at,
+        rate,
+        hot: rate.is_none() || filling || near,
+    }
+}
+
+/// `fs` with `rate` bytes/s of growth over `horizon` moved from avail to used:
+/// the filesystem as the next check would find it. A flat, shrinking or
+/// unknown rate projects nothing, and growth stops at full.
+fn project_fs(fs: (u64, u64, u64), rate: Option<f64>, horizon: Duration) -> (u64, u64, u64) {
+    let (total, used, avail) = fs;
+    let Some(rate) = rate.filter(|r| *r > 0.0) else {
+        return fs;
+    };
+    let more = ((rate * horizon.as_secs_f64()) as u64).min(avail);
+    (total, used + more, avail - more)
+}
+
+/// The urgent grower's verdict for one reading: [`grow_verdict`] on the
+/// filesystem as it is, or — for a schema filling fast enough to cross the
+/// threshold before it is next sampled and stopped — as it will be by then.
+/// A projected crossing on a device already at the cap stays `NotNeeded`: the
+/// at-cap complaint is for a disk that is actually full.
+fn urgent_verdict(
+    fs: (u64, u64, u64),
+    device_bytes: u64,
+    sample: &GrowSample,
+    urgent_pct: f64,
+    max_gb: u64,
+) -> GrowVerdict {
+    let current = grow_verdict(fs, device_bytes, urgent_pct, max_gb);
+    if current != GrowVerdict::NotNeeded {
+        return current;
+    }
+    let horizon = sample.every() + URGENT_GROW_STOP_MARGIN;
+    match grow_verdict(
+        project_fs(fs, sample.rate, horizon),
+        device_bytes,
+        urgent_pct,
+        max_gb,
+    ) {
+        GrowVerdict::AtCap { .. } => GrowVerdict::NotNeeded,
+        verdict => verdict,
+    }
 }
 
 /// Permanently delete sandbox `id` (kill = sandbox + disk; the SDK treats an
@@ -3772,8 +5255,18 @@ async fn checkpoint_and_stop(entry: &SchemaEntry, schema: &str) {
             "pre-stop CHECKPOINT for schema {schema} timed out after {PRE_STOP_CHECKPOINT_TIMEOUT:?}"
         ),
     }
-    if let Err(e) = entry.sandbox.stop().await {
-        warn!("failed to stop VM for schema {schema}: {e:#}");
+    // Bounded: an unbounded stop against a wedged daemon parks the caller
+    // forever, and both callers are background passes that must keep moving
+    // (see [`IDLE_STOP_TIMEOUT`]). A stop that times out is not lost work —
+    // the VM stays running, its warm entry is already gone, and the untracked
+    // reaper picks it up on its next pass.
+    match tokio::time::timeout(IDLE_STOP_TIMEOUT, entry.sandbox.stop()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("failed to stop VM for schema {schema}: {e:#}"),
+        Err(_) => warn!(
+            "stopping VM for schema {schema} timed out after {IDLE_STOP_TIMEOUT:?}; \
+             leaving it to the untracked reaper"
+        ),
     }
 }
 
@@ -4035,6 +5528,13 @@ impl<'a> ArchivingGuard<'a> {
             None
         }
     }
+
+    /// Whether this is the still-live claim for exactly `schema` in `set`.
+    /// Checking both identities prevents a claim for another registry or
+    /// schema from becoming a general maintenance bypass.
+    fn owns(&self, set: &StdMutex<HashSet<String>>, schema: &str) -> bool {
+        std::ptr::eq(self.set, set) && self.schema == schema
+    }
 }
 
 impl Drop for ArchivingGuard<'_> {
@@ -4059,10 +5559,84 @@ fn normalized_load() -> Option<f64> {
     Some(load1 / cores)
 }
 
+/// Why the offload pacer is not dispatching (see
+/// [`SchemaRegistry::dispatch_backpressure`]). Split by *kind* because only
+/// one of them is negotiable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backpressure {
+    /// A client is parked waiting for a bring-up slot. Pure politeness: a job
+    /// that boots no VM takes nothing that client is queued for, so a pacer
+    /// starved this way past `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` may
+    /// dispatch one no-boot job at a time anyway rather than let the backlog
+    /// (and the disk) grow until the host happens to go quiet.
+    ClientsQueued,
+    /// A reclaim pass is fsck'ing/shrinking disks an offload would read.
+    ///
+    /// Deferring on it is a *progress* choice, not a safety one: the actual
+    /// exclusion is per disk, taken by the job itself
+    /// (`reclaim::try_disk_permit`, which never preempts a pass), so the worst
+    /// a dispatch during a pass can do is find the one disk it wanted busy and
+    /// skip that schema. What deferring buys is that the pass keeps its
+    /// progress instead of the two of them trading disks — worth having while
+    /// there is any other time to run, which is why this defers by default.
+    ///
+    /// It is overridable for the same reason [`Self::ClientsQueued`] is, and
+    /// it matters more: a pass runs up to `RECLAIM_TIMEOUT` (30 minutes) and
+    /// is re-triggered 30s after every idle reap, so on a churning host
+    /// "later" was very nearly never — the pacer would stand down host-wide
+    /// for most of the day while the disk it was supposed to be freeing
+    /// climbed toward the pressure mark. Forced dispatches here are no-boot
+    /// kinds only, single file, exactly as for queued clients.
+    ReclaimPass,
+    /// A manual or disk-pressure sweep is already draining through the same
+    /// picker. Overriding it would only double-dispatch against the claims it
+    /// already holds.
+    Sweeping,
+}
+
+impl Backpressure {
+    fn reason(self) -> &'static str {
+        match self {
+            Backpressure::ClientsQueued => "client bring-ups are queued",
+            Backpressure::ReclaimPass => "a disk-reclaim pass is running",
+            Backpressure::Sweeping => "a manual sweep is running",
+        }
+    }
+}
+
 /// May the dispatcher start another offload job right now? The first job is
 /// always allowed (parity with the classic single pacer, which had no load
 /// gate); every extra one requires both a free worker slot and known load
 /// headroom — an unreadable load means no extras, never a stampede.
+/// The starvation escape hatch: may the pacer dispatch a job even though
+/// `bp` says the host is busy? `held` is how long the current unbroken stretch
+/// of backpressure has run and `idle` whether the pacer has nothing in flight.
+///
+/// Three conditions, each load-bearing: the backpressure must be one of the
+/// negotiable kinds (see [`Backpressure`] — `Sweeping` never is, because
+/// overriding it would only double-dispatch against claims the sweep already
+/// holds), only a pacer with nothing in flight may force one (so the override
+/// can never stack), and only past the operator's holdoff — `None` keeps the
+/// historical behavior of yielding forever.
+///
+/// Both negotiable kinds are counted by the same `held` clock on purpose. They
+/// alternate on a busy host — clients queue, a reap fires a reclaim pass,
+/// clients queue again — and a clock that reset on every changeover would
+/// never reach the holdoff at all, which is exactly how the pacer could go
+/// hours without dispatching while neither condition alone looked pathological.
+fn forced_dispatch(
+    bp: Backpressure,
+    held: Duration,
+    idle: bool,
+    max_holdoff: Option<Duration>,
+) -> bool {
+    matches!(
+        bp,
+        Backpressure::ClientsQueued | Backpressure::ReclaimPass
+    ) && idle
+        && max_holdoff.is_some_and(|limit| held >= limit)
+}
+
 fn dispatch_allowance(in_flight: usize, workers: usize, load: Option<f64>, load_max: f64) -> bool {
     if in_flight >= workers {
         return false;
@@ -4071,6 +5645,141 @@ fn dispatch_allowance(in_flight: usize, workers: usize, load: Option<f64>, load_
         return true;
     }
     load.is_some_and(|l| l < load_max)
+}
+
+/// The password to challenge `role` with, composing the two credential
+/// stores. Free-standing so the ordering can be tested without a registry.
+fn challenge_password_in(
+    repl: &crate::replication::ReplStore,
+    ded: &Credentials,
+    shared: Option<&str>,
+    role: &str,
+) -> Option<String> {
+    repl.repl_password(role)
+        .or_else(|| ded.password_for_role(role))
+        .or_else(|| shared.map(str::to_string))
+}
+
+/// Whether `role` may route to `database`, composing the two stores.
+///
+/// The replication lookup must come **first**. A replication login's database
+/// is by definition a dedicated one, so delegating first would have
+/// `Credentials::authorize` reject it under "this database is dedicated and
+/// can only be opened by its own role" — which is the one database it exists
+/// to reach.
+fn authorize_route_in(
+    repl: &crate::replication::ReplStore,
+    ded: &Credentials,
+    role: &str,
+    database: &str,
+    physical: bool,
+) -> Result<String, String> {
+    if let Some(rec) = repl.by_repl_role(role) {
+        if physical {
+            // PostgreSQL discards the database parameter for a physical
+            // walsender. pg_basebackup/walreceiver normally send "replication".
+            // Only the already-authenticated replication identity selects a VM.
+            return if rec.role == crate::replication::Role::Primary && rec.state.pins() {
+                Ok(rec.database)
+            } else {
+                Err("physical replication requires a live primary pairing".into())
+            };
+        }
+        return if rec.database == database {
+            Ok(database.into())
+        } else {
+            Err(format!(
+                "role \"{role}\" is a replication login for database \"{}\" only \
+                 and cannot open any other database",
+                rec.database
+            ))
+        };
+    }
+    if physical {
+        return Err("physical replication requires a registered replication login".into());
+    }
+    ded.authorize(role, database).map(|()| database.into())
+}
+
+#[cfg(test)]
+mod auth_composition_tests {
+    use super::*;
+    use crate::replication::{ReplRecord, ReplStore, Role, State};
+
+    fn stores(tag: &str) -> (ReplStore, Credentials) {
+        let dir = std::env::temp_dir();
+        let stamp = format!("{}-{:?}-{tag}", std::process::id(), std::thread::current().id());
+        let rp = dir.join(format!("pgvmpool-authrepl-{stamp}.tsv"));
+        let dp = dir.join(format!("pgvmpool-authded-{stamp}.tsv"));
+        let _ = std::fs::remove_file(&rp);
+        let _ = std::fs::remove_file(&dp);
+        let repl = ReplStore::load(rp);
+        let ded = Credentials::load(dp);
+        ded.create("acme", "acme", "tenantpassword").unwrap();
+        let mut rec = ReplRecord::new("acme", Role::Primary, "node_b", "replpassword12");
+        rec.state = State::Active;
+        repl.create(rec, &|r| ded.by_role(r).is_some()).unwrap();
+        (repl, ded)
+    }
+
+    #[test]
+    fn each_login_is_challenged_with_its_own_password() {
+        let (repl, ded) = stores("challenge");
+        let shared = Some("sharedpassword");
+        assert_eq!(
+            challenge_password_in(&repl, &ded, shared, "acme_pgfcrepl").as_deref(),
+            Some("replpassword12")
+        );
+        assert_eq!(
+            challenge_password_in(&repl, &ded, shared, "acme").as_deref(),
+            Some("tenantpassword")
+        );
+        assert_eq!(
+            challenge_password_in(&repl, &ded, shared, "postgres").as_deref(),
+            Some("sharedpassword")
+        );
+        // No shared password configured is the loopback default: no gate for
+        // an unknown role, but a replication login is still challenged, so
+        // enabling replication adds a gate where there was none.
+        assert_eq!(challenge_password_in(&repl, &ded, None, "postgres"), None);
+        assert_eq!(
+            challenge_password_in(&repl, &ded, None, "acme_pgfcrepl").as_deref(),
+            Some("replpassword12")
+        );
+    }
+
+    #[test]
+    fn a_replication_login_reaches_its_own_dedicated_database_and_nothing_else() {
+        let (repl, ded) = stores("authorize");
+        // The regression this ordering exists to prevent: `acme` IS a
+        // dedicated database, so delegating to `Credentials::authorize` first
+        // would reject the very login that has to reach it.
+        assert!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", "acme", false).is_ok());
+        let err = authorize_route_in(&repl, &ded, "acme_pgfcrepl", "other", false).unwrap_err();
+        assert!(err.contains("replication login"), "{err}");
+        // Everything the dedicated rules already guaranteed still holds.
+        assert!(authorize_route_in(&repl, &ded, "acme", "acme", false).is_ok());
+        assert!(authorize_route_in(&repl, &ded, "acme", "other", false).is_err());
+        assert!(authorize_route_in(&repl, &ded, "postgres", "acme", false).is_err());
+        assert!(authorize_route_in(&repl, &ded, "postgres", "tenant1", false).is_ok());
+    }
+
+    #[test]
+    fn physical_replication_routes_by_identity_not_claimed_database() {
+        let (repl, ded) = stores("physical");
+        for claimed in ["replication", "other_tenant", "postgres", "acme"] {
+            assert_eq!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", claimed, true).unwrap(), "acme");
+        }
+        for user in ["acme", "postgres", "unknown"] {
+            assert!(authorize_route_in(&repl, &ded, user, "acme", true).is_err());
+        }
+        let mut replica = ReplRecord::new("standby", Role::Replica, "node_a", "replpassword34");
+        replica.state = State::Active;
+        repl.create(replica, &|r| ded.by_role(r).is_some()).unwrap();
+        assert!(authorize_route_in(&repl, &ded, "standby_pgfcrepl", "replication", true).is_err());
+        repl.set_state("acme", State::Detached, "test detached pairing").unwrap();
+        assert!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", "replication", true).is_err());
+    }
 }
 
 fn now_unix() -> u64 {
@@ -4328,6 +6037,7 @@ mod archive_tests {
             sandbox_id: "sb-x".into(),
             last_active,
             tier: if archived { Tier::Archived } else { Tier::Live },
+            disk_gb: 0,
         }
     }
 
@@ -4394,6 +6104,7 @@ mod archive_tests {
             sandbox_id: "sb-x".into(),
             last_active: NOW - idle,
             tier,
+            disk_gb: 0,
         }
     }
 
@@ -4436,6 +6147,169 @@ mod archive_tests {
         assert!(b.holding("b").is_none());
         b.clear("a");
         assert!(b.holding("a").is_none());
+    }
+
+    /// The two-speed reaper's whole policy: price the warm hold off what the
+    /// bring-up actually cost. The failure it exists for is a fleet of VMs
+    /// that are cheap to restart sitting warm for the timeout a *create*
+    /// deserves, holding RAM and disks the reclaim and offload ladders cannot
+    /// touch until the VM is stopped.
+    #[test]
+    fn idle_budget_prices_the_warm_hold_off_the_measured_bringup() {
+        let normal = Duration::from_secs(900);
+        let fast = Some(Duration::from_secs(60));
+        let threshold = Duration::from_secs(5);
+        let budget = |took: u64| idle_budget(Duration::from_secs(took), normal, fast, threshold);
+
+        // A restart of a VM still on disk: ~200ms, so a 900s hold buys the
+        // next client 200ms. Short budget.
+        assert_eq!(
+            idle_budget(Duration::from_millis(200), normal, fast, threshold),
+            Duration::from_secs(60)
+        );
+        // The boundary is inclusive — a bring-up exactly at the threshold is
+        // still a cheap one.
+        assert_eq!(budget(5), Duration::from_secs(60));
+        // A create, a spare claim that had to initdb, an S3 thaw: expensive,
+        // so the full hold is worth paying for.
+        assert_eq!(budget(6), normal);
+        assert_eq!(budget(40), normal);
+
+        // The load backstop, which is why this is measured rather than keyed
+        // on "was the VM already on disk". A saturated heyvmd turns a 200ms
+        // restart into seconds; those VMs fall back to the long hold on their
+        // own, so the reaper stops adding stop/start work to a daemon that is
+        // already behind.
+        assert_eq!(budget(30), normal);
+
+        // Disabled: one timeout for everything, whatever the bring-up cost.
+        assert_eq!(idle_budget(Duration::from_millis(200), normal, None, threshold), normal);
+    }
+
+    /// The sawtooth fix. A flat per-pass cap does not decide the drain shape:
+    /// any cohort bigger than the cap keeps the reaper saturated at
+    /// cap-per-tick regardless of how the deadlines spread, which is why
+    /// widening the jitter cannot fix a mass expiry and bounding the rate can.
+    #[test]
+    fn drain_allowance_is_a_constant_slope_bounded_both_ways() {
+        let tick = Duration::from_secs(15);
+        let window = Some(Duration::from_secs(600));
+        let a = |live| drain_allowance(live, tick, window);
+
+        // live * tick / window, so the whole fleet takes one window to drain.
+        assert_eq!(a(600), 15, "600 live over 600s at a 15s tick");
+        assert_eq!(a(400), 10);
+
+        // Floored: a small fleet is not a swing, so don't smooth it into one.
+        assert_eq!(a(0), IDLE_MIN_STOPS_PER_PASS);
+        assert_eq!(a(10), IDLE_MIN_STOPS_PER_PASS);
+
+        // Ceilinged: the daemon's protection wins over the window, and a fleet
+        // that big just drains over longer than the window.
+        assert_eq!(a(100_000), IDLE_MAX_STOPS_PER_PASS);
+
+        // Never zero while a window is set — a fractional allowance rounds up,
+        // or the reaper would stall entirely on a tiny fleet.
+        assert!(drain_allowance(1, Duration::from_secs(1), Some(Duration::from_secs(86_400))) >= 1);
+
+        // Disabled: the flat ceiling, i.e. the pre-window behaviour.
+        assert_eq!(drain_allowance(10_000, tick, None), IDLE_MAX_STOPS_PER_PASS);
+        assert_eq!(
+            drain_allowance(10_000, tick, Some(Duration::ZERO)),
+            IDLE_MAX_STOPS_PER_PASS
+        );
+    }
+
+    /// The property that actually matters to an operator watching a chart:
+    /// draining a synchronized cohort must be a straight line, not a spike
+    /// followed by a tail. That is why the allowance is sized off the
+    /// live-tier count (which a stop does not change) and not the warm count
+    /// (which shrinks under it, decaying the slope).
+    #[test]
+    fn a_synchronized_cohort_drains_as_a_ramp_not_a_cliff() {
+        let tick = Duration::from_secs(15);
+        let window = Some(Duration::from_secs(600));
+        let live = 600;
+
+        // Constant divisor ⇒ every pass of the drain gets the same allowance.
+        let rates: Vec<usize> = (0..=live)
+            // The point of the constant case: how many have already stopped
+            // does not enter into it.
+            .step_by(15)
+            .map(|_stopped| drain_allowance(live, tick, window))
+            .collect();
+        assert!(
+            rates.windows(2).all(|w| w[0] == w[1]),
+            "the slope must not change as the cohort drains: {rates:?}"
+        );
+
+        // Had it been sized off the shrinking warm count, the rate would decay
+        // — this is the shape being rejected, asserted so nobody reintroduces
+        // it thinking the two are equivalent.
+        let decaying: Vec<usize> = (0..=live)
+            .step_by(15)
+            .map(|stopped| drain_allowance(live - stopped, tick, window))
+            .collect();
+        assert!(
+            decaying.first() > decaying.last(),
+            "sanity: warm-count sizing really does decay: {decaying:?}"
+        );
+
+        // And the ramp is long enough to read as one: a full drain takes about
+        // the window, never a handful of passes.
+        let passes = live.div_ceil(drain_allowance(live, tick, window));
+        let secs = passes as u64 * tick.as_secs();
+        assert!((540..=660).contains(&secs), "drain took {secs}s, want ~600s");
+    }
+
+    /// End-to-end drain shape through the real `drain_allowance`, not a model
+    /// of it: a cohort that all comes due at once must leave the fleet on a
+    /// straight line whose per-minute peak is close to its median. The old
+    /// flat cap is run alongside on the same cohort so the regression this
+    /// fixes stays visible if anyone reverts the policy.
+    #[test]
+    fn a_mass_expiry_leaves_at_a_steady_rate() {
+        let tick = Duration::from_secs(15);
+        let live = 600usize;
+
+        /// Drain `n` VMs, `per_pass` at a time, returning stops per minute.
+        fn per_minute(n: usize, per_pass: usize, tick: Duration) -> Vec<usize> {
+            let passes_per_min = (60 / tick.as_secs().max(1)) as usize;
+            let mut left = n;
+            let mut out = Vec::new();
+            while left > 0 {
+                let mut minute = 0;
+                for _ in 0..passes_per_min {
+                    let take = per_pass.min(left);
+                    left -= take;
+                    minute += take;
+                }
+                out.push(minute);
+            }
+            out
+        }
+
+        let limited = per_minute(
+            live,
+            drain_allowance(live, tick, Some(Duration::from_secs(600))),
+            tick,
+        );
+        let flat = per_minute(live, drain_allowance(live, tick, None), tick);
+
+        let peak = *limited.iter().max().unwrap();
+        // Every full minute of the ramp moves the same number of VMs, so peak
+        // and median coincide — that is what "a ramp, not a cliff" means.
+        assert_eq!(peak, 60, "600 live / 600s window = 60 VMs a minute");
+        assert!(limited.len() >= 9, "drain spans ~10 minutes, got {}", limited.len());
+
+        // The policy this replaces runs every fleet at the ceiling regardless
+        // of its size, which is the cliff. At 600 live the gap is 96 vs 60 a
+        // minute; the gap widens as the fleet gets smaller, because the flat
+        // cap does not scale down and the window does.
+        assert_eq!(*flat.iter().max().unwrap(), 96);
+        assert!(peak < *flat.iter().max().unwrap());
+        let small = drain_allowance(120, tick, Some(Duration::from_secs(600)));
+        assert_eq!(small * 4, 16, "120 live drains at 16/min, not the flat 96");
     }
 
     #[test]
@@ -4514,6 +6388,43 @@ mod archive_tests {
         assert!(!dispatch_allowance(1, 4, Some(0.75), 0.75));
         assert!(!dispatch_allowance(1, 4, Some(2.0), 0.75));
         assert!(!dispatch_allowance(1, 4, None, 0.75));
+    }
+
+    /// The starvation escape hatch. The failure it exists for is a pacer that
+    /// dispatches nothing for hours because the bring-up queue is never empty
+    /// for a whole tick, then drains the whole backlog in one burst against a
+    /// disk already near the pressure line.
+    #[test]
+    fn forced_dispatch_overrides_deferrals_but_never_a_running_sweep() {
+        let limit = Some(Duration::from_secs(300));
+        let (under, over) = (Duration::from_secs(299), Duration::from_secs(300));
+
+        // The case it exists for: starved on queued clients, nothing running.
+        assert!(forced_dispatch(Backpressure::ClientsQueued, over, true, limit));
+        // ...but not one second early.
+        assert!(!forced_dispatch(Backpressure::ClientsQueued, under, true, limit));
+        // ...and never stacked: a forced job runs strictly single-file.
+        assert!(!forced_dispatch(Backpressure::ClientsQueued, over, false, limit));
+
+        // A reclaim pass is the same shape of deferral, and the one that
+        // starves the pacer hardest: a pass runs up to half an hour and is
+        // re-triggered after every idle reap. The job's own per-disk permit
+        // (`reclaim::try_disk_permit`) is what keeps the two off the same
+        // disk, so the pacer no longer has to stand down host-wide for it.
+        let forever = Duration::from_secs(86_400);
+        assert!(forced_dispatch(Backpressure::ReclaimPass, over, true, limit));
+        assert!(!forced_dispatch(Backpressure::ReclaimPass, under, true, limit));
+        assert!(!forced_dispatch(Backpressure::ReclaimPass, over, false, limit));
+
+        // A running sweep is different in kind: it drains through this very
+        // picker and already holds per-schema claims, so forcing past it would
+        // only double-dispatch. No holdoff, however long, overrides it.
+        assert!(!forced_dispatch(Backpressure::Sweeping, forever, true, limit));
+
+        // Disabled (PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS=0) keeps the strict
+        // yield-to-everything behavior.
+        assert!(!forced_dispatch(Backpressure::ClientsQueued, forever, true, None));
+        assert!(!forced_dispatch(Backpressure::ReclaimPass, forever, true, None));
     }
 
     /// Kind ⇒ boot is exact: only the dump-based kinds take the bring-up gate,
@@ -4853,6 +6764,52 @@ fn used_pct(used: u64, avail: u64) -> Option<f64> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn owned_claim_checkout_progresses_while_ordinary_checkout_waits() {
+        let dir = std::env::temp_dir().join(format!("pgfc-claimed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::from_env().unwrap();
+        cfg.state_file = dir.join("registry.tsv");
+        cfg.dedicated_file = dir.join("dedicated.tsv");
+        cfg.peers_file = dir.join("peers.tsv");
+        cfg.replication_file = dir.join("replication.tsv");
+        cfg.reclaim = None;
+        cfg.run_dir = None;
+        cfg.warm_spares = 0;
+        cfg.freeze = None;
+        cfg.archive = None;
+        let registry = Arc::new(SchemaRegistry::new(cfg).unwrap());
+        // Fail immediately after passing the maintenance gate, without any
+        // daemon or database connection. The original apply path instead
+        // waited forever on its own claim and never reached this breaker.
+        registry.bringup_breaker.record_failure("tenant");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.apply_replication_mode("tenant"),
+        )
+        .await
+        .expect("replication mode checkout must not wait on its own claim");
+        assert!(format!("{:#}", result.unwrap_err()).contains("holding off new attempts"));
+        assert!(!registry.is_archiving("tenant"), "failed operation must release its claim");
+
+        let claim = ArchivingGuard::claim(&registry.archiving, "tenant").unwrap();
+        let ordinary = registry.checkout("tenant");
+        tokio::pin!(ordinary);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut ordinary)
+                .await
+                .is_err(),
+            "public checkout must remain blocked while maintenance owns the schema"
+        );
+
+        drop(claim);
+        let result = tokio::time::timeout(Duration::from_secs(1), ordinary)
+            .await
+            .expect("ordinary checkout must resume after the claim is released");
+        assert!(result.err().unwrap().to_string().contains("holding off new attempts"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The orphan sweep's abort breaker must count *consecutive* daemon
     /// errors. It once cleared its run only on `Gone`, which made it count
     /// "errors since the last orphan" instead — and a run dir's forgotten
@@ -4971,36 +6928,190 @@ mod tests {
 
     #[test]
     fn grow_target_doubles_capped_and_gates_correctly() {
-        let cfg = DiskGrowConfig { pct: 80.0, max_gb: 100 };
+        let (pct, max_gb) = (80.0, 100);
         let gib = |n: u64| n * GIB;
 
         // 4GiB device, fs spans it, 90% used → double to 8.
         assert_eq!(
-            grow_target_gb((gib(4), gib(4) * 9 / 10, gib(4) / 10), gib(4), &cfg),
-            Some(8)
+            grow_verdict((gib(4), gib(4) * 9 / 10, gib(4) / 10), gib(4), pct, max_gb),
+            GrowVerdict::Grow(8)
         );
         // Below the trigger → no growth.
         assert_eq!(
-            grow_target_gb((gib(4), gib(2), gib(2)), gib(4), &cfg),
-            None
+            grow_verdict((gib(4), gib(2), gib(2)), gib(4), pct, max_gb),
+            GrowVerdict::NotNeeded
         );
         // Full fs but THIN under a bigger device → the guest watcher's job.
         assert_eq!(
-            grow_target_gb((gib(4), gib(4) * 9 / 10, gib(4) / 10), gib(16), &cfg),
-            None
+            grow_verdict((gib(4), gib(4) * 9 / 10, gib(4) / 10), gib(16), pct, max_gb),
+            GrowVerdict::NotNeeded
         );
         // Doubling past the cap clamps to it.
         assert_eq!(
-            grow_target_gb((gib(64), gib(60), gib(4)), gib(64), &cfg),
-            Some(100)
+            grow_verdict((gib(64), gib(60), gib(4)), gib(64), pct, max_gb),
+            GrowVerdict::Grow(100)
         );
-        // Already at the cap → never grows.
+        // Already at the cap → `AtCap`, NOT `NotNeeded`. The distinction is
+        // the whole point: this schema is full and the pooler has no lever
+        // left, which the urgent grower reports at error level instead of
+        // quietly declining to act.
         assert_eq!(
-            grow_target_gb((gib(100), gib(95), gib(5)), gib(100), &cfg),
-            None
+            grow_verdict((gib(100), gib(95), gib(5)), gib(100), pct, max_gb),
+            GrowVerdict::AtCap { current_gb: 100 }
         );
         // Unreadable df (0/0) → no decision.
-        assert_eq!(grow_target_gb((0, 0, 0), gib(4), &cfg), None);
+        assert_eq!(
+            grow_verdict((0, 0, 0), gib(4), pct, max_gb),
+            GrowVerdict::NotNeeded
+        );
+    }
+
+    /// The urgent threshold has to be strictly later than the idle-stop one:
+    /// the cheap path must keep catching everything that does go idle, and the
+    /// expensive path (which drops live sessions) must only fire on what it
+    /// misses. Same filesystem, two thresholds, two answers.
+    #[test]
+    fn the_urgent_threshold_fires_later_than_the_idle_stop_one() {
+        let gib = |n: u64| n * GIB;
+        // 88% full on a device the fs spans: past the idle-stop trigger (85),
+        // short of the urgent one (95).
+        let fs = (gib(8), gib(8) * 88 / 100, gib(8) * 12 / 100);
+        assert_eq!(grow_verdict(fs, gib(8), 85.0, 100), GrowVerdict::Grow(16));
+        assert_eq!(grow_verdict(fs, gib(8), 95.0, 100), GrowVerdict::NotNeeded);
+
+        // 96% full: both agree, and both pick the same target — the urgent
+        // path is a different *trigger*, never a different growth policy.
+        let full = (gib(8), gib(8) * 96 / 100, gib(8) * 4 / 100);
+        assert_eq!(grow_verdict(full, gib(8), 85.0, 100), GrowVerdict::Grow(16));
+        assert_eq!(grow_verdict(full, gib(8), 95.0, 100), GrowVerdict::Grow(16));
+    }
+
+    /// A bulk load is caught before its disk is full: two samples make a fill
+    /// rate, the rate projects what the next check would find, and the grow
+    /// fires while there is still room to stop cleanly.
+    #[test]
+    fn a_filling_disk_grows_before_it_reaches_the_threshold() {
+        let mib = |n: u64| n * 1024 * 1024;
+        let dev = 2 * GIB;
+        let fs_at = |used: u64| (dev, used, dev - used);
+        let t0 = Instant::now();
+
+        // First reading, 40% used: no rate yet, so it is looked at again soon.
+        let used0 = dev * 40 / 100;
+        let first = next_grow_sample(None, fs_at(used0), t0, 95.0);
+        assert_eq!(first.rate, None);
+        assert!(first.hot);
+        assert_eq!(
+            urgent_verdict(fs_at(used0), dev, &first, 95.0, 100),
+            GrowVerdict::NotNeeded
+        );
+
+        // 300MiB later, ten seconds on: 30MiB/s. The next check plus the stop
+        // (20s) would land near 84% — not yet.
+        let t1 = t0 + Duration::from_secs(10);
+        let used1 = used0 + mib(300);
+        let second = next_grow_sample(Some(&first), fs_at(used1), t1, 95.0);
+        assert!((second.rate.unwrap() - mib(30) as f64).abs() < 1.0);
+        assert!(second.hot);
+        assert_eq!(
+            urgent_verdict(fs_at(used1), dev, &second, 95.0, 100),
+            GrowVerdict::NotNeeded
+        );
+
+        // Another 300MiB: 69% used, which alone is nowhere near 95% — but by
+        // the next check it would be past it. Grow now, with ~600MiB to spare.
+        let t2 = t1 + Duration::from_secs(10);
+        let used2 = used1 + mib(300);
+        let third = next_grow_sample(Some(&second), fs_at(used2), t2, 95.0);
+        assert_eq!(
+            grow_verdict(fs_at(used2), dev, 95.0, 100),
+            GrowVerdict::NotNeeded
+        );
+        assert_eq!(
+            urgent_verdict(fs_at(used2), dev, &third, 95.0, 100),
+            GrowVerdict::Grow(4)
+        );
+    }
+
+    /// The fast cadence is for schemas that earn it. Everything else keeps
+    /// the one guest query a minute the warm set can afford.
+    #[test]
+    fn only_filling_or_nearly_full_schemas_get_the_fast_cadence() {
+        let mib = |n: u64| n * 1024 * 1024;
+        let dev = 8 * GIB;
+        let fs_at = |used: u64| (dev, used, dev - used);
+        let t0 = Instant::now();
+
+        // Never sampled: due now. Sampled once: due again on the fast cadence.
+        assert!(urgent_sample_due(None, t0));
+        let first = next_grow_sample(None, fs_at(2 * GIB), t0, 95.0);
+        assert!(urgent_sample_due(
+            Some(&first),
+            t0 + URGENT_GROW_FAST_INTERVAL
+        ));
+
+        // Quiet (1MiB in 10s) at 25%: back to once a minute.
+        let t1 = t0 + Duration::from_secs(10);
+        let quiet = next_grow_sample(Some(&first), fs_at(2 * GIB + mib(1)), t1, 95.0);
+        assert!(!quiet.hot);
+        assert!(!urgent_sample_due(
+            Some(&quiet),
+            t1 + URGENT_GROW_FAST_INTERVAL
+        ));
+        assert!(urgent_sample_due(
+            Some(&quiet),
+            t1 + URGENT_GROW_CHECK_INTERVAL
+        ));
+
+        // Filling at 2MiB/s: fast.
+        let t2 = t1 + Duration::from_secs(10);
+        let filling = next_grow_sample(Some(&quiet), fs_at(2 * GIB + mib(21)), t2, 95.0);
+        assert!(filling.hot);
+
+        // Flat, but within the watch margin of the threshold (82% vs 80%): fast.
+        let flat_near = GrowSample {
+            used: dev * 82 / 100,
+            at: t1,
+            rate: Some(0.0),
+            hot: false,
+        };
+        let near = next_grow_sample(Some(&flat_near), fs_at(dev * 82 / 100), t2, 95.0);
+        assert_eq!(near.rate, Some(0.0));
+        assert!(near.hot);
+
+        // Shrinking and far from the wall: not filling.
+        let shrinking = next_grow_sample(Some(&quiet), fs_at(GIB), t2, 95.0);
+        assert!(!shrinking.hot);
+    }
+
+    #[test]
+    fn projection_never_invents_growth_or_a_cap_complaint() {
+        let fs = (2 * GIB, GIB, GIB);
+        let horizon = Duration::from_secs(20);
+        // No rate, flat, or shrinking: the reading as it is.
+        assert_eq!(project_fs(fs, None, horizon), fs);
+        assert_eq!(project_fs(fs, Some(0.0), horizon), fs);
+        assert_eq!(project_fs(fs, Some(-1e6), horizon), fs);
+        // Growth beyond the space left stops at full.
+        assert_eq!(project_fs(fs, Some(1e12), horizon), (2 * GIB, 2 * GIB, 0));
+
+        // Projected to cross on a device already at the cap: not a complaint
+        // yet — only a disk that is actually full gets the at-cap error.
+        let racing = GrowSample {
+            used: GIB,
+            at: Instant::now(),
+            rate: Some(1e9),
+            hot: true,
+        };
+        assert_eq!(
+            urgent_verdict(fs, 2 * GIB, &racing, 95.0, 2),
+            GrowVerdict::NotNeeded
+        );
+        let full = (2 * GIB, 2 * GIB * 96 / 100, 2 * GIB * 4 / 100);
+        assert_eq!(
+            urgent_verdict(full, 2 * GIB, &racing, 95.0, 2),
+            GrowVerdict::AtCap { current_gb: 2 }
+        );
     }
 
     #[test]

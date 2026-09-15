@@ -141,6 +141,9 @@ pub enum Resource {
     /// A per-sandbox disk on the app-lb host: the `/workspace` data disk, the
     /// rootfs copy and the boot scratch, with whatever still claims them.
     Disk,
+    /// A namespace: not an object, but the set of deployments that name it.
+    /// Listable and filterable; never created or deleted directly.
+    Namespace,
     /// `get all` — every kind that has a listing.
     All,
 }
@@ -161,6 +164,11 @@ impl Resource {
             // `pv` and `volume` because that is what someone arriving from
             // kubectl will type, and this listing answers the same question.
             "disk" | "pv" | "volume" | "vol" | "storage" => Some(Self::Disk),
+            // `n` rather than `ns` because the match runs on the word with its
+            // trailing `s` already stripped, so `ns` arrives here as `n`. It
+            // coexists with `--namespace`'s `-n` the same way `d` coexists with
+            // `-d`: only the positional resource word reaches this.
+            "namespace" | "n" => Some(Self::Namespace),
             "all" => Some(Self::All),
             _ => None,
         }
@@ -175,6 +183,7 @@ impl Resource {
             Self::Workflow => "workflow",
             Self::Job => "job",
             Self::Disk => "disk",
+            Self::Namespace => "namespace",
             Self::All => "all",
         }
     }
@@ -262,6 +271,38 @@ mod tests {
         assert_eq!((kind, names), (Resource::Deployment, vec!["web".to_string()]));
         let (_, names) = parse_ref(&args(&["deployment", "web", "api"]), None).unwrap();
         assert_eq!(names, vec!["web".to_string(), "api".to_string()]);
+    }
+
+    #[test]
+    fn namespaces_are_listable_under_the_names_people_reach_for() {
+        for word in ["namespace", "namespaces", "ns"] {
+            assert_eq!(
+                parse_ref(&args(&[word]), None).unwrap().0,
+                Resource::Namespace,
+                "{word}",
+            );
+        }
+        // The trailing `s` is stripped before matching, so `ns` and `n` are the
+        // same word by the time it gets here — as `d`/`ds` already are.
+        assert_eq!(Resource::parse("n"), Some(Resource::Namespace));
+        assert_eq!(Resource::Namespace.singular(), "namespace");
+    }
+
+    /// `apply` dispatches on `kind`, and its absence has to keep meaning
+    /// "deployment" — every spec file written before namespaces existed says
+    /// nothing about kind, and there are a lot of them.
+    #[test]
+    fn an_object_with_no_kind_is_still_a_deployment() {
+        use serde_json::json;
+        let kind_of = |v: &serde_json::Value| {
+            v.get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("deployment")
+                .to_string()
+        };
+        assert_eq!(kind_of(&json!({"id": "web", "routes": []})), "deployment");
+        assert_eq!(kind_of(&json!({"kind": "namespace", "name": "sam"})), "namespace");
+        assert_eq!(kind_of(&json!({"kind": "deployment", "id": "web"})), "deployment");
     }
 
     #[test]
