@@ -1,34 +1,9 @@
-//! The submit endpoint: `git submit` posts here.
+//! The submit endpoint: `git submit` posts a bounded source descriptor here.
 //!
-//! The client sends the source it wants built — a **`git bundle`** by default,
-//! or a **`git archive` tarball** with `--archive`. Two consequences follow from
-//! the submitter packing it rather than the server fetching it, and both are the
-//! point:
-//!
-//! - **No repository credential exists anywhere in this system.** Not on the
-//!   orchestrator, not in a guest. The submitter already had read access — they
-//!   ran `git bundle` — so nothing here needs its own. A CI system that clones
-//!   for you is a CI system holding a key to every repository it builds.
-//! - **The tree is exactly what the submitter meant.** No re-resolving a ref
-//!   that may have moved, no guessing whether `--dirty` work was included. What
-//!   arrives is what runs.
-//!
-//! ## Why a bundle, and why the tarball survives
-//!
-//! A bundle clones in the guest into a real repository, so `git describe`,
-//! `git log` and `git rev-parse` work in a step — which a tarball cannot offer,
-//! having no `.git` at all.
-//!
-//! It costs history. A bundle that clones on its own **must reach a root
-//! commit**: `git bundle create --depth` does not exist, and a `--max-count`
-//! slice is refused at clone time with *"Repository lacks these prerequisite
-//! commits"*. So the payload is proportional to the repository's history rather
-//! than to one tree, and `--archive` stays supported for the repository where
-//! that is the wrong trade.
-//!
-//! Both formats need a tool the other does not: a bundle needs `git` on the
-//! orchestrator *and* in the guest image; a tarball needs neither. Each absence
-//! is reported by name.
+//! The descriptor identifies an immutable base revision and target tree, carries
+//! a patch for a runner-owned checkout, and includes only the workflow YAML the
+//! server needs to plan the run. The server validates and stores that metadata;
+//! it neither clones nor expands repository content.
 //!
 //! ## The signature is the whole security boundary
 //!
@@ -44,6 +19,7 @@ use crate::paths::Changes;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use sha2::Sha256;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -93,6 +69,57 @@ pub struct SourceArchive {
     /// arrive where they already are.
     #[serde(skip)]
     pub bytes: Option<Vec<u8>>,
+}
+
+/// The small, durable description of source a worker must reconstruct.
+/// Repository location and credentials deliberately are not part of this
+/// client-controlled value; the executor takes the canonical URL from ci_run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPatchSource {
+    pub base_revision: String,
+    pub target_tree: String,
+    pub patch_base64: String,
+    #[serde(deserialize_with = "deserialize_workflows")]
+    pub workflows: BTreeMap<String, String>,
+    #[serde(default)]
+    pub changes: Changes,
+}
+
+fn deserialize_workflows<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, MapAccess, Visitor};
+
+    struct WorkflowsVisitor;
+    impl<'de> Visitor<'de> for WorkflowsVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an object of unique workflow paths and YAML text")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut workflows = BTreeMap::new();
+            while let Some((path, text)) = map.next_entry::<String, String>()? {
+                if workflows.insert(path.clone(), text).is_some() {
+                    return Err(A::Error::custom(format!("duplicate workflow path {path:?}")));
+                }
+            }
+            Ok(workflows)
+        }
+    }
+
+    deserializer.deserialize_map(WorkflowsVisitor)
+}
+
+impl GitPatchSource {
+    pub fn patch(&self) -> Result<Vec<u8>, TriggerError> {
+        base64::engine::general_purpose::STANDARD
+            .decode(self.patch_base64.as_bytes())
+            .map_err(|e| TriggerError::BadArchive(format!("patchBase64 is not valid base64: {e}")))
+    }
 }
 
 /// What a re-run carries that a submit does not. Set only in-process by
@@ -221,19 +248,23 @@ pub fn verify_signature(
     }
 }
 
-/// How a submitted tree arrived, and therefore how it reaches the guest.
+/// A stored source format. Legacy formats remain identifiable so historical
+/// files can be retained and rejected explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFormat {
-    /// `git archive` of one tree. No `.git` in the guest.
+    GitPatch,
+    /// Historical `git archive` of one tree; no longer accepted.
     TarGz,
-    /// `git bundle` of the branch. Clones in the guest into a real repository,
-    /// so `git describe`, `git log` and `git rev-parse` work in a step.
+    /// Historical `git bundle` of a branch; no longer accepted.
     GitBundle,
 }
 
 impl SourceFormat {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim() {
+            "git-patch" => Some(Self::GitPatch),
+            // Recognized for locating historical data. New materialization
+            // below still rejects both legacy bulk formats.
             "tar.gz" => Some(Self::TarGz),
             "git-bundle" => Some(Self::GitBundle),
             _ => None,
@@ -242,6 +273,7 @@ impl SourceFormat {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::GitPatch => "git-patch",
             Self::TarGz => "tar.gz",
             Self::GitBundle => "git-bundle",
         }
@@ -254,6 +286,7 @@ impl SourceFormat {
     /// the file that exists is what tells it which one to ship.
     fn extension(&self) -> &'static str {
         match self {
+            Self::GitPatch => "source.json",
             Self::TarGz => "tar.gz",
             Self::GitBundle => "bundle",
         }
@@ -267,6 +300,8 @@ pub struct Workspace {
     pub tarball: PathBuf,
     /// `git bundle`, when that is what was submitted.
     pub bundle: PathBuf,
+    /// Validated git-patch descriptor. This is metadata, never a repository.
+    pub descriptor: PathBuf,
 }
 
 impl Workspace {
@@ -279,20 +314,23 @@ impl Workspace {
             bundle: config
                 .workspace_dir
                 .join(format!("{run_id}.{}", SourceFormat::GitBundle.extension())),
+            descriptor: config
+                .workspace_dir
+                .join(format!("{run_id}.{}", SourceFormat::GitPatch.extension())),
         }
     }
 
     pub fn path_for(&self, format: SourceFormat) -> &Path {
         match format {
+            SourceFormat::GitPatch => &self.descriptor,
             SourceFormat::TarGz => &self.tarball,
             SourceFormat::GitBundle => &self.bundle,
         }
     }
 
-    /// Which of the two is actually on disk, for a run whose submit happened in
-    /// another process.
+    /// Which source is on disk, including retained historical submissions.
     pub fn stored_source(&self) -> Option<(SourceFormat, &Path)> {
-        for format in [SourceFormat::GitBundle, SourceFormat::TarGz] {
+        for format in [SourceFormat::GitPatch, SourceFormat::GitBundle, SourceFormat::TarGz] {
             let path = self.path_for(format);
             if path.exists() {
                 return Some((format, path));
@@ -302,14 +340,7 @@ impl Workspace {
     }
 }
 
-/// Decode a submitted source into `workspace.root`, keeping the original bytes
-/// alongside it for shipping to the guest.
-///
-/// Keeping the original rather than re-packing is not just an optimisation: a
-/// round trip through unpack-and-repack would silently normalise permissions and
-/// drop anything the unpacker chose not to write, so what runs in the guest
-/// would differ from what was submitted. For a bundle it matters more still —
-/// re-packing would discard the history that is the whole reason to send one.
+/// Validate and persist a source descriptor and its bounded workflow metadata.
 pub fn materialize(
     source: &SourceArchive,
     workspace: &Workspace,
@@ -317,6 +348,9 @@ pub fn materialize(
 ) -> Result<usize, TriggerError> {
     let format = SourceFormat::parse(&source.format)
         .ok_or_else(|| TriggerError::UnsupportedFormat(source.format.clone()))?;
+    if format != SourceFormat::GitPatch {
+        return Err(TriggerError::UnsupportedFormat(source.format.clone()));
+    }
 
     let bytes = match &source.bytes {
         Some(bytes) => bytes.clone(),
@@ -331,6 +365,12 @@ pub fn materialize(
         });
     }
 
+    // Validation must precede every filesystem mutation. A malformed retry for
+    // an existing run must leave its last valid descriptor and workflows intact.
+    let descriptor: GitPatchSource = serde_json::from_slice(&bytes)
+        .map_err(|e| TriggerError::BadArchive(format!("git-patch descriptor is not valid JSON: {e}")))?;
+    validate_descriptor(&descriptor)?;
+
     if workspace.root.exists() {
         std::fs::remove_dir_all(&workspace.root).map_err(|e| TriggerError::Io {
             path: workspace.root.clone(),
@@ -342,185 +382,76 @@ pub fn materialize(
         reason: e.to_string(),
     })?;
 
-    // The bytes are written before they are unpacked, because cloning a bundle
-    // reads it from disk — and because a stale file of the *other* format left
-    // by a re-submit would otherwise be what `stored_source` finds later.
+    // Persist only bounded metadata and workflow YAML. The patch remains in the
+    // descriptor and is never applied or expanded by the CI server.
+    for (path, text) in &descriptor.workflows {
+        let destination = workspace.root.join(path);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| TriggerError::Io {
+                path: parent.to_path_buf(), reason: e.to_string(),
+            })?;
+        }
+        std::fs::write(&destination, text).map_err(|e| TriggerError::Io {
+            path: destination, reason: e.to_string(),
+        })?;
+    }
+
+    // The bytes are written after validation; malformed submissions cannot
+    // replace durable source that a rerun may read later.
     let stored = workspace.path_for(format);
     std::fs::write(stored, &bytes).map_err(|e| TriggerError::Io {
         path: stored.to_path_buf(),
         reason: e.to_string(),
     })?;
-    let _ = std::fs::remove_file(workspace.path_for(match format {
-        SourceFormat::TarGz => SourceFormat::GitBundle,
-        SourceFormat::GitBundle => SourceFormat::TarGz,
-    }));
-
-    match format {
-        SourceFormat::TarGz => extract(&bytes, &workspace.root)?,
-        SourceFormat::GitBundle => clone_bundle(stored, &workspace.root)?,
-    }
     Ok(bytes.len())
 }
 
-/// Clone a submitted bundle into `root`, producing a real working tree.
-///
-/// Shelling out to `git` rather than linking a git library: the orchestrator
-/// only needs this to read workflow files and hash `cache_key_files` out of the
-/// tree, and `git` is already a hard requirement of the deployment (app-lb's
-/// update block runs `git pull`). A missing binary is reported by name rather
-/// than as a confusing clone failure.
-///
-/// **The bundle is unauthenticated input until the credential check passes**, and
-/// only as trustworthy afterwards as whoever holds the token. `git clone` of a
-/// local bundle writes only inside the destination — there is no hook to run,
-/// because hooks live in the destination's own `.git` which git creates fresh —
-/// but it is still given an empty environment-ish treatment below: `core.hooksPath`
-/// is pinned away and the bundle is verified before it is used.
-fn clone_bundle(bundle: &Path, root: &Path) -> Result<(), TriggerError> {
-    let git = |args: &[&str]| -> Result<std::process::Output, TriggerError> {
-        std::process::Command::new("git")
-            .args(args)
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    TriggerError::NoGit
-                } else {
-                    TriggerError::BadArchive(format!("running git: {e}"))
-                }
-            })
-    };
+const MAX_WORKFLOWS: usize = 128;
+const MAX_WORKFLOW_BYTES: usize = 1024 * 1024;
 
-    // `git bundle verify` needs a repository to run in — "need a repository to
-    // verify a bundle" otherwise — because a bundle may declare prerequisite
-    // commits and the check is against *some* object store. The orchestrator's
-    // own working directory is deliberately not a repository (and must not be
-    // relied on either way: `cargo test` runs inside one, which is exactly how
-    // this dependence went unnoticed), so verify gets a scratch repo of its
-    // own. Empty on purpose: against no objects at all, "verifies" means the
-    // bundle is complete, so a client that sent a shallow slice is named here
-    // as missing its prerequisites rather than failing later as an unexplained
-    // empty checkout.
-    let scratch = bundle.with_extension("verify");
-    let _ = std::fs::remove_dir_all(&scratch);
-    let init = git(&["init", "--quiet", &scratch.display().to_string()])?;
-    if !init.status.success() {
-        return Err(TriggerError::BadArchive(format!(
-            "could not prepare a scratch repository to verify the bundle: {}",
-            String::from_utf8_lossy(&init.stderr).trim()
-        )));
-    }
-    let scratch_dir = scratch.display().to_string();
-    let inspected = inspect_bundle(&git, &scratch_dir, bundle);
-    let _ = std::fs::remove_dir_all(&scratch);
-    inspected?;
-
-    let out = git(&[
-        // A hooks path that cannot exist, so nothing in the submitted history
-        // can arrange to be executed by the clone.
-        "-c",
-        "core.hooksPath=/nonexistent",
-        "clone",
-        "--quiet",
-        &bundle.display().to_string(),
-        &root.display().to_string(),
-    ])?;
-    if !out.status.success() {
-        return Err(TriggerError::BadArchive(format!(
-            "cloning the submitted bundle failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(())
-}
-
-/// The bundle checks that need a repository: verify, then a ref count.
-///
-/// Split out of [`clone_bundle`] so the scratch repository is removed on every
-/// exit path without a guard type. `scratch_dir` is a freshly `git init`ed
-/// directory; see the call site for why it is empty.
-fn inspect_bundle(
-    git: &dyn Fn(&[&str]) -> Result<std::process::Output, TriggerError>,
-    scratch_dir: &str,
-    bundle: &Path,
-) -> Result<(), TriggerError> {
-    // Verify first: `git bundle verify` rejects a truncated or corrupt bundle,
-    // and a bundle whose prerequisites are absent — which is exactly what a
-    // client that tried to send a shallow slice would produce.
-    let verify = git(&[
-        "-C",
-        scratch_dir,
-        "bundle",
-        "verify",
-        &bundle.display().to_string(),
-    ])?;
-    if !verify.status.success() {
-        return Err(TriggerError::BadArchive(format!(
-            "the git bundle is not usable on its own: {}",
-            String::from_utf8_lossy(&verify.stderr).trim()
-        )));
-    }
-
-    // `verify` is not enough, and the gap is not obvious: a file containing
-    // nothing but the header `# v2 git bundle` **passes** it — reported as
-    // "is okay", "0 refs", "records a complete history" — and then clones into
-    // an empty repository. The submitter's next error would be "no workflow
-    // files matched", sending them to look at their glob when the real problem
-    // is that nothing was sent. So the refs are counted explicitly.
-    let heads = git(&[
-        "-C",
-        scratch_dir,
-        "bundle",
-        "list-heads",
-        &bundle.display().to_string(),
-    ])?;
-    if heads.stdout.iter().all(u8::is_ascii_whitespace) {
-        return Err(TriggerError::BadArchive(
-            "the git bundle contains no refs, so there is nothing to check out. \
-             It passed `git bundle verify`, which reports a ref-less bundle as \
-             complete — check that the client packed a branch and not a bare \
-             commit."
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Extract a gzipped tar, refusing any entry that would write outside `root`.
-///
-/// The archive is unauthenticated input right up until the signature check
-/// passes, and even then it is only as trustworthy as whoever holds the webhook
-/// secret. `tar`'s own protections have historically varied by version, so every
-/// path is checked here: no absolute paths, no `..`, and no symlink or hard link
-/// pointing outside the tree.
-fn extract(gz: &[u8], root: &Path) -> Result<(), TriggerError> {
-    let decoder = flate2::read::GzDecoder::new(gz);
-    let mut archive = tar::Archive::new(decoder);
-    // Ownership from the archive is meaningless here and would need privileges.
-    archive.set_preserve_permissions(true);
-    archive.set_unpack_xattrs(false);
-
-    let entries = archive
-        .entries()
-        .map_err(|e| TriggerError::BadArchive(e.to_string()))?;
-
-    for entry in entries {
-        let mut entry = entry.map_err(|e| TriggerError::BadArchive(e.to_string()))?;
-        let path = entry
-            .path()
-            .map_err(|e| TriggerError::BadArchive(e.to_string()))?
-            .into_owned();
-        check_contained(&path)?;
-
-        // A link's *target* escapes just as effectively as a path does.
-        if let Ok(Some(link)) = entry.link_name() {
-            check_contained(&link)?;
+fn validate_descriptor(source: &GitPatchSource) -> Result<(), TriggerError> {
+    for (field, value) in [("baseRevision", &source.base_revision), ("targetTree", &source.target_tree)] {
+        if !matches!(value.len(), 40 | 64) || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(TriggerError::BadArchive(format!("{field} must be a full hexadecimal Git object ID")));
         }
-
-        entry
-            .unpack_in(root)
-            .map_err(|e| TriggerError::BadArchive(format!("unpacking {}: {e}", path.display())))?;
+    }
+    source.patch()?;
+    if source.workflows.len() > MAX_WORKFLOWS {
+        return Err(TriggerError::BadArchive(format!("at most {MAX_WORKFLOWS} workflow files may be submitted")));
+    }
+    let mut total = 0usize;
+    for (path, text) in &source.workflows {
+        let p = Path::new(path);
+        check_contained(p)?;
+        if path.contains('\\') || p.components().any(|c| matches!(c, Component::CurDir) || matches!(c, Component::Normal(v) if v == ".git"))
+            || !matches!(p.extension().and_then(|v| v.to_str()), Some("yml" | "yaml"))
+        {
+            return Err(TriggerError::BadArchive(format!("workflow path {path:?} must be a normalized relative YAML path without .git components")));
+        }
+        let normalized = p.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+        if normalized != *path {
+            return Err(TriggerError::BadArchive(format!("workflow path {path:?} is not normalized")));
+        }
+        total = total.saturating_add(path.len()).saturating_add(text.len());
+    }
+    if total > MAX_WORKFLOW_BYTES {
+        return Err(TriggerError::BadArchive(format!("workflow metadata exceeds {MAX_WORKFLOW_BYTES} bytes")));
     }
     Ok(())
+}
+
+pub fn read_descriptor(workspace: &Workspace) -> Result<GitPatchSource, TriggerError> {
+    read_descriptor_path(&workspace.descriptor)
+}
+
+pub fn read_descriptor_path(path: &Path) -> Result<GitPatchSource, TriggerError> {
+    let bytes = std::fs::read(path).map_err(|e| TriggerError::Io {
+        path: path.to_path_buf(), reason: e.to_string(),
+    })?;
+    let source = serde_json::from_slice(&bytes)
+        .map_err(|e| TriggerError::BadArchive(format!("stored git-patch descriptor is invalid: {e}")))?;
+    validate_descriptor(&source)?;
+    Ok(source)
 }
 
 /// Whether a path stays inside the extraction root.
@@ -539,87 +470,18 @@ fn check_contained(path: &Path) -> Result<(), TriggerError> {
     Ok(())
 }
 
-/// What a submit changed, read out of the submitted bundle's own history.
-///
-/// **The `after` side is the clone's `HEAD`, not the payload's `after` field.**
-/// With `git submit --dirty` the client reports `<sha>-dirty`, which is a label
-/// for a person and not a resolvable object: the tree that actually travelled is
-/// a throwaway commit the client made from the index plus the worktree, and the
-/// bundle's `HEAD` is the only thing that points at it. Diffing what arrived
-/// against what the client says it came from is also the only version of this
-/// that stays true for `--ref`, where `HEAD` is not the submitter's `HEAD`.
-///
-/// Every failure here is [`Changes::Unknown`], never an empty diff — see the
-/// [`crate::paths`] module doc for why that direction is the whole point.
-pub fn changed_paths(workspace: &Workspace, before: &str) -> Changes {
+/// What a submit changed, as recorded in its validated descriptor.
+pub fn changed_paths(workspace: &Workspace, _before: &str) -> Changes {
+    if let Ok(source) = read_descriptor(workspace) {
+        return source.changes;
+    }
     let Some((format, _)) = workspace.stored_source() else {
         return Changes::unknown("this run's submitted source is no longer on disk");
     };
-    if format != SourceFormat::GitBundle {
-        return Changes::unknown(
-            "the submit is a `--archive` tarball, which carries no history to diff against. \
-             Submit a git bundle (the default) for path filters to have an answer",
-        );
-    }
-    let before = before.trim();
-    if before.is_empty() {
-        return Changes::unknown(
-            "the submitted commit has no parent, so there is nothing to diff against",
-        );
-    }
-
-    let root = workspace.root.display().to_string();
-    let git = |args: &[&str]| -> Result<std::process::Output, String> {
-        std::process::Command::new("git")
-            .args(["-C", &root])
-            .args(args)
-            .output()
-            .map_err(|e| e.to_string())
-    };
-
-    // Checked separately from the diff so the reason names the missing commit
-    // rather than reporting git's own message about an ambiguous argument. A
-    // bundle reaches a root commit, so an absent parent means the client sent a
-    // `before` from a history this bundle is not part of.
-    match git(&[
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        &format!("{before}^{{commit}}"),
-    ]) {
-        Err(e) => return Changes::unknown(format!("could not run git to read the diff: {e}")),
-        Ok(out) if !out.status.success() => {
-            return Changes::unknown(format!(
-                "commit {before} is not in the submitted bundle, so there is nothing to \
-                 diff against"
-            ));
-        }
-        Ok(_) => {}
-    }
-
-    // `--no-renames` on purpose: with rename detection a file moved out of one
-    // package and into another reports only its new path, so the package that
-    // lost it would not rebuild. Both sides of a move are a change to both.
-    // `-z` because git quotes unusual bytes in a path otherwise, and a quoted
-    // path would not match the glob the workflow author wrote.
-    let out = match git(&["diff", "--name-only", "--no-renames", "-z", before, "HEAD"]) {
-        Ok(o) => o,
-        Err(e) => return Changes::unknown(format!("could not run git to read the diff: {e}")),
-    };
-    if !out.status.success() {
-        return Changes::unknown(format!(
-            "git could not diff {before}..HEAD: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-
-    Changes::known(
-        String::from_utf8_lossy(&out.stdout)
-            .split('\0')
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
-            .collect(),
-    )
+    Changes::unknown(format!(
+        "this historical {} submission is retained but cannot be loaded; resubmit with a git-patch client",
+        format.as_str()
+    ))
 }
 
 /// Find workflow files in an extracted tree.
@@ -697,8 +559,6 @@ pub enum TriggerError {
         reason: String,
     },
     NoWorkflows(String),
-    /// `git` is not on the orchestrator's PATH, so a bundle cannot be read.
-    NoGit,
 }
 
 impl TriggerError {
@@ -733,9 +593,10 @@ impl fmt::Display for TriggerError {
             Self::UnsupportedFormat(fmt) => write!(
                 f,
                 "source archive format {fmt:?} is not supported; this server \
-                 understands `tar.gz`. Upgrade `git submit`."
+                 accepts only `git-patch`. Upgrade `git submit` and resubmit; legacy \
+                 tar.gz and git-bundle runs are retained but cannot be run or rerun."
             ),
-            Self::BadArchive(e) => write!(f, "the source archive could not be read: {e}"),
+            Self::BadArchive(e) => write!(f, "the source descriptor could not be read: {e}"),
             Self::EscapingEntry(p) => write!(
                 f,
                 "the source archive contains {p:?}, which would write outside the \
@@ -743,20 +604,13 @@ impl fmt::Display for TriggerError {
             ),
             Self::ArchiveTooLarge { bytes, max } => write!(
                 f,
-                "the source archive is {bytes} bytes, over the {max}-byte limit. \
-                 Raise CI_MAX_SOURCE_BYTES, or exclude build output with a \
-                 .gitattributes `export-ignore`."
+                "the source descriptor is {bytes} bytes, over the {max}-byte limit. \
+                 Raise CI_MAX_SOURCE_BYTES or reduce the submitted patch/workflow metadata."
             ),
             Self::Io { path, reason } => write!(f, "{}: {reason}", path.display()),
             Self::NoWorkflows(pattern) => write!(
                 f,
                 "no workflow files matched {pattern:?} in the submitted tree"
-            ),
-            Self::NoGit => write!(
-                f,
-                "this submit is a git bundle, but `git` is not on this server's PATH. \
-                 Install git on the orchestrator, or submit with `git submit --archive` \
-                 to send a plain tree instead."
             ),
         }
     }
@@ -766,6 +620,130 @@ impl std::error::Error for TriggerError {}
 
 #[cfg(test)]
 mod tests {
+    mod patches {
+        use super::super::*;
+        use base64::Engine;
+
+        fn descriptor(path: &str) -> SourceArchive {
+            let value = serde_json::json!({
+                "baseRevision": "a".repeat(40),
+                "targetTree": "b".repeat(40),
+                "patchBase64": base64::engine::general_purpose::STANDARD.encode(b"diff --git a/x b/x\n"),
+                "workflows": { path: "name: test\non: [submit]\njobs: {}\n" },
+                "changes": { "kind": "known", "paths": ["deleted", "binary", "executable"] }
+            });
+            SourceArchive {
+                format: "git-patch".into(),
+                content_base64: base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&value).unwrap()),
+                bytes: None,
+            }
+        }
+
+        fn workspace() -> (PathBuf, Workspace) {
+            let dir = std::env::temp_dir().join(format!("ci-patch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let ws = Workspace {
+                root: dir.join("run"),
+                tarball: dir.join("run.tar.gz"),
+                bundle: dir.join("run.bundle"),
+                descriptor: dir.join("run.source.json"),
+            };
+            (dir, ws)
+        }
+
+        #[test]
+        fn materializes_only_workflow_metadata_and_persists_descriptor() {
+            let (dir, ws) = workspace();
+            materialize(&descriptor(".ci/workflows/build.yml"), &ws, 1 << 20).unwrap();
+            assert!(ws.descriptor.is_file());
+            assert!(ws.root.join(".ci/workflows/build.yml").is_file());
+            assert_eq!(std::fs::read_dir(&ws.root).unwrap().count(), 1);
+            assert_eq!(read_descriptor(&ws).unwrap().changes.paths(), &["deleted", "binary", "executable"]);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn rejects_legacy_bulk_source_and_malicious_workflow_paths() {
+            let legacy = SourceArchive { format: "git-bundle".into(), content_base64: String::new(), bytes: Some(vec![]) };
+            let (dir, ws) = workspace();
+            assert!(matches!(materialize(&legacy, &ws, 100), Err(TriggerError::UnsupportedFormat(_))));
+            for path in ["../evil.yml", "/evil.yml", ".git/hooks/evil.yml", "a/./evil.yml", "evil.txt"] {
+                assert!(materialize(&descriptor(path), &ws, 1 << 20).is_err(), "accepted {path}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn invalid_replacement_preserves_the_last_valid_source() {
+            let (dir, ws) = workspace();
+            let first = descriptor(".ci/workflows/old.yml");
+            materialize(&first, &ws, 1 << 20).unwrap();
+            let stored = std::fs::read(&ws.descriptor).unwrap();
+
+            let invalid = descriptor("../escape.yml");
+            assert!(materialize(&invalid, &ws, 1 << 20).is_err());
+            assert_eq!(std::fs::read(&ws.descriptor).unwrap(), stored);
+            assert!(ws.root.join(".ci/workflows/old.yml").is_file());
+            assert!(!ws.root.join("escape.yml").exists());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn a_valid_retry_replaces_workflow_metadata_without_merging() {
+            let (dir, ws) = workspace();
+            materialize(&descriptor(".ci/workflows/old.yml"), &ws, 1 << 20).unwrap();
+            let replacement = descriptor(".ci/workflows/new.yml");
+            let expected_size = base64::engine::general_purpose::STANDARD
+                .decode(&replacement.content_base64).unwrap().len();
+            assert_eq!(materialize(&replacement, &ws, 1 << 20).unwrap(), expected_size);
+            assert!(!ws.root.join(".ci/workflows/old.yml").exists());
+            assert!(ws.root.join(".ci/workflows/new.yml").is_file());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn rerun_bytes_recreate_equivalent_workspace_and_changes() {
+            let (dir, original) = workspace();
+            materialize(&descriptor(".ci/workflows/build.yml"), &original, 1 << 20).unwrap();
+            let bytes = std::fs::read(&original.descriptor).unwrap();
+            let rerun = Workspace { root: dir.join("rerun"), tarball: dir.join("rerun.tar.gz"), bundle: dir.join("rerun.bundle"), descriptor: dir.join("rerun.source.json") };
+            let source = SourceArchive { format: "git-patch".into(), content_base64: String::new(), bytes: Some(bytes.clone()) };
+            assert_eq!(materialize(&source, &rerun, 1 << 20).unwrap(), bytes.len());
+            assert_eq!(std::fs::read(&rerun.descriptor).unwrap(), bytes);
+            assert_eq!(changed_paths(&original, "ignored"), changed_paths(&rerun, "ignored"));
+            assert_eq!(find_workflows(&original.root, ".ci/workflows/*.yml").unwrap(), find_workflows(&rerun.root, ".ci/workflows/*.yml").unwrap());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn malformed_descriptors_and_duplicate_paths_are_rejected() {
+            let (dir, ws) = workspace();
+            for json in [
+                r#"{"baseRevision":"no","targetTree":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","patchBase64":"","workflows":{}}"#.to_string(),
+                format!(r#"{{"baseRevision":"{}","targetTree":"{}","patchBase64":"%%%","workflows":{{}}}}"#, "a".repeat(40), "b".repeat(40)),
+                format!(r#"{{"baseRevision":"{}","targetTree":"{}","patchBase64":"","workflows":{{"a.yml":"one","a.yml":"two"}}}}"#, "a".repeat(40), "b".repeat(40)),
+            ] {
+                let source = SourceArchive { format: "git-patch".into(), content_base64: base64::engine::general_purpose::STANDARD.encode(json), bytes: None };
+                assert!(matches!(materialize(&source, &ws, 1 << 20), Err(TriggerError::BadArchive(_))));
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn descriptor_reload_preserves_known_and_unknown_changes() {
+            for changes in [serde_json::json!({"kind":"known","paths":["src/a.rs"]}), serde_json::json!({"kind":"unknown","reason":"base unavailable"})] {
+                let (dir, ws) = workspace();
+                let mut value: serde_json::Value = serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(descriptor("build.yml").content_base64).unwrap()).unwrap();
+                value["changes"] = changes;
+                let source = SourceArchive { format: "git-patch".into(), content_base64: base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&value).unwrap()), bytes: None };
+                materialize(&source, &ws, 1 << 20).unwrap();
+                assert_eq!(changed_paths(&ws, "unused"), read_descriptor(&ws).unwrap().changes);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[cfg(any())]
     mod bundles {
         use super::super::clone_bundle;
         use std::path::{Path, PathBuf};
@@ -909,8 +887,6 @@ mod tests {
     }
 
     use super::*;
-    use std::io::Write;
-
     const SECRET: &str = "0123456789abcdef";
 
     fn sign(secret: &str, body: &[u8]) -> String {
@@ -971,6 +947,11 @@ mod tests {
         assert_eq!(TriggerError::BadSignature.status(), 401);
     }
 
+    #[cfg(any())]
+    mod obsolete_bulk_materialization_tests {
+    use super::*;
+    use std::io::Write;
+
     fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut ar = tar::Builder::new(Vec::new());
         for (name, content) in entries {
@@ -1001,6 +982,7 @@ mod tests {
             root: base.join("tree"),
             tarball: base.join("source.tar.gz"),
             bundle: base.join("source.bundle"),
+            descriptor: base.join("source.json"),
         }
     }
 
@@ -1562,6 +1544,7 @@ mod tests {
         // A pattern must not match a shorter name by overlapping its own
         // prefix and suffix: `*.yml` must not match `.yml`'s own dot.
         assert!(!matches_pattern(".yml", "*x.yml"));
+    }
     }
 
     #[test]

@@ -80,9 +80,6 @@ pub async fn merge(
     if token.is_empty() {
         return Err("release token is empty".into());
     }
-    if !source.join(".git").exists() {
-        return Err("release requires a materialized Git checkout".into());
-    }
     let run = store
         .get_run(&msg.run_id)
         .await
@@ -149,8 +146,12 @@ pub async fn merge(
     let request_hash = hex::encode(Sha256::digest(
         serde_json::to_vec(&identity).map_err(|e| e.to_string())?,
     ));
-    let prepared =
-        release_git::prepare(source, release_base, &run.sha, &target_ref, &policy, tags).await?;
+    // `source` is Workspace::root. Submissions intentionally persist metadata,
+    // not a controller-side checkout, alongside it as `<run>.source.json`.
+    let descriptor = crate::trigger::read_descriptor_path(&source.with_extension("source.json"))
+        .map_err(|e| format!("read release source descriptor: {e}"))?;
+    let release_checkout=release_git::materialize(&run.repo_url,&descriptor,token).await?;
+    let prepared=release_git::prepare(release_checkout.path(),release_base,&run.sha,&target_ref,&policy,tags).await?;
     let prepared_json = serde_json::to_value(&prepared).map_err(|e| e.to_string())?;
 
     let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
@@ -204,7 +205,7 @@ pub async fn merge(
         return Err("cancelled job cannot publish a release".into());
     }
     if let Err(_publish_error) =
-        release_git::publish(source, &run.repo_url, token, release_base, &saved).await
+        release_git::publish(release_checkout.path(), &run.repo_url, token, release_base, &saved).await
     {
         let generic = "release publication outcome is unknown; retry the persisted candidate";
         let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;

@@ -16,10 +16,27 @@ use toml_edit::{DocumentMut, value};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Export the immutable release tree for a clean build in a job VM.
-pub async fn archive(source: &Path, sha: &str) -> Result<Vec<u8>, String> {
-    validate_sha(sha)?;
-    git_bytes(source, &[], &["archive", "--format=tar.gz", sha], None).await
+/// Materialize source only for the controller's authorized release operation.
+pub async fn materialize(repository:&str,descriptor:&crate::trigger::GitPatchSource,token:&str)->Result<TempDir,String>{
+    validate_repository(repository)?;validate_sha(&descriptor.base_revision)?;
+    let dir=TempDir::new().map_err(|e|format!("create release checkout: {e}"))?;
+    let home=TempDir::new().map_err(|e|format!("create isolated Git home: {e}"))?;
+    let home_s=home.path().to_string_lossy().into_owned();
+    let basic=base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    let key=format!("http.{repository}.extraHeader");
+    let auth=format!("Authorization: Basic {basic}");
+    let env=[("HOME",home_s.as_str()),("XDG_CONFIG_HOME",home_s.as_str()),("GIT_CONFIG_NOSYSTEM","1"),("GIT_CONFIG_GLOBAL","/dev/null"),("GIT_TERMINAL_PROMPT","0"),("GCM_INTERACTIVE","Never"),("GIT_CONFIG_COUNT","3"),("GIT_CONFIG_KEY_0","credential.helper"),("GIT_CONFIG_VALUE_0",""),("GIT_CONFIG_KEY_1","protocol.ext.allow"),("GIT_CONFIG_VALUE_1","never"),("GIT_CONFIG_KEY_2",key.as_str()),("GIT_CONFIG_VALUE_2",auth.as_str())];
+    let safe=|e|redact_git_error(e,token);
+    git(dir.path(),&env,&["init","--quiet"],None).await.map_err(safe)?;
+    git(dir.path(),&env,&["remote","add","origin",repository],None).await.map_err(safe)?;
+    git(dir.path(),&env,&["fetch","--quiet","--tags","origin","+refs/heads/*:refs/remotes/origin/*"],None).await.map_err(safe)?;
+    if git(dir.path(),&env,&["cat-file","-e",&format!("{}^{{commit}}",descriptor.base_revision)],None).await.is_err(){git(dir.path(),&env,&["fetch","--quiet","origin",&descriptor.base_revision],None).await.map_err(safe)?;}
+    git(dir.path(),&env,&["-c","core.hooksPath=/dev/null","checkout","--quiet","--detach",&descriptor.base_revision],None).await.map_err(safe)?;
+    let patch=descriptor.patch().map_err(|e|e.to_string())?;
+    if !patch.is_empty(){return Err("release publication requires an exact published source commit, not a patched submission".into())}
+    let tree=git(dir.path(),&env,&["write-tree"],None).await.map_err(safe)?;
+    if tree.trim()!=descriptor.target_tree{return Err("release checkout tree does not match validated descriptor".into())}
+    Ok(dir)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -245,7 +262,7 @@ pub async fn publish(
         (
             "GIT_CONFIG_COUNT".into(),
             if repository.starts_with("https://") {
-                "2"
+                "3"
             } else {
                 "1"
             }
@@ -258,9 +275,11 @@ pub async fn publish(
         let auth =
             base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
         owned.extend([
-            ("GIT_CONFIG_KEY_1".into(), "http.extraHeader".into()),
+            ("GIT_CONFIG_KEY_1".into(), "protocol.ext.allow".into()),
+            ("GIT_CONFIG_VALUE_1".into(), "never".into()),
+            ("GIT_CONFIG_KEY_2".into(), format!("http.{repository}.extraHeader")),
             (
-                "GIT_CONFIG_VALUE_1".into(),
+                "GIT_CONFIG_VALUE_2".into(),
                 format!("Authorization: Basic {auth}"),
             ),
         ]);

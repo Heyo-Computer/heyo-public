@@ -115,6 +115,30 @@ struct StepResult {
     outputs: Value,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all="camelCase")]
+struct SourceMetadata { repository:String, descriptor:SourceDescriptor, workflow_path:String }
+#[derive(Deserialize)]
+#[serde(rename_all="camelCase")]
+struct SourceDescriptor { base_revision:String, target_tree:String, patch_base64:String, workflows:BTreeMap<String,String> }
+#[derive(Deserialize)]
+struct ReleaseMetadata { repository:String, sha:String }
+
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn validate_oid(value:&str)->Result<()>{if !matches!(value.len(),40|64)||!value.bytes().all(|b|b.is_ascii_hexdigit()){bail!("source metadata contains an invalid Git object ID")}Ok(())}
+fn validate_repository(value:&str)->Result<()>{
+    #[cfg(test)] if Path::new(value).is_absolute(){return Ok(())}
+    let url=reqwest::Url::parse(value).context("repository must be a valid HTTPS URL")?;
+    if url.scheme()!="https"||url.host_str().is_none()||!url.username().is_empty()||url.password().is_some()||url.query().is_some()||url.fragment().is_some(){bail!("repository must be HTTPS without credentials, query, or fragment")}
+    Ok(())
+}
+fn validate_workflow_path(value:&str)->Result<()>{
+    let path=Path::new(value);let normalized=path.components().map(|c|c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");if value.contains('\\')||normalized!=value||path.is_absolute()||path.components().any(|c|!matches!(c,std::path::Component::Normal(_)))||!matches!(path.extension().and_then(|v|v.to_str()),Some("yml"|"yaml")){bail!("workflow path is not a safe normalized relative YAML path")}Ok(())
+}
+fn basic_credential(token:&str)->String{base64::Engine::encode(&base64::engine::general_purpose::STANDARD,format!("x-access-token:{token}"))}
+fn redact_git_error(error:anyhow::Error,token:Option<&str>)->anyhow::Error{let mut text=error.to_string();if let Some(token)=token{let basic=basic_credential(token);text=text.replace(token,"[REDACTED]").replace(&basic,"[REDACTED]");}anyhow::anyhow!(text)}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let c = config()?;
@@ -298,8 +322,8 @@ async fn execute(h: &reqwest::Client, c: &Config, j: &Lease, mut lost:tokio::syn
         .send()
         .await?;
     if response.status().is_redirection(){bail!("source redirects are forbidden")}
-    let bytes=response.error_for_status()?.bytes().await?;
-    extract_source(bytes.to_vec(),root.clone()).await?;
+    let source:SourceMetadata=response.error_for_status()?.json().await?;
+    checkout_source(&root,&source,git_token(j)).await?;
     let mut reports = vec![];
     let mut ctx=expr::Context::from_value(j.context.clone());
     let mut step_scope=serde_json::Map::new();
@@ -403,27 +427,52 @@ async fn execute(h: &reqwest::Client, c: &Config, j: &Lease, mut lost:tokio::syn
 fn failure_reports(j:&Lease,error:&str)->Vec<StepResult>{j.plan.steps.iter().enumerate().map(|(i,_)|StepResult{index:i,status:"failure".into(),exit_code:None,log:String::new(),error:Some(error.into()),outputs:serde_json::json!({})}).collect()}
 fn mask(text:&str,values:&[String])->String{values.iter().filter(|v|v.len()>=4).fold(text.to_string(),|s,v|s.replace(v,"***"))}
 async fn parse_outputs(path:&Path)->Result<Value>{let bytes=match tokio::fs::read(path).await{Ok(v)=>v,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(serde_json::json!({})),Err(e)=>return Err(e.into())};let text=if bytes.starts_with(&[0xff,0xfe]){if bytes.len()%2!=0{bail!("invalid UTF-16 output")};String::from_utf16(&bytes[2..].chunks_exact(2).map(|b|u16::from_le_bytes([b[0],b[1]])).collect::<Vec<_>>())?}else{String::from_utf8(bytes)?};let mut m=serde_json::Map::new();for line in text.trim_start_matches('\u{feff}').lines(){let (k,v)=line.split_once('=').context("invalid output; expected name=value")?;if k.is_empty()||k.contains(|c:char|!c.is_ascii_alphanumeric()&&c!='_'&&c!='-'){bail!("invalid output name")};m.insert(k.into(),Value::String(v.into()));}Ok(Value::Object(m))}
-async fn extract_source(bytes:Vec<u8>,root:PathBuf)->Result<()>{tokio::task::spawn_blocking(move||->Result<()>{let gz=flate2::read::GzDecoder::new(bytes.as_slice());let mut ar=tar::Archive::new(gz);for entry in ar.entries()?{let mut e=entry?;let p=e.path()?.into_owned();if p.is_absolute()||p.components().any(|c|matches!(c,std::path::Component::ParentDir)){bail!("source archive path escapes workspace")};let kind=e.header().entry_type();if kind.is_symlink()||kind.is_hard_link(){bail!("source archive links are forbidden")};e.unpack_in(&root)?;}Ok(())}).await??;Ok(())}
+fn git_token(j:&Lease)->Option<&str>{j.context.get("secrets").and_then(|v|v.get("CI_GIT_AUTH_TOKEN").or_else(||v.get("GITHUB_TOKEN"))).and_then(Value::as_str)}
+async fn git(root:&Path,args:&[&str],auth:Option<(&str,&str)>,input:Option<&[u8]>)->Result<String>{
+    let mut command=Command::new("git");command.arg("-C").arg(root).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.env("GIT_TERMINAL_PROMPT","0").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL",if cfg!(windows){"NUL"}else{"/dev/null"}).env("GCM_INTERACTIVE","Never").env("GIT_CONFIG_COUNT",if auth.is_some(){"3"}else{"2"}).env("GIT_CONFIG_KEY_0","credential.helper").env("GIT_CONFIG_VALUE_0","").env("GIT_CONFIG_KEY_1","protocol.ext.allow").env("GIT_CONFIG_VALUE_1","never");
+    if let Some((repository,token))=auth { command.env("GIT_CONFIG_KEY_2",format!("http.{repository}.extraHeader")).env("GIT_CONFIG_VALUE_2",format!("Authorization: Basic {}",basic_credential(token))); }
+    if input.is_some(){command.stdin(Stdio::piped());} command.env_remove("CI_NATIVE_RUNNER_SECRET");
+    command.kill_on_drop(true);let token=auth.map(|(_,t)|t);
+    let mut child=command.spawn().map_err(|e|redact_git_error(e.into(),token))?;if let Some(bytes)=input{use tokio::io::AsyncWriteExt;child.stdin.take().context("git stdin unavailable")?.write_all(bytes).await.map_err(|e|redact_git_error(e.into(),token))?}
+    let out=tokio::time::timeout(GIT_TIMEOUT,child.wait_with_output()).await.map_err(|_|anyhow::anyhow!("git command timed out"))?.map_err(|e|redact_git_error(e.into(),token))?;if !out.status.success(){return Err(redact_git_error(anyhow::anyhow!("git {} failed: {}",args.join(" "),String::from_utf8_lossy(&out.stderr)),token))}Ok(String::from_utf8(out.stdout)?.trim().into())
+}
+async fn checkout_source(root:&Path,source:&SourceMetadata,token:Option<&str>)->Result<()>{
+    validate_repository(&source.repository)?;validate_oid(&source.descriptor.base_revision)?;validate_oid(&source.descriptor.target_tree)?;validate_workflow_path(&source.workflow_path)?;
+    let auth=token.map(|t|(source.repository.as_str(),t));
+    git(root,&["init","--quiet"],None,None).await?;git(root,&["remote","add","origin",&source.repository],None,None).await?;
+    git(root,&["fetch","--quiet","--tags","origin","+refs/heads/*:refs/remotes/origin/*"],auth,None).await?;
+    if git(root,&["cat-file","-e",&format!("{}^{{commit}}",source.descriptor.base_revision)],None,None).await.is_err(){git(root,&["fetch","--quiet","origin",&source.descriptor.base_revision],auth,None).await?;}
+    git(root,&["-c","core.hooksPath=/dev/null","checkout","--quiet","--detach",&source.descriptor.base_revision],None,None).await?;
+    let patch=base64::Engine::decode(&base64::engine::general_purpose::STANDARD,&source.descriptor.patch_base64)?;
+    if !patch.is_empty(){git(root,&["apply","--index","--binary","-"],None,Some(&patch)).await?;let tree=git(root,&["write-tree"],None,None).await?;if tree!=source.descriptor.target_tree{bail!("checked out tree does not match submitted target tree")}git(root,&["-c","core.hooksPath=/dev/null","-c","user.name=CI","-c","user.email=ci@invalid","commit","--quiet","-m","CI synthetic patched tree"],None,None).await?;}
+    let tree=git(root,&["rev-parse","HEAD^{tree}"],None,None).await?;if tree!=source.descriptor.target_tree{bail!("checked out tree does not match submitted target tree")}
+    let expected=source.descriptor.workflows.get(&source.workflow_path).context("planned workflow missing from descriptor")?;
+    let canonical_root=tokio::fs::canonicalize(root).await?;let workflow=tokio::fs::canonicalize(root.join(&source.workflow_path)).await?;if !workflow.starts_with(&canonical_root){bail!("workflow path escapes checkout through a symlink")}
+    let actual=tokio::fs::read_to_string(workflow).await?;if actual!=*expected{bail!("workflow content does not match planned descriptor")}
+    Ok(())
+}
 async fn checkout_release(h:&reqwest::Client,c:&Config,j:&Lease,index:usize,root:&Path)->Result<String>{
     let url=format!("{}/api/native/jobs/{}/release-source/{index}",c.endpoint,j.lease_token);
     let parsed=reqwest::Url::parse(&url)?;let endpoint=reqwest::Url::parse(&c.endpoint)?;
     if parsed.origin()!=endpoint.origin()||!parsed.path().starts_with("/api/native/jobs/"){bail!("release source URL is outside the configured CI origin/path")}
     let response=h.get(parsed).bearer_auth(&c.token).send().await?;
     if response.status().is_redirection(){bail!("release source redirects are forbidden")}
-    let response=response.error_for_status()?;
-    let sha=response.headers().get("x-heyo-release-sha").context("release source omitted sha")?.to_str()?.to_string();
+    let metadata:ReleaseMetadata=response.error_for_status()?.json().await?;
+    let sha=metadata.sha;
     if sha.len()!=40||!sha.bytes().all(|b|b.is_ascii_hexdigit()){bail!("release source returned invalid sha")}
-    let bytes=response.bytes().await?.to_vec();
-    replace_checkout(bytes,c,root).await?;
+    replace_checkout(&metadata.repository,&sha,git_token(j),c,root).await?;
     Ok(sha)
 }
-async fn replace_checkout(bytes:Vec<u8>,c:&Config,root:&Path)->Result<()>{
+async fn replace_checkout(repository:&str,sha:&str,token:Option<&str>,c:&Config,root:&Path)->Result<()>{
+    validate_repository(repository)?;validate_oid(sha)?;let auth=token.map(|t|(repository,t));
     let workdir=tokio::fs::canonicalize(&c.workdir).await?;let current=tokio::fs::canonicalize(root).await?;
     if !current.starts_with(&workdir)||current==workdir{bail!("job checkout is outside native workdir")}
     let parent=current.parent().context("job checkout has no parent")?;
     let staging=parent.join(format!(".release-{}",Uuid::new_v4()));let backup=parent.join(format!(".previous-{}",Uuid::new_v4()));
     tokio::fs::create_dir(&staging).await?;
-    if let Err(e)=extract_source(bytes,staging.clone()).await{let _=tokio::fs::remove_dir_all(&staging).await;return Err(e)}
+    let prepared=async{git(&staging,&["init","--quiet"],None,None).await?;git(&staging,&["remote","add","origin",repository],None,None).await?;git(&staging,&["fetch","--quiet","--no-tags","origin",sha],auth,None).await?;git(&staging,&["-c","core.hooksPath=/dev/null","checkout","--quiet","--detach",sha],None,None).await?;let got=git(&staging,&["rev-parse","HEAD"],None,None).await?;if got!=sha{bail!("release checkout did not resolve exact published sha")}Ok::<_,anyhow::Error>(())}.await;
+    if let Err(e)=prepared{let _=tokio::fs::remove_dir_all(&staging).await;return Err(e)}
     tokio::fs::rename(&current,&backup).await?;
     if let Err(e)=tokio::fs::rename(&staging,&current).await{let _=tokio::fs::rename(&backup,&current).await;return Err(e.into())}
     tokio::fs::remove_dir_all(backup).await?;
@@ -485,6 +534,16 @@ fn ensure_inside(root: &Path, path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn source_metadata_rejects_unsafe_urls_oids_and_paths(){
+        for url in ["file:///tmp/repo","ext::echo owned","https://u:p@example.test/repo","ssh://git@example.test/repo"]{assert!(validate_repository(url).is_err(),"{url}")}
+        assert!(validate_repository("https://github.com/org/repo.git").is_ok());
+        assert!(validate_oid(&"a".repeat(40)).is_ok());assert!(validate_oid("HEAD").is_err());
+        for path in ["../build.yml","/build.yml","a/./build.yml","build.txt"]{assert!(validate_workflow_path(path).is_err(),"{path}")}
+        assert!(validate_workflow_path(".ci/workflows/build.yml").is_ok());
+    }
+    #[test]
+    fn git_errors_redact_raw_and_basic_credentials(){let token="secret-token";let basic=basic_credential(token);let error=redact_git_error(anyhow::anyhow!("{token} Authorization: Basic {basic}"),Some(token)).to_string();assert!(!error.contains(token));assert!(!error.contains(&basic));}
+    #[test]
     fn wire_step_preserves_workflow_fields_and_omitted_maps() {
         let step: Step = serde_json::from_value(serde_json::json!({"run":"exit 3", "if":"always()",
             "working-directory":"src", "timeout-minutes":2, "continue-on-error":true})).unwrap();
@@ -503,13 +562,18 @@ mod tests {
 
     fn step(run:&str)->Step{Step{name:None,id:None,condition:None,uses:None,with:BTreeMap::new(),run:Some(run.into()),shell:None,working_directory:None,env:BTreeMap::new(),timeout_minutes:None,continue_on_error:false}}
 
-    async fn source_server()->(String,tokio::task::JoinHandle<()>) {
-        let mut gz=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());
-        {let mut tar=tar::Builder::new(&mut gz);tar.finish().unwrap();}
-        let bytes=gz.finish().unwrap();
-        let app=axum::Router::new().route("/api/native/jobs/test/source",axum::routing::get(move||{let bytes=bytes.clone();async move{bytes}}));
+    async fn source_server()->(String,tokio::task::JoinHandle<()>,tempfile::TempDir) {
+        let repo=tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init","-q"]).current_dir(repo.path()).status().unwrap();
+        std::fs::write(repo.path().join("workflow.yml"),"jobs: {}\n").unwrap();
+        std::process::Command::new("git").args(["add","."]).current_dir(repo.path()).status().unwrap();
+        std::process::Command::new("git").args(["-c","user.name=Test","-c","user.email=test@invalid","commit","-qm","source"]).current_dir(repo.path()).status().unwrap();
+        let sha=String::from_utf8(std::process::Command::new("git").args(["rev-parse","HEAD"]).current_dir(repo.path()).output().unwrap().stdout).unwrap().trim().to_string();
+        let tree=String::from_utf8(std::process::Command::new("git").args(["rev-parse","HEAD^{tree}"]).current_dir(repo.path()).output().unwrap().stdout).unwrap().trim().to_string();
+        let body=serde_json::json!({"repository":repo.path(),"descriptor":{"baseRevision":sha,"targetTree":tree,"patchBase64":"","workflows":{"workflow.yml":"jobs: {}\n"}},"workflowPath":"workflow.yml"});
+        let app=axum::Router::new().route("/api/native/jobs/test/source",axum::routing::get(move||{let body=body.clone();async move{axum::Json(body)}}));
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
-        let task=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});(format!("http://{addr}"),task)
+        let task=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});(format!("http://{addr}"),task,repo)
     }
     fn lease(endpoint:&str,steps:Vec<Step>,timeout:Duration)->Lease{Lease{job_id:"job".into(),run_id:Uuid::new_v4().to_string(),lease_token:Uuid::new_v4(),plan:Plan{key:"job".into(),env:BTreeMap::new(),steps,timeout},source_url:format!("{endpoint}/api/native/jobs/test/source"),context:serde_json::json!({}),mask_values:vec![]}}
     fn config(endpoint:&str,dir:&Path)->Config{Config{endpoint:endpoint.into(),token:"test".into(),id:"runner".into(),name:"runner".into(),labels:vec![],platform:if cfg!(windows){"windows"}else{"macos"}.into(),workdir:dir.into()}}
@@ -587,36 +651,16 @@ mod tests {
 
     #[tokio::test]
     async fn executor_reports_failure_skips_condition_and_hands_off_outputs(){
-        let (endpoint,server)=source_server().await;let dir=tempfile::tempdir().unwrap();let mut first=step(if cfg!(windows){"'answer=42' >> $env:GITHUB_OUTPUT"}else{"echo answer=42 >> \"$GITHUB_OUTPUT\""});first.id=Some("build".into());let mut skipped=step("exit 99");skipped.condition=Some("${{ false }}".into());let handoff=step(if cfg!(windows){"if ('${{ steps.build.outputs.answer }}' -ne '42') { exit 9 }"}else{"test '${{ steps.build.outputs.answer }}' = 42"});let mut failed=step("exit 7");failed.continue_on_error=true;
+        let (endpoint,server,_repo)=source_server().await;let dir=tempfile::tempdir().unwrap();let mut first=step(if cfg!(windows){"'answer=42' >> $env:GITHUB_OUTPUT"}else{"echo answer=42 >> \"$GITHUB_OUTPUT\""});first.id=Some("build".into());let mut skipped=step("exit 99");skipped.condition=Some("${{ false }}".into());let handoff=step(if cfg!(windows){"if ('${{ steps.build.outputs.answer }}' -ne '42') { exit 9 }"}else{"test '${{ steps.build.outputs.answer }}' = 42"});let mut failed=step("exit 7");failed.continue_on_error=true;
         let reports=execute(&reqwest::Client::new(),&config(&endpoint,dir.path()),&lease(&endpoint,vec![first,skipped,handoff,failed],Duration::from_secs(5)),tokio::sync::watch::channel(false).1).await.unwrap();server.abort();
         assert_eq!(reports.iter().map(|x|x.status.as_str()).collect::<Vec<_>>(),vec!["success","skipped","success","failure"]);assert_eq!(reports[3].exit_code,Some(7));
     }
 
     #[tokio::test]
     async fn executor_timeout_kills_and_reports_job_failure(){
-        let (endpoint,server)=source_server().await;let dir=tempfile::tempdir().unwrap();let job=lease(&endpoint,vec![step("sleep 30")],Duration::from_millis(50));
+        let (endpoint,server,_repo)=source_server().await;let dir=tempfile::tempdir().unwrap();let job=lease(&endpoint,vec![step("sleep 30")],Duration::from_millis(50));
         let error=execute(&reqwest::Client::new(),&config(&endpoint,dir.path()),&job,tokio::sync::watch::channel(false).1).await.unwrap_err();server.abort();assert!(error.to_string().contains("timed out"));
         assert_eq!(failure_reports(&job,&error.to_string())[0].status,"failure");
     }
 
-    fn archive_file(name:&str,contents:&[u8])->Vec<u8>{let mut gz=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());{let mut tar=tar::Builder::new(&mut gz);let mut header=tar::Header::new_gnu();header.set_size(contents.len() as u64);header.set_mode(0o644);header.set_cksum();tar.append_data(&mut header,name,contents).unwrap();tar.finish().unwrap();}gz.finish().unwrap()}
-
-    #[tokio::test]
-    async fn release_checkout_reports_server_sha_and_replaces_submitted_bytes(){
-        let bytes=archive_file("version.txt",b"bumped");let sha="0123456789abcdef0123456789abcdef01234567";
-        let app=axum::Router::new().route("/api/native/jobs/{lease}/release-source/{index}",axum::routing::get(move||{let bytes=bytes.clone();async move{([(axum::http::HeaderName::from_static("x-heyo-release-sha"),sha)],bytes)}}));
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
-        let dir=tempfile::tempdir().unwrap();let root=dir.path().join("job");tokio::fs::create_dir(&root).await.unwrap();tokio::fs::write(root.join("version.txt"),b"submitted").await.unwrap();
-        let endpoint=format!("http://{addr}");let job=lease(&endpoint,vec![],Duration::from_secs(1));
-        assert_eq!(checkout_release(&reqwest::Client::new(),&config(&endpoint,dir.path()),&job,0,&root).await.unwrap(),sha);
-        assert_eq!(tokio::fs::read(root.join("version.txt")).await.unwrap(),b"bumped");server.abort();
-    }
-
-    #[tokio::test]
-    async fn unsafe_release_archive_is_rejected_without_destroying_checkout(){
-        let mut gz=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());{let mut tar=tar::Builder::new(&mut gz);let mut header=tar::Header::new_gnu();header.set_entry_type(tar::EntryType::Symlink);header.set_size(0);header.set_mode(0o777);header.set_link_name("outside").unwrap();header.set_cksum();tar.append_data(&mut header,"link",std::io::empty()).unwrap();tar.finish().unwrap();}let bytes=gz.finish().unwrap();
-        let dir=tempfile::tempdir().unwrap();let root=dir.path().join("job");tokio::fs::create_dir(&root).await.unwrap();tokio::fs::write(root.join("keep"),b"safe").await.unwrap();
-        assert!(replace_checkout(bytes,&config("http://localhost",dir.path()),&root).await.is_err());
-        assert_eq!(tokio::fs::read(root.join("keep")).await.unwrap(),b"safe");
-    }
 }

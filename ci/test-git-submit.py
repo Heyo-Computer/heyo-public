@@ -143,8 +143,7 @@ class GitSubmitTest(unittest.TestCase):
                                                     "CI_TOKEN": TOKEN})
         self.assertIn(self.base + "/api/submit", result.stdout)
         self.assertEqual(SubmitHandler.requests, [])
-        files = result.stdout.split("  files:\n", 1)[1].splitlines()
-        self.assertEqual(len(files), 20)
+        self.assertIn("source     git-patch", result.stdout)
 
     def test_pr_selector_submits_remote_pr_head_without_checkout_or_remote_write(self):
         head_before = self.git("rev-parse", "HEAD").stdout.strip()
@@ -162,11 +161,9 @@ class GitSubmitTest(unittest.TestCase):
         self.assertEqual(self.git("ls-remote", "origin").stdout, remote_before)
         self.assertEqual(self.git("for-each-ref", "refs/git-submit").stdout, "")
 
-        bundle = pathlib.Path(self.temp.name) / "submitted.bundle"
-        bundle.write_bytes(base64.b64decode(payload["source"]["contentBase64"]))
-        heads = subprocess.run(["git", "bundle", "list-heads", bundle], check=True,
-                               text=True, capture_output=True).stdout
-        self.assertIn(f"{self.pr_sha} refs/heads/pull/59", heads)
+        descriptor = json.loads(base64.b64decode(payload["source"]["contentBase64"]))
+        self.assertEqual(payload["source"]["format"], "git-patch")
+        self.assertEqual(descriptor["targetTree"], self.git("rev-parse", f"{self.pr_sha}^{{tree}}").stdout.strip())
 
     def test_linked_worktree_bundles_use_the_shared_object_store(self):
         linked = pathlib.Path(self.temp.name) / "linked worktree"
@@ -177,13 +174,9 @@ class GitSubmitTest(unittest.TestCase):
             with self.subTest(selector=selector):
                 self.run_client(*selector, env={"CI_ENDPOINT": self.base, "CI_TOKEN": TOKEN})
                 payload = json.loads(SubmitHandler.requests.pop()[2])
-                bundle = pathlib.Path(self.temp.name) / "linked.bundle"
-                bundle.write_bytes(base64.b64decode(payload["source"]["contentBase64"]))
-                with tempfile.TemporaryDirectory() as clone:
-                    subprocess.run(["git", "clone", "-q", str(bundle), clone], check=True)
-                    actual = subprocess.check_output(["git", "-C", clone, "rev-parse", "HEAD"], text=True).strip()
-                    self.assertEqual(actual, sha)
-                    self.assertEqual((pathlib.Path(clone) / "file.txt").read_text(), contents)
+                descriptor = json.loads(base64.b64decode(payload["source"]["contentBase64"]))
+                self.assertEqual(payload["source"]["format"], "git-patch")
+                self.assertEqual(descriptor["targetTree"], self.git("rev-parse", f"{sha}^{{tree}}").stdout.strip())
                 self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.feature_sha)
                 self.assertEqual(self.git("status", "--porcelain").stdout, "")
                 self.assertEqual(self.git("for-each-ref", "refs/git-submit").stdout, "")
