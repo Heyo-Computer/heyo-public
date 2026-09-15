@@ -697,6 +697,7 @@ mod tests {
                 ttl_seconds: 3600,
             }),
             scaling: ScalingPolicy::default(),
+            maintenance: false,
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
@@ -719,6 +720,7 @@ mod tests {
             routes,
             vm: None,
             scaling: ScalingPolicy::default(),
+            maintenance: false,
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             discovery: None,
@@ -728,6 +730,40 @@ mod tests {
             update: None,
             auth: None,
         }
+    }
+
+    #[test]
+    fn maintenance_update_preserves_managed_pool_and_route_identity() {
+        let state_file = scratch("maintenance");
+        let registry = Registry::new(&state_file);
+        let original = registry.upsert(spec("demo", vec![RouteRule {
+            host: Some("demo.local".into()),
+            host_suffix: None,
+            path_prefix: None,
+            strip_prefix: false,
+        }]));
+        let backend = Arc::new(crate::deployment::VmBackend::new(
+            "sb-1".into(),
+            "127.0.0.1:8080".parse().unwrap(),
+        ));
+        original.set_backends(vec![backend.clone()]);
+
+        let mut edited = original.spec.clone();
+        edited.maintenance = true;
+        let updated = registry.update(edited).unwrap();
+
+        assert!(updated.spec.maintenance);
+        assert!(Arc::ptr_eq(&backend, &updated.backends()[0]), "PUT-style update keeps the VM pool");
+        assert!(Arc::ptr_eq(&updated, &registry.route(Some("demo.local"), "/").unwrap()));
+
+        registry.persist_one("demo").unwrap();
+        let reloaded = Registry::new(&state_file);
+        assert_eq!(reloaded.load().unwrap(), 1);
+        let persisted = reloaded.get("demo").unwrap();
+        assert!(persisted.spec.maintenance);
+        assert_eq!(persisted.spec.namespace, "default");
+        assert_eq!(persisted.spec.routes, updated.spec.routes);
+        assert_eq!(persisted.spec.auth, updated.spec.auth);
     }
 
     fn host(h: &str) -> RouteRule {

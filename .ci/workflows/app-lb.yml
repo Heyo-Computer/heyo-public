@@ -202,6 +202,7 @@ jobs:
         run: |
           cargo fetch --locked
           df -P / "$CARGO_TARGET_DIR"
+          cargo test --locked --bin app-lb || exit $?
           if ! cargo build --release --locked --workspace --bins; then
             echo "=== build failed; guest kernel log tail ==="
             dmesg | tail -100 || true

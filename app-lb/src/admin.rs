@@ -3127,15 +3127,20 @@ async fn register(
     // Replacing a deployment abandons its old pool; tear it down explicitly so
     // the VMs don't linger until their TTL.
     //
-    // The swap happens *first*, for the same reason `deregister` removes before
-    // tearing down: while the old deployment is still the registry's, a
-    // concurrent autoscaler tick will happily boot VMs into it, and those would
-    // be orphaned by the swap that follows. Once it is no longer live the
-    // autoscaler stops creating for it and kills anything it created (see
-    // `Autoscaler::unclaimed`).
+    // For a workspace, first drain the autoscaler's create slots and persist a
+    // stale-seed fence. The registry swap still precedes teardown, so the old
+    // object cannot create orphan VMs; the fence keeps the newly exposed object
+    // from booting until teardown's final old-state capture has published.
     let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
     let replaced = old.is_some();
+    let workspace_replacement = match &old {
+        Some(old) => match state.autoscaler.fence_workspace_replacement(old).await {
+            Ok(fence) => fence,
+            Err(message) => return err(StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+        },
+        None => None,
+    };
     let deployment = state.registry.upsert(spec);
     if let Err(e) = state.registry.persist_one(&id) {
         tracing::error!(deployment = %id, error = %e, "failed to persist state");
@@ -3143,6 +3148,9 @@ async fn register(
     drop(change);
     if let Some(old) = old {
         state.autoscaler.teardown(&old).await;
+    }
+    if let Some(fence) = workspace_replacement {
+        fence.finish();
     }
     tracing::info!(deployment = %id, "registered");
     state.feed.announce(
@@ -3218,13 +3226,21 @@ async fn update(
 
     // The owner is not part of the template, so a stamp never recycles a pool.
     let rebuild = old.spec.vm != spec.vm || old.spec.upstreams != spec.upstreams;
+    let workspace_replacement = if rebuild {
+        match state.autoscaler.fence_workspace_replacement(&old).await {
+            Ok(fence) => fence,
+            Err(message) => return err(StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+        }
+    } else {
+        None
+    };
     let deployment = if rebuild {
         // The backend set changed — a managed VM *template*, or a static
         // deployment's upstream list (or a switch between the two kinds). The
         // running backends no longer match the spec, so rebuild from scratch
         // (`teardown` is a no-op-that-clears-routing for the static kind).
         //
-        // Swap first, tear down second: see the note in `register`.
+        // Fence, swap, then tear down: see the note in `register`.
         tracing::info!(deployment = %id, "updating deployment (backends changed; rebuilding)");
         state.registry.upsert(spec)
     } else {
@@ -3242,6 +3258,9 @@ async fn update(
     drop(change);
     if rebuild {
         state.autoscaler.teardown(&old).await;
+    }
+    if let Some(fence) = workspace_replacement {
+        fence.finish();
     }
     // Reconcile to the new policy immediately (scale up/down, warm pool).
     deployment.scale_signal.notify_one();
@@ -4586,6 +4605,9 @@ struct PullRequest {
     /// without making that digest the deployment's default.
     #[serde(default, rename = "ref")]
     artifact_ref: Option<String>,
+    /// Enables durable idempotency and replacement-readiness verification.
+    #[serde(default)]
+    operation_id: Option<String>,
     /// Re-fetch even when the image is already on disk. Rarely wanted — the
     /// filename is the digest, so the image being there is proof the bytes are
     /// right — and it exists for the case where the file was damaged after it
@@ -4601,8 +4623,11 @@ fn job_start_error(e: StartError) -> Response {
         e @ StartError::NoDeployment(_) => {
             err(StatusCode::NOT_FOUND, e.to_string()).into_response()
         }
-        e @ StartError::AlreadyRunning(_) => {
+        e @ (StartError::AlreadyRunning(_) | StartError::ConflictingOperation(_)) => {
             err(StatusCode::CONFLICT, e.to_string()).into_response()
+        }
+        e @ StartError::Persistence(_) => {
+            err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
         }
         e => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
@@ -4649,7 +4674,14 @@ async fn start_pull(
     body: Option<Json<PullRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    match state.jobs.start_pull(&id, req.artifact_ref, req.force) {
+    let result = match req.operation_id {
+        Some(operation_id) => match req.artifact_ref {
+            Some(digest) => state.jobs.start_correlated_pull(&id, operation_id, digest, req.force),
+            None => Err(StartError::BadRef("operation_id requires an explicit pinned `ref` digest".into())),
+        },
+        None => state.jobs.start_pull(&id, req.artifact_ref, req.force),
+    };
+    match result {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "artifact pull started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
