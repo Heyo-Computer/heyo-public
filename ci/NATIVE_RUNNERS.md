@@ -27,7 +27,8 @@ capacity is checked transactionally before leasing. Identical completion
 retries are idempotent; changed evidence is rejected. Pending DAG advancement
 is durable and retried by later runner polls.
 
-Idle polling retries network failures, HTTP 5xx, and HTTP 429 after five seconds,
+Idle polling retries network failures, HTTP 5xx (including temporary database or
+secret-service failures), and HTTP 429 after five seconds,
 so a CI restart does not terminate the runner. Other HTTP errors, including
 401 and 403, remain terminal and require correcting the credential or request.
 Artifact uploads use a five-minute request timeout and up to three attempts for

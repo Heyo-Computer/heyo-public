@@ -151,7 +151,16 @@ fn native_auth(state: &AppState, headers: &HeaderMap) -> Result<(), axum::respon
     if expected.as_bytes().ct_eq(got.as_bytes()).into() { Ok(()) } else { Err(error(StatusCode::UNAUTHORIZED,"invalid native runner bearer")) }
 }
 async fn native_register(State(s):State<AppState>,h:HeaderMap,Json(r):Json<crate::native::Registration>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::register(&s.store,r).await {Ok(())=>Json(serde_json::json!({"ok":true})).into_response(),Err(e)=>error(StatusCode::BAD_REQUEST,&e)} }
-async fn native_poll(State(s):State<AppState>,h:HeaderMap,Json(p):Json<crate::native::Poll>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};if let Ok(runs)=crate::native::pending_advancements(&s.store).await{for run in runs{if s.dispatcher.advance_run(&run).await.is_ok(){let _=crate::native::advancement_done(&s.store,&run).await;}}} match crate::native::poll(&s.store,p,&s.config.public_url,&s.dispatcher.secrets).await {Ok(job)=>Json(serde_json::json!({"job":job})).into_response(),Err(e)=>error(StatusCode::CONFLICT,&e)} }
+fn native_poll_error(e: crate::native::PollError) -> axum::response::Response {
+    match e {
+        crate::native::PollError::Rejected(message) => error(StatusCode::CONFLICT, &message),
+        crate::native::PollError::Internal(detail) => {
+            tracing::error!(error = %detail, "native runner poll failed");
+            error(StatusCode::SERVICE_UNAVAILABLE, "native runner polling is temporarily unavailable")
+        }
+    }
+}
+async fn native_poll(State(s):State<AppState>,h:HeaderMap,Json(p):Json<crate::native::Poll>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};if let Ok(runs)=crate::native::pending_advancements(&s.store).await{for run in runs{if s.dispatcher.advance_run(&run).await.is_ok(){let _=crate::native::advancement_done(&s.store,&run).await;}}} match crate::native::poll(&s.store,p,&s.config.public_url,&s.dispatcher.secrets).await {Ok(job)=>Json(serde_json::json!({"job":job})).into_response(),Err(e)=>native_poll_error(e)} }
 async fn native_heartbeat(State(s):State<AppState>,h:HeaderMap,Json(u):Json<crate::native::LeaseUpdate>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::heartbeat(&s.store,&u).await {Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)} }
 async fn native_complete(State(s):State<AppState>,h:HeaderMap,Json(c):Json<crate::native::Completion>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::complete(&s.store,&s.dispatcher.secrets,c).await {Ok(Some(run))=>{match s.dispatcher.advance_run(&run).await{Ok(_)=>{let _=crate::native::advancement_done(&s.store,&run).await;},Err(e)=>tracing::error!("native completion scheduling failed: {e}")} StatusCode::NO_CONTENT.into_response()},Ok(None)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::CONFLICT,&e)} }
 async fn native_source(State(s):State<AppState>,h:HeaderMap,Path(lease):Path<uuid::Uuid>)->impl IntoResponse {
@@ -1594,8 +1603,27 @@ async fn join_network(
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn native_poll_rejections_are_terminal_but_pool_failures_are_retryable_and_redacted() {
+        for message in ["unsupported protocol 0; expected 1", "runner is not registered"] {
+            let response = native_poll_error(crate::native::PollError::Rejected(message.into()));
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains(message));
+        }
+
+        let detail = "pool timed out while waiting for an open connection";
+        let response = native_poll_error(crate::native::PollError::Internal(detail.into()));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("temporarily unavailable"));
+        assert!(!body.contains(detail));
+    }
 
     /// Binds no port — `oneshot` drives the router directly.
     pub(crate) fn test_config() -> Arc<Config> {
