@@ -50,9 +50,11 @@ fn golden(name: &str, value: &impl Serialize) {
         panic!("{}: {e}\nrun `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`", path.display())
     });
 
+    // Object ordering is not part of the JSON wire contract and can change
+    // when workspace feature unification enables serde_json's preserve_order.
     assert_eq!(
-        recorded,
-        rendered,
+        serde_json::from_str::<serde_json::Value>(&recorded).expect("recorded fixture is JSON"),
+        serde_json::from_str::<serde_json::Value>(&rendered).expect("rendered fixture is JSON"),
         "{} is stale — the wire format changed.\n\
          Every client re-declares these types, so this is an API change even if \
          no Rust caller broke.\n\
