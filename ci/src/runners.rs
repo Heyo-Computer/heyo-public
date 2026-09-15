@@ -864,10 +864,10 @@ impl Runners {
     /// these options rides the same link rather than opening another.
     pub async fn options_for(&self, runner_id: &str) -> Result<HeyoClientOptions, RunnerError> {
         if let Some(url) = &self.config.heyvm.local_runner {
-            // A same-machine daemon runs without JWT_SECRET and ignores a
-            // bearer, so none is sent — matching `HeyoClient::local`.
+            // Development daemons may need no bearer; regional hosts can
+            // require their own internal key rather than the Cloud token.
             return Ok(HeyoClientOptions {
-                api_key: None,
+                api_key: self.config.heyvm.local_runner_token.clone(),
                 base_url: Some(url.clone()),
                 timeout: None,
             });
@@ -933,7 +933,12 @@ impl Runners {
         if let Some(known) = self.capabilities.lock().unwrap().get(runner_id) {
             return Ok(known.clone());
         }
-        let client = self.client_for(runner_id).await?;
+        let client = HeyoClient::new(self.options_for(runner_id).await?).map_err(|e| {
+            RunnerError::Unreachable {
+                runner: runner_id.to_string(),
+                reason: format!("could not build a daemon client: {e}"),
+            }
+        })?;
         let response = client
             .raw_request(
                 Method::GET,
@@ -1686,6 +1691,27 @@ mod tests {
             std::env::set_var("CI_WEBHOOK_SECRET", "0123456789abcdef");
         }
         Config::from_env().expect("test config resolves")
+    }
+
+    #[tokio::test]
+    async fn direct_runner_capabilities_use_daemon_credentials_without_cloud_registration() {
+        use axum::{Json, Router, http::HeaderMap, routing::get};
+        let app = Router::new().route("/capabilities", get(|headers: HeaderMap| async move {
+            assert_eq!(headers["authorization"], "Bearer daemon-only-key");
+            Json(serde_json::json!({"supportedDrivers":["firecracker","libvirt"]}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        unsafe { std::env::set_var("CI_NETWORK", "test-net") };
+        let mut config = test_config();
+        config.heyvm.base_url = Some("http://127.0.0.1:1".into());
+        config.heyvm.local_runner = Some(url);
+        config.heyvm.local_runner_token = Some("daemon-only-key".into());
+        let runners = Runners::new(Arc::new(config));
+        let result = runners.supported_drivers("hd-local").await;
+        server.abort();
+        assert_eq!(result.unwrap().unwrap().as_ref(), &["firecracker", "libvirt"]);
     }
 
     fn test_runners(allow_unauthenticated: bool) -> Runners {

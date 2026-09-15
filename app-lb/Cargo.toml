@@ -93,6 +93,7 @@ reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 # already present under reqwest/url, and hand-rolling percent-encoding is a
 # classic source of bugs.
 form_urlencoded = "1"
+url = "2"
 
 async-trait = "0.1"
 futures.workspace = true

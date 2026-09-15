@@ -37,7 +37,7 @@
 #   CI_WEBHOOK_SECRET / git config ci.secret     the shared HMAC secret
 set -euo pipefail
 
-GIT_SUBMIT_VERSION="0.5.0"
+GIT_SUBMIT_VERSION="0.6.0"
 
 # `git-submit` invoked as `git submit`, `git-ci` invoked as `git ci`. Only used
 # in messages, but a script that tells you to run a command that does not exist
@@ -49,12 +49,14 @@ die() { printf '%s: %s\n' "$cmd" "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-Usage: $cmd [--dirty] [--ref <rev>] [--only <workflow>] [--workflow <id>] [--dry-run] [--submit-empty]
+Usage: $cmd [pr<number>] [--dirty] [--ref <rev>] [--only <workflow>] [--workflow <id>] [--dry-run] [--submit-empty]
 
 Submits a tarball of the tree to the CI orchestrator and prints the runs it
 started.
 
 Options:
+  pr<number>        fetch and submit that GitHub pull request's exact head
+                   commit (for example, pr59), without checking it out
   --dirty          include uncommitted tracked changes
   --submit-empty   submit even when the tree is identical to the default
                    branch — a run that rebuilds what main already is
@@ -86,6 +88,8 @@ EOF
 # --- argument parsing -------------------------------------------------------
 
 rev="HEAD"
+ref_selected=0
+pr_number=""
 dirty=0
 dry_run=0
 archive=0
@@ -98,7 +102,7 @@ while [ $# -gt 0 ]; do
     --submit-empty) submit_empty=1; shift ;;
     --archive)  archive=1; shift ;;
     --dry-run)  dry_run=1; shift ;;
-    --ref)      rev="${2:?--ref needs a revision}"; shift 2 ;;
+    --ref)      rev="${2:?--ref needs a revision}"; ref_selected=1; shift 2 ;;
     --workflow) workflow="${2:?--workflow needs an id}"; shift 2 ;;
     --only)     only+=("${2:?--only needs a workflow name}"); shift 2 ;;
     --upgrade)
@@ -110,9 +114,25 @@ while [ $# -gt 0 ]; do
       ;;
     --version)  printf '%s %s\n' "$me" "$GIT_SUBMIT_VERSION"; exit 0 ;;
     -h|--help)  usage; exit 0 ;;
+    pr*)
+      pr_candidate="${1#pr}"
+      case "$pr_candidate" in
+        ""|0|0*|*[!0-9]*)
+          die "malformed pull request selector $1 (expected pr<number>, for example pr59)"
+          ;;
+      esac
+      [ -z "$pr_number" ] || die "only one pull request selector may be used"
+      pr_number="$pr_candidate"
+      shift
+      ;;
     *)          die "unknown argument $1 (try --help)" ;;
   esac
 done
+
+if [ -n "$pr_number" ]; then
+  [ "$ref_selected" -eq 0 ] || die "pr$pr_number cannot be combined with --ref"
+  [ "$dirty" -eq 0 ] || die "pr$pr_number cannot be combined with --dirty"
+fi
 
 for tool in git curl base64; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is required but not on PATH"
@@ -122,12 +142,33 @@ git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
 
 # --- configuration ----------------------------------------------------------
 
-endpoint="${CI_ENDPOINT:-$(git config --get ci.endpoint || true)}"
+# cicd.endpoint/CICD_ENDPOINT were used by the original private client. Accept
+# them so an existing `git submit` installation can move to this public client,
+# but never guess when old and new settings point at different services.
+normalize_endpoint() {
+  local value="${1%/}"
+  case "$value" in
+    */api/submit) printf '%s\n' "$value" ;;
+    */git/push) printf '%s/api/submit\n' "${value%/git/push}" ;;
+    *) printf '%s/api/submit\n' "$value" ;;
+  esac
+}
+
+ci_config_endpoint="$(git config --get ci.endpoint || true)"
+cicd_config_endpoint="$(git config --get cicd.endpoint || true)"
+canonical_endpoint="${CI_ENDPOINT:-$ci_config_endpoint}"
+legacy_endpoint="${CICD_ENDPOINT:-$cicd_config_endpoint}"
+endpoint="${canonical_endpoint:-$legacy_endpoint}"
 [ -n "$endpoint" ] || die "no endpoint. Set CI_ENDPOINT or run:
     git config ci.endpoint https://ci.example.com"
-base="${endpoint%/}"
-base="${base%/api/submit}"
-submit_url="$base/api/submit"
+submit_url="$(normalize_endpoint "$endpoint")"
+
+if [ -n "$canonical_endpoint" ] && [ -n "$legacy_endpoint" ] \
+    && [ "$(normalize_endpoint "$canonical_endpoint")" != "$(normalize_endpoint "$legacy_endpoint")" ]; then
+  die "conflicting endpoint settings. ci.endpoint/CI_ENDPOINT and legacy cicd.endpoint/CICD_ENDPOINT must resolve to the same public submission API"
+fi
+
+base="${submit_url%/api/submit}"
 
 token="${CI_TOKEN:-$(git config --get ci.token || true)}"
 secret="${CI_WEBHOOK_SECRET:-$(git config --get ci.secret || true)}"
@@ -150,20 +191,42 @@ fi
 
 # --- what to submit ---------------------------------------------------------
 
+work=""
+pr_ref=""
+cleanup() {
+  [ -z "$pr_ref" ] || git update-ref -d "$pr_ref" >/dev/null 2>&1 || true
+  [ -z "$work" ] || rm -rf "$work"
+}
+trap cleanup EXIT
+
+if [ -n "$pr_number" ]; then
+  pr_ref="refs/git-submit/pull-$pr_number-$$"
+  git fetch --quiet --no-tags origin "+refs/pull/$pr_number/head:$pr_ref" \
+    || die "cannot fetch GitHub pull request #$pr_number from origin"
+  rev="$pr_ref"
+fi
+
 sha="$(git rev-parse --verify "$rev^{commit}" 2>/dev/null)" \
   || die "cannot resolve $rev to a commit"
 branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 [ "$branch" = "HEAD" ] && branch="detached"
+if [ -n "$pr_number" ]; then
+  branch="pull/$pr_number"
+fi
 repo_url="$(git config --get remote.origin.url || echo "")"
 repo_name="$(basename "$(git rev-parse --show-toplevel)")"
 default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
-before="$(git rev-parse --verify "${rev}^" 2>/dev/null || echo "")"
+# Keep ordinary CI change detection independent of the release target. Missing
+# target metadata disables release publication, not ordinary build submission.
+before="$(git rev-parse --verify "${rev}^" 2>/dev/null || true)"
+release_base=""
+if [ -n "$default_branch" ]; then
+  release_base="$(git rev-parse --verify "refs/remotes/origin/$default_branch^{commit}" 2>/dev/null || true)"
+fi
 pusher_name="$(git config --get user.name || echo "")"
 pusher_email="$(git config --get user.email || echo "")"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/git-submit.XXXXXX")"
-cleanup() { rm -rf "$work"; }
-trap cleanup EXIT
 
 tarball="$work/source.tar.gz"
 bundle="$work/source.bundle"
@@ -231,7 +294,9 @@ else
   # repository is touched, including on a failed submit.
   pack="$work/pack.git"
   git init -q --bare "$pack"
-  printf '%s/objects\n' "$(git rev-parse --absolute-git-dir)" \
+  # Linked worktrees keep objects in the common Git directory, not their
+  # per-worktree administrative directory. Ask Git for the actual object path.
+  printf '%s\n' "$(git rev-parse --path-format=absolute --git-path objects)" \
     > "$pack/objects/info/alternates"
   ref="refs/heads/$branch"
   [ "$branch" = "detached" ] && ref="refs/heads/ci-submit"
@@ -250,6 +315,7 @@ if [ "$dry_run" -eq 1 ]; then
   printf '  repository %s (%s)\n' "$repo_name" "${repo_url:-no remote}"
   printf '  ref        refs/heads/%s\n' "$branch"
   printf '  commit     %s\n' "$sha"
+  printf '  release    %s at %s\n' "${default_branch:-unavailable}" "${release_base:-unavailable}"
   printf '  source     %s, %s bytes%s\n' "$format" "$size" \
     "$([ "$dirty" -eq 1 ] && echo ' (including uncommitted changes)')"
   printf '  credential %s\n' "$([ -n "$token" ] && echo 'repository token (ci.token)' || echo 'shared secret (ci.secret)')"
@@ -260,7 +326,9 @@ if [ "$dry_run" -eq 1 ]; then
     git bundle list-heads "$bundle" | sed 's/^/    /'
   fi
   printf '  files:\n'
-  git ls-tree -r --name-only "$send_sha" | head -20 | sed 's/^/    /'
+  # Consume the whole tree so pipefail does not turn head's SIGPIPE into a
+  # failed dry-run for repositories whose listing exceeds the pipe buffer.
+  git ls-tree -r --name-only "$send_sha" | sed -n '1,20{s/^/    /;p;}'
   exit 0
 fi
 
@@ -283,12 +351,12 @@ base64 < "$payload_file" | tr -d '\n' > "$content"
 if command -v jq >/dev/null 2>&1; then
   jq -n \
     --arg id "$repo_name" --arg name "$repo_name" --arg url "$repo_url" \
-    --arg db "$default_branch" --arg ref "refs/heads/$branch" \
+    --arg db "$default_branch" --arg rb "$release_base" --arg ref "refs/heads/$branch" \
     --arg before "$before" --arg after "$sha" \
     --arg pn "$pusher_name" --arg pe "$pusher_email" \
     --arg wf "$workflow" --arg fmt "$format" --rawfile content "$content" \
     --arg only "$(printf '%s\n' ${only[@]+"${only[@]}"})" \
-    '{repository:{id:$id,name:$name,url:$url,defaultBranch:(if $db=="" then null else $db end)},
+    '{repository:{id:$id,name:$name,url:$url,defaultBranch:(if $db=="" then null else $db end),releaseBaseSha:(if $rb=="" then null else $rb end)},
       ref:$ref, before:$before, after:$after, dryRun:false,
       pusher:{name:$pn,email:$pe},
       workflowId:(if $wf=="" then null else $wf end),
@@ -301,9 +369,10 @@ else
   # variable, for the reason above.
   esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
   {
-    printf '{"repository":{"id":"%s","name":"%s","url":"%s","defaultBranch":%s},' \
+    printf '{"repository":{"id":"%s","name":"%s","url":"%s","defaultBranch":%s,"releaseBaseSha":%s},' \
       "$(esc "$repo_name")" "$(esc "$repo_name")" "$(esc "$repo_url")" \
-      "$([ -n "$default_branch" ] && printf '"%s"' "$(esc "$default_branch")" || printf 'null')"
+      "$([ -n "$default_branch" ] && printf '"%s"' "$(esc "$default_branch")" || printf 'null')" \
+      "$([ -n "$release_base" ] && printf '"%s"' "$release_base" || printf 'null')"
     printf '"ref":"refs/heads/%s","before":"%s","after":"%s","dryRun":false,' \
       "$(esc "$branch")" "$before" "$sha"
     printf '"pusher":{"name":"%s","email":"%s"},' "$(esc "$pusher_name")" "$(esc "$pusher_email")"

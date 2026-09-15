@@ -39,7 +39,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && apt-get install -y --no-install-recommends \
         build-essential \
+        cmake \
+        perl \
         git \
+        python3 \
         pkg-config \
         libssl-dev \
     && rm -rf /var/lib/apt/lists/*

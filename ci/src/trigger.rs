@@ -65,6 +65,8 @@ pub struct RepositoryRef {
     pub url: String,
     #[serde(default)]
     pub default_branch: Option<String>,
+    #[serde(default)]
+    pub release_base_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

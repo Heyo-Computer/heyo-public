@@ -129,6 +129,7 @@ pub struct DeploymentSpec {
     pub account_id: Option<String>,
     pub user_id: Option<String>,
     pub routes: Vec<RouteRule>,
+    pub maintenance: bool,
     pub vm: Option<VmSpec>,
     pub scaling: ScalingPolicy,
     pub health: HealthCheck,
