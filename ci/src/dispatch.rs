@@ -1337,13 +1337,10 @@ impl Dispatcher {
             }
             return Ok((node.id.clone(), vm));
         }
-        // Unpinned: the first online host **that can run the job's driver**.
-        // The set is small and stable, so first-match stays predictable — but
-        // predictable used to mean "whichever host the cloud listed first",
-        // and when a macbook joined the network that was the macbook, handed a
-        // firecracker job macOS cannot run. Every skip is collected so the
-        // error names each host and why, instead of "no online runner" on a
-        // page showing three of them.
+        // Unpinned: compare fresh disk capacity on every compatible host.
+        // Liveness alone does not make a full host eligible for a new VM.
+        let required = runner_disk_requirement(&plan.vm);
+        let mut candidates = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
         for candidate in placement.network.dispatchable() {
             match self.runners.supported_drivers(&candidate.id).await {
@@ -1354,10 +1351,17 @@ impl Dispatcher {
                         supported.join(", ")
                     ));
                 }
-                // Known-capable, or old enough that it cannot say: it gets the
-                // job. Refusing every un-upgraded daemon would take down a
-                // working fleet to enforce a check it cannot answer.
-                Ok(_) => return Ok((candidate.id.clone(), vm)),
+                Ok(_) => match self.runners.free_disk_bytes(&candidate.id).await {
+                    Ok(free) => {
+                        candidates.push((candidate.id.clone(), free));
+                        if free < required {
+                            skipped.push(format!(
+                                "{} has {free} free disk bytes; this job requires at least {required}", candidate.name
+                            ));
+                        }
+                    }
+                    Err(e) => skipped.push(format!("{} capacity unavailable: {e}", candidate.name)),
+                },
                 Err(e) => {
                     tracing::warn!(
                         runner = %candidate.name,
@@ -1366,6 +1370,9 @@ impl Dispatcher {
                     skipped.push(format!("{} could not be reached", candidate.name));
                 }
             }
+        }
+        if let Some(runner) = roomiest_runner(candidates, required) {
+            return Ok((runner, vm));
         }
         if skipped.is_empty() {
             return Err(DispatchError::NoOnlineRunner(
@@ -4042,6 +4049,22 @@ fn host_can_run(supported: Option<&[String]>, driver: &str) -> bool {
     }
 }
 
+/// A conservative lower bound: data disk, two declared rootfs copies (image
+/// and VM), and 5 GiB left for host operation. Auto-sized images/build scratch
+/// are unknown here; this is admission headroom, not a storage reservation.
+fn runner_disk_requirement(spec: &crate::vm::VmSpec) -> u64 {
+    let data = u64::from(spec.disk_size_gb.unwrap_or(0)) * (1 << 30);
+    let rootfs = spec.build.as_ref().and_then(|b| b.size_mb).unwrap_or(0)
+        .saturating_mul(1 << 20).saturating_mul(2);
+    data.saturating_add(rootfs).saturating_add(5 * (1 << 30))
+}
+
+fn roomiest_runner(candidates: Vec<(String, u64)>, required: u64) -> Option<String> {
+    candidates.into_iter().filter(|(_, free)| *free >= required).max_by(|a, b| {
+        a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0))
+    }).map(|(id, _)| id)
+}
+
 /// The TTL a VM is parked with, and so boots with on its next claim: the longer
 /// of the instance default and the workflow's own `ttl_seconds`. It bounds a
 /// *running* VM only — a parked VM is stopped, and its lifetime is the idle
@@ -5805,6 +5828,35 @@ mod tests {
             "firecracker"
         );
         assert_eq!(super::driver_name(heyo_sdk::SandboxDriver::Kvm), "kvm");
+    }
+
+    #[test]
+    fn disk_placement_prefers_capacity_not_discovery_order() {
+        let gib = 1 << 30;
+        for eu1 in [0, 21 * gib, 80 * gib] {
+            let hosts = vec![("eu1".into(), eu1), ("us3".into(), 2808 * gib)];
+            let reverse = hosts.iter().cloned().rev().collect();
+            assert_eq!(super::roomiest_runner(hosts, 65 * gib).as_deref(), Some("us3"));
+            assert_eq!(super::roomiest_runner(reverse, 65 * gib).as_deref(), Some("us3"));
+        }
+        assert_eq!(super::roomiest_runner(vec![("full".into(), 64)], 65), None);
+        assert_eq!(super::roomiest_runner(vec![("exact".into(), 65)], 65).as_deref(), Some("exact"));
+        assert_eq!(super::roomiest_runner(vec![], 65), None);
+        for hosts in [vec![("b".into(), 70), ("a".into(), 70)], vec![("a".into(), 70), ("b".into(), 70)]] {
+            assert_eq!(super::roomiest_runner(hosts, 65).as_deref(), Some("a"));
+        }
+    }
+
+    #[test]
+    fn disk_placement_budgets_image_copy_data_and_host_headroom() {
+        let mut spec = crate::vm::VmSpec::default();
+        spec.disk_size_gb = Some(40);
+        spec.build = Some(crate::vm::ImageBuild {
+            dockerfile: "Dockerfile".into(), context: None, size_mb: Some(10240),
+        });
+        assert_eq!(super::runner_disk_requirement(&spec), 69_793_218_560);
+        spec.build.as_mut().unwrap().size_mb = Some(u64::MAX);
+        assert_eq!(super::runner_disk_requirement(&spec), u64::MAX);
     }
 
     /// A workflow that declares a long `ttl_seconds` keeps its warm VM that
