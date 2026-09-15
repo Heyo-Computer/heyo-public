@@ -477,9 +477,10 @@ fn is_sha256_digest(value: &str) -> bool {
 }
 
 fn fingerprint(value: &impl Serialize) -> String {
-    // Value's object map sorts keys, including nested HashMaps in VM templates.
-    // Hashing the struct directly makes retry identity depend on hash seed.
-    let value = serde_json::to_value(value).expect("job intent serializes");
+    // Feature unification can enable serde_json's preserve_order. Sort nested
+    // objects explicitly so retry identity never depends on map insertion order.
+    let mut value = serde_json::to_value(value).expect("job intent serializes");
+    value.sort_all_objects();
     let bytes = serde_json::to_vec(&value).expect("job intent serializes");
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -2609,6 +2610,11 @@ mod tests {
         let second: HashMap<_, _> = [("a", "first"), ("z", "last")].into_iter().collect();
         assert_eq!(fingerprint(&first), fingerprint(&second));
         assert_eq!(fingerprint(&first), fingerprint(&serde_json::json!({"a":"first", "z":"last"})));
+        let first: serde_json::Value = serde_json::from_str(r#"{"z":[{"b":2,"a":1}],"a":0}"#).unwrap();
+        let second: serde_json::Value = serde_json::from_str(r#"{"a":0,"z":[{"a":1,"b":2}]}"#).unwrap();
+        assert_eq!(fingerprint(&first), fingerprint(&second));
+        assert_ne!(fingerprint(&first), fingerprint(&serde_json::json!({"a":0,"z":[{"a":2,"b":1}]})));
+        assert_ne!(fingerprint(&serde_json::json!([1,2])), fingerprint(&serde_json::json!([2,1])));
     }
 
     #[test]
