@@ -34,7 +34,14 @@
     "client_secret": { "secret": "google", "key": "client_secret" },
     "allowed_domains": ["heyo.computer"],
     "allowed_emails": [],
-    "public_paths": ["/healthz", "/blobs/", "/manifests", "/tags", "/usage", "/__ui/"],
+    "public_paths": [
+      { "path": "/healthz", "scope": "public" },
+      { "path": "/__ui/", "scope": "public" },
+      { "path": "/blobs/", "scope": "admin" },
+      { "path": "/manifests", "scope": "admin" },
+      { "path": "/tags", "scope": "admin" },
+      { "path": "/usage", "scope": "admin" }
+    ],
     "session_ttl_secs": 43200,
     "cookie_domain": "us2.heyo.work",
     "forward_identity": true

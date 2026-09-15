@@ -3,7 +3,8 @@
 An MCP server over heyo: **heyo cloud** for sandboxes — boot a microVM, run a
 command in it, get files in and out — and the three services that answer
 operational questions about a fleet, [app-lb](../app-lb) (deployments and VM
-pools), [app-obs](../app-obs) (logs and metrics) and [ci](../ci) (builds).
+pools), [app-obs](../app-obs) (logs and metrics), [ci](../ci) (builds) and the
+[artifact store](../artifacts) (the bytes a deployment runs from).
 
 The sandbox half is the API an agent runs work on. The operational half exists
 because its questions span three services: "why is nothing running" is app-lb's
@@ -41,8 +42,11 @@ ci, or a cloud that is not the public one.
 | `APPLB_BASIC` | `user:pass`, or a complete `Basic …` header |
 | `APP_OBS_URL` | app-obs base URL |
 | `APP_OBS_API_TOKEN` | bearer for its query routes (`/healthz` stays open) |
-| `CI_URL` | ci's **own** listener — see above |
-| `CI_TOKEN` | bearer, if ci is reached somewhere that wants one |
+| `CI_URL` | ci's **own** listener for the pages — see below; the read API works either way |
+| `CI_TOKEN` | a repository submit token (`git config ci.token`) — what `ci_run_status` and `ci_run_logs` present |
+| `ART_URL` | artifact store base URL |
+| `ART_API_KEY` | the store's own key, sent as `x-api-key` |
+| `ART_GATE_TOKEN` | app-token for the gate in front of the store; defaults to `APPLB_TOKEN` |
 | `HEYO_MCP_TIMEOUT_MS` | per-request bound, default 30000 |
 
 Each service is independent: configure one and its tools work while the others
@@ -53,32 +57,113 @@ surfaces there rather than inside some later call.
 A `Basic` value is passed through byte for byte, because app-lb compares it that
 way — a re-encoded-but-equivalent header is rejected.
 
-## ci needs a direct URL, and no token changes that
+## Publishing a build
 
-`ci` deployed behind an app-lb `AuthGate` **admits browsers and nothing else.**
-The gate splits on `Accept: text/html`, and ci's `public_paths` are only:
+`art_publish` is the tool for "update deployment X with this build". It is the
+step `applb_pull` cannot do: app-lb rolls a deployment onto bytes that must
+already be in the store, so without this the workflow dead-ends halfway.
 
-```json
-["/healthz", "/api/submit", "/api/stream/", "/__ui/"]
+A publish is **three** requests and the order and the digests matter:
+
+```
+PUT /blobs/{sha256}     the bytes, at their own hash
+PUT /manifests          {schema:1, kind:"generic", entries:[{name,digest,size}]}
+                        → answers {digest} — the MANIFEST's digest
+PUT /tags/{tag}         that manifest digest, as text/plain
 ```
 
-Every page worth reading — runs, jobs, `/networks`, `/runners`, `/vms`,
-`/repos` — is outside that list, so a machine client is refused whatever
-credential it presents. This is deliberate in ci: minting a submit token is
-minting the right to run code on a runner, so those routes are for browsers with
-an admin role.
+**A tag names a manifest, never a blob.** The store does not check this: it
+writes whatever digest it is handed, so tagging a blob digest succeeds and then
+resolves for no reader — a tag that looks right in a listing and works for
+nobody. That is why publishing is one composite tool rather than three
+primitives with a warning: a composite that always uses the manifest digest
+cannot make the mistake. The primitives are still there (`art_request`) for
+everything else.
 
-So `CI_URL` wants **ci's own listener**, not its public hostname — from the host
-it runs on, or through an SSH tunnel:
+Then `applb_pull` to roll the deployment onto it, and `applb_job` to watch the
+job it returns.
+
+**Not `applb_host_update`.** That runs a *static* deployment's own
+`update.commands` on the app-lb host and refuses a managed (`vm`) deployment
+outright — app-lb's `HostUpdate` job applies to `upstreams` and `site` backends
+only. Until 2026-09-10 both this page and `art_publish`'s own result named it as
+the next step, which was wrong for the main case; `applb_pull` is what rolls a
+managed deployment onto new bytes, and `applb_build` is what rebuilds an image
+from a Dockerfile.
+
+### Two credentials, one request
+
+The store is the only service here with **two authenticators stacked in front of
+it**, and until both were used it could not be written to from outside the
+network at all:
+
+| Layer | Credential | Header |
+|---|---|---|
+| app-lb's gate | app-token with `admin` scope over the `artifacts` deployment | `Authorization: Bearer applb_…` |
+| the store itself | `ART_API_KEY` | `x-api-key` |
+
+Both are ordinarily presented as `Authorization`, which is why this reads as
+unsatisfiable: whichever one you send, the other layer refuses it. The way
+through is that the store also accepts `x-api-key`, so one request passes both
+doors. ci never hits this because ci runs inside the network, where there is no
+gate.
+
+Reached on its own listener there is no gate, and `ART_API_KEY` alone is enough.
+
+## ci: the pages need a direct URL, the read API does not
+
+`ci` deployed behind an app-lb `AuthGate` **admits browsers and almost nothing
+else.** The gate splits on `Accept: text/html`, and ci's `public_paths` are only:
+
+```json
+["/healthz", "/api/submit", "/api/runs/", "/api/stream/", "/__ui/"]
+```
+
+The pages — runs, jobs, `/networks`, `/runners`, `/vms`, `/repos` — are outside
+that list, so a machine client is refused there whatever credential it presents.
+This is deliberate in ci: minting a submit token is minting the right to run code
+on a runner, so those routes are for browsers with an admin role.
+
+So `CI_URL` wants **ci's own listener** for `diagnose_ci_job` and the rest — from
+the host it runs on, or through an SSH tunnel:
 
 ```bash
 ssh -N -L 8081:127.0.0.1:8081 us2.heyo.work   # then CI_URL=http://127.0.0.1:8081
 ```
 
-Pointed at the gated host, ci tools fail with that explanation rather than a
-bare 401, because a token hunt is the wrong response to it.
+`/api/runs/` is the exception, and it is the one that matters most often.
+`ci_run_status` and `ci_run_logs` are machine routes with their own credential —
+a repository submit token in `CI_TOKEN`, the same value `git submit` uses — so
+they work against the public hostname too. Without them a client that submitted a
+build was blind to its outcome, and silence reads as failure: a run that is
+merely slow is indistinguishable from one that died. Read `run.finished`, not the
+status string; builds here routinely take tens of minutes.
+
+Pointed at the gated host, the page-backed tools fail with that explanation
+rather than a bare 401, because a token hunt is the wrong response to it.
 
 app-lb and app-obs are ordinary bearer APIs and need no such arrangement.
+
+## Which credential am I?
+
+`heyo_whoami` answers it: admin scope, namespace, deployment scope, expiry.
+
+Run it first on any 401 or 403 from an `applb_*` tool. Scope problems and
+authentication problems look identical from outside — a token minted without
+admin scope, or scoped to the wrong namespace, produces a refusal that reads as
+a broken connection — and this is what tells them apart. It used to take a
+second, wider credential on another machine to answer, because listing tokens is
+itself an `admin` route.
+
+Two scopes decide everything, and they are checked in **different places**:
+
+- the **admin tier** (`none` / `view` / `admin`) is what app-lb's admin API
+  requires;
+- the **deployment scope** is what a deployment's own gate requires — that gate
+  checks reach and never the tier.
+
+So a token can pass a gate and be refused by the admin API, and the reverse.
+Read both fields.
 
 ## Sandboxes
 
@@ -164,8 +249,10 @@ SDK's `Namespaces.create`, and deployments registered through this door land
 in it whether or not the spec says so.
 
 What the door exposes: `applb_list_deployments`, `applb_get_deployment`,
-`applb_create_deployment`, `applb_scale`, `applb_start_build`,
-`applb_start_update`, `applb_deployment_jobs`, `applb_delete_deployment`,
+`applb_deploy`, `applb_create_deployment`, `applb_update_deployment`,
+`applb_scale`, `applb_build`, `applb_pull`, `applb_pull_mounts`,
+`applb_host_update`, `applb_job`, `applb_deployment_jobs`,
+`applb_delete_deployment`, `applb_spec_schema`,
 `applb_evict_vm`, `applb_exec` and `applb_metrics`. The fleet-wide operator
 tools — `applb_disks`, `applb_certs`, `applb_purge_disk`,
 `applb_purge_orphan_disks`, `applb_sweep_disks` — answer `404 route not exposed
@@ -179,6 +266,17 @@ header goes upstream instead, so every caller acts under their own key and
 therefore their own namespaces. A configured token otherwise wins over a
 caller's header — an instance deployed to act as itself must not be talked into
 acting as someone else.
+
+**Behind an app-token gate, the instance's own MCP path has to be public.** A
+gate checks a token against the deployment *it* belongs to before anything
+behind it runs, and a hosted instance usually lives in `default` — so a token
+confined to any other namespace is refused at the door with a 403, however well
+it is scoped for everything else. Give the path
+`{"path": "/mcp", "scope": "public"}` and set `HEYO_MCP_REQUIRE_IDENTITY=0`.
+That is safe only because the instance holds no credential: an anonymous
+request reaches a server with nothing to act with, and every call it makes
+carries the caller's own token to be judged where it lands. Over HTTP,
+`art_publish` takes `content_base64` only. `deploy/vm.md` has the reasoning.
 
 **One credential overrides that, and must: a token app-lb minted itself.** A
 caller presenting `Authorization: Bearer applb_…` reaches app-lb with *that*
@@ -343,64 +441,213 @@ daemon, anything holding a static bearer) therefore wants either
 Pick deliberately. Turning the check off *without* a gate in front leaves an
 unauthenticated hole into a process that can delete a deployment.
 
+## Deploying: one tool, and reference material behind it
+
+`applb_deploy` is the entry point. It carries the deployment spec's schema —
+generated from app-lb's own Rust types, not transcribed — checks the cross-field
+rules a schema cannot express, registers *or* edits as appropriate, starts the
+job that matches the backend, and reports what TLS will do.
+
+Three of those steps exist because each was easy to get wrong by hand:
+
+- **Register or edit.** `POST /deployments` replaces a deployment and recycles
+  its VM pool; `PUT` preserves the pool whenever the `vm` block is unchanged.
+  Only the first was exposed, so every scaling or route edit cost a full roll.
+- **Which job.** app-lb's job kinds each apply to a subset of backends. `build`
+  is for a `vm` with a Dockerfile, `pull` rolls a `vm` or `site` onto bytes from
+  a store, and `host_update` runs a *static* deployment's own commands on the
+  app-lb host and refuses a managed one. Picking wrong is refused, not ignored.
+- **TLS.** An exact `host` route is issued automatically within seconds. A
+  `host_suffix` route never gets its own certificate and needs a fleet wildcard;
+  one no wildcard covers is served a fallback that will not validate.
+
+The primitives are still there — `applb_create_deployment`,
+`applb_update_deployment`, `applb_build`, `applb_pull`, `applb_pull_mounts`,
+`applb_host_update`, `applb_job` — for when you want exactly one request.
+
+### What a host's approval dialog sees
+
+Every tool carries MCP annotations, derived rather than declared: `destructiveHint`
+comes from the `DESTRUCTIVE.` sentence at the front of a description, so the two
+cannot drift apart. The prose is what the model reads — the SDK is explicit that
+clients should never make tool use decisions from annotations — and the
+annotation is what an approval UI reads.
+
+Only what the MCP defaults do not already say is emitted, which matters for
+correctness and not just size: `destructiveHint` defaults to **true**, so a tool
+that is neither read-only nor destructive has to say `destructiveHint: false` out
+loud or a host is told it destroys things.
+
+`readOnlyHint` is the one hint that cannot be derived, and the one where being
+wrong is a safety problem — a host may auto-approve what it believes is a read.
+The list of read-only tools is checked by running each of them against a stubbed
+transport and failing if any issues anything but a `GET`.
+
+### Resources and prompts
+
+The server serves reference material as MCP **resources**, which are pulled when
+wanted rather than pushed on every connect:
+
+| URI | What |
+|---|---|
+| `heyo://applb/deployment-spec` | the full generated schema, plus every cross-field rule |
+| `heyo://applb/deploy-guide` | the sequence end to end |
+| `heyo://applb/tls` | why an exact host gets HTTPS and a suffix does not |
+| `heyo://applb/examples/{name}` | each of app-lb's shipped example specs, with its notes |
+
+That split is what makes it honest for the advertised schema to summarise the
+auth gate and the mount blocks: `applb_spec_schema` and these resources have
+them in full, one call away, costing nothing until asked for.
+
+There is one **prompt**, `deploy_a_service(kind, id, host?)`, which returns the
+ordered plan for that backend kind. A host that surfaces prompts as slash
+commands turns "how do I deploy" into a visible affordance rather than something
+to infer from sixty tool names.
+
 ## Tools
 
-**Diagnostics** — cross-service, shaped like the question:
+<!-- BEGIN GENERATED CATALOGUE -->
 
-| Tool | Answers |
-|---|---|
-| `heyo_status` | which services are reachable, and what each says about itself |
-| `fleet_overview` | every deployment, host CPU/memory, app-lb topology, ingest counters |
-| `diagnose_deployment` | one deployment: record, jobs, series, recent errors |
-| `deployment_logs` | log lines with app-obs's filters and paging |
-| `diagnose_empty_pool` | why a pool is empty or will not fill |
-| `diagnose_ci_job` | why a ci job is not running |
+### Diagnostics
 
-**Sandboxes** — heyo cloud:
+Cross-service, shaped like the question rather than the endpoint.
 
-| Tool | Does |
-|---|---|
-| `sandbox_create` | boot one and wait for it; `archive_id` seeds `/workspace` |
-| `sandbox_list` / `sandbox_info` | find one again; poll readiness |
-| `sandbox_exec` | run a command, buffered, with its exit code |
-| `sandbox_read_file` / `sandbox_write_file` | small files inline; the write refuses what 413 would |
-| `sandbox_upload_url` / `sandbox_finalize_upload` / `sandbox_attach_archive` | the route past the 1 MB body |
-| `sandbox_set_ttl` | keep a sandbox alive across a conversation |
-| `sandbox_stop` / `sandbox_start` / `sandbox_restart` | park and resume; the disk survives all three |
-| `sandbox_kill` | DESTRUCTIVE — the VM and its disk |
-| `heyo_capacity` | your daemons and your running sandboxes, before booting more |
+| Tool | | Does |
+| --- | --- | --- |
+| `heyo_status` | read-only | Which of heyo cloud, app-lb, app-obs, ci and the artifact store this server can reach, and what each says about itself. |
+| `heyo_whoami` | read-only | What this server's credential is and what it may do: admin scope, namespace, deployment scope and expiry. |
+| `fleet_overview` | read-only | The whole managed fleet in one call: app-obs's per-deployment rows with host CPU and memory, app-lb's current topology with health and drain state, and app-obs's ingest counters. |
+| `diagnose_deployment` | read-only | Everything about one deployment at once: app-lb's record and its VM pool, app-obs's bucketed series, and the most recent error-level logs. |
+| `deployment_logs` | read-only | Log lines for one deployment, newest first, with the filters app-obs supports: time window or explicit from/to, level, backend, a substring query, and a cursor for paging. |
+| `diagnose_empty_pool` | read-only | Why a deployment's VM pool is empty or will not fill. |
+| `diagnose_ci_job` | read-only | Why a ci job is not running. |
 
-**The event feed** — app-lb's per-namespace RSS, as data:
+### Deploying
 
-| Tool | Answers |
-|---|---|
-| `applb_feeds` | which namespaces have events |
-| `applb_feed` | deployment lifecycle and issues, newest first, since a cursor |
+`applb_deploy` is the entry point and does the whole sequence; the rest are the primitives underneath it. Which job tool applies depends on the backend, and picking wrong is refused rather than ignored — `applb_build` for a Dockerfile, `applb_pull` for bytes from a store, `applb_host_update` for a static deployment's own commands.
 
-The feed is **polled, never pushed**, and no subscription state exists anywhere:
-app-lb tracks no per-reader watermark, so `applb_feed` takes `since_id` and
-returns `latest_id` for the caller to keep. The ring is in memory, so an app-lb
-restart empties it and ids begin again — a cursor from before that reads as
-ahead of everything, and the tool says "feed reset" and returns the lot rather
-than reporting nothing new for ever. Nothing publishes unless a deployment's
-spec opts in with `feed.announce` or `feed.issues`.
+| Tool | | Does |
+| --- | --- | --- |
+| `applb_deploy` |  | **THE tool for 'deploy this'.** Takes a full spec and does the whole sequence: checks the rules a schema cannot express, registers or edits as appropriate, starts the job that matches the backend, waits for it, and reports what TLS will do. |
+| `applb_spec_schema` | read-only | The deployment spec in full: every field of a named block with its complete documentation, plus the cross-field rules that apply to it. |
+| `applb_create_deployment` |  | Register a deployment from a full spec, REPLACING any deployment with the same id and recycling its VM pool. |
+| `applb_update_deployment` |  | Edit an existing deployment in place, replacing its whole spec. |
+| `applb_delete_deployment` | **destructive** | Deregisters a deployment from app-lb and tears down its backends. |
+| `applb_scale` |  | Change a deployment's scaling parameters. |
+| `applb_build` |  | Build a managed (`vm`) deployment's image from its `build` block and roll the pool onto it. |
+| `applb_pull` |  | Materialize a `vm` or `site` deployment's bytes from an artifact store and roll it onto them. |
+| `applb_pull_mounts` |  | Re-unpack the guest mounts a `vm` deployment declares, from their artifact stores. |
+| `applb_host_update` |  | Run a STATIC (`upstreams`) or `site` deployment's own `update.commands` on the app-lb host, then re-probe its upstreams. |
+| `applb_job` | read-only | One job by its id — what applb_build, applb_pull, applb_pull_mounts and applb_host_update each return. |
+| `applb_deployment_jobs` | read-only | Recent build/pull/update jobs for a deployment, with their outcomes. |
 
-**Actions** — app-lb reads and lifecycle, ci run control, and `*_request` raw
-tools covering everything without a dedicated tool.
+### Fleet and pools
+
+Reads over app-lb's topology, plus the operations that move VMs and disks.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `applb_list_deployments` | read-only | Every deployment app-lb manages, with its backends and current state. |
+| `applb_get_deployment` | read-only | One deployment in full: its spec, desired and ready replica counts, and every VM with its health. |
+| `applb_metrics` | read-only | app-lb's live metrics: per-deployment pool counters, request stats, and create/boot outcomes. |
+| `applb_disks` | read-only | Disk inventory and usage. |
+| `applb_certs` | read-only | TLS certificates app-lb holds, with their hostname, issuer and expiry. |
+| `applb_drain_upstream` | **destructive** | Take one upstream of a STATIC (`upstreams`) deployment out of rotation. |
+| `applb_uncordon_upstream` |  | Put a drained upstream back into rotation. |
+| `applb_evict_vm` | **destructive** | Removes one VM from a deployment's pool and destroys it. |
+| `applb_purge_disk` | **destructive** | Permanently deletes one disk and everything on it. |
+| `applb_purge_orphan_disks` | **destructive** | Deletes every disk app-lb considers orphaned, in one call. |
+| `applb_sweep_disks` | **destructive** | Runs the disk expiry sweep now instead of waiting for the next tick, deleting every disk past its TTL. |
+| `applb_exec` | **destructive** | Runs a command inside a deployment's guest and returns its output. |
+
+### The event feed
+
+app-lb's per-namespace RSS, as data.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `applb_feeds` | read-only | Which namespaces have deployment events, and how many. |
+| `applb_feed` | read-only | Deployment events for one namespace, newest first: deployed, updated, removed, and operational issues. |
+
+### Sandboxes
+
+heyo cloud. Listed only when a usable cloud API key is configured.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `sandbox_create` |  | Boot a sandbox (a microVM) and return it once it is running. |
+| `sandbox_list` |  | Every sandbox this key can see, with status, image, uptime and bound URLs. |
+| `sandbox_info` |  | One sandbox by id: status, region, size, TTL and bound URLs. |
+| `sandbox_exec` |  | Run a command in the sandbox with `sh -c` and return stdout, stderr and exit_code. |
+| `sandbox_read_file` |  | Read a file from the sandbox. |
+| `sandbox_write_file` |  | Write a file into the sandbox. |
+| `sandbox_upload_url` |  | Reserve an archive and return a presigned URL to PUT its bytes to. |
+| `sandbox_finalize_upload` |  | Close out an upload started by sandbox_upload_url: the archive is only usable once finalized. |
+| `sandbox_attach_archive` |  | Mount a finalized archive onto a sandbox that is already running, replacing what is at `sandbox_path`. |
+| `sandbox_set_ttl` |  | Reset how long the sandbox may run unattended, from now. |
+| `sandbox_stop` |  | Stop the sandbox without destroying it. |
+| `sandbox_start` |  | Start a stopped sandbox again, with its disk as it was left. |
+| `sandbox_restart` |  | Reboot the sandbox. |
+| `sandbox_kill` | **destructive** | Permanently deletes the sandbox and its disk. |
+| `heyo_capacity` | read-only | What can be told about capacity *before* booting something. |
+
+### The artifact store
+
+Where a deployment's bytes come from.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `art_publish` |  | Publish a bundle to the artifact store and point a tag at it. |
+| `art_list_tags` | read-only | Every tag in the store and the digest it points at. |
+| `art_get_tag` | read-only | What one tag points at. |
+| `art_get_manifest` | read-only | One manifest by digest or by tag: its kind, its entries and their digests and sizes. |
+| `art_list_blobs` | read-only | Every blob with its size, its label and the tags pointing at it. |
+| `art_usage` | read-only | The store's disk usage. |
+
+### ci
+
+Build status and VM pool control.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `ci_run_status` | read-only | Whether a ci run has finished and whether it worked, with every job and step. |
+| `ci_run_logs` | read-only | What a run printed, per job and step. |
+| `ci_cancel_run` | **destructive** | Cancels a ci run and every unfinished job in it. |
+| `ci_destroy_vm` | **destructive** | Destroys one pooled ci VM. |
+| `ci_cleanup_failed_vms` | **destructive** | Destroys every idle ci VM whose last run failed. |
+
+### Raw escape hatches
+
+Everything without a dedicated tool. Prefer a named tool when one exists — a raw call's intent cannot be read without reading its arguments.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `heyo_request` |  | Raw HTTP against heyo cloud, for endpoints without a dedicated tool above. |
+| `applb_request` |  | Raw HTTP against app-lb, for endpoints without a dedicated tool above. |
+| `obs_request` |  | Raw HTTP against app-obs, for endpoints without a dedicated tool above. |
+| `ci_request` |  | Raw HTTP against ci, for endpoints without a dedicated tool above. |
+| `art_request` |  | Raw HTTP against the artifact store, for endpoints without a dedicated tool above. |
+
+_64 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
+
+<!-- END GENERATED CATALOGUE -->
 
 ### Destructive tools are named, not hidden
 
-`applb_delete_deployment`, `applb_evict_vm`, `applb_purge_disk`,
-`applb_purge_orphan_disks`, `applb_exec`, `ci_cancel_run`, `ci_destroy_vm` and
-`ci_cleanup_failed_vms` each have their own tool and a description that opens
-with `DESTRUCTIVE`. Folding them into a generic request tool would hide a
-`DELETE` inside a parameter, where it is invisible in a transcript and in an
-approval prompt.
+Each has its own tool and a description that opens with `DESTRUCTIVE` — marked
+in the tables above, so the set is generated rather than listed here. It used to
+be listed here, and named eight when there were eleven.
 
-`sandbox_kill` is named the same way, for the same reason.
+Folding them into a generic request tool would hide a `DELETE` inside a
+parameter, where it is invisible in a transcript and in an approval prompt. The
+same reasoning names `sandbox_kill` rather than leaving it to `heyo_request`.
 
-The raw `heyo_request` / `applb_request` / `obs_request` / `ci_request` tools
-reach the rest of each API, including destructive methods. Prefer a named tool when one exists —
+The prose is the part that matters: the SDK is explicit that clients should
+never make tool-use decisions from annotations, so the sentence the model reads
+carries the warning and `destructiveHint` is derived from it.
+
+The raw `heyo_request` / `applb_request` / `obs_request` / `ci_request` /
+`art_request` tools reach the rest of each API, including destructive methods. Prefer a named tool when one exists —
 the raw one's intent cannot be read without reading its arguments.
 
 `applb_purge_orphan_disks` deserves particular care: *orphaned* is app-lb's
@@ -414,4 +661,6 @@ exactly like one belonging to nothing.
 beside a pool that will not fill is a signal, not the absence of one — read the
 file with `applb_exec`.
 
-**Anything ci knows, when ci is behind its gate.** See above.
+**ci's pages, when ci is behind its gate.** Runs, jobs, runners, vms and repos
+need ci's own listener. `ci_run_status` and `ci_run_logs` are the exception and
+work either way — see above.

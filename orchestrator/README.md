@@ -49,7 +49,23 @@ The services are independent processes but can share one PostgreSQL database. Ea
 - **Orchestrator** never talks to the backend hypervisor directly during a request — it persists the desired state, then a reconciler loop drives `mvm-ctrl` to converge. When deploying a Heyo-managed *service* whose manifest references secrets (`envRefs`), it calls **HeyoSecret** to materialize them just-in-time using the `heyosecret-client` crate.
 - **HeyoSecret** is a small KV with versioning, audit history, and AES-GCM encryption at rest. Only the orchestrator (and other internal services) holds the `HEYOSECRET_INTERNAL_API_KEY`; tenant code never sees it.
 
-Service rollouts keep the previous healthy deployment active while the candidate converges. The controller retries Cloud state and health reads with capped backoff under one deployment deadline, requires candidate and app-lb route health to remain successful for 10 seconds, and uses the candidate's public endpoint for stable route cutover even when an internal endpoint answers health first. Only persisted terminal state or the deadline is failure; deployment events are diagnostics, not a liveness signal.
+Service rollouts keep the previous healthy deployment active while the candidate converges. The controller retries Cloud state and health reads with capped backoff under one deployment deadline and requires candidate and app-lb route health to remain successful for 10 seconds. It prefers the candidate's internal endpoint for readiness and upstream routing: the public sandbox URL can require end-user authentication and return 401 for an otherwise healthy service. Legacy `url` and public endpoints remain fallbacks when no internal endpoint is supplied. Only persisted terminal state or the deadline is failure; deployment events are diagnostics, not a liveness signal.
+
+## Public service deployment boundary
+
+The public VM workflow deploys only Orchestrator, HeyoSecret and app-obs.
+app-lb runs on the host and is not a VM deployment target, including for
+`service=all`. app-obs still connects to the existing app-lb admin endpoint.
+Automatic selection requires a change under the service's source paths or its
+`.heyo/services/<service>.json` declaration;
+shared workflow/environment edits and empty change lists select no services.
+Use an explicit service dispatch when only shared deployment settings change.
+
+The receiver-only prerequisite uses the flat request and selects Orchestrator
+alone. This JSON caller workflow must wait until that receiver upgrades. Before any
+receiver rollout, ensure host app-lb discovery does not depend on the retiring
+Orchestrator VM's port. Verify discovery through a stable endpoint and preserve
+the existing host proxy; do not recreate app-lb to upgrade the receiver.
 
 ## Layout
 
@@ -85,9 +101,17 @@ Set `ORCHESTRATOR_PROXY_BASE_DOMAINS` to a comma-separated list of wildcard prox
 
 Rolling replicas are an explicit discovery-routed traffic mode. Configure `ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES` with a comma-separated allowlist. A replicated request must include the service's stable `route`; Orchestrator verifies that route through the active app-lb backend, rewrites ingress to that backend, and only then drains a previous replica. Asynchronous retirement persists drain intent but does not stop an old replica until the parent rollout has recorded success, so Orchestrator can safely roll itself. `replicaRegions` may assign each desired replica to a region and must contain exactly `desiredReplicas` entries. `placementPool` selects a Cloud-managed host pool without naming physical servers; Cloud additionally scopes that pool to its own configured environment. app-lb itself must never be in the discovery-routing allowlist.
 
-The public-service workflow accepts `HEYO_SERVICE_REPLICA_REGIONS` as a comma-separated list such as `EU,US`, which sets both `replicaRegions` and `desiredReplicas` for every allowlisted service. `HEYO_SERVICE_PLACEMENT_POOL` is required for those allowlisted deployments; use `platform` after the intended shared hosts have registered in that pool. Manual dispatches may provide `discoveryRoutedServices`, `replicaRegions`, `placementPool`, and `serviceDriver` without changing the CICD service environment; omitted inputs retain the configured environment values and existing single-region behavior. `HEYO_SERVICE_REPLICAS` remains available as either one count or a per-service map such as `heyosecret=2,orchestrator=2`; when both settings are present, their counts must agree. app-lb candidates contain the discovery-backed route definitions and an app-lb replacement health-gates those routes before moving them from the old app-lb backend.
+Retirement authority cannot carry across a newer replica rollout. Cleanup requires the owning rollout to remain current and successful, as well as an expired drain and a non-active target. An unfinished rollout remains protected even after its lease expires; lease expiry permits a new rollout claim, not deletion of the old instance. Deployment and retirement hold the same PostgreSQL per-service advisory lock, and retirement rechecks eligibility under that lock before making a Cloud stop/delete call. Different services can progress independently; concurrent operations on the same service must retry after the current operation finishes.
 
-Activate the mode without a config bootstrap race: first deploy compatible Cloud and heyvm versions, then verify that Cloud records one EU and one US host in the target environment and pool `platform`, with distinct node IDs. Merge and deploy this version while the discovery allowlist is unset. Then set `ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES=app-obs,heyosecret,orchestrator`, `HEYO_SERVICE_REPLICA_REGIONS=EU,US`, and `HEYO_SERVICE_PLACEMENT_POOL=platform`; workflow-dispatch `orchestrator` once with `bootstrapDiscoveryRouting=true`, then workflow-dispatch `all`. The bootstrap request leaves Orchestrator on its existing singleton route while loading the allowlist into the active process. The full rollout then runs app-lb → app-obs → HeyoSecret → Orchestrator. Phase 1 keeps one app-lb ingress while placing one replica of every discovery-routed service in EU and one in US.
+Migration `034` records `previous-retire-cancelled` events when an active deployment changes back to a target of earlier retirement work. This is atomic with the state update, including direct recovery SQL, and does not rewrite historical rollout results. Moving away from that deployment later cannot revive the cancelled retirement. Obsolete cleanup is deliberately left ineligible rather than guessing whether its target is safe to delete; the current rollout must own any fresh retirement. Direct database recovery still requires quiescing deployment/cleanup first: a trigger cannot recall a Cloud deletion already in flight. Older Orchestrator binaries do not participate in the new lock/cancellation protocol, so mixed-version operation is not a substitute for that recovery precaution.
+
+PostgreSQL regression tests use an isolated, rolled-back schema and two independent connection pools: `ORCHESTRATOR_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:54329/postgres cargo test --locked --manifest-path orchestrator/Cargo.toml retirement_ -- --include-ignored`. Point this only at a disposable local database. The tests cover reactivation, superseded legacy cleanup, unfinished/expired leases, completed rollout and drain gating, and same-service exclusion in both directions.
+
+Workflow step claims lock the step row before checking readiness and inserting an attempt, so concurrent instances cannot both claim the same ready step. Run its disposable-PostgreSQL regression with `ORCHESTRATOR_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:54329/postgres cargo test --locked --manifest-path orchestrator/Cargo.toml concurrent_step_claim_creates_one_running_attempt_postgres -- --ignored`. The dedicated `.ci/workflows/orchestrator.yml` runs this check and packages the tested release binary and migrations; it does not merge or deploy.
+
+The public-service workflow accepts `HEYO_SERVICE_REPLICA_REGIONS` as a comma-separated list such as `EU,US`, which sets both `replicaRegions` and `desiredReplicas` for every allowlisted service. `HEYO_SERVICE_PLACEMENT_POOL` is optional; use `platform` after the intended shared hosts have registered in that pool. Manual dispatches may provide `discoveryRoutedServices`, `replicaRegions`, `placementPool`, and `serviceDriver` without changing the CICD service environment; omitted inputs retain the configured environment values and existing single-region behavior. `HEYO_SERVICE_REPLICAS` remains available as either one count or a per-service map such as `heyosecret=2,orchestrator=2`; when both settings are present, their counts must agree. The existing host app-lb must already contain the discovery-backed route definitions; this workflow does not install or replace it.
+
+For a first-time activation without a config bootstrap race: first deploy compatible Cloud and heyvm versions, then verify that Cloud records one EU and one US host in the target environment and pool `platform`, with distinct node IDs. Deploy the compatible receiver before activating its discovery allowlist. Then set `ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES=app-obs,heyosecret,orchestrator`, `HEYO_SERVICE_REPLICA_REGIONS=EU,US`, and `HEYO_SERVICE_PLACEMENT_POOL=platform`; workflow-dispatch `orchestrator` once with `bootstrapDiscoveryRouting=true`, then workflow-dispatch `all`. The bootstrap request leaves Orchestrator on its existing singleton route while loading the allowlist into the active process. The full VM rollout then runs app-obs → HeyoSecret → Orchestrator, using the existing host app-lb ingress. Do not repeat this bootstrap for an environment with discovery already active. Phase 1 keeps one app-lb ingress while placing one replica of every discovery-routed service in EU and one in US.
 
 If you plan to deploy services with `envRefs`, also set:
 
@@ -123,7 +147,125 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 - `POST /orchestration/resources/deployments` — request a sandbox; reconciler converges it.
 - `POST /orchestration/resources/deployments/{id}/exec` — run a command inside.
 - `POST /orchestration/services/archives/presign` (and `/finalize`) — authenticated direct upload for large Heyo-managed service archives; pass the finalized `archiveId` to the service deployment request.
-- `POST /orchestration/services/deployments` — deploy a Heyo-managed service; resolves `envRefs` against HeyoSecret. Set `desiredReplicas` (1–16), optionally `replicaRegions`, and a Cloud `placementPool` for an allowlisted discovery-routed service to converge a revision with health-gated, one-at-a-time rolling replacement. Without them, the legacy direct-route single-candidate behavior is preserved.
+- `POST /orchestration/services/deployments` — deploy a Heyo-managed service using the snake_case app-lb-style service format described below. **Breaking change:** old flat camelCase requests are rejected, not converted or accepted through aliases.
 - `GET  /orchestration/services/{service_id}/discovery` — authenticated, versioned endpoint membership for app-lb, including each endpoint's region when known. Rolling deploys publish and health-gate one candidate, drain one old replica, and repeat. A failed candidate leaves the remaining healthy set serving. `retirePrevious=false` only adds capacity up to `desiredReplicas`.
 - `POST /internal/deployments/lifecycle` — callback from the backend reporting deploy state transitions.
 - `POST /orchestration/approvals/{approval_id}/decide` — gate an in-flight workflow.
+
+### Service deployment files
+
+Service configuration lives in [`.heyo/services`](../.heyo/services). The workflow
+loads a file, fills in the build artifact, target host/region and revision, then
+submits it. Install the receiver-only upgrade before activating this workflow;
+see the breaking-change rollout below.
+Application environment variables remain application settings; there is no change
+to Orchestrator's own process-config loader.
+
+The request has `{ id, user_id, account_id?, vm, routes?, health?, scaling?, deploy }`.
+It uses app-lb's field names with an Orchestrator-only `deploy` operation section.
+It is a supported subset, not a promise that every app-lb lifecycle feature works
+through Orchestrator. Unknown fields and unsupported features fail explicitly.
+
+| Section | Supported behavior |
+| --- | --- |
+| `vm` | Required `driver`, `image`, primary `port`; optional `open_ports`, `start_command`, `working_directory`, `setup_hooks`, `size_class` (default `small`), `ttl_seconds`, `env_vars`, `env_from` |
+| `vm.env_from` | `{ "secret": "orchestrator", "key": "database-url", "as": "DATABASE_URL" }` resolves active HeyoSecret path `orchestrator/database-url`. Default key is `token`, default environment name is uppercased key. Secrets override matching `env_vars` literals, as in app-lb. Explicit namespaces and duplicate secret target names are rejected. No secret values in the file. |
+| `routes` | Zero or one exact `host` with optional `path_prefix` and `strip_prefix` (default false). Existing Traefik renderer cannot represent wildcard/hostless/multiple routes, so these are rejected. |
+| `health` | HTTP `path` (default `/`), same port as the VM, positive `timeout_secs` (default 2) for each candidate probe. Templates specify 5 to preserve existing deployments. TCP and a different health port are unsupported. |
+| `scaling` | Fixed `min_replicas == max_replicas`, 1–16. Omit for direct single-candidate execution. Dynamic autoscaling options are rejected, not silently ignored. |
+| `deploy` | Operation metadata: `deployment_id`, `name`, `async`, `archive_id` / `archive_bytes_base64`, `archive_name`, `region` (default `local`), `placement_pool`, `replica_regions`, overall `health_timeout_seconds` (default 180), retirement flags, `drain_seconds` (default 10), `metadata`, `revision_guard` |
+| `deploy.ingress` | Traefik-specific `entry_points`, `cert_resolver`, `priority`, `pass_host_header`, `backend_url`; requires a route |
+| `deploy.host_mounts` | Existing host bindings `{ host_path, sandbox_path, read_only }`, with absolute, traversal-free paths. CICD's persistent run directory uses this. These are not app-lb's artifact-backed `vm.mounts`, which remain unsupported. |
+
+`deploy.revision_guard` uses `repository_url`, `ref`, `expected_sha`, and optional
+`force`. `deploy.retire_previous` defaults to true; `retire_previous_async` and
+`delete_previous` default to false. Secrets continue to resolve through HeyoSecret;
+Cloud's internal VM allocation protocol and deployment response/status formats are
+unchanged. `health.timeout_secs` is not the overall rollout deadline and does not
+change the separate post-cutover route health check.
+
+### Breaking-change rollout
+
+The deployment workflow loads host-keyed defaults from
+`.heyo/deployment-environments.json` before constructing requests. Staging's
+verified existing policy is `heyosecret,orchestrator`, one replica each, with no
+explicit replica-region list or placement pool. Nonempty dispatch/CI settings
+override these defaults. A pool is optional; when absent, Cloud uses its existing
+regional allocation policy. The same discovery-service list is passed into the
+replacement Orchestrator, so the upgrade does not silently disable discovery.
+Other hosts receive no staging defaults. No server IDs are selected by this file.
+
+The PR #55 receiver deployment failed before cutover: the installed CICD runner
+overwrote `GITHUB_ENV` defaults with empty job environment values. Load the
+host-keyed defaults inside the deployment Python process, before constructing
+the request, so recovery does not require a CICD upgrade first. The new-format
+Orchestrator is now serving staging. The PR #58 deployment was rejected with HTTP
+422 because the workflow still sent the flat `serviceId` request. Public callers
+now load `.heyo/services/{service}.json` and send `id`, `vm`, `routes`, `health`,
+`scaling`, and `deploy`; no old-format fallback is supported.
+Shared workflow edits alone select no services, and app-lb remains host-managed.
+Run `python3 .heyo/test_deployment_environment.py` for offline regression checks.
+
+Both public and private service-deployment workflows must move with this interface.
+The public workflow covers HeyoSecret, Orchestrator and app-obs; the private
+companion covers Cloud, CICD and Retail. No dual-format server is provided.
+
+1. Submit the receiver-only change first. Its unchanged workflow sends the old
+   request to the running old receiver, which deploys the new Orchestrator binary.
+   Only `orchestrator/` changes, so the workflow selects only Orchestrator. The
+   resource allocation API used by CICD and deployment status responses are unchanged.
+2. Wait for that deployment to finish and the public Orchestrator health endpoint
+   to report the new revision. Do not run unrelated service deployments during
+   this transition: old callers cannot deploy to the new receiver.
+3. Submit the public caller migration, then the private caller migration. Both
+   require the new receiver. Do not resubmit the receiver-only revision after
+   cutover; further Orchestrator deployments must use the migrated caller.
+
+This is a coordinated breaking cutover, not a dual-format compatibility period.
+If the first deployment fails before cutover, diagnose it while the old receiver
+still serves; do not advance the callers. After cutover, use the new callers.
+No deployment or infrastructure change is performed by preparing these PRs.
+
+Receiver validation: `cargo test --locked --manifest-path orchestrator/Cargo.toml`.
+Offline validation: `python3 .heyo/services/test_service_specs.py` executes the
+workflow with mocked network/build calls. `SERVICE_SPEC_BASELINE_REF` optionally
+compares against an old-workflow Git revision. `SERVICE_SPEC_FIXTURE_DIR` exports
+synthetic payloads; use the same directory for the private caller tests and the
+Rust contract test to validate all six VM service requests.
+
+### us3 app-lb deployment
+
+`app-lb.us3.json` is an inert bootstrap spec: no public routes, zero replicas,
+and a commit placeholder. `Dockerfile.firecracker` builds and tests the locked
+Rust source from the public repository root. It includes migrations and a serial
+guest init; app-lb launches the daemon with resolved `env_from` secrets.
+
+Before registering it, replace the build ref with the verified public commit,
+provision a region-isolated database, and deliver its URL and existing JWT/internal
+keys through app-lb secrets backed by HeyoSecret. Do not reuse `orchestrator_db`
+for us3: it holds eu1 service state and retirement history even though its Postgres
+host is in us3. Startup runs migrations and immediately processes pending events,
+expired step leases, and eligible previous-deployment stop/delete intents.
+
+Build through `POST /deployments/orchestrator-us3/build` on the existing us3
+app-lb, inspect the returned job, then set one minimum replica. Attach the existing
+Heyo JWT gate and `orchestrator.us3.heyo.work` route only after readiness. Machine
+API paths must retain Orchestrator's own bearer authentication. This adds an app;
+it does not replace app-lb or change retail/login.
+
+A healthy `/health` does not prove CD works. Configure and verify regional
+`CLOUD_INTERNAL_URL`, `ORCHESTRATOR_BACKEND_API_URL`, proxy domains, and optional
+`ORCHESTRATOR_NATS_URL`/`ORCHESTRATOR_NATS_ENABLED` before accepting deployment
+jobs. Cloud must accept the configured internal key and allocate the us3 backend.
+The current Orchestrator also reads Cloud's `deployed_sandboxes` table directly:
+regional Cloud must use this region's database and populate its deployment state.
+Pointing an isolated Orchestrator at staging Cloud does not satisfy that contract.
+Keep staging/eu1 dependencies explicit until those services are regionalized;
+do not call a health-only installation an independent region.
+
+The app-lb host needs Docker for image builds. If Postgres is protected by the
+existing per-VM allowlist, grant each candidate's exact IP and tap interface
+access to port 6432 before expecting database readiness. Retain existing rules;
+do not open the database publicly. A replacement VM needs its own grant, so this
+bootstrap setup is not unattended rollout readiness. Keep a candidate's boot
+deadline long enough to establish that access, then restore the normal deadline.

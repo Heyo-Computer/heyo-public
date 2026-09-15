@@ -36,7 +36,9 @@ use crate::store::{JobStatus, RunStatus, StepStatus, Store, step_id};
 use crate::vm::{ExecOutput, SizeCheck, Vm, VmError, Vms, sandbox_name};
 use crate::workflow::{Fallback, Step};
 use async_nats::jetstream::AckKind;
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::Digest;
+use sqlx::Row;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -429,6 +431,8 @@ impl Dispatcher {
                             git_ref: req.r#ref.clone(),
                             sha: req.after.clone(),
                             before_sha: req.before.clone(),
+                            default_branch: req.repository.default_branch.clone(),
+                            release_base_sha: req.repository.release_base_sha.clone(),
                             // A workflow forced by `--only` gets *unknown*
                             // changes, not the real diff. The real diff is what
                             // just declined it at the workflow gate, and the
@@ -527,10 +531,9 @@ impl Dispatcher {
     /// name their logs, step operation ids derive from them and the daemon
     /// reattaches to an operation it has already seen, and the failed attempt
     /// is the thing somebody will want to read next to the one that passed.
-    /// What the two share is the source: every submit keeps its bundle or
-    /// tarball beside the workspace, so the bytes that ran are the bytes that
-    /// run again — and no clone is needed, which matters because this service
-    /// has never held a credential for one.
+    /// What the two share is the source: every submit keeps its validated patch
+    /// descriptor beside the workspace, so the immutable revisions and patch
+    /// are replayed exactly. Checkout credentials are resolved afresh per job.
     ///
     /// It goes through [`Self::submit`] with the original run's workflow file
     /// as its one `--only` selector, so it is planned, routed and secreted
@@ -560,6 +563,20 @@ impl Dispatcher {
                 run.status
             )));
         }
+        // A failed job can make the run's rollup fail while siblings still run.
+        // Retrying that rollup must not duplicate the siblings' work.
+        if self.store.jobs_of(run_id).await?.iter()
+            .any(|job| !matches!(job.status.as_str(), "success" | "failure" | "skipped" | "cancelled")) {
+            return Err(DispatchError::Workflow(
+                "jobs in this run are still active; wait for them to finish before re-running it".into()
+            ));
+        }
+        if self.store.service_deployments_of(run_id).await?.iter()
+            .any(|d| !matches!(d.status.as_str(), "passed" | "failed")) {
+            return Err(DispatchError::Workflow(
+                "a service rollout is still running or has an unknown submission outcome; reconcile it before creating another run".into()
+            ));
+        }
 
         // The registration the original ran under, when it had one — it is
         // what decides the workflow glob, the network and the secrets prefix,
@@ -586,6 +603,13 @@ impl Dispatcher {
                 self.config.workspace_dir.display()
             )));
         };
+        if format != crate::trigger::SourceFormat::GitPatch {
+            return Err(DispatchError::Workflow(format!(
+                "run {run_id} uses legacy source format {}; its historical source is retained, \
+                 but cannot be rerun. Upgrade `git submit` and resubmit the revision",
+                format.as_str()
+            )));
+        }
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|e| DispatchError::Checkout(format!("{}: {e}", path.display())))?;
@@ -599,7 +623,8 @@ impl Dispatcher {
                     .or_else(|| run.repo_name.clone())
                     .unwrap_or_default(),
                 url: run.repo_url.clone(),
-                default_branch: None,
+                default_branch: run.default_branch.clone(),
+                release_base_sha: run.release_base_sha.clone(),
             },
             r#ref: run.git_ref.clone(),
             before: run.before_sha.clone(),
@@ -716,9 +741,6 @@ impl Dispatcher {
                     self.store
                         .set_job_status(&job.id, JobStatus::Skipped, None)
                         .await?;
-                    self.bus
-                        .publish_event(run_id, &plan.key, &serde_json::json!({"status": "skipped"}))
-                        .await;
                     continue;
                 }
                 Err(e) => {
@@ -732,6 +754,13 @@ impl Dispatcher {
                         .await?;
                     continue;
                 }
+            }
+
+            if !plan.native_labels.is_empty() {
+                crate::native::enqueue(&self.store, &job.id, run_id, &plan.native_labels)
+                    .await.map_err(DispatchError::Native)?;
+                tracing::info!(run=run_id, job=%plan.key, labels=?plan.native_labels, "queued for native runner");
+                continue;
             }
 
             let route = match self.route_for(&plan).await {
@@ -798,19 +827,20 @@ impl Dispatcher {
     /// the network assignment next to it. The reason is that the two are not the
     /// same kind of fact: a repository's network can be reassigned while a build
     /// is in flight, so the plan freezes it; the commit a run is for is fixed
-    /// when the bundle is unpacked and cannot move under a redelivery. Freezing
+    /// by its durable source descriptor and cannot move under a redelivery. Freezing
     /// it anyway would copy a monorepo-sized path list onto every job row.
     ///
     /// A run this process cannot read at all yields an empty scope rather than
     /// an error: `ci.sha` resolving to null is a condition an author can see is
     /// wrong, whereas failing the job says nothing about what to fix.
-    fn ci_scope(run: Option<&crate::store::Run>) -> Value {
+    pub(crate) fn ci_scope(run: Option<&crate::store::Run>) -> Value {
         let Some(run) = run else {
             return Value::Object(Default::default());
         };
         serde_json::json!({
             "sha": run.sha,
             "before": run.before_sha,
+            "release_base_sha": run.release_base_sha,
             "ref": run.git_ref,
             "branch": run.git_ref.strip_prefix("refs/heads/").unwrap_or(&run.git_ref),
             "repository": run.repo_url,
@@ -872,6 +902,12 @@ impl Dispatcher {
     ) -> Result<(), DispatchError> {
         let pool = self.runners.snapshot();
         for job in &mut plan.jobs {
+            if !job.native_labels.is_empty() {
+                if self.config.native_runner_secret.is_none() {
+                    return Err(DispatchError::Native("configure native runners before submitting runs-on jobs".into()));
+                }
+                continue;
+            }
             // `uses: default` names no network on purpose — it is wherever this
             // orchestrator's host happens to be — so the repository's assignment
             // must not be written over it.
@@ -1100,19 +1136,13 @@ impl Dispatcher {
             tracing::info!(job = %msg.job_key, "no longer runnable; dropping delivery");
             return Ok(JobStatus::Success);
         }
-        self.bus
-            .publish_event(
-                &msg.run_id,
-                &plan.key,
-                &serde_json::json!({
-                    "status": "running", "runner": runner,
-                    "phase": "acquiring a VM", "attempt": attempt
-                }),
-            )
-            .await;
         tracing::info!(job = %plan.key, runner = %runner, attempt, "acquiring a VM");
 
-        let workspace = self.workspace(&msg.run_id);
+        let needs_source = existing_vm.is_none()
+            && (plan.vm.build.is_some() || !plan.vm.cache_key_files.is_empty());
+        let prepared = if needs_source {
+            Some(self.prepare_source(&runner, &plan, msg, Duration::from_secs(40 * 60)).await?)
+        } else { None };
 
         // `vm.build` becomes `vm.image` here, building the image on the runner
         // if that host does not have it yet. Resolved before the fingerprint is
@@ -1124,9 +1154,9 @@ impl Dispatcher {
         //
         // On the *local* plan only. The stored plan keeps what the author wrote,
         // so a redelivery re-derives the name rather than inheriting one.
-        if let Some(build) = plan.vm.build.clone() {
+        if existing_vm.is_none() && let Some(build) = plan.vm.build.clone() {
             let image = self
-                .ensure_image(&runner, &plan, &build, &workspace, msg)
+                .ensure_image(&runner, &plan, &build, prepared.as_ref().expect("build requires preparation"), msg)
                 .await?;
             plan.vm.image = Some(image);
             plan.vm.build = None;
@@ -1156,7 +1186,9 @@ impl Dispatcher {
                 (vm, true, "existing".to_string())
             }
             None => {
-                let fingerprint = crate::pool::fingerprint(&plan.vm, &workspace)?;
+                let empty = std::collections::BTreeMap::new();
+                let cache_keys = prepared.as_ref().map(|p| &p.cache_keys).unwrap_or(&empty);
+                let fingerprint = crate::pool::fingerprint(&plan.vm, cache_keys)?;
                 let (vm, reused) = self
                     .acquire_vm(&runner, &plan, &fingerprint, &msg.job_id)
                     .await?;
@@ -1173,17 +1205,6 @@ impl Dispatcher {
             self.release_vm(&plan, &vm, false).await;
             return Ok(JobStatus::Success);
         }
-        self.bus
-            .publish_event(
-                &msg.run_id,
-                &plan.key,
-                &serde_json::json!({
-                    "status": "running", "runner": runner,
-                    "sandbox": vm.id(), "reusedVm": reused, "attempt": attempt,
-                    "sizeClass": plan.vm.size_class.map(|s| s.as_str())
-                }),
-            )
-            .await;
         tracing::info!(
             job = %plan.key, runner = %runner, vm = vm.id(), reused,
             "running"
@@ -1230,14 +1251,48 @@ impl Dispatcher {
         self.store
             .set_job_status(&msg.job_id, status, error.as_deref())
             .await?;
-        self.bus
-            .publish_event(
-                &msg.run_id,
-                &plan.key,
-                &serde_json::json!({"status": status.as_str(), "error": error}),
-            )
-            .await;
         Ok(status)
+    }
+
+    /// Reconstruct this run's immutable source on a runner. This owns secret
+    /// resolution so every replay gets a fresh job-scoped checkout credential.
+    async fn prepare_source(
+        &self,
+        runner: &str,
+        plan: &JobPlan,
+        msg: &JobMessage,
+        deadline: Duration,
+    ) -> Result<crate::image::PreparedSource, DispatchError> {
+        let source_workspace = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
+        let descriptor = crate::trigger::read_descriptor(&source_workspace)?;
+        let run = self.store.get_run(&msg.run_id).await?.ok_or_else(|| {
+            DispatchError::Checkout(format!("run {} disappeared before source preparation", msg.run_id))
+        })?;
+        if !production_repo_url(&run.repo_url) {
+            return Err(DispatchError::Checkout("the canonical repository URL is not safe for runner checkout".into()));
+        }
+        let workflow_hashes = descriptor.workflows.iter().map(|(path, yaml)| {
+            (path.clone(), hex::encode(sha2::Sha256::digest(yaml.as_bytes())))
+        }).collect();
+        let environment = plan.env.get("CI_ENVIRONMENT").cloned().unwrap_or_else(|| "default".into());
+        let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix(&run.workflow_id, &environment))
+            .await.map_err(|e| DispatchError::Secrets(format!("resolving source credential: {e}")))?;
+        let git_auth_token = resolved.secrets.get("CI_GIT_AUTH_TOKEN")
+            .or_else(|| resolved.secrets.get("GITHUB_TOKEN")).cloned();
+        let mut cache_key_files = plan.vm.cache_key_files.clone();
+        cache_key_files.sort();
+        cache_key_files.dedup();
+        let image_build = plan.vm.build.as_ref().map(|build| crate::image::PrepareImageBuild {
+            dockerfile: build.dockerfile.clone(), context: build.context.clone(),
+            size_mb: build.size_mb, driver: "firecracker",
+        });
+        let request = crate::image::PrepareRequest {
+            repository_url: run.repo_url, base_revision: descriptor.base_revision,
+            target_tree: descriptor.target_tree, patch_base64: descriptor.patch_base64,
+            workflow_hashes, cache_key_files, image_build, git_auth_token,
+        };
+        let options = self.runners.options_for(runner).await?;
+        Ok(crate::image::prepare_remote(options, &request, deadline).await?)
     }
 
     /// Resolve the plan's target to a concrete online runner, and the existing
@@ -1335,7 +1390,8 @@ impl Dispatcher {
     /// The build itself runs on the runner — its daemon runs the same
     /// docker → export → mke2fs pipeline `heyvm mvm build` runs locally, so
     /// the host's docker layer cache applies and no builder VM is booted.
-    /// This process only uploads the inputs and polls.
+    /// This process sends only a signed descriptor and polls; repository and
+    /// image-context bytes never pass through CI.
     ///
     /// Concurrency is settled twice, at two scopes. [`crate::image::Catalog::claim`]
     /// hands exactly one *job* the build and tells the rest to wait, so N jobs
@@ -1348,7 +1404,7 @@ impl Dispatcher {
         runner: &str,
         plan: &JobPlan,
         build: &crate::vm::ImageBuild,
-        workspace: &std::path::Path,
+        prepared: &crate::image::PreparedSource,
         msg: &JobMessage,
     ) -> Result<String, DispatchError> {
         /// How long to wait — for somebody else's build of the same image, and
@@ -1358,8 +1414,10 @@ impl Dispatcher {
         const BUILD_BUDGET: Duration = Duration::from_secs(40 * 60);
         const WAIT_POLL: Duration = Duration::from_secs(10);
 
-        let build_plan = crate::image::plan_for(build, &plan.vm, workspace)?;
-        let name = build_plan.name.clone();
+        let prepared_image = prepared.image.as_ref().ok_or_else(|| crate::image::ImageError::Protocol(
+            "source preparation omitted image metadata".into()))?;
+        let name = prepared_image.name.clone();
+        let input_digest = prepared_image.input_digest.clone();
 
         let deadline = std::time::Instant::now() + BUILD_BUDGET;
         loop {
@@ -1401,26 +1459,53 @@ impl Dispatcher {
             job = %plan.key, runner,
             "asking the runner to build image {name} from {}", build.dockerfile
         );
-        let options = self.runners.options_for(runner).await?;
-        let outcome = crate::image::build_remote(
-            options,
-            &build_plan,
-            build.size_mb,
-            BUILD_BUDGET,
-            // Renewed on every poll so the catalog claim outlives a long
-            // build; the daemon is doing the work, so there is no VM lease or
-            // heartbeat task to piggyback on.
-            || async {
-                if let Err(e) = self
-                    .images
-                    .renew(&name, runner, crate::image::BUILD_LEASE)
-                    .await
-                {
+        let mut current = prepared.clone();
+        let mut replays = 0usize;
+        let outcome = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break Err(crate::image::ImageError::BuildTimeout { name: name.clone(), after: BUILD_BUDGET });
+            }
+            let options = self.runners.options_for(runner).await?;
+            let result = crate::image::build_remote(options, &current.source_id, &name, remaining, || async {
+                if let Err(e) = self.images.renew(&name, runner, crate::image::BUILD_LEASE).await {
                     tracing::warn!("could not renew the image build claim: {e}");
                 }
-            },
-        )
-        .await;
+            }).await;
+            if !matches!(result, Err(crate::image::ImageError::SourceExpired)) {
+                break result;
+            }
+            if replays >= 2 {
+                break Err(crate::image::ImageError::Source("prepared source repeatedly expired during image build".into()));
+            }
+            replays += 1;
+            // Keep the shared image-name lock live while source is recreated.
+            self.images.renew(&name, runner, crate::image::BUILD_LEASE).await?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break Err(crate::image::ImageError::BuildTimeout { name: name.clone(), after: BUILD_BUDGET });
+            }
+            let replay = self.prepare_source(runner, plan, msg, remaining);
+            tokio::pin!(replay);
+            let replayed = loop {
+                tokio::select! {
+                    result = &mut replay => break result?,
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                        self.images.renew(&name, runner, crate::image::BUILD_LEASE).await?;
+                    }
+                }
+            };
+            self.images.renew(&name, runner, crate::image::BUILD_LEASE).await?;
+            let replayed_image = replayed.image.as_ref().ok_or_else(|| crate::image::ImageError::Protocol(
+                "replayed source preparation omitted image metadata".into()))?;
+            if replayed_image.name != name || replayed_image.input_digest != input_digest {
+                break Err(crate::image::ImageError::Protocol(format!(
+                    "replayed source changed image metadata from ({name}, {input_digest}) to ({}, {})",
+                    replayed_image.name, replayed_image.input_digest
+                )));
+            }
+            current = replayed;
+        };
 
         match outcome {
             Ok(built) => {
@@ -1979,6 +2064,11 @@ impl Dispatcher {
         vm: &Vm,
     ) -> Result<(), DispatchError> {
         let sid = format!("{}.checkout", msg.job_id);
+        // A redelivery starts from the submitted source again. Do not retain
+        // release provenance from a previous VM or attempt.
+        sqlx::query("UPDATE ci_job SET release_sha=NULL WHERE id=$1")
+            .bind(&msg.job_id).execute(self.store.pool()).await
+            .map_err(|e| DispatchError::Checkout(e.to_string()))?;
         self.store
             .create_step(&sid, &msg.job_id, -1, "Checkout", None)
             .await?;
@@ -1986,7 +2076,7 @@ impl Dispatcher {
         let log_path = self.store.log_path(&msg.run_id, &plan.key, -1, &sid);
 
         let workspace = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
-        let Some((format, archive)) = workspace.stored_source() else {
+        let Some((format, _archive)) = workspace.stored_source() else {
             let detail = format!(
                 "no submitted source is on disk for run {} under {}",
                 msg.run_id,
@@ -2000,79 +2090,60 @@ impl Dispatcher {
                 .await?;
             return Err(DispatchError::Checkout(detail));
         };
-        let archive = archive.to_path_buf();
-        let bytes = match tokio::fs::read(&archive).await {
-            Ok(b) => b,
-            Err(e) => {
-                let detail = format!(
-                    "the submitted source is missing at {}: {e}",
-                    archive.display()
-                );
-                self.store
-                    .append_log(&sid, &log_path, &format!("[ci] {detail}\n"))
-                    .await?;
-                self.store
-                    .finish_step(&sid, StepStatus::Failure, None, Some(&detail))
-                    .await?;
-                return Err(DispatchError::Checkout(detail));
-            }
-        };
-
+        if format != crate::trigger::SourceFormat::GitPatch {
+            let detail = format!(
+                "legacy source format {} cannot be checked out; upgrade `git submit` and resubmit",
+                format.as_str()
+            );
+            self.store.append_log(&sid, &log_path, &format!("[ci] {detail}\n")).await?;
+            self.store.finish_step(&sid, StepStatus::Failure, Some(1), Some(&detail)).await?;
+            return Err(DispatchError::Checkout(detail));
+        }
+        let descriptor = crate::trigger::read_descriptor(&workspace)?;
+        let run = self.store.get_run(&msg.run_id).await?.ok_or_else(|| {
+            DispatchError::Checkout(format!("run {} disappeared before checkout", msg.run_id))
+        })?;
+        if !production_repo_url(&run.repo_url) {
+            return Err(DispatchError::Checkout(
+                "the canonical repository URL must be an https:// or ssh:// URL (or scp-style SSH); local filesystem repository URLs are forbidden".into(),
+            ));
+        }
+        let workflow_text = descriptor.workflows.get(&run.workflow_path).ok_or_else(|| {
+            DispatchError::Checkout(format!(
+                "planned workflow {} is absent from the durable source descriptor",
+                run.workflow_path
+            ))
+        })?;
+        let workflow_hash = hex::encode(sha2::Sha256::digest(workflow_text.as_bytes()));
         let workdir = plan
             .vm
             .working_directory
             .clone()
             .unwrap_or_else(|| DEFAULT_WORKDIR.to_string());
-        let wd = workdir.trim_end_matches('/');
-        let remote = match format {
-            crate::trigger::SourceFormat::TarGz => format!("{wd}/.ci-source.tar.gz"),
-            crate::trigger::SourceFormat::GitBundle => format!("{wd}/.ci-source.bundle"),
-        };
+        // Outside the working directory: checkout begins by deleting that
+        // directory so a pooled VM cannot leak files from its previous job.
+        let remote = format!("/tmp/ci-source-{}.patch", msg.job_id);
+        let patch = descriptor.patch()?;
+
+        // Checkout credentials use the same job-scoped HeyoSecret namespace as
+        // steps. They travel only in exec env; neither the persisted command nor
+        // the descriptor contains them.
+        let environment = plan.env.get("CI_ENVIRONMENT").cloned().unwrap_or_else(|| "default".into());
+        let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix(&run.workflow_id, &environment))
+            .await.map_err(|e| DispatchError::Secrets(format!("resolving checkout credential: {e}")))?;
+        let masker = resolved.masker();
+        let mut checkout_env = HashMap::new();
+        if let Some(token) = resolved.secrets.get("CI_GIT_AUTH_TOKEN").or_else(|| resolved.secrets.get("GITHUB_TOKEN")) {
+            checkout_env.insert("CI_GIT_AUTH_TOKEN".to_string(), token.clone());
+        }
 
         let result = async {
-            vm.upload_bytes(&sid, &remote, &bytes).await?;
-            let script = match format {
-                // `--strip-components` is deliberately absent: `git archive`
-                // writes paths relative to the repository root already, and
-                // stripping would silently drop a top-level file.
-                crate::trigger::SourceFormat::TarGz => format!(
-                    "set -e; mkdir -p {wd}; find {wd} -mindepth 1 -maxdepth 1 \
-                     ! -name .ci-source.tar.gz -exec rm -rf {{}} +; \
-                     tar -xzf {src} -C {wd}; rm -f {src}; ls -a {wd} | head -50",
-                    wd = shell_quote(&workdir),
-                    src = shell_quote(&remote),
-                ),
-                // Cloned into a scratch directory and then moved into place,
-                // because `git clone` refuses a destination that already has
-                // anything in it — and the destination here is the mount the
-                // bundle was just uploaded into. The bundle is removed after,
-                // so a step never sees it as repository content.
-                //
-                // `git` in the guest is a hard requirement of this format;
-                // `command -v` turns its absence into one line naming the fix
-                // rather than a bare `not found` from a subshell.
-                crate::trigger::SourceFormat::GitBundle => format!(
-                    "set -e; \
-                     command -v git >/dev/null 2>&1 || {{ \
-                       echo '[ci] this run submitted a git bundle, but the guest image \
-has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.' >&2; \
-                       exit 127; }}; \
-                     mkdir -p {wd}; rm -rf {tmp}; \
-                     git -c core.hooksPath=/nonexistent clone --quiet {src} {tmp}; \
-                     find {wd} -mindepth 1 -maxdepth 1 ! -name .ci-clone ! -name .ci-source.bundle \
-                       -exec rm -rf {{}} +; \
-                     tar -C {tmp} -cf - . | tar -C {wd} -xf -; \
-                     rm -rf {tmp} {src}; \
-                     git -C {wd} -c color.ui=never log --oneline -1; ls -a {wd} | head -50",
-                    wd = shell_quote(&workdir),
-                    tmp = shell_quote(&format!("{wd}/.ci-clone")),
-                    src = shell_quote(&remote),
-                ),
-            };
+            vm.upload_bytes(&sid, &remote, &patch).await?;
+            let script = checkout_script(&workdir, &remote, &run.repo_url, &descriptor, &run.workflow_path, &workflow_hash);
             vm.exec(
                 &format!("{sid}.x"),
                 &script,
-                &HashMap::new(),
+                &checkout_env,
                 Duration::from_secs(300),
             )
             .await
@@ -2086,9 +2157,9 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                         &sid,
                         &log_path,
                         &format!(
-                            "[ci] {} bytes extracted into {workdir}\n{}",
-                            bytes.len(),
-                            out.combined()
+                            "[ci] source reconstructed from {} patch bytes in {workdir}\n{}",
+                            patch.len(),
+                            masker.mask(&out.combined())
                         ),
                     )
                     .await?;
@@ -2099,18 +2170,18 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
             }
             Ok(out) => {
                 self.store
-                    .append_log(&sid, &log_path, &out.combined())
+                    .append_log(&sid, &log_path, &masker.mask(&out.combined()))
                     .await?;
                 self.store
                     .finish_step(&sid, StepStatus::Failure, Some(out.exit_code), None)
                     .await?;
                 Err(DispatchError::Checkout(format!(
-                    "extracting the source exited {}",
+                    "reconstructing the source exited {}",
                     out.exit_code
                 )))
             }
             Err(e) => {
-                let detail = e.to_string();
+                let detail = masker.mask(&e.to_string());
                 self.store
                     .append_log(&sid, &log_path, &format!("[ci] {detail}\n"))
                     .await?;
@@ -2215,10 +2286,15 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     .log_path(&msg.run_id, &plan.key, idx as i32, &sid);
                 self.store.start_step(&sid, &sid).await?;
                 match self
-                    .run_action(msg, plan, vm, action, step, &ctx, &sid, &log_path)
+                    .run_action(msg, plan, vm, action, step, &ctx, &sid, &log_path, &masker)
                     .await
                 {
-                    Ok(note) => {
+                    Ok((note, outputs)) => {
+                        if let Some(id) = &step.id {
+                            step_outputs.insert(id.clone(), serde_json::json!({
+                                "outputs": outputs, "outcome": "success"
+                            }));
+                        }
                         self.store
                             .append_log(&sid, &log_path, &masker.mask(&note))
                             .await?;
@@ -2376,7 +2452,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
 
     /// Run a built-in `uses:` action.
     ///
-    /// Only the artifact actions exist. Composite actions — fetching an
+    /// Artifact publication and service deployment. Composite actions — fetching an
     /// `action.yml` from a repository and running its steps — are a different
     /// feature with a different trust model, and pretending to support them by
     /// silently doing nothing would be worse than saying so.
@@ -2391,10 +2467,131 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
         ctx: &Context,
         sid: &str,
         log_path: &std::path::Path,
-    ) -> Result<String, DispatchError> {
+        masker: &crate::secrets::Masker,
+    ) -> Result<(String, Value), DispatchError> {
         let with = |k: &str| step.with.get(k).map(|v| ctx.substitute(v));
+        let required = |key: &str| with(key).filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
         match action {
+            "ci/merge-release" => {
+                let manifests: Vec<String> = serde_json::from_str(&required("manifests")?)
+                    .map_err(|_| DispatchError::StepFailed("with.manifests must be a JSON array of manifest paths".into()))?;
+                let tags = with("tags").map(|raw| serde_json::from_str(&raw)
+                    .map_err(|_| DispatchError::StepFailed("with.tags must be a JSON object mapping manifest paths to tag prefixes".into())))
+                    .transpose()?.unwrap_or_default();
+                let source = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
+                let release = crate::release::merge(&self.store, msg, plan, &source.root,
+                    &manifests, &tags, &required("token")?).await.map_err(DispatchError::StepFailed)?;
+                Ok((format!("[ci] merged and published release {} on {}\nVersions: {}\n",
+                    release.release_sha, release.git_ref, release.versions), serde_json::json!({
+                        "sha": release.release_sha, "ref": release.git_ref, "versions": release.versions.to_string(),
+                        "tags": release.tags
+                    })))
+            }
+            "ci/checkout-release" => {
+                let release = crate::release::get(&self.store, &msg.run_id).await
+                    .map_err(DispatchError::StepFailed)?.filter(|r| r.status == "published")
+                    .ok_or_else(|| DispatchError::StepFailed("release checkout requires a confirmed published release".into()))?;
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                let run=self.store.get_run(&msg.run_id).await?.ok_or_else(||DispatchError::StepFailed("release run disappeared".into()))?;
+                if !production_repo_url(&run.repo_url){return Err(DispatchError::StepFailed("release repository URL is not canonical".into()))}
+                let wd=shell_quote(workdir);let repo=shell_quote(&run.repo_url);let sha=shell_quote(&release.prepared.release_sha);
+                let command=format!("set -eu; test {wd} != /; find {wd} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +; git -C {wd} init --quiet; git -C {wd} remote add origin {repo}; git -C {wd} fetch --quiet --no-tags origin {sha}; git -C {wd} checkout --quiet --detach {sha}; test \"$(git -C {wd} rev-parse HEAD)\" = {sha}");
+                let primary=ctx.substitute("${{ secrets.CI_GIT_AUTH_TOKEN }}");let fallback=ctx.substitute("${{ secrets.GITHUB_TOKEN }}");let token=if primary.is_empty(){fallback}else{primary};
+                let mut env=HashMap::from([("GIT_TERMINAL_PROMPT".into(),"0".into()),("GIT_CONFIG_NOSYSTEM".into(),"1".into()),("GIT_CONFIG_GLOBAL".into(),"/dev/null".into()),("GCM_INTERACTIVE".into(),"Never".into())]);if !token.is_empty(){let basic=base64::Engine::encode(&base64::engine::general_purpose::STANDARD,format!("x-access-token:{token}"));env.insert("GIT_CONFIG_COUNT".into(),"3".into());env.insert("GIT_CONFIG_KEY_0".into(),"credential.helper".into());env.insert("GIT_CONFIG_VALUE_0".into(),"".into());env.insert("GIT_CONFIG_KEY_1".into(),"protocol.ext.allow".into());env.insert("GIT_CONFIG_VALUE_1".into(),"never".into());env.insert("GIT_CONFIG_KEY_2".into(),format!("http.{}.extraHeader",run.repo_url));env.insert("GIT_CONFIG_VALUE_2".into(),format!("Authorization: Basic {basic}"));}
+                let out = vm.exec(&format!("{sid}.release"), &command, &env, step_timeout(step, plan)).await?;
+                if !out.succeeded() { return Err(DispatchError::StepFailed("release checkout failed".into())); }
+                sqlx::query("UPDATE ci_job SET release_sha=$2 WHERE id=$1")
+                    .bind(&msg.job_id).bind(&release.prepared.release_sha).execute(self.store.pool()).await
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                Ok((format!("[ci] clean checkout of release {}\n", release.prepared.release_sha),
+                    serde_json::json!({"sha": release.prepared.release_sha})))
+            }
+            "ci/publish-service-archive" => {
+                let sha: Option<String> = sqlx::query_scalar("SELECT release_sha FROM ci_job WHERE id=$1")
+                    .bind(&msg.job_id).fetch_one(self.store.pool()).await
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                let sha = sha.ok_or_else(|| DispatchError::StepFailed("service archive must be built after ci/checkout-release in this job".into()))?;
+                let base = required("url")?;
+                let path = required("path")?;
+                let name = required("name")?;
+                let user = required("user-id")?;
+                let token = required("token")?;
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                if std::path::Path::new(&path).is_absolute() || std::path::Path::new(&path).components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+                    return Err(DispatchError::StepFailed("archive path must be relative to the job working directory".into()));
+                }
+                let bytes = vm.download_file(&format!("{sid}.archive"), &format!("{workdir}/{path}"), step_timeout(step, plan)).await?;
+                let archive = crate::service_archive::publish(&base, &token, &user, sid, &name, bytes)
+                    .await.map_err(DispatchError::StepFailed)?;
+                let mut tx = self.store.pool().begin().await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                sqlx::query("INSERT INTO ci_service_archive(step_id,run_id,job_id,archive_id,sha,orchestrator_url) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(step_id) DO UPDATE SET archive_id=excluded.archive_id,sha=excluded.sha,orchestrator_url=excluded.orchestrator_url")
+                    .bind(sid).bind(&msg.run_id).bind(&msg.job_id).bind(&archive).bind(&sha).bind(base.trim_end_matches('/'))
+                    .execute(&mut *tx).await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                let event = Store::add_event(&mut tx, &msg.run_id, Some(&msg.job_id), Some(&msg.job_key), Some(sid),
+                    "ci.service_archive.published.v1", "published", None).await?;
+                sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2 WHERE id=$1")
+                    .bind(event).bind(serde_json::json!({"archive_id":archive,"release_sha":sha}))
+                    .execute(&mut *tx).await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                tx.commit().await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                Ok((format!("[ci] finalized service archive {archive} for release {sha}\n"),
+                    serde_json::json!({"archive-id":archive,"sha":sha})))
+            }
+            "ci/deploy-service" => {
+                let required = |key: &str| with(key).filter(|v| !v.trim().is_empty())
+                    .ok_or_else(|| DispatchError::StepFailed(format!("ci/deploy-service requires with.{key}")));
+                let spec: Value = serde_json::from_str(&required("spec")?)
+                    .map_err(|_| DispatchError::StepFailed("ci/deploy-service with.spec must be JSON".into()))?;
+                crate::cd::deploy(&self.store, msg, sid, spec, &required("url")?,
+                    &required("token")?, step_timeout(step, plan), masker)
+                    .await.map(|note| (note, serde_json::json!({}))).map_err(DispatchError::StepFailed)
+            }
+            "ci/publish-rootfs" => {
+                let path = required("path")?;
+                let image = required("image")?;
+                if std::path::Path::new(&path).is_absolute() || std::path::Path::new(&path).components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+                    return Err(DispatchError::Artifact("rootfs path must be relative to the job working directory".into()));
+                }
+                // Establish release provenance before handing a store credential
+                // to the guest or causing any externally visible upload.
+                let sha = crate::cd::publication_source_sha(&self.store, msg).await.map_err(DispatchError::StepFailed)?;
+                let push = self.artifacts.guest_push().ok_or_else(|| DispatchError::Artifact(
+                    "ci/publish-rootfs requires the artifacts HTTP sink; disk and S3 are not rootfs registries".into()))?;
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                let file = format!("{}/{path}", workdir.trim_end_matches('/'));
+                let budget = step_timeout(step, plan);
+                let mut env = HashMap::new();
+                env.insert("CI_ARTIFACT_URL".to_string(), push.url);
+                if let Some(token) = &push.token { env.insert("CI_ARTIFACT_TOKEN".to_string(), token.clone()); }
+                let out = vm.exec(&format!("{sid}.rootfs"), &guest_push_command(&file, push.token.is_some(), budget), &env, budget).await?;
+                let (blob, size) = parse_guest_push(&out).map_err(DispatchError::Artifact)?;
+                let published = self.artifacts.publish_pushed_rootfs(&blob, size, &image).await
+                    .map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                let size: i64 = published.size_bytes.try_into().map_err(|_| DispatchError::Artifact("rootfs is too large to record".into()))?;
+                let mut tx = self.store.pool().begin().await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                sqlx::query("INSERT INTO ci_app_lb_artifact(step_id,run_id,job_id,sha,store_url,manifest_digest,blob_digest,size_bytes) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(step_id) DO UPDATE SET sha=excluded.sha,store_url=excluded.store_url,manifest_digest=excluded.manifest_digest,blob_digest=excluded.blob_digest,size_bytes=excluded.size_bytes")
+                    .bind(sid).bind(&msg.run_id).bind(&msg.job_id).bind(&sha).bind(&published.store_url)
+                    .bind(&published.manifest_digest).bind(&published.blob_digest).bind(size)
+                    .execute(&mut *tx).await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                let event = Store::add_event(&mut tx, &msg.run_id, Some(&msg.job_id), Some(&msg.job_key), Some(sid),
+                    "ci.rootfs.published.v1", "published", None).await?;
+                sqlx::query("UPDATE ci_event_outbox SET payload=payload || $2 WHERE id=$1").bind(event).bind(json!({
+                    "sha":sha,"store_url":published.store_url,"manifest_digest":published.manifest_digest,
+                    "blob_digest":published.blob_digest,"size_bytes":published.size_bytes
+                })).execute(&mut *tx).await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                tx.commit().await.map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                Ok((format!("[ci] published rootfs manifest {} ({} bytes) for {sha}\n", published.manifest_digest, published.size_bytes),
+                    json!({"manifest":published.manifest_digest,"blob":published.blob_digest,"size":published.size_bytes,"store":published.store_url,"sha":sha})))
+            }
+            "ci/deploy-app-lb" => {
+                crate::cd::deploy_app_lb(&self.store, msg, sid, &required("url")?, &required("token")?,
+                    &required("deployment")?, &required("namespace")?, &required("manifest")?, &required("store")?,
+                    step_timeout(step, plan), masker).await
+                    .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
+            }
             "ci/upload-artifact" => {
                 let name = with("name").ok_or_else(|| {
                     DispatchError::Artifact("ci/upload-artifact needs `with.name`".into())
@@ -2592,7 +2789,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                 let transfer = started.elapsed();
 
                 self.store
-                    .record_artifact(&msg.run_id, &msg.job_id, &name, &stored)
+                    .record_artifact(&msg.run_id, &msg.job_id, sid, &name, &stored)
                     .await?;
                 // The link is the point of `public: true`, so it goes in the
                 // log where a person reading the run will find it. A sink
@@ -2606,15 +2803,51 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
                     ),
                     (None, false) => String::new(),
                 };
-                Ok(format!(
+                Ok((format!(
                     "[ci] stored artifact {name:?} ({} bytes) in the {} sink as {} — \
                      {how} in {transfer:.0?}{public}\n",
                     stored.size_bytes, stored.sink, stored.uri
-                ))
+                ), serde_json::json!({})))
+            }
+            "ci/download-artifact" => {
+                let name = required("name")?;
+                let path = required("path")?;
+                let producer = with("job").filter(|v| !v.trim().is_empty());
+                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                let remote = artifact_download_path(workdir, &path)?;
+                // Scope at the query boundary: workflow input can name an
+                // artifact and (only for duplicate names) its producer, never
+                // a run, URI, path in the sink, or remote URL.
+                let rows = sqlx::query(
+                    "SELECT a.run_id,a.name,a.sink,a.digest,a.size_bytes,a.uri,a.public_url,
+                            j.job_key,j.status,j.finished_at IS NOT NULL AS finished
+                       FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id
+                      WHERE a.run_id=$1 AND a.name=$2 ORDER BY a.created_at",
+                ).bind(&msg.run_id).bind(&name).fetch_all(self.store.pool()).await
+                    .map_err(|e| DispatchError::Artifact(format!("looking up artifact {name:?}: {e}")))?;
+                let candidates = rows.iter().map(|r| Ok(DownloadCandidate {
+                    run_id: r.get("run_id"), name: r.get("name"), job_key: r.get("job_key"),
+                    status: r.get("status"), finished: r.get("finished"),
+                    stored: crate::artifacts::StoredArtifact {
+                        sink: match r.get::<String,_>("sink").as_str() {
+                            "disk" => "disk", "s3" => "s3", "artifacts" => "artifacts",
+                            other => return Err(DispatchError::Artifact(format!("artifact {name:?} has unknown recorded sink {other:?}"))),
+                        },
+                        digest: r.get("digest"), size_bytes: r.get::<i64,_>("size_bytes").try_into()
+                            .map_err(|_| DispatchError::Artifact(format!("artifact {name:?} has invalid recorded size")))?,
+                        uri: r.get("uri"), public_url: r.get("public_url"),
+                    },
+                })).collect::<Result<Vec<_>, DispatchError>>()?;
+                let selected = select_download(&msg.run_id, &name, producer.as_deref(), &candidates)?;
+                let bytes = self.artifacts.get(&selected.stored).await
+                    .map_err(|e| DispatchError::Artifact(format!("downloading artifact {name:?}: {e}")))?;
+                vm.upload_bytes(sid, &remote, &bytes).await?;
+                Ok((format!("[ci] downloaded artifact {name:?} from job {:?} to {path:?} ({} bytes)\n",
+                    selected.job_key, bytes.len()), serde_json::json!({})))
             }
             other => Err(DispatchError::Artifact(format!(
                 "`uses: {other}` is not a built-in action. Available: \
-                 ci/upload-artifact. Composite actions from a repository are not \
+                 ci/upload-artifact, ci/download-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service, ci/publish-rootfs, ci/deploy-app-lb. Composite actions from a repository are not \
                  supported."
             ))),
         }
@@ -2645,12 +2878,111 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
     }
 }
 
+fn production_repo_url(url: &str) -> bool {
+    if url.chars().any(char::is_whitespace) || url.chars().any(char::is_control) {
+        return false;
+    }
+    if url.starts_with("https://") || url.starts_with("ssh://") {
+        return reqwest::Url::parse(url).is_ok_and(|u| u.host_str().is_some()
+            && u.password().is_none() && u.query().is_none() && u.fragment().is_none()
+            && (u.scheme() == "ssh" || u.username().is_empty()));
+    }
+    // SCP-style SSH, not arbitrary Git remote helpers such as ext::commands.
+    let Some((user, rest)) = url.split_once('@') else { return false; };
+    let Some((host, path)) = rest.split_once(':') else { return false; };
+    !user.is_empty() && !user.starts_with('-') && user.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        && !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+        && !path.is_empty() && !path.starts_with('-')
+}
+
+fn checkout_script(workdir: &str, patch_path: &str, repo_url: &str, source: &crate::trigger::GitPatchSource, workflow_path: &str, workflow_hash: &str) -> String {
+    let wd = shell_quote(workdir.trim_end_matches('/'));
+    let patch = shell_quote(patch_path);
+    let repo = shell_quote(repo_url);
+    let base = shell_quote(&source.base_revision);
+    let tree = shell_quote(&source.target_tree);
+    let workflow = shell_quote(&format!("{}/{}", workdir.trim_end_matches('/'), workflow_path));
+    let expected = shell_quote(workflow_hash);
+    let apply = if source.patch_base64.is_empty() {
+        format!("test \"$(git rev-parse HEAD^{{tree}})\" = {tree}")
+    } else {
+        format!("git apply --index --binary {patch}; test \"$(git write-tree)\" = {tree}; git -c core.hooksPath=/nonexistent -c user.name=CI -c user.email=ci@invalid commit --quiet -m 'CI synthetic patched tree'; test \"$(git rev-parse HEAD^{{tree}})\" = {tree}")
+    };
+    format!(r#"set -eu
+command -v git >/dev/null
+command -v sha256sum >/dev/null
+# The workspace may be a mountpoint: clear its contents, not the mount itself.
+test {wd} != / && test -n {wd}
+mkdir -p {wd}
+find {wd} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +
+auth_dir=$(mktemp -d)
+patch_file={patch}
+trap 'rm -rf "$auth_dir"; rm -f "$patch_file"' EXIT
+askpass="$auth_dir/askpass"
+printf '%s\n' '#!/bin/sh' 'case "$1" in *Username*) printf %s x-access-token;; *) printf %s "${{CI_GIT_AUTH_TOKEN:-}}";; esac' > "$askpass"
+chmod 700 "$askpass"
+export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass"
+git -c core.hooksPath=/nonexistent init --quiet {wd}
+git -C {wd} remote add origin {repo}
+# Fetch history/tags for builds using git describe. Never use a fetched branch
+# tip as the requested revision: the explicit checkout below remains mandatory.
+git -C {wd} fetch --quiet --tags origin '+refs/heads/*:refs/remotes/origin/*'
+if ! git -C {wd} cat-file -e {base}^{{commit}}; then
+    git -C {wd} fetch --quiet origin {base}
+fi
+git -C {wd} -c core.hooksPath=/nonexistent checkout --quiet --detach {base}
+test "$(git -C {wd} rev-parse HEAD)" = {base}
+cd {wd}
+{apply}
+test "$(git rev-parse HEAD^{{tree}})" = {tree}
+test "$(sha256sum {workflow} | awk '{{print $1}}')" = {expected}
+git -c color.ui=never log --oneline -1
+"#)
+}
+
+#[derive(Debug, Clone)]
+struct DownloadCandidate {
+    run_id: String,
+    name: String,
+    job_key: String,
+    status: String,
+    finished: bool,
+    stored: crate::artifacts::StoredArtifact,
+}
+
+fn select_download<'a>(run_id: &str, name: &str, producer: Option<&str>, candidates: &'a [DownloadCandidate])
+    -> Result<&'a DownloadCandidate, DispatchError>
+{
+    let matching = candidates.iter().filter(|a| a.run_id == run_id && a.name == name &&
+        producer.is_none_or(|job| a.job_key == job)).collect::<Vec<_>>();
+    match matching.as_slice() {
+        [] => Err(DispatchError::Artifact(format!("no artifact named {name:?}{} exists in the current run",
+            producer.map(|j| format!(" from job {j:?}")).unwrap_or_default()))),
+        [one] if one.status != "success" || !one.finished => Err(DispatchError::Artifact(format!(
+            "artifact {name:?} was produced by job {:?}, which is not completed successfully (status {:?})",
+            one.job_key, one.status))),
+        [one] => Ok(one),
+        many => Err(DispatchError::Artifact(format!("artifact {name:?} is ambiguous: {} producers match; set with.job", many.len()))),
+    }
+}
+
+fn artifact_download_path(workdir: &str, path: &str) -> Result<String, DispatchError> {
+    let relative = std::path::Path::new(path);
+    if path.trim().is_empty() || path.ends_with('/') || relative.file_name().is_none()
+        || relative.is_absolute() || !relative.components().all(|c|
+            matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+    {
+        return Err(DispatchError::Artifact(
+            "ci/download-artifact with.path must name a file relative to the job working directory".into(),
+        ));
+    }
+    Ok(std::path::Path::new(workdir).join(relative).to_string_lossy().into_owned())
+}
+
 /// Give a second run of the same submission its own workspace.
 ///
-/// The archive is hard-linked rather than copied — it is the same immutable
-/// bytes, and a large tree copied once per workflow file would be pure waste.
-/// The extracted tree is re-extracted from it, because two runs must not share a
-/// directory that a step could write into.
+/// Copy the source descriptor and regenerate its bounded workflow metadata.
+/// No repository is fetched or copied by the CI service.
 async fn copy_tree(
     from: &crate::trigger::Workspace,
     to: &crate::trigger::Workspace,
@@ -2700,14 +3032,15 @@ where
 /// `num_pending` is only a useful backlog number if each consumer serves one
 /// host.
 async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
-    use futures::StreamExt;
-
     let label = format!("{route:?}");
     /// How many unpinned jobs one network queue may be running at once — the
     /// fan-out bound for `Route::Network` below. Small: each slot can be a VM
     /// create somewhere in the fleet.
     const NETWORK_CONCURRENCY: usize = 4;
-    let network_slots = Arc::new(tokio::sync::Semaphore::new(NETWORK_CONCURRENCY));
+    let slots = Arc::new(tokio::sync::Semaphore::new(match &route {
+        Route::Runner(_) => 1,
+        Route::Network(_) => NETWORK_CONCURRENCY,
+    }));
     loop {
         let consumer = match dispatcher.bus.consumer_for(&route).await {
             Ok(c) => c,
@@ -2718,20 +3051,13 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
             }
         };
 
-        let mut messages = match consumer.messages().await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("{label}: could not stream messages, retrying: {e}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-
-        while let Some(next) = messages.next().await {
-            let msg = match next {
-                Ok(m) => m,
+        loop {
+            let (msg, permit) = match pull_with_capacity(&consumer, Arc::clone(&slots)).await {
+                Ok(Some(delivery)) => delivery,
+                Ok(None) => continue,
                 Err(e) => {
                     tracing::warn!("{label}: message error, rebinding: {e}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                     break;
                 }
             };
@@ -2748,6 +3074,7 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 // A runner's own queue is strictly serial: one job on that
                 // host at a time, each getting its full budget from pickup.
                 Route::Runner(_) => {
+                    let _permit = permit;
                     process_delivery(Arc::clone(&dispatcher), msg, job, attempt).await;
                 }
                 // The network's shared queue is where "any host" jobs wait, and
@@ -2760,11 +3087,6 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 // keeps a burst from starting more VM creates than a host
                 // fleet wants concurrently.
                 Route::Network(_) => {
-                    let permit = network_slots
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .expect("the semaphore is never closed");
                     let dispatcher = Arc::clone(&dispatcher);
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -2773,6 +3095,24 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 }
             }
         }
+    }
+}
+
+/// Reserve capacity before JetStream delivers anything. The continuous stream
+/// prefetches 200 messages, starting AckWait while buffered jobs have no worker
+/// or progress heartbeat. A finite blocking batch avoids both that redelivery
+/// race and an idle polling loop.
+async fn pull_with_capacity(
+    consumer: &async_nats::jetstream::consumer::PullConsumer,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<Option<(async_nats::jetstream::Message, tokio::sync::OwnedSemaphorePermit)>, async_nats::Error> {
+    use futures::StreamExt;
+    let permit = slots.acquire_owned().await?;
+    let mut batch = consumer.batch().max_messages(1)
+        .expires(Duration::from_secs(30)).messages().await?;
+    match batch.next().await {
+        Some(message) => Ok(Some((message?, permit))),
+        None => Ok(None),
     }
 }
 
@@ -2880,14 +3220,6 @@ async fn process_delivery(
                     delay.as_secs()
                 );
                 let _ = dispatcher.store.note_job_error(&job.job_id, &detail).await;
-                dispatcher
-                    .bus
-                    .publish_event(
-                        &job.run_id,
-                        &job.job_key,
-                        &serde_json::json!({"status": "running", "error": detail}),
-                    )
-                    .await;
                 let _ = msg
                     .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
                     .await;
@@ -3876,6 +4208,7 @@ fn or_none(items: &[String]) -> String {
 
 #[derive(Debug)]
 pub enum DispatchError {
+    Native(String),
     Store(crate::store::StoreError),
     Pool(crate::pool::PoolError),
     Bus(crate::bus::BusError),
@@ -4061,6 +4394,7 @@ fn checkout_error(e: VmError) -> DispatchError {
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Native(e) => write!(f, "native runner: {e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Pool(e) => write!(f, "{e}"),
             Self::Bus(e) => write!(f, "{e}"),
@@ -4299,6 +4633,92 @@ mod tests {
     use crate::workflow::Step;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn source_urls_exclude_local_paths_remote_helpers_and_embedded_secrets() {
+        for url in ["https://github.com/org/repo.git", "ssh://git@example.com/repo", "git@example.com:org/repo.git"] {
+            assert!(production_repo_url(url), "{url}");
+        }
+        for url in ["/tmp/repo", "file:///tmp/repo", "ext::sh -c command@host:repo", "https://user:secret@example.com/repo", "https:///", "-x@host:repo"] {
+            assert!(!production_repo_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn checkout_reconstructs_exact_tree_and_rejects_wrong_revision_or_workflow() {
+        use base64::Engine;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::process::Command;
+        let root = std::env::temp_dir().join(format!("ci-checkout-{}", uuid::Uuid::new_v4()));
+        let origin = root.join("origin");
+        let workspace = root.join("worker's workspace");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let inode = std::fs::metadata(&workspace).unwrap().ino();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(dir).args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Test").env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test").env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            out.stdout
+        };
+        let oid = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap().trim().to_owned();
+        git(&origin, &["init", "-q"]);
+        std::fs::write(origin.join("build.yml"), "jobs: {}\n").unwrap();
+        std::fs::write(origin.join("deleted"), "old\n").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-qm", "base"]);
+        git(&origin, &["tag", "v1"]);
+        let base = oid(git(&origin, &["rev-parse", "HEAD"]));
+        let base_tree = oid(git(&origin, &["rev-parse", "HEAD^{tree}"]));
+        std::fs::remove_file(origin.join("deleted")).unwrap();
+        std::fs::write(origin.join("binary"), b"\0\xff\x01payload").unwrap();
+        std::fs::write(origin.join("executable"), "#!/bin/sh\necho patch\n").unwrap();
+        std::fs::set_permissions(origin.join("executable"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&origin, &["add", "-A"]);
+        git(&origin, &["commit", "-qm", "target"]);
+        let target = oid(git(&origin, &["rev-parse", "HEAD^{tree}"]));
+        let patch = git(&origin, &["diff", "--binary", "--full-index", &base, "HEAD"]);
+        // The remote branch advances after submission. It must not affect the build.
+        std::fs::write(origin.join("not-submitted"), "later\n").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-qm", "later"]);
+        let mut source = crate::trigger::GitPatchSource {
+            base_revision: base.clone(), target_tree: base_tree, patch_base64: String::new(),
+            workflows: BTreeMap::from([("build.yml".into(), "jobs: {}\n".into())]),
+            changes: crate::paths::Changes::default(),
+        };
+        let hash = hex::encode(sha2::Sha256::digest(b"jobs: {}\n"));
+        let execute = |source: &crate::trigger::GitPatchSource, hash: &str| {
+            let path = root.join("source's patch");
+            std::fs::write(&path, source.patch().unwrap()).unwrap();
+            let script = checkout_script(workspace.to_str().unwrap(), path.to_str().unwrap(),
+                origin.to_str().unwrap(), source, "build.yml", hash);
+            Command::new("sh").arg("-c").arg(script).env("GIT_CONFIG_GLOBAL", "/dev/null").output().unwrap()
+        };
+        let out = execute(&source, &hash);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(oid(git(&workspace, &["rev-parse", "HEAD"])), base);
+        assert_eq!(oid(git(&workspace, &["describe", "--tags", "--exact-match"])), "v1");
+        source.target_tree = target.clone();
+        source.patch_base64 = base64::engine::general_purpose::STANDARD.encode(patch);
+        let out = execute(&source, &hash);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(oid(git(&workspace, &["rev-parse", "HEAD^{tree}"])), target);
+        assert_eq!(std::fs::metadata(&workspace).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(workspace.join("binary")).unwrap(), b"\0\xff\x01payload");
+        assert!(!workspace.join("deleted").exists() && !workspace.join("not-submitted").exists());
+        assert_ne!(std::fs::metadata(workspace.join("executable")).unwrap().permissions().mode() & 0o111, 0);
+        assert!(!execute(&source, &"0".repeat(64)).status.success());
+        source.target_tree = "a".repeat(40);
+        assert!(!execute(&source, &hash).status.success());
+        source.base_revision = "b".repeat(40);
+        assert!(!execute(&source, &hash).status.success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn step(run: &str) -> Step {
         Step {
             name: None,
@@ -4321,6 +4741,39 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             exit_code: exit,
+        }
+    }
+
+    fn download_candidate(run: &str, job: &str) -> DownloadCandidate {
+        DownloadCandidate {
+            run_id: run.into(), name: "bundle".into(), job_key: job.into(),
+            status: "success".into(), finished: true,
+            stored: crate::artifacts::StoredArtifact {
+                sink: "disk", digest: None, size_bytes: 1, uri: "/recorded".into(), public_url: None,
+            },
+        }
+    }
+
+    #[test]
+    fn artifact_download_selection_is_same_run_unique_and_explicit() {
+        let wrong = vec![download_candidate("other-run", "build")];
+        assert!(select_download("this-run", "bundle", None, &wrong).unwrap_err().to_string().contains("current run"));
+        assert!(select_download("this-run", "missing", None, &[]).unwrap_err().to_string().contains("no artifact"));
+
+        let two = vec![download_candidate("this-run", "mac"), download_candidate("this-run", "windows")];
+        assert!(select_download("this-run", "bundle", None, &two).unwrap_err().to_string().contains("ambiguous"));
+        assert_eq!(select_download("this-run", "bundle", Some("windows"), &two).unwrap().job_key, "windows");
+    }
+
+    #[test]
+    fn artifact_download_requires_a_finished_successful_producer_and_safe_path() {
+        let mut failed = download_candidate("run", "build");
+        failed.status = "failure".into();
+        assert!(select_download("run", "bundle", None, &[failed]).unwrap_err().to_string().contains("not completed successfully"));
+        assert_eq!(artifact_download_path("/workspace", "dist/native.tar.gz").unwrap(), "/workspace/dist/native.tar.gz");
+        assert_eq!(artifact_download_path("/workspace/", ".cache/native.tar.gz").unwrap(), "/workspace/.cache/native.tar.gz");
+        for path in ["../secret", "dist/../../secret", "/etc/passwd", ".", "", "dist/"] {
+            assert!(artifact_download_path("/workspace", path).is_err(), "{path:?}");
         }
     }
 
@@ -4566,6 +5019,49 @@ mod tests {
             ..job
         };
         assert_eq!(never_queued.queue_wait(), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_NATS_URL; disposable JetStream"]
+    async fn queued_jobs_are_not_delivered_before_capacity_or_prefetched() {
+        let client = async_nats::connect(std::env::var("CI_TEST_NATS_URL").unwrap()).await.unwrap();
+        let js = async_nats::jetstream::new(client);
+        let name = format!("capacity_{}", uuid::Uuid::new_v4().simple());
+        let stream = js.create_stream(async_nats::jetstream::stream::Config {
+            name: name.clone(), subjects: vec![name.clone()], ..Default::default()
+        }).await.unwrap();
+        let mut consumer = stream.create_consumer(async_nats::jetstream::consumer::pull::Config {
+            ack_wait: Duration::from_millis(100), ..Default::default()
+        }).await.unwrap();
+        for body in ["first", "second", "third"] {
+            js.publish(name.clone(), body.into()).await.unwrap().await.unwrap();
+        }
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (first, permit) = pull_with_capacity(&consumer, Arc::clone(&slots)).await.unwrap().unwrap();
+        assert_eq!(first.payload.as_ref(), b"first");
+        first.double_ack().await.unwrap();
+        let waiting = {
+            let consumer = consumer.clone();
+            let slots = Arc::clone(&slots);
+            tokio::spawn(async move { pull_with_capacity(&consumer, slots).await })
+        };
+        // Longer than AckWait: neither waiting job may have entered delivery.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(!waiting.is_finished());
+        let info = consumer.info().await.unwrap();
+        assert_eq!(info.delivered.consumer_sequence, 1);
+        assert_eq!(info.num_pending, 2);
+        assert_eq!(info.num_ack_pending, 0);
+        drop(permit);
+        let (second, permit) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await.unwrap().unwrap().unwrap().unwrap();
+        assert_eq!(second.payload.as_ref(), b"second");
+        assert_eq!(second.info().unwrap().delivered, 1);
+        second.double_ack().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(consumer.info().await.unwrap().num_pending, 1, "no background refill may take the third job");
+        drop(permit);
+        js.delete_stream(name).await.unwrap();
     }
 
     /// Three jobs on one route with capacity one. Each takes 90% of the
@@ -5496,12 +5992,11 @@ mod tests {
         })
     }
 
-    /// Lay down a run's workspace *and* its source archive, the way a real
+    /// Lay down a run's workflow workspace and source descriptor, the way a real
     /// submit does.
     ///
-    /// Writing the extracted tree alone is not enough any more: a job's checkout
-    /// step ships the archive into the guest, so a test that skips it is testing
-    /// a path production does not have.
+    /// Writing workflow YAML alone is not enough: checkout also consumes the
+    /// immutable revisions and patch from the descriptor.
     fn seed_workspace(d: &Arc<Dispatcher>, run_id: &str, files: &[(&str, &str)]) {
         use base64::Engine;
         use std::io::Write;

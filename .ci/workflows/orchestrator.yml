@@ -1,0 +1,55 @@
+name: orchestrator
+
+on:
+  submit:
+    paths:
+      - 'orchestrator/**'
+      - 'heyosecret-client/**'
+      - '.ci/workflows/orchestrator.yml'
+      - '.ci/image/ci/**'
+
+jobs:
+  release:
+    vm:
+      driver: firecracker
+      build:
+        dockerfile: .ci/image/ci/Dockerfile
+        context: .ci/image/ci
+        size_mb: 6144
+      size_class: large
+      disk_size_gb: 20
+      ttl_seconds: 5400
+      cache_key_files: [orchestrator/Cargo.lock, orchestrator/Cargo.toml]
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '4'
+    timeout-minutes: 90
+    steps:
+      - name: Prepare disposable PostgreSQL
+        run: |
+          set -eu
+          test "$(stat -c %d "$CARGO_TARGET_DIR")" != "$(stat -c %d /)"
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-16
+          pg_ctlcluster 16 main status >/dev/null 2>&1 || pg_ctlcluster -o '-c listen_addresses=127.0.0.1' 16 main start
+          runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "ALTER ROLE postgres PASSWORD 'disposable-test-password'"
+
+      - name: Test, build, and package orchestrator
+        working-directory: /workspace/orchestrator
+        timeout-minutes: 75
+        run: |
+          set -eu
+          cargo test --locked
+          ORCHESTRATOR_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/postgres cargo test --locked --bin orchestrator concurrent_step_claim_creates_one_running_attempt_postgres -- --ignored
+          cargo build --release --locked --bin orchestrator
+          mkdir -p /workspace/dist
+          cp "$CARGO_TARGET_DIR/release/orchestrator" /workspace/dist/orchestrator
+          strip /workspace/dist/orchestrator
+          cp -R migrations /workspace/dist/migrations
+          printf '%s\n' '${{ ci.sha }}' > /workspace/dist/REVISION
+          (cd /workspace/dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+
+      - uses: ci/upload-artifact
+        with:
+          name: orchestrator-linux
+          path: dist

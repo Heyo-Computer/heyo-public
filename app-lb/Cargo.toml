@@ -93,6 +93,7 @@ reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 # already present under reqwest/url, and hand-rolling percent-encoding is a
 # classic source of bugs.
 form_urlencoded = "1"
+url = "2"
 
 async-trait = "0.1"
 futures.workspace = true
@@ -202,3 +203,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # It matters more than usual because the field-dictionary constants become the
 # field *names* in app-obs: a rename would reshape every security log stored.
 u-siem = "=0.7.0"
+schemars = "1.2.2"

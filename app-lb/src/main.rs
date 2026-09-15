@@ -16,6 +16,7 @@ mod acme;
 mod admin;
 mod artifact;
 mod auth;
+mod auth_providers;
 mod autoscale;
 mod config;
 mod deployment;
@@ -242,6 +243,9 @@ fn config_from_env() -> LbConfig {
     }
     if let Ok(v) = std::env::var("APP_LB_ROUTE53_ZONE_ID") {
         cfg.route53_zone_id = Some(v.trim().to_string()).filter(|z| !z.is_empty());
+    }
+    if let Ok(v) = std::env::var("APP_LB_DEPLOY_BASE_DOMAIN") {
+        cfg.deploy_base_domain = Some(v.trim().to_string()).filter(|d| !d.is_empty());
     }
     if let Ok(v) = std::env::var("APP_LB_UPDATE_SHELL") {
         cfg.update_shell = v;
@@ -487,6 +491,20 @@ fn main() {
             "restored declared namespaces; some objects were unreadable and were left on disk"
         ),
     }
+    let auth_providers = Arc::new(crate::auth_providers::AuthProviderStore::new(
+        crate::auth_providers::auth_provider_dir(&cfg.state_path),
+    ));
+    match auth_providers.load() {
+        (0, 0) => tracing::debug!(dir = %auth_providers.dir().display(), "no declared auth providers"),
+        (n, 0) => tracing::info!(count = n, "restored declared auth providers"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %auth_providers.dir().display(),
+            "restored declared auth providers; some objects were unreadable and were left on disk"
+        ),
+    }
+
     // A deregistration whose file removal failed would otherwise resurrect the
     // deployment on this start. Declines to run if the load above skipped
     // anything, so it can never delete a spec it merely failed to understand.
@@ -593,10 +611,14 @@ fn main() {
             }
             let Some(gate) = &spec.auth else { continue };
             let health = spec.health.path.as_deref();
+            // Only the entries that still admit an unauthenticated request. A
+            // scoped entry is no longer a bypass — app-lb checks the scope
+            // itself — so listing one here would cry wolf about the very fix.
             let exposed: Vec<&str> = gate
                 .public_paths
                 .iter()
-                .map(String::as_str)
+                .filter(|p| p.scope == crate::config::PathScope::Public)
+                .map(|p| p.path.as_str())
                 .filter(|p| *p != "/healthz" && Some(*p) != health)
                 .collect();
             if !exposed.is_empty() {
@@ -639,12 +661,13 @@ fn main() {
             .unwrap_or_else(|| Arc::from(obs::LB_DEPLOYMENT)),
     );
 
-    let auth = Arc::new(Authenticator::new(
+    let auth = Arc::new(Authenticator::with_admin_addr(
         Authenticator::load_key(&auth_key_path)
             .unwrap_or_else(|e| panic!("cannot read or create {}: {e}", auth_key_path.display())),
         secrets.clone(),
         Some(tokens.clone()),
         siem.as_ref().map(|s| s.sink.clone()),
+        Some(cfg.admin_addr.clone()),
     ));
 
     let daemon_api_key = ["APP_LB_DAEMON_API_KEY", "HEYO_API_KEY"]
@@ -876,6 +899,18 @@ fn main() {
     });
     let acme_signal = acme_svc.as_ref().map(|svc| svc.task().signal());
 
+    match cfg.deploy_host_base() {
+        Some(base) => tracing::info!(
+            base = %base,
+            explicit = cfg.deploy_base_domain.is_some(),
+            "a deployment that names no host will be routed at <id>.{base}"
+        ),
+        None => tracing::info!(
+            "no deploy base domain (APP_LB_DEPLOY_BASE_DOMAIN or a wildcard); a hostless \
+             deployment is handled as before"
+        ),
+    }
+
     let admin_svc = background_service(
         "admin",
         AdminApi::new(
@@ -905,6 +940,7 @@ fn main() {
             secrets,
             workflows,
             namespaces,
+            auth_providers.clone(),
             tokens,
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),
@@ -914,6 +950,7 @@ fn main() {
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
             event_feed.clone(),
             &cfg.public_ips,
+            cfg.deploy_host_base().map(str::to_string),
         ),
     );
 
@@ -928,6 +965,7 @@ fn main() {
             siem.as_ref().map(|s| s.sink.clone()),
             guard.clone(),
             event_feed,
+            auth_providers.clone(),
         ),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);

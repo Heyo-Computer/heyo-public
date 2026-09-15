@@ -212,6 +212,11 @@ pub struct WorkspaceRecord {
     pub seeds: BTreeMap<String, Seed>,
     #[serde(default)]
     pub pending: Vec<PendingCapture>,
+    /// A deployment replacement has withdrawn the old pool but has not yet
+    /// queued (or completed) every workspace capture. Persisted because a
+    /// restart in this interval must not boot from the previous snapshot.
+    #[serde(default)]
+    pub replacement_captures_remaining: usize,
     #[serde(default)]
     pub last_error: Option<String>,
     #[serde(default)]
@@ -518,6 +523,9 @@ impl Workspaces {
         let id = &d.spec.id;
         let record = self.record(id);
         let (phase, restore_wanted, _) = self.runtime(id);
+        if record.replacement_captures_remaining > 0 {
+            return Some("workspace capture for deployment replacement is pending".into());
+        }
         if let Some(phase) = phase {
             return Some(format!("workspace {phase}"));
         }
@@ -655,6 +663,30 @@ impl Workspaces {
             .pending
             .iter()
             .any(|p| p.sandbox_id == sandbox_id)
+    }
+
+    /// Close the stale-seed window before a replacement is installed in the
+    /// registry. The autoscaler holds its create permits while setting this,
+    /// so an old-template create cannot slip between the fence and the swap.
+    pub(crate) fn begin_replacement(&self, deployment_id: &str, expected: usize) -> Result<(), String> {
+        self.with_record(deployment_id, |r| {
+            // A second edit may see an empty replacement pool while the first
+            // edit is still capturing its predecessor. It cannot clear that
+            // predecessor's fence merely because its own pool has no VMs.
+            if r.replacement_captures_remaining == 0 {
+                r.replacement_captures_remaining = expected;
+            }
+        });
+        if self.persist_failed(deployment_id) {
+            return Err("could not persist workspace replacement fence; deployment remains unchanged".into());
+        }
+        Ok(())
+    }
+
+    fn complete_replacement_capture(&self, deployment_id: &str) {
+        self.with_record(deployment_id, |r| {
+            r.replacement_captures_remaining = r.replacement_captures_remaining.saturating_sub(1);
+        });
     }
 
     /// Take a replica out of service: sync, stop, and queue its capture.
@@ -914,6 +946,7 @@ impl Workspaces {
                     self.with_record(id, |r| {
                         r.pending.retain(|p| p.sandbox_id != next.sandbox_id)
                     });
+                    self.complete_replacement_capture(id);
                     self.kill(id, &next.sandbox_id).await;
                 }
                 Err(CaptureError::Retry(why)) => {
@@ -937,6 +970,7 @@ impl Workspaces {
     }
 
     async fn after_capture(&self, id: &str, done: &PendingCapture) {
+        self.complete_replacement_capture(id);
         let owner = self.owners.lock().unwrap().remove(&done.sandbox_id);
         match done.then {
             Then::Kill => self.kill(id, &done.sandbox_id).await,
@@ -1976,6 +2010,16 @@ mod tests {
         s
     }
 
+    #[test]
+    fn replacement_refuses_to_proceed_without_a_durable_fence() {
+        let (ws, _, _) = store("fence-write-failure");
+        let directory = ws.dir("demo");
+        std::fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        std::fs::write(&directory, b"not a directory").unwrap();
+        assert!(ws.begin_replacement("demo", 1).is_err());
+        assert!(ws.blocked(&Deployment::new(workspace_spec())).is_some());
+    }
+
     /// The create path's contract: nothing boots until the store has been
     /// consulted; a seeded VM is remembered; a queued capture blocks the next
     /// create; and the sweep is told to keep its hands off anything this
@@ -2009,11 +2053,21 @@ mod tests {
             "a live VM is dirty until captured"
         );
 
+        // Replacement is exposed only after this durable fence is installed.
+        // Model a deliberately delayed stop: even though no capture is queued
+        // yet, the fresh deployment cannot boot from the old (empty) seed.
+        ws.begin_replacement("demo", 1).unwrap();
+        let replacement = registry.upsert(workspace_spec());
+        let why = ws.seed_for_create(&replacement).unwrap_err();
+        assert!(why.contains("replacement"), "{why}");
+        ws.begin_replacement("demo", 0).unwrap();
+        assert!(ws.seed_for_create(&replacement).is_err(), "another edit cannot clear a predecessor's fence");
+
         // Retiring a stopped VM queues it and blocks creates.
         ws.retire_stopped(&d, "sb-1", Then::Kill).unwrap();
         assert!(ws.is_pending("demo", "sb-1"));
         let why = ws.seed_for_create(&d).unwrap_err();
-        assert!(why.contains("capture of sb-1"), "{why}");
+        assert!(why.contains("replacement"), "{why}");
         ws.retire_stopped(&d, "sb-1", Then::Kill).unwrap();
         assert_eq!(ws.record("demo").pending.len(), 1, "queued once");
 
@@ -2021,9 +2075,13 @@ mod tests {
         let (ws2, _registry2, _) = store_at(dir.clone());
         assert_eq!(ws2.load(), 1);
         assert!(ws2.is_pending("demo", "sb-1"));
+        assert!(
+            ws2.seed_for_create(&replacement).unwrap_err().contains("replacement"),
+            "the pre-capture replacement fence survives restart"
+        );
 
-        // A VM captured at the current snapshot is free; one from an older
-        // snapshot, or never captured, is held.
+        // Publish the delayed capture, then release the replacement fence. The
+        // replacement can now see only that final snapshot, never the old seed.
         ws.with_record("demo", |r| {
             r.pending.clear();
             r.digest = Some("b".repeat(64));
@@ -2044,6 +2102,13 @@ mod tests {
                 },
             );
         });
+        ws.complete_replacement_capture("demo");
+        std::fs::create_dir_all(ws.tree_path("demo", Some(&"b".repeat(64)))).unwrap();
+        let seeded = ws.seed_for_create(&replacement).unwrap().unwrap();
+        assert_eq!(seeded.digest.as_deref(), Some("b".repeat(64).as_str()));
+
+        // A VM captured at the current snapshot is free; one from an older
+        // snapshot, or never captured, is held.
         assert!(!ws.holds("demo", "sb-1"));
         assert!(ws.holds("demo", "sb-0"));
         assert!(ws.holds("demo", "sb-unknown"));

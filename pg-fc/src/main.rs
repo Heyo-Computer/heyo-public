@@ -31,6 +31,7 @@ mod startup;
 mod store;
 mod tls;
 mod vm;
+mod writer_routing;
 
 use std::sync::Arc;
 
@@ -96,7 +97,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("pending-bringups.tsv"),
     );
-    let registry = Arc::new(SchemaRegistry::new(cfg));
+    let registry = Arc::new(SchemaRegistry::new(cfg)?);
     registry.spawn_reaper();
     // Stops running VMs nothing tracks (left over from a pooler restart, a
     // failed idle-stop, or a daemon-side boot) so the ladder can reclaim them.
@@ -142,6 +143,9 @@ async fn main() -> Result<()> {
     // when an inactive slot starts pinning WAL. No-op when nothing is
     // replicating.
     registry.spawn_replication_monitor();
+    // Continue explicitly authorized physical handoffs after request loss or
+    // process restart, including when orchestrator's own database is moving.
+    replication::physical::spawn_handoff_recovery(registry.clone());
     // Delete VMs whose bring-up handed out an id but never reached a registry
     // binding — the "stuck in provisioning, bound to nothing" leak no other
     // sweep covers. Always on; idle when the pending ledger is empty.
@@ -223,14 +227,42 @@ async fn handle_conn(
     // credential may open only its own database (so it can never provision a
     // second VM), a shared-password client may not open a dedicated one, and a
     // replication login may open only the database it replicates.
-    if let Err(reason) = registry.authorize_route(&info.user, &info.database) {
-        // Tell the client why rather than dropping the socket: "cannot open any
-        // other database" is exactly the feedback that stops someone retrying a
-        // typo'd database name forever.
-        auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
-        anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
+    let schema = match registry.authorize_route(&info.user, &info.database, info.physical_replication) {
+        Ok(schema) => schema,
+        Err(reason) => {
+            auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
+            anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
+        }
+    };
+    if writer_routing::is_routable_tenant(&registry, &info, &schema) {
+        match writer_routing::route(&registry, &schema)? {
+            writer_routing::Route::Local => {}
+            writer_routing::Route::Peer { peer, claim } => {
+                return writer_routing::forward(client, &info.raw, peer, claim).await;
+            }
+            writer_routing::Route::Unavailable(reason) => {
+                auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, reason).await?;
+                anyhow::bail!("writer unavailable for {schema}: {reason}");
+            }
+        }
     }
-    let schema = info.database.clone();
+    if !info.physical_replication && !registry.physical_admission_ready(&schema) {
+        auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, "physical handoff is incomplete; admission remains closed").await?;
+        anyhow::bail!("refused connection during incomplete physical handoff for {schema}");
+    }
+    if let Some(fence) = registry.replication().get(&schema).and_then(|r| r.fence)
+        && (fence.mode != "selective"
+            || registry.replication().by_repl_role(&info.user).is_none())
+        && !(info.physical_replication && registry.physical_reconnect_allowed(&schema, &info.user))
+    {
+        auth::send_fatal(
+            &mut client,
+            auth::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            "database is fenced for a planned switchover; operator unfence is required",
+        )
+        .await?;
+        anyhow::bail!("refused connection to fenced database {schema}");
+    }
     if !is_valid_schema(&schema) {
         anyhow::bail!("rejecting invalid schema name {schema:?}");
     }

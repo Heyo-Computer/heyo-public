@@ -122,6 +122,7 @@ impl StoreRecord {
 }
 
 /// Internal map value backing a [`StoreRecord`].
+#[derive(Clone)]
 struct Rec {
     sandbox_id: String,
     last_active: u64,
@@ -201,6 +202,25 @@ impl Store {
         self.map.lock().unwrap().get(schema).map(Rec::view)
     }
 
+    /// How many schemas are on the live tier — data on a VM disk rather than
+    /// offloaded to a dump, a compacted image or S3.
+    ///
+    /// Counted under the lock without cloning, because the idle reaper reads
+    /// it every pass to size its drain rate ([`crate::registry`]'s
+    /// `drain_allowance`) and [`Self::records`] would clone the whole map for
+    /// a number. Deliberately *not* "how many VMs are running": stopping a VM
+    /// does not change its tier, so this stays constant while a cohort drains
+    /// — which is exactly what makes the drain a constant slope instead of a
+    /// decaying one.
+    pub fn live_count(&self) -> usize {
+        self.map
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.tier == Tier::Live)
+            .count()
+    }
+
     /// Every `(schema, record)` known to the store — the durable list of schemas
     /// the pooler has backed, including those whose VM is stopped or archived.
     pub fn records(&self) -> Vec<(String, StoreRecord)> {
@@ -253,6 +273,37 @@ impl Store {
             }
         };
         self.write_detached(snapshot);
+    }
+
+    /// Commit a handoff binding, or fail without publishing it in memory.
+    /// The caller must hold its database operation lock and keep admission
+    /// closed until its handoff journal acknowledges this commit. Retrying an
+    /// already-committed candidate is allowed; an unrelated binding is not.
+    ///
+    /// Unlike ordinary activity writes, this rare operation holds the map
+    /// across fsync to prevent another snapshot from racing the binding. Run
+    /// it on a blocking thread. Errors after rename have an unknown durable
+    /// outcome, so they must retain the handoff fence and be retried.
+    pub fn commit_handoff_binding(&self, schema: &str, expected: &str, candidate: &str) -> Result<()> {
+        let mut map = self.map.lock().unwrap();
+        let current = map.get(schema).context("handoff database has no serving binding")?;
+        anyhow::ensure!(current.tier == Tier::Live, "handoff binding is not live");
+        anyhow::ensure!(current.sandbox_id == expected || current.sandbox_id == candidate,
+            "handoff serving binding changed");
+        let mut next = map.clone();
+        next.get_mut(schema).unwrap().sandbox_id = candidate.to_string();
+        let (seq, contents) = self.stamp(serialize(&next));
+        let mut newest = self.written.lock().unwrap();
+        write_atomic(&self.path, &contents)?;
+        let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)?.sync_all().context("fsync handoff binding directory")?;
+        *newest = seq;
+        *map = next;
+        drop(newest);
+        drop(map);
+        *self.bound_cache.lock().unwrap() = None;
+        Ok(())
     }
 
     /// Bind `schema` to the archived tier so the next checkout restores it from
@@ -600,6 +651,43 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pg-fc-store-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Store::load(dir.join("registry.tsv"))
+    }
+
+    #[test]
+    fn handoff_binding_is_durable_idempotent_and_rejects_stale_writes() {
+        let store = tmp_store("handoff");
+        store.put("a", "sb-old");
+        store.put("other", "sb-unrelated");
+        store.set_disk_gb("a", 13);
+        let stale = store.stamp(serialize(&store.map.lock().unwrap()));
+        assert!(store.bound_ids().contains("sb-old"));
+        store.commit_handoff_binding("a", "sb-old", "sb-candidate").unwrap();
+        write_latest(&store.path, &store.written, stale.0, &stale.1);
+        store.commit_handoff_binding("a", "sb-old", "sb-candidate").unwrap();
+        assert!(store.commit_handoff_binding("a", "sb-old", "sb-wrong").is_err());
+        assert!(store.commit_handoff_binding("missing", "sb-old", "sb-candidate").is_err());
+        let loaded = Store::load(store.path.clone());
+        let record = loaded.record("a").unwrap();
+        assert_eq!(record.sandbox_id, "sb-candidate");
+        assert_eq!(record.disk_gb, 13);
+        assert_eq!(loaded.record("other").unwrap().sandbox_id, "sb-unrelated");
+        assert!(store.bound_ids().contains("sb-candidate"));
+        assert!(!store.bound_ids().contains("sb-old"));
+    }
+
+    #[test]
+    fn handoff_persistence_failure_does_not_publish_the_candidate() {
+        let store = tmp_store("handoff-failure");
+        store.put("a", "sb-old");
+        let backup = store.path.with_extension("backup");
+        std::fs::rename(&store.path, &backup).unwrap();
+        std::fs::create_dir(&store.path).unwrap();
+        assert!(store.commit_handoff_binding("a", "sb-old", "sb-candidate").is_err());
+        assert_eq!(store.record("a").unwrap().sandbox_id, "sb-old");
+        assert_eq!(Store::load(backup).record("a").unwrap().sandbox_id, "sb-old");
+        std::fs::remove_dir(&store.path).unwrap();
+        store.commit_handoff_binding("a", "sb-old", "sb-candidate").unwrap();
+        assert_eq!(Store::load(store.path.clone()).record("a").unwrap().sandbox_id, "sb-candidate");
     }
 
     #[test]

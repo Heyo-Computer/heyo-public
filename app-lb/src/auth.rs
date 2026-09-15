@@ -48,6 +48,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod heyo_login;
+
 /// Where the browser is sent to sign in.
 const GOOGLE_AUTHORIZE: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 /// Where app-lb exchanges the code for tokens, server to server.
@@ -78,6 +80,13 @@ pub struct Identity {
     pub name: Option<String>,
     /// The Google Workspace domain governing the account, when there is one.
     pub hosted_domain: Option<String>,
+    /// An app-token minted for this session, to be presented upstream on its
+    /// behalf. `None` unless the gate sets `session_scope`.
+    ///
+    /// The secret itself, not its id: the proxy has to put it in a header, and
+    /// the only alternative is a lookup on every request for a value the
+    /// session already carries.
+    pub session_token: Option<String>,
 }
 
 /// What the gate decided.
@@ -149,6 +158,11 @@ pub struct RequestInfo<'a> {
     /// True when the caller looks like a browser navigating, which is what makes
     /// a redirect the right answer instead of a 401.
     pub wants_html: bool,
+    /// Whether this deployment's upstream is app-lb's own admin listener. When
+    /// it is, the gate checks a scoped public path's *tier* and leaves
+    /// deployment and namespace scoping to the admin API, which does it better.
+    /// See [`Authenticator::fronts_admin_api`].
+    pub fronts_admin_api: bool,
     /// The value of an `Authorization: Bearer …` header, if there was one. An
     /// app-token gate checks this; a Google gate ignores it.
     pub bearer: Option<String>,
@@ -171,12 +185,39 @@ pub struct Authenticator {
     /// Queues rejected sign-ins for analysis. `None` when `APP_LB_SIEM=0`, and in
     /// tests.
     security: Option<crate::siem::SecuritySink>,
+    /// This process's admin listener address, so a deployment fronting it can
+    /// be recognised. `None` in tests and anywhere the gate stands only in
+    /// front of ordinary applications.
+    admin_addr: Option<String>,
     /// Issuer key sets for `jwks_url` gates. One cache for the whole LB, so two
     /// deployments behind the same issuer fetch its keys once between them.
     jwks: crate::jwt::JwksCache,
 }
 
 impl Authenticator {
+    /// Whether this deployment's upstream is app-lb's own admin listener.
+    ///
+    /// The one upstream that authorizes *better* than the gate in front of it
+    /// can. Every other upstream is an application with no idea what an
+    /// app-token's namespace means, so the gate has to answer "may this
+    /// credential touch this deployment" on its behalf. The admin API answers a
+    /// finer question — may this credential touch this *deployment it is being
+    /// asked about* — and asking the coarse one first can only ever refuse
+    /// callers the fine one would have admitted.
+    ///
+    /// Compared as *addresses*, not as strings. A byte comparison was the first
+    /// version and it was wrong on the first fleet that ran it: app-lb bound
+    /// `0.0.0.0:9090` while the deployment fronting it named `127.0.0.1:9090` —
+    /// the same listener, spelled the way each side naturally spells it. The
+    /// mismatch is invisible (everything routes, the dashboard works) and
+    /// surfaces only as a namespace-scoped token refused at the gate for no
+    /// discoverable reason.
+    pub fn fronts_admin_api(&self, spec: &crate::config::DeploymentSpec) -> bool {
+        self.admin_addr
+            .as_deref()
+            .is_some_and(|addr| spec.upstreams.iter().any(|u| same_listener(addr, u)))
+    }
+
     /// Queue one refused sign-in for analysis.
     ///
     /// Never carries a token or a code — only which step refused, and for the
@@ -222,11 +263,24 @@ impl Authenticator {
         tokens: Option<Arc<crate::tokens::TokenStore>>,
         security: Option<crate::siem::SecuritySink>,
     ) -> Self {
+        Self::with_admin_addr(key, secrets, tokens, security, None)
+    }
+
+    /// As [`new`](Self::new), plus the address of this process's own admin
+    /// listener — so the gate can recognise a deployment that fronts it.
+    pub fn with_admin_addr(
+        key: Vec<u8>,
+        secrets: Arc<SecretStore>,
+        tokens: Option<Arc<crate::tokens::TokenStore>>,
+        security: Option<crate::siem::SecuritySink>,
+        admin_addr: Option<String>,
+    ) -> Self {
         Self {
             key,
             secrets,
             tokens,
             security,
+            admin_addr,
             http: reqwest::Client::builder()
                 .timeout(TOKEN_TIMEOUT)
                 // A login is a person waiting; there is no retry that helps.
@@ -299,8 +353,20 @@ impl Authenticator {
             return Decision::Answered(self.start(gate, deployment_id, req, "/"));
         }
 
-        if gate.is_public(req.path) {
-            return Decision::Allow(Box::new(None));
+        // A path the sign-in gate does not sit in front of. That has never
+        // meant "no authorization" — it means an API client is not sent to
+        // Google — so what it requires instead is the entry's scope, checked
+        // right here rather than left to an upstream that may not be checking.
+        if let Some(scope) = gate.public_scope(req.path) {
+            let Some(want) = scope.required() else {
+                // `public`: the only spelling that admits a request presenting
+                // nothing. Either the upstream authorizes, or there is nothing
+                // behind this path to protect.
+                return Decision::Allow(Box::new(None));
+            };
+            return self
+                .scoped_public(gate, deployment_id, deployment_namespace, req, want)
+                .await;
         }
 
         // An app-token, if this gate takes them. Checked before the session
@@ -311,11 +377,25 @@ impl Authenticator {
         // Providers are alternatives: a gate listing both admits a person with a
         // Google session *or* a program with a token, and neither has to know
         // the other exists.
+        // `admits` is skipped in front of app-lb's own admin API, for the same
+        // reason it is skipped on a scoped public path there: the caller is not
+        // acting on the deployment that fronts the API, and the API behind it
+        // scope-checks every request against the deployment actually being
+        // addressed. See `Authenticator::fronts_admin_api`.
+        //
+        // Both places need it. A path listed in `public_paths` takes the scoped
+        // branch; everything else takes this one — so fixing only the first
+        // leaves a namespace token able to reach `/metrics` and not
+        // `/deployments`, which is a distinction nobody asked for.
+        //
+        // Admitting here is not authorizing: no tier is checked at this gate at
+        // all, and the admin listener refuses an `admin: none` token on every
+        // route it guards.
         if gate.accepts_app_token()
             && let Some(presented) = &req.bearer
             && let Some(tokens) = &self.tokens
             && let Some(token) = tokens.verify(presented, now_secs())
-            && token.admits(deployment_id, deployment_namespace)
+            && (req.fronts_admin_api || token.admits(deployment_id, deployment_namespace))
         {
             // No `Identity`: a token is not a person, and forwarding
             // `x-auth-request-email` for one would put a name upstream that
@@ -386,6 +466,92 @@ impl Authenticator {
         match self.session(gate, deployment_id, req) {
             Some(identity) => Decision::Allow(Box::new(Some(identity))),
             None => {
+                // A token this store *recognises* that did not admit this deployment is
+                // a different answer from no credential at all, and until this branch
+                // the gate gave both the same one: a 401 naming a browser sign-in URL.
+                // To a program that reads as "your connection is broken" — so the
+                // holder of a perfectly valid token goes looking at transport,
+                // credentials and DNS, none of which is the problem. The scoped-public
+                // path has explained this since it was written (`scoped_public`); every
+                // other path did not, which is an inconsistency nobody could have
+                // guessed at from the outside.
+                //
+                // Discloses nothing: it is the caller's own token, and they reached
+                // this deployment by naming it.
+                //
+                // Placed *after* the session check rather than beside the
+                // admitting branch above, so this can only ever change a
+                // refusal and never create one. A browser holding a valid
+                // session that also happens to send an `Authorization` header
+                // is let in exactly as before; only a caller with no other way
+                // through reaches this, and for them the alternative was the
+                // sign-in redirect that started the confusion.
+                if gate.accepts_app_token()
+                    && let Some(presented) = &req.bearer
+                    && let Some(tokens) = &self.tokens
+                    && let Some(token) = tokens.verify(presented, now_secs())
+                {
+                    // The admitting branch above returns on exactly one condition, so
+                    // reaching here with a verified token means precisely that it does
+                    // not admit this deployment. Never the tier: this gate does not
+                    // check one, and saying "insufficient tier" here would send someone
+                    // to mint a wider token that would be refused identically.
+                    debug_assert!(
+                        !req.fronts_admin_api,
+                        "in front of the admin API `admits` is skipped, so a verified token \
+                         cannot reach this branch",
+                    );
+                    tracing::info!(
+                        deployment = %deployment_id,
+                        namespace = %deployment_namespace,
+                        token = %token.id,
+                        path = %req.path,
+                        "refused a recognised token that does not admit this deployment",
+                    );
+                    // Built with `serde_json` rather than `format!`, unlike the older
+                    // bodies in this file: this one interpolates a deployment id, a
+                    // namespace and a token name, none of which this module controls.
+                    // Hand-escaping three caller-influenced strings into JSON is a bug
+                    // waiting for the first id with a quote in it.
+                    let scope = match &token.namespace {
+                        Some(ns) => format!("confined to namespace \"{ns}\""),
+                        None => "not confined to a namespace".to_string(),
+                    };
+                    let body = serde_json::json!({
+                        "error": "insufficient_scope",
+                        "detail": format!(
+                            "this token is {scope} and its deployment scope does not cover \
+                             \"{deployment_id}\" in namespace \"{deployment_namespace}\". This gate \
+                             checks reach, never the admin tier, so a wider tier will not change \
+                             this answer — the token needs this deployment, or its namespace, in \
+                             scope."
+                        ),
+                        "deployment": deployment_id,
+                        "namespace": deployment_namespace,
+                        // Enough of the presenting token to explain *this* refusal, and
+                        // deliberately not its full `deployments` list. The caller
+                        // already holds the token, so nothing here is new to them — but
+                        // this body is reachable at every gated hostname on the public
+                        // internet, and a stolen token that answers "and here is
+                        // everything else I open" at the first door is worse than one
+                        // whose reach has to be probed. `GET /whoami` on the admin API
+                        // gives the whole scope; that listener is loopback by default,
+                        // which is the surface that difference is about.
+                        "token_id": token.id,
+                        "token_admin_scope": token.admin.as_str(),
+                        "token_namespace": token.namespace,
+                    });
+                    return Decision::Answered(Response::json(
+                        403,
+                        serde_json::to_string(&body).unwrap_or_else(|_| {
+                            // Unreachable — every value above is a string, a list of
+                            // strings or null — but a gate must refuse rather than
+                            // panic on the request path.
+                            r#"{"error":"insufficient_scope"}"#.to_string()
+                        }) + "\n",
+                    ));
+                }
+
                 let return_to = match req.query {
                     Some(q) if !q.is_empty() => format!("{}?{}", req.path, q),
                     _ => req.path.to_string(),
@@ -393,6 +559,133 @@ impl Authenticator {
                 Decision::Answered(self.start(gate, deployment_id, req, &return_to))
             }
         }
+    }
+
+    /// Decide a request on a scoped public path: no sign-in, but a credential.
+    ///
+    /// Deliberately never redirects. Every caller of one of these paths is a
+    /// program — that is what taking the path out of the sign-in flow was for —
+    /// and a program handed a 302 to an HTML login page fails in a way nobody
+    /// can read. So the refusal is a 401 that names what would work.
+    ///
+    /// An app-token must both carry the tier *and* be scoped to this
+    /// deployment: `admits` is what stops a token minted for one deployment
+    /// walking in through another's public path. A JWT satisfies only the
+    /// lowest tier, because a JWT carries an identity and no admin scope —
+    /// there is nothing in it to compare against `view` or `admin`.
+    async fn scoped_public(
+        &self,
+        gate: &AuthGate,
+        deployment_id: &str,
+        deployment_namespace: &str,
+        req: &RequestInfo<'_>,
+        want: crate::tokens::AdminScope,
+    ) -> Decision {
+        // `admits` asks "may this credential touch *this deployment*", which is
+        // the right question for an ordinary application: the upstream has no
+        // idea what a namespace is, so the gate answers on its behalf.
+        //
+        // It is the wrong question in front of app-lb's own admin API. A caller
+        // there is not acting on the deployment that fronts it — they are acting
+        // on whatever the admin API routes to, and the admin API scope-checks
+        // that per request, per deployment, per namespace. Asking the coarse
+        // question first can only refuse callers the fine one would admit: a
+        // token confined to a namespace admits no deployment outside it, so it
+        // could never pass a gate on a fronting deployment sitting in
+        // `default` — and would then be refused for a namespace it never asked
+        // about.
+        if let Some(presented) = &req.bearer
+            && let Some(tokens) = &self.tokens
+            && let Some(token) = tokens.verify(presented, now_secs())
+            && (req.fronts_admin_api || token.admits(deployment_id, deployment_namespace))
+            && token.admin.satisfies(want)
+        {
+            tracing::debug!(
+                deployment = %deployment_id,
+                token = %token.id,
+                path = %req.path,
+                scope = ?want,
+                "scoped public path admitted by app-token",
+            );
+            return Decision::Allow(Box::new(None));
+        }
+
+        // A JWT is an identity, not a tier. It answers "who", which is all the
+        // lowest scope asks for.
+        if want == crate::tokens::AdminScope::None
+            && let Some(policy) = gate.jwt_policy()
+            && let Some(presented) = self.jwt_candidate(policy, req)
+            && let Ok(identity) = self.verify_jwt(policy, &presented).await
+        {
+            return Decision::Allow(Box::new(Some(identity)));
+        }
+
+        // A token this store knows, that simply does not satisfy this path, is a
+        // *different answer* from a token nothing recognises — and conflating
+        // them costs an afternoon, because the fixes have nothing in common.
+        // One means "mint a wider token"; the other means "your token is not
+        // from this server, or something in front answered before app-lb did".
+        //
+        // 403 discloses nothing here that the caller does not already hold: it
+        // is their own token, and they reached this deployment by name. The
+        // admin listener behind answers exactly this way for exactly this
+        // situation (`decide_access`), so the two layers now agree.
+        let known = req
+            .bearer
+            .as_ref()
+            .and_then(|b| self.tokens.as_ref().and_then(|t| t.verify(b, now_secs())));
+
+        if req.bearer.is_some() {
+            self.observe_auth(deployment_id, req, crate::siem::AuthAction::GateToken, None);
+        }
+        tracing::info!(
+            deployment = %deployment_id,
+            path = %req.path,
+            scope = ?want,
+            recognised = known.is_some(),
+            "refused a scoped public path",
+        );
+
+        if let Some(token) = known {
+            let why = if !token.admin.satisfies(want) {
+                format!(
+                    "this token's admin scope is '{}', and this path needs '{}' or higher",
+                    token.admin.as_str(),
+                    want.as_str(),
+                )
+            } else {
+                format!(
+                    "this token does not admit deployment \"{deployment_id}\" — a token \
+                     confined to a namespace admits only deployments in that namespace, so \
+                     it cannot pass a gate on one outside it",
+                )
+            };
+            debug_assert!(
+                !req.fronts_admin_api || !token.admin.satisfies(want),
+                "in front of the admin API only the tier is checked, so a refusal here \
+                 can only ever be about the tier",
+            );
+            return Decision::Answered(Response::json(
+                403,
+                format!(
+                    "{{\"error\":\"{}\",\"scope\":\"{}\"}}\n",
+                    why.replace('"', "\\\""),
+                    want.as_str(),
+                ),
+            ));
+        }
+
+        Decision::Answered(Response::json(
+            401,
+            format!(
+                "{{\"error\":\"authentication required\",\"scope\":\"{}\",\
+                 \"detail\":\"this path is outside the sign-in gate but still needs an \
+                 app-token scoped to this deployment with admin scope '{}' or higher, as \
+                 `Authorization: Bearer applb_…`\"}}\n",
+                want.as_str(),
+                want.as_str(),
+            ),
+        ))
     }
 
     /// The token a JWT gate should try, from the `Authorization` header or the
@@ -464,6 +757,9 @@ impl Authenticator {
             // one from an email suffix is the mistake `AuthGate::allows`
             // documents at length.
             hosted_domain: None,
+            // A JWT is its own credential; there is no session behind it and
+            // nothing to mint one from.
+            session_token: None,
         })
     }
 
@@ -475,16 +771,56 @@ impl Authenticator {
         req: &RequestInfo<'_>,
         return_to: &str,
     ) -> Response {
+        if req.wants_html && gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some()) {
+            return self.heyo_login_page(gate, deployment_id, req, return_to);
+        }
         // A token-only gate has no sign-in flow to start: there is no provider to
         // redirect to and no cookie to set. Say what would actually work rather
         // than sending a browser into an OAuth round trip that ends in a blank
         // `client_id`.
         let Some((client_id, _)) = gate.google_credentials() else {
+            // Unless the JWT provider names a hosted sign-in page: then a
+            // *browser* holding no token is redirected there with the URL it
+            // wanted, the issuer signs the person in and sets the JWT cookie,
+            // and the return navigation is admitted by the cookie the gate
+            // already knows to read. app-lb holds no flow state here — the
+            // issuer's cookie is the whole session. See `JwtSpec::login_url`.
+            //
+            // A program (no HTML in `Accept`) falls through to the 401 below:
+            // it can act on that, and cannot follow a redirect into an HTML
+            // sign-in page anyway.
+            if req.wants_html
+                && let Some(policy) = gate.jwt_policy()
+                && let Some(login_url) = policy.login_url.as_deref()
+            {
+                // The return URL is this deployment's own origin plus the safe
+                // local path — never a caller-supplied absolute URL, so this
+                // cannot be turned into an open redirect through the issuer.
+                let return_uri = format!("{}{}", origin(req), safe_return_path(return_to));
+                let sep = if login_url.contains('?') { '&' } else { '?' };
+                let url = format!(
+                    "{login_url}{sep}{}",
+                    form_urlencoded::Serializer::new(String::new())
+                        .append_pair(policy.login_redirect_param(), &return_uri)
+                        .finish()
+                );
+                return Response::redirect(url, vec![]);
+            }
             let mut accepts: Vec<&str> = Vec::new();
             let mut detail: Vec<&str> = Vec::new();
             if gate.accepts_app_token() {
                 accepts.push("\"app-token\"");
-                detail.push("an app-token as `Authorization: Bearer applb_…` or `?app_token=`");
+                // The header, and only the header. `?app_token=` was advertised
+                // here for a long time and has never worked at this gate: the
+                // credential is read from `Authorization` alone
+                // (`proxy::request_info`), and the query form exists on exactly
+                // one route in the whole system — the admin API's WebSocket
+                // shell, because a browser's `WebSocket` constructor cannot set
+                // headers. Advertising it here sent programmatic callers to
+                // generalise a form that is refused everywhere they would try
+                // it, and a 401 that names a mechanism the path rejects is
+                // worse than one that names nothing.
+                detail.push("an app-token as `Authorization: Bearer applb_…`");
             }
             if gate.accepts_jwt() {
                 accepts.push("\"jwt\"");
@@ -707,6 +1043,12 @@ impl Authenticator {
             );
         }
 
+        // The credential this session will present upstream, if the gate says
+        // a sign-in is worth one. Minted here rather than on first use because
+        // this is the one moment the identity has been proven; every later
+        // request only has a cookie saying it once was.
+        let (token, token_id) = self.mint_session_token(gate, deployment_id, &identity);
+
         let session = Session {
             subject: identity.subject.clone(),
             email: identity.email.clone(),
@@ -715,6 +1057,8 @@ impl Authenticator {
             deployment: deployment_id.to_string(),
             policy: gate.policy_fingerprint(),
             exp: now_secs() + gate.session_ttl_secs,
+            token,
+            token_id,
         };
         tracing::info!(
             deployment = %deployment_id,
@@ -737,17 +1081,101 @@ impl Authenticator {
         )
     }
 
+    /// Mint the app-token a session presents upstream, if this gate asks for
+    /// one. Returns `(secret, id)`, both `None` when it does not.
+    ///
+    /// Scoped to the whole fleet rather than to this deployment, because the
+    /// case it exists for is a dashboard whose upstream *is* the admin API —
+    /// a token admitting only the deployment it was minted at could not read
+    /// the deployment list that dashboard is for. That is a real grant, which
+    /// is why `session_scope` has no default and has to be written down.
+    ///
+    /// A failure to mint is logged and not fatal: the session is still valid
+    /// for the gate itself, so the person gets in and the upstream refuses
+    /// them, which is a far better failure than a sign-in that dead-ends.
+    fn mint_session_token(
+        &self,
+        gate: &AuthGate,
+        deployment_id: &str,
+        identity: &Identity,
+    ) -> (Option<String>, Option<String>) {
+        let (Some(scope), Some(tokens)) = (gate.session_scope, self.tokens.as_ref()) else {
+            return (None, None);
+        };
+        // Named for the person and the deployment, because this list is read
+        // by an operator deciding what to revoke, and "session" alone would be
+        // a page of identical rows.
+        let name = format!("session {} @ {}", identity.email, deployment_id);
+        let req = crate::tokens::NewToken {
+            name,
+            admin: scope,
+            namespace: None,
+            deployments: vec!["*".to_string()],
+            // Expires with the session. A token outliving the cookie that
+            // carries it is a credential nobody can present and nobody revokes.
+            expires_in_secs: Some(gate.session_ttl_secs),
+        };
+        match tokens.mint(req, now_secs()) {
+            Ok((summary, secret)) => {
+                if let Err(e) = tokens.persist() {
+                    // In memory and working; gone on restart. Worth saying,
+                    // not worth refusing the sign-in over.
+                    tracing::warn!(error = %e, "session token minted but not persisted");
+                }
+                tracing::info!(
+                    deployment = %deployment_id,
+                    email = %identity.email,
+                    token = %summary.id,
+                    scope = %scope.as_str(),
+                    "minted a session token",
+                );
+                (Some(secret), Some(summary.id))
+            }
+            Err(e) => {
+                tracing::error!(deployment = %deployment_id, error = %e, "could not mint a session token");
+                (None, None)
+            }
+        }
+    }
+
     fn logout(&self, gate: &AuthGate, req: &RequestInfo<'_>) -> Response {
+        // Revoke the session's token before dropping the cookie that carries
+        // it. Clearing the cookie alone would leave a live fleet-scoped
+        // credential in the store with nothing pointing at it — unreachable by
+        // its owner and unnoticed by everyone else until it expired.
+        if let Some(tokens) = self.tokens.as_ref() {
+            for raw in cookie_values(&req.cookies, &gate.cookie_name) {
+                let Some(session) = self.verify(&raw).and_then(|b| Session::decode(&b)) else {
+                    continue;
+                };
+                if let Some(id) = &session.token_id
+                    && tokens.revoke(id)
+                {
+                    if let Err(e) = tokens.persist() {
+                        tracing::warn!(error = %e, "session token revoked but not persisted");
+                    }
+                    tracing::info!(token = %id, email = %session.email, "revoked a session token");
+                }
+            }
+        }
+
         // Only app-lb's own cookie is cleared: signing the user out of Google
         // itself is not app-lb's to do, and doing it would sign them out of
         // every other tab they have open.
-        Response::redirect(
+        let mut response = Response::redirect(
             format!("{}{}", origin(req), gate.login_path()),
             vec![
                 clear_cookie(&gate.cookie_name, req.secure, gate.cookie_domain_for(req.host).as_deref()),
                 clear_cookie(FLOW_COOKIE, req.secure, None),
             ],
-        )
+        );
+        if let Some(policy) = gate.jwt_policy()
+            && policy.login_endpoint.is_some()
+            && let Some(cookie) = policy.cookie.as_deref()
+        {
+            response.cookies.push(clear_cookie(cookie, req.secure, None));
+        }
+        response
     }
 
     /// The identity in the request's session cookie, if it has a valid one.
@@ -833,6 +1261,10 @@ impl Authenticator {
             email: session.email,
             name: session.name,
             hosted_domain: session.hosted_domain,
+            // Carried straight through to the proxy, which presents it
+            // upstream. Absent on every session issued before the gate asked
+            // for one, and on every gate that still does not.
+            session_token: session.token,
         })
     }
 
@@ -960,6 +1392,15 @@ struct Session {
     policy: String,
     #[serde(rename = "e")]
     exp: u64,
+    /// The minted token's secret, presented upstream while this session lasts.
+    #[serde(rename = "t", skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    /// Its id, so signing out can revoke it. Kept apart from the secret because
+    /// revocation needs the id and the header needs the secret, and carrying
+    /// only one would mean deriving the other — which for a hashed secret is
+    /// not possible in that direction.
+    #[serde(rename = "ti", skip_serializing_if = "Option::is_none")]
+    token_id: Option<String>,
 }
 
 impl Session {
@@ -1055,10 +1496,61 @@ fn validate_claims(claims: &IdClaims, client_id: &str) -> Result<Identity, Strin
         email: email.to_ascii_lowercase(),
         name: claims.name.clone(),
         hosted_domain: claims.hd.clone(),
+        // Minted by the callback once the allow-list has had its say, not here:
+        // these are the provider's claims, and being able to prove who you are
+        // is not the same as being allowed in.
+        session_token: None,
     })
 }
 
 // -- small helpers ---------------------------------------------------------
+
+/// Whether two `host:port` strings name the same local listener.
+///
+/// The port must match exactly; the host is compared by what it *means*:
+///
+/// * a wildcard bind (`0.0.0.0`, `::`, `*`, or an empty host) answers on every
+///   local address, so any host on that port reaches it;
+/// * otherwise the two must be the same address — textually, as parsed IPs, or
+///   as two spellings of loopback.
+///
+/// No DNS. This runs on the request path, and a name lookup there would trade a
+/// comparison for a network round trip; a hostname that needs one falls through
+/// to `false`, which refuses rather than admits.
+fn same_listener(admin: &str, upstream: &str) -> bool {
+    fn split(s: &str) -> Option<(String, String)> {
+        let (host, port) = s.trim().rsplit_once(':')?;
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        Some((host.to_ascii_lowercase(), port.trim().to_string()))
+    }
+    let (Some((ah, ap)), Some((uh, up))) = (split(admin), split(upstream)) else {
+        return false;
+    };
+    if ap != up {
+        return false;
+    }
+    // A wildcard bind is reachable at every local address on that port, so the
+    // upstream's choice of spelling cannot make it a different listener. Nor can
+    // anything else be listening there: binding 0.0.0.0:P and 127.0.0.1:P at
+    // once is what the OS refuses.
+    if matches!(ah.as_str(), "0.0.0.0" | "::" | "*" | "") {
+        return true;
+    }
+    if ah == uh {
+        return true;
+    }
+    let loopback = |h: &str| {
+        h == "localhost"
+            || h.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+    };
+    if loopback(&ah) && loopback(&uh) {
+        return true;
+    }
+    match (ah.parse::<std::net::IpAddr>(), uh.parse::<std::net::IpAddr>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let pkey = openssl::pkey::PKey::hmac(key).expect("hmac key");
@@ -1230,6 +1722,7 @@ mod tests {
 
     fn gate() -> AuthGate {
         AuthGate {
+            session_scope: None,
             provider: Default::default(),
             client_id: Some("cid.apps.googleusercontent.com".into()),
             client_secret: Some(SecretRef {
@@ -1248,6 +1741,7 @@ mod tests {
             redirect_url: None,
             forward_identity: true,
             jwt: None,
+            provider_ref: None,
         }
     }
 
@@ -1271,6 +1765,9 @@ mod tests {
             cookies,
             secure: true,
             wants_html: true,
+            // The ordinary case: a gate in front of an application, where the
+            // deployment check is the gate's to make.
+            fronts_admin_api: false,
             bearer: None,
             client: None,
         }
@@ -1278,6 +1775,7 @@ mod tests {
 
     fn identity(email: &str, hd: Option<&str>) -> Identity {
         Identity {
+            session_token: None,
             subject: "sub-1".into(),
             email: email.into(),
             name: Some("A Person".into()),
@@ -1287,6 +1785,8 @@ mod tests {
 
     fn session_cookie(a: &Authenticator, g: &AuthGate, id: &Identity, exp: u64) -> String {
         let s = Session {
+            token: None,
+            token_id: None,
             subject: id.subject.clone(),
             email: id.email.clone(),
             name: id.name.clone(),
@@ -1489,6 +1989,94 @@ mod tests {
         use serde_json::json;
 
         const SECRET: &str = "a-shared-secret-of-some-length";
+
+        #[tokio::test]
+        async fn browser_login_uses_issuer_then_checks_policy_and_sets_host_cookie() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/login", listener.local_addr().unwrap());
+            let token = heyo_token(json!({}));
+            let router = axum::Router::new().route("/login", axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let token = token.clone();
+                    async move {
+                        assert_eq!(body, json!({"email":"someone@example.com","password":"p&ss word"}));
+                        axum::Json(json!({"success":true,"data":{"tokens":{"accessToken":token,"expiresIn":3600}}}))
+                    }
+                },
+            ));
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let a = with_secret();
+            let mut g = jwt_gate(r#""jwt""#, &format!(r#", "cookie":"heyo_login", "login_endpoint":"{endpoint}""#));
+            let page = a.start(&g, "web", &req("/runs/abc", vec![]), "/runs/abc?before=17");
+            assert_eq!(page.status, 200);
+            assert!(page.body.contains("autocomplete=\"current-password\""));
+            assert!(page.cookies[0].contains("Secure") && page.cookies[0].contains("HttpOnly"));
+            if let Ok(path) = std::env::var("HEYO_LOGIN_HTML") { std::fs::write(path, &page.body).unwrap(); }
+            let raw = cookie_values(&page.cookies, FLOW_COOKIE).remove(0);
+            let flow = Flow::decode(&a.verify(&raw).unwrap()).unwrap();
+            let body = form_urlencoded::Serializer::new(String::new())
+                .append_pair("state", &flow.nonce).append_pair("email", "someone@example.com")
+                .append_pair("password", "p&ss word").finish();
+            let request = req("/__applb/auth/login", page.cookies);
+            let r = a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com:443"), body.as_bytes()).await;
+            assert_eq!(r.status, 302);
+            assert_eq!(r.location.as_deref(), Some("/runs/abc?before=17"));
+            assert!(r.cookies[0].starts_with("heyo_login="));
+            assert!(r.cookies[0].contains("Secure") && r.cookies[0].contains("HttpOnly"));
+            assert!(!r.cookies[0].contains("Domain="));
+            assert!(matches!(a.decide(&g, "web", "default", &req("/runs/abc", r.cookies)).await, Decision::Allow(identity) if identity.is_some()));
+            g.jwt.as_mut().unwrap().require.insert("email".into(), json!("other@example.com"));
+            let denied = a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), body.as_bytes()).await;
+            assert_eq!(denied.status, 403);
+            assert!(denied.cookies.is_empty());
+            let logout = a.logout(&g, &request);
+            assert!(logout.cookies.iter().any(|c| c.starts_with("heyo_login=") && c.contains("Max-Age=0")));
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn browser_login_rejects_cross_site_expired_and_wrong_deployment_flows() {
+            let a = with_secret();
+            let g = jwt_gate(r#""jwt""#, r#", "cookie":"heyo_login", "login_endpoint":"http://127.0.0.1:9/login""#);
+            let mut request = req("/__applb/auth/login", vec![]);
+            for origin in [None, Some("https://evil.example.com"), Some("https://app.example.com:444"), Some("http://app.example.com")] {
+                assert_eq!(a.heyo_login_submit(&g, "web", &request, origin, b"state=a").await.status, 403);
+            }
+            for (deployment, exp, nonce) in [("other", now_secs()+60, "a"), ("web", now_secs(), "a"), ("web", now_secs()+60, "wrong")] {
+                let flow = Flow { deployment:deployment.into(), exp, nonce:nonce.into(), verifier:String::new(), return_to:"/".into() };
+                request.cookies = vec![format!("{FLOW_COOKIE}={}", a.sign(&flow.encode()))];
+                assert_eq!(a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), b"state=a&email=a&password=b").await.status, 403);
+            }
+            request.secure = false;
+            assert_eq!(a.start(&g, "web", &request, "/").status, 403);
+            request.secure = true;
+            request.wants_html = false;
+            assert_eq!(a.start(&g, "web", &request, "/").status, 401);
+            assert_eq!(a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), &vec![b'x';8193]).await.status, 413);
+        }
+
+        #[tokio::test]
+        async fn browser_login_does_not_forward_passwords_through_redirects() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/login", listener.local_addr().unwrap());
+            let captured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = captured.clone();
+            let router = axum::Router::new()
+                .route("/login", axum::routing::post(|| async { axum::response::Redirect::temporary("/capture") }))
+                .route("/capture", axum::routing::post(move || {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async { "unexpected credential forwarding" }
+                }));
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let a = with_secret();
+            let g = jwt_gate(r#""jwt""#, &format!(r#", "cookie":"heyo_login", "login_endpoint":"{endpoint}""#));
+            let flow = Flow { deployment:"web".into(), exp:now_secs()+60, nonce:"a".into(), verifier:String::new(), return_to:"/".into() };
+            let request = req("/__applb/auth/login", vec![format!("{FLOW_COOKIE}={}", a.sign(&flow.encode()))]);
+            let response = a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), b"state=a&email=a%40example.com&password=b").await;
+            assert_eq!(response.status, 502);
+            assert!(!captured.load(std::sync::atomic::Ordering::SeqCst));
+            server.abort();
+        }
 
         /// An authenticator whose secret store holds the issuer's signing key,
         /// as a real deployment's would.
@@ -1733,6 +2321,101 @@ mod tests {
             assert!(r.location.is_none(), "there is no flow to redirect to");
         }
 
+        /// With a hosted sign-in configured, a token-less *browser* is redirected
+        /// to it carrying where it was going, while a program still gets the 401
+        /// it can act on.
+        #[tokio::test]
+        async fn a_hosted_login_redirects_a_browser_and_still_401s_a_program() {
+            let a = with_secret();
+            let g: AuthGate = serde_json::from_str(
+                r#"{"provider":"jwt","jwt":{"secret":{"secret":"heyo-auth","key":"jwt_secret"},
+                    "algorithms":["HS256"],"issuer":"auth-service",
+                    "cookie":"heyo_access_token",
+                    "login_url":"https://auth.example.com/login"}}"#,
+            )
+            .unwrap();
+
+            // A browser with no token is bounced to the hosted sign-in, with the
+            // URL it wanted so the issuer can send it back.
+            let mut browser = req("/dashboard", vec![]);
+            browser.query = Some("tab=usage");
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &browser).await else {
+                panic!("a token-less browser must be answered, not let through");
+            };
+            assert_eq!(r.status, 302);
+            let loc = r.location.expect("a redirect carries a Location");
+            assert!(loc.starts_with("https://auth.example.com/login?"), "{loc}");
+            assert!(
+                loc.contains("redirect_uri=https%3A%2F%2Fapp.example.com%2Fdashboard%3Ftab%3Dusage"),
+                "the return URL is this deployment's own path, encoded: {loc}",
+            );
+
+            // A program (no HTML in Accept) still gets the actionable 401: it
+            // cannot follow a redirect into an HTML sign-in page.
+            let mut program = req("/dashboard", vec![]);
+            program.wants_html = false;
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &program).await else {
+                panic!("must not let a token-less program through");
+            };
+            assert_eq!(r.status, 401);
+            assert!(r.location.is_none(), "a program is not redirected");
+        }
+
+        /// The return parameter's name is configurable, for issuers that do not
+        /// call it `redirect_uri`.
+        #[tokio::test]
+        async fn the_return_parameter_name_is_configurable() {
+            let a = with_secret();
+            let g: AuthGate = serde_json::from_str(
+                r#"{"provider":"jwt","jwt":{"secret":{"secret":"heyo-auth","key":"jwt_secret"},
+                    "algorithms":["HS256"],"issuer":"auth-service",
+                    "cookie":"heyo_access_token",
+                    "login_url":"https://auth.example.com/login",
+                    "login_redirect_param":"next"}}"#,
+            )
+            .unwrap();
+            let Decision::Answered(r) =
+                a.decide(&g, "web", "default", &req("/", vec![])).await
+            else {
+                panic!("a token-less browser must be answered");
+            };
+            let loc = r.location.expect("a redirect carries a Location");
+            assert!(loc.contains("next=https%3A%2F%2Fapp.example.com%2F"), "{loc}");
+            assert!(!loc.contains("redirect_uri="), "the default name must not leak in: {loc}");
+        }
+
+        /// A 401 must not name a mechanism the path will refuse.
+        ///
+        /// `?app_token=` was advertised here for a long time and has never been
+        /// read at this gate — `proxy::request_info` takes the bearer from the
+        /// `Authorization` header alone. The cost of the wrong sentence is not
+        /// abstract: a client generalised it to another host, spent a
+        /// permission grant proving it did not work, and reported the wrong
+        /// cause. The query form exists on exactly one route in the system
+        /// (the admin API's WebSocket shell, which cannot set headers), and
+        /// this is not that route.
+        #[tokio::test]
+        async fn an_app_token_gate_advertises_only_the_header_it_reads() {
+            let a = with_secret();
+            let g: AuthGate =
+                serde_json::from_str(r#"{"provider":"app-token"}"#).unwrap();
+
+            let Decision::Answered(r) = a.decide(&g, "web", "default", &req("/", vec![])).await
+            else {
+                panic!("an unauthenticated request must not be let through");
+            };
+            assert_eq!(r.status, 401);
+            let body: serde_json::Value =
+                serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{}: {e}", r.body));
+            assert_eq!(body["accepts"], serde_json::json!(["app-token"]));
+            let detail = body["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("Authorization: Bearer applb_"), "{body}");
+            assert!(
+                !detail.contains("app_token="),
+                "the gate advertised a query parameter it does not read: {body}",
+            );
+        }
+
         /// A gate taking both machine credentials names both.
         #[tokio::test]
         async fn a_gate_taking_both_machine_credentials_says_so() {
@@ -1778,7 +2461,7 @@ mod tests {
         async fn public_paths_are_still_public_on_a_jwt_gate() {
             let a = with_secret();
             let mut g = jwt_gate(r#""jwt""#, "");
-            g.public_paths = vec!["/healthz".into()];
+            g.public_paths = vec![crate::config::PublicPath::public("/healthz")];
             let Decision::Allow(identity) = a.decide(&g, "web", "default", &req("/healthz", vec![])).await
             else {
                 panic!("a public path must be served without a credential");
@@ -1894,13 +2577,28 @@ mod tests {
             let g = token_gate(r#""app-token""#);
             let secret = mint(&t, &["other"]);
 
-            // Refused as if no credential were presented — the deployment it *is*
-            // scoped to is none of this deployment's business.
+            // A 403 that says why, not a 401 that implies the credential was
+            // never understood. This used to answer 401 "as if no credential
+            // were presented", and that reads to a program as a broken
+            // connection: the holder of a valid token goes and checks
+            // transport, DNS and the token itself, none of which is wrong.
+            // What is disclosed is the caller's own token and a deployment they
+            // named, so the discretion bought nothing.
             let Decision::Answered(r) = a.decide(&g, "web", "default", &bearing("/private", &secret)).await
             else {
                 panic!("expected a refusal");
             };
-            assert_eq!(r.status, 401);
+            assert_eq!(r.status, 403);
+            let body: serde_json::Value =
+                serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{}: {e}", r.body));
+            assert_eq!(body["error"], "insufficient_scope");
+            assert_eq!(body["deployment"], "web");
+            assert_eq!(body["namespace"], "default");
+            // The other deployment this token *is* scoped to stays that
+            // token's business: this body is reachable from every gated
+            // hostname on the internet.
+            assert!(body.get("token_deployments").is_none(), "{body}");
+            assert!(!r.body.contains("other"), "{}", r.body);
         }
 
         #[tokio::test]
@@ -1932,7 +2630,42 @@ mod tests {
             else {
                 panic!("expected a refusal outside the namespace");
             };
-            assert_eq!(r.status, 401);
+            assert_eq!(r.status, 403);
+            let body: serde_json::Value =
+                serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{}: {e}", r.body));
+            // The wall that actually refused this, named — a namespace token
+            // refused outside its namespace looked identical to a bad password
+            // before, which is a long way from the fix (mint in the right
+            // namespace, or widen the token).
+            assert_eq!(body["token_namespace"], "team-a");
+            assert_eq!(body["namespace"], "default");
+            assert!(
+                body["detail"].as_str().is_some_and(|d| d.contains("namespace")),
+                "{body}"
+            );
+        }
+
+        /// The new explanation must only ever change a *refusal*, never create
+        /// one. A gate taking both providers, a session that is valid, and a
+        /// bearer scoped somewhere else: the session wins, exactly as before.
+        #[tokio::test]
+        async fn a_valid_session_still_wins_over_a_bearer_scoped_elsewhere() {
+            let (a, t) = with_tokens();
+            let g = token_gate(r#"["google","app-token"]"#);
+            let elsewhere = mint(&t, &["other"]);
+            let who = super::identity("someone@example.com", Some("example.com"));
+            let cookie = super::session_cookie(&a, &g, &who, now_secs() + 3600);
+
+            let req = RequestInfo {
+                bearer: Some(elsewhere.clone()),
+                cookies: vec![cookie],
+                ..req("/private", vec![])
+            };
+            let Decision::Allow(identity) = a.decide(&g, "web", "default", &req).await else {
+                panic!("a valid session must still admit, bearer or no bearer");
+            };
+            let identity = identity.expect("a session carries an identity");
+            assert_eq!(identity.email, "someone@example.com");
         }
 
         #[tokio::test]
@@ -2016,9 +2749,10 @@ mod tests {
         #[tokio::test]
         async fn public_paths_are_still_public_on_a_token_gate() {
             let (a, _) = with_tokens();
-            let g: AuthGate =
-                serde_json::from_str(r#"{"provider":"app-token","public_paths":["/healthz"]}"#)
-                    .unwrap();
+            let g: AuthGate = serde_json::from_str(
+                r#"{"provider":"app-token","public_paths":[{"path":"/healthz","scope":"public"}]}"#,
+            )
+            .unwrap();
             assert!(matches!(
                 a.decide(&g, "web", "default", &req("/healthz", vec![])).await,
                 Decision::Allow(_)
@@ -2087,9 +2821,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_paths_skip_the_gate_entirely() {
+    async fn a_public_scoped_path_skips_the_gate_entirely() {
         let (a, mut g) = (auth(), gate());
-        g.public_paths = vec!["/healthz".into(), "/hooks/".into()];
+        // `public` is the only scope that admits a request presenting nothing.
+        // Written out, because a bare string now means `admin`.
+        g.public_paths = vec![
+            crate::config::PublicPath::public("/healthz"),
+            crate::config::PublicPath::public("/hooks/"),
+        ];
 
         for path in ["/healthz", "/hooks/github"] {
             let Decision::Allow(id) = a.decide(&g, "web", "default", &req(path, vec![])).await else {
@@ -2102,6 +2841,446 @@ mod tests {
             a.decide(&g, "web", "default", &req("/health", vec![])).await,
             Decision::Answered(_)
         ));
+    }
+
+    /// The whole point of the change: a path outside the sign-in gate is not a
+    /// path outside authorization. These four cases are the contract.
+    mod scoped_public_paths {
+        use super::*;
+        use crate::config::{PathScope, PublicPath};
+        use crate::secrets::SecretStore;
+        use crate::tokens::{AdminScope, NewToken, TokenStore};
+        use std::sync::Arc;
+
+        /// A local copy rather than reaching into `app_token::with_tokens`:
+        /// these tests need a token store too, and a sibling module's private
+        /// helper is not theirs to borrow.
+        fn with_tokens() -> (Authenticator, Arc<TokenStore>) {
+            let tokens = Arc::new(TokenStore::new("/nonexistent/tokens.json"));
+            let secrets = Arc::new(SecretStore::new("/nonexistent/secrets.json", None));
+            (
+                Authenticator::new(vec![7u8; 32], secrets, Some(tokens.clone()), None),
+                tokens,
+            )
+        }
+
+        fn scoped(path: &str, scope: PathScope) -> PublicPath {
+            PublicPath { path: path.into(), scope }
+        }
+
+        fn bearer<'a>(path: &'a str, token: &'a str) -> RequestInfo<'a> {
+            let mut r = req(path, vec![]);
+            r.bearer = Some(token.to_string());
+            // A program, not a browser: the refusal must be a 401 it can read.
+            r.wants_html = false;
+            r
+        }
+
+        fn admin_token(t: &TokenStore, deployments: &[&str], admin: AdminScope) -> String {
+            t.mint(
+                NewToken {
+                    name: "api".into(),
+                    namespace: None,
+                    admin,
+                    deployments: deployments.iter().map(|d| d.to_string()).collect(),
+                    expires_in_secs: None,
+                },
+                now_secs(),
+            )
+            .unwrap()
+            .1
+        }
+
+        /// The migration default, and the reason this is a breaking change: a
+        /// spec written before scopes existed lists bare strings, and every one
+        /// of them now demands `admin` rather than standing open.
+        #[test]
+        fn a_bare_string_means_admin() {
+            let g: AuthGate = serde_json::from_str(
+                r#"{"provider":"google","public_paths":["/deployments","/healthz"]}"#,
+            )
+            .unwrap();
+            assert_eq!(g.public_scope("/deployments"), Some(PathScope::Admin));
+            assert_eq!(g.public_scope("/healthz"), Some(PathScope::Admin));
+            assert_eq!(g.public_scope("/elsewhere"), None);
+        }
+
+        /// Longest prefix wins, so a narrow entry can tighten a broad one and
+        /// the answer never depends on the order somebody typed them in.
+        #[test]
+        fn the_most_specific_entry_decides() {
+            let mut g = gate();
+            g.public_paths = vec![
+                scoped("/api/", PathScope::View),
+                scoped("/api/admin/", PathScope::Admin),
+                PublicPath::public("/api/health"),
+            ];
+            assert_eq!(g.public_scope("/api/things"), Some(PathScope::View));
+            assert_eq!(g.public_scope("/api/admin/wipe"), Some(PathScope::Admin));
+            assert_eq!(g.public_scope("/api/health"), Some(PathScope::Public));
+        }
+
+        #[tokio::test]
+        async fn a_scoped_path_refuses_an_empty_hand_without_a_redirect() {
+            let (a, _) = with_tokens();
+            let mut g = gate();
+            g.public_paths = vec![scoped("/deployments", PathScope::Admin)];
+
+            let mut r = req("/deployments", vec![]);
+            r.wants_html = false;
+            let Decision::Answered(res) = a.decide(&g, "web", "default", &r).await else {
+                panic!("a scoped path must not admit an unauthenticated request");
+            };
+            assert_eq!(res.status, 401, "not a redirect: the caller is a program");
+            assert!(res.body.contains("admin"), "{}", res.body);
+            assert!(
+                !res.body.contains("login_url"),
+                "a program handed a sign-in URL fails unreadably: {}",
+                res.body
+            );
+        }
+
+        #[tokio::test]
+        async fn the_tier_and_the_deployment_both_have_to_match() {
+            let (a, tokens) = with_tokens();
+            let mut g = gate();
+            g.public_paths = vec![scoped("/deployments", PathScope::Admin)];
+
+            // Right tier, right deployment.
+            let ok = admin_token(&tokens, &["web"], AdminScope::Admin);
+            assert!(matches!(
+                a.decide(&g, "web", "default", &bearer("/deployments", &ok)).await,
+                Decision::Allow(_)
+            ));
+
+            // Right deployment, tier too low. `view` does not reach `admin`.
+            let weak = admin_token(&tokens, &["web"], AdminScope::View);
+            assert!(matches!(
+                a.decide(&g, "web", "default", &bearer("/deployments", &weak)).await,
+                Decision::Answered(_)
+            ));
+
+            // Right tier, wrong deployment — this is what stops a token minted
+            // for one deployment walking in through another's public path.
+            let elsewhere = admin_token(&tokens, &["other"], AdminScope::Admin);
+            assert!(matches!(
+                a.decide(&g, "web", "default", &bearer("/deployments", &elsewhere)).await,
+                Decision::Answered(_)
+            ));
+
+            // And a `public` entry still needs nothing at all.
+            g.public_paths = vec![PublicPath::public("/healthz")];
+            assert!(matches!(
+                a.decide(&g, "web", "default", &req("/healthz", vec![])).await,
+                Decision::Allow(_)
+            ));
+        }
+
+        /// 401 and 403 are different answers with different fixes, and the
+        /// gate used to give 401 for both. That cost real time: a
+        /// namespace-confined token was reported as one the server did not
+        /// recognise, which sends you to look at the token instead of the gate.
+        #[tokio::test]
+        async fn a_known_token_is_refused_differently_from_an_unknown_one() {
+            let (a, tokens) = with_tokens();
+            let mut g = gate();
+            g.public_paths = vec![scoped("/deployments", PathScope::Admin)];
+
+            // Known, right tier, but confined to a namespace this deployment is
+            // not in — `admits` fails, and the reason is worth saying.
+            let confined = tokens
+                .mint(
+                    NewToken {
+                        name: "ns".into(),
+                        admin: AdminScope::Admin,
+                        namespace: Some("samcurrie".into()),
+                        deployments: Vec::new(),
+                        expires_in_secs: None,
+                    },
+                    now_secs(),
+                )
+                .unwrap()
+                .1;
+            let Decision::Answered(r) =
+                a.decide(&g, "app-lb-admin", "default", &bearer("/deployments", &confined)).await
+            else {
+                panic!("a namespace token cannot pass a gate outside its namespace");
+            };
+            assert_eq!(r.status, 403, "known but not admitted is a 403");
+            assert!(r.body.contains("does not admit"), "{}", r.body);
+            assert!(r.body.contains("app-lb-admin"), "{}", r.body);
+
+            // Known, wrong tier: also 403, and says which tier.
+            let low = admin_token(&tokens, &["app-lb-admin"], AdminScope::View);
+            let Decision::Answered(r) =
+                a.decide(&g, "app-lb-admin", "default", &bearer("/deployments", &low)).await
+            else {
+                panic!("view does not reach admin");
+            };
+            assert_eq!(r.status, 403);
+            assert!(r.body.contains("'view'") && r.body.contains("'admin'"), "{}", r.body);
+
+            // Not known at all: 401, because nothing verified it — a different
+            // problem with a different fix.
+            let Decision::Answered(r) = a
+                .decide(&g, "app-lb-admin", "default", &bearer("/deployments", "applb_dead_nope"))
+                .await
+            else {
+                panic!("an unknown token is refused");
+            };
+            assert_eq!(r.status, 401, "unrecognised is a 401");
+        }
+
+        /// The comparison that decides whether a deployment fronts the admin API.
+    /// A byte-for-byte version of this shipped and was wrong in production:
+    /// `0.0.0.0:9090` and `127.0.0.1:9090` are the same listener.
+    #[test]
+    fn the_admin_listener_is_matched_by_address_not_by_spelling() {
+        // The case that broke: a wildcard bind, an upstream naming loopback.
+        assert!(same_listener("0.0.0.0:9090", "127.0.0.1:9090"));
+        assert!(same_listener("0.0.0.0:9090", "localhost:9090"));
+        assert!(same_listener("[::]:9090", "127.0.0.1:9090"));
+        // Two spellings of loopback.
+        assert!(same_listener("127.0.0.1:9090", "localhost:9090"));
+        assert!(same_listener("localhost:9090", "127.0.0.1:9090"));
+        assert!(same_listener("[::1]:9090", "127.0.0.1:9090"));
+        // Identical, and equivalent IPv6 spellings.
+        assert!(same_listener("127.0.0.1:9090", "127.0.0.1:9090"));
+        assert!(same_listener("[0:0:0:0:0:0:0:1]:9090", "[::1]:9090"));
+
+        // The port is never negotiable — a different port is a different
+        // process, whatever the host says.
+        assert!(!same_listener("0.0.0.0:9090", "127.0.0.1:9091"));
+        assert!(!same_listener("127.0.0.1:9090", "127.0.0.1:8080"));
+        // A specific non-loopback bind is not every address.
+        assert!(!same_listener("10.0.0.5:9090", "127.0.0.1:9090"));
+        assert!(!same_listener("10.0.0.5:9090", "10.0.0.6:9090"));
+        // A name needing DNS is refused rather than resolved on the hot path.
+        assert!(!same_listener("127.0.0.1:9090", "some-host:9090"));
+        // Malformed input refuses.
+        assert!(!same_listener("9090", "127.0.0.1:9090"));
+        assert!(!same_listener("", ""));
+    }
+
+    /// In front of app-lb's own admin API the gate checks the tier and
+        /// nothing else, because the API behind it scope-checks better than the
+        /// gate can. Without this a namespace-confined token could not reach
+        /// the admin API at all through its hostname — it admits no deployment
+        /// outside its namespace, and the fronting deployment lives in
+        /// `default`.
+        #[tokio::test]
+        async fn the_admin_api_does_its_own_scoping_so_the_gate_does_not_double_check() {
+            let (a, tokens) = with_tokens();
+            let mut g = gate();
+            g.public_paths = vec![scoped("/deployments", PathScope::Admin)];
+
+            let confined = tokens
+                .mint(
+                    NewToken {
+                        name: "ns".into(),
+                        admin: AdminScope::Admin,
+                        namespace: Some("samcurrie".into()),
+                        deployments: Vec::new(),
+                        expires_in_secs: None,
+                    },
+                    now_secs(),
+                )
+                .unwrap()
+                .1;
+
+            // The fronting deployment is in `default`; the token is walled into
+            // `samcurrie`. `admits` says no, and for an ordinary app that is the
+            // right answer.
+            let mut ordinary = bearer("/deployments", &confined);
+            ordinary.fronts_admin_api = false;
+            assert!(matches!(
+                a.decide(&g, "app-lb-admin", "default", &ordinary).await,
+                Decision::Answered(_)
+            ));
+
+            // In front of the admin API it is the wrong question, and is not
+            // asked. The tier still is.
+            let mut fronting = bearer("/deployments", &confined);
+            fronting.fronts_admin_api = true;
+            assert!(matches!(
+                a.decide(&g, "app-lb-admin", "default", &fronting).await,
+                Decision::Allow(_)
+            ));
+
+            // Tier is still enforced here — skipping `admits` is not skipping
+            // authorization, and a `view` token gets no further than before.
+            let low = tokens
+                .mint(
+                    NewToken {
+                        name: "low".into(),
+                        admin: AdminScope::View,
+                        namespace: Some("samcurrie".into()),
+                        deployments: Vec::new(),
+                        expires_in_secs: None,
+                    },
+                    now_secs(),
+                )
+                .unwrap()
+                .1;
+            let mut low_req = bearer("/deployments", &low);
+            low_req.fronts_admin_api = true;
+            let Decision::Answered(r) = a.decide(&g, "app-lb-admin", "default", &low_req).await
+            else {
+                panic!("view does not reach admin, wherever the gate stands");
+            };
+            assert_eq!(r.status, 403);
+            assert!(r.body.contains("'view'"), "{}", r.body);
+        }
+
+        /// The same relaxation on the *ordinary* gate path, which is the one a
+        /// request takes when the route is not in `public_paths` at all. Both
+        /// branches need it: fixing only the scoped one leaves a namespace
+        /// token able to reach a listed path and not an unlisted one, which is
+        /// a distinction nobody asked for and nobody could predict.
+        #[tokio::test]
+        async fn the_ordinary_gate_path_skips_admits_in_front_of_the_admin_api_too() {
+            let (a, tokens) = with_tokens();
+            // No public_paths at all — the shape after `/deployments` is removed
+            // from the list, which is what a hardened admin gate looks like.
+            let g: AuthGate = serde_json::from_str(r#"{"provider":"app-token"}"#).unwrap();
+
+            // Exactly the token that failed: namespaced, admin tier, `*`.
+            // `*` inside a wall means every deployment *there*, so it does not
+            // help across one.
+            let t = tokens
+                .mint(
+                    NewToken {
+                        name: "sam".into(),
+                        admin: AdminScope::Admin,
+                        namespace: Some("samcurrie".into()),
+                        deployments: vec!["*".into()],
+                        expires_in_secs: None,
+                    },
+                    now_secs(),
+                )
+                .unwrap()
+                .1;
+
+            let mut ordinary = bearer("/deployments", &t);
+            ordinary.fronts_admin_api = false;
+            assert!(
+                matches!(a.decide(&g, "app-lb-admin", "default", &ordinary).await, Decision::Answered(_)),
+                "in front of an application the namespace wall is the gate's to enforce",
+            );
+
+            let mut fronting = bearer("/deployments", &t);
+            fronting.fronts_admin_api = true;
+            assert!(
+                matches!(a.decide(&g, "app-lb-admin", "default", &fronting).await, Decision::Allow(_)),
+                "in front of the admin API it is the API's to enforce, per request",
+            );
+        }
+
+        /// A token admitted at a scoped path forwards no identity, exactly as
+        /// one admitted at the gate does: a token is not a person.
+        #[tokio::test]
+        async fn an_admitted_token_still_forwards_nobody() {
+            let (a, tokens) = with_tokens();
+            let mut g = gate();
+            g.public_paths = vec![scoped("/api/", PathScope::None)];
+            let t = admin_token(&tokens, &["web"], AdminScope::None);
+            let Decision::Allow(id) = a.decide(&g, "web", "default", &bearer("/api/x", &t)).await
+            else {
+                panic!("an app-token with `none` satisfies the lowest tier");
+            };
+            assert_eq!(*id, None);
+        }
+    }
+
+    /// A sign-in that mints a credential the upstream can actually check —
+    /// the thing whose absence made operators turn their admin API's own
+    /// authentication off.
+    mod session_tokens {
+        use super::*;
+        use crate::secrets::SecretStore;
+        use crate::tokens::{AdminScope, TokenStore};
+        use std::sync::Arc;
+
+        fn with_tokens() -> (Authenticator, Arc<TokenStore>) {
+            let tokens = Arc::new(TokenStore::new("/nonexistent/tokens.json"));
+            let secrets = Arc::new(SecretStore::new("/nonexistent/secrets.json", None));
+            (
+                Authenticator::new(vec![7u8; 32], secrets, Some(tokens.clone()), None),
+                tokens,
+            )
+        }
+
+        #[test]
+        fn no_scope_means_no_token() {
+            // The default, and the one that matters: a gate in front of an
+            // ordinary web app must not hand the browser a credential for
+            // app-lb's admin API just because somebody signed in.
+            let (a, tokens) = with_tokens();
+            let g = gate();
+            assert!(g.session_scope.is_none(), "unset is the default");
+            let (secret, id) = a.mint_session_token(&g, "web", &identity("a@example.com", None));
+            assert!(secret.is_none() && id.is_none());
+            assert!(tokens.list().is_empty(), "nothing was minted");
+        }
+
+        #[test]
+        fn a_scoped_gate_mints_a_real_token_that_expires_with_the_session() {
+            let (a, tokens) = with_tokens();
+            let mut g = gate();
+            g.session_scope = Some(AdminScope::Admin);
+            g.session_ttl_secs = 3600;
+
+            let (secret, id) = a.mint_session_token(&g, "app-lb-admin", &identity("a@example.com", None));
+            let (secret, id) = (secret.expect("a secret"), id.expect("an id"));
+
+            // It is a real app-token: the store verifies it like any other, and
+            // that is the whole point — the upstream's existing check works.
+            let t = tokens.verify(&secret, now_secs()).expect("the store knows it");
+            assert_eq!(t.id, id);
+            assert_eq!(t.admin, AdminScope::Admin);
+            assert!(t.deployments.iter().any(|d| d == "*"), "fleet-scoped: the dashboard reads every deployment");
+            assert!(t.name.contains("a@example.com"), "named so it can be recognised: {}", t.name);
+
+            // Expiring with the session, not outliving it.
+            let exp = t.expires_at.expect("a session token must expire");
+            assert!(exp > now_secs() && exp <= now_secs() + 3600 + 2, "exp={exp}");
+        }
+
+        #[tokio::test]
+        async fn the_token_rides_the_session_cookie_and_dies_at_logout() {
+            let (a, tokens) = with_tokens();
+            let mut g = gate();
+            g.session_scope = Some(AdminScope::Admin);
+
+            let (secret, id) = a.mint_session_token(&g, "web", &identity("a@example.com", None));
+            let (secret, id) = (secret.unwrap(), id.unwrap());
+            let session = Session {
+                subject: "sub-1".into(),
+                email: "a@example.com".into(),
+                name: None,
+                hosted_domain: None,
+                deployment: "web".into(),
+                policy: g.policy_fingerprint(),
+                exp: now_secs() + 600,
+                token: Some(secret.clone()),
+                token_id: Some(id.clone()),
+            };
+            let cookie = format!("{}={}", g.cookie_name, a.sign(&session.encode()));
+
+            // The proxy reads it off the identity, which is the only way it
+            // reaches the upstream.
+            let Decision::Allow(who) = a.decide(&g, "web", "default", &req("/", vec![cookie.clone()])).await
+            else {
+                panic!("a valid session admits");
+            };
+            assert_eq!(who.as_ref().as_ref().unwrap().session_token.as_deref(), Some(secret.as_str()));
+
+            // Signing out revokes it. Clearing the cookie alone would leave a
+            // live fleet-scoped credential nobody could reach or notice.
+            let _ = a.decide(&g, "web", "default", &req(&g.logout_path(), vec![cookie])).await;
+            assert!(tokens.verify(&secret, now_secs()).is_none(), "revoked");
+            assert!(tokens.get(&id).is_none());
+        }
     }
 
     #[tokio::test]

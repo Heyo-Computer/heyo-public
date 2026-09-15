@@ -1498,13 +1498,27 @@ function tokenScopeNote() {
   if (!el) return;
   const ns = $("tk-ns").value.trim();
   const scope = $("tk-scope").value;
-  el.textContent = ns
+  const where = ns
     ? (scope
        ? `Reaches ${scope} only, and only while it is in ${ns}. Nothing outside ${ns} — creating there is refused too.`
        : `Reaches everything in ${ns}, including deployments made later, and nothing outside it.`)
     : (scope
        ? `Reaches ${scope} in any namespace.`
        : "Fleet-wide: every deployment in every namespace.");
+
+  // The `deployments` axis says *which* deployments; `admin` says whether the
+  // admin API is reachable at all — and they are easy to confuse, because
+  // "all deployments" sounds like it covers everything. It does not: a token
+  // with admin `none` and every deployment in scope still cannot call a single
+  // admin route, which is the shape somebody gets when they mint one here to
+  // use with heyctl and leave the first field alone.
+  const admin = $("tk-admin").value;
+  const api = admin === "none"
+    ? " Admin API: nothing — this token gets an application past its deployment's gate, and heyctl will refuse it."
+    : admin === "view"
+    ? " Admin API: metrics, disks and feeds only. heyctl can read those and nothing else."
+    : " Admin API: everything, including deleting deployments and running commands in their VMs.";
+  el.textContent = where + api;
 }
 
 function openNewToken() {
@@ -1541,7 +1555,7 @@ function openNewToken() {
   );
   // The form is in the DOM once openModal returns, so the note can be wired and
   // shown for the default selection rather than only after the first keystroke.
-  ["tk-ns", "tk-scope"].forEach(id => {
+  ["tk-ns", "tk-scope", "tk-admin"].forEach(id => {
     const el = $(id);
     if (el) el.addEventListener("input", tokenScopeNote);
   });
@@ -1567,6 +1581,25 @@ function showMintedToken(t) {
      </div>
      <input id="tk-secret" class="mono" readonly value="${esc(t.token)}"
             style="width:100%" onclick="this.select()">
+     ${t.admin === "none"
+        ? `<div class="note" style="margin-top:10px">
+             This token has no admin scope, so it reaches no admin route and
+             <strong>heyctl will refuse it</strong> — that is what
+             <em>the server knows this token but will not let it list deployments</em>
+             means. It is the right shape for an application getting past its own
+             deployment's gate. For a CLI credential, mint another with
+             <strong>admin</strong>.
+           </div>`
+        : `<div class="note" style="margin-top:10px">
+             Use it from the CLI — this creates a context and verifies it in one step:
+             <input class="mono" readonly style="width:100%;margin-top:6px"
+                    onclick="this.select()"
+                    value="heyctl login --server ${esc(location.origin)} --token ${esc(t.token)}">
+             <div style="margin-top:6px">Reaching this hostname with a token also needs
+               <code>app-token</code> in this deployment's <code>auth.provider</code>;
+               without it the sign-in gate answers first and heyctl reports that the
+               server did not recognise the token.</div>
+           </div>`}
      <div class="note" style="margin-top:10px">
        Present it as <code>Authorization: Bearer &lt;token&gt;</code>. On the shell
        WebSocket only, <code>?app_token=</code> also works — that exists because a

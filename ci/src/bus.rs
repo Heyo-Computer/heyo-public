@@ -395,21 +395,51 @@ impl Bus {
         }))
     }
 
-    /// Publish a state transition for dashboards to tail. Best-effort: an event
-    /// that does not land must never fail the job it describes, because the
-    /// database already holds the authoritative state.
-    pub async fn publish_event(&self, run_id: &str, job_key: &str, event: &serde_json::Value) {
-        let (Ok(()), Ok(())) = (check_token(run_id), check_token(job_key)) else {
-            tracing::debug!("not publishing an event for un-tokenizable ids");
-            return;
-        };
-        let subject = format!("{}.evt.{run_id}.{job_key}", self.prefix);
-        let Ok(payload) = serde_json::to_vec(event) else {
-            return;
-        };
-        if let Err(e) = self.js.publish(subject, payload.into()).await {
-            tracing::debug!("event publish failed (state is still in Postgres): {e}");
-        }
+    /// Publish one durable outbox row and wait for the JetStream PubAck.
+    async fn publish_outbox(&self, event: &crate::store::OutboxEvent) -> Result<(), BusError> {
+        let subject = format!("{}.evt.{}", self.prefix, event.subject);
+        let payload = serde_json::to_vec(&event.payload).map_err(|e| BusError::Encode(e.to_string()))?;
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("Nats-Msg-Id", event.id.to_string());
+        self.js.publish_with_headers(subject.clone(), headers, payload.into()).await
+            .map_err(|e| BusError::Publish { subject: subject.clone(), reason: e.to_string() })?
+            .await.map_err(|e| BusError::Publish { subject, reason: e.to_string() })?;
+        Ok(())
+    }
+
+    /// Start the only event publisher. Rows survive process and NATS restarts;
+    /// a crash after PubAck but before the DB update republishes the same stable
+    /// message id, so JetStream deduplication makes delivery effectively once
+    /// within its duplicate window. Consumers must still be idempotent.
+    pub fn spawn_outbox_publisher(self: std::sync::Arc<Self>, store: crate::store::Store) {
+        tokio::spawn(async move {
+            loop {
+                match store.next_outbox_event().await {
+                    Ok(Some(event)) => match self.publish_outbox(&event).await {
+                        Ok(()) => {
+                            if let Err(e) = store.mark_outbox_published(event.id).await {
+                                tracing::warn!(event_id=%event.id, "PubAck received but outbox update failed: {e}");
+                                // Avoid a tight duplicate-publish loop while Postgres is
+                                // recovering. Nats-Msg-Id still deduplicates the retry.
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(event_id=%event.id, "event publish failed; will retry: {e}");
+                            if let Err(mark_error) = store.mark_outbox_failed(event.id, &e.to_string()).await {
+                                tracing::warn!(event_id=%event.id, "could not record outbox publish failure: {mark_error}");
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    },
+                    Ok(None) => tokio::time::sleep(Duration::from_millis(250)).await,
+                    Err(e) => {
+                        tracing::warn!("reading event outbox failed; will retry: {e}");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -777,6 +807,27 @@ mod tests {
         cleanup(&bus).await;
     }
 
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_NATS_URL"]
+    async fn an_outbox_retry_after_puback_is_deduplicated() {
+        let prefix = test_prefix();
+        let bus = test_bus(&prefix).await;
+        let event = crate::store::OutboxEvent {
+            id: uuid::Uuid::new_v4(),
+            subject: "run1.build".into(),
+            payload: serde_json::json!({"version": 1, "status": "running"}),
+        };
+
+        bus.publish_outbox(&event).await.unwrap();
+        // Models PubAck succeeding and the following Postgres mark failing.
+        bus.publish_outbox(&event).await.unwrap();
+
+        let mut stream = bus.js.get_stream(bus.events_stream()).await.unwrap();
+        assert_eq!(stream.info().await.unwrap().state.messages, 1,
+            "the stable Nats-Msg-Id must collapse a post-PubAck retry");
+        cleanup(&bus).await;
+    }
+
     /// A message that is never acked comes back, which is what makes a
     /// dispatcher crash recoverable — and the reason `ack_wait` must exceed the
     /// job timeout.
@@ -835,25 +886,6 @@ mod tests {
         cleanup(&bus).await;
     }
 
-    #[tokio::test]
-    #[ignore = "needs a NATS with JetStream"]
-    async fn events_are_fan_out_and_survive_being_read() {
-        let prefix = test_prefix();
-        let bus = test_bus(&prefix).await;
-        bus.publish_event("run1", "build", &serde_json::json!({"status": "running"}))
-            .await;
-
-        let mut stream = bus.js.get_stream(bus.events_stream()).await.unwrap();
-        assert_eq!(stream.info().await.unwrap().state.messages, 1);
-        // Limits retention, so reading does not consume: the message is still
-        // there for the next dashboard to tail.
-        assert_eq!(
-            stream.info().await.unwrap().state.messages,
-            1,
-            "an event must not be consumed by being read"
-        );
-        cleanup(&bus).await;
-    }
 }
 
 #[cfg(test)]

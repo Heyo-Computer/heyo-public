@@ -26,16 +26,26 @@
  * stopped sandbox keeps its disk and starts again with its files, which is the
  * cheap way to park a conversation that may resume. TTL expiry reaps only a
  * *running* sandbox, so parking one is also how you stop the clock.
+ *
+ * # Why `heyo_capacity` is in this module
+ *
+ * It is the one tool here whose name does not begin `sandbox_`, because it
+ * answers a question about the fleet rather than about a sandbox: which daemons
+ * are online and what they have room for. It lives here anyway because it hits
+ * *cloud*, and `buildTools` gates this whole group on a usable cloud credential.
+ * Listing it beside the app-lb tools would advertise it on a fleet-operations
+ * instance that has no cloud key and could never answer it.
  */
 
 import { z } from "zod";
+import { num , DESTRUCTIVE_PREFIX } from "./schema.js";
 import type { Clients } from "../clients/index.js";
 import { settle } from "../clients/index.js";
 import { json, report, section } from "../format.js";
 import { ServiceError } from "../http.js";
 import type { Tool } from "./diagnose.js";
 
-const DESTRUCTIVE = "DESTRUCTIVE. ";
+const DESTRUCTIVE = DESTRUCTIVE_PREFIX;
 
 /**
  * The most content a write may carry inline, in bytes before encoding.
@@ -130,15 +140,15 @@ export function sandboxTools(clients: Clients): Tool[] {
         start_command: z.string().optional(),
         working_directory: z.string().optional(),
         env_vars: z.record(z.string()).optional(),
-        open_ports: z.array(z.number()).optional(),
+        open_ports: z.array(num()).optional(),
         setup_hooks: z.array(z.string()).optional(),
-        ttl_seconds: z.number().optional().describe("0 means unlimited, if the plan allows"),
-        disk_size_gb: z.number().optional(),
+        ttl_seconds: num().optional().describe("0 means unlimited, if the plan allows"),
+        disk_size_gb: num().optional(),
         wait_seconds: z
           .number()
           .optional()
           .describe("how long to wait for it to leave 'provisioning'; default 120, 0 returns at once"),
-        retries: z.number().optional().describe("capacity (503) retries; default 3, 0 disables"),
+        retries: num().optional().describe("capacity (503) retries; default 3, 0 disables"),
       },
       handler: async (a) => {
         // The SDK fills these in before it posts, and a tool that did not would
@@ -410,7 +420,7 @@ export function sandboxTools(clients: Clients): Tool[] {
         "unlimited where the plan allows it.\n\n" +
         "Only a *running* sandbox is reaped, so a stopped one is not on this clock at " +
         "all — sandbox_stop is the other way to keep one indefinitely.",
-      schema: { id: z.string(), ttl_seconds: z.number() },
+      schema: { id: z.string(), ttl_seconds: num() },
       handler: async (a) =>
         json(
           await clients.cloud({

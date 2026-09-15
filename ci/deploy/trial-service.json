@@ -1,0 +1,47 @@
+{
+  "id": "ci-us3-trial",
+  "user_id": "REPLACE_WITH_SERVICE_OWNER",
+  "account_id": "REPLACE_WITH_SERVICE_ACCOUNT",
+  "vm": {
+    "driver": "firecracker",
+    "image": "REPLACE_WITH_LINUX_RUNTIME_IMAGE",
+    "port": 9500,
+    "size_class": "small",
+    "ttl_seconds": 0,
+    "working_directory": "/workspace",
+    "start_command": "setsid nohup bash /workspace/start.sh </dev/null >/workspace/ci-state.log 2>&1 &",
+    "env_vars": {
+      "CI_NAME": "ci-us3-trial",
+      "CI_LISTEN_ADDR": "0.0.0.0:9500",
+      "CI_PUBLIC_URL": "https://ci.us3.heyo.work",
+      "CI_HEYO_BASE_URL": "https://stage.heyo.computer/cloud",
+      "CI_NETWORK": "REPLACE_WITH_NETWORK_ID",
+      "CI_ADMIN_EMAILS": "REPLACE_WITH_ADMIN_EMAIL",
+      "CI_NATS_URL": "nats://127.0.0.1:4222",
+      "CI_NATS_SUBJECT_PREFIX": "ci_us3_trial",
+      "CI_LOG_DIR": "/workspace/ci-state/logs",
+      "CI_WORKSPACE_DIR": "/workspace/ci-state/workspaces",
+      "CI_ARTIFACT_SINK": "disk",
+      "CI_ARTIFACT_DIR": "/workspace/ci-state/artifacts",
+      "CI_REQUIRE_REPO_TOKEN": "true"
+    },
+    "env_from": [
+      { "secret": "ci-us3-trial", "key": "database-url", "as": "CI_DATABASE_URL" },
+      { "secret": "ci-us3-trial", "key": "cloud-api-key", "as": "CI_HEYO_API_KEY" },
+      { "secret": "ci-us3-trial", "key": "webhook-secret", "as": "CI_WEBHOOK_SECRET" },
+      { "secret": "ci-us3-trial", "key": "native-runner-secret", "as": "CI_NATIVE_RUNNER_SECRET" },
+      { "secret": "ci-us3-trial", "key": "nats-token", "as": "CI_NATS_TOKEN" }
+    ]
+  },
+  "routes": [],
+  "health": { "path": "/healthz", "timeout_secs": 5 },
+  "deploy": {
+    "name": "ci-us3-trial",
+    "async": true,
+    "region": "US",
+    "placement_pool": "platform",
+    "health_timeout_seconds": 600,
+    "retire_previous": false,
+    "delete_previous": false
+  }
+}

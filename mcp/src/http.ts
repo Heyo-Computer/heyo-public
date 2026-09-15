@@ -16,7 +16,7 @@
  */
 
 import type { Config, ServiceConfig } from "./config.js";
-import { CI_GATE_HINT, CLOUD_CAPACITY_HINT } from "./config.js";
+import { CI_GATE_HINT, CLOUD_CAPACITY_HINT, CLOUD_KEY_HINT, isApplbToken } from "./config.js";
 
 export class ServiceError extends Error {
   constructor(
@@ -51,6 +51,33 @@ export interface RequestOptions {
   path: string;
   query?: Record<string, string | number | undefined>;
   body?: unknown;
+  /**
+   * Sent verbatim instead of `body`, for an API that takes bytes rather than
+   * JSON. The artifact store's `PUT /blobs/{digest}` is the case: the body is
+   * the blob, and JSON-encoding it would both corrupt it and change its digest
+   * — which is its name.
+   */
+  rawBody?: Uint8Array | string;
+  /** Content type for `rawBody`. Ignored when `body` is used, which is JSON. */
+  contentType?: string;
+  /**
+   * Return the response body as text rather than parsing it.
+   *
+   * For the endpoints whose success answer is not JSON and must not be guessed
+   * at — `PUT /manifests` answers JSON, but `GET /manifests/{ref}` answers the
+   * manifest document and `GET /tags/{name}` answers a bare digest.
+   */
+  expectText?: boolean;
+  /**
+   * A sentence attached to any error from this call, on top of whatever the
+   * status alone implies.
+   *
+   * For a call the *user* did not make. Namespace discovery is the case: it
+   * runs inside the first app-lb tool of the process, against cloud, on a path
+   * nobody asked for, so its failures need to say what they were for before
+   * they say what went wrong.
+   */
+  hint?: string;
 }
 
 function withQuery(path: string, query?: RequestOptions["query"]): string {
@@ -72,7 +99,14 @@ export async function request(
   const path = withQuery(opts.path, opts.query);
   const headers: Record<string, string> = { accept: "application/json" };
   if (cfg.auth) headers.authorization = cfg.auth;
+  // Before the per-request ones, so a service that carries a second credential
+  // cannot have it silently dropped, and after `authorization`, which is the
+  // one header a service config never puts here. See `ServiceConfig.headers`.
+  Object.assign(headers, cfg.headers ?? {});
   if (opts.body !== undefined) headers["content-type"] = "application/json";
+  if (opts.rawBody !== undefined) {
+    headers["content-type"] = opts.contentType ?? "application/octet-stream";
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -81,7 +115,12 @@ export async function request(
     res = await fetch(`${cfg.baseUrl}${path}`, {
       method: opts.method ?? "GET",
       headers,
-      body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+      body:
+        opts.rawBody !== undefined
+          ? opts.rawBody
+          : opts.body === undefined
+            ? undefined
+            : JSON.stringify(opts.body),
       signal: controller.signal,
     });
   } catch (e) {
@@ -102,15 +141,27 @@ export async function request(
     // more often than it is a bad token, and a 503 from cloud is region
     // capacity rather than a fault. Attaching the sentence here means every
     // call site carries it, including the ones that only pass a body through.
-    const hint =
+    const status =
       service === "ci" && res.status === 401
         ? CI_GATE_HINT
         : service === "heyo cloud" && res.status === 503
           ? CLOUD_CAPACITY_HINT
-          : undefined;
+          : // A cloud 401 or 403 with an app-lb token is not a bad password, it
+            // is the wrong *kind* of credential, and the difference decides
+            // whether retrying is pointless. Checked here rather than only at
+            // config load because a hosted instance holds no key of its own and
+            // takes the caller's — see `withForwardedAuth`, which can install
+            // this credential long after `credentialFaults` has run.
+            (res.status === 401 || res.status === 403) &&
+              service === "heyo cloud" &&
+              isApplbToken(cfg.auth ?? "")
+            ? CLOUD_KEY_HINT
+            : undefined;
+    const hint = [opts.hint, status].filter(Boolean).join("\n\n") || undefined;
     throw new ServiceError(service, res.status, path, text, hint);
   }
   if (!text.trim()) return null;
+  if (opts.expectText) return text;
   try {
     return JSON.parse(text);
   } catch {

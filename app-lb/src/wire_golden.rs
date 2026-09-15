@@ -90,6 +90,7 @@ fn vm_spec() -> DeploymentSpec {
                 strip_prefix: false,
             },
         ],
+        maintenance: false,
         vm: Some(crate::config::VmSpec {
             env_from: vec![],
             workspace_archive: None,
@@ -179,7 +180,19 @@ fn vm_spec() -> DeploymentSpec {
             }),
             allowed_domains: vec!["example.com".into()],
             allowed_emails: vec!["someone@other.example".into()],
-            public_paths: vec!["/healthz".into()],
+            // Set here because this fixture is where a client author learns the
+            // field exists; most gates leave it unset and mint nothing.
+            session_scope: Some(crate::tokens::AdminScope::Admin),
+            // Both spellings, because the golden is where a client author
+            // learns the shape: one path genuinely open, one outside the
+            // sign-in gate but still requiring a scope.
+            public_paths: vec![
+                crate::config::PublicPath::public("/healthz"),
+                crate::config::PublicPath {
+                    path: "/api/".into(),
+                    scope: crate::config::PathScope::View,
+                },
+            ],
             base_path: "/__applb/auth".into(),
             session_ttl_secs: 43200,
             cookie_name: "applb_session".into(),
@@ -187,6 +200,11 @@ fn vm_spec() -> DeploymentSpec {
             redirect_url: Some("https://sandbox.example.com/__applb/auth/callback".into()),
             forward_identity: true,
             jwt: None,
+            // This gate spells its identity out inline; the inherited shape is a
+            // separate golden (`auth_provider` / `inherited_gate`). Unset here,
+            // and `skip_serializing_if` keeps it out of the wire entirely, so
+            // this fixture is byte-for-byte what it was before the field existed.
+            provider_ref: None,
         }),
     }
 }
@@ -219,6 +237,7 @@ fn site_spec() -> DeploymentSpec {
         }],
         vm: None,
         scaling: crate::config::ScalingPolicy::default(),
+        maintenance: false,
         health: crate::config::HealthCheck::default(),
         upstreams: vec![],
         discovery: None,
@@ -274,6 +293,7 @@ fn static_spec() -> DeploymentSpec {
         }],
         vm: None,
         scaling: crate::config::ScalingPolicy::default(),
+        maintenance: false,
         health: crate::config::HealthCheck::default(),
         upstreams: vec!["10.0.0.4:8080".into(), "10.0.0.5:8080".into()],
         discovery: Some(crate::config::DiscoverySpec {
@@ -310,6 +330,7 @@ fn jwt_spec() -> DeploymentSpec {
         }),
         allowed_domains: vec!["example.com".into()],
         allowed_emails: vec![],
+        session_scope: None,
         public_paths: vec!["/healthz".into()],
         base_path: "/__applb/auth".into(),
         session_ttl_secs: 43200,
@@ -343,7 +364,13 @@ fn jwt_spec() -> DeploymentSpec {
             name_claim: "name".into(),
             leeway_secs: Some(30),
             cookie: Some("heyo_access_token".into()),
+            login_endpoint: None,
+            // A token-less browser at this gate is bounced here to sign in and
+            // redirected back; the cookie above carries the token on the return.
+            login_url: Some("https://auth.example.com/login".into()),
+            login_redirect_param: None,
         }),
+        provider_ref: None,
     });
     s
 }
@@ -477,6 +504,88 @@ fn deployment_status_is_stable() {
             },
         );
     }
+}
+
+/// The auth-provider objects and the shape of a gate that inherits one, so a
+/// client author learns both the reusable identity object and how a deployment
+/// references it. The generated deployment-spec schema carries the `provider_ref`
+/// field; this carries the *object* and a worked inherited gate.
+#[test]
+fn auth_provider_objects_are_stable() {
+    // A Google provider: the identity half of a gate, named and namespaced.
+    let google = crate::config::AuthProviderSpec {
+        name: "corp-google".into(),
+        namespace: "team-a".into(),
+        description: Some("Workspace sign-in for team-a's apps".into()),
+        created_at: 1_722_400_000,
+        provider: crate::config::Providers::default(),
+        client_id: Some("1234.apps.googleusercontent.com".into()),
+        client_secret: Some(crate::secrets::SecretRef {
+            namespace: None,
+            secret: "google-oauth".into(),
+            key: "client_secret".into(),
+            username: None,
+        }),
+        allowed_domains: vec!["example.com".into()],
+        allowed_emails: vec![],
+        jwt: None,
+        cookie_domain: Some(".example.com".into()),
+    };
+    google.validate().expect("the google provider fixture must be valid");
+    golden("auth-provider-google", &google);
+
+    // The Heyo auth API as a provider — what the `heyo` preset materialises from
+    // a secret alone. Built through the same constructor the handler uses, so the
+    // golden and the preset cannot drift.
+    let heyo = crate::config::AuthProviderSpec {
+        name: "heyo".into(),
+        namespace: "team-a".into(),
+        description: None,
+        created_at: 1_722_400_000,
+        provider: crate::config::Providers::one(crate::config::AuthProvider::Jwt),
+        client_id: None,
+        client_secret: None,
+        allowed_domains: vec![],
+        allowed_emails: vec![],
+        jwt: Some(crate::config::JwtSpec::heyo(crate::secrets::SecretRef {
+            namespace: None,
+            secret: "heyo-auth".into(),
+            key: "jwt_secret".into(),
+            username: None,
+        })),
+        cookie_domain: None,
+    };
+    heyo.validate().expect("the heyo provider fixture must be valid");
+    golden("auth-provider-heyo", &heyo);
+
+    // A deployment whose gate inherits a provider: only the route-scoped fields
+    // are its own, and `provider_ref` names the object above.
+    let mut inheriting = vm_spec();
+    inheriting.id = "team-a-app".into();
+    inheriting.namespace = "team-a".into();
+    inheriting.auth = Some(crate::config::AuthGate {
+        provider_ref: Some("corp-google".into()),
+        // Everything identity-related is unset: the provider supplies it.
+        provider: crate::config::Providers::default(),
+        client_id: None,
+        client_secret: None,
+        allowed_domains: vec![],
+        allowed_emails: vec![],
+        jwt: None,
+        cookie_domain: None,
+        // Route-scoped, this deployment's own.
+        session_scope: None,
+        public_paths: vec![crate::config::PublicPath::public("/healthz")],
+        base_path: "/__applb/auth".into(),
+        session_ttl_secs: 43200,
+        cookie_name: "applb_session".into(),
+        redirect_url: None,
+        forward_identity: true,
+    });
+    inheriting
+        .validate()
+        .expect("the inheriting deployment fixture must be valid on its own");
+    golden("deployment-inherited-gate", &inheriting);
 }
 
 #[test]
@@ -645,6 +754,13 @@ fn job_records_are_stable() {
         status: JobStatus::Succeeded,
         started_at: 1_722_400_000,
         finished_at: Some(1_722_400_123),
+        operation_id: None,
+        target_namespace: None,
+        intent_fingerprint: None,
+        config_fingerprint: None,
+        source_spec_fingerprint: None,
+        readiness_verified: None,
+        reconciliation_required: false,
         repo: None,
         git_ref: None,
         commit: None,

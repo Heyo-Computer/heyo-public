@@ -192,6 +192,10 @@ struct AdminState {
     /// mention are not in here — `GET /namespaces` reports the union, and
     /// `declared` on each row is what tells them apart.
     namespaces: Arc<crate::namespaces::NamespaceStore>,
+    /// Reusable, namespace-scoped auth providers. A deployment inherits one with
+    /// `auth.provider_ref`; the proxy resolves it live. Managed through this API,
+    /// walled by namespace exactly as `secrets` is.
+    auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
     /// App-tokens. Verified on every gated request, so reads are lock-free.
     tokens: Arc<crate::tokens::TokenStore>,
     /// Resolves bearers the Heyo auth service issued. `None` when
@@ -228,6 +232,10 @@ struct AdminState {
     /// The per-namespace event feed, read by `GET /feeds/:namespace` and
     /// written by the deployment lifecycle handlers.
     feed: Arc<crate::feed::Feed>,
+    /// Base domain a hostless deployment's `<id>.<base>` route is built under,
+    /// already resolved from config (explicit, else the first wildcard). `None`
+    /// disables host synthesis. See [`assume_host`].
+    deploy_base_domain: Option<Arc<str>>,
 }
 
 impl AdminState {
@@ -263,6 +271,7 @@ impl AdminApi {
         secrets: Arc<SecretStore>,
         workflows: Arc<crate::workflows::WorkflowStore>,
         namespaces: Arc<crate::namespaces::NamespaceStore>,
+        auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
         tokens: Arc<crate::tokens::TokenStore>,
         jobs: Arc<Jobs>,
         obs: Option<Arc<crate::obs::Stats>>,
@@ -272,6 +281,7 @@ impl AdminApi {
         public_url: PublicUrl,
         feed: Arc<crate::feed::Feed>,
         public_ips: &[std::net::IpAddr],
+        deploy_base_domain: Option<String>,
     ) -> Self {
         let ingress = Arc::new(Ingress::from_ips(public_ips));
         // Render the display name into the page once; the placeholder appears in
@@ -323,6 +333,7 @@ impl AdminApi {
                 ingress,
                 workflows,
                 namespaces,
+                auth_providers,
                 tokens,
                 jobs,
                 obs,
@@ -336,6 +347,10 @@ impl AdminApi {
                 disks_html,
                 public_url,
                 feed,
+                deploy_base_domain: deploy_base_domain
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(Arc::from),
             },
         }
     }
@@ -468,6 +483,23 @@ impl Caller {
             Self::Federated(_) => None,
         }
     }
+
+    /// The single namespace this caller is confined to, when it reaches exactly
+    /// one — the namespace a deployment spec may omit and have filled in. A
+    /// namespace token always has exactly one; a federated grant may name
+    /// several, so it qualifies only when it names one. An unconfined or
+    /// fleet caller has no single namespace to assume, so it gets `None` and the
+    /// spec keeps whatever it said (`default` when it said nothing).
+    fn sole_namespace(&self) -> Option<&str> {
+        match self {
+            Self::Ungated | Self::Operator => None,
+            Self::Token(t) => t.namespace.as_deref(),
+            Self::Federated(g) if !g.fleet && g.namespaces.len() == 1 => {
+                g.namespaces.keys().next().map(String::as_str)
+            }
+            Self::Federated(_) => None,
+        }
+    }
 }
 
 /// The deployment ids `caller` may see, or `None` for all of them.
@@ -505,15 +537,36 @@ fn narrows_itself(matched: &str) -> bool {
     // `/namespaces` narrows through `may_view`, exactly as `/metrics` does — it
     // is the deployment directory regrouped, so refusing a scoped token here
     // while handing it the directory would be a wall with a door beside it.
+    // `/whoami` is the extreme case of narrowing: it answers only about the
+    // credential presented, so there is nothing there for a scoped token to
+    // reach past. Refusing it as "fleet-wide" would deny a caller the one fact
+    // it already holds, which is how a token's own scope became undiscoverable
+    // without a *second*, wider credential to list tokens with.
     matches!(
         matched,
-        "/" | "/metrics" | "/dashboard" | "/security" | "/siem" | "/ingress" | "/namespaces"
+        "/" | "/metrics"
+            | "/dashboard"
+            | "/security"
+            | "/siem"
+            | "/ingress"
+            | "/namespaces"
+            | "/auth-providers"
+            | "/whoami"
     )
 }
 
 /// The secret store's routes, which are walled by namespace in their handlers.
 fn is_secret_route(matched: &str) -> bool {
     matches!(matched, "/secrets" | "/secrets/:id")
+}
+
+/// The auth-provider routes, walled by namespace in their handlers for the same
+/// reason the secret ones are: for `POST /auth-providers` the namespace is in
+/// the body, and for the item routes it is a path parameter the gate does not
+/// read, so the handler checks reach rather than the gate. `GET /auth-providers`
+/// is handled by `narrows_itself` instead, like `/secrets` on `GET`.
+fn is_auth_provider_route(matched: &str) -> bool {
+    matches!(matched, "/auth-providers" | "/auth-providers/:namespace/:name")
 }
 
 /// The deployment a matched route acts on, if it acts on one.
@@ -710,6 +763,10 @@ fn decide_access(
             // reach — the gate cannot, because for `/secrets` the namespace is
             // in the body or the query, not the path.
             None if is_secret_route(matched) && caller.confined() => {}
+            // Auth providers, walled the same way: the `:namespace` is a path
+            // parameter the gate does not read (and the body names it on
+            // `POST`), so the handler measures the caller's reach against it.
+            None if is_auth_provider_route(matched) && caller.confined() => {}
             None if !narrows_itself(matched) && !caller.covers_fleet() => {
                 return Verdict::Forbidden(
                     "this token is scoped to specific deployments, so it cannot use a \
@@ -881,6 +938,22 @@ async fn require_view_auth(State(state): State<AdminState>, req: Request, next: 
 
 async fn require_crud_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
     authorize(state, req, next, crate::tokens::AdminScope::Admin).await
+}
+
+/// The lowest bar there is: a credential this server recognises, and no tier.
+///
+/// Only `/whoami` uses it, and the tier is `None` rather than `View` on
+/// purpose. A token minted with `admin: none` — the shape an application is
+/// handed to get past its own deployment's gate — is precisely the one whose
+/// holder cannot work out why the admin API refuses them, so it is the one that
+/// most needs to be able to ask. Requiring `view` here would leave exactly that
+/// caller unable to discover the thing that would explain their 403s.
+async fn require_any_credential(
+    State(state): State<AdminState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    authorize(state, req, next, crate::tokens::AdminScope::None).await
 }
 
 #[derive(Serialize)]
@@ -2144,6 +2217,270 @@ async fn delete_namespace(
     }
 }
 
+// ---- auth providers -----------------------------------------------------
+
+/// Whether `caller` may read (`admin == false`) or change (`admin == true`) the
+/// auth providers of `ns`. Walled exactly as secrets are: an ungated or operator
+/// caller may do anything; a confined credential is measured against its reach.
+fn may_use_auth_providers(caller: Option<&Caller>, ns: &str, admin: bool) -> Result<(), Response> {
+    let Some(caller) = caller else {
+        return Ok(());
+    };
+    if !caller.reaches_namespace(ns) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!("this credential cannot reach the \"{ns}\" namespace's auth providers"),
+        )
+        .into_response());
+    }
+    if admin && !caller.satisfies_in(crate::tokens::AdminScope::Admin, Some(ns)) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!(
+                "this credential may only view the \"{ns}\" namespace, not change its auth providers"
+            ),
+        )
+        .into_response());
+    }
+    Ok(())
+}
+
+/// Deployments in `ns` whose sign-in gate inherits the provider `name`. Used to
+/// keep a delete from pulling a provider out from under a live gate — which,
+/// because resolution fails closed, would take those deployments offline.
+fn auth_provider_users(state: &AdminState, ns: &str, name: &str) -> Vec<String> {
+    let mut users: Vec<String> = state
+        .registry
+        .deployments()
+        .values()
+        .filter(|d| {
+            d.spec.namespace == ns
+                && d.spec.auth.as_ref().and_then(|g| g.provider_ref.as_deref()) == Some(name)
+        })
+        .map(|d| d.spec.id.clone())
+        .collect();
+    users.sort();
+    users
+}
+
+/// The body of `POST /auth-providers`: an [`AuthProviderSpec`] plus two
+/// request-only conveniences that never reach the store.
+///
+/// `preset` expands a known template — currently only `"heyo"`, which builds the
+/// JWT policy for the Heyo auth API from `secret` alone — so "the Heyo app works
+/// out of the box once the secret is provided" is one POST rather than a dozen
+/// fields nobody should have to know.
+#[derive(Deserialize)]
+struct CreateProviderBody {
+    #[serde(flatten)]
+    spec: crate::config::AuthProviderSpec,
+    /// Expand a provider template before validation. Request-only.
+    #[serde(default)]
+    preset: Option<String>,
+    /// The signing secret a preset needs. Request-only.
+    #[serde(default)]
+    secret: Option<crate::secrets::SecretRef>,
+}
+
+/// `GET /auth-providers[?namespace=]` — the providers this caller may see.
+///
+/// View tier, and it narrows itself: with a namespace it answers only that one
+/// (refusing a caller that cannot reach it), and without, only the namespaces
+/// the caller reaches — the same shape as `list_secrets`.
+async fn list_auth_providers(
+    State(state): State<AdminState>,
+    Query(q): Query<SecretQuery>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let caller = caller.as_deref();
+    if let Some(ns) = q.namespace.as_deref().map(str::trim).filter(|ns| !ns.is_empty()) {
+        if let Err(refused) = may_use_auth_providers(caller, ns, false) {
+            return refused;
+        }
+        return Json(state.auth_providers.list(ns)).into_response();
+    }
+    let visible: Vec<_> = state
+        .auth_providers
+        .list_all()
+        .into_iter()
+        .filter(|p| caller.is_none_or(|c| c.reaches_namespace(&p.namespace)))
+        .collect();
+    Json(visible).into_response()
+}
+
+/// `POST /auth-providers` — declare or replace one in the namespace the body
+/// names (`default` when it names none). A confined caller must reach that
+/// namespace as an admin, exactly as it must to write a secret there.
+async fn create_auth_provider(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+    Json(body): Json<CreateProviderBody>,
+) -> Response {
+    let mut spec = body.spec;
+
+    // Apply the preset before validation, so what is stored and what is checked
+    // are the fully materialised provider — no preset expansion lives on the hot
+    // path or in the state file.
+    if let Some(preset) = body.preset.as_deref() {
+        match preset {
+            "heyo" => {
+                let Some(secret) = body.secret else {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "the \"heyo\" preset needs a `secret` reference to the JWT signing key, \
+                         e.g. {\"secret\": \"heyo-auth\", \"key\": \"jwt_secret\"}",
+                    )
+                    .into_response();
+                };
+                spec.provider = crate::config::Providers::one(crate::config::AuthProvider::Jwt);
+                spec.jwt = Some(crate::config::JwtSpec::heyo(secret));
+            }
+            other => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    crate::config::SpecError::UnknownAuthPreset(other.to_string()).to_string(),
+                )
+                .into_response();
+            }
+        }
+    }
+
+    let ns = spec.namespace.clone();
+    if let Err(refused) = may_use_auth_providers(caller.as_deref(), &ns, true) {
+        return refused;
+    }
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    // Stamped here, never from the body; re-declaring keeps the original clock so
+    // `apply` is idempotent.
+    let existing = state.auth_providers.get(&ns, &spec.name);
+    spec.created_at = match &existing {
+        Some(p) => p.created_at,
+        None => now_secs(),
+    };
+    let existed = existing.is_some();
+    match state.auth_providers.upsert(spec) {
+        Ok(p) => (
+            if existed { StatusCode::OK } else { StatusCode::CREATED },
+            Json(p),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "auth provider write failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not persist the auth provider",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `GET /auth-providers/:namespace/:name`. The client secret is a reference,
+/// never a value, so the object is safe to echo — the same reason a deployment
+/// spec is.
+async fn get_auth_provider(
+    State(state): State<AdminState>,
+    Path((namespace, name)): Path<(String, String)>,
+    caller: Option<axum::Extension<Caller>>,
+) -> Response {
+    if let Err(refused) = may_use_auth_providers(caller.as_deref(), &namespace, false) {
+        return refused;
+    }
+    match state.auth_providers.get(&namespace, &name) {
+        Some(p) => Json(p).into_response(),
+        None => err(
+            StatusCode::NOT_FOUND,
+            format!("no auth provider {name:?} in namespace {namespace:?}"),
+        )
+        .into_response(),
+    }
+}
+
+/// `DELETE /auth-providers/:namespace/:name`.
+///
+/// Refused while a deployment's gate still inherits it: resolution fails closed,
+/// so removing a referenced provider would take those deployments offline. The
+/// message names them, exactly as deleting a still-referenced secret does.
+async fn delete_auth_provider(
+    State(state): State<AdminState>,
+    Path((namespace, name)): Path<(String, String)>,
+    caller: Option<axum::Extension<Caller>>,
+) -> Response {
+    if let Err(refused) = may_use_auth_providers(caller.as_deref(), &namespace, true) {
+        return refused;
+    }
+    if state.auth_providers.get(&namespace, &name).is_none() {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no auth provider {name:?} in namespace {namespace:?}"),
+        )
+        .into_response();
+    }
+    let users = auth_provider_users(&state, &namespace, &name);
+    if !users.is_empty() {
+        return err(
+            StatusCode::CONFLICT,
+            format!(
+                "auth provider {name:?} is inherited by deployment(s) {}; their sign-in gates \
+                 would fail closed. Repoint or remove them first",
+                users.join(", ")
+            ),
+        )
+        .into_response();
+    }
+    match state.auth_providers.remove(&namespace, &name) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(
+            StatusCode::NOT_FOUND,
+            format!("no auth provider {name:?} in namespace {namespace:?}"),
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "auth provider delete failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not remove the auth provider",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// If `spec`'s gate inherits an auth provider, resolve it against the store now
+/// and validate the merged deployment — so a reference to a missing or
+/// incompatible provider is refused at registration (400) with the provider
+/// named, rather than surfacing as a 500 on the first gated request.
+fn check_provider_ref(state: &AdminState, spec: &DeploymentSpec) -> Result<(), Response> {
+    let Some(name) = spec.auth.as_ref().and_then(|g| g.provider_ref.as_deref()) else {
+        return Ok(());
+    };
+    let Some(provider) = state.auth_providers.get(&spec.namespace, name) else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            crate::config::SpecError::UnknownAuthProvider {
+                namespace: spec.namespace.clone(),
+                name: name.to_string(),
+            }
+            .to_string(),
+        )
+        .into_response());
+    };
+    // Validate the deployment as though the inherited identity had been written
+    // inline: the resolved gate goes through the same `DeploymentSpec::validate`,
+    // so an incompatible provider is caught here with the gate error named.
+    let mut resolved = spec.clone();
+    resolved.auth = Some(provider.resolve(spec.auth.as_ref().expect("gate present")));
+    resolved.validate().map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("auth.provider_ref {name:?} resolves to a provider this deployment cannot use: {e}"),
+        )
+        .into_response()
+    })
+}
+
 #[derive(Deserialize)]
 struct FeedQuery {
     /// `json` returns the events as structured data instead of RSS — what
@@ -2653,6 +2990,69 @@ fn warn_about(spec: &DeploymentSpec) {
 /// An operator, a local token or an ungated caller keeps what the body said:
 /// on a self-hosted app-lb there is no meter, and on the managed one those are
 /// the platform's own hands.
+/// Fill in the namespace a confined caller could have named but didn't.
+///
+/// A credential that reaches exactly one namespace should not have to repeat it
+/// in every spec: an unnamed spec (which serde parses as the `default`
+/// namespace) is taken to mean "my namespace". This never widens what a token
+/// can reach — it writes only the one namespace the caller could already have
+/// named — and it deliberately leaves an *explicit* namespace alone, so a token
+/// confined to `team-a` that writes `team-b` is still refused by the scope check
+/// downstream rather than silently rewritten. The one case it cannot serve is a
+/// confined token that genuinely wants the literal `default` namespace, which is
+/// only reachable by a token actually confined to `default` (a no-op here) —
+/// every other confined token is walled out of `default` regardless.
+///
+/// Runs before `normalize`, so secret refs bind to the assumed namespace, and
+/// before `stamp_owner`, so a federated grant meters to the right account.
+fn assume_namespace(spec: &mut DeploymentSpec, caller: Option<&Caller>) {
+    if spec.namespace == crate::config::DEFAULT_NAMESPACE
+        && let Some(sole) = caller.and_then(Caller::sole_namespace)
+    {
+        spec.namespace = sole.to_string();
+    }
+}
+
+/// Give a deployment that names no host one of its own: `<id>.<base>`.
+///
+/// So a deployment need not restate the fleet's domain to be reachable: with a
+/// base domain configured (an explicit one, else the wildcard zone that already
+/// has a certificate and DNS pointing here — see
+/// [`LbConfig::deploy_host_base`]), a spec that pins no hostname gets a route to
+/// `<id>.<base>`. Ids are globally unique, so the name is too.
+///
+/// Two shapes are left exactly as written:
+/// - one that already pins a `host` or `host_suffix` — there is nothing to
+///   assume; and
+/// - a *routeless VM*, the intentional headless-sandbox shape reached only
+///   through `exec`/`shell`. A VM earns a host only once it exposes a port with
+///   a route (even a path-only one); every other backend is unreachable without
+///   a route, so a routeless site or static deployment does get one rather than
+///   being dead weight.
+///
+/// Runs before `validate`, so the generated route is checked like any other and
+/// an auth callback resolves against it. Off entirely when no base is
+/// configured, leaving a hostless deployment to be handled exactly as before.
+///
+/// [`LbConfig::deploy_host_base`]: crate::config::LbConfig::deploy_host_base
+fn assume_host(spec: &mut DeploymentSpec, base: Option<&str>) {
+    let Some(base) = base else { return };
+    // A pinned hostname is respected; an empty id is left for `validate` to
+    // reject rather than baked into a nonsense `.base` name.
+    if spec.has_host_route() || spec.id.trim().is_empty() {
+        return;
+    }
+    // A routeless VM is private on purpose. Any other backend, or a VM that has
+    // exposed a port with a route, is reached through the proxy and gets a name.
+    if spec.routes.is_empty() && spec.vm.is_some() {
+        return;
+    }
+    spec.routes.push(crate::config::RouteRule {
+        host: Some(format!("{}.{}", spec.id.trim(), base)),
+        ..Default::default()
+    });
+}
+
 pub(crate) fn stamp_owner(spec: &mut DeploymentSpec, caller: Option<&Caller>) {
     if let Some(Caller::Federated(g)) = caller {
         spec.account_id = g.account_for(&spec.namespace).map(str::to_string);
@@ -2665,6 +3065,12 @@ async fn register(
     caller: Option<axum::Extension<Caller>>,
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
+    // A namespace token may omit the namespace and have its own filled in.
+    // Runs first, so the assumed namespace is what secret refs bind to.
+    assume_namespace(&mut spec, caller.as_ref().map(|c| &c.0));
+    // A spec that pins no hostname gets `<id>.<base>`, so a route is checked
+    // and an auth callback resolves against it below.
+    assume_host(&mut spec, state.deploy_base_domain.as_deref());
     // Bind secret references to the spec's namespace before anything reads
     // them; see `DeploymentSpec::normalize`.
     spec.normalize();
@@ -2672,6 +3078,9 @@ async fn register(
     // no guest_ip) from ever being booted.
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(refused) = check_provider_ref(&state, &spec) {
+        return refused;
     }
     warn_about(&spec);
 
@@ -2718,15 +3127,20 @@ async fn register(
     // Replacing a deployment abandons its old pool; tear it down explicitly so
     // the VMs don't linger until their TTL.
     //
-    // The swap happens *first*, for the same reason `deregister` removes before
-    // tearing down: while the old deployment is still the registry's, a
-    // concurrent autoscaler tick will happily boot VMs into it, and those would
-    // be orphaned by the swap that follows. Once it is no longer live the
-    // autoscaler stops creating for it and kills anything it created (see
-    // `Autoscaler::unclaimed`).
+    // For a workspace, first drain the autoscaler's create slots and persist a
+    // stale-seed fence. The registry swap still precedes teardown, so the old
+    // object cannot create orphan VMs; the fence keeps the newly exposed object
+    // from booting until teardown's final old-state capture has published.
     let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
     let replaced = old.is_some();
+    let workspace_replacement = match &old {
+        Some(old) => match state.autoscaler.fence_workspace_replacement(old).await {
+            Ok(fence) => fence,
+            Err(message) => return err(StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+        },
+        None => None,
+    };
     let deployment = state.registry.upsert(spec);
     if let Err(e) = state.registry.persist_one(&id) {
         tracing::error!(deployment = %id, error = %e, "failed to persist state");
@@ -2734,6 +3148,9 @@ async fn register(
     drop(change);
     if let Some(old) = old {
         state.autoscaler.teardown(&old).await;
+    }
+    if let Some(fence) = workspace_replacement {
+        fence.finish();
     }
     tracing::info!(deployment = %id, "registered");
     state.feed.announce(
@@ -2769,9 +3186,17 @@ async fn update(
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
     spec.id = id.clone();
+    // A namespace token may omit the namespace and have its own filled in,
+    // rather than trip the cross-namespace refusal below with an unnamed spec.
+    assume_namespace(&mut spec, caller.as_ref().map(|c| &c.0));
+    // A spec that pins no hostname gets `<id>.<base>`, as at registration.
+    assume_host(&mut spec, state.deploy_base_domain.as_deref());
     spec.normalize();
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(refused) = check_provider_ref(&state, &spec) {
+        return refused;
     }
     warn_about(&spec);
 
@@ -2801,13 +3226,21 @@ async fn update(
 
     // The owner is not part of the template, so a stamp never recycles a pool.
     let rebuild = old.spec.vm != spec.vm || old.spec.upstreams != spec.upstreams;
+    let workspace_replacement = if rebuild {
+        match state.autoscaler.fence_workspace_replacement(&old).await {
+            Ok(fence) => fence,
+            Err(message) => return err(StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+        }
+    } else {
+        None
+    };
     let deployment = if rebuild {
         // The backend set changed — a managed VM *template*, or a static
         // deployment's upstream list (or a switch between the two kinds). The
         // running backends no longer match the spec, so rebuild from scratch
         // (`teardown` is a no-op-that-clears-routing for the static kind).
         //
-        // Swap first, tear down second: see the note in `register`.
+        // Fence, swap, then tear down: see the note in `register`.
         tracing::info!(deployment = %id, "updating deployment (backends changed; rebuilding)");
         state.registry.upsert(spec)
     } else {
@@ -2825,6 +3258,9 @@ async fn update(
     drop(change);
     if rebuild {
         state.autoscaler.teardown(&old).await;
+    }
+    if let Some(fence) = workspace_replacement {
+        fence.finish();
     }
     // Reconcile to the new policy immediately (scale up/down, warm pool).
     deployment.scale_signal.notify_one();
@@ -4169,6 +4605,9 @@ struct PullRequest {
     /// without making that digest the deployment's default.
     #[serde(default, rename = "ref")]
     artifact_ref: Option<String>,
+    /// Enables durable idempotency and replacement-readiness verification.
+    #[serde(default)]
+    operation_id: Option<String>,
     /// Re-fetch even when the image is already on disk. Rarely wanted — the
     /// filename is the digest, so the image being there is proof the bytes are
     /// right — and it exists for the case where the file was damaged after it
@@ -4184,8 +4623,11 @@ fn job_start_error(e: StartError) -> Response {
         e @ StartError::NoDeployment(_) => {
             err(StatusCode::NOT_FOUND, e.to_string()).into_response()
         }
-        e @ StartError::AlreadyRunning(_) => {
+        e @ (StartError::AlreadyRunning(_) | StartError::ConflictingOperation(_)) => {
             err(StatusCode::CONFLICT, e.to_string()).into_response()
+        }
+        e @ StartError::Persistence(_) => {
+            err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
         }
         e => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
@@ -4232,7 +4674,14 @@ async fn start_pull(
     body: Option<Json<PullRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    match state.jobs.start_pull(&id, req.artifact_ref, req.force) {
+    let result = match req.operation_id {
+        Some(operation_id) => match req.artifact_ref {
+            Some(digest) => state.jobs.start_correlated_pull(&id, operation_id, digest, req.force),
+            None => Err(StartError::BadRef("operation_id requires an explicit pinned `ref` digest".into())),
+        },
+        None => state.jobs.start_pull(&id, req.artifact_ref, req.force),
+    };
+    match result {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "artifact pull started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
@@ -4348,6 +4797,10 @@ fn router(state: AdminState) -> Router {
         // it names only namespaces whose deployments the caller can already
         // list, so it is the directory's own information regrouped.
         .route("/namespaces", get(namespaces))
+        // View tier, and it narrows itself to the caller's namespaces exactly as
+        // `/namespaces` does — a scoped token gets its own providers rather than
+        // a 403. The item reads and every write are on the CRUD side below.
+        .route("/auth-providers", get(list_auth_providers))
         .route("/feeds", get(feeds_index))
         .route("/feeds/:namespace", get(feed_rss))
         // Where DNS should point. View tier: it is the answer to "what do I
@@ -4428,6 +4881,15 @@ fn router(state: AdminState) -> Router {
         // matches on path, not method.
         .route("/namespaces", post(create_namespace))
         .route("/namespaces/:name", delete(delete_namespace))
+        // Auth providers. `POST` shares its path with the view-tier list above,
+        // exactly as `/namespaces` does; the item read sits here beside its
+        // delete so one path lives on one tier. The item GET is CRUD-tier out of
+        // the same caution that keeps a deployment spec there.
+        .route("/auth-providers", post(create_auth_provider))
+        .route(
+            "/auth-providers/:namespace/:name",
+            get(get_auth_provider).delete(delete_auth_provider),
+        )
         .route("/tokens", post(mint_token).get(list_tokens))
         .route(
             "/tokens/:id",
@@ -4457,9 +4919,21 @@ fn router(state: AdminState) -> Router {
         require_view_auth,
     ));
 
+    // Self-introspection, on its own layer because it is the only route with no
+    // tier requirement at all. It is never folded into `view`: `gate_view` off
+    // would then make it answer `Ungated` to callers who did present a token,
+    // which is the one answer it must never give wrongly.
+    let whoami = Router::new()
+        .route("/whoami", get(whoami))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_any_credential,
+        ));
+
     Router::new()
         .route("/healthz", get(healthz))
         .merge(view)
+        .merge(whoami)
         .merge(crud)
         .merge(open)
         .with_state(state)
@@ -4504,6 +4978,124 @@ impl BackgroundService for AdminApi {
             tracing::error!(error = %e, "admin API stopped");
         }
     }
+}
+
+// -- self-introspection ------------------------------------------------------
+
+/// `GET /whoami` — what this credential is, and what it may do.
+///
+/// ## Why this route exists
+///
+/// A token's scope was, until this route, only readable through `GET /tokens`,
+/// which needs `admin`. That is a circular dependency dressed as a permission
+/// check: the caller who most needs to know their scope is the one whose scope
+/// is too small to look it up, so the only way to answer "why am I getting a
+/// 401" was to go and find a *second*, wider credential on another machine. A
+/// client could not discover its own reach, and every scope problem therefore
+/// presented as an authentication problem — which sends people to rotate a
+/// token that was never the issue.
+///
+/// ## Why it discloses nothing
+///
+/// Every field describes the credential the caller already holds. There is no
+/// registry read, no other token, and no fleet inventory here — `deployments`
+/// is the token's own scope list as it was minted, not a list of things that
+/// exist. Answering "you are `admin` over `["marketing"]`" tells the holder of
+/// that token exactly what it could work out by trying two requests, minus the
+/// afternoon.
+///
+/// The secret is never echoed, for the reason [`MintedToken`] gives: only its
+/// hash is kept, and a route that could read one back would undo that.
+async fn whoami(caller: Option<axum::Extension<Caller>>) -> impl IntoResponse {
+    let now = now_secs();
+    // The layer always inserts one; `None` would mean the route was reached
+    // without the middleware, which is a wiring bug rather than a caller error.
+    let Some(axum::Extension(caller)) = caller else {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no caller on this request; /whoami was reached without its auth layer",
+        )
+        .into_response();
+    };
+
+    let mut body = serde_json::json!({
+        // What kind of credential answered, spelled the way the rest of the API
+        // spells them, so "app-token" here and `applb_…` in a header are
+        // recognisably the same thing.
+        "caller": match &caller {
+            Caller::Ungated => "ungated",
+            Caller::Operator => "operator",
+            Caller::Token(_) => "app-token",
+            Caller::Federated(_) => "federated",
+        },
+        // The two questions a refused request actually raises, answered
+        // directly rather than left to be derived from the tier.
+        "may": {
+            "read_view_routes": caller.satisfies(crate::tokens::AdminScope::View),
+            "use_admin_routes": caller.satisfies(crate::tokens::AdminScope::Admin),
+        },
+        // Whether this credential is confined to a namespace, which is the
+        // other half of why a request gets refused and the half that does not
+        // show up in the tier at all.
+        "fleet": caller.covers_fleet(),
+        "confined": caller.confined(),
+    });
+
+    match &caller {
+        Caller::Ungated => {
+            body["admin_scope"] = "unchecked".into();
+            body["detail"] = "this listener has no credential configured, so every request                               is admitted and no scope is checked. APP_LB_ADMIN_PASSWORD is                               what turns the gate on."
+                .into();
+        }
+        Caller::Operator => {
+            body["admin_scope"] = "admin".into();
+            body["detail"] = "the configured Basic credential, which is unscoped by                               definition — it is what mints tokens, so it outranks every                               token it could produce."
+                .into();
+        }
+        Caller::Token(t) => {
+            body["admin_scope"] = t.admin.as_str().into();
+            body["token"] = serde_json::json!({ "id": t.id, "name": t.name });
+            body["namespace"] = t.namespace.clone().into();
+            // Verbatim, including `["*"]` and the empty list, because both are
+            // meaningful and neither means what it looks like: `*` is every
+            // deployment, and empty on a *namespace* token is everything in
+            // that namespace rather than nothing.
+            body["deployments"] = t.deployments.clone().into();
+            body["expires_at"] = t.expires_at.into();
+            body["expires_in_secs"] = t.expires_at.map(|e| e.saturating_sub(now)).into();
+        }
+        Caller::Federated(g) => {
+            // A grant has a tier per namespace rather than one tier, so the
+            // strongest is reported alongside the map instead of instead of it.
+            body["admin_scope"] = if caller.satisfies(crate::tokens::AdminScope::Admin) {
+                crate::tokens::AdminScope::Admin.as_str()
+            } else if caller.satisfies(crate::tokens::AdminScope::View) {
+                crate::tokens::AdminScope::View.as_str()
+            } else {
+                crate::tokens::AdminScope::None.as_str()
+            }
+            .into();
+            body["subject"] = serde_json::json!({
+                "user_id": g.subject.user_id,
+                "email": g.subject.email,
+                "account_id": g.subject.account_id,
+            });
+            body["namespaces"] = serde_json::json!(
+                g.namespaces
+                    .iter()
+                    .map(|(ns, scope)| (ns.clone(), scope.as_str()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            );
+        }
+    }
+
+    // Named here rather than left to the caller to know: the gate in front of a
+    // deployment and this API check *different* things, and a caller who has
+    // only ever seen one of them will attribute a refusal to the wrong one.
+    body["note"] = "A deployment's own gate checks whether this credential admits that                     deployment; it does not check the admin tier. This API checks the                     tier as well. A token can therefore pass a gate and still be refused                     here, and vice versa."
+        .into();
+
+    Json(body).into_response()
 }
 
 // -- app-tokens --------------------------------------------------------------
@@ -5563,6 +6155,75 @@ mod tests {
             )
         }
 
+        /// The circularity `/whoami` exists to break: the credential that most
+        /// needs to know its own scope is the one whose scope is too small to
+        /// look it up.
+        #[test]
+        fn a_token_with_no_admin_scope_can_still_ask_what_it_is() {
+            let t = store();
+            let hdr = format!("Bearer {}", mint(&t, AdminScope::None, &["marketing"]));
+
+            // The route it needs, at the tier its layer asks for.
+            assert!(matches!(
+                on(Some(&basic()), &t, Some(&hdr), "/whoami", "/whoami", AdminScope::None),
+                Verdict::Allow(_)
+            ));
+
+            // And every other way of asking stays shut, which is the whole
+            // reason the scope was undiscoverable: listing tokens is `admin`,
+            // and the dashboard's data is `view`.
+            assert!(matches!(
+                on(Some(&basic()), &t, Some(&hdr), "/tokens", "/tokens", AdminScope::Admin),
+                Verdict::Forbidden(_)
+            ));
+            assert!(matches!(
+                on(Some(&basic()), &t, Some(&hdr), "/metrics", "/metrics", AdminScope::View),
+                Verdict::Forbidden(_)
+            ));
+        }
+
+        /// A deployment-scoped token is not "fleet-wide" on this route: there is
+        /// nothing on it to reach past, because the answer is only ever about
+        /// the caller. Without `narrows_itself` the fleet-route rule would
+        /// refuse exactly the callers the route is for.
+        #[test]
+        fn a_scoped_token_is_not_refused_at_whoami_as_a_fleet_route() {
+            let t = store();
+            let scoped = format!("Bearer {}", mint(&t, AdminScope::Admin, &["marketing"]));
+            let confined = format!("Bearer {}", mint_in_namespace(&t, AdminScope::None, "team-a"));
+
+            for hdr in [&scoped, &confined] {
+                assert!(
+                    matches!(
+                        on(Some(&basic()), &t, Some(hdr), "/whoami", "/whoami", AdminScope::None),
+                        Verdict::Allow(_)
+                    ),
+                    "a confined caller must be able to ask about itself",
+                );
+            }
+
+            // The contrast: a genuinely fleet-wide route still refuses both.
+            assert!(matches!(
+                on(Some(&basic()), &t, Some(&scoped), "/jobs", "/jobs", AdminScope::Admin),
+                Verdict::Forbidden(_)
+            ));
+        }
+
+        /// No credential is still no credential. `/whoami` lowers the tier, not
+        /// the requirement — an anonymous caller has no "self" to report.
+        #[test]
+        fn whoami_still_needs_a_credential() {
+            let t = store();
+            assert!(matches!(
+                on(Some(&basic()), &t, None, "/whoami", "/whoami", AdminScope::None),
+                Verdict::Unauthorized
+            ));
+            assert!(matches!(
+                on(Some(&basic()), &t, Some("Bearer applb_nope_nope"), "/whoami", "/whoami", AdminScope::None),
+                Verdict::Unauthorized
+            ));
+        }
+
         #[test]
         fn a_namespace_token_reaches_its_namespace_and_nothing_else() {
             let t = store();
@@ -5688,6 +6349,119 @@ mod tests {
                 stamp_owner(&mut spec, caller.as_ref());
                 assert_eq!(spec.account_id, None);
             }
+        }
+
+        /// A confined credential reaching exactly one namespace has an unnamed
+        /// spec (the `default` namespace) filled in with its own; an explicit,
+        /// different namespace is left for the scope check to refuse; and a
+        /// caller with no single namespace rewrites nothing.
+        #[test]
+        fn a_confined_caller_has_its_lone_namespace_assumed() {
+            let t = store();
+            let raw = mint_in_namespace(&t, AdminScope::Admin, "team-a");
+            let token = Caller::Token(t.verify(&raw, NOW).unwrap());
+
+            // Unnamed spec (default) → the token's own namespace.
+            let mut spec = spec_in("default", None);
+            assume_namespace(&mut spec, Some(&token));
+            assert_eq!(spec.namespace, "team-a");
+
+            // An explicit, different namespace is untouched — the downstream
+            // scope check refuses it rather than have it silently rewritten.
+            let mut spec = spec_in("team-b", None);
+            assume_namespace(&mut spec, Some(&token));
+            assert_eq!(spec.namespace, "team-b");
+
+            // A federated grant naming exactly one namespace is assumed too...
+            let one = Caller::Federated(grant(&[("team-a", AdminScope::Admin)], false));
+            let mut spec = spec_in("default", None);
+            assume_namespace(&mut spec, Some(&one));
+            assert_eq!(spec.namespace, "team-a");
+
+            // ...but one naming several has no lone namespace to assume, and a
+            // fleet, operator, ungated or absent caller never assumes at all.
+            let many = Caller::Federated(grant(
+                &[("team-a", AdminScope::Admin), ("team-b", AdminScope::Admin)],
+                false,
+            ));
+            for caller in [
+                Some(many),
+                Some(Caller::Federated(grant(&[], true))),
+                Some(Caller::Operator),
+                Some(Caller::Ungated),
+                None,
+            ] {
+                let mut spec = spec_in("default", None);
+                assume_namespace(&mut spec, caller.as_ref());
+                assert_eq!(spec.namespace, "default");
+            }
+        }
+
+        fn spec_json(v: serde_json::Value) -> DeploymentSpec {
+            serde_json::from_value(v).unwrap()
+        }
+
+        fn only_host(spec: &DeploymentSpec) -> Option<&str> {
+            match spec.routes.as_slice() {
+                [one] => one.host.as_deref(),
+                _ => None,
+            }
+        }
+
+        /// A backend that cannot be reached without a route — a site or a static
+        /// upstream list — gets `<id>.<base>` when it names no host, and a VM
+        /// gets one only once it has exposed a port with a route. A routeless VM
+        /// stays private, and a pinned host or an absent base is left alone.
+        #[test]
+        fn a_hostless_deployment_is_routed_under_the_base_domain() {
+            let base = Some("us2.heyo.work");
+
+            // A routeless site is dead weight without a host — it gets one.
+            let mut site = spec_json(serde_json::json!({
+                "id": "docs", "routes": [], "site": { "root": "/srv/docs" },
+            }));
+            assume_host(&mut site, base);
+            assert_eq!(only_host(&site), Some("docs.us2.heyo.work"));
+
+            // So does a routeless static upstream list.
+            let mut api = spec_json(serde_json::json!({
+                "id": "api", "routes": [], "upstreams": ["127.0.0.1:9000"],
+            }));
+            assume_host(&mut api, base);
+            assert_eq!(only_host(&api), Some("api.us2.heyo.work"));
+
+            // A routeless VM is a headless sandbox on purpose — no host.
+            let mut headless = spec_json(serde_json::json!({
+                "id": "agent", "routes": [], "vm": { "driver": "firecracker", "port": 8080 },
+            }));
+            assume_host(&mut headless, base);
+            assert!(headless.routes.is_empty());
+
+            // A VM that has exposed a port with a (host-less) route gets a host
+            // route added beside it, leaving the original route untouched.
+            let mut web = spec_json(serde_json::json!({
+                "id": "web", "routes": [{ "path_prefix": "/" }],
+                "vm": { "driver": "firecracker", "port": 8080 },
+            }));
+            assume_host(&mut web, base);
+            assert!(web.has_host_route());
+            assert!(web.routes.iter().any(|r| r.host.as_deref() == Some("web.us2.heyo.work")));
+            assert!(web.routes.iter().any(|r| r.path_prefix.as_deref() == Some("/")));
+
+            // A pinned host is respected; nothing is added.
+            let mut pinned = spec_json(serde_json::json!({
+                "id": "x", "routes": [{ "host": "chosen.example.com" }],
+                "site": { "root": "/srv/x" },
+            }));
+            assume_host(&mut pinned, base);
+            assert_eq!(only_host(&pinned), Some("chosen.example.com"));
+
+            // No base configured ⇒ host synthesis is off entirely.
+            let mut no_base = spec_json(serde_json::json!({
+                "id": "docs", "routes": [], "site": { "root": "/srv/docs" },
+            }));
+            assume_host(&mut no_base, None);
+            assert!(no_base.routes.is_empty());
         }
 
         fn host_sandbox(id: &str, account: Option<&str>) -> HostSandboxView {

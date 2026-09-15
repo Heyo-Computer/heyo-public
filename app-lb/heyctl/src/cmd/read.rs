@@ -1235,7 +1235,17 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
             }
         }
         if !auth.public_paths.is_empty() {
-            output::field("Public paths", auth.public_paths.join(", "));
+            // Rendered with the scope, because the path alone no longer says
+            // what reaching it takes — and "public" vs "admin" on the same path
+            // is the whole difference between open and closed.
+            output::field(
+                "Public paths",
+                auth.public_paths
+                    .iter()
+                    .map(|p| format!("{} ({})", p.path, p.scope))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
         }
         // The single most common reason a gate doesn't work is that this exact
         // URL is not registered with the provider, so print it rather than

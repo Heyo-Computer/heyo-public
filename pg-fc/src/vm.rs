@@ -19,7 +19,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::registry::SchemaEntry;
+use crate::registry::{GIB, GrowVerdict, SchemaEntry};
 use crate::s3::S3Config;
 
 const VM_PG_PORT: u16 = 5432;
@@ -268,6 +268,12 @@ const READY_NOTFOUND_GRACE: Duration = Duration::from_secs(45);
 /// and no data to lose: one that hasn't booted in this long is a sick build to
 /// throw away and retry, not something to keep a replenish pass parked on.
 pub(crate) const SPARE_READY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long a power-cycle waits for Firecracker to let go of a just-stopped
+/// VM's data disk before checking whether it needs to grow. The daemon acks
+/// the stop before the process exits; past this the restart goes ahead on the
+/// disk as it is.
+const POWER_CYCLE_DISK_SETTLE: Duration = Duration::from_secs(10);
 
 /// Exclusive use of the process-wide VM state for the caller's whole test.
 ///
@@ -536,6 +542,11 @@ pub async fn ensure_vm(
     let mut phase = Instant::now();
     let _admission = admission_slot(schema).await;
     let admission_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
+    // Everything from here to a serving Postgres is what this VM costs to
+    // bring back, and therefore what the reaper's warm hold is buying (see
+    // `SchemaEntry::idle_budget`). The admission wait above is excluded: it
+    // measures how many other clients arrived at once, not this VM.
+    let bringup_started = phase;
     let name = format!("pg-{schema}");
     let keepalive = up.pinned;
     // Floored at the configured starting size (a smaller recorded value is a
@@ -651,7 +662,13 @@ pub async fn ensure_vm(
         );
 
         Ok(Arc::new(SchemaEntry::new(
-            sandbox, target, tunnel, pool, keepalive, slots,
+            sandbox,
+            target,
+            tunnel,
+            pool,
+            keepalive,
+            slots,
+            bringup_started.elapsed(),
         )))
     }
     .await;
@@ -697,6 +714,22 @@ pub async fn ensure_vm(
         }
     }
     result
+}
+
+/// Reattach only to an already-bound fenced VM. Never creates/restores a
+/// sandbox or database and never opens the tenant database for grants.
+pub async fn ensure_fenced_vm(cfg: &Config, schema: &str, sandbox_id: &str) -> Result<Arc<SchemaEntry>> {
+    let sandbox = Sandbox::connect(sandbox_id.to_string(), local_opts())?;
+    sandbox.set_ttl(0).await.context("pinning fenced VM")?;
+    let name = format!("pg-{schema}");
+    let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
+    let client = pool.get().await.context("connecting to fenced VM maintenance database")?;
+    if client.query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&schema]).await?.is_none() {
+        bail!("fenced database {schema} is missing from VM {sandbox_id}");
+    }
+    drop(client);
+    let slots = client_slot_budget(&pool, &name).await;
+    Ok(Arc::new(SchemaEntry::new(sandbox, target, tunnel, pool, true, slots, Duration::ZERO)))
 }
 
 /// Validity window for a presigned S3 URL handed to the guest. Generous enough
@@ -1986,6 +2019,41 @@ async fn exec_guest_env(
         .with_context(|| format!("{what}: guest exec failed"))
 }
 
+pub(crate) async fn physical_exec(
+    cfg: &Config, sandbox: &Sandbox, command: &str, env: HashMap<String, String>, what: &str,
+) -> Result<CommandResult> {
+    let command = physical_exec_command(command);
+    exec_guest_env(cfg, sandbox, &command, Some(env), what).await
+}
+
+fn physical_exec_command(command: &str) -> String {
+    use base64::Engine;
+    // No literal newlines may reach the serial shell, even inside quotes:
+    // console framing can finish capture before multiline bodies print.
+    let body = format!("for pgbin in /usr/lib/postgresql/*/bin; do [ ! -d \"$pgbin\" ] || export PATH=\"$pgbin:$PATH\"; done\n{command}");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(body);
+    format!("printf '%s' '{encoded}' | base64 -d | sh")
+}
+
+/// Resolve by the operation's unique durable name before creating.  This is
+/// the lost-create-response recovery path; physical candidates deliberately
+/// bypass normal schema checkout and are never entered in the serving store.
+pub(crate) async fn physical_candidate(cfg: &Config, name: &str, allow_create: bool, own: &(dyn Fn(&str) -> Result<()> + Send + Sync)) -> Result<Sandbox> {
+    if !name.starts_with("repl-seed-") { bail!("invalid physical candidate name"); }
+    if let Some(info) = find_by_name_with_retry(name).await.context("finding physical candidate")? {
+        own(&info.id).context("durably adopting named physical candidate")?;
+        return bring_up_existing(cfg, name, &info.id).await?.context("physical candidate disappeared while resuming");
+    }
+    if !allow_create {
+        bail!("physical create outcome is unknown and named candidate is not visible; refusing a second create");
+    }
+    create_vm_within(cfg, name, true, cfg.ready_timeout, cfg.data_disk_gb, Some(own)).await
+}
+
+pub(crate) async fn connect_physical_candidate(cfg: &Config, name: &str, id: &str) -> Result<Sandbox> {
+    bring_up_existing(cfg, name, id).await?.context("recorded physical candidate no longer exists")
+}
+
 /// Best-effort human-readable detail from a failed guest command: the combined
 /// output if the backend populated it, else stderr.
 fn exec_detail(res: &CommandResult) -> &str {
@@ -2217,6 +2285,14 @@ async fn power_cycle(
             .stop()
             .await
             .with_context(|| format!("stopping {name} for power-cycle"))?;
+        // A postmaster that died of a full disk dies again on a fresh boot
+        // into it. The daemon acks the stop before Firecracker lets go of the
+        // disk, hence the settle.
+        if let Err(e) =
+            grow_stopped_disk(cfg, name, sandbox.sandbox_id(), POWER_CYCLE_DISK_SETTLE).await
+        {
+            warn!("{name}: {e:#}; restarting it on the disk it has");
+        }
         sandbox
             .start()
             .await
@@ -2337,9 +2413,23 @@ pub(crate) async fn probe_pg(pool: &Pool) -> PgProbe {
 /// reply (io error, refused, EOF): nothing is listening.
 fn classify_pg_error(e: &tokio_postgres::Error) -> PgProbe {
     if e.code().is_some() {
-        PgProbe::Responding(e.to_string())
+        PgProbe::Responding(pg_error_text(e))
     } else {
-        PgProbe::Unreachable(e.to_string())
+        PgProbe::Unreachable(pg_error_text(e))
+    }
+}
+
+/// `tokio_postgres::Error` displays only its kind, so a server refusing the
+/// connection — the very case the readiness waits exist for — prints as a
+/// bare "db error", its SQLSTATE and reason behind `source()`. Spell them out:
+/// the readiness logs are the only place a boot's refusal ever surfaces.
+fn pg_error_text(e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        return format!("{} {}: {}", db.severity(), db.code().code(), db.message());
+    }
+    match std::error::Error::source(e) {
+        Some(cause) => format!("{e}: {cause}"),
+        None => e.to_string(),
     }
 }
 
@@ -2536,8 +2626,8 @@ fn spare_can_serve(disk_gb: u32, default_gb: u32) -> bool {
 pub(crate) const DAEMON_MAX_DISK_GB: u32 = 250;
 
 /// Grow a sandbox's persistent data device to `target_gb` through the
-/// daemon's offline workspace resize (`POST /deployed-sandboxes/{id}/resize`
-/// with `disk_size_gb`; heyvmd's workspace-resize feature, grow-only).
+/// daemon's offline workspace resize (`POST /sandboxes/{id}/resize` with
+/// `disk_size_gb`; heyvmd's workspace-resize feature, grow-only).
 ///
 /// The daemon takes the sandbox's lifecycle lock, stops it, grows the image
 /// and its ext4 in place, cold-boots once to verify the new capacity from
@@ -2547,8 +2637,11 @@ pub(crate) const DAEMON_MAX_DISK_GB: u32 = 250;
 /// reflects that.
 ///
 /// Raw HTTP rather than the SDK: the published heyo-sdk (0.1.5) predates
-/// `Sandbox::resize_disk`. Swap to the SDK call once 0.1.6 ships — the wire
-/// format here is byte-identical to it.
+/// `Sandbox::resize_disk`. Before swapping to the SDK call once it ships, check
+/// the route it targets: the SDK's size-class `resize` posts to
+/// `/deployed-sandboxes/{id}/resize`, which the local daemon doesn't serve at
+/// all — a disk grow sent there is an empty-bodied 404, and every growth
+/// attempt fails.
 pub(crate) async fn resize_disk(sandbox_id: &str, target_gb: u64) -> Result<()> {
     resize_disk_at(daemon_base_url(), sandbox_id, target_gb).await
 }
@@ -2560,7 +2653,7 @@ async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Res
         (1..=u64::from(DAEMON_MAX_DISK_GB)).contains(&target_gb),
         "disk_size_gb must be within 1–{DAEMON_MAX_DISK_GB} GiB (daemon limit)"
     );
-    let url = format!("{base_url}/deployed-sandboxes/{sandbox_id}/resize");
+    let url = format!("{base_url}/sandboxes/{sandbox_id}/resize");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()
@@ -2576,8 +2669,8 @@ async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Res
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         bail!(
-            "daemon workspace resize returned {status}: {} (a 404/405 means the \
-             deployed heyvmd predates the workspace-resize feature)",
+            "daemon workspace resize returned {status}: {} (a 404 with an empty \
+             body means the deployed heyvmd has no workspace-resize route)",
             body.trim()
         );
     }
@@ -2650,6 +2743,7 @@ pub(crate) async fn create_spare(cfg: &Config, name: &str) -> Result<Sandbox> {
         false,
         cfg.ready_timeout.min(SPARE_READY_TIMEOUT),
         cfg.data_disk_gb,
+        None,
     )
     .await
 }
@@ -2671,6 +2765,72 @@ pub(crate) async fn pg_listening(sandbox: &Sandbox) -> Result<Option<bool>> {
         .await
         .is_ok_and(|r| r.is_ok());
     Ok(Some(connected))
+}
+
+/// Grow a stopped VM's data device before booting it, when its filesystem is
+/// at the grow trigger and fills the device.
+///
+/// A VM whose Postgres died of `No space left on device` never gets warm
+/// again — crash recovery has to write before the server accepts a
+/// connection — so neither grow path that samples through Postgres ever sees
+/// it, and every bring-up boots it back into the same full disk (pg-0rtk7Stq
+/// retried all day on a 2GiB disk 94% full). So read it offline, the way a
+/// restored image is: dumpe2fs on the disk file, judged by
+/// [`crate::imgarchive::offline_grow_verdict`].
+///
+/// Does nothing without a run dir or disk file, or while anything holds the
+/// disk open: a running VM's filesystem is the guest's to report, and there
+/// is no resizing under it. `settle` is how long to wait for a just-stopped
+/// VM's Firecracker to let go. The caller holds the boot permit — the
+/// daemon's resize fscks the file, which must not interleave with a reclaim
+/// pass. The registry banks the new size from its first sample of the booted
+/// VM, as it does for every warm schema.
+async fn grow_stopped_disk(cfg: &Config, name: &str, id: &str, settle: Duration) -> Result<()> {
+    let Some(run_dir) = cfg.run_dir.as_ref() else {
+        return Ok(());
+    };
+    let disk = run_dir.join(id).join("data.ext4");
+    let Ok(md) = tokio::fs::metadata(&disk).await else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + settle;
+    while crate::imgarchive::disk_held_open(&disk).await {
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    let Some(usage) = crate::imgarchive::offline_fs_usage(&disk).await else {
+        return Ok(());
+    };
+    let (total_blocks, free_blocks, _) = usage;
+    let used_pct = 100.0 * (1.0 - free_blocks as f64 / total_blocks.max(1) as f64);
+    let size_gb = md.len().div_ceil(GIB);
+    match crate::imgarchive::offline_grow_verdict(usage, md.len(), cfg.disk_grow) {
+        GrowVerdict::NotNeeded => Ok(()),
+        GrowVerdict::AtCap { current_gb } => {
+            warn!(
+                "{name}: stopped data disk is {used_pct:.0}% full and its {current_gb}GiB device \
+                 is already at the growth cap — Postgres may not start on it (raise \
+                 PG_VM_POOL_DISK_MAX_GB)"
+            );
+            Ok(())
+        }
+        GrowVerdict::Grow(target) => {
+            info!(
+                "{name}: stopped data disk is {used_pct:.0}% full on a {size_gb}GiB device — \
+                 growing it to {target}GiB before booting {id}, so Postgres has room to start"
+            );
+            resize_disk(id, target).await.with_context(|| {
+                format!("growing {name}'s data device to {target}GiB before boot")
+            })?;
+            crate::events::journal_info(
+                "disk-grow",
+                format!("{name}: device grown to {target}GiB before boot ({id})"),
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Connect to an existing sandbox by id and force it to a running, ready state.
@@ -2702,6 +2862,12 @@ async fn bring_up_existing(cfg: &Config, name: &str, id: &str) -> Result<Option<
     // no cycle to deadlock on.
     let started = {
         let _permit = crate::reclaim::boot_permit(id).await;
+        // Under the permit, before the slot: the check reads the disk offline
+        // and a grow resizes it, neither of which is boot traffic. A failed
+        // grow still boots, on the disk it had.
+        if let Err(e) = grow_stopped_disk(cfg, name, id, Duration::ZERO).await {
+            warn!("{name}: {e:#}; booting it on the disk it has");
+        }
         let _slot = bringup_slot(name).await;
         sb.start().await
     };
@@ -2726,7 +2892,7 @@ pub(crate) async fn create_vm(
     keepalive: bool,
     disk_gb: u32,
 ) -> Result<Sandbox> {
-    create_vm_within(cfg, name, keepalive, cfg.ready_timeout, disk_gb).await
+    create_vm_within(cfg, name, keepalive, cfg.ready_timeout, disk_gb, None).await
 }
 
 /// [`create_vm`] with an explicit readiness budget — warm spares get a shorter
@@ -2737,6 +2903,7 @@ async fn create_vm_within(
     keepalive: bool,
     ready_timeout: Duration,
     disk_gb: u32,
+    own: Option<&(dyn Fn(&str) -> Result<()> + Send + Sync)>,
 ) -> Result<Sandbox> {
     info!(
         "creating VM {name}{}{}",
@@ -2747,9 +2914,15 @@ async fn create_vm_within(
             format!(" with a {disk_gb}GiB data device (default is {}GiB)", cfg.data_disk_gb)
         }
     );
-    let sandbox = {
+    let (sandbox, create_started) = {
         let _slot = bringup_slot(name).await;
-        Sandbox::create(
+        // The clock for the VmCreate timing starts once the daemon is actually
+        // ours to talk to. The wait for a bring-up slot above measures how many
+        // other creates are already in flight — a queue depth, not a cost of
+        // this create — and folding it in would make the percentiles a
+        // function of concurrency rather than of how fast the daemon builds.
+        let started = Instant::now();
+        let sandbox = Sandbox::create(
             SandboxCreateOptions {
                 name: Some(name.to_string()),
                 image: Some(cfg.image.clone()),
@@ -2779,8 +2952,10 @@ async fn create_vm_within(
             },
         )
         .await
-        .with_context(|| format!("creating VM {name}"))?
+        .with_context(|| format!("creating VM {name}"))?;
+        (sandbox, started)
     };
+    if let Some(own) = own { own(sandbox.sandbox_id()).context("durably owning physical candidate VM")?; }
     // The daemon 202-accepts deploys, so this id exists (with a daemon-side
     // record behind it) long before the VM is usable — and until the registry
     // binds schema→id on full bring-up success, this variable is the only
@@ -2793,6 +2968,7 @@ async fn create_vm_within(
     }
     crate::inventory::insert(name, sandbox.sandbox_id());
     if let Err(e) = wait_ready(&sandbox, ready_timeout, name).await {
+        if own.is_some() { return Err(e).with_context(|| format!("waiting for owned physical candidate {name}")); }
         // Kill the half-built VM now, by the id in hand — no listing, which is
         // exactly what's unreachable when bring-ups fail en masse. It never
         // served a client, so its disk holds nothing worth keeping. Best
@@ -2820,7 +2996,14 @@ async fn create_vm_within(
         }
         return Err(e).with_context(|| format!("waiting for created VM {name}"));
     }
+    let took = create_started.elapsed();
+    // Success only, and paired with the event so the "VMs created" chart and
+    // these percentiles always describe the same set of creates. A failed
+    // create is bounded by `ready_timeout` rather than by how fast the daemon
+    // works, so counting it would pull every percentile toward that ceiling.
+    info!("created VM {name} in {took:?}");
     crate::events::record(crate::events::Event::VmCreated);
+    crate::events::record_timing(crate::events::Timing::VmCreate, took);
     Ok(sandbox)
 }
 
@@ -2932,8 +3115,9 @@ async fn wait_pg_ready(pool: &Pool, timeout: Duration, name: &str) -> Result<()>
         let last_err = match pool.get().await {
             Ok(client) => match client.simple_query("SELECT 1").await {
                 Ok(_) => return Ok(()),
-                Err(e) => e.to_string(),
+                Err(e) => pg_error_text(&e),
             },
+            Err(deadpool_postgres::PoolError::Backend(e)) => pg_error_text(&e),
             Err(e) => e.to_string(),
         };
         if Instant::now() >= deadline {
@@ -2954,8 +3138,38 @@ async fn wait_pg_ready(pool: &Pool, timeout: Duration, name: &str) -> Result<()>
 mod tests {
     use super::*;
 
+    #[test]
+    fn physical_exec_preserves_one_shell_body_and_exit_status() {
+        let command = physical_exec_command("cat <<'SQL'\nSELECT :'db', '$literal';\nSQL\nprintf '%s\\n' \"$PGFC_VALUE\"\nexit 17");
+        assert!(!command.contains('\n'), "serial capture needs one physical line");
+        let output = std::process::Command::new("sh").args(["-c", &command])
+            .env("PGFC_VALUE", "a'b $unchanged").output().unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "SELECT :'db', '$literal';\na'b $unchanged\n");
+    }
+
     fn pool_at(port: u16) -> Pool {
         build_pool("127.0.0.1", port, "postgres", "postgres", None).unwrap()
+    }
+
+    /// The cause has to survive into the text: the error's own Display is just
+    /// its kind, which is how readiness logs used to say only "db error".
+    #[tokio::test]
+    async fn pg_error_text_carries_the_cause() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = tokio_postgres::connect(
+            &format!("host=127.0.0.1 port={port} user=postgres connect_timeout=2"),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .err()
+        .expect("nothing listens on a just-released port");
+        let text = pg_error_text(&err);
+        assert!(text.starts_with(&err.to_string()), "{text}");
+        assert!(text.len() > err.to_string().len(), "cause dropped: {text}");
     }
 
     /// Exhaust the gate, confirm nothing is left, and confirm dropped permits
@@ -3038,6 +3252,9 @@ mod tests {
         // replica try to publish or subscribe on its own behalf.
         assert!(body.contains("--no-publications") && body.contains("--no-subscriptions"), "{body}");
         assert!(body.contains("ON_ERROR_STOP=1") && body.contains(" -1 "), "{body}");
+        // The mirrored tenant must retain table ownership and grants after
+        // promotion; restoring everything as postgres would break app writes.
+        assert!(!body.contains("--no-owner") && !body.contains("--no-privileges"), "{body}");
     }
 
     #[test]
@@ -3677,7 +3894,7 @@ mod tests {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
         let log = seen.clone();
         let app = axum::Router::new().route(
-            "/deployed-sandboxes/{id}/resize",
+            "/sandboxes/{id}/resize",
             axum::routing::post(move |AxPath(id): AxPath<String>, req_body: String| {
                 log.lock().unwrap().push((id, req_body));
                 async move { (status, body) }
@@ -3795,6 +4012,69 @@ mod tests {
     }
 
     #[test]
+    fn replication_marker_round_trips_through_the_boot_shell_reader() {
+        let dir = std::env::temp_dir().join(format!("pgfc-repl-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("marker");
+        for role in ["primary", "replica"] {
+            let command = replication_marker_command(Some(role))
+                .replace(REPL_MARKER, marker.to_str().unwrap());
+            let out = std::process::Command::new("sh").args(["-c", &command]).output().unwrap();
+            assert!(out.status.success(), "{:?}", out);
+            assert_eq!(std::fs::read(&marker).unwrap(), format!("{role}\n").as_bytes());
+            let out = std::process::Command::new("sh")
+                .args(["-c", "read -r role < \"$1\" && printf %s \"$role\"", "sh"])
+                .arg(&marker).output().unwrap();
+            assert!(out.status.success());
+            assert_eq!(out.stdout, role.as_bytes());
+        }
+        let command = replication_marker_command(None).replace(REPL_MARKER, marker.to_str().unwrap());
+        assert!(std::process::Command::new("sh").args(["-c", &command]).status().unwrap().success());
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replication_restart_supplies_role_settings_and_preserves_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::replication::Role;
+        let dir = std::env::temp_dir().join(format!("pgfc-repl-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, body) in [
+            ("gosu", "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PGDATA/args\"\nexit \"$TEST_RC\"\n"),
+            ("nproc", "#!/bin/sh\necho 3\n"),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join("replication-restart.log"), "restart failure detail\n").unwrap();
+        for (role, code, expected) in [
+            (Some(Role::Primary), 0, "wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10"),
+            (Some(Role::Replica), 0, "wal_level=minimal -c max_wal_senders=0 -c max_replication_slots=8"),
+            (None, 0, "wal_level=minimal -c max_wal_senders=0 -c max_replication_slots=10"),
+            (Some(Role::Primary), 7, "wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10"),
+        ] {
+            let out = std::process::Command::new("sh")
+                .args(["-c", &replication_restart_command(role)])
+                .env("PATH", format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()))
+                .env("PGDATA", &dir).env("TEST_RC", code.to_string())
+                .output().unwrap();
+            assert_eq!(out.status.code(), Some(code), "{:?}", out);
+            let args = std::fs::read_to_string(dir.join("args")).unwrap();
+            assert!(args.contains(&format!("-o\n-c {expected}")), "{args}");
+            if role == Some(Role::Replica) {
+                assert!(args.contains("max_worker_processes=15"), "{args}");
+            }
+            if code != 0 {
+                assert!(String::from_utf8_lossy(&out.stderr).contains("restart failure detail"));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn quote_ident_escapes_embedded_quotes() {
         assert_eq!(quote_ident("acme"), "\"acme\"");
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
@@ -3841,7 +4121,7 @@ fn schema_copy_job_body(user: &str, db: &str, conninfo: &str) -> String {
         "ec=0\n\
          rm -f {SCHEMA_COPY_FAIL_MARK}\n\
          {{ pg_dump --schema-only --no-publications --no-subscriptions \
-         --no-security-labels --no-owner --no-privileges -d {conninfo} \
+         --no-security-labels -d {conninfo} \
          || echo 1 > {SCHEMA_COPY_FAIL_MARK}; }} \
          | psql -h 127.0.0.1 -U {user} -d {db} -v ON_ERROR_STOP=1 -1 -q || ec=$?\n\
          if [ -f {SCHEMA_COPY_FAIL_MARK} ]; then\n\
@@ -3963,37 +4243,36 @@ async fn ensure_replication_mode(
     // What the running cluster is actually at, which is the only thing worth
     // reconciling against — the marker says what the NEXT start will do.
     let client = pool.get().await.context("checkout for wal_level check")?;
-    let have: String = client
-        .query_one("SELECT current_setting('wal_level')", &[])
+    let settings = client
+        .query_one(
+            "SELECT current_setting('wal_level'), current_setting('max_wal_senders')::int4, \
+             current_setting('max_replication_slots')::int4",
+            &[],
+        )
         .await
-        .context("reading wal_level")?
-        .get(0);
+        .context("reading replication settings")?;
+    let have: String = settings.get(0);
+    let senders: i32 = settings.get(1);
+    let slots: i32 = settings.get(2);
     drop(client);
-    let want_level = match want {
-        // A publisher needs `logical`. A subscriber only applies changes, so
-        // it keeps the cheap `minimal` profile — what it needs from init.sh is
-        // slots and apply workers, which are not visible here.
-        Some(crate::replication::Role::Primary) => "logical",
-        Some(crate::replication::Role::Replica) | None => "minimal",
-    };
+    let (want_level, want_senders, want_slots) = replication_settings(want);
 
     write_replication_marker(cfg, sandbox, schema, want.map(|r| r.as_str())).await?;
 
-    // A replica's WAL level is unchanged, so only the marker mattered — but it
-    // still has to be planted before the next boot picks up its worker budget.
-    if have == want_level {
+    // A subscriber can already be at minimal WAL while lacking the slots
+    // needed for replication origins. Compare the complete role settings.
+    if have == want_level && senders == want_senders && slots == want_slots {
         return Ok(());
     }
     info!(
         "schema {schema}: wal_level is {have}, replication needs {want_level} — \
          restarting Postgres in-guest"
     );
-    // `$PGDATA` is the guest's own environment (init.sh exports it), so let
-    // the guest shell expand it and fall back to the image's default rather
-    // than baking a path the image could change.
-    let restart = "gosu postgres pg_ctl -D \"${PGDATA:-/workspace/pgdata}\" \
-                   -m fast -w -t 60 restart >/dev/null 2>&1"
-        .to_string();
+    // init.sh consumes the marker only on a VM boot. A postmaster-only
+    // restart must supply the same settings explicitly; otherwise it reloads
+    // the old tuning file. Command-line settings also override stale manual
+    // ALTER SYSTEM values without rewriting unrelated operator configuration.
+    let restart = replication_restart_command(want);
     let res = exec_guest(cfg, sandbox, &restart, false, "restarting Postgres").await?;
     if res.exit_code != 0 {
         bail!(
@@ -4019,19 +4298,62 @@ async fn ensure_replication_mode(
         ),
     }
     let client = pool.get().await.context("checkout after restart")?;
-    let now: String = client
-        .query_one("SELECT current_setting('wal_level')", &[])
+    let settings = client
+        .query_one(
+            "SELECT current_setting('wal_level'), current_setting('max_wal_senders')::int4, \
+             current_setting('max_replication_slots')::int4",
+            &[],
+        )
         .await
-        .context("re-reading wal_level")?
-        .get(0);
-    if now != want_level {
+        .context("re-reading replication settings")?;
+    let now: String = settings.get(0);
+    if now != want_level || settings.get::<_, i32>(1) != want_senders
+        || settings.get::<_, i32>(2) != want_slots
+    {
         bail!(
-            "schema {schema}: Postgres restarted but wal_level is {now}, not {want_level} — \
-             the guest image predates replication support (rebuild it from init.sh)"
+            "schema {schema}: Postgres restarted but replication settings do not match \
+             the requested role (wal_level={now}, expected {want_level})"
         );
     }
     info!("schema {schema}: wal_level is now {now}");
     Ok(())
+}
+
+fn replication_settings(role: Option<crate::replication::Role>) -> (&'static str, i32, i32) {
+    match role {
+        Some(crate::replication::Role::Primary) => ("logical", 10, 10),
+        Some(crate::replication::Role::Replica) => ("minimal", 0, 8),
+        None => ("minimal", 0, 10),
+    }
+}
+
+fn replication_restart_command(role: Option<crate::replication::Role>) -> String {
+    let (level, senders, slots) = replication_settings(role);
+    let workers = if role == Some(crate::replication::Role::Replica) {
+        " -c max_logical_replication_workers=4 -c max_sync_workers_per_subscription=2 \
+         -c max_worker_processes=$(( $(nproc) + 12 ))"
+    } else {
+        ""
+    };
+    format!(
+        "for pgbin in /usr/lib/postgresql/*/bin; do \
+           [ ! -d \"$pgbin\" ] || export PATH=\"$pgbin:$PATH\"; done; \
+         PGDATA=\"${{PGDATA:-/workspace/pgdata}}\"; \
+         if gosu postgres pg_ctl -D \"$PGDATA\" -m fast -w -t 60 \
+           -l \"$PGDATA/replication-restart.log\" \
+           -o \"-c wal_level={level} -c max_wal_senders={senders} -c max_replication_slots={slots}{workers}\" restart; \
+         then :; else rc=$?; tail -c 2000 \"$PGDATA/replication-restart.log\" >&2; exit \"$rc\"; fi"
+    )
+}
+
+fn replication_marker_command(role: Option<&str>) -> String {
+    match role {
+        Some(r) => format!(
+            "printf '%s\\n' {} > {REPL_MARKER}.tmp && mv {REPL_MARKER}.tmp {REPL_MARKER} && sync && echo ok",
+            shell_squote(r)
+        ),
+        None => format!("rm -f {REPL_MARKER} {REPL_MARKER}.tmp && sync && echo ok"),
+    }
 }
 
 /// Plant or remove [`REPL_MARKER`] on the data disk.
@@ -4051,13 +4373,7 @@ async fn write_replication_marker(
     schema: &str,
     role: Option<&str>,
 ) -> Result<()> {
-    let cmd = match role {
-        Some(r) => format!(
-            "printf %s\\n {} > {REPL_MARKER}.tmp && mv {REPL_MARKER}.tmp {REPL_MARKER} && sync && echo ok",
-            shell_squote(r)
-        ),
-        None => format!("rm -f {REPL_MARKER} {REPL_MARKER}.tmp && sync && echo ok"),
-    };
+    let cmd = replication_marker_command(role);
     let res = exec_guest(cfg, sandbox, &cmd, false, "writing the replication marker").await?;
     if res.exit_code != 0 {
         bail!(

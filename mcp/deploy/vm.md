@@ -74,22 +74,29 @@ This is also what makes the VM's `0.0.0.0` bind acceptable. See below.
 
 ## Minting caller tokens
 
-A caller's reach is their token's scope, and going through the front door adds
-one requirement: **the token must admit every deployment whose gate it has to
-clear**, because `admits()` is checked against the deployment the *gate* belongs
-to before anything behind it sees the request. With no credentials of its own,
-this server can clear no gate the caller cannot. So a token needs the admin
-deployment for the app-lb tools, `app-obs` for `applb_metrics` and friends, and
-`ci` for the ci tools — each one it is expected to use. Either
+A caller's reach is their token's scope. **This deployment's own gate does not
+check it**: `/mcp` is a `public` path (next section), so the token passes through
+untouched and is judged by the gates of the services it is used against, each
+of which checks `admits()` against the deployment *it* belongs to. With no
+credentials of its own, this server can clear no gate the caller cannot.
 
-- list them alongside the targets:
-  `deployments: ["app-lb-admin", "app-obs", "ci", "fastcar"]`, or
-- confine by namespace with an empty `deployments` list, which admits everything
-  in that namespace (`app-lb/src/tokens.rs:155-163`) and is the simpler answer
-  for anyone who needs more than one.
+- **app-lb tools** go through `app-lb-admin`, whose upstream is the admin
+  listener. That gate admits any verified app-token and leaves the scope check
+  to the listener (`fronts_admin_api`, `app-lb/src/auth.rs`), so a namespace
+  token works and sees and creates only within its namespace. The spec must say
+  `"namespace": "<ns>"`: registering does not fill it in, and a spec without one
+  means `default`, which such a token cannot reach.
+- **app-obs and ci tools** go through gates that still apply the namespace wall.
+  Both live in `default`, so a token confined to any other namespace gets a 403
+  from them and working app-lb tools everywhere else — the intended shape.
+- A token that lists deployments instead of confining by namespace —
+  `deployments: ["app-lb-admin", "app-obs", "ci", "fastcar"]` — clears those
+  gates but cannot use a fleet-wide route: it can operate `fastcar`, and it
+  cannot create a deployment.
 
-A token that omits one of them does not get a degraded server — it gets a 401
-from that gate and working tools everywhere else, which is the intended shape.
+This section used to recommend confining by namespace as "the simpler answer"
+without noticing that every gate on the path lives in `default`, which made it
+true only for `default` itself.
 
 The `admin` axis is unchanged and still coarser than it sounds: `view` reaches
 only `/metrics`, `/disks`, `/feeds`, `/security`, `/ingress`, `/storage`. There
@@ -97,6 +104,48 @@ is no read-only tier for deployment routes — `GET /deployments/:id` is CRUD-ti
 because a spec's env vars can hold secrets — so a token that can *read* a
 deployment can also delete it. `env_from` above is why this spec has nothing
 worth reading.
+
+## Why `/mcp` is public at this deployment's gate
+
+The gate is `app-token` with two public paths:
+
+```json
+"auth": {
+  "provider": "app-token",
+  "public_paths": [
+    { "path": "/healthz", "scope": "public" },
+    { "path": "/mcp", "scope": "public" }
+  ]
+}
+```
+
+Until 2026-09-11 only `/healthz` was public, and every token confined to a
+namespace other than `default` was refused with a 403. The gate checks
+`admits("heyo-mcp", "default")` before the request reaches anything, and this
+deployment's upstream is a VM rather than the admin listener, so the
+`fronts_admin_api` exemption never applies. The hosted server was unusable by
+exactly the tenant-scoped callers it exists for.
+
+Opening `/mcp` is safe for the reason the rest of this document is about: **the
+server holds nothing.** An unauthenticated request reaches a server with no
+credential to act with, and every upstream call carries the caller's own bearer.
+app-lb forwards `Authorization` untouched on a public path — it replaces the
+header only when a gate minted a session, which a public path never does
+(`app-lb/src/proxy.rs`) — so the services behind this one judge that bearer as
+if it had been sent to them directly.
+
+Three things follow:
+
+- **`HEYO_MCP_REQUIRE_IDENTITY=0` is required.** No identity header arrives on a
+  public path.
+- **`art_publish` takes no `path` over HTTP.** Over stdio a path names the
+  caller's own file; over HTTP it would name this server's disk for whoever
+  asked. It is left out of the schema in HTTP mode and refused if it arrives.
+- **Public paths are prefixes**, so this opens `/mcp…` as well. The server
+  answers nothing there but `/mcp` itself.
+
+An anonymous caller gets the tool list, the deployment schema and examples, and
+`heyo_status`'s view of which services answer — documentation, not capability.
 
 ## This deployment has no sandbox tools, on purpose
 
