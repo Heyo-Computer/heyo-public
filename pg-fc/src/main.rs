@@ -175,11 +175,25 @@ async fn main() -> Result<()> {
         });
     }
 
+    raise_open_files_limit();
     let listener = TcpListener::bind(listen_addr).await?;
     info!("pg-vm-pool listening on {listen_addr}");
 
     loop {
-        let (sock, peer) = listener.accept().await?;
+        let (sock, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // Never fatal. Returning here ended the process, and a restart
+                // drops every connected client with it — the 2026-09-15 mia3
+                // crash was exactly this, `accept` failing with EMFILE once
+                // parked clients had used up the open-files limit. EMFILE and
+                // ENFILE clear as connections close; the rest (ECONNABORTED
+                // and the like) concern a single connection.
+                warn!("accepting a client connection failed: {e}; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         // Disable Nagle on the client->pooler leg (mirrors the pooler->VM leg in
         // proxy::splice). The Postgres wire protocol is request/response, so
         // Nagle + delayed-ACK adds per-round-trip latency on the many small
@@ -256,6 +270,48 @@ async fn handle_conn(
         }
     };
     proxy::splice(client, guard.entry(), &info.raw).await
+}
+
+/// Raise this process's open-files soft limit to its hard limit.
+///
+/// Every parked client, spliced session and daemon call holds a descriptor,
+/// and the soft limit a supervised service inherits is usually 1024 — which a
+/// busy host outgrows: on 2026-09-15 all three hosts logged EMFILE, and mia3's
+/// pooler died of it when `accept` failed. The hard limit there was 524288, so
+/// the fix is only ever this call. Best-effort: a host that won't allow it
+/// keeps the old limit and says so.
+fn raise_open_files_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit only read and write the struct passed in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        warn!(
+            "could not read the open-files limit: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    if limit.rlim_cur >= limit.rlim_max {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: limit.rlim_max,
+        rlim_max: limit.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        info!(
+            "raised the open-files limit from {} to {}",
+            limit.rlim_cur, limit.rlim_max
+        );
+    } else {
+        warn!(
+            "could not raise the open-files limit from {}: {}",
+            limit.rlim_cur,
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 /// Sanity-check `PG_VM_POOL_RUN_DIR` at startup: it must be *heyvmd's* run dir

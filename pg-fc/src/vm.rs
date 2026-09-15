@@ -333,7 +333,16 @@ async fn admission_slot(
         }
         None => Err(BringupShed {
             schema: schema.to_string(),
-            waited: queued.elapsed(),
+            // Since the client's cold start began, not just this attempt's
+            // turn in the queue: a client that sat behind another client's
+            // attempt at the same schema is shed the moment its own turn
+            // comes, and "no slot after 60ms" would hide the 15s it waited.
+            waited: match (deadline, admission_wait()) {
+                (Some(deadline), Some(wait)) => {
+                    wait + Instant::now().saturating_duration_since(deadline)
+                }
+                _ => queued.elapsed(),
+            },
             queued: bringups_waiting(),
         }
         .into()),
