@@ -15,11 +15,12 @@ and a request path that continues without a control-plane call per request.
 
 ### Operator experience: one concise JSON service file
 
-Adopt the style of [app-lb deployment files](../app-lb/examples/README.md): one
-declarative file with `id`, `routes`, `vm`, `scaling` and `health`. Extend it with
-regional overrides instead of exposing separate operator-managed placement,
-discovery and traffic-assignment documents. This is a proposed authoring format,
-not an assertion that existing app-lb accepts the new fields.
+The [app-lb deployment file](../app-lb/examples/README.md) style is implemented:
+one declarative file with `id`, `routes`, `vm`, `scaling` and `health` is also
+accepted by Orchestrator's service deployment endpoint. The regional overrides and
+traffic fields below remain proposed extensions; existing app-lb does not accept
+them. They avoid separate operator-managed placement, discovery and
+traffic-assignment documents.
 
 Illustrative fragment (images are placeholders; application routes, launch settings
 and secret references are omitted):
@@ -201,16 +202,21 @@ existing healthy instance to create its replacement, then verifies the replaceme
 before removing the old instance. Shared durable state and exclusive operation
 ownership are prerequisites to active replicas, not consequences of adding a gateway.
 
-## First implementation change: Orchestrator's regional service plan
+## Existing implementation foundation and next regional change
 
-**Extend the existing regional replica placement and discovery into one reconciled
-service plan.** This is the first implementation slice, not the whole Phase 1 and
-not an app-lb forwarding patch.
+Orchestrator service deployment already accepts `desiredReplicas` and
+`replicaRegions`, preserves replica regions during rolling replacement, and fails a
+rollout that does not establish the requested regional coverage. It also accepts the
+app-lb-style service JSON and translates equal `scaling.min_replicas`/
+`scaling.max_replicas` values and `deploy.replica_regions` into that deployment
+machinery. **The next regional change is to extend those foundations into the
+reconciled service plan below.** It is not the whole Phase 1 and not an app-lb
+forwarding patch.
 
 | Part | Concrete change |
 | --- | --- |
-| Desired state | Accept the concise service JSON, expand its regional intent into the existing `replicaRegions` placement representation, and persist regional runtime/resource requirements; operators do not maintain both forms |
-| Reconciliation | Compare ready and pending replicas against those slots; request only missing capacity in the required region through Cloud; use existing rolling-deployment ownership for retries |
+| Desired state | Extend the implemented concise service JSON and `replicaRegions` representation with the proposed per-region runtime/resource overrides; operators do not maintain separate forms |
+| Reconciliation | Generalize the existing rollout-time regional coverage checks into continuous reconciliation: compare ready and pending replicas against those slots, request only missing capacity in the required region through Cloud, and use existing rolling-deployment ownership for retries |
 | Observed state | Derive a region-grouped view from existing service discovery; show missing capacity separately from ready capacity |
 | Routing output | Compile explicit operator weights and eligible regional membership into one versioned decision; never route to merely planned capacity |
 | Incomplete topology | Preserve the coverage failure visibly. Traffic can use other ready regions only when the service's explicit failover policy allows it; do not silently renormalize a missing required region |
@@ -223,23 +229,29 @@ placements, repeated reconciliation does not duplicate pending replicas, and onl
 ready endpoints appear in routing output. Runtime/profile selection must support
 EU libvirt and US Firecracker without assuming one global driver/image.
 
-The next slice makes app-lb consume this shared regional decision and implements
+The following slice makes app-lb consume this shared regional decision and implements
 the cross-region request path. Phase 2 then changes how weights and extra replicas
 are calculated, without replacing the ownership model. The JSON fragment specifies
-the proposed authoring experience, not a complete wire schema. Detailed schema and
-endpoint design follows agreement on these boundaries.
+proposed regional extensions, not a complete wire schema. Detailed schema and
+endpoint design follow agreement on these boundaries.
 
 ## Scope and deployment constraints
 
-- Initial staging topology: eu1 and us3. Production/us1 is out of scope.
-- Keep `stage.heyo.computer` entering through eu1; no DNS change is assumed.
-- Use the existing us3 gateway installation and `us3.heyo.computer` address,
-  subject to live TLS, authentication, and reachability verification.
-- eu1 retains its existing libvirt workloads; us3 uses Firecracker. Routing
+The topology statements below are the historical planning snapshot used when this
+proposal was drafted, not a verification of current live deployment state:
+
+- The initial staging topology was eu1 and us3; production/us1 was out of scope.
+- The plan kept `stage.heyo.computer` entering through eu1; no DNS change was assumed.
+- The plan reused the us3 gateway installation and `us3.heyo.computer` address,
+  subject to live TLS, authentication, and reachability verification before use.
+- The plan retained eu1's libvirt workloads and used Firecracker on us3. Routing
   consumes service endpoints, not hypervisor-specific VM addresses.
-- Five database VMs remain on us3. Application evacuation does not evacuate,
-  restart, or migrate databases. Runtime updates must independently prove that
-  these VMs and their network paths remain uninterrupted.
+- At drafting time, the inventory recorded five database VMs on us3; this PR does
+  not re-verify that count. Application evacuation does not evacuate, restart, or
+  migrate databases. The production application writer remains on us3; no writer
+  failover or application-level writer drain is claimed or verified here. Runtime
+  updates must independently prove that database VMs and their network paths remain
+  uninterrupted.
 - Reuse existing installations. This proposal authorizes no infrastructure
   changes, deployments, cleanup, or database writes.
 
@@ -253,11 +265,12 @@ Verified against the repository when preparing this proposal:
 
 | Existing source | Reuse | Missing capability |
 | --- | --- | --- |
-| [Service deployment](../orchestrator/src/handlers/service_deploy.rs) | `desiredReplicas`, `replicaRegions`, region-preserving replacement, rollout ownership | Continuous regional minimum/capacity reconciliation and a coordinated regional maintenance barrier |
+| [Service deployment](../orchestrator/src/handlers/service_deploy.rs) | `desiredReplicas`, `replicaRegions`, region-preserving replacement, rollout ownership, and final regional-coverage verification | Continuous regional minimum/capacity reconciliation and a coordinated regional maintenance barrier |
+| [Service specification](../orchestrator/src/handlers/service_spec.rs) | app-lb-style `.heyo/services` JSON translated into service deployment requests | Proposed per-region runtime/resource overrides and traffic weights |
 | [Service discovery](../orchestrator/src/handlers/service_discovery.rs) | PostgreSQL-backed endpoint sets, versions, region, health and draining | Gateway registration, coherent regional assignments and consumer observations |
 | [app-lb discovery](../app-lb/src/discovery.rs) | Polling, version comparison, retaining the last good upstream set | Parser drops endpoint region; upstream conversion accepts only plaintext, pathless HTTP with explicit port |
 | [app-lb registry](../app-lb/src/registry.rs) | Atomic local snapshots and local JSON persistence | Local files are not an authoritative shared routing store |
-| [app-lb selection](../app-lb/src/deployment.rs) | Least-in-flight local backend selection | Regional selection and coordinated load feedback |
+| [app-lb selection](../app-lb/src/deployment.rs) | Least-in-flight local backend selection; durable static-upstream cordon state and atomic in-flight admission/drain tracking | Regional selection and coordinated load feedback |
 
 Private companion repository integration: `cloud/src/repositories/mvm_ctrl_backend_server_repository.rs`
 currently filters placement by region, driver, environment/pool, physical identity
@@ -417,9 +430,10 @@ assignments subject to local health/admission, but cannot invent new global poli
 Unknown control state blocks destructive maintenance and new capacity assumptions.
 Cold start without an authorized snapshot fails closed for multi-region deployments.
 
-The current topology cannot survive complete eu1 loss for the staging hostname,
-or complete us3 database loss. External ingress/DNS failover and database availability
-are separately reviewed projects, not promises delivered by this routing protocol.
+The historical topology described above could not survive complete eu1 loss for the
+staging hostname or complete us3 database loss. Current live topology requires fresh
+verification. External ingress/DNS failover and database availability are separately
+reviewed projects, not promises delivered by this routing protocol.
 
 Phase 4 acceptance: documented and exercised behavior for each failure above,
 including overload when remaining capacity is inadequate. Availability claims must
