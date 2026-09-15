@@ -1134,6 +1134,13 @@ impl SchemaRegistry {
         self.cfg.archive.is_some()
     }
 
+    /// Whether any offload tier is configured — local compaction or S3. That
+    /// is all the manual TTL sweep needs, so it gates that dashboard control:
+    /// a compaction-only host still gets a way to drain its backlog on demand.
+    pub fn offload_enabled(&self) -> bool {
+        self.cfg.archive.is_some() || self.cfg.compact.is_some()
+    }
+
     /// Point `schema` back at its S3 archive: set its tier to `Archived` so the
     /// next checkout takes the restore path instead of reattaching to a dead
     /// binding — or, when the bound VM is gone, creating a fresh empty VM and
@@ -3132,7 +3139,7 @@ impl SchemaRegistry {
     /// is configured or a sweep is already running.
     pub fn spawn_ttl_sweep_now(self: &Arc<Self>, ttl_secs: u64) -> Result<()> {
         anyhow::ensure!(
-            self.cfg.archive.is_some() || self.cfg.compact.is_some(),
+            self.offload_enabled(),
             "no offload tier is configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_* \
              and/or PG_VM_POOL_COMPACT_AFTER_SECS)"
         );
