@@ -755,7 +755,7 @@ impl Store {
         tx.commit().await.map_err(StoreError::sql)
     }
 
-    async fn add_service_deployment_event(
+    pub(crate) async fn add_service_deployment_event(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, id: &str,
     ) -> Result<(), StoreError> {
         let row = sqlx::query("SELECT d.*,j.job_key FROM ci_service_deployment d JOIN ci_job j ON j.id=d.job_id WHERE d.id=$1")
@@ -1129,14 +1129,25 @@ impl Store {
     /// value, so the two cannot disagree — which is exactly what happens when
     /// a crash lands between "last job finished" and "mark the run done".
     pub async fn roll_up_run(&self, run_id: &str) -> Result<RunStatus, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let status = Self::roll_up_run_in(&mut tx, run_id).await?;
+        tx.commit().await.map_err(StoreError::sql)?;
+        Ok(status)
+    }
+
+    pub(crate) async fn roll_up_run_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, run_id: &str,
+    ) -> Result<RunStatus, StoreError> {
+        let previous: String = sqlx::query_scalar("SELECT status FROM ci_run WHERE id=$1 FOR UPDATE")
+            .bind(run_id).fetch_one(&mut **tx).await.map_err(StoreError::sql)?;
         let rows = sqlx::query("SELECT status FROM ci_job WHERE run_id = $1")
             .bind(run_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut **tx)
             .await
             .map_err(StoreError::sql)?;
 
         let statuses: Vec<String> = rows.iter().map(|r| r.get::<String, _>("status")).collect();
-        let status = if statuses.is_empty() {
+        let mut status = if statuses.is_empty() {
             RunStatus::Success
         } else if statuses.iter().any(|s| s == "cancelled") {
             RunStatus::Cancelled
@@ -1153,7 +1164,26 @@ impl Store {
             RunStatus::Running
         };
 
-        self.set_run_status(run_id, status, None).await?;
+        // The self-update job records intent and exits before its controller
+        // is replaced. Its success is not deployment success. Cancellation
+        // remains sticky even if an already-submitted update later succeeds.
+        if previous == "cancelled" {
+            status = RunStatus::Cancelled;
+        } else if matches!(status, RunStatus::Success) {
+            let deployments: Vec<String> = sqlx::query_scalar(
+                "SELECT s.status FROM ci_service_deployment s JOIN ci_controller_rollout c ON c.id=s.id WHERE s.run_id=$1",
+            ).bind(run_id).fetch_all(&mut **tx).await.map_err(StoreError::sql)?;
+            if deployments.iter().any(|s| s == "failed") {
+                status = RunStatus::Failure;
+            } else if deployments.iter().any(|s| s != "passed") {
+                status = RunStatus::Running;
+            }
+        }
+        sqlx::query("UPDATE ci_run SET status=$2, started_at=CASE WHEN $2='running' THEN COALESCE(started_at,now()) ELSE started_at END, finished_at=CASE WHEN $2 IN ('success','failure','cancelled') THEN COALESCE(finished_at,now()) ELSE NULL END WHERE id=$1")
+            .bind(run_id).bind(status.as_str()).execute(&mut **tx).await.map_err(StoreError::sql)?;
+        if previous != status.as_str() {
+            Self::add_event(tx, run_id, None, None, None, "ci.run.status.v1", status.as_str(), None).await?;
+        }
         Ok(status)
     }
 

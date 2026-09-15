@@ -116,6 +116,8 @@ async fn rerun_failed(
         }))).into_response(),
         Err(crate::dispatch::DispatchError::Workflow(message)) =>
             error(StatusCode::CONFLICT, &message),
+        Err(crate::dispatch::DispatchError::ControllerUnavailable(message)) =>
+            error(StatusCode::SERVICE_UNAVAILABLE, &message),
         Err(e) => {
             tracing::error!(run = %run_id, "could not rerun failed jobs: {e}");
             error(StatusCode::INTERNAL_SERVER_ERROR, "could not rerun failed jobs")

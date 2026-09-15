@@ -101,6 +101,54 @@ promotions retain the managed CI workspace and external database.
 
 ## Submitting a build
 
+For this repository's `ci` workflow, submission includes merge after the
+non-ignored CI test suite and artifact validation. The merge uses `ci/merge-release`
+with the registered HeyoSecret `GIT_AUTH_TOKEN`, no version bump or tags, and
+refuses changes outside the CI component and its workflow/image. The captured
+trunk must still match at publication; a moved trunk requires revalidation.
+
+CI runtime changes also require `ci/deploy-controller`. It records a durable
+rollout, closes new submissions (HTTP 503), and lets existing jobs finish before
+replacing the controller. The requesting job finishes first; the **run remains
+running** until the replacement resumes reconciliation and its public health
+endpoint identifies the expected revision and executable SHA256. Documentation
+and workflow-only changes need no runtime deploy. Other workflows retain their
+own release policy; this does not make all workflows merge or deploy automatically.
+
+Self-deployment is opt-in and currently supports **one Firecracker controller
+with a persistent workspace**, not active-active controllers or regional DB
+writer handoff. Configure the following through the service's HeyoSecret-backed
+configuration before enabling the workflow:
+
+- `CI_CONTROLLER_DEPLOYMENT`: the app-lb deployment ID of this controller.
+- `CI_CONTROLLER_REPOSITORY`: the only repository allowed to replace it.
+- `CI_APP_LB_URL` and `CI_APP_LB_TOKEN`: its app-lb admin endpoint and credential.
+- `CI_PUBLIC_URL`: must match the deployment's configured public URL.
+- `CI_EXPECTED_SHA`: set by promotion; health also hashes the running executable.
+
+The deployment must have min/max replicas of one, no warm pool, and exactly one
+read-only `/opt/ci-release` artifact mount with `strip_components: 1`, using the
+controller's HTTP artifact store. Its startup command must install that mounted
+binary. Only the mount digest/ref and expected revision change during promotion;
+database, NATS, workspace, routes and other service configuration are preserved.
+The archive must contain `dist/ci`, `dist/REVISION` and `dist/SHA256SUMS` and come
+from a successful job building the exact confirmed merged release.
+
+**Bootstrap order matters:** first deploy app-lb's conditional deployment updates
+(GET ETag / PUT If-Match), then install a CI controller supporting this action
+through the existing drained deployment path, then enable the configured workflow.
+An older controller cannot deploy its own first implementation of this action.
+Missing capabilities or configuration fail the deployment rather than claim success.
+
+The durable rollout waits for jobs, claimed/building VMs, live native leases and
+other unresolved deployments. Before the first replacement attempt,
+`CI_MAX_JOB_SECONDS` bounds the drain; timeout or cancellation leaves the
+controller unchanged and reopens submissions. After an ambiguous replacement
+attempt, admission stays closed until reconciliation proves the outcome. Inspect
+the run's service-deployment status and controller logs; do not clear the durable
+barrier or retry a blind replacement. Cancellation after submission cannot undo
+the external update, and the cancelled run stays cancelled after reconciliation.
+
 ```bash
 ./install-git-submit.sh                  # installs `git-submit` onto PATH
 

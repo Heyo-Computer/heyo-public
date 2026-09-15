@@ -305,6 +305,11 @@ pub struct Config {
     pub app_lb_url: Option<String>,
     pub app_lb_token: Option<String>,
 
+    /// Opt-in self-deployment target and the only repository allowed to update it.
+    pub controller_deployment: Option<String>,
+    pub controller_repository: Option<String>,
+    pub expected_sha: Option<String>,
+
     /// Shared secret the `git submit` client HMACs its payload with, when it
     /// has no repository token.
     ///
@@ -635,6 +640,9 @@ impl Config {
                 .unwrap_or_else(|| crate::heyo_ui::THEME_COOKIE.to_string()),
             app_lb_url: opt("CI_APP_LB_URL").map(|u| u.trim_end_matches('/').to_string()),
             app_lb_token: opt("CI_APP_LB_TOKEN"),
+            controller_deployment: opt("CI_CONTROLLER_DEPLOYMENT"),
+            controller_repository: opt("CI_CONTROLLER_REPOSITORY"),
+            expected_sha: opt("CI_EXPECTED_SHA"),
             webhook_secret,
             require_repo_token: flag("CI_REQUIRE_REPO_TOKEN", false)?,
             native_runner_secret: opt("CI_NATIVE_RUNNER_SECRET"),

@@ -160,9 +160,9 @@ fn native_poll_error(e: crate::native::PollError) -> axum::response::Response {
         }
     }
 }
-async fn native_poll(State(s):State<AppState>,h:HeaderMap,Json(p):Json<crate::native::Poll>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};if let Ok(runs)=crate::native::pending_advancements(&s.store).await{for run in runs{if s.dispatcher.advance_run(&run).await.is_ok(){let _=crate::native::advancement_done(&s.store,&run).await;}}} match crate::native::poll(&s.store,p,&s.config.public_url,&s.dispatcher.secrets).await {Ok(job)=>Json(serde_json::json!({"job":job})).into_response(),Err(e)=>native_poll_error(e)} }
-async fn native_heartbeat(State(s):State<AppState>,h:HeaderMap,Json(u):Json<crate::native::LeaseUpdate>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::heartbeat(&s.store,&u).await {Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)} }
-async fn native_complete(State(s):State<AppState>,h:HeaderMap,Json(c):Json<crate::native::Completion>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e}; match crate::native::complete(&s.store,&s.dispatcher.secrets,c).await {Ok(Some(run))=>{match s.dispatcher.advance_run(&run).await{Ok(_)=>{let _=crate::native::advancement_done(&s.store,&run).await;},Err(e)=>tracing::error!("native completion scheduling failed: {e}")} StatusCode::NO_CONTENT.into_response()},Ok(None)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::CONFLICT,&e)} }
+async fn native_poll(State(s):State<AppState>,h:HeaderMap,Json(p):Json<crate::native::Poll>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _work=match s.dispatcher.lifecycle.work(&s.store).await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)};if let Ok(runs)=crate::native::pending_advancements(&s.store).await{for run in runs{if s.dispatcher.advance_run(&run).await.is_ok(){let _=crate::native::advancement_done(&s.store,&run).await;}}} match crate::native::poll(&s.store,p,&s.config.public_url,&s.dispatcher.secrets).await {Ok(job)=>Json(serde_json::json!({"job":job})).into_response(),Err(e)=>native_poll_error(e)} }
+async fn native_heartbeat(State(s):State<AppState>,h:HeaderMap,Json(u):Json<crate::native::LeaseUpdate>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _work=match s.dispatcher.lifecycle.work(&s.store).await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)}; match crate::native::heartbeat(&s.store,&u).await {Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)} }
+async fn native_complete(State(s):State<AppState>,h:HeaderMap,Json(c):Json<crate::native::Completion>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _work=match s.dispatcher.lifecycle.work(&s.store).await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)}; match crate::native::complete(&s.store,&s.dispatcher.secrets,c).await {Ok(Some(run))=>{match s.dispatcher.advance_run(&run).await{Ok(_)=>{let _=crate::native::advancement_done(&s.store,&run).await;},Err(e)=>tracing::error!("native completion scheduling failed: {e}")} StatusCode::NO_CONTENT.into_response()},Ok(None)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::CONFLICT,&e)} }
 async fn native_source(State(s):State<AppState>,h:HeaderMap,Path(lease):Path<uuid::Uuid>)->impl IntoResponse {
     if let Err(e)=native_auth(&s,&h){return e}
     let run_id=match crate::native::source_run(&s.store,lease).await {Ok(Some(r))=>r,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e)};
@@ -178,7 +178,14 @@ async fn native_release_source(State(s):State<AppState>,h:HeaderMap,Path((lease,
     Json(serde_json::json!({"repository":run.repo_url,"sha":sha})).into_response()
 }
 #[derive(serde::Deserialize)] struct NativeArtifactQuery{name:String,#[serde(default)]description:Option<String>,#[serde(default)]public:bool}
-async fn native_artifact(State(s):State<AppState>,h:HeaderMap,Path((lease,index)):Path<(uuid::Uuid,usize)>,Query(q):Query<NativeArtifactQuery>,body:Bytes)->impl IntoResponse{if let Err(e)=native_auth(&s,&h){return e};if q.name.trim().is_empty()||q.name.contains('/')||q.name.contains('\\')||q.name==".."{return error(StatusCode::BAD_REQUEST,"invalid artifact name")};let (run,_job,key,workflow)=match crate::native::artifact_context(&s.store,lease,index).await{Ok(Some(v))=>v,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::BAD_REQUEST,&e)};let r=crate::artifacts::ArtifactRef{run_id:run,job_key:key,workflow_id:workflow,name:q.name.clone(),description:q.description,public:q.public};let stored=match s.dispatcher.artifacts.put(&r,body.to_vec()).await{Ok(v)=>v,Err(e)=>return error(StatusCode::BAD_GATEWAY,&e.to_string())};match crate::native::record_artifact(&s.store,lease,index,&q.name,&stored).await{Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced during upload"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)}}
+async fn native_artifact(State(s):State<AppState>,h:HeaderMap,Path((lease,index)):Path<(uuid::Uuid,usize)>,Query(q):Query<NativeArtifactQuery>,body:Bytes)->impl IntoResponse {
+    if let Err(e)=native_auth(&s,&h){return e};
+    let _work = match s.dispatcher.lifecycle.work(&s.store).await {
+        Ok(permit) => permit,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    };
+    if q.name.trim().is_empty()||q.name.contains('/')||q.name.contains('\\')||q.name==".."{return error(StatusCode::BAD_REQUEST,"invalid artifact name")};let (run,_job,key,workflow)=match crate::native::artifact_context(&s.store,lease,index).await{Ok(Some(v))=>v,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::BAD_REQUEST,&e)};let r=crate::artifacts::ArtifactRef{run_id:run,job_key:key,workflow_id:workflow,name:q.name.clone(),description:q.description,public:q.public};let stored=match s.dispatcher.artifacts.put(&r,body.to_vec()).await{Ok(v)=>v,Err(e)=>return error(StatusCode::BAD_GATEWAY,&e.to_string())};match crate::native::record_artifact(&s.store,lease,index,&q.name,&stored).await{Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced during upload"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)}
+}
 
 /// How a submit proved it may start a build.
 enum Credential {
@@ -363,6 +370,8 @@ async fn submit(
             )
                 .into_response()
         }
+        Err(crate::dispatch::DispatchError::ControllerUnavailable(message)) =>
+            error(StatusCode::SERVICE_UNAVAILABLE, &message),
         Err(e) => {
             tracing::warn!("submit failed: {e}");
             error(StatusCode::BAD_REQUEST, &e.to_string())
@@ -374,8 +383,17 @@ fn error(status: StatusCode, message: &str) -> axum::response::Response {
     (status, axum::Json(serde_json::json!({ "error": message }))).into_response()
 }
 
-async fn healthz() -> &'static str {
-    "ok\n"
+async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    if let Some(sha) = &state.config.expected_sha
+        && let Ok(value) = sha.parse() {
+        headers.insert("x-ci-revision", value);
+    }
+    if let Some(hash) = crate::controller_rollout::binary_sha256()
+        && let Ok(value) = hash.parse() {
+        headers.insert("x-ci-binary-sha256", value);
+    }
+    (headers, "ok\n")
 }
 
 /// Where the executor records a VM's own console. Mirrors checkout at `-1`; see
@@ -1659,6 +1677,7 @@ mod tests {
         store.migrate().await.expect("migrations");
         let runners = test_runners(config.clone());
         let dispatcher = Arc::new(Dispatcher {
+            lifecycle: Arc::new(crate::lifecycle::Lifecycle::default()),
             config: config.clone(),
             store: store.clone(),
             pool: crate::pool::Pool::new(store.pool().clone()),

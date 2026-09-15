@@ -1,17 +1,14 @@
-# Build the `ci` release binary and upload it as an artifact.
+# Validate CI, merge the verified revision, and request a drained self-deployment.
 #
 # This is the orchestrator building itself. The process that reads this file,
 # plans the run and drives the VM is the program the run compiles — it serves
 # ci.us2.heyo.work, and since the subtree merge its source is `ci/` here rather
 # than a repository of its own.
 #
-# That is less delicate than it sounds, and it is worth saying why. This
-# workflow *builds*; it does not deploy. The artifact is picked up by a person,
-# or by `ci/deploy/ci.json`'s `update` block, never by this run. And a restart
-# in the middle of a run is not lost work: the job sits on a JetStream work
-# queue and the executor is idempotent, so it is redelivered. The one failure
-# this cannot catch is a `ci` binary too broken to dispatch anything, which is
-# the bootstrap every CI system has and not one a workflow file can solve.
+# Successful validation authorizes ci/merge-release, using the registered
+# workflow's HeyoSecret Git credential. Runtime changes record a durable rollout;
+# the run stays pending until the replacement controller verifies its binary
+# through public health. No tags are published.
 #
 # Submitted from the repository root, with a pinned Git-patch descriptor:
 #
@@ -22,7 +19,7 @@
 # through CI. The guest has `.git`; a patched local submission may have a
 # synthetic HEAD. Changed-path metadata drives the `paths:` filter.
 #
-# ## One build job with targeted placement regression tests
+# ## Validation, merge, and deployment status
 #
 # One buildable thing in one file, like every workflow here: whether `ci`
 # passes says nothing about the platform or about codegraph, so it earns its
@@ -30,9 +27,8 @@
 #
 # `cargo fmt --check` and `cargo clippy` would work here — the image installs
 # both components rather than leaving a bare `--profile minimal` toolchain — and
-# are deliberately left for a follow-up. The disk-placement tests below need
-# no Postgres, NATS or live heyvmd; they exercise capacity selection and the
-# authenticated telemetry read against a local mock daemon.
+# are deliberately left for a follow-up. The non-ignored test suite runs below;
+# integration tests that require Postgres, NATS or a live heyvmd remain separate.
 name: ci
 
 on:
@@ -75,11 +71,8 @@ jobs:
     # disagree about what a pattern covers — including the case that matters, an
     # unknown change set, where both are true.
     if: ${{ changed('ci/**', '.ci/workflows/ci.yml', '.ci/image/ci/**') }}
-    # Use the installation's default runner. Operators can choose its node
-    # through CI_DEFAULT_NODE without editing this workflow.
-    # Warm caches remain host-local; moving the default node starts a cold build.
-    uses: default
-    vm:
+    # Unpinned: the controller chooses an eligible host in the runner network.
+    vm: &ci_vm
       driver: firecracker
       build:
         # Built by the runner's own daemon (`POST /images/build` — docker build
@@ -258,9 +251,9 @@ jobs:
           fi
         timeout-minutes: 60
 
-      - name: Test disk-aware runner placement
+      - name: Test CI
         working-directory: /workspace/ci
-        run: cargo test --release --locked --bin ci disk_placement -- --test-threads=1
+        run: cargo test --release --locked -- --test-threads=1
         timeout-minutes: 10
 
       # `ci` takes no arguments at all — no clap, no `env::args` anywhere in
@@ -364,11 +357,12 @@ jobs:
           branch    ${{ ci.branch }}
           run       ${{ ci.run_id }}
           EOF
+          printf '%s\n' '${{ ci.sha }}' > dist/REVISION
           # The migrations are summed alongside the binary, unlike app-lb.yml's
           # binaries-only list: these are SQL statements that will be executed
           # against a production database, and the checksum is the cheap way to
           # prove the file applied is the file built.
-          ( cd dist && sha256sum ci ci.conf migrations/*.sql > SHA256SUMS )
+          ( cd dist && sha256sum ci REVISION ci.conf migrations/*.sql > SHA256SUMS )
           ls -la dist dist/migrations
           cat dist/BUILD-INFO
 
@@ -390,3 +384,57 @@ jobs:
             the build of the service that produced this artifact.
             Built from ${{ ci.branch }}.
           path: dist
+
+  merge:
+    needs: [release]
+    vm: *ci_vm
+    outputs:
+      deploy_required: ${{ steps.scope.outputs.deploy_required }}
+    steps:
+      - id: scope
+        name: Verify the whole submitted revision is covered by CI validation
+        env:
+          RELEASE_BASE: ${{ ci.release_base_sha }}
+          SOURCE_SHA: ${{ ci.sha }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import os, subprocess
+          base, head = os.environ['RELEASE_BASE'], os.environ['SOURCE_SHA']
+          if not base or not head:
+              raise SystemExit('release requires captured trunk and source revisions')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', base, head], check=True)
+          paths = subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', '-z', base, head]).decode().split('\0')
+          paths = [p for p in paths if p]
+          def covered(p):
+              return p.startswith(('ci/', '.ci/image/ci/')) or p == '.ci/workflows/ci.yml'
+          outside = [p for p in paths if not covered(p)]
+          if outside:
+              raise SystemExit('CI validation does not authorize merging these paths: ' + ', '.join(outside))
+          runtime = any((p.startswith('ci/') and not p.endswith('.md')) or p.startswith('.ci/image/ci/') for p in paths)
+          with open(os.environ['CI_OUTPUT'], 'a') as output:
+              output.write('deploy_required=' + str(runtime).lower() + '\n')
+          PY
+      - uses: ci/merge-release
+        with:
+          manifests: '[]'
+          token: ${{ secrets.GIT_AUTH_TOKEN }}
+
+  deploy:
+    needs: [merge]
+    vm: *ci_vm
+    steps:
+      - name: Validate deployment decision
+        env:
+          DEPLOY_REQUIRED: ${{ needs.merge.outputs.deploy_required }}
+        run: |
+          set -eu
+          case "$DEPLOY_REQUIRED" in
+            false) echo 'No CI runtime change; deployment is not required.' ;;
+            true) echo 'Runtime changed; requesting a drained controller replacement.' ;;
+            *) echo 'Missing deployment decision; refusing to report release success.' >&2; exit 1 ;;
+          esac
+      - uses: ci/deploy-controller
+        if: ${{ needs.merge.outputs.deploy_required == 'true' }}
+        with:
+          artifact: ci

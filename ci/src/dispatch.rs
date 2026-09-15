@@ -160,6 +160,7 @@ impl QueueVerdict {
 }
 
 pub struct Dispatcher {
+    pub lifecycle: Arc<crate::lifecycle::Lifecycle>,
     pub config: Arc<Config>,
     pub store: Store,
     pub pool: Pool,
@@ -197,6 +198,17 @@ impl Dispatcher {
     /// against comes from the registration rather than from a field the client
     /// filled in.
     pub async fn submit(
+        &self,
+        req: &crate::trigger::SubmitRequest,
+        actor: Option<&crate::web::identity::Identity>,
+        repo: Option<&crate::store::Repo>,
+    ) -> Result<Submitted, DispatchError> {
+        let _admission = self.lifecycle.admission(&self.store).await
+            .map_err(DispatchError::ControllerUnavailable)?;
+        self.submit_admitted(req, actor, repo).await
+    }
+
+    async fn submit_admitted(
         &self,
         req: &crate::trigger::SubmitRequest,
         actor: Option<&crate::web::identity::Identity>,
@@ -551,6 +563,8 @@ impl Dispatcher {
         failed_only: bool,
         actor: Option<&crate::web::identity::Identity>,
     ) -> Result<Submitted, DispatchError> {
+        let _admission = self.lifecycle.admission(&self.store).await
+            .map_err(DispatchError::ControllerUnavailable)?;
         let run = self
             .store
             .get_run(run_id)
@@ -647,7 +661,7 @@ impl Dispatcher {
                 changes: run.changes.clone(),
             }),
         };
-        let submitted = self.submit(&req, actor, repo.as_ref()).await?;
+        let submitted = self.submit_admitted(&req, actor, repo.as_ref()).await?;
         tracing::info!(
             "re-run of {run_id} ({}) by {}: {}",
             if failed_only {
@@ -2599,6 +2613,10 @@ impl Dispatcher {
                     step_timeout(step, plan), masker).await
                     .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
             }
+            "ci/deploy-controller" => {
+                crate::controller_rollout::request(self, msg, sid, &required("artifact")?).await
+                    .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
+            }
             "ci/upload-artifact" => {
                 let name = with("name").ok_or_else(|| {
                     DispatchError::Artifact("ci/upload-artifact needs `with.name`".into())
@@ -2854,7 +2872,7 @@ impl Dispatcher {
             }
             other => Err(DispatchError::Artifact(format!(
                 "`uses: {other}` is not a built-in action. Available: \
-                 ci/upload-artifact, ci/download-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service, ci/publish-rootfs, ci/deploy-app-lb. Composite actions from a repository are not \
+                 ci/upload-artifact, ci/download-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service, ci/publish-rootfs, ci/deploy-app-lb, ci/deploy-controller. Composite actions from a repository are not \
                  supported."
             ))),
         }
@@ -3157,6 +3175,19 @@ async fn process_delivery(
                 }
             }
         })
+    };
+
+    // A delivery already removed from the pull stream stays ours while the
+    // controller is quiesced. Progress ACKs preserve its delivery attempt;
+    // retrying admission does not burn the JetStream retry ladder.
+    let _work = loop {
+        match dispatcher.lifecycle.work(&dispatcher.store).await {
+            Ok(permit) => break permit,
+            Err(e) => {
+                tracing::debug!(job = %job.job_key, "holding delivery until work reopens: {e}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
     };
 
     // `CI_MAX_JOB_SECONDS` is enforced here, and only here. It used to
@@ -3849,6 +3880,7 @@ impl Dispatcher {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                let Ok(_work) = self.lifecycle.work(&self.store).await else { continue };
                 if let Err(e) = self.pool.renew_leases(self.lease()).await {
                     // Not fatal, and not worth giving up a VM over: the lease
                     // has time left, and the next tick may well succeed.
@@ -4231,6 +4263,7 @@ fn or_none(items: &[String]) -> String {
 
 #[derive(Debug)]
 pub enum DispatchError {
+    ControllerUnavailable(String),
     Native(String),
     Store(crate::store::StoreError),
     Pool(crate::pool::PoolError),
@@ -4541,6 +4574,7 @@ impl std::fmt::Display for DispatchError {
             Self::Artifact(r) => write!(f, "{r}"),
             Self::Trigger(e) => write!(f, "{e}"),
             Self::Workflow(e) => write!(f, "{e}"),
+            Self::ControllerUnavailable(e) => write!(f, "{e}"),
         }
     }
 }
@@ -6028,6 +6062,7 @@ mod tests {
         );
 
         Arc::new(Dispatcher {
+            lifecycle: Arc::new(crate::lifecycle::Lifecycle::default()),
             config: config.clone(),
             store: store.clone(),
             pool: Pool::new(store.pool().clone()),

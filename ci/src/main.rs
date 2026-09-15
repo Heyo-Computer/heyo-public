@@ -20,11 +20,13 @@ mod cd;
 // axum versions, so the shared module deliberately names no framework type and
 // each one wires its own routes. See `ui/README.md`.
 mod config;
+mod controller_rollout;
 mod dispatch;
 mod expr;
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;
 mod image;
+mod lifecycle;
 mod nats_auth;
 mod native;
 mod objects;
@@ -242,6 +244,7 @@ async fn main() {
     }
 
     let dispatcher = Arc::new(Dispatcher {
+        lifecycle: Arc::new(lifecycle::Lifecycle::default()),
         config: config.clone(),
         store: store.clone(),
         pool: Pool::new(store.pool().clone()),
@@ -278,6 +281,7 @@ async fn main() {
     }
     dispatcher.clone().spawn_lease_loop();
     dispatcher.clone().spawn_consumers();
+    controller_rollout::spawn(dispatcher.clone());
 
     // Bind before announcing readiness. A listener that cannot bind is a hard
     // failure here rather than a task that dies quietly and leaves the process

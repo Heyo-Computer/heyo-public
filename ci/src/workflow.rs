@@ -1630,19 +1630,66 @@ mod repo_workflow {
 
         let plan =
             crate::plan::Plan::build(&wf).unwrap_or_else(|e| panic!("{path} does not plan: {e}"));
-        assert!(!plan.jobs.is_empty());
+        assert_eq!(plan.jobs.len(), 3);
+        let merge = plan.jobs.iter().find(|j| j.base_id == "merge").unwrap();
+        assert_eq!(merge.needs, ["release"]);
+        let deploy = plan.jobs.iter().find(|j| j.base_id == "deploy").unwrap();
+        assert_eq!(deploy.needs, ["merge"]);
+        let validate = plan.jobs.iter().find(|j| j.base_id == "release").unwrap();
+        assert!(!validate.target.local, "CI builds must not pin the controller host");
+        assert!(validate.steps.iter().any(|s| s.run.as_deref().is_some_and(|s|
+            s == "cargo test --release --locked -- --test-threads=1")));
 
         // Every `uses:` step in it must name an action that exists, or the
         // build fails at the step rather than at parse time.
         for job in &plan.jobs {
             for step in &job.steps {
                 if let Some(action) = &step.uses {
-                    assert_eq!(
-                        action, "ci/upload-artifact",
+                    assert!(
+                        matches!(action.as_str(), "ci/upload-artifact" | "ci/merge-release" | "ci/deploy-controller"),
                         "{path} uses {action:?}, which is not a built-in action"
                     );
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ci_release_scope_and_deployment_gate_execute_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let text = include_str!("../../.ci/workflows/ci.yml");
+        let wf = Workflow::parse("ci.yml", text).unwrap();
+        let plan = crate::plan::Plan::build(&wf).unwrap();
+        let merge = plan.jobs.iter().find(|j| j.base_id == "merge").unwrap();
+        let scope = merge.steps[0].run.as_ref().unwrap();
+        let deploy = plan.jobs.iter().find(|j| j.base_id == "deploy").unwrap();
+        let gate = deploy.steps[0].run.as_ref().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let git = tmp.path().join("git");
+        std::fs::write(&git, "#!/bin/sh\ncase \"$1\" in\nmerge-base) exit 0;;\ndiff) printf '%s\\0' \"$TEST_PATH\";;\n*) exit 2;;\nesac\n").unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (path, expected) in [("ci/src/main.rs", Some("true")), ("ci/README.md", Some("false")),
+            (".ci/workflows/ci.yml", Some("false")), (".ci/image/ci/Dockerfile", Some("true")),
+            ("app-lb/src/main.rs", None)] {
+            let output_file = tmp.path().join("outputs");
+            std::fs::write(&output_file, "").unwrap();
+            let out = std::process::Command::new("sh").arg("-c").arg(scope)
+                .env("PATH", format!("{}:{}", tmp.path().display(), std::env::var("PATH").unwrap()))
+                .env("RELEASE_BASE", "base").env("SOURCE_SHA", "head")
+                .env("TEST_PATH", path).env("CI_OUTPUT", &output_file).output().unwrap();
+            assert_eq!(out.status.success(), expected.is_some(), "{}", String::from_utf8_lossy(&out.stderr));
+            if let Some(expected) = expected {
+                assert_eq!(std::fs::read_to_string(output_file).unwrap(), format!("deploy_required={expected}\n"));
+            }
+        }
+        for (value, success) in [("false", true), ("true", true), ("", false)] {
+            let out = std::process::Command::new("sh").arg("-c").arg(gate)
+                .env("DEPLOY_REQUIRED", value).output().unwrap();
+            assert_eq!(out.status.success(), success);
+        }
+        let rollout = &deploy.steps[1];
+        assert_eq!(rollout.uses.as_deref(), Some("ci/deploy-controller"));
+        assert_eq!(rollout.condition.as_deref(), Some("${{ needs.merge.outputs.deploy_required == 'true' }}"));
     }
 }
