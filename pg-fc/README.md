@@ -188,6 +188,8 @@ Config via env (all optional):
 | `PG_VM_POOL_DISK_MAX_GB` | `100` | ceiling device growth never passes (the daemon itself caps at 250) |
 | `PG_VM_POOL_ADMIT_TIMEOUT_SECS` | `30` | how long a client waits for a free connection slot on its schema's VM before the pooler errors it; `0` fails immediately when full |
 | `PG_VM_POOL_MAX_CONCURRENT_BRINGUPS` | `3` | max VM deploys/boots in flight against heyvmd; the excess queues FIFO in the pooler (an unbounded burst can wedge the daemon, whose watchdog restart then kills every running VM); `0` disables |
+| `PG_VM_POOL_MAX_PENDING_BRINGUPS` | `16` | max whole bring-ups (deploy through ready/restore) in flight at once; the excess queues FIFO at the pooler's front door; `0` disables |
+| `PG_VM_POOL_ADMISSION_WAIT_SECS` | `15` | how long a client's bring-up may wait in that queue before it is shed with FATAL `53300`. Nothing is built for a shed bring-up and it doesn't count toward the schema's bring-up circuit breaker. Just past the Platform's 12s create budget, so no VM is built for a client that has already given up; `0` waits forever |
 | `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
 | `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
 | `PG_VM_POOL_STATE_FILE` | `~/.heyo/pg-vm-pool/registry.tsv` | persisted schema→VM map |

@@ -238,7 +238,23 @@ async fn handle_conn(
 
     // Hold the guard for the whole connection: it keeps the VM off the idle
     // reaper's radar until the client disconnects.
-    let guard = registry.checkout(&schema).await?;
+    let guard = match registry.checkout(&schema).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            // Say why before hanging up. A bare dropped socket reaches a libpq
+            // client as "SSL SYSCALL error: EOF detected", which reads as a
+            // network fault and says nothing about a pooler at capacity or a
+            // schema being held off. Best-effort: the client may be gone.
+            let sqlstate = if vm::is_shed(&e) {
+                auth::SQLSTATE_TOO_MANY_CONNECTIONS
+            } else {
+                auth::SQLSTATE_CANNOT_CONNECT_NOW
+            };
+            let message = auth::client_message(&format!("pg-vm-pool: {e:#}"));
+            let _ = auth::send_fatal(&mut client, sqlstate, &message).await;
+            return Err(e);
+        }
+    };
     proxy::splice(client, guard.entry(), &info.raw).await
 }
 

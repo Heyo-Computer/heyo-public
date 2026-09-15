@@ -219,23 +219,125 @@ fn admission_gate() -> Option<&'static Semaphore> {
         .as_ref()
 }
 
+/// How long a client's bring-up may wait for an admission slot before it is
+/// shed. Overridden by `PG_VM_POOL_ADMISSION_WAIT_SECS`; `0` waits forever
+/// (the old behaviour).
+///
+/// Why shed at all: the queue is FIFO and unbounded in time, and its callers
+/// are not. The Platform gives a new workbook's pooler build 12s before it
+/// abandons it and builds elsewhere — but it never closes the connection it
+/// was waiting on, so nothing here can tell it has left. A bring-up that
+/// dequeues after that serves no one: it still builds an 8 GiB VM and holds
+/// it until the idle reaper takes it, and every such VM is admission budget
+/// the next real client can't get. In the 2026-09-15 storm queue waits ran
+/// p50 17-25s and p90 around five minutes, so most bring-up work went to
+/// clients that were already gone. Shedding instead hands the client a real
+/// error it can act on (retry, or build somewhere else) and keeps the slots
+/// for those still waiting. The default sits just past that 12s budget.
+const DEFAULT_ADMISSION_WAIT: Duration = Duration::from_secs(15);
+
+fn admission_wait() -> Option<Duration> {
+    static WAIT: OnceLock<Option<Duration>> = OnceLock::new();
+    *WAIT.get_or_init(|| {
+        let secs = std::env::var("PG_VM_POOL_ADMISSION_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_ADMISSION_WAIT.as_secs());
+        if secs == 0 {
+            warn!("PG_VM_POOL_ADMISSION_WAIT_SECS=0: queued bring-ups wait for a slot forever");
+        }
+        (secs > 0).then(|| Duration::from_secs(secs))
+    })
+}
+
+/// When a bring-up that began at `start` must give up its place in the
+/// admission queue, or `None` to wait forever. See [`BringUp::admission_deadline`].
+pub(crate) fn admission_deadline_from(start: Instant) -> Option<Instant> {
+    admission_wait().map(|wait| start + wait)
+}
+
+/// A bring-up shed from the admission queue: it reached its deadline without
+/// a slot and was dropped before any daemon call. Not a failure of the schema
+/// — nothing was built, so the registry stops no VM for it and keeps it out of
+/// the circuit breaker — and the client is told the pooler is busy rather
+/// than that its database is broken.
+#[derive(Debug)]
+pub struct BringupShed {
+    pub schema: String,
+    pub waited: Duration,
+    pub queued: usize,
+}
+
+impl std::fmt::Display for BringupShed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "schema {}: pooler at capacity — no bring-up slot after {:?} with {} bring-up(s) \
+             queued; shed rather than served after the client has given up, retry shortly",
+            self.schema, self.waited, self.queued
+        )
+    }
+}
+
+impl std::error::Error for BringupShed {}
+
+/// Whether `e` is, or wraps, a [`BringupShed`].
+pub fn is_shed(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<BringupShed>())
+}
+
+/// Wait for a permit until `deadline` — `None` once it passes — or forever
+/// when there is none. Pulled out of [`admission_slot`] so the deadline can be
+/// tested against a local semaphore rather than the process-wide gate.
+async fn acquire_within(
+    gate: &Semaphore,
+    deadline: Option<Instant>,
+) -> Option<SemaphorePermit<'_>> {
+    let permit = match deadline {
+        Some(deadline) => {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), gate.acquire())
+                .await
+                .ok()?
+        }
+        None => gate.acquire().await,
+    };
+    Some(permit.expect("admission gate is never closed"))
+}
+
 /// Take an admission slot for one whole bring-up. Held across all of
 /// `ensure_vm` — deploy, ready wait, Postgres bootstrap, restore — so it
 /// bounds how many bring-ups exist at once, not how fast they start.
-async fn admission_slot(schema: &str) -> Option<SemaphorePermit<'static>> {
-    let gate = admission_gate()?;
+///
+/// A bring-up still waiting at `deadline` is shed with a [`BringupShed`]
+/// error; see [`DEFAULT_ADMISSION_WAIT`].
+async fn admission_slot(
+    schema: &str,
+    deadline: Option<Instant>,
+) -> Result<Option<SemaphorePermit<'static>>> {
+    let Some(gate) = admission_gate() else {
+        return Ok(None);
+    };
     if let Ok(permit) = gate.try_acquire() {
-        return Some(permit);
+        return Ok(Some(permit));
     }
     let queued = Instant::now();
     let _waiting = Waiting::new();
     info!("schema {schema}: all bring-up admission slots busy; queueing at the pooler");
-    let permit = gate.acquire().await.expect("admission gate is never closed");
-    info!(
-        "schema {schema}: bring-up admitted after {:?} queued",
-        queued.elapsed()
-    );
-    Some(permit)
+    match acquire_within(gate, deadline).await {
+        Some(permit) => {
+            info!(
+                "schema {schema}: bring-up admitted after {:?} queued",
+                queued.elapsed()
+            );
+            Ok(Some(permit))
+        }
+        None => Err(BringupShed {
+            schema: schema.to_string(),
+            waited: queued.elapsed(),
+            queued: bringups_waiting(),
+        }
+        .into()),
+    }
 }
 
 /// How often [`wait_ready`] re-asks the daemon for a pending VM's status.
@@ -517,6 +619,11 @@ pub struct BringUp<'a> {
     /// logical slots, and an orphaned slot pins WAL until the disk fills, so
     /// it must stay outside what a leaked tenant password can reach.
     pub repl_login: Option<&'a crate::dedicated::Credential>,
+    /// When this bring-up gives up waiting for an admission slot and is shed
+    /// (see [`DEFAULT_ADMISSION_WAIT`]); `None` waits forever. Only a client
+    /// checkout arms one — maintenance bring-ups (archive, freeze) have no
+    /// client to lose, so they queue for as long as it takes.
+    pub admission_deadline: Option<Instant>,
 }
 
 /// `disk_gb` is the data-device size this schema is known to need — the
@@ -539,8 +646,10 @@ pub async fn ensure_vm(
     // burst beyond the cap queues here (each waiter is one parked client
     // connection) instead of becoming daemon load. Held to the end of the
     // function: the pending *population* is what the daemon can't survive.
+    // A client's wait is bounded too: past its deadline this returns a
+    // `BringupShed` before anything has been built.
     let mut phase = Instant::now();
-    let _admission = admission_slot(schema).await;
+    let _admission = admission_slot(schema, up.admission_deadline).await?;
     let admission_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
     // Everything from here to a serving Postgres is what this VM costs to
     // bring back, and therefore what the reaper's warm hold is buying (see
@@ -3127,6 +3236,46 @@ mod tests {
         assert_eq!(gate.available_permits(), 1, "dropped permits must recycle");
         drop(held);
         assert_eq!(gate.available_permits(), cap);
+    }
+
+    /// The admission deadline: no slot by the deadline sheds the waiter, a
+    /// slot freed before it is taken, and no deadline waits it out.
+    #[tokio::test]
+    async fn acquire_within_sheds_at_its_deadline_and_admits_before_it() {
+        let gate = Semaphore::new(1);
+        let held = gate.acquire().await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        assert!(acquire_within(&gate, Some(deadline)).await.is_none());
+        assert!(Instant::now() >= deadline, "shed before its deadline");
+        // A deadline already past sheds at once rather than hanging.
+        assert!(acquire_within(&gate, Some(Instant::now())).await.is_none());
+
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        };
+        let (admitted, ()) = tokio::join!(
+            acquire_within(&gate, Some(Instant::now() + Duration::from_secs(5))),
+            release
+        );
+        assert!(admitted.is_some(), "a slot freed before the deadline is taken");
+        drop(admitted);
+        assert!(acquire_within(&gate, None).await.is_some());
+    }
+
+    /// The registry and the connection handler both recognise a shed through
+    /// whatever context the bring-up path wraps it in.
+    #[test]
+    fn a_shed_is_recognised_through_context() {
+        let shed: anyhow::Error = BringupShed {
+            schema: "s".into(),
+            waited: Duration::from_secs(15),
+            queued: 3,
+        }
+        .into();
+        assert!(is_shed(&shed.context("bringing up s")));
+        assert!(!is_shed(&anyhow::anyhow!("host memory capacity unavailable")));
     }
 
 

@@ -747,6 +747,9 @@ impl SchemaRegistry {
                 .filter(|r| r.state.pins())
                 .map(|r| r.role),
             repl_login,
+            // Maintenance bring-ups wait as long as it takes; only a client
+            // checkout arms a deadline (see `checkout`).
+            admission_deadline: None,
         }
     }
 
@@ -1490,7 +1493,12 @@ impl SchemaRegistry {
             // scratch, which carries the data but no roles.
             let owner = self.owner_of(schema);
             let repl_login = self.repl_login_for(schema);
-            let up = self.bring_up_for(schema, owner.as_ref(), repl_login.as_ref());
+            let mut up = self.bring_up_for(schema, owner.as_ref(), repl_login.as_ref());
+            // A client waits only so long in the admission queue (see
+            // `vm::DEFAULT_ADMISSION_WAIT`), counted from when this cold start
+            // began — so time spent behind another client's attempt at the
+            // same schema counts against it too.
+            up.admission_deadline = vm::admission_deadline_from(started);
             match cell
                 .get_or_try_init(|| {
                     vm::ensure_vm(
@@ -1554,6 +1562,14 @@ impl SchemaRegistry {
                         );
                     };
                     return Ok(guard);
+                }
+                Err(e) if vm::is_shed(&e) => {
+                    // Load, not a broken schema: nothing was built, so there
+                    // is no VM to stop, and the circuit breaker stays out of
+                    // it — the next client gets a fresh place in the queue,
+                    // not a hold-off.
+                    warn!("{e:#}");
+                    return Err(e);
                 }
                 Err(e) => {
                     warn!(
