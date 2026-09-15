@@ -27,10 +27,29 @@ process. A deployment is one of three kinds:
 
 A deployment sets exactly one of `vm`, `upstreams` or `site`.
 
-Only Firecracker and KVM are supported. This is not a limitation of taste: app-lb routes
-directly to `SandboxInfo.guest_ip`, which the daemon only populates for tap-networked
-Firecracker/KVM backends on a local daemon. A Libvirt VM would boot fine and then be
-unroutable, so the driver is rejected at registration.
+Managed pools support **Firecracker, KVM, and libvirt**. Firecracker/KVM use
+`SandboxInfo.guest_ip`. For libvirt, older daemons omit that field, so app-lb
+uses the authenticated `GET /sandboxes/:id/internal-url?port=...` endpoint.
+
+### Libvirt requirements
+
+- Run app-lb on the backend host, with a heyvmd version exposing the internal-address
+  endpoint and libvirt lifecycle operations.
+- Configure a host-reachable libvirt guest network (heyvmd's `HEYO_VIRT_NETWORK`,
+  or its legacy `HEYO_LIBVIRT_SDN_NETWORK` setting). SLIRP-only localhost/host-port
+  forwarding is not supported by this direct-guest routing mode. DHCP/address lookup
+  failures wait within `scaling.boot_timeout_secs`; they never fall back to the host.
+- Use `vm.driver: "libvirt"` and a daemon-supported `vm.image`, for example
+  `ubuntu:24.04`. Existing `build` and rootfs `artifact` pipelines produce raw ext4,
+  not libvirt disks, and are rejected for this driver. Persistent `vm.workspace`
+  capture remains Firecracker-only.
+- `scaling.idle_action: "retain"` preserves libvirt's qcow2 root disk as well as
+  its sandbox record. Unlike Firecracker/KVM, rootfs writes survive a retained
+  stop/start. `destroy` still delegates full VM deletion to heyvmd.
+
+An app-lb restart re-adopts its own libvirt replicas through the bounded readiness
+path; a temporarily missing guest address does not delete their disks. This does
+not adopt or replace unrelated libvirt VMs already running on the host.
 
 ## Requirements
 

@@ -458,7 +458,7 @@
       ]
     },
     "Driver": {
-      "description": "Which runtime boots a deployment's replicas.\n\napp-lb's own enum rather than [`heyo_sdk::SandboxDriver`], because not every\ndriver is a heyvm one: `lxc` is a system container app-lb creates on this\nhost through Incus, and the SDK has no name for it. The spellings are\ndeliberately identical to the SDK's, so a spec written against either\ndeserializes the same and the wire fixtures are unchanged.\n\n`Libvirt` and `FirecrackerContainerd` exist here only so that a spec naming\none still *deserializes* and is then refused by\n[`DeploymentSpec::validate`] with an explanation. Dropping the variants\nwould turn a good error message into an opaque serde failure.",
+      "description": "Which runtime boots a deployment's replicas.\n\napp-lb's own enum rather than [`heyo_sdk::SandboxDriver`], because not every\ndriver is a heyvm one: `lxc` is a system container app-lb creates on this\nhost through Incus, and the SDK has no name for it. The spellings are\ndeliberately identical to the SDK's, so a spec written against either\ndeserializes the same and the wire fixtures are unchanged.\n\n`FirecrackerContainerd` exists here only so that a spec naming it still\n*deserializes* and is then refused by [`DeploymentSpec::validate`] with an\nexplanation. Dropping the variant would turn a good error message into an\nopaque serde failure.",
       "oneOf": [
         {
           "type": "string",
@@ -531,7 +531,7 @@
       }
     },
     "IdleAction": {
-      "description": "What becomes of a VM the autoscaler no longer needs.\n\nThe distinction only exists because a *sandbox* is not a replica. Retiring\none of four interchangeable web VMs should reclaim everything it held;\nretiring the single VM that is somebody's working directory should not.\n\nNote what `Retain` can and cannot keep: a stopped sandbox keeps its record\nand its **`/workspace` data disk** (`vm.disk_size_gb`), and loses its memory\nand any writes to the rootfs. For Firecracker the daemon enforces that —\nthe rootfs is recopied from the base image on every cold boot — and for KVM\nthe autoscaler does, by discarding the persisted rootfs copy right after a\nsuspend rather than parking a gigabyte per idle replica. A `Retain`\ndeployment with no data disk therefore saves boot time and nothing else.\nPersistent state has to live under `/workspace`.",
+      "description": "What becomes of a VM the autoscaler no longer needs.\n\nThe distinction only exists because a *sandbox* is not a replica. Retiring\none of four interchangeable web VMs should reclaim everything it held;\nretiring the single VM that is somebody's working directory should not.\n\nNote what `Retain` can and cannot keep: a stopped sandbox keeps its record\nand its **`/workspace` data disk** (`vm.disk_size_gb`), and loses its memory\nand any writes to the rootfs. For Firecracker the daemon enforces that —\nthe rootfs is recopied from the base image on every cold boot — and for KVM\nthe autoscaler does, by discarding the persisted rootfs copy right after a\nsuspend rather than parking a gigabyte per idle replica. A `Retain`\ndeployment with no data disk therefore saves boot time and nothing else.\nPersistent state has to live under `/workspace`.\nLibvirt is different: its qcow2 root disk also survives `Retain` and must\nnot be discarded, because the daemon resumes that disk in place.",
       "oneOf": [
         {
           "description": "Kill it: the sandbox, its data disk and its rootfs all go. The default,\nand right for a pool of interchangeable replicas.",
@@ -1074,7 +1074,7 @@
           "minimum": 0
         },
         "driver": {
-          "description": "`firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system\ncontainer from an OCI image). `libvirt` and `firecracker_containerd`\nare rejected at registration.",
+          "description": "`firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system\ncontainer from an OCI image). `libvirt` uses a managed qcow2 VM with a\nhost-reachable guest network. `firecracker_containerd` is rejected.",
           "$ref": "#/$defs/Driver"
         },
         "env_from": {

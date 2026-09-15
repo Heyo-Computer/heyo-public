@@ -476,6 +476,8 @@ fn default_boot_timeout_secs() -> u64 {
 /// suspend rather than parking a gigabyte per idle replica. A `Retain`
 /// deployment with no data disk therefore saves boot time and nothing else.
 /// Persistent state has to live under `/workspace`.
+/// Libvirt is different: its qcow2 root disk also survives `Retain` and must
+/// not be discarded, because the daemon resumes that disk in place.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum IdleAction {
@@ -496,10 +498,10 @@ pub enum IdleAction {
 /// deliberately identical to the SDK's, so a spec written against either
 /// deserializes the same and the wire fixtures are unchanged.
 ///
-/// `Libvirt` and `FirecrackerContainerd` exist here only so that a spec naming
-/// one still *deserializes* and is then refused by
-/// [`DeploymentSpec::validate`] with an explanation. Dropping the variants
-/// would turn a good error message into an opaque serde failure.
+/// `FirecrackerContainerd` exists here only so that a spec naming it still
+/// *deserializes* and is then refused by [`DeploymentSpec::validate`] with an
+/// explanation. Dropping the variant would turn a good error message into an
+/// opaque serde failure.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Driver {
@@ -522,7 +524,8 @@ impl Driver {
         match self {
             Self::Firecracker => Some(SandboxDriver::Firecracker),
             Self::Kvm => Some(SandboxDriver::Kvm),
-            Self::Lxc | Self::Libvirt | Self::FirecrackerContainerd => None,
+            Self::Libvirt => Some(SandboxDriver::Libvirt),
+            Self::Lxc | Self::FirecrackerContainerd => None,
         }
     }
 
@@ -747,8 +750,8 @@ enum SandboxSizeSchema {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct VmSpec {
     /// `firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system
-    /// container from an OCI image). `libvirt` and `firecracker_containerd`
-    /// are rejected at registration.
+    /// container from an OCI image). `libvirt` uses a managed qcow2 VM with a
+    /// host-reachable guest network. `firecracker_containerd` is rejected.
     pub driver: Driver,
     /// Defaults to `ubuntu:24.04` daemon-side when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3631,6 +3634,7 @@ pub enum SpecError {
     /// on a proxied request, and an unrouted deployment receives none.
     AuthWithoutRoutes,
     UnsupportedDriver(Driver),
+    LibvirtImagePipeline,
     /// A `driver: lxc` spec naming a block that only means something on heyvm.
     /// Carries the field, because "this is not supported" without saying which
     /// of eight blocks is the problem is not an error anyone can act on.
@@ -3966,8 +3970,11 @@ impl std::fmt::Display for SpecError {
             ),
             Self::UnsupportedDriver(d) => write!(
                 f,
-                "driver {d} is not supported: app-lb routes directly to the guest IP, \
-                 which the daemon only exposes for tap-networked firecracker/kvm backends"
+                "driver {d} is not supported: managed pools require firecracker, kvm, libvirt, or lxc"
+            ),
+            Self::LibvirtImagePipeline => write!(
+                f,
+                "libvirt requires a daemon-supported vm.image; build and artifact produce raw ext4 images, not libvirt disks"
             ),
             Self::NotForLxc(field) => write!(
                 f,
@@ -4490,9 +4497,8 @@ impl DeploymentSpec {
     ///
     /// A deployment is either *managed* (a `vm` template, autoscaled) or *static*
     /// (a fixed `upstreams` list, proxy_pass); exactly one must be set. For the
-    /// managed kind the driver check is load-bearing: `SandboxInfo.guest_ip` is
-    /// only populated for tap-networked Firecracker/KVM on a local daemon, so a
-    /// Libvirt VM would boot fine and then be unroutable.
+    /// managed kind requires a supported VM driver and a reachable guest
+    /// network. Libvirt addressing is resolved through the local daemon.
     /// Bind every secret reference in the spec to the spec's own namespace.
     ///
     /// Run before [`validate`](Self::validate) on every path a spec enters by
@@ -4788,11 +4794,14 @@ impl DeploymentSpec {
         if let Some(vm) = &self.vm {
             // Managed: validate the VM template and scaling policy.
             match vm.driver {
-                Driver::Firecracker | Driver::Kvm => {}
+                Driver::Firecracker | Driver::Kvm | Driver::Libvirt => {}
                 Driver::Lxc => self.validate_lxc(vm)?,
-                d @ (Driver::Libvirt | Driver::FirecrackerContainerd) => {
+                d @ Driver::FirecrackerContainerd => {
                     return Err(SpecError::UnsupportedDriver(d));
                 }
+            }
+            if vm.driver == Driver::Libvirt && (self.build.is_some() || self.artifact.is_some()) {
+                return Err(SpecError::LibvirtImagePipeline);
             }
             if vm.port == 0 {
                 return Err(SpecError::ZeroPort);
@@ -6749,16 +6758,19 @@ mod tests {
         assert!(s.validate().is_ok());
         s.vm.as_mut().unwrap().driver = Driver::Kvm;
         assert!(s.validate().is_ok());
+        s.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        assert!(s.validate().is_ok());
     }
 
     #[test]
-    fn rejects_libvirt_because_it_has_no_guest_ip() {
+    fn libvirt_rejects_ext4_image_pipelines() {
         let mut s = spec();
         s.vm.as_mut().unwrap().driver = Driver::Libvirt;
-        assert_eq!(
-            s.validate(),
-            Err(SpecError::UnsupportedDriver(Driver::Libvirt))
-        );
+        s.build = Some(build_spec());
+        assert_eq!(s.validate(), Err(SpecError::LibvirtImagePipeline));
+        s.build = None;
+        s.artifact = Some(artifact_spec());
+        assert_eq!(s.validate(), Err(SpecError::LibvirtImagePipeline));
     }
 
     /// The whole reason `Driver` is app-lb's own enum and not the SDK's: it has
@@ -6795,11 +6807,7 @@ mod tests {
     #[test]
     fn an_unbootable_driver_is_refused_by_validate_not_by_serde() {
         for (json, expected) in [
-            ("libvirt", SpecError::UnsupportedDriver(Driver::Libvirt)),
-            (
-                "firecracker_containerd",
-                SpecError::UnsupportedDriver(Driver::FirecrackerContainerd),
-            ),
+            ("firecracker_containerd", SpecError::UnsupportedDriver(Driver::FirecrackerContainerd)),
         ] {
             let mut s = spec();
             s.vm.as_mut().unwrap().driver = serde_json::from_str(&format!("\"{json}\"")).unwrap();
@@ -8285,11 +8293,9 @@ mod tests {
             // and still six.
             let sizes = enum_values(&defs["SandboxSize"]);
             assert_eq!(sizes.len(), 6, "the size classes moved: {sizes:?}");
-            // `libvirt` and `firecracker_containerd` deserialize and are then
-            // refused, so the schema lists them — it describes what parses. The
-            // caveat has to travel with them, and it does, because the doc
-            // comments say so and doc comments are what a generated schema is
-            // made of. That is the whole argument for generating this file.
+            // Every wire spelling remains in the generated schema. Libvirt is
+            // supported; firecracker_containerd parses but is refused, so that
+            // caveat must travel with the field documentation.
             let drivers = enum_values(&defs["Driver"]);
             for expected in ["firecracker", "kvm", "lxc", "libvirt"] {
                 assert!(drivers.contains(&expected.to_string()), "driver lost {expected}: {drivers:?}");
@@ -8298,8 +8304,9 @@ mod tests {
                 .as_str()
                 .expect("the driver field is documented");
             assert!(
-                caveat.contains("libvirt") && caveat.contains("rejected"),
-                "the driver field no longer warns that two of its values are refused: {caveat}",
+                caveat.contains("libvirt") && caveat.contains("firecracker_containerd")
+                    && caveat.contains("rejected"),
+                "the driver field no longer distinguishes supported libvirt from the refused driver: {caveat}",
             );
         }
     }
