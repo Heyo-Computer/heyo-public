@@ -76,9 +76,10 @@ jobs:
     # disagree about what a pattern covers — including the case that matters, an
     # unknown change set, where both are true.
     if: ${{ changed('ci/**', '.ci/workflows/ci.yml', '.ci/image/ci/**') }}
-    # Inherit the repository's runner network. Installations can choose their
-    # default node through CI_DEFAULT_NODE without editing this workflow.
+    # Use the installation's default runner. Operators can choose its node
+    # through CI_DEFAULT_NODE without editing this workflow.
     # Warm caches remain host-local; moving the default node starts a cold build.
+    uses: default
     vm:
       driver: firecracker
       build:
