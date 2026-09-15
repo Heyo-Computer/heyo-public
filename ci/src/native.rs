@@ -10,6 +10,20 @@ use uuid::Uuid;
 pub const PROTOCOL_VERSION: u32 = 1;
 const LEASE_SECONDS: i64 = 90;
 
+#[derive(Debug)]
+pub enum PollError {
+    Rejected(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for PollError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(message) | Self::Internal(message) => f.write_str(message),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Registration {
@@ -143,23 +157,25 @@ pub async fn poll(
     p: Poll,
     public_url: &str,
     secrets: &crate::secrets::Secrets,
-) -> Result<Option<Lease>, String> {
-    validate_protocol(p.protocol_version)?;
-    let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
+) -> Result<Option<Lease>, PollError> {
+    validate_protocol(p.protocol_version).map_err(PollError::Rejected)?;
+    let internal = |e: Box<dyn std::fmt::Display>| PollError::Internal(e.to_string());
+    let mut tx = store.pool().begin().await.map_err(|e| internal(Box::new(e)))?;
     let runner = sqlx::query("UPDATE ci_native_runner SET last_seen_at=now() WHERE id=$1 RETURNING labels,max_concurrent")
-        .bind(&p.runner_id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?.ok_or("runner is not registered")?;
+        .bind(&p.runner_id).fetch_optional(&mut *tx).await.map_err(|e| internal(Box::new(e)))?
+        .ok_or_else(|| PollError::Rejected("runner is not registered".into()))?;
     let active: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_native_job WHERE runner_id=$1 AND state='leased' AND lease_expires_at>now()")
-        .bind(&p.runner_id).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+        .bind(&p.runner_id).fetch_one(&mut *tx).await.map_err(|e| internal(Box::new(e)))?;
     if active >= runner.get::<i32, _>("max_concurrent") as i64 {
-        tx.commit().await.map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| internal(Box::new(e)))?;
         return Ok(None);
     }
     let labels: Vec<String> = runner.get("labels");
     let token = Uuid::new_v4();
     let row = sqlx::query("WITH candidate AS (SELECT n.job_id FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id WHERE (n.state='queued' OR (n.state='leased' AND n.lease_expires_at<=now())) AND n.required_labels <@ $2 AND j.status IN ('queued','running') AND r.status NOT IN ('success','failure','cancelled') AND ((j.plan->>'max_parallel') IS NULL OR (SELECT count(*) FROM ci_native_job peer JOIN ci_job pj ON pj.id=peer.job_id WHERE pj.run_id=j.run_id AND pj.base_id=j.base_id AND peer.state='leased' AND peer.lease_expires_at>now()) < (j.plan->>'max_parallel')::int) ORDER BY n.created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE ci_native_job n SET state='leased',runner_id=$1,lease_token=$3,lease_expires_at=now()+make_interval(secs=>$4) FROM candidate WHERE n.job_id=candidate.job_id RETURNING n.job_id,n.run_id,n.lease_expires_at")
-        .bind(&p.runner_id).bind(labels).bind(token).bind(LEASE_SECONDS as f64).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
+        .bind(&p.runner_id).bind(labels).bind(token).bind(LEASE_SECONDS as f64).fetch_optional(&mut *tx).await.map_err(|e| internal(Box::new(e)))?;
     let Some(row) = row else {
-        tx.commit().await.map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| internal(Box::new(e)))?;
         return Ok(None);
     };
     let job_id: String = row.get("job_id");
@@ -167,29 +183,29 @@ pub async fn poll(
         .bind(&job_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| e.to_string())?;
-    let plan: JobPlan = serde_json::from_value(plan_value).map_err(|e| e.to_string())?;
+        .map_err(|e| internal(Box::new(e)))?;
+    let plan: JobPlan = serde_json::from_value(plan_value).map_err(|e| internal(Box::new(e)))?;
     let claimed = sqlx::query("UPDATE ci_job SET status='running',runner_hd_id=$2,started_at=COALESCE(started_at,now()) WHERE id=$1 AND status IN ('queued','running') RETURNING job_key")
-        .bind(&job_id).bind(&p.runner_id).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
-    let Some(claimed) = claimed else { tx.rollback().await.map_err(|e|e.to_string())?; return Ok(None) };
+        .bind(&job_id).bind(&p.runner_id).fetch_optional(&mut *tx).await.map_err(|e|internal(Box::new(e)))?;
+    let Some(claimed) = claimed else { tx.rollback().await.map_err(|e|internal(Box::new(e)))?; return Ok(None) };
     let job_key: String = claimed.get("job_key");
-    Store::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(&job_id), Some(&job_key), None, "ci.job.status.v1", "running", None).await.map_err(|e|e.to_string())?;
+    Store::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(&job_id), Some(&job_key), None, "ci.job.status.v1", "running", None).await.map_err(|e|internal(Box::new(e)))?;
     for (index, step) in plan.steps.iter().enumerate() {
         let sid=crate::store::step_id(&job_id,index);
         let inserted=sqlx::query("INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT(job_id,idx) DO NOTHING")
-            .bind(&sid).bind(&job_id).bind(index as i32).bind(step.label(index)).bind(step.uses.as_deref()).execute(&mut *tx).await.map_err(|e|e.to_string())?;
-        if inserted.rows_affected()==1 { Store::add_event(&mut tx,&row.get::<String,_>("run_id"),Some(&job_id),Some(&job_key),Some(&sid),"ci.step.status.v1","pending",None).await.map_err(|e|e.to_string())?; }
+            .bind(&sid).bind(&job_id).bind(index as i32).bind(step.label(index)).bind(step.uses.as_deref()).execute(&mut *tx).await.map_err(|e|internal(Box::new(e)))?;
+        if inserted.rows_affected()==1 { Store::add_event(&mut tx,&row.get::<String,_>("run_id"),Some(&job_id),Some(&job_key),Some(&sid),"ci.step.status.v1","pending",None).await.map_err(|e|internal(Box::new(e)))?; }
     }
-    tx.commit().await.map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| internal(Box::new(e)))?;
     let run_id: String = row.get("run_id");
-    let run=store.get_run(&run_id).await.map_err(|e|e.to_string())?;
+    let run=store.get_run(&run_id).await.map_err(|e|internal(Box::new(e)))?;
     let workflow=run.as_ref().map(|r|r.workflow_id.as_str()).unwrap_or("");
     let environment=plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default");
-    let resolved=secrets.resolve(&crate::secrets::Secrets::prefix(workflow,environment)).await.map_err(|e|e.to_string())?;
+    let resolved=secrets.resolve(&crate::secrets::Secrets::prefix(workflow,environment)).await.map_err(|e|internal(Box::new(e)))?;
     let (secret_scope,var_scope)=resolved.scopes();
     let mut context=plan.base_context();
     context.set("ci", crate::dispatch::Dispatcher::ci_scope(run.as_ref()));
-    context.set("needs",store.needs_context(&run_id).await.map_err(|e|e.to_string())?)
+    context.set("needs",store.needs_context(&run_id).await.map_err(|e|internal(Box::new(e)))?)
         .set("secrets",secret_scope).set("vars",var_scope);
     Ok(Some(Lease {
         job_id,
