@@ -22,7 +22,7 @@
 # through CI. The guest has `.git`; a patched local submission may have a
 # synthetic HEAD. Changed-path metadata drives the `paths:` filter.
 #
-# ## One job, and no checks yet
+# ## One build job with targeted placement regression tests
 #
 # One buildable thing in one file, like every workflow here: whether `ci`
 # passes says nothing about the platform or about codegraph, so it earns its
@@ -30,10 +30,9 @@
 #
 # `cargo fmt --check` and `cargo clippy` would work here — the image installs
 # both components rather than leaving a bare `--profile minimal` toolchain — and
-# are deliberately left for a follow-up. `cargo test` would run too: the 54
-# tests that need Postgres, NATS or a live heyvmd are all `#[ignore]`d, and the
-# other 321 need nothing. It is left out only because this file's job is the
-# artifact; the GitHub `platform-services` job already runs the suite.
+# are deliberately left for a follow-up. The disk-placement tests below need
+# no Postgres, NATS or live heyvmd; they exercise capacity selection and the
+# authenticated telemetry read against a local mock daemon.
 name: ci
 
 on:
@@ -258,6 +257,11 @@ jobs:
             exit 1
           fi
         timeout-minutes: 60
+
+      - name: Test disk-aware runner placement
+        working-directory: /workspace/ci
+        run: cargo test --release --locked --bin ci disk_placement -- --test-threads=1
+        timeout-minutes: 10
 
       # `ci` takes no arguments at all — no clap, no `env::args` anywhere in
       # `src/` — and is configured entirely from `CI_*` variables, so there is

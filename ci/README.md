@@ -286,12 +286,27 @@ uses: prod-runners/bigbox/sb-1a34   # that existing VM; `vm:` is unused and
 # absent                            # the repository's assigned network, any host
 ```
 
-An unpinned job goes to the first online host **whose daemon supports the
-job's `vm.driver`** (`GET /capabilities` on the daemon, learned once per host):
+An unpinned job goes to the online compatible host with **the most free disk
+space**, not the first host discovered. Driver eligibility uses
+`GET /capabilities` on the daemon, learned once per host:
 a macOS daemon that joined the network advertises `apple_container`/`apple_virt`
 and is skipped by a `driver: firecracker` job instead of being handed a VM it
 cannot boot. A *pinned* job gets the same check as a named error. A daemon too
 old to answer `/capabilities` is given the benefit of the doubt.
+
+Before each unpinned placement, CI reads `/storage` over its existing authenticated
+daemon connection—the same free-space source app-lb exposes through `/disks`.
+Missing, failed, or malformed capacity measurements exclude that host; a full host
+is not treated as available merely because its heartbeat is online. Hosts must
+have room for the declared data disk, twice the declared image-build rootfs size
+(image plus VM copy), and 5 GiB of host headroom. Equal free space is broken by
+runner ID, independently of discovery order. Explicit host/VM pins are unchanged.
+
+This is a disk admission estimate, not a resource reservation or CPU/RAM load
+balancer. Auto-sized/named images, build scratch space, and concurrent allocations
+can require additional space. The check is conservative for warm VMs whose disks
+already exist. It does not change queues, create a scheduler service, or require
+an app-lb endpoint or configuration change.
 
 **`uses:` carries everything needed to place the job**, and the third form is
 why that matters. A sandbox does not record which host it is on — `SandboxInfo`

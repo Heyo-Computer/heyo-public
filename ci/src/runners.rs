@@ -982,6 +982,27 @@ impl Runners {
         Ok(drivers)
     }
 
+    /// Fresh free-space measurement from the same daemon inventory app-lb uses.
+    /// Unlike driver capabilities this must not be cached across allocations.
+    pub async fn free_disk_bytes(&self, runner_id: &str) -> Result<u64, RunnerError> {
+        let options = self.options_for(runner_id).await?;
+        let result = async {
+            let client = HeyoClient::new(options)?;
+            let response = client.raw_request(
+                Method::GET, "/storage", None::<&()>,
+                RequestOptions { timeout: Some(Duration::from_secs(15)), query: Vec::new() },
+            ).await?;
+            let response = response.error_for_status()?;
+            #[derive(serde::Deserialize)]
+            struct Storage { free_bytes: u64 }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(response.json::<Storage>().await?.free_bytes)
+        }.await;
+        result.map_err(|e| RunnerError::Unreachable {
+            runner: runner_id.to_string(),
+            reason: format!("GET /storage free-space measurement failed: {e}"),
+        })
+    }
+
     /// Drop a runner's tunnel so the next `client_for` redials.
     ///
     /// Called when a request over the tunnel fails in a way that suggests the
@@ -1712,6 +1733,40 @@ mod tests {
         let result = runners.supported_drivers("hd-local").await;
         server.abort();
         assert_eq!(result.unwrap().unwrap().as_ref(), &["firecracker", "libvirt"]);
+    }
+
+    #[tokio::test]
+    async fn disk_placement_reads_fresh_authenticated_capacity_and_rejects_unknown() {
+        use axum::{Json, Router, http::{HeaderMap, StatusCode}, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let calls = reads.clone();
+        let app = Router::new().route("/storage", get(move |headers: HeaderMap| {
+            let calls = calls.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer daemon-only-key");
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => (StatusCode::OK, Json(serde_json::json!({"free_bytes": 100}))),
+                    1 => (StatusCode::OK, Json(serde_json::json!({"free_bytes": 0}))),
+                    2 => (StatusCode::OK, Json(serde_json::json!({}))),
+                    _ => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"free_bytes": 999}))),
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        unsafe { std::env::set_var("CI_NETWORK", "test-net") };
+        let mut config = test_config();
+        config.heyvm.local_runner = Some(url);
+        config.heyvm.local_runner_token = Some("daemon-only-key".into());
+        let runners = Runners::new(Arc::new(config));
+        assert_eq!(runners.free_disk_bytes("hd-local").await.unwrap(), 100);
+        assert_eq!(runners.free_disk_bytes("hd-local").await.unwrap(), 0);
+        assert!(runners.free_disk_bytes("hd-local").await.is_err());
+        assert!(runners.free_disk_bytes("hd-local").await.is_err());
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+        server.abort();
     }
 
     fn test_runners(allow_unauthenticated: bool) -> Runners {
