@@ -25,6 +25,7 @@ use base64::Engine;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -3060,6 +3061,52 @@ pub(crate) fn stamp_owner(spec: &mut DeploymentSpec, caller: Option<&Caller>) {
     }
 }
 
+/// A strong validator for the complete, normalized spec as represented on the
+/// wire. Going through `Value` is intentional: object keys are serialized in
+/// the map's stable lexical order, rather than inheriting Rust struct field
+/// order.
+fn deployment_etag(spec: &DeploymentSpec) -> Result<String, serde_json::Error> {
+    let value = serde_json::to_value(spec)?;
+    let bytes = serde_json::to_vec(&value)?;
+    Ok(format!("\"{:x}\"", Sha256::digest(bytes)))
+}
+
+/// Accept only the one conditional-update form app-lb implements: one exact,
+/// strong tag emitted by `GET`. Lists, wildcards and weak validators have
+/// semantics this endpoint does not promise and are rejected rather than
+/// approximated.
+fn if_match(headers: &axum::http::HeaderMap) -> Result<Option<&str>, Response> {
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let Some(value) = values.next() else { return Ok(None) };
+    if values.next().is_some() {
+        return Err(err(StatusCode::BAD_REQUEST, "If-Match must contain exactly one strong ETag").into_response());
+    }
+    let value = value.to_str().map_err(|_| {
+        err(StatusCode::BAD_REQUEST, "If-Match is not a valid HTTP header value").into_response()
+    })?;
+    let valid = value.len() == 66
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && value[1..65].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !valid {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "If-Match must be one quoted lowercase SHA256 ETag from GET /deployments/:id",
+        ).into_response());
+    }
+    Ok(Some(value))
+}
+
+fn check_etag_precondition(expected: Option<&str>, current: &DeploymentSpec) -> Result<(), StatusCode> {
+    let Some(expected) = expected else { return Ok(()) };
+    let current = deployment_etag(current).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if expected == current {
+        Ok(())
+    } else {
+        Err(StatusCode::PRECONDITION_FAILED)
+    }
+}
+
 async fn register(
     State(state): State<AdminState>,
     caller: Option<axum::Extension<Caller>>,
@@ -3183,8 +3230,13 @@ async fn update(
     State(state): State<AdminState>,
     Path(id): Path<String>,
     caller: Option<axum::Extension<Caller>>,
+    headers: axum::http::HeaderMap,
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
+    let expected_etag = match if_match(&headers) {
+        Ok(value) => value.map(str::to_owned),
+        Err(response) => return response,
+    };
     spec.id = id.clone();
     // A namespace token may omit the namespace and have its own filled in,
     // rather than trip the cross-namespace refusal below with an unnamed spec.
@@ -3219,10 +3271,28 @@ async fn update(
     }
 
     stamp_owner(&mut spec, caller.as_ref().map(|c| &c.0));
+    let response_etag = match deployment_etag(&spec) {
+        Ok(etag) => etag,
+        Err(e) => {
+            tracing::error!(deployment = %id, error = %e, "failed to serialize deployment ETag");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "failed to serialize deployment ETag").into_response();
+        }
+    };
     let change = state.registry.change_guard().await;
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    // Compare while holding the same writer guard that covers fencing, the
+    // registry swap, persistence and teardown scheduling. A stale request must
+    // leave all of those untouched.
+    if let Err(status) = check_etag_precondition(expected_etag.as_deref(), &old.spec) {
+        let message = if status == StatusCode::PRECONDITION_FAILED {
+            "If-Match does not match the current deployment spec"
+        } else {
+            "failed to serialize deployment ETag"
+        };
+        return err(status, message).into_response();
+    }
 
     // The owner is not part of the template, so a stamp never recycles a pool.
     let rebuild = old.spec.vm != spec.vm || old.spec.upstreams != spec.upstreams;
@@ -3277,7 +3347,7 @@ async fn update(
         now_secs(),
     );
 
-    Json(status_of(&state, &deployment)).into_response()
+    ([(header::ETAG, response_etag)], Json(status_of(&state, &deployment))).into_response()
 }
 
 /// Manually scale a deployment: `PATCH /deployments/:id/scaling`.
@@ -3382,7 +3452,13 @@ async fn list(
 
 async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
     match state.registry.get(&id) {
-        Some(d) => Json(status_of(&state, &d)).into_response(),
+        Some(d) => match deployment_etag(&d.spec) {
+            Ok(etag) => ([(header::ETAG, etag)], Json(status_of(&state, &d))).into_response(),
+            Err(e) => {
+                tracing::error!(deployment = %id, error = %e, "failed to serialize deployment ETag");
+                err(StatusCode::INTERNAL_SERVER_ERROR, "failed to serialize deployment ETag").into_response()
+            }
+        },
         None => err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response(),
     }
 }
@@ -5228,6 +5304,78 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod deployment_etags {
+        use super::*;
+
+        fn spec(route: &str) -> DeploymentSpec {
+            let mut spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
+                "id": "web",
+                "routes": [{"host": route}],
+                "upstreams": ["127.0.0.1:8080"]
+            }))
+            .unwrap();
+            spec.normalize();
+            spec
+        }
+
+        fn headers(value: Option<&str>) -> axum::http::HeaderMap {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(header::IF_MATCH, value.parse().unwrap());
+            }
+            headers
+        }
+
+        #[test]
+        fn matching_tag_succeeds_and_unconditioned_update_stays_compatible() {
+            let current = spec("old.example.com");
+            let tag = deployment_etag(&current).unwrap();
+            assert!(check_etag_precondition(if_match(&headers(Some(&tag))).unwrap(), &current).is_ok());
+            assert!(check_etag_precondition(if_match(&headers(None)).unwrap(), &current).is_ok());
+        }
+
+        #[tokio::test]
+        async fn stale_tag_does_not_replace_the_deployment_or_its_pool() {
+            let registry = crate::registry::Registry::new("unused-etag-test-state.json");
+            let first = registry.upsert(spec("first.example.com"));
+            let stale = deployment_etag(&first.spec).unwrap();
+            let current = registry.upsert(spec("current.example.com"));
+
+            let _change = registry.change_guard().await;
+            let observed = registry.get("web").unwrap();
+            assert_eq!(
+                check_etag_precondition(Some(&stale), &observed.spec),
+                Err(StatusCode::PRECONDITION_FAILED)
+            );
+            // The failed CAS never calls update/upsert: the exact Deployment
+            // object (and therefore its backend pool) remains installed.
+            assert!(Arc::ptr_eq(&current, &registry.get("web").unwrap()));
+            assert_eq!(registry.get("web").unwrap().spec.routes[0].host.as_deref(), Some("current.example.com"));
+        }
+
+        #[test]
+        fn malformed_weak_wildcard_and_list_tags_are_refused() {
+            for value in [
+                "not-an-etag",
+                "W/\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+                "*",
+                "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+                "\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"",
+            ] {
+                assert_eq!(if_match(&headers(Some(value))).unwrap_err().status(), StatusCode::BAD_REQUEST, "{value}");
+            }
+        }
+
+        #[test]
+        fn tag_hashes_the_serialized_value_of_the_full_spec() {
+            let spec = spec("hash.example.com");
+            let value = serde_json::to_value(&spec).unwrap();
+            let expected = format!("\"{:x}\"", Sha256::digest(serde_json::to_vec(&value).unwrap()));
+            assert_eq!(deployment_etag(&spec).unwrap(), expected);
+            assert_eq!(expected.len(), 66);
+        }
+    }
 
     mod upstream_drains {
         use super::*;

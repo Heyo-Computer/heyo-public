@@ -423,6 +423,26 @@ or health edit never disturbs live VMs; only a change to the `vm` block reboots
 them, because the existing VMs were built from the old template. (This is unlike
 `POST /deployments`, which always replaces and tears the pool down.)
 
+`GET /deployments/:id` returns an `ETag` for the response's complete normalized
+`spec`. To make a compare-and-swap update, send that exact value in
+`If-Match` on `PUT /deployments/:id`. The comparison is made under the
+deployment change lock before any fence, registry or persisted-state mutation,
+or VM teardown; a stale tag returns **412 Precondition Failed** with no change.
+Omitting `If-Match` retains the original unconditional replace behavior. Only
+one exact strong tag is supported: wildcard, list, weak, malformed, uppercase,
+or unquoted forms return **400 Bad Request**. A successful PUT also returns the
+new `ETag`.
+
+The tag is `"<hex>"`, where `<hex>` is lowercase SHA-256 of the compact JSON
+bytes produced by first serializing the full normalized `DeploymentSpec` to a
+`serde_json::Value`, then serializing that value. Thus a Rust client can compute
+the same tag from the GET body's `spec` with
+`format!("\"{:x}\"", Sha256::digest(serde_json::to_vec(&spec_value)?))`; hash
+the `spec` value, not the whole status response and not a client struct's field
+order. This is concurrency detection, not a claim that a successful PUT is
+durable or idempotent: existing persistence failures are logged after the
+in-memory replacement, as before.
+
 Set `maintenance: true` in that complete spec to return **503** on the
 deployment's public routes before authentication or backend selection. This
 preserves the VM pool and keeps the separate admin API, including exec,
