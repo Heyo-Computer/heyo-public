@@ -1,6 +1,6 @@
 //! The durable record of what this node is replicating, and to or from whom.
 //!
-//! One row per database, twelve tab-separated columns, `0600`, temp-file +
+//! One row per database, eighteen tab-separated columns, `0600`, temp-file +
 //! rename — the same shape as [`crate::dedicated`] and for the same reasons.
 //! It holds a cleartext password (the replication login's) so it is no more
 //! world-readable than `dedicated.tsv` is.
@@ -149,6 +149,39 @@ pub struct ReplRecord {
     pub message: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Durable planned-switchover source fence. This is deliberately
+    /// orthogonal to replication state: fencing never promotes either side.
+    pub fence: Option<Fence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fence {
+    /// `hard` closes the whole database; `selective` leaves only the private
+    /// controller and this pairing's authenticated replication login usable.
+    pub mode: String,
+    pub phase: String,
+    pub message: String,
+    pub vm_id: String,
+    pub barrier_lsn: String,
+    pub requested_at: u64,
+    pub updated_at: u64,
+    /// Authoritative source values captured after the selective drain.
+    pub sequences: Vec<SequenceSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SequenceSnapshot {
+    pub schema: String,
+    pub name: String,
+    pub data_type: String,
+    pub start_value: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub increment_by: i64,
+    pub cycle: bool,
+    pub cache_size: i64,
+    pub last_value: i64,
+    pub is_called: bool,
 }
 
 impl ReplRecord {
@@ -169,6 +202,7 @@ impl ReplRecord {
             message: String::new(),
             created_at: now,
             updated_at: now,
+            fence: None,
         }
     }
 }
@@ -239,7 +273,7 @@ impl ReplStore {
             .lock()
             .unwrap()
             .get(database)
-            .is_some_and(|r| r.state.pins())
+            .is_some_and(|r| r.state.pins() || r.fence.is_some())
     }
 
     /// Every pinned database, so startup can warm them before the untracked
@@ -250,7 +284,7 @@ impl ReplStore {
             .lock()
             .unwrap()
             .values()
-            .filter(|r| r.state.pins())
+            .filter(|r| r.state.pins() || r.fence.is_some())
             .map(|r| r.database.clone())
             .collect();
         out.sort();
@@ -275,12 +309,12 @@ impl ReplStore {
                 rec.repl_role
             );
         }
-        let snapshot = {
+        {
             let mut map = self.by_database.lock().unwrap();
             // A finished or failed pairing may be replaced; a live one may not
             // — re-pairing a streaming database would silently orphan its slot.
             if let Some(old) = map.get(&rec.database)
-                && !old.state.is_terminal()
+                && (!old.state.is_terminal() || old.fence.is_some())
             {
                 bail!(
                     "database {:?} is already replicating ({} with peer {:?}); \
@@ -303,14 +337,11 @@ impl ReplStore {
                     other.database
                 );
             }
-            map.insert(rec.database.clone(), rec.clone());
-            serialize(&map)
-        };
-        if let Err(e) = write_atomic(&self.path, &snapshot) {
-            self.by_database.lock().unwrap().remove(&rec.database);
-            return Err(e).with_context(|| {
-                format!("persisting replication records to {}", self.path.display())
-            });
+            let old = map.insert(rec.database.clone(), rec.clone());
+            if let Err(e) = write_atomic(&self.path, &serialize(&map)) {
+                if let Some(old) = old { map.insert(rec.database.clone(), old); } else { map.remove(&rec.database); }
+                return Err(e).with_context(|| format!("persisting replication records to {}", self.path.display()));
+            }
         }
         info!(
             "replication: recorded {} as {} with peer {}",
@@ -324,8 +355,9 @@ impl ReplStore {
     /// Advance a record's state and persist. `message` is sanitized to one
     /// printable line.
     pub fn set_state(&self, database: &str, state: State, message: &str) -> Result<()> {
-        let snapshot = {
-            let mut map = self.by_database.lock().unwrap();
+        let mut map = self.by_database.lock().unwrap();
+        let old = map.get(database).cloned().with_context(|| format!("no replication record for database {database:?}"))?;
+        {
             let Some(rec) = map.get_mut(database) else {
                 bail!("no replication record for database {database:?}");
             };
@@ -335,25 +367,97 @@ impl ReplStore {
             rec.state = state;
             rec.message = one_line(message);
             rec.updated_at = now_unix();
-            serialize(&map)
-        };
-        write_atomic(&self.path, &snapshot)
-            .with_context(|| format!("persisting replication records to {}", self.path.display()))
+        }
+        if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
+        Ok(())
+    }
+
+    /// Persist fence intent/progress before the corresponding database side
+    /// effect. Once present it remains until an explicit successful unfence.
+    pub fn set_fence(
+        &self,
+        database: &str,
+        phase: &str,
+        message: &str,
+        vm_id: &str,
+        barrier_lsn: &str,
+    ) -> Result<()> {
+        let mut map = self.by_database.lock().unwrap();
+        let old = map.get(database).cloned().with_context(|| format!("no replication record for database {database:?}"))?;
+        {
+            let Some(rec) = map.get_mut(database) else {
+                bail!("no replication record for database {database:?}");
+            };
+            let now = now_unix();
+            let requested_at = rec.fence.as_ref().map(|f| f.requested_at).unwrap_or(now);
+            let mode = rec.fence.as_ref().map(|f| f.mode.clone()).unwrap_or_else(|| "hard".into());
+            let sequences = rec.fence.as_ref().map(|f| f.sequences.clone()).unwrap_or_default();
+            rec.fence = Some(Fence {
+                mode,
+                phase: one_line(phase),
+                message: one_line(message),
+                vm_id: one_line(vm_id),
+                barrier_lsn: one_line(barrier_lsn),
+                requested_at,
+                updated_at: now,
+                sequences,
+            });
+            rec.updated_at = now;
+        }
+        if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
+        Ok(())
+    }
+
+    pub fn set_fence_payload(
+        &self,
+        database: &str,
+        mode: &str,
+        phase: &str,
+        message: &str,
+        vm_id: &str,
+        barrier_lsn: &str,
+        sequences: Vec<SequenceSnapshot>,
+    ) -> Result<()> {
+        let mut map = self.by_database.lock().unwrap();
+        let old = map.get(database).cloned().context("replication record disappeared")?;
+        let rec = map.get_mut(database).context("replication record disappeared")?;
+        let now = now_unix();
+        let requested_at = rec.fence.as_ref().map(|f| f.requested_at).unwrap_or(now);
+        rec.fence = Some(Fence {
+            mode: one_line(mode), phase: one_line(phase), message: one_line(message),
+            vm_id: one_line(vm_id), barrier_lsn: one_line(barrier_lsn), requested_at,
+            updated_at: now, sequences,
+        });
+        rec.updated_at = now;
+        if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
+        Ok(())
+    }
+
+    pub fn clear_fence(&self, database: &str) -> Result<()> {
+        let mut map = self.by_database.lock().unwrap();
+        let old = map.get(database).cloned().with_context(|| format!("no replication record for database {database:?}"))?;
+        {
+            let Some(rec) = map.get_mut(database) else {
+                bail!("no replication record for database {database:?}");
+            };
+            rec.fence = None;
+            rec.updated_at = now_unix();
+        }
+        if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
+        Ok(())
+    }
+
+    pub fn is_fenced(&self, database: &str) -> bool {
+        self.get(database).is_some_and(|r| r.fence.is_some())
     }
 
     /// Forget a pairing entirely. The Postgres objects are the caller's
     /// problem — this only drops the bookkeeping.
     pub fn remove(&self, database: &str) -> Result<bool> {
-        let snapshot = {
-            let mut map = self.by_database.lock().unwrap();
-            if map.remove(database).is_none() {
-                return Ok(false);
-            }
-            serialize(&map)
-        };
-        write_atomic(&self.path, &snapshot).with_context(|| {
-            format!("persisting replication records to {}", self.path.display())
-        })?;
+        let mut map = self.by_database.lock().unwrap();
+        if map.get(database).is_some_and(|r| r.fence.is_some()) { bail!("{database} is fenced; explicitly unfence before removal"); }
+        let Some(old) = map.remove(database) else { return Ok(false); };
+        if let Err(e) = write_atomic(&self.path, &serialize(&map)) { map.insert(database.into(), old); return Err(e); }
         info!("replication: removed the record for {database}");
         Ok(true)
     }
@@ -439,6 +543,21 @@ fn parse(s: &str) -> HashMap<String, ReplRecord> {
                 message: f[9].to_string(),
                 created_at: f.get(10).and_then(|v| v.parse().ok()).unwrap_or(0),
                 updated_at: f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0),
+                fence: f.get(12).filter(|v| !v.is_empty()).map(|phase| {
+                    let mode = f.get(18).filter(|v| !v.is_empty()).unwrap_or(&"hard").to_string();
+                    let sequences = f.get(19).and_then(|v| serde_json::from_str(v).ok());
+                    let invalid = mode == "selective" && sequences.is_none();
+                    Fence {
+                    mode,
+                    phase: if invalid { "error".into() } else { (*phase).to_string() },
+                    message: if invalid { "invalid sequence snapshot; source fence retained".into() } else { f.get(13).unwrap_or(&"").to_string() },
+                    vm_id: f.get(14).unwrap_or(&"").to_string(),
+                    barrier_lsn: if invalid { String::new() } else { f.get(15).unwrap_or(&"").to_string() },
+                    requested_at: f.get(16).and_then(|v| v.parse().ok()).unwrap_or(0),
+                    updated_at: f.get(17).and_then(|v| v.parse().ok()).unwrap_or(0),
+                    sequences: sequences.unwrap_or_default(),
+                    }
+                }),
             },
         );
     }
@@ -482,6 +601,20 @@ fn serialize(map: &HashMap<String, ReplRecord>) -> String {
         out.push_str(&r.created_at.to_string());
         out.push('\t');
         out.push_str(&r.updated_at.to_string());
+        out.push('\t');
+        if let Some(f) = &r.fence {
+            for field in [&f.phase, &f.message, &f.vm_id, &f.barrier_lsn] {
+                out.push_str(field);
+                out.push('\t');
+            }
+            out.push_str(&f.requested_at.to_string());
+            out.push('\t');
+            out.push_str(&f.updated_at.to_string());
+            out.push('\t');
+            out.push_str(&f.mode);
+            out.push('\t');
+            out.push_str(&serde_json::to_string(&f.sequences).expect("sequence snapshots serialize"));
+        }
         out.push('\n');
     }
     out
@@ -508,6 +641,9 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))
         .with_context(|| format!("tightening permissions on {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::File::open(parent)?.sync_all()
+        .with_context(|| format!("syncing replication record directory {}", parent.display()))?;
     Ok(())
 }
 
@@ -552,6 +688,80 @@ mod tests {
         assert!(s.remove("acme").unwrap());
         assert!(!s.remove("acme").unwrap());
         assert!(ReplStore::load(s.path.clone()).list().is_empty());
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn fence_round_trips_and_pins_until_explicit_clear() {
+        let s = store();
+        s.create(rec("acme", Role::Primary), &free).unwrap();
+        s.set_fence("acme", "intent", "requested", "vm-7", "").unwrap();
+        assert!(s.is_fenced("acme"));
+        assert!(s.is_pinned("acme"), "a pending fence survives lifecycle cleanup");
+        let reloaded = ReplStore::load(s.path.clone());
+        let f = reloaded.get("acme").unwrap().fence.unwrap();
+        assert_eq!(f.phase, "intent");
+        assert_eq!(f.vm_id, "vm-7");
+        reloaded.set_fence("acme", "ready", "flushed", "vm-7", "0/CAFE").unwrap();
+        assert_eq!(reloaded.get("acme").unwrap().fence.unwrap().barrier_lsn, "0/CAFE");
+        reloaded.clear_fence("acme").unwrap();
+        assert!(!reloaded.is_fenced("acme"));
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn selective_fence_payload_round_trips_without_moving_identity() {
+        let s = store();
+        s.create(rec("acme", Role::Primary), &free).unwrap();
+        let sequence = SequenceSnapshot {
+            schema: "odd schema".into(), name: "orders_seq".into(), data_type: "bigint".into(),
+            start_value: 1, min_value: 1, max_value: i64::MAX, increment_by: 1,
+            cycle: false, cache_size: 32, last_value: 96, is_called: true,
+        };
+        s.set_fence_payload("acme", "selective", "ready", "captured", "vm-7", "0/BEEF", vec![sequence.clone()]).unwrap();
+        let fence = ReplStore::load(s.path.clone()).get("acme").unwrap().fence.unwrap();
+        assert_eq!(fence.mode, "selective");
+        assert_eq!(fence.vm_id, "vm-7");
+        assert_eq!(fence.barrier_lsn, "0/BEEF");
+        assert_eq!(fence.sequences, vec![sequence]);
+        let content = std::fs::read_to_string(&s.path).unwrap();
+        let malformed = content.replace("\"last_value\":96", "\"last_value\":null");
+        assert_ne!(content, malformed);
+        std::fs::write(&s.path, malformed).unwrap();
+        let recovered = ReplStore::load(s.path.clone());
+        let fence = recovered.get("acme").unwrap().fence.unwrap();
+        assert!(recovered.is_fenced("acme"));
+        assert_eq!(fence.phase, "error");
+        assert!(fence.barrier_lsn.is_empty(), "corrupt sequence evidence must invalidate readiness");
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn failed_fence_clear_keeps_memory_and_disk_fenced() {
+        let s = store();
+        s.create(rec("acme", Role::Primary), &free).unwrap();
+        s.set_fence("acme", "ready", "flushed", "vm-7", "0/CAFE").unwrap();
+        let expected = s.get("acme").unwrap().fence;
+        // Force the atomic replacement's temporary-file open to fail without
+        // relying on permissions (which root test runners can bypass).
+        let temporary = s.path.with_extension("tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        assert!(s.clear_fence("acme").is_err());
+        assert_eq!(s.get("acme").unwrap().fence, expected);
+        assert_eq!(ReplStore::load(s.path.clone()).get("acme").unwrap().fence, expected);
+        std::fs::remove_dir(temporary).unwrap();
+        std::fs::remove_file(&s.path).unwrap();
+    }
+
+    #[test]
+    fn a_fenced_terminal_record_cannot_be_recreated_or_removed() {
+        let s = store();
+        s.create(rec("acme", Role::Primary), &free).unwrap();
+        s.set_state("acme", State::Detached, "done").unwrap();
+        s.set_fence("acme", "error", "operator action required", "vm-7", "").unwrap();
+        assert!(s.create(rec("acme", Role::Replica), &free).is_err());
+        assert!(s.remove("acme").is_err());
+        assert_eq!(s.get("acme").unwrap().role, Role::Primary);
         let _ = std::fs::remove_file(&s.path);
     }
 

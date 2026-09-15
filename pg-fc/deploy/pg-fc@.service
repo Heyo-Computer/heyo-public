@@ -1,0 +1,19 @@
+[Unit]
+Description=PostgreSQL Firecracker pooler (%i)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/pg-fc/%i.env
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pg-fc/%i.env
+EnvironmentFile=/etc/pg-fc/%i.secrets.env
+WorkingDirectory=/var/lib/pg-fc-%i
+ExecStart=/usr/local/bin/pg-vm-pool
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

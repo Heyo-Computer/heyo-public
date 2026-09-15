@@ -15,6 +15,31 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WriterClaimKind { Activation, InitialSource }
+
+/// Exact, single-hop ownership assertion carried by the SQL upgrade request.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WriterClaim {
+    pub kind: WriterClaimKind,
+    pub database: String,
+    pub generation: String,
+    pub candidate_id: String,
+    pub source_vm_id: String,
+    pub system_identifier: String,
+    pub pg_major: u32,
+    pub sender_node: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterTunnelRequest {
+    pub claim: WriterClaim,
+    pub startup: Vec<u8>,
+}
+
 /// `GET /api/replication/peer/node` — the handshake before anything is
 /// created, so a mismatch is a clean refusal rather than half a pairing.
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -38,6 +63,84 @@ pub struct NodeInfo {
     /// they typed against what the peer actually believes.
     #[serde(default)]
     pub pg_listen_port: Option<u16>,
+    /// Explicit opt-in: old peers deserialize without this and are refused by
+    /// physical preparation before either side creates a slot or VM.
+    #[serde(default)]
+    pub physical_prepare: bool,
+    #[serde(default)]
+    pub physical_handoff: bool,
+    #[serde(default)]
+    pub physical_successor: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PhysicalPrepareRequest { pub generation: String }
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct PhysicalHandoffRequest {
+    pub database: String,
+    pub generation: String,
+    pub candidate_id: String,
+    pub source_vm_id: String,
+    pub system_identifier: String,
+    pub pg_major: u32,
+    pub barrier_lsn: String,
+    pub source_node: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct PhysicalHandoffGrantJson {
+    pub database: String,
+    pub generation: String,
+    pub candidate_id: String,
+    pub source_vm_id: String,
+    pub system_identifier: String,
+    pub pg_major: u32,
+    pub barrier_lsn: String,
+    pub peer: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PhysicalReplicaRequest {
+    pub database: String,
+    pub generation: String,
+    #[serde(default)]
+    pub predecessor: Option<String>,
+    pub source_node: String,
+    pub source_vm_id: String,
+    pub system_identifier: String,
+    pub pg_major: u32,
+    pub source_lsn: String,
+    pub settings: std::collections::BTreeMap<String, i32>,
+    pub tenant: Login,
+    pub repl: Login,
+    pub primary: PrimaryEndpoint,
+    pub slot: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct PhysicalRecordJson {
+    pub database: String,
+    pub generation: String,
+    pub phase: String,
+    pub candidate_id: Option<String>,
+    pub previous_vm_id: Option<String>,
+    pub source_vm_id: String,
+    #[serde(default)]
+    pub source_node: String,
+    #[serde(default)]
+    pub system_identifier: String,
+    #[serde(default)]
+    pub pg_major: u32,
+    pub last_error: Option<String>,
+}
+
+impl From<&crate::replication::PhysicalRecord> for PhysicalRecordJson {
+    fn from(r: &crate::replication::PhysicalRecord) -> Self { Self {
+        database: r.database.clone(), generation: r.generation.clone(), phase: format!("{:?}", r.phase).to_lowercase(),
+        candidate_id: r.candidate_id.clone(), previous_vm_id: r.previous_vm_id.clone(), source_vm_id: r.source_vm_id.clone(), last_error: r.last_error.clone(),
+        source_node: r.source_node.clone(), system_identifier: r.system_identifier.clone(), pg_major: r.pg_major,
+    }}
 }
 
 /// One end of the replication link, as the *other* node must dial it.
@@ -117,7 +220,25 @@ pub struct RecordJson {
     pub message: String,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub fence: Option<FenceJson>,
 }
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct FenceJson {
+    #[serde(default = "hard_fence_mode")]
+    pub mode: String,
+    pub phase: String,
+    pub message: String,
+    pub vm_id: String,
+    pub barrier_lsn: String,
+    pub requested_at: u64,
+    pub updated_at: u64,
+    #[serde(default)]
+    pub sequences: Vec<crate::replication::SequenceSnapshot>,
+}
+
+fn hard_fence_mode() -> String { "hard".into() }
 
 impl From<&crate::replication::ReplRecord> for RecordJson {
     fn from(r: &crate::replication::ReplRecord) -> Self {
@@ -133,8 +254,21 @@ impl From<&crate::replication::ReplRecord> for RecordJson {
             message: r.message.clone(),
             created_at: r.created_at,
             updated_at: r.updated_at,
+            fence: r.fence.as_ref().map(|f| FenceJson {
+                mode: f.mode.clone(), phase: f.phase.clone(), message: f.message.clone(), vm_id: f.vm_id.clone(),
+                barrier_lsn: f.barrier_lsn.clone(), requested_at: f.requested_at,
+                updated_at: f.updated_at, sequences: f.sequences.clone(),
+            }),
         }
     }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct FenceResponse {
+    pub record: RecordJson,
+    pub database: String,
+    pub vm_id: String,
+    pub barrier_lsn: String,
 }
 
 /// What a primary can see about its own side of the link.
@@ -262,6 +396,28 @@ mod tests {
             serde_json::from_str(r#"{"node":"b","replication_enabled":true}"#).unwrap();
         assert!(!n.tls, "unknown means do not assume TLS");
         assert_eq!(n.server_version_num, None);
+    }
+
+    #[test]
+    fn physical_status_supplies_handoff_identity_without_credentials() {
+        let record = crate::replication::PhysicalRecord {
+            database: "acme".into(), generation: "g1".into(), predecessor: None,
+            candidate_name: "repl-seed-g1".into(), candidate_id: Some("candidate-e1".into()),
+            previous_vm_id: Some("old-e0".into()), source_node: "us3".into(), source_vm_id: "source-u0".into(),
+            system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(),
+            phase: crate::replication::PhysicalPhase::Verified, handoff_barrier: None, last_error: None,
+            repl: Some(Login { role: "repl_acme".into(), password: "not-for-status".into() }),
+        };
+        let mut value = serde_json::to_value(PhysicalRecordJson::from(&record)).unwrap();
+        assert!(!value.to_string().contains("not-for-status"));
+        assert!(!value.to_string().contains("repl_acme"));
+        value["barrier_lsn"] = "0/0".into();
+        let request: PhysicalHandoffRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(request.source_node, "us3");
+        assert_eq!(request.source_vm_id, "source-u0");
+        assert_eq!(request.candidate_id, "candidate-e1");
+        assert_eq!(request.system_identifier, "7431234567890123456");
+        assert_eq!(request.pg_major, 18);
     }
 
     /// Both passwords cross the wire in this one struct; neither may reach a

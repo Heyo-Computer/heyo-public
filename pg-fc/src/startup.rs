@@ -2,8 +2,9 @@
 //!
 //! We only read enough of the v3 protocol to (a) answer the SSL/GSS preamble —
 //! upgrading to TLS when the pooler has a cert, declining otherwise — and
-//! (b) pull the `database` parameter out of the `StartupMessage`; that name is
-//! our schema/VM routing key. The raw startup bytes are kept so the proxy can
+//! (b) read the database and replication mode from the `StartupMessage`.
+//! Physical replication ignores the database and routes by authenticated role.
+//! The raw startup bytes are kept so the proxy can
 //! replay them verbatim to the VM (always plaintext upstream — TLS terminates
 //! here), leaving the rest of the session a pure byte splice.
 
@@ -34,6 +35,12 @@ pub struct StartupInfo {
     /// a dedicated database — the key the pooler resolves the client's
     /// credential from (see [`crate::dedicated`]).
     pub user: String,
+    /// Physical replication has no PostgreSQL database context. Its VM must
+    /// be selected from the authenticated replication login, not `database`.
+    pub physical_replication: bool,
+    /// Any explicit replication startup parameter, including logical
+    /// `replication=database`. Writer routing never intercepts these sessions.
+    pub replication_requested: bool,
     /// The full StartupMessage bytes (length prefix included) to replay upstream.
     pub raw: Vec<u8>,
 }
@@ -124,11 +131,47 @@ fn parse_startup_message(len_buf: &[u8; 4], body: &[u8]) -> Result<StartupInfo> 
     if database.is_empty() {
         bail!("startup packet had neither database nor user");
     }
+    let physical_replication = match params.get("replication").map(String::as_str) {
+        None | Some("database") => false,
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "t" | "tr" | "tru" | "true" | "y" | "ye" | "yes" | "on" => true,
+            "0" | "f" | "fa" | "fal" | "fals" | "false" | "n" | "no" | "of" | "off" => false,
+            _ => bail!("invalid replication startup parameter"),
+        },
+    };
+    let replication_requested = params.contains_key("replication");
 
     let mut raw = Vec::with_capacity(4 + body.len());
     raw.extend_from_slice(len_buf);
     raw.extend_from_slice(body);
-    Ok(StartupInfo { database, user, raw })
+    Ok(StartupInfo { database, user, physical_replication, replication_requested, raw })
+}
+
+/// Parse startup bytes received inside the authenticated writer tunnel.  A
+/// tunnel carries exactly one v3 StartupMessage: encryption negotiation and
+/// oversized or trailing input are rejected rather than replayed to Postgres.
+pub(crate) fn parse_forwarded(raw: &[u8]) -> Result<StartupInfo> {
+    if raw.len() < 8 || raw.len() > 10 * 1024 { bail!("invalid forwarded startup length"); }
+    let len: [u8; 4] = raw[..4].try_into().unwrap();
+    if i32::from_be_bytes(len) as usize != raw.len() { bail!("forwarded startup framing mismatch"); }
+    let body = &raw[4..];
+    if i32::from_be_bytes(body[..4].try_into().unwrap()) != PROTOCOL_V3 {
+        bail!("forwarded request is not a PostgreSQL v3 startup");
+    }
+    // Avoid authenticating one interpretation and replaying another. Require
+    // complete UTF-8 pairs, a final terminator, and unambiguous parameter keys.
+    let mut params = &body[4..];
+    let mut keys = std::collections::HashSet::new();
+    while params != [0] {
+        let end = params.iter().position(|b| *b == 0).context("unterminated startup key")?;
+        let key = std::str::from_utf8(&params[..end]).context("invalid startup key")?;
+        if key.is_empty() || !keys.insert(key) { bail!("empty or duplicate startup key"); }
+        params = &params[end + 1..];
+        let end = params.iter().position(|b| *b == 0).context("unterminated startup value")?;
+        std::str::from_utf8(&params[..end]).context("invalid startup value")?;
+        params = &params[end + 1..];
+    }
+    parse_startup_message(&len, body)
 }
 
 /// Parameters are a flat `key\0value\0...\0` list terminated by an extra `\0`.
@@ -147,4 +190,54 @@ fn parse_params(bytes: &[u8]) -> HashMap<String, String> {
         );
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_mode_matches_postgres_without_rewriting_startup() {
+        for (value, physical) in [("true", true), ("T", true), ("ye", true), ("ON", true),
+            ("1", true), ("database", false), ("false", false), ("of", false), ("0", false)] {
+            let mut body = PROTOCOL_V3.to_be_bytes().to_vec();
+            body.extend_from_slice(format!("user\0acme_pgfcrepl\0database\0replication\0replication\0{value}\0\0").as_bytes());
+            let len = ((body.len() + 4) as i32).to_be_bytes();
+            let info = parse_startup_message(&len, &body).unwrap();
+            assert_eq!(info.physical_replication, physical, "{value}");
+            assert!(info.replication_requested);
+            assert_eq!(info.database, "replication");
+            assert_eq!(info.user, "acme_pgfcrepl");
+            assert_eq!(info.raw, [len.as_slice(), body.as_slice()].concat());
+        }
+        for value in ["", "o", "Database", "truth"] {
+            let mut body = PROTOCOL_V3.to_be_bytes().to_vec();
+            body.extend_from_slice(format!("user\0acme\0replication\0{value}\0\0").as_bytes());
+            let len = ((body.len() + 4) as i32).to_be_bytes();
+            assert!(parse_startup_message(&len, &body).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn forwarded_startup_rejects_non_v3_trailing_and_replication_is_visible() {
+        let mut body = PROTOCOL_V3.to_be_bytes().to_vec();
+        body.extend_from_slice(b"user\0acme\0database\0acme\0\0");
+        let len = ((body.len() + 4) as i32).to_be_bytes();
+        let raw = [len.as_slice(), body.as_slice()].concat();
+        assert!(!parse_forwarded(&raw).unwrap().replication_requested);
+        let mut trailing = raw.clone(); trailing.push(0);
+        assert!(parse_forwarded(&trailing).is_err());
+        let mut wrong = raw; wrong[4..8].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+        assert!(parse_forwarded(&wrong).is_err());
+    }
+
+    #[test]
+    fn forwarded_startup_rejects_ambiguous_parameters() {
+        for params in [b"user\0alice\0user\0bob\0\0".as_slice(), b"user\0alice\0", b"user\0alice", b"user\0\xff\0\0", b"user\0alice\0\0ignored\0x\0\0"] {
+            let mut raw = ((8 + params.len()) as i32).to_be_bytes().to_vec();
+            raw.extend_from_slice(&PROTOCOL_V3.to_be_bytes());
+            raw.extend_from_slice(params);
+            assert!(parse_forwarded(&raw).is_err());
+        }
+    }
 }
