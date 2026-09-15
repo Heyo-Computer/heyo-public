@@ -8177,7 +8177,9 @@ mod tests {
             // printing both of them buries the one line that matters under a
             // screenful nobody reads. Name what moved instead, and leave the
             // diff to git — which is where the reviewer is going to read it.
-            if current != rendered {
+            if serde_json::from_str::<serde_json::Value>(&current).expect("recorded schema is JSON")
+                != serde_json::from_str::<serde_json::Value>(&rendered).expect("generated schema is JSON")
+            {
                 let (old, new) = (parse_defs(&current), parse_defs(&rendered));
                 let added: Vec<_> = new.iter().filter(|k| !old.contains(*k)).collect();
                 let removed: Vec<_> = old.iter().filter(|k| !new.contains(*k)).collect();
