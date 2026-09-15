@@ -76,41 +76,9 @@ jobs:
     # disagree about what a pattern covers — including the case that matters, an
     # unknown change set, where both are true.
     if: ${{ changed('ci/**', '.ci/workflows/ci.yml', '.ci/image/ci/**') }}
-    # Pinned, unlike the other two workflows here, and the reason is the cache
-    # disk below rather than anything about this host.
-    #
-    # **The warm pool is host-local.** A pooled VM is claimed by
-    # `(runner_hd_id, fingerprint, idle)` — a VM warmed on one host is invisible
-    # to a job that lands on another. Unpinned, this job goes on the network's
-    # shared queue and takes whichever host is free, so the 40 GB
-    # `/var/cache/ci` disk that "is what makes reusing a warm VM worth anything"
-    # is only reused when the job happens to come back to the host that built
-    # it. Across four runners that is a cold build most of the time: an hour of
-    # compiling 510 packages instead of minutes of relinking. Pinning is what
-    # makes the disk a cache rather than four disks that each miss.
-    #
-    # **Named, not `default`.** They resolve to the same machine today and are
-    # not the same instruction. `uses: default` reads the local `daemon.json`
-    # (CI_DAEMON_STATE_PATH) and can therefore name a host that is not in this
-    # repository's network at all, which is a placement nobody asked for and a
-    # refused job at submit. `<network>/<node>` resolves through the pool this
-    # repository actually builds on, and `Runner::matches` takes the friendly
-    # name case-insensitively, so this stays readable and survives the id
-    # changing under it.
-    #
-    # **The cost, accepted deliberately.** This is the box already serving
-    # ci.us2.heyo.work, its Postgres and its NATS, and this job puts a `large`
-    # VM (4 CPU, 8 GB) with a 40 GB disk on it. That is a real load on the
-    # machine the dashboard runs on, taken knowingly for the cache locality
-    # above. If this host starts contending, the fix is a dedicated build runner
-    # named here — not going back to unpinned, which loses the disk.
-    #
-    # **No `fallback: any`.** Migrating discards the warm VM and the populated
-    # cache the pin exists to reuse, so a migrated build is a cold build that
-    # also starts filling a second 40 GB disk elsewhere. A pinned job waits for
-    # its own host; if that host is down, `CI_RUNNER_WAIT_SECS` fails the job
-    # naming it, which is the honest outcome.
-    uses: ci-runners/us2.heyo.computer
+    # Inherit the repository's runner network. Installations can choose their
+    # default node through CI_DEFAULT_NODE without editing this workflow.
+    # Warm caches remain host-local; moving the default node starts a cold build.
     vm:
       driver: firecracker
       build:
