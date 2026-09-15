@@ -367,6 +367,25 @@ impl SparePool {
             plan_replenish(&plan_input, bound, &claimed, self.target)
         };
 
+        // Nothing is built while clients are queued for bring-ups. Every spare
+        // built now competes for the bring-up slots and the daemon's create
+        // queue those clients are waiting on, and on a host refusing VMs for
+        // memory it fails and is retried the next pass (thousands an hour in
+        // the 2026-09-15 storm). Spares exist to make clients faster; they
+        // must never be what keeps one waiting. The health pass above and the
+        // surplus deletes below still run.
+        let mut plan = plan;
+        let queued = vm::bringups_waiting();
+        if queued > 0 && (plan.create > 0 || !plan.start.is_empty()) {
+            info!(
+                "warm-spares: {queued} client bring-up(s) queued; not building {} spare(s) \
+                 this pass",
+                plan.create + plan.start.len()
+            );
+            plan.start.clear();
+            plan.create = 0;
+        }
+
         // 3. Build the deficit: restart stranded spares and create the rest,
         //    concurrently and independently of each other's failures.
         let (restarted, created) = futures::future::join(
