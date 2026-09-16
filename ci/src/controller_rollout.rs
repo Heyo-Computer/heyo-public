@@ -31,7 +31,10 @@ pub fn binary_sha256() -> Option<&'static str> {
 }
 
 fn etag(spec: &Value) -> String {
-    format!("\"{}\"", hex::encode(Sha256::digest(serde_json::to_vec(spec).expect("JSON serializes"))))
+    let mut spec = spec.clone();
+    // Match app-lb independently of serde_json's transitive preserve_order feature.
+    spec.sort_all_objects();
+    format!("\"{}\"", hex::encode(Sha256::digest(serde_json::to_vec(&spec).expect("JSON serializes"))))
 }
 
 fn artifact_identity(bytes: &[u8], sha: &str) -> Result<String, String> {
@@ -302,6 +305,17 @@ pub fn spawn(d: Arc<Dispatcher>) {
 mod tests {
     use super::*;
     use crate::{lifecycle::Lifecycle, store::{JobStatus, RunStatus}};
+
+    #[test]
+    fn etag_sorts_nested_objects_but_preserves_array_order() {
+        let input: Value = serde_json::from_str(r#"{"z":[{"z":2,"a":1},3],"a":{"z":4,"a":5}}"#).unwrap();
+        let canonical = br#"{"a":{"a":5,"z":4},"z":[{"a":1,"z":2},3]}"#;
+        let expected = format!("\"{:x}\"", Sha256::digest(canonical));
+        assert_eq!(etag(&input), expected);
+        let mut reordered = input;
+        reordered["z"].as_array_mut().unwrap().reverse();
+        assert_ne!(etag(&reordered), expected);
+    }
 
     fn package(revision: &str, sum: &str, duplicate: bool) -> Vec<u8> {
         let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());

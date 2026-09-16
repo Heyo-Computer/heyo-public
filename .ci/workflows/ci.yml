@@ -412,6 +412,10 @@ jobs:
           if outside:
               raise SystemExit('CI validation does not authorize merging these paths: ' + ', '.join(outside))
           runtime = any((p.startswith('ci/') and not p.endswith('.md')) or p.startswith('.ci/image/ci/') for p in paths)
+          # Explicitly resubmitting the already-merged revision is also a CD
+          # retry. Its empty trunk diff must not turn a failed deploy into a
+          # successful no-op. The guard above still rejects uncovered changes.
+          runtime = runtime or base == head
           with open(os.environ['CI_OUTPUT'], 'a') as output:
               output.write('deploy_required=' + str(runtime).lower() + '\n')
           PY
