@@ -36,6 +36,7 @@ mod namespaces;
 mod obs;
 mod proxy;
 mod registry;
+mod rollout;
 mod runtime;
 mod secrets;
 mod siem;

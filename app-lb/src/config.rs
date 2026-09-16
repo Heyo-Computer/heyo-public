@@ -610,7 +610,7 @@ impl Default for LxcConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ScalingPolicy {
     /// Replicas kept running even with no traffic. Defaults to 0, which lets
     /// the pool scale to zero and makes the next request pay a cold start.
@@ -686,12 +686,23 @@ fn default_health_timeout_secs() -> u64 {
     2
 }
 
+/// A response identity assertion, in addition to HTTP success.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ExpectedHeader {
+    pub name: String,
+    pub value: String,
+}
+
 /// How a freshly-booted VM is proven ready before it joins the pool.
 ///
 /// This exists because the SDK's readiness signal is not trustworthy on its own
 /// (see `vm::wait_until_running`), so we always probe the guest ourselves.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HealthCheck {
+    /// With an identity assertion, require a 2xx response and exactly one
+    /// matching header. An old baked-in listener must not verify a new release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_header: Option<ExpectedHeader>,
     /// `None` means a bare TCP connect is enough.
     #[serde(default = "default_health_path")]
     pub path: Option<String>,
@@ -707,6 +718,7 @@ pub struct HealthCheck {
 impl Default for HealthCheck {
     fn default() -> Self {
         Self {
+            expected_header: None,
             path: default_health_path(),
             port: None,
             timeout_secs: default_health_timeout_secs(),
@@ -3164,7 +3176,7 @@ impl AuthGate {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct DeploymentSpec {
     /// Unique name for this deployment, and its handle in every other call.
     /// Registering an id that already exists REPLACES that deployment.

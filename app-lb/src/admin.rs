@@ -150,6 +150,7 @@ fn html_escape(s: &str) -> String {
 
 #[derive(Clone)]
 struct AdminState {
+    rollouts: Arc<crate::rollout::Rollouts>,
     registry: Arc<Registry>,
     autoscaler: Arc<Autoscaler>,
     metrics: Arc<Metrics>,
@@ -318,6 +319,7 @@ impl AdminApi {
         Self {
             addr,
             state: AdminState {
+                rollouts: Arc::new(crate::rollout::Rollouts::new(registry.clone(), autoscaler.clone(), jobs.clone())),
                 registry,
                 autoscaler,
                 metrics,
@@ -968,6 +970,7 @@ struct VmStatus {
 
 #[derive(Serialize)]
 struct DeploymentStatus {
+    rollout_revision: String,
     spec: DeploymentSpec,
     /// `"vm"` (managed pool) or `"static"` (fixed proxy_pass upstreams).
     kind: &'static str,
@@ -1071,6 +1074,7 @@ fn pull_mounts_if_needed(state: &AdminState, spec: &DeploymentSpec) {
 fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> DeploymentStatus {
     let backends = d.backends();
     DeploymentStatus {
+        rollout_revision: d.state().rollout_revision.clone(),
         workspace: state.autoscaler.workspaces().status(d),
         spec: d.spec.clone(),
         kind: deployment_kind(d),
@@ -3180,6 +3184,9 @@ async fn register(
     // from booting until teardown's final old-state capture has published.
     let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
+    if old.as_ref().is_some_and(|d| crate::rollout::reserved(d)) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
     let replaced = old.is_some();
     let workspace_replacement = match &old {
         Some(old) => match state.autoscaler.fence_workspace_replacement(old).await {
@@ -3282,6 +3289,9 @@ async fn update(
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    if crate::rollout::reserved(&old) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
     // Compare while holding the same writer guard that covers fencing, the
     // registry swap, persistence and teardown scheduling. A stale request must
     // leave all of those untouched.
@@ -3366,6 +3376,9 @@ async fn scale(
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    if crate::rollout::reserved(&old) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
 
     // Only a managed deployment is autoscaled; for the others the scaling policy
     // is inert, so a scale request is a mistake rather than a no-op.
@@ -3451,6 +3464,15 @@ async fn list(
 }
 
 async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
+    let _change = state.registry.change_guard().await;
+    if let Some(d) = state.registry.get(&id) {
+        if d.state().rollout_revision.is_empty() { d.mutate_state(|s| s.rollout_revision = crate::rollout::revision()); }
+    }
+    if state.registry.get(&id).is_some() && !state.registry.get(&id).is_some_and(|d| crate::rollout::reserved(&d)) {
+        if state.registry.persist_one(&id).is_err() {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "could not persist rollout revision").into_response();
+        }
+    }
     match state.registry.get(&id) {
         Some(d) => match deployment_etag(&d.spec) {
             Ok(etag) => ([(header::ETAG, etag)], Json(status_of(&state, &d))).into_response(),
@@ -3724,6 +3746,9 @@ async fn uncordon_upstream(
 
 async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
     let change = state.registry.change_guard().await;
+    if state.registry.get(&id).is_some_and(|d| crate::rollout::reserved(&d) || !d.state().rollouts.is_empty()) {
+        return err(StatusCode::CONFLICT, "rollout generations must be explicitly reconciled before deregistration").into_response();
+    }
     let Some(d) = state.registry.remove(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
@@ -3770,9 +3795,13 @@ async fn evict_vm(
     Path((id, sandbox_id)): Path<(String, String)>,
     Query(params): Query<EvictParams>,
 ) -> impl IntoResponse {
+    let _change = state.registry.change_guard().await;
     let Some(d) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    if crate::rollout::reserved(&d) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
 
     // Eviction recycles a VM and lets the autoscaler boot a replacement, which
     // only means something for a managed deployment. A static one's upstreams are
@@ -4843,6 +4872,27 @@ async fn get_job(
     }
 }
 
+async fn start_rollout(State(state): State<AdminState>, Path(id): Path<String>, Json(mut request): Json<crate::rollout::Request>) -> Response {
+    if request.spec.id != id { return err(StatusCode::BAD_REQUEST, "spec.id must match deployment").into_response(); }
+    request.spec.normalize();
+    if let Err(refused) = check_provider_ref(&state, &request.spec) { return refused; }
+    let _lifecycle = state.autoscaler.rollout_guard().await;
+    let _change = state.registry.change_guard().await;
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    match state.jobs.with_rollout_slot(&id, || state.rollouts.admit(&d, request)) {
+        Ok(o) => (StatusCode::ACCEPTED, Json(o.view())).into_response(),
+        Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+async fn get_rollout(State(state): State<AdminState>, Path((id, operation)): Path<(String, String)>) -> Response {
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    match d.state().rollouts.iter().find(|o| o.operation_id == operation) {
+        Some(o) => Json(o.view()).into_response(),
+        None => err(StatusCode::NOT_FOUND, "rollout not found").into_response(),
+    }
+}
+
 fn router(state: AdminState) -> Router {
     // The dashboard view + its data source are always behind the optional gate.
     let view = Router::new()
@@ -4890,6 +4940,8 @@ fn router(state: AdminState) -> Router {
     // `admin_auth` is on; otherwise it stays open, as before.
     let crud = Router::new()
         .route("/deployments", post(register).get(list))
+        .route("/deployments/:id/rollouts", post(start_rollout))
+        .route("/deployments/:id/rollouts/:operation", get(get_rollout))
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
         .route("/deployments/:id/scaling", patch(scale))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
@@ -5026,6 +5078,15 @@ impl BackgroundService for AdminApi {
             }
         };
         tracing::info!(addr = %self.addr, "admin API listening");
+        let rollouts = self.state.rollouts.clone();
+        let mut rollout_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop { tokio::select! {
+                _ = tick.tick() => rollouts.tick().await,
+                _ = rollout_shutdown.changed() => break,
+            } }
+        });
 
         // `into_make_service_with_connect_info` rather than the bare router:
         // without it there is no `ConnectInfo` extension anywhere in the admin

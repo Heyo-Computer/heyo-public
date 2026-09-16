@@ -35,6 +35,7 @@ pub type Extra = serde_json::Map<String, Value>;
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct DeploymentStatus {
+    pub rollout_revision: String,
     pub spec: DeploymentSpec,
     /// `"vm"` (managed pool), `"static"` (fixed proxy_pass upstreams) or
     /// `"site"` (files served off disk).
@@ -901,9 +902,16 @@ pub struct ScalingPolicy {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct HealthCheck {
+    pub expected_header: Option<ExpectedHeader>,
     pub path: Option<String>,
     pub port: Option<u16>,
     pub timeout_secs: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ExpectedHeader {
+    pub name: String,
+    pub value: String,
 }
 
 // -- GET /metrics ----------------------------------------------------------

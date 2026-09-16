@@ -40,6 +40,70 @@ unroutable, so the driver is rejected at registration.
   otherwise uses `http://127.0.0.1:34099`
 - `cmake` — a hard build dependency of `pingora-core`, via `flate2`'s `zlib-ng` backend
 
+## Conditional candidate-first service rollout
+
+For existing **stateless Firecracker services**, use `POST /deployments/:id/rollouts`
+instead of destructive PUT/pull/mount replacement. First GET `/deployments/:id`:
+its `rollout_revision` is an opaque persisted CAS token, distinct from the spec ETag.
+Send `{ "operation_id": "release-123", "expected_revision": "<GET token>", "spec": <complete desired spec> }`.
+IDs are 1–128 ASCII letters, digits, hyphens or underscores. Exact replay returns the
+same operation, including terminal operations; conflicting payloads/revisions return 409.
+GET `/deployments/:id/rollouts/:operation_id` reports `operation_id`, `deployment`,
+`source_revision`, `target_spec_sha256`, `status`, `phase`, `readiness_verified`,
+`previous_stopped`, and `error`. Status is `running`, `succeeded`, `failed`, or
+`reconciliation_required`. Admission is not rollout success.
+
+`target_spec_sha256` hashes compact JSON of the **requested normalized spec**, with
+all object keys recursively sorted and array order preserved. A spec copied from
+GET is already normalized (including secret-reference namespaces). Rootfs import
+uses an operation-specific image alias in a separately recorded prepared spec;
+that materialization does not change the requested-spec hash.
+
+The desired spec must contain `artifact: { "store": "https://…", "ref": "<64 lowercase hex SHA256>" }`.
+The ref identifies a rootfs blob or the canonical artifacts manifest containing
+`rootfs.ext4`. Optional existing fields are `auth: { "secret": "id", "key": "token" }`,
+`grow_gb`, `image_name`, and `strip_components`. Candidate preparation verifies
+manifest and blob content and does not trust the catalog's name/size reuse check.
+The current daemon catalog has no digest, so a preinstalled image alias without
+pinned artifact metadata is **not sufficient**, even if the image name is unchanged.
+Every code mount must be read-only with `ref` and `digest` set to the same blob SHA256.
+Startup, environment and those mounts are applied together to the candidate.
+
+Routes, namespace, owner, request authentication and maintenance mode must remain
+unchanged. Workspace/archive-seeded VMs, writable mounts, non-Firecracker runtimes,
+Cloud ingress and extra exposed ports are rejected. An HTTP health path and a
+stable old serving pool (no pending/draining replicas) are required. Legacy writes
+and jobs are reserved out while the operation runs or requires reconciliation.
+The desired health check must include `expected_header: { "name": "x-heyo-revision", "value": "<exact lowercase Git SHA>" }`.
+Readiness requires 2xx and exactly one matching response header, using a bounded
+16 KiB parser that accepts fragmented headers. The service must emit an immutable
+build-stamped identity, **not echo a deployment environment variable**: an old
+baked-in listener must not pass when the new startup command fails. Missing/wrong
+identity, redirects and even otherwise healthy 404 responses cannot pass a rollout.
+Legacy health checks without `expected_header` retain their existing semantics.
+
+The deployment's existing fsync/rename record stores the operation, unique allocation
+intents, active generation, and exact retiring VM IDs. Candidates stay unrouted until
+healthy. Cutover persists first, then fences admission on old backends and publishes
+the candidate pool. Acquired requests drain until zero or `drain_timeout_secs`; only
+then are recorded previous replicas stopped, **not destroyed**. Their records/disks
+remain claimed, and old retained VMs cannot resume into the new generation.
+Retirement relies on the daemon's stop acknowledgment: install a daemon that
+propagates termination errors and preserves live handles on failure before
+enabling rollouts. Older daemons that swallow stop errors cannot establish
+`previous_stopped` reliably. Normal ephemeral rootfs cleanup performed by the
+daemon on successful stop is unchanged; app-lb never purges the retained sandbox.
+
+Restart reconciles attempted creates by exact recorded name, never by issuing another
+create. Unknown allocations or ambiguous persistence retain both generations for
+operator reconciliation. A failed candidate leaves the source serving; failed candidate
+allocations are retained, not purged. Post-cutover stop/readiness failure is bounded by
+the drain deadline plus five minutes and never reports `previous_stopped`. The record
+requires one owning app-lb process, as the existing registry does; it is not a shared
+multi-process database. Retained history requires explicit operator reconciliation
+before deregistration. This endpoint does not migrate external ingress or coordinate
+regions; the caller must wait for both success flags before rolling the next region.
+
 ## Run
 
 ```sh

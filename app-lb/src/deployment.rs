@@ -341,6 +341,12 @@ pub struct UpstreamDrain {
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeploymentState {
+    #[serde(default = "crate::rollout::revision")]
+    pub rollout_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rollouts: Vec<crate::rollout::Operation>,
     /// Sandboxes this deployment stopped rather than destroyed, under
     /// `scaling.idle_action: retain`. They hold their `/workspace` data disk and
     /// are candidates for resume in preference to a cold create.
@@ -410,7 +416,7 @@ impl Deployment {
             .collect();
         Self {
             spec,
-            state: ArcSwap::from_pointee(DeploymentState::default()),
+            state: ArcSwap::from_pointee(DeploymentState { rollout_revision: crate::rollout::revision(), ..Default::default() }),
             backends: ArcSwap::from_pointee(backends),
             pending: ArcSwap::from_pointee(Vec::new()),
             waiters: AtomicUsize::new(0),
