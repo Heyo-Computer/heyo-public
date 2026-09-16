@@ -144,7 +144,11 @@ An older controller cannot deploy its own first implementation of this action.
 Missing capabilities or configuration fail the deployment rather than claim success.
 
 The durable rollout waits for jobs, claimed/building VMs, live native leases and
-other unresolved deployments. Before the first replacement attempt,
+other unresolved deployments. A historical running native job does not block
+once its lease has expired and its parent run is terminal: native endpoints
+reject further writes and the job cannot be leased again. An expired lease on
+a still-runnable run remains a blocker. No historical rows are deleted.
+Before the first replacement attempt,
 `CI_MAX_JOB_SECONDS` bounds the drain; timeout or cancellation leaves the
 controller unchanged and reopens submissions. After an ambiguous replacement
 attempt, admission stays closed until reconciliation proves the outcome. Inspect

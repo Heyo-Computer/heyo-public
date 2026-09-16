@@ -399,7 +399,13 @@ mod tests {
         sqlx::query("UPDATE ci_vm_pool SET status='idle'").execute(s.pool()).await.unwrap();
         sqlx::query("INSERT INTO ci_native_job(job_id,run_id,required_labels,state,lease_expires_at) VALUES('job','run','{}','leased',now()+interval '1 minute')").execute(s.pool()).await.unwrap();
         assert!(!gate.quiesce(s, "op").await.unwrap(), "native lease remains authoritative even with a terminal job row");
-        sqlx::query("UPDATE ci_native_job SET state='completed',lease_expires_at=NULL").execute(s.pool()).await.unwrap();
+        s.set_job_status("job", JobStatus::Running, None).await.unwrap();
+        sqlx::query("UPDATE ci_native_job SET lease_expires_at=now()-interval '1 minute'").execute(s.pool()).await.unwrap();
+        s.set_run_status("run", RunStatus::Running, None).await.unwrap();
+        assert!(!gate.quiesce(s, "op").await.unwrap(), "an expired lease on a runnable run can be claimed again");
+        s.set_run_status("run", RunStatus::Failure, None).await.unwrap();
+        // All native writes and future claims are fenced by expiry and the
+        // terminal parent, even if historical job status still says running.
         assert!(gate.quiesce(s, "op").await.unwrap());
         assert!(Lifecycle::default().work(s).await.is_err());
         sqlx::query("UPDATE ci_controller_rollout SET phase='complete'").execute(s.pool()).await.unwrap();

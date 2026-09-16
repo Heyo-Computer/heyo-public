@@ -75,10 +75,12 @@ impl Lifecycle {
             return Err(format!("rollout {id} cannot quiesce from phase {phase:?}"));
         }
 
-        // Running jobs count regardless of their parent's rollup. Pending and
-        // queued jobs count only while their run can still schedule them.
+        // Running jobs count even when their parent failed, except a native
+        // lease that expired on a terminal run: native endpoints fence every
+        // heartbeat/completion/upload, and poll cannot lease that run again.
+        // Pending/queued jobs count while their run can still schedule them.
         let blocked: bool = sqlx::query(
-            "SELECT EXISTS(SELECT 1 FROM ci_job j WHERE j.status='running' OR (j.status IN ('pending','queued') AND EXISTS (SELECT 1 FROM ci_run r WHERE r.id=j.run_id AND r.status NOT IN ('success','failure','cancelled')))) AS jobs, EXISTS(SELECT 1 FROM ci_vm_pool WHERE status IN ('claimed','building')) AS vms, EXISTS(SELECT 1 FROM ci_native_job WHERE state='leased' AND lease_expires_at>now()) AS native, EXISTS(SELECT 1 FROM ci_service_deployment WHERE id<>$1 AND status NOT IN ('passed','failed')) AS effects"
+            "SELECT EXISTS(SELECT 1 FROM ci_job j JOIN ci_run r ON r.id=j.run_id WHERE (j.status='running' AND NOT (r.status IN ('success','failure','cancelled') AND EXISTS (SELECT 1 FROM ci_native_job n WHERE n.job_id=j.id AND n.state='leased' AND n.lease_expires_at<=now()))) OR (j.status IN ('pending','queued') AND r.status NOT IN ('success','failure','cancelled'))) AS jobs, EXISTS(SELECT 1 FROM ci_vm_pool WHERE status IN ('claimed','building')) AS vms, EXISTS(SELECT 1 FROM ci_native_job WHERE state='leased' AND lease_expires_at>now()) AS native, EXISTS(SELECT 1 FROM ci_service_deployment WHERE id<>$1 AND status NOT IN ('passed','failed')) AS effects"
         ).bind(id).fetch_one(&mut *tx).await.map_err(|e|e.to_string())
         .map(|r| r.get::<bool,_>("jobs") || r.get::<bool,_>("vms") || r.get::<bool,_>("native") || r.get::<bool,_>("effects"))?;
         if blocked { tx.rollback().await.map_err(|e|e.to_string())?; return Ok(false); }
