@@ -42,6 +42,10 @@ fn desired_spec(mut spec: Value, target: &Target, store: &str, artifact: &str, s
         "registered deployment identity differs from target");
     ensure!(spec["vm"]["driver"] == "firecracker" && spec["vm"]["workspace"].is_null(),
         "service rollout requires a stateless Firecracker deployment");
+    let health = spec["health"].as_object_mut().ok_or_else(|| anyhow::anyhow!("missing HTTP readiness configuration"))?;
+    ensure!(health.get("path").and_then(Value::as_str).is_some_and(|p| p.starts_with('/')),
+        "candidate rollout requires an HTTP readiness path");
+    health.insert("expected_header".into(), json!({"name":"x-heyo-revision","value":sha}));
     ensure!(target.mount_path.starts_with("/opt/") && Path::new(&target.mount_path).components()
         .all(|c| matches!(c, Component::RootDir | Component::Normal(_))), "release mount must be an absolute /opt path without traversal");
     ensure!(target.working_directory == target.mount_path && target.start_command == format!("{}/start.sh", target.mount_path),
@@ -245,7 +249,9 @@ mod tests {
     fn rollout_preserves_routes_secrets_runtime_and_unrelated_mounts() {
         let before = current();
         let after = desired_spec(before.clone(), &target(), "https://art.test", "new-bundle", "new-sha").unwrap();
-        for key in ["routes", "health"] { assert_eq!(before[key], after[key]); }
+        assert_eq!(before["routes"], after["routes"]);
+        for key in ["path", "timeout_secs"] { assert_eq!(before["health"][key], after["health"][key]); }
+        assert_eq!(after["health"]["expected_header"], json!({"name":"x-heyo-revision","value":"new-sha"}));
         for key in ["driver", "image", "port", "env_from"] { assert_eq!(before["vm"][key], after["vm"][key]); }
         assert_eq!(after["vm"]["env_vars"]["PORT"], "8080");
         assert_eq!(after["vm"]["env_vars"]["HEYO_CLOUD_DEPLOYMENT_GIT_SHA"], "new-sha");
