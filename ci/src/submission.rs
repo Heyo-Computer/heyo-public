@@ -25,7 +25,7 @@ pub fn validate_validation_plan(plan: &Plan) -> Result<(), String> {
         }
         if job.steps.iter().any(|s| matches!(s.uses.as_deref(),
             Some("ci/merge-release" | "ci/checkout-release" | "ci/deploy-service" |
-                 "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance"))) {
+                 "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/rollout-service"))) {
             return Err(format!("{}: move publication/deployment into the on: release workflow", plan.workflow_path));
         }
     }
@@ -425,6 +425,8 @@ jobs:
         let plan = release_plan();
         assert!(validate_release_plan(&plan).is_ok());
         assert!(validate_validation_plan(&plan).is_err());
+        let rollout = crate::workflow::Workflow::parse("rollout.yml", "jobs:\n  deploy:\n    steps: [{uses: ci/rollout-service}]\n").unwrap();
+        assert!(validate_validation_plan(&Plan::build(&rollout).unwrap()).is_err());
         let mut conditional = plan.clone();
         conditional.jobs[0].condition = Some("false".into());
         assert!(validate_release_plan(&conditional).is_err());

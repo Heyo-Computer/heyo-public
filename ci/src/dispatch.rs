@@ -2592,7 +2592,7 @@ impl Dispatcher {
             .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
         if matches!(action, "ci/merge-release" | "ci/publish-service-archive" |
-            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance") {
+            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/rollout-service") {
             crate::submission::authorize_publication(&self.store, &msg.run_id).await
                 .map_err(DispatchError::StepFailed)?;
         }
@@ -2735,6 +2735,17 @@ impl Dispatcher {
                     &required("deployment")?, &required("namespace")?, &required("manifest")?, &required("store")?,
                     step_timeout(step, plan), masker).await
                     .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
+            }
+            "ci/rollout-service" => {
+                let mount_path = required("mount-path")?;
+                let target = crate::service_rollout::Target {
+                    url: required("url")?, deployment: required("deployment")?, namespace: required("namespace")?,
+                    revision_env: required("revision-env")?, start_command: format!("{mount_path}/start.sh"),
+                    working_directory: mount_path.clone(), mount_path,
+                };
+                crate::service_rollout::deploy(self, msg, sid, target, &required("token")?,
+                    &required("workflow")?, &required("artifact")?, step_timeout(step, plan), masker).await
+                    .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
             }
             "ci/deploy-controller" => {
                 crate::controller_rollout::request(self, msg, sid, &required("artifact")?, with("workflow").as_deref()).await
