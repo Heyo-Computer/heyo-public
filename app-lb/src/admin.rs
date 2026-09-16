@@ -3062,11 +3062,11 @@ pub(crate) fn stamp_owner(spec: &mut DeploymentSpec, caller: Option<&Caller>) {
 }
 
 /// A strong validator for the complete, normalized spec as represented on the
-/// wire. Going through `Value` is intentional: object keys are serialized in
-/// the map's stable lexical order, rather than inheriting Rust struct field
-/// order.
+/// wire. Explicitly sort every object: serde_json's `preserve_order` feature
+/// can be enabled transitively and must not change the validator protocol.
 fn deployment_etag(spec: &DeploymentSpec) -> Result<String, serde_json::Error> {
-    let value = serde_json::to_value(spec)?;
+    let mut value = serde_json::to_value(spec)?;
+    value.sort_all_objects();
     let bytes = serde_json::to_vec(&value)?;
     Ok(format!("\"{:x}\"", Sha256::digest(bytes)))
 }
@@ -5328,6 +5328,27 @@ mod tests {
         }
 
         #[test]
+        fn validator_uses_lexical_keys_even_with_preserve_order() {
+            // Independent canonical encoder: sort keys at each object, keeping
+            // arrays ordered. Do not use the production sort_all_objects call.
+            fn canonical(value: &serde_json::Value) -> String {
+                match value {
+                    serde_json::Value::Object(map) => {
+                        let sorted: std::collections::BTreeMap<_, _> = map.iter().collect();
+                        format!("{{{}}}", sorted.into_iter().map(|(k, v)|
+                            format!("{}:{}", serde_json::to_string(k).unwrap(), canonical(v))
+                        ).collect::<Vec<_>>().join(","))
+                    }
+                    serde_json::Value::Array(items) => format!("[{}]", items.iter().map(canonical).collect::<Vec<_>>().join(",")),
+                    other => other.to_string(),
+                }
+            }
+            let current = spec("test.example.com");
+            let expected = format!("\"{:x}\"", Sha256::digest(canonical(&serde_json::to_value(&current).unwrap()).as_bytes()));
+            assert_eq!(deployment_etag(&current).unwrap(), expected);
+        }
+
+        #[test]
         fn matching_tag_succeeds_and_unconditioned_update_stays_compatible() {
             let current = spec("old.example.com");
             let tag = deployment_etag(&current).unwrap();
@@ -5370,7 +5391,8 @@ mod tests {
         #[test]
         fn tag_hashes_the_serialized_value_of_the_full_spec() {
             let spec = spec("hash.example.com");
-            let value = serde_json::to_value(&spec).unwrap();
+            let mut value = serde_json::to_value(&spec).unwrap();
+            value.sort_all_objects();
             let expected = format!("\"{:x}\"", Sha256::digest(serde_json::to_vec(&value).unwrap()));
             assert_eq!(deployment_etag(&spec).unwrap(), expected);
             assert_eq!(expected.len(), 66);

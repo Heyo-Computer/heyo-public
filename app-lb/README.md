@@ -435,8 +435,11 @@ new `ETag`.
 
 The tag is `"<hex>"`, where `<hex>` is lowercase SHA-256 of the compact JSON
 bytes produced by first serializing the full normalized `DeploymentSpec` to a
-`serde_json::Value`, then serializing that value. Thus a Rust client can compute
-the same tag from the GET body's `spec` with
+`serde_json::Value`, recursively sorting every object's keys lexically, then
+serializing that value. Array order is preserved. Sorting must be explicit even
+when the default map implementation already sorts: transitive dependencies can
+enable serde_json's `preserve_order` feature. Thus a Rust client must call
+`spec_value.sort_all_objects()` on the GET body's `spec` before computing
 `format!("\"{:x}\"", Sha256::digest(serde_json::to_vec(&spec_value)?))`; hash
 the `spec` value, not the whole status response and not a client struct's field
 order. This is concurrency detection, not a claim that a successful PUT is
