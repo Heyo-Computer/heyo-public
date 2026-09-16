@@ -44,25 +44,9 @@ on:
 
 jobs:
   release:
-    # Pinned to the orchestrator's own host — the Linux CI machine. `default`
-    # rather than a spelled-out `<network>/<node>`, so the pin survives the
-    # host being renamed or the network reorganised.
-    #
-    # This used to be unpinned ("any online host"), and the 2026-08-24 run is
-    # why it no longer is: a macbook daemon joined the network and the job
-    # landed on it — a firecracker build on a host that only runs apple_*
-    # drivers. Placement filters on driver capability now, but the warm VM,
-    # its cache disk and the image catalog all live on one machine, so "any
-    # host" was never what these jobs meant; every placement elsewhere is a
-    # cold build.
-    #
-    # `app-obs.yml` is pinned to the same host, and nothing orders the two any
-    # more — a commit touching both, or the shared image, runs them side by
-    # side, asking the host for 12 vCPUs and 24 GB between them. Each then
-    # takes longer than it would alone. That was the reason the old `apps.yml`
-    # ran app-obs after app-lb; it is accepted here as the price of being able
-    # to run either one on its own.
-    uses: default
+    # Let CI choose an eligible Firecracker host by available capacity rather
+    # than pinning builds to the controller's host. Driver filtering excludes
+    # native-only machines; a warm cache must not override disk headroom.
     vm:
       driver: firecracker
       build:
