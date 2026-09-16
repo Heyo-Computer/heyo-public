@@ -1428,6 +1428,39 @@ actions do not change app-lb, namespaces, existing VM pages, or Retail.
 
 ### Service deployments
 
+For candidate-first updates of existing stateless app-lb services, use
+`ci/rollout-service` in a release workflow. It reuses a successful validation
+bundle at the exact merged SHA, rather than rebuilding after merge. Inputs are
+`url`, secret `token`, `deployment`, `namespace`, `mount-path`, `revision-env`,
+`workflow` (the validation workflow path), and `artifact` (its uploaded bundle
+name). The HTTP artifact bundle must contain `dist/start.sh` and all runtime
+dependencies. The script must run from its release directory, not assume
+`/workspace`. CI mounts the verified bundle read-only with one path component
+stripped, executes `<mount-path>/start.sh`, and sets the requested revision
+environment variable. Existing routes, runtime settings and secret references
+are preserved; a conflicting secret revision override is refused.
+
+This action requires app-lb's conditional candidate rollout API, a pinned
+rootfs artifact, pinned read-only mounts and an HTTP readiness path. Catalog
+image names alone cannot prove rootfs identity. Workspace/writable deployments
+and alternate ingress are not supported by this rollout path. Upgrade app-lb
+before enabling the action; CI never falls back to stop-first mutation APIs.
+CI sets `health.expected_header` to `x-heyo-revision` with the exact release SHA.
+The service must return that identity stamped into its build, not echoed from
+runtime environment variables. A generic healthy response from an old listener
+must not authorize cutover. app-lb requires a 2xx status and the exact header.
+
+CI persists the source revision, source/target configuration hashes, exact
+artifact and deadline before submission, without storing live secrets. Queue
+replay first looks up the exact operation. A missing operation can be submitted
+again only while the original source revision and configuration still match;
+app-lb must deduplicate that operation ID. Admission is not success: CI waits
+for identity-matched `succeeded`, verified readiness and previous-generation
+retirement. Cancellation or timeout stops waiting, not the remote operation.
+Reconcile an uncertain operation before submitting a replacement. Chain
+regional jobs with `needs` so the next region cannot start before this verified
+completion; a parallel job graph does not provide sequential regional CD.
+
 For an existing app-lb VM deployment, use `ci/publish-rootfs` followed by
 `ci/deploy-app-lb`. Publication takes `path` (a relative raw ext4 file) and
 `image` (its image name), and requires the HTTP artifacts sink. Its outputs are

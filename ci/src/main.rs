@@ -40,6 +40,7 @@ mod repos;
 mod runners;
 mod secrets;
 mod service_archive;
+mod service_rollout;
 mod store;
 mod submission;
 mod trigger;
