@@ -23,6 +23,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: never
       CARGO_BUILD_JOBS: '4'
+      HEYO_BUILD_GIT_SHA: '${{ ci.sha }}'
     timeout-minutes: 90
     steps:
       - name: Prepare disposable PostgreSQL
@@ -46,6 +47,14 @@ jobs:
           cp "$CARGO_TARGET_DIR/release/orchestrator" /workspace/dist/orchestrator
           strip /workspace/dist/orchestrator
           cp -R migrations /workspace/dist/migrations
+          cat > /workspace/dist/start.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          CDPATH= cd -- "$(dirname -- "$0")"
+          export ORCHESTRATOR_MIGRATIONS_DIR="${ORCHESTRATOR_MIGRATIONS_DIR:-$PWD/migrations}"
+          exec ./orchestrator
+          SH
+          chmod +x /workspace/dist/start.sh
           printf '%s\n' '${{ ci.sha }}' > /workspace/dist/REVISION
           (cd /workspace/dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 

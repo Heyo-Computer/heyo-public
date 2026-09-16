@@ -282,11 +282,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn health_check() -> Json<serde_json::Value> {
-    Json(json!({
+async fn health_check() -> impl axum::response::IntoResponse {
+    // Readiness identifies the built binary, not an old image's runtime env.
+    ([("x-heyo-revision", option_env!("HEYO_BUILD_GIT_SHA").unwrap_or("unknown"))], Json(json!({
         "status": "ok",
         "deploymentGitSha": std::env::var("HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA").unwrap_or_default(),
         "deploymentPrNumber": std::env::var("HEYO_ORCHESTRATOR_DEPLOYMENT_PR_NUMBER").unwrap_or_default(),
         "deploymentId": std::env::var("HEYO_ORCHESTRATOR_DEPLOYMENT_ID").unwrap_or_default(),
-    }))
+    })))
+}
+
+#[cfg(test)]
+mod health_tests {
+    #[tokio::test]
+    async fn readiness_header_identifies_build_not_runtime_environment() {
+        use axum::response::IntoResponse;
+        let response = super::health_check().await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.headers()["x-heyo-revision"], option_env!("HEYO_BUILD_GIT_SHA").unwrap_or("unknown"));
+    }
 }
