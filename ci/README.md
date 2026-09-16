@@ -122,7 +122,10 @@ configuration before enabling the workflow:
 
 - `CI_CONTROLLER_DEPLOYMENT`: the app-lb deployment ID of this controller.
 - `CI_CONTROLLER_REPOSITORY`: the only repository allowed to replace it.
-- `CI_APP_LB_URL` and `CI_APP_LB_TOKEN`: its app-lb admin endpoint and credential.
+- `CI_CONTROLLER_APP_LB_URL` and `CI_CONTROLLER_APP_LB_TOKEN`: its app-lb admin
+  endpoint and a credential restricted to that deployment. These are separate
+  from `CI_APP_LB_URL/TOKEN`, which enable workflow-object discovery; enabling
+  self-deployment must not change how existing repositories find workflows.
 - `CI_PUBLIC_URL`: must match the deployment's configured public URL.
 - `CI_EXPECTED_SHA`: set by promotion; health also hashes the running executable.
 

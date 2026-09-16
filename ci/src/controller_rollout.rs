@@ -98,10 +98,10 @@ fn target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return Err("invalid CI_CONTROLLER_DEPLOYMENT".into());
     }
-    let base = d.config.app_lb_url.as_deref().ok_or("CI_APP_LB_URL is not configured")?;
+    let base = d.config.controller_app_lb_url.as_deref().ok_or("CI_CONTROLLER_APP_LB_URL is not configured")?;
     crate::cd::app_lb_endpoint(base)?;
     crate::cd::app_lb_endpoint(&d.config.public_url)?;
-    let token = d.config.app_lb_token.as_deref().filter(|s| !s.is_empty()).ok_or("CI_APP_LB_TOKEN is not configured")?;
+    let token = d.config.controller_app_lb_token.as_deref().filter(|s| !s.is_empty()).ok_or("CI_CONTROLLER_APP_LB_TOKEN is not configured")?;
     Ok((id, base, token))
 }
 
@@ -436,7 +436,9 @@ mod tests {
         let mut config = crate::config::Config::from_env().unwrap();
         config.controller_deployment = Some("ci-test".into());
         config.controller_repository = Some("https://github.com/example/ci.git".into());
-        config.app_lb_url = Some(base.into()); config.app_lb_token = Some("test-admin".into());
+        config.app_lb_url = None; config.app_lb_token = None;
+        config.controller_app_lb_url = Some(base.into()); config.controller_app_lb_token = Some("test-admin".into());
+        assert!(!crate::objects::Workflows::new(&config).is_configured(), "self-deployment must not enable workflow-object discovery");
         config.public_url = base.into();
         config.nats_prefix = format!("rollout{}", uuid::Uuid::new_v4().simple());
         config.artifact_sink = crate::config::ArtifactSinkKind::Disk;
