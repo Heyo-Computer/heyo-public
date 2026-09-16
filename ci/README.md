@@ -143,6 +143,13 @@ through the existing drained deployment path, then enable the configured workflo
 An older controller cannot deploy its own first implementation of this action.
 Missing capabilities or configuration fail the deployment rather than claim success.
 
+To retry deployment after the candidate has already merged, submit that revision
+with `git submit --only ci --submit-empty`. CI revalidates and republishes the
+candidate, then requests deployment even though its diff against trunk is empty.
+This explicit retry can replace the controller even if that revision is already
+running. New documentation-only changes still skip deployment; mixed unmerged
+changes still fail the CI-only merge scope guard.
+
 The durable rollout waits for jobs, claimed/building VMs, live native leases and
 other unresolved deployments. A historical running native job does not block
 once its lease has expired and its parent run is terminal: native endpoints
