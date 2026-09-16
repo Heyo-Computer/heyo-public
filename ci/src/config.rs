@@ -951,13 +951,13 @@ mod tests {
         }
         let config = Config::from_env().unwrap();
         let runners = crate::runners::Runners::new(std::sync::Arc::new(config));
-        assert!(runners.options_for("hd-local").await.unwrap().api_key.is_none());
+        assert!(runners.options_for("hd-local").await.unwrap().options.api_key.is_none());
         unsafe { std::env::set_var("CI_LOCAL_RUNNER_TOKEN", "distinct-daemon-key") };
         let config = Config::from_env().unwrap();
         let runners = crate::runners::Runners::new(std::sync::Arc::new(config));
         let options = runners.options_for("hd-local").await.unwrap();
-        assert_eq!(options.api_key.as_deref(), Some("distinct-daemon-key"));
-        assert_eq!(options.base_url.as_deref(), Some("https://runner.example.test"));
+        assert_eq!(options.options.api_key.as_deref(), Some("distinct-daemon-key"));
+        assert_eq!(options.options.base_url.as_deref(), Some("https://runner.example.test"));
         unsafe {
             std::env::remove_var("CI_LOCAL_RUNNER");
             std::env::remove_var("CI_LOCAL_RUNNER_TOKEN");

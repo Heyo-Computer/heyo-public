@@ -110,9 +110,10 @@ struct PrepareStatus {
 #[serde(rename_all = "camelCase")]
 struct PreparedImageWire { name: String, input_digest: String }
 
-pub async fn prepare_remote(options: HeyoClientOptions, request: &PrepareRequest, deadline: Duration) -> Result<PreparedSource, ImageError> {
+pub async fn prepare_remote(options: impl Into<crate::runners::Connection>, request: &PrepareRequest, deadline: Duration) -> Result<PreparedSource, ImageError> {
     let poll = poll_interval();
-    let client = HeyoClient::new(options).map_err(|source| ImageError::Daemon { what: "building a client for source preparation", source })?;
+    let connection = options.into();
+    let client = HeyoClient::new(connection.options.clone()).map_err(|source| ImageError::Daemon { what: "building a client for source preparation", source })?;
     let started = std::time::Instant::now();
     let mut status: PrepareStatus = client.request(Method::POST, "/sources/prepare", Some(request), RequestOptions { timeout: Some(Duration::from_secs(120)), query: vec![] })
         .await.map_err(|source| match source {
@@ -218,7 +219,7 @@ pub struct Built {
 /// state aged out; the POST is simply re-sent — it is idempotent, and if the
 /// image landed before the restart the re-POST answers `ready`.
 pub async fn build_remote<F, Fut>(
-    options: HeyoClientOptions,
+    options: impl Into<crate::runners::Connection>,
     source_id: &str,
     name: &str,
     deadline: Duration,
@@ -232,7 +233,8 @@ where
 
     let poll = poll_interval();
 
-    let client = HeyoClient::new(options).map_err(|e| ImageError::Daemon {
+    let connection = options.into();
+    let client = HeyoClient::new(connection.options.clone()).map_err(|e| ImageError::Daemon {
         what: "building a client for the runner",
         source: e,
     })?;
@@ -866,18 +868,28 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_http_contract_posts_metadata_and_polls_same_source() {
-        use axum::{Json, Router, routing::{get, post}};
+        use axum::{Json, Router, extract::State, routing::{get, post}};
+        use std::sync::{Arc, Weak};
+        let owner = Arc::new(HeyoClient::new(HeyoClientOptions::default()).unwrap());
+        let weak = Arc::downgrade(&owner);
         let app = Router::new()
-            .route("/sources/prepare", post(|Json(body): Json<serde_json::Value>| async move {
+            .route("/sources/prepare", post(|State(owner): State<Weak<HeyoClient>>, Json(body): Json<serde_json::Value>| async move {
+                assert!(owner.upgrade().is_some(), "source POST lost its connection owner");
                 assert_eq!(body["repositoryUrl"], "https://github.com/acme/repo.git");
                 assert_eq!(body["gitAuthToken"], "fresh-secret");
                 assert!(body.get("context_tar_gz").is_none());
                 Json(serde_json::json!({"sourceId":"source_1", "status":"preparing"}))
             }))
-            .route("/sources/source_1", get(|| async { Json(ready_source("source_1")) }));
-        let prepared = prepare_remote(http_options(app).await, &prepare_request(), Duration::from_secs(1)).await.unwrap();
+            .route("/sources/source_1", get(|State(owner): State<Weak<HeyoClient>>| async move {
+                assert!(owner.upgrade().is_some(), "source polling lost its connection owner");
+                Json(ready_source("source_1"))
+            }))
+            .with_state(weak.clone());
+        let connection = crate::runners::Connection { options: http_options(app).await, _tunnel: Some(owner) };
+        let prepared = prepare_remote(connection, &prepare_request(), Duration::from_secs(1)).await.unwrap();
         assert_eq!(prepared.source_id, "source_1");
         assert_eq!(prepared.image.unwrap().name, "ci-img-aabbccddee11");
+        assert!(weak.upgrade().is_none(), "completed preparation leaked its connection");
     }
 
     #[tokio::test]

@@ -2046,7 +2046,7 @@ impl Dispatcher {
         wanted: &str,
     ) -> Result<String, DispatchError> {
         let options = self.runners.options_for(runner).await?;
-        let sandboxes = heyo_sdk::Sandbox::list(options).await.map_err(|e| {
+        let sandboxes = heyo_sdk::Sandbox::list(options.options.clone()).await.map_err(|e| {
             DispatchError::Vm(crate::vm::VmError::Daemon {
                 sandbox: wanted.to_string(),
                 what: "listing sandboxes on the node",

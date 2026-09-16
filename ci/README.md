@@ -880,6 +880,12 @@ do. A daemon that answers and does not know the VM, or cannot start it, is a
 verdict: the VM is destroyed and a fresh one built. Destroyed rather than merely
 forgotten, because a forgotten stopped VM is disk nothing will ever reclaim.
 
+Runner connections retain ownership of their forwarding listener throughout
+source preparation, image builds, VM execution, and teardown. Evicting a failed
+cached connection makes subsequent work redial without closing the listener
+under other active jobs. This does not recover a genuinely broken remote link
+or replay a command whose outcome is unknown.
+
 ### A VM being created is on the page too
 
 A row appears as `building` **before** the create is attempted, not once it
