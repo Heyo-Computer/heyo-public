@@ -855,6 +855,17 @@ behind, sitting beside the one that replaced it. Claimed VMs are refused in the
 query; `draining` keeps a taken VM out of circulation until the daemon confirms
 it is gone.
 
+Disk pressure overrides this retention window during VM admission. Before
+comparing compatible hosts (and for a pinned host), CI evicts that host's oldest
+idle caches one at a time until measured free space meets the incoming job's
+disk budget: its data disk, two declared rootfs copies, and 5 GiB host headroom.
+Free space is read again after every deletion, and checked again before a cold
+VM creation. Claimed, building, and already-draining VMs are never victims;
+only CI pool rows on that host qualify. A failed deletion stays tracked as
+draining and stops that cleanup attempt. If no idle caches remain and space is
+still insufficient, the host cannot admit a new VM. This is admission headroom,
+not a disk reservation against concurrent allocations or unknown build scratch.
+
 A claim that cannot *reach* a pooled VM — the tunnel, the daemon not answering
 — hands the row back and fails the delivery so the ladder retries; discarding a
 warm cache because the runner blinked is the most expensive thing this code can

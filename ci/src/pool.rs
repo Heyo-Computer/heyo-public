@@ -624,6 +624,25 @@ impl Pool {
         Ok(rows.iter().map(PooledVm::from_row).collect())
     }
 
+    /// Take just the oldest idle cache on this host under disk pressure.
+    /// Locking and marking it draining atomically excludes concurrent claims.
+    pub async fn take_oldest_idle(&self, runner: &str) -> Result<Option<PooledVm>, PoolError> {
+        let row = sqlx::query(
+            "UPDATE ci_vm_pool SET status = 'draining'
+              WHERE sandbox_id = (
+                    SELECT sandbox_id FROM ci_vm_pool
+                     WHERE status = 'idle' AND runner_hd_id = $1
+                     ORDER BY last_used_at ASC, sandbox_id ASC
+                     LIMIT 1 FOR UPDATE SKIP LOCKED
+              ) RETURNING *",
+        )
+        .bind(runner)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(row.as_ref().map(PooledVm::from_row))
+    }
+
     /// Idle VMs whose fingerprint is no longer wanted, or which have sat unused
     /// too long.
     ///
@@ -1556,6 +1575,41 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn disk_pressure_takes_oldest_idle_only_on_requested_host() {
+        let (pool, _) = test_pool().await;
+        let runner = runner_id();
+        let other = runner_id();
+        for (host, name, age, idle) in [
+            (&runner, "new", 1, true),
+            (&runner, "old", 2, true),
+            (&runner, "claimed", 3, false),
+            (&other, "foreign", 4, true),
+        ] {
+            let id = sb(host, name);
+            pool.register(&id, host, name, "wf", None, "j", held()).await.unwrap();
+            if idle { pool.release(&id).await.unwrap(); }
+            sqlx::query("UPDATE ci_vm_pool SET last_used_at = now() - make_interval(secs => $2) WHERE sandbox_id = $1")
+                .bind(id).bind(f64::from(age)).execute(&pool.db).await.unwrap();
+        }
+        let building = pool.begin_build("j", &runner, "building", "wf", None, held()).await.unwrap();
+        // A concurrent claim holding the oldest row wins; eviction skips it.
+        let mut claim = pool.db.begin().await.unwrap();
+        sqlx::query("SELECT sandbox_id FROM ci_vm_pool WHERE sandbox_id = $1 FOR UPDATE")
+            .bind(sb(&runner, "old")).fetch_one(&mut *claim).await.unwrap();
+        let taken = pool.take_oldest_idle(&runner).await.unwrap().unwrap();
+        assert_eq!(taken.sandbox_id, sb(&runner, "new"));
+        assert_eq!(taken.status, "draining");
+        claim.rollback().await.unwrap();
+        assert_eq!(pool.take_oldest_idle(&runner).await.unwrap().unwrap().sandbox_id, sb(&runner, "old"));
+        assert!(pool.take_oldest_idle(&runner).await.unwrap().is_none());
+        assert!(pool.claim(&runner, "old", "j2", held()).await.unwrap().is_none());
+        assert_eq!(pool.get(&sb(&runner, "claimed")).await.unwrap().unwrap().status, "claimed");
+        assert_eq!(pool.get(&sb(&other, "foreign")).await.unwrap().unwrap().status, "idle");
+        assert_eq!(pool.get(&building).await.unwrap().unwrap().status, "building");
     }
 
     /// Sweeping marks VMs `draining` so a concurrent claim cannot take one that

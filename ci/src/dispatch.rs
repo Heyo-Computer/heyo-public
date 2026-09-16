@@ -1168,6 +1168,7 @@ impl Dispatcher {
         //
         // On the *local* plan only. The stored plan keeps what the author wrote,
         // so a redelivery re-derives the name rather than inheriting one.
+        let disk_requirement = runner_disk_requirement(&plan.vm);
         if existing_vm.is_none() && let Some(build) = plan.vm.build.clone() {
             let image = self
                 .ensure_image(&runner, &plan, &build, prepared.as_ref().expect("build requires preparation"), msg)
@@ -1204,7 +1205,7 @@ impl Dispatcher {
                 let cache_keys = prepared.as_ref().map(|p| &p.cache_keys).unwrap_or(&empty);
                 let fingerprint = crate::pool::fingerprint(&plan.vm, cache_keys)?;
                 let (vm, reused) = self
-                    .acquire_vm(&runner, &plan, &fingerprint, &msg.job_id)
+                    .acquire_vm(&runner, &plan, &fingerprint, &msg.job_id, disk_requirement)
                     .await?;
                 (vm, reused, fingerprint)
             }
@@ -1349,6 +1350,9 @@ impl Dispatcher {
                     supported: supported.join(", "),
                 });
             }
+            if vm.is_none() {
+                self.reclaim_disk_space(&node.id, runner_disk_requirement(&plan.vm)).await?;
+            }
             return Ok((node.id.clone(), vm));
         }
         // Unpinned: compare fresh disk capacity on every compatible host.
@@ -1365,14 +1369,9 @@ impl Dispatcher {
                         supported.join(", ")
                     ));
                 }
-                Ok(_) => match self.runners.free_disk_bytes(&candidate.id).await {
+                Ok(_) => match self.reclaim_disk_space(&candidate.id, required).await {
                     Ok(free) => {
                         candidates.push((candidate.id.clone(), free));
-                        if free < required {
-                            skipped.push(format!(
-                                "{} has {free} free disk bytes; this job requires at least {required}", candidate.name
-                            ));
-                        }
                     }
                     Err(e) => skipped.push(format!("{} capacity unavailable: {e}", candidate.name)),
                 },
@@ -1587,6 +1586,7 @@ impl Dispatcher {
         plan: &JobPlan,
         fingerprint: &str,
         job_id: &str,
+        required: u64,
     ) -> Result<(Vm, bool), DispatchError> {
         let options = self.runners.options_for(runner).await?;
 
@@ -1655,6 +1655,10 @@ impl Dispatcher {
                 }
             }
         }
+
+        // A warm claim above needs no new disks. A cold create must recheck:
+        // image building or another job may have consumed admission headroom.
+        self.reclaim_disk_space(runner, required).await?;
 
         let name = sandbox_name(
             &plan.base_id,
@@ -3740,6 +3744,29 @@ impl Dispatcher {
             .collect()
     }
 
+    /// Reclaim only idle CI caches, oldest first, until this host can admit
+    /// the requested VM. Never estimate recovered space from virtual disk size.
+    async fn reclaim_disk_space(&self, runner: &str, required: u64) -> Result<u64, DispatchError> {
+        let mut free = self.runners.free_disk_bytes(runner).await?;
+        while free < required {
+            let Some(vm) = self.pool.take_oldest_idle(runner).await? else {
+                return Err(DispatchError::DiskPressure(format!(
+                    "{runner} has {free} free disk bytes and no idle caches left; this job requires {required}"
+                )));
+            };
+            tracing::info!(runner, sandbox = %vm.sandbox_id, free, required,
+                "evicting idle CI cache for VM disk headroom");
+            let (_, failed) = self.destroy_swept(vec![vm]).await;
+            if !failed.is_empty() {
+                return Err(DispatchError::DiskPressure(format!(
+                    "{runner} idle-cache cleanup failed: {}", failed.join("; ")
+                )));
+            }
+            free = self.runners.free_disk_bytes(runner).await?;
+        }
+        Ok(free)
+    }
+
     /// Destroy VMs that have been taken out of circulation, and forget them.
     ///
     /// The row goes only once the daemon confirms — a row removed while the
@@ -4264,6 +4291,7 @@ fn or_none(items: &[String]) -> String {
 #[derive(Debug)]
 pub enum DispatchError {
     ControllerUnavailable(String),
+    DiskPressure(String),
     Native(String),
     Store(crate::store::StoreError),
     Pool(crate::pool::PoolError),
@@ -4511,6 +4539,7 @@ impl std::fmt::Display for DispatchError {
                  that was running — the command in the guest finishes or hits its own \
                  timeout, since the daemon cannot abort it — and nothing after it ran."
             ),
+            Self::DiskPressure(message) => write!(f, "{message}"),
             Self::VmNotSweepable(id) => write!(
                 f,
                 "{id} cannot be destroyed from here. It is either unknown, on a host \
@@ -6077,6 +6106,62 @@ mod tests {
             // takes anyway.
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
+    async fn disk_pressure_rechecks_space_and_stops_at_budget() {
+        use axum::{Json, Router, extract::Path, http::StatusCode, routing::{get, delete}};
+        use std::sync::atomic::AtomicU64;
+        let free = Arc::new(AtomicU64::new(50));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let storage = free.clone();
+        let disk = free.clone();
+        let errors = fail.clone();
+        let calls = deleted.clone();
+        let app = Router::new()
+            .route("/storage", get(move || {
+                let storage = storage.clone();
+                async move { Json(serde_json::json!({"free_bytes": storage.load(Ordering::SeqCst)})) }
+            }))
+            .route("/deployed-sandboxes/{id}", delete(move |Path(id): Path<String>| {
+                let (disk, errors, calls) = (disk.clone(), errors.clone(), calls.clone());
+                async move {
+                    calls.lock().unwrap().push(id);
+                    if errors.load(Ordering::SeqCst) { return StatusCode::FORBIDDEN; }
+                    disk.fetch_add(25, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        unsafe { std::env::set_var("CI_TEST_DAEMON", url); }
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let runner = format!("pressure-{}", crate::vm::new_id());
+        for (id, age) in [("new", 1.0), ("middle", 2.0), ("old", 3.0)] {
+            let id = format!("{runner}-{id}");
+            d.pool.register(&id, &runner, "fp", "wf", None, "job", d.lease()).await.unwrap();
+            d.pool.release(&id).await.unwrap();
+            sqlx::query("UPDATE ci_vm_pool SET last_used_at = now() - make_interval(secs => $2) WHERE sandbox_id = $1")
+                .bind(id).bind(age).execute(d.store.pool()).await.unwrap();
+        }
+        assert_eq!(d.reclaim_disk_space(&runner, 50).await.unwrap(), 50);
+        assert!(deleted.lock().unwrap().is_empty(), "exactly enough space must not evict");
+        assert_eq!(d.reclaim_disk_space(&runner, 100).await.unwrap(), 100);
+        assert_eq!(*deleted.lock().unwrap(), vec![format!("{runner}-old"), format!("{runner}-middle")]);
+        assert!(d.pool.get(&format!("{runner}-old")).await.unwrap().is_none());
+        assert_eq!(d.pool.get(&format!("{runner}-new")).await.unwrap().unwrap().status, "idle");
+        // Failure must retain ownership and stop rather than deleting more caches.
+        fail.store(true, Ordering::SeqCst);
+        assert!(d.reclaim_disk_space(&runner, 101).await.is_err());
+        assert_eq!(d.pool.get(&format!("{runner}-new")).await.unwrap().unwrap().status, "draining");
+        let error = d.reclaim_disk_space(&runner, 101).await.unwrap_err();
+        assert!(error.to_string().contains("no idle caches left"), "{error}");
+        server.abort();
+        unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
     }
 
     /// Lay down a run's workflow workspace and source descriptor, the way a real
