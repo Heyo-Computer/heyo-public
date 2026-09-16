@@ -11,6 +11,37 @@ use std::time::Duration;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Select the exact packaged service archive from a verified validation artifact.
+/// Never unpack workflow-controlled paths onto the controller's filesystem.
+pub fn validated_archive(bytes: &[u8], path: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use std::path::{Component, Path};
+    const MAX: u64 = 512 * 1024 * 1024;
+    let wanted = Path::new(path);
+    if path.is_empty() || wanted.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err("validated archive path must be a nonempty relative file path".into());
+    }
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder.take(MAX + 1));
+    let mut selected = None;
+    for entry in archive.entries().map_err(|e| format!("read validation artifact: {e}"))? {
+        let mut entry = entry.map_err(|e| format!("read validation artifact entry: {e}"))?;
+        let entry_path = entry.path().map_err(|e| e.to_string())?.into_owned();
+        if entry_path.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
+            return Err("validation artifact contains an unsafe path".into());
+        }
+        if entry_path != wanted { continue; }
+        if selected.is_some() || !entry.header().entry_type().is_file() || entry.size() > MAX {
+            return Err("validated archive must be one bounded regular file".into());
+        }
+        let mut value = Vec::new();
+        entry.read_to_end(&mut value).map_err(|e| e.to_string())?;
+        if value.is_empty() { return Err("validated service archive is empty".into()); }
+        selected = Some(value);
+    }
+    selected.ok_or_else(|| format!("validation artifact omitted service archive {path:?}"))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PresignRequest<'a> {
@@ -167,6 +198,34 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn promotion_selects_exact_bytes_and_rejects_ambiguous_or_linked_members() {
+        let pack = |entries: &[(&str, &[u8], tar::EntryType)]| {
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut archive = tar::Builder::new(encoder);
+            for (path, bytes, kind) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_entry_type(*kind);
+                header.set_cksum();
+                archive.append_data(&mut header, path, *bytes).unwrap();
+            }
+            archive.into_inner().unwrap().finish().unwrap()
+        };
+        let bytes = pack(&[("dist/cloud.tar.gz", b"validated bytes", tar::EntryType::Regular),
+            ("dist/other.tar.gz", b"different bytes", tar::EntryType::Regular)]);
+        assert_eq!(validated_archive(&bytes, "dist/cloud.tar.gz").unwrap(), b"validated bytes");
+        for path in ["dist/missing.tar.gz", "../dist/cloud.tar.gz", "/dist/cloud.tar.gz", ""] {
+            assert!(validated_archive(&bytes, path).is_err());
+        }
+        let duplicate = pack(&[("dist/cloud.tar.gz", b"first", tar::EntryType::Regular),
+            ("dist/cloud.tar.gz", b"second", tar::EntryType::Regular)]);
+        assert!(validated_archive(&duplicate, "dist/cloud.tar.gz").is_err());
+        let linked = pack(&[("dist/cloud.tar.gz", b"", tar::EntryType::Symlink)]);
+        assert!(validated_archive(&linked, "dist/cloud.tar.gz").is_err());
+    }
 
     #[derive(Clone, Default)]
     struct Seen(Arc<Mutex<Vec<String>>>);

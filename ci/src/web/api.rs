@@ -433,8 +433,23 @@ async fn run_status(
         }
     };
 
+    let validation_ids = match crate::submission::validations(&state.store, &run_id).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!("could not load submission validations for {run_id}: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "could not load submission validations");
+        }
+    };
+    let mut validations = Vec::new();
+    for id in validation_ids {
+        match readable_run(&state, &reader, &id).await {
+            Ok(validation) => validations.push(run_json(&state, &validation)),
+            Err(response) => return response,
+        }
+    }
     axum::Json(serde_json::json!({
         "run": run_json(&state, &run),
+        "validations": validations,
         "reruns": reruns.iter().map(|run| run_json(&state, run)).collect::<Vec<_>>(),
         "jobs": job_views,
         "artifacts": artifacts

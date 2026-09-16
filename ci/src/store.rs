@@ -969,7 +969,18 @@ impl Store {
         plan: &Plan,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        Self::create_run_in(&mut tx, run_id, req, plan).await?;
+        tx.commit().await.map_err(StoreError::sql)?;
+        Ok(())
+    }
 
+    /// Admission can persist a whole submission before any job is visible.
+    pub(crate) async fn create_run_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        run_id: &str,
+        req: &RunRequest,
+        plan: &Plan,
+    ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO ci_run (id, workflow_id, workflow_path, workflow_name, repo_url,
                                  git_ref, sha, before_sha, actor_subject, actor_email,
@@ -1001,7 +1012,7 @@ impl Store {
         .bind(&req.rerun_of)
         .bind(&req.default_branch)
         .bind(&req.release_base_sha)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(StoreError::sql)?;
 
@@ -1022,15 +1033,14 @@ impl Store {
             .bind(&job.target.network)
             .bind(&matrix)
             .bind(&plan_json)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(StoreError::sql)?;
-            Self::add_event(&mut tx, run_id, Some(&id), Some(&job.key), None, "ci.job.status.v1", "pending", None).await?;
+            Self::add_event(tx, run_id, Some(&id), Some(&job.key), None, "ci.job.status.v1", "pending", None).await?;
         }
 
-        Self::add_event(&mut tx, run_id, None, None, None, "ci.run.status.v1", "queued", None).await?;
+        Self::add_event(tx, run_id, None, None, None, "ci.run.status.v1", "queued", None).await?;
 
-        tx.commit().await.map_err(StoreError::sql)?;
         Ok(())
     }
 
@@ -1497,6 +1507,13 @@ impl Store {
                JOIN ci_job j ON j.run_id = r.id
               WHERE r.status NOT IN ('success','failure','cancelled')
                 AND j.status = 'pending'
+                AND (NOT EXISTS (
+                    SELECT 1 FROM ci_submission_validation m JOIN ci_run v ON v.id=m.validation_run_id
+                    WHERE m.release_run_id=r.id AND v.status IN ('queued','running')
+                ) OR EXISTS (
+                    SELECT 1 FROM ci_submission_validation m JOIN ci_run v ON v.id=m.validation_run_id
+                    WHERE m.release_run_id=r.id AND v.status IN ('failure','cancelled')
+                ))
               ORDER BY r.id
               LIMIT $1",
         )

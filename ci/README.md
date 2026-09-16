@@ -1254,7 +1254,53 @@ Postgres for runs, jobs, steps, artifacts and the pool; **step logs go to disk**
 with the path and byte count on the row. A build log is megabytes, and putting it
 in a column means every listing query drags all of it across the wire.
 
-### Validation, merge, version bump, build and deployment
+### One submission across validation workflows and deployment
+
+A repository can define exactly one trusted workflow with `on: release`, alongside
+its `on: submit` validation workflows. CI persists the selected validations and
+the release run together. The release run waits for every selected validation;
+failed, cancelled, skipped, carried-over, or error-tolerant evidence blocks it.
+The membership survives controller restarts. `git submit` prints a submission
+completion link; the submit response's `submission` field identifies this release
+run, and its run-status response includes the validation run IDs in `validations`.
+Individual successful validation runs do **not** mean deployment has finished.
+
+The release workflow must have one unconditional merge job containing only
+`ci/merge-release`, with `manifests: '[]'` and no tags. Every deployment job must
+depend on that merge, directly or transitively. This preserves the exact validated
+commit and lets deployment reuse its artifacts. A `ci/deploy-controller` step must
+be last and its job must depend on all other release jobs. Sequence regional
+deployments with `needs`; a failed regional job then prevents the next one.
+
+Validation workflows in a coordinated submission cannot contain merge or deploy
+actions. `--only`, explicit workflow selections, and individual reruns are
+validation-only and cannot publish or deploy. The submit client computes changed
+paths across the full trunk-to-feature diff, including earlier feature commits.
+
+For artifact reuse, `ci/download-artifact` accepts `with.workflow` naming the exact
+validation workflow path. CI resolves it only within this submission's frozen,
+successful membership, never from an arbitrary run ID or a latest-artifact tag.
+`ci/promote-service-archive` takes `workflow`, `artifact`, optional producer `job`,
+and `path` naming a packaged tarball inside that artifact, plus Orchestrator `url`,
+`token`, `user-id`, and archive `name`. It verifies the artifact digest, uploads the
+selected bytes through the service archive API, and records release provenance.
+Its outputs are `archive-id` and `sha`; pass the archive ID to `ci/deploy-service`.
+Package runtime dependencies and startup scripts during validation, not deployment.
+`ci/deploy-controller` also accepts `workflow` for its validated binary artifact.
+
+This follows the private CICD contract: all validation, then merge, then required
+deployments, with controller replacement last. Host-daemon maintenance is a
+separate contract: it must stop new placement, drain leases, release its own job
+sandbox before waiting, update, verify, and uncordon. A generic service deployment
+does not implement that host maintenance protocol.
+
+Install a controller supporting `on: release` **before** migrating live workflows.
+Older controllers do not coordinate this trigger. Existing standalone workflows
+remain supported; the repository's bootstrap CI workflow retains its own release
+steps until that migration. These engine capabilities do not by themselves enable
+or verify a production two-region rollout.
+
+### Standalone validation, merge, version bump, build and deployment
 
 The opt-in [release workflow example](release-example.yml) connects these stages
 using built-in actions. It is outside `.ci/workflows/` and does not enable live
@@ -1272,8 +1318,8 @@ explicit `with.tags` policy.
   `origin/HEAD` and its remote-tracking tip. Fetch trunk before submission. That
   base must be an ancestor of the submitted source, and target trunk must still
   equal that base at publication. The submitted feature branch is not advanced.
-  Ordinary `before` change detection is unchanged; missing release metadata
-  prevents release publication but does not prevent ordinary builds.
+  Missing release metadata prevents release publication but does not prevent
+  ordinary builds.
   Publication fast-forwards target trunk to the source plus a deterministic
   version commit, never merges unvalidated concurrent trunk changes. Resubmit and
   revalidate if trunk moved. Use the Git-patch submission format; legacy bundles
@@ -1364,7 +1410,8 @@ tenant-scoped customer deployment credential.
 
 `deploy.archive_id` must identify a finalized **Orchestrator service archive**,
 uploaded through its existing archive APIs. It is not a `ci/upload-artifact`
-tag/digest; automatic transfer between the two stores is not implemented here.
+tag/digest; use `ci/promote-service-archive` to transfer a validated submission's
+packaged archive, or `ci/publish-service-archive` for a standalone release build.
 Use the repository-owned service spec for real startup, health, route, and
 secret-reference settings. The action overwrites `deploy.deployment_id`, `async`,
 and `revision_guard` with its stable step identity and the CI run's repository,

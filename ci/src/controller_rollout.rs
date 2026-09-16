@@ -121,7 +121,7 @@ async fn snapshot(d: &Dispatcher) -> Result<Value, String> {
 
 /// Persist intent, not credentials or a running deploy job. Publication and
 /// merge must already have succeeded; the run remains running after this job.
-pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &str) -> Result<String, String> {
+pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &str, workflow: Option<&str>) -> Result<String, String> {
     let (deployment, base, _) = target(d)?;
     let run = d.store.get_run(&msg.run_id).await.map_err(|e| e.to_string())?.ok_or("missing run")?;
     let repository = d.config.controller_repository.as_deref().ok_or("CI_CONTROLLER_REPOSITORY is not configured")?;
@@ -130,9 +130,17 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &st
         .filter(|r| r.status == "published").ok_or("controller deployment requires a confirmed merged release")?;
     let sha = release.prepared.release_sha;
     if sha != run.sha { return Err("build must match the exact merged revision; version-bump releases must rebuild first".into()); }
-    let row = sqlx::query("SELECT a.* FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id WHERE a.run_id=$1 AND a.name=$2 AND a.sink='artifacts' AND j.status='success' ORDER BY a.created_at DESC LIMIT 1")
-        .bind(&msg.run_id).bind(artifact).fetch_optional(d.store.pool()).await.map_err(|e| e.to_string())?.ok_or("no successfully built controller artifact")?;
-    let digest: String = row.get::<Option<String>,_>("digest").ok_or("artifact omitted digest")?;
+    let stored = if let Some(workflow) = workflow {
+        crate::submission::artifact(&d.store, &msg.run_id, workflow, artifact, None).await?
+    } else {
+        let row = sqlx::query("SELECT a.* FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id WHERE a.run_id=$1 AND a.name=$2 AND a.sink='artifacts' AND j.status='success' ORDER BY a.created_at DESC LIMIT 1")
+            .bind(&msg.run_id).bind(artifact).fetch_optional(d.store.pool()).await.map_err(|e| e.to_string())?.ok_or("no successfully built controller artifact")?;
+        StoredArtifact { sink: "artifacts", digest: row.get("digest"),
+            size_bytes: row.get::<i64,_>("size_bytes").try_into().map_err(|_| "invalid artifact size")?,
+            uri: row.get("uri"), public_url: None }
+    };
+    if stored.sink != "artifacts" { return Err("controller update requires the HTTP artifact sink".into()); }
+    let digest = stored.digest.clone().ok_or("artifact omitted digest")?;
     let id = format!("ci-controller-{}", hex::encode(Sha256::digest(step.as_bytes())));
     if let Some(existing) = sqlx::query_scalar::<_, Value>("SELECT request FROM ci_controller_rollout WHERE id=$1")
         .bind(&id).fetch_optional(d.store.pool()).await.map_err(|e| e.to_string())? {
@@ -142,10 +150,8 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &st
         }
         return Ok(format!("[ci] controller deployment {id} is durably recorded\n"));
     }
-    let size: i64 = row.get("size_bytes");
-    if !(1..=256 * 1024 * 1024).contains(&size) { return Err("controller artifact exceeds verification budget".into()); }
-    let bytes = d.artifacts.get(&StoredArtifact { sink: "artifacts", digest: Some(digest.clone()),
-        size_bytes: size as u64, uri: row.get("uri"), public_url: None }).await.map_err(|e| e.to_string())?;
+    if !(1..=256 * 1024 * 1024).contains(&stored.size_bytes) { return Err("controller artifact exceeds verification budget".into()); }
+    let bytes = d.artifacts.get(&stored).await.map_err(|e| e.to_string())?;
     if hex::encode(Sha256::digest(&bytes)) != digest { return Err("controller artifact digest mismatch".into()); }
     let binary_sha256 = artifact_identity(&bytes, &sha)?;
     let current = snapshot(d).await?;

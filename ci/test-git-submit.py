@@ -107,6 +107,18 @@ class GitSubmitTest(unittest.TestCase):
         self.assertEqual(payload["repository"]["releaseBaseSha"], self.main_sha)
         self.assertNotIn(TOKEN, raw.decode())
 
+    def test_change_filters_cover_all_commits_being_released(self):
+        self.git("config", "ci.endpoint", self.base)
+        self.git("config", "ci.token", TOKEN)
+        (self.repo / "second.txt").write_text("another component\n")
+        self.git("add", "second.txt")
+        self.git("commit", "-qm", "second component")
+        self.run_client()
+        payload = json.loads(SubmitHandler.requests[-1][2])
+        self.assertEqual(payload["before"], self.main_sha)
+        descriptor = json.loads(base64.b64decode(payload["source"]["contentBase64"]))
+        self.assertEqual(set(descriptor["changes"]["paths"]), {"file.txt", "second.txt"})
+
     def test_legacy_endpoint_git_push_and_shared_hmac(self):
         self.run_client(env={"CICD_ENDPOINT": self.base + "/git/push",
                              "CI_WEBHOOK_SECRET": SECRET})

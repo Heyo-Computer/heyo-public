@@ -456,8 +456,8 @@ impl SubmitFilter {
 pub struct Workflow {
     pub path: String,
     pub name: Option<String>,
-    /// Trigger names from `on:`. Only `submit` is honoured today; anything else
-    /// parses and is reported as unsupported rather than silently ignored.
+    /// `submit` starts validation; `release` is coordinator-only and waits for
+    /// the complete frozen submission's validation evidence.
     pub on: Vec<String>,
     /// The filters written under `on: submit:`. Default — no filters, build
     /// everything — when `on:` is absent or names `submit` without a block.
@@ -515,7 +515,15 @@ impl Workflow {
 
         let (on, on_submit) = match header.on {
             None => (vec!["submit".to_string()], SubmitFilter::default()),
-            Some(v) => (trigger_names(&v), submit_filter(path, &v)?),
+            Some(v) => {
+                if v.as_mapping().and_then(|m| m.get("release")).is_some_and(|v| !v.is_null()) {
+                    return Err(WorkflowError::Yaml {
+                        path: path.to_string(),
+                        detail: "release trigger does not accept filters; it coordinates all selected validations".into(),
+                    });
+                }
+                (trigger_names(&v), submit_filter(path, &v)?)
+            }
         };
         on_submit.validate(path)?;
 

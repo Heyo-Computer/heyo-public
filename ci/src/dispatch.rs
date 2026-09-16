@@ -85,6 +85,8 @@ static NONCE: AtomicU64 = AtomicU64::new(1);
 pub struct Submitted {
     pub run_ids: Vec<String>,
     pub warnings: Vec<String>,
+    /// The release run is the completion boundary for coordinated submissions.
+    pub submission: Option<String>,
 }
 
 /// Where one job runs, resolved from its `uses:` against the live pool.
@@ -311,6 +313,8 @@ impl Dispatcher {
         };
 
         let mut run_ids = Vec::new();
+        let mut planned = Vec::new();
+        let mut release_run_id = None;
         let mut patterns_tried = Vec::new();
         // `--only` bookkeeping: which selectors found a workflow file at all.
         // Checked across every source, after the loop — a selector that matched
@@ -350,10 +354,16 @@ impl Dispatcher {
             for (path, text) in &files {
                 let wf = crate::workflow::Workflow::parse(path, text)
                     .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+                let is_release = wf.on.iter().any(|t| t == "release");
+                if is_release && wf.on.len() != 1 {
+                    return Err(DispatchError::Workflow(format!(
+                        "{path}: release must be a coordinator-only trigger"
+                    )));
+                }
                 // `--only`: the submit names the workflow files it wants, and
                 // every other file is left alone — not "declined", not warned
                 // about, simply not asked.
-                let named = if only.is_empty() {
+                let named = if only.is_empty() || is_release {
                     false
                 } else {
                     let mut hit = false;
@@ -368,7 +378,7 @@ impl Dispatcher {
                     }
                     true
                 };
-                if !wf.on.iter().any(|t| t == "submit") {
+                if !is_release && !wf.on.iter().any(|t| t == "submit") {
                     if named {
                         // Explicitly asked for, and unable to comply: that is
                         // an answer for the terminal, not a line in a log.
@@ -390,6 +400,11 @@ impl Dispatcher {
                 // a manual dispatch outranks a path filter. Said out loud in the
                 // response, so a run on an unexpected branch is never a mystery.
                 if let Err(why) = wf.on_submit.admits(req.branch(), &changes) {
+                    if is_release {
+                        return Err(DispatchError::Workflow(format!(
+                            "{path}: release workflow cannot filter submission membership"
+                        )));
+                    }
                     if named {
                         let by = if req.rerun.is_some() {
                             "the re-run"
@@ -405,6 +420,10 @@ impl Dispatcher {
                 }
                 let mut plan = crate::plan::Plan::build(&wf)
                     .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+                if is_release {
+                    crate::submission::validate_release_plan(&plan)
+                        .map_err(DispatchError::Workflow)?;
+                }
 
                 // Resolved once, here, and written into every job that did not
                 // name a network with `uses:`. The plan is persisted on the job
@@ -426,10 +445,7 @@ impl Dispatcher {
                     id
                 };
 
-                self.store
-                    .create_run(
-                        &run_id,
-                        &crate::store::RunRequest {
+                let request = crate::store::RunRequest {
                             workflow_id: source
                                 .id
                                 .clone()
@@ -479,17 +495,13 @@ impl Dispatcher {
                             }
                             .to_string(),
                             rerun_of: req.rerun.as_ref().map(|r| r.of.clone()),
-                        },
-                        &plan,
-                    )
-                    .await?;
-                // Before the first scheduling pass, so a job whose `needs:`
-                // succeeded last time sees that result and not a `pending`
-                // row it would wait on for ever.
-                if let Some(rerun) = req.rerun.as_ref().filter(|r| r.failed_only) {
-                    self.carry_over_successes(&run_id, &rerun.of).await?;
+                        };
+                if is_release && release_run_id.replace(run_id.clone()).is_some() {
+                    return Err(DispatchError::Workflow(
+                        "a submission must have exactly one on: release workflow".into()
+                    ));
                 }
-                self.advance_run(&run_id).await?;
+                planned.push((run_id.clone(), request, plan));
                 run_ids.push(run_id);
             }
         }
@@ -523,6 +535,23 @@ impl Dispatcher {
                 patterns_tried.join(", "),
             )));
         }
+        if release_run_id.is_some() {
+            for (id, _, plan) in &planned {
+                if Some(id) != release_run_id.as_ref() {
+                    crate::submission::validate_validation_plan(plan)
+                        .map_err(DispatchError::Workflow)?;
+                }
+            }
+            // Partial runs and diagnostic reruns can never authorize publication.
+            if !only.is_empty() || req.workflow_id.is_some() || req.rerun.is_some()
+                || planned.len() == 1
+            {
+                let id = release_run_id.take().unwrap();
+                planned.retain(|(run, _, _)| run != &id);
+                run_ids.retain(|run| run != &id);
+                warnings.push("validation only: partial, rerun, or empty submissions do not authorize merge/deployment".into());
+            }
+        }
         if run_ids.is_empty() && skipped.is_empty() {
             return Err(crate::trigger::TriggerError::NoWorkflows(format!(
                 "{} (nothing matched, or nothing triggering on `submit`)",
@@ -533,7 +562,30 @@ impl Dispatcher {
         // Reported whether or not anything else ran: with several workflows, the
         // interesting question is usually why the *other* one did not.
         warnings.extend(skipped.into_iter().map(|s| format!("no run started — {s}")));
-        Ok(Submitted { run_ids, warnings })
+        let mut tx = self.store.pool().begin().await
+            .map_err(|e| DispatchError::Workflow(format!("begin submission: {e}")))?;
+        for (id, request, plan) in &planned {
+            Store::create_run_in(&mut tx, id, request, plan).await?;
+            if !only.is_empty() || req.workflow_id.is_some() || req.rerun.is_some() {
+                sqlx::query("UPDATE ci_run SET validation_only=true WHERE id=$1")
+                    .bind(id).execute(&mut *tx).await
+                    .map_err(|e| DispatchError::Workflow(format!("record partial submission: {e}")))?;
+            }
+        }
+        if let Some(release) = &release_run_id {
+            let validations = run_ids.iter().filter(|id| *id != release).cloned().collect::<Vec<_>>();
+            crate::submission::record(&mut tx, release, &validations).await
+                .map_err(DispatchError::Workflow)?;
+        }
+        tx.commit().await.map_err(|e| DispatchError::Workflow(format!("commit submission: {e}")))?;
+        // Nothing becomes schedulable before the complete membership commits.
+        for id in &run_ids {
+            if let Some(rerun) = req.rerun.as_ref().filter(|r| r.failed_only) {
+                self.carry_over_successes(id, &rerun.of).await?;
+            }
+            self.advance_run(id).await?;
+        }
+        Ok(Submitted { run_ids, warnings, submission: release_run_id })
     }
 
     /// Start a new run from a finished one's source — the dashboard's "Run
@@ -700,6 +752,18 @@ impl Dispatcher {
     /// the job's own id (`Nats-Msg-Id`), and moving a job from `pending` to
     /// `queued` is conditional on it still being `pending`.
     pub async fn advance_run(&self, run_id: &str) -> Result<RunStatus, DispatchError> {
+        match crate::submission::gate(&self.store, run_id).await.map_err(DispatchError::Workflow)? {
+            crate::submission::Gate::Waiting => return Ok(RunStatus::Queued),
+            crate::submission::Gate::Rejected(reason) => {
+                for job in self.store.jobs_of(run_id).await? {
+                    if job.status == "pending" {
+                        self.store.set_job_status(&job.id, JobStatus::Failure, Some(&reason)).await?;
+                    }
+                }
+                return self.store.roll_up_run(run_id).await.map_err(Into::into);
+            }
+            crate::submission::Gate::Unmanaged | crate::submission::Gate::Ready => {}
+        }
         let jobs = self.store.jobs_of(run_id).await?;
         let needs = self.store.needs_context(run_id).await?;
         // One read for the whole wave, not one per job: the commit a run is for
@@ -2498,6 +2562,12 @@ impl Dispatcher {
         let required = |key: &str| with(key).filter(|v| !v.trim().is_empty())
             .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
+        if matches!(action, "ci/merge-release" | "ci/publish-service-archive" |
+            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller") {
+            crate::submission::authorize_publication(&self.store, &msg.run_id).await
+                .map_err(DispatchError::StepFailed)?;
+        }
+
         match action {
             "ci/merge-release" => {
                 let manifests: Vec<String> = serde_json::from_str(&required("manifests")?)
@@ -2533,22 +2603,36 @@ impl Dispatcher {
                 Ok((format!("[ci] clean checkout of release {}\n", release.prepared.release_sha),
                     serde_json::json!({"sha": release.prepared.release_sha})))
             }
-            "ci/publish-service-archive" => {
-                let sha: Option<String> = sqlx::query_scalar("SELECT release_sha FROM ci_job WHERE id=$1")
-                    .bind(&msg.job_id).fetch_one(self.store.pool()).await
-                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
-                let sha = sha.ok_or_else(|| DispatchError::StepFailed("service archive must be built after ci/checkout-release in this job".into()))?;
+            "ci/publish-service-archive" | "ci/promote-service-archive" => {
                 let base = required("url")?;
                 let path = required("path")?;
                 let name = required("name")?;
                 let user = required("user-id")?;
                 let token = required("token")?;
-                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
-                if std::path::Path::new(&path).is_absolute() || std::path::Path::new(&path).components()
-                    .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
-                    return Err(DispatchError::StepFailed("archive path must be relative to the job working directory".into()));
-                }
-                let bytes = vm.download_file(&format!("{sid}.archive"), &format!("{workdir}/{path}"), step_timeout(step, plan)).await?;
+                let (sha, bytes) = if action == "ci/promote-service-archive" {
+                    let release = crate::release::get(&self.store, &msg.run_id).await
+                        .map_err(DispatchError::StepFailed)?.filter(|r| r.status == "published")
+                        .ok_or_else(|| DispatchError::StepFailed("artifact promotion requires a confirmed merged release".into()))?;
+                    let stored = crate::submission::artifact(&self.store, &msg.run_id,
+                        &required("workflow")?, &required("artifact")?, with("job").as_deref())
+                        .await.map_err(DispatchError::Artifact)?;
+                    let bytes = self.artifacts.get(&stored).await
+                        .map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                    let archive = crate::service_archive::validated_archive(&bytes, &path)
+                        .map_err(DispatchError::Artifact)?;
+                    (release.prepared.release_sha, archive)
+                } else {
+                    let sha: Option<String> = sqlx::query_scalar("SELECT release_sha FROM ci_job WHERE id=$1")
+                        .bind(&msg.job_id).fetch_one(self.store.pool()).await
+                        .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                    let sha = sha.ok_or_else(|| DispatchError::StepFailed("service archive must be built after ci/checkout-release in this job".into()))?;
+                    let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                    if std::path::Path::new(&path).is_absolute() || std::path::Path::new(&path).components()
+                        .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+                        return Err(DispatchError::StepFailed("archive path must be relative to the job working directory".into()));
+                    }
+                    (sha, vm.download_file(&format!("{sid}.archive"), &format!("{workdir}/{path}"), step_timeout(step, plan)).await?)
+                };
                 let archive = crate::service_archive::publish(&base, &token, &user, sid, &name, bytes)
                     .await.map_err(DispatchError::StepFailed)?;
                 let mut tx = self.store.pool().begin().await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
@@ -2618,7 +2702,7 @@ impl Dispatcher {
                     .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
             }
             "ci/deploy-controller" => {
-                crate::controller_rollout::request(self, msg, sid, &required("artifact")?).await
+                crate::controller_rollout::request(self, msg, sid, &required("artifact")?, with("workflow").as_deref()).await
                     .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
             }
             "ci/upload-artifact" => {
@@ -2842,17 +2926,22 @@ impl Dispatcher {
                 let name = required("name")?;
                 let path = required("path")?;
                 let producer = with("job").filter(|v| !v.trim().is_empty());
+                let artifact_run = match with("workflow") {
+                    Some(workflow) => crate::submission::artifact_run(&self.store, &msg.run_id, &workflow)
+                        .await.map_err(DispatchError::Artifact)?,
+                    None => msg.run_id.clone(),
+                };
                 let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
                 let remote = artifact_download_path(workdir, &path)?;
                 // Scope at the query boundary: workflow input can name an
-                // artifact and (only for duplicate names) its producer, never
-                // a run, URI, path in the sink, or remote URL.
+                // artifact and its producer, never an arbitrary run, URI or URL.
+                // Cross-run lookup requires frozen successful submission membership.
                 let rows = sqlx::query(
                     "SELECT a.run_id,a.name,a.sink,a.digest,a.size_bytes,a.uri,a.public_url,
                             j.job_key,j.status,j.finished_at IS NOT NULL AS finished
                        FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id
                       WHERE a.run_id=$1 AND a.name=$2 ORDER BY a.created_at",
-                ).bind(&msg.run_id).bind(&name).fetch_all(self.store.pool()).await
+                ).bind(&artifact_run).bind(&name).fetch_all(self.store.pool()).await
                     .map_err(|e| DispatchError::Artifact(format!("looking up artifact {name:?}: {e}")))?;
                 let candidates = rows.iter().map(|r| Ok(DownloadCandidate {
                     run_id: r.get("run_id"), name: r.get("name"), job_key: r.get("job_key"),
@@ -2867,7 +2956,7 @@ impl Dispatcher {
                         uri: r.get("uri"), public_url: r.get("public_url"),
                     },
                 })).collect::<Result<Vec<_>, DispatchError>>()?;
-                let selected = select_download(&msg.run_id, &name, producer.as_deref(), &candidates)?;
+                let selected = select_download(&artifact_run, &name, producer.as_deref(), &candidates)?;
                 let bytes = self.artifacts.get(&selected.stored).await
                     .map_err(|e| DispatchError::Artifact(format!("downloading artifact {name:?}: {e}")))?;
                 vm.upload_bytes(sid, &remote, &bytes).await?;

@@ -361,6 +361,7 @@ async fn submit(
                 StatusCode::ACCEPTED,
                 axum::Json(serde_json::json!({
                     "runs": submitted.run_ids,
+                    "submission": submitted.submission,
                     "url": format!("{}/", state.config.public_url),
                     // Warnings, not errors: the runs exist. A job pinned to a
                     // host that is briefly offline waits rather than failing,
