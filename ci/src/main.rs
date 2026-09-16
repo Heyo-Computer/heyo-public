@@ -23,6 +23,7 @@ mod config;
 mod controller_rollout;
 mod dispatch;
 mod expr;
+mod host_maintenance;
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;
 mod image;
@@ -283,6 +284,7 @@ async fn main() {
     dispatcher.clone().spawn_lease_loop();
     dispatcher.clone().spawn_consumers();
     controller_rollout::spawn(dispatcher.clone());
+    host_maintenance::spawn(dispatcher.clone());
 
     // Bind before announcing readiness. A listener that cannot bind is a hard
     // failure here rather than a task that dies quietly and leaves the process

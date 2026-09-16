@@ -311,6 +311,8 @@ pub struct Config {
     pub controller_app_lb_url: Option<String>,
     pub controller_app_lb_token: Option<String>,
     pub expected_sha: Option<String>,
+    /// Operator-owned runner/backend/archive-database mapping; never workflow supplied.
+    pub host_maintenance_targets: Option<String>,
 
     /// Shared secret the `git submit` client HMACs its payload with, when it
     /// has no repository token.
@@ -647,6 +649,7 @@ impl Config {
             controller_app_lb_url: opt("CI_CONTROLLER_APP_LB_URL").map(|u| u.trim_end_matches('/').to_string()),
             controller_app_lb_token: opt("CI_CONTROLLER_APP_LB_TOKEN"),
             expected_sha: opt("CI_EXPECTED_SHA"),
+            host_maintenance_targets: opt("CI_HOST_MAINTENANCE_TARGETS"),
             webhook_secret,
             require_repo_token: flag("CI_REQUIRE_REPO_TOKEN", false)?,
             native_runner_secret: opt("CI_NATIVE_RUNNER_SECRET"),

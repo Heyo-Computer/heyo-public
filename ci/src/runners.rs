@@ -382,6 +382,11 @@ impl Runners {
         self.snapshot.load_full()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_pool(&self, pool: Pool) {
+        self.snapshot.store(Arc::new(pool));
+    }
+
     fn client_options(&self) -> HeyoClientOptions {
         HeyoClientOptions {
             api_key: Some(self.config.heyvm.api_key.clone()),

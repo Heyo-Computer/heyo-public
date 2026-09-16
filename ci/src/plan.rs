@@ -135,6 +135,7 @@ impl Plan {
                     fail_fast: strategy.map(|s| s.fail_fast).unwrap_or(true),
                 };
                 substitute_matrix(&mut cell);
+                crate::host_maintenance::validate_plan(&cell).map_err(|e| PlanError::Workflow(e.to_string()))?;
                 jobs.push(cell);
             }
         }

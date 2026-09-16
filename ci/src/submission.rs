@@ -25,7 +25,7 @@ pub fn validate_validation_plan(plan: &Plan) -> Result<(), String> {
         }
         if job.steps.iter().any(|s| matches!(s.uses.as_deref(),
             Some("ci/merge-release" | "ci/checkout-release" | "ci/deploy-service" |
-                 "ci/deploy-app-lb" | "ci/deploy-controller"))) {
+                 "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance"))) {
             return Err(format!("{}: move publication/deployment into the on: release workflow", plan.workflow_path));
         }
     }

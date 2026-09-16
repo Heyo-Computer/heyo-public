@@ -1300,6 +1300,72 @@ remain supported; the repository's bootstrap CI workflow retains its own release
 steps until that migration. These engine capabilities do not by themselves enable
 or verify a production two-region rollout.
 
+### Host heyvm maintenance (opt-in)
+
+`ci/host-heyvm-maintenance` must be the last step of a CI-owned VM job, with no
+`continue-on-error` on the action or job. It requires the normal publication gate,
+a confirmed merged release, and a successfully published service archive from
+that exact release. Arbitrary external archive IDs cannot authorize maintenance.
+Publication records the archive owner, compressed archive digest, and SHA256 of
+the unambiguous regular ELF `heyvm` executable inside the archive; Cloud's
+`sha256` refers to **that executable**, not the tarball.
+
+The operator must configure `CI_HOST_MAINTENANCE_TARGETS` as a JSON object:
+
+```json
+{"eu1":{"repository":"https://github.com/your-org/your-repo.git",
+  "runner_hd_id":"hd-app-lb-runner-id","backend_server_id":"cloud-backend-id",
+  "cloud_url":"https://cloud.example","orchestrator_url":"https://orch.example",
+  "artifact_user_id":"archive-owner","target":"stage-eu1-host-heyvm","region":"eu1"}}
+```
+
+Runner `hd` IDs and Cloud `backendServerId` are **different namespaces**. The
+mapping explicitly attests their association and the archive database/storage
+association: Orchestrator's `CLOUD_INTERNAL_URL` must use the **same Cloud archive
+database and storage** as `cloud_url`. CI cannot discover or prove this from a
+public hostname. `target` is an opaque daemon-layout selector, not a revision;
+the current daemon supports the legacy `stage-eu1-host-heyvm` layout only. Do not
+infer that a us3 host supports it from the region name.
+
+```yaml
+- uses: ci/host-heyvm-maintenance
+  timeout-minutes: 30
+  with:
+    runner: eu1                     # trusted mapping alias, not either backend ID
+    url: ${{ vars.CLOUD_URL }}       # must equal the mapping's cloud_url
+    token: ${{ secrets.CLOUD_KEY }}  # direct secret reference, re-resolved on restart
+    archive-id: ${{ steps.publish.outputs.archive-id }}
+```
+
+CI durably fences claims and placement on that runner only, stops/releases its own
+job VM before draining other running jobs and active pool leases, then uses
+`POST /internal/mvm-ctrl/backend-servers/host-heyvm/upgrades` with a persisted
+64-character `maintenanceId`. It reconciles through singular
+`GET /internal/mvm-ctrl/backend-servers/host-heyvm/upgrade/{maintenanceId}`. HTTPS
+is mandatory and bearer redirects are disabled. No idle/service VMs are deleted
+to accelerate drain. Queued work retains its delivery and retry budget; unpinned
+work can select another runner. The step, job and run do not succeed on admission.
+Only an exact `completed` operation with matching backend, target, archive owner,
+archive ID, executable digest and operation identity releases the fence.
+
+Cancellation, timeout, missing identity, changed configuration and terminal
+failure **retain the CI cordon**, even if Cloud uncordons its own backend. An
+expired/unknown lease blocks drain rather than proving the VM stopped. Operators
+must reconcile the persisted operation and host before explicitly repairing an
+unresolved fence; this action has no automatic failure-unlock or force option.
+`ci_host_work` records each claimed delivery/runner until verified release.
+Cancelled VM acquisition, interrupted delivery, or failed stop can leave durable
+drain evidence requiring operator reconciliation; terminal job status alone is
+not proof that host work stopped. Retries cannot clear another delivery's record.
+Deadlines include VM release and drain, survive restart, and cap HTTP retries.
+
+Deploy the new Cloud endpoint **and every Cloud worker's cross-instance operation
+locking** before enabling this action. Older Cloud cannot execute the plural POST,
+and CI never falls back to the legacy non-idempotent singular POST. This feature
+does not authorize any production host upgrade or establish regional readiness.
+All CI dispatchers sharing these runners must also run this fencing-aware engine;
+drain or explicitly reconcile work started by older engines before enabling it.
+
 ### Standalone validation, merge, version bump, build and deployment
 
 The opt-in [release workflow example](release-example.yml) connects these stages

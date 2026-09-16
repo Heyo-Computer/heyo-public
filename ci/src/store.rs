@@ -1335,12 +1335,21 @@ impl Store {
         attempt: i32,
     ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        // Same transaction-scoped runner lock as maintenance intent. The
+        // subsequent snapshot sees a committed fence, or maintenance sees
+        // this running job and must drain it before submitting.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 222))")
+            .bind(runner_hd_id).execute(&mut *tx).await.map_err(StoreError::sql)?;
+        let cordoned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed')")
+            .bind(runner_hd_id).fetch_one(&mut *tx).await.map_err(StoreError::sql)?;
+        if cordoned { return Ok(false); }
         let row = sqlx::query(
             "UPDATE ci_job
                 SET status = 'running', runner_hd_id = $2, attempt = $3,
                     started_at = COALESCE(started_at, now())
               WHERE id = $1
                 AND status NOT IN ('success','failure','skipped','cancelled')
+                AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_maintenance h ON h.id=s.id WHERE s.job_id=ci_job.id)
               RETURNING run_id, job_key",
         )
         .bind(job_id)
@@ -1351,10 +1360,20 @@ impl Store {
         .map_err(StoreError::sql)?;
         if let Some(row) = row {
             let run: String = row.get("run_id"); let key: String = row.get("job_key");
+            sqlx::query("INSERT INTO ci_host_work(job_id,runner_hd_id,attempt) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
+                .bind(job_id).bind(runner_hd_id).bind(attempt).execute(&mut *tx).await.map_err(StoreError::sql)?;
             Self::add_event(&mut tx, &run, Some(job_id), Some(&key), None, "ci.job.status.v1", "running", None).await?;
             tx.commit().await.map_err(StoreError::sql)?;
             Ok(true)
         } else { tx.commit().await.map_err(StoreError::sql)?; Ok(false) }
+    }
+
+    /// Only an executor with a verified VM release may clear drain evidence.
+    /// Cancellation and terminal status updates intentionally do not clear it.
+    pub async fn end_host_work(&self, job_id: &str, runner: &str, attempt: i32) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM ci_host_work WHERE job_id=$1 AND runner_hd_id=$2 AND attempt=$3")
+            .bind(job_id).bind(runner).bind(attempt).execute(&self.pool).await.map_err(StoreError::sql)?;
+        Ok(())
     }
 
     /// Record why an attempt failed, without deciding the job's fate.

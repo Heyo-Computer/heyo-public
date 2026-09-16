@@ -1171,6 +1171,8 @@ impl Dispatcher {
         let plan: JobPlan = serde_json::from_value(row.plan.clone())
             .map_err(|e| DispatchError::BadPlan(e.to_string()))?;
 
+        if crate::host_maintenance::owns_job(&self.store, &msg.job_id).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Ok(JobStatus::Running); }
         let (runner, existing_vm) = self.pick_runner(&plan).await?;
 
         // The one place a job's failure and its runner are both in hand. A
@@ -1211,6 +1213,10 @@ impl Dispatcher {
         // cancelled, or finished by a delivery whose ack was lost — and the
         // right move is to stop here, before spending a VM on it.
         if !self.store.claim_job(&msg.job_id, &runner, attempt).await? {
+            if crate::host_maintenance::cordoned(&self.store, &runner).await
+                .map_err(|e| DispatchError::StepFailed(e.to_string()))? {
+                return Err(DispatchError::MaintenancePaused);
+            }
             tracing::info!(job = %msg.job_key, "no longer runnable; dropping delivery");
             return Ok(JobStatus::Success);
         }
@@ -1281,7 +1287,9 @@ impl Dispatcher {
             .await?
         {
             // Something else finished this job while we were booting a VM.
-            self.release_vm(&plan, &vm, false).await;
+            if self.release_vm(&plan, &vm, false).await {
+                self.store.end_host_work(&msg.job_id, &runner, attempt).await?;
+            }
             return Ok(JobStatus::Success);
         }
         tracing::info!(
@@ -1293,6 +1301,11 @@ impl Dispatcher {
             Ok(()) => self.run_steps(msg, &plan, &vm).await,
             Err(e) => Err(e),
         };
+        // Durable maintenance owns strict VM stop/release and final job status.
+        // Do not stop or repool here: another reconciler may already have done
+        // so and that VM might now belong to a different job.
+        if crate::host_maintenance::owns_job(&self.store, &msg.job_id).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Ok(JobStatus::Running); }
         // Before the release, always: a VM with `reuse: false` is destroyed on
         // the next line, and the console of the boot that just failed is exactly
         // what somebody wants when a job dies before its first step.
@@ -1301,7 +1314,10 @@ impl Dispatcher {
             .as_ref()
             .err()
             .is_some_and(DispatchError::indicates_guest_corruption);
-        self.release_vm(&plan, &vm, guest_corrupted).await;
+        let released = self.release_vm(&plan, &vm, guest_corrupted).await;
+        if released && !(plan.target.is_existing_vm() && outcome.is_err()) {
+            self.store.end_host_work(&msg.job_id, &runner, attempt).await?;
+        }
 
         // A tunnel that dies mid-job fails the job rather than propagating —
         // the match below absorbs the error into a status — so the eviction in
@@ -1391,6 +1407,8 @@ impl Dispatcher {
         let driver = driver_name(plan.vm.driver);
 
         if let Some(node) = placement.node {
+            if crate::host_maintenance::cordoned(&self.store, &node.id).await
+                .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Err(DispatchError::MaintenancePaused); }
             if !node.status.is_dispatchable() {
                 return Err(DispatchError::RunnerOffline {
                     runner: node.name.clone(),
@@ -1424,7 +1442,10 @@ impl Dispatcher {
         let required = runner_disk_requirement(&plan.vm);
         let mut candidates = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
+        let mut maintenance = false;
         for candidate in placement.network.dispatchable() {
+            if crate::host_maintenance::cordoned(&self.store, &candidate.id).await
+                .map_err(|e| DispatchError::StepFailed(e.to_string()))? { maintenance = true; continue; }
             match self.runners.supported_drivers(&candidate.id).await {
                 Ok(Some(supported)) if !host_can_run(Some(&supported), driver) => {
                     skipped.push(format!(
@@ -1451,6 +1472,7 @@ impl Dispatcher {
         if let Some(runner) = roomiest_runner(candidates, required) {
             return Ok((runner, vm));
         }
+        if maintenance { return Err(DispatchError::MaintenancePaused); }
         if skipped.is_empty() {
             return Err(DispatchError::NoOnlineRunner(
                 placement.network.network_name.clone(),
@@ -2065,7 +2087,7 @@ impl Dispatcher {
     /// would hand the next attempt — which prefers an idle VM with the same
     /// fingerprint on the same runner — the same broken ext4, and the job
     /// would burn every delivery on one sick machine.
-    async fn release_vm(&self, plan: &JobPlan, vm: &Vm, guest_corrupted: bool) {
+    async fn release_vm(&self, plan: &JobPlan, vm: &Vm, guest_corrupted: bool) -> bool {
         // A VM named in `uses:` is not ours. It was not created for this job,
         // it is not in the pool, and somebody else's long-lived machine must not
         // be destroyed because a workflow happened to set `reuse: false` in a
@@ -2081,7 +2103,7 @@ impl Dispatcher {
                      target this instance does not own — leaving it as it is"
                 );
             }
-            return;
+            return true;
         }
         if guest_corrupted {
             tracing::warn!(
@@ -2092,11 +2114,14 @@ impl Dispatcher {
         if !plan.vm.reuse || guest_corrupted {
             if let Err(e) = vm.destroy().await {
                 tracing::warn!(vm = vm.id(), "could not destroy: {e}");
+                // An uncertain teardown is still active drain evidence.
+                return false;
             }
             if let Err(e) = self.pool.forget(vm.id()).await {
                 tracing::warn!(vm = vm.id(), "could not forget: {e}");
+                return false;
             }
-            return;
+            return true;
         }
         // The TTL is what the VM boots with next time — `start` counts it from
         // then — and it honors the workflow's own `ttl_seconds` when that is
@@ -2123,16 +2148,19 @@ impl Dispatcher {
         // which a concurrent claim sees the VM running, then has it stopped
         // out from under its first step.
         if let Err(e) = vm.stop().await {
-            // A running idle VM is what the pool used to hold; it still works,
-            // it just costs memory until the TTL takes it.
+            // Keep the claim: maintenance must not interpret an unverified
+            // stop as a drained host. Its cordon also prevents orphan release.
             tracing::warn!(
                 vm = vm.id(),
-                "could not stop the VM; leaving it running: {e}"
+                "could not stop the VM; retaining its claim: {e}"
             );
+            return false;
         }
         if let Err(e) = self.pool.release(vm.id()).await {
             tracing::warn!(vm = vm.id(), "could not release into the pool: {e}");
+            return false;
         }
+        true
     }
 
     /// Put the submitted tree into the guest.
@@ -2387,6 +2415,7 @@ impl Dispatcher {
                         self.store
                             .append_log(&sid, &log_path, &masker.mask(&note))
                             .await?;
+                        if action == "ci/host-heyvm-maintenance" { return Ok(json!({})); }
                         self.store
                             .finish_step(&sid, StepStatus::Success, Some(0), None)
                             .await?;
@@ -2563,7 +2592,7 @@ impl Dispatcher {
             .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
         if matches!(action, "ci/merge-release" | "ci/publish-service-archive" |
-            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller") {
+            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance") {
             crate::submission::authorize_publication(&self.store, &msg.run_id).await
                 .map_err(DispatchError::StepFailed)?;
         }
@@ -2618,6 +2647,9 @@ impl Dispatcher {
                         .await.map_err(DispatchError::Artifact)?;
                     let bytes = self.artifacts.get(&stored).await
                         .map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                    if stored.digest.as_deref() != Some(hex::encode(sha2::Sha256::digest(&bytes)).as_str()) {
+                        return Err(DispatchError::Artifact("validated promotion artifact digest mismatch".into()));
+                    }
                     let archive = crate::service_archive::validated_archive(&bytes, &path)
                         .map_err(DispatchError::Artifact)?;
                     (release.prepared.release_sha, archive)
@@ -2633,11 +2665,14 @@ impl Dispatcher {
                     }
                     (sha, vm.download_file(&format!("{sid}.archive"), &format!("{workdir}/{path}"), step_timeout(step, plan)).await?)
                 };
+                let archive_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+                let heyvm_sha256 = crate::host_maintenance::executable_digest(&bytes).ok();
                 let archive = crate::service_archive::publish(&base, &token, &user, sid, &name, bytes)
                     .await.map_err(DispatchError::StepFailed)?;
                 let mut tx = self.store.pool().begin().await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
-                sqlx::query("INSERT INTO ci_service_archive(step_id,run_id,job_id,archive_id,sha,orchestrator_url) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(step_id) DO UPDATE SET archive_id=excluded.archive_id,sha=excluded.sha,orchestrator_url=excluded.orchestrator_url")
+                sqlx::query("INSERT INTO ci_service_archive(step_id,run_id,job_id,archive_id,sha,orchestrator_url,archive_user_id,archive_sha256,heyvm_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(step_id) DO UPDATE SET archive_id=excluded.archive_id,sha=excluded.sha,orchestrator_url=excluded.orchestrator_url,archive_user_id=excluded.archive_user_id,archive_sha256=excluded.archive_sha256,heyvm_sha256=excluded.heyvm_sha256")
                     .bind(sid).bind(&msg.run_id).bind(&msg.job_id).bind(&archive).bind(&sha).bind(base.trim_end_matches('/'))
+                    .bind(&user).bind(&archive_sha256).bind(&heyvm_sha256)
                     .execute(&mut *tx).await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
                 let event = Store::add_event(&mut tx, &msg.run_id, Some(&msg.job_id), Some(&msg.job_key), Some(sid),
                     "ci.service_archive.published.v1", "published", None).await?;
@@ -2704,6 +2739,20 @@ impl Dispatcher {
             "ci/deploy-controller" => {
                 crate::controller_rollout::request(self, msg, sid, &required("artifact")?, with("workflow").as_deref()).await
                     .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
+            }
+            "ci/host-heyvm-maintenance" => {
+                required("token")?;
+                let secret = crate::host_maintenance::token_secret(step.with.get("token").map(String::as_str).unwrap_or(""))
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                // Persist outputs from earlier steps before handing completion
+                // to the reconciler; downstream jobs may start immediately
+                // after its atomic successful completion.
+                let outputs: serde_json::Map<String, Value> = plan.outputs.iter()
+                    .map(|(key, value)| (key.clone(), json!(masker.mask(&ctx.substitute(value))))).collect();
+                self.store.set_job_outputs(&msg.job_id, &Value::Object(outputs)).await?;
+                crate::host_maintenance::request(self, msg, plan, sid, &required("runner")?, &required("url")?,
+                    &required("archive-id")?, &secret, step_timeout(step, plan)).await
+                    .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
             }
             "ci/upload-artifact" => {
                 let name = with("name").ok_or_else(|| {
@@ -3299,8 +3348,16 @@ async fn process_delivery(
     // queue fans out, but either way the ceiling is measured from the
     // moment the job is taken, not from when it was submitted.
     let ceiling = dispatcher.config.max_job_duration;
-    let outcome =
-        bounded_from_pickup(ceiling, &job.job_key, dispatcher.run_job(&job, attempt)).await;
+    let outcome = loop {
+        let result = bounded_from_pickup(ceiling, &job.job_key, dispatcher.run_job(&job, attempt)).await;
+        if matches!(result, Err(DispatchError::MaintenancePaused)) {
+            // Preserve this delivery and its retry budget. Re-select on every
+            // pass so unpinned work can use another runner immediately.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        break result;
+    };
     // Before the ack, always — including on the error paths below, which
     // is why it is aborted here rather than in each arm.
     heartbeat.abort();
@@ -3521,6 +3578,17 @@ impl Dispatcher {
             // network, whatever its `uses:` said.
             let plan: Option<JobPlan> = serde_json::from_value(job.plan.clone()).ok();
             let placed = plan.as_ref().and_then(|p| Self::place(&pool, p).ok());
+            if let Some(placement) = &placed {
+                let runners: Vec<_> = if let Some(node) = placement.node { vec![node] }
+                    else { placement.network.runners.iter().collect() };
+                let mut maintenance = false;
+                for runner in runners {
+                    // A database failure is uncertainty, not evidence that a
+                    // deliberately held delivery should be discarded.
+                    maintenance |= crate::host_maintenance::cordoned(&self.store, &runner.id).await.unwrap_or(true);
+                }
+                if maintenance { continue; }
+            }
 
             // A host that came online between the query and now will take the
             // job, and failing it here would kill work about to start.
@@ -4379,6 +4447,7 @@ fn or_none(items: &[String]) -> String {
 
 #[derive(Debug)]
 pub enum DispatchError {
+    MaintenancePaused,
     ControllerUnavailable(String),
     DiskPressure(String),
     Native(String),
@@ -4577,6 +4646,7 @@ impl std::fmt::Display for DispatchError {
             Self::BadPlan(e) => write!(f, "the stored plan could not be read: {e}"),
             Self::Condition(e) => write!(f, "an `if:` condition could not be evaluated: {e}"),
             Self::UnknownJob(id) => write!(f, "no job {id} exists"),
+            Self::MaintenancePaused => write!(f, "runner is cordoned for host maintenance; job remains queued"),
             Self::UnknownRunner { wanted, network } => write!(
                 f,
                 "no runner {wanted:?} is a host member of network {network:?}. Add it \
@@ -6195,6 +6265,209 @@ mod tests {
             // takes anyway.
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; fake Cloud and heyvm HTTP"]
+    async fn host_maintenance_drains_recovers_and_fails_closed() {
+        use crate::host_maintenance as maintenance;
+        use axum::{Json, Router, extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::{get, post}};
+        #[derive(Default)]
+        struct Remote { posts: Vec<Value>, stops: Vec<String>, status: String, wrong: bool, lost: bool, hidden: bool, old: bool, stop_failure: bool }
+        let remote = Arc::new(std::sync::Mutex::new(Remote::default()));
+        let app = Router::new()
+            .route("/storage", get(|| async { Json(json!({"free_bytes":1u64 << 50})) }))
+            .route("/capabilities", get(|| async { Json(json!({"supportedDrivers":["firecracker","kvm","avf"]})) }))
+            .route("/sandbox/{id}/stop", post(|State(remote): State<Arc<std::sync::Mutex<Remote>>>, Path(id): Path<String>| async move {
+                let mut r = remote.lock().unwrap();
+                if r.stop_failure { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+                r.stops.push(id); Json(json!({})).into_response()
+            }))
+            .route("/internal/mvm-ctrl/backend-servers/host-heyvm/upgrades", post(
+                |State(remote): State<Arc<std::sync::Mutex<Remote>>>, headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                    assert_eq!(headers["authorization"], "Bearer fake-key");
+                    let mut r = remote.lock().unwrap();
+                    if r.old { return StatusCode::NOT_FOUND.into_response(); }
+                    assert!(!r.stops.is_empty(), "own VM must stop before POST");
+                    assert_eq!(body["backendServerId"], "cloud-backend-982");
+                    assert_ne!(body["backendServerId"], "hd-local");
+                    assert_eq!(body["sha256"], "b".repeat(64));
+                    if let Some(previous) = r.posts.first() { assert_eq!(&body, previous, "retry payload must be exact"); }
+                    r.posts.push(body.clone());
+                    if r.lost { return StatusCode::BAD_GATEWAY.into_response(); }
+                    Json(json!({"maintenanceId":body["maintenanceId"],"backendServerId":body["backendServerId"],"status":"accepted"})).into_response()
+                }))
+            .route("/internal/mvm-ctrl/backend-servers/host-heyvm/upgrade/{id}", get(
+                |State(remote): State<Arc<std::sync::Mutex<Remote>>>, Path(id): Path<String>| async move {
+                    // Give competing reconcilers time to contend for ownership.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let r = remote.lock().unwrap();
+                    if r.hidden || r.posts.is_empty() { return StatusCode::NOT_FOUND.into_response(); }
+                    let p = &r.posts[0]; assert_eq!(id, p["maintenanceId"]);
+                    Json(json!({"maintenanceId":id,"backendServerId":p["backendServerId"],"operationType":"host_heyvm_upgrade",
+                        "target":p["target"],"requestedBy":p["requestedBy"],"targetSha256":if r.wrong { json!("wrong") } else { p["sha256"].clone() },
+                        "artifactArchiveId":p["artifactArchiveId"],"artifactUserId":p["artifactUserId"],"status":r.status,
+                        "completedAt":if matches!(r.status.as_str(), "completed" | "failed") { json!("2026-09-16T00:00:00Z") } else { Value::Null }})).into_response()
+                })).with_state(remote.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let target = maintenance::Target { repository: "https://example.test/repo.git".into(), runner_hd_id: "hd-local".into(),
+            backend_server_id: "cloud-backend-982".into(), cloud_url: base.clone(), orchestrator_url: "https://orch.test".into(),
+            artifact_user_id: "archive-owner".into(), target: "stage-eu1-host-heyvm".into(), region: Some("eu1".into()) };
+        unsafe {
+            std::env::set_var("CI_TEST_DAEMON", &base);
+            std::env::set_var("CI_HOST_MAINTENANCE_TARGETS", json!({"selected":target}).to_string());
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let mut networks = d.runners.snapshot().networks.clone();
+        networks[0].runners.push(crate::runners::Runner { id: "hd-other".into(), name: "other".into(), status: crate::runners::RunnerStatus::Online, last_seen_at: None });
+        d.runners.set_test_pool(crate::runners::Pool { networks, default_network_id: "local".into(), default_node_id: "hd-local".into(), ..Default::default() });
+        for scenario in ["success", "failed", "identity", "cancel-before", "cancel-after", "deadline", "old-cloud"] {
+            *remote.lock().unwrap() = Remote { status: "maintenance".into(), lost: true, ..Default::default() };
+            let workflow = crate::workflow::Workflow::parse("maintenance.yml", "jobs:\n  upgrade:\n    steps: [{uses: ci/promote-service-archive}, {uses: ci/host-heyvm-maintenance}]\n  existing:\n    steps: [{run: echo existing}]\n  waiting:\n    steps: [{run: echo waiting}]\n  other:\n    steps: [{run: echo other}]\n").unwrap();
+            let plan = crate::plan::Plan::build(&workflow).unwrap();
+            let run = crate::vm::new_id(); let sha = "a".repeat(40);
+            d.store.create_run(&run, &crate::store::RunRequest { repo_url: target.repository.clone(), git_ref: "refs/heads/main".into(), sha: sha.clone(), ..Default::default() }, &plan).await.unwrap();
+            let jobs = d.store.jobs_of(&run).await.unwrap();
+            let job = jobs.iter().find(|j| j.job_key == "upgrade").unwrap();
+            let existing = jobs.iter().find(|j| j.job_key == "existing").unwrap();
+            let waiting = jobs.iter().find(|j| j.job_key == "waiting").unwrap();
+            let other = jobs.iter().find(|j| j.job_key == "other").unwrap();
+            let job_plan: JobPlan = serde_json::from_value(job.plan.clone()).unwrap();
+            let msg = crate::bus::JobMessage { run_id: run.clone(), job_id: job.id.clone(), job_key: job.job_key.clone() };
+            let sandbox = format!("sb-{run}");
+            assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+            d.store.start_job(&job.id, "hd-local", &sandbox, "fp", 1).await.unwrap();
+            d.pool.register(&sandbox, "hd-local", "fp", "wf", None, &job.id, d.lease()).await.unwrap();
+            assert!(d.store.claim_job(&existing.id, "hd-local", 1).await.unwrap());
+            let publication = crate::store::step_id(&job.id, 0); let sid = crate::store::step_id(&job.id, 1);
+            d.store.create_step(&publication, &job.id, 0, "Publish", Some("ci/promote-service-archive")).await.unwrap();
+            d.store.create_step(&sid, &job.id, 1, "Maintenance", Some("ci/host-heyvm-maintenance")).await.unwrap();
+            d.store.start_step(&sid, &sid).await.unwrap();
+            let prepared = json!({"source_sha":sha,"release_sha":sha,"git_ref":"refs/heads/main","versions":{}});
+            sqlx::query("INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status) VALUES($1,'test',$2,$2,'refs/heads/main','{}',$2,$3,'published')")
+                .bind(&run).bind(&sha).bind(prepared).execute(d.store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_service_archive(step_id,run_id,job_id,archive_id,sha,orchestrator_url,archive_user_id,archive_sha256,heyvm_sha256) VALUES($1,$2,$3,$4,$5,'https://orch.test','archive-owner',$6,$7)")
+                .bind(&publication).bind(&run).bind(&job.id).bind(&run).bind(&sha).bind("c".repeat(64)).bind("b".repeat(64)).execute(d.store.pool()).await.unwrap();
+            // An existing row isn't publication success; caller-supplied IDs and unknown mappings also fail before cordon.
+            assert!(maintenance::request(&d, &msg, &job_plan, &sid, "selected", &base, &run, "CLOUD_KEY", Duration::from_secs(120)).await.is_err());
+            d.store.finish_step(&publication, StepStatus::Success, Some(0), None).await.unwrap();
+            for (alias, archive, url) in [("unknown", run.as_str(), base.as_str()), ("selected", "external-archive", base.as_str()), ("selected", run.as_str(), "https://wrong-cloud.test")] {
+                assert!(maintenance::request(&d, &msg, &job_plan, &sid, alias, url, archive, "CLOUD_KEY", Duration::from_secs(120)).await.is_err());
+            }
+            for (revision, owner, orch) in [("wrong-sha", "archive-owner", "https://orch.test"),
+                (sha.as_str(), "wrong-owner", "https://orch.test"), (sha.as_str(), "archive-owner", "https://wrong-orch.test")] {
+                sqlx::query("UPDATE ci_service_archive SET sha=$2,archive_user_id=$3,orchestrator_url=$4 WHERE step_id=$1")
+                    .bind(&publication).bind(revision).bind(owner).bind(orch).execute(d.store.pool()).await.unwrap();
+                assert!(maintenance::request(&d, &msg, &job_plan, &sid, "selected", &base, &run, "CLOUD_KEY", Duration::from_secs(120)).await.is_err());
+            }
+            sqlx::query("UPDATE ci_service_archive SET sha=$2,archive_user_id='archive-owner',orchestrator_url='https://orch.test' WHERE step_id=$1")
+                .bind(&publication).bind(&sha).execute(d.store.pool()).await.unwrap();
+            assert!(!maintenance::cordoned(&d.store, "hd-local").await.unwrap());
+            // Serialize competing maintenance admission/claims using the real shared lock.
+            let mut gate = d.store.pool().begin().await.unwrap();
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('hd-local',222))").execute(&mut *gate).await.unwrap();
+            let release_gate = async { tokio::time::sleep(Duration::from_millis(30)).await; gate.commit().await.unwrap(); };
+            let (a,b,claimed,()) = tokio::join!(
+                maintenance::request(&d, &msg, &job_plan, &sid, "selected", &base, &run, "CLOUD_KEY", Duration::from_secs(120)),
+                maintenance::request(&d, &msg, &job_plan, &sid, "selected", &base, &run, "CLOUD_KEY", Duration::from_secs(120)),
+                d.store.claim_job(&waiting.id, "hd-local", 1), release_gate);
+            a.unwrap(); b.unwrap(); let claimed = claimed.unwrap();
+            let id = hex::encode(sha2::Sha256::digest(sid.as_bytes()));
+            assert_eq!(id.len(), 64);
+            assert!(maintenance::cordoned(&d.store, "hd-local").await.unwrap());
+            assert!(!d.store.claim_job(&other.id, "hd-local", 1).await.unwrap());
+            assert!(d.store.claim_job(&other.id, "hd-other", 1).await.unwrap(), "another runner remains usable");
+            let mut pinned = job_plan.clone(); pinned.target.node = Some("local".into());
+            assert!(matches!(d.pick_runner(&pinned).await, Err(DispatchError::MaintenancePaused)), "pinned placement must honor the fence");
+            assert_eq!(d.pick_runner(&job_plan).await.unwrap().0, "hd-other", "unpinned placement must choose the unfenced runner");
+            assert_eq!(d.run_job(&msg, 2).await.unwrap(), JobStatus::Running, "duplicate delivery must not reacquire a VM");
+            maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+            assert!(remote.lock().unwrap().posts.is_empty());
+            // Expired own lease must not be reclaimed before a verified stop.
+            sqlx::query("UPDATE ci_vm_pool SET leased_by='dead-process',leased_until=now()-interval '1 hour' WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            d.reclaim_pool().await.unwrap();
+            assert_eq!(d.pool.get(&sandbox).await.unwrap().unwrap().status, "claimed");
+            if scenario == "success" {
+                // Simulate process loss after stop but before the atomic pool
+                // release/phase commit. Retry must still own this exact VM.
+                sqlx::query("ALTER TABLE ci_host_maintenance ADD CONSTRAINT test_release_crash CHECK (phase<>'draining')").execute(d.store.pool()).await.unwrap();
+                assert!(maintenance::release(&d, &id).await.is_err());
+                sqlx::query("ALTER TABLE ci_host_maintenance DROP CONSTRAINT test_release_crash").execute(d.store.pool()).await.unwrap();
+                assert_eq!(d.pool.get(&sandbox).await.unwrap().unwrap().status, "claimed");
+                assert!(remote.lock().unwrap().posts.is_empty());
+            }
+            let (a,b) = tokio::join!(maintenance::release(&d, &id), maintenance::release(&d, &id)); a.unwrap(); b.unwrap();
+            assert_eq!(remote.lock().unwrap().stops, vec![sandbox.clone(); if scenario == "success" { 2 } else { 1 }]);
+            assert_eq!(d.pool.get(&sandbox).await.unwrap().unwrap().status, "idle");
+            assert_eq!(d.store.get_job(&job.id).await.unwrap().unwrap().status, "running");
+            if scenario == "success" { d.store.migrate().await.unwrap(); } // restart must not recreate released work
+            maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+            assert!(remote.lock().unwrap().posts.is_empty(), "existing running work must drain");
+            d.store.set_job_status(&existing.id, JobStatus::Cancelled, None).await.unwrap();
+            d.store.set_job_status(&other.id, JobStatus::Success, None).await.unwrap();
+            if claimed { d.store.set_job_status(&waiting.id, JobStatus::Success, None).await.unwrap(); }
+            else { d.store.set_job_status(&waiting.id, JobStatus::Skipped, None).await.unwrap(); }
+            d.store.end_host_work(&other.id, "hd-other", 1).await.unwrap();
+            d.store.end_host_work(&waiting.id, "hd-local", 1).await.unwrap();
+            d.store.end_host_work(&existing.id, "hd-local", 99).await.unwrap();
+            maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+            let phase: String = sqlx::query_scalar("SELECT phase FROM ci_host_maintenance WHERE id=$1").bind(&id).fetch_one(d.store.pool()).await.unwrap();
+            assert_eq!(phase, "draining", "cancellation during VM acquisition and a stale delivery must not erase active host work");
+            d.store.end_host_work(&existing.id, "hd-local", 1).await.unwrap();
+            d.store.set_job_status(&existing.id, JobStatus::Success, None).await.unwrap();
+            if scenario == "success" {
+                let active = format!("sb-active-{run}");
+                d.pool.register(&active, "hd-local", "fp", "wf", None, &existing.id, d.lease()).await.unwrap();
+                let vm = d.vms.open(d.runners.options_for("hd-local").await.unwrap(), active.clone()).await.unwrap();
+                let mut reusable = job_plan.clone(); reusable.vm.reuse = true;
+                remote.lock().unwrap().stop_failure = true;
+                d.release_vm(&reusable, &vm, false).await;
+                assert_eq!(d.pool.get(&active).await.unwrap().unwrap().status, "claimed", "failed stop must retain drain evidence even when job finished");
+                maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+                assert!(remote.lock().unwrap().posts.is_empty());
+                assert!(d.pool.take_for_sweep(&["hd-local".into()], &[], 0).await.unwrap().is_empty(), "maintenance does not delete idle caches");
+                remote.lock().unwrap().stop_failure = false;
+                d.release_vm(&reusable, &vm, false).await;
+                assert_eq!(d.pool.get(&active).await.unwrap().unwrap().status, "idle");
+                d.pool.forget(&active).await.unwrap();
+            }
+            if scenario == "cancel-before" { d.store.cancel_run(&run).await.unwrap(); }
+            if scenario == "deadline" { sqlx::query("UPDATE ci_host_maintenance SET deadline=now()-interval '1 second' WHERE id=$1").bind(&id).execute(d.store.pool()).await.unwrap(); }
+            if scenario == "old-cloud" { remote.lock().unwrap().old = true; }
+            maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap(); // durable submitting boundary
+            let (a,b) = tokio::join!(maintenance::poll(&d.store, &id, "fake-key", Some(&target)), maintenance::poll(&d.store, &id, "fake-key", Some(&target))); a.unwrap(); b.unwrap();
+            if matches!(scenario, "cancel-before" | "deadline" | "old-cloud") {
+                assert!(remote.lock().unwrap().posts.is_empty());
+            } else {
+                assert_eq!(remote.lock().unwrap().posts.len(), 1, "concurrent reconcilers issue one attempt");
+                // Reconnect after lost POST response; even a transient missing GET
+                // replays only the persisted ID and exact semantic payload.
+                let restarted = Store::connect(&std::env::var("CI_TEST_DATABASE_URL").unwrap(), workspace.path().join("restart"), Duration::from_secs(30)).await.unwrap();
+                remote.lock().unwrap().hidden = true;
+                maintenance::poll(&restarted, &id, "fake-key", Some(&target)).await.unwrap();
+                assert_eq!(remote.lock().unwrap().posts.len(), 2);
+                { let mut r = remote.lock().unwrap(); r.hidden = false; r.status = if scenario == "failed" { "failed" } else { "completed" }.into(); r.wrong = scenario == "identity"; }
+                if scenario == "cancel-after" { d.store.cancel_run(&run).await.unwrap(); }
+                let (a,b) = tokio::join!(maintenance::poll(&restarted, &id, "fake-key", Some(&target)), maintenance::poll(&restarted, &id, "fake-key", Some(&target))); a.unwrap(); b.unwrap();
+            }
+            let success = scenario == "success";
+            assert_eq!(maintenance::cordoned(&d.store, "hd-local").await.unwrap(), !success, "{scenario}");
+            let expected = if success { "success" } else if scenario.starts_with("cancel") { "cancelled" } else { "failure" };
+            assert_eq!(d.store.get_job(&job.id).await.unwrap().unwrap().status, expected, "{scenario}");
+            assert_eq!(d.store.get_run(&run).await.unwrap().unwrap().status, expected, "{scenario}");
+            let posts = remote.lock().unwrap().posts.len();
+            remote.lock().unwrap().status = "completed".into();
+            maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+            assert_eq!(remote.lock().unwrap().posts.len(), posts);
+            assert_eq!(maintenance::cordoned(&d.store, "hd-local").await.unwrap(), !success, "failure must be sticky");
+            // Disposable fixture cleanup only; production has no automatic uncordon.
+            sqlx::query("DELETE FROM ci_host_maintenance WHERE id=$1").bind(&id).execute(d.store.pool()).await.unwrap();
+            d.pool.forget(&sandbox).await.unwrap();
+        }
+        server.abort();
     }
 
     #[tokio::test]
