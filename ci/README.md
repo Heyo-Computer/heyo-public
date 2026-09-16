@@ -1445,6 +1445,10 @@ rootfs artifact, pinned read-only mounts and an HTTP readiness path. Catalog
 image names alone cannot prove rootfs identity. Workspace/writable deployments
 and alternate ingress are not supported by this rollout path. Upgrade app-lb
 before enabling the action; CI never falls back to stop-first mutation APIs.
+CI sets `health.expected_header` to `x-heyo-revision` with the exact release SHA.
+The service must return that identity stamped into its build, not echoed from
+runtime environment variables. A generic healthy response from an old listener
+must not authorize cutover. app-lb requires a 2xx status and the exact header.
 
 CI persists the source revision, source/target configuration hashes, exact
 artifact and deadline before submission, without storing live secrets. Queue
