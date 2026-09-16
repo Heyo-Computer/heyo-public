@@ -21,7 +21,17 @@
 //! - the source bytes are archived exactly as they are. A sick filesystem is
 //!   never repaired before upload (repair belongs on a restore-time copy);
 //!   the best-effort trim uses `e2fsck -fp`, the same preen the reclaim
-//!   scripts run, and a disk that fails it is uploaded untrimmed.
+//!   scripts run, and a disk that fails it is uploaded untrimmed;
+//! - but a filesystem whose superblock records kernel-detected corruption
+//!   never *overwrites* an archive that predates it. That older copy still
+//!   boots; the damaged one cannot, and archiving it makes the schema
+//!   permanently unservable — every restore rebuilds the same disk and
+//!   Postgres PANICs on it. With no earlier copy to keep, the damaged bytes
+//!   are still archived, loudly: they are the only copy there will be;
+//! - repair happens on the restore-time copy, which is scratch: a restored
+//!   image with fsck findings is repaired with `e2fsck -fy` before any VM
+//!   boots it, and one that is still damaged after that fails the bring-up
+//!   with that reason instead of crash-looping a guest against it.
 //!
 //! Restore inverts the readopt maneuver from emergency-drain.sh: create a
 //! fresh VM, stop it, copy the downloaded image **in place** over its
@@ -244,6 +254,44 @@ pub async fn archive_disk(
     // only copy, and repair belongs on a restore-time copy.
     trim_disk(schema, &disk).await;
 
+    // What the trim cannot undo is corruption the kernel already recorded. An
+    // image of that filesystem is unservable forever: every restore rebuilds
+    // the same disk and Postgres PANICs on it (`could not flush dirty data:
+    // Structure needs cleaning`), burning a full ready_timeout per attempt —
+    // eighteen of them on one workbook on 2026-09-15, because the damage had
+    // been archived on top of a copy that still booted.
+    if let Some(health) = fs_health(&disk).await
+        && health.is_damaged()
+    {
+        // Only refuse when there is something to lose. An image already in S3
+        // predates this damage and still boots, so it must not be overwritten
+        // by one that cannot. With no image there, these damaged bytes are the
+        // only copy there will be — archiving them beats dropping them, and
+        // the restore path repairs what it can before booting.
+        let existing = match reqwest::Client::builder().build() {
+            Ok(http) => s3
+                .head_object(&http, &s3.image_object_key(schema), HEAD_TIMEOUT)
+                .await
+                .ok()
+                .flatten(),
+            Err(_) => None,
+        };
+        if existing.is_some() {
+            bail!(
+                "schema {schema}: this disk's filesystem is damaged ({}) — refusing to \
+                 overwrite the image already in S3, which predates the damage and still \
+                 boots; repair the disk (e2fsck -fy on a copy) before archiving it again",
+                health.summary()
+            );
+        }
+        warn!(
+            "schema {schema}: archiving a damaged filesystem ({}) — there is no earlier \
+             image to keep, so these bytes are the only copy; a restore from it is \
+             repaired before it boots",
+            health.summary()
+        );
+    }
+
     // Spool space: the compressed image can't exceed the disk's allocated
     // bytes, so that (plus slack) is the safe bound to check.
     let allocated = {
@@ -305,6 +353,33 @@ pub async fn compact_disk(
     // more than for an upload. Same best-effort posture as the archive path —
     // a disk that fails preen is imaged exactly as it is.
     trim_disk(schema, &disk).await;
+
+    // And the same refusal as `archive_disk`, for the same reason: corruption
+    // the kernel already recorded outlives the trim, and this file is what the
+    // tier serves from — and what `promote_compact` later uploads — so writing
+    // it out of a damaged filesystem makes the damage the schema's permanent
+    // state.
+    if let Some(health) = fs_health(&disk).await
+        && health.is_damaged()
+    {
+        if tokio::fs::metadata(compact.compact_path(schema))
+            .await
+            .is_ok()
+        {
+            bail!(
+                "schema {schema}: this disk's filesystem is damaged ({}) — refusing to \
+                 overwrite the compact image already on disk, which predates the damage and \
+                 still boots; repair the disk (e2fsck -fy on a copy) before compacting it again",
+                health.summary()
+            );
+        }
+        warn!(
+            "schema {schema}: compacting a damaged filesystem ({}) — there is no earlier \
+             image to keep, so these bytes are the only copy; a restore from it is \
+             repaired before it boots",
+            health.summary()
+        );
+    }
 
     let allocated = {
         use std::os::unix::fs::MetadataExt;
@@ -823,19 +898,59 @@ async fn adopt_zst_image(
     check_ext4_magic(raw)
         .await
         .with_context(|| format!("schema {schema}: downloaded image is not an ext4 filesystem"))?;
-    // Report-only fsck: a dirty journal is expected (the archive-time stop is
-    // an unclean power-off) and the guest replays it on boot; this just puts
-    // the disk's state on the record before the VM gets it.
-    if let Ok(out) = run(
-        Command::new("e2fsck").args(["-fn"]).arg(raw),
-        FSCK_TIMEOUT,
-    )
-    .await && !out.status.success()
+    // Check, then repair if needed. A dirty journal is expected — the
+    // archive-time stop is an unclean power-off — and on its own the guest
+    // would replay it at boot. But findings here also cover real corruption
+    // that was archived along with the data, and booting that is what turns
+    // one damaged filesystem into an unservable schema: Postgres PANICs on
+    // the end-of-recovery checkpoint (`could not flush dirty data: Structure
+    // needs cleaning`), the postmaster restarts, and the pooler waits out a
+    // full ready_timeout before trying the whole restore again.
+    //
+    // This image is scratch — the durable copy is the archive it came from —
+    // so repairing it in place costs nothing and is the one moment repair is
+    // safe. `-y` because there is nobody to answer the questions, and because
+    // a half-repaired filesystem is what the reclaim script's preen leaves
+    // behind when it gives up.
+    if let Ok(out) = run(Command::new("e2fsck").args(["-fn"]).arg(raw), FSCK_TIMEOUT).await
+        && !out.status.success()
     {
         info!(
-            "schema {schema}: restored image has fsck findings (exit {:?}) — expected \
-             for an unclean-stop archive; the guest replays the journal on boot",
+            "schema {schema}: restored image has fsck findings (exit {:?}) — repairing the \
+             restored copy before the VM gets it",
             out.status.code()
+        );
+        match run(Command::new("e2fsck").args(["-fy"]).arg(raw), FSCK_TIMEOUT).await {
+            // <4: clean, or errors corrected. 4+: errors left uncorrected.
+            Ok(fixed) if matches!(fixed.status.code(), Some(c) if c < 4) => info!(
+                "schema {schema}: repaired the restored image (fsck exit {:?})",
+                fixed.status.code()
+            ),
+            Ok(fixed) => bail!(
+                "schema {schema}: the archived filesystem is corrupt and e2fsck could not \
+                 repair it (exit {:?}): {}. Booting it would only crash-loop Postgres; \
+                 repair the archive itself, or restore this schema from an older copy",
+                fixed.status.code(),
+                String::from_utf8_lossy(&fixed.stdout)
+                    .lines()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ),
+            Err(e) => bail!("schema {schema}: repairing the restored image failed: {e:#}"),
+        }
+    }
+    // Belt and braces: a repair that "succeeded" while the superblock still
+    // records errors is not something to hand a guest — the counter is what
+    // e2fsck clears when it has actually fixed the filesystem.
+    if let Some(health) = fs_health(raw).await
+        && health.is_damaged()
+    {
+        bail!(
+            "schema {schema}: the archived filesystem still reports damage after repair \
+             ({}) — refusing to boot it; repair the archive itself, or restore this schema \
+             from an older copy",
+            health.summary()
         );
     }
     ensure_restore_headroom(cfg, schema, raw).await?;
@@ -996,6 +1111,99 @@ pub(crate) async fn offline_fs_usage(disk: &Path) -> Option<(u64, u64, u64)> {
     match run(Command::new("dumpe2fs").arg(disk), FSCK_TIMEOUT).await {
         Ok(out) if out.status.success() => dumpe2fs_usage(&String::from_utf8_lossy(&out.stdout)),
         _ => None,
+    }
+}
+
+/// What a filesystem's own superblock records about its health.
+///
+/// The kernel writes an error counter and the first/last failure site into the
+/// superblock whenever it trips on corruption, and that record survives
+/// unmount, imaging, upload and restore — which is exactly why it is worth
+/// reading. On 2026-09-15 a workbook whose ext4 went bad on the host was
+/// compacted, uploaded and then restored eighteen times; every copy carried
+/// `FS Error count: 91011` and every boot ended in the same Postgres PANIC
+/// (`could not flush dirty data: Structure needs cleaning`), five minutes at a
+/// time. A counter that travels with the bytes is the one signal that can stop
+/// that at the source.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FsHealth {
+    /// `FS Error count`, absent from the header when it is zero.
+    pub errors: u64,
+    /// `Filesystem state` carrying "with errors" — kept separate because an
+    /// older e2fsck can clear the counter while leaving the state set.
+    pub state_with_errors: bool,
+    pub first_error: Option<String>,
+    pub first_error_fn: Option<String>,
+}
+
+impl FsHealth {
+    /// Whether the kernel has ever reported corruption on this filesystem.
+    pub(crate) fn is_damaged(&self) -> bool {
+        self.errors > 0 || self.state_with_errors
+    }
+
+    /// One operator-facing line: what was recorded, and when it started.
+    pub(crate) fn summary(&self) -> String {
+        let mut s = format!("{} error(s) recorded in the superblock", self.errors);
+        if let Some(when) = &self.first_error {
+            s.push_str(&format!(", first at {when}"));
+        }
+        if let Some(func) = &self.first_error_fn {
+            s.push_str(&format!(" in {func}"));
+        }
+        s
+    }
+}
+
+/// Parse [`FsHealth`] out of `dumpe2fs -h` output. `None` when this isn't
+/// dumpe2fs header output at all (no `Filesystem state` line), which is the
+/// only case a caller must not read as "healthy".
+fn parse_fs_health(out: &str) -> Option<FsHealth> {
+    let value = |line: &str, key: &str| -> Option<String> {
+        line.strip_prefix(key).map(|v| v.trim().to_string())
+    };
+    let mut health = FsHealth {
+        errors: 0,
+        state_with_errors: false,
+        first_error: None,
+        first_error_fn: None,
+    };
+    let mut saw_state = false;
+    for line in out.lines() {
+        if let Some(state) = value(line, "Filesystem state:") {
+            saw_state = true;
+            health.state_with_errors = state.contains("with errors");
+        } else if let Some(count) = value(line, "FS Error count:") {
+            health.errors = count.parse().unwrap_or(0);
+        } else if let Some(when) = value(line, "First error time:") {
+            health.first_error = Some(when);
+        } else if let Some(func) = value(line, "First error function:") {
+            health.first_error_fn = Some(func);
+        }
+    }
+    saw_state.then_some(health)
+}
+
+/// [`parse_fs_health`] of the ext4 filesystem in `disk`, read offline.
+///
+/// `dumpe2fs -h` rather than the full dump [`offline_fs_usage`] runs: the
+/// header is the part that survives real damage. The image that prompted this
+/// could not be read by full `dumpe2fs` at all (its group descriptors were
+/// gone) while its header still reported the error counter that proved it was
+/// the wrong thing to serve. Its exit status is ignored for the same reason —
+/// dumpe2fs can complain about a filesystem and still print a usable header.
+///
+/// `None` means "could not tell", never "healthy": callers decide what to do
+/// with an unreadable answer, and none of them may treat it as a pass.
+pub(crate) async fn fs_health(disk: &Path) -> Option<FsHealth> {
+    match run(
+        Command::new("dumpe2fs").args(["-h"]).arg(disk),
+        FSCK_TIMEOUT,
+    )
+    .await
+    {
+        Ok(out) => parse_fs_health(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => None,
     }
 }
 
@@ -1423,6 +1631,67 @@ Group 1: (Blocks 32768-65535) csum 0x3c4d [INODE_UNINIT, ITABLE_ZEROED]
     fn dumpe2fs_usage_sums_group_descriptors_not_the_superblock() {
         assert_eq!(dumpe2fs_usage(DUMPE2FS_FULL), Some((524_288, 12, 4096)));
         assert_eq!(dumpe2fs_usage("Block count: 10\nBlock size: 4096\n"), None);
+    }
+
+    /// `dumpe2fs -h` of a filesystem the kernel has tripped on. These fields
+    /// are what survive imaging, upload and restore — which is what makes them
+    /// worth refusing on rather than re-discovering in a guest.
+    const DUMPE2FS_DAMAGED: &str = "\
+Filesystem volume name:   <none>
+Filesystem state:         clean with errors
+Errors behavior:          Continue
+Block count:              524288
+FS Error count:           91011
+First error time:         Tue Sep 15 18:55:03 2026
+First error function:     ext4_lookup
+Last error time:          Tue Sep 15 23:27:47 2026
+";
+
+    const DUMPE2FS_CLEAN: &str = "\
+Filesystem volume name:   <none>
+Filesystem state:         clean
+Block count:              524288
+Block size:               4096
+";
+
+    #[test]
+    fn fs_health_reads_the_superblock_error_record() {
+        let bad = parse_fs_health(DUMPE2FS_DAMAGED).expect("a dumpe2fs header parses");
+        assert!(bad.is_damaged());
+        assert_eq!(bad.errors, 91_011);
+        assert_eq!(bad.first_error_fn.as_deref(), Some("ext4_lookup"));
+        assert!(
+            bad.summary().contains("91011 error(s)"),
+            "{}",
+            bad.summary()
+        );
+        assert!(bad.summary().contains("ext4_lookup"), "{}", bad.summary());
+
+        let good = parse_fs_health(DUMPE2FS_CLEAN).expect("a dumpe2fs header parses");
+        assert!(!good.is_damaged());
+        assert_eq!(good.errors, 0);
+    }
+
+    /// "clean with errors" without a counter is still damaged: an older e2fsck
+    /// can clear the count and leave the state set, and that filesystem is no
+    /// safer to archive over a copy that still boots.
+    #[test]
+    fn a_cleared_error_counter_does_not_clear_the_state() {
+        let h = parse_fs_health("Filesystem state:         clean with errors\n")
+            .expect("a dumpe2fs header parses");
+        assert_eq!(h.errors, 0);
+        assert!(h.is_damaged());
+    }
+
+    /// Output that is not a dumpe2fs header means "could not tell", never
+    /// "healthy" — no caller may read `None` as a pass.
+    #[test]
+    fn unreadable_output_is_not_a_clean_bill_of_health() {
+        assert_eq!(parse_fs_health(""), None);
+        assert_eq!(
+            parse_fs_health("dumpe2fs: Bad magic number in super-block while trying to open\n"),
+            None
+        );
     }
 
     #[test]
