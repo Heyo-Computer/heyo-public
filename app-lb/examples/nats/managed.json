@@ -1,0 +1,39 @@
+{
+  "id": "nats-managed",
+  "routes": [],
+  "vm": {
+    "driver": "firecracker",
+    "image": "REPLACE_WITH_VERIFIED_NATS_2_11_17_IMAGE",
+    "port": 8222,
+    "open_ports": [4222],
+    "size_class": "small",
+    "disk_size_gb": 20,
+    "ttl_seconds": 0,
+    "start_command": "setsid nohup /opt/nats/start.sh </dev/null >/tmp/nats-boot.log 2>&1 &",
+    "env_from": [
+      {"secret": "nats-managed", "key": "token", "as": "NATS_TOKEN"}
+    ],
+    "workspace": {
+      "path": "/workspace",
+      "store": "https://REPLACE_WITH_PRIVATE_ARTIFACT_STORE",
+      "ref": "workspace-nats-managed",
+      "auth": {"secret": "nats-artifacts", "key": "api-key"}
+    }
+  },
+  "build": {
+    "repo": "https://github.com/Heyo-Computer/heyo-public.git",
+    "ref": "REPLACE_WITH_CI_VERIFIED_COMMIT",
+    "dockerfile": "app-lb/examples/nats/Dockerfile.managed",
+    "context": ".",
+    "image_size_mb": 512
+  },
+  "scaling": {
+    "min_replicas": 0,
+    "max_replicas": 1,
+    "warm_pool": 0,
+    "scale_to_zero_after_secs": 0,
+    "boot_timeout_secs": 180,
+    "idle_action": "retain"
+  },
+  "health": {"path": "/healthz?js-enabled-only=true", "timeout_secs": 5}
+}

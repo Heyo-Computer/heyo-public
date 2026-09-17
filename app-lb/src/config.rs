@@ -5346,6 +5346,27 @@ mod tests {
     }
 
     #[test]
+    fn managed_nats_template_preserves_single_writer_storage_and_private_access() {
+        let mut spec: DeploymentSpec = serde_json::from_str(include_str!("../examples/nats/managed.json")).unwrap();
+        spec.normalize();
+        spec.validate().unwrap();
+        let vm = spec.vm.as_ref().unwrap();
+        assert_eq!(vm.driver, Driver::Firecracker);
+        assert_eq!(vm.workspace.as_ref().unwrap().guest_path(), "/workspace");
+        assert_eq!(vm.ttl_seconds, 0);
+        assert!(vm.env_from.iter().any(|secret| secret.env.as_deref() == Some("NATS_TOKEN")));
+        assert!(spec.routes.is_empty());
+        assert_eq!(spec.scaling.min_replicas, 0);
+        assert_eq!(spec.scaling.max_replicas, 1);
+        assert_eq!(spec.scaling.warm_pool, 0);
+        assert_eq!(spec.scaling.idle_action, IdleAction::Retain);
+        spec.scaling.min_replicas = 1;
+        spec.validate().unwrap();
+        spec.scaling.max_replicas = 2;
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
     fn a_workspace_archive_needs_its_key_and_excludes_a_persistent_workspace() {
         let mut spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
             "id": "web", "routes": [],
