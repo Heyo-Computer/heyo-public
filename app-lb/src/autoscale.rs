@@ -179,6 +179,10 @@ impl Autoscaler {
         &self.workspaces
     }
 
+    pub(crate) async fn workspace_recovery_guard(&self) -> WorkspaceReplacementGuard<'_> {
+        WorkspaceReplacementGuard { _creates: self.creates.acquire_many(CREATE_CONCURRENCY as u32).await.expect("create semaphore open") }
+    }
+
     /// Fence a workspace rollout before its replacement becomes live.
     /// Acquiring all slots first waits out creates already using the old seed;
     /// the durable fence then prevents both the old and new objects creating.
@@ -251,6 +255,10 @@ impl Autoscaler {
     /// two that do not — the orphan sweeps, where the deployment is already
     /// gone — use [`crate::runtime::Runtime::kill_unknown`] instead.
     async fn kill_vm(&self, d: &Arc<Deployment>, sandbox_id: &str) -> Result<(), vm::VmError> {
+        if self.workspaces.recovery_pinned(sandbox_id) { return Ok(()); }
+        if Self::has_workspace(d) && self.workspaces.source_retained(sandbox_id) {
+            return self.vms().suspend(sandbox_id).await;
+        }
         let driver = d.spec.driver().unwrap_or_default();
         self.runtime.kill(driver, sandbox_id).await
     }
@@ -373,6 +381,8 @@ impl Autoscaler {
         for (id, info) in fleet {
             if vm::owner_of(&info.name) != Some(d.spec.id.as_str())
                 || !crate::rollout::adoptable(d, &info.name, id)
+                || self.workspaces.recovery_pinned(id)
+                || self.workspaces.recovery_active(&d.spec.id)
                 || tracked.contains(id.as_str())
                 || state.suspended.contains(id)
                 || vm::is_terminal(&info.status)
@@ -1464,6 +1474,7 @@ impl Autoscaler {
     /// what happened before this existed, and the resume path does not care
     /// either way.
     async fn discard_rootfs_of(&self, d: &Arc<Deployment>, sandbox_id: &str) {
+        if self.workspaces.source_retained(sandbox_id) { return; }
         let (removed, failed) = crate::disks::discard_rootfs(self.vms(), sandbox_id).await;
         if !removed.is_empty() {
             tracing::info!(
@@ -1510,6 +1521,7 @@ impl Autoscaler {
         sandbox_id: &str,
         origin: BootOrigin,
     ) {
+        if self.workspaces.source_retained(sandbox_id) { return; }
         if origin != BootOrigin::Created {
             tracing::info!(
                 deployment = %d.spec.id,
@@ -1582,8 +1594,8 @@ impl Autoscaler {
     fn take_suspended(&self, d: &Arc<Deployment>) -> Option<String> {
         let mut taken = None;
         let changed = d.mutate_state(|s| {
-            if !s.suspended.is_empty() {
-                taken = Some(s.suspended.remove(0));
+            if let Some(index) = s.suspended.iter().position(|id| !self.workspaces.recovery_pinned(id)) {
+                taken = Some(s.suspended.remove(index));
             }
         });
         if changed && let Err(e) = self.registry.persist_one(&d.spec.id) {
@@ -1736,6 +1748,7 @@ impl Autoscaler {
         }
 
         for (sandbox_id, owner) in &orphans {
+            if self.workspaces.source_retained(sandbox_id) { continue; }
             tracing::warn!(deployment = %owner, sandbox = %sandbox_id, "destroying unclaimed suspended VM");
             if let Err(e) = self.runtime.kill_unknown(sandbox_id).await {
                 tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill suspended VM");
@@ -1789,6 +1802,7 @@ impl Autoscaler {
         let mut orphans = Vec::new();
 
         for info in &fleet {
+            if self.workspaces.recovery_pinned(&info.id) { continue; }
             let Some(owner) = vm::owner_of(&info.name) else {
                 continue; // not ours; leave it alone
             };
@@ -1847,6 +1861,7 @@ impl Autoscaler {
         }
 
         for id in orphans {
+            if self.workspaces.source_retained(&id) { continue; }
             tracing::info!(sandbox = %id, "killing orphaned VM from a previous run");
             if let Err(e) = self.runtime.kill_unknown(&id).await {
                 tracing::warn!(sandbox = %id, error = %e, "failed to kill orphan");
@@ -3230,5 +3245,25 @@ mod tests {
             assert_eq!(std::fs::read(registry.state_dir().join("demo.json")).unwrap(), persisted);
         }
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_recovery_admission_waits_for_creates_and_blocks_new_placement() {
+        let mut spec = spec();
+        spec.vm.as_mut().unwrap().workspace = Some(serde_json::from_value(serde_json::json!({"store":"/unused"})).unwrap());
+        let (scaler, registry) = autoscaler_against("http://127.0.0.1:1", spec);
+        let d = registry.get("demo").unwrap();
+        let in_progress = scaler.creates.acquire().await.unwrap();
+        let guard = scaler.workspace_recovery_guard(); tokio::pin!(guard);
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut guard).await.is_err());
+        drop(in_progress);
+        let admission = guard.await;
+        scaler.workspaces.begin_replacement("demo", 1).unwrap();
+        let create = scaler.scale_up(&d, 1); tokio::pin!(create);
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut create).await.is_err());
+        drop(admission);
+        create.await;
+        assert!(d.pending().is_empty());
+        assert!(scaler.workspaces.blocked(&d).is_some());
     }
 }

@@ -1442,6 +1442,9 @@ impl Jobs {
             ));
         };
         if crate::rollout::reserved(&old) { return Err("candidate rollout reserves this deployment".into()); }
+        if self.autoscaler.workspaces().recovery_active(deployment_id) {
+            return Err("workspace recovery reserves this deployment".into());
+        }
         {
             let history = self.history.lock().expect("job history mutex poisoned");
             if let Some(record) = history.iter().find(|r| r.id == job_id && r.operation_id.is_some()) {
@@ -1766,6 +1769,9 @@ impl Jobs {
             ));
         };
         if crate::rollout::reserved(&old) { return Err("candidate rollout reserves this deployment".into()); }
+        if self.autoscaler.workspaces().recovery_active(deployment_id) {
+            return Err("workspace recovery reserves this deployment".into());
+        }
         let mut spec = old.spec.clone();
         let Some(vm) = spec.vm.as_mut() else {
             return Err(format!(
