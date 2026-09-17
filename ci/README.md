@@ -119,19 +119,23 @@ retain the managed CI workspace, external database and broker configuration.
 
 ## Submitting a build
 
-For this repository's `ci` workflow, submission includes merge after the
-non-ignored CI test suite and artifact validation. The merge uses `ci/merge-release`
-with the registered HeyoSecret `GIT_AUTH_TOKEN`, no version bump or tags, and
-refuses changes outside the CI component and its workflow/image. The captured
-trunk must still match at publication; a moved trunk requires revalidation.
+This repository's `ci` workflow only validates and produces an artifact.
+`git submit --only ci` never merges or deploys. Once the installed platform meets
+the prerequisites described under [coordinated submissions](#one-submission-across-validation-workflows-and-deployment),
+an unrestricted submission also selects `.ci/workflows/regional-release.yml`.
+That workflow owns the single merge after all selected validations pass, then
+deploys sequentially to us3, eu1, and finally the CI controller. The merge uses
+the registered HeyoSecret `GIT_AUTH_TOKEN`, with no version bump or tags. The
+captured trunk must still match at publication; a moved trunk requires revalidation.
 
 CI runtime changes also require `ci/deploy-controller`. It records a durable
 rollout, closes new submissions (HTTP 503), and lets existing jobs finish before
 replacing the controller. The requesting job finishes first; the **run remains
 running** until the replacement resumes reconciliation and its public health
 endpoint identifies the expected revision and executable SHA256. Documentation
-and workflow-only changes need no runtime deploy. Other workflows retain their
-own release policy; this does not make all workflows merge or deploy automatically.
+and workflow-only changes need no controller replacement unless the release
+workflow explicitly selects one. A passing validation run is not deployment
+completion; inspect the coordinated release run.
 
 Self-deployment is opt-in and currently supports **one Firecracker controller
 with a persistent workspace**, not active-active controllers or regional DB
@@ -161,12 +165,10 @@ through the existing drained deployment path, then enable the configured workflo
 An older controller cannot deploy its own first implementation of this action.
 Missing capabilities or configuration fail the deployment rather than claim success.
 
-To retry deployment after the candidate has already merged, submit that revision
-with `git submit --only ci --submit-empty`. CI revalidates and republishes the
-candidate, then requests deployment even though its diff against trunk is empty.
-This explicit retry can replace the controller even if that revision is already
-running. New documentation-only changes still skip deployment; mixed unmerged
-changes still fail the CI-only merge scope guard.
+`git submit --only ci --submit-empty` also remains validation-only: it cannot
+retry controller replacement. Use the coordinated release policy for deployment;
+do not treat an individual validation rerun or a successful artifact upload as
+authorization to publish or as evidence that a replacement occurred.
 
 The durable rollout waits for jobs, claimed/building VMs, live native leases and
 other unresolved deployments. A historical running native job does not block
