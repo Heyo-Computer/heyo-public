@@ -1,10 +1,13 @@
 """Boot-contract tests; only the filesystem-device probe is simulated."""
 import hashlib
+import ipaddress
+import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from urllib.parse import urlsplit
 
 
 class ArtifactBootTest(unittest.TestCase):
@@ -74,6 +77,27 @@ class ArtifactBootTest(unittest.TestCase):
     def test_refuses_corrupted_binary(self):
         (self.release / "ci").write_bytes(b"different bytes\n")
         self.assert_refused(self.boot())
+
+
+class DeploymentTemplateTest(unittest.TestCase):
+    def test_service_templates_require_an_external_authenticated_broker(self):
+        root = Path(__file__).resolve().parents[1]
+        repository = root.parent
+        for path in (root / "deploy/trial-service.json", repository / ".heyo/regions/us3/ci.json"):
+            with self.subTest(path=path):
+                vm = json.loads(path.read_text())["vm"]
+                broker = urlsplit(vm["env_vars"]["CI_NATS_URL"])
+                self.assertIn(broker.scheme, ("nats", "tls"))
+                self.assertTrue(broker.hostname)
+                self.assertNotEqual(broker.hostname, "localhost")
+                self.assertFalse(broker.hostname.endswith(".localhost"))
+                try:
+                    address = ipaddress.ip_address(broker.hostname)
+                except ValueError:
+                    pass  # Explicit DNS name, including the unconfigured placeholder.
+                else:
+                    self.assertFalse(address.is_loopback or address.is_unspecified)
+                self.assertTrue(any(ref.get("as") == "CI_NATS_TOKEN" for ref in vm["env_from"]))
 
 
 if __name__ == "__main__":
