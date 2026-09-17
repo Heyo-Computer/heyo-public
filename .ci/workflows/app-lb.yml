@@ -118,7 +118,6 @@ jobs:
         - rust-toolchain.toml
     env:
       CARGO_TERM_COLOR: never
-      HEYO_BUILD_GIT_SHA: ${{ ci.sha }}
     # The job needs headroom over the sum of its steps. A cold build compiles
     # OpenSSL and aws-lc from source before it reaches the first Rust crate that
     # needs them; a warm VM reuses /var/cache/ci and relinks.
@@ -185,6 +184,7 @@ jobs:
         # the exec channel, not the serial console that carries the marker
         # protocol.
         run: |
+          export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
           cargo fetch --locked
           df -P / "$CARGO_TARGET_DIR"
           cargo test --locked --bin app-lb || exit $?
