@@ -65,19 +65,21 @@ private `CICD_RUNNER_TOKEN` and the public CI submission token. Allow
 itself. The checked-in us2 route example includes that exception but changing
 the file does not change an installed route.
 
-For an artifact-backed single-VM trial, `deploy/trial-service.json` is an
+For an artifact-backed CI service, `deploy/trial-service.json` is an
 Orchestrator service template. Replace its owner/account, Linux runtime image,
-network and admin-email placeholders. Package the Linux x86_64 `ci` and
-`nats-server` binaries with `deploy/trial-start.sh` as `start.sh` and
-`deploy/trial-nats.conf` as `nats.conf` at the archive root. Upload that archive
+network, private NATS service URL and admin-email placeholders. Package the Linux
+x86_64 `ci` binary with `deploy/trial-start.sh` as `start.sh` at the archive root.
+NATS must have its own deployment, credentials and persistent JetStream storage;
+the CI image and launcher no longer contain or supervise it. Upload the CI archive
 through Orchestrator's service archive API and attach its ID and exact source
 revision to the deployment request. A local artifact build does not merge the
 branch or submit CI; bypassing the normal CICD deployment path requires approval.
 
 This template uses a dedicated Postgres database and the five
-`ci-us3-trial/*` HeyoSecret references named in `env_from`. NATS runs only on
-the VM's loopback interface; its monitoring port is not exposed. If either
-process exits, the startup wrapper terminates the other and exits nonzero.
+`ci-us3-trial/*` HeyoSecret references named in `env_from`. Connect to NATS over a
+private authenticated endpoint; do not expose its monitoring port publicly.
+CI exit or replacement must not stop the broker. Preserve the existing subject
+prefix, stream/consumer identities and credentials when migrating a bundled trial.
 The template creates no public route: configure an authenticated app-lb route
 only after checking that the VM port has no public bypass. A staging JWT gate
 can forward the existing Auth identity. For browser email/password sign-in,

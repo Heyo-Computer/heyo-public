@@ -1,6 +1,7 @@
 //! Deferred self-deployment. The requesting job finishes before replacement;
 //! the replacement controller reconciles the same durable operation at startup.
 use crate::{artifacts::StoredArtifact, bus::JobMessage, dispatch::Dispatcher, store::Store};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -73,6 +74,16 @@ fn artifact_identity(bytes: &[u8], sha: &str) -> Result<String, String> {
 }
 
 fn desired_spec(mut spec: Value, digest: &str, sha: &str) -> Result<Value, String> {
+    let broker = spec["vm"]["env_vars"]["CI_NATS_URL"].as_str()
+        .ok_or("controller requires an explicit external CI_NATS_URL before self-deployment")?;
+    let url = reqwest::Url::parse(broker).map_err(|_| "invalid controller CI_NATS_URL")?;
+    let host = url.host_str().ok_or("CI_NATS_URL has no host")?;
+    let local = host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
+        || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
+    if !matches!(url.scheme(), "nats" | "tls") || local {
+        return Err("controller self-deployment requires an independently managed NATS service, not a loopback broker".into());
+    }
     if spec["vm"]["driver"] != "firecracker" || !spec["vm"]["workspace"].is_object()
         || spec["scaling"]["max_replicas"] != 1 || spec["scaling"]["min_replicas"] != 1
         || spec["scaling"]["warm_pool"].as_u64().unwrap_or(0) != 0 {
@@ -88,6 +99,8 @@ fn desired_spec(mut spec: Value, digest: &str, sha: &str) -> Result<Value, Strin
     mount["ref"] = json!(digest);
     mount["digest"] = json!(digest);
     spec["vm"]["env_vars"]["CI_EXPECTED_SHA"] = json!(sha);
+    let boot = base64::engine::general_purpose::STANDARD.encode(include_str!("../deploy/start-artifact.sh"));
+    spec["vm"]["start_command"] = json!(format!("echo {boot} | base64 -d > /tmp/ci-start-artifact.sh; setsid nohup bash /tmp/ci-start-artifact.sh /opt/ci-release /opt/ci /workspace/ci-state </dev/null >/workspace/ci-state.log 2>&1 &"));
     Ok(spec)
 }
 
@@ -351,19 +364,29 @@ mod tests {
         json!({"id":"ci-test","routes":[{"host":"ci.example.test"}],
             "scaling":{"min_replicas":1,"max_replicas":1,"warm_pool":0},
             "vm":{"driver":"firecracker","workspace":{"ref":"preserve-me"},
-                "env_vars":{"OTHER":"unchanged","CI_EXPECTED_SHA":"old"},
+                "env_vars":{"OTHER":"unchanged","CI_EXPECTED_SHA":"old","CI_NATS_URL":"nats://broker.internal:4222"},
                 "mounts":[{"path":"/opt/data","ref":"leave-me"},
                     {"path":"/opt/ci-release","ref":"old","digest":"old","read_only":true,"strip_components":1}]}})
     }
 
     #[test]
-    fn promotion_changes_only_release_mount_and_revision_and_refuses_unsafe_topology() {
+    fn promotion_preserves_broker_and_state_and_replaces_legacy_launcher() {
         let original = spec();
         let mut expected = original.clone();
         expected["vm"]["mounts"][1]["ref"] = json!("blob");
         expected["vm"]["mounts"][1]["digest"] = json!("blob");
         expected["vm"]["env_vars"]["CI_EXPECTED_SHA"] = json!("revision");
-        assert_eq!(desired_spec(original.clone(), "blob", "revision").unwrap(), expected);
+        let mut actual = desired_spec(original.clone(), "blob", "revision").unwrap();
+        let command = actual["vm"].as_object_mut().unwrap().remove("start_command").unwrap();
+        let encoded = command.as_str().unwrap().split_whitespace().nth(1).unwrap();
+        let boot = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(encoded).unwrap()).unwrap();
+        assert!(boot.contains("exec ./ci"));
+        assert!(!boot.contains("exec bash \"$runtime/start.sh\""));
+        assert_eq!(actual, expected);
+        for broker in [Value::Null, json!("nats://localhost:4222"), json!("nats://127.0.0.2:4222"), json!("nats://[::1]:4222"), json!("http://broker.internal:4222")] {
+            let mut invalid = original.clone(); invalid["vm"]["env_vars"]["CI_NATS_URL"] = broker;
+            assert!(desired_spec(invalid, "blob", "revision").is_err());
+        }
         for pointer in ["/scaling/max_replicas", "/scaling/min_replicas", "/scaling/warm_pool"] {
             let mut invalid = original.clone(); *invalid.pointer_mut(pointer).unwrap() = json!(2);
             assert!(desired_spec(invalid, "blob", "revision").is_err());

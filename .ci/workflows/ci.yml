@@ -256,6 +256,9 @@ jobs:
         run: cargo test --release --locked -- --test-threads=1
         timeout-minutes: 10
 
+      - name: Test CI boot and deployment templates
+        run: python3 /workspace/ci/deploy/test_start_artifact.py
+
       # `ci` takes no arguments at all — no clap, no `env::args` anywhere in
       # `src/` — and is configured entirely from `CI_*` variables, so there is
       # no `--version` to call the way there is for `codegraph`. That is the
@@ -407,7 +410,9 @@ jobs:
           paths = subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', '-z', base, head]).decode().split('\0')
           paths = [p for p in paths if p]
           def covered(p):
-              return p.startswith(('ci/', '.ci/image/ci/')) or p == '.ci/workflows/ci.yml'
+              return p.startswith(('ci/', '.ci/image/ci/')) or p in (
+                  '.ci/workflows/ci.yml', '.heyo/regions/us3/ci.json',
+                  '.heyo/regions/us3/README.md')
           outside = [p for p in paths if not covered(p)]
           if outside:
               raise SystemExit('CI validation does not authorize merging these paths: ' + ', '.join(outside))

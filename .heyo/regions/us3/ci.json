@@ -15,7 +15,7 @@
       "CI_PUBLIC_URL": "https://ci.us3.heyo.work",
       "CI_HEYO_BASE_URL": "https://cloud.us3.heyo.work",
       "CI_NETWORK": "local",
-      "CI_NATS_URL": "nats://127.0.0.1:4222",
+      "CI_NATS_URL": "nats://REPLACE_WITH_PRIVATE_NATS_SERVICE:4222",
       "CI_NATS_SUBJECT_PREFIX": "ci_us3",
       "CI_LOG_DIR": "/workspace/ci-state/logs",
       "CI_WORKSPACE_DIR": "/workspace/ci-state/workspaces",

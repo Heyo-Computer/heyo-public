@@ -7,8 +7,12 @@ The existing Auth service and S3 object store can be shared without moving them.
 ## CI
 
 `ci.json` builds `ci/Dockerfile.firecracker` through app-lb from a pinned public
-commit. It starts inert, with no route and zero replicas. CI and NATS run in
-the image; Postgres stays external. Existing us3 CI test files are disposable.
+commit. It starts inert, with no route and zero replicas. The image runs CI only;
+Postgres and NATS are independent services. Replace `CI_NATS_URL` with the
+authenticated broker's private endpoint before starting CI. NATS needs its own
+persistent JetStream storage and lifecycle, not CI's writable workspace. For an
+existing bundled installation, follow the backup/restore and cutover requirements
+in `ci/README.md`; existing messages and consumer state are not disposable.
 
 Populate app-lb's `ci-us3` delivery secret from HeyoSecret: the existing
 `ci-us3-trial/{database-url,cloud-api-key,webhook-secret,native-runner-secret,nats-token}`
