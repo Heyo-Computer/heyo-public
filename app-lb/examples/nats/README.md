@@ -22,6 +22,11 @@ restore**. A fresh broker for network restore needs an explicitly seeded empty
 directory and marker; do not connect production clients until restore is verified.
 SSH password authentication is disabled.
 
+The launcher JSON-quotes the opaque `NATS_TOKEN` into `NATS_CONFIG_TOKEN` for
+NATS's config parser. Supply the raw token through managed secrets; do not
+pre-quote it. Numeric prefixes, quotes, and backslashes must not change the
+credential or turn it into a config expression.
+
 `managed.json` starts with zero replicas and no public route. Configure the
 verified image, HeyoSecret-backed token delivery, and a dedicated artifact-store
 workspace reference. Never use CI's workspace or snapshot tag. `vm.workspace`

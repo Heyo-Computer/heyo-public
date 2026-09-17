@@ -17,4 +17,9 @@ if [ ! -d "$state/jetstream" ] || [ -L "$state/jetstream" ] || [ "$(stat -c %d "
     echo 'NATS refuses to start without the seeded JetStream directory' >&2
     exit 1
 fi
+# NATS parses environment references as config values, not opaque strings.
+# JSON quoting preserves numeric prefixes, quotes and backslashes without
+# exposing the credential in process arguments or writing it to the image.
+NATS_CONFIG_TOKEN=$(printf '%s' "$NATS_TOKEN" | jq -Rs .)
+export NATS_CONFIG_TOKEN
 exec nats-server -c /etc/nats/managed.conf

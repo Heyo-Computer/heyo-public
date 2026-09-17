@@ -4,7 +4,7 @@
 FROM nats:2.11.17-alpine AS upstream
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates openssh-server iproute2 util-linux \
+    ca-certificates openssh-server iproute2 util-linux jq \
     && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d \
     && printf 'PermitRootLogin prohibit-password\nPermitEmptyPasswords no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' > /etc/ssh/sshd_config.d/00-heyo.conf \
@@ -16,6 +16,6 @@ COPY app-lb/examples/nats/image/managed.conf /etc/nats/managed.conf
 RUN sed -i 's/hostname heyosecret/hostname nats/' /init.sh \
     && chmod 755 /init.sh /opt/nats/start.sh \
     && mkdir -p /workspace \
-    && NATS_TOKEN=build-time-validation-only nats-server -t -c /etc/nats/managed.conf
+    && NATS_CONFIG_TOKEN='"9j-build-time-validation-only"' nats-server -t -c /etc/nats/managed.conf
 EXPOSE 22 4222 8222
 CMD ["/init.sh"]

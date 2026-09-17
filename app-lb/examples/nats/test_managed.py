@@ -69,6 +69,16 @@ class ManagedBrokerTest(unittest.TestCase):
     def test_refuses_missing_credentials(self):
         self.refused(self.store("state"), "configure the managed broker credential", token=False)
 
+    def test_credentials_are_opaque_not_config_expressions(self):
+        for index, token in enumerate(['9j-token', '123456', 'true', '9j-"quoted"\\slash']):
+            with self.subTest(index=index):
+                self.env['NATS_TOKEN'] = token
+                _, url = self.broker(self.store('token-' + str(index)))
+                self.assertFalse(json.loads(self.cli(url, 'stream', 'ls', '--json').stdout))
+                wrong = {**self.env, 'NATS_TOKEN': token + '-wrong'}
+                self.assertNotEqual(self.cli(url, 'stream', 'ls', '--json', check=False,
+                                            env=wrong).returncode, 0)
+
     def test_refuses_rootfs_storage(self):
         self.refused(None, "dedicated mounted workspace")
 
