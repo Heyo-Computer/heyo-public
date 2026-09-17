@@ -11,7 +11,9 @@ pub(crate) mod bundle;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct Target { repository: String, url: String, deployment: String, namespace: String, health_url: String }
+pub(crate) struct Target {
+    pub repository: String, pub url: String, pub deployment: String, pub namespace: String, pub health_url: String,
+}
 
 #[derive(Serialize, Deserialize, PartialEq)]
 struct Intent { target: Target, request: Value, store: String }
@@ -38,7 +40,7 @@ async fn fetch_bundle(store: &str, digest: &str, size: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn mapping(raw: Option<&str>, alias: &str) -> Result<Target> {
+pub(crate) fn mapping(raw: Option<&str>, alias: &str) -> Result<Target> {
     let targets: BTreeMap<String, Target> = serde_json::from_str(raw.ok_or_else(|| anyhow::anyhow!("CI_HOST_APP_LB_TARGETS is not configured"))?)?;
     let target = targets.get(alias).ok_or_else(|| anyhow::anyhow!("unknown host app-lb target"))?.clone();
     crate::cd::app_lb_endpoint(&target.url).map_err(anyhow::Error::msg)?;

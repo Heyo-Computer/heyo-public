@@ -75,8 +75,20 @@ async fn main() {
             }
             return;
         }
+        if args[0] == "--check-host-bootstrap" && args.len() == 4 {
+            let targets = std::env::var("CI_HOST_APP_LB_TARGETS").ok();
+            let token = std::env::var("CI_HOST_APP_LB_TOKEN").unwrap_or_default();
+            match host_bootstrap::check(args[2].as_ref(), &args[3], &args[1], targets.as_deref(), &token).await {
+                Ok(status) => println!("{status}"),
+                Err(error) => {
+                    eprintln!("bootstrap remains unverified: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         if args[0] != "--check-workflows" || args.len() < 2 {
-            eprintln!("usage: ci [--check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON]");
+            eprintln!("usage: ci [--check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
             std::process::exit(2);
         }
         let mut failed = false;

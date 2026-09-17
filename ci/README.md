@@ -1583,6 +1583,24 @@ this command does not send or retry legacy update POSTs. After replacement, use
 the authenticated bootstrap-operation GET for completion, not the mapped legacy
 update endpoint, which is deliberately disabled.
 
+`ci --check-host-bootstrap TARGET manifest.json INTENT_SHA256` performs that
+completion check once, without loading the CI database or broker. `TARGET` must
+exist in operator-owned `CI_HOST_APP_LB_TARGETS`; supply its namespace-admin
+credential through `CI_HOST_APP_LB_TOKEN` from the managed secret configuration,
+not a command argument. The manifest bytes must match the previously recorded
+hash and the target's deployment, namespace and public health URL.
+
+The command checks the authenticated native receipt's operation, intent, source,
+target, journal and helper-unit identities, completed status, and verified
+readiness; it then independently requests public health without credentials and
+requires one exact revision header. Both requests forbid redirects and have
+timeouts; the receipt is capped at 64 KiB. Only verified completion exits zero.
+Missing/old endpoints, busy helpers, mismatched receipts and unavailable health
+exit nonzero without sending any POST, changing IDs, or retrying installation.
+It can be rerun for the same manifest/intent. The native GET can persist success
+and release its fence; this is an authenticated reconciliation action, not an
+unauthenticated status probe. Initial launch delivery remains separate.
+
 ### Service deployments
 
 For candidate-first updates of existing stateless app-lb services, use

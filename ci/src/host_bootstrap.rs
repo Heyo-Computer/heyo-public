@@ -1,5 +1,5 @@
-//! Offline preparation only. Native admission owns host validation and mutation;
-//! this command neither authorizes a release nor delivers a legacy update POST.
+//! Offline preparation and authenticated completion checks. Native admission
+//! owns installation; neither command delivers or retries a legacy update POST.
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -140,6 +140,48 @@ pub fn run(plan: &Path, inspection: &Path, archive: &Path, output: &Path) -> Res
     Ok(json!({"status":"prepared","intent_sha256":bundle::sha(&manifest),"manifest_path":output}))
 }
 
+pub async fn check(path: &Path, intent: &str, alias: &str, targets: Option<&str>, token: &str) -> Result<Value> {
+    ensure!(!token.trim().is_empty(), "CI_HOST_APP_LB_TOKEN is required");
+    let target = crate::host_app_lb::mapping(targets, alias)?;
+    let bytes = read(path, LIMIT)?;
+    ensure!(bundle::valid_sha(intent, 64) && bundle::sha(&bytes) == intent, "manifest differs from recorded intent");
+    let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid manifest JSON"))?;
+    let id = manifest["operation_id"].as_str().filter(|s| !s.is_empty() && s.len() <= 128
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+        .ok_or_else(|| anyhow::anyhow!("invalid operation ID"))?;
+    let revision = manifest["target"]["revision"].as_str().filter(|s| bundle::valid_sha(s, 40))
+        .ok_or_else(|| anyhow::anyhow!("invalid target revision"))?;
+    ensure!(manifest["config"]["deployment"] == target.deployment && manifest["config"]["namespace"] == target.namespace
+        && manifest["config"]["health_url"] == target.health_url, "manifest differs from trusted target mapping");
+    ensure!(manifest["source"].is_object() && manifest["target"].is_object(), "missing manifest identities");
+    let state = manifest["config"]["state_dir"].as_str().filter(|s| absolute(s))
+        .ok_or_else(|| anyhow::anyhow!("invalid manifest state directory"))?;
+    let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5)).timeout(std::time::Duration::from_secs(20)).build()?;
+    // A missing operation, old controller, timeout or busy helper never causes
+    // an admission POST. The native GET alone may persist verified completion.
+    let mut response = http.get(format!("{}/deployments/{}/update/bootstrap/{id}", target.url.trim_end_matches('/'), target.deployment))
+        .bearer_auth(token).send().await.map_err(|_| anyhow::anyhow!("bootstrap lookup unavailable; no launch attempted"))?;
+    ensure!(response.status().is_success(), "bootstrap lookup returned {}; no launch attempted", response.status());
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| anyhow::anyhow!("bootstrap lookup interrupted"))? {
+        ensure!(body.len() + chunk.len() <= 64 * 1024, "bootstrap response exceeds byte limit");
+        body.extend_from_slice(&chunk);
+    }
+    let receipt: Value = serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("invalid bootstrap response"))?;
+    ensure!(receipt["protocol"] == "host-app-lb-bootstrap-v1" && receipt["operation_id"] == id
+        && receipt["intent_sha256"] == intent && receipt["deployment"] == target.deployment && receipt["namespace"] == target.namespace
+        && receipt["source"] == manifest["source"] && receipt["target"] == manifest["target"]
+        && receipt["journal_path"] == json!(Path::new(state).join("bootstrap.json"))
+        && receipt["unit_name"] == format!("app-lb-bootstrap-{intent}"), "bootstrap receipt identity differs");
+    ensure!(receipt["status"] == "succeeded" && receipt["phase"] == "complete" && receipt["readiness_verified"] == true
+        && receipt.get("error") == Some(&Value::Null), "bootstrap remains unverified; reconcile the same operation");
+    let health = http.get(&target.health_url).send().await.map_err(|_| anyhow::anyhow!("public bootstrap health unavailable"))?;
+    ensure!(health.status().is_success() && health.headers().get_all("x-heyo-revision").iter().count() == 1
+        && health.headers().get("x-heyo-revision").and_then(|h| h.to_str().ok()) == Some(revision), "public build differs from bootstrap target");
+    Ok(json!({"status":"succeeded","operation_id":id,"intent_sha256":intent,"revision":revision}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +291,63 @@ mod tests {
         fs::write(&p, vec![b' '; LIMIT + 1]).unwrap();
         assert!(run(&p, &i, &a, &dir.path().join("oversized.json")).is_err());
         assert!(!dir.path().join("oversized.json").exists());
+    }
+
+    #[tokio::test]
+    async fn completion_requires_exact_receipt_and_health_without_relaunch_or_redirect() {
+        use axum::{Router, routing::any, extract::State, http::{Request, StatusCode}, body::Body, response::IntoResponse};
+        use std::sync::{Arc, Mutex};
+        let remote = Arc::new(Mutex::new((String::new(), Value::Null, Vec::<String>::new())));
+        let app = Router::new().fallback(any(|State(remote): State<Arc<Mutex<(String, Value, Vec<String>)>>>, request: Request<Body>| async move {
+            let mut remote = remote.lock().unwrap();
+            remote.2.push(format!("{} {}", request.method(), request.uri().path()));
+            assert_eq!(request.method(), "GET");
+            if request.uri().path() == "/healthz" {
+                assert!(!request.headers().contains_key("authorization"));
+                let mut response = StatusCode::OK.into_response();
+                if remote.0 == "health-non2xx" { *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE; }
+                if remote.0 != "health-missing" {
+                    let revision = if remote.0 == "health-wrong" { "e".repeat(40) } else { "a".repeat(40) };
+                    response.headers_mut().insert("x-heyo-revision", revision.parse().unwrap());
+                    if remote.0 == "health-duplicate" { response.headers_mut().append("x-heyo-revision", revision.parse().unwrap()); }
+                }
+                return response;
+            }
+            assert_eq!(request.headers()["authorization"], "Bearer test-bootstrap-token");
+            if remote.0 == "missing" { return StatusCode::NOT_FOUND.into_response(); }
+            if remote.0 == "busy" { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+            if remote.0 == "redirect" { return (StatusCode::TEMPORARY_REDIRECT, [("location", "/sink")]).into_response(); }
+            if remote.0 == "oversized" { return vec![b' '; 65537].into_response(); }
+            axum::Json(remote.1.clone()).into_response()
+        })).with_state(remote.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (plan, inspection, archive) = fixture();
+        let mut manifest: Value = serde_json::from_slice(&prepared(plan, inspection, &archive).unwrap()).unwrap();
+        manifest["config"]["health_url"] = json!(format!("{base}/healthz"));
+        let bytes = serde_json::to_vec(&manifest).unwrap(); let intent = bundle::sha(&bytes);
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("manifest.json"); fs::write(&path, &bytes).unwrap();
+        let targets = json!({"us3":{"repository":"https://repo.test/repo.git","url":base,"deployment":"app-lb-host",
+            "namespace":"default","health_url":format!("{base}/healthz")}}).to_string();
+        let receipt = json!({"protocol":"host-app-lb-bootstrap-v1","operation_id":"bootstrap-us3-1","intent_sha256":intent,
+            "deployment":"app-lb-host","namespace":"default","source":manifest["source"],"target":manifest["target"],
+            "journal_path":"/var/lib/app-lb-host-update/bootstrap.json","unit_name":format!("app-lb-bootstrap-{intent}"),
+            "status":"succeeded","phase":"complete","readiness_verified":true,"error":null});
+        for mode in ["success", "missing", "busy", "redirect", "oversized", "intent_sha256", "namespace", "source", "target",
+            "journal_path", "unit_name", "status", "phase", "readiness_verified", "error", "health-wrong", "health-missing", "health-duplicate", "health-non2xx"] {
+            { let mut r = remote.lock().unwrap(); r.0 = mode.into(); r.1 = receipt.clone(); r.2.clear();
+                if receipt.get(mode).is_some() { r.1[mode] = json!("wrong"); }
+            }
+            let result = check(&path, &intent, "us3", Some(&targets), "test-bootstrap-token").await;
+            assert_eq!(result.is_ok(), mode == "success", "{mode}: {result:?}");
+            let requests = &remote.lock().unwrap().2;
+            assert_eq!(requests[0], "GET /deployments/app-lb-host/update/bootstrap/bootstrap-us3-1");
+            assert!(requests.len() <= 2 && requests.iter().all(|s| !s.contains("/sink")));
+        }
+        remote.lock().unwrap().2.clear();
+        assert!(check(&path, &"f".repeat(64), "us3", Some(&targets), "test-bootstrap-token").await.is_err());
+        assert!(remote.lock().unwrap().2.is_empty());
+        server.abort();
     }
 }
