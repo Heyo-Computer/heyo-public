@@ -111,10 +111,11 @@ Configure `ORCHESTRATOR_URL`,
 workflow's HeyoSecret scope. The workflow inserts only the finalized archive ID
 into that spec. The target must supply external Postgres/NATS and durable CI
 workspace/log/artifact storage. This archive does **not** replace the stateful
-CI/NATS bundle by itself: it contains no broker. For the new us3 installation,
-`ci/Dockerfile.firecracker` packages CI and NATS together and
-`.heyo/regions/us3/ci.json` defines the app-lb deployment. Subsequent artifact
-promotions retain the managed CI workspace and external database.
+CI/NATS bundle by itself: it contains no broker. For a new us3 installation,
+`ci/Dockerfile.firecracker` packages CI only and `.heyo/regions/us3/ci.json`
+defines the app-lb deployment with an explicit external broker placeholder.
+Provision independent NATS before starting CI. Subsequent artifact promotions
+retain the managed CI workspace, external database and broker configuration.
 
 ## Submitting a build
 
