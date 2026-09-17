@@ -1547,6 +1547,42 @@ This action does not provide regional ordering by itself. Parent release jobs
 must use sequential `needs` edges and must not tolerate rollout failure. No
 repository workflows are enabled by this primitive.
 
+#### Preparing the initial native bootstrap manifest
+
+`ci --prepare-host-bootstrap plan.json inspection.json app-lb.tar.gz manifest.json`
+is an offline operator command. It does not load CI service configuration or
+connect to Postgres, NATS, or a host. It prepares a private, atomically published
+manifest without overwriting an existing file, and prints only its path,
+canonical SHA256 and `prepared` status. Preparation is **not deployment or
+release authorization**.
+
+The plan contains `operation_id`, the expected 40-hex build `revision`, the exact
+native host `config`, `mapping_path`, and `files`. Each file has `path`, numeric
+`mode`, and exactly one of `after_base64`, `preserve: true`, or
+`supervisor_environment: true`. Omit inactive keys. Do not supply `before_sha256`:
+the command derives it from the native `inspect` response. The ordered file list
+must match both `config.config_files` and the inspection, including the mapping
+file. That mapping requires explicit non-secret `after_base64` bytes that decode
+to the same `config`. Literal modes are 384 (0600) or 420 (0644); preservation
+and the native Supervisor edit require the inspected existing mode.
+
+Use `preserve` or the native Supervisor edit for secret-bearing files; never
+copy their contents into `after_base64`, inspection output, or logs. The command
+retains hashes and typed edits without reading the original host file contents.
+It verifies the supplied bundle's revision and executable checksum, derives the
+artifact/helper/executable digests, and emits compact recursively sorted native
+manifest JSON. JSON inputs/output are bounded to 4 MiB and 32 config files;
+the shared host-bundle parser enforces archive limits.
+
+Obtain the bundle from trusted CI evidence and the inspection from an authorized
+native host inspection; this offline command cannot authenticate their source
+or establish that the inspection is still current. Native admission must still
+check root ownership, paths, current source generation, all file hashes and
+loaded service identity. Delivery/reconciliation is a separate bootstrap step:
+this command does not send or retry legacy update POSTs. After replacement, use
+the authenticated bootstrap-operation GET for completion, not the mapped legacy
+update endpoint, which is deliberately disabled.
+
 ### Service deployments
 
 For candidate-first updates of existing stateless app-lb services, use

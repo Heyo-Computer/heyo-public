@@ -7,7 +7,7 @@ use sqlx::Row;
 use std::{collections::BTreeMap, time::Duration};
 
 #[path = "../../app-lb/src/host_bundle.rs"]
-mod bundle;
+pub(crate) mod bundle;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
