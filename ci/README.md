@@ -1508,7 +1508,15 @@ actions do not change app-lb, namespaces, existing VM pages, or Retail.
 `workflow` (frozen validation workflow path), and `artifact` (bundle name).
 Job/step `continue-on-error` is rejected for this action.
 It does not accept paths, service names, commands, revisions, or digests from
-the workflow. The operator supplies `CI_HOST_APP_LB_TARGETS` as JSON:
+the workflow. The operator supplies `CI_HOST_APP_LB_TARGETS` as JSON. When
+that environment variable is absent, the action reads the same JSON from
+the fixed HeyoSecret path `ci-controller/host-app-lb-targets`, using the
+controller's existing HeyoSecret configuration. This operator-owned path is
+outside workflow secret prefixes; job variables cannot select or override it.
+Missing or invalid configuration refuses the rollout. Explicit environment
+configuration takes precedence, including invalid values (no fallback).
+
+Example mapping:
 
 ```json
 {

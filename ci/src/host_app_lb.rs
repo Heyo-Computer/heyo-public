@@ -56,7 +56,15 @@ pub async fn deploy(d: &Dispatcher, msg: &JobMessage, step: &str, alias: &str, t
     workflow: &str, artifact: &str, timeout: Duration, masker: &Masker) -> Result<String> {
     crate::submission::authorize_publication(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?;
     ensure!(!token.trim().is_empty(), "host rollout requires a credential");
-    let target = mapping(d.config.host_app_lb_targets.as_deref(), alias)?;
+    let managed;
+    let raw = match d.config.host_app_lb_targets.as_deref() {
+        Some(raw) => raw,
+        None => {
+            managed = d.secrets.host_app_lb_targets().await?;
+            managed.as_str()
+        }
+    };
+    let target = mapping(Some(raw), alias)?;
     let run = d.store.get_run(&msg.run_id).await?.ok_or_else(|| anyhow::anyhow!("missing run"))?;
     ensure!(crate::repos::same_repo(&target.repository, &run.repo_url), "repository is not authorized for this host");
     let release = crate::release::get(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?
