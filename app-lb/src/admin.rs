@@ -4893,6 +4893,15 @@ async fn get_host_rollout(State(state): State<AdminState>, axum::Extension(calle
     }
 }
 
+async fn get_host_bootstrap(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path((id, operation)): Path<(String,String)>) -> Response {
+    let (path, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::bootstrap::get(&config, &path, &operation).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) if e == "operation not found" => err(StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
 async fn list_jobs(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.jobs.records(None))
 }
@@ -5080,6 +5089,7 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/update", post(start_update))
         .route("/deployments/:id/update/rollouts", get(host_update_snapshot).post(start_host_rollout))
         .route("/deployments/:id/update/rollouts/:operation", get(get_host_rollout))
+        .route("/deployments/:id/update/bootstrap/:operation", get(get_host_bootstrap))
         .route("/deployments/:id/jobs", get(deployment_jobs))
         .route("/jobs", get(list_jobs))
         .route("/jobs/:job_id", get(get_job))

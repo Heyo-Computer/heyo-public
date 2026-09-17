@@ -113,6 +113,120 @@ regions; the caller must wait for both success flags before rolling the next reg
 
 ## Correlated host executable rollout
 
+### One-time native bootstrap over the existing managed command transport
+
+An installed predecessor without the correlated helper uses a **separately
+staged, validated new app-lb binary**, not a shell installer. No bootstrap is
+enabled by a repository workflow alone. A root operator supplies a private
+manifest through the existing management channel. The CI caller durably records
+the intended submission/artifact and manifest hash before requesting its fixed
+managed launcher. Successful legacy job/oneshot exit is **not** deployment success.
+
+The new binary exposes these commands (one redacted JSON object on stdout):
+
+```text
+app-lb --bootstrap-host-update inspect /absolute/desired-config.json
+app-lb --bootstrap-host-update admit /absolute/manifest.json INTENT_SHA256
+app-lb --bootstrap-host-update status /absolute/state/bootstrap.json INTENT_SHA256
+app-lb --bootstrap-host-update apply /absolute/state/bootstrap.json INTENT_SHA256
+```
+
+`inspect` and `status` are read-only. `inspect` returns `source` and `files`
+(path, SHA256 or null for absence, and mode). `status` returns `not_found` for
+an absent journal; it never launches or attests a process. `apply` is internal
+to the independently launched systemd oneshot. `admit` returns `protocol:
+host-app-lb-bootstrap-v1`, `operation_id`, `intent_sha256`, `journal_path`,
+`unit_name`, deployment/namespace, status, phase, source/target identities,
+`readiness_verified` and error. Outputs never include config file contents.
+
+The strict manifest schema is:
+
+```text
+{
+  operation_id, helper_sha256,
+  source: {disk_sha256, running_sha256,
+           generation: {boot_id, pid, start_time}},
+  config: <complete AFTER host Config shown below>,
+  mapping_path: <absolute APP_LB_HOST_UPDATE_CONFIG path>,
+  files: [{path, before_sha256: <SHA256 or null>, after_base64, mode}],
+  target: {artifact_sha256, binary_sha256, revision}
+}
+```
+
+`INTENT_SHA256` hashes UTF-8 compact JSON with recursively sorted object keys,
+unchanged array order and no extra whitespace. Include every required field,
+including null `before_sha256`; omit inactive file-action keys. `helper_sha256`
+must equal `target.binary_sha256` and the
+executing new helper's digest; it is **not** the predecessor digest. The exact
+pinned bundle supplies `dist/app-lb`, `dist/REVISION`, and `dist/SHA256SUMS`
+under the same 256 MiB/no-links/no-traversal archive rules as normal rollout.
+The predecessor's disk and running digests must agree. Boot ID/PID/kernel
+start-time bind the observed predecessor generation, not an alias or service
+name alone. A predecessor already configured for normal host updates is refused.
+
+`files` exactly enumerates `config.config_files` in order. Each file has `path`,
+`before_sha256`, `mode`, and **exactly one** of:
+
+- `after_base64`: explicit new bytes. Required for the non-secret mapping file,
+  whose decoded Config must equal `config`. Also suitable for a new systemd
+  environment drop-in. Modes are decimal 384 (0600) or 420 (0644).
+- `preserve:true`: assert and back up existing bytes locally without rewriting
+  the original. Requires its inspected non-null SHA and unchanged mode.
+- `supervisor_environment:true`: derive an edit locally from the preserved
+  original, append only `APP_LB_HOST_UPDATE_CONFIG` in the mapped program's
+  environment, and preserve all other bytes/settings. Requires non-null SHA
+  and unchanged mode. No existing secrets appear in the manifest or output.
+
+The native Supervisor edit requires one effective, ungrouped `[program:name]`
+definition with single-line settings. Duplicate sections/environment keys, continuation
+lines, inline environment comments, ambiguous quotes, pre-existing mapping
+assignment, and colon delimiters are rejected. Mapping path characters are
+restricted to ASCII letters/digits and `/_.-` to avoid interpolation/quoting
+ambiguity. Other environment values and CRLF/LF endings remain untouched.
+Use `preserve:true` for all other effective unit/include/env files. Never export
+those files into CI job logs. Derivation is bound by the BEFORE hash, typed edit,
+mapped process/path and authorized helper digest.
+
+Unknown fields are rejected. Manifest and desired-config reads are bounded at
+4 MiB, decoded/derived AFTER bytes total at 4 MiB, each BEFORE config file at
+4 MiB, and file count at 32. Manifest must be owner-only. All paths and ancestors
+must be root-owned, not group/world writable, with no symlinks or hardlinked
+files. Stage under an operator-owned `/var/lib` or `/opt` tree, **not `/tmp`**.
+Config targets must not overlap the executable or updater state directory.
+
+Admission first durably fences `state_dir/bootstrap.json`, preserves original
+executable/config bytes, modes and explicit absence, then launches exactly once
+as `app-lb-bootstrap-<intent hash>`. Same-ID replay only reads the journal.
+Different intent conflicts; a terminal unit is never recycled. File writes use
+fsync and same-directory atomic rename. Systemd runs bounded `daemon-reload`
+then the exact unit restart. Supervisor runs from `/`, requires one ungrouped
+program, requires `reread` to report only that program changed, then issues
+`update <program>` (not restart-only, `all`, or `supervisor.service`). No VM,
+disk, workspace or unrelated program is touched. Original bytes are retained
+indefinitely; no rollback, automatic relaunch, cancellation/unpin or partial
+install resume is provided.
+
+Only authenticated namespace-admin GET
+`/deployments/:id/update/bootstrap/:operation_id` in the installed replacement
+can persist success and release the normal-rollout fence. It verifies this exact
+new mapped process, disk/running/compiled identities, effective mapping env,
+all AFTER files/modes, preserved originals and public 2xx health with **one exact**
+`x-heyo-revision` header. Native status cannot replace this attestation. Lost
+launch replies, interrupted config/binary commits, and failed restarts stay
+fenced; GET can reconcile only a fully verified replacement. Operators must
+retain journals/backups and must not concurrently alter files or supervision.
+This requires root, local durable filesystems, one controller owner and one
+fixed operator-owned mapping/state directory per executable, executable helper
+storage, systemd-run, and the same default Supervisor instance from `/`.
+Multi-file changes are not one filesystem transaction: interruption may leave
+partial configuration installed and require explicit operator reconciliation.
+The mapped legacy `/update` POST remains blocked once configuration is active;
+use authenticated bootstrap GET after replacement, not another legacy job.
+Native status remains available through a separately authorized read-only root
+management transport. A busy helper makes GET retryable, never successful.
+
+### Subsequent unchanged-configuration updates
+
 This is a separate operation from VM/service rollout. It replaces **only the
 running host app-lb executable**, retaining its predecessor indefinitely. It
 does not install bundled units/configuration/heyctl, recreate VMs, purge disks,

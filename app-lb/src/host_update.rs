@@ -4,6 +4,7 @@ use crate::host_bundle::{self, sha, valid_sha};
 use serde::{Deserialize, Serialize};
 use std::{fs::{self, File, OpenOptions}, io::Write, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, time::Duration};
 
+pub mod bootstrap;
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -75,6 +76,11 @@ pub fn configured() -> Result<(PathBuf, Config)> {
 fn load_config(path: &Path) -> Result<Config> {
     if !path.is_absolute() { return Err("host mapping path must be absolute".into()); }
     let config: Config = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<()> {
     let valid_process = match &config.process {
         Process::Systemd { unit } => !unit.starts_with('-') && unit.ends_with(".service") && safe_id(unit.trim_end_matches(".service")),
         Process::Supervisor { program } => safe_id(program) && !program.starts_with('-') && program != "all",
@@ -88,15 +94,39 @@ fn load_config(path: &Path) -> Result<Config> {
         }
     }
     endpoint(&config.artifact_store)?; endpoint(&config.health_url)?;
-    Ok(config)
+    Ok(())
 }
 
-fn lock(dir: &Path) -> Result<File> {
+// flock belongs to an open file description, including descriptors inherited
+// by concurrent forks. Closing this descriptor alone need not release it.
+struct UpdateLock(File);
+impl Drop for UpdateLock { fn drop(&mut self) { let _ = self.0.unlock(); } }
+
+fn lock(dir: &Path) -> Result<UpdateLock> {
+    lock_with_wait(dir, Duration::from_secs(2))
+}
+
+fn executor_lock(dir: &Path) -> Result<UpdateLock> {
+    lock_with_wait(dir, Duration::ZERO)
+}
+
+fn lock_with_wait(dir: &Path, wait: Duration) -> Result<UpdateLock> {
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     File::open(dir.parent().ok_or("missing state parent")?).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
     let file = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("lock")).map_err(|e| e.to_string())?;
-    file.try_lock().map_err(|_| "host update is busy".to_string())?;
-    Ok(file)
+    // Ledger writers have short critical sections. A concurrent reader/writer
+    // or briefly inherited descriptor must not permanently strand staging.
+    // Executor ownership is different: it spans awaits and never waits here.
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Err(std::fs::TryLockError::WouldBlock) => return Err("host update is busy".into()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(UpdateLock(file))
 }
 
 fn ledger(config: &Config) -> Result<Ledger> {
@@ -112,6 +142,7 @@ fn atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&temp).map_err(|e| e.to_string())?;
     file.set_permissions(fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())?;
     file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
+    drop(file); // Do not publish an executable while this writer still holds it.
     fs::rename(temp, path).map_err(|e| e.to_string())?;
     File::open(path.parent().ok_or("missing parent")?).and_then(|f| f.sync_all()).map_err(|e| e.to_string())
 }
@@ -152,8 +183,20 @@ async fn command(program: &str, args: &[&str]) -> Result<String> {
     let mut cmd = tokio::process::Command::new(program);
     // Supervisor's default config discovery includes cwd. Admission and the
     // independently launched helper must use the identical fixed directory.
-    cmd.args(args).current_dir("/").kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(45), cmd.output()).await
+    cmd.args(args).current_dir("/").kill_on_drop(true)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let child = loop {
+        match cmd.spawn() {
+            Ok(child) => break child,
+            // Fork can briefly inherit a CLOEXEC write descriptor for a newly
+            // published executable. ETXTBSY is an explicit exec failure: no
+            // command ran. Never retry an exit status, timeout or lost output.
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(5)).await,
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let output = tokio::time::timeout(Duration::from_secs(45), child.wait_with_output()).await
         .map_err(|_| "systemd command timed out; outcome unknown")?.map_err(|e| e.to_string())?;
     if !output.status.success() { return Err(format!("systemd command failed ({})", output.status)); }
     String::from_utf8(output.stdout).map_err(|e| e.to_string())
@@ -215,6 +258,7 @@ pub async fn snapshot(config: &Config) -> Result<serde_json::Value> {
 
 fn admit(config: &Config, request: Request, binary: &str, fingerprint: &str, invocation: &str) -> Result<(Operation, bool)> {
     let _lock = lock(&config.state_dir)?;
+    bootstrap::unblocked(config)?;
     let mut state = ledger(config)?;
     if let Some(old) = state.operations.iter().find(|o| o.request.operation_id == request.operation_id) {
         return if old.request == request && old.deployment == config.deployment && old.namespace == config.namespace { Ok((old.clone(), false)) } else { Err("operation payload conflicts".into()) };
@@ -265,6 +309,7 @@ async fn download(config: &Config, request: &Request) -> Result<Vec<u8>> {
 /// Replay never relaunches. A persisted launch with no process evidence needs an
 /// operator, not a guessed retry. The helper unit name is never recycled here.
 pub async fn start(path: &Path, config: &Config, request: Request) -> Result<Operation> {
+    bootstrap::unblocked(config)?;
     if let Some(old) = ledger(config)?.operations.iter().find(|o| o.request.operation_id == request.operation_id) {
         return if old.request == request && old.deployment == config.deployment && old.namespace == config.namespace { Ok(old.clone()) } else { Err("operation payload conflicts".into()) };
     }
@@ -348,7 +393,7 @@ pub async fn get(config: &Config, id: &str) -> Result<Operation> {
 async fn apply(path: &Path, id: &str) -> Result<()> {
     let config = load_config(path)?;
     let execution = config.state_dir.join("executor");
-    let _executor = lock(&execution)?;
+    let _executor = executor_lock(&execution)?;
     let op = ledger(&config)?.operations.into_iter().last().filter(|o| o.request.operation_id == id).ok_or("unknown operation")?;
     if op.phase != "launching" || op.status != "running" { return Err("helper invocation is not authorized by current operation".into()); }
     let result: Result<()> = async {
@@ -387,6 +432,7 @@ async fn apply(path: &Path, id: &str) -> Result<()> {
 
 pub fn helper_main() -> Option<i32> {
     let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--bootstrap-host-update") { return Some(bootstrap::cli(&args)); }
     if args.get(1).map(String::as_str) != Some("--apply-host-update") { return None; }
     if args.len() != 4 || !safe_id(&args[3]) { return Some(2); }
     let runtime = tokio::runtime::Runtime::new().expect("helper runtime");
@@ -399,13 +445,13 @@ mod tests {
     use axum::{Router, routing::get as route_get, response::IntoResponse, http::{StatusCode, HeaderMap, HeaderValue}};
     use std::sync::{Arc, Mutex};
 
-    struct Fixture {
-        dir: tempfile::TempDir, config: Config, path: PathBuf, request: Request,
-        health: Arc<Mutex<(u16, Option<String>)>>, server: tokio::task::JoinHandle<()>,
+    pub(super) struct Fixture {
+        pub(super) dir: tempfile::TempDir, pub(super) config: Config, pub(super) path: PathBuf, pub(super) request: Request,
+        pub(super) health: Arc<Mutex<(u16, Option<String>)>>, server: tokio::task::JoinHandle<()>,
     }
     impl Drop for Fixture { fn drop(&mut self) { self.server.abort(); } }
 
-    async fn fixture(supervisor: bool) -> Fixture {
+    pub(super) async fn fixture(supervisor: bool) -> Fixture {
         let dir = tempfile::tempdir().unwrap(); let root = dir.path();
         fs::create_dir(root.join("proc")).unwrap();
         fs::write(root.join("running"), b"\x7fELFprevious executable").unwrap();
@@ -617,5 +663,44 @@ esac
             fs::write(&f.path,serde_json::to_vec(&config).unwrap()).unwrap();
             assert!(load_config(&f.path).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn host_update_stage_waits_for_transient_ledger_contention_not_executor() {
+        let f = fixture(false).await;
+        TEST_HOST.scope(f.dir.path().to_path_buf(), async {
+            let (text, invocation) = unit(&f.config).await.unwrap();
+            let (op, _) = admit(&f.config,f.request.clone(),&f.request.expected_binary_sha256,&config_sha(&f.config,&text).unwrap(),&invocation).unwrap();
+            let guard = lock(&f.config.state_dir).unwrap();
+            let release = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(150)); drop(guard); });
+            stage(f.path.clone(),f.config.clone(),op,f.request.expected_binary_sha256.clone()).await;
+            release.join().unwrap();
+            let op = &ledger(&f.config).unwrap().operations[0];
+            assert_eq!(op.phase,"launching"); assert!(op.error.is_none(),"{:?}",op.error);
+            assert_eq!(fs::read_to_string(f.dir.path().join("launches")).unwrap().lines().count(),1);
+            let execution = f.config.state_dir.join("executor");
+            let held = executor_lock(&execution).unwrap();
+            let inherited = held.0.try_clone().unwrap();
+            assert!(executor_lock(&execution).is_err());
+            drop(held);
+            let _next = executor_lock(&execution).expect("retained duplicate/fork descriptor must not prolong ownership");
+            drop(inherited);
+        }).await;
+    }
+
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    async fn host_update_retries_only_known_pre_exec_text_busy_never_started_failure() {
+        let f=fixture(false).await;
+        TEST_HOST.scope(f.dir.path().to_path_buf(),async {
+            let program=f.dir.path().join("systemd-run");
+            let writer=OpenOptions::new().write(true).open(&program).unwrap();
+            assert_eq!(std::process::Command::new(&program).status().unwrap_err().raw_os_error(),Some(libc::ETXTBSY));
+            fs::write(f.dir.path().join("lose-launch"),"").unwrap();
+            let release=std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(150)); drop(writer); });
+            assert!(command("/usr/bin/systemd-run",&["one-attempt"]).await.is_err());
+            release.join().unwrap();
+            assert_eq!(fs::read_to_string(f.dir.path().join("launches")).unwrap(),"one-attempt\n");
+        }).await;
     }
 }
