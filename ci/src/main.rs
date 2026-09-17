@@ -45,6 +45,7 @@ mod store;
 mod submission;
 mod trigger;
 mod vm;
+mod vm_cleanup;
 mod web;
 mod workflow;
 
@@ -286,6 +287,7 @@ async fn main() {
     dispatcher.clone().spawn_consumers();
     controller_rollout::spawn(dispatcher.clone());
     host_maintenance::spawn(dispatcher.clone());
+    vm_cleanup::spawn(dispatcher.clone());
 
     // Bind before announcing readiness. A listener that cannot bind is a hard
     // failure here rather than a task that dies quietly and leaves the process

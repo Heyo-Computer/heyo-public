@@ -1287,7 +1287,11 @@ impl Dispatcher {
             .await?
         {
             // Something else finished this job while we were booting a VM.
-            if self.release_vm(&plan, &vm, false).await {
+            if !plan.target.is_existing_vm() {
+                crate::vm_cleanup::handoff(self, &msg.job_id, &runner, attempt, vm.id(),
+                    !plan.vm.reuse, JobStatus::Cancelled, None).await
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+            } else if self.release_vm(&plan, &vm, false).await {
                 self.store.end_host_work(&msg.job_id, &runner, attempt).await?;
             }
             return Ok(JobStatus::Success);
@@ -1314,10 +1318,6 @@ impl Dispatcher {
             .as_ref()
             .err()
             .is_some_and(DispatchError::indicates_guest_corruption);
-        let released = self.release_vm(&plan, &vm, guest_corrupted).await;
-        if released && !(plan.target.is_existing_vm() && outcome.is_err()) {
-            self.store.end_host_work(&msg.job_id, &runner, attempt).await?;
-        }
 
         // A tunnel that dies mid-job fails the job rather than propagating —
         // the match below absorbs the error into a status — so the eviction in
@@ -1343,9 +1343,27 @@ impl Dispatcher {
             Err(_) => JobStatus::Failure,
         };
         let error = outcome.as_ref().err().map(|e| e.to_string());
-        self.store
-            .set_job_status(&msg.job_id, status, error.as_deref())
-            .await?;
+        if !plan.target.is_existing_vm() {
+            if plan.vm.reuse && !guest_corrupted {
+                let ttl = idle_pool_ttl(plan.vm.ttl_seconds, self.config.heyvm.vm_ttl);
+                if let Err(e) = vm.renew_ttl(ttl).await {
+                    tracing::warn!(vm = vm.id(), "could not renew the TTL: {e}");
+                }
+            }
+            crate::vm_cleanup::handoff(self, &msg.job_id, &runner, attempt, vm.id(),
+                !plan.vm.reuse || guest_corrupted, status, error.as_deref()).await
+                .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+            // The durable reconciler owns retries, including after restart.
+            // No more guest commands or direct release after this handoff.
+            if let Err(e) = crate::vm_cleanup::reconcile(self).await {
+                tracing::warn!("could not reconcile VM cleanup: {e}");
+            }
+        } else {
+            if self.release_vm(&plan, &vm, guest_corrupted).await && outcome.is_ok() {
+                self.store.end_host_work(&msg.job_id, &runner, attempt).await?;
+            }
+            self.store.set_job_status(&msg.job_id, status, error.as_deref()).await?;
+        }
         Ok(status)
     }
 
@@ -6276,6 +6294,120 @@ mod tests {
             // takes anyway.
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "needs empty disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; tests global drain with fake heyvm HTTP"]
+    async fn durable_vm_cleanup_recovers_without_guessing_ownership() {
+        use crate::vm_cleanup::{handoff, reconcile};
+        use axum::{Json, Router, extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::{get, post}};
+        #[derive(Default)]
+        struct Remote { stopped: bool, removed: bool, wrong: bool, lost: bool, ineffective: bool, stops: usize, deletes: usize }
+        let remote = Arc::new(std::sync::Mutex::new(Remote::default()));
+        let app = Router::new()
+            .route("/storage", get(|| async { Json(json!({"free_bytes":1u64 << 50})) }))
+            .route("/capabilities", get(|| async { Json(json!({"supportedDrivers":["firecracker"]})) }))
+            .route("/deployed-sandboxes/{id}", get(|State(remote): State<Arc<std::sync::Mutex<Remote>>>, Path(id): Path<String>| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let r = remote.lock().unwrap();
+                if r.removed { return StatusCode::NOT_FOUND.into_response(); }
+                Json(json!({"id":if r.wrong { "another-vm".to_string() } else { id },
+                    "status":if r.stopped { "stopped" } else { "running" }, "status_changed_at":"2026-09-17T00:00:00Z"})).into_response()
+            }).delete(|State(remote): State<Arc<std::sync::Mutex<Remote>>>| async move {
+                let mut r = remote.lock().unwrap();
+                assert!(r.stopped, "deletion requires verified stop");
+                r.deletes += 1; r.removed = true;
+                if r.lost { StatusCode::BAD_GATEWAY.into_response() } else { Json(json!({})).into_response() }
+            }))
+            .route("/sandbox/{id}/stop", post(|State(remote): State<Arc<std::sync::Mutex<Remote>>>| async move {
+                let mut r = remote.lock().unwrap(); r.stops += 1;
+                if !r.ineffective { r.stopped = true; }
+                if r.lost { StatusCode::BAD_GATEWAY.into_response() } else { Json(json!({})).into_response() }
+            })).with_state(remote.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        unsafe { std::env::set_var("CI_TEST_DAEMON", format!("http://{}", listener.local_addr().unwrap())); }
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        for scenario in ["lost-stop", "ineffective-stop", "wrong-id", "changed-owner", "changed-attempt", "cancel", "destroy-loss", "concurrent"] {
+            *remote.lock().unwrap() = Remote::default();
+            let workflow = crate::workflow::Workflow::parse("cleanup.yml", "jobs:\n  build:\n    steps: [{run: echo test}]\n").unwrap();
+            let plan = crate::plan::Plan::build(&workflow).unwrap();
+            let run = crate::vm::new_id(); let sandbox = format!("sb-{run}");
+            d.store.create_run(&run, &crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(), ..Default::default() }, &plan).await.unwrap();
+            let job = d.store.jobs_of(&run).await.unwrap().remove(0);
+            assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+            d.store.start_job(&job.id, "hd-local", &sandbox, "fp", 1).await.unwrap();
+            d.pool.register(&sandbox, "hd-local", "fp", "wf", None, &job.id, d.lease()).await.unwrap();
+            // A bad handoff must not publish a terminal job or a cleanup intent.
+            assert!(handoff(&d, &job.id, "hd-local", 2, &sandbox, false, JobStatus::Failure, None).await.is_err());
+            let status: String = sqlx::query_scalar("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap();
+            assert_eq!(status, "running");
+            if scenario == "cancel" {
+                d.store.set_job_status(&job.id, JobStatus::Cancelled, None).await.unwrap();
+                reconcile(&d).await.unwrap();
+                assert_eq!(remote.lock().unwrap().stops, 0, "cancellation is not a handoff");
+            }
+            handoff(&d, &job.id, "hd-local", 1, &sandbox, scenario == "destroy-loss", JobStatus::Failure, Some("executor finished")).await.unwrap();
+            d.pool.renew_leases(d.lease()).await.unwrap();
+            assert!(sqlx::query_scalar::<_,bool>("SELECT leased_until='infinity'::timestamptz FROM ci_vm_pool WHERE sandbox_id=$1")
+                .bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), "process heartbeat must not replace cleanup ownership");
+            let status: String = sqlx::query_scalar("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap();
+            assert_eq!(status, if scenario == "cancel" { "cancelled" } else { "failure" });
+            assert!(handoff(&d, &job.id, "hd-local", 1, &sandbox, false, JobStatus::Success, None).await.is_err());
+            assert_eq!(sqlx::query_scalar::<_,String>("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap(), status);
+            let rollout = format!("rollout-{run}");
+            d.store.create_step(&rollout, &job.id, 0, "controller", None).await.unwrap();
+            sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES($1,$1,$2,$3,'ci','test','running','test','main')")
+                .bind(&rollout).bind(&run).bind(&job.id).execute(d.store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_controller_rollout(id,request,phase) VALUES($1,'{}','draining')")
+                .bind(&rollout).execute(d.store.pool()).await.unwrap();
+            assert!(d.lifecycle.work(&d.store).await.is_ok(), "cleanup is allowed during drain");
+            assert!(!d.lifecycle.quiesce(&d.store, &rollout).await.unwrap());
+            let message: String = sqlx::query_scalar("SELECT message FROM ci_service_deployment WHERE id=$1").bind(&rollout).fetch_one(d.store.pool()).await.unwrap();
+            assert!(message.contains(&sandbox));
+            // Restart + expired lease must not hand a cleanup-owned VM to a job.
+            sqlx::query("UPDATE ci_vm_pool SET leased_until=now()-interval '1 hour' WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            assert_eq!(d.pool.release_orphans(&["hd-local".into()], "restarted-instance").await.unwrap(), 0);
+            match scenario {
+                "lost-stop" => remote.lock().unwrap().lost = true,
+                "ineffective-stop" => remote.lock().unwrap().ineffective = true,
+                "wrong-id" => remote.lock().unwrap().wrong = true,
+                "destroy-loss" => { let mut r = remote.lock().unwrap(); r.stopped = true; r.lost = true; }
+                "changed-owner" => { sqlx::query("UPDATE ci_vm_pool SET claimed_by_job=NULL WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap(); }
+                "changed-attempt" => { sqlx::query("UPDATE ci_job SET attempt=2 WHERE id=$1").bind(&job.id).execute(d.store.pool()).await.unwrap(); }
+                _ => {}
+            }
+            if scenario == "concurrent" {
+                let (a,b) = tokio::join!(reconcile(&d), reconcile(&d)); a.unwrap(); b.unwrap();
+                assert_eq!(remote.lock().unwrap().stops, 1);
+            } else { reconcile(&d).await.unwrap(); }
+            if !matches!(scenario, "cancel" | "concurrent") {
+                let error: Option<String> = sqlx::query_scalar("SELECT last_error FROM ci_vm_cleanup WHERE sandbox_id=$1").bind(&sandbox).fetch_one(d.store.pool()).await.unwrap();
+                assert!(error.is_some(), "retry must explain failure: {scenario}");
+                assert_eq!(sqlx::query_scalar::<_,String>("SELECT status FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), "claimed");
+                if matches!(scenario, "wrong-id" | "changed-owner" | "changed-attempt") { assert_eq!(remote.lock().unwrap().stops, 0); }
+                { let mut r = remote.lock().unwrap(); r.lost = false; r.ineffective = false; r.wrong = false; }
+                // Restore only deliberately corrupted disposable test evidence.
+                sqlx::query("UPDATE ci_vm_pool SET claimed_by_job=$2 WHERE sandbox_id=$1").bind(&sandbox).bind(&job.id).execute(d.store.pool()).await.unwrap();
+                sqlx::query("UPDATE ci_job SET attempt=1 WHERE id=$1").bind(&job.id).execute(d.store.pool()).await.unwrap();
+                sqlx::query("UPDATE ci_vm_cleanup SET next_attempt_at=now() WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+                let restarted = test_dispatcher(workspace.path()).await;
+                reconcile(&restarted).await.unwrap();
+                if scenario == "lost-stop" { assert_eq!(remote.lock().unwrap().stops, 1, "readback recovers lost stop without repeating it"); }
+                if scenario == "destroy-loss" { assert_eq!(remote.lock().unwrap().deletes, 1); }
+            }
+            assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM ci_vm_cleanup WHERE sandbox_id=$1").bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), 0);
+            assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM ci_host_work WHERE job_id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap(), 0);
+            let status: Option<String> = sqlx::query_scalar("SELECT status FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).fetch_optional(d.store.pool()).await.unwrap();
+            assert_eq!(status.as_deref(), if scenario == "destroy-loss" { None } else { Some("idle") });
+            assert!(d.lifecycle.quiesce(&d.store, &rollout).await.unwrap(), "verified cleanup unblocks drain");
+            sqlx::query("DELETE FROM ci_controller_rollout WHERE id=$1").bind(&rollout).execute(d.store.pool()).await.unwrap();
+            sqlx::query("DELETE FROM ci_service_deployment WHERE id=$1").bind(&rollout).execute(d.store.pool()).await.unwrap();
+            sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
+        }
+        server.abort();
     }
 
     #[tokio::test]

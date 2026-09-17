@@ -748,6 +748,31 @@ about somebody stopping the run, so it does not convert a cancellation into a
 success — and the executor does not write `failure` over it, which would make a
 deliberate stop read as a broken build.
 
+### VM cleanup survives a failed connection
+
+After execution finishes, CI atomically records the terminal job outcome and a
+`ci_vm_cleanup` obligation for its exact runner, VM and attempt. The same handoff
+handles a VM acquired after its job was cancelled. The VM stays claimed until a
+fresh daemon read confirms that exact VM is stopped. Non-reusable or corrupted
+VMs also require confirmed removal before CI forgets their pool record.
+
+Cleanup retries during normal operation and controller drain, including after
+controller restart. A failed request evicts the cached runner connection and
+records its error and next retry time. Each pass handles one due obligation with
+a 20-second timeout; the background loop runs every 30 seconds. Concurrent
+workers serialize on the durable obligation. Expired leases do not make these
+VMs available to another job. Controller deployment messages name cleanup VMs
+blocking drain; confirmed cleanup releases that barrier automatically.
+
+Cancellation, failed-job status and lease age **do not authorize cleanup** on
+their own. CI must have the executor's durable handoff and matching pool
+ownership. Existing named/service VMs are excluded. Upgrade all dispatchers
+sharing a VM pool before relying on this protection: older orphan-reclaim code
+does not understand cleanup obligations. Legacy claims, interrupted acquisition
+and crashes before handoff are not retroactively declared safe; they still need
+ownership reconciliation. Do not clear their claims or delete VMs based only on
+a `ci-` name or terminal job status.
+
 ## Re-running a run
 
 Two buttons on a finished run's page, and the routes behind them:

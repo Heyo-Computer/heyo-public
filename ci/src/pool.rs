@@ -717,7 +717,8 @@ impl Pool {
         let result = sqlx::query(
             "UPDATE ci_vm_pool
                 SET leased_until = now() + make_interval(secs => $2)
-              WHERE leased_by = $1 AND status IN ('claimed','building')",
+              WHERE leased_by = $1 AND status IN ('claimed','building')
+                AND leased_until IS DISTINCT FROM 'infinity'::timestamptz",
         )
         .bind(lease.instance)
         .bind(lease.ttl.as_secs() as f64)
@@ -778,6 +779,7 @@ impl Pool {
                 SET status='idle', claimed_by_job=NULL, leased_by=NULL, leased_until=NULL
               WHERE p.status = 'claimed'
                 AND p.runner_hd_id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM ci_vm_cleanup c WHERE c.sandbox_id=p.sandbox_id)
                 AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' AND (h.runner_hd_id=p.runner_hd_id OR s.job_id=p.claimed_by_job))
                 AND p.leased_by IS DISTINCT FROM $2
                 AND (
