@@ -45,7 +45,8 @@ jobs:
           token: ${{ secrets.APP_LB_US3_TOKEN }}
           deployment: orchestrator-us3-next
           namespace: default
-          mount-path: /opt/heyo-release
+          # Reuse the registered release mount and its private-store credential.
+          mount-path: /opt/orchestrator-release
           revision-env: HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA
           workflow: .ci/workflows/orchestrator.yml
           artifact: orchestrator-linux
@@ -73,7 +74,8 @@ jobs:
           token: ${{ secrets.APP_LB_EU1_TOKEN }}
           deployment: orchestrator-eu1
           namespace: default
-          mount-path: /opt/heyo-release
+          # Reuse the registered release mount and its private-store credential.
+          mount-path: /opt/orchestrator-release
           revision-env: HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA
           workflow: .ci/workflows/orchestrator.yml
           artifact: orchestrator-linux

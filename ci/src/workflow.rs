@@ -1687,6 +1687,8 @@ mod repo_workflow {
             assert_eq!(steps[1].uses.as_deref(), Some("ci/rollout-service"));
             assert_eq!(steps[1].with["deployment"], deployment);
             assert_eq!(steps[1].with["url"], format!("https://admin.{region}.heyo.work"));
+            assert_eq!(steps[1].with["mount-path"], "/opt/orchestrator-release",
+                "reuse the registered private release mount instead of adding an unauthenticated mount");
         }
         assert_eq!(plan.jobs[3].steps.last().unwrap().uses.as_deref(), Some("ci/deploy-controller"));
 
