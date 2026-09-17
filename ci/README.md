@@ -1634,6 +1634,16 @@ A crashed coordinator also leaves a local lock directory for explicit operator
 reconciliation. A successful legacy job is only transport evidence: use
 `--check-host-bootstrap` to attest the actual replacement and release its fence.
 
+For an explicitly reconciled failure **before launch**, the delivery CLI accepts
+`ci --deliver-host-bootstrap TARGET replan NEW_MANIFEST BUNDLE NEW_DELIVERY_JOURNAL EXPECTED_OLD_INTENT_SHA256`.
+The native replan capability must be present in the pinned bundle. It requires
+the same operation/source/config/files and checks the old exact intent,
+`reconciliation_required/preserving` phase, unchanged originals, intact backups,
+and absence of a launched helper. Only helper/target artifact identity changes.
+It archives the old record under the same state directory and preserves its
+backups. This is not permission to retry an ambiguous launch or switch, change
+the source assertions, or choose a fresh state directory to bypass a fence.
+
 ### Service deployments
 
 For candidate-first updates of existing stateless app-lb services, use

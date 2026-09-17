@@ -66,10 +66,10 @@ use vm::Vms;
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !args.is_empty() {
-        if args[0] == "--deliver-host-bootstrap" && args.len() == 6 {
+        if args[0] == "--deliver-host-bootstrap" && matches!(args.len(), 6 | 7) {
             let targets = std::env::var("CI_HOST_APP_LB_TARGETS").ok();
             let token = std::env::var("CI_HOST_APP_LB_TOKEN").unwrap_or_default();
-            match host_bootstrap_delivery::run(&args[1], &args[2], args[3].as_ref(), args[4].as_ref(), args[5].as_ref(), targets.as_deref(), &token).await {
+            match host_bootstrap_delivery::run(&args[1], &args[2], args[3].as_ref(), args[4].as_ref(), args[5].as_ref(), args.get(6).map(String::as_str), targets.as_deref(), &token).await {
                 Ok(status) => println!("{status}"),
                 Err(error) => {
                     eprintln!("bootstrap delivery incomplete: {error}");

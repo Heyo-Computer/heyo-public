@@ -79,9 +79,11 @@ async fn deliver(http: &reqwest::Client, target: &Target, token: &str, path: &Pa
     Ok(value)
 }
 
-pub async fn run(alias: &str, phase: &str, input: &Path, archive: &Path, journal: &Path, targets: Option<&str>, token: &str) -> Result<Value> {
+pub async fn run(alias: &str, phase: &str, input: &Path, archive: &Path, journal: &Path, supersedes: Option<&str>, targets: Option<&str>, token: &str) -> Result<Value> {
     host_bootstrap::operator_authorization(token)?;
-    ensure!(matches!(phase,"inspect"|"admit"), "inspect/admit phase required");
+    ensure!(matches!(phase,"inspect"|"admit"|"replan"), "inspect/admit/replan phase required");
+    ensure!(if phase == "replan" { supersedes.is_some_and(|s| bundle::valid_sha(s,64)) } else { supersedes.is_none() },
+        "replan alone requires the exact previous intent SHA256");
     let target = crate::host_app_lb::mapping(targets, alias)?;
     let original = host_bootstrap::read(input, 4 * 1024 * 1024)?;
     let value: Value = serde_json::from_slice(&original)?;
@@ -95,7 +97,7 @@ pub async fn run(alias: &str, phase: &str, input: &Path, archive: &Path, journal
     let revision = revision.as_str().ok_or_else(|| anyhow::anyhow!("missing revision"))?;
     let archive = host_bootstrap::read(archive, bundle::LIMIT as usize)?;
     let binary = bundle::executable(&archive, revision).map_err(anyhow::Error::msg)?;
-    if phase == "admit" {
+    if phase != "inspect" {
         ensure!(value["target"]["artifact_sha256"] == bundle::sha(&archive) && value["target"]["binary_sha256"] == bundle::sha(&binary)
             && value["helper_sha256"] == bundle::sha(&binary), "manifest artifact differs");
     }
@@ -103,9 +105,10 @@ pub async fn run(alias: &str, phase: &str, input: &Path, archive: &Path, journal
     crate::cd::app_lb_endpoint(store).map_err(anyhow::Error::msg)?;
     ensure!(store.starts_with("https://"), "bootstrap artifacts require public HTTPS");
     let data = if phase == "inspect" { serde_json::to_vec(config)? } else { original.clone() };
-    let request = json!({"phase":phase,"operation_id":id,"input_base64":STANDARD.encode(&data),"input_sha256":bundle::sha(&data),
+    let mut request = json!({"phase":phase,"operation_id":id,"input_base64":STANDARD.encode(&data),"input_sha256":bundle::sha(&data),
         "binary_sha256":bundle::sha(&binary),"artifact_sha256":bundle::sha(&archive),"artifact_size":archive.len(),
         "artifact_url":format!("{}/blobs/{}",store.trim_end_matches('/'),bundle::sha(&archive))});
+    if let Some(old) = supersedes { request["supersedes"] = json!(old); }
     let command = format!("python3 -c \"import base64;exec(base64.b64decode('{}'))\" '{}'", STANDARD.encode(STAGE), STANDARD.encode(serde_json::to_vec(&request)?));
     ensure!(command.len() <= 100_000, "bootstrap recipe exceeds safe shell argument budget");
     let path = std::path::absolute(journal)?;
@@ -119,7 +122,9 @@ pub async fn run(alias: &str, phase: &str, input: &Path, archive: &Path, journal
     let identity = json!({"target":target,"phase":phase,"input_sha256":bundle::sha(&original),"request":request});
     let mut state = if path.exists() {
         let state: Value = serde_json::from_slice(&host_bootstrap::read(&path, 16 * 1024 * 1024)?)?;
-        ensure!(state["identity"] == identity && state["spec"]["update"]["commands"] == json!([command]), "delivery inputs changed");
+        // A CLI upgrade must not rewrite an older immutable transport recipe.
+        // The private journal remains authoritative; compare its bound inputs.
+        ensure!(state["identity"] == identity, "delivery inputs changed");
         state
     } else {
         let launcher = format!("bootstrap-{}", uuid::Uuid::new_v4().simple());
@@ -141,6 +146,14 @@ mod tests {
     use super::*;
     use axum::{Router, routing::{get, post}, extract::State, Json, http::StatusCode};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn replan_requires_exact_old_intent_before_any_io() {
+        for (phase, old) in [("replan",None),("replan",Some("bad")),("admit",Some("bad")),("inspect",Some("bad"))] {
+            let error = run("missing",phase,Path::new("missing"),Path::new("missing"),Path::new("missing"),old,None,"token").await.unwrap_err();
+            assert!(error.to_string().contains("replan alone requires"));
+        }
+    }
 
     #[derive(Default)]
     struct Server { spec: Option<Value>, registrations: usize, starts: usize, lost: bool }

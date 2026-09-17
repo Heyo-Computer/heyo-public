@@ -99,8 +99,10 @@ def main():
     input_path = root / (request["input_sha256"] + ".json")
     publish(input_path, data, 0o600)
     argv = [str(binary_path), "--bootstrap-host-update", request["phase"], str(input_path)]
-    if request["phase"] == "admit":
+    if request["phase"] in ("admit", "replan"):
         argv.append(request["input_sha256"])
+        if request["phase"] == "replan":
+            argv.append(request["supersedes"])
     elif request["phase"] != "inspect":
         raise ValueError("unsupported transport phase")
     # No restart/config mutation here: the pinned native binary alone owns it.
