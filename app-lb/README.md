@@ -82,6 +82,13 @@ baked-in listener must not pass when the new startup command fails. Missing/wron
 identity, redirects and even otherwise healthy 404 responses cannot pass a rollout.
 Legacy health checks without `expected_header` retain their existing semantics.
 
+app-lb's own admin `/healthz` also returns `x-heyo-revision`, compiled from
+`HEYO_BUILD_GIT_SHA` (a full lowercase Git SHA; `unknown` for unstamped local
+builds). Runtime environment variables cannot change this header. CI stamps
+the validated source and includes a checksummed `REVISION` in the release bundle,
+so a host-controller rollout can verify the intended build through the public
+admin endpoint instead of accepting an old process's generic `ok` response.
+
 The deployment's existing fsync/rename record stores the operation, unique allocation
 intents, active generation, and exact retiring VM IDs. Candidates stay unrouted until
 healthy. Cutover persists first, then fences admission on old backends and publishes

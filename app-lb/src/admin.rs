@@ -4288,8 +4288,8 @@ async fn pump_shell(
     let _ = tx.send(Message::Close(None)).await;
 }
 
-async fn healthz() -> &'static str {
-    "ok\n"
+async fn healthz() -> impl IntoResponse {
+    ([("x-heyo-revision", env!("APP_LB_BUILD_REVISION"))], "ok\n")
 }
 
 /// Issued certificates: `GET /certs`.
@@ -5415,6 +5415,15 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn healthz_reports_compiled_revision() {
+        let response = healthz().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-heyo-revision"], env!("APP_LB_BUILD_REVISION"));
+        let body = axum::body::to_bytes(response.into_body(), 32).await.unwrap();
+        assert_eq!(body.as_ref(), b"ok\n");
+    }
 
     mod deployment_etags {
         use super::*;
