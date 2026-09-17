@@ -1601,6 +1601,35 @@ It can be rerun for the same manifest/intent. The native GET can persist success
 and release its fence; this is an authenticated reconciliation action, not an
 unauthenticated status probe. Initial launch delivery remains separate.
 
+`ci --deliver-host-bootstrap TARGET inspect plan.json app-lb.tar.gz inspect-delivery.json`
+registers an operation-specific static launcher and invokes the pinned native
+inspection. Save its JSON output as the inspection input above. Poll with the
+**same command and journal** if the job is still running. Then prepare the
+manifest and invoke
+`ci --deliver-host-bootstrap TARGET admit manifest.json app-lb.tar.gz admit-delivery.json`.
+This uses the same managed target/token configuration as completion checking.
+Only use public artifacts tied to successful trusted CI evidence.
+
+This is an explicitly authorized bootstrap operation, not an ordinary release
+fallback. One designated coordinator owns each operation and its journals; no
+other writer may alter its launchers. Each phase gets a new, never-reused static
+deployment ID with an exact `.invalid` hostname, maintenance 503, and an
+unresolvable upstream. It creates no VM and changes no existing service route.
+The fixed transport requires root and Python 3, downloads without credentials or
+redirects, verifies the exact archive/executable, writes only root-owned staging
+files, and invokes native `inspect` or `admit`. It never installs a service or
+restarts a process itself. Preserve/native edits keep existing secrets on-host;
+never put secret literal bytes in these logged launcher recipes.
+
+The caller fsyncs its immutable recipe before registration and `delivery_armed`
+before its single update POST. Matching existing recipes are not rewritten;
+conflicts fail closed. An armed phase is GET-only on every later invocation,
+even if a crash happened before sending or the response was lost. Keep the
+journals and launchers; do not generate a new journal/ID to retry uncertainty.
+A crashed coordinator also leaves a local lock directory for explicit operator
+reconciliation. A successful legacy job is only transport evidence: use
+`--check-host-bootstrap` to attest the actual replacement and release its fence.
+
 ### Service deployments
 
 For candidate-first updates of existing stateless app-lb services, use

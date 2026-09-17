@@ -25,6 +25,7 @@ mod dispatch;
 mod expr;
 mod host_app_lb;
 mod host_bootstrap;
+mod host_bootstrap_delivery;
 mod host_maintenance;
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;
@@ -65,6 +66,18 @@ use vm::Vms;
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !args.is_empty() {
+        if args[0] == "--deliver-host-bootstrap" && args.len() == 6 {
+            let targets = std::env::var("CI_HOST_APP_LB_TARGETS").ok();
+            let token = std::env::var("CI_HOST_APP_LB_TOKEN").unwrap_or_default();
+            match host_bootstrap_delivery::run(&args[1], &args[2], args[3].as_ref(), args[4].as_ref(), args[5].as_ref(), targets.as_deref(), &token).await {
+                Ok(status) => println!("{status}"),
+                Err(error) => {
+                    eprintln!("bootstrap delivery incomplete: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         if args[0] == "--prepare-host-bootstrap" && args.len() == 5 {
             match host_bootstrap::run(args[1].as_ref(), args[2].as_ref(), args[3].as_ref(), args[4].as_ref()) {
                 Ok(status) => println!("{status}"),
@@ -88,7 +101,7 @@ async fn main() {
             return;
         }
         if args[0] != "--check-workflows" || args.len() < 2 {
-            eprintln!("usage: ci [--check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
+            eprintln!("usage: ci [--check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --deliver-host-bootstrap TARGET inspect|admit INPUT_JSON BUNDLE JOURNAL_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
             std::process::exit(2);
         }
         let mut failed = false;

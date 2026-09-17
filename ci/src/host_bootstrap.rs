@@ -45,7 +45,7 @@ struct Original { path: String, sha256: Option<String>, mode: Option<u32> }
 #[serde(deny_unknown_fields)]
 struct Inspection { protocol: String, source: Source, files: Vec<Original> }
 
-fn read(path: &Path, limit: usize) -> Result<Vec<u8>> {
+pub(super) fn read(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let file = File::open(path)?;
     ensure!(file.metadata()?.is_file() && file.metadata()?.len() <= limit as u64, "input is not a bounded regular file");
     let mut bytes = Vec::new();
