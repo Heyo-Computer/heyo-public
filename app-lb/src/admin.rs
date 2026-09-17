@@ -2559,6 +2559,7 @@ async fn patch_disk(
     let Some(store) = state.disks.as_ref() else {
         return disks_off();
     };
+    let _retention = state.autoscaler.workspaces().lifecycle_guard().await;
     if let Err(e) = store.set_policy(&id, body.retain, body.note) {
         return disk_error(e);
     }
@@ -3180,6 +3181,9 @@ async fn register(
     // from booting until teardown's final old-state capture has published.
     let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
+    if state.autoscaler.workspaces().recovery_active(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
     let replaced = old.is_some();
     let workspace_replacement = match &old {
         Some(old) => match state.autoscaler.fence_workspace_replacement(old).await {
@@ -3285,6 +3289,9 @@ async fn update(
     // Compare while holding the same writer guard that covers fencing, the
     // registry swap, persistence and teardown scheduling. A stale request must
     // leave all of those untouched.
+    if state.autoscaler.workspaces().recovery_active(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
     if let Err(status) = check_etag_precondition(expected_etag.as_deref(), &old.spec) {
         let message = if status == StatusCode::PRECONDITION_FAILED {
             "If-Match does not match the current deployment spec"
@@ -3369,6 +3376,9 @@ async fn scale(
 
     // Only a managed deployment is autoscaled; for the others the scaling policy
     // is inert, so a scale request is a mistake rather than a no-op.
+    if state.autoscaler.workspaces().recovery_active(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
     if !old.spec.is_managed() {
         let fix = if old.spec.is_site() {
             "a site serves files off disk and has nothing to scale"
@@ -3724,6 +3734,9 @@ async fn uncordon_upstream(
 
 async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
     let change = state.registry.change_guard().await;
+    if state.autoscaler.workspaces().has_recovery(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery history and retained source must be preserved").into_response();
+    }
     let Some(d) = state.registry.remove(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
@@ -4843,6 +4856,36 @@ async fn get_job(
     }
 }
 
+fn recovery_authorized(caller: &Caller, spec: &DeploymentSpec) -> bool {
+    !matches!(caller, Caller::Ungated)
+        && caller.satisfies_in(crate::tokens::AdminScope::Admin, Some(&spec.namespace))
+        && caller.may_touch(&spec.id, Some(&spec.namespace))
+}
+
+async fn recover_workspace(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>, Json(request): Json<crate::workspace::RecoveryRequest>) -> Response {
+    let _writer = state.registry.change_guard().await;
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    if !recovery_authorized(&caller, &d.spec) { return forbidden("authenticated namespace admin required"); }
+    let _creates = state.autoscaler.workspace_recovery_guard().await;
+    let ws = state.autoscaler.workspaces();
+    let _lifecycle = ws.lifecycle_guard().await;
+    match ws.admit_recovery(&d, request).await {
+        Ok(operation) => (StatusCode::ACCEPTED, Json(operation)).into_response(),
+        Err(message) => err(StatusCode::CONFLICT, message).into_response(),
+    }
+}
+
+async fn get_workspace_recovery(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path((id, operation_id)): Path<(String, String)>) -> Response {
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    if !recovery_authorized(&caller, &d.spec) { return forbidden("authenticated namespace admin required"); }
+    match state.autoscaler.workspaces().recovery(&id, &operation_id) {
+        Some(operation) if operation.namespace == d.spec.namespace => Json(operation).into_response(),
+        _ => err(StatusCode::NOT_FOUND, "recovery not found in this namespace").into_response(),
+    }
+}
+
 fn router(state: AdminState) -> Router {
     // The dashboard view + its data source are always behind the optional gate.
     let view = Router::new()
@@ -5006,8 +5049,15 @@ fn router(state: AdminState) -> Router {
             require_any_credential,
         ));
 
+    // Unlike legacy CRUD, explicit data recovery is never available ungated.
+    let recovery = Router::new()
+        .route("/deployments/:id/workspace/recoveries", post(recover_workspace))
+        .route("/deployments/:id/workspace/recoveries/:operation_id", get(get_workspace_recovery))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
+
     Router::new()
         .route("/healthz", get(healthz))
+        .merge(recovery)
         .merge(view)
         .merge(whoami)
         .merge(crud)
@@ -6438,6 +6488,20 @@ mod tests {
             // lets a confined caller through to be measured there.
             assert!(matches!(at("/secrets", "/secrets"), Verdict::Allow(_)));
             assert!(matches!(at("/secrets/:id", "/secrets/github"), Verdict::Allow(_)));
+        }
+
+        #[test]
+        fn workspace_recovery_requires_explicit_namespace_admin_even_when_ungated() {
+            let spec: DeploymentSpec = serde_json::from_value(serde_json::json!({"id":"svc","namespace":"team-a","routes":[]})).unwrap();
+            assert!(!recovery_authorized(&Caller::Ungated, &spec));
+            assert!(recovery_authorized(&Caller::Operator, &spec));
+            let t = store();
+            for (namespace, tier, allowed) in [("team-a", AdminScope::Admin, true), ("team-b", AdminScope::Admin, false), ("team-a", AdminScope::View, false)] {
+                let token = mint_in_namespace(&t, tier, namespace);
+                let caller = Caller::Token(t.verify(&token, NOW).unwrap());
+                assert_eq!(recovery_authorized(&caller, &spec), allowed);
+            }
+            assert_eq!(deployment_of("/deployments/:id/workspace/recoveries", "/deployments/svc/workspace/recoveries"), Some("svc"));
         }
 
         /// The handler-side wall: a confined caller reaches its own

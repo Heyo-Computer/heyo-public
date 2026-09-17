@@ -40,6 +40,55 @@ unroutable, so the driver is rejected at registration.
   otherwise uses `http://127.0.0.1:34099`
 - `cmake` — a hard build dependency of `pingora-core`, via `flate2`'s `zlib-ng` backend
 
+## Recover a retained workspace lineage
+
+`POST /deployments/:id/workspace/recoveries` explicitly selects a stopped retained
+VM as the source of a new workspace snapshot. It is not a VM restart or a data
+merge. The operator must first decide that replacing the current snapshot with
+this source is appropriate; the API verifies filesystem capture, not application
+integrity (for example, JetStream message checks).
+
+```json
+{
+  "operation_id": "recover-retained-source-1",
+  "source_sandbox_id": "sb-exact-retained-id",
+  "expected_snapshot": "<current 64-character lowercase SHA256>",
+  "confirm_replace": true
+}
+```
+
+Admission requires authenticated namespace-admin authority even when ordinary
+CRUD is ungated. The deployment must have exactly one unresolved replacement
+capture, an empty serving/pending/resumable pool, and no queued captures. The
+source must have a unique durable seed record with a mount index, matching
+remembered workspace namespace/path/store, and an exact stopped daemon record.
+Unknown, running, foreign, or missing sources and stale snapshots fail closed.
+The source need not have been seeded from the current snapshot: this explicit
+operation is the only exception, and it does not rewrite its seed history.
+
+GET `/deployments/:id/workspace/recoveries/:operation_id` returns the original
+`request`, deployment/namespace, `status`, resulting `snapshot`, and `error`.
+Status is `running` or `succeeded`; failures remain running with an error and
+the creation fence intact. IDs are 1–128 ASCII letters/digits/hyphens/underscores.
+Exact replay returns the same operation, including after restart/completion;
+reuse with another payload conflicts. There is no unsafe cancel/unpin shortcut.
+
+Recovery first persists intent and a permanent source pin, then captures and
+verifies the stopped source. Snapshot files and the workspace record are synced
+before atomically releasing the replacement fence. Restart retries read-only
+capture if needed; uncertain writes never report success or permit placement.
+The selected VM is never stopped, resumed, deleted, or added to the resumable
+pool by recovery. Its pin survives completion and defeats even forced disk purge.
+PUT/register/scaling and image/mount replacement commits are blocked while
+recovery runs; deletion of a deployment with recovery history is refused.
+One owning app-lb process is required for this local state directory.
+
+Separately, `PATCH /disks/:id {"retain":true}` now also protects workspace
+predecessors from post-capture replacement deletion, not just disk expiry.
+Such predecessors remain stopped after replacement capture; ordinary unpinned
+retirement and same-pool idle suspension retain their existing behavior. These
+app-lb protections cannot prevent an out-of-band daemon/operator deletion.
+
 ## Run
 
 ```sh

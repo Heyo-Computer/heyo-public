@@ -805,7 +805,8 @@ fn main() {
     let autoscaler = autoscaler_svc.task();
 
     let disks = {
-        let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()));
+        let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()).with_workspaces(workspaces.clone()));
+        workspaces.attach_disk_store(&store);
         match store.load() {
             Ok(0) => {}
             Ok(n) => tracing::info!(count = n, "loaded disk retention policies"),
