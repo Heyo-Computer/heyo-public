@@ -1679,6 +1679,7 @@ mod repo_workflow {
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
         for (path, expected) in [("ci/src/main.rs", Some("true")), ("ci/README.md", Some("false")),
             (".ci/workflows/ci.yml", Some("false")), (".ci/image/ci/Dockerfile", Some("true")),
+            ("app-lb/src/host_bundle.rs", Some("true")),
             ("app-lb/src/main.rs", None)] {
             let output_file = tmp.path().join("outputs");
             std::fs::write(&output_file, "").unwrap();

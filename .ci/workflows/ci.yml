@@ -57,6 +57,7 @@ on:
       # this one.
       - '.ci/workflows/ci.yml'
       - '.ci/image/ci/**'
+      - 'app-lb/src/host_bundle.rs'
 
 jobs:
   release:
@@ -70,7 +71,7 @@ jobs:
     # runs the same glob matcher as `paths:`, so the guard and the filter cannot
     # disagree about what a pattern covers — including the case that matters, an
     # unknown change set, where both are true.
-    if: ${{ changed('ci/**', '.ci/workflows/ci.yml', '.ci/image/ci/**') }}
+    if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', '.ci/workflows/ci.yml', '.ci/image/ci/**') }}
     # Unpinned: the controller chooses an eligible host in the runner network.
     vm: &ci_vm
       driver: firecracker
@@ -412,11 +413,11 @@ jobs:
           def covered(p):
               return p.startswith(('ci/', '.ci/image/ci/')) or p in (
                   '.ci/workflows/ci.yml', '.heyo/regions/us3/ci.json',
-                  '.heyo/regions/us3/README.md')
+                  '.heyo/regions/us3/README.md', 'app-lb/src/host_bundle.rs')
           outside = [p for p in paths if not covered(p)]
           if outside:
               raise SystemExit('CI validation does not authorize merging these paths: ' + ', '.join(outside))
-          runtime = any((p.startswith('ci/') and not p.endswith('.md')) or p.startswith('.ci/image/ci/') for p in paths)
+          runtime = any((p.startswith('ci/') and not p.endswith('.md')) or p.startswith('.ci/image/ci/') or p == 'app-lb/src/host_bundle.rs' for p in paths)
           # Explicitly resubmitting the already-merged revision is also a CD
           # retry. Its empty trunk diff must not turn a failed deploy into a
           # successful no-op. The guard above still rejects uncovered changes.
