@@ -17,7 +17,7 @@
       "CI_HEYO_BASE_URL": "https://stage.heyo.computer/cloud",
       "CI_NETWORK": "REPLACE_WITH_NETWORK_ID",
       "CI_ADMIN_EMAILS": "REPLACE_WITH_ADMIN_EMAIL",
-      "CI_NATS_URL": "nats://127.0.0.1:4222",
+      "CI_NATS_URL": "nats://REPLACE_WITH_PRIVATE_NATS_SERVICE:4222",
       "CI_NATS_SUBJECT_PREFIX": "ci_us3_trial",
       "CI_LOG_DIR": "/workspace/ci-state/logs",
       "CI_WORKSPACE_DIR": "/workspace/ci-state/workspaces",

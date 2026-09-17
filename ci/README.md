@@ -57,14 +57,31 @@ Linux tests and release compilation have separate steps with explicit 60-minute
 limits: the two-hour job limit does not override the default 30-minute step limit.
 
 The `ci-linux` artifact also supports branch deployment without a merge or rebuild.
-On an existing CI/NATS runtime image, pin that successful run's artifact digest
+On a CI runtime image, pin that successful run's artifact digest
 as a read-only app-lb mount at `/opt/ci-release`, with `strip_components: 1`.
 `deploy/start-artifact.sh` verifies `CI_EXPECTED_SHA` and `SHA256SUMS`, installs
-the CI binary into the runtime, and starts its existing supervisor on every boot.
+the CI binary into the runtime, and executes CI directly on every boot. It never
+calls a baked-in supervisor that might start or stop NATS. `CI_NATS_URL` is required;
+NATS must run as an independent service with its own persistent JetStream volume.
 It requires a separately mounted persistent state directory with a
 `.managed-state` marker containing `ci-state-v1`; it refuses an empty or rootfs
 fallback rather than silently losing CI history. Arguments are the release,
 runtime, and state directories. This boot wrapper is included in new artifacts.
+Self-deployment installs this CI-only boot command and refuses a missing or
+loopback broker URL. It preserves the broker configuration rather than changing
+or replacing NATS during CI deployment.
+
+For a previously bundled installation, fence submissions and stop producers and
+consumers before moving broker state. Inventory streams, consumers, pending
+messages and acknowledgement positions; take a verified JetStream backup and
+restore it into the independent broker's dedicated persistent volume. Preserve
+account/subject names and credentials. Never concurrently mount CI's existing
+writable workspace into the broker VM, and never copy a live JetStream directory
+as if it were a consistent backup. Retain the old data untouched for rollback.
+Verify the restored stream/consumer state and authenticated connectivity before
+switching `CI_NATS_URL` and launching CI alone. After accepting new writes, the
+old backup is no longer a lossless rollback target. Test CI restart with broker
+identity, uptime and pending messages unchanged before reopening submissions.
 
 For an existing rootfs-only installation, wait for jobs to finish, fence public
 traffic with app-lb's 503 maintenance mode, and confirm no work remains before
