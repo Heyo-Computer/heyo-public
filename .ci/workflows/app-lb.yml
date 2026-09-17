@@ -41,6 +41,7 @@ on:
       # it rebuilds both, which is the one change that genuinely must.
       - '.ci/workflows/app-lb.yml'
       - '.ci/image/apps/**'
+      - '.ci/workflows/regional-release.yml'
 
 jobs:
   release:

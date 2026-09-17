@@ -7,6 +7,7 @@ on:
       - 'heyosecret-client/**'
       - '.ci/workflows/orchestrator.yml'
       - '.ci/image/ci/**'
+      - '.ci/workflows/regional-release.yml'
 
 jobs:
   release:
@@ -23,7 +24,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: never
       CARGO_BUILD_JOBS: '4'
-      HEYO_BUILD_GIT_SHA: '${{ ci.sha }}'
     timeout-minutes: 90
     steps:
       - name: Prepare disposable PostgreSQL
@@ -40,6 +40,7 @@ jobs:
         timeout-minutes: 75
         run: |
           set -eu
+          export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
           cargo test --locked
           ORCHESTRATOR_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/postgres cargo test --locked --bin orchestrator concurrent_step_claim_creates_one_running_attempt_postgres -- --ignored
           cargo build --release --locked --bin orchestrator

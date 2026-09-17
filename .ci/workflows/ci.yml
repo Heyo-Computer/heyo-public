@@ -1,14 +1,13 @@
-# Validate CI, merge the verified revision, and request a drained self-deployment.
+# Validate and package CI. regional-release.yml owns merge and deployment.
 #
 # This is the orchestrator building itself. The process that reads this file,
 # plans the run and drives the VM is the program the run compiles — it serves
 # ci.us2.heyo.work, and since the subtree merge its source is `ci/` here rather
 # than a repository of its own.
 #
-# Successful validation authorizes ci/merge-release, using the registered
-# workflow's HeyoSecret Git credential. Runtime changes record a durable rollout;
-# the run stays pending until the replacement controller verifies its binary
-# through public health. No tags are published.
+# This workflow cannot publish or deploy on its own. The submission coordinator
+# waits for every selected validation before merging the exact source, and
+# replaces the CI controller only after the regional stages succeed.
 #
 # Submitted from the repository root, with a pinned Git-patch descriptor:
 #
@@ -59,6 +58,7 @@ on:
       # this one.
       - '.ci/workflows/ci.yml'
       - '.ci/image/ci/**'
+      - '.ci/workflows/regional-release.yml'
 
 jobs:
   release:
@@ -72,7 +72,7 @@ jobs:
     # runs the same glob matcher as `paths:`, so the guard and the filter cannot
     # disagree about what a pattern covers — including the case that matters, an
     # unknown change set, where both are true.
-    if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', '.ci/workflows/ci.yml', '.ci/image/ci/**') }}
+    if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', '.ci/workflows/ci.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
     # Unpinned: the controller chooses an eligible host in the runner network.
     vm: &ci_vm
       driver: firecracker
@@ -389,63 +389,3 @@ jobs:
             the build of the service that produced this artifact.
             Built from ${{ ci.branch }}.
           path: dist
-
-  merge:
-    needs: [release]
-    vm: *ci_vm
-    outputs:
-      deploy_required: ${{ steps.scope.outputs.deploy_required }}
-    steps:
-      - id: scope
-        name: Verify the whole submitted revision is covered by CI validation
-        env:
-          RELEASE_BASE: ${{ ci.release_base_sha }}
-          SOURCE_SHA: ${{ ci.sha }}
-        run: |
-          set -eu
-          python3 - <<'PY'
-          import os, subprocess
-          base, head = os.environ['RELEASE_BASE'], os.environ['SOURCE_SHA']
-          if not base or not head:
-              raise SystemExit('release requires captured trunk and source revisions')
-          subprocess.run(['git', 'merge-base', '--is-ancestor', base, head], check=True)
-          paths = subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', '-z', base, head]).decode().split('\0')
-          paths = [p for p in paths if p]
-          def covered(p):
-              return p.startswith(('ci/', '.ci/image/ci/')) or p in (
-                  '.ci/workflows/ci.yml', '.heyo/regions/us3/ci.json',
-                  '.heyo/regions/us3/README.md')
-          outside = [p for p in paths if not covered(p)]
-          if outside:
-              raise SystemExit('CI validation does not authorize merging these paths: ' + ', '.join(outside))
-          runtime = any((p.startswith('ci/') and not p.endswith('.md')) or p.startswith('.ci/image/ci/') for p in paths)
-          # Explicitly resubmitting the already-merged revision is also a CD
-          # retry. Its empty trunk diff must not turn a failed deploy into a
-          # successful no-op. The guard above still rejects uncovered changes.
-          runtime = runtime or base == head
-          with open(os.environ['CI_OUTPUT'], 'a') as output:
-              output.write('deploy_required=' + str(runtime).lower() + '\n')
-          PY
-      - uses: ci/merge-release
-        with:
-          manifests: '[]'
-          token: ${{ secrets.GIT_AUTH_TOKEN }}
-
-  deploy:
-    needs: [merge]
-    vm: *ci_vm
-    steps:
-      - name: Validate deployment decision
-        env:
-          DEPLOY_REQUIRED: ${{ needs.merge.outputs.deploy_required }}
-        run: |
-          set -eu
-          case "$DEPLOY_REQUIRED" in
-            false) echo 'No CI runtime change; deployment is not required.' ;;
-            true) echo 'Runtime changed; requesting a drained controller replacement.' ;;
-            *) echo 'Missing deployment decision; refusing to report release success.' >&2; exit 1 ;;
-          esac
-      - uses: ci/deploy-controller
-        if: ${{ needs.merge.outputs.deploy_required == 'true' }}
-        with:
-          artifact: ci

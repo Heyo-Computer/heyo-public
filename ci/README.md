@@ -1331,6 +1331,26 @@ actions. `--only`, explicit workflow selections, and individual reruns are
 validation-only and cannot publish or deploy. The submit client computes changed
 paths across the full trunk-to-feature diff, including earlier feature commits.
 
+This repository's `.ci/workflows/regional-release.yml` sequences public app-lb
+and Orchestrator updates as `merge → us3 → eu1 → controller`. The three build
+workflows are validation-only; a coordinator change selects all three so every
+referenced artifact is built from the same submission. Component-only changes
+select only their matching deployments, including CI when the shared host-bundle
+parser changes. Private Auth/Cloud/heyvm deployment remains a separate repository
+workflow. NATS is not part of CI's artifact or replacement.
+
+Before activating coordinated submissions, both regional app-lb hosts must have
+the verified native bootstrap and correlated rollout APIs installed, the CI
+controller must support the rollout actions, and service rootfs artifacts must
+be pinned. Provision repository-scoped `CI_HOST_APP_LB_TARGETS` entries named
+`app-lb-us3` and `app-lb-eu1` with each host's exact deployment/namespace/public
+health mapping. The registered workflow resolves `GIT_AUTH_TOKEN`,
+`APP_LB_US3_TOKEN`, and `APP_LB_EU1_TOKEN` through its HeyoSecret-backed secrets;
+no values belong in YAML. The existing controller-deployment mapping owns the
+final CI replacement. Until these prerequisites are verified, use only
+validation-only submissions such as `git submit --only ci`; a pushed workflow
+or passing build does not establish regional deployment readiness.
+
 For artifact reuse, `ci/download-artifact` accepts `with.workflow` naming the exact
 validation workflow path. CI resolves it only within this submission's frozen,
 successful membership, never from an arbitrary run ID or a latest-artifact tag.
