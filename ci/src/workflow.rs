@@ -1645,6 +1645,10 @@ mod repo_workflow {
         assert_eq!(deploy.needs, ["merge"]);
         let validate = plan.jobs.iter().find(|j| j.base_id == "release").unwrap();
         assert!(!validate.target.local, "CI builds must not pin the controller host");
+        assert!(wf.on_submit.paths.iter().any(|p| p == "app-lb/src/host_bundle.rs"),
+            "CI must rebuild when its shared archive validator changes");
+        assert!(validate.condition.as_deref().unwrap().contains("'app-lb/src/host_bundle.rs'"),
+            "the job filter must not skip a shared archive validator change");
         assert!(validate.steps.iter().any(|s| s.run.as_deref().is_some_and(|s|
             s == "cargo test --release --locked -- --test-threads=1")));
 
