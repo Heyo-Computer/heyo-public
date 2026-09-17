@@ -17,7 +17,7 @@ struct Source { disk_sha256: String, running_sha256: String, generation: Generat
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Target { artifact_sha256: String, binary_sha256: String, revision: String }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Change {
     path: PathBuf, before_sha256: Option<String>, mode: u32,
@@ -42,6 +42,8 @@ struct Original { path: PathBuf, sha256: Option<String>, mode: Option<u32> }
 struct Journal {
     manifest: Manifest, intent_sha256: String, originals: Vec<Original>,
     status: String, phase: String, error: Option<String>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    supersedes: Option<String>,
 }
 
 fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -112,6 +114,11 @@ fn write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 fn journal_path(c: &Config) -> PathBuf { c.state_dir.join("bootstrap.json") }
 fn backup(c: &Config, index: usize) -> PathBuf { c.state_dir.join(format!("bootstrap/original-{index}")) }
 fn helper(c: &Config) -> PathBuf { c.state_dir.join("bootstrap/helper") }
+fn staged_helper(j: &Journal) -> PathBuf {
+    if j.supersedes.is_some() { j.manifest.config.state_dir.join("bootstrap/helpers").join(&j.intent_sha256) }
+    else { helper(&j.manifest.config) }
+}
+fn archived(c: &Config, intent: &str) -> PathBuf { c.state_dir.join("bootstrap/replans").join(format!("{intent}.json")) }
 fn unit_name(j: &Journal) -> String { format!("app-lb-bootstrap-{}", j.intent_sha256) }
 fn save(j: &Journal) -> Result<()> { write(&journal_path(&j.manifest.config), &serde_json::to_vec(j).map_err(|e| e.to_string())?, 0o600) }
 fn save_locked(j: &Journal) -> Result<()> {
@@ -121,7 +128,9 @@ fn save_locked(j: &Journal) -> Result<()> {
 fn load(path: &Path, intent: Option<&str>) -> Result<Journal> {
     let j: Journal = serde_json::from_slice(&read(path, LIMIT * 2)?).map_err(|e| e.to_string())?;
     if path != journal_path(&j.manifest.config) || sha(&canonical(&j.manifest)?) != j.intent_sha256
-        || intent.is_some_and(|i| i != j.intent_sha256) { return Err("bootstrap journal identity conflict".into()); }
+        || intent.is_some_and(|i| i != j.intent_sha256) || j.supersedes.as_ref().is_some_and(|s| !valid_sha(s,64)) {
+        return Err("bootstrap journal identity conflict".into());
+    }
     validate(&j.manifest)?; Ok(j)
 }
 pub(super) fn unblocked(c: &Config) -> Result<()> {
@@ -138,7 +147,8 @@ fn output(j: &Journal) -> Value {
     json!({"protocol":PROTOCOL,"operation_id":j.manifest.operation_id,"intent_sha256":j.intent_sha256,
         "journal_path":journal_path(&j.manifest.config),"unit_name":unit_name(j),"status":j.status,"phase":j.phase,
         "deployment":j.manifest.config.deployment,"namespace":j.manifest.config.namespace,
-        "readiness_verified":j.status == "succeeded","error":j.error,"source":j.manifest.source,"target":j.manifest.target})
+        "readiness_verified":j.status == "succeeded","error":j.error,"source":j.manifest.source,"target":j.manifest.target,
+        "supersedes":j.supersedes})
 }
 
 fn validate(m: &Manifest) -> Result<()> {
@@ -259,22 +269,31 @@ async fn admit(m: Manifest, intent: &str) -> Result<Value> {
     if ledger(&m.config)?.operations.iter().any(|o| o.status != "succeeded") { return Err("normal host update remains unresolved".into()); }
     let mut originals = vec![original(&m.config.executable,host_bundle::LIMIT as usize)?];
     for f in &m.files { originals.push(original(&f.path,LIMIT)?); }
-    let mut j = Journal {manifest:m,intent_sha256:intent.into(),originals,status:"running".into(),phase:"preserving".into(),error:None};
+    let j = Journal {manifest:m,intent_sha256:intent.into(),originals,status:"running".into(),phase:"preserving".into(),error:None,supersedes:None};
     save(&j)?; // This is the durable fence, before any launch or target mutation.
     drop(guard);
+    stage(j,None).await
+}
+
+async fn stage(mut j: Journal, executor: Option<UpdateLock>) -> Result<Value> {
+    let path = journal_path(&j.manifest.config);
+    let intent = j.intent_sha256.clone();
     let result: Result<()> = async {
         for (i,old) in j.originals.iter().enumerate() {
             if let Some(hash) = &old.sha256 {
                 let bytes = read(&old.path,host_bundle::LIMIT as usize)?;
                 if sha(&bytes) != *hash { return Err("source changed during preservation".into()); }
-                write(&backup(&j.manifest.config,i),&bytes,0o600)?;
+                let path=backup(&j.manifest.config,i);
+                if j.supersedes.is_some() {
+                    if sha(&read(&path,host_bundle::LIMIT as usize)?) != *hash { return Err("preserved source is corrupt".into()); }
+                } else { write(&path,&bytes,0o600)?; }
             }
         }
         let m = &j.manifest;
         let request = Request {operation_id:m.operation_id.clone(),expected_binary_sha256:m.source.disk_sha256.clone(),
             expected_config_sha256:String::new(),artifact_sha256:m.target.artifact_sha256.clone(),binary_sha256:m.target.binary_sha256.clone(),revision:m.target.revision.clone()};
         let bytes = download(&m.config,&request).await?;
-        write(&helper(&m.config),&bytes,0o700)?;
+        write(&staged_helper(&j),&bytes,0o700)?;
         preflight(m).await?;
         let mut total=0;
         for i in 0..m.files.len() { total+=desired(&j,i)?.len(); if total>LIMIT { return Err("derived AFTER configuration exceeds budget".into()); } }
@@ -282,14 +301,72 @@ async fn admit(m: Manifest, intent: &str) -> Result<Value> {
         Ok(())
     }.await;
     if let Err(e) = result { j.status="reconciliation_required".into(); j.error=Some(e); save_locked(&j)?; return Ok(output(&j)); }
+    // The durable launching phase now refuses all replans. Relinquish the
+    // executor only here so the independently launched apply can acquire it.
+    drop(executor);
     let launch = command("/usr/bin/systemd-run", &["--unit",&unit_name(&j),"--no-block","--property=Type=oneshot",
         "--property=RemainAfterExit=yes","--property=Restart=no","--property=WorkingDirectory=/","--",
-        helper(&j.manifest.config).to_str().ok_or("invalid helper path")?,"--bootstrap-host-update","apply",
-        path.to_str().ok_or("invalid journal path")?,intent]).await;
+        staged_helper(&j).to_str().ok_or("invalid helper path")?,"--bootstrap-host-update","apply",
+        path.to_str().ok_or("invalid journal path")?,&intent]).await;
     let _guard = lock(&j.manifest.config.state_dir)?;
-    j = load(&path,Some(intent))?;
+    j = load(&path,Some(&intent))?;
     if let Err(e) = launch { if j.status != "succeeded" { j.error=Some(e); save(&j)?; } }
     Ok(output(&j))
+}
+
+async fn replan(m: Manifest, intent: &str, expected_old: &str) -> Result<Value> {
+    validate(&m)?;
+    if !valid_sha(intent,64) || !valid_sha(expected_old,64) || intent == expected_old
+        || sha(&canonical(&m)?) != intent || running_sha()? != m.helper_sha256 || compiled_revision() != m.target.revision {
+        return Err("unauthorized bootstrap replan helper or intent".into());
+    }
+    let c=&m.config; let path=journal_path(c);
+    mkdir(&c.state_dir.join("executor"))?; trusted(&c.state_dir.join("executor/lock"))?;
+    let executor=executor_lock(&c.state_dir.join("executor"))?;
+    let old=load(&path,None)?;
+    if old.intent_sha256 == intent && old.supersedes.as_deref() == Some(expected_old) {
+        return Ok(output(&old)); // Never resume a delivery, even if it never launched.
+    }
+    if old.intent_sha256 != expected_old || old.status != "reconciliation_required" || old.phase != "preserving"
+        || old.manifest.operation_id != m.operation_id || old.manifest.config != m.config
+        || old.manifest.source != m.source || old.manifest.mapping_path != m.mapping_path || old.manifest.files != m.files {
+        return Err("bootstrap replan conflicts with the failed prelaunch intent".into());
+    }
+    let next_helper=c.state_dir.join("bootstrap/helpers").join(intent);
+    trusted(&next_helper)?; trusted(&staged_helper(&old))?;
+    if archived(c,intent).exists() || next_helper.exists() {
+        return Err("replacement intent was already used".into());
+    }
+    preflight(&m).await?;
+    preserved(&old)?;
+    if staged_helper(&old).exists() && sha(&read(&staged_helper(&old),host_bundle::LIMIT as usize)?) != old.manifest.helper_sha256 {
+        return Err("previous helper is corrupt".into());
+    }
+    for hash in [expected_old,intent] {
+        let unit=format!("app-lb-bootstrap-{hash}.service");
+        let state=command("/usr/bin/systemctl", &["show",&unit,"--property=LoadState","--value"]).await?;
+        if state.trim() != "not-found" { return Err("bootstrap helper unit is not proven absent".into()); }
+    }
+    // No async work under the ledger lock. The executor covers all inspection,
+    // replacement and staging; the CAS also excludes any stale journal writer.
+    let guard=lock(&c.state_dir)?;
+    let raw=read(&path,LIMIT*2)?;
+    if canonical(&load(&path,None)?)? != canonical(&old)? { return Err("bootstrap journal changed during replan".into()); }
+    if ledger(c)?.operations.iter().any(|o| o.status != "succeeded") { return Err("normal host update remains unresolved".into()); }
+    for (i,original_file) in old.originals.iter().enumerate() {
+        if original(&original_file.path,if i == 0 {host_bundle::LIMIT as usize} else {LIMIT})? != *original_file {
+            return Err("preserved preimage or mode changed".into());
+        }
+    }
+    let archive=archived(c,expected_old);
+    if archive.exists() {
+        if read(&archive,LIMIT*2)? != raw { return Err("archived bootstrap evidence differs".into()); }
+    } else { write(&archive,&raw,0o600)?; }
+    let j=Journal {manifest:m,intent_sha256:intent.into(),originals:old.originals,
+        status:"running".into(),phase:"preserving".into(),error:None,supersedes:Some(expected_old.into())};
+    save(&j)?; // Atomic new fence before download, helper writes or launch.
+    drop(guard);
+    stage(j,Some(executor)).await
 }
 
 fn preserved(j: &Journal) -> Result<()> {
@@ -316,15 +393,17 @@ fn desired(j: &Journal, index: usize) -> Result<Vec<u8>> {
     supervisor_environment(&before,program,&j.manifest.mapping_path)
 }
 
-/// Deliberately supports only one single-line environment in one ungrouped
-/// program section. Never parses/prints secret values into the caller's intent.
-/// Unsupported continuations, comments and duplicate assignments fail closed.
+/// Inspect a logical INI value, but edit only at its last physical content byte.
+/// Continuations are relative to the option's indentation, not the preceding
+/// continuation. Blank/comment lines and all original secret bytes stay intact.
 fn supervisor_environment(before: &[u8], program: &str, mapping: &Path) -> Result<Vec<u8>> {
     let text=std::str::from_utf8(before).map_err(|_| "Supervisor file must be UTF-8")?;
     let path=mapping.to_str().ok_or("invalid mapping path")?;
     if !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b)) { return Err("native Supervisor mapping path requires plain ASCII path characters".into()); }
     let section=format!("[program:{program}]"); let assignment=format!("APP_LB_HOST_UPDATE_CONFIG=\"{path}\"");
-    let mut offset=0; let mut header=None; let mut active=false; let mut env=None; let mut previous_indent=None;
+    let mut offset=0; let mut header=None; let mut active=false;
+    let mut env: Option<(usize,String)>=None;
+    let mut previous: Option<(usize,bool)>=None;
     for line in text.split_inclusive('\n') {
         let body=line.trim_end_matches(['\r','\n']); let trimmed=body.trim();
         if trimmed.starts_with('[') {
@@ -333,38 +412,23 @@ fn supervisor_environment(before: &[u8], program: &str, mapping: &Path) -> Resul
                 if header.is_some() { return Err("duplicate Supervisor program section".into()); }
                 header=Some((offset+line.len(),if line.ends_with("\r\n") {"\r\n"} else {"\n"},line.ends_with('\n')));
             }
-            previous_indent=None;
+            previous=None;
         } else if active && !trimmed.is_empty() && !trimmed.starts_with(['#',';']) {
             let indent=body.len()-body.trim_start().len();
-            if previous_indent.is_some_and(|i| indent>i) { return Err("multiline Supervisor program values are unsupported".into()); }
-            previous_indent=Some(indent);
+            if let Some((base,is_env))=previous.filter(|(base,_)| indent>*base) {
+                if !is_env { return Err("ambiguous non-environment continuation".into()); }
+                let (end,value)=env.as_mut().ok_or("missing environment option")?;
+                value.push('\n'); value.push_str(trimmed); *end=offset+body.len();
+                previous=Some((base,true)); offset+=line.len(); continue;
+            }
+            previous=Some((indent,false));
             if trimmed.split_once(':').is_some_and(|(k,_)| k.trim().eq_ignore_ascii_case("environment")) {
                 return Err("Supervisor environment must use '=' delimiter".into());
             }
             if let Some((key,value))=trimmed.split_once('=') {
                 if key.trim().eq_ignore_ascii_case("environment") {
                     if env.is_some() { return Err("duplicate Supervisor environment".into()); }
-                    let mut quote=None; let mut escaped=false; let mut start=0; let mut assignments=Vec::new();
-                    for (i,ch) in value.char_indices() {
-                        if escaped { escaped=false; continue; }
-                        if ch=='\\' { escaped=true; continue; }
-                        if quote == Some(ch) { quote=None; continue; }
-                        if quote.is_none() {
-                            if ch=='\'' || ch=='"' { quote=Some(ch); }
-                            else if ch==',' { assignments.push(&value[start..i]); start=i+1; }
-                            else if ch=='#' || ch==';' { return Err("commented Supervisor environment is unsupported".into()); }
-                        }
-                    }
-                    if quote.is_some() || escaped { return Err("ambiguous Supervisor environment quoting".into()); }
-                    if !value.trim().is_empty() { assignments.push(&value[start..]); }
-                    let mut keys=std::collections::HashSet::new();
-                    for item in assignments {
-                        let (name,value)=item.split_once('=').ok_or("invalid Supervisor environment assignment")?;
-                        let name=name.trim();
-                        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b==b'_') || value.trim().is_empty()
-                            || name=="APP_LB_HOST_UPDATE_CONFIG" || !keys.insert(name) { return Err("duplicate, invalid or preconfigured Supervisor environment key".into()); }
-                    }
-                    env=Some((offset+body.len(),!value.trim().is_empty()));
+                    env=Some((offset+body.len(),value.into())); previous=Some((indent,true));
                 }
             }
         }
@@ -372,10 +436,49 @@ fn supervisor_environment(before: &[u8], program: &str, mapping: &Path) -> Resul
     }
     let (header_end,newline,has_newline)=header.ok_or("mapped Supervisor program section missing")?;
     let mut after=text.to_string();
-    if let Some((end,nonempty))=env { after.insert_str(end,&format!("{}{assignment}",if nonempty {","} else {""})); }
+    if let Some((end,value))=env {
+        validate_environment(&value)?;
+        let separator=if value.trim().is_empty() || value.trim_end().ends_with(',') {""} else {","};
+        after.insert_str(end,&format!("{separator}{assignment}"));
+    }
     else { after.insert_str(header_end,&format!("{}environment={assignment}{newline}",if has_newline {""} else {newline})); }
     if after.len()>LIMIT { return Err("derived Supervisor configuration exceeds budget".into()); }
     Ok(after.into_bytes())
+}
+
+fn validate_environment(value: &str) -> Result<()> {
+    let mut quote=None; let mut escaped=false; let mut start=0; let mut assignments=Vec::new();
+    for (i,ch) in value.char_indices() {
+        if escaped { escaped=false; continue; }
+        if ch=='\\' { escaped=true; continue; }
+        if quote == Some(ch) { quote=None; continue; }
+        if quote.is_none() {
+            if ch=='\'' || ch=='"' { quote=Some(ch); }
+            else if ch==',' { assignments.push(&value[start..i]); start=i+1; }
+            else if ch=='#' || ch==';' { return Err("inline environment comments are unsupported".into()); }
+        }
+    }
+    if quote.is_some() || escaped { return Err("ambiguous Supervisor environment quoting".into()); }
+    // Supervisor accepts a final separator, but never guess a missing separator.
+    if !value[start..].trim().is_empty() { assignments.push(&value[start..]); }
+    let mut keys=std::collections::HashSet::new();
+    for item in assignments {
+        let (name,value)=item.split_once('=').ok_or("invalid Supervisor environment assignment")?;
+        let name=name.trim(); let value=value.trim();
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b==b'_') || value.is_empty()
+            || name=="APP_LB_HOST_UPDATE_CONFIG" || !keys.insert(name) { return Err("duplicate, invalid or preconfigured Supervisor environment key".into()); }
+        if value.starts_with(['\'','"']) {
+            let delimiter=value.chars().next().unwrap(); let mut escaped=false; let mut end=None;
+            for (i,ch) in value.char_indices().skip(1) {
+                if escaped { escaped=false; continue; }
+                if ch=='\\' { escaped=true; } else if ch==delimiter { end=Some(i+1); break; }
+            }
+            if end != Some(value.len()) { return Err("ambiguous environment scalar or missing comma".into()); }
+        } else if !value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_/.+-():".contains(&b)) {
+            return Err("unquoted environment scalar or missing comma is ambiguous".into());
+        }
+    }
+    Ok(())
 }
 
 async fn apply(path: &Path, intent: &str) -> Result<Value> {
@@ -395,7 +498,7 @@ async fn apply(path: &Path, intent: &str) -> Result<Value> {
         for (i,old) in j.originals.iter().enumerate() {
             if original(&old.path,if i == 0 {host_bundle::LIMIT as usize} else {LIMIT})? != *old { return Err("preserved preimage or mode changed".into()); }
         }
-        let bytes = read(&helper(&c),host_bundle::LIMIT as usize)?;
+        let bytes = read(&staged_helper(&j),host_bundle::LIMIT as usize)?;
         if sha(&bytes) != j.manifest.target.binary_sha256 { return Err("bootstrap executable is corrupt".into()); }
         j.phase="installing".into(); save_locked(&j)?;
         for (i,f) in j.manifest.files.iter().enumerate() {
@@ -490,6 +593,11 @@ pub(super) fn cli(args: &[String]) -> i32 {
                 if fs::metadata(path).map_err(|e| e.to_string())?.mode() & 0o077 != 0 { return Err("manifest must be owner-only".into()); }
                 admit(serde_json::from_slice(&bytes).map_err(|e| e.to_string())?,&args[4]).await
             }
+            ("replan",6) => {
+                let bytes = read(path,LIMIT)?;
+                if fs::metadata(path).map_err(|e| e.to_string())?.mode() & 0o077 != 0 { return Err("manifest must be owner-only".into()); }
+                replan(serde_json::from_slice(&bytes).map_err(|e| e.to_string())?,&args[4],&args[5]).await
+            }
             ("apply",5) => apply(path,&args[4]).await,
             _ => Err("invalid bootstrap arguments".into()),
         }
@@ -519,7 +627,11 @@ cd '{}'
 printf '%s\n' "$*" >> calls
 case "$1" in
 cat) cat unit;;
-show) case "$*" in *MainPID*) echo {};; *) printf 'LoadState=loaded\nUser=root\n';; esac;;
+show) case "$*" in
+ *--property=LoadState\ --value*)
+  [ ! -e unit-probe-error ] || {{ echo not-found; exit 1; }}
+  if [ -e existing-helper ] && {{ [ ! -s existing-helper ] || [ "$(cat existing-helper)" = "$2" ]; }}; then echo loaded; else echo not-found; fi;;
+ *MainPID*) echo {};; *) printf 'LoadState=loaded\nUser=root\n';; esac;;
 pid) echo {};;
 status) echo 'app-lb RUNNING pid 1';;
 daemon-reload) [ ! -e fail-reload ];;
@@ -755,6 +867,155 @@ esac
             "environment=X=1,X=2\n","[program:app-lb]\n","command=foo\n  environment=X=1\n"] {
             assert!(supervisor_environment(format!("[program:app-lb]\n{body}").as_bytes(),"app-lb",path).is_err(),"{body}");
         }
+    }
+
+    #[test]
+    fn bootstrap_multiline_environment_preserves_physical_bytes() {
+        let before="[program:other]\nenvironment=KEEP=elsewhere\n[program:app-lb]\ncommand=/opt/app-lb\ndirectory=/\nuser=root\nenvironment=\n    RUST_LOG=info,\n    APP_LB_STATE_PATH=\"/var/lib/app-lb\",\n    PASSWORD=\"asymmetric,secret=with;punctuation\"\n\n# keep this comment exactly\n    ,AUTH=\"escaped\\\"quote\"\n     ,NAME=us3\n    ,CERT=\"/opt/tls/cert.pem\"\n    # trailing comment\nautostart=true\n[program:last]\nenvironment=OTHER=untouched\n";
+        let suffix=",APP_LB_HOST_UPDATE_CONFIG=\"/opt/app-lb/mapping.json\"";
+        for newline in ["\n","\r\n"] {
+            let before=before.replace('\n',newline);
+            let expected=before.replace("CERT=\"/opt/tls/cert.pem\"",&format!("CERT=\"/opt/tls/cert.pem\"{suffix}"));
+            assert_eq!(supervisor_environment(before.as_bytes(),"app-lb",Path::new("/opt/app-lb/mapping.json")).unwrap(),expected.as_bytes());
+        }
+        for body in ["environment=\n    X=1\n    ,X=2\n", "environment=\n    X=1\n    Y=2\n",
+            "environment=\n    X=1,\n    APP_LB_HOST_UPDATE_CONFIG=old\n", "environment=\n    X=1,,\n    Y=2\n"] {
+            assert!(supervisor_environment(format!("[program:app-lb]\n{body}").as_bytes(),"app-lb",Path::new("/opt/map")).is_err(),"{body}");
+        }
+        assert_eq!(supervisor_environment(b"[program:app-lb]\nenvironment=\n    X=1,\n# retained\n","app-lb",Path::new("/opt/map")).unwrap(),
+            b"[program:app-lb]\nenvironment=\n    X=1,APP_LB_HOST_UPDATE_CONFIG=\"/opt/map\"\n# retained\n");
+    }
+
+    async fn failed_preservation(m: &Manifest) -> String {
+        let mut old=m.clone(); old.target.artifact_sha256="f".repeat(64);
+        let hash=sha(&canonical(&old).unwrap());
+        let result=admit(old.clone(),&hash).await.unwrap();
+        assert_eq!(result["status"],"reconciliation_required"); assert_eq!(result["phase"],"preserving");
+        // A historical parser failure had already staged an authorized helper.
+        let bytes=read(&TEST_HOST.with(|r| r.join("running")),host_bundle::LIMIT as usize).unwrap();
+        write(&helper(&m.config),&bytes,0o700).unwrap();
+        hash
+    }
+
+    #[tokio::test]
+    async fn bootstrap_replan_preserves_old_evidence_and_replay_never_launches() {
+        let f=fixture(true).await;
+        TEST_HOST.scope(f.dir.path().to_path_buf(),async {
+            let mut m=manifest(&f).await;
+            let before=b"[program:app-lb]\ncommand=/opt/app-lb\nenvironment=\n    TOKEN=\"local,secret\"\n# preserved\n     ,OTHER=17\nautostart=true\n";
+            fs::write(&m.files[0].path,before).unwrap();
+            m.files[0].before_sha256=Some(sha(before)); m.files[0].mode=0o644;
+            m.files[0].after_base64=None; m.files[0].supervisor_environment=Some(true);
+            let old=failed_preservation(&m).await; let intent=sha(&canonical(&m).unwrap());
+            let path=journal_path(&m.config); let raw=read(&path,LIMIT*2).unwrap();
+            let inode=fs::metadata(backup(&m.config,0)).unwrap().ino();
+            let helper_inode=fs::metadata(helper(&m.config)).unwrap().ino();
+            let value=replan(m.clone(),&intent,&old).await.unwrap();
+            assert_eq!(value["phase"],"launching"); assert_eq!(value["supersedes"],old);
+            assert_eq!(read(&archived(&m.config,&old),LIMIT*2).unwrap(),raw);
+            assert_eq!(fs::metadata(backup(&m.config,0)).unwrap().ino(),inode);
+            assert_eq!(fs::metadata(helper(&m.config)).unwrap().ino(),helper_inode);
+            assert_eq!(fs::read(&m.files[0].path).unwrap(),before);
+            let j=load(&path,Some(&intent)).unwrap(); assert_ne!(staged_helper(&j),helper(&m.config));
+            assert!(replan(m.clone(),&intent,&"d".repeat(64)).await.is_err());
+            replan(m.clone(),&intent,&old).await.unwrap();
+            assert!(unblocked(&m.config).is_err());
+            apply(&path,&intent).await.unwrap();
+            assert_eq!(get(&m.config,&f.path,&m.operation_id).await.unwrap()["status"],"succeeded");
+            replan(m.clone(),&intent,&old).await.unwrap();
+            assert_eq!(fs::read_to_string(f.dir.path().join("launches")).unwrap().lines().count(),1);
+            assert_eq!(fs::read_to_string(f.dir.path().join("restarts")).unwrap(),"update app-lb\n");
+            assert_eq!(fs::read(backup(&m.config,1)).unwrap(),before);
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_replan_rejects_drift_busy_launched_and_unknown_units() {
+        for fault in ["intent","operation","files","source","generation","config","mode","backup","helper","helper-link","executor",
+            "normal","running","launching","installing","unit","new-unit","unit-error","archive","journal"] {
+            let f=fixture(false).await;
+            TEST_HOST.scope(f.dir.path().to_path_buf(),async {
+                let mut m=manifest(&f).await; let old=failed_preservation(&m).await;
+                let path=journal_path(&m.config); let mut owner=None;
+                match fault {
+                    "operation"=>m.operation_id="different-operation".into(),
+                    "files"=>m.files[0].after_base64=Some(STANDARD.encode("different AFTER")),
+                    "source"=>fs::write(&m.config.executable,"drift").unwrap(),
+                    "generation"=>fs::write(f.dir.path().join("boot-id"),"new-boot").unwrap(),
+                    "config"=>fs::write(&m.files[0].path,"drift").unwrap(),
+                    "mode"=>fs::set_permissions(&m.files[0].path,fs::Permissions::from_mode(0o600)).unwrap(),
+                    "backup"=>fs::write(backup(&m.config,1),"corrupt").unwrap(),
+                    "helper"=>fs::write(helper(&m.config),"corrupt").unwrap(),
+                    "helper-link"=>{ fs::remove_file(helper(&m.config)).unwrap(); std::os::unix::fs::symlink(f.dir.path().join("missing"),helper(&m.config)).unwrap(); }
+                    "executor"=>{ mkdir(&m.config.state_dir.join("executor")).unwrap(); owner=Some(executor_lock(&m.config.state_dir.join("executor")).unwrap()); }
+                    "normal"=>persist(&m.config,&Ledger {operations:vec![Operation {request:f.request.clone(),deployment:m.config.deployment.clone(),namespace:m.config.namespace.clone(),
+                        status:"running".into(),phase:"accepted".into(),error:None,source_invocation:String::new(),readiness_verified:false}]}).unwrap(),
+                    "running"|"launching"|"installing"=>{ let mut j=load(&path,None).unwrap(); if fault=="running" {j.status="running".into();} else {j.phase=fault.into();} save(&j).unwrap(); }
+                    "unit"=>fs::write(f.dir.path().join("existing-helper"),"").unwrap(),
+                    "new-unit"=>fs::write(f.dir.path().join("existing-helper"),format!("app-lb-bootstrap-{}.service",sha(&canonical(&m).unwrap()))).unwrap(),
+                    "unit-error"=>fs::write(f.dir.path().join("unit-probe-error"),"").unwrap(),
+                    "archive"=>{ mkdir(archived(&m.config,&old).parent().unwrap()).unwrap(); fs::create_dir(archived(&m.config,&old).with_extension("writing")).unwrap(); }
+                    "journal"=>fs::create_dir(path.with_extension("writing")).unwrap(),
+                    "intent"=>(), _=>unreachable!(),
+                }
+                let raw=read(&path,LIMIT*2).unwrap(); let intent=sha(&canonical(&m).unwrap());
+                let expected=if fault=="intent" {"e".repeat(64)} else {old};
+                assert!(replan(m.clone(),&intent,&expected).await.is_err(),"{fault}");
+                assert_eq!(read(&path,LIMIT*2).unwrap(),raw,"{fault}");
+                assert!(!f.dir.path().join("launches").exists(),"{fault}");
+                assert!(unblocked(&m.config).is_err()); drop(owner);
+            }).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_replan_replacement_faults_and_interruption_stay_fenced() {
+        for fault in ["download","helper-write","lost-launch","interrupted"] {
+            let f=fixture(false).await;
+            TEST_HOST.scope(f.dir.path().to_path_buf(),async {
+                let mut m=manifest(&f).await; let old=failed_preservation(&m).await;
+                if fault=="download" { m.target.artifact_sha256="d".repeat(64); }
+                let intent=sha(&canonical(&m).unwrap()); let path=journal_path(&m.config);
+                if fault=="helper-write" {
+                    let p=m.config.state_dir.join("bootstrap/helpers").join(&intent).with_extension("writing");
+                    mkdir(p.parent().unwrap()).unwrap(); fs::create_dir(p).unwrap();
+                }
+                if fault=="lost-launch" { fs::write(f.dir.path().join("lose-launch"),"").unwrap(); }
+                if fault=="interrupted" {
+                    // Reconstruct the durable boundary after replacement and before
+                    // staging, as observed by a new process after the owner dies.
+                    let mut j=load(&path,Some(&old)).unwrap();
+                    write(&archived(&m.config,&old),&read(&path,LIMIT*2).unwrap(),0o600).unwrap();
+                    j.manifest=m.clone(); j.intent_sha256=intent.clone(); j.supersedes=Some(old.clone());
+                    j.status="running".into(); j.error=None; save(&j).unwrap();
+                } else { replan(m.clone(),&intent,&old).await.unwrap(); }
+                let raw=read(&path,LIMIT*2).unwrap(); let j=load(&path,Some(&intent)).unwrap();
+                assert!(j.status=="reconciliation_required" || j.phase=="launching" || fault=="interrupted");
+                replan(m.clone(),&intent,&old).await.unwrap(); admit(m.clone(),&intent).await.unwrap();
+                assert_eq!(read(&path,LIMIT*2).unwrap(),raw);
+                assert!(unblocked(&m.config).is_err()); preserved(&j).unwrap();
+                assert_eq!(fs::read(&m.config.executable).unwrap(),b"\x7fELFprevious executable");
+                let launches=fs::read_to_string(f.dir.path().join("launches")).unwrap_or_default();
+                assert_eq!(launches.lines().count(),usize::from(fault=="lost-launch"));
+                assert!(!f.dir.path().join("restarts").exists());
+            }).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_replan_concurrent_intents_cannot_overwrite_owner() {
+        let f=fixture(false).await;
+        TEST_HOST.scope(f.dir.path().to_path_buf(),async {
+            let m=manifest(&f).await; let old=failed_preservation(&m).await;
+            let intent=sha(&canonical(&m).unwrap()); let mut other=m.clone(); other.target.artifact_sha256="d".repeat(64);
+            let other_intent=sha(&canonical(&other).unwrap());
+            let (a,b)=tokio::join!(replan(m.clone(),&intent,&old),replan(other,&other_intent,&old));
+            assert_eq!(a.unwrap()["phase"],"launching"); assert!(b.is_err());
+            let j=load(&journal_path(&m.config),Some(&intent)).unwrap();
+            assert_eq!(sha(&read(&staged_helper(&j),host_bundle::LIMIT as usize).unwrap()),m.helper_sha256);
+            assert!(!m.config.state_dir.join("bootstrap/helpers").join(other_intent).exists());
+            assert_eq!(fs::read_to_string(f.dir.path().join("launches")).unwrap().lines().count(),1);
+        }).await;
     }
 
     #[tokio::test]

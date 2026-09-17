@@ -127,6 +127,7 @@ The new binary exposes these commands (one redacted JSON object on stdout):
 ```text
 app-lb --bootstrap-host-update inspect /absolute/desired-config.json
 app-lb --bootstrap-host-update admit /absolute/manifest.json INTENT_SHA256
+app-lb --bootstrap-host-update replan /absolute/manifest.json NEW_INTENT_SHA256 EXPECTED_OLD_INTENT_SHA256
 app-lb --bootstrap-host-update status /absolute/state/bootstrap.json INTENT_SHA256
 app-lb --bootstrap-host-update apply /absolute/state/bootstrap.json INTENT_SHA256
 ```
@@ -178,8 +179,11 @@ name alone. A predecessor already configured for normal host updates is refused.
   and unchanged mode. No existing secrets appear in the manifest or output.
 
 The native Supervisor edit requires one effective, ungrouped `[program:name]`
-definition with single-line settings. Duplicate sections/environment keys, continuation
-lines, inline environment comments, ambiguous quotes, pre-existing mapping
+definition. Its environment may continue on indented lines, including leading
+commas and intervening blank/comment lines. The edit appends at the final physical
+value line without rewriting any existing bytes. Other multiline settings,
+duplicate sections/environment keys, missing separators, inline environment
+comments, ambiguous quotes, pre-existing mapping
 assignment, and colon delimiters are rejected. Mapping path characters are
 restricted to ASCII letters/digits and `/_.-` to avoid interpolation/quoting
 ambiguity. Other environment values and CRLF/LF endings remain untouched.
@@ -205,6 +209,22 @@ program, requires `reread` to report only that program changed, then issues
 disk, workspace or unrelated program is touched. Original bytes are retained
 indefinitely; no rollback, automatic relaunch, cancellation/unpin or partial
 install resume is provided.
+
+`replan` is the sole explicit exception to the different-intent conflict. It
+requires the exact old intent in `reconciliation_required` / `preserving`, the
+same operation, Config/state directory, source, mapping path and file actions.
+Only helper/target identities may change. It verifies unchanged predecessor
+generation/executable/config bytes and modes, intact backups and staged helper,
+no unresolved normal operation, and successful `systemctl show` probes returning
+exact `LoadState=not-found` values for both helper units. Errors or existing
+terminal units are not absence. Executor exclusion covers inspection through
+staging; the ledger CAS archives the old journal at
+`state_dir/bootstrap/replans/<old-intent>.json` and atomically replaces the
+active intent before further effects. Original backups and helpers remain pinned;
+the new helper uses `state_dir/bootstrap/helpers/<new-intent>`. Output includes
+`supersedes`. Exact replays only return state, including after interruption or a
+lost launch reply. Running preservation, launch/install and uncertain phases
+cannot be replanned. Never bypass a fence by changing state directories or IDs.
 
 Only authenticated namespace-admin GET
 `/deployments/:id/update/bootstrap/:operation_id` in the installed replacement
