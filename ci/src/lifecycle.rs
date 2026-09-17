@@ -75,6 +75,16 @@ impl Lifecycle {
             return Err(format!("rollout {id} cannot quiesce from phase {phase:?}"));
         }
 
+        let cleanup: Vec<String> = sqlx::query_scalar("SELECT sandbox_id FROM ci_vm_cleanup ORDER BY created_at LIMIT 5")
+            .fetch_all(&mut *tx).await.map_err(|e| e.to_string())?;
+        if !cleanup.is_empty() {
+            sqlx::query("UPDATE ci_service_deployment SET message=$2,updated_at=now() WHERE id=$1")
+                .bind(id).bind(format!("Waiting for verified VM cleanup (automatic retries): {}", cleanup.join(", ")))
+                .execute(&mut *tx).await.map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+
         // Running jobs count even when their parent failed, except a native
         // lease that expired on a terminal run: native endpoints fence every
         // heartbeat/completion/upload, and poll cannot lease that run again.

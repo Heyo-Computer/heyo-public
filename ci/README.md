@@ -57,14 +57,31 @@ Linux tests and release compilation have separate steps with explicit 60-minute
 limits: the two-hour job limit does not override the default 30-minute step limit.
 
 The `ci-linux` artifact also supports branch deployment without a merge or rebuild.
-On an existing CI/NATS runtime image, pin that successful run's artifact digest
+On a CI runtime image, pin that successful run's artifact digest
 as a read-only app-lb mount at `/opt/ci-release`, with `strip_components: 1`.
 `deploy/start-artifact.sh` verifies `CI_EXPECTED_SHA` and `SHA256SUMS`, installs
-the CI binary into the runtime, and starts its existing supervisor on every boot.
+the CI binary into the runtime, and executes CI directly on every boot. It never
+calls a baked-in supervisor that might start or stop NATS. `CI_NATS_URL` is required;
+NATS must run as an independent service with its own persistent JetStream volume.
 It requires a separately mounted persistent state directory with a
 `.managed-state` marker containing `ci-state-v1`; it refuses an empty or rootfs
 fallback rather than silently losing CI history. Arguments are the release,
 runtime, and state directories. This boot wrapper is included in new artifacts.
+Self-deployment installs this CI-only boot command and refuses a missing or
+loopback broker URL. It preserves the broker configuration rather than changing
+or replacing NATS during CI deployment.
+
+For a previously bundled installation, fence submissions and stop producers and
+consumers before moving broker state. Inventory streams, consumers, pending
+messages and acknowledgement positions; take a verified JetStream backup and
+restore it into the independent broker's dedicated persistent volume. Preserve
+account/subject names and credentials. Never concurrently mount CI's existing
+writable workspace into the broker VM, and never copy a live JetStream directory
+as if it were a consistent backup. Retain the old data untouched for rollback.
+Verify the restored stream/consumer state and authenticated connectivity before
+switching `CI_NATS_URL` and launching CI alone. After accepting new writes, the
+old backup is no longer a lossless rollback target. Test CI restart with broker
+identity, uptime and pending messages unchanged before reopening submissions.
 
 For an existing rootfs-only installation, wait for jobs to finish, fence public
 traffic with app-lb's 503 maintenance mode, and confirm no work remains before
@@ -94,10 +111,11 @@ Configure `ORCHESTRATOR_URL`,
 workflow's HeyoSecret scope. The workflow inserts only the finalized archive ID
 into that spec. The target must supply external Postgres/NATS and durable CI
 workspace/log/artifact storage. This archive does **not** replace the stateful
-CI/NATS bundle by itself: it contains no broker. For the new us3 installation,
-`ci/Dockerfile.firecracker` packages CI and NATS together and
-`.heyo/regions/us3/ci.json` defines the app-lb deployment. Subsequent artifact
-promotions retain the managed CI workspace and external database.
+CI/NATS bundle by itself: it contains no broker. For a new us3 installation,
+`ci/Dockerfile.firecracker` packages CI only and `.heyo/regions/us3/ci.json`
+defines the app-lb deployment with an explicit external broker placeholder.
+Provision independent NATS before starting CI. Subsequent artifact promotions
+retain the managed CI workspace, external database and broker configuration.
 
 ## Submitting a build
 
@@ -748,6 +766,36 @@ about somebody stopping the run, so it does not convert a cancellation into a
 success — and the executor does not write `failure` over it, which would make a
 deliberate stop read as a broken build.
 
+### VM cleanup survives a failed connection
+
+After execution finishes, CI atomically records the terminal job outcome and a
+`ci_vm_cleanup` obligation for its exact runner, VM and attempt. The same handoff
+handles a VM acquired after its job was cancelled. The VM stays claimed until a
+fresh daemon read confirms that exact VM is stopped. Non-reusable or corrupted
+VMs also require confirmed removal before CI forgets their pool record.
+
+Cleanup retries during normal operation and controller drain, including after
+controller restart. A failed request evicts the cached runner connection and
+records its error and next retry time. Each pass handles one due obligation with
+a 20-second timeout; the background loop runs every 30 seconds. Concurrent
+workers serialize on the durable obligation. Expired leases do not make these
+VMs available to another job. Controller deployment messages name cleanup VMs
+blocking drain; confirmed cleanup releases that barrier automatically.
+
+Placement also evicts its cached runner connection when a capacity measurement
+fails, so the next delivery redials instead of repeating a request over a dead
+tunnel. A valid zero/low free-space reading does not evict the connection or
+bypass the job's disk requirement.
+
+Cancellation, failed-job status and lease age **do not authorize cleanup** on
+their own. CI must have the executor's durable handoff and matching pool
+ownership. Existing named/service VMs are excluded. Upgrade all dispatchers
+sharing a VM pool before relying on this protection: older orphan-reclaim code
+does not understand cleanup obligations. Legacy claims, interrupted acquisition
+and crashes before handoff are not retroactively declared safe; they still need
+ownership reconciliation. Do not clear their claims or delete VMs based only on
+a `ci-` name or terminal job status.
+
 ## Re-running a run
 
 Two buttons on a finished run's page, and the routes behind them:
@@ -879,6 +927,12 @@ warm cache because the runner blinked is the most expensive thing this code can
 do. A daemon that answers and does not know the VM, or cannot start it, is a
 verdict: the VM is destroyed and a fresh one built. Destroyed rather than merely
 forgotten, because a forgotten stopped VM is disk nothing will ever reclaim.
+
+Runner connections retain ownership of their forwarding listener throughout
+source preparation, image builds, VM execution, and teardown. Evicting a failed
+cached connection makes subsequent work redial without closing the listener
+under other active jobs. This does not recover a genuinely broken remote link
+or replay a command whose outcome is unknown.
 
 ### A VM being created is on the page too
 

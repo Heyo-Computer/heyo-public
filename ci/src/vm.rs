@@ -542,11 +542,12 @@ impl Vms {
     /// that runner's tunnel. Issues no network call.
     pub async fn open(
         &self,
-        options: HeyoClientOptions,
+        options: impl Into<crate::runners::Connection>,
         sandbox_id: String,
     ) -> Result<Vm, VmError> {
+        let connection = options.into();
         let sandbox =
-            Sandbox::connect(sandbox_id.clone(), options).map_err(|e| VmError::Daemon {
+            Sandbox::connect(sandbox_id.clone(), connection.options.clone()).map_err(|e| VmError::Daemon {
                 sandbox: sandbox_id.clone(),
                 what: "connecting to the sandbox",
                 source: e,
@@ -556,18 +557,20 @@ impl Vms {
             sandbox,
             id: sandbox_id,
             lock,
+            _connection: connection,
         })
     }
 
     /// Create a VM on a runner and wait for it to be genuinely runnable.
     pub async fn create(
         &self,
-        options: HeyoClientOptions,
+        options: impl Into<crate::runners::Connection>,
         name: &str,
         spec: &VmSpec,
         ttl: Duration,
         boot_timeout: Duration,
     ) -> Result<Vm, VmError> {
+        let connection = options.into();
         let opts = SandboxCreateOptions {
             name: Some(name.to_string()),
             driver: Some(spec.driver),
@@ -592,7 +595,7 @@ impl Vms {
         // `setup_hooks`, `disk_size_gb`, `working_directory`, `env_vars` and
         // `ttl_seconds` straight through (mvm-ctrl/src/api.rs:2449). So the whole
         // `vm:` block lands, and none of it is silently defaulted.
-        let sandbox = Sandbox::create(opts, options)
+        let sandbox = Sandbox::create(opts, connection.options.clone())
             .await
             .map_err(|e| VmError::Create {
                 name: name.to_string(),
@@ -601,7 +604,7 @@ impl Vms {
 
         let id = sandbox.sandbox_id().to_string();
         let lock = self.lock_for(&id).await;
-        let vm = Vm { sandbox, id, lock };
+        let vm = Vm { sandbox, id, lock, _connection: connection };
         // `create` already waited, but waiting is not the same as running — see
         // trap 1. Assert before handing the VM to a job.
         vm.ensure_running(boot_timeout).await?;
@@ -614,6 +617,7 @@ pub struct Vm {
     sandbox: Sandbox,
     id: String,
     lock: Arc<Mutex<()>>,
+    _connection: crate::runners::Connection,
 }
 
 impl Vm {
