@@ -61,7 +61,7 @@ fn absolute(path: &str) -> bool {
 
 fn prepare(plan: Plan, inspection: Inspection, archive: &[u8]) -> Result<Vec<u8>> {
     ensure!(!plan.operation_id.is_empty() && plan.operation_id.len() <= 128
-        && plan.operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+        && plan.operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
         "invalid bootstrap operation ID");
     ensure!(bundle::valid_sha(&plan.revision, 40), "invalid build revision");
     ensure!(inspection.protocol == "host-app-lb-bootstrap-v1"
@@ -200,9 +200,10 @@ mod tests {
 
     #[test]
     fn mismatched_inspection_edit_or_mapping_never_produces_a_manifest() {
-        for case in ["source", "coverage", "order", "mode", "absent", "mixed", "false", "mapping", "duplicate", "unknown"] {
+        for case in ["operation", "source", "coverage", "order", "mode", "absent", "mixed", "false", "mapping", "duplicate", "unknown"] {
             let (mut plan, mut inspection, archive) = fixture();
             match case {
+                "operation" => plan["operation_id"] = json!("bootstrap.1"),
                 "source" => inspection["source"]["running_sha256"] = json!("e".repeat(64)),
                 "coverage" => { inspection["files"].as_array_mut().unwrap().pop(); }
                 "order" => inspection["files"].as_array_mut().unwrap().swap(1, 2),
