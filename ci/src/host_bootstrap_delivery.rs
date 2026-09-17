@@ -49,29 +49,30 @@ fn result(job: &Value, id: &str) -> Result<Value> {
 }
 
 async fn deliver(http: &reqwest::Client, target: &Target, token: &str, path: &Path, state: &mut Value) -> Result<Value> {
+    let authorization = host_bootstrap::operator_authorization(token)?;
     let id = state["spec"]["id"].as_str().unwrap().to_owned();
     let base = target.url.trim_end_matches('/');
     if state["delivery_armed"] != true {
-        let response = http.get(format!("{base}/deployments/{id}")).bearer_auth(token).send().await?;
+        let response = http.get(format!("{base}/deployments/{id}")).header(reqwest::header::AUTHORIZATION, &authorization).send().await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             // Never mutate an existing ID. This fresh ID is saved before registration.
-            body(http.post(format!("{base}/deployments")).bearer_auth(token).json(&state["spec"]).send().await?).await?;
+            body(http.post(format!("{base}/deployments")).header(reqwest::header::AUTHORIZATION, &authorization).json(&state["spec"]).send().await?).await?;
         } else {
             ensure!(same_spec(&body(response).await?["spec"], &state["spec"]), "launcher recipe conflict");
         }
-        let actual = body(http.get(format!("{base}/deployments/{id}")).bearer_auth(token).send().await?).await?;
+        let actual = body(http.get(format!("{base}/deployments/{id}")).header(reqwest::header::AUTHORIZATION, &authorization).send().await?).await?;
         ensure!(same_spec(&actual["spec"], &state["spec"]), "registered launcher differs");
         state["delivery_armed"] = json!(true);
         save(path, state)?;
         // No retries/redirects. Failure or lost response leaves delivery armed.
-        let job = body(http.post(format!("{base}/deployments/{id}/update")).bearer_auth(token).send().await?).await?;
+        let job = body(http.post(format!("{base}/deployments/{id}/update")).header(reqwest::header::AUTHORIZATION, &authorization).send().await?).await?;
         ensure!(job["deployment"] == id, "unexpected launcher job");
         state["job_id"] = job["id"].clone();
         save(path, state)?;
     }
     let job_id = state["job_id"].as_str().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b,b'-'|b'_')))
         .ok_or_else(|| anyhow::anyhow!("delivery armed without a receipt; use native GET reconciliation, never resend"))?;
-    let job = body(http.get(format!("{base}/jobs/{job_id}")).bearer_auth(token).send().await?).await?;
+    let job = body(http.get(format!("{base}/jobs/{job_id}")).header(reqwest::header::AUTHORIZATION, &authorization).send().await?).await?;
     let value = result(&job, &id)?;
     state["result"] = value.clone();
     save(path, state)?;
@@ -79,7 +80,8 @@ async fn deliver(http: &reqwest::Client, target: &Target, token: &str, path: &Pa
 }
 
 pub async fn run(alias: &str, phase: &str, input: &Path, archive: &Path, journal: &Path, targets: Option<&str>, token: &str) -> Result<Value> {
-    ensure!(!token.trim().is_empty() && matches!(phase,"inspect"|"admit"), "credential and inspect/admit phase required");
+    host_bootstrap::operator_authorization(token)?;
+    ensure!(matches!(phase,"inspect"|"admit"), "inspect/admit phase required");
     let target = crate::host_app_lb::mapping(targets, alias)?;
     let original = host_bootstrap::read(input, 4 * 1024 * 1024)?;
     let value: Value = serde_json::from_slice(&original)?;

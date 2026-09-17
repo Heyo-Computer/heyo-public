@@ -1587,7 +1587,11 @@ update endpoint, which is deliberately disabled.
 completion check once, without loading the CI database or broker. `TARGET` must
 exist in operator-owned `CI_HOST_APP_LB_TARGETS`; supply its namespace-admin
 credential through `CI_HOST_APP_LB_TOKEN` from the managed secret configuration,
-not a command argument. The manifest bytes must match the previously recorded
+not a command argument. Existing operator Basic credentials are also supported
+through `CI_HOST_APP_LB_USER` and `CI_HOST_APP_LB_PASSWORD` when no bearer token
+is supplied; no new token or access-control change is required. These credentials
+are sent only to the mapped admin endpoint, never public health or artifacts.
+The manifest bytes must match the previously recorded
 hash and the target's deployment, namespace and public health URL.
 
 The command checks the authenticated native receipt's operation, intent, source,

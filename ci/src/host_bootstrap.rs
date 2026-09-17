@@ -140,8 +140,16 @@ pub fn run(plan: &Path, inspection: &Path, archive: &Path, output: &Path) -> Res
     Ok(json!({"status":"prepared","intent_sha256":bundle::sha(&manifest),"manifest_path":output}))
 }
 
+pub(super) fn operator_authorization(token: &str) -> Result<String> {
+    if !token.trim().is_empty() { return Ok(format!("Bearer {token}")); }
+    let user = std::env::var("CI_HOST_APP_LB_USER").unwrap_or_default();
+    let password = std::env::var("CI_HOST_APP_LB_PASSWORD").unwrap_or_default();
+    ensure!(!user.is_empty() && !user.contains(':') && !password.is_empty(), "managed host operator credentials required");
+    Ok(format!("Basic {}", STANDARD.encode(format!("{user}:{password}"))))
+}
+
 pub async fn check(path: &Path, intent: &str, alias: &str, targets: Option<&str>, token: &str) -> Result<Value> {
-    ensure!(!token.trim().is_empty(), "CI_HOST_APP_LB_TOKEN is required");
+    let authorization = operator_authorization(token)?;
     let target = crate::host_app_lb::mapping(targets, alias)?;
     let bytes = read(path, LIMIT)?;
     ensure!(bundle::valid_sha(intent, 64) && bundle::sha(&bytes) == intent, "manifest differs from recorded intent");
@@ -161,7 +169,7 @@ pub async fn check(path: &Path, intent: &str, alias: &str, targets: Option<&str>
     // A missing operation, old controller, timeout or busy helper never causes
     // an admission POST. The native GET alone may persist verified completion.
     let mut response = http.get(format!("{}/deployments/{}/update/bootstrap/{id}", target.url.trim_end_matches('/'), target.deployment))
-        .bearer_auth(token).send().await.map_err(|_| anyhow::anyhow!("bootstrap lookup unavailable; no launch attempted"))?;
+        .header(reqwest::header::AUTHORIZATION, authorization).send().await.map_err(|_| anyhow::anyhow!("bootstrap lookup unavailable; no launch attempted"))?;
     ensure!(response.status().is_success(), "bootstrap lookup returned {}; no launch attempted", response.status());
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| anyhow::anyhow!("bootstrap lookup interrupted"))? {
