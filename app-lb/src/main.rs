@@ -27,6 +27,8 @@ mod federated;
 mod feed;
 mod guard;
 mod health;
+mod host_bundle;
+mod host_update;
 mod incus;
 mod jobs;
 mod jwt;
@@ -284,6 +286,7 @@ fn init_tracing(events: Option<obs::LogSink>) {
 }
 
 fn main() {
+    if let Some(code) = host_update::helper_main() { std::process::exit(code); }
     // Before the subscriber, because shipping app-lb's own events means adding a
     // layer to it, and a subscriber can only be built once. Reads the environment
     // and allocates a channel — no threads, nothing that a later fork would lose.

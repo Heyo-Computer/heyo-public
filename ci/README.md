@@ -1480,6 +1480,51 @@ but failed/uncertain finalization never authorizes a deployment. Publication,
 release and deployment state write NATS outbox events transactionally. These
 actions do not change app-lb, namespaces, existing VM pages, or Retail.
 
+### Host app-lb executable rollout
+
+`ci/rollout-host-app-lb` is a release-only action with `target`, secret `token`,
+`workflow` (frozen validation workflow path), and `artifact` (bundle name).
+Job/step `continue-on-error` is rejected for this action.
+It does not accept paths, service names, commands, revisions, or digests from
+the workflow. The operator supplies `CI_HOST_APP_LB_TARGETS` as JSON:
+
+```json
+{
+  "eu1": {
+    "repository": "https://github.com/Heyo-Computer/heyo-public.git",
+    "url": "https://admin.eu1.heyo.work",
+    "deployment": "app-lb-host-controller",
+    "namespace": "default",
+    "health_url": "https://admin.eu1.heyo.work/healthz"
+  }
+}
+```
+
+This example does not enable a target or release workflow. The host requires
+the matching operator-owned [host update mapping](../app-lb/README.md#correlated-host-executable-rollout)
+and bootstrapped correlated API/helper support. API and health URLs require
+HTTPS; redirects are never followed. Host and CI must agree on the configured
+artifact store and public health URL. The validated blob must be public for
+the helper's credential-free pinned download.
+
+The action uses successful frozen artifact membership at the exact confirmed
+merged SHA, verifies the bounded bundle and derives its executable digest from
+`dist/app-lb`, `dist/REVISION`, and `dist/SHA256SUMS`. It stores the immutable
+request, original executable/configuration hashes and deadline in Postgres
+before POST. Secrets and live host configuration are not persisted.
+
+Every reconciliation first GETs the same operation ID. Admission and systemd
+launch success do not complete a job: CI requires exact operation identity,
+verified replacement completion and a separate public 2xx health response with
+the exact immutable `x-heyo-revision`. Cancellation/deadline fences late success
+and prevents further admission, but does not roll back already accepted work.
+An uncertain helper launch/switch remains blocked for operator reconciliation,
+never retried as a different operation or through legacy commands.
+
+This action does not provide regional ordering by itself. Parent release jobs
+must use sequential `needs` edges and must not tolerate rollout failure. No
+repository workflows are enabled by this primitive.
+
 ### Service deployments
 
 For candidate-first updates of existing stateless app-lb services, use

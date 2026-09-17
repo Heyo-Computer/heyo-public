@@ -23,6 +23,7 @@ mod config;
 mod controller_rollout;
 mod dispatch;
 mod expr;
+mod host_app_lb;
 mod host_maintenance;
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;

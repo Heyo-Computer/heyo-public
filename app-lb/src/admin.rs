@@ -4846,12 +4846,50 @@ async fn start_update(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if std::env::var_os("APP_LB_HOST_UPDATE_CONFIG").is_some() {
+        match crate::host_update::configured() {
+            Ok((_, config)) if config.deployment != id => {}
+            _ => return err(StatusCode::CONFLICT, "mapped host requires correlated /update/rollouts, not legacy commands").into_response(),
+        }
+    }
     match state.jobs.start_update(&id) {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "host update started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
         }
         Err(e) => job_start_error(e),
+    }
+}
+
+fn host_update_mapping(state: &AdminState, caller: &Caller, id: &str) -> Result<(std::path::PathBuf, crate::host_update::Config), Response> {
+    let (path, config) = crate::host_update::configured().map_err(|e| err(StatusCode::CONFLICT, e).into_response())?;
+    let d = state.registry.get(id).ok_or_else(|| err(StatusCode::NOT_FOUND, "deployment not found").into_response())?;
+    if config.deployment != id || config.namespace != d.spec.namespace || !recovery_authorized(caller, &d.spec) {
+        return Err(forbidden("authenticated mapped namespace admin required"));
+    }
+    Ok((path, config))
+}
+
+async fn host_update_snapshot(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path(id): Path<String>) -> Response {
+    let (_, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::snapshot(&config).await {
+        Ok(value) => Json(value).into_response(), Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+async fn start_host_rollout(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path(id): Path<String>, Json(request): Json<crate::host_update::Request>) -> Response {
+    let (path, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::start(&path, &config, request).await {
+        Ok(value) => (StatusCode::ACCEPTED, Json(value)).into_response(), Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+async fn get_host_rollout(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path((id, operation)): Path<(String,String)>) -> Response {
+    let (_, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::get(&config, &operation).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) if e == "operation not found" => err(StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     }
 }
 
@@ -5040,6 +5078,8 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/pull", post(start_pull))
         .route("/deployments/:id/mounts/pull", post(start_mount_pull))
         .route("/deployments/:id/update", post(start_update))
+        .route("/deployments/:id/update/rollouts", get(host_update_snapshot).post(start_host_rollout))
+        .route("/deployments/:id/update/rollouts/:operation", get(get_host_rollout))
         .route("/deployments/:id/jobs", get(deployment_jobs))
         .route("/jobs", get(list_jobs))
         .route("/jobs/:job_id", get(get_job))

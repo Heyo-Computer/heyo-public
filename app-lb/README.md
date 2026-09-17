@@ -111,6 +111,97 @@ multi-process database. Retained history requires explicit operator reconciliati
 before deregistration. This endpoint does not migrate external ingress or coordinate
 regions; the caller must wait for both success flags before rolling the next region.
 
+## Correlated host executable rollout
+
+This is a separate operation from VM/service rollout. It replaces **only the
+running host app-lb executable**, retaining its predecessor indefinitely. It
+does not install bundled units/configuration/heyctl, recreate VMs, purge disks,
+or change workspace state. Bootstrap this API/helper once through the existing
+managed platform update process before enabling CI callers. Unstamped builds
+(`x-heyo-revision: unknown`) cannot complete a correlated rollout.
+
+Disabled by default. `APP_LB_HOST_UPDATE_CONFIG` must name an absolute,
+operator-owned JSON file, inaccessible to workflow writes, for example:
+
+```json
+{
+  "deployment": "app-lb-host-controller",
+  "namespace": "default",
+  "executable": "/usr/local/bin/app-lb-eu1",
+  "process": {"kind": "systemd", "unit": "app-lb-eu1.service"},
+  "state_dir": "/var/lib/heyo-eu1/app-lb/host-updates",
+  "artifact_store": "https://artifacts.eu1.heyo.work",
+  "health_url": "https://admin.eu1.heyo.work/healthz",
+  "config_files": ["/etc/systemd/system/app-lb-eu1.service", "/etc/heyo/app-lb-eu1.env"]
+}
+```
+
+These are example values, not defaults or a provisioning command. A Supervisor
+installation instead uses `"process":{"kind":"supervisor","program":"app-lb"}`.
+It restarts **only that program**, never `supervisor.service`. `config_files`
+must explicitly enumerate all effective startup/unit/include/environment files;
+their contents are hashed, never sent to CI. Do not list mutable deployment or
+workspace state. Mapping/config changes and source binary drift invalidate the
+conditional request. Supervisor requires its already-loaded configuration to
+match these files; operators must not concurrently change/reload supervision.
+The controller and independent helper must resolve the same default
+`supervisorctl` configuration/socket; every supervisor command explicitly runs
+from `/` in both processes. Non-default client layouts are unsupported, and
+the reserved multi-program target `all` and option-like targets are rejected.
+
+Supported hosts are Linux with local durable storage, one controller owning the
+mapped executable, and permission to run `/usr/bin/systemd-run` and the mapped
+`/usr/bin/systemctl` or `/usr/bin/supervisorctl` operation. Mapping, executable
+directory, and state directory must be trusted root-owned locations. Pre-create
+the state directory durably, on a filesystem that allows helper execution.
+Symlink executables and arbitrary shell commands
+are unsupported. No privilege changes or units are provisioned by this feature.
+The supervisor-reported PID must be this app-lb process, not a wrapper/parent.
+
+Authenticated namespace admins use GET `/deployments/:id/update/rollouts` for
+`protocol:host-app-lb-v1`, `binary_sha256`, `config_sha256`, and mapped public
+health/artifact URLs. POST the same path with:
+
+```json
+{
+  "operation_id": "ci-host-stable-id",
+  "expected_binary_sha256": "<GET source SHA256>",
+  "expected_config_sha256": "<GET configuration SHA256>",
+  "artifact_sha256": "<validated public bundle SHA256>",
+  "binary_sha256": "<derived dist/app-lb SHA256>",
+  "revision": "<exact validated 40-character Git SHA>"
+}
+```
+
+GET `/deployments/:id/update/rollouts/:operation_id` returns the exact `request`,
+deployment/namespace, status, phase, error and `readiness_verified`. IDs are
+1–128 ASCII letters/digits/hyphens/underscores. Different replay payloads
+conflict. The mapped deployment cannot use legacy uncorrelated `/update`.
+
+Admission persists before staging or launch. Downloads use the configured
+HTTPS public blob store, never redirects or workflow-selected URLs. Both CI
+and app-lb verify the archive digest, unique regular `dist/app-lb`, exact
+`dist/REVISION`, and `dist/SHA256SUMS`; links, special files, traversal,
+duplicate identity entries, and expansion beyond 256 MiB are rejected.
+Only the verified executable is written; tar paths are never extracted.
+
+The operation retains `.previous` and `.candidate` bytes, syncs files and
+directories, then launches a stable-name independent systemd helper using the
+previous executable. The helper checks source process/configuration again,
+records switch intent, atomically renames a same-directory executable, syncs,
+and restarts only the mapped process. Completion requires a new process start
+identity, exact running/on-disk executable hash, immutable compiled revision,
+unchanged mapped configuration, and public 2xx health with that exact header.
+Command success or generic health is never sufficient.
+
+Interrupted staging/launch with no definitive helper evidence remains fenced;
+replay **does not launch again**. A surviving helper can finish across HTTP
+process restart; GET reconciles the replacement. Ambiguous switch/restart or
+failure never triggers rollback, unit recycling, or VM deletion. CI cancellation
+stops waiting, not accepted remote work. Inspect the recorded operation and
+its stable helper unit before operator reconciliation; do not remove its ledger
+to manufacture a retry. There is intentionally no force/unlock shortcut.
+
 ## Recover a retained workspace lineage
 
 `POST /deployments/:id/workspace/recoveries` explicitly selects a stopped retained
