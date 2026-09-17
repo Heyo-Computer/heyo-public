@@ -180,10 +180,11 @@ name alone. A predecessor already configured for normal host updates is refused.
 
 The native Supervisor edit requires one effective, ungrouped `[program:name]`
 definition. Its environment may continue on indented lines, including leading
-commas and intervening blank/comment lines. The edit appends at the final physical
-value line without rewriting any existing bytes. Other multiline settings,
-duplicate sections/environment keys, missing separators, inline environment
-comments, ambiguous quotes, pre-existing mapping
+commas and intervening blank/comment lines. Whitespace-prefixed `;` and `#`
+inline comments follow Supervisor's ConfigParser rules (before quote parsing).
+The edit appends before the final physical value line's comment, preserving
+existing bytes and spacing. Other multiline settings, duplicate
+sections/environment keys, missing separators, ambiguous quotes, pre-existing mapping
 assignment, and colon delimiters are rejected. Mapping path characters are
 restricted to ASCII letters/digits and `/_.-` to avoid interpolation/quoting
 ambiguity. Other environment values and CRLF/LF endings remain untouched.

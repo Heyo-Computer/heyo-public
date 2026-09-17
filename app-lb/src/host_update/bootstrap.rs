@@ -405,7 +405,16 @@ fn supervisor_environment(before: &[u8], program: &str, mapping: &Path) -> Resul
     let mut env: Option<(usize,String)>=None;
     let mut previous: Option<(usize,bool)>=None;
     for line in text.split_inclusive('\n') {
-        let body=line.trim_end_matches(['\r','\n']); let trimmed=body.trim();
+        let body=line.trim_end_matches(['\r','\n']);
+        // Supervisor configures ConfigParser with both inline prefixes. It
+        // strips them before parsing quotes, but only after whitespace (or at
+        // column zero). Keep the raw suffix and insert before its whitespace.
+        let mut previous_char=None;
+        let comment=body.char_indices().find_map(|(i,ch)| {
+            let found=matches!(ch,';'|'#') && previous_char.is_none_or(char::is_whitespace);
+            previous_char=Some(ch); found.then_some(i)
+        }).unwrap_or(body.len());
+        let content=body[..comment].trim_end(); let trimmed=content.trim();
         if trimmed.starts_with('[') {
             active=trimmed == section;
             if active {
@@ -418,7 +427,7 @@ fn supervisor_environment(before: &[u8], program: &str, mapping: &Path) -> Resul
             if let Some((base,is_env))=previous.filter(|(base,_)| indent>*base) {
                 if !is_env { return Err("ambiguous non-environment continuation".into()); }
                 let (end,value)=env.as_mut().ok_or("missing environment option")?;
-                value.push('\n'); value.push_str(trimmed); *end=offset+body.len();
+                value.push('\n'); value.push_str(trimmed); *end=offset+content.len();
                 previous=Some((base,true)); offset+=line.len(); continue;
             }
             previous=Some((indent,false));
@@ -428,7 +437,7 @@ fn supervisor_environment(before: &[u8], program: &str, mapping: &Path) -> Resul
             if let Some((key,value))=trimmed.split_once('=') {
                 if key.trim().eq_ignore_ascii_case("environment") {
                     if env.is_some() { return Err("duplicate Supervisor environment".into()); }
-                    env=Some((offset+body.len(),value.into())); previous=Some((indent,true));
+                    env=Some((offset+content.len(),value.into())); previous=Some((indent,true));
                 }
             }
         }
@@ -862,11 +871,23 @@ esac
         let path=Path::new("/opt/app-lb/mapping.json");
         assert_eq!(supervisor_environment(b"[program:app-lb]\r\ncommand=x\r\n[program:other]\r\ncommand=y\r\n","app-lb",path).unwrap(),
             b"[program:app-lb]\r\nenvironment=APP_LB_HOST_UPDATE_CONFIG=\"/opt/app-lb/mapping.json\"\r\ncommand=x\r\n[program:other]\r\ncommand=y\r\n");
-        for body in ["environment=X=1\n  Y=2\n","environment=X=1 ; comment\n","environment=X=\"unterminated\n",
+        for body in ["environment=X=1\n  Y=2\n","environment=X=\"value ; truncated quote\"\n","environment=X=\"unterminated\n",
             "environment: X=1\n","environment=X=1\nenvironment=Y=2\n","environment=APP_LB_HOST_UPDATE_CONFIG=old\n",
             "environment=X=1,X=2\n","[program:app-lb]\n","command=foo\n  environment=X=1\n"] {
             assert!(supervisor_environment(format!("[program:app-lb]\n{body}").as_bytes(),"app-lb",path).is_err(),"{body}");
         }
+    }
+
+    #[test]
+    fn bootstrap_environment_inline_comments_follow_supervisor() {
+        let before="[program:app-lb]\nenvironment=\n    TOKEN=\"secret;punctuation#kept\", ; comment, not a value\n    CERT=\"/tls/cert\"\t# another comment\n    ,DIR=\"/state\"  ; final; comment\n# trailing comment\nautostart=true\n";
+        for newline in ["\n","\r\n"] {
+            let before=before.replace('\n',newline);
+            let expected=before.replace("DIR=\"/state\"", "DIR=\"/state\",APP_LB_HOST_UPDATE_CONFIG=\"/opt/map\"");
+            assert_eq!(supervisor_environment(before.as_bytes(),"app-lb",Path::new("/opt/map")).unwrap(),expected.as_bytes());
+        }
+        assert_eq!(supervisor_environment(b"[program:app-lb]\nenvironment=X=1 ; retained\n","app-lb",Path::new("/opt/map")).unwrap(),
+            b"[program:app-lb]\nenvironment=X=1,APP_LB_HOST_UPDATE_CONFIG=\"/opt/map\" ; retained\n");
     }
 
     #[test]
