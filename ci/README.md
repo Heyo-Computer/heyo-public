@@ -764,6 +764,11 @@ workers serialize on the durable obligation. Expired leases do not make these
 VMs available to another job. Controller deployment messages name cleanup VMs
 blocking drain; confirmed cleanup releases that barrier automatically.
 
+Placement also evicts its cached runner connection when a capacity measurement
+fails, so the next delivery redials instead of repeating a request over a dead
+tunnel. A valid zero/low free-space reading does not evict the connection or
+bypass the job's disk requirement.
+
 Cancellation, failed-job status and lease age **do not authorize cleanup** on
 their own. CI must have the executor's durable handoff and matching pool
 ownership. Existing named/service VMs are excluded. Upgrade all dispatchers

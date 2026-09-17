@@ -1019,6 +1019,12 @@ impl Runners {
             struct Storage { free_bytes: u64 }
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(response.json::<Storage>().await?.free_bytes)
         }.await;
+        if result.is_err() {
+            // Placement failures happen before run_claimed, so its transport
+            // recovery never sees them. Do not retry the same dead tunnel on
+            // every delivery. Existing VMs retain their own connection owner.
+            self.evict(runner_id).await;
+        }
         result.map_err(|e| RunnerError::Unreachable {
             runner: runner_id.to_string(),
             reason: format!("GET /storage free-space measurement failed: {e}"),
@@ -1814,12 +1820,22 @@ mod tests {
         config.heyvm.local_runner = Some(url);
         config.heyvm.local_runner_token = Some("daemon-only-key".into());
         let runners = Runners::new(Arc::new(config));
+        let cached = HeyoClient::new(runners.client_options()).unwrap();
+        runners.tunnels.lock().await.insert("hd-local".into(), cached.clone());
         assert_eq!(runners.free_disk_bytes("hd-local").await.unwrap(), 100);
         assert_eq!(runners.free_disk_bytes("hd-local").await.unwrap(), 0);
+        assert!(runners.tunnels.lock().await.contains_key("hd-local"), "low capacity is not a broken connection");
         assert!(runners.free_disk_bytes("hd-local").await.is_err());
+        assert!(!runners.tunnels.lock().await.contains_key("hd-local"), "unknown capacity must not poison every retry");
+        runners.tunnels.lock().await.insert("hd-local".into(), cached);
         assert!(runners.free_disk_bytes("hd-local").await.is_err());
+        assert!(!runners.tunnels.lock().await.contains_key("hd-local"), "HTTP failure must force a fresh connection");
         assert_eq!(reads.load(Ordering::SeqCst), 4);
         server.abort();
+        let _ = server.await;
+        runners.tunnels.lock().await.insert("hd-local".into(), HeyoClient::new(runners.client_options()).unwrap());
+        assert!(runners.free_disk_bytes("hd-local").await.is_err());
+        assert!(!runners.tunnels.lock().await.contains_key("hd-local"), "transport failure must force a fresh connection");
     }
 
     fn test_runners(allow_unauthenticated: bool) -> Runners {
