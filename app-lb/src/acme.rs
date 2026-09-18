@@ -840,6 +840,7 @@ mod tests {
             routes,
             vm: None,
             scaling: Default::default(),
+            maintenance: false,
             health: Default::default(),
             upstreams: vec!["127.0.0.1:8080".into()],
             discovery: None,

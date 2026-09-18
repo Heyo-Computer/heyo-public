@@ -211,6 +211,7 @@ pub struct Puller {
     /// it.
     home: Option<String>,
     http: reqwest::Client,
+    candidate: bool,
 }
 
 impl Puller {
@@ -220,12 +221,42 @@ impl Puller {
             scratch,
             vms,
             home,
+            candidate: false,
             http: reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
                 .read_timeout(READ_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
         }
+    }
+
+    /// Isolate rollout transport policy from legacy pulls. All candidate GET,
+    /// HEAD and blob downloads use this client, never a redirect destination.
+    pub fn for_candidate(&self) -> Result<Self, String> {
+        Ok(Self {
+            art_bin: self.art_bin.clone(), scratch: self.scratch.clone(),
+            vms: self.vms.clone(), home: self.home.clone(), candidate: true,
+            http: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT).read_timeout(READ_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build().map_err(|e| e.to_string())?,
+        })
+    }
+
+    /// Verify the immutable manifest itself, not just the blob it names.
+    /// The artifacts API emits its canonical manifest JSON verbatim.
+    pub async fn pinned_rootfs(&self, spec: &ArtifactSpec, key: Option<&str>) -> Result<String, String> {
+        let base = spec.store.trim_end_matches('/');
+        // This entry point is safe even when invoked on a legacy puller.
+        let safe;
+        let puller = if self.candidate { self } else { safe = self.for_candidate()?; &safe };
+        let response = puller.get(&format!("{base}/manifests/{}", spec.artifact_ref), key).await.map_err(|e| e.to_string())?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(spec.artifact_ref.clone()); }
+        if !response.status().is_success() { return Err("pinned rootfs manifest unavailable".into()); }
+        let bytes = candidate_manifest_bytes(response).await?;
+        if format!("{:x}", Sha256::digest(&bytes)) != spec.artifact_ref { return Err("rootfs manifest digest mismatch".into()); }
+        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        blob_entry(&manifest, &spec.artifact_ref, Some(ROOTFS_FILENAME)).map(|(digest, _)| digest)
     }
 
     /// Resolve `spec.artifact_ref`, put the rootfs behind it in the image
@@ -845,15 +876,18 @@ impl Puller {
         let url = format!("{base}/manifests/{reference}");
         let manifest_err = match self.get(&url, api_key).await {
             Ok(resp) if resp.status().is_success() => {
-                let m: Manifest = resp
+                let m: Manifest = if self.candidate {
+                    serde_json::from_slice(&candidate_manifest_bytes(resp).await?)
+                        .map_err(|e| format!("the manifest at {url} was not readable: {e}"))?
+                } else { resp
                     .json()
                     .await
-                    .map_err(|e| format!("the manifest at {url} was not readable: {e}"))?;
+                    .map_err(|e| format!("the manifest at {url} was not readable: {e}"))? };
                 return blob_entry(&m, reference, expected);
             }
             Ok(resp) => {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+                let body = if self.candidate { String::new() } else { resp.text().await.unwrap_or_default() };
                 format!("GET {url} answered {status}{}", detail(&body))
             }
             Err(e) => format!("GET {url} failed: {e}"),
@@ -1259,6 +1293,22 @@ impl Puller {
             None => req,
         }
     }
+}
+
+const CANDIDATE_MANIFEST_MAX_BYTES: usize = 1024 * 1024;
+
+async fn candidate_manifest_bytes(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    if response.content_length().is_some_and(|n| n > CANDIDATE_MANIFEST_MAX_BYTES as u64) {
+        return Err("candidate manifest exceeds 1 MiB".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if chunk.len() > CANDIDATE_MANIFEST_MAX_BYTES - bytes.len() {
+            return Err("candidate manifest exceeds 1 MiB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 struct Materialized {
@@ -1843,6 +1893,102 @@ mod tests {
         assert_eq!(human(512), "512 B");
         assert_eq!(human(1024), "1.0 KiB");
         assert_eq!(human(21_474_836_480), "20.0 GiB");
+    }
+
+    #[tokio::test]
+    async fn rollout_rootfs_manifest_is_verified_before_its_blob_is_trusted() {
+        use axum::{Router, routing::get, extract::{Path, State}, http::StatusCode, response::IntoResponse};
+        const MANIFEST: &str = r#"{"schema":1,"kind":"heyvm.rootfs.v1","entries":[{"name":"rootfs.ext4","digest":"1111111111111111111111111111111111111111111111111111111111111111","size":123}],"annotations":{}}"#;
+        // Independently computed with sha256sum, not from the resolver's output.
+        const HASH: &str = "dd468e827f167dc1603d2f896da50dff2b6de2427d78dcc844dce55fed313104";
+        let tamper = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let app = Router::new().route("/manifests/:id", get(|Path(id): Path<String>, State(tamper): State<std::sync::Arc<std::sync::atomic::AtomicBool>>| async move {
+            if id != HASH { return StatusCode::NOT_FOUND.into_response(); }
+            if tamper.load(std::sync::atomic::Ordering::SeqCst) { MANIFEST.replace("123", "124").into_response() }
+            else { MANIFEST.into_response() }
+        })).with_state(tamper.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = tempfile::tempdir().unwrap();
+        let vms = crate::vm::VmManager::new(Some("http://127.0.0.1:1".into()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let puller = Puller::new("art".into(), dir.path().join("scratch"), None, vms);
+        let mut artifact: ArtifactSpec = serde_json::from_value(serde_json::json!({"store":base,"ref":HASH})).unwrap();
+        assert_eq!(puller.pinned_rootfs(&artifact, None).await.unwrap(), "1".repeat(64));
+        tamper.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(puller.pinned_rootfs(&artifact, None).await.unwrap_err().contains("digest mismatch"));
+        artifact.artifact_ref = "2".repeat(64);
+        assert_eq!(puller.pinned_rootfs(&artifact, None).await.unwrap(), "2".repeat(64), "blob refs must remain exact");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn candidate_manifest_limit_covers_length_and_chunked_boundaries() {
+        use axum::{Router, routing::get, extract::Path, response::IntoResponse, body::Body};
+        let app = Router::new().route("/:mode/manifests/:size", get(|Path((mode, size)): Path<(String, usize)>| async move {
+            let mut bytes = br#"{"schema":1,"kind":"heyvm.rootfs.v1","entries":[{"name":"rootfs.ext4","digest":"1111111111111111111111111111111111111111111111111111111111111111","size":123}],"annotations":{}}"#.to_vec();
+            bytes.resize(size, b' ');
+            if mode == "length" { return bytes.into_response(); }
+            let chunks: Vec<_> = bytes.chunks(7919).map(|chunk| Ok::<_, std::io::Error>(chunk.to_vec())).collect();
+            Body::from_stream(futures::stream::iter(chunks)).into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = tempfile::tempdir().unwrap();
+        let vms = crate::vm::VmManager::new(Some("http://127.0.0.1:1".into()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let legacy = Puller::new("art".into(), dir.path().join("scratch"), None, vms);
+        let candidate = legacy.for_candidate().unwrap();
+        for mode in ["length", "chunked"] {
+            for size in [1024 * 1024 - 1, 1024 * 1024, 1024 * 1024 + 1] {
+                let url = format!("{base}/{mode}/manifests/{size}");
+                let response = candidate.get(&url, None).await.unwrap();
+                assert_eq!(response.content_length().is_some(), mode == "length");
+                let bytes = candidate_manifest_bytes(response).await;
+                if size <= 1024 * 1024 { assert_eq!(bytes.unwrap().len(), size); }
+                else { assert!(bytes.unwrap_err().contains("exceeds 1 MiB")); }
+                let resolved = candidate.resolve_remote(&format!("{base}/{mode}"), &size.to_string(), None, Some(ROOTFS_FILENAME)).await;
+                if size <= 1024 * 1024 { assert_eq!(resolved.unwrap(), ("1".repeat(64), 123)); }
+                else {
+                    assert!(resolved.unwrap_err().contains("exceeds 1 MiB"));
+                    let artifact: ArtifactSpec = serde_json::from_value(serde_json::json!({"store":format!("{base}/{mode}"),"ref":size.to_string()})).unwrap();
+                    assert!(legacy.pinned_rootfs(&artifact, None).await.unwrap_err().contains("exceeds 1 MiB"));
+                    assert_eq!(legacy.resolve_remote(&format!("{base}/{mode}"), &size.to_string(), None, Some(ROOTFS_FILENAME)).await.unwrap(), ("1".repeat(64), 123), "legacy behavior is unchanged");
+                }
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn candidate_requests_never_follow_bearer_redirects_but_legacy_still_does() {
+        use axum::{Router, routing::get, http::{HeaderMap, StatusCode}, response::IntoResponse};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let leaks = Arc::new(AtomicUsize::new(0));
+        let received = leaks.clone();
+        let app = Router::new()
+            .route("/manifests/:id", get(|| async { (StatusCode::TEMPORARY_REDIRECT, [("location", "/target")]).into_response() }))
+            .route("/target", get(move |headers: HeaderMap| { let received = received.clone(); async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer test-credential");
+                received.fetch_add(1, Ordering::SeqCst);
+                "redirected"
+            }}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = tempfile::tempdir().unwrap();
+        let vms = crate::vm::VmManager::new(Some("http://127.0.0.1:1".into()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let legacy = Puller::new("art".into(), dir.path().join("scratch"), None, vms);
+        let candidate = legacy.for_candidate().unwrap();
+        let artifact: ArtifactSpec = serde_json::from_value(serde_json::json!({"store":base,"ref":"a".repeat(64)})).unwrap();
+        let url = format!("{base}/manifests/{}", artifact.artifact_ref);
+        assert!(legacy.pinned_rootfs(&artifact, Some("test-credential")).await.is_err());
+        assert_eq!(candidate.get(&url, Some("test-credential")).await.unwrap().status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(candidate.head(&url, Some("test-credential")).await.unwrap().status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(leaks.load(Ordering::SeqCst), 0, "candidate redirects must not reach even a same-origin credential sink");
+        assert_eq!(legacy.get(&url, Some("test-credential")).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(leaks.load(Ordering::SeqCst), 1, "legacy client retains its existing policy");
+        server.abort();
     }
 
     /// Both transports, against a real store, laying out a real recipe.

@@ -599,10 +599,13 @@ pub struct SchemaRegistry {
     // replicating VM off the idle reaper and the offload ladder — see
     // [`Self::pinned`].
     replication: Arc<crate::replication::ReplStore>,
+    physical: Arc<crate::replication::PhysicalStore>,
+    physical_sources: Arc<crate::replication::PhysicalSourceStore>,
+    replication_ops: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SchemaRegistry {
-    pub fn new(cfg: Config) -> Self {
+    pub fn new(cfg: Config) -> Result<Self> {
         // Per-disk reclaim locks live under the run dir. Publish it once here:
         // the boot path is a free function with no access to the config.
         crate::reclaim::set_run_dir(cfg.run_dir.clone());
@@ -622,7 +625,9 @@ impl SchemaRegistry {
         let replication = Arc::new(crate::replication::ReplStore::load(
             cfg.replication_file.clone(),
         ));
-        Self {
+        let physical = Arc::new(crate::replication::PhysicalStore::load(cfg.replication_file.with_extension("physical.json"))?);
+        let physical_sources = Arc::new(crate::replication::PhysicalSourceStore::load(cfg.replication_file.with_extension("physical-sources.json"))?);
+        Ok(Self {
             cfg,
             entries: Mutex::new(HashMap::new()),
             store,
@@ -640,9 +645,12 @@ impl SchemaRegistry {
             dedicated,
             peers,
             replication,
+            physical,
+            physical_sources,
+            replication_ops: StdMutex::new(HashMap::new()),
             repl_status: StdMutex::new(HashMap::new()),
             repl_inactive: StdMutex::new(HashMap::new()),
-        }
+        })
     }
 
     /// The trusted peer nodes — what the replication API and dashboard mutate.
@@ -653,6 +661,57 @@ impl SchemaRegistry {
     /// The replication pairings this node is part of.
     pub fn replication(&self) -> &Arc<crate::replication::ReplStore> {
         &self.replication
+    }
+
+    pub fn physical(&self) -> &Arc<crate::replication::PhysicalStore> { &self.physical }
+    pub fn physical_sources(&self) -> &Arc<crate::replication::PhysicalSourceStore> { &self.physical_sources }
+    pub fn bound_vm_id(&self, database: &str) -> Option<String> { self.store.record(database).map(|r| r.sandbox_id) }
+
+    pub fn physical_admission_ready(&self, database: &str) -> bool {
+        let bound = self.bound_vm_id(database);
+        if bound.is_none() && (self.physical.get(database).is_some() || self.physical_sources.get(database).is_some()) { return false; }
+        !bound.as_deref().is_some_and(|id| self.physical_sources.has_grant_for_source_vm(database, id))
+            && !self.physical_source_fenced(database)
+            && self.physical.get(database).is_none_or(|r| {
+                if r.handoff_started() {
+                    r.phase == crate::replication::PhysicalPhase::Activated && r.candidate_id == bound
+                } else { r.previous_vm_id == bound }
+            })
+    }
+
+    pub fn physical_source_fenced(&self, database: &str) -> bool {
+        self.physical_sources.get(database).is_some_and(|r| r.fence.is_some()
+            && self.bound_vm_id(database).as_deref() == Some(r.source_vm_id.as_str()))
+    }
+
+    pub fn physical_reconnect_allowed(&self, database: &str, role: &str) -> bool {
+        let Some(source) = self.physical_sources.get(database) else { return false };
+        (source.handoff.is_some() || source.fence.is_some())
+            && (source.repl.as_ref().is_some_and(|login| login.role == role)
+                || self.replication.by_repl_role(role).is_some_and(|r| r.database == database && r.repl_role == role))
+            && self.bound_vm_id(database).as_deref() == Some(source.source_vm_id.as_str())
+    }
+
+    pub async fn commit_physical_binding(self: &Arc<Self>, database: &str, expected: &str, candidate: &str) -> Result<()> {
+        let reg = self.clone();
+        let (db, old, new) = (database.to_owned(), expected.to_owned(), candidate.to_owned());
+        tokio::task::spawn_blocking(move || reg.store.commit_handoff_binding(&db, &old, &new)).await??;
+        self.entries.lock().await.remove(database);
+        Ok(())
+    }
+
+    pub async fn exec_bound(&self, database: &str, expected_id: &str, command: &str, env: HashMap<String, String>) -> Result<()> {
+        let guard = self.checkout(database).await?;
+        if guard.entry().sandbox_id() != expected_id { bail!("database binding changed during physical preparation"); }
+        let result = vm::physical_exec(&self.cfg, &guard.entry().sandbox, command, env, "physical source setup").await?;
+        if result.exit_code != 0 { bail!("physical source guest setup failed (exit {})", result.exit_code); }
+        Ok(())
+    }
+
+    pub async fn replication_operation(&self, database: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self.replication_ops.lock().unwrap().entry(database.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
+        lock.lock_owned().await
     }
 
     /// Whether replication is enabled on this node (`PG_VM_POOL_REPLICATION`).
@@ -675,6 +734,7 @@ impl SchemaRegistry {
     /// including emergency disk-pressure eviction.
     pub fn pinned(&self, schema: &str) -> bool {
         self.cfg.is_keepalive(schema) || self.replication.is_pinned(schema)
+            || self.physical.reserves_database(schema) || self.physical_sources.get(schema).is_some()
     }
 
     /// [`Self::pin_reason`] for whichever schema currently binds VM `id`, so a
@@ -682,6 +742,12 @@ impl SchemaRegistry {
     /// having to resolve the schema itself. `None` when the VM backs nothing
     /// pinned.
     pub fn pin_reason_for_vm(&self, id: &str) -> Option<String> {
+        if self.physical.owns_vm(id) || self.physical_sources.owns_vm(id)
+            || !self.physical.list().is_empty() {
+            // Also covers a create accepted by the daemon before its ID can be
+            // durably recorded. No manual unbound-VM cleanup during preparation.
+            return Some(format!("VM cleanup is reserved by physical replica preparation ({id})"));
+        }
         self.store_records()
             .into_iter()
             .find(|(_, r)| r.sandbox_id == id && r.tier == Tier::Live)
@@ -691,6 +757,12 @@ impl SchemaRegistry {
     /// Why `schema` is pinned, for a dashboard refusal that tells the operator
     /// what to do about it. `None` when it isn't.
     pub fn pin_reason(&self, schema: &str) -> Option<String> {
+        if self.physical.reserves_database(schema) || self.physical_sources.get(schema).is_some() {
+            return Some(format!("{schema} is reserved by physical replication; ordinary lifecycle changes are disabled"));
+        }
+        if self.replication.is_fenced(schema) {
+            return Some(format!("{schema} is fenced for a planned switchover; explicitly unfence it first"));
+        }
         if let Some(rec) = self.replication.get(schema).filter(|r| r.state.pins()) {
             return Some(format!(
                 "{schema} is replicating ({} with peer {}); detach or promote it first",
@@ -747,6 +819,9 @@ impl SchemaRegistry {
                 .filter(|r| r.state.pins())
                 .map(|r| r.role),
             repl_login,
+            // Maintenance bring-ups wait as long as it takes; only a client
+            // checkout arms a deadline (see `checkout`).
+            admission_deadline: None,
         }
     }
 
@@ -837,6 +912,40 @@ impl SchemaRegistry {
         Ok((guard, client))
     }
 
+    /// Connect to this VM's `postgres` maintenance database. This path is not
+    /// publicly routable by database name and remains usable while the tenant
+    /// database has `ALLOW_CONNECTIONS false`.
+    pub async fn maintenance_client(
+        &self,
+        schema: &str,
+    ) -> Result<(ConnGuard, deadpool_postgres::Object)> {
+        let expected_vm = self.physical_sources.get(schema).filter(|r| r.fence.is_some()
+            && self.bound_vm_id(schema).as_deref() == Some(r.source_vm_id.as_str())).map(|r| r.source_vm_id)
+            .or_else(|| self.replication.get(schema).and_then(|r| r.fence).map(|f| f.vm_id))
+            .with_context(|| format!("refusing maintenance bypass for unfenced database {schema}"))?;
+        let record = self.store.record(schema)
+            .with_context(|| format!("fenced database {schema} has no durable VM binding"))?;
+        if record.tier != Tier::Live { bail!("fenced database {schema} is not on a live VM"); }
+        if !expected_vm.is_empty() && expected_vm != record.sandbox_id {
+            bail!("fenced database {schema} VM identity changed");
+        }
+        let cell = self.entries.lock().await.entry(schema.to_string())
+            .or_insert_with(|| Arc::new(OnceCell::new())).clone();
+        if let Some(entry) = cell.get() && entry.sandbox_id() != record.sandbox_id {
+            bail!("warm VM identity differs from the durable fenced VM binding");
+        }
+        let entry = cell.get_or_try_init(|| vm::ensure_fenced_vm(&self.cfg, schema, &record.sandbox_id)).await?;
+        let guard = ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await
+            .with_context(|| format!("maintenance connection slots exhausted for {schema}"))?;
+        let client = guard
+            .entry()
+            .pool
+            .get()
+            .await
+            .with_context(|| format!("connecting to maintenance database for {schema}"))?;
+        Ok((guard, client))
+    }
+
     /// Make `schema`'s running VM match the replication role now recorded for
     /// it — planting the durable marker and, when the WAL level has to change,
     /// restarting Postgres inside the guest.
@@ -855,7 +964,7 @@ impl SchemaRegistry {
     /// the pressure pass and the dashboard's buttons from picking this schema
     /// out from under a half-finished restart.
     pub async fn apply_replication_mode(self: &Arc<Self>, schema: &str) -> Result<()> {
-        let _claim = ArchivingGuard::claim(&self.archiving, schema)
+        let claim = ArchivingGuard::claim(&self.archiving, schema)
             .with_context(|| format!("schema {schema} is busy with another offload or restart"))?;
         // Drop the warm entry so the next checkout re-runs the full bring-up
         // (which reattaches to the same VM by id — nothing is stopped here).
@@ -864,7 +973,7 @@ impl SchemaRegistry {
             self.evict(schema, &cell).await;
         }
         let _guard = self
-            .checkout(schema)
+            .checkout_inner(schema, Some(&claim))
             .await
             .with_context(|| format!("bringing schema {schema} up in its new replication mode"))?;
         Ok(())
@@ -1103,6 +1212,9 @@ impl SchemaRegistry {
     /// whatever was asked for, so a prober cannot enumerate provisioned names
     /// by watching which connections get challenged.
     pub fn challenge_password_for(&self, role: &str) -> Option<String> {
+        if let Some(source) = self.physical_sources.by_repl_role(role) {
+            return source.repl.map(|login| login.password);
+        }
         challenge_password_in(
             &self.replication,
             &self.dedicated,
@@ -1111,15 +1223,21 @@ impl SchemaRegistry {
         )
     }
 
-    /// Whether an *authenticated* client may route to `database`.
+    /// Resolve an *authenticated* client's VM, rejecting unauthorized routes.
     ///
     /// A replication login is pinned to its own database exactly as a
     /// dedicated one is — and it has to be resolved **first**, because
     /// `Credentials::authorize` would otherwise reject it under the "this
     /// database is dedicated, only its own role may open it" rule, which is
     /// precisely the database it is trying to reach.
-    pub fn authorize_route(&self, role: &str, database: &str) -> Result<(), String> {
-        authorize_route_in(&self.replication, &self.dedicated, role, database)
+    pub fn authorize_route(&self, role: &str, database: &str, physical: bool) -> Result<String, String> {
+        if physical && let Some(source) = self.physical_sources.by_repl_role(role) {
+            if self.bound_vm_id(&source.database).as_deref() != Some(source.source_vm_id.as_str()) {
+                return Err("physical source no longer owns the serving binding".into());
+            }
+            return Ok(source.database);
+        }
+        authorize_route_in(&self.replication, &self.dedicated, role, database, physical)
     }
 
     /// The configured idle-reaping timeout (`None` when reaping is disabled), so
@@ -1350,6 +1468,48 @@ impl SchemaRegistry {
     /// The returned guard keeps the VM off the reaper's radar until dropped.
     /// Concurrent callers for the same schema share one bring-up.
     pub async fn checkout(&self, schema: &str) -> Result<ConnGuard> {
+        // An outgoing grant/fence takes precedence over the older activation
+        // that originally made this same VM a writer.
+        if self.physical_source_fenced(schema) {
+            return self.maintenance_client(schema).await.map(|(guard, _)| guard);
+        }
+        if self.bound_vm_id(schema).as_deref().is_some_and(|id| self.physical_sources.has_grant_for_source_vm(schema, id)) {
+            if self.replication.is_fenced(schema) {
+                return self.maintenance_client(schema).await.map(|(guard, _)| guard);
+            }
+            bail!("physical source grant lost its fence; refusing ordinary checkout");
+        }
+        if let Some(rec) = self.physical.get(schema).filter(|r| r.handoff_started()) {
+            if rec.phase != crate::replication::PhysicalPhase::Activated {
+                bail!("physical handoff for {schema} is incomplete; admission remains closed");
+            }
+            let candidate = rec.candidate_id.context("activated handoff lost candidate identity")?;
+            if self.bound_vm_id(schema).as_deref() != Some(candidate.as_str()) {
+                bail!("activated physical handoff binding mismatch");
+            }
+            let cell = self.entries.lock().await.entry(schema.to_string()).or_insert_with(|| Arc::new(OnceCell::new())).clone();
+            let entry = cell.get_or_try_init(|| vm::ensure_fenced_vm(&self.cfg, schema, &candidate)).await?;
+            if entry.sandbox_id() != candidate { bail!("warm physical handoff binding mismatch"); }
+            return ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await
+                .context("physical handoff connection slots exhausted");
+        }
+        if self.replication.is_fenced(schema) {
+            // Status polling and startup warming must not take the normal
+            // restore/grant path for a fenced database either.
+            return self.maintenance_client(schema).await.map(|(guard, _)| guard);
+        }
+        if !self.physical_admission_ready(schema) { bail!("physical preparation binding mismatch; refusing ordinary checkout"); }
+        self.checkout_inner(schema, None).await
+    }
+
+    /// Check out while this caller owns this schema's maintenance claim. The
+    /// borrowed claim is both the authority to pass the archiving wait and the
+    /// lifetime proof that exclusion remains held through the checkout.
+    async fn checkout_inner(
+        &self,
+        schema: &str,
+        claim: Option<&ArchivingGuard<'_>>,
+    ) -> Result<ConnGuard> {
         // Refresh durable activity up front so the S3 eviction sweep sees this
         // schema as recently used even long after its VM leaves the warm map
         // (the in-memory `SchemaEntry::last_active` doesn't survive that).
@@ -1362,7 +1522,9 @@ impl SchemaRegistry {
             // completely silent — a client parked here for a whole offload
             // read as unexplained connect latency — so name it, once, and
             // account for it when it ends.
-            if self.is_archiving(schema) {
+            if self.is_archiving(schema)
+                && !claim.is_some_and(|c| c.owns(&self.archiving, schema))
+            {
                 if offload_waited.is_none() {
                     offload_waited = Some(Instant::now());
                     info!(
@@ -1449,15 +1611,27 @@ impl SchemaRegistry {
                     // actually holds data decides the restore strategy (a HEAD
                     // or two on the cold path; transport trouble defaults to
                     // the dump path, exactly the pre-image behavior).
-                    Some(a) => Some(
-                        match crate::imgarchive::pick_restore(&a.s3, schema).await {
-                            crate::imgarchive::RestoreKind::Dump => RestoreSource::S3(a.s3.clone()),
+                    //
+                    // The config that comes back is addressed at the prefix
+                    // holding the archive — the legacy one when this host's
+                    // own prefix is known to hold nothing for the schema.
+                    Some(a) => Some({
+                        let (kind, s3) = crate::imgarchive::pick_restore(&a.s3, schema).await;
+                        if s3.prefix != a.s3.prefix {
+                            info!(
+                                "schema {schema}: nothing under s3://{}/{}; restoring from the \
+                                 legacy prefix {}",
+                                a.s3.bucket, a.s3.prefix, s3.prefix
+                            );
+                        }
+                        match kind {
+                            crate::imgarchive::RestoreKind::Dump => RestoreSource::S3(s3),
                             crate::imgarchive::RestoreKind::Image => {
                                 info!("schema {schema}: restoring from its disk-image archive");
-                                RestoreSource::S3Image(a.s3.clone())
+                                RestoreSource::S3Image(s3)
                             }
-                        },
-                    ),
+                        }
+                    }),
                     None => bail!(
                         "schema {schema} is archived to S3, but the eviction tier is not \
                          configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*) — \
@@ -1490,7 +1664,12 @@ impl SchemaRegistry {
             // scratch, which carries the data but no roles.
             let owner = self.owner_of(schema);
             let repl_login = self.repl_login_for(schema);
-            let up = self.bring_up_for(schema, owner.as_ref(), repl_login.as_ref());
+            let mut up = self.bring_up_for(schema, owner.as_ref(), repl_login.as_ref());
+            // A client waits only so long in the admission queue (see
+            // `vm::DEFAULT_ADMISSION_WAIT`), counted from when this cold start
+            // began — so time spent behind another client's attempt at the
+            // same schema counts against it too.
+            up.admission_deadline = vm::admission_deadline_from(started);
             match cell
                 .get_or_try_init(|| {
                     vm::ensure_vm(
@@ -1531,6 +1710,10 @@ impl SchemaRegistry {
                         _ => None,
                     };
                     if let Some(file) = thawed_file {
+                        // The emptiness marker describes the image, not the
+                        // schema: it goes with it.
+                        let _ =
+                            tokio::fs::remove_file(crate::imgarchive::empty_marker(&file)).await;
                         match tokio::fs::remove_file(&file).await {
                             Ok(()) => {
                                 info!("schema {schema}: thawed; removed {}", file.display());
@@ -1554,6 +1737,14 @@ impl SchemaRegistry {
                         );
                     };
                     return Ok(guard);
+                }
+                Err(e) if vm::is_shed(&e) => {
+                    // Load, not a broken schema: nothing was built, so there
+                    // is no VM to stop, and the circuit breaker stays out of
+                    // it — the next client gets a fresh place in the queue,
+                    // not a hold-off.
+                    warn!("{e:#}");
+                    return Err(e);
                 }
                 Err(e) => {
                     warn!(
@@ -2165,8 +2356,13 @@ impl SchemaRegistry {
         }
         if let Some(a) = &self.cfg.archive {
             tiers.push(format!(
-                "S3 >= {:?} (s3://{}/{})",
-                a.archive_after, a.s3.bucket, a.s3.prefix
+                "S3 >= {:?} (s3://{}/{}{})",
+                a.archive_after,
+                a.s3.bucket,
+                a.s3.prefix,
+                a.s3.fallback_prefix()
+                    .map(|p| format!("; restores fall back to {p}"))
+                    .unwrap_or_default()
             ));
         }
         if tiers.is_empty() {
@@ -3407,6 +3603,24 @@ impl SchemaRegistry {
                 crate::events::journal_info("archive", format!("schema {schema} → archived (S3)"));
                 crate::events::record(crate::events::Event::OffloadDone);
             }
+            // Not a failure: the schema has nothing worth uploading, and the
+            // pooler can rebuild an empty database for free. Backed off all
+            // the same, so sweeps stop re-asking a question whose answer only
+            // changes when a client writes to it.
+            Err(e)
+                if e.downcast_ref::<crate::imgarchive::EmptyCluster>()
+                    .is_some() =>
+            {
+                let (_, delay) = self.offload_backoff.record_failure(schema, Instant::now());
+                crate::events::journal_info(
+                    "archive",
+                    format!(
+                        "schema {schema} kept local — its database holds no user data \
+                         (sweeps skip it for {})",
+                        fmt_backoff(delay)
+                    ),
+                );
+            }
             // Losing the claim race to another worker / the dashboard is
             // benign — no backoff, no error journal.
             Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {
@@ -3523,6 +3737,20 @@ impl SchemaRegistry {
         // sees it), it burns RAM, and it pins its disk open against reclaim.
         // A whole sweep of failures leaks a fleet of them at once. Stop, not
         // kill: the data on its disk is still the only copy.
+        // The same refusal the image paths make offline, asked of the running
+        // Postgres this path already has: a dump of a database with no user
+        // relations restores as an empty workbook, and uploading it replaces
+        // whatever the schema's key holds. Unreachable (None) is not empty.
+        if vm::has_user_relations(&self.cfg, &entry.target, schema).await == Some(false) {
+            checkpoint_and_stop(&entry, schema).await;
+            return Err(crate::imgarchive::empty_cluster(format!(
+                "schema {schema}: refusing to dump it to S3 — its database has no user \
+                 relations, and the upload would replace whatever s3://{}/{} holds",
+                archive.s3.bucket,
+                archive.s3.object_key(schema),
+            )));
+        }
+
         let dumps = self
             .dumps
             .as_deref()
@@ -3579,6 +3807,19 @@ impl SchemaRegistry {
         );
 
         let path = dumps.dump_path(schema);
+        // Set by `freeze_schema`, which had a live Postgres to ask.
+        if tokio::fs::metadata(crate::imgarchive::empty_marker(&path))
+            .await
+            .is_ok()
+        {
+            return Err(crate::imgarchive::empty_cluster(format!(
+                "schema {schema}: refusing to promote {} to S3 — it dumps a database with no \
+                 user relations, and the upload would replace whatever s3://{}/{} holds",
+                path.display(),
+                archive.s3.bucket,
+                archive.s3.object_key(schema),
+            )));
+        }
         let meta = std::fs::metadata(&path)
             .with_context(|| format!("reading local dump {}", path.display()))?;
         let len = meta.len();
@@ -3913,6 +4154,10 @@ impl SchemaRegistry {
     }
 
     async fn purge_pass(&self) {
+        if !self.physical.list().is_empty() {
+            crate::events::journal_error("purge", "physical replica preparation is pending; refusing all purge cleanup");
+            return;
+        }
         let infos = match heyo_sdk::Sandbox::list(vm::local_opts()).await {
             Ok(l) => l,
             Err(e) => {
@@ -4166,6 +4411,13 @@ impl SchemaRegistry {
             self.store.set_disk_gb(schema, device_gb(dev));
         }
 
+        // Asked here, where a running Postgres can answer it, and recorded
+        // beside the dump: the promotion to S3 has only the dump file, and
+        // "how many relations does this dump hold" is not a question a dump
+        // file answers cheaply. Freezing an empty database locally is fine —
+        // uploading it is what must not happen.
+        let empty = vm::has_user_relations(&self.cfg, &entry.target, schema).await == Some(false);
+
         // Same leak guard as archive_schema_inner: a failed dump must not
         // leave the VM it booted running and unowned.
         let bytes = match vm::dump_to_local(
@@ -4185,6 +4437,19 @@ impl SchemaRegistry {
                     .with_context(|| format!("dumping schema {schema} to the local dump store"));
             }
         };
+
+        let marker = crate::imgarchive::empty_marker(&dumps.dump_path(schema));
+        if empty {
+            info!(
+                "schema {schema}: froze an empty database — keeping it local; it will not be \
+                 promoted to S3"
+            );
+            if let Err(e) = tokio::fs::write(&marker, b"").await {
+                warn!("schema {schema}: writing {} failed: {e}", marker.display());
+            }
+        } else {
+            let _ = tokio::fs::remove_file(&marker).await;
+        }
 
         self.store.set_tier(schema, Tier::Frozen).await;
         let accomplished = format!("frozen to a {bytes}-byte local dump");
@@ -4386,6 +4651,10 @@ impl SchemaRegistry {
     /// and deletion needs the daemon to positively confirm the record — the
     /// same ambiguity-never-deletes rule as the orphan-disk sweep.
     async fn pending_pass(&self) -> usize {
+        if !self.physical.list().is_empty() {
+            warn!("pending-bringup janitor: physical preparation pending; refusing cleanup");
+            return 0;
+        }
         // Twice the ready budget plus slack: a slow-but-alive bring-up (ready
         // wait + restore) must never race its own janitor.
         let min_age = self.cfg.ready_timeout * 2 + Duration::from_secs(300);
@@ -4480,6 +4749,10 @@ impl SchemaRegistry {
     /// same in-use and age guards as a directory, plus the daemon reporting the
     /// VM not running; the cost of being wrong is one extra image clone.
     async fn sweep_orphans(&self) -> (usize, usize) {
+        if !self.physical.list().is_empty() {
+            warn!("orphan-disk sweep: physical preparation pending; refusing cleanup");
+            return (0, 0);
+        }
         let Some(run_dir) = self.cfg.run_dir.clone() else {
             return (0, 0);
         };
@@ -5357,6 +5630,13 @@ impl<'a> ArchivingGuard<'a> {
             None
         }
     }
+
+    /// Whether this is the still-live claim for exactly `schema` in `set`.
+    /// Checking both identities prevents a claim for another registry or
+    /// schema from becoming a general maintenance bypass.
+    fn owns(&self, set: &StdMutex<HashSet<String>>, schema: &str) -> bool {
+        std::ptr::eq(self.set, set) && self.schema == schema
+    }
 }
 
 impl Drop for ArchivingGuard<'_> {
@@ -5494,10 +5774,21 @@ fn authorize_route_in(
     ded: &Credentials,
     role: &str,
     database: &str,
-) -> Result<(), String> {
+    physical: bool,
+) -> Result<String, String> {
     if let Some(rec) = repl.by_repl_role(role) {
+        if physical {
+            // PostgreSQL discards the database parameter for a physical
+            // walsender. pg_basebackup/walreceiver normally send "replication".
+            // Only the already-authenticated replication identity selects a VM.
+            return if rec.role == crate::replication::Role::Primary && rec.state.pins() {
+                Ok(rec.database)
+            } else {
+                Err("physical replication requires a live primary pairing".into())
+            };
+        }
         return if rec.database == database {
-            Ok(())
+            Ok(database.into())
         } else {
             Err(format!(
                 "role \"{role}\" is a replication login for database \"{}\" only \
@@ -5506,7 +5797,10 @@ fn authorize_route_in(
             ))
         };
     }
-    ded.authorize(role, database)
+    if physical {
+        return Err("physical replication requires a registered replication login".into());
+    }
+    ded.authorize(role, database).map(|()| database.into())
 }
 
 #[cfg(test)]
@@ -5562,14 +5856,31 @@ mod auth_composition_tests {
         // The regression this ordering exists to prevent: `acme` IS a
         // dedicated database, so delegating to `Credentials::authorize` first
         // would reject the very login that has to reach it.
-        assert!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", "acme").is_ok());
-        let err = authorize_route_in(&repl, &ded, "acme_pgfcrepl", "other").unwrap_err();
+        assert!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", "acme", false).is_ok());
+        let err = authorize_route_in(&repl, &ded, "acme_pgfcrepl", "other", false).unwrap_err();
         assert!(err.contains("replication login"), "{err}");
         // Everything the dedicated rules already guaranteed still holds.
-        assert!(authorize_route_in(&repl, &ded, "acme", "acme").is_ok());
-        assert!(authorize_route_in(&repl, &ded, "acme", "other").is_err());
-        assert!(authorize_route_in(&repl, &ded, "postgres", "acme").is_err());
-        assert!(authorize_route_in(&repl, &ded, "postgres", "tenant1").is_ok());
+        assert!(authorize_route_in(&repl, &ded, "acme", "acme", false).is_ok());
+        assert!(authorize_route_in(&repl, &ded, "acme", "other", false).is_err());
+        assert!(authorize_route_in(&repl, &ded, "postgres", "acme", false).is_err());
+        assert!(authorize_route_in(&repl, &ded, "postgres", "tenant1", false).is_ok());
+    }
+
+    #[test]
+    fn physical_replication_routes_by_identity_not_claimed_database() {
+        let (repl, ded) = stores("physical");
+        for claimed in ["replication", "other_tenant", "postgres", "acme"] {
+            assert_eq!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", claimed, true).unwrap(), "acme");
+        }
+        for user in ["acme", "postgres", "unknown"] {
+            assert!(authorize_route_in(&repl, &ded, user, "acme", true).is_err());
+        }
+        let mut replica = ReplRecord::new("standby", Role::Replica, "node_a", "replpassword34");
+        replica.state = State::Active;
+        repl.create(replica, &|r| ded.by_role(r).is_some()).unwrap();
+        assert!(authorize_route_in(&repl, &ded, "standby_pgfcrepl", "replication", true).is_err());
+        repl.set_state("acme", State::Detached, "test detached pairing").unwrap();
+        assert!(authorize_route_in(&repl, &ded, "acme_pgfcrepl", "replication", true).is_err());
     }
 }
 
@@ -6554,6 +6865,52 @@ fn used_pct(used: u64, avail: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owned_claim_checkout_progresses_while_ordinary_checkout_waits() {
+        let dir = std::env::temp_dir().join(format!("pgfc-claimed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::from_env().unwrap();
+        cfg.state_file = dir.join("registry.tsv");
+        cfg.dedicated_file = dir.join("dedicated.tsv");
+        cfg.peers_file = dir.join("peers.tsv");
+        cfg.replication_file = dir.join("replication.tsv");
+        cfg.reclaim = None;
+        cfg.run_dir = None;
+        cfg.warm_spares = 0;
+        cfg.freeze = None;
+        cfg.archive = None;
+        let registry = Arc::new(SchemaRegistry::new(cfg).unwrap());
+        // Fail immediately after passing the maintenance gate, without any
+        // daemon or database connection. The original apply path instead
+        // waited forever on its own claim and never reached this breaker.
+        registry.bringup_breaker.record_failure("tenant");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.apply_replication_mode("tenant"),
+        )
+        .await
+        .expect("replication mode checkout must not wait on its own claim");
+        assert!(format!("{:#}", result.unwrap_err()).contains("holding off new attempts"));
+        assert!(!registry.is_archiving("tenant"), "failed operation must release its claim");
+
+        let claim = ArchivingGuard::claim(&registry.archiving, "tenant").unwrap();
+        let ordinary = registry.checkout("tenant");
+        tokio::pin!(ordinary);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut ordinary)
+                .await
+                .is_err(),
+            "public checkout must remain blocked while maintenance owns the schema"
+        );
+
+        drop(claim);
+        let result = tokio::time::timeout(Duration::from_secs(1), ordinary)
+            .await
+            .expect("ordinary checkout must resume after the claim is released");
+        assert!(result.err().unwrap().to_string().contains("holding off new attempts"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// The orphan sweep's abort breaker must count *consecutive* daemon
     /// errors. It once cleared its run only on `Gone`, which made it count

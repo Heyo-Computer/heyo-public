@@ -622,6 +622,7 @@ pub struct DiskStore {
     cfg: DiskConfig,
     vms: VmManager,
     registry: Arc<Registry>,
+    workspaces: Option<Arc<crate::workspace::Workspaces>>,
     policies: Mutex<BTreeMap<String, DiskPolicy>>,
     archives: Mutex<VecDeque<ArchiveJob>>,
     /// Sandboxes with an archive in flight. Held separately from `archives` so
@@ -639,6 +640,7 @@ impl DiskStore {
             cfg,
             vms,
             registry,
+            workspaces: None,
             policies: Mutex::new(BTreeMap::new()),
             archives: Mutex::new(VecDeque::new()),
             archiving: Mutex::new(HashSet::new()),
@@ -649,6 +651,11 @@ impl DiskStore {
 
     pub fn config(&self) -> &DiskConfig {
         &self.cfg
+    }
+
+    pub fn with_workspaces(mut self, workspaces: Arc<crate::workspace::Workspaces>) -> Self {
+        self.workspaces = Some(workspaces);
+        self
     }
 
     /// Load retention decisions. A missing file is not an error.
@@ -724,7 +731,10 @@ impl DiskStore {
         let mut claimed: HashSet<String> = HashSet::new();
         for d in deployments.values() {
             claimed.extend(d.state().suspended.iter().cloned());
+            claimed.extend(crate::rollout::protected_ids(&d.state()).cloned());
+            claimed.extend(known.values().filter(|info| d.state().rollouts.iter().any(|o| info.name.starts_with(&o.prefix))).map(|info| info.id.clone()));
         }
+        if let Some(ws) = &self.workspaces { claimed.extend(ws.recovery_pins()); }
 
         let policies = self.policies.lock().unwrap().clone();
         let now = now_secs();
@@ -888,6 +898,10 @@ impl DiskStore {
 
     // -- retention ---------------------------------------------------------
 
+    pub fn is_retained(&self, sandbox_id: &str) -> bool {
+        self.policies.lock().unwrap().get(sandbox_id).is_some_and(|p| p.retain)
+    }
+
     /// Mark a disk retained (or not) and note why.
     ///
     /// Accepted for a sandbox with no disks on this host, so an operator can
@@ -948,6 +962,10 @@ impl DiskStore {
     /// not fatal — the point of this path is the residue, and residue is exactly
     /// what the daemon cannot see.
     pub async fn purge(&self, sandbox_id: &str, force: bool) -> Result<PurgeOutcome, DiskError> {
+        if self.workspaces.as_ref().is_some_and(|ws| ws.recovery_pinned(sandbox_id)) {
+            return Err(DiskError::Held { sandbox_id: sandbox_id.into(),
+                reason: "explicit workspace recovery permanently pins this source", forceable: false });
+        }
         let (disk, complete) = self.one(sandbox_id).await?;
         self.purge_resolved(disk, complete, force).await
     }
@@ -964,6 +982,13 @@ impl DiskStore {
         complete: bool,
         force: bool,
     ) -> Result<PurgeOutcome, DiskError> {
+        // Share admission's lock: a stale sweep inventory cannot race a newly
+        // persisted recovery pin. No force flag overrides the selected source.
+        let _recovery = match &self.workspaces { Some(ws) => Some(ws.lifecycle_guard().await), None => None };
+        if self.workspaces.as_ref().is_some_and(|ws| ws.recovery_pinned(&disk.sandbox_id)) {
+            return Err(DiskError::Held { sandbox_id: disk.sandbox_id,
+                reason: "explicit workspace recovery permanently pins this source", forceable: false });
+        }
         // First, and under no flag. Deleting the disks out from under a live
         // hypervisor corrupts the guest rather than freeing anything, and the
         // operator's actual intent — stop it, then reclaim it — is two clicks

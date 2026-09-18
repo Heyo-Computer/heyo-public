@@ -24,7 +24,7 @@ const WIRE = join(here, "..", "..", "..", "testdata", "wire");
  */
 const KNOWN = {
   common: {
-    DeploymentStatus: ["spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms"],
+    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
     DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed"],
     DiscoverySpec: ["service_id"],
@@ -33,7 +33,8 @@ const KNOWN = {
     VmSpec: ["driver", "image", "port", "start_command", "size_class", "disk_size_gb", "working_directory", "env_vars", "setup_hooks", "open_ports", "mounts", "workspace", "env_from", "workspace_archive", "image_download_url", "image_size_bytes", "image_sha256", "ttl_seconds"],
     MountSpec: ["path", "store", "ref", "auth", "strip_components", "read_only", "digest"],
     ScalingPolicy: ["min_replicas", "max_replicas", "warm_pool", "target_concurrency", "scale_to_zero_after_secs", "cold_start_timeout_secs", "drain_timeout_secs", "boot_timeout_secs", "idle_action"],
-    HealthCheck: ["path", "port", "timeout_secs"],
+    HealthCheck: ["expected_header", "path", "port", "timeout_secs"],
+    ExpectedHeader: ["name", "value"],
     BuildSpec: ["repo", "store", "ref", "dockerfile", "context", "image_name", "image_size_mb", "auth"],
     ArtifactSpec: ["store", "ref", "auth", "grow_gb", "image_name", "strip_components"],
     SiteSpec: ["root", "index", "not_found", "spa", "cache_control"],
@@ -134,6 +135,7 @@ const FIXTURES = {
 /** Which declaration governs a nested object, by the key that holds it. */
 const NESTED = {
   spec: "DeploymentSpec", vm: "VmSpec", scaling: "ScalingPolicy", health: "HealthCheck",
+  expected_header: "ExpectedHeader",
   discovery: "DiscoverySpec", build: "BuildSpec", artifact: "ArtifactSpec", site: "SiteSpec", update: "UpdateSpec",
   auth: "AuthGate", client_secret: "SecretRef", pool: "PoolStatus", host: "HostUsage",
   // Each entry is a path plus the scope app-lb requires there; a client that

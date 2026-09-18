@@ -66,6 +66,7 @@
 
 use crate::config::{ArtifactSinkKind, ArtifactsConfig, Config, S3Config};
 use async_trait::async_trait;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::PathBuf;
@@ -74,7 +75,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredArtifact {
     pub sink: &'static str,
-    /// sha256, for the content-addressed sink; `None` for disk and S3.
+    /// SHA256 for disk and content-addressed uploads. Older disk records may
+    /// omit it; downloads of those records can only verify their size.
     pub digest: Option<String>,
     pub size_bytes: u64,
     /// How to get it back — a path, an `s3://` URL, or a tag.
@@ -122,10 +124,25 @@ pub struct GuestPush {
     pub token: Option<String>,
 }
 
+/// Identity of a raw ext4 publication. Unlike [`StoredArtifact`], the digest
+/// here names the rootfs manifest (the reference app-lb consumes), while
+/// `blob_digest` names the bytes pushed by the guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedRootfs {
+    pub store_url: String,
+    pub manifest_digest: String,
+    pub blob_digest: String,
+    pub size_bytes: u64,
+}
+
 #[async_trait]
 pub trait ArtifactSink: Send + Sync {
     /// Store `bytes` the orchestrator has in hand.
     async fn put(&self, r: &ArtifactRef, bytes: Vec<u8>) -> Result<StoredArtifact, ArtifactError>;
+
+    /// Read bytes named by a database record through this configured sink.
+    /// Implementations must not treat `uri` as a caller-provided URL/path.
+    async fn get(&self, stored: &StoredArtifact) -> Result<Vec<u8>, ArtifactError>;
 
     /// How a guest can push a blob into this sink directly, if it can at all.
     /// `None` — the default — means the orchestrator reads the bytes out of the
@@ -148,6 +165,17 @@ pub trait ArtifactSink: Send + Sync {
         Err(ArtifactError::Misconfigured(format!(
             "the {} sink cannot accept a blob pushed from a guest (digest {digest})",
             self.kind()
+        )))
+    }
+
+    /// Finish an already-pushed raw ext4 image as a bootable rootfs manifest.
+    /// This is opt-in so disk/S3 can never masquerade as a rootfs registry.
+    async fn publish_pushed_rootfs(
+        &self, digest: &str, size: u64, image: &str,
+    ) -> Result<PublishedRootfs, ArtifactError> {
+        let _ = (size, image);
+        Err(ArtifactError::Misconfigured(format!(
+            "the {} sink is not a rootfs registry (blob {digest})", self.kind()
         )))
     }
 
@@ -201,16 +229,34 @@ impl ArtifactSink for DiskSink {
                 .map_err(|e| ArtifactError::Io(format!("{}: {e}", parent.display())))?;
         }
         let size = bytes.len() as u64;
+        let digest = hex::encode(Sha256::digest(&bytes));
         tokio::fs::write(&path, bytes)
             .await
             .map_err(|e| ArtifactError::Io(format!("{}: {e}", path.display())))?;
         Ok(StoredArtifact {
             sink: "disk",
-            digest: None,
+            digest: Some(digest),
             size_bytes: size,
             uri: path.to_string_lossy().into_owned(),
             public_url: None,
         })
+    }
+
+    async fn get(&self, stored: &StoredArtifact) -> Result<Vec<u8>, ArtifactError> {
+        if stored.sink != self.kind() {
+            return Err(ArtifactError::InvalidRecord(format!("artifact was recorded for the {} sink, not disk", stored.sink)));
+        }
+        let root = tokio::fs::canonicalize(&self.root).await
+            .map_err(|e| ArtifactError::Io(format!("resolving artifact directory: {e}")))?;
+        let path = tokio::fs::canonicalize(&stored.uri).await
+            .map_err(|e| ArtifactError::Io(format!("resolving recorded artifact: {e}")))?;
+        if !path.starts_with(&root) {
+            return Err(ArtifactError::InvalidRecord("disk artifact path is outside the configured artifact directory".into()));
+        }
+        let bytes = tokio::fs::read(&path).await
+            .map_err(|e| ArtifactError::Io(format!("reading {}: {e}", path.display())))?;
+        validate(stored, &bytes)?;
+        Ok(bytes)
     }
 }
 
@@ -240,6 +286,11 @@ impl ArtifactSink for S3Sink {
                 self.key_for(r)
             ),
         })
+    }
+
+
+    async fn get(&self, stored: &StoredArtifact) -> Result<Vec<u8>, ArtifactError> {
+        Err(ArtifactError::NotImplemented { sink: "s3", detail: format!("would download {}", stored.uri) })
     }
 }
 
@@ -308,6 +359,23 @@ impl ArtifactSink for ArtifactsSink {
         self.finish(r, digest, size).await
     }
 
+    async fn get(&self, stored: &StoredArtifact) -> Result<Vec<u8>, ArtifactError> {
+        if stored.sink != self.kind() {
+            return Err(ArtifactError::InvalidRecord(format!("artifact was recorded for the {} sink, not artifacts", stored.sink)));
+        }
+        let digest = stored.digest.as_deref().ok_or_else(||
+            ArtifactError::InvalidRecord("artifacts-store record has no digest".into()))?;
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ArtifactError::InvalidRecord("artifacts-store record has an invalid digest".into()));
+        }
+        let response = self.auth(self.http.get(format!("{}/blobs/{digest}", self.config.url)))
+            .send().await.map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        let bytes = check(response, "downloading a blob").await?.bytes().await
+            .map_err(|e| ArtifactError::Transport(e.to_string()))?.to_vec();
+        validate(stored, &bytes)?;
+        Ok(bytes)
+    }
+
     fn guest_push(&self) -> Option<GuestPush> {
         Some(GuestPush {
             url: self.config.url_for_guest().to_string(),
@@ -337,6 +405,35 @@ impl ArtifactSink for ArtifactsSink {
             }),
             Some(_) => self.finish(r, digest.to_string(), size).await,
         }
+    }
+
+    async fn publish_pushed_rootfs(
+        &self, digest: &str, size: u64, image: &str,
+    ) -> Result<PublishedRootfs, ArtifactError> {
+        validate_digest(digest)?;
+        if image.trim().is_empty() {
+            return Err(ArtifactError::InvalidRecord("rootfs image name is empty".into()));
+        }
+        match self.stat_blob(digest).await? {
+            None => return Err(ArtifactError::NotPushed { digest: digest.into(), detail: "the store does not have it".into() }),
+            Some(Some(stored)) if stored != size => return Err(ArtifactError::NotPushed {
+                digest: digest.into(), detail: format!("the guest measured {size} bytes, the store holds {stored}"),
+            }),
+            // A rootfs publication requires a verified HEAD size, rather than
+            // accepting an old store that omitted Content-Length.
+            Some(None) => return Err(ArtifactError::NotPushed { digest: digest.into(), detail: "HEAD did not report a Content-Length".into() }),
+            Some(Some(_)) => {}
+        }
+        let manifest = rootfs_manifest(digest, size, image);
+        let response = self.auth(self.http.put(format!("{}/manifests", self.config.url)))
+            .json(&manifest).send().await.map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        let body: serde_json::Value = check(response, "storing a rootfs manifest").await?
+            .json().await.map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        let manifest_digest = body.get("digest").and_then(Value::as_str)
+            .ok_or_else(|| ArtifactError::InvalidRecord("store omitted the rootfs manifest digest".into()))?;
+        validate_digest(manifest_digest)?;
+        Ok(PublishedRootfs { store_url: self.config.url.trim_end_matches('/').into(),
+            manifest_digest: manifest_digest.into(), blob_digest: digest.into(), size_bytes: size })
     }
 }
 
@@ -540,6 +637,21 @@ fn manifest_for(r: &ArtifactRef, digest: &str, size: u64) -> serde_json::Value {
     })
 }
 
+fn rootfs_manifest(digest: &str, size: u64, image: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1, "kind": "heyvm.rootfs.v1",
+        "entries": [{"name":"rootfs.ext4", "digest":digest, "size":size}],
+        "annotations": {"heyvm.image":image, "heyvm.nominal_size":size.to_string(), "heyvm.primitive":"ext4_raw"}
+    })
+}
+
+fn validate_digest(digest: &str) -> Result<(), ArtifactError> {
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return Err(ArtifactError::InvalidRecord("digest must be 64 lowercase hexadecimal characters".into()));
+    }
+    Ok(())
+}
+
 /// A tag the store will accept: `[A-Za-z0-9_.-]`, at most 64 characters, no
 /// leading `-` or `.`.
 ///
@@ -587,6 +699,8 @@ pub enum ArtifactError {
     Misconfigured(String),
     Io(String),
     Transport(String),
+    InvalidRecord(String),
+    Corrupt(String),
     Store {
         what: String,
         status: u16,
@@ -610,6 +724,8 @@ impl fmt::Display for ArtifactError {
             Self::Misconfigured(e) => write!(f, "the artifact sink is misconfigured: {e}"),
             Self::Io(e) => write!(f, "writing an artifact: {e}"),
             Self::Transport(e) => write!(f, "could not reach the artifact store: {e}"),
+            Self::InvalidRecord(e) => write!(f, "invalid recorded artifact: {e}"),
+            Self::Corrupt(e) => write!(f, "downloaded artifact failed validation: {e}"),
             Self::Store {
                 what,
                 status,
@@ -648,6 +764,19 @@ impl fmt::Display for ArtifactError {
     }
 }
 
+fn validate(stored: &StoredArtifact, bytes: &[u8]) -> Result<(), ArtifactError> {
+    if bytes.len() as u64 != stored.size_bytes {
+        return Err(ArtifactError::Corrupt(format!("expected {} bytes, received {}", stored.size_bytes, bytes.len())));
+    }
+    if let Some(expected) = &stored.digest {
+        let actual = hex::encode(Sha256::digest(bytes));
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(ArtifactError::Corrupt(format!("sha256 mismatch: expected {expected}, received {actual}")));
+        }
+    }
+    Ok(())
+}
+
 impl std::error::Error for ArtifactError {}
 
 #[cfg(test)]
@@ -665,6 +794,19 @@ mod tests {
             description: None,
             public: false,
         }
+    }
+
+    #[test]
+    fn rootfs_publication_schema_matches_app_lb() {
+        let digest = "a".repeat(64);
+        let m = rootfs_manifest(&digest, 4096, "app-image");
+        assert_eq!(m["kind"], "heyvm.rootfs.v1");
+        assert_eq!(m["entries"][0], serde_json::json!({"name":"rootfs.ext4","digest":digest,"size":4096}));
+        assert_eq!(m["annotations"]["heyvm.primitive"], "ext4_raw");
+        assert_eq!(m["annotations"]["heyvm.nominal_size"], "4096");
+        assert_eq!(m["annotations"]["heyvm.image"], "app-image");
+        assert!(validate_digest(&"A".repeat(64)).is_err());
+        assert!(validate_digest("abc").is_err());
     }
 
     /// The store's tag charset excludes `/`, which every natural artifact
@@ -748,6 +890,41 @@ mod tests {
         assert_eq!(std::fs::read(&stored.uri).unwrap(), b"payload");
         assert!(stored.uri.contains("build-x86_64"), "{}", stored.uri);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn disk_download_roundtrips_and_rejects_changed_bytes() {
+        let root = std::env::temp_dir().join(format!("ci-art-{}", crate::vm::new_id()));
+        let sink = DiskSink { root: root.clone() };
+        let stored = sink.put(&aref(), b"payload".to_vec()).await.unwrap();
+        assert_eq!(sink.get(&stored).await.unwrap(), b"payload");
+        // Equal length distinguishes digest checking from a size-only check.
+        tokio::fs::write(&stored.uri, b"changed").await.unwrap();
+        assert!(matches!(sink.get(&stored).await.unwrap_err(), ArtifactError::Corrupt(_)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn artifacts_download_uses_configured_store_auth_and_checks_digest() {
+        use axum::{Router, body::Bytes, extract::{Path as AxumPath, State}, http::{HeaderMap, StatusCode}, response::IntoResponse, routing::get};
+        #[derive(Clone)]
+        struct StateData { bytes: Bytes }
+        let bytes = Bytes::from_static(b"native-output");
+        let app = Router::new().route("/blobs/{digest}", get(
+            |State(st): State<StateData>, AxumPath(_): AxumPath<String>, headers: HeaderMap| async move {
+                if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer scoped-token") {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                st.bytes.into_response()
+            })).with_state(StateData { bytes: bytes.clone() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let sink = ArtifactsSink::new(ArtifactsConfig { url: format!("http://{addr}"), token: Some("scoped-token".into()), guest_url: None });
+        let stored = StoredArtifact { sink: "artifacts", digest: Some(hex::encode(Sha256::digest(&bytes))), size_bytes: bytes.len() as u64, uri: "ignored-recorded-tag".into(), public_url: None };
+        assert_eq!(sink.get(&stored).await.unwrap(), bytes);
+        let corrupt = StoredArtifact { digest: Some("0".repeat(64)), ..stored };
+        assert!(matches!(sink.get(&corrupt).await.unwrap_err(), ArtifactError::Corrupt(_)));
     }
 
     /// An artifact name arrives from a workflow file; one `..` would write

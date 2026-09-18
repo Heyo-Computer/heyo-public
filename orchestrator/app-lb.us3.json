@@ -1,0 +1,34 @@
+{
+  "id": "orchestrator-us3",
+  "routes": [],
+  "vm": {
+    "driver": "firecracker",
+    "image": "orchestrator-us3-pending",
+    "port": 4446,
+    "size_class": "small",
+    "ttl_seconds": 0,
+    "working_directory": "/opt/orchestrator",
+    "start_command": "nohup /usr/local/bin/orchestrator </dev/null >/tmp/orchestrator.log 2>&1 &",
+    "env_vars": {
+      "ORCHESTRATOR_SERVER_PORT": "4446",
+      "ORCHESTRATOR_MIGRATIONS_DIR": "/opt/orchestrator/migrations",
+      "ORCHESTRATOR_HEYOSECRET_URL": "https://heyosecret.us3.heyo.work"
+    },
+    "env_from": [
+      {"secret": "orchestrator-us3", "key": "database-url", "as": "DATABASE_URL"},
+      {"secret": "orchestrator-us3", "key": "jwt-secret", "as": "JWT_SECRET"},
+      {"secret": "orchestrator-us3", "key": "internal-api-key", "as": "INTERNAL_API_KEY"},
+      {"secret": "heyosecret-us3", "key": "internal-api-key", "as": "HEYOSECRET_INTERNAL_API_KEY"}
+    ]
+  },
+  "health": {"path": "/health", "timeout_secs": 5},
+  "scaling": {"min_replicas": 0, "max_replicas": 1, "warm_pool": 0, "boot_timeout_secs": 300},
+  "build": {
+    "repo": "https://github.com/Heyo-Computer/heyo-public.git",
+    "ref": "REPLACE_WITH_VERIFIED_COMMIT",
+    "dockerfile": "orchestrator/Dockerfile.firecracker",
+    "context": ".",
+    "image_name": "orchestrator-us3",
+    "image_size_mb": 768
+  }
+}

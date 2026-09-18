@@ -33,6 +33,13 @@ dmesg -n 1 2>/dev/null
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 hostname ci-rust
 
+# Docker's injected hosts file is not included by docker export. Restore local
+# name resolution in the guest without replacing any backend-provided entries.
+if ! grep -Eq '^127\.0\.0\.1[[:space:]]+.*\blocalhost\b' /etc/hosts 2>/dev/null; then
+    printf '127.0.0.1 localhost\n::1 localhost\n' >> /etc/hosts
+fi
+ip link set lo up
+
 # Network: the kernel ip= param may not be fully applied before init runs. A
 # build needs it working — `cargo` fetches crates from the registry.
 ip link set eth0 up 2>/dev/null

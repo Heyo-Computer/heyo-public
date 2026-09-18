@@ -1,7 +1,8 @@
-//! Building a runner's VM image from a Dockerfile in the submitted tree.
+//! Preparing verified source and building VM images on the selected runner.
 //!
-//! The build itself runs **on the runner, by its daemon**: `ci` uploads the
-//! Dockerfile and its build context to `POST /images/build`, and heyvmd runs
+//! The build itself runs **on the runner, by its daemon**. The daemon checks out
+//! and verifies the descriptor, then builds directly from its local context; CI
+//! never reads or uploads Dockerfile/context/repository bytes. Heyvmd runs
 //! the same `docker build → docker export → mke2fs` pipeline `heyvm mvm build`
 //! runs locally, writing `~/.heyo/images/firecracker/{name}.ext4` into the
 //! host's own catalog. `ci` never parses the Dockerfile and never boots a
@@ -40,18 +41,13 @@
 //! file went away forgets the row and rebuilds, the same way `acquire_vm`
 //! already recovers from a pooled VM the daemon lost.
 
-use crate::vm::{ImageBuild, VmSpec};
 use heyo_sdk::{HeyoClient, HeyoClientOptions, RequestOptions};
 use reqwest::Method;
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
 use std::time::Duration;
-
-/// Hex characters kept from the digest, matching the VM pool's fingerprint.
-const FINGERPRINT_LEN: usize = 12;
 
 /// How long a build may hold its catalog claim without renewal.
 ///
@@ -60,139 +56,132 @@ const FINGERPRINT_LEN: usize = 12;
 /// duplicate build request, which the daemon's own idempotency then collapses.
 pub const BUILD_LEASE: Duration = Duration::from_secs(30 * 60);
 
-// ---- what gets uploaded ------------------------------------------------
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareRequest {
+    pub repository_url: String,
+    pub base_revision: String,
+    pub target_tree: String,
+    pub patch_base64: String,
+    pub workflow_hashes: BTreeMap<String, String>,
+    pub cache_key_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_build: Option<PrepareImageBuild>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_auth_token: Option<String>,
+}
 
-/// A resolved `vm.build`: the name the image will have, and the bytes that
-/// name was derived from — which are also the bytes the daemon builds from,
-/// so the name can never describe inputs other than the ones sent.
-#[derive(Debug)]
-pub struct BuildPlan {
-    pub name: String,
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareImageBuild {
     pub dockerfile: String,
-    /// Gzipped tar of the context directory. `None` when the context is empty,
-    /// which is legal: a Dockerfile that copies nothing needs no context.
-    pub context_tar_gz: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_mb: Option<u64>,
+    pub driver: &'static str,
 }
 
-/// Resolve a job's `vm.build` against the checkout: read the Dockerfile, pack
-/// the context, and derive the image name from their content.
-///
-/// The fingerprint hashes the Dockerfile's raw bytes rather than anything
-/// parsed — `ci` no longer understands Dockerfiles, docker does — so a comment
-/// edit does rebuild. That trade is deliberate: the daemon's docker layer
-/// cache makes the rebuild cheap, and a parser kept only to avoid it would be
-/// a second implementation of Dockerfile semantics waiting to disagree with
-/// the first.
-///
-/// The whole context directory is hashed and shipped, as `docker build` ships
-/// it. `.dockerignore` is honoured by docker *during* the build but not by
-/// this hash, so editing an ignored file rebuilds needlessly — mildly wasteful,
-/// never wrong.
-pub fn plan_for(
-    build: &ImageBuild,
-    spec: &VmSpec,
-    workspace: &Path,
-) -> Result<BuildPlan, ImageError> {
-    let dockerfile_path = workspace.join(&build.dockerfile);
-    let dockerfile =
-        std::fs::read_to_string(&dockerfile_path).map_err(|e| ImageError::NoDockerfile {
-            path: build.dockerfile.clone(),
-            reason: e.to_string(),
+#[derive(Debug, Clone)]
+pub struct PreparedSource {
+    pub source_id: String,
+    pub cache_keys: BTreeMap<String, crate::pool::VerifiedContent>,
+    pub image: Option<PreparedImage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedImage { pub name: String, pub input_digest: String }
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CacheKey { Present { sha256: String }, Absent { absent: bool } }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareStatus {
+    source_id: String,
+    status: String,
+    #[serde(default)] cache_keys: Option<BTreeMap<String, CacheKey>>,
+    #[serde(default)] image: Option<PreparedImageWire>,
+    #[serde(default)] error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreparedImageWire { name: String, input_digest: String }
+
+pub async fn prepare_remote(options: impl Into<crate::runners::Connection>, request: &PrepareRequest, deadline: Duration) -> Result<PreparedSource, ImageError> {
+    let poll = poll_interval();
+    let connection = options.into();
+    let client = HeyoClient::new(connection.options.clone()).map_err(|source| ImageError::Daemon { what: "building a client for source preparation", source })?;
+    let started = std::time::Instant::now();
+    let mut status: PrepareStatus = client.request(Method::POST, "/sources/prepare", Some(request), RequestOptions { timeout: Some(Duration::from_secs(120)), query: vec![] })
+        .await.map_err(|source| match source {
+            heyo_sdk::HeyoError::NotFound(_) => ImageError::Capability,
+            source => ImageError::Daemon { what: "preparing verified source on the runner", source },
         })?;
-
-    let context_dir = workspace.join(build.context_dir());
-    let mut files = Vec::new();
-    if context_dir.is_dir() {
-        walk(&context_dir, &context_dir, &mut files)?;
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut h = Sha256::new();
-    // Versioned, so a change to what the hash covers renames every image
-    // rather than colliding new inputs onto old files.
-    h.update(b"ci-image-v2\0");
-    h.update(dockerfile.as_bytes());
-    h.update([0]);
-    // The size override changes the ext4 the daemon writes, and the driver
-    // decides which catalog the name resolves against.
-    h.update(format!("{:?}\0{}\0", spec.driver, build.size_mb.unwrap_or(0)).as_bytes());
-    for (rel, bytes) in &files {
-        h.update(rel.as_bytes());
-        h.update([0]);
-        let mut fh = Sha256::new();
-        fh.update(bytes);
-        h.update(fh.finalize());
-    }
-    let name = format!("ci-img-{}", &hex::encode(h.finalize())[..FINGERPRINT_LEN]);
-
-    let context_tar_gz = if files.is_empty() {
-        None
-    } else {
-        Some(pack_context(&files)?)
-    };
-
-    Ok(BuildPlan {
-        name,
-        dockerfile,
-        context_tar_gz,
-    })
-}
-
-/// Read every file under `dir`, as context-relative paths.
-///
-/// Symlinks are skipped rather than followed: a link out of the context would
-/// ship a file the fingerprint never hashed — and the tree this walks was
-/// submitted by whoever ran `git submit`.
-fn walk(dir: &Path, context: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<(), ImageError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| ImageError::UnreadableContext {
-        path: rel_of(dir, context),
-        reason: e.to_string(),
-    })?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata() else { continue };
-        if meta.is_symlink() {
-            continue;
+    validate_source_id(&status.source_id)?;
+    let source_id = status.source_id.clone();
+    loop {
+        if status.source_id != source_id {
+            return Err(ImageError::Protocol(format!("runner changed sourceId from {source_id:?} to {:?} while polling", status.source_id)));
         }
-        if meta.is_dir() {
-            walk(&path, context, out)?;
-        } else if meta.is_file() {
-            let bytes = std::fs::read(&path).map_err(|e| ImageError::UnreadableContext {
-                path: rel_of(&path, context),
-                reason: e.to_string(),
+        match status.status.as_str() {
+            "ready" => return validate_prepared(status, request),
+            "failed" => return Err(ImageError::Source(status.error.unwrap_or_else(|| "runner reported no reason".into()))),
+            "preparing" => {}
+            other => return Err(ImageError::Protocol(format!("unknown source preparation status {other:?}"))),
+        }
+        if started.elapsed() >= deadline { return Err(ImageError::SourceTimeout(deadline)); }
+        tokio::time::sleep(poll).await;
+        status = client.request(Method::GET, &format!("/sources/{source_id}"), None::<&()>, RequestOptions { timeout: Some(Duration::from_secs(30)), query: vec![] }).await
+            .map_err(|source| match source {
+                heyo_sdk::HeyoError::NotFound(_) => ImageError::SourceExpired,
+                source => ImageError::Daemon { what: "polling verified source preparation", source },
             })?;
-            out.push((rel_of(&path, context), bytes));
-        }
     }
-    Ok(())
 }
 
-fn rel_of(path: &Path, context: &Path) -> String {
-    path.strip_prefix(context)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+fn validate_source_id(value: &str) -> Result<(), ImageError> {
+    if (1..=128).contains(&value.len())
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(ImageError::Protocol(format!("runner returned malformed sourceId {value:?}")))
+    }
 }
 
-/// Tar and gzip the context files for upload.
-fn pack_context(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, ImageError> {
-    use std::io::Write;
-    let mut ar = tar::Builder::new(Vec::new());
-    for (rel, bytes) in files {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        ar.append_data(&mut header, rel, bytes.as_slice())
-            .map_err(|e| ImageError::Pack(e.to_string()))?;
+fn poll_interval() -> Duration {
+    if cfg!(test) { Duration::from_millis(10) } else { Duration::from_secs(3) }
+}
+
+fn validate_prepared(status: PrepareStatus, request: &PrepareRequest) -> Result<PreparedSource, ImageError> {
+    validate_source_id(&status.source_id)?;
+    let expected: BTreeSet<_> = request.cache_key_files.iter().cloned().collect();
+    let keys = status.cache_keys.unwrap_or_default();
+    let actual: BTreeSet<_> = keys.keys().cloned().collect();
+    if actual != expected { return Err(ImageError::Protocol(format!("runner returned cache key set {actual:?}, requested {expected:?}"))); }
+    let mut cache_keys = BTreeMap::new();
+    for (path, value) in keys {
+        let value = match value {
+            CacheKey::Present { sha256 } => {
+                let bytes = hex::decode(&sha256).map_err(|_| ImageError::Protocol(format!("invalid SHA-256 for cache key {path:?}")))?;
+                let digest: [u8; 32] = bytes.try_into().map_err(|_| ImageError::Protocol(format!("invalid SHA-256 length for cache key {path:?}")))?;
+                crate::pool::VerifiedContent::Sha256(digest)
+            }
+            CacheKey::Absent { absent: true } => crate::pool::VerifiedContent::Absent,
+            CacheKey::Absent { absent: false } => return Err(ImageError::Protocol(format!("invalid absent marker for cache key {path:?}"))),
+        };
+        cache_keys.insert(path, value);
     }
-    let tar_bytes = ar
-        .into_inner()
-        .map_err(|e| ImageError::Pack(e.to_string()))?;
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    gz.write_all(&tar_bytes)
-        .map_err(|e| ImageError::Pack(e.to_string()))?;
-    gz.finish().map_err(|e| ImageError::Pack(e.to_string()))
+    let image = match (request.image_build.is_some(), status.image) {
+        (true, Some(i)) if !i.name.is_empty() && !i.input_digest.is_empty() && hex::decode(&i.input_digest).is_ok_and(|d| d.len() == 32) => Some(PreparedImage { name: i.name, input_digest: i.input_digest }),
+        (true, _) => return Err(ImageError::Protocol("runner omitted or returned invalid prepared image metadata".into())),
+        (false, None) => None,
+        (false, Some(_)) => return Err(ImageError::Protocol("runner returned unrequested image metadata".into())),
+    };
+    Ok(PreparedSource { source_id: status.source_id, cache_keys, image })
 }
 
 // ---- driving the daemon ------------------------------------------------
@@ -203,6 +192,8 @@ fn pack_context(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, ImageError> {
 #[derive(Debug, Deserialize)]
 struct BuildStatus {
     status: String,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
@@ -228,9 +219,9 @@ pub struct Built {
 /// state aged out; the POST is simply re-sent — it is idempotent, and if the
 /// image landed before the restart the re-POST answers `ready`.
 pub async fn build_remote<F, Fut>(
-    options: HeyoClientOptions,
-    plan: &BuildPlan,
-    size_mb: Option<u64>,
+    options: impl Into<crate::runners::Connection>,
+    source_id: &str,
+    name: &str,
     deadline: Duration,
     mut renew: F,
 ) -> Result<Built, ImageError>
@@ -238,50 +229,32 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    use base64::Engine;
     use std::fmt::Write as _;
 
-    const POLL: Duration = Duration::from_secs(3);
+    let poll = poll_interval();
 
-    let client = HeyoClient::new(options).map_err(|e| ImageError::Daemon {
+    let connection = options.into();
+    let client = HeyoClient::new(connection.options.clone()).map_err(|e| ImageError::Daemon {
         what: "building a client for the runner",
         source: e,
     })?;
 
-    let body = serde_json::json!({
-        "name": plan.name,
-        "dockerfile": plan.dockerfile,
-        "context_tar_gz": plan.context_tar_gz.as_deref().map(|b| {
-            base64::engine::general_purpose::STANDARD.encode(b)
-        }),
-        "size_mb": size_mb,
-    });
-
     let mut log = String::new();
-    let _ = writeln!(
-        log,
-        "[ci] building image {} on the runner: {} byte Dockerfile, {} byte context{}",
-        plan.name,
-        plan.dockerfile.len(),
-        plan.context_tar_gz.as_ref().map(|c| c.len()).unwrap_or(0),
-        match size_mb {
-            Some(mb) => format!(", rootfs {mb} MB"),
-            None => ", rootfs auto-sized".to_string(),
-        }
-    );
+    let _ = writeln!(log, "[ci] building verified image {name} from prepared source {source_id}");
+    let path = format!("/sources/{source_id}/image");
 
-    let post = |client: &HeyoClient, body: serde_json::Value| {
+    let post = |client: &HeyoClient| {
         let client = client.clone();
+        let path = path.clone();
         async move {
             client
                 .request::<BuildStatus>(
                     Method::POST,
-                    "/images/build",
-                    Some(&body),
+                    &path,
+                    None::<&()>,
                     RequestOptions {
-                        // The context rides in this request; give a large one
-                        // time to cross the tunnel. The build itself is not
-                        // waited on here — the route returns on acceptance.
+                        // The build itself is not waited on here — the route
+                        // returns after accepting the prepared source.
                         timeout: Some(Duration::from_secs(120)),
                         query: Vec::new(),
                     },
@@ -290,12 +263,12 @@ where
         }
     };
 
-    let first = post(&client, body.clone())
-        .await
-        .map_err(|e| ImageError::Daemon {
-            what: "starting the image build",
-            source: e,
-        })?;
+    let map_build_error = |what, e| match e {
+        heyo_sdk::HeyoError::NotFound(_) => ImageError::SourceExpired,
+        source => ImageError::Daemon { what, source },
+    };
+    let first = post(&client).await.map_err(|e| map_build_error("starting the image build", e))?;
+    validate_build_name(&first, name)?;
     if first.status == "ready" {
         // The daemon already had it — the whole point of content-hashed names.
         let _ = writeln!(log, "[ci] the runner already has this image");
@@ -307,31 +280,29 @@ where
 
     let started = std::time::Instant::now();
     loop {
-        tokio::time::sleep(POLL).await;
+        tokio::time::sleep(poll).await;
         renew().await;
 
         let status: BuildStatus = client
             .request(
                 Method::GET,
-                "/images/build/status",
+                &path,
                 None::<&()>,
                 RequestOptions {
                     timeout: Some(Duration::from_secs(30)),
-                    query: vec![("name".to_string(), plan.name.clone())],
+                    query: vec![],
                 },
             )
             .await
-            .map_err(|e| ImageError::Daemon {
-                what: "polling the image build",
-                source: e,
-            })?;
+            .map_err(|e| map_build_error("polling the image build", e))?;
 
+        validate_build_name(&status, name)?;
         match status.status.as_str() {
             "ready" => {
                 let _ = writeln!(
                     log,
                     "[ci] image {} is ready after {:?}",
-                    plan.name,
+                    name,
                     started.elapsed()
                 );
                 return Ok(Built {
@@ -345,37 +316,37 @@ where
                     .unwrap_or_else(|| "the daemon reported no reason".to_string());
                 let _ = writeln!(log, "[ci] build failed: {detail}");
                 return Err(ImageError::Build {
-                    name: plan.name.clone(),
+                    name: name.to_string(),
                     detail,
                 });
             }
             "building" => {}
-            // The daemon restarted, or a terminal state aged out of its
-            // tracker. Re-POST: idempotent, and it re-answers `ready` if the
-            // image landed before the restart.
-            _ => {
-                let _ = writeln!(log, "[ci] build state lost on the runner; re-requesting");
-                let re = post(&client, body.clone())
-                    .await
-                    .map_err(|e| ImageError::Daemon {
-                        what: "re-requesting the image build",
-                        source: e,
-                    })?;
-                if re.status == "ready" {
-                    return Ok(Built {
-                        size_bytes: re.size_bytes.unwrap_or(0),
-                        log,
-                    });
+            "unknown" => {
+                let restarted = post(&client).await
+                    .map_err(|e| map_build_error("restarting the interrupted image build", e))?;
+                validate_build_name(&restarted, name)?;
+                match restarted.status.as_str() {
+                    "ready" => return Ok(Built { size_bytes: restarted.size_bytes.unwrap_or(0), log }),
+                    "building" => {}
+                    "failed" => return Err(ImageError::Build { name: name.to_string(), detail: restarted.error.unwrap_or_else(|| "the daemon reported no reason".into()) }),
+                    other => return Err(ImageError::Protocol(format!("unknown image build status {other:?} after restart"))),
                 }
             }
+            other => return Err(ImageError::Protocol(format!("unknown image build status {other:?}"))),
         }
 
         if started.elapsed() >= deadline {
             return Err(ImageError::BuildTimeout {
-                name: plan.name.clone(),
+                name: name.to_string(),
                 after: deadline,
             });
         }
+    }
+}
+
+fn validate_build_name(status: &BuildStatus, expected: &str) -> Result<(), ImageError> {
+    if status.name.as_deref() == Some(expected) { Ok(()) } else {
+        Err(ImageError::Protocol(format!("runner image response named {:?}, expected {expected:?}", status.name)))
     }
 }
 
@@ -591,15 +562,11 @@ impl Catalog {
 
 #[derive(Debug)]
 pub enum ImageError {
-    NoDockerfile {
-        path: String,
-        reason: String,
-    },
-    UnreadableContext {
-        path: String,
-        reason: String,
-    },
-    Pack(String),
+    Capability,
+    SourceExpired,
+    Source(String),
+    SourceTimeout(Duration),
+    Protocol(String),
     /// The daemon could not be asked, or stopped answering. The source is kept
     /// typed so a transport-level failure — the tunnel, not the build — can be
     /// told from the daemon actually refusing.
@@ -643,14 +610,11 @@ impl ImageError {
 impl fmt::Display for ImageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoDockerfile { path, reason } => write!(
-                f,
-                "vm.build.dockerfile {path:?} could not be read from the submitted tree: {reason}"
-            ),
-            Self::UnreadableContext { path, reason } => {
-                write!(f, "build context file {path:?} could not be read: {reason}")
-            }
-            Self::Pack(e) => write!(f, "could not pack the build context: {e}"),
+            Self::Capability => write!(f, "runner backend does not support verified source preparation; upgrade heyvmd (the CI service will not upload repository or image-context bytes)"),
+            Self::SourceExpired => write!(f, "prepared source expired on the runner"),
+            Self::Source(e) => write!(f, "runner failed to prepare verified source: {e}"),
+            Self::SourceTimeout(after) => write!(f, "runner did not prepare verified source within {after:?}"),
+            Self::Protocol(e) => write!(f, "runner returned an invalid verified-source response: {e}"),
             Self::Daemon { what, source } => write!(f, "{what}: {source}"),
             Self::Build { name, detail } => {
                 write!(f, "the runner could not build image {name}: {detail}")
@@ -675,9 +639,43 @@ impl std::error::Error for ImageError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::{ImageBuild, VmSpec};
     use heyo_sdk::{SandboxDriver, SandboxSize};
+    use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    const FINGERPRINT_LEN: usize = 12;
+    #[derive(Debug)]
+    struct LocalPlan { name: String, context_tar_gz: Option<Vec<u8>> }
+    fn plan_for(build: &ImageBuild, spec: &VmSpec, workspace: &std::path::Path) -> Result<LocalPlan, std::io::Error> {
+        fn collect(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<(), std::io::Error> {
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                if path.is_dir() { collect(&path, root, out)?; }
+                else if path.is_file() { out.push((path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"), std::fs::read(path)?)); }
+            }
+            Ok(())
+        }
+        let dockerfile = std::fs::read(workspace.join(&build.dockerfile))?;
+        let root = workspace.join(build.context_dir());
+        let mut files = vec![];
+        collect(&root, &root, &mut files)?;
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut h = Sha256::new();
+        h.update(b"ci-image-v2\0"); h.update(&dockerfile); h.update([0]);
+        h.update(format!("{:?}\0{}\0", spec.driver, build.size_mb.unwrap_or(0)).as_bytes());
+        for (path, bytes) in &files { h.update(path.as_bytes()); h.update([0]); h.update(Sha256::digest(bytes)); }
+        let name = format!("ci-img-{}", &hex::encode(h.finalize())[..FINGERPRINT_LEN]);
+        let context_tar_gz = if files.is_empty() { None } else {
+            use std::io::Write;
+            let mut tar = tar::Builder::new(Vec::new());
+            for (path, bytes) in files { let mut header = tar::Header::new_gnu(); header.set_size(bytes.len() as u64); header.set_mode(0o644); header.set_cksum(); tar.append_data(&mut header, path, bytes.as_slice())?; }
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            gz.write_all(&tar.into_inner()?)?; Some(gz.finish()?)
+        };
+        Ok(LocalPlan { name, context_tar_gz })
+    }
 
     fn spec() -> VmSpec {
         VmSpec {
@@ -797,8 +795,7 @@ mod tests {
     #[test]
     fn a_missing_dockerfile_names_the_path() {
         let w = ws(&[]);
-        let e = plan_for(&build("absent/Dockerfile"), &spec(), &w).unwrap_err();
-        assert!(e.to_string().contains("absent/Dockerfile"), "{e}");
+        assert!(plan_for(&build("absent/Dockerfile"), &spec(), &w).is_err());
         std::fs::remove_dir_all(&w).ok();
     }
 
@@ -840,6 +837,106 @@ mod tests {
         assert_eq!(seen.get("sub/b.txt").map(String::as_str), Some("beta"));
         assert!(seen.contains_key("Dockerfile"));
         std::fs::remove_dir_all(&w).ok();
+    }
+
+    fn prepare_request() -> PrepareRequest {
+        PrepareRequest {
+            repository_url: "https://github.com/acme/repo.git".into(),
+            base_revision: "a".repeat(40), target_tree: "b".repeat(40),
+            patch_base64: "cGF0Y2g=".into(),
+            workflow_hashes: BTreeMap::from([(".ci/workflows/a.yml".into(), "c".repeat(64))]),
+            cache_key_files: vec!["Cargo.lock".into()],
+            image_build: Some(PrepareImageBuild { dockerfile: "Dockerfile".into(), context: None, size_mb: None, driver: "firecracker" }),
+            git_auth_token: Some("fresh-secret".into()),
+        }
+    }
+
+    async fn http_options(app: axum::Router) -> HeyoClientOptions {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        HeyoClientOptions { api_key: None, base_url: Some(format!("http://{addr}")), timeout: None }
+    }
+
+    fn ready_source(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sourceId": id, "status": "ready",
+            "cacheKeys": {"Cargo.lock": {"sha256": "11".repeat(32)}},
+            "image": {"name": "ci-img-aabbccddee11", "inputDigest": "22".repeat(32)}
+        })
+    }
+
+    #[tokio::test]
+    async fn prepare_http_contract_posts_metadata_and_polls_same_source() {
+        use axum::{Json, Router, extract::State, routing::{get, post}};
+        use std::sync::{Arc, Weak};
+        let owner = Arc::new(HeyoClient::new(HeyoClientOptions::default()).unwrap());
+        let weak = Arc::downgrade(&owner);
+        let app = Router::new()
+            .route("/sources/prepare", post(|State(owner): State<Weak<HeyoClient>>, Json(body): Json<serde_json::Value>| async move {
+                assert!(owner.upgrade().is_some(), "source POST lost its connection owner");
+                assert_eq!(body["repositoryUrl"], "https://github.com/acme/repo.git");
+                assert_eq!(body["gitAuthToken"], "fresh-secret");
+                assert!(body.get("context_tar_gz").is_none());
+                Json(serde_json::json!({"sourceId":"source_1", "status":"preparing"}))
+            }))
+            .route("/sources/source_1", get(|State(owner): State<Weak<HeyoClient>>| async move {
+                assert!(owner.upgrade().is_some(), "source polling lost its connection owner");
+                Json(ready_source("source_1"))
+            }))
+            .with_state(weak.clone());
+        let connection = crate::runners::Connection { options: http_options(app).await, _tunnel: Some(owner) };
+        let prepared = prepare_remote(connection, &prepare_request(), Duration::from_secs(1)).await.unwrap();
+        assert_eq!(prepared.source_id, "source_1");
+        assert_eq!(prepared.image.unwrap().name, "ci-img-aabbccddee11");
+        assert!(weak.upgrade().is_none(), "completed preparation leaked its connection");
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_malformed_and_changed_source_ids_and_reports_expiry() {
+        use axum::{Json, Router, routing::{get, post}};
+        let malformed = Router::new().route("/sources/prepare", post(|| async {
+            Json(serde_json::json!({"sourceId":"../bad", "status":"preparing"}))
+        }));
+        assert!(matches!(prepare_remote(http_options(malformed).await, &prepare_request(), Duration::from_secs(1)).await, Err(ImageError::Protocol(_))));
+
+        let changed = Router::new()
+            .route("/sources/prepare", post(|| async { Json(serde_json::json!({"sourceId":"one", "status":"preparing"})) }))
+            .route("/sources/one", get(|| async { Json(ready_source("two")) }));
+        assert!(matches!(prepare_remote(http_options(changed).await, &prepare_request(), Duration::from_secs(1)).await, Err(ImageError::Protocol(_))));
+
+        let expired = Router::new()
+            .route("/sources/prepare", post(|| async { Json(serde_json::json!({"sourceId":"gone", "status":"preparing"})) }))
+            .route("/sources/gone", get(|| async { axum::http::StatusCode::NOT_FOUND }));
+        assert!(matches!(prepare_remote(http_options(expired).await, &prepare_request(), Duration::from_secs(1)).await, Err(ImageError::SourceExpired)));
+    }
+
+    #[tokio::test]
+    async fn interrupted_build_unknown_is_reposted_and_wrong_metadata_is_rejected() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let posts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/sources/source_1/image", post(|State(n): State<Arc<AtomicUsize>>| async move {
+                let call = n.fetch_add(1, Ordering::SeqCst);
+                Json(if call == 0 { serde_json::json!({"status":"building","name":"image"}) } else { serde_json::json!({"status":"ready","name":"image","size_bytes":9}) })
+            }).get(|| async { Json(serde_json::json!({"status":"unknown","name":"image"})) }))
+            .with_state(posts.clone());
+        let built = build_remote(http_options(app).await, "source_1", "image", Duration::from_secs(1), || async {}).await.unwrap();
+        assert_eq!(built.size_bytes, 9);
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+
+        let wrong = Router::new().route("/sources/source_1/image", post(|| async {
+            Json(serde_json::json!({"status":"ready","name":"another"}))
+        }));
+        assert!(matches!(build_remote(http_options(wrong).await, "source_1", "image", Duration::from_secs(1), || async {}).await, Err(ImageError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn build_post_404_requests_source_replay() {
+        use axum::{Router, routing::post};
+        let app = Router::new().route("/sources/source_1/image", post(|| async { axum::http::StatusCode::NOT_FOUND }));
+        assert!(matches!(build_remote(http_options(app).await, "source_1", "image", Duration::from_secs(1), || async {}).await, Err(ImageError::SourceExpired)));
     }
 
     // ---- the catalog ----------------------------------------------------

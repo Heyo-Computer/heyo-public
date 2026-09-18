@@ -18,7 +18,8 @@ use super::names;
 /// statement of a real constraint: the guest microVMs ship with an empty
 /// `/etc/resolv.conf`, so a hostname handed to a guest simply never resolves.
 /// The pooler resolves peer hostnames on the *host* side, exactly as the S3
-/// path pins IPs with `curl --resolve`.
+/// path pins IPs with `curl --resolve`. Rendering also sets `host` to this
+/// address so an inherited `PGHOST` cannot become libpq's TLS server name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conninfo {
     pub hostaddr: Ipv4Addr,
@@ -63,7 +64,8 @@ impl Conninfo {
 
     fn render(&self, password: &str) -> String {
         format!(
-            "hostaddr={} port={} dbname={} user={} password={} sslmode={} application_name={}",
+            "host={} hostaddr={} port={} dbname={} user={} password={} sslmode={} application_name={}",
+            quote_conn(&self.hostaddr.to_string()),
             quote_conn(&self.hostaddr.to_string()),
             quote_conn(&self.port.to_string()),
             quote_conn(&self.dbname),
@@ -106,6 +108,87 @@ fn quote_ident(s: &str) -> String {
 fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
+
+pub fn set_allow_connections(database: &str, allow: bool) -> String {
+    format!(
+        "ALTER DATABASE {} ALLOW_CONNECTIONS {}",
+        quote_ident(database),
+        if allow { "true" } else { "false" }
+    )
+}
+
+pub const PREPARED_XACTS_SQL: &str = "SELECT count(*)::int8 FROM pg_prepared_xacts WHERE database = $1";
+
+pub const TENANT_ROLE_ESCAPE_SQL: &str = "\
+WITH RECURSIVE can_become_owner(roleid) AS (
+  SELECT oid FROM pg_roles WHERE rolname = $1
+  UNION
+  SELECT m.member FROM pg_auth_members m JOIN can_become_owner c ON c.roleid = m.roleid
+  WHERE m.set_option OR m.inherit_option
+)
+SELECT r.rolname FROM can_become_owner c JOIN pg_roles r ON r.oid = c.roleid
+WHERE r.rolcanlogin AND r.rolname <> $1
+ORDER BY 1";
+
+// A dedicated cluster may admit only its controller, owner and replication
+// login. Other logins can hold independent table grants without inheriting the
+// owner, so checking owner membership alone does not establish a write fence.
+pub const UNSUPPORTED_FENCE_ROLES_SQL: &str = "\
+SELECT rolname FROM pg_roles
+WHERE (rolcanlogin AND rolname NOT IN (current_user, $1, $2))
+   OR (rolname IN ($1, $2) AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolbypassrls))
+ORDER BY 1";
+
+pub const SEQUENCES_SQL: &str = "\
+SELECT n.nspname, c.relname, format_type(s.seqtypid, NULL), s.seqstart, s.seqmin,
+       s.seqmax, s.seqincrement, s.seqcycle, s.seqcache
+FROM pg_sequence s JOIN pg_class c ON c.oid=s.seqrelid
+JOIN pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') ORDER BY 1,2";
+
+pub fn selective_admission(database: &str, owner: &str, repl_role: &str) -> String {
+    format!(
+        "ALTER DATABASE {} ALLOW_CONNECTIONS true; ALTER ROLE {} NOLOGIN; \
+         REVOKE CONNECT ON DATABASE {} FROM PUBLIC; REVOKE CONNECT ON DATABASE {} FROM {}; \
+         GRANT CONNECT ON DATABASE {} TO {}",
+        quote_ident(database), quote_ident(owner), quote_ident(database), quote_ident(database),
+        quote_ident(owner), quote_ident(database), quote_ident(repl_role)
+    )
+}
+
+pub fn restore_selective_admission(database: &str, owner: &str) -> String {
+    format!(
+        "ALTER ROLE {} LOGIN; GRANT CONNECT ON DATABASE {} TO {}",
+        quote_ident(owner), quote_ident(database), quote_ident(owner)
+    )
+}
+
+pub fn sequence_value(schema: &str, name: &str) -> String {
+    format!("SELECT last_value::int8, is_called FROM {}.{}", quote_ident(schema), quote_ident(name))
+}
+
+pub const DATABASE_OBJECT_LOCKS_SQL: &str = "\
+SELECT l.pid FROM pg_locks l
+WHERE l.locktype = 'object' AND l.classid = 'pg_database'::regclass
+  AND l.objid = (SELECT oid FROM pg_database WHERE datname = $1)
+  AND l.granted AND l.pid IS NOT NULL";
+
+/// Preserve only our positively identified logical sender (the active pid of
+/// this pairing's exact slot). Everything else is classified by the caller.
+pub const FENCE_ACTIVITY_SQL: &str = "\
+SELECT a.pid, a.backend_type, a.usename, a.application_name,
+       a.pid = COALESCE(s.active_pid, -1) AS is_expected_sender
+FROM pg_stat_activity a
+LEFT JOIN pg_replication_slots s ON s.slot_name = $2
+WHERE a.datname = $1 AND a.pid <> pg_backend_pid()";
+
+pub const TERMINATE_APP_SESSIONS_SQL: &str = "\
+SELECT pg_terminate_backend(a.pid)
+FROM pg_stat_activity a
+LEFT JOIN pg_replication_slots s ON s.slot_name = $2
+WHERE a.datname = $1 AND a.pid <> pg_backend_pid()
+  AND a.backend_type = 'client backend'
+  AND NOT (a.backend_type = 'walsender' AND a.pid = s.active_pid)";
 
 // --- primary side -----------------------------------------------------------
 
@@ -186,6 +269,12 @@ WHERE c.relkind = 'r'
 ORDER BY 1";
 
 // --- replica side -----------------------------------------------------------
+
+/// Schema dumps include the publisher's grants to its replication role. The
+/// subscriber needs the grantee name, but not a login or replication privilege.
+pub fn create_replica_acl_role(role: &str) -> String {
+    format!("CREATE ROLE {} NOLOGIN NOREPLICATION", quote_ident(role))
+}
 
 /// `create_slot = true` means the *subscriber* creates the slot on the
 /// primary. That ordering is deliberate and load-bearing: until this runs, the
@@ -339,6 +428,17 @@ mod tests {
     }
 
     #[test]
+    fn conninfo_renderings_pin_host_and_hostaddr_to_the_resolved_ip() {
+        let c = conn();
+        for s in [c.to_libpq(), c.without_password(), c.redacted()] {
+            assert!(
+                s.starts_with("host='203.0.113.10' hostaddr='203.0.113.10'"),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
     fn redacted_conninfo_never_contains_the_password() {
         let c = conn();
         let r = c.redacted();
@@ -358,6 +458,14 @@ mod tests {
         assert!(
             s.contains("user='acme_pgfcrepl'") && s.contains("sslmode='require'"),
             "{s}"
+        );
+    }
+
+    #[test]
+    fn replica_acl_role_is_quoted_and_cannot_log_in_or_replicate() {
+        assert_eq!(
+            create_replica_acl_role("a\"b"),
+            "CREATE ROLE \"a\"\"b\" NOLOGIN NOREPLICATION"
         );
     }
 
@@ -384,6 +492,14 @@ mod tests {
         let s = drop_slot_if_inactive("pgfc_acme_node_b");
         assert!(s.contains("NOT s.active"), "{s}");
         assert!(s.contains("'pgfc_acme_node_b'"), "{s}");
+    }
+
+    #[test]
+    fn fence_uses_the_startup_object_lock_and_only_terminates_clients() {
+        assert!(DATABASE_OBJECT_LOCKS_SQL.contains("'pg_database'::regclass"));
+        assert!(DATABASE_OBJECT_LOCKS_SQL.contains("l.granted"));
+        assert!(TERMINATE_APP_SESSIONS_SQL.contains("backend_type = 'client backend'"));
+        assert!(FENCE_ACTIVITY_SQL.contains("s.active_pid"));
     }
 
     #[test]

@@ -216,6 +216,19 @@ against their own issuer and points `--login-url` there; app-lb prefers neither.
 `redirect_uri` unless set, and `return_to`, `next` and `rd` are the other
 spellings in the wild.
 
+### The other browser path: `login_endpoint`
+
+app-lb can also serve the password form itself: `jwt.login_endpoint` points at
+Heyo Auth's `/api/auth/login`, the gate posts the credentials there, checks the
+returned token against this very policy, and sets its own host-only cookie (see
+"Browser sign-in with existing Heyo Auth" in the README).
+
+That one pairs with the **`heyo`** shape, not `heyo-jwks`: `/api/auth/login`
+returns an `HS256` access token with `aud: heyo-app`, which a `heyo-jwks` policy
+is built to refuse. So the two browser paths line up with the two presets — the
+hosted page (`--login-url`) for a gate that verifies gate tokens and holds no
+secret, `login_endpoint` for a gate that already holds the signing key.
+
 `--login-url` requires `--cookie`. Without the cookie the browser is redirected
 to sign in, comes back carrying nothing the gate can read, and is redirected
 again — a loop that is impossible to diagnose from outside. It must be `https://`

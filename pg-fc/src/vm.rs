@@ -219,23 +219,134 @@ fn admission_gate() -> Option<&'static Semaphore> {
         .as_ref()
 }
 
+/// How long a client's bring-up may wait for an admission slot before it is
+/// shed. Overridden by `PG_VM_POOL_ADMISSION_WAIT_SECS`; `0` waits forever
+/// (the old behaviour).
+///
+/// Why shed at all: the queue is FIFO and unbounded in time, and its callers
+/// are not. The Platform gives a new workbook's pooler build 12s before it
+/// abandons it and builds elsewhere — but it never closes the connection it
+/// was waiting on, so nothing here can tell it has left. A bring-up that
+/// dequeues after that serves no one: it still builds an 8 GiB VM and holds
+/// it until the idle reaper takes it, and every such VM is admission budget
+/// the next real client can't get. In the 2026-09-15 storm queue waits ran
+/// p50 17-25s and p90 around five minutes, so most bring-up work went to
+/// clients that were already gone. Shedding instead hands the client a real
+/// error it can act on (retry, or build somewhere else) and keeps the slots
+/// for those still waiting. The default sits just past that 12s budget.
+const DEFAULT_ADMISSION_WAIT: Duration = Duration::from_secs(15);
+
+fn admission_wait() -> Option<Duration> {
+    static WAIT: OnceLock<Option<Duration>> = OnceLock::new();
+    *WAIT.get_or_init(|| {
+        let secs = std::env::var("PG_VM_POOL_ADMISSION_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_ADMISSION_WAIT.as_secs());
+        if secs == 0 {
+            warn!("PG_VM_POOL_ADMISSION_WAIT_SECS=0: queued bring-ups wait for a slot forever");
+        }
+        (secs > 0).then(|| Duration::from_secs(secs))
+    })
+}
+
+/// When a bring-up that began at `start` must give up its place in the
+/// admission queue, or `None` to wait forever. See [`BringUp::admission_deadline`].
+pub(crate) fn admission_deadline_from(start: Instant) -> Option<Instant> {
+    admission_wait().map(|wait| start + wait)
+}
+
+/// A bring-up shed from the admission queue: it reached its deadline without
+/// a slot and was dropped before any daemon call. Not a failure of the schema
+/// — nothing was built, so the registry stops no VM for it and keeps it out of
+/// the circuit breaker — and the client is told the pooler is busy rather
+/// than that its database is broken.
+#[derive(Debug)]
+pub struct BringupShed {
+    pub schema: String,
+    pub waited: Duration,
+    pub queued: usize,
+}
+
+impl std::fmt::Display for BringupShed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "schema {}: pooler at capacity — no bring-up slot after {:?} with {} bring-up(s) \
+             queued; shed rather than served after the client has given up, retry shortly",
+            self.schema, self.waited, self.queued
+        )
+    }
+}
+
+impl std::error::Error for BringupShed {}
+
+/// Whether `e` is, or wraps, a [`BringupShed`].
+pub fn is_shed(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<BringupShed>())
+}
+
+/// Wait for a permit until `deadline` — `None` once it passes — or forever
+/// when there is none. Pulled out of [`admission_slot`] so the deadline can be
+/// tested against a local semaphore rather than the process-wide gate.
+async fn acquire_within(
+    gate: &Semaphore,
+    deadline: Option<Instant>,
+) -> Option<SemaphorePermit<'_>> {
+    let permit = match deadline {
+        Some(deadline) => {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), gate.acquire())
+                .await
+                .ok()?
+        }
+        None => gate.acquire().await,
+    };
+    Some(permit.expect("admission gate is never closed"))
+}
+
 /// Take an admission slot for one whole bring-up. Held across all of
 /// `ensure_vm` — deploy, ready wait, Postgres bootstrap, restore — so it
 /// bounds how many bring-ups exist at once, not how fast they start.
-async fn admission_slot(schema: &str) -> Option<SemaphorePermit<'static>> {
-    let gate = admission_gate()?;
+///
+/// A bring-up still waiting at `deadline` is shed with a [`BringupShed`]
+/// error; see [`DEFAULT_ADMISSION_WAIT`].
+async fn admission_slot(
+    schema: &str,
+    deadline: Option<Instant>,
+) -> Result<Option<SemaphorePermit<'static>>> {
+    let Some(gate) = admission_gate() else {
+        return Ok(None);
+    };
     if let Ok(permit) = gate.try_acquire() {
-        return Some(permit);
+        return Ok(Some(permit));
     }
     let queued = Instant::now();
     let _waiting = Waiting::new();
     info!("schema {schema}: all bring-up admission slots busy; queueing at the pooler");
-    let permit = gate.acquire().await.expect("admission gate is never closed");
-    info!(
-        "schema {schema}: bring-up admitted after {:?} queued",
-        queued.elapsed()
-    );
-    Some(permit)
+    match acquire_within(gate, deadline).await {
+        Some(permit) => {
+            info!(
+                "schema {schema}: bring-up admitted after {:?} queued",
+                queued.elapsed()
+            );
+            Ok(Some(permit))
+        }
+        None => Err(BringupShed {
+            schema: schema.to_string(),
+            // Since the client's cold start began, not just this attempt's
+            // turn in the queue: a client that sat behind another client's
+            // attempt at the same schema is shed the moment its own turn
+            // comes, and "no slot after 60ms" would hide the 15s it waited.
+            waited: match (deadline, admission_wait()) {
+                (Some(deadline), Some(wait)) => {
+                    wait + Instant::now().saturating_duration_since(deadline)
+                }
+                _ => queued.elapsed(),
+            },
+            queued: bringups_waiting(),
+        }
+        .into()),
+    }
 }
 
 /// How often [`wait_ready`] re-asks the daemon for a pending VM's status.
@@ -517,6 +628,11 @@ pub struct BringUp<'a> {
     /// logical slots, and an orphaned slot pins WAL until the disk fills, so
     /// it must stay outside what a leaked tenant password can reach.
     pub repl_login: Option<&'a crate::dedicated::Credential>,
+    /// When this bring-up gives up waiting for an admission slot and is shed
+    /// (see [`DEFAULT_ADMISSION_WAIT`]); `None` waits forever. Only a client
+    /// checkout arms one — maintenance bring-ups (archive, freeze) have no
+    /// client to lose, so they queue for as long as it takes.
+    pub admission_deadline: Option<Instant>,
 }
 
 /// `disk_gb` is the data-device size this schema is known to need — the
@@ -539,8 +655,10 @@ pub async fn ensure_vm(
     // burst beyond the cap queues here (each waiter is one parked client
     // connection) instead of becoming daemon load. Held to the end of the
     // function: the pending *population* is what the daemon can't survive.
+    // A client's wait is bounded too: past its deadline this returns a
+    // `BringupShed` before anything has been built.
     let mut phase = Instant::now();
-    let _admission = admission_slot(schema).await;
+    let _admission = admission_slot(schema, up.admission_deadline).await?;
     let admission_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
     // Everything from here to a serving Postgres is what this VM costs to
     // bring back, and therefore what the reaper's warm hold is buying (see
@@ -661,6 +779,14 @@ pub async fn ensure_vm(
              restore {restore_took:?}, slots {bootstrap_took:?}",
         );
 
+        // Time to a serving Postgres, per restore source — the same span the
+        // line above breaks into phases, and the same bound `VmCreate` uses:
+        // successful bring-ups only, admission wait excluded. A bring-up with
+        // nothing to restore is already covered by `VmCreate`.
+        if let Some(source) = restore {
+            crate::events::record_timing(restore_timing(source), bringup_started.elapsed());
+        }
+
         Ok(Arc::new(SchemaEntry::new(
             sandbox,
             target,
@@ -714,6 +840,22 @@ pub async fn ensure_vm(
         }
     }
     result
+}
+
+/// Reattach only to an already-bound fenced VM. Never creates/restores a
+/// sandbox or database and never opens the tenant database for grants.
+pub async fn ensure_fenced_vm(cfg: &Config, schema: &str, sandbox_id: &str) -> Result<Arc<SchemaEntry>> {
+    let sandbox = Sandbox::connect(sandbox_id.to_string(), local_opts())?;
+    sandbox.set_ttl(0).await.context("pinning fenced VM")?;
+    let name = format!("pg-{schema}");
+    let (target, tunnel, pool) = ready_pg(cfg, &sandbox, &name).await?;
+    let client = pool.get().await.context("connecting to fenced VM maintenance database")?;
+    if client.query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&schema]).await?.is_none() {
+        bail!("fenced database {schema} is missing from VM {sandbox_id}");
+    }
+    drop(client);
+    let slots = client_slot_budget(&pool, &name).await;
+    Ok(Arc::new(SchemaEntry::new(sandbox, target, tunnel, pool, true, slots, Duration::ZERO)))
 }
 
 /// Validity window for a presigned S3 URL handed to the guest. Generous enough
@@ -1806,8 +1948,14 @@ async fn restore_from_s3(
         match s3.head_object(&http, &key, ARCHIVE_HEAD_TIMEOUT).await {
             Ok(None) => bail!(
                 "schema {schema} is marked archived but s3://{}/{key} does not exist — \
-                 there is no archive to restore",
-                s3.bucket
+                 there is no archive to restore{}",
+                s3.bucket,
+                s3.fallback_prefix()
+                    .map(|p| format!(
+                        " (the legacy prefix {p} is read only when this host's prefix is \
+                         known to hold nothing for the schema)"
+                    ))
+                    .unwrap_or_default()
             ),
             Ok(Some(id)) if id.content_length < MIN_ARCHIVE_BYTES => bail!(
                 "schema {schema}: the archive at s3://{}/{key} is only {} bytes — it was \
@@ -2001,6 +2149,41 @@ async fn exec_guest_env(
         .run(command, opts)
         .await
         .with_context(|| format!("{what}: guest exec failed"))
+}
+
+pub(crate) async fn physical_exec(
+    cfg: &Config, sandbox: &Sandbox, command: &str, env: HashMap<String, String>, what: &str,
+) -> Result<CommandResult> {
+    let command = physical_exec_command(command);
+    exec_guest_env(cfg, sandbox, &command, Some(env), what).await
+}
+
+fn physical_exec_command(command: &str) -> String {
+    use base64::Engine;
+    // No literal newlines may reach the serial shell, even inside quotes:
+    // console framing can finish capture before multiline bodies print.
+    let body = format!("for pgbin in /usr/lib/postgresql/*/bin; do [ ! -d \"$pgbin\" ] || export PATH=\"$pgbin:$PATH\"; done\n{command}");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(body);
+    format!("printf '%s' '{encoded}' | base64 -d | sh")
+}
+
+/// Resolve by the operation's unique durable name before creating.  This is
+/// the lost-create-response recovery path; physical candidates deliberately
+/// bypass normal schema checkout and are never entered in the serving store.
+pub(crate) async fn physical_candidate(cfg: &Config, name: &str, allow_create: bool, own: &(dyn Fn(&str) -> Result<()> + Send + Sync)) -> Result<Sandbox> {
+    if !name.starts_with("repl-seed-") { bail!("invalid physical candidate name"); }
+    if let Some(info) = find_by_name_with_retry(name).await.context("finding physical candidate")? {
+        own(&info.id).context("durably adopting named physical candidate")?;
+        return bring_up_existing(cfg, name, &info.id).await?.context("physical candidate disappeared while resuming");
+    }
+    if !allow_create {
+        bail!("physical create outcome is unknown and named candidate is not visible; refusing a second create");
+    }
+    create_vm_within(cfg, name, true, cfg.ready_timeout, cfg.data_disk_gb, Some(own)).await
+}
+
+pub(crate) async fn connect_physical_candidate(cfg: &Config, name: &str, id: &str) -> Result<Sandbox> {
+    bring_up_existing(cfg, name, id).await?.context("recorded physical candidate no longer exists")
 }
 
 /// Best-effort human-readable detail from a failed guest command: the combined
@@ -2287,7 +2470,7 @@ async fn power_cycle(
 /// Never fails — every failure mode becomes descriptive text.
 async fn boot_evidence(cfg: &Config, sandbox: &Sandbox) -> String {
     let cmd = "v=$(cat /workspace/pgdata/PG_VERSION 2>/dev/null || echo '?'); \
-               s=$(postgres --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo '?'); \
+               s=$(ls /usr/lib/postgresql 2>/dev/null | sort -n | tail -1); [ -n \"$s\" ] || s='?'; \
                echo \"pgdata=v$v server=v$s pg-procs=$(pgrep -c postgres 2>/dev/null || echo 0)\"; \
                tail -n 4 /workspace/pg-startup.log 2>/dev/null; \
                tail -n 3 \"$(ls -t /workspace/pgdata/log/*.log 2>/dev/null | head -1)\" 2>/dev/null \
@@ -2512,6 +2695,21 @@ pub(crate) async fn resolve_sandbox(
         .map(|sb| (sb, Provenance::Created))
 }
 
+/// Which total a restore of this source records. Kept apart rather than
+/// summed into one "restore" figure: a dump reloads through Postgres while an
+/// image swaps a disk under a booted VM, and the S3 pair pays a download the
+/// local pair does not — one percentile over all four would describe no
+/// restore anyone actually waited for.
+fn restore_timing(source: &RestoreSource) -> crate::events::Timing {
+    use crate::events::Timing;
+    match source {
+        RestoreSource::S3(_) => Timing::RestoreS3Dump,
+        RestoreSource::S3Image(_) => Timing::RestoreS3Image,
+        RestoreSource::Local { .. } => Timing::RestoreLocalDump,
+        RestoreSource::LocalImage(_) => Timing::RestoreLocalImage,
+    }
+}
+
 /// A booted, ready VM for an image restore to use as its *vehicle*: the caller
 /// stops it immediately, overwrites its data disk with the restored image, and
 /// boots it on the real data.
@@ -2692,6 +2890,7 @@ pub(crate) async fn create_spare(cfg: &Config, name: &str) -> Result<Sandbox> {
         false,
         cfg.ready_timeout.min(SPARE_READY_TIMEOUT),
         cfg.data_disk_gb,
+        None,
     )
     .await
 }
@@ -2840,7 +3039,7 @@ pub(crate) async fn create_vm(
     keepalive: bool,
     disk_gb: u32,
 ) -> Result<Sandbox> {
-    create_vm_within(cfg, name, keepalive, cfg.ready_timeout, disk_gb).await
+    create_vm_within(cfg, name, keepalive, cfg.ready_timeout, disk_gb, None).await
 }
 
 /// [`create_vm`] with an explicit readiness budget — warm spares get a shorter
@@ -2851,6 +3050,7 @@ async fn create_vm_within(
     keepalive: bool,
     ready_timeout: Duration,
     disk_gb: u32,
+    own: Option<&(dyn Fn(&str) -> Result<()> + Send + Sync)>,
 ) -> Result<Sandbox> {
     info!(
         "creating VM {name}{}{}",
@@ -2902,6 +3102,7 @@ async fn create_vm_within(
         .with_context(|| format!("creating VM {name}"))?;
         (sandbox, started)
     };
+    if let Some(own) = own { own(sandbox.sandbox_id()).context("durably owning physical candidate VM")?; }
     // The daemon 202-accepts deploys, so this id exists (with a daemon-side
     // record behind it) long before the VM is usable — and until the registry
     // binds schema→id on full bring-up success, this variable is the only
@@ -2914,6 +3115,7 @@ async fn create_vm_within(
     }
     crate::inventory::insert(name, sandbox.sandbox_id());
     if let Err(e) = wait_ready(&sandbox, ready_timeout, name).await {
+        if own.is_some() { return Err(e).with_context(|| format!("waiting for owned physical candidate {name}")); }
         // Kill the half-built VM now, by the id in hand — no listing, which is
         // exactly what's unreachable when bring-ups fail en masse. It never
         // served a client, so its disk holds nothing worth keeping. Best
@@ -3083,6 +3285,16 @@ async fn wait_pg_ready(pool: &Pool, timeout: Duration, name: &str) -> Result<()>
 mod tests {
     use super::*;
 
+    #[test]
+    fn physical_exec_preserves_one_shell_body_and_exit_status() {
+        let command = physical_exec_command("cat <<'SQL'\nSELECT :'db', '$literal';\nSQL\nprintf '%s\\n' \"$PGFC_VALUE\"\nexit 17");
+        assert!(!command.contains('\n'), "serial capture needs one physical line");
+        let output = std::process::Command::new("sh").args(["-c", &command])
+            .env("PGFC_VALUE", "a'b $unchanged").output().unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "SELECT :'db', '$literal';\na'b $unchanged\n");
+    }
+
     fn pool_at(port: u16) -> Pool {
         build_pool("127.0.0.1", port, "postgres", "postgres", None).unwrap()
     }
@@ -3127,6 +3339,46 @@ mod tests {
         assert_eq!(gate.available_permits(), 1, "dropped permits must recycle");
         drop(held);
         assert_eq!(gate.available_permits(), cap);
+    }
+
+    /// The admission deadline: no slot by the deadline sheds the waiter, a
+    /// slot freed before it is taken, and no deadline waits it out.
+    #[tokio::test]
+    async fn acquire_within_sheds_at_its_deadline_and_admits_before_it() {
+        let gate = Semaphore::new(1);
+        let held = gate.acquire().await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        assert!(acquire_within(&gate, Some(deadline)).await.is_none());
+        assert!(Instant::now() >= deadline, "shed before its deadline");
+        // A deadline already past sheds at once rather than hanging.
+        assert!(acquire_within(&gate, Some(Instant::now())).await.is_none());
+
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        };
+        let (admitted, ()) = tokio::join!(
+            acquire_within(&gate, Some(Instant::now() + Duration::from_secs(5))),
+            release
+        );
+        assert!(admitted.is_some(), "a slot freed before the deadline is taken");
+        drop(admitted);
+        assert!(acquire_within(&gate, None).await.is_some());
+    }
+
+    /// The registry and the connection handler both recognise a shed through
+    /// whatever context the bring-up path wraps it in.
+    #[test]
+    fn a_shed_is_recognised_through_context() {
+        let shed: anyhow::Error = BringupShed {
+            schema: "s".into(),
+            waited: Duration::from_secs(15),
+            queued: 3,
+        }
+        .into();
+        assert!(is_shed(&shed.context("bringing up s")));
+        assert!(!is_shed(&anyhow::anyhow!("host memory capacity unavailable")));
     }
 
 
@@ -3187,6 +3439,9 @@ mod tests {
         // replica try to publish or subscribe on its own behalf.
         assert!(body.contains("--no-publications") && body.contains("--no-subscriptions"), "{body}");
         assert!(body.contains("ON_ERROR_STOP=1") && body.contains(" -1 "), "{body}");
+        // The mirrored tenant must retain table ownership and grants after
+        // promotion; restoring everything as postgres would break app writes.
+        assert!(!body.contains("--no-owner") && !body.contains("--no-privileges"), "{body}");
     }
 
     #[test]
@@ -3944,6 +4199,69 @@ mod tests {
     }
 
     #[test]
+    fn replication_marker_round_trips_through_the_boot_shell_reader() {
+        let dir = std::env::temp_dir().join(format!("pgfc-repl-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("marker");
+        for role in ["primary", "replica"] {
+            let command = replication_marker_command(Some(role))
+                .replace(REPL_MARKER, marker.to_str().unwrap());
+            let out = std::process::Command::new("sh").args(["-c", &command]).output().unwrap();
+            assert!(out.status.success(), "{:?}", out);
+            assert_eq!(std::fs::read(&marker).unwrap(), format!("{role}\n").as_bytes());
+            let out = std::process::Command::new("sh")
+                .args(["-c", "read -r role < \"$1\" && printf %s \"$role\"", "sh"])
+                .arg(&marker).output().unwrap();
+            assert!(out.status.success());
+            assert_eq!(out.stdout, role.as_bytes());
+        }
+        let command = replication_marker_command(None).replace(REPL_MARKER, marker.to_str().unwrap());
+        assert!(std::process::Command::new("sh").args(["-c", &command]).status().unwrap().success());
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replication_restart_supplies_role_settings_and_preserves_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::replication::Role;
+        let dir = std::env::temp_dir().join(format!("pgfc-repl-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, body) in [
+            ("gosu", "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PGDATA/args\"\nexit \"$TEST_RC\"\n"),
+            ("nproc", "#!/bin/sh\necho 3\n"),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join("replication-restart.log"), "restart failure detail\n").unwrap();
+        for (role, code, expected) in [
+            (Some(Role::Primary), 0, "wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10"),
+            (Some(Role::Replica), 0, "wal_level=minimal -c max_wal_senders=0 -c max_replication_slots=8"),
+            (None, 0, "wal_level=minimal -c max_wal_senders=0 -c max_replication_slots=10"),
+            (Some(Role::Primary), 7, "wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10"),
+        ] {
+            let out = std::process::Command::new("sh")
+                .args(["-c", &replication_restart_command(role)])
+                .env("PATH", format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()))
+                .env("PGDATA", &dir).env("TEST_RC", code.to_string())
+                .output().unwrap();
+            assert_eq!(out.status.code(), Some(code), "{:?}", out);
+            let args = std::fs::read_to_string(dir.join("args")).unwrap();
+            assert!(args.contains(&format!("-o\n-c {expected}")), "{args}");
+            if role == Some(Role::Replica) {
+                assert!(args.contains("max_worker_processes=15"), "{args}");
+            }
+            if code != 0 {
+                assert!(String::from_utf8_lossy(&out.stderr).contains("restart failure detail"));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn quote_ident_escapes_embedded_quotes() {
         assert_eq!(quote_ident("acme"), "\"acme\"");
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
@@ -3990,7 +4308,7 @@ fn schema_copy_job_body(user: &str, db: &str, conninfo: &str) -> String {
         "ec=0\n\
          rm -f {SCHEMA_COPY_FAIL_MARK}\n\
          {{ pg_dump --schema-only --no-publications --no-subscriptions \
-         --no-security-labels --no-owner --no-privileges -d {conninfo} \
+         --no-security-labels -d {conninfo} \
          || echo 1 > {SCHEMA_COPY_FAIL_MARK}; }} \
          | psql -h 127.0.0.1 -U {user} -d {db} -v ON_ERROR_STOP=1 -1 -q || ec=$?\n\
          if [ -f {SCHEMA_COPY_FAIL_MARK} ]; then\n\
@@ -4049,6 +4367,34 @@ const REPL_MARKER: &str = "/workspace/heyvm-replication";
 /// grants and every replication status view are per-database objects, so they
 /// need their own connection. Built fresh per call rather than pooled: these
 /// are operator-paced actions and a monitor tick, not a hot path.
+/// Whether `schema`'s database holds any user relation — the SQL answer to
+/// the question [`crate::imgarchive::cluster_contents_of`] answers offline,
+/// used where a running Postgres is in hand (the dump archive path).
+///
+/// `None` when the question couldn't be answered at all: an unreachable
+/// database is never a reason to call a workbook empty.
+pub(crate) async fn has_user_relations(
+    cfg: &Config,
+    target: &SocketAddr,
+    schema: &str,
+) -> Option<bool> {
+    let ask = async {
+        let client = db_client(cfg, target, schema).await.ok()?;
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM pg_class c                  JOIN pg_namespace n ON n.oid = c.relnamespace                  WHERE c.relkind IN ('r', 'p', 'm', 'f')                  AND n.nspname NOT IN ('pg_catalog', 'information_schema')",
+                &[],
+            )
+            .await
+            .ok()?;
+        let relations: i64 = row.get(0);
+        Some(relations > 0)
+    };
+    tokio::time::timeout(Duration::from_secs(30), ask)
+        .await
+        .ok()?
+}
+
 pub(crate) async fn db_client(
     cfg: &Config,
     target: &SocketAddr,
@@ -4112,37 +4458,36 @@ async fn ensure_replication_mode(
     // What the running cluster is actually at, which is the only thing worth
     // reconciling against — the marker says what the NEXT start will do.
     let client = pool.get().await.context("checkout for wal_level check")?;
-    let have: String = client
-        .query_one("SELECT current_setting('wal_level')", &[])
+    let settings = client
+        .query_one(
+            "SELECT current_setting('wal_level'), current_setting('max_wal_senders')::int4, \
+             current_setting('max_replication_slots')::int4",
+            &[],
+        )
         .await
-        .context("reading wal_level")?
-        .get(0);
+        .context("reading replication settings")?;
+    let have: String = settings.get(0);
+    let senders: i32 = settings.get(1);
+    let slots: i32 = settings.get(2);
     drop(client);
-    let want_level = match want {
-        // A publisher needs `logical`. A subscriber only applies changes, so
-        // it keeps the cheap `minimal` profile — what it needs from init.sh is
-        // slots and apply workers, which are not visible here.
-        Some(crate::replication::Role::Primary) => "logical",
-        Some(crate::replication::Role::Replica) | None => "minimal",
-    };
+    let (want_level, want_senders, want_slots) = replication_settings(want);
 
     write_replication_marker(cfg, sandbox, schema, want.map(|r| r.as_str())).await?;
 
-    // A replica's WAL level is unchanged, so only the marker mattered — but it
-    // still has to be planted before the next boot picks up its worker budget.
-    if have == want_level {
+    // A subscriber can already be at minimal WAL while lacking the slots
+    // needed for replication origins. Compare the complete role settings.
+    if have == want_level && senders == want_senders && slots == want_slots {
         return Ok(());
     }
     info!(
         "schema {schema}: wal_level is {have}, replication needs {want_level} — \
          restarting Postgres in-guest"
     );
-    // `$PGDATA` is the guest's own environment (init.sh exports it), so let
-    // the guest shell expand it and fall back to the image's default rather
-    // than baking a path the image could change.
-    let restart = "gosu postgres pg_ctl -D \"${PGDATA:-/workspace/pgdata}\" \
-                   -m fast -w -t 60 restart >/dev/null 2>&1"
-        .to_string();
+    // init.sh consumes the marker only on a VM boot. A postmaster-only
+    // restart must supply the same settings explicitly; otherwise it reloads
+    // the old tuning file. Command-line settings also override stale manual
+    // ALTER SYSTEM values without rewriting unrelated operator configuration.
+    let restart = replication_restart_command(want);
     let res = exec_guest(cfg, sandbox, &restart, false, "restarting Postgres").await?;
     if res.exit_code != 0 {
         bail!(
@@ -4168,19 +4513,62 @@ async fn ensure_replication_mode(
         ),
     }
     let client = pool.get().await.context("checkout after restart")?;
-    let now: String = client
-        .query_one("SELECT current_setting('wal_level')", &[])
+    let settings = client
+        .query_one(
+            "SELECT current_setting('wal_level'), current_setting('max_wal_senders')::int4, \
+             current_setting('max_replication_slots')::int4",
+            &[],
+        )
         .await
-        .context("re-reading wal_level")?
-        .get(0);
-    if now != want_level {
+        .context("re-reading replication settings")?;
+    let now: String = settings.get(0);
+    if now != want_level || settings.get::<_, i32>(1) != want_senders
+        || settings.get::<_, i32>(2) != want_slots
+    {
         bail!(
-            "schema {schema}: Postgres restarted but wal_level is {now}, not {want_level} — \
-             the guest image predates replication support (rebuild it from init.sh)"
+            "schema {schema}: Postgres restarted but replication settings do not match \
+             the requested role (wal_level={now}, expected {want_level})"
         );
     }
     info!("schema {schema}: wal_level is now {now}");
     Ok(())
+}
+
+fn replication_settings(role: Option<crate::replication::Role>) -> (&'static str, i32, i32) {
+    match role {
+        Some(crate::replication::Role::Primary) => ("logical", 10, 10),
+        Some(crate::replication::Role::Replica) => ("minimal", 0, 8),
+        None => ("minimal", 0, 10),
+    }
+}
+
+fn replication_restart_command(role: Option<crate::replication::Role>) -> String {
+    let (level, senders, slots) = replication_settings(role);
+    let workers = if role == Some(crate::replication::Role::Replica) {
+        " -c max_logical_replication_workers=4 -c max_sync_workers_per_subscription=2 \
+         -c max_worker_processes=$(( $(nproc) + 12 ))"
+    } else {
+        ""
+    };
+    format!(
+        "for pgbin in /usr/lib/postgresql/*/bin; do \
+           [ ! -d \"$pgbin\" ] || export PATH=\"$pgbin:$PATH\"; done; \
+         PGDATA=\"${{PGDATA:-/workspace/pgdata}}\"; \
+         if gosu postgres pg_ctl -D \"$PGDATA\" -m fast -w -t 60 \
+           -l \"$PGDATA/replication-restart.log\" \
+           -o \"-c wal_level={level} -c max_wal_senders={senders} -c max_replication_slots={slots}{workers}\" restart; \
+         then :; else rc=$?; tail -c 2000 \"$PGDATA/replication-restart.log\" >&2; exit \"$rc\"; fi"
+    )
+}
+
+fn replication_marker_command(role: Option<&str>) -> String {
+    match role {
+        Some(r) => format!(
+            "printf '%s\\n' {} > {REPL_MARKER}.tmp && mv {REPL_MARKER}.tmp {REPL_MARKER} && sync && echo ok",
+            shell_squote(r)
+        ),
+        None => format!("rm -f {REPL_MARKER} {REPL_MARKER}.tmp && sync && echo ok"),
+    }
 }
 
 /// Plant or remove [`REPL_MARKER`] on the data disk.
@@ -4200,13 +4588,7 @@ async fn write_replication_marker(
     schema: &str,
     role: Option<&str>,
 ) -> Result<()> {
-    let cmd = match role {
-        Some(r) => format!(
-            "printf %s\\n {} > {REPL_MARKER}.tmp && mv {REPL_MARKER}.tmp {REPL_MARKER} && sync && echo ok",
-            shell_squote(r)
-        ),
-        None => format!("rm -f {REPL_MARKER} {REPL_MARKER}.tmp && sync && echo ok"),
-    };
+    let cmd = replication_marker_command(role);
     let res = exec_guest(cfg, sandbox, &cmd, false, "writing the replication marker").await?;
     if res.exit_code != 0 {
         bail!(

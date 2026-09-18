@@ -268,13 +268,16 @@ impl MountStore {
 /// module note: a VM holds its own copy from the moment it is created, so what
 /// a tree is still needed for is the next create — and that is what a spec says.
 pub fn referenced_trees(registry: &Registry) -> HashSet<String> {
-    registry
-        .deployments()
-        .values()
-        .filter_map(|d| d.spec.vm.as_ref())
-        .flat_map(|vm| vm.mounts.iter())
-        .filter_map(|m| Some(tree_name(m.digest.as_deref()?, m.strip())))
-        .collect()
+    let mut referenced = HashSet::new();
+    for d in registry.deployments().values() {
+        let state = d.state();
+        for spec in std::iter::once(&d.spec).chain(state.rollouts.iter().map(|o| &o.spec)) {
+            if let Some(vm) = &spec.vm {
+                referenced.extend(vm.mounts.iter().filter_map(|m| Some(tree_name(m.digest.as_deref()?, m.strip()))));
+            }
+        }
+    }
+    referenced
 }
 
 /// The directory name for a blob unpacked with a given strip. See the module

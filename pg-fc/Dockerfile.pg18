@@ -32,10 +32,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         postgresql-${PG_MAJOR} \
         postgresql-client-${PG_MAJOR} \
+        postgresql-${PG_MAJOR}-hypopg \
         e2fsprogs \
         util-linux \
         mount \
+        locales \
         gosu \
+    && localedef -i en_US -f UTF-8 en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 
 # Put the versioned Postgres binaries on PATH so init.sh stays version-agnostic.

@@ -31,6 +31,7 @@ mod startup;
 mod store;
 mod tls;
 mod vm;
+mod writer_routing;
 
 use std::sync::Arc;
 
@@ -96,7 +97,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("pending-bringups.tsv"),
     );
-    let registry = Arc::new(SchemaRegistry::new(cfg));
+    let registry = Arc::new(SchemaRegistry::new(cfg)?);
     registry.spawn_reaper();
     // Stops running VMs nothing tracks (left over from a pooler restart, a
     // failed idle-stop, or a daemon-side boot) so the ladder can reclaim them.
@@ -142,6 +143,9 @@ async fn main() -> Result<()> {
     // when an inactive slot starts pinning WAL. No-op when nothing is
     // replicating.
     registry.spawn_replication_monitor();
+    // Continue explicitly authorized physical handoffs after request loss or
+    // process restart, including when orchestrator's own database is moving.
+    replication::physical::spawn_handoff_recovery(registry.clone());
     // Delete VMs whose bring-up handed out an id but never reached a registry
     // binding — the "stuck in provisioning, bound to nothing" leak no other
     // sweep covers. Always on; idle when the pending ledger is empty.
@@ -175,11 +179,25 @@ async fn main() -> Result<()> {
         });
     }
 
+    raise_open_files_limit();
     let listener = TcpListener::bind(listen_addr).await?;
     info!("pg-vm-pool listening on {listen_addr}");
 
     loop {
-        let (sock, peer) = listener.accept().await?;
+        let (sock, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // Never fatal. Returning here ended the process, and a restart
+                // drops every connected client with it — the 2026-09-15 mia3
+                // crash was exactly this, `accept` failing with EMFILE once
+                // parked clients had used up the open-files limit. EMFILE and
+                // ENFILE clear as connections close; the rest (ECONNABORTED
+                // and the like) concern a single connection.
+                warn!("accepting a client connection failed: {e}; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         // Disable Nagle on the client->pooler leg (mirrors the pooler->VM leg in
         // proxy::splice). The Postgres wire protocol is request/response, so
         // Nagle + delayed-ACK adds per-round-trip latency on the many small
@@ -223,14 +241,42 @@ async fn handle_conn(
     // credential may open only its own database (so it can never provision a
     // second VM), a shared-password client may not open a dedicated one, and a
     // replication login may open only the database it replicates.
-    if let Err(reason) = registry.authorize_route(&info.user, &info.database) {
-        // Tell the client why rather than dropping the socket: "cannot open any
-        // other database" is exactly the feedback that stops someone retrying a
-        // typo'd database name forever.
-        auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
-        anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
+    let schema = match registry.authorize_route(&info.user, &info.database, info.physical_replication) {
+        Ok(schema) => schema,
+        Err(reason) => {
+            auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
+            anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
+        }
+    };
+    if writer_routing::is_routable_tenant(&registry, &info, &schema) {
+        match writer_routing::route(&registry, &schema)? {
+            writer_routing::Route::Local => {}
+            writer_routing::Route::Peer { peer, claim } => {
+                return writer_routing::forward(client, &info.raw, peer, claim).await;
+            }
+            writer_routing::Route::Unavailable(reason) => {
+                auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, reason).await?;
+                anyhow::bail!("writer unavailable for {schema}: {reason}");
+            }
+        }
     }
-    let schema = info.database.clone();
+    if !info.physical_replication && !registry.physical_admission_ready(&schema) {
+        auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, "physical handoff is incomplete; admission remains closed").await?;
+        anyhow::bail!("refused connection during incomplete physical handoff for {schema}");
+    }
+    if let Some(fence) = registry.replication().get(&schema).and_then(|r| r.fence)
+        && (fence.mode != "selective"
+            || registry.replication().by_repl_role(&info.user).is_none())
+        && !(info.physical_replication && registry.physical_reconnect_allowed(&schema, &info.user))
+    {
+        auth::send_fatal(
+            &mut client,
+            auth::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            "database is fenced for a planned switchover; operator unfence is required",
+        )
+        .await?;
+        anyhow::bail!("refused connection to fenced database {schema}");
+    }
     if !is_valid_schema(&schema) {
         anyhow::bail!("rejecting invalid schema name {schema:?}");
     }
@@ -238,8 +284,66 @@ async fn handle_conn(
 
     // Hold the guard for the whole connection: it keeps the VM off the idle
     // reaper's radar until the client disconnects.
-    let guard = registry.checkout(&schema).await?;
+    let guard = match registry.checkout(&schema).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            // Say why before hanging up. A bare dropped socket reaches a libpq
+            // client as "SSL SYSCALL error: EOF detected", which reads as a
+            // network fault and says nothing about a pooler at capacity or a
+            // schema being held off. Best-effort: the client may be gone.
+            let sqlstate = if vm::is_shed(&e) {
+                auth::SQLSTATE_TOO_MANY_CONNECTIONS
+            } else {
+                auth::SQLSTATE_CANNOT_CONNECT_NOW
+            };
+            let message = auth::client_message(&format!("pg-vm-pool: {e:#}"));
+            let _ = auth::send_fatal(&mut client, sqlstate, &message).await;
+            return Err(e);
+        }
+    };
     proxy::splice(client, guard.entry(), &info.raw).await
+}
+
+/// Raise this process's open-files soft limit to its hard limit.
+///
+/// Every parked client, spliced session and daemon call holds a descriptor,
+/// and the soft limit a supervised service inherits is usually 1024 — which a
+/// busy host outgrows: on 2026-09-15 all three hosts logged EMFILE, and mia3's
+/// pooler died of it when `accept` failed. The hard limit there was 524288, so
+/// the fix is only ever this call. Best-effort: a host that won't allow it
+/// keeps the old limit and says so.
+fn raise_open_files_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit only read and write the struct passed in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        warn!(
+            "could not read the open-files limit: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    if limit.rlim_cur >= limit.rlim_max {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: limit.rlim_max,
+        rlim_max: limit.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        info!(
+            "raised the open-files limit from {} to {}",
+            limit.rlim_cur, limit.rlim_max
+        );
+    } else {
+        warn!(
+            "could not raise the open-files limit from {}: {}",
+            limit.rlim_cur,
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 /// Sanity-check `PG_VM_POOL_RUN_DIR` at startup: it must be *heyvmd's* run dir

@@ -559,6 +559,7 @@ impl OrchestrationRepository {
         let txn = self.db.begin().await?;
         let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().into();
         let Some(step) = OrchestrationStepRunEntity::find_by_id(step_run_id)
+            .lock_exclusive()
             .one(&txn)
             .await
             .map_err(|e| anyhow::anyhow!("Database query error: {}", e))?
@@ -1981,9 +1982,15 @@ fn pretty_json(value: &Value) -> String {
 mod tests {
     use super::{
         all_tracked_deployments_running, deployment_ids_from_outputs, merge_deploy_event_outputs,
+        OrchestrationRepository,
     };
-    use crate::entities::orchestration_external_event;
+    use crate::entities::{
+        orchestration_external_event, orchestration_step_attempt,
+        OrchestrationStepAttempt as OrchestrationStepAttemptEntity,
+    };
+    use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
     use serde_json::json;
+    use uuid::Uuid;
 
     fn deployment_event(
         external_ref: &str,
@@ -2053,5 +2060,68 @@ mod tests {
 
         let second = merge_deploy_event_outputs(first, &deployment_event("dep-b", "running"));
         assert!(all_tracked_deployments_running(&second));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ORCHESTRATOR_TEST_DATABASE_URL (disposable PostgreSQL)"]
+    async fn concurrent_step_claim_creates_one_running_attempt_postgres() -> anyhow::Result<()> {
+        let url = std::env::var("ORCHESTRATOR_TEST_DATABASE_URL")?;
+        let admin = sea_orm::Database::connect(&url).await?;
+        let schema = format!("step_claim_test_{}", Uuid::new_v4().simple());
+        admin
+            .execute_unprepared(&format!(
+                "CREATE SCHEMA {schema};
+                 CREATE TABLE {schema}.orchestration_step_runs (
+                    id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL, key TEXT NOT NULL,
+                    type TEXT NOT NULL, kind TEXT NOT NULL, phase TEXT NOT NULL, status TEXT NOT NULL,
+                    adapter TEXT, depends_on JSONB NOT NULL DEFAULT '[]', can_fan_out BOOLEAN NOT NULL DEFAULT FALSE,
+                    requires_approval_before_start BOOLEAN NOT NULL DEFAULT FALSE, inputs JSONB NOT NULL DEFAULT '{{}}',
+                    outputs JSONB, artifact_contract JSONB, retry_count INTEGER NOT NULL DEFAULT 0,
+                    max_retries INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT, external_ref TEXT,
+                    started_at TIMESTAMPTZ, completed_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                 );
+                 CREATE TABLE {schema}.orchestration_step_attempts (
+                    id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL, step_run_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL, worker_id TEXT NOT NULL, status TEXT NOT NULL,
+                    lease_expires_at TIMESTAMPTZ NOT NULL, heartbeat_at TIMESTAMPTZ, failure_reason TEXT,
+                    started_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE (step_run_id, attempt_number)
+                 );
+                 CREATE UNIQUE INDEX ON {schema}.orchestration_step_attempts(step_run_id) WHERE status = 'running';
+                 CREATE FUNCTION {schema}.delay_claim() RETURNS trigger LANGUAGE plpgsql AS
+                    'BEGIN PERFORM pg_sleep(0.2); RETURN NEW; END';
+                 CREATE TRIGGER delay_claim BEFORE INSERT ON {schema}.orchestration_step_attempts
+                    FOR EACH ROW EXECUTE FUNCTION {schema}.delay_claim();
+                 INSERT INTO {schema}.orchestration_step_runs
+                    (id, workflow_run_id, key, type, kind, phase, status)
+                    VALUES ('step-1', 'workflow-1', 'deploy', 'deterministic', 'deployment', 'deploying', 'ready');"
+            ))
+            .await?;
+
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let scoped_url = format!("{url}{separator}options=-csearch_path%3D{schema}");
+        let first = OrchestrationRepository::new(sea_orm::Database::connect(&scoped_url).await?);
+        let second = OrchestrationRepository::new(sea_orm::Database::connect(&scoped_url).await?);
+        let (first_result, second_result) = tokio::join!(
+            first.try_claim_step("step-1", "worker-1", 60),
+            second.try_claim_step("step-1", "worker-2", 60),
+        );
+
+        let claims = [first_result?, second_result?];
+        assert_eq!(claims.into_iter().filter(|claimed| *claimed).count(), 1);
+        let attempts = OrchestrationStepAttemptEntity::find()
+            .filter(orchestration_step_attempt::Column::StepRunId.eq("step-1"))
+            .filter(orchestration_step_attempt::Column::Status.eq("running"))
+            .all(&first.db)
+            .await?;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt_number, 1);
+
+        admin
+            .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await?;
+        Ok(())
     }
 }

@@ -13,28 +13,42 @@
 
 mod artifacts;
 mod bus;
+mod cd;
 // The platform UI kit — tokens, the theme cookie and forwarded identity —
 // shared with app-lb, app-obs, heyosecret and artifacts. Included by path
 // rather than depended on as a crate: those five apps sit on three different
 // axum versions, so the shared module deliberately names no framework type and
 // each one wires its own routes. See `ui/README.md`.
 mod config;
+mod controller_rollout;
 mod dispatch;
 mod expr;
+mod host_app_lb;
+mod host_bootstrap;
+mod host_bootstrap_delivery;
+mod host_maintenance;
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;
 mod image;
+mod lifecycle;
 mod nats_auth;
+mod native;
 mod objects;
 mod paths;
 mod plan;
 mod pool;
+mod release;
+mod release_git;
 mod repos;
 mod runners;
 mod secrets;
+mod service_archive;
+mod service_rollout;
 mod store;
+mod submission;
 mod trigger;
 mod vm;
+mod vm_cleanup;
 mod web;
 mod workflow;
 
@@ -50,6 +64,64 @@ use vm::Vms;
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        if args[0] == "--deliver-host-bootstrap" && matches!(args.len(), 6 | 7) {
+            let targets = std::env::var("CI_HOST_APP_LB_TARGETS").ok();
+            let token = std::env::var("CI_HOST_APP_LB_TOKEN").unwrap_or_default();
+            match host_bootstrap_delivery::run(&args[1], &args[2], args[3].as_ref(), args[4].as_ref(), args[5].as_ref(), args.get(6).map(String::as_str), targets.as_deref(), &token).await {
+                Ok(status) => println!("{status}"),
+                Err(error) => {
+                    eprintln!("bootstrap delivery incomplete: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if args[0] == "--prepare-host-bootstrap" && args.len() == 5 {
+            match host_bootstrap::run(args[1].as_ref(), args[2].as_ref(), args[3].as_ref(), args[4].as_ref()) {
+                Ok(status) => println!("{status}"),
+                Err(error) => {
+                    eprintln!("bootstrap preparation refused: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if args[0] == "--check-host-bootstrap" && args.len() == 4 {
+            let targets = std::env::var("CI_HOST_APP_LB_TARGETS").ok();
+            let token = std::env::var("CI_HOST_APP_LB_TOKEN").unwrap_or_default();
+            match host_bootstrap::check(args[2].as_ref(), &args[3], &args[1], targets.as_deref(), &token).await {
+                Ok(status) => println!("{status}"),
+                Err(error) => {
+                    eprintln!("bootstrap remains unverified: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if args[0] != "--check-workflows" || args.len() < 2 {
+            eprintln!("usage: ci [--check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --deliver-host-bootstrap TARGET inspect|admit INPUT_JSON BUNDLE JOURNAL_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
+            std::process::exit(2);
+        }
+        let mut failed = false;
+        for path in &args[1..] {
+            let result = std::fs::read_to_string(path)
+                .map_err(|e| format!("{path}: {e}"))
+                .and_then(|yaml| workflow::Workflow::parse(path, &yaml).map_err(|e| e.to_string()))
+                .and_then(|workflow| plan::Plan::build(&workflow).map_err(|e| e.to_string()));
+            match result {
+                Ok(plan) => println!("{path}: valid plan ({} jobs)", plan.jobs.len()),
+                Err(error) => {
+                    eprintln!("{path}: {error}");
+                    failed = true;
+                }
+            }
+        }
+        // Offline: no configuration, database, broker or runner connections.
+        std::process::exit(if failed { 1 } else { 0 });
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -185,6 +257,7 @@ async fn main() {
         bus.jobs_stream(),
         bus.events_stream()
     );
+    bus.clone().spawn_outbox_publisher(store.clone());
 
     let artifacts = match artifacts::sink_for(&config) {
         Ok(s) => Arc::from(s),
@@ -212,6 +285,7 @@ async fn main() {
     }
 
     let dispatcher = Arc::new(Dispatcher {
+        lifecycle: Arc::new(lifecycle::Lifecycle::default()),
         config: config.clone(),
         store: store.clone(),
         pool: Pool::new(store.pool().clone()),
@@ -248,6 +322,9 @@ async fn main() {
     }
     dispatcher.clone().spawn_lease_loop();
     dispatcher.clone().spawn_consumers();
+    controller_rollout::spawn(dispatcher.clone());
+    host_maintenance::spawn(dispatcher.clone());
+    vm_cleanup::spawn(dispatcher.clone());
 
     // Bind before announcing readiness. A listener that cannot bind is a hard
     // failure here rather than a task that dies quietly and leaves the process

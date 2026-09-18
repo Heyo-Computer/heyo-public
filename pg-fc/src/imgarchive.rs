@@ -21,14 +21,24 @@
 //! - the source bytes are archived exactly as they are. A sick filesystem is
 //!   never repaired before upload (repair belongs on a restore-time copy);
 //!   the best-effort trim uses `e2fsck -fp`, the same preen the reclaim
-//!   scripts run, and a disk that fails it is uploaded untrimmed.
+//!   scripts run, and a disk that fails it is uploaded untrimmed;
+//! - but a filesystem whose superblock records kernel-detected corruption
+//!   never *overwrites* an archive that predates it. That older copy still
+//!   boots; the damaged one cannot, and archiving it makes the schema
+//!   permanently unservable — every restore rebuilds the same disk and
+//!   Postgres PANICs on it. With no earlier copy to keep, the damaged bytes
+//!   are still archived, loudly: they are the only copy there will be;
+//! - repair happens on the restore-time copy, which is scratch: a restored
+//!   image with fsck findings is repaired with `e2fsck -fy` before any VM
+//!   boots it, and one that is still damaged after that fails the bring-up
+//!   with that reason instead of crash-looping a guest against it.
 //!
 //! Restore inverts the readopt maneuver from emergency-drain.sh: create a
 //! fresh VM, stop it, copy the downloaded image **in place** over its
 //! `data.ext4` (same inode — a jailer hard-link must keep pointing at the
 //! adopted bytes), and boot on the real data.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -94,6 +104,138 @@ pub struct ImageArchived {
     pub pg_version: Option<String>,
 }
 
+/// Refusal marker: the cluster in hand holds no user data, so it must not be
+/// written to S3.
+///
+/// An empty cluster in the bucket is worth nothing — restoring one leaves the
+/// client exactly where a fresh create would — and the upload is not free of
+/// consequence: a schema's key is stable and shared, so writing an empty
+/// cluster replaces whatever is there. Every incident where a workbook came
+/// back empty ran through this door: a copy that was never filled (a
+/// failed-over create, a bring-up that fell through to a new VM) reached an
+/// archive before the copy that held the data.
+///
+/// Carried as an error so every S3 write path refuses the same way, and
+/// distinguished by the registry, which journals it as a skip rather than a
+/// failure.
+#[derive(Debug)]
+pub struct EmptyCluster;
+
+impl std::fmt::Display for EmptyCluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the database holds no user data — nothing worth archiving")
+    }
+}
+
+impl std::error::Error for EmptyCluster {}
+
+/// The refusal as an `anyhow::Error`, with `why` as its context. Also used by
+/// the dump paths, which reach the same verdict through SQL.
+pub(crate) fn empty_cluster(why: String) -> anyhow::Error {
+    anyhow::Error::new(EmptyCluster).context(why)
+}
+
+/// What an offline look at a stopped cluster's `base/` directory says it holds.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum ClusterContents {
+    /// No user database, or one no larger than the template it was copied
+    /// from: no table has ever been created in it.
+    Empty,
+    UserData,
+    /// The disk could not be read (no debugfs, a busy or damaged filesystem).
+    /// Never a reason to refuse an archive — an unreadable disk is exactly
+    /// when the bytes matter most.
+    Unknown,
+}
+
+/// `template1`, the database every other one is copied from.
+const TEMPLATE1_OID: u32 = 1;
+/// First OID handed to a user-created object; everything below is the
+/// cluster's own (`template0`, `postgres`, and their catalogs).
+const FIRST_NORMAL_OID: u32 = 16384;
+
+/// Pure decision over `base/` entry counts, as `(oid, files)`.
+///
+/// `CREATE DATABASE` copies template1 file for file, and a database only ever
+/// grows from there: one relation is at least one file, and a table that has
+/// never held a row still has its own. So a user database no larger than
+/// template1 has no user relations at all — the cluster is as it was created.
+/// Measured on a production host: template1 300 files, an empty workbook
+/// database 300, the smallest real workbook 345, a busy one 4017.
+fn cluster_contents(dirs: &[(u32, usize)]) -> ClusterContents {
+    let Some(template) = dirs
+        .iter()
+        .find(|(oid, _)| *oid == TEMPLATE1_OID)
+        .map(|(_, files)| *files)
+    else {
+        // No template1 means this is not a cluster we can read, not that it
+        // is empty.
+        return ClusterContents::Unknown;
+    };
+    let mut user = dirs.iter().filter(|(oid, _)| *oid >= FIRST_NORMAL_OID);
+    match user.any(|(_, files)| *files > template) {
+        true => ClusterContents::UserData,
+        // Includes "no user database at all": the create never got that far.
+        false => ClusterContents::Empty,
+    }
+}
+
+/// Read `base/` off a stopped disk and judge what the cluster holds. Best
+/// effort by construction — every failure answers [`ClusterContents::Unknown`].
+pub(crate) async fn cluster_contents_of(disk: &Path) -> ClusterContents {
+    let Some(dbs) = debugfs_names(disk, "/pgdata/base").await else {
+        return ClusterContents::Unknown;
+    };
+    let mut dirs = Vec::new();
+    for oid in dbs.iter().filter_map(|n| n.parse::<u32>().ok()) {
+        // Only what the verdict turns on: template1 and the user databases.
+        if oid != TEMPLATE1_OID && oid < FIRST_NORMAL_OID {
+            continue;
+        }
+        let Some(files) = debugfs_names(disk, &format!("/pgdata/base/{oid}")).await else {
+            return ClusterContents::Unknown;
+        };
+        dirs.push((oid, files.len()));
+    }
+    cluster_contents(&dirs)
+}
+
+/// `debugfs ls -l` on a directory, as the entry names it holds (`.` and `..`
+/// dropped). `None` when debugfs can't be run or the listing fails; an empty
+/// `Vec` when the directory is genuinely empty or absent.
+async fn debugfs_names(disk: &Path, dir: &str) -> Option<Vec<String>> {
+    for catastrophic in [false, true] {
+        let mut cmd = Command::new("debugfs");
+        if catastrophic {
+            cmd.arg("-c");
+        }
+        cmd.args(["-R", &format!("ls -l {dir}")]).arg(disk);
+        deprioritize(&mut cmd);
+        let out = run(&mut cmd, Duration::from_secs(30)).await.ok()?;
+        if !out.status.success() {
+            continue;
+        }
+        return Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.split_whitespace().next_back())
+                .filter(|n| *n != "." && *n != "..")
+                .map(str::to_string)
+                .collect(),
+        );
+    }
+    None
+}
+
+/// The marker written beside a compacted image whose cluster holds no user
+/// data, so [`promote_compact`] refuses it without the raw disk the verdict
+/// needs. Removed whenever the image it describes is.
+pub(crate) fn empty_marker(image: &Path) -> PathBuf {
+    let mut name = image.as_os_str().to_os_string();
+    name.push(".empty");
+    PathBuf::from(name)
+}
+
 /// Which S3 object a restore of an archived schema should use.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RestoreKind {
@@ -114,17 +256,94 @@ fn choose_restore(dump_len: Option<u64>, image_len: Option<u64>) -> RestoreKind 
     }
 }
 
-/// HEAD both keys and pick the restore source for an archived schema. Any
-/// transport failure falls back to the dump path — exactly what every
+/// What one prefix's archive keys hold for a schema: the config addressed at
+/// that prefix, the dump HEAD, and the image HEAD — `None` when a plausible
+/// dump already decided the restore and the image was never asked about.
+struct PrefixHeads {
+    s3: S3Config,
+    dump: Result<Option<crate::s3::ObjectId>>,
+    image: Option<Result<Option<crate::s3::ObjectId>>>,
+}
+
+impl PrefixHeads {
+    async fn fetch(s3: S3Config, http: &reqwest::Client, schema: &str) -> Self {
+        let dump = s3
+            .head_object(http, &s3.object_key(schema), HEAD_TIMEOUT)
+            .await;
+        // Only ask about the image when the dump can't decide — the common
+        // case (dump-archived schema) costs one HEAD, not two.
+        let image = if matches!(&dump, Ok(Some(d)) if d.content_length >= MIN_DUMP_BYTES) {
+            None
+        } else {
+            Some(
+                s3.head_object(http, &s3.image_object_key(schema), HEAD_TIMEOUT)
+                    .await,
+            )
+        };
+        Self { s3, dump, image }
+    }
+
+    /// Both keys answered, and both answered "no such object". A HEAD that
+    /// failed in transit is not that, and neither is an object of any size —
+    /// a torn one included.
+    fn is_empty(&self) -> bool {
+        matches!(self.dump, Ok(None)) && matches!(self.image, Some(Ok(None)))
+    }
+
+    fn kind(&self) -> RestoreKind {
+        let len = |r: &Result<Option<crate::s3::ObjectId>>| {
+            r.as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map(|id| id.content_length)
+        };
+        choose_restore(len(&self.dump), self.image.as_ref().and_then(len))
+    }
+}
+
+/// HEAD a schema's archive keys under the write prefix — and under the legacy
+/// prefix only when the write prefix is *known* to hold nothing.
+///
+/// Known is the point. Once a host has archived a schema under its own
+/// prefix, that copy is newer than anything in the legacy layout, which other
+/// hosts may also have written. So a HEAD that failed in transit, or a torn
+/// object, keeps the restore on the write prefix, where the restore paths
+/// already report those faithfully, rather than quietly serving an older
+/// copy. A legacy prefix that is empty too leaves the write prefix's answer in
+/// place, so "no archive to restore" names the key this host writes.
+async fn resolve_archive(s3: &S3Config, http: &reqwest::Client, schema: &str) -> PrefixHeads {
+    let own = PrefixHeads::fetch(s3.clone(), http, schema).await;
+    if let Some(legacy) = s3.fallback_prefix()
+        && own.is_empty()
+    {
+        let older = PrefixHeads::fetch(s3.at_prefix(legacy), http, schema).await;
+        if !older.is_empty() {
+            return older;
+        }
+    }
+    own
+}
+
+/// Pick the restore source for an archived schema, and the config addressed
+/// at the prefix holding it (see [`resolve_archive`]). Any transport failure
+/// falls back to the dump path under the write prefix — exactly what every
 /// archived schema used before images existed.
+pub async fn pick_restore(s3: &S3Config, schema: &str) -> (RestoreKind, S3Config) {
+    let Ok(http) = reqwest::Client::builder().build() else {
+        return (RestoreKind::Dump, s3.clone());
+    };
+    let found = resolve_archive(s3, &http, schema).await;
+    (found.kind(), found.s3)
+}
+
 /// What a restore of `schema` would actually find in S3 right now: the object
 /// the checkout path would choose, or `None` when neither key holds anything
 /// usable.
 ///
-/// Shares [`choose_restore`]'s precedence with [`pick_restore`] on purpose —
-/// the dashboard's archive-reconciliation page must never advertise a restore
-/// that the checkout path would then decline to perform, and the two would
-/// drift apart the moment they each decided "is there an archive?" for
+/// Shares [`resolve_archive`] and [`choose_restore`] with [`pick_restore`] on
+/// purpose — the dashboard's archive-reconciliation page must never advertise
+/// a restore that the checkout path would then decline to perform, and the two
+/// would drift apart the moment they each decided "is there an archive?" for
 /// themselves. Takes the HTTP client so a scan over many schemas reuses one
 /// connection pool instead of building a client per probe.
 pub(crate) async fn probe_archive(
@@ -132,28 +351,34 @@ pub(crate) async fn probe_archive(
     http: &reqwest::Client,
     schema: &str,
 ) -> Option<ArchiveProbe> {
-    let len_of = |r: anyhow::Result<Option<crate::s3::ObjectId>>| match r {
-        Ok(id) => id,
-        Err(_) => None,
-    };
-    let dump_key = s3.object_key(schema);
-    let image_key = s3.image_object_key(schema);
-    let dump = len_of(s3.head_object(http, &dump_key, HEAD_TIMEOUT).await);
-    let image = len_of(s3.head_object(http, &image_key, HEAD_TIMEOUT).await);
-    match choose_restore(
-        dump.as_ref().map(|d| d.content_length),
-        image.as_ref().map(|i| i.content_length),
-    ) {
+    let found = resolve_archive(s3, http, schema).await;
+    let kind = found.kind();
+    let PrefixHeads { s3, dump, image } = found;
+    match kind {
         // `choose_restore` defaults to Dump when neither key is usable, so the
         // size gate has to be re-checked here — that default is a restore-path
         // convenience (it produces the better error message), not a claim that
         // an object exists.
-        RestoreKind::Dump => dump.filter(|d| d.content_length >= MIN_DUMP_BYTES).map(|d| {
-            ArchiveProbe { kind: RestoreKind::Dump, key: dump_key, bytes: d.content_length, last_modified: d.last_modified }
-        }),
-        RestoreKind::Image => image.filter(|i| i.content_length >= MIN_IMAGE_BYTES).map(|i| {
-            ArchiveProbe { kind: RestoreKind::Image, key: image_key, bytes: i.content_length, last_modified: i.last_modified }
-        }),
+        RestoreKind::Dump => dump
+            .ok()
+            .flatten()
+            .filter(|d| d.content_length >= MIN_DUMP_BYTES)
+            .map(|d| ArchiveProbe {
+                kind,
+                key: s3.object_key(schema),
+                bytes: d.content_length,
+                last_modified: d.last_modified,
+            }),
+        RestoreKind::Image => image
+            .and_then(Result::ok)
+            .flatten()
+            .filter(|i| i.content_length >= MIN_IMAGE_BYTES)
+            .map(|i| ArchiveProbe {
+                kind,
+                key: s3.image_object_key(schema),
+                bytes: i.content_length,
+                last_modified: i.last_modified,
+            }),
     }
 }
 
@@ -176,30 +401,6 @@ impl ArchiveProbe {
             RestoreKind::Image => "image",
         }
     }
-}
-
-pub async fn pick_restore(s3: &S3Config, schema: &str) -> RestoreKind {
-    let Ok(http) = reqwest::Client::builder().build() else {
-        return RestoreKind::Dump;
-    };
-    let len_of = |r: anyhow::Result<Option<crate::s3::ObjectId>>| match r {
-        Ok(id) => id.map(|i| i.content_length),
-        Err(_) => None,
-    };
-    let dump = len_of(
-        s3.head_object(&http, &s3.object_key(schema), HEAD_TIMEOUT)
-            .await,
-    );
-    // Only ask about the image when the dump can't decide — the common case
-    // (dump-archived schema) costs one HEAD, not two.
-    if matches!(dump, Some(d) if d >= MIN_DUMP_BYTES) {
-        return RestoreKind::Dump;
-    }
-    let image = len_of(
-        s3.head_object(&http, &s3.image_object_key(schema), HEAD_TIMEOUT)
-            .await,
-    );
-    choose_restore(dump, image)
 }
 
 /// Archive `sandbox_id`'s data disk for `schema` to S3. The caller must hold
@@ -234,6 +435,19 @@ pub async fn archive_disk(
 
     wait_disk_released(&disk).await?;
 
+    // Before anything is compressed, let alone uploaded: an empty cluster is
+    // not worth a key, and writing one replaces whatever the key holds.
+    if cluster_contents_of(&disk).await == ClusterContents::Empty {
+        return Err(empty_cluster(format!(
+            "schema {schema}: refusing to archive {} to S3 — the cluster on it has no user \
+             relations, so a restore from it would serve an empty database while the upload \
+             replaced whatever s3://{}/{} holds",
+            disk.display(),
+            s3.bucket,
+            s3.image_object_key(schema),
+        )));
+    }
+
     let pg_version = pg_version_of(&disk).await;
     if let Some(v) = &pg_version {
         info!("schema {schema}: disk carries pgdata v{v}");
@@ -243,6 +457,50 @@ pub async fn archive_disk(
     // that fails preen is uploaded exactly as it is — these bytes may be the
     // only copy, and repair belongs on a restore-time copy.
     trim_disk(schema, &disk).await;
+
+    // What the trim cannot undo is corruption the kernel already recorded. An
+    // image of that filesystem is unservable forever: every restore rebuilds
+    // the same disk and Postgres PANICs on it (`could not flush dirty data:
+    // Structure needs cleaning`), burning a full ready_timeout per attempt —
+    // eighteen of them on one workbook on 2026-09-15, because the damage had
+    // been archived on top of a copy that still booted.
+    if let Some(health) = fs_health(&disk).await
+        && health.is_damaged()
+    {
+        // Only refuse when there is something to lose. An image already in S3
+        // predates this damage and still boots, so it must not be overwritten
+        // by one that cannot. With no image there, these damaged bytes are the
+        // only copy there will be — archiving them beats dropping them, and
+        // the restore path repairs what it can before booting.
+        // Looked up under whichever prefix a restore would read: an image
+        // the legacy layout holds boots just the same, and archiving under
+        // the write prefix would shadow it.
+        let existing = match reqwest::Client::builder().build() {
+            Ok(http) => {
+                let found = resolve_archive(s3, &http, schema).await.s3;
+                found
+                    .head_object(&http, &found.image_object_key(schema), HEAD_TIMEOUT)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            Err(_) => None,
+        };
+        if existing.is_some() {
+            bail!(
+                "schema {schema}: this disk's filesystem is damaged ({}) — refusing to \
+                 overwrite the image already in S3, which predates the damage and still \
+                 boots; repair the disk (e2fsck -fy on a copy) before archiving it again",
+                health.summary()
+            );
+        }
+        warn!(
+            "schema {schema}: archiving a damaged filesystem ({}) — there is no earlier \
+             image to keep, so these bytes are the only copy; a restore from it is \
+             repaired before it boots",
+            health.summary()
+        );
+    }
 
     // Spool space: the compressed image can't exceed the disk's allocated
     // bytes, so that (plus slack) is the safe bound to check.
@@ -306,6 +564,33 @@ pub async fn compact_disk(
     // a disk that fails preen is imaged exactly as it is.
     trim_disk(schema, &disk).await;
 
+    // And the same refusal as `archive_disk`, for the same reason: corruption
+    // the kernel already recorded outlives the trim, and this file is what the
+    // tier serves from — and what `promote_compact` later uploads — so writing
+    // it out of a damaged filesystem makes the damage the schema's permanent
+    // state.
+    if let Some(health) = fs_health(&disk).await
+        && health.is_damaged()
+    {
+        if tokio::fs::metadata(compact.compact_path(schema))
+            .await
+            .is_ok()
+        {
+            bail!(
+                "schema {schema}: this disk's filesystem is damaged ({}) — refusing to \
+                 overwrite the compact image already on disk, which predates the damage and \
+                 still boots; repair the disk (e2fsck -fy on a copy) before compacting it again",
+                health.summary()
+            );
+        }
+        warn!(
+            "schema {schema}: compacting a damaged filesystem ({}) — there is no earlier \
+             image to keep, so these bytes are the only copy; a restore from it is \
+             repaired before it boots",
+            health.summary()
+        );
+    }
+
     let allocated = {
         use std::os::unix::fs::MetadataExt;
         tokio::fs::metadata(&disk).await.map(|m| m.blocks() * 512).unwrap_or(md.len())
@@ -326,11 +611,32 @@ pub async fn compact_disk(
         );
     }
 
+    // The raw disk is the only place the emptiness verdict can be read, and
+    // this is the last look at it: `promote_compact` has just the compressed
+    // image. Record it beside the image so the promotion can refuse without
+    // decompressing 2 GiB to find out.
+    let contents = cluster_contents_of(&disk).await;
+
     let dest = compact.compact_path(schema);
     let tmp = compact.compact_dir.join(format!("{schema}.img.zst.tmp"));
     let res = compact_via_tmp(schema, &disk, &tmp, &dest, Some(disk_lock)).await;
     if res.is_err() {
         let _ = tokio::fs::remove_file(&tmp).await;
+        return res;
+    }
+    let marker = empty_marker(&dest);
+    if contents == ClusterContents::Empty {
+        info!(
+            "schema {schema}: compacted an empty cluster — keeping it local; it will not be \
+             promoted to S3"
+        );
+        if let Err(e) = tokio::fs::write(&marker, b"").await {
+            warn!("schema {schema}: writing {} failed: {e}", marker.display());
+        }
+    } else {
+        // This image has data: clear any marker an earlier, emptier compaction
+        // of the same schema left behind.
+        let _ = tokio::fs::remove_file(&marker).await;
     }
     res
 }
@@ -412,6 +718,16 @@ async fn compact_via_tmp(
 /// time (restores prefer dumps — see [`choose_restore`]). The caller flips
 /// the tier and removes the local file on `Ok`.
 pub async fn promote_compact(s3: &S3Config, schema: &str, path: &Path) -> Result<u64> {
+    // Set by `compact_disk`, which had the raw disk to judge from.
+    if tokio::fs::metadata(empty_marker(path)).await.is_ok() {
+        return Err(empty_cluster(format!(
+            "schema {schema}: refusing to promote {} to S3 — it images a cluster with no user \
+             relations, and the upload would replace whatever s3://{}/{} holds",
+            path.display(),
+            s3.bucket,
+            s3.image_object_key(schema),
+        )));
+    }
     let len = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("statting compact image {}", path.display()))?
@@ -793,7 +1109,15 @@ async fn materialize_inner(
     // bring-up.
     pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
-    download(s3, http, key, expect_len, zst).await?;
+    let started = std::time::Instant::now();
+    let downloaded = download(s3, http, key, expect_len, zst).await;
+    // Recorded before the `?`: a download that lands and is then wasted by a
+    // failed adoption still moved the bytes, and that is exactly the restore
+    // worth seeing in the network figures.
+    if downloaded.is_ok() {
+        crate::events::record_timing(crate::events::Timing::RestoreS3Download, started.elapsed());
+    }
+    downloaded?;
     adopt_zst_image(cfg, schema, zst, raw, spares, pinned).await
 }
 
@@ -814,6 +1138,25 @@ async fn adopt_zst_image(
     // Whether this schema's VM must never be idle-stopped — see the callers.
     pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
+    let started = std::time::Instant::now();
+    let adopted = adopt_zst_image_inner(cfg, schema, zst, raw, spares, pinned).await;
+    // Success only: a failed adoption is bounded by whichever step gave up,
+    // not by what the work costs — the same reason `VmCreate` counts only
+    // creates that finished.
+    if adopted.is_ok() {
+        crate::events::record_timing(crate::events::Timing::RestoreImageAdopt, started.elapsed());
+    }
+    adopted
+}
+
+async fn adopt_zst_image_inner(
+    cfg: &Config,
+    schema: &str,
+    zst: &Path,
+    raw: &Path,
+    spares: crate::vm::Spares<'_>,
+    pinned: bool,
+) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     run_ok(
         Command::new("zstd").args(["-q", "-d", "-f", "--sparse", "-o"]).arg(raw).arg(zst),
         "decompressing the disk image (is zstd installed?)",
@@ -823,19 +1166,59 @@ async fn adopt_zst_image(
     check_ext4_magic(raw)
         .await
         .with_context(|| format!("schema {schema}: downloaded image is not an ext4 filesystem"))?;
-    // Report-only fsck: a dirty journal is expected (the archive-time stop is
-    // an unclean power-off) and the guest replays it on boot; this just puts
-    // the disk's state on the record before the VM gets it.
-    if let Ok(out) = run(
-        Command::new("e2fsck").args(["-fn"]).arg(raw),
-        FSCK_TIMEOUT,
-    )
-    .await && !out.status.success()
+    // Check, then repair if needed. A dirty journal is expected — the
+    // archive-time stop is an unclean power-off — and on its own the guest
+    // would replay it at boot. But findings here also cover real corruption
+    // that was archived along with the data, and booting that is what turns
+    // one damaged filesystem into an unservable schema: Postgres PANICs on
+    // the end-of-recovery checkpoint (`could not flush dirty data: Structure
+    // needs cleaning`), the postmaster restarts, and the pooler waits out a
+    // full ready_timeout before trying the whole restore again.
+    //
+    // This image is scratch — the durable copy is the archive it came from —
+    // so repairing it in place costs nothing and is the one moment repair is
+    // safe. `-y` because there is nobody to answer the questions, and because
+    // a half-repaired filesystem is what the reclaim script's preen leaves
+    // behind when it gives up.
+    if let Ok(out) = run(Command::new("e2fsck").args(["-fn"]).arg(raw), FSCK_TIMEOUT).await
+        && !out.status.success()
     {
         info!(
-            "schema {schema}: restored image has fsck findings (exit {:?}) — expected \
-             for an unclean-stop archive; the guest replays the journal on boot",
+            "schema {schema}: restored image has fsck findings (exit {:?}) — repairing the \
+             restored copy before the VM gets it",
             out.status.code()
+        );
+        match run(Command::new("e2fsck").args(["-fy"]).arg(raw), FSCK_TIMEOUT).await {
+            // <4: clean, or errors corrected. 4+: errors left uncorrected.
+            Ok(fixed) if matches!(fixed.status.code(), Some(c) if c < 4) => info!(
+                "schema {schema}: repaired the restored image (fsck exit {:?})",
+                fixed.status.code()
+            ),
+            Ok(fixed) => bail!(
+                "schema {schema}: the archived filesystem is corrupt and e2fsck could not \
+                 repair it (exit {:?}): {}. Booting it would only crash-loop Postgres; \
+                 repair the archive itself, or restore this schema from an older copy",
+                fixed.status.code(),
+                String::from_utf8_lossy(&fixed.stdout)
+                    .lines()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ),
+            Err(e) => bail!("schema {schema}: repairing the restored image failed: {e:#}"),
+        }
+    }
+    // Belt and braces: a repair that "succeeded" while the superblock still
+    // records errors is not something to hand a guest — the counter is what
+    // e2fsck clears when it has actually fixed the filesystem.
+    if let Some(health) = fs_health(raw).await
+        && health.is_damaged()
+    {
+        bail!(
+            "schema {schema}: the archived filesystem still reports damage after repair \
+             ({}) — refusing to boot it; repair the archive itself, or restore this schema \
+             from an older copy",
+            health.summary()
         );
     }
     ensure_restore_headroom(cfg, schema, raw).await?;
@@ -999,6 +1382,99 @@ pub(crate) async fn offline_fs_usage(disk: &Path) -> Option<(u64, u64, u64)> {
     }
 }
 
+/// What a filesystem's own superblock records about its health.
+///
+/// The kernel writes an error counter and the first/last failure site into the
+/// superblock whenever it trips on corruption, and that record survives
+/// unmount, imaging, upload and restore — which is exactly why it is worth
+/// reading. On 2026-09-15 a workbook whose ext4 went bad on the host was
+/// compacted, uploaded and then restored eighteen times; every copy carried
+/// `FS Error count: 91011` and every boot ended in the same Postgres PANIC
+/// (`could not flush dirty data: Structure needs cleaning`), five minutes at a
+/// time. A counter that travels with the bytes is the one signal that can stop
+/// that at the source.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FsHealth {
+    /// `FS Error count`, absent from the header when it is zero.
+    pub errors: u64,
+    /// `Filesystem state` carrying "with errors" — kept separate because an
+    /// older e2fsck can clear the counter while leaving the state set.
+    pub state_with_errors: bool,
+    pub first_error: Option<String>,
+    pub first_error_fn: Option<String>,
+}
+
+impl FsHealth {
+    /// Whether the kernel has ever reported corruption on this filesystem.
+    pub(crate) fn is_damaged(&self) -> bool {
+        self.errors > 0 || self.state_with_errors
+    }
+
+    /// One operator-facing line: what was recorded, and when it started.
+    pub(crate) fn summary(&self) -> String {
+        let mut s = format!("{} error(s) recorded in the superblock", self.errors);
+        if let Some(when) = &self.first_error {
+            s.push_str(&format!(", first at {when}"));
+        }
+        if let Some(func) = &self.first_error_fn {
+            s.push_str(&format!(" in {func}"));
+        }
+        s
+    }
+}
+
+/// Parse [`FsHealth`] out of `dumpe2fs -h` output. `None` when this isn't
+/// dumpe2fs header output at all (no `Filesystem state` line), which is the
+/// only case a caller must not read as "healthy".
+fn parse_fs_health(out: &str) -> Option<FsHealth> {
+    let value = |line: &str, key: &str| -> Option<String> {
+        line.strip_prefix(key).map(|v| v.trim().to_string())
+    };
+    let mut health = FsHealth {
+        errors: 0,
+        state_with_errors: false,
+        first_error: None,
+        first_error_fn: None,
+    };
+    let mut saw_state = false;
+    for line in out.lines() {
+        if let Some(state) = value(line, "Filesystem state:") {
+            saw_state = true;
+            health.state_with_errors = state.contains("with errors");
+        } else if let Some(count) = value(line, "FS Error count:") {
+            health.errors = count.parse().unwrap_or(0);
+        } else if let Some(when) = value(line, "First error time:") {
+            health.first_error = Some(when);
+        } else if let Some(func) = value(line, "First error function:") {
+            health.first_error_fn = Some(func);
+        }
+    }
+    saw_state.then_some(health)
+}
+
+/// [`parse_fs_health`] of the ext4 filesystem in `disk`, read offline.
+///
+/// `dumpe2fs -h` rather than the full dump [`offline_fs_usage`] runs: the
+/// header is the part that survives real damage. The image that prompted this
+/// could not be read by full `dumpe2fs` at all (its group descriptors were
+/// gone) while its header still reported the error counter that proved it was
+/// the wrong thing to serve. Its exit status is ignored for the same reason —
+/// dumpe2fs can complain about a filesystem and still print a usable header.
+///
+/// `None` means "could not tell", never "healthy": callers decide what to do
+/// with an unreadable answer, and none of them may treat it as a pass.
+pub(crate) async fn fs_health(disk: &Path) -> Option<FsHealth> {
+    match run(
+        Command::new("dumpe2fs").args(["-h"]).arg(disk),
+        FSCK_TIMEOUT,
+    )
+    .await
+    {
+        Ok(out) => parse_fs_health(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => None,
+    }
+}
+
 /// Whether anything on the host holds `disk` open right now — the same
 /// (device, inode) fd scan [`wait_disk_released`] polls. A scan that can see
 /// nothing reads as "not held".
@@ -1027,6 +1503,38 @@ async fn swap_and_boot(
         .context("stopping the fresh VM for the disk swap timed out")?
         .context("stopping the fresh VM for the disk swap")?;
     wait_disk_released(&disk).await?;
+
+    // Refuse a cross-major adoption before it overwrites anything. Postgres
+    // majors are never on-disk compatible, in either direction, and nothing
+    // outside the guest sees it happen: the VM boots, init.sh emits
+    // HEYVM_READY, and the postmaster exits a second later with "database
+    // files are incompatible with server". The pooler then waits out a full
+    // ready_timeout, power-cycles, waits again, and the next client repeats the
+    // whole restore — ~5.5 minutes an attempt, against a failure no retry can
+    // ever fix. This happens whenever an archive written under one image is
+    // restored under another: a fleet running mixed majors shares one S3 key
+    // per schema.
+    //
+    // The server major comes from the vehicle itself. Its data disk was
+    // initdb'd by this host's image moments ago (a warm spare, or the create
+    // just now), so its PG_VERSION is exactly what this image serves — read the
+    // same way as the archive's, with no config to drift from the rootfs.
+    match major_verdict(pg_version_of(raw).await, pg_version_of(&disk).await) {
+        MajorVerdict::Compatible => {}
+        MajorVerdict::Mismatch { archived, server } => bail!(
+            "schema {schema}: the archived cluster was initialized by PostgreSQL {archived}, \
+             but this host's image serves PostgreSQL {server} — refusing to adopt it (the \
+             server would exit with \"database files are incompatible with server\"). The \
+             archive is untouched; it needs a PostgreSQL {archived} server to dump it before \
+             this host can serve it (see pg-fc/dump-oldpg.sh and \
+             docs/runbook-pg-major-mismatch.md)"
+        ),
+        MajorVerdict::Unknown => warn!(
+            "schema {schema}: could not read PG_VERSION from the archived image or from \
+             {} — adopting without a major-version check",
+            disk.display()
+        ),
+    }
 
     // Exact-size gate on the copy: at this point the raw image exists, so its
     // *allocated* bytes (not the sparse apparent size) are exactly what the
@@ -1172,6 +1680,32 @@ async fn trim_disk(schema: &str, disk: &Path) {
 /// `PG_VERSION` from `/pgdata` on the (unmounted) disk, via debugfs — with
 /// the `-c` fallback for a dirty journal, where normal open refuses on bitmap
 /// checksums. Best-effort provenance, never load-bearing.
+/// Whether an archived cluster can be served by this host's Postgres — see
+/// the gate in [`swap_and_boot`].
+#[derive(Debug, PartialEq, Eq)]
+enum MajorVerdict {
+    Compatible,
+    Mismatch {
+        archived: String,
+        server: String,
+    },
+    /// Either `PG_VERSION` was unreadable. Not a pass, but no grounds to refuse
+    /// data that may be perfectly servable either: the boot decides, and if it
+    /// dies, `boot_evidence` reports both majors.
+    Unknown,
+}
+
+/// [`MajorVerdict`] for an archived cluster's major against the server's.
+/// Any difference is a mismatch — a newer server cannot open an older
+/// cluster's files any more than an older one can open a newer's.
+fn major_verdict(archived: Option<String>, server: Option<String>) -> MajorVerdict {
+    match (archived, server) {
+        (Some(a), Some(s)) if a == s => MajorVerdict::Compatible,
+        (Some(archived), Some(server)) => MajorVerdict::Mismatch { archived, server },
+        _ => MajorVerdict::Unknown,
+    }
+}
+
 async fn pg_version_of(disk: &Path) -> Option<String> {
     for catastrophic in [false, true] {
         let mut cmd = Command::new("debugfs");
@@ -1425,6 +1959,95 @@ Group 1: (Blocks 32768-65535) csum 0x3c4d [INODE_UNINIT, ITABLE_ZEROED]
         assert_eq!(dumpe2fs_usage("Block count: 10\nBlock size: 4096\n"), None);
     }
 
+    /// `dumpe2fs -h` of a filesystem the kernel has tripped on. These fields
+    /// are what survive imaging, upload and restore — which is what makes them
+    /// worth refusing on rather than re-discovering in a guest.
+    const DUMPE2FS_DAMAGED: &str = "\
+Filesystem volume name:   <none>
+Filesystem state:         clean with errors
+Errors behavior:          Continue
+Block count:              524288
+FS Error count:           91011
+First error time:         Tue Sep 15 18:55:03 2026
+First error function:     ext4_lookup
+Last error time:          Tue Sep 15 23:27:47 2026
+";
+
+    const DUMPE2FS_CLEAN: &str = "\
+Filesystem volume name:   <none>
+Filesystem state:         clean
+Block count:              524288
+Block size:               4096
+";
+
+    #[test]
+    fn fs_health_reads_the_superblock_error_record() {
+        let bad = parse_fs_health(DUMPE2FS_DAMAGED).expect("a dumpe2fs header parses");
+        assert!(bad.is_damaged());
+        assert_eq!(bad.errors, 91_011);
+        assert_eq!(bad.first_error_fn.as_deref(), Some("ext4_lookup"));
+        assert!(
+            bad.summary().contains("91011 error(s)"),
+            "{}",
+            bad.summary()
+        );
+        assert!(bad.summary().contains("ext4_lookup"), "{}", bad.summary());
+
+        let good = parse_fs_health(DUMPE2FS_CLEAN).expect("a dumpe2fs header parses");
+        assert!(!good.is_damaged());
+        assert_eq!(good.errors, 0);
+    }
+
+    /// The gate that keeps a v16 archive from being booted under a v18 image —
+    /// the incident where every restore burned ~5.5 minutes on a postmaster
+    /// that exits the instant it reads the cluster's files.
+    #[test]
+    fn a_cross_major_archive_is_refused_before_adoption() {
+        let v = |s: &str| Some(s.to_string());
+        assert_eq!(major_verdict(v("18"), v("18")), MajorVerdict::Compatible);
+        // Either direction: an upgraded image can't open the old cluster, and a
+        // host still on the old image can't open an archive from an upgraded one.
+        assert_eq!(
+            major_verdict(v("16"), v("18")),
+            MajorVerdict::Mismatch {
+                archived: "16".into(),
+                server: "18".into()
+            }
+        );
+        assert_eq!(
+            major_verdict(v("18"), v("16")),
+            MajorVerdict::Mismatch {
+                archived: "18".into(),
+                server: "16".into()
+            }
+        );
+        // An unreadable side proves nothing either way; the boot decides.
+        assert_eq!(major_verdict(None, v("18")), MajorVerdict::Unknown);
+        assert_eq!(major_verdict(v("16"), None), MajorVerdict::Unknown);
+    }
+
+    /// "clean with errors" without a counter is still damaged: an older e2fsck
+    /// can clear the count and leave the state set, and that filesystem is no
+    /// safer to archive over a copy that still boots.
+    #[test]
+    fn a_cleared_error_counter_does_not_clear_the_state() {
+        let h = parse_fs_health("Filesystem state:         clean with errors\n")
+            .expect("a dumpe2fs header parses");
+        assert_eq!(h.errors, 0);
+        assert!(h.is_damaged());
+    }
+
+    /// Output that is not a dumpe2fs header means "could not tell", never
+    /// "healthy" — no caller may read `None` as a pass.
+    #[test]
+    fn unreadable_output_is_not_a_clean_bill_of_health() {
+        assert_eq!(parse_fs_health(""), None);
+        assert_eq!(
+            parse_fs_health("dumpe2fs: Bad magic number in super-block while trying to open\n"),
+            None
+        );
+    }
+
     #[test]
     fn restore_grows_a_full_image_even_with_growth_off() {
         let full = dumpe2fs_usage(DUMPE2FS_FULL).unwrap();
@@ -1499,6 +2122,203 @@ Group 1: (Blocks 32768-65535) csum 0x3c4d [INODE_UNINIT, ITABLE_ZEROED]
         // Neither: default to the dump path, whose preflight names the truth.
         assert_eq!(choose_restore(None, None), RestoreKind::Dump);
         assert_eq!(choose_restore(Some(100), Some(10)), RestoreKind::Dump);
+    }
+
+    /// S3 stub for HEADs only: a table of `bucket/key` → `Some(len)` (an
+    /// object) or `None` (a 500), 404 for anything else. Records every path
+    /// asked about, in order.
+    async fn spawn_head_stub(objects: &[(&str, Option<u64>)]) -> (String, Arc<Mutex<Vec<String>>>) {
+        use axum::body::Body;
+        use axum::extract::State;
+        use axum::http::{Response, Uri};
+        use axum::routing::any;
+        type Table = std::collections::HashMap<String, Option<u64>>;
+        type Stub = (Arc<Table>, Arc<Mutex<Vec<String>>>);
+        let table: Arc<Table> = Arc::new(
+            objects
+                .iter()
+                .map(|(k, v)| (format!("/wb/{k}"), *v))
+                .collect(),
+        );
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/{*path}",
+                any(
+                    |State((table, asked)): State<Stub>,
+                     uri: Uri| async move {
+                        asked.lock().unwrap().push(uri.path().to_string());
+                        let res = Response::builder();
+                        match table.get(uri.path()) {
+                            Some(Some(len)) => res
+                                .header("content-length", len.to_string())
+                                .header("etag", "\"e\"")
+                                .header("last-modified", "Wed, 16 Sep 2026 00:00:00 GMT"),
+                            Some(None) => res.status(500),
+                            None => res.status(404),
+                        }
+                        .body(Body::empty())
+                        .unwrap()
+                    },
+                ),
+            )
+            .with_state((table, asked.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), asked)
+    }
+
+    /// A host moved onto its own prefix, still able to read the shared one.
+    fn moved_s3(endpoint: String) -> S3Config {
+        S3Config {
+            prefix: "pg-vm-pool/host-a/".into(),
+            legacy_prefix: Some("pg-vm-pool/".into()),
+            ..stub_s3(endpoint)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_moved_prefix_restores_from_the_legacy_layout_only_when_its_own_is_empty() {
+        const IMG: u64 = 1 << 20;
+        const DUMP: u64 = 4096;
+        let (ep, asked) = spawn_head_stub(&[
+            // Archived before the move: only the legacy layout has it.
+            ("pg-vm-pool/image-before.img.zst", Some(IMG)),
+            ("pg-vm-pool/dump-before.dump", Some(DUMP)),
+            // Archived again after the move: this host's copy is the newer one.
+            ("pg-vm-pool/host-a/rearchived.img.zst", Some(IMG)),
+            ("pg-vm-pool/rearchived.dump", Some(DUMP)),
+            // This host's prefix did not answer cleanly — never a reason to
+            // serve the older copy.
+            ("pg-vm-pool/host-a/flaky.dump", None),
+            ("pg-vm-pool/flaky.img.zst", Some(IMG)),
+            ("pg-vm-pool/host-a/torn.dump", Some(100)),
+            ("pg-vm-pool/torn.img.zst", Some(IMG)),
+        ])
+        .await;
+        let s3 = moved_s3(ep.clone());
+        let legacy_asked = |schema: &str| {
+            let hit = format!("/wb/pg-vm-pool/{schema}.");
+            asked.lock().unwrap().iter().any(|p| p.starts_with(&hit))
+        };
+
+        let (kind, view) = pick_restore(&s3, "image-before").await;
+        assert_eq!(kind, RestoreKind::Image);
+        assert_eq!(
+            view.image_object_key("image-before"),
+            "pg-vm-pool/image-before.img.zst"
+        );
+        assert_eq!(
+            view.fallback_prefix(),
+            None,
+            "the restore view must not chain further"
+        );
+
+        let (kind, view) = pick_restore(&s3, "dump-before").await;
+        assert_eq!(kind, RestoreKind::Dump);
+        assert_eq!(
+            view.object_key("dump-before"),
+            "pg-vm-pool/dump-before.dump"
+        );
+
+        let (kind, view) = pick_restore(&s3, "rearchived").await;
+        assert_eq!(
+            kind,
+            RestoreKind::Image,
+            "the stale legacy dump must not win"
+        );
+        assert_eq!(view.prefix, "pg-vm-pool/host-a/");
+        assert!(!legacy_asked("rearchived"));
+
+        for schema in ["flaky", "torn"] {
+            let (kind, view) = pick_restore(&s3, schema).await;
+            assert_eq!(kind, RestoreKind::Dump, "{schema}");
+            assert_eq!(view.prefix, "pg-vm-pool/host-a/", "{schema}");
+            assert!(
+                !legacy_asked(schema),
+                "{schema} must not consult the legacy layout"
+            );
+        }
+
+        // Nowhere at all: the write prefix answers (its error names this
+        // host's key), and the view still knows a fallback was configured.
+        let (kind, view) = pick_restore(&s3, "absent").await;
+        assert_eq!(kind, RestoreKind::Dump);
+        assert_eq!(view.prefix, "pg-vm-pool/host-a/");
+        assert_eq!(view.fallback_prefix(), Some("pg-vm-pool/"));
+        assert!(legacy_asked("absent"));
+
+        // The dashboard sees exactly what a restore would use.
+        let http = reqwest::Client::new();
+        let probe = probe_archive(&s3, &http, "image-before").await.unwrap();
+        assert_eq!(probe.key, "pg-vm-pool/image-before.img.zst");
+        assert_eq!(probe.bytes, IMG);
+        assert!(probe_archive(&s3, &http, "absent").await.is_none());
+
+        // With the fallback turned off, the legacy layout is never read.
+        let off = S3Config {
+            legacy_prefix: None,
+            ..moved_s3(ep)
+        };
+        asked.lock().unwrap().clear();
+        let (kind, view) = pick_restore(&off, "image-before").await;
+        assert_eq!(
+            (kind, view.prefix.as_str()),
+            (RestoreKind::Dump, "pg-vm-pool/host-a/")
+        );
+        assert!(!legacy_asked("image-before"));
+    }
+
+    #[test]
+    fn an_untouched_cluster_is_not_worth_a_key() {
+        // Counts measured on a production host.
+        const TEMPLATE: usize = 300;
+        // A database created and never written to is template1's size.
+        assert_eq!(
+            cluster_contents(&[(1, TEMPLATE), (4, 300), (5, 301), (16384, TEMPLATE)]),
+            ClusterContents::Empty
+        );
+        // The smallest real workbook carries its own relations.
+        assert_eq!(
+            cluster_contents(&[(1, TEMPLATE), (4, 300), (5, 301), (16388, 345)]),
+            ClusterContents::UserData
+        );
+        assert_eq!(
+            cluster_contents(&[(1, TEMPLATE), (16388, 4017)]),
+            ClusterContents::UserData
+        );
+        // A create that never got as far as the database.
+        assert_eq!(
+            cluster_contents(&[(1, TEMPLATE), (4, 300), (5, 301)]),
+            ClusterContents::Empty
+        );
+        // One full database is enough, whichever one it is.
+        assert_eq!(
+            cluster_contents(&[(1, TEMPLATE), (16384, TEMPLATE), (16999, 900)]),
+            ClusterContents::UserData
+        );
+        // The cluster's own databases never decide it: `postgres` grows with
+        // cluster activity, and template0 is not a user database.
+        assert_eq!(
+            cluster_contents(&[(1, TEMPLATE), (4, 300), (5, 492), (16384, TEMPLATE)]),
+            ClusterContents::Empty
+        );
+        // Unreadable is not empty — an archive must never be refused on a
+        // listing that failed.
+        assert_eq!(cluster_contents(&[]), ClusterContents::Unknown);
+        assert_eq!(
+            cluster_contents(&[(4, 300), (16384, 999)]),
+            ClusterContents::Unknown
+        );
+    }
+
+    #[test]
+    fn the_empty_marker_sits_beside_the_image_it_describes() {
+        assert_eq!(
+            empty_marker(Path::new("/compact/s1.img.zst")),
+            Path::new("/compact/s1.img.zst.empty")
+        );
     }
 
     #[test]
@@ -1733,6 +2553,7 @@ Group 1: (Blocks 32768-65535) csum 0x3c4d [INODE_UNINIT, ITABLE_ZEROED]
         S3Config {
             bucket: "wb".into(),
             prefix: "pg-vm-pool/".into(),
+            legacy_prefix: None,
             region: "us-east-1".into(),
             discovered_region: Default::default(),
             endpoint: Some(endpoint),

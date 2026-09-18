@@ -38,6 +38,10 @@ mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
 dmesg -n 1 2>/dev/null
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 hostname ci-apps
+# Docker supplies /etc/hosts as a container mount; its exported rootfs has an
+# empty file. Restore local names at boot instead of sending localhost to DNS.
+printf '127.0.0.1 localhost ci-apps\n::1 localhost ip6-localhost ip6-loopback\n' > /etc/hosts
+ip link set lo up
 
 # Network: the kernel ip= param may not be fully applied before init runs. A
 # build needs it working — `cargo` fetches crates from the registry.

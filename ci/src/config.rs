@@ -228,6 +228,9 @@ pub struct HeyvmConfig {
     /// because it is the only configuration a test can assert against without a
     /// second machine. queue-fn is local-daemon-only for the same reason.
     pub local_runner: Option<String>,
+    /// Optional bearer for a protected direct daemon. Separate from the Cloud
+    /// credential: the host may trust a different internal API key.
+    pub local_runner_token: Option<String>,
 }
 
 /// Default for `CI_ALLOW_UNAUTHENTICATED_RUNNERS`.
@@ -302,6 +305,17 @@ pub struct Config {
     pub app_lb_url: Option<String>,
     pub app_lb_token: Option<String>,
 
+    /// Opt-in self-deployment target and the only repository allowed to update it.
+    pub controller_deployment: Option<String>,
+    pub controller_repository: Option<String>,
+    pub controller_app_lb_url: Option<String>,
+    pub controller_app_lb_token: Option<String>,
+    pub expected_sha: Option<String>,
+    /// Operator-owned runner/backend/archive-database mapping; never workflow supplied.
+    pub host_maintenance_targets: Option<String>,
+    /// Repository-scoped managed systemd app-lb targets; never workflow supplied.
+    pub host_app_lb_targets: Option<String>,
+
     /// Shared secret the `git submit` client HMACs its payload with, when it
     /// has no repository token.
     ///
@@ -318,6 +332,9 @@ pub struct Config {
     /// repository, cannot say which repository is submitting, and a leaked copy
     /// is a leak of the whole system.
     pub require_repo_token: bool,
+    /// Dedicated bearer for native runner machine routes. Never inferred from
+    /// app-lb forwarded identity or the submit credential.
+    pub native_runner_secret: Option<String>,
     /// Glob for workflow files inside a submitted tree.
     ///
     /// A workflow object will override this per repository; until then it is the
@@ -453,6 +470,7 @@ impl Config {
                 "1" | "true" | "yes" | "on" => heyo_sdk::DEFAULT_LOCAL_BASE_URL.to_string(),
                 other => other.trim_end_matches('/').to_string(),
             }),
+            local_runner_token: opt("CI_LOCAL_RUNNER_TOKEN"),
         };
 
         let nats_url = opt("CI_NATS_URL").unwrap_or_else(|| "nats://127.0.0.1:4222".to_string());
@@ -628,8 +646,16 @@ impl Config {
                 .unwrap_or_else(|| crate::heyo_ui::THEME_COOKIE.to_string()),
             app_lb_url: opt("CI_APP_LB_URL").map(|u| u.trim_end_matches('/').to_string()),
             app_lb_token: opt("CI_APP_LB_TOKEN"),
+            controller_deployment: opt("CI_CONTROLLER_DEPLOYMENT"),
+            controller_repository: opt("CI_CONTROLLER_REPOSITORY"),
+            controller_app_lb_url: opt("CI_CONTROLLER_APP_LB_URL").map(|u| u.trim_end_matches('/').to_string()),
+            controller_app_lb_token: opt("CI_CONTROLLER_APP_LB_TOKEN"),
+            expected_sha: opt("CI_EXPECTED_SHA"),
+            host_maintenance_targets: opt("CI_HOST_MAINTENANCE_TARGETS"),
+            host_app_lb_targets: opt("CI_HOST_APP_LB_TARGETS"),
             webhook_secret,
             require_repo_token: flag("CI_REQUIRE_REPO_TOKEN", false)?,
+            native_runner_secret: opt("CI_NATIVE_RUNNER_SECRET"),
             default_workflow_path: opt("CI_WORKFLOW_PATH")
                 .unwrap_or_else(|| ".ci/workflows/*.yml".to_string()),
             max_source_bytes: bytes("CI_MAX_SOURCE_BYTES", 64 * 1024 * 1024)?,
@@ -910,8 +936,8 @@ mod tests {
 
     /// A `CI_NETWORK` of only separators names nothing, and an instance serving
     /// nothing would accept submits it can never run.
-    #[test]
-    fn a_network_list_that_names_nothing_is_refused_at_startup() {
+    #[tokio::test]
+    async fn a_network_list_that_names_nothing_is_refused_at_startup() {
         unsafe {
             std::env::set_var("CI_HEYO_API_KEY", "k");
             std::env::set_var("CI_DATABASE_URL", "postgres://localhost/ci");
@@ -922,6 +948,23 @@ mod tests {
         assert!(err.to_string().contains("CI_NETWORK"), "{err}");
         assert!(err.to_string().contains("names no network"), "{err}");
         unsafe { std::env::set_var("CI_NETWORK", "test-net") };
+        unsafe {
+            std::env::set_var("CI_LOCAL_RUNNER", "https://runner.example.test");
+            std::env::remove_var("CI_LOCAL_RUNNER_TOKEN");
+        }
+        let config = Config::from_env().unwrap();
+        let runners = crate::runners::Runners::new(std::sync::Arc::new(config));
+        assert!(runners.options_for("hd-local").await.unwrap().options.api_key.is_none());
+        unsafe { std::env::set_var("CI_LOCAL_RUNNER_TOKEN", "distinct-daemon-key") };
+        let config = Config::from_env().unwrap();
+        let runners = crate::runners::Runners::new(std::sync::Arc::new(config));
+        let options = runners.options_for("hd-local").await.unwrap();
+        assert_eq!(options.options.api_key.as_deref(), Some("distinct-daemon-key"));
+        assert_eq!(options.options.base_url.as_deref(), Some("https://runner.example.test"));
+        unsafe {
+            std::env::remove_var("CI_LOCAL_RUNNER");
+            std::env::remove_var("CI_LOCAL_RUNNER_TOKEN");
+        }
     }
 
     /// Retention is the one duration where zero is meaningful — it is how an

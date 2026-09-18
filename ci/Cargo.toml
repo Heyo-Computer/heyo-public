@@ -48,6 +48,8 @@ arc-swap = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+toml_edit = "0.25"
+tempfile = "3"
 
 # The submitted source arrives as a gzipped tar. Pure-Rust rather than shelling
 # out to `tar`, because the archive is attacker-supplied: entry paths are checked
@@ -82,6 +84,7 @@ sqlx = { version = "0.8", features = [
     "runtime-tokio-rustls",
     "chrono",
     "json",
+    "uuid",
 ] }
 
 chrono = { version = "0.4", features = ["serde"] }
@@ -91,6 +94,7 @@ futures = "0.3"
 # the readable way to write one without hand-rolling a `Stream` impl.
 async-stream = "0.3"
 async-trait = "0.1"
+anyhow = "1"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

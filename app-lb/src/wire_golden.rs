@@ -50,9 +50,11 @@ fn golden(name: &str, value: &impl Serialize) {
         panic!("{}: {e}\nrun `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`", path.display())
     });
 
+    // Object ordering is not part of the JSON wire contract and can change
+    // when workspace feature unification enables serde_json's preserve_order.
     assert_eq!(
-        recorded,
-        rendered,
+        serde_json::from_str::<serde_json::Value>(&recorded).expect("recorded fixture is JSON"),
+        serde_json::from_str::<serde_json::Value>(&rendered).expect("rendered fixture is JSON"),
         "{} is stale — the wire format changed.\n\
          Every client re-declares these types, so this is an API change even if \
          no Rust caller broke.\n\
@@ -90,6 +92,7 @@ fn vm_spec() -> DeploymentSpec {
                 strip_prefix: false,
             },
         ],
+        maintenance: false,
         vm: Some(crate::config::VmSpec {
             env_from: vec![],
             workspace_archive: None,
@@ -144,6 +147,7 @@ fn vm_spec() -> DeploymentSpec {
             idle_action: crate::config::IdleAction::Retain,
         },
         health: crate::config::HealthCheck {
+            expected_header: Some(crate::config::ExpectedHeader { name: "x-heyo-revision".into(), value: "0123456789abcdef0123456789abcdef01234567".into() }),
             path: Some("/healthz".into()),
             port: Some(8080),
             timeout_secs: 2,
@@ -236,6 +240,7 @@ fn site_spec() -> DeploymentSpec {
         }],
         vm: None,
         scaling: crate::config::ScalingPolicy::default(),
+        maintenance: false,
         health: crate::config::HealthCheck::default(),
         upstreams: vec![],
         discovery: None,
@@ -291,6 +296,7 @@ fn static_spec() -> DeploymentSpec {
         }],
         vm: None,
         scaling: crate::config::ScalingPolicy::default(),
+        maintenance: false,
         health: crate::config::HealthCheck::default(),
         upstreams: vec!["10.0.0.4:8080".into(), "10.0.0.5:8080".into()],
         discovery: Some(crate::config::DiscoverySpec {
@@ -361,6 +367,7 @@ fn jwt_spec() -> DeploymentSpec {
             name_claim: "name".into(),
             leeway_secs: Some(30),
             cookie: Some("heyo_access_token".into()),
+            login_endpoint: None,
             // A token-less browser at this gate is bounced here to sign in and
             // redirected back; the cookie above carries the token on the return.
             login_url: Some("https://auth.example.com/login".into()),
@@ -479,6 +486,7 @@ fn deployment_status_is_stable() {
         golden(
             name,
             &DeploymentStatus {
+                rollout_revision: "persisted-opaque-revision".into(),
                 spec,
                 kind,
                 desired_replicas: if managed { 1 } else { 0 },
@@ -750,6 +758,13 @@ fn job_records_are_stable() {
         status: JobStatus::Succeeded,
         started_at: 1_722_400_000,
         finished_at: Some(1_722_400_123),
+        operation_id: None,
+        target_namespace: None,
+        intent_fingerprint: None,
+        config_fingerprint: None,
+        source_spec_fingerprint: None,
+        readiness_verified: None,
+        reconciliation_required: false,
         repo: None,
         git_ref: None,
         commit: None,

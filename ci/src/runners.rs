@@ -56,6 +56,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// SDK options plus ownership of the forwarding listener they refer to.
+/// Evicting a cached tunnel must not close it underneath in-flight work.
+#[derive(Clone)]
+pub struct Connection {
+    pub options: HeyoClientOptions,
+    pub(crate) _tunnel: Option<Arc<HeyoClient>>,
+}
+
+impl From<HeyoClientOptions> for Connection {
+    fn from(options: HeyoClientOptions) -> Self {
+        Self { options, _tunnel: None }
+    }
+}
+
 /// Pick the daemon a name or id refers to.
 ///
 /// An exact id is unambiguous and wins outright. A **name is not**: `name`
@@ -380,6 +394,11 @@ impl Runners {
 
     pub fn snapshot(&self) -> Arc<Pool> {
         self.snapshot.load_full()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_pool(&self, pool: Pool) {
+        self.snapshot.store(Arc::new(pool));
     }
 
     fn client_options(&self) -> HeyoClientOptions {
@@ -859,24 +878,26 @@ impl Runners {
     ///
     /// This is the seam between this module and [`crate::vm`]: tunnels and
     /// credentials live here, and the VM layer only ever sees options. The
-    /// returned `base_url` is a local forwarded port that stays open because the
-    /// cache above holds the client that owns it — building a second client from
-    /// these options rides the same link rather than opening another.
-    pub async fn options_for(&self, runner_id: &str) -> Result<HeyoClientOptions, RunnerError> {
+    /// returned connection keeps its local forwarded port alive independently
+    /// of the cache. Keep it for the entire operation, including VM teardown.
+    pub async fn options_for(&self, runner_id: &str) -> Result<Connection, RunnerError> {
         if let Some(url) = &self.config.heyvm.local_runner {
-            // A same-machine daemon runs without JWT_SECRET and ignores a
-            // bearer, so none is sent — matching `HeyoClient::local`.
+            // Development daemons may need no bearer; regional hosts can
+            // require their own internal key rather than the Cloud token.
             return Ok(HeyoClientOptions {
-                api_key: None,
+                api_key: self.config.heyvm.local_runner_token.clone(),
                 base_url: Some(url.clone()),
                 timeout: None,
-            });
+            }.into());
         }
         let client = self.client_for(runner_id).await?;
-        Ok(HeyoClientOptions {
-            api_key: Some(self.config.heyvm.api_key.clone()),
-            base_url: Some(client.base_url().to_string()),
-            timeout: None,
+        Ok(Connection {
+            options: HeyoClientOptions {
+                api_key: Some(self.config.heyvm.api_key.clone()),
+                base_url: Some(client.base_url().to_string()),
+                timeout: None,
+            },
+            _tunnel: Some(Arc::new(client)),
         })
     }
 
@@ -933,7 +954,13 @@ impl Runners {
         if let Some(known) = self.capabilities.lock().unwrap().get(runner_id) {
             return Ok(known.clone());
         }
-        let client = self.client_for(runner_id).await?;
+        let connection = self.options_for(runner_id).await?;
+        let client = HeyoClient::new(connection.options.clone()).map_err(|e| {
+            RunnerError::Unreachable {
+                runner: runner_id.to_string(),
+                reason: format!("could not build a daemon client: {e}"),
+            }
+        })?;
         let response = client
             .raw_request(
                 Method::GET,
@@ -975,6 +1002,33 @@ impl Runners {
             .unwrap()
             .insert(runner_id.to_string(), drivers.clone());
         Ok(drivers)
+    }
+
+    /// Fresh free-space measurement from the same daemon inventory app-lb uses.
+    /// Unlike driver capabilities this must not be cached across allocations.
+    pub async fn free_disk_bytes(&self, runner_id: &str) -> Result<u64, RunnerError> {
+        let options = self.options_for(runner_id).await?;
+        let result = async {
+            let client = HeyoClient::new(options.options.clone())?;
+            let response = client.raw_request(
+                Method::GET, "/storage", None::<&()>,
+                RequestOptions { timeout: Some(Duration::from_secs(15)), query: Vec::new() },
+            ).await?;
+            let response = response.error_for_status()?;
+            #[derive(serde::Deserialize)]
+            struct Storage { free_bytes: u64 }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(response.json::<Storage>().await?.free_bytes)
+        }.await;
+        if result.is_err() {
+            // Placement failures happen before run_claimed, so its transport
+            // recovery never sees them. Do not retry the same dead tunnel on
+            // every delivery. Existing VMs retain their own connection owner.
+            self.evict(runner_id).await;
+        }
+        result.map_err(|e| RunnerError::Unreachable {
+            runner: runner_id.to_string(),
+            reason: format!("GET /storage free-space measurement failed: {e}"),
+        })
     }
 
     /// Drop a runner's tunnel so the next `client_for` redials.
@@ -1686,6 +1740,102 @@ mod tests {
             std::env::set_var("CI_WEBHOOK_SECRET", "0123456789abcdef");
         }
         Config::from_env().expect("test config resolves")
+    }
+
+    #[tokio::test]
+    async fn active_vms_keep_evicted_tunnel_ownership_until_last_handle_drops() {
+        let mut config = test_config();
+        config.heyvm.local_runner = None;
+        let runners = Runners::new(Arc::new(config));
+        let client = |port| HeyoClient::new(HeyoClientOptions {
+            api_key: Some("test-key".into()),
+            base_url: Some(format!("http://127.0.0.1:{port}")),
+            timeout: None,
+        }).unwrap();
+        runners.tunnels.lock().await.insert("hd-test".into(), client(31001));
+        let connection = runners.options_for("hd-test").await.unwrap();
+        let owner = Arc::downgrade(connection._tunnel.as_ref().unwrap());
+        let vms = crate::vm::Vms::new();
+        let first = vms.open(connection.clone(), "sb-first".into()).await.unwrap();
+        let second = vms.open(connection, "sb-second".into()).await.unwrap();
+
+        runners.evict("hd-test").await;
+        assert!(runners.tunnels.lock().await.is_empty());
+        assert!(owner.upgrade().is_some(), "cache eviction dropped active VM connection ownership");
+        // A replacement connection must not redirect existing operations.
+        runners.tunnels.lock().await.insert("hd-test".into(), client(31002));
+        let replacement = runners.options_for("hd-test").await.unwrap();
+        assert_eq!(replacement.options.base_url.as_deref(), Some("http://127.0.0.1:31002"));
+        assert_eq!(owner.upgrade().unwrap().base_url(), "http://127.0.0.1:31001");
+        drop(first);
+        assert!(owner.upgrade().is_some(), "another VM still owns the old connection");
+        drop(second);
+        assert!(owner.upgrade().is_none(), "unused connection must not leak");
+    }
+
+    #[tokio::test]
+    async fn direct_runner_capabilities_use_daemon_credentials_without_cloud_registration() {
+        use axum::{Json, Router, http::HeaderMap, routing::get};
+        let app = Router::new().route("/capabilities", get(|headers: HeaderMap| async move {
+            assert_eq!(headers["authorization"], "Bearer daemon-only-key");
+            Json(serde_json::json!({"supportedDrivers":["firecracker","libvirt"]}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        unsafe { std::env::set_var("CI_NETWORK", "test-net") };
+        let mut config = test_config();
+        config.heyvm.base_url = Some("http://127.0.0.1:1".into());
+        config.heyvm.local_runner = Some(url);
+        config.heyvm.local_runner_token = Some("daemon-only-key".into());
+        let runners = Runners::new(Arc::new(config));
+        let result = runners.supported_drivers("hd-local").await;
+        server.abort();
+        assert_eq!(result.unwrap().unwrap().as_ref(), &["firecracker", "libvirt"]);
+    }
+
+    #[tokio::test]
+    async fn disk_placement_reads_fresh_authenticated_capacity_and_rejects_unknown() {
+        use axum::{Json, Router, http::{HeaderMap, StatusCode}, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let calls = reads.clone();
+        let app = Router::new().route("/storage", get(move |headers: HeaderMap| {
+            let calls = calls.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer daemon-only-key");
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => (StatusCode::OK, Json(serde_json::json!({"free_bytes": 100}))),
+                    1 => (StatusCode::OK, Json(serde_json::json!({"free_bytes": 0}))),
+                    2 => (StatusCode::OK, Json(serde_json::json!({}))),
+                    _ => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"free_bytes": 999}))),
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        unsafe { std::env::set_var("CI_NETWORK", "test-net") };
+        let mut config = test_config();
+        config.heyvm.local_runner = Some(url);
+        config.heyvm.local_runner_token = Some("daemon-only-key".into());
+        let runners = Runners::new(Arc::new(config));
+        let cached = HeyoClient::new(runners.client_options()).unwrap();
+        runners.tunnels.lock().await.insert("hd-local".into(), cached.clone());
+        assert_eq!(runners.free_disk_bytes("hd-local").await.unwrap(), 100);
+        assert_eq!(runners.free_disk_bytes("hd-local").await.unwrap(), 0);
+        assert!(runners.tunnels.lock().await.contains_key("hd-local"), "low capacity is not a broken connection");
+        assert!(runners.free_disk_bytes("hd-local").await.is_err());
+        assert!(!runners.tunnels.lock().await.contains_key("hd-local"), "unknown capacity must not poison every retry");
+        runners.tunnels.lock().await.insert("hd-local".into(), cached);
+        assert!(runners.free_disk_bytes("hd-local").await.is_err());
+        assert!(!runners.tunnels.lock().await.contains_key("hd-local"), "HTTP failure must force a fresh connection");
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+        server.abort();
+        let _ = server.await;
+        runners.tunnels.lock().await.insert("hd-local".into(), HeyoClient::new(runners.client_options()).unwrap());
+        assert!(runners.free_disk_bytes("hd-local").await.is_err());
+        assert!(!runners.tunnels.lock().await.contains_key("hd-local"), "transport failure must force a fresh connection");
     }
 
     fn test_runners(allow_unauthenticated: bool) -> Runners {

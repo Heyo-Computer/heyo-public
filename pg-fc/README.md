@@ -53,6 +53,22 @@ Linux only — Firecracker needs KVM, so there's no macOS host support.
 | `heyvm` / `heyvmd` (from the sibling `heyo` project) | the VM control plane: `heyvmd` (or `heyvm --api --port 34099`) serves the local sandbox HTTP API pg-vm-pool drives, and the `heyvm` CLI builds the `pg` image (`heyvm mvm build`) |
 | `heyo-sdk` crate, `>= 0.1.5` | Rust client for that API; pulled automatically by `cargo build` from crates.io, already pinned in `Cargo.toml` — no separate install needed |
 
+### Host service on systemd
+
+`deploy/pg-fc@.service` runs `/usr/local/bin/pg-vm-pool` using
+`/etc/pg-fc/<node>.env`, `/etc/pg-fc/<node>.secrets.env`, and working directory
+`/var/lib/pg-fc-<node>`. Create these paths before enabling the instance. Set
+`PG_VM_POOL_STATE_FILE` explicitly inside that state directory; the working
+directory alone does not override the default registry path. Keep the secrets
+file mode `0600`, populated from your secret manager, including `HEYO_API_KEY`
+when the host-local heyvm API requires authentication.
+
+Install the unit under `/etc/systemd/system/` and validate it with
+`systemd-analyze verify` before reloading systemd and enabling the instance.
+It does not install heyvm, provision an image, expose ports, or establish
+replication. Leave automatic eviction, orphan sweeping, and disk reclamation
+disabled on a shared host until resource ownership is configured.
+
 ## Postgres VM
 
 A Firecracker rootfs that boots straight into Postgres, with the data directory
@@ -77,6 +93,12 @@ The OS rootfs stays disposable; **all database state lives on `/workspace`**,
 which is a second Firecracker drive (`/dev/vdb` by default). On first boot the
 volume is formatted ext4 and the cluster is `initdb`'d into
 `/workspace/pgdata`; subsequent boots just mount and start.
+
+Both image recipes include `en_US.UTF-8`, so existing clusters initialized
+with that locale remain readable after a cold boot. Running `localedef` only
+inside a guest is not a durable repair: Firecracker recreates its disposable
+rootfs from the catalog image when it boots again. Preserve the PostgreSQL
+major version and the separate data disk when updating a database's rootfs.
 
 ### Build
 
@@ -188,6 +210,8 @@ Config via env (all optional):
 | `PG_VM_POOL_DISK_MAX_GB` | `100` | ceiling device growth never passes (the daemon itself caps at 250) |
 | `PG_VM_POOL_ADMIT_TIMEOUT_SECS` | `30` | how long a client waits for a free connection slot on its schema's VM before the pooler errors it; `0` fails immediately when full |
 | `PG_VM_POOL_MAX_CONCURRENT_BRINGUPS` | `3` | max VM deploys/boots in flight against heyvmd; the excess queues FIFO in the pooler (an unbounded burst can wedge the daemon, whose watchdog restart then kills every running VM); `0` disables |
+| `PG_VM_POOL_MAX_PENDING_BRINGUPS` | `16` | max whole bring-ups (deploy through ready/restore) in flight at once; the excess queues FIFO at the pooler's front door; `0` disables |
+| `PG_VM_POOL_ADMISSION_WAIT_SECS` | `15` | how long a client's bring-up may wait in that queue before it is shed with FATAL `53300`. Nothing is built for a shed bring-up and it doesn't count toward the schema's bring-up circuit breaker. Just past the Platform's 12s create budget, so no VM is built for a client that has already given up; `0` waits forever |
 | `PG_VM_POOL_CONNECT_TIMEOUT_SECS` | `30` | iroh tunnel handshake cap |
 | `PG_VM_POOL_DIRECT_CONNECT` | on | dial guest IP directly; `0` forces the tunnel |
 | `PG_VM_POOL_STATE_FILE` | `~/.heyo/pg-vm-pool/registry.tsv` | persisted schema→VM map |
@@ -206,7 +230,8 @@ Config via env (all optional):
 | `PG_VM_POOL_OFFLOAD_LOAD_MAX` | `0.75` | normalized host load (1-min loadavg / cores; on Linux this includes tasks blocked on disk I/O) at or above which the pacer stops adding jobs beyond the first — aggressive with headroom, single file without |
 | `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` | `300` | how long queued client bring-ups **or a running reclaim pass** may hold the pacer off before it dispatches anyway — single-file, no-boot kinds only. Bounds the sawtooth on a host whose bring-up queue is never empty and whose reaper keeps re-triggering reclaim; `0` yields indefinitely — see "Offload pacer" |
 | `PG_VM_POOL_S3_BUCKET` | unset | S3 bucket for dumps (required when eviction is on) |
-| `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the object per schema is `{prefix}{schema}.dump` |
+| `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the objects per schema are `{prefix}{schema}.dump` and `{prefix}{schema}.img.zst`. Joined as plain text, so end it with `/`. Every upload and delete uses it. Give each host its own (e.g. `pg-vm-pool/<host>/`) so hosts sharing a bucket can't overwrite each other's archives |
+| `PG_VM_POOL_S3_LEGACY_PREFIX` | `pg-vm-pool/` when `PG_VM_POOL_S3_PREFIX` differs, else unset | read-only fallback for restores: consulted only when both of a schema's keys under `PG_VM_POOL_S3_PREFIX` are known absent (a failed HEAD or a torn object keeps the restore on the write prefix), so changing the prefix on a host with existing archives doesn't strand them. Nothing is ever written or deleted under it. Set it empty to disable the fallback |
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
 | `PG_VM_POOL_S3_ENDPOINT` | unset (AWS) | custom endpoint for an S3-compatible store (MinIO/R2); path-style addressing |
 | `PG_VM_POOL_S3_ACCESS_KEY_ID` / `PG_VM_POOL_S3_SECRET_ACCESS_KEY` | unset | S3 credentials (fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) |
@@ -566,6 +591,18 @@ pooler and the S3 secret key never leaves it. This requires the guest VMs to
 have outbound network egress to the S3 endpoint. Each schema maps to one object,
 `s3://{bucket}/{prefix}{schema}.dump`; a single `PUT` caps at 5 GB, which is
 ample for one-workbook databases.
+
+**Empty databases are never uploaded.** A schema's key is stable and shared, so
+an upload replaces whatever is already at it — and a cluster with no user
+relations is worth nothing in a bucket: restoring one leaves a client exactly
+where a fresh create would. Every path that writes to S3 refuses such a cluster
+first. The image paths read the stopped disk's `base/` directory offline (a
+database is copied from `template1` and only grows, so a user database no
+larger than template1 has no relations of its own); the dump paths ask the
+running Postgres. Compaction and local freezing still run — the bytes stay on
+the host, the registry row keeps its tier, and the pooler journals
+`kept local — its database holds no user data`. An unreadable disk or an
+unreachable database is never treated as empty.
 
 **Disk-pressure eviction (emergency tier):** the threshold-driven pacer can't
 help when load outruns it — a filesystem that hits `No space left on device`
@@ -1052,6 +1089,12 @@ second pg-fc host. The flow is: provision the database on node A as usual, add
 node B as a **peer**, then start replication from node A's `/replication` page.
 Node B builds a VM for the same database, seeds it, and follows.
 
+Upgrade the guest image as well as the host binary. The image must contain
+the current `init.sh` support for `/workspace/heyvm-replication`; older images
+can keep `wal_level=minimal` after pg-fc requests replication. Verify the
+marker and locale survive a cold boot on a disposable data disk before
+changing a service database.
+
 ```
 node A (primary)                              node B (replica)
   pg-acme VM, wal_level=logical                 pg-acme VM
@@ -1065,12 +1108,175 @@ It is **logical** replication, not a physical standby, and that choice has
 consequences worth reading before you rely on it — see "What it does not
 carry" below.
 
-Nothing in the proxy path needed changing to carry the stream. The replica's
-walreceiver connects to node A's ordinary pooler listener like any other
+The logical replica's walreceiver connects to node A's ordinary pooler listener like any other
 client: the pooler challenges it for the replication login's password, the
 `dbname` routes it to the right VM, and the raw StartupMessage (including
 `replication=database`) is replayed upstream verbatim. So the only network
 requirement is that node A's `PG_VM_POOL_LISTEN` is reachable from node B.
+
+The listener also accepts **physical replication protocol** connections from
+a registered replication login on an active or syncing primary pairing. In
+this mode PostgreSQL ignores `dbname`, so the authenticated login selects its
+bound database VM, regardless of the client's database parameter. Tenant and
+shared credentials cannot request this mode. The bound VM's hard fence denies
+it; a selective fence allows the replication login to reconnect. Upstream
+PostgreSQL must also allow physical replication in `pg_hba.conf` (a `host all`
+rule does not cover it). The original startup packet is forwarded unchanged.
+Existing pairings remain logical until explicitly migrated. Physical candidate
+preparation is a separate, authenticated operation; it does not promote or
+replace a serving database.
+
+#### Preparing a physical replacement
+
+Upgrade the host binary on both peers and build the new guest image with the
+**same PostgreSQL major as the source**. `physical.sh` must be installed as
+`/usr/local/bin/pg-fc-physical`. Guest boot now refuses to initialize a database
+when its persistent volume is missing, keeping only the management console up.
+The release artifact includes checksummed guest build inputs alongside the
+host binary. The guest requires the full `python3` package: `python3-minimal`
+does not provide `ctypes`, used to parse credentials with libpq. Run
+`python3 pg-fc/deploy/test_physical_seed.py` from the repository root to test
+the production guest Dockerfile with PostgreSQL 18, including TTY status output
+and retry after a helper exits unexpectedly.
+
+On the existing logical primary, POST `/api/replication/<database>/physical-prepare`
+with `{"generation":"<unique-lowercase-operation-id>"}`. Repeating that request
+resumes the same operation. The source durably owns a separate physical slot
+before creating it; the existing logical slot and serving databases remain
+untouched. Both peers must advertise physical preparation support.
+
+The peer creates a distinct `repl-seed-<generation>` VM, records its ownership,
+and runs `pg_basebackup` under an exclusive guest lock. A durable plan inhibits
+ordinary initialization until backup validation and activation succeed. Verify
+progress with GET `/api/replication/<database>/physical` on the replica. The
+`verified` phase requires the expected system identifier, recovery/read-only
+mode, source sender and slot, database/role, and replay position. After guest
+startup, verification waits within the setup deadline for streaming and replay
+to become ready; command errors or malformed probe output still fail immediately.
+It does not change the serving VM binding. Existing eu1 logical or libvirt
+databases are not seed targets.
+
+Errors retain ownership and lifecycle protection. If creation was attempted
+but the daemon has no visible record yet, retries refuse a second create.
+While candidates exist, destructive cleanup is conservatively blocked,
+including pending-creation and orphan-disk cleanup. Logical promote/detach
+cannot remove credentials or slots owned by an ongoing physical migration.
+Preparation itself does not activate the candidate. A planned handoff is a
+separate controller operation described below.
+
+#### Planned physical handoff
+
+POST `/api/replication/<database>/physical-handoff` on the source with the
+exact generation, candidate ID, source node/VM, system identifier, PostgreSQL
+major, and an initially informational `barrier_lsn` (use `0/0`). Obtain the
+identity fields from GET `/api/replication/<database>/physical` on the candidate
+region; the response includes no replication credentials. The controller re-reads
+the candidate from the trusted peer and durably authorizes that exact candidate
+before fencing. It then fences and drains the exact source VM,
+captures the authoritative flushed WAL barrier, then durably and irrevocably
+grants only that peer/candidate/generation/barrier. Ordinary unfence is refused
+once candidate authorization is saved, even before the grant. Request failure
+or disconnection does not cancel an accepted handoff. A controller worker scans
+every five seconds, including after restart, and retries authorized source
+operations and destination `prepared` through `binding` operations. A merely
+`verified` standby never promotes automatically. Completed source requests are
+acknowledged durably and removed from the retry set, not from ownership history.
+
+The destination independently reads that grant through the authenticated peer
+API and persists its barrier before any guest transition. Subsequent retries
+use that durable authorization even if the source is offline, and reject a
+different barrier. It journals `prepared`, `promoting`, `promoted`, `binding`, and
+`activated` around guest preparation/promotion, the fsynced expected-old to
+candidate registry CAS, stale warm-entry removal, logical metadata retirement,
+and explicit admission open. Until `activated`, ordinary client admission is
+fail-closed. After activation, checkout attaches the exact candidate ID via the
+no-DDL fenced attach path; a mismatched registry binding is refused. The old
+logical VM remains owned and is not stopped, overwritten, or deleted.
+
+This protocol is operator-driven planned handoff, not automatic failover.
+For switch-back, call `physical-prepare` on the activated writer with a new
+generation. Both peers must advertise `physical_successor`. The request links
+the new operation to the preceding activation and source grant, retains the
+replication credential, and seeds a fresh VM in the other region. It never
+reuses or rewinds a former writer. Repeat `physical-handoff` after verification.
+Current operations and immutable history are persisted together; an old VM's
+grant permanently revokes that VM even after later switches. Stale requests
+and queued seed workers cannot mutate a newer generation.
+
+Physical sources own their durable fences independently of logical replication
+metadata. Before handoff authorization, `unfence` invalidates the saved barrier
+before reopening admission. After authorization the operation must finish; after
+a grant reopening that source VM is permanently forbidden. An
+ambiguous journal directory-sync failure stops the controller so restart reloads
+disk state instead of continuing with stale in-memory authorization.
+
+Cleanup, external secret DSNs, and regional/application routing remain outside
+the controller operation.
+
+#### Stable region-local SQL endpoints
+
+For dedicated tenants participating in physical handoff, the regional pooler
+routes new ordinary SQL connections to the authorized writer. A verified initial
+physical preparation routes to its source; an irrevocable source grant routes
+to its exact activated destination. The old guest remains revoked even though
+its region's frontend can forward to the new writer. Incomplete handoffs, stale
+bindings, mismatched identities, and unavailable peers fail closed.
+
+Forwarding uses a one-hop HTTP/1.1 upgrade on the peer dashboard API with
+certificate-verified HTTPS, no redirects, and the existing full-trust dashboard
+Basic credentials. These credentials are full administrative access, not an
+isolated SQL permission. The receiving endpoint validates tenant and ownership
+and can only attach a local writer; it never forwards again. Replication and
+maintenance connections are excluded. Sessions remain pinned to one backend;
+disconnects never cause SQL or transactions to be replayed. Applications must
+reconnect after a handoff, but can retain their region-local connection URL.
+This does not move applications, elect a writer during a partition, or implement
+regional maintenance orchestration. Prepare both peers before adopting these URLs.
+
+#### Guest promoted-but-fenced transition
+
+`pg-fc-physical` provides a deliberately narrower primitive for an authenticated
+controller that has already fenced the source. It is **not standalone failover**:
+the helper does not authorize or fence a source, change a serving binding,
+admit tenants, route traffic, or rejoin the old primary. The controller supplies
+the final source WAL barrier and must not commit serving ownership until the
+guest reports `promoted-but-fenced`.
+
+The controller invokes two durable boundaries, with the same environment on
+every retry:
+
+```sh
+PG_FC_GENERATION=generation-1 PG_FC_SYSTEM_IDENTIFIER=... PG_FC_PG_MAJOR=18 PG_FC_TENANT_DATABASE=tenant_db PG_FC_BARRIER_LSN=0/ABC PG_FC_ADMIN_ROLE=postgres PG_FC_ADMIN_PASSWORD=... /usr/local/bin/pg-fc-physical prepare-promotion
+PG_FC_GENERATION=generation-1 PG_FC_SYSTEM_IDENTIFIER=... PG_FC_PG_MAJOR=18 PG_FC_TENANT_DATABASE=tenant_db PG_FC_BARRIER_LSN=0/ABC PG_FC_ADMIN_ROLE=postgres PG_FC_ADMIN_PASSWORD=... /usr/local/bin/pg-fc-physical promote
+```
+
+`prepare-promotion` validates the values against the durable seed plan and
+cluster, requires the exact database to exist with `ALLOW_CONNECTIONS false`,
+and requires a recovering standby whose replay LSN is at or beyond the barrier.
+It then atomically writes mode-0600
+`/workspace/pg-fc-physical/promotion.json` with the generation, system ID,
+PostgreSQL major, database, barrier and phase `prepared`. The password is read
+only from the environment and is never included in the operation record,
+status, command output, or retained error log.
+
+`promote` changes the record to `promoting` before calling `pg_promote`. It then
+verifies recovery ended, identity is unchanged, and tenant admission is still
+closed; finally it changes only `PG_FC_ADMIN_ROLE`'s password (the role must
+already be a superuser) and records `promoted-but-fenced`. PostgreSQL identifier
+and password quoting are performed by PostgreSQL rather than shell SQL
+interpolation. Tenant and replication roles are not modified. There is no
+guest command to reopen admission.
+
+Both commands and `seed` serialize on `seed.lock`. Once any promotion record
+exists, seeding refuses permanently. A retry at `prepared` repeats preflight; a
+retry at `promoting` distinguishes recovery from an already-promoted primary,
+then resumes credential reconciliation and acknowledgment. A restart with a
+valid promotion record remains in physical boot mode: `prepared` still requires
+`standby.signal`, while `promoting` and `promoted-but-fenced` accept the same
+identity after promotion removed it. Missing, corrupt, extra-field, or
+plan-mismatched metadata inhibits PostgreSQL boot and cannot fall through to
+ordinary initialization. The durable seed plan and persistent root marker are
+retained throughout.
 
 #### Setting it up
 
@@ -1099,6 +1305,19 @@ another host. It is resolved to an IPv4 address **on the host** before it ever
 reaches a guest, because the microVMs ship with an empty `/etc/resolv.conf` —
 the same reason the S3 path pins IPs with `curl --resolve`.
 
+The resolved address is set as both libpq `host` and `hostaddr`, so an inherited
+guest `PGHOST` cannot override the TLS server name. Role changes persist a
+boot marker and apply the WAL, sender, and slot settings on an in-guest
+Postgres restart; restart failures are reported rather than hidden.
+
+Initial schema copy preserves table ownership and privileges. The tenant login
+is mirrored before copying, and the publisher's replication role is created as
+a non-login ACL grantee. Additional roles referenced by the source schema must
+already exist on the replica or the transactional schema copy fails.
+Both guest image recipes include HypoPG so schemas using that extension can be
+restored. Other extensions must be installed in the replica image before copying;
+schema copy does not silently omit an unavailable extension.
+
 Then, on node A's dashboard: add node B under **peers** (its dashboard URL and
 Basic credentials, plus the host and port a guest on node A would dial to reach
 node B's pooler), pick the database and the peer, and press **start
@@ -1114,6 +1333,87 @@ curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication \
      -H 'content-type: application/json' -d '{"database":"acme","peer":"node_b"}'
 
 curl -u admin:secret http://127.0.0.1:34199/api/replication/acme   # state + lag
+```
+
+For an operator-coordinated planned switchover, node A also exposes a bounded
+source-admission fence (all routes are protected by the same dashboard Basic
+authentication):
+
+```sh
+curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication/acme/fence
+curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication/acme/fence-selective
+curl -u admin:secret http://127.0.0.1:34199/api/replication/acme
+curl -u admin:secret -X POST http://127.0.0.1:34199/api/replication/acme/unfence
+```
+
+`fence` is valid only on a replication primary. It durably records intent,
+then uses that VM's private `postgres` maintenance connection to commit
+`ALTER DATABASE acme ALLOW_CONNECTIONS false` with `synchronous_commit=on`.
+ALTER does not lock out already-admitted startup processes. After its commit,
+pg-fc explicitly waits for target database-object lock holders to finish startup,
+then freshly classifies and terminates application sessions and waits for their
+actual exit. It rejects prepared transactions before and after drain and unknown
+database workers, preserving only the walsender positively identified by this
+pairing's slot. It then captures one fixed `pg_current_wal_insert_lsn()`, runs
+`CHECKPOINT`, and verifies `pg_current_wal_flush_lsn()` reached that barrier.
+The successful JSON response contains `database`, `vm_id`, `barrier_lsn`, and
+the full replication `record`; GET exposes durable fence phase/error/barrier
+under `record.fence` after a restart as well.
+
+Any failure leaves the durable fence in phase `error`; it never auto-unfences.
+Because PostgreSQL's database fence is intentionally nonselective, logical
+replication may disconnect and cannot reconnect while fenced. That is an
+abort/unfence/retry condition, not permission to reopen the source for
+catch-up. `unfence` durably invalidates any ready barrier, explicitly restores
+`ALLOW_CONNECTIONS true` through the maintenance database with synchronous
+commit, then clears the durable intent.
+Neither endpoint promotes a replica, drops replication objects, or authorizes
+target writes. The barrier is local source durability evidence only; a later
+coordinator must prove the replica applied that exact LSN before handoff.
+
+`fence-selective` is the explicit reversible-handoff variant for dedicated,
+unprivileged tenants. The ordinary `fence` remains the hard default, and a hard
+fence must be explicitly unfenced before selective mode can be requested.
+Selective mode durably records its mode and bound VM, sets the database owner
+`NOLOGIN`, revokes database `CONNECT` from both `PUBLIC` and the owner, and
+grants it only to the pairing's exact replication role. The frontend continues
+to authenticate that role with its replication password and bind it to this
+database; all tenant routes are rejected. Before changing admission, pg-fc
+rejects alternative LOGIN roles, including inherited/`SET ROLE` ownership,
+and privileged tenant roles. Only the controller, tenant owner, and exact
+replication login may be login roles in this dedicated cluster. Existing tenant
+sessions in other databases are terminated too. Sessions/startups are drained with the same worker,
+prepared-transaction, fixed-barrier, checkpoint, and flush checks as the hard
+fence while one private controller connection remains attached.
+
+After drain, the controller reads every schema-qualified sequence's actual
+`last_value` and `is_called`, plus type/start/min/max/increment/cycle/cache
+definition, directly from the sequence and catalogs. It persists that snapshot
+with the fixed barrier and VM identity in `record.fence.sequences`; values are
+never inferred from table maxima. A ready retry returns the same durable
+snapshot/barrier. Controller/Postgres restart recovery reattaches only the
+bound VM through the maintenance path and does not run ordinary role DDL, so it
+cannot restore tenant `LOGIN`. `unfence` restores owner `LOGIN` and owner
+`CONNECT` before clearing durable intent. It does not regrant `PUBLIC` access.
+This endpoint deliberately stops at the callable source boundary: it does not
+prove target replay, apply sequences, promote, or establish reverse pairing.
+
+Run the PostgreSQL protocol regressions against a disposable PostgreSQL 18
+server with `wal_level=logical`, `max_prepared_transactions > 0`, and
+`synchronous_commit=off`. Install `pg_recvlogical` for the sender test. The
+controller-recovery test uses the mock daemon's fixed guest port, so run the
+disposable server on `127.0.0.1:5432` to include it:
+
+```sh
+PG_FC_FENCE_TEST_URL=postgres://postgres:password@127.0.0.1:5432/postgres cargo test --locked --manifest-path pg-fc/Cargo.toml postgres_fence -- --ignored --nocapture
+```
+
+Selective-fence regressions require an otherwise isolated cluster and run
+serially. The restart test requires a disposable Docker container whose name
+starts with `heyo-pg-fence-`, using disk-backed PostgreSQL storage, not tmpfs:
+
+```sh
+PG_FC_FENCE_TEST_URL=postgres://postgres:password@127.0.0.1:55440/postgres PG_FC_FENCE_RESTART_CONTAINER=heyo-pg-fence-durable-restart cargo test --locked --manifest-path pg-fc/Cargo.toml postgres_selective -- --ignored --test-threads=1
 ```
 
 What that does, in order — each step durable before the thing it describes
@@ -1267,7 +1567,25 @@ the host-local tap.
 
 The cert files are **hot-reloaded**: the pooler stats them before each
 handshake and rebuilds its acceptor when they change, so an external renewer
-can rotate certs with no pooler restart. With Let's Encrypt/certbot:
+can rotate certs with no pooler restart.
+
+When host-local Traefik owns the certificate, `deploy/sync-traefik-cert.py`
+exports the exact hostname's certificate and key from its ACME JSON store.
+It validates expiry, hostname, and matching public keys with OpenSSL before
+atomically switching a `current` symlink to a protected certificate generation:
+
+```sh
+python3 deploy/sync-traefik-cert.py /path/acme.json pg.example.com /etc/pg-fc/tls
+```
+
+Point `PG_VM_POOL_TLS_CERT` at `/etc/pg-fc/tls/current/cert.pem` and
+`PG_VM_POOL_TLS_KEY` at `/etc/pg-fc/tls/current/key.pem`. Run the exporter
+periodically or after certificate renewal. Unchanged material is a no-op;
+invalid material leaves the existing certificate in place. The pooler
+hot-reloads the exported files without a restart.
+The exporter does not modify Traefik's ACME store or request certificates.
+
+With Let's Encrypt/certbot:
 
 ```sh
 # one-time issuance (needs public DNS -> this host, port 80 free for the challenge)
@@ -1385,6 +1703,39 @@ extra column on the event lines so the event format is unchanged: roll back to
 an older binary and it still reads its charts, simply ignoring the timing
 files. The same numbers are also in the pooler log, one line per create
 (`created VM pg-<schema> in …`).
+
+#### Restore latency (time to a serving Postgres)
+
+Under the two restore charts the monitoring page reports, over the same
+trailing 24 hours, how long a restore took to reach a Postgres serving the
+client — one row per source, because the four have nothing in common to
+average:
+
+| source | what it does |
+| --- | --- |
+| S3 disk image | download `{prefix}{schema}.img.zst`, decompress, swap the disk under a vehicle VM, boot on it |
+| S3 dump | bring a VM up, `CREATE DATABASE`, then the guest's `curl \| pg_restore` |
+| local image (compacted) | the S3 image path minus the download |
+| local dump (frozen) | the S3 dump path minus the download |
+
+Read the two image rows against each other: everything after the download is
+identical work, so the gap between them is what fetching from the bucket costs.
+The note under the table splits an image restore further, into the download and
+everything after it (decompress, `e2fsck`, disk swap, boot) — which is the
+reading that separates "the bucket is slow" from "this host is busy", and points
+at what to tune: the bucket's throughput on one side, or the run-dir filesystem
+(the decompress and the in-place copy are disk-bound) and the warm-spare pool
+that supplies the vehicle on the other.
+
+Bounded exactly as the create figures are: the admission wait is excluded (it
+measures how many other clients arrived at once, not what this restore costs),
+only restores that finished are counted, and percentiles are nearest-rank, so
+every figure is a restore someone actually waited through. A source with no
+restores in the window shows dashes rather than zeros, and a window too thin to
+support a percentile marks it rather than printing the maximum three times.
+Samples share the `timings-*.tsv` partitions with the create figures, so they
+survive a restart the same way; the download phase is recorded even when the
+restore that follows it fails, since the bytes still moved.
 
 #### Webhook alerts
 

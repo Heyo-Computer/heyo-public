@@ -1001,6 +1001,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_PRESSURE_CHECK_SECS",
     "PG_VM_POOL_S3_BUCKET",
     "PG_VM_POOL_S3_PREFIX",
+    "PG_VM_POOL_S3_LEGACY_PREFIX",
     "PG_VM_POOL_S3_REGION",
     "PG_VM_POOL_S3_ENDPOINT",
     "PG_VM_POOL_S3_ACCESS_KEY_ID",
@@ -1014,6 +1015,10 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_COMPACT_SWEEP_SECS",
     "PG_VM_POOL_COMPACT_DIR",
     "PG_VM_POOL_MAX_CONCURRENT_BRINGUPS",
+    // Read by `vm.rs`'s admission gate; the first was historically missing
+    // here too, so tuning the pending-bring-up cap logged a spurious warning.
+    "PG_VM_POOL_MAX_PENDING_BRINGUPS",
+    "PG_VM_POOL_ADMISSION_WAIT_SECS",
     "PG_VM_POOL_ARCHIVE_VIA_GUEST",
     // Cross-host logical replication (see `crate::replication`).
     "PG_VM_POOL_REPLICATION",
@@ -1505,7 +1510,11 @@ impl ArchiveConfig {
         };
         let region = nonempty("PG_VM_POOL_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
         let prefix = std::env::var("PG_VM_POOL_S3_PREFIX")
-            .unwrap_or_else(|_| "pg-vm-pool/".to_string());
+            .unwrap_or_else(|_| crate::s3::DEFAULT_PREFIX.to_string());
+        let legacy_prefix = crate::s3::legacy_prefix_for(
+            &prefix,
+            std::env::var("PG_VM_POOL_S3_LEGACY_PREFIX").ok(),
+        );
         let endpoint = nonempty("PG_VM_POOL_S3_ENDPOINT");
 
         Ok(Some(Self {
@@ -1515,6 +1524,7 @@ impl ArchiveConfig {
             s3: crate::s3::S3Config {
                 bucket,
                 prefix,
+                legacy_prefix,
                 region,
                 // Filled in on the first HEAD if S3 says the bucket lives
                 // somewhere other than `region`.

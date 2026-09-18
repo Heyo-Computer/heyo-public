@@ -88,6 +88,10 @@
         }
       ]
     },
+    "maintenance": {
+      "description": "Temporarily fence this deployment's public data plane. Routed requests\nreceive HTTP 503 before auth or backend selection, while deployment\nmanagement and VM exec remain available on the separate admin listener.\nPersisted as part of the deployment spec and safe to toggle with PUT.",
+      "type": "boolean"
+    },
     "namespace": {
       "description": "The namespace this deployment belongs to. Namespaces segregate use: a\ntoken minted for a namespace reaches only the deployments in it, and the\nevent feed is kept per namespace. Absent means `\"default\"`, so a fleet\nthat never says the word keeps behaving as one namespace.",
       "type": "string"
@@ -472,6 +476,22 @@
         }
       ]
     },
+    "ExpectedHeader": {
+      "description": "A response identity assertion, in addition to HTTP success.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ]
+    },
     "FeedSpec": {
       "description": "A deployment's opt-in hooks into its namespace's event feed.\n\nEverything here defaults to *off*: the feed is a megaphone, and a\ndeployment should end up on it only because its spec said so, never because\na default did. The three switches are independent — a deployment can\nannounce itself without reporting issues, report issues without announcing,\nor neither and only `expose` the feed for the rest of its namespace.",
       "type": "object",
@@ -499,6 +519,17 @@
       "description": "How a freshly-booted VM is proven ready before it joins the pool.\n\nThis exists because the SDK's readiness signal is not trustworthy on its own\n(see `vm::wait_until_running`), so we always probe the guest ourselves.",
       "type": "object",
       "properties": {
+        "expected_header": {
+          "description": "With an identity assertion, require a 2xx response and exactly one\nmatching header. An old baked-in listener must not verify a new release.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpectedHeader"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "path": {
           "description": "`None` means a bare TCP connect is enough.",
           "type": [
@@ -606,6 +637,13 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "login_endpoint": {
+          "description": "Optional Heyo Auth `/api/auth/login` endpoint for browser email/password\nsign-in. The returned access token must pass this JWT policy before a\nhost-only HttpOnly cookie is set. Requires `cookie`; never stores refresh\ntokens or passwords. Existing bearer-only gates remain unchanged.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "login_redirect_param": {
           "description": "The query parameter the hosted sign-in reads the return URL from. Only\nmeaningful with `login_url`; unset means `redirect_uri`. Set it to whatever\nthe issuer expects — `return_to`, `next`, `rd`.",
