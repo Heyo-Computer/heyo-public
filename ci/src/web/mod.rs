@@ -177,14 +177,14 @@ async fn native_release_source(State(s):State<AppState>,h:HeaderMap,Path((lease,
     let run=match s.store.get_run(&run_id).await {Ok(Some(r))=>r,Ok(None)=>return error(StatusCode::CONFLICT,"run disappeared"),Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())};
     Json(serde_json::json!({"repository":run.repo_url,"sha":sha})).into_response()
 }
-#[derive(serde::Deserialize)] struct NativeArtifactQuery{name:String,#[serde(default)]description:Option<String>,#[serde(default)]public:bool}
+#[derive(serde::Deserialize)] struct NativeArtifactQuery{name:String,#[serde(default)]description:Option<String>,#[serde(default)]public:bool,#[serde(default)]alias:Option<String>}
 async fn native_artifact(State(s):State<AppState>,h:HeaderMap,Path((lease,index)):Path<(uuid::Uuid,usize)>,Query(q):Query<NativeArtifactQuery>,body:Bytes)->impl IntoResponse {
     if let Err(e)=native_auth(&s,&h){return e};
     let _work = match s.dispatcher.lifecycle.work(&s.store).await {
         Ok(permit) => permit,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
     };
-    if q.name.trim().is_empty()||q.name.contains('/')||q.name.contains('\\')||q.name==".."{return error(StatusCode::BAD_REQUEST,"invalid artifact name")};let (run,_job,key,workflow)=match crate::native::artifact_context(&s.store,lease,index).await{Ok(Some(v))=>v,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::BAD_REQUEST,&e)};let r=crate::artifacts::ArtifactRef{run_id:run,job_key:key,workflow_id:workflow,name:q.name.clone(),description:q.description,public:q.public};let stored=match s.dispatcher.artifacts.put(&r,body.to_vec()).await{Ok(v)=>v,Err(e)=>return error(StatusCode::BAD_GATEWAY,&e.to_string())};match crate::native::record_artifact(&s.store,lease,index,&q.name,&stored).await{Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced during upload"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)}
+    if q.name.trim().is_empty()||q.name.contains('/')||q.name.contains('\\')||q.name==".."{return error(StatusCode::BAD_REQUEST,"invalid artifact name")};let (run,_job,key,workflow)=match crate::native::artifact_context(&s.store,lease,index).await{Ok(Some(v))=>v,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::BAD_REQUEST,&e)};let r=crate::artifacts::ArtifactRef{run_id:run,job_key:key,workflow_id:workflow,name:q.name.clone(),description:q.description,public:q.public,alias:q.alias.filter(|a|!a.trim().is_empty())};let stored=match s.dispatcher.artifacts.put(&r,body.to_vec()).await{Ok(v)=>v,Err(e)=>return error(StatusCode::BAD_GATEWAY,&e.to_string())};match crate::native::record_artifact(&s.store,lease,index,&q.name,&stored).await{Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced during upload"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)}
 }
 
 /// How a submit proved it may start a build.

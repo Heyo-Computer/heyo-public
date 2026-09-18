@@ -2803,6 +2803,12 @@ impl Dispatcher {
                 // `with:` values are strings so they can be substituted. Only
                 // the two spellings a person would write are accepted; a
                 // typo must not silently mean "private".
+                // The stable tag this upload should become, if the workflow
+                // names one. Validated when it is set, not here, so one code
+                // path decides what the store will accept.
+                let alias = with("alias")
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty());
                 let public = match with("public").as_deref().map(str::trim) {
                     None | Some("") | Some("false") => false,
                     Some("true") => true,
@@ -2891,6 +2897,7 @@ impl Dispatcher {
                     name: name.clone(),
                     description,
                     public,
+                    alias,
                 };
 
                 // The fast path: the guest pushes the tarball to the store
