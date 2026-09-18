@@ -108,6 +108,21 @@ pub struct ArtifactRef {
     /// public flag opens `GET /blobs/{digest}` for that one digest and nothing
     /// else, so the tag, the manifest and every listing stay behind the key.
     pub public: bool,
+    /// A second, **stable** tag to move onto this upload — the workflow's
+    /// `alias:`.
+    ///
+    /// [`tag_for`] names an artifact after the run that made it, which is
+    /// right for addressing one build and useless for following the newest:
+    /// a deployment pinned to `ci-…-00000004-release-retail` keeps serving
+    /// that build forever, and every release needs somebody to repoint it by
+    /// hand. An alias is the moving half of the pair — `retail-live` — so a
+    /// deployment names it once and a pull takes whatever the last green run
+    /// published.
+    ///
+    /// Refused if it starts with `ci-`: that prefix belongs to the per-run
+    /// tags, and an alias that could overwrite one would let a workflow
+    /// rewrite another run's address.
+    pub alias: Option<String>,
 }
 
 /// What a guest needs to push a blob into the store itself: where, and as
@@ -497,6 +512,22 @@ impl ArtifactsSink {
             .map_err(|e| ArtifactError::Transport(e.to_string()))?;
         check(put_tag, "setting a tag").await?;
 
+        // The alias, if the workflow asked for one. It fails the upload rather
+        // than being best-effort like a label: an alias is what a deployment
+        // *resolves through*, so a run that stored bytes but left the alias on
+        // the previous build has published nothing and must say so.
+        if let Some(alias) = r.alias.as_deref() {
+            let alias = validate_alias(alias)?;
+            let put_alias = self
+                .auth(self.http.put(format!("{base}/tags/{alias}")))
+                .header(reqwest::header::CONTENT_TYPE, "text/plain")
+                .body(manifest_digest.clone())
+                .send()
+                .await
+                .map_err(|e| ArtifactError::Transport(e.to_string()))?;
+            check(put_alias, "moving the alias tag").await?;
+        }
+
         // The public flag goes on the blob, by digest, after it is named and
         // before the labels: a failure here must fail the upload — a workflow
         // that asked for a public link and got a build that 401s on it has
@@ -675,6 +706,37 @@ pub fn tag_for(r: &ArtifactRef) -> String {
     tag
 }
 
+/// An alias the store will accept, or why it will not.
+///
+/// Stricter than [`safe`] on purpose: a per-run tag is generated, so mangling
+/// an odd character in it is a kindness, while an alias is typed by a person
+/// into a workflow and then typed again into a deployment's `artifact.ref`. A
+/// `retail live` silently stored as `retail-live` is two names for one thing
+/// and a deployment that resolves neither.
+pub fn validate_alias(alias: &str) -> Result<&str, ArtifactError> {
+    let bad = |why: &str| {
+        Err(ArtifactError::InvalidRecord(format!(
+            "`alias: {alias}` is not a usable tag: {why}"
+        )))
+    };
+    if alias.is_empty() || alias.len() > 64 {
+        return bad("it must be 1 to 64 characters");
+    }
+    if !alias
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return bad("only letters, digits, `-`, `_` and `.` are allowed");
+    }
+    if alias.starts_with('-') || alias.starts_with('.') {
+        return bad("it may not start with `-` or `.`");
+    }
+    if alias.starts_with("ci-") {
+        return bad("the `ci-` prefix names the per-run tags, which an alias must not overwrite");
+    }
+    Ok(alias)
+}
+
 /// Reduce a component to the tag/path charset.
 fn safe(s: &str) -> String {
     let out: String = s
@@ -793,6 +855,7 @@ mod tests {
             name: "binary.tar.gz".into(),
             description: None,
             public: false,
+            alias: None,
         }
     }
 
@@ -852,6 +915,7 @@ mod tests {
             name: "..".into(),
             description: None,
             public: false,
+            alias: None,
         };
         let tag = tag_for(&r);
         assert!(!tag.is_empty());
@@ -1147,6 +1211,51 @@ mod tests {
         assert!(matches!(err, ArtifactError::NotPushed { .. }), "{err}");
         assert!(err.to_string().contains("999"), "{err}");
         assert!(store.manifests.lock().unwrap().is_empty());
+    }
+
+    /// The alias is the moving half of the pair: the per-run tag still names
+    /// this build, and a second tag points at the same manifest, so a
+    /// deployment pinned to the alias follows the newest green run.
+    #[tokio::test]
+    async fn an_alias_is_set_beside_the_run_tag_and_resolves_to_the_same_manifest() {
+        let store = FakeStore::start().await;
+        store.blobs.lock().unwrap().insert(DIGEST.into(), 3);
+        let r = ArtifactRef { alias: Some("retail-live".into()), ..aref() };
+        let stored = store.sink().put_pushed(&r, DIGEST, 3).await.unwrap();
+
+        // The artifact still reports its own immutable address, not the alias.
+        assert_eq!(stored.uri, tag_for(&r));
+        let tags = store.tags.lock().unwrap();
+        assert_eq!(
+            tags.as_slice(),
+            &[
+                (tag_for(&r), "manifest-digest".to_string()),
+                ("retail-live".to_string(), "manifest-digest".to_string()),
+            ],
+            "both tags, and both resolving to the manifest the run stored",
+        );
+    }
+
+    /// An alias is typed by a person into a workflow and then again into a
+    /// deployment's `artifact.ref`, so a name the store would mangle is an
+    /// error rather than a quiet rewrite — and the `ci-` namespace is not the
+    /// workflow's to write into.
+    #[test]
+    fn an_unusable_alias_is_refused_with_the_reason() {
+        assert_eq!(validate_alias("retail-live").unwrap(), "retail-live");
+        assert_eq!(validate_alias("docs.live_2").unwrap(), "docs.live_2");
+
+        for (bad, why) in [
+            ("", "1 to 64"),
+            ("retail live", "only letters"),
+            ("-retail", "may not start"),
+            (".retail", "may not start"),
+            ("ci-Heyo-Mono-01a0-00000004-release-retail", "per-run tags"),
+        ] {
+            let err = validate_alias(bad).unwrap_err().to_string();
+            assert!(err.contains(why), "{bad:?} -> {err}");
+        }
+        assert!(validate_alias(&"a".repeat(65)).is_err());
     }
 
     /// The store has it at the size the guest measured: the artifact is named

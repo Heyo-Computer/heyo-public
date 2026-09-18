@@ -343,6 +343,10 @@ jobs:
           # is printed in the step log and shown on the run page. Nothing
           # else opens: tags, manifests and listings still need the key.
           public: true
+          # Optional; `artifacts` sink only. A second, stable tag moved onto
+          # this upload, so something downstream can follow the newest build
+          # by name instead of being repointed at each run's own tag.
+          alias: app-live
 
   deploy:
     uses: prod-runners              # any online host in that network
@@ -1156,6 +1160,19 @@ parquet. Chunked, each exec has its own timeout regardless of the artifact's
 size, and the whole transfer is bounded by the step's `timeout-minutes` — so a
 genuinely enormous artifact fails as the step's timeout, with the chunk count in
 the log, rather than as a daemon-side kill with a thousand lines of base64.
+
+`alias:` is the moving half of an artifact's name. Every upload is tagged
+`ci-<workflow>-<run>-<job>-<name>`, which addresses that one build for as long
+as the store keeps it and is exactly wrong for "serve the newest": a deployment
+pinned to `ci-…-00000004-release-retail` keeps serving that build until somebody
+repoints it by hand, which is how a site ends up months behind its pipeline.
+With `alias: retail-live` the run also moves that tag onto the manifest it just
+stored, so a deployment names `retail-live` once and each pull takes the last
+green run. The alias fails the step if it cannot be set — unlike a label, it is
+what a deployment *resolves through*, and a run that stored bytes while leaving
+the alias on the previous build has published nothing. `ci-` is refused as a
+prefix, so an alias can never overwrite a per-run tag, and the name is validated
+rather than mangled: `retail live` is an error, not a silent `retail-live`.
 
 `public: true` on the step asks the `artifacts` sink to mark the blob public
 once it is named: `PUT /public/{digest}`, which opens anonymous `GET`/`HEAD
