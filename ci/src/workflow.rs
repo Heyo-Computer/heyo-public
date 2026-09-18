@@ -1693,10 +1693,12 @@ mod repo_workflow {
         assert_eq!(plan.jobs[3].steps.last().unwrap().uses.as_deref(), Some("ci/deploy-controller"));
 
         // Exercise asymmetric changes: a shared parser affects CI and app-lb,
-        // while a service-only edit must not silently demand an absent bundle.
+        // release-mount extraction affects app-lb and its mounted service, while
+        // a service-only edit must not silently demand an absent bundle.
         for (path, expected) in [
             ("app-lb/src/main.rs", vec!["app-lb"]),
             ("app-lb/src/host_bundle.rs", vec!["app-lb", "ci"]),
+            ("app-lb/src/unpack.rs", vec!["app-lb", "orchestrator-linux"]),
             ("ci/src/main.rs", vec!["ci"]),
             ("orchestrator/src/main.rs", vec!["orchestrator-linux"]),
             ("heyosecret-client/src/lib.rs", vec!["orchestrator-linux"]),

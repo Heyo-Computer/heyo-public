@@ -79,6 +79,14 @@ pub mod wait;
 pub mod blocking;
 
 pub use api::{Client, ClientBuilder, ExecRequest, Gates, MetricsQuery, NewToken};
+
+/// The namespace an object belongs to when nothing says otherwise.
+///
+/// app-lb's own default, repeated here because the item routes for
+/// namespace-scoped objects — an auth provider is `(namespace, name)` — need a
+/// namespace in the *path*, so a client that omits `--namespace` still has to
+/// name one.
+pub const DEFAULT_NAMESPACE: &str = "default";
 pub use error::{Credential, Error, Result};
 pub use shell::{Shell, ShellEvent, ShellExit, ShellOptions};
 pub use transport::{Auth, Transport};

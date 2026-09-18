@@ -144,6 +144,9 @@ pub enum Resource {
     /// A namespace: not an object, but the set of deployments that name it.
     /// Listable and filterable; never created or deleted directly.
     Namespace,
+    /// A declared auth provider: the identity half of a sign-in gate, owned by
+    /// a namespace and inherited by deployments with `auth.provider_ref`.
+    AuthProvider,
     /// `get all` — every kind that has a listing.
     All,
 }
@@ -169,6 +172,10 @@ impl Resource {
             // coexists with `--namespace`'s `-n` the same way `d` coexists with
             // `-d`: only the positional resource word reaches this.
             "namespace" | "n" => Some(Self::Namespace),
+            // `idp` is what somebody arriving from an OIDC console will type,
+            // and `provider` is the field's own name in a spec. All three
+            // arrive here with any trailing `s` already stripped.
+            "auth-provider" | "authprovider" | "provider" | "idp" => Some(Self::AuthProvider),
             "all" => Some(Self::All),
             _ => None,
         }
@@ -184,6 +191,7 @@ impl Resource {
             Self::Job => "job",
             Self::Disk => "disk",
             Self::Namespace => "namespace",
+            Self::AuthProvider => "auth-provider",
             Self::All => "all",
         }
     }
@@ -286,6 +294,20 @@ mod tests {
         // same word by the time it gets here — as `d`/`ds` already are.
         assert_eq!(Resource::parse("n"), Some(Resource::Namespace));
         assert_eq!(Resource::Namespace.singular(), "namespace");
+    }
+
+    #[test]
+    fn auth_providers_are_addressable_under_the_words_people_reach_for() {
+        for word in ["auth-provider", "auth-providers", "provider", "providers", "idp"] {
+            assert_eq!(
+                parse_ref(&args(&[word]), None).unwrap().0,
+                Resource::AuthProvider,
+                "{word}",
+            );
+        }
+        let (kind, names) = parse_ref(&args(&["auth-provider/heyo"]), None).unwrap();
+        assert_eq!((kind, names), (Resource::AuthProvider, vec!["heyo".to_string()]));
+        assert_eq!(Resource::AuthProvider.singular(), "auth-provider");
     }
 
     /// `apply` dispatches on `kind`, and its absence has to keep meaning

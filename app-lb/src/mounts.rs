@@ -292,9 +292,9 @@ fn tree_name(digest: &str, strip: usize) -> String {
 
 /// `0755`, so heyvmd can read the tree when it runs as another user.
 ///
-/// The files inside land under app-lb's umask, which is the same treatment
-/// [`crate::unpack`] gives a site's bundle and for the same reason: an archive
-/// must not be able to ship something setuid or group-writable.
+/// Files inside are normalized by [`crate::unpack`] to safe read permissions
+/// plus their archived executable bits. An archive cannot ship something
+/// setuid or group-writable, but release entry points remain runnable.
 fn set_readable(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {

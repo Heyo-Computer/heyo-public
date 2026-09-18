@@ -4,6 +4,72 @@ A Firecracker rootfs carrying [NATS](https://nats.io) with JetStream enabled, an
 the app-lb deployment that owns its lifecycle. This is suitable for heyo's cloud
 service and other JetStream clients that can reach the VM's guest network.
 
+## Managed service variant for separating CI and NATS
+
+Use `Dockerfile.managed` and `managed.json` for a broker whose lifecycle must be
+independent of CI. The standalone example below is not a production migration
+recipe: its data disk belongs to one sandbox, its authentication is optional,
+and its guest init formats unrecognized disks. None of those behaviors is used
+by the managed variant.
+
+The managed image contains NATS 2.11.17, not CI. PID 1 only prepares the guest;
+app-lb supplies the credential and mounts storage before running
+`/opt/nats/start.sh`. The launcher requires `NATS_TOKEN`, a dedicated mounted
+`/workspace`, a `.managed-state` file containing `nats-state-v1`, and a
+`jetstream` directory on that filesystem. It never formats a disk or initializes
+missing state. The marker is an initialization guard, **not proof of a valid
+restore**. A fresh broker for network restore needs an explicitly seeded empty
+directory and marker; do not connect production clients until restore is verified.
+SSH password authentication is disabled.
+
+The launcher JSON-quotes the opaque `NATS_TOKEN` into `NATS_CONFIG_TOKEN` for
+NATS's config parser. Supply the raw token through managed secrets; do not
+pre-quote it. Numeric prefixes, quotes, and backslashes must not change the
+credential or turn it into a config expression.
+
+`managed.json` starts with zero replicas and no public route. Configure the
+verified image, HeyoSecret-backed token delivery, and a dedicated artifact-store
+workspace reference. Never use CI's workspace or snapshot tag. `vm.workspace`
+carries state across replacement; `disk_size_gb` alone does not. Keep
+`max_replicas: 1`, `warm_pool: 0`, `idle_action: retain`, and no expiry. Set
+`min_replicas: 1` when activating the prepared broker. Broker replacement has a
+stop/capture/restore gap; this is not a replicated NATS cluster or a zero-downtime
+broker upgrade. Workspace capture is crash-consistent storage recovery, not a
+substitute for a verified JetStream backup before a planned migration.
+
+Build and test locally from the repository root with OrbStack/Docker and the
+NATS CLI (tested with 0.3.2):
+
+```sh
+docker build --platform linux/amd64 -f app-lb/examples/nats/Dockerfile.managed -t heyo-nats-managed-test:2.11.17 .
+NATS_TEST_IMAGE=heyo-nats-managed-test:2.11.17 python3 app-lb/examples/nats/test_managed.py -v
+```
+
+These tests exercise actual authenticated NATS, mounted disposable stores,
+startup rejection, network backup/restore including pending acknowledgements,
+and restart. They do not boot Firecracker or verify app-lb workspace capture.
+Production image publication and deployment must use CI and the managed
+deployment APIs; a local image build is not deployment verification.
+
+For migration, fence submissions and stop all producers/consumers first. Preserve
+stream names, subjects, configs, messages, first/last sequences, consumer configs,
+delivered sequences, acknowledgement floors and pending acknowledgements. Use
+JetStream network backup **with consumers**, then restore and compare that state
+before switching CI's endpoint. Never copy the live JetStream directory as a
+consistent backup. Keep the old volume untouched; once the new broker accepts
+writes, the old snapshot is no longer a lossless rollback target.
+
+Port 4222 remains a private raw-TCP endpoint, not an app-lb HTTP route. The guest
+IP must be discovered from deployment status; a replacement can change it, so
+the broker replacement operation must update client configuration before
+resuming work. Do not expose the unauthenticated monitoring port publicly or
+send the token over an untrusted network. Cross-host access requires a verified
+private encrypted network or TLS, not merely an open firewall port. After
+cutover, verify that restarting CI leaves the broker ID, uptime and queue state
+unchanged before reopening submissions.
+
+## Standalone example
+
 ```sh
 ./build-image.sh                              # -> ~/.heyo/images/firecracker/nats.ext4
 heyctl apply -f nats.json
